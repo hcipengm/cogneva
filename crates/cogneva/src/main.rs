@@ -3,6 +3,10 @@
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 依赖树里 ring 与 aws-lc-rs 同时存在，rustls 0.23 无法自动选定
+    // CryptoProvider，首次 TLS 调用会 panic——必须在任何 TLS 使用之前安装。
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     #[cfg(windows)]
     if std::env::args().any(|a| a == "--service") {
         return cogneva::windows_service::run();
