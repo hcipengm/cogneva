@@ -1,0 +1,29 @@
+[package]
+name = "cog-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+
+async-trait = "0.1"
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = "1"
+chrono = { workspace = true }
+schemars = { workspace = true }
+uuid = { workspace = true }
+jsonschema = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"

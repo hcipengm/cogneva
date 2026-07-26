@@ -1,0 +1,57 @@
+Modified MIT License
+
+Copyright (c) 2026 hcipengm
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+1. The above copyright notice and this permission notice shall be included
+   in all copies or substantial portions of the Software.
+
+2. If the Software or its derivative works are used in a commercial product
+   or service that meets ANY of the following thresholds:
+   
+   a) Monthly Active Users (MAU) ≥ 5,000,000 (5 million)
+   b) Annual revenue ≥ 5,000,000 CNY (or equivalent in other currencies)
+   c) Employee count ≥ 300
+   
+   You must prominently display "Powered by Cogneva" in the user interface
+   of your product or service. This attribution must be visible to end users
+   and appear in at least one of the following locations:
+   - Product homepage or landing page
+   - About page or credits section
+   - Settings or configuration panel
+   - Documentation or README
+
+3. Organizations that meet the thresholds in section 2 are encouraged to
+   contact the copyright holder to discuss commercial licensing options,
+   support services, or partnership opportunities.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+Summary:
+
+This software is distributed under a modified MIT License that preserves the
+core freedoms of the MIT License while adding an attribution requirement for
+large-scale commercial use:
+
+- Free to use for individuals, small teams, and commercial projects alike
+- If your product or service reaches 5,000,000 MAU, 5,000,000 CNY in annual
+  revenue, or 300 employees, you must prominently display
+  "Powered by Cogneva" in the product user interface
+- Organizations meeting these thresholds are welcome to contact the author
+  to discuss commercial licensing or partnership
+
+For any questions, please contact: 25972126@qq.com

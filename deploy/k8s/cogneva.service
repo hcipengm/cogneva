@@ -1,0 +1,43 @@
+[Unit]
+Description=SF-Network AI Multi-Agent Collaboration Platform
+Documentation=https://github.com/sf-network/docs
+After=network-online.target redis.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/opt/sf-network/bin/sf-network
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -SIGTERM $MAINPID
+PIDFile=/run/sf-network/sf-network.pid
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sf-data /var/log/sf-network /run/sf-network
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Environment
+Environment="RUST_LOG=info"
+Environment="SF_CONFIG_DIR=/etc/sf-network"
+Environment="SF_DATA_DIR=/var/lib/sf-data"
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+StartLimitInterval=60s
+StartLimitBurst=3
+
+# Graceful shutdown timeout
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,220 @@
+//! Cogneva library — pure wiring and composition root.
+//! This crate is both a library (for integration tests) and a binary.
+//! All modules are declared here so tests can access them via `cogneva::`.
+
+pub mod assembly;
+pub mod bootstrap;
+pub mod config_loader;
+pub mod config_watcher;
+pub mod daemon;
+pub mod hot_reload;
+pub mod pidfile;
+pub mod platform;
+pub mod plugin_registry;
+pub mod shutdown_coordinator;
+pub mod validate_config;
+
+#[cfg(windows)]
+pub mod windows_service;
+
+/// Global shutdown coordinator reference for Windows Service STOP handling.
+pub static SHUTDOWN: std::sync::OnceLock<shutdown_coordinator::ShutdownCoordinator> =
+    std::sync::OnceLock::new();
+
+use std::sync::Arc;
+use tracing::warn;
+
+/// Pure wiring logic: initialize components and connect them together.
+pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = assembly::infra::load_and_normalize_config();
+    // 解析 secret://env|file|vault 引用（审计 3.3）。
+    config_loader::resolve_secret_refs(&mut config).await?;
+
+    let ctx = cog_core::PluginContext::new(config.core.clone());
+    ctx.publish(Arc::new(config.core.clone()));
+
+    let (daemon, _pid_file) = assembly::infra::init_daemon_and_pidfile();
+
+    let task_event_tx = tokio::sync::broadcast::channel::<cog_core::TaskEvent>(
+        config.system.task_event_channel_capacity,
+    )
+    .0;
+    ctx.publish(Arc::new(task_event_tx.clone()));
+
+    // Create shutdown coordinator early (before plugin init)
+    let shutdown =
+        shutdown_coordinator::ShutdownCoordinator::new(config.core.system.shutdown_timeout_ms);
+    let _ = SHUTDOWN.set(shutdown.clone());
+    let shutdown = Arc::new(shutdown);
+
+    let mut plugin_runner = plugin_registry::register_all()?;
+
+    // Config-driven plugin filtering
+    if let Some(ref enabled) = config.system.enabled_plugins {
+        plugin_runner.retain(|name| enabled.contains(&name.to_string()));
+    } else if !config.system.disabled_plugins.is_empty() {
+        plugin_runner.retain(|name| !config.system.disabled_plugins.contains(&name.to_string()));
+    }
+
+    // Validate that filtering did not break required dependencies
+    plugin_runner.validate_after_filter()?;
+
+    plugin_runner.init_all(&ctx).await?;
+
+    // Register shutdown hook now that RawLogger is available
+    if let Some(raw_logger) = ctx.consume_service::<dyn cog_core::RawLogger>() {
+        let logger = raw_logger.clone();
+        shutdown.register_hook(move || {
+            let l = logger.clone();
+            async move {
+                tracing::info!("Shutdown hook: flushing raw logger");
+                if let Err(e) = l.shutdown().await {
+                    tracing::warn!("Raw logger shutdown failed: {}", e);
+                }
+            }
+        });
+    }
+
+    // Publish shutdown infrastructure so plugins can consume it
+    let (shutdown_broadcast_tx, _shutdown_broadcast_rx) = tokio::sync::broadcast::channel(1);
+    let shutdown_signal = shutdown.signal();
+    tokio::spawn({
+        let sig = shutdown_signal.clone();
+        let tx = shutdown_broadcast_tx.clone();
+        async move {
+            sig.wait().await;
+            let _ = tx.send(());
+        }
+    });
+    ctx.publish(shutdown.clone());
+    ctx.publish(Arc::new(cog_core::ShutdownBroadcastTx(
+        shutdown_broadcast_tx,
+    )));
+    ctx.publish(Arc::new(shutdown_signal));
+
+    plugin_runner.start_all(&ctx).await?;
+
+    daemon.ready();
+
+    // Spawn config hot-reload consumer (direct orchestration, not a plugin)
+    let (config_watcher_opt, _notify_watcher) = assembly::infra::init_config_watcher();
+    if let Some(watcher) = config_watcher_opt {
+        let mut rx = watcher.subscribe();
+        let log_handle = ctx
+            .consume::<cog_observability::plugin::LogFilterHandleHolder>()
+            .map(|h| h.0.clone());
+        let supervisor_config_tx = ctx
+            .consume::<Arc<cog_supervisor::plugin::SupervisorConfigTxHolder>>()
+            .expect("supervisor config tx")
+            .0
+            .clone();
+        let gateway_state = ctx
+            .consume::<Arc<cog_gateway::GatewayState>>()
+            .expect("gateway state");
+        let llm_hot_swap = ctx.consume::<cog_llm::HotSwappableLlmClient>();
+        let llm_http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
+
+        let initial_config = watcher.current();
+        tokio::spawn(async move {
+            let mut active_llm = initial_config.llm.clone();
+            let mut active_llm_routing = initial_config.llm_routing.clone();
+            while rx.changed().await.is_ok() {
+                let new_config = rx.borrow_and_update().clone();
+                let mut applied = Vec::new();
+                let mut need_restart = Vec::new();
+
+                // 1. log_level
+                if let Some(ref handle) = log_handle {
+                    if let Ok(new_filter) =
+                        tracing_subscriber::EnvFilter::try_new(&new_config.app.log_level)
+                    {
+                        if let Err(e) = handle.reload(new_filter) {
+                            tracing::warn!("Failed to reload log filter: {}", e);
+                        } else {
+                            applied.push(format!("log_level={}", new_config.app.log_level));
+                        }
+                    }
+                }
+
+                // 2. gateway config
+                let (gateway_applied, gateway_restart) =
+                    crate::hot_reload::apply_gateway_config_update(
+                        &gateway_state.config,
+                        &new_config.gateway,
+                        &gateway_state.request_timeout_secs,
+                        &gateway_state.sandbox_task_timeout_secs,
+                    );
+                applied.extend(gateway_applied);
+                need_restart.extend(gateway_restart.clone());
+                if !gateway_restart.is_empty() {
+                    tracing::error!(
+                        "PORT CHANGE DETECTED: {}. These CANNOT be hot-reloaded. The process MUST be restarted.",
+                        gateway_restart.join("; ")
+                    );
+                }
+
+                // 3. supervisor intervals
+                let new_supervisor_cfg: cog_supervisor::SupervisorConfig =
+                    new_config.supervisor.clone().into();
+                if let Err(e) = supervisor_config_tx.send(new_supervisor_cfg) {
+                    tracing::warn!("Failed to send supervisor config reload: {}", e);
+                } else {
+                    applied.push("supervisor_intervals_updated".to_string());
+                }
+
+                // 4. LLM provider hot-swap
+                if active_llm != new_config.llm || active_llm_routing != new_config.llm_routing {
+                    if let Some(ref llm_hot_swap) = llm_hot_swap {
+                        let new_provider = match cog_llm::plugin::build_llm_provider(
+                            new_config.tuning.stream_capacity,
+                            new_config.system.anthropic_default_max_tokens,
+                            &new_config.llm_routing,
+                            &new_config.llm,
+                            llm_http_client.clone(),
+                        ) {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                tracing::warn!("Failed to reload LLM provider graph: {}", e);
+                                None
+                            }
+                        };
+                        if let Some(new_provider) = new_provider {
+                            llm_hot_swap.swap(new_provider).await;
+                            active_llm = new_config.llm.clone();
+                            active_llm_routing = new_config.llm_routing.clone();
+                            applied.push("llm_provider_swapped".to_string());
+                        }
+                    } else {
+                        need_restart
+                            .push("llm_config_changed_but_no_provider_initialized".to_string());
+                    }
+                }
+
+                // 5. metrics
+                need_restart.push(format!(
+                    "metrics_enabled={}, interval={}s (requires restart)",
+                    new_config.metrics.enabled, new_config.metrics.interval_secs
+                ));
+
+                if !applied.is_empty() {
+                    tracing::info!("Config hot-reloaded (applied): {}", applied.join("; "));
+                }
+                if !need_restart.is_empty() {
+                    tracing::error!(
+                        "Config changed but requires restart: {}",
+                        need_restart.join("; ")
+                    );
+                }
+            }
+        });
+    }
+
+    let _signal_handle = shutdown.spawn_signal_listener();
+    shutdown.signal().wait().await;
+    warn!("Shutdown signal received, stopping plugins...");
+
+    plugin_runner.shutdown_all().await?;
+    shutdown.wait_for_shutdown().await;
+    warn!("Cogneva shutdown complete");
+    Ok(())
+}

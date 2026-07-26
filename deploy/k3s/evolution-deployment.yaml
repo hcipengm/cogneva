@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cogneva-evolution
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva-evolution
+    app.kubernetes.io/component: evolution
+    app.kubernetes.io/version: "0.1.39"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cogneva-evolution
+      app.kubernetes.io/component: evolution
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cogneva-evolution
+        app.kubernetes.io/component: evolution
+        app.kubernetes.io/version: "0.1.39"
+    spec:
+      serviceAccountName: cogneva-evolution
+      # The evolution worker runs as root inside a privileged container so it
+      # can chmod, apt install, git init, self_exec, and build release binaries.
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+      initContainers:
+        # Populate the source PVC from the local bare git repository on first boot only.
+        # This gives the Pod an isolated working tree while still allowing bidirectional
+        # sync through the bare repo (host <-> bare repo <-> Pod).
+        - name: seed-source
+          image: localhost/cogneva:0.1.39
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              git config --global --add safe.directory /host-git
+              if [ ! -d /opt/cogneva/sandbox/src/.git ] || [ ! -f /opt/cogneva/sandbox/src/Cargo.toml ]; then
+                echo "Source PVC is empty or incomplete; cloning from local bare repo..."
+                find /opt/cogneva/sandbox/src -mindepth 1 -delete 2>/dev/null || true
+                git clone /host-git /opt/cogneva/sandbox/src
+              else
+                echo "Source PVC already populated; ensuring local remote points to bare repo..."
+              fi
+              cd /opt/cogneva/sandbox/src
+              git config user.email "evolution@cogneva.local"
+              git config user.name "Cogneva Evolution"
+              git remote remove local 2>/dev/null || true
+              git remote add local /host-git
+              git fetch local
+          volumeMounts:
+            - name: source
+              mountPath: /opt/cogneva/sandbox/src
+            - name: git-remote
+              mountPath: /host-git
+      containers:
+        - name: cogneva
+          image: localhost/cogneva:0.1.39
+          imagePullPolicy: IfNotPresent
+          workingDir: /opt/cogneva/sandbox/src
+          # Privileged container = filesystem sandbox boundary. All writes go
+          # into the mounted PVCs; the node itself is only exposed through the
+          # privileged boundary. For a stricter setup use a dedicated build
+          # Pod + image push instead of privileged self_exec.
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
+            runAsUser: 0
+          envFrom:
+            - configMapRef:
+                name: cogneva-config
+            - configMapRef:
+                name: cogneva-evolution-config
+          env:
+            - name: COGNEVA_CONFIG_PATH
+              value: "/etc/cogneva/cogneva.json"
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - |
+                    git config --global --add safe.directory /host-git
+                    git config --global --add safe.directory /opt/cogneva/sandbox/src
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: sandbox-data
+              mountPath: /opt/cogneva/sandbox
+            - name: source
+              mountPath: /opt/cogneva/sandbox/src
+            - name: git-remote
+              mountPath: /host-git
+              readOnly: false
+            - name: cogneva-json
+              mountPath: /etc/cogneva/cogneva.json
+              readOnly: true
+            # Mount the Docker socket only if you plan to build container images
+            # from inside the evolution Pod. Remove for pure self_exec mode.
+            # - name: docker-sock
+            #   mountPath: /var/run/docker.sock
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: 4000m
+              memory: 8Gi
+      volumes:
+        - name: sandbox-data
+          persistentVolumeClaim:
+            claimName: cogneva-evolution-pvc
+        - name: source
+          persistentVolumeClaim:
+            claimName: cogneva-evolution-source-pvc
+        - name: git-remote
+          hostPath:
+            path: /root/omc_workspace/cogneva.git
+            type: Directory
+        - name: cogneva-json
+          hostPath:
+            path: /root/omc_workspace/cogneva/cogneva.json
+            type: File
+        # - name: docker-sock
+        #   hostPath:
+        #     path: /var/run/docker.sock
+        #     type: Socket

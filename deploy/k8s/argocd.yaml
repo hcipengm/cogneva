@@ -1,0 +1,67 @@
+# ArgoCD — GitOps continuous delivery
+# Recommended install: helm install argocd argo/argo-cd --namespace argocd --create-namespace
+# This manifest provides the core Application definitions for Cogneva services.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+---
+# Cogneva core application (monitored by ArgoCD)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cogneva-core
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/hcipengm/cogneva.git
+    targetRevision: HEAD
+    path: deploy/k8s
+    directory:
+      recurse: true
+      include: "*.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+---
+# Monitoring stack application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cogneva-monitoring
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/hcipengm/cogneva.git
+    targetRevision: HEAD
+    path: deploy/k8s/monitoring
+    directory:
+      recurse: true
+      include: "*.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

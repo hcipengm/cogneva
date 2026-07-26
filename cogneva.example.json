@@ -1,0 +1,480 @@
+{
+  "_comment": "Cogneva unified configuration. Place this file at /etc/cogneva/cogneva.json or set COGNEVA_CONFIG_PATH env.",
+  "system": {
+    "event_channel_capacity": 1024,
+    "task_event_channel_capacity": 256,
+    "shutdown_timeout_ms": 30000,
+    "timeout_checker_interval_secs": 30,
+    "stale_task_detector_poll_secs": 15,
+    "trace_migrator_interval_secs": 3600,
+    "tool_timeout_secs": 30,
+    "skill_hot_reload_interval_secs": 30,
+    "grpc_reconnect_interval_secs": 5,
+    "probe_timeout_secs": 5,
+    "http_timeout_secs": 10,
+    "pattern_db_max_size": 256,
+    "pattern_max_age_days": 30,
+    "pg_max_connections": 16,
+    "pg_min_connections": 1,
+    "pg_acquire_timeout_secs": 10,
+    "pg_idle_timeout_secs": 600,
+    "memory_message_broadcast_capacity": 1024,
+    "observability_event_channel_capacity": 256,
+    "websocket_event_cache_capacity": 1000,
+    "anthropic_default_max_tokens": 4096,
+    "strict_persistence": true,
+    "vector_backend_required": true,
+    "_comment_plugin_filtering": "Plugin loading control. enabled_plugins = whitelist (omit for all). disabled_plugins = blacklist (applied when enabled_plugins is omitted).",
+    "disabled_plugins": []
+  },
+  "env": {
+    "_comment": "Environment-variable → config-path mappings. Keys are env-var names, values are dot-separated JSON paths inside this file.",
+    "COGNEVA_APP_NAME": "app.name",
+    "COGNEVA_APP_VERSION": "app.version",
+    "COGNEVA_LOG_LEVEL": "app.log_level",
+    "COGNEVA_DATA_DIR": "app.data_dir",
+    "COGNEVA_CONFIG_DIR": "app.config_dir",
+    "COGNEVA_APP_DIR": "app.app_dir",
+    "COGNEVA_LLM_PROVIDER": "llm.provider",
+    "COGNEVA_LLM_API_KEY": "llm.api_key",
+    "COGNEVA_LLM_BASE_URL": "llm.base_url",
+    "COGNEVA_LLM_MODEL": "llm.model",
+    "COGNEVA_LLM_EMBEDDING_MODEL": "llm.embedding_model",
+    "COGNEVA_LLM_MAX_TOKENS": "llm.max_tokens",
+    "COGNEVA_LLM_TEMPERATURE": "llm.temperature",
+    "COGNEVA_LLM_TIMEOUT_SECS": "llm.timeout_secs",
+    "COGNEVA_DB_PROVIDER": "providers.db.provider",
+    "COGNEVA_PG_PROVIDER": "providers.pg.provider",
+    "COGNEVA_VECTOR_PROVIDER": "providers.vector.provider",
+    "COGNEVA_MEDIA_PROVIDER": "providers.media.provider",
+    "COGNEVA_STORAGE_PROVIDER": "providers.storage.provider",
+    "COGNEVA_WIKI_PROVIDER": "providers.wiki.provider",
+    "COGNEVA_REDIS_URL": "dag_executor.redis_url",
+    "COGNEVA_WORKSPACE_ID": "dag_executor.workspace_id",
+    "COGNEVA_CONSUMER_GROUP": "dag_executor.consumer_group",
+    "COGNEVA_READY_TASK_POLL_INTERVAL_SECS": "dag_executor.ready_task_poll_interval_secs",
+    "COGNEVA_BATCH_PERSISTENCE_ENABLED": "dag_executor.batch_persistence_enabled",
+    "COGNEVA_BATCH_PERSISTENCE_MAX_CHANGES": "dag_executor.batch_persistence_max_changes",
+    "COGNEVA_BATCH_PERSISTENCE_INTERVAL_SECS": "dag_executor.batch_persistence_interval_secs",
+    "COGNEVA_HTTP_PORT": "gateway.http_port",
+    "COGNEVA_WS_PORT": "gateway.ws_port",
+    "COGNEVA_METRICS_PORT": "gateway.metrics_port",
+    "COGNEVA_RAW_LOGGER_ENABLED": "raw_logger.enabled",
+    "COGNEVA_RAW_LOGGER_BASE_DIR": "raw_logger.base_dir",
+    "COGNEVA_RAW_LOGGER_BUFFER_SIZE": "raw_logger.max_buffer_size",
+    "COGNEVA_MEMORY_ENABLED": "memory.enabled",
+    "COGNEVA_MEMORY_BACKEND_TYPE": "memory.backend_type",
+    "COGNEVA_MEMORY_BASE_DIR": "memory.base_dir",
+    "COGNEVA_MEMORY_EMBEDDING_DIMENSION": "memory.embedding_dimension",
+    "COGNEVA_MEMORY_AUTO_INGEST": "memory.auto_ingest",
+    "COGNEVA_TIER_MIGRATOR_ENABLED": "tier_migrator.enabled",
+    "COGNEVA_TIER_HOT_DURATION_SECS": "tier_migrator.hot_duration_secs",
+    "COGNEVA_TIER_WARM_DURATION_SECS": "tier_migrator.warm_duration_secs",
+    "COGNEVA_TIER_SCAN_INTERVAL_SECS": "tier_migrator.scan_interval_secs",
+    "COGNEVA_TIER_COLD_KEY_PREFIX": "tier_migrator.cold_key_prefix",
+    "COGNEVA_METRICS_ENABLED": "metrics.enabled",
+    "COGNEVA_SUPERVISOR_HEALTH_INTERVAL_SECS": "supervisor.health_interval_secs",
+    "COGNEVA_SUPERVISOR_QUOTA_INTERVAL_SECS": "supervisor.quota_interval_secs",
+    "COGNEVA_SUPERVISOR_CONTROL_PLANE_INTERVAL_SECS": "supervisor.control_plane_interval_secs",
+    "COGNEVA_SUPERVISOR_CONTROL_PLANE_URL": "supervisor.control_plane_url",
+    "COGNEVA_HOOK_ENGINE_DEDUP_WINDOW_SECS": "hook_engine.dedup_window_secs",
+    "COGNEVA_AGENT_LOOP_MAX_ITERATIONS": "agent_loop.max_iterations",
+    "COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE": "agent_loop.context_window_size",
+    "COGNEVA_AGENT_LOOP_ROLE": "agent_loop.role",
+    "COGNEVA_AGENT_LOOP_SKILL_CACHE_TTL_SECS": "agent_loop.skill_cache_ttl_secs",
+    "COGNEVA_SELF_REVIEW_ENABLED": "self_review.enabled",
+    "COGNEVA_SELF_REVIEW_MAX_ITERATIONS": "self_review.max_iterations",
+    "COGNEVA_SELF_REVIEW_QUALITY_THRESHOLD": "self_review.quality_threshold",
+    "COGNEVA_SELF_EVOLUTION_ENABLED": "self_evolution.enabled",
+    "COGNEVA_SELF_EVOLUTION_AUTO_APPLY": "self_evolution.auto_apply",
+    "COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY": "self_evolution.auto_deploy",
+    "COGNEVA_SELF_EVOLUTION_SANDBOX_MODE": "self_evolution.sandbox_mode",
+    "COGNEVA_SELF_EVOLUTION_FORCE_AUTONOMOUS": "self_evolution.force_autonomous",
+    "COGNEVA_SELF_EVOLUTION_SWITCH_MODE": "self_evolution.switch_mode",
+    "COGNEVA_SELF_EVOLUTION_PATCH_DIR": "self_evolution.patch_dir",
+    "COGNEVA_SELF_EVOLUTION_BINARY_DIR": "self_evolution.binary_dir",
+    "COGNEVA_SELF_EVOLUTION_BACKUP_DIR": "self_evolution.backup_dir",
+    "COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS": "self_evolution.poll_interval_secs",
+    "COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS": "self_evolution.test_timeout_secs",
+    "COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS": "self_evolution.build_timeout_secs",
+    "COGNEVA_TOOL_TIMEOUT_SECS": "system.tool_timeout_secs",
+    "COGNEVA_SKILL_HOT_RELOAD_INTERVAL_SECS": "system.skill_hot_reload_interval_secs",
+    "COGNEVA_GRPC_RECONNECT_INTERVAL_SECS": "system.grpc_reconnect_interval_secs",
+    "COGNEVA_PROBE_TIMEOUT_SECS": "system.probe_timeout_secs",
+    "COGNEVA_HTTP_TIMEOUT_SECS": "system.http_timeout_secs",
+    "COGNEVA_PATTERN_DB_MAX_SIZE": "system.pattern_db_max_size",
+    "COGNEVA_PATTERN_MAX_AGE_DAYS": "system.pattern_max_age_days",
+    "COGNEVA_PG_MAX_CONNECTIONS": "system.pg_max_connections",
+    "COGNEVA_PG_MIN_CONNECTIONS": "system.pg_min_connections",
+    "COGNEVA_PG_ACQUIRE_TIMEOUT_SECS": "system.pg_acquire_timeout_secs",
+    "COGNEVA_PG_IDLE_TIMEOUT_SECS": "system.pg_idle_timeout_secs",
+    "COGNEVA_MEMORY_MESSAGE_BROADCAST_CAPACITY": "system.memory_message_broadcast_capacity",
+    "COGNEVA_OBSERVABILITY_EVENT_CHANNEL_CAPACITY": "system.observability_event_channel_capacity",
+    "COGNEVA_WEBSOCKET_EVENT_CACHE_CAPACITY": "system.websocket_event_cache_capacity",
+    "COGNEVA_ANTHROPIC_DEFAULT_MAX_TOKENS": "system.anthropic_default_max_tokens",
+    "COGNEVA_WEBSOCKET_TIMEOUT_SECS": "gateway.websocket_timeout_secs",
+    "COGNEVA_WEBSOCKET_INACTIVITY_TIMEOUT_SECS": "gateway.websocket_inactivity_timeout_secs",
+    "COGNEVA_WEBSOCKET_TICK_SECS": "gateway.websocket_tick_secs",
+    "COGNEVA_NOTIFICATION_LIMIT": "gateway.notification_limit",
+    "COGNEVA_SANDBOX_TASK_TIMEOUT_SECS": "gateway.sandbox_task_timeout_secs",
+    "COGNEVA_REQUEST_TIMEOUT_SECS": "gateway.request_timeout_secs",
+    "COGNEVA_NOTIFICATION_WEBHOOK_URL": "gateway.notification_webhook_url",
+    "COGNEVA_STREAM_CAPACITY": "tuning.stream_capacity",
+    "COGNEVA_HIGH_WATERMARK": "tuning.high_watermark",
+    "COGNEVA_LOW_WATERMARK": "tuning.low_watermark",
+    "COGNEVA_MAX_SUMMARIES": "tuning.max_summaries",
+    "COGNEVA_STRICT_PERSISTENCE": "system.strict_persistence",
+    "COGNEVA_VECTOR_BACKEND_REQUIRED": "system.vector_backend_required"
+  },
+  "app": {
+    "name": "cogneva",
+    "version": "0.1.0",
+    "log_level": "info",
+    "data_dir": "/var/lib/cogneva-data",
+    "config_dir": "/etc/cogneva",
+    "app_dir": "/opt/cogneva"
+  },
+  "llm_routing": {
+    "_comment": "多 LLM 故障转移。api_style 声明兼容的 API 风格：openai 或 anthropic。默认 openai。",
+    "strategy": "failover",
+    "retry_on_429": true,
+    "retry_on_402": true,
+    "max_failover_attempts": 3,
+    "backends": [
+      {
+        "provider": "kimi",
+        "api_key": "${KIMI_API_KEY}",
+        "base_url": "https://api.kimi.com/coding/v1",
+        "model": "kimi-k2.6",
+        "api_style": "openai",
+        "weight": 1,
+        "enabled": true
+      },
+      {
+        "provider": "doubao",
+        "api_key": "${ARK_API_KEY}",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "model": "doubao-seed-2.0-code",
+        "api_style": "openai",
+        "weight": 1,
+        "enabled": false
+      }
+    ]
+  },
+  "providers": {
+    "db": {
+      "provider": "mysql",
+      "enabled": false,
+      "options": {
+        "host": "mysql.cogneva.svc.cluster.local",
+        "port": 3306,
+        "database": "cogneva",
+        "user": "cog_user",
+        "password": "${DB_PASSWORD}"
+      }
+    },
+    "pg": {
+      "provider": "postgres",
+      "enabled": true,
+      "options": {
+        "connection": "postgres://cog_user:${PG_PASSWORD}@postgres.cogneva.svc.cluster.local:5432/cogneva",
+        "host": "postgres.cogneva.svc.cluster.local",
+        "port": 5432,
+        "database": "cogneva",
+        "user": "cog_user",
+        "password": "${PG_PASSWORD}"
+      }
+    },
+    "vector": {
+      "provider": "qdrant",
+      "enabled": true,
+      "options": {
+        "url": "http://qdrant.cogneva.svc.cluster.local:6334",
+        "collection": "summaries",
+        "api_key": null
+      }
+    },
+    "media": {
+      "provider": "local-sfu",
+      "enabled": false,
+      "options": {}
+    },
+    "storage": {
+      "provider": "local-fs",
+      "enabled": true,
+      "options": {
+        "base_path": "/var/lib/cogneva-data/storage"
+      }
+    },
+    "wiki": {
+      "provider": "meilisearch",
+      "enabled": true,
+      "options": {
+        "host": "http://meilisearch.cogneva.svc.cluster.local:7700",
+        "api_key": null,
+        "index": "wiki"
+      }
+    }
+  },
+  "dag_executor": {
+    "redis_url": "redis://redis-0.redis.cogneva.svc.cluster.local:6379",
+    "nats": {
+      "urls": [],
+      "auth": {
+        "username": null,
+        "password": null,
+        "token": null
+      },
+      "tls": {
+        "enabled": false,
+        "ca_cert_path": null,
+        "client_cert_path": null,
+        "client_key_path": null,
+        "insecure_skip_verify": false
+      }
+    },
+    "workspace_id": "default",
+    "consumer_group": "cogneva",
+    "max_retries": 3,
+    "retry_delay_ms": 1000,
+    "ready_task_poll_interval_secs": 5,
+    "batch_persistence_enabled": false,
+    "batch_persistence_max_changes": 10,
+    "batch_persistence_interval_secs": 5,
+    "archive_enabled": true,
+    "archive_after_secs": 3600,
+    "archive_poll_interval_secs": 300
+  },
+  "gateway": {
+    "http_port": 8080,
+    "ws_port": 8081,
+    "metrics_port": 9090,
+    "cors_origins": [
+      "*"
+    ],
+    "websocket_timeout_secs": 30,
+    "websocket_inactivity_timeout_secs": 90,
+    "websocket_tick_secs": 5,
+    "notification_limit": 50,
+    "sandbox_task_timeout_secs": 30,
+    "request_timeout_secs": 30,
+    "notification_webhook_url": null
+  },
+  "metrics": {
+    "enabled": true,
+    "endpoint": "/metrics",
+    "interval_secs": 15
+  },
+  "raw_logger": {
+    "enabled": false,
+    "base_dir": "/var/lib/cogneva-data/raw",
+    "max_buffer_size": 1000,
+    "format": "jsonl",
+    "zstd_level": null
+  },
+  "memory": {
+    "_comment": "Memory backend — enabled by default for self-evolution persistence.",
+    "enabled": true,
+    "backend_type": "memory",
+    "base_dir": "/var/lib/cogneva-data/memory",
+    "embedding_dimension": 128,
+    "auto_ingest": true
+  },
+  "tier_migrator": {
+    "enabled": false,
+    "hot_duration_secs": 86400,
+    "warm_duration_secs": 604800,
+    "warm_compression_level": 3,
+    "cold_compression_level": 9,
+    "scan_interval_secs": 3600,
+    "cold_key_prefix": "raw"
+  },
+  "supervisor": {
+    "health_interval_secs": 10,
+    "quota_interval_secs": 60,
+    "rebalance_interval_secs": 300,
+    "event_window_secs": 30,
+    "broadcast_capacity": 256,
+    "quota_threshold": 1000,
+    "behavior_history_max": 20,
+    "heartbeat_history_max": 1000,
+    "alert_history_max": 10000,
+    "control_plane_interval_secs": 30,
+    "control_plane_url": null,
+    "health_checker": {
+      "suspect_after_secs": 15,
+      "dead_after_secs": 60,
+      "stuck_after_secs": 600
+    },
+    "task_rebalancer": {
+      "max_tasks_per_agent": 4,
+      "max_assignments_per_pass": 32
+    }
+  },
+  "hook_engine": {
+    "dedup_window_secs": 1,
+    "hook_timeout_secs": 30,
+    "default_rate_limit": {
+      "burst": 100,
+      "per_second": 100
+    }
+  },
+  "boundary": {
+    "rules": [
+      {
+        "name": "TokenBudget",
+        "rule_type": "hard",
+        "threshold": 100000,
+        "description": "单个任务的 estimated_tokens 不得超过阈值",
+        "enabled": true
+      },
+      {
+        "name": "OutputQuality",
+        "rule_type": "soft",
+        "threshold": null,
+        "description": "生成输出必须满足以下质量标准：1) 代码必须包含单元测试 2) 文档必须完整 3) 无已知安全漏洞",
+        "enabled": true
+      }
+    ]
+  },
+  "agent_loop": {
+    "agent_id": "agent-001",
+    "role": "planner",
+    "max_iterations": 10,
+    "context_window_size": 4000,
+    "skill_cache_ttl_secs": 30
+  },
+  "self_review": {
+    "_comment": "PGE actor self-review quality gate. enabled=true 时 Planner/Generator/Evaluator/Moderator/Merger 的输出会经过 SelfReviewLoop 审查并用修订结果替换原始输出。",
+    "enabled": false,
+    "max_iterations": 2,
+    "quality_threshold": 0.8,
+    "spec": null,
+    "best_practices": []
+  },
+  "pge": {
+    "_comment": "PGE actor 输出契约。schemas 按 actor 名（planner/generator/evaluator/moderator/merger）配置 JSON Schema；配置后 schema 会注入 prompt 上下文并对 LLM 原始输出做校验，校验失败仅告警并回退宽松解析，不会中断流水线。默认为空 = 使用内置契约。",
+    "schemas": {}
+  },
+  "lifecycle": {
+    "heartbeat_interval_secs": 5,
+    "suspect_threshold": 2,
+    "dead_threshold": 5,
+    "registration_ttl_secs": 60,
+    "cleanup_interval_secs": 300
+  },
+  "tuning": {
+    "stream_capacity": 256,
+    "high_watermark": 1000,
+    "low_watermark": 100,
+    "max_summaries": 10
+  },
+  "agent_pool": {
+    "enabled": true,
+    "worker_count": 3,
+    "worker_role": "planner"
+  },
+  "self_evolution": {
+    "_comment": "Self-evolution auto-deploy pipeline. enabled/auto_apply/auto_deploy all true means fully autonomous: LLM generates patches, tests, commits, builds, and switches binary without human intervention. Sandbox boundary check: real apply/deploy requires a detected isolated environment (K8s Pod/container/COGNEVA_SANDBOX), sandbox_mode=true, or force_autonomous=true; otherwise the pipeline downgrades to dry-run.",
+    "enabled": true,
+    "auto_apply": true,
+    "auto_deploy": true,
+    "sandbox_mode": true,
+    "force_autonomous": false,
+    "manual_approve": false,
+    "patch_dir": "./evolution-patches",
+    "binary_dir": "/opt/cogneva/bin",
+    "backup_dir": "/opt/cogneva/bin/backups",
+    "switch_mode": "self_exec",
+    "health_check_grace_period_secs": 10,
+    "health_check_interval_secs": 5,
+    "health_check_max_retries": 6,
+    "test_timeout_secs": 600,
+    "build_timeout_secs": 1800,
+    "poll_interval_secs": 60,
+    "notify_on_success": true,
+    "notify_on_failure": true
+  },
+  "multi_backend_consumer": {
+    "enabled": true,
+    "channel": "cogneva-events",
+    "group": "cogneva-consumer",
+    "retry_interval_secs": 5
+  },
+  "github_integration": {
+    "_comment": "GitHub integration for self-evolution. Tokens are resolved from environment variables and never enter the sandbox.",
+    "enabled": false,
+    "discovery_mode": "polling",
+    "repo": "owner/cogneva",
+    "base_branch": "main",
+    "accounts": [
+      {
+        "kind": "bot",
+        "username": "cogneva-bot",
+        "name": "Cogneva Bot",
+        "email": "bot@cogneva.ai",
+        "token_env": "COGNEVA_GITHUB_BOT_TOKEN",
+        "token": null,
+        "app_installation_id": null
+      },
+      {
+        "kind": "human",
+        "username": "human-operator",
+        "name": "Human Operator",
+        "email": "human@example.com",
+        "token_env": "COGNEVA_GITHUB_HUMAN_TOKEN",
+        "token": null
+      }
+    ],
+    "poll_interval_secs": 300,
+    "max_issues_per_scan": 50,
+    "webhook": {
+      "_comment": "Webhook event entry, used when discovery_mode=events/both. Secret resolved from env, never stored here.",
+      "port": 9090,
+      "secret_env": "COGNEVA_GITHUB_WEBHOOK_SECRET",
+      "path": "/webhooks/github"
+    },
+    "auto_create_pr": true,
+    "auto_merge_policy": {
+      "enabled": true,
+      "require_ci_pass": true,
+      "require_no_review_requested": false,
+      "max_changed_lines": 200,
+      "forbidden_paths": [
+        ".github/workflows",
+        "deploy/",
+        "secrets/",
+        "*.lock"
+      ],
+      "forbidden_labels": [
+        "security",
+        "breaking-change",
+        "manual-only"
+      ],
+      "cooldown_hours": 24,
+      "require_human_review_override": true
+    },
+    "human_required_labels": [
+      "security",
+      "breaking-change"
+    ],
+    "forbidden_labels": [
+      "wontfix",
+      "manual-only"
+    ],
+    "allowed_issue_states": [
+      "open"
+    ],
+    "conversation": {
+      "max_clarification_rounds": 3,
+      "awaiting_reply_timeout_hours": 72,
+      "auto_reply": true,
+      "bot_signature": "— Cogneva Bot"
+    },
+    "bot_identity": {
+      "username": "cogneva-bot",
+      "name": "Cogneva Bot",
+      "email": "bot@cogneva.ai"
+    }
+  }
+}

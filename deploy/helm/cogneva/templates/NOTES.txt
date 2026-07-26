@@ -1,0 +1,12 @@
+Cogneva 已部署到命名空间 {{ .Values.global.namespace }}。
+
+验证：
+  kubectl -n {{ .Values.global.namespace }} get pods
+  kubectl -n {{ .Values.global.namespace }} port-forward svc/cogneva 8080:8080
+
+{{- if .Values.ingress.enabled }}
+入口：http://{{ .Values.ingress.host }}
+{{- end }}
+
+注意：生产环境请用 --set secrets.dbPassword=... 等方式覆盖默认口令，
+或设 secrets.create=false 并预先创建 cogneva-secrets。

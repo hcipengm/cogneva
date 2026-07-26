@@ -1,0 +1,68 @@
+# 沙盒网络隔离：evolution Pod 默认拒绝出站，仅放行安全网关与集群 DNS。
+# 原则：凭证绝对不入沙盒 —— 沙盒所有外网/LLM 流量必须经 security-gateway 脱敏代理。
+# 注意：K3s 默认 Flannel 从 v1.21 起支持 NetworkPolicy；其他 CNI 需自行确认支持。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cogneva-evolution-deny-egress
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva-evolution
+    app.kubernetes.io/component: evolution
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: evolution
+  policyTypes:
+    - Egress
+  egress:
+    # 只允许访问安全网关（外网代理 8080 / LLM 代理 8081）
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: security-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8081
+    # 只允许访问集群 DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# 安全网关自身：允许出站（代沙盒访问外网与 LLM API），入站不限来源命名空间内 Pod。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cogneva-security-gateway
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: security-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: security-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8081
+  egress:
+    - {}

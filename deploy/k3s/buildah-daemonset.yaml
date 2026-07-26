@@ -1,0 +1,62 @@
+# 容器构建沙盒：在每个节点上提供 buildah 镜像构建能力（K3s 不带镜像构建）。
+# 构建产物通过 `buildah push ... docker-archive:` + `ctr images import` 进入 containerd，
+# 供 localhost/cogneva:* 镜像在本节点直接使用（imagePullPolicy: IfNotPresent）。
+# 使用 hostPath 挂载节点容器存储与 containerd socket，仅应在受控节点上运行。
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cogneva-buildah
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: image-builder
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cogneva
+      app.kubernetes.io/component: image-builder
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cogneva
+        app.kubernetes.io/component: image-builder
+    spec:
+      hostPID: true
+      containers:
+        - name: buildah
+          # 与宿主构建环境一致的 buildah 镜像；可按需替换为内部镜像仓库地址
+          image: quay.io/buildah/stable:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]
+          securityContext:
+            # buildah 构建需要 user namespace/overlayfs 能力，rootless 模式在
+            # 多数 K3s 节点上仍需 privileged；未来迁移 MicroVM 构建后移除
+            privileged: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+          volumeMounts:
+            - name: containers-storage
+              mountPath: /var/lib/containers
+            - name: containerd-socket
+              mountPath: /run/k3s/containerd
+              readOnly: false
+            - name: build-workspace
+              mountPath: /workspace
+      volumes:
+        - name: containers-storage
+          hostPath:
+            path: /var/lib/cogneva-buildah
+            type: DirectoryOrCreate
+        - name: containerd-socket
+          hostPath:
+            path: /run/k3s/containerd
+            type: Directory
+        - name: build-workspace
+          emptyDir: {}
+      tolerations:
+        - operator: Exists

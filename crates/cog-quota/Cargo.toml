@@ -1,0 +1,35 @@
+[package]
+name = "cog-quota"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+
+redis = { workspace = true }
+sqlx = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+tokio = { workspace = true }
+
+prometheus = { workspace = true }
+
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+axum = { workspace = true }
+
+tracing = { workspace = true }
+async-trait = "0.1"
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

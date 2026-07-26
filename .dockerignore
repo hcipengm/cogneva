@@ -1,0 +1,51 @@
+# Git
+.git
+.gitignore
+
+# Node.js / TypeScript (legacy)
+node_modules
+npm-debug.log
+package-lock.json
+package.json
+tsconfig.json
+jest.config.mjs
+.eslintrc.js
+dist
+src
+frontend
+
+# Documentation
+docs
+*.md
+CLAUDE.md
+
+# OMC / CI
+.omc
+.claude
+.github
+
+# Build artifacts
+target
+*.lock
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests
+tests
+
+# Scripts (not needed in image)
+scripts
+
+# Deploy configs (not needed in image)
+deploy
+
+# Local data
+/var/lib/sf-data

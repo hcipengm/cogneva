@@ -1,0 +1,137 @@
+//! GatewayState builder — moved from cogneva assembly layer.
+
+use std::sync::Arc;
+use tokio::sync::broadcast;
+
+/// Backend health probe.
+pub fn init_backend_health_probe(
+    config: &cog_core::Config,
+    pg_pool_explain: &Option<sqlx::PgPool>,
+    memory_backend: &Option<Arc<dyn cog_core::MemoryBackend>>,
+) -> Option<Arc<crate::backend_health::BackendHealthProbe>> {
+    Some(Arc::new(crate::backend_health::BackendHealthProbe {
+        redis_url: config.dag_executor.redis_url.clone(),
+        pg_pool: pg_pool_explain.clone(),
+        nats_url: config.dag_executor.nats_url.clone(),
+        memory_backend: memory_backend.clone(),
+    }))
+}
+
+/// Assemble the [`GatewayState"] — the single source of truth for all
+/// runtime components accessible from HTTP/WebSocket handlers.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_gateway_state(
+    config: &cog_core::Config,
+    event_tx: &broadcast::Sender<cog_core::AgentEvent>,
+    task_event_tx: &broadcast::Sender<cog_core::TaskEvent>,
+    jwt_manager: &Arc<dyn cog_core::AuthProvider>,
+    quota_manager: &Arc<dyn cog_core::QuotaManager>,
+    hierarchy_manager: &Option<Arc<dyn cog_core::HierarchyManager>>,
+    raw_logger: &Arc<dyn cog_core::RawLogger>,
+    memory_backend: &Option<Arc<dyn cog_core::MemoryBackend>>,
+    memory_ingestor: &Option<Arc<dyn cog_core::MemoryIngestor>>,
+    metrics_backend: &Option<Arc<dyn cog_core::MetricsBackend>>,
+    metrics_exporter: &Option<Arc<dyn cog_core::MetricsExporter>>,
+    search_backend: &Option<Arc<dyn cog_core::SearchBackend>>,
+    raw_log_index_store: &Option<Arc<dyn cog_core::RawLogIndexStore>>,
+    hook_engine: &Option<Arc<dyn cog_core::HookEngine>>,
+    hook_archive: &Option<Arc<dyn cog_core::HookArchive>>,
+    shared_orchestrator: &Arc<dyn cog_core::OrchestratorControl>,
+    task_executors: Arc<dyn cog_core::TaskExecutor>,
+    agent_registry: &Arc<dyn cog_core::AgentRegistry>,
+    observability_gateway: &Option<Arc<dyn cog_core::ObservabilityGateway>>,
+    wiki_adapter: &Option<Arc<dyn cog_core::WikiBackend>>,
+    supervisor: &Arc<dyn cog_core::Supervisor>,
+    alert_store: &Arc<dyn cog_core::AlertStore>,
+    backend_health_probe: &Option<Arc<crate::backend_health::BackendHealthProbe>>,
+    supervisor_registry: &Arc<dyn cog_core::HeartbeatRegistry>,
+    snapshot_store: &Arc<dyn cog_core::CheckpointStore>,
+    trace_store: &Arc<dyn cog_core::TraceStore>,
+    replay_engine: &Arc<dyn cog_core::ReplayEngine>,
+    session_manager: &Arc<dyn cog_core::SessionManager>,
+    sandbox_backend: &Arc<dyn cog_core::SandboxBackend>,
+    plugin_registry: &Arc<dyn cog_core::PluginRegistry>,
+    guardrail: &Arc<dyn cog_core::Guardrail>,
+    eval_service: &Option<Arc<dyn cog_core::EvalService>>,
+    observables: Vec<Arc<dyn cog_core::Observable>>,
+    mcp_client: &Option<Arc<dyn cog_core::McpClient>>,
+    external_skill_registry: &Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
+    agent_pool: &Option<Arc<dyn cog_core::AgentManager>>,
+    event_publisher: &Option<Arc<dyn cog_core::EventPublisher>>,
+    media_backend: &Option<Arc<dyn cog_core::MediaBackend>>,
+    notification_dispatcher: &Option<Arc<dyn cog_core::NotificationDispatcher>>,
+    notification_tx: &broadcast::Sender<cog_core::Notification>,
+    notification_store: &Option<Arc<dyn cog_core::NotificationStore>>,
+    websocket_client: &Option<Arc<dyn cog_core::WebSocketClient>>,
+    evolution_admin: &Option<Arc<dyn cog_core::EvolutionAdmin>>,
+    evolution_stream: &Option<Arc<tokio::sync::broadcast::Sender<cog_core::EvolutionPatchInfo>>>,
+    audit_stream: &Option<Arc<dyn cog_core::AuditStream>>,
+) -> Result<Arc<crate::GatewayState>, Box<dyn std::error::Error>> {
+    let gateway_state = Arc::new(crate::GatewayState {
+        config: std::sync::RwLock::new(config.gateway.clone()),
+        data_dir: config.app.data_dir.clone(),
+        request_timeout_secs: std::sync::atomic::AtomicU64::new(
+            config.gateway.request_timeout_secs,
+        ),
+        sandbox_task_timeout_secs: std::sync::atomic::AtomicU64::new(
+            config.gateway.sandbox_task_timeout_secs,
+        ),
+        event_tx: event_tx.clone(),
+        task_event_tx: task_event_tx.clone(),
+        jwt_manager: jwt_manager.clone(),
+        quota_manager: quota_manager.clone(),
+        hierarchy_manager: hierarchy_manager.clone(),
+        action_plan_store: Default::default(),
+        collaboration_graph: Some(Arc::new(crate::collaboration::CollaborationGraph::new())),
+        raw_logger: raw_logger.clone(),
+        memory_backend: memory_backend.clone(),
+        memory_ingestor: memory_ingestor.clone(),
+        metrics_backend: metrics_backend.clone(),
+        metrics_exporter: metrics_exporter.clone(),
+        search_backend: search_backend.clone(),
+        raw_log_index_store: raw_log_index_store.clone(),
+        hook_engine: hook_engine.clone(),
+        hook_archive: hook_archive.clone(),
+        orchestrator: shared_orchestrator.clone(),
+        task_executors,
+        agent_registry: Some(agent_registry.clone()),
+        observability_gateway: observability_gateway.clone(),
+        connection_manager: Some(Arc::new(
+            crate::websocket_protocol::ConnectionManager::with_event_cache_capacity(
+                config.system.websocket_event_cache_capacity,
+            ),
+        )),
+        wiki_adapter: wiki_adapter.clone(),
+        user_store: None,
+        login_rate_limiter: None,
+        supervisor: Some(supervisor.clone()),
+        alert_store: Some(alert_store.clone()),
+        backend_health_probe: backend_health_probe.clone(),
+        heartbeat_history: Some(supervisor_registry.clone()),
+        snapshot_store: Some(snapshot_store.clone()),
+        trace_store: Some(trace_store.clone()),
+        replay_engine: Some(replay_engine.clone()),
+        session_manager: Some(session_manager.clone()),
+        sandbox_backend: Some(sandbox_backend.clone()),
+        plugin_registry: Some(plugin_registry.clone()),
+        guardrail: Some(guardrail.clone()),
+        eval_service: eval_service.clone(),
+        observables,
+        mcp_client: mcp_client.clone(),
+        object_backend: None,
+        notification_store: notification_store.clone(),
+        notification_dispatcher: notification_dispatcher.clone(),
+        notification_tx: notification_tx.clone(),
+        workspace_store: None,
+        external_skill_registry: external_skill_registry.clone(),
+        agent_pool: agent_pool.clone(),
+        event_publisher: event_publisher.clone(),
+        media_backend: media_backend.clone(),
+        websocket_client: websocket_client.clone(),
+        evolution_admin: evolution_admin.clone(),
+        evolution_stream: evolution_stream.clone(),
+        audit_stream: audit_stream.clone(),
+    });
+
+    Ok(gateway_state)
+}

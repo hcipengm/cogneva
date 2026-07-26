@@ -1,0 +1,54 @@
+# Velero — cluster backup and disaster recovery
+# Recommended install via Helm or velero CLI:
+#   velero install --provider aws --plugins velero/velero-plugin-for-aws:v1.8.0 \
+#     --bucket cogneva-backups --prefix cluster \
+#     --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=https://minio.cogneva.io:9000 \
+#     --secret-file ./credentials-velero
+# This manifest provides the BackupStorageLocation and a scheduled backup.
+---
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: default
+  namespace: velero
+spec:
+  provider: aws
+  objectStorage:
+    bucket: cogneva-backups
+    prefix: cluster
+  config:
+    region: minio
+    s3ForcePathStyle: "true"
+    s3Url: https://minio.cogneva.io:9000
+    insecureSkipTLSVerify: "false"
+---
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: cogneva-daily-backup
+  namespace: velero
+spec:
+  schedule: "0 2 * * *"
+  template:
+    includedNamespaces:
+      - default
+      - longhorn-system
+    excludedResources:
+      - events
+      - pods
+    snapshotVolumes: true
+    storageLocation: default
+    ttl: 720h0m0s
+    volumeSnapshotLocations:
+      - default
+---
+# Restore example (keep as reference, do not apply by default)
+# apiVersion: velero.io/v1
+# kind: Restore
+# metadata:
+#   name: cogneva-restore
+#   namespace: velero
+# spec:
+#   backupName: cogneva-daily-backup
+#   includedNamespaces:
+#     - default

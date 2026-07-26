@@ -1,0 +1,104 @@
+{{- if .Values.backends.nats.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nats-pvc
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/component: event-bus
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.backends.nats.storage }}
+  storageClassName: {{ .Values.global.storageClass }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/component: event-bus
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nats
+      app.kubernetes.io/component: event-bus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nats
+        app.kubernetes.io/component: event-bus
+    spec:
+      containers:
+        - name: nats
+          image: {{ .Values.backends.nats.image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--jetstream"
+            - "--store_dir=/data"
+            - "--server_name=cogneva-nats"
+          ports:
+            - name: client
+              containerPort: 4222
+              protocol: TCP
+            - name: monitor
+              containerPort: 8222
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: nats-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-service
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/component: event-bus
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/component: event-bus
+  ports:
+    - name: client
+      port: 4222
+      targetPort: client
+      protocol: TCP
+    - name: monitor
+      port: 8222
+      targetPort: monitor
+      protocol: TCP
+{{- end }}

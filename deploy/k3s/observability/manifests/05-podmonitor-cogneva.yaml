@@ -1,0 +1,23 @@
+# PodMonitor — 作为 ServiceMonitor 的替代方案
+# 直接监控带 annotation 的 Pod，无需通过 Service
+
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: cogneva-pods
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - default
+  selector:
+    matchLabels:
+      app: cogneva
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 10s
+      scrapeTimeout: 5s
+      honorLabels: true

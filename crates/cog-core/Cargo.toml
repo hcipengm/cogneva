@@ -1,0 +1,32 @@
+[package]
+name = "cog-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+futures = { workspace = true }
+bytes = { workspace = true }
+schemars = { workspace = true }
+jsonschema = { workspace = true }
+sqlx = { workspace = true }
+redis = { workspace = true }
+blake3 = { workspace = true }
+zstd = { workspace = true }
+regex = "1.11"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+filetime = "0.2"

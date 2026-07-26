@@ -1,0 +1,89 @@
+# 独立安全网关：代持全部敏感凭证（LLM API Key 等），沙盒 Pod 零凭证。
+# 两个通道：8080 外网代理（脱敏审查后出站）、8081 LLM 代理（意图封装后代调）。
+# 依赖：主程序需以 security-gateway 模式运行（见 docs/2026-06-27_14-37-48_元启动实施计划.md §2.6.1）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cogneva-security-gateway
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: security-gateway
+    app.kubernetes.io/version: "0.1.22"
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cogneva
+      app.kubernetes.io/component: security-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cogneva
+        app.kubernetes.io/component: security-gateway
+        app.kubernetes.io/version: "0.1.22"
+    spec:
+      containers:
+        - name: security-gateway
+          image: localhost/cogneva:0.1.22
+          imagePullPolicy: IfNotPresent
+          command: ["/opt/cogneva/cogneva"]
+          args: ["security-gateway"]
+          ports:
+            - name: egress-proxy
+              containerPort: 8080
+              protocol: TCP
+            - name: llm-proxy
+              containerPort: 8081
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: cogneva-config
+          env:
+            # 凭证仅注入网关，沙盒 Pod 不挂载任何 Secret
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: openai-api-key
+                  optional: true
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: anthropic-api-key
+                  optional: true
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: llm-api-key
+                  optional: true
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: egress-proxy
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: egress-proxy
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001

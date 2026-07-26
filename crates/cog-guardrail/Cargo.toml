@@ -1,0 +1,34 @@
+[package]
+name = "cog-guardrail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+
+# Regex for pattern matching
+regex = "1.11"
+
+# Content filtering
+rs-snowflake = "0.6"
+
+# Unicode normalization for adversarial input detection
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"

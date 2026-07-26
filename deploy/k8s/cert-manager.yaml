@@ -1,0 +1,40 @@
+# cert-manager — automatic TLS certificate provisioning
+# Recommended install: helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --set installCRDs=true
+# This manifest provides the namespace, CRD note, and ClusterIssuer for Let's Encrypt.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager
+---
+# Production Let's Encrypt ClusterIssuer
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@cogneva.io
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+---
+# Staging Let's Encrypt ClusterIssuer (for testing)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: ops@cogneva.io
+    privateKeySecretRef:
+      name: letsencrypt-staging
+    solvers:
+      - http01:
+          ingress:
+            class: nginx

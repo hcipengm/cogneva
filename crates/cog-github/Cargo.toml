@@ -1,0 +1,37 @@
+[package]
+name = "cog-github"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+# GitHub API client (chosen in design doc).
+octocrab = "0.41"
+# HTTP client for non-octocrab calls (webhooks, Gitee, etc).
+reqwest = { workspace = true }
+# GitHub App JWT generation (reserved for future bot/JWT support).
+jsonwebtoken = { workspace = true }
+# For async trait in provider abstraction.
+async-trait = "0.1"
+# Temp files for git-apply of patches.
+tempfile = "3"
+# Webhook 事件入口（discovery_mode=events/both）。
+axum = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

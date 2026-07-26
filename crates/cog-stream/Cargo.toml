@@ -1,0 +1,28 @@
+[package]
+name = "cog-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
+futures = { workspace = true }
+
+# Optional backends
+redis = { workspace = true, optional = true }
+async-nats = { workspace = true, optional = true }
+
+[features]
+default = ["redis", "nats", "mem"]
+redis = ["dep:redis"]
+nats = ["dep:async-nats"]
+mem = []

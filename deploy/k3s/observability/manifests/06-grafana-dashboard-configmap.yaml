@@ -1,0 +1,208 @@
+# Grafana Dashboard ConfigMap
+# kube-prometheus-stack Helm values中通过 dashboardsConfigMaps 引用
+# 部署后 Grafana 自动加载此 Dashboard
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cogneva-dashboards
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+    grafana_dashboard: "1"
+data:
+  cogneva-overview.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "uid": "cogneva-overview",
+        "title": "Cogneva Overview",
+        "tags": ["cogneva", "overview"],
+        "timezone": "browser",
+        "schemaVersion": 36,
+        "refresh": "10s",
+        "panels": [
+          {
+            "id": 1,
+            "title": "HTTP Request Rate",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "targets": [
+              {
+                "expr": "rate(http_requests_total[5m])",
+                "legendFormat": "{{method}} {{status}}",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "reqps",
+                "custom": {"drawStyle": "line", "lineWidth": 2}
+              }
+            }
+          },
+          {
+            "id": 2,
+            "title": "HTTP P99 Latency",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
+                "legendFormat": "P99",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "s",
+                "custom": {"drawStyle": "line", "lineWidth": 2}
+              }
+            }
+          },
+          {
+            "id": 3,
+            "title": "LLM Call Rate",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+            "targets": [
+              {
+                "expr": "rate(llm_calls_total[5m])",
+                "legendFormat": "{{model}} - {{status}}",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "reqps",
+                "custom": {"drawStyle": "line", "lineWidth": 2}
+              }
+            }
+          },
+          {
+            "id": 4,
+            "title": "LLM P95 Latency",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.95, rate(llm_call_latency_ms_bucket[5m]))",
+                "legendFormat": "{{model}}",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "ms",
+                "custom": {"drawStyle": "line", "lineWidth": 2}
+              }
+            }
+          },
+          {
+            "id": 5,
+            "title": "Active Alerts",
+            "type": "stat",
+            "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16},
+            "targets": [
+              {
+                "expr": "sum(ALERTS{alertstate=\"firing\"})",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {"value": 0, "color": "green"},
+                    {"value": 1, "color": "yellow"},
+                    {"value": 5, "color": "red"}
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "id": 6,
+            "title": "Pod CPU Usage",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 6, "y": 16},
+            "targets": [
+              {
+                "expr": "rate(container_cpu_usage_seconds_total{pod=~\"cogneva-.*\"}[5m])",
+                "legendFormat": "{{pod}}",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percentunit",
+                "custom": {"drawStyle": "line", "lineWidth": 2}
+              }
+            }
+          },
+          {
+            "id": 7,
+            "title": "Pod Memory Usage",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+            "targets": [
+              {
+                "expr": "container_memory_working_set_bytes{pod=~\"cogneva-.*\"}",
+                "legendFormat": "{{pod}}",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "bytes",
+                "custom": {"drawStyle": "line", "lineWidth": 2}
+              }
+            }
+          },
+          {
+            "id": 8,
+            "title": "Recent Logs",
+            "type": "logs",
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+            "targets": [
+              {
+                "expr": "{job=\"cogneva\"} |= \"$trace_id\"",
+                "refId": "A",
+                "datasource": {"type": "loki", "uid": "${loki_datasource}"}
+              }
+            ],
+            "options": {
+              "showTime": true,
+              "wrapLogMessage": true,
+              "sortOrder": "Descending"
+            }
+          }
+        ],
+        "templating": {
+          "list": [
+            {
+              "name": "datasource",
+              "type": "datasource",
+              "query": "prometheus",
+              "current": {"text": "Prometheus", "value": "Prometheus"}
+            },
+            {
+              "name": "loki_datasource",
+              "type": "datasource",
+              "query": "loki",
+              "current": {"text": "Loki", "value": "Loki"}
+            },
+            {
+              "name": "trace_id",
+              "type": "textbox",
+              "query": "",
+              "current": {"text": "", "value": ""},
+              "hide": 0,
+              "label": "Trace ID"
+            }
+          ]
+        }
+      },
+      "overwrite": true
+    }

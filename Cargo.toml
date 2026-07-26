@@ -1,0 +1,148 @@
+[workspace]
+members = [
+    "crates/cog-core",
+    "crates/cog-storage",
+    "crates/cog-llm",
+    "crates/cog-agent",
+    "crates/cog-collaboration",
+    "crates/cog-orchestrator",
+    "crates/cogneva",
+    "crates/cog-auth",
+    "crates/cog-quota",
+    "crates/cog-wiki",
+    "crates/cog-observability",
+    "crates/cog-memory",
+    "crates/cog-reflection",
+    "crates/cog-prompt",
+    "crates/cog-eval",
+    "crates/cog-guardrail",
+    "crates/cog-protocol",
+    "crates/cog-stream",
+    "crates/cog-net",
+    "crates/cog-notification",
+    "crates/cog-extension",
+    "crates/cog-skill",
+    "crates/cog-gateway",
+    "crates/cog-supervisor",
+    "crates/cog-github",
+    "crates/bootstrap",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.20"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Cogneva Team"]
+license = "MIT"
+repository = "https://github.com/hcipengm/cogneva"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# HTTP / SSE
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "http2"] }
+eventsource-stream = "0.2"
+futures = "0.3"
+tokio-tungstenite = "0.26"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "http2", "multipart"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout", "compression-gzip", "catch-panic", "fs"] }
+
+# Redis
+redis = { version = "0.29", features = ["tokio-comp", "connection-manager"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "postgres", "json", "chrono", "uuid"] }
+
+# Vector database
+qdrant-client = "1.13"
+
+# Message streaming (production alternative to Redis Streams)
+async-nats = { version = "0.40" }
+
+# Distributed KV / Service discovery (production alternative to Redis for registry)
+etcd-client = { version = "0.14", features = ["tls"] }
+
+# Metrics
+prometheus = "0.13"
+
+# Logging / Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Validation
+validator = { version = "0.20", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1.15", features = ["v4", "serde"] }
+
+# Hashing & compression (raw-data tier migration)
+blake3 = "1.5"
+zstd = "0.13"
+
+# Protobuf (raw-data binary format)
+prost = "0.13"
+prost-build = "0.13"
+tonic = "0.12"
+tonic-build = "0.12"
+bytes = "1"
+
+# Platform paths
+dirs = "5.0"
+
+# Structured LLM I/O (JSON Schema generation)
+schemars = "0.8"
+jsonschema = "0.29"
+
+# Auth
+jsonwebtoken = "9.0"
+bcrypt = "0.17"
+argon2 = "0.5"
+
+# S3 signature
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# Internal crates
+cog-core = { path = "crates/cog-core" }
+cog-llm = { path = "crates/cog-llm" }
+cog-agent = { path = "crates/cog-agent" }
+cog-collaboration = { path = "crates/cog-collaboration" }
+cog-orchestrator = { path = "crates/cog-orchestrator" }
+cog-auth = { path = "crates/cog-auth" }
+cog-quota = { path = "crates/cog-quota" }
+cog-wiki = { path = "crates/cog-wiki" }
+cog-observability = { path = "crates/cog-observability" }
+cog-memory = { path = "crates/cog-memory" }
+cog-storage = { path = "crates/cog-storage" }
+cog-reflection = { path = "crates/cog-reflection" }
+cog-prompt = { path = "crates/cog-prompt" }
+cog-eval = { path = "crates/cog-eval" }
+cog-guardrail = { path = "crates/cog-guardrail" }
+cog-protocol = { path = "crates/cog-protocol" }
+cog-extension = { path = "crates/cog-extension" }
+cog-skill = { path = "crates/cog-skill" }
+cog-stream = { path = "crates/cog-stream" }
+cog-net = { path = "crates/cog-net" }
+cog-notification = { path = "crates/cog-notification" }
+cog-gateway = { path = "crates/cog-gateway" }
+cog-supervisor = { path = "crates/cog-supervisor" }
+cog-github = { path = "crates/cog-github" }

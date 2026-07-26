@@ -1,0 +1,194 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cogneva-secrets
+type: Opaque
+stringData:
+  OPENAI_API_KEY: "${OPENAI_API_KEY}"
+  COGNEVA_DATABASE_URL: "${COGNEVA_DATABASE_URL}"
+  LIVEKIT_API_KEY: "${LIVEKIT_API_KEY}"
+  LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET}"
+  LIVEKIT_SERVER_URL: "${LIVEKIT_SERVER_URL}"
+  REDIS_URL: "${REDIS_URL}"
+  QDRANT_URL: "${QDRANT_URL}"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cogneva-config
+data:
+  cogneva.json: |
+    {
+      "app": {
+        "name": "cogneva",
+        "version": "0.1.0",
+        "log_level": "info",
+        "data_dir": "/var/lib/cogneva-data",
+        "config_dir": "/etc/cogneva",
+        "app_dir": "/opt/cogneva"
+      },
+      "llm": {
+        "provider": "openai",
+        "api_key": "${OPENAI_API_KEY}",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o",
+        "embedding_model": "text-embedding-3-small",
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "timeout_secs": 60
+      },
+      "providers": {
+        "pg": {
+          "provider": "postgres",
+          "enabled": true,
+          "options": {
+            "connection": "${COGNEVA_DATABASE_URL}"
+          }
+        },
+        "vector": {
+          "provider": "qdrant",
+          "enabled": true,
+          "options": {
+            "uri": "${QDRANT_URL}"
+          }
+        },
+        "media": {
+          "provider": "livekit",
+          "enabled": true,
+          "options": {}
+        },
+        "storage": {
+          "provider": "s3",
+          "enabled": true,
+          "options": {
+            "endpoint": "${S3_ENDPOINT}",
+            "region": "${S3_REGION}",
+            "bucket": "${S3_BUCKET}",
+            "access_key": "${S3_ACCESS_KEY}",
+            "secret_key": "${S3_SECRET_KEY}"
+          }
+        }
+      },
+      "dag_executor": {
+        "redis_url": "${REDIS_URL}",
+        "workspace_id": "default",
+        "consumer_group": "cogneva-agents",
+        "max_retries": 3,
+        "retry_delay_ms": 1000
+      },
+      "gateway": {
+        "http_port": 8080,
+        "ws_port": 8081,
+        "metrics_port": 9090,
+        "cors_origins": ["*"],
+        "request_timeout_secs": 30,
+        "sandbox_task_timeout_secs": 30
+      },
+      "metrics": {
+        "enabled": true,
+        "endpoint": "/metrics",
+        "interval_secs": 15
+      },
+      "memory": {
+        "enabled": true,
+        "backend_type": "composite",
+        "base_dir": "/var/lib/cogneva-data/memory",
+        "embedding_dimension": 1024,
+        "auto_ingest": true
+      },
+      "tier_migrator": {
+        "enabled": true,
+        "hot_duration_secs": 604800,
+        "warm_duration_secs": 2592000
+      }
+    }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-data-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: longhorn
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cogneva
+  labels:
+    app: cogneva
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cogneva
+  template:
+    metadata:
+      labels:
+        app: cogneva
+    spec:
+      containers:
+        - name: cogneva
+          image: cogneva:v0.1.0
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8081
+              name: websocket
+            - containerPort: 9090
+              name: metrics
+          envFrom:
+            - secretRef:
+                name: cogneva-secrets
+          env:
+            - name: COGNEVA_TRACE_STORE_BACKEND
+              value: "redis"
+            - name: RUST_LOG
+              value: "info"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/cogneva
+            - name: data
+              mountPath: /var/lib/cogneva-data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: cogneva-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: cogneva-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-service
+spec:
+  selector:
+    app: cogneva
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+    - port: 8081
+      targetPort: 8081
+      name: websocket
+    - port: 9090
+      targetPort: 9090
+      name: metrics
+  type: ClusterIP

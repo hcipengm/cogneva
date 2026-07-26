@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cogneva Takeover Console</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg-0: #08090a;
+    --bg-1: #0f1011;
+    --bg-2: #161718;
+    --bg-3: #1e2022;
+    --line: rgba(255, 255, 255, .07);
+    --line-soft: rgba(255, 255, 255, .045);
+    --text-0: #e8eaed;
+    --text-1: #8a8f98;
+    --text-2: #62666d;
+    --accent: #5e6ad2;
+    --accent-hover: #7178e2;
+    --accent-soft: rgba(94, 106, 210, .14);
+    --ok: #4cc38a;
+    --ok-soft: rgba(76, 195, 138, .1);
+    --warn: #e5a13c;
+    --warn-soft: rgba(229, 161, 60, .1);
+    --err: #e5484d;
+    --err-soft: rgba(229, 72, 77, .1);
+    --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  ::selection { background: rgba(94, 106, 210, .35); }
+  html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  body {
+    margin: 0; font-family: var(--font-ui); background: var(--bg-0);
+    color: var(--text-0); font-size: 13px; line-height: 1.5;
+    font-feature-settings: "cv01", "ss03", "zero";
+  }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    position: fixed; inset: 0 auto 0 0; width: 216px; z-index: 5;
+    display: flex; flex-direction: column;
+    background: var(--bg-1); border-right: 1px solid var(--line);
+    padding: 14px 12px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 2px 8px 14px; }
+  .logo {
+    width: 26px; height: 26px; border-radius: 6px; flex: none;
+    background: linear-gradient(135deg, var(--accent), #2e3390);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18), 0 0 0 1px rgba(255, 255, 255, .06);
+    position: relative;
+  }
+  .logo::after {
+    content: ""; position: absolute; inset: 7px;
+    border-radius: 3px; border: 1.5px solid rgba(255, 255, 255, .85);
+  }
+  .brand .name { font-size: 13px; font-weight: 560; letter-spacing: -.011em; line-height: 1.25; }
+  .brand .name span { display: block; font-size: 10.5px; font-weight: 400; color: var(--text-2); }
+
+  nav { display: grid; gap: 1px; }
+  nav a {
+    display: flex; align-items: center; gap: 9px;
+    padding: 5px 8px; border-radius: 6px; cursor: pointer;
+    color: var(--text-1); font-size: 12.5px; font-weight: 450; text-decoration: none;
+    transition: background .1s, color .1s;
+  }
+  nav a:hover { background: var(--bg-3); color: var(--text-0); }
+  nav a.active { background: var(--bg-3); color: var(--text-0); }
+  nav a svg { width: 14px; height: 14px; flex: none; opacity: .75; }
+  nav .label {
+    margin: 14px 8px 4px; font-size: 10px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .08em; color: var(--text-2);
+  }
+  .sidebar .foot { margin-top: auto; display: grid; gap: 10px; padding: 10px 8px 2px; }
+  .sidebar .hints { font-size: 11px; color: var(--text-2); display: grid; gap: 5px; }
+  .sidebar .hints div { display: flex; align-items: center; gap: 6px; }
+
+  .live {
+    display: inline-flex; align-items: center; gap: 6px; width: fit-content;
+    font-size: 10.5px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+    padding: 2.5px 9px; border-radius: 999px; border: 1px solid var(--line);
+    color: var(--text-1); background: var(--bg-2);
+  }
+  .live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-2); }
+  .live.on { color: var(--ok); border-color: rgba(76, 195, 138, .3); }
+  .live.on::before { background: var(--ok); box-shadow: 0 0 6px rgba(76, 195, 138, .8); animation: pulse 2.2s infinite; }
+  .live.connecting::before { background: var(--warn); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  .kbd {
+    font-family: var(--font-mono); font-size: 10px; color: var(--text-2);
+    border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px;
+    padding: 0 4px; background: var(--bg-2);
+  }
+
+  /* ── Content ── */
+  .content { margin-left: 216px; min-height: 100vh; position: relative; }
+  .content::before {
+    content: ""; position: absolute; inset: 0 0 auto; height: 260px; pointer-events: none;
+    background: radial-gradient(ellipse 70% 100% at 50% -40%, rgba(94, 106, 210, .08), transparent 70%);
+  }
+  .topbar {
+    position: sticky; top: 0; z-index: 4;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 12px 24px; border-bottom: 1px solid var(--line);
+    background: rgba(8, 9, 10, .82); backdrop-filter: blur(10px);
+  }
+  .topbar h1 { font-size: 14px; font-weight: 560; margin: 0; letter-spacing: -.011em; }
+  .topbar .sub { color: var(--text-2); font-size: 12px; }
+
+  input[type=password] {
+    background: var(--bg-2); border: 1px solid var(--line); color: var(--text-0);
+    border-radius: 6px; padding: 5px 10px; font: inherit; font-size: 12.5px; width: 240px;
+    outline: none; transition: border-color .12s, box-shadow .12s;
+  }
+  input[type=password]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  input[type=password]::placeholder { color: var(--text-2); }
+
+  button {
+    background: var(--accent); border: none; color: #fff; border-radius: 6px;
+    padding: 5.5px 12px; font: inherit; font-size: 12.5px; font-weight: 500; cursor: pointer;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .12), 0 0 0 1px rgba(0, 0, 0, .2);
+    transition: background .12s, transform .05s;
+  }
+  button:hover { background: var(--accent-hover); }
+  button:active { transform: translateY(1px); }
+  button.ghost { background: transparent; color: var(--text-0); border: 1px solid var(--line); box-shadow: none; }
+  button.ghost:hover { background: var(--bg-3); }
+  button.danger { background: transparent; color: var(--err); border: 1px solid rgba(229, 72, 77, .35); box-shadow: none; }
+  button.danger:hover { background: var(--err-soft); }
+  button.sm { padding: 3px 9px; font-size: 12px; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  main { position: relative; padding: 18px 24px 30px; display: grid; gap: 14px; max-width: 1240px; }
+
+  /* Slim stat strip — one row, dividers instead of boxes. */
+  .stats {
+    display: flex; align-items: stretch; gap: 0;
+    border: 1px solid var(--line); border-radius: 10px; background: var(--bg-1);
+    overflow: hidden;
+  }
+  .stat { flex: 1; padding: 12px 16px; border-right: 1px solid var(--line-soft); }
+  .stat:last-child { border-right: none; }
+  .stat .v {
+    font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+    font-size: 22px; font-weight: 600; line-height: 1.15; letter-spacing: -.02em;
+  }
+  .stat .k { font-size: 10.5px; color: var(--text-2); margin-top: 2px; text-transform: uppercase; letter-spacing: .07em; }
+  .stat.bad .v { color: var(--err); }
+  .stat.good .v { color: var(--ok); }
+
+  section {
+    border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+    background: var(--bg-1); scroll-margin-top: 70px;
+  }
+  h2 {
+    font-size: 11px; margin: 0 0 11px; color: var(--text-1);
+    text-transform: uppercase; letter-spacing: .08em; font-weight: 560;
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--text-2); }
+  h2 .spacer { flex: 1; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
+  th { color: var(--text-2); font-weight: 560; font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; }
+  tbody tr.patch { cursor: pointer; transition: background .1s; }
+  tbody tr.patch:hover { background: rgba(255, 255, 255, .03); }
+  tbody tr.patch.open { background: rgba(94, 106, 210, .06); }
+  td.mono, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 12px; }
+  td.dim { color: var(--text-1); }
+  td.ellipsis { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td .chev {
+    display: inline-block; width: 14px; color: var(--text-2);
+    transition: transform .15s; font-size: 10px;
+  }
+  tr.patch.open .chev { transform: rotate(90deg); }
+
+  @keyframes rowflash { from { background: rgba(94, 106, 210, .22); } to { background: transparent; } }
+  tr.flash > td { animation: rowflash 1.4s ease-out; }
+
+  /* Inline detail drawer (expanded row). */
+  tr.detail td { padding: 0; border-bottom: 1px solid var(--line-soft); background: var(--bg-2); }
+  .detail-wrap { padding: 14px 18px; display: grid; gap: 10px; }
+  .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .detail-grid .dk { font-size: 10.5px; color: var(--text-2); text-transform: uppercase; letter-spacing: .07em; margin-bottom: 3px; }
+  .detail-grid .dv { font-size: 12.5px; color: var(--text-0); overflow-wrap: anywhere; }
+  .detail-grid .dv.mono { font-size: 12px; color: var(--text-1); }
+  .detail-actions { display: flex; gap: 8px; padding-top: 4px; border-top: 1px solid var(--line-soft); }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 1.5px 8px; border-radius: 4px;
+    font-size: 11px; font-weight: 560; letter-spacing: .02em;
+    background: var(--bg-3); color: var(--text-1); border: 1px solid var(--line);
+  }
+  .pill::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .pill.ok { background: var(--ok-soft); color: var(--ok); border-color: rgba(76, 195, 138, .25); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); border-color: rgba(229, 161, 60, .25); }
+  .pill.err { background: var(--err-soft); color: var(--err); border-color: rgba(229, 72, 77, .25); }
+  .tag {
+    display: inline-block; padding: 1px 7px; border-radius: 4px;
+    font-family: var(--font-mono); font-size: 11px;
+    background: var(--accent-soft); color: #a5aef5;
+  }
+
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .muted { color: var(--text-2); font-size: 12px; }
+
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+
+  ul.events { margin: 0; padding: 0; list-style: none; font-size: 12px; max-height: 280px; overflow: auto; }
+  ul.events li {
+    padding: 6px 10px; border-bottom: 1px solid var(--line-soft);
+    font-family: var(--font-mono); color: var(--text-1); overflow-wrap: anywhere;
+  }
+  ul.events li:last-child { border-bottom: none; }
+  ul.events::-webkit-scrollbar, pre::-webkit-scrollbar { width: 8px; height: 8px; }
+  ul.events::-webkit-scrollbar-thumb, pre::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 4px; }
+
+  pre {
+    background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: 6px;
+    padding: 10px 12px; overflow: auto; max-height: 240px;
+    font-family: var(--font-mono); font-size: 12px; color: var(--text-1); margin: 0;
+  }
+
+  #toast {
+    position: fixed; right: 16px; bottom: 16px; z-index: 10;
+    background: var(--bg-2); border: 1px solid var(--line); border-left: 2px solid var(--accent);
+    border-radius: 8px; padding: 10px 14px; max-width: 420px; display: none;
+    white-space: pre-wrap; font-size: 12.5px; box-shadow: 0 12px 32px rgba(0, 0, 0, .5);
+  }
+  #toast.err { border-left-color: var(--err); }
+  #toast.ok { border-left-color: var(--ok); }
+
+  @media (max-width: 860px) {
+    .sidebar { display: none; }
+    .content { margin-left: 0; }
+  }
+</style>
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <div class="logo"></div>
+    <div class="name">Cogneva<span>Takeover Console</span></div>
+  </div>
+  <nav>
+    <div class="label">Operate</div>
+    <a class="active" data-target="sec-pipeline">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4h12M2 8h8M2 12h10"/></svg>
+      Patch Pipeline
+    </a>
+    <a data-target="sec-events">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 2v12M2 8h12"/></svg>
+      Evolution Events
+    </a>
+    <a data-target="sec-audit">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="2" width="10" height="12" rx="1.5"/><path d="M6 6h4M6 9h4"/></svg>
+      Audit Trail
+    </a>
+    <a data-target="sec-result">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      Operation Result
+    </a>
+  </nav>
+  <div class="foot">
+    <span id="live" class="live">offline</span>
+    <div class="hints">
+      <div><span class="kbd">⌘K</span> focus token</div>
+      <div><span class="kbd">R</span> refresh all</div>
+    </div>
+  </div>
+</aside>
+
+<div class="content">
+  <div class="topbar">
+    <h1>Patch Pipeline</h1>
+    <span class="sub">Bootstrap has exited — this console operates the self-evolution system</span>
+    <span style="flex:1"></span>
+    <input id="token" type="password" placeholder="Admin Bearer Token" />
+    <button id="saveToken" class="ghost">Save Token</button>
+    <button id="refresh">Refresh</button>
+  </div>
+
+  <main>
+    <div class="stats" id="sec-metrics">
+      <div class="stat"><div class="v" id="m-events">–</div><div class="k">Total Events</div></div>
+      <div class="stat bad"><div class="v" id="m-events-failed">–</div><div class="k">Failed Events</div></div>
+      <div class="stat good"><div class="v" id="m-applied">–</div><div class="k">Patches Applied</div></div>
+      <div class="stat bad"><div class="v" id="m-failed">–</div><div class="k">Patches Failed</div></div>
+    </div>
+
+    <section id="sec-pipeline">
+      <h2>
+        Patch Pipeline
+        <span class="hint">click a row for detail · live via SSE, polling resumes if the stream drops</span>
+        <span class="spacer"></span>
+        <button class="danger sm" id="rollbackBtn">Roll Back to Previous Version</button>
+      </h2>
+      <table>
+        <thead><tr><th></th><th>ID</th><th>Kind</th><th>Status</th><th>Description</th><th>Eval Verdict</th><th>Created</th></tr></thead>
+        <tbody id="patches"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </section>
+
+    <div class="split">
+      <section id="sec-events">
+        <h2>Evolution Events</h2>
+        <ul class="events" id="events"><li class="muted">Loading…</li></ul>
+      </section>
+      <section id="sec-audit">
+        <h2>Audit Trail</h2>
+        <ul class="events" id="audit"><li class="muted">Loading…</li></ul>
+      </section>
+    </div>
+
+    <section id="sec-result">
+      <h2>Operation Result</h2>
+      <pre id="output">(none)</pre>
+    </section>
+  </main>
+</div>
+<div id="toast"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+const TOKEN_KEY = 'cogneva_admin_token';
+$('token').value = localStorage.getItem(TOKEN_KEY) || '';
+
+const patchRows = new Map();
+const expanded = new Set();
+let eventSource = null;
+let pollTimer = null;
+
+function toast(msg, kind) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = kind || '';
+  t.style.display = 'block';
+  clearTimeout(t._h);
+  t._h = setTimeout(() => (t.style.display = 'none'), 4000);
+}
+
+async function api(path, method = 'GET') {
+  const token = $('token').value.trim();
+  const resp = await fetch(path, {
+    method,
+    headers: token ? { Authorization: 'Bearer ' + token } : {},
+  });
+  const text = await resp.text();
+  let body;
+  try { body = JSON.parse(text); } catch { body = text; }
+  if (!resp.ok) {
+    const msg = (body && body.message) || (body && body.error) || ('HTTP ' + resp.status);
+    throw new Error(msg);
+  }
+  return body;
+}
+
+function show(obj) { $('output').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
+
+function relTime(iso) {
+  const t = Date.parse(iso);
+  if (isNaN(t)) return iso || '—';
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
+// ── Metrics with count-up animation ──
+function animateValue(el, to) {
+  const from = parseInt(el.textContent, 10);
+  if (isNaN(from) || from === to) { el.textContent = to; return; }
+  const start = performance.now(), dur = 500;
+  const step = (t) => {
+    const k = Math.min(1, (t - start) / dur);
+    const eased = 1 - Math.pow(1 - k, 3);
+    el.textContent = Math.round(from + (to - from) * eased);
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+async function loadMetrics() {
+  try {
+    const m = await api('/api/v1/evolution/metrics');
+    animateValue($('m-events'), m.events_total);
+    animateValue($('m-events-failed'), m.events_failed);
+    animateValue($('m-applied'), m.patches_applied);
+    animateValue($('m-failed'), m.patches_failed);
+  } catch (e) { toast('Failed to load metrics: ' + e.message, 'err'); }
+}
+
+// ── Patch table ──
+function statusPillClass(s) {
+  const v = (s || '').toLowerCase();
+  if (v === 'awaitingreview') return 'warn';
+  if (v === 'active' || v === 'applied' || v === 'deployed') return 'ok';
+  if (v === 'rejected' || v === 'failed' || v === 'rolledback') return 'err';
+  return '';
+}
+
+function actionButtons(p, sizeCls) {
+  const wrap = document.createElement('span');
+  wrap.className = 'row';
+  const mk = (label, path, cls) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.className = (sizeCls || '') + (cls ? ' ' + cls : '');
+    b.onclick = (e) => { e.stopPropagation(); act(path, label + ' ' + p.id); };
+    wrap.appendChild(b);
+  };
+  const awaiting = (p.status || '').toLowerCase() === 'awaitingreview';
+  const isPolicy = p.kind === 'policy_update';
+  if (awaiting) mk('Approve', `/api/v1/evolution/patches/${p.id}/approve`);
+  if (!isPolicy) {
+    mk('Apply', `/api/v1/evolution/patches/${p.id}/apply`, 'ghost');
+    mk('Deploy', `/api/v1/evolution/patches/${p.id}/deploy`, 'ghost');
+  }
+  return wrap;
+}
+
+function field(dk, dv, mono) {
+  const box = document.createElement('div');
+  const k = document.createElement('div');
+  k.className = 'dk';
+  k.textContent = dk;
+  const v = document.createElement('div');
+  v.className = 'dv' + (mono ? ' mono' : '');
+  v.textContent = dv || '—';
+  box.appendChild(k);
+  box.appendChild(v);
+  return box;
+}
+
+function renderPatches(flashId) {
+  const tb = $('patches');
+  tb.innerHTML = '';
+  if (!patchRows.size) {
+    tb.innerHTML = '<tr><td colspan="7" class="muted">No patches</td></tr>';
+    return;
+  }
+  const rows = [...patchRows.values()].sort((a, b) =>
+    String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  for (const p of rows) {
+    const tr = document.createElement('tr');
+    tr.className = 'patch' + (expanded.has(p.id) ? ' open' : '');
+    if (p.id === flashId) tr.classList.add('flash');
+    tr.onclick = () => {
+      if (expanded.has(p.id)) expanded.delete(p.id); else expanded.add(p.id);
+      renderPatches(null);
+    };
+
+    const tdChev = document.createElement('td');
+    const chev = document.createElement('span');
+    chev.className = 'chev';
+    chev.textContent = '▶';
+    tdChev.appendChild(chev);
+    tr.appendChild(tdChev);
+
+    const tdId = document.createElement('td');
+    tdId.className = 'mono dim';
+    tdId.textContent = p.id;
+    tr.appendChild(tdId);
+
+    const tdKind = document.createElement('td');
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.textContent = p.kind;
+    tdKind.appendChild(tag);
+    tr.appendChild(tdKind);
+
+    const tdStatus = document.createElement('td');
+    const pill = document.createElement('span');
+    pill.className = 'pill ' + statusPillClass(p.status);
+    pill.textContent = p.status;
+    tdStatus.appendChild(pill);
+    tr.appendChild(tdStatus);
+
+    const tdDesc = document.createElement('td');
+    tdDesc.className = 'ellipsis';
+    tdDesc.textContent = p.description;
+    tdDesc.title = p.description || '';
+    tr.appendChild(tdDesc);
+
+    const tdEval = document.createElement('td');
+    tdEval.className = 'mono dim ellipsis';
+    tdEval.textContent = p.eval_summary || '—';
+    tr.appendChild(tdEval);
+
+    const tdTime = document.createElement('td');
+    tdTime.className = 'mono dim';
+    tdTime.textContent = relTime(p.created_at);
+    tdTime.title = p.created_at || '';
+    tr.appendChild(tdTime);
+
+    tb.appendChild(tr);
+
+    if (expanded.has(p.id)) {
+      const dr = document.createElement('tr');
+      dr.className = 'detail';
+      const dc = document.createElement('td');
+      dc.colSpan = 7;
+      const wrap = document.createElement('div');
+      wrap.className = 'detail-wrap';
+      const grid = document.createElement('div');
+      grid.className = 'detail-grid';
+      grid.appendChild(field('Patch ID', p.id, true));
+      grid.appendChild(field('Description', p.description));
+      grid.appendChild(field('Diff Summary', p.diff_summary, true));
+      grid.appendChild(field('Eval Verdict', p.eval_summary, true));
+      grid.appendChild(field('Created At', p.created_at, true));
+      wrap.appendChild(grid);
+      const actions = document.createElement('div');
+      actions.className = 'detail-actions';
+      actions.appendChild(actionButtons(p, ''));
+      wrap.appendChild(actions);
+      dc.appendChild(wrap);
+      dr.appendChild(dc);
+      tb.appendChild(dr);
+    }
+  }
+}
+
+function upsertPatch(row) {
+  patchRows.set(row.id, row);
+  renderPatches(row.id);
+}
+
+async function loadPatches() {
+  try {
+    const { patches } = await api('/api/v1/evolution/patches');
+    patchRows.clear();
+    for (const p of patches) patchRows.set(p.id, p);
+    renderPatches(null);
+  } catch (e) {
+    $('patches').innerHTML = `<tr><td colspan="7" class="muted">Load failed: ${e.message}</td></tr>`;
+  }
+}
+
+// ── SSE live stream with polling fallback ──
+function setLive(state) {
+  const el = $('live');
+  el.className = 'live' + (state === 'live' ? ' on' : state === 'connecting' ? ' connecting' : '');
+  el.textContent = state === 'live' ? 'Live' : state === 'connecting' ? 'Connecting' : 'Polling';
+}
+
+function startPolling() {
+  if (!pollTimer) pollTimer = setInterval(refreshAll, 30000);
+}
+function stopPolling() {
+  clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+function connectStream() {
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  const token = $('token').value.trim();
+  if (!token) { setLive('polling'); startPolling(); return; }
+  setLive('connecting');
+  const es = new EventSource('/api/v1/evolution/stream?token=' + encodeURIComponent(token));
+  eventSource = es;
+  es.onopen = () => { setLive('live'); stopPolling(); };
+  es.onmessage = (ev) => {
+    try {
+      upsertPatch(JSON.parse(ev.data));
+      loadMetrics();
+    } catch { /* keep-alive / malformed frame */ }
+  };
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED) {
+      setLive('polling');
+      startPolling();
+    } else {
+      setLive('connecting');
+    }
+  };
+}
+
+// ── Events & audit ──
+function renderEvents(el, items, fmt) {
+  el.innerHTML = '';
+  if (!items.length) { el.innerHTML = '<li class="muted">No events</li>'; return; }
+  for (const it of items) {
+    const li = document.createElement('li');
+    li.textContent = fmt(it);
+    el.appendChild(li);
+  }
+}
+
+async function loadEvents() {
+  try {
+    const { events } = await api('/api/v1/evolution/events?limit=50');
+    renderEvents($('events'), events, (e) =>
+      `[${e.kind || e.event || 'event'}] ${e.patch_id || ''} ${e.message || e.detail || JSON.stringify(e)}`);
+  } catch (e) { $('events').innerHTML = `<li class="muted">Load failed: ${e.message}</li>`; }
+}
+
+async function loadAudit() {
+  try {
+    const body = await api('/api/v1/audit/events?limit=50');
+    const events = body.events || body;
+    renderEvents($('audit'), events, (e) =>
+      `[${e.kind || e.action || 'audit'}] ${e.actor || ''} ${e.target || e.resource || ''} ${e.timestamp || e.created_at || ''}`);
+  } catch (e) { $('audit').innerHTML = `<li class="muted">Load failed: ${e.message}</li>`; }
+}
+
+async function act(path, label) {
+  try {
+    const r = await api(path, 'POST');
+    show(r);
+    toast(label + ' succeeded', 'ok');
+    refreshAll();
+  } catch (e) {
+    show(String(e.message));
+    toast(label + ' failed: ' + e.message, 'err');
+  }
+}
+
+function refreshAll() { loadMetrics(); loadPatches(); loadEvents(); loadAudit(); }
+
+$('saveToken').onclick = () => {
+  localStorage.setItem(TOKEN_KEY, $('token').value.trim());
+  toast('Token saved', 'ok');
+  refreshAll();
+  connectStream();
+};
+$('refresh').onclick = () => {
+  refreshAll();
+  if (!eventSource || eventSource.readyState === EventSource.CLOSED) connectStream();
+};
+$('rollbackBtn').onclick = () => {
+  if (confirm('Roll back to the previous version?')) act('/api/v1/evolution/rollback', 'Rollback');
+};
+
+document.querySelectorAll('nav a').forEach((a) => {
+  a.onclick = () => {
+    document.querySelectorAll('nav a').forEach((x) => x.classList.remove('active'));
+    a.classList.add('active');
+    const el = document.getElementById(a.dataset.target);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+});
+
+document.addEventListener('keydown', (e) => {
+  const typing = document.activeElement &&
+    ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName);
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    $('token').focus();
+    $('token').select();
+  } else if (!typing && e.key.toLowerCase() === 'r') {
+    refreshAll();
+  }
+});
+
+refreshAll();
+connectStream();
+</script>
+</body>
+</html>

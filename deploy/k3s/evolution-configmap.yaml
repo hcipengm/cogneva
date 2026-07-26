@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cogneva-evolution-config
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva-evolution
+    app.kubernetes.io/component: evolution
+# These env vars override fields in /etc/cogneva/cogneva.json via the
+# config_loader env-var layer. They enable the self-evolution sandbox mode
+# and point all directories into the mounted PVC.
+data:
+  COGNEVA_SELF_EVOLUTION_ENABLED: "true"
+  COGNEVA_SELF_EVOLUTION_AUTO_APPLY: "true"
+  COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY: "true"
+  COGNEVA_SELF_EVOLUTION_SANDBOX_MODE: "true"
+  COGNEVA_SELF_EVOLUTION_SWITCH_MODE: "self_exec"
+  COGNEVA_SELF_EVOLUTION_PATCH_DIR: "/opt/cogneva/sandbox/patches"
+  COGNEVA_SELF_EVOLUTION_BINARY_DIR: "/opt/cogneva/sandbox/bin"
+  COGNEVA_SELF_EVOLUTION_BACKUP_DIR: "/opt/cogneva/sandbox/backups"
+  COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS: "300"
+  COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS: "600"
+  COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS: "1800"
+  # Disable memory/vector backends in the evolution worker to avoid downloading
+  # embedding models inside the sandbox on every boot.
+  COGNEVA_MEMORY_ENABLED: "false"
+  COGNEVA_VECTOR_BACKEND_REQUIRED: "false"
+  # The evolution worker does not need strict persistence; allow memory fallbacks
+  # for PostgreSQL/Redis-dependent plugins so the self-evolution loop can start.
+  COGNEVA_STRICT_PERSISTENCE: "false"

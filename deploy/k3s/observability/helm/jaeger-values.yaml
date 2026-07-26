@@ -1,0 +1,70 @@
+# Jaeger Helm Values — K3s 生产环境
+#
+# helm repo add jaegertracing https://jaegertracing.github.io/helm-charts
+# helm install jaeger jaegertracing/jaeger \
+#   -n monitoring --create-namespace -f jaeger-values.yaml
+
+provisionDataStore:
+  cassandra: false
+  kafka: false
+  elasticsearch: false
+  opensearch: false
+
+storage:
+  type: badger
+  badger:
+    persistence:
+      enabled: true
+      storageClassName: "local-path"
+      size: 30Gi
+    keep: false
+    ephemeral: false
+
+agent:
+  enabled: false
+
+collector:
+  enabled: true
+  replicaCount: 2
+  service:
+    otlp:
+      grpc:
+        name: otlp-grpc
+        port: 4317
+      http:
+        name: otlp-http
+        port: 4318
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+
+query:
+  enabled: true
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 16686
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - jaeger.cogneva.local
+    tls:
+      - secretName: jaeger-tls
+        hosts:
+          - jaeger.cogneva.local
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# OTLP 接收（cog-observability JaegerLayer 推送端点）
+allInOne:
+  enabled: false

@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-security-gateway
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: security-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: security-gateway
+  ports:
+    - name: egress-proxy
+      port: 8080
+      targetPort: egress-proxy
+      protocol: TCP
+    - name: llm-proxy
+      port: 8081
+      targetPort: llm-proxy
+      protocol: TCP

@@ -1,0 +1,40 @@
+[package]
+name = "cog-prompt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Template engine (Jinja2-style)
+tera = "1.20"
+
+# File watching for hot reload
+notify = { version = "7.0", default-features = false, features = ["macos_fsevent"] }
+
+# YAML support for prompt files
+serde_yaml = "0.9"
+
+# Async trait
+async-trait = "0.1"
+
+# Random for A/B testing
+rand = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-service
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/component: event-bus
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/component: event-bus
+  ports:
+    - name: client
+      port: 4222
+      targetPort: client
+      protocol: TCP
+    - name: monitor
+      port: 8222
+      targetPort: monitor
+      protocol: TCP

@@ -1,0 +1,7 @@
+# Build output
+target/
+node_modules/
+dist/
+
+# Local runtime config (template: cogneva.example.json)
+cogneva.json

@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package sf.wal.v1;
+
+// WAL (Write-Ahead Log) record for event persistence.
+//
+// Each record is a self-contained unit that can be appended to a durable
+// log and replayed later for recovery.  The on-disk format is
+// length-delimited: <varint length><WalRecord bytes>...
+//
+// Schema is additive-only; field numbers are stable.
+message WalRecord {
+  // Monotonic sequence number within a session.
+  uint64 seq = 1;
+
+  // Session identifier for grouping related records.
+  string session_id = 2;
+
+  // Event type discriminator.
+  WalEventType event_type = 3;
+
+  // Opaque JSON payload.  Schema depends on event_type.
+  // Kept as raw bytes so the WAL layer does not need to know
+  // every possible payload shape.
+  bytes payload_json = 4;
+
+  // UTC timestamp of when the record was created,
+  // expressed as RFC 3339 string.
+  string timestamp_rfc3339 = 5;
+
+  // Optional checksum for integrity verification (future).
+  // When absent the field is omitted (zero bytes in proto3).
+  optional string checksum = 6;
+}
+
+// Event type classification for WAL records.
+//
+// Values are assigned explicitly so re-ordering the enum in
+// generated code does not change the wire format.
+enum WalEventType {
+  WAL_EVENT_TYPE_UNSPECIFIED = 0;
+  WAL_EVENT_TYPE_AGENT_START = 1;
+  WAL_EVENT_TYPE_AGENT_END = 2;
+  WAL_EVENT_TYPE_TURN_START = 3;
+  WAL_EVENT_TYPE_TURN_END = 4;
+  WAL_EVENT_TYPE_MESSAGE_START = 5;
+  WAL_EVENT_TYPE_MESSAGE_DELTA = 6;
+  WAL_EVENT_TYPE_MESSAGE_END = 7;
+  WAL_EVENT_TYPE_TOOL_EXECUTION_START = 8;
+  WAL_EVENT_TYPE_TOOL_EXECUTION_DELTA = 9;
+  WAL_EVENT_TYPE_TOOL_EXECUTION_END = 10;
+  WAL_EVENT_TYPE_STATE_CHANGE = 11;
+  WAL_EVENT_TYPE_TASK_STATUS_CHANGE = 12;
+  WAL_EVENT_TYPE_CUSTOM = 13;
+  WAL_EVENT_TYPE_SELF_REVIEW = 14;
+  WAL_EVENT_TYPE_REACT_STEP_START = 15;
+  WAL_EVENT_TYPE_REACT_STEP_END = 16;
+  WAL_EVENT_TYPE_AGENT_ERROR = 17;
+  WAL_EVENT_TYPE_RESOURCE_ALERT = 18;
+  WAL_EVENT_TYPE_HEARTBEAT = 19;
+  WAL_EVENT_TYPE_CHECKPOINT_SAVED = 20;
+}

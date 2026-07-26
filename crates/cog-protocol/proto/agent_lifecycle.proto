@@ -1,0 +1,131 @@
+syntax = "proto3";
+package sf.network.agent_lifecycle;
+
+service AgentLifecycle {
+  // Agent -> Supervisor: pure heartbeat (Unary)
+  rpc Heartbeat(HeartbeatReq) returns (HeartbeatResp);
+
+  // Agent <- Supervisor: command dispatch (Server Streaming)
+  rpc SubscribeCommands(SubscribeCommandsReq) returns (stream Command);
+
+  // Agent -> Supervisor: low-frequency critical event (Unary)
+  rpc ReportEvent(ReportEventReq) returns (ReportEventResp);
+
+  // Agent -> Supervisor: high-frequency event batch (Client Streaming)
+  rpc UploadEvents(stream UploadEventsReq) returns (UploadEventsResp);
+
+  // External -> Supervisor: management operations
+  rpc Kill(KillReq) returns (KillResp);
+  rpc Restart(RestartReq) returns (RestartResp);
+  rpc Checkpoint(CheckpointReq) returns (CheckpointResp);
+  rpc QueryState(QueryStateReq) returns (QueryStateResp);
+}
+
+// ===== Agent -> Supervisor =====
+message HeartbeatReq {
+  string agent_id = 1;
+  int64 timestamp = 2;
+  string state = 3;
+}
+
+message HeartbeatResp {
+  string agent_id = 1;
+  bool accepted = 2;
+}
+
+message SubscribeCommandsReq {
+  string agent_id = 1;
+}
+
+// Low-frequency critical event — reported one-by-one via Unary.
+message ReportEventReq {
+  string agent_id = 1;
+  // JSON-serialized AgentEvent (keeps cog-core free of prost/tonic).
+  string event_json = 2;
+}
+
+message ReportEventResp {
+  string agent_id = 1;
+  bool accepted = 2;
+}
+
+// High-frequency event — batched via Client Streaming.
+message UploadEventsReq {
+  string agent_id = 1;
+  // JSON-serialized AgentEvent.
+  string event_json = 2;
+}
+
+message UploadEventsResp {
+  string agent_id = 1;
+  // Number of events accepted by the server in this stream.
+  int32 accepted_count = 2;
+}
+
+// ===== Supervisor -> Agent =====
+message Command {
+  oneof payload {
+    KillCmd kill = 1;
+    RestartCmd restart = 2;
+    CheckpointCmd checkpoint = 3;
+    ConfigUpdate config = 4;
+  }
+}
+
+message KillCmd {
+  string reason = 1;
+}
+
+message RestartCmd {
+  bool preserve_context = 1;
+}
+
+message CheckpointCmd {
+  string task_id = 1;
+}
+
+message ConfigUpdate {
+  bytes config_json = 1;
+}
+
+// ===== External -> Supervisor =====
+message KillReq {
+  string agent_id = 1;
+  string reason = 2;
+}
+
+message KillResp {
+  string agent_id = 1;
+  bool success = 2;
+}
+
+message RestartReq {
+  string agent_id = 1;
+  bool preserve_context = 2;
+}
+
+message RestartResp {
+  string agent_id = 1;
+  bool success = 2;
+}
+
+message CheckpointReq {
+  string agent_id = 1;
+  string task_id = 2;
+}
+
+message CheckpointResp {
+  string agent_id = 1;
+  string checkpoint_id = 2;
+  bool success = 3;
+}
+
+message QueryStateReq {
+  string agent_id = 1;
+}
+
+message QueryStateResp {
+  string agent_id = 1;
+  string state = 2;
+  int32 iteration = 3;
+}

@@ -1,0 +1,14 @@
+# 显式声明 StorageClass，避免隐式依赖 K3s 默认的 local-path。
+# K3s 自带的 local-path reclaimPolicy=Delete 且不可变，这里提供 Retain 版本，
+# 用于进化源码/数据等不可误删的卷。新 PVC 指定 storageClassName: cogneva-local-retain。
+# 已有 PVC 的 storageClassName 不可变，需迁移时重建 PVC 并拷贝数据。
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cogneva-local-retain
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: storage
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer

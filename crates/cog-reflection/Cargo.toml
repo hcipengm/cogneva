@@ -1,0 +1,27 @@
+[package]
+name = "cog-reflection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+schemars = { workspace = true }
+sha2 = { workspace = true }
+
+tempfile = "3"
+
+[dev-dependencies]
+tokio-test = "0.4"

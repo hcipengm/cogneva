@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cogneva-config
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config
+data:
+  COGNEVA_APP_NAME: "cogneva"
+  COGNEVA_APP_VERSION: {{ .Values.image.tag | quote }}
+  COGNEVA_LOG_LEVEL: "info"
+  COGNEVA_DATA_DIR: "/var/lib/cogneva-data"
+  COGNEVA_CONFIG_DIR: "/etc/cogneva"
+  COGNEVA_APP_DIR: "/opt/cogneva"
+
+  COGNEVA_DB_PROVIDER: "mysql"
+  COGNEVA_PG_PROVIDER: "postgres"
+  COGNEVA_VECTOR_PROVIDER: "qdrant"
+  QDRANT_URL: "http://qdrant.{{ include "cogneva.namespace" . }}.svc.cluster.local:6334"
+  COGNEVA_MEDIA_PROVIDER: "local-sfu"
+  COGNEVA_STORAGE_PROVIDER: "local-fs"
+  COGNEVA_REDIS_URL: "redis://redis-0.redis.{{ include "cogneva.namespace" . }}.svc.cluster.local:6379"
+
+  COGNEVA_WORKSPACE_ID: "default"
+  COGNEVA_CONSUMER_GROUP: "cogneva"
+
+  COGNEVA_HTTP_PORT: "8080"
+  COGNEVA_WS_PORT: "8081"
+  COGNEVA_METRICS_PORT: "9090"
+
+  COGNEVA_RAW_LOGGER_ENABLED: "true"
+  COGNEVA_RAW_LOGGER_BASE_DIR: "/var/lib/cogneva-data/raw-logs"
+  COGNEVA_RAW_LOGGER_BUFFER_SIZE: "1000"
+
+  COGNEVA_MEMORY_ENABLED: "false"
+  COGNEVA_MEMORY_BACKEND_TYPE: "memory"
+  COGNEVA_MEMORY_BASE_DIR: "/var/lib/cogneva-data/memory"
+  COGNEVA_MEMORY_EMBEDDING_DIMENSION: "128"
+  COGNEVA_MEMORY_AUTO_INGEST: "false"

@@ -1,0 +1,35 @@
+[package]
+name = "cog-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+[dependencies]
+cog-core = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+
+prost = { workspace = true }
+bytes = { workspace = true }
+tonic = { workspace = true }
+zstd = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+futures = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

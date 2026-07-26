@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-evolution-pvc
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva-evolution
+    app.kubernetes.io/component: evolution
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # Adjust to your K3s storage class (e.g., local-path, longhorn).
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-evolution-source-pvc
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva-evolution
+    app.kubernetes.io/component: evolution-source
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path

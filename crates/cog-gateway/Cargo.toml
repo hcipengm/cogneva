@@ -1,0 +1,40 @@
+[package]
+name = "cog-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+
+axum = { workspace = true }
+sqlx = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+redis = { workspace = true }
+base64 = "0.22"
+argon2 = { workspace = true }
+async-trait = "0.1"
+reqwest = { workspace = true }
+regex = "1.10"
+
+[dev-dependencies]
+tokio-test = "0.4"
+redis = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tempfile = "3"
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"

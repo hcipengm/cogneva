@@ -1,0 +1,43 @@
+[package]
+name = "cog-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+
+async-trait = "0.1"
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+redis = { workspace = true }
+sqlx = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+jsonwebtoken = { workspace = true }
+bcrypt = { workspace = true }
+argon2 = { workspace = true }
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+tracing = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+urlencoding = "2.1"
+
+[dev-dependencies]
+tokio-test = "0.4"

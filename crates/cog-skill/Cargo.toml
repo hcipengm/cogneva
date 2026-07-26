@@ -1,0 +1,25 @@
+[package]
+name = "cog-skill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cog-core = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+walkdir = "2"
+tempfile = "3"
+reqwest = { workspace = true }
+dirs = "5"
+
+[dev-dependencies]
+tokio-test = "0.4"

@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package sf.raw.v1;
+
+// Simplified raw-data envelope.
+//
+// Payload is a plain JSON blob — no typed per-stream messages.
+// Adding a new stream does not require changing this proto.
+message RawRecord {
+  RawMeta meta = 1;
+  RawContext context = 2;
+  bytes payload_json = 3;
+}
+
+message RawMeta {
+  string version = 1;
+  string stream = 2;
+  int64 recorded_at_unix_nanos = 3;
+  string recorded_by = 4;
+  uint64 sequence = 5;
+  string trace_id = 6;
+  optional string span_id = 7;
+}
+
+message RawContext {
+  optional string session_id = 1;
+  optional string user_id = 2;
+  optional string workspace_id = 3;
+  optional string agent_id = 4;
+  optional string task_id = 5;
+}

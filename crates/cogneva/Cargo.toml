@@ -1,0 +1,73 @@
+[package]
+name = "cogneva"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "cogneva"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cogneva"
+path = "src/main.rs"
+
+[dependencies]
+cog-core = { workspace = true }
+cog-llm = { workspace = true }
+cog-agent = { workspace = true }
+cog-collaboration = { workspace = true }
+cog-orchestrator = { workspace = true }
+cog-auth = { workspace = true }
+cog-quota = { workspace = true }
+cog-wiki = { workspace = true }
+cog-storage = { workspace = true, features = ["livekit", "meilisearch"] }
+cog-stream = { workspace = true }
+cog-memory = { workspace = true }
+cog-observability = { workspace = true }
+cog-notification = { workspace = true }
+cog-net = { workspace = true }
+cog-prompt = { workspace = true }
+cog-extension = { workspace = true }
+cog-skill = { workspace = true }
+cog-guardrail = { workspace = true }
+cog-eval = { workspace = true }
+cog-reflection = { workspace = true }
+cog-protocol = { workspace = true }
+cog-gateway = { workspace = true }
+cog-supervisor = { workspace = true }
+cog-github = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+redis = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+dirs = "5"
+sd-notify = "0.4"
+notify = "6"
+futures = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tonic = { workspace = true }
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = "3"
+filetime = "0.2"
+async-trait = "0.1"

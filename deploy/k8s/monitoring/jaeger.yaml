@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jaeger-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: longhorn
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:latest
+          ports:
+            - containerPort: 16686
+              name: ui
+            - containerPort: 14268
+              name: collector-http
+            - containerPort: 14250
+              name: collector-grpc
+            - containerPort: 9411
+              name: zipkin
+          env:
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+          volumeMounts:
+            - name: data
+              mountPath: /badger
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: jaeger-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-service
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - port: 16686
+      targetPort: 16686
+      name: ui
+    - port: 14268
+      targetPort: 14268
+      name: collector-http
+    - port: 14250
+      targetPort: 14250
+      name: collector-grpc
+    - port: 9411
+      targetPort: 9411
+      name: zipkin

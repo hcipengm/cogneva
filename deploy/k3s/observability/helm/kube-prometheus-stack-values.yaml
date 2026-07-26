@@ -1,0 +1,429 @@
+# kube-prometheus-stack Helm Values
+# 用于 K3s 生产环境部署 16 项 DevOps 可观测性组件
+#
+# 安装方式:
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm repo update
+#   helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace -f kube-prometheus-stack-values.yaml
+#
+# 商用级别配置：持久化、资源限制、Ingress TLS、多副本、网络隔离
+
+nameOverride: "cog-observability"
+fullnameOverride: "cog-observability"
+
+# ─── 全局 ──────────────────────────────────────────────────────────
+global:
+  rbac:
+    create: true
+  imagePullSecrets: []
+
+# ─── Namespace ─────────────────────────────────────────────────────
+namespaceOverride: "monitoring"
+
+# ─── Prometheus ────────────────────────────────────────────────────
+prometheus:
+  enabled: true
+
+  prometheusSpec:
+    replicas: 2
+    retention: 30d
+    retentionSize: "50GB"
+    enableAdminAPI: false
+    walCompression: true
+
+    # 资源限制
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
+
+    # 持久化
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: "local-path"   # K3s 默认 StorageClass
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 100Gi
+
+    # 节点亲和性：尽量分散到不同节点
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - prometheus
+              topologyKey: kubernetes.io/hostname
+
+    # 告警规则选择器
+    ruleSelectorNilUsesHelmValues: false
+    ruleSelector: {}
+    ruleNamespaceSelector: {}
+
+    # ServiceMonitor 选择器：监控所有 namespace
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelector: {}
+    serviceMonitorNamespaceSelector: {}
+
+    # PodMonitor 选择器
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelector: {}
+    podMonitorNamespaceSelector: {}
+
+    # 额外 scrape 配置（cogneva 自身 + Blackbox）
+    additionalScrapeConfigs:
+      - job_name: 'cogneva'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - default
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: cogneva
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+
+      - job_name: 'blackbox-http'
+        metrics_path: /probe
+        params:
+          module: [http_2xx]
+        kubernetes_sd_configs:
+          - role: ingress
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_ingress_scheme, __address__, __meta_kubernetes_ingress_path]
+            regex: (.+);(.+);(.+)
+            replacement: ${1}://${2}${3}
+            target_label: __param_target
+          - target_label: __address__
+            replacement: cog-observability-blackbox-exporter:9115
+          - source_labels: [__param_target]
+            target_label: instance
+          - action: labelmap
+            regex: __meta_kubernetes_ingress_label_(.+)
+
+    # Alertmanager 配置
+    alerting:
+      alertmanagers:
+        - namespace: monitoring
+          name: cog-observability-alertmanager
+          port: http-web
+
+  # Service
+  service:
+    type: ClusterIP
+    port: 9090
+
+  # Ingress（商用：必须启用 TLS）
+  ingress:
+    enabled: true
+    ingressClassName: traefik   # K3s 默认 IngressClass
+    hosts:
+      - prometheus.cogneva.local
+    paths:
+      - /
+    tls:
+      - secretName: prometheus-tls
+        hosts:
+          - prometheus.cogneva.local
+
+# ─── Alertmanager ────────────────────────────────────────────────
+alertmanager:
+  enabled: true
+
+  config:
+    global:
+      smtp_smarthost: 'mail.example.com:587'
+      smtp_from: 'alerts@cogneva.local'
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname', 'severity', 'team']
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 12h
+      receiver: 'default'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'critical-all'
+          group_wait: 0s
+          repeat_interval: 5m
+          continue: true
+        - match:
+            team: ai
+          receiver: 'ai-team'
+          continue: true
+        - match:
+            team: platform
+          receiver: 'platform-team'
+          continue: true
+    receivers:
+      - name: 'default'
+        webhook_configs:
+          - url: 'https://cogneva.local/webhooks/alerts'
+            send_resolved: true
+      - name: 'critical-all'
+        slack_configs:
+          - api_url: '${SLACK_WEBHOOK_URL}'
+            channel: '#sf-alerts-critical'
+            send_resolved: true
+        webhook_configs:
+          - url: 'https://cogneva.local/webhooks/alerts-critical'
+            send_resolved: true
+      - name: 'ai-team'
+        webhook_configs:
+          - url: 'https://cogneva.local/webhooks/alerts-ai'
+            send_resolved: true
+      - name: 'platform-team'
+        webhook_configs:
+          - url: 'https://cogneva.local/webhooks/alerts-platform'
+            send_resolved: true
+    inhibit_rules:
+      - source_match:
+          severity: 'critical'
+        target_match:
+          severity: 'warning'
+        equal: ['instance']
+
+  alertmanagerSpec:
+    replicas: 2
+    retention: 120h
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: "local-path"
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - alertmanager
+              topologyKey: kubernetes.io/hostname
+
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - alertmanager.cogneva.local
+    paths:
+      - /
+    tls:
+      - secretName: alertmanager-tls
+        hosts:
+          - alertmanager.cogneva.local
+
+# ─── Grafana ───────────────────────────────────────────────────────
+grafana:
+  enabled: true
+  replicas: 1
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  persistence:
+    enabled: true
+    storageClassName: "local-path"
+    accessModes: ["ReadWriteOnce"]
+    size: 10Gi
+
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - grafana.cogneva.local
+    paths:
+      - /
+    tls:
+      - secretName: grafana-tls
+        hosts:
+          - grafana.cogneva.local
+
+  admin:
+    existingSecret: "grafana-admin-credentials"
+    userKey: admin-user
+    passwordKey: admin-password
+
+  # 数据源配置（与 Helm Chart 集成）
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://cog-observability-prometheus:9090
+          isDefault: true
+          editable: false
+          jsonData:
+            manageAlerts: true
+            alertmanagerUid: alertmanager
+        - name: Loki
+          type: loki
+          url: http://cog-observability-loki:3100
+          editable: false
+          jsonData:
+            derivedFields:
+              - name: TraceID
+                matcherRegex: '"trace_id":"([^"]+)"'
+                url: 'https://jaeger.cogneva.local/trace/${__value.raw}'
+        - name: Jaeger
+          type: jaeger
+          url: http://cog-observability-jaeger-query:16686
+          editable: false
+          jsonData:
+            tracesToLogs:
+              datasourceUid: loki
+              tags: ['task_id', 'agent_id']
+
+  # Dashboard 自动加载
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: 'cogneva'
+          orgId: 1
+          folder: 'Cogneva'
+          type: configmap
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/cogneva
+  dashboardsConfigMaps:
+    cogneva: "cogneva-dashboards"
+
+  # 默认启用的插件
+  plugins:
+    - grafana-clock-panel
+    - grafana-piechart-panel
+
+# ─── Node Exporter ───────────────────────────────────────────────
+nodeExporter:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# ─── kube-state-metrics ──────────────────────────────────────────
+kubeStateMetrics:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# ─── prometheus-node-exporter ────────────────────────────────────
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# ─── prometheusOperator ──────────────────────────────────────────
+prometheusOperator:
+  enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  admissionWebhooks:
+    patch:
+      enabled: true
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+
+# ─── defaultRules ────────────────────────────────────────────────
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: true
+    configReloaders: true
+    general: true
+    k8s: true
+    kubeApiserverAvailability: true
+    kubeApiserverBurnrate: true
+    kubeApiserverHistogram: true
+    kubeApiserverSlos: true
+    kubeControllerManager: true
+    kubelet: true
+    kubeProxy: true
+    kubePrometheusGeneral: true
+    kubePrometheusNodeRecording: true
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    kubernetesSystem: true
+    kubeSchedulerAlerting: true
+    kubeSchedulerRecording: true
+    kubeStateMetrics: true
+    network: true
+    node: true
+    nodeExporterAlerting: true
+    nodeExporterRecording: true
+    prometheus: true
+    prometheusOperator: true

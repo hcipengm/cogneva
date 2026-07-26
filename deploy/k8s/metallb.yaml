@@ -1,0 +1,23 @@
+# MetalLB — layer-2 load-balancer for on-prem / bare-metal clusters
+# Requires: helm install metallb metallb/metallb --namespace metallb-system --create-namespace
+# Then apply this configuration.
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    # Replace with your cluster's available IP range
+    - 192.168.1.100-192.168.1.120
+  autoAssign: true
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default-advertisement
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - default-pool

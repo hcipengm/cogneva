@@ -1,0 +1,75 @@
+global:
+  namespace: cogneva
+  # K3s 默认 local-path；生产可换 longhorn 等
+  storageClass: local-path
+
+image:
+  repository: localhost/cogneva
+  tag: "0.1.39"
+  pullPolicy: IfNotPresent
+
+gateway:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+
+# 独立安全网关：代持全部敏感凭证，沙盒 Pod 零凭证
+securityGateway:
+  enabled: true
+  replicas: 1
+
+# 自进化 worker（特权容器 = 文件系统沙盒边界；接 image-based 滚动更新后可关特权）
+evolution:
+  enabled: true
+  # 宿主机 bare 仓库与主配置（开发态直挂；生产建议改用 PVC/镜像内置）
+  gitRemoteHostPath: /root/omc_workspace/cogneva.git
+  configHostPath: /root/omc_workspace/cogneva/cogneva.json
+  sandboxStorage: 20Gi
+  sourceStorage: 10Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: 4000m
+      memory: 8Gi
+
+# 可选后端；禁用即假定使用外部服务（在 config 中指向外部地址）
+backends:
+  postgres:
+    enabled: true
+    image: postgres:16-alpine
+    storage: 10Gi
+  redis:
+    enabled: true
+    image: redis:7-alpine
+    storage: 5Gi
+  qdrant:
+    enabled: true
+    image: qdrant/qdrant:v1.13.4
+    storage: 10Gi
+  nats:
+    enabled: true
+    image: nats:2.10-alpine
+    storage: 10Gi
+
+# 明文默认值仅用于开发；生产请用 --set-file 或外部 Secret（然后 secrets.create=false）
+secrets:
+  create: true
+  dbPassword: "changeme"
+  pgPassword: "changeme"
+  redisPassword: ""
+  llmApiKey: ""
+
+ingress:
+  enabled: true
+  className: traefik
+  host: cogneva.local
+
+networkPolicy:
+  enabled: true

@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cogneva
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: gateway
+  annotations:
+    # Traefik is the default ingress controller in K3s
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    # Enable WebSocket support for the Ugents layer
+    traefik.ingress.kubernetes.io/router.middlewares: "cogneva-websocket-headers@kubernetescrd"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: cogneva.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cogneva
+                port:
+                  number: 8080
+---
+# Middleware to ensure WebSocket upgrade headers are preserved
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: websocket-headers
+  namespace: cogneva
+spec:
+  headers:
+    customRequestHeaders:
+      X-Forwarded-Proto: "https"
+    customResponseHeaders:
+      X-Frame-Options: "SAMEORIGIN"

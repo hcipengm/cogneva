@@ -1,0 +1,24 @@
+[Unit]
+Description=SF-Network 7x24 Autonomous Multi-Agent Collaboration Platform
+After=network-online.target redis.service mysql.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/opt/sf-network/sf-network
+ExecReload=/bin/kill -HUP $MAINPID
+PIDFile=/run/sf-network/sf-network.pid
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sf-network
+
+# Security hardening (optional — adjust for your environment)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sf-data /var/log/sf-network /run/sf-network
+
+[Install]
+WantedBy=multi-user.target

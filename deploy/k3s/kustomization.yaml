@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - storage-class.yaml
+  - configmap.yaml
+  - secret.yaml
+  - cogneva-json-configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - gateway-deployment.yaml
+  - gateway-service.yaml
+  - evolution-configmap.yaml
+  - evolution-deployment.yaml
+  - evolution-pvc.yaml
+  - evolution-rbac.yaml
+  - buildah-daemonset.yaml
+  - postgres-deployment.yaml
+  - postgres-service.yaml
+  - redis-deployment.yaml
+  - redis-service.yaml
+  - mysql-deployment.yaml
+  - mysql-service.yaml
+  - qdrant-pvc.yaml
+  - qdrant-deployment.yaml
+  - qdrant-service.yaml
+  - nats-deployment.yaml
+  - nats-service.yaml
+  - network-policy.yaml
+  - ingress.yaml

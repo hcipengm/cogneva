@@ -1,0 +1,50 @@
+# Longhorn — cloud-native distributed block storage for Kubernetes
+# Recommended install: helm install longhorn longhorn/longhorn --namespace longhorn-system --create-namespace
+# This manifest provides the StorageClass and a backup target example.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: longhorn-system
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "3"
+  staleReplicaTimeout: "2880"
+  fromBackup: ""
+  fsType: ext4
+  dataLocality: best-effort
+---
+# Example PersistentVolumeClaim using Longhorn
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-longhorn-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 50Gi
+---
+# Backup target (optional — configure S3/MinIO endpoint in Longhorn UI or settings)
+# apiVersion: longhorn.io/v1beta2
+# kind: BackupTarget
+# metadata:
+#   name: default
+#   namespace: longhorn-system
+# spec:
+#   backupTargetURL: s3://backups@minio.cogneva.io:9000/longhorn
+#   credentialSecret: minio-credentials
+#   pollInterval: 300

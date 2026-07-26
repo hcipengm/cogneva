@@ -1,0 +1,310 @@
+plugins:
+- name: llm
+  factory_crate: cog-llm
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::HotSwappableLlmClient }
+  - { type: cog_core::LlmClient }
+  - { type: cog_core::Observable }
+  consumes: []
+
+- name: agent
+  factory_crate: cog-agent
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::HookEngine }
+  - { type: cog_core::ToolRegistry }
+  - { type: cog_core::AgentManager }
+  - { type: cog_core::AgentRuntime }
+  - { type: cog_core::Observable }
+  consumes:
+  - { type: cog_core::MessageBackend, required: false }
+  - { type: cog_core::SandboxBackend, required: true }
+  - { type: cog_core::Guardrail, required: true }
+  - { type: cog_core::PluginRegistry, required: true }
+  - { type: cog_core::HookArchive, required: false }
+  - { type: cog_core::AgentRegistry, required: true }
+  - { type: cog_core::StateBackend, required: true }
+  - { type: cog_core::ExternalSkillRegistry, required: false }
+  - { type: cog_core::LlmClient, required: false }
+  - { type: cog_core::TaskExecutionCallback, required: false }
+
+- name: auth
+  factory_crate: cog-auth
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::AuthProvider }
+  - { type: cog_core::SessionManager }
+  consumes:
+  - { type: cog_core::RedisClient, required: true }
+
+- name: collaboration
+  factory_crate: cog-collaboration
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::TaskExecutor }
+  - { type: cog_core::Observable }
+  consumes:
+  - { type: cog_core::LlmClient, required: false }
+  - { type: cog_core::HookEngine, required: false }
+  - { type: cog_core::CrewReflection, required: false }
+  - { type: cog_core::SquadReflection, required: false }
+  - { type: cog_core::MetaLearning, required: false }
+
+- name: core
+  factory_crate: cog-core
+  factory_fn: plugin::factory
+  provides: []
+  consumes: []
+
+- name: eval
+  factory_crate: cog-eval
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::EvalService }
+  consumes:
+  - { type: cog_core::AgentRuntime, required: true }
+  - { type: cog_core::LlmClient, required: true }
+  - { type: cog_core::Observable, required: false }
+
+- name: extension
+  factory_crate: cog-extension
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::SandboxBackend }
+  - { type: cog_core::PluginRegistry }
+  - { type: cog_core::TaskExecutor }
+
+- name: gateway
+  factory_crate: cog-gateway
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::GatewayState }
+  - { type: cog_core::TaskExecutionCallback }
+  consumes:
+  - { type: cog_core::Sender<AgentEvent>, required: true }
+  - { type: cog_core::Sender<TaskEvent>, required: true }
+  - { type: cog_core::AuthProvider, required: true }
+  - { type: cog_core::QuotaManager, required: true }
+  - { type: cog_core::RawLogger, required: true }
+  - { type: cog_core::OrchestratorControl, required: true }
+  - { type: cog_core::TaskExecutor, required: true }
+  - { type: cog_core::AgentRegistry, required: true }
+  - { type: cog_core::Supervisor, required: true }
+  - { type: cog_core::AlertStore, required: true }
+  - { type: cog_core::HeartbeatRegistry, required: true }
+  - { type: cog_core::CheckpointStore, required: true }
+  - { type: cog_core::TraceStore, required: true }
+  - { type: cog_core::ReplayEngine, required: true }
+  - { type: cog_core::SessionManager, required: true }
+  - { type: cog_core::SandboxBackend, required: true }
+  - { type: cog_core::PluginRegistry, required: true }
+  - { type: cog_core::Guardrail, required: true }
+  - { type: cog_core::HttpClient, required: true }
+  - { type: cog_core::Observable, required: false }
+  - { type: cog_core::HierarchyManager, required: false }
+  - { type: cog_core::MemoryBackend, required: false }
+  - { type: cog_core::MemoryIngestor, required: false }
+  - { type: cog_core::MetricsBackend, required: false }
+  - { type: cog_core::MetricsExporter, required: false }
+  - { type: cog_core::SearchBackend, required: false }
+  - { type: cog_core::RawLogIndexStore, required: false }
+  - { type: cog_core::HookEngine, required: false }
+  - { type: cog_core::ExplainPool, required: false }
+  - { type: cog_core::HookArchive, required: false }
+  - { type: cog_core::MediaBackend, required: false }
+  - { type: cog_core::ObservabilityGateway, required: false }
+  - { type: cog_core::WikiBackend, required: false }
+  - { type: cog_core::EvalService, required: false }
+  - { type: cog_core::McpClient, required: false }
+  - { type: cog_core::ExternalSkillRegistry, required: false }
+  - { type: cog_core::EventPublisher, required: false }
+  - { type: cog_core::WebSocketClient, required: false }
+  - { type: cog_core::AgentManager, required: false }
+  - { type: cog_core::NotificationDispatcher, required: false }
+  - { type: cog_core::Sender<Notification>, required: false }
+  - { type: cog_core::NotificationStore, required: false }
+
+- name: guardrail
+  factory_crate: cog-guardrail
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::Guardrail }
+  - { type: cog_core::Observable }
+  consumes:
+  - { type: cog_core::GuardAuditRecorder, required: false }
+
+- name: memory
+  factory_crate: cog-memory
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::MemoryBackend }
+  - { type: cog_core::MemoryIngestor }
+  - { type: cog_core::EmbeddingProvider }
+  - { type: cog_core::RerankerProvider }
+  - { type: cog_core::Observable }
+  consumes:
+  - { type: cog_core::ExplainPool, required: false }
+  - { type: cog_core::MetricsBackend, required: false }
+  - { type: cog_core::VectorBackend, required: false }
+  - { type: cog_core::ObjectBackend, required: false }
+
+- name: net
+  factory_crate: cog-net
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::HttpClient }
+  - { type: cog_core::WebSocketClient }
+  consumes: []
+
+- name: notification
+  factory_crate: cog-notification
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::NotificationDispatcher }
+  - { type: cog_core::NotificationStore }
+  - { type: cog_core::Sender<Notification> }
+  consumes:
+  - { type: cog_core::HttpClient, required: true }
+
+- name: observability
+  factory_crate: cog-observability
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::MetricsExporter }
+  - { type: cog_core::RawLogger }
+  - { type: cog_core::TraceCollector }
+  - { type: cog_core::ReplayEngine }
+  - { type: cog_core::TraceTierMigrator }
+  - { type: cog_core::SearchBackend }
+  - { type: cog_core::LogFilterHandle }
+  - { type: cog_core::Observable }
+  consumes:
+  - { type: cog_core::HttpClient, required: true }
+  - { type: cog_core::RawLogger, required: true }
+  - { type: cog_core::TraceStore, required: true }
+  - { type: cog_core::Supervisor, required: false }
+
+- name: orchestrator
+  factory_crate: cog-orchestrator
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::OrchestratorControl }
+  - { type: cog_core::TaskExecutor }
+  - { type: cog_core::ActionPlanner }
+  - { type: cog_core::DagExecutorRuntime }
+  - { type: cog_core::Observable }
+  consumes:
+  - { type: cog_core::Sender<TaskEvent>, required: true }
+  - { type: cog_core::StateBackend, required: true }
+  - { type: cog_core::RawLogger, required: true }
+  - { type: cog_core::LlmClient, required: false }
+  - { type: cog_core::MessageBackend, required: false }
+  - { type: cog_core::ObjectBackend, required: false }
+  - { type: cog_core::VectorBackend, required: false }
+  - { type: cog_core::AgentRegistry, required: false }
+  - { type: cog_core::CheckpointStore, required: false }
+  - { type: cog_core::TaskExecutor, required: false }
+
+- name: prompt
+  factory_crate: cog-prompt
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::PromptProvider }
+  consumes: []
+
+- name: protocol
+  factory_crate: cog-protocol
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::McpClient }
+  consumes: []
+
+- name: quota
+  factory_crate: cog-quota
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::QuotaManager }
+  - { type: cog_core::HierarchyManager }
+  - { type: cog_core::WorkspaceQuotaSource }
+  consumes:
+  - { type: cog_core::RedisClient, required: true }
+
+- name: reflection
+  factory_crate: cog-reflection
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::ReflectionEngine }
+  - { type: cog_core::CrewReflection }
+  - { type: cog_core::SquadReflection }
+  - { type: cog_core::MetaLearning }
+  consumes:
+  - { type: cog_core::LlmClient, required: false }
+  - { type: cog_core::MemoryBackend, required: false }
+  - { type: cog_core::SkillRegistry, required: true }
+  - { type: cog_core::PromptProvider, required: true }
+  - { type: cog_core::HookEngine, required: true }
+  - { type: cog_core::ToolRegistry, required: true }
+
+- name: skill
+  factory_crate: cog-skill
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::SkillRegistry }
+  - { type: cog_core::ExternalSkillRegistry }
+  consumes: []
+
+- name: storage
+  factory_crate: cog-storage
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::RawLogger }
+  - { type: cog_core::TraceStore }
+  - { type: cog_core::StateBackend }
+  - { type: cog_core::RedisClient }
+  - { type: cog_core::VectorBackend }
+  - { type: cog_core::AgentRegistry }
+  - { type: cog_core::ObjectBackend }
+  - { type: cog_core::CheckpointStore }
+  - { type: cog_core::RawLogIndexStore }
+  - { type: cog_core::GuardAuditRecorder }
+  - { type: cog_core::MetricsBackend }
+  - { type: cog_core::ObservabilityGateway }
+  - { type: cog_core::HookArchive }
+  - { type: cog_core::MediaBackend }
+  consumes: []
+
+- name: stream
+  factory_crate: cog-stream
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::MessageBackend }
+  - { type: cog_core::EventPublisher }
+  - { type: cog_core::Sender<AgentEvent> }
+  consumes: []
+
+- name: supervisor
+  factory_crate: cog-supervisor
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::Supervisor }
+  - { type: cog_core::AlertStore }
+  - { type: cog_core::HeartbeatRegistry }
+  - { type: cog_core::SchedulerGate }
+  - { type: cog_core::SupervisorConfigTx }
+  consumes:
+  - { type: cog_core::WorkspaceQuotaSource, required: true }
+  - { type: cog_core::StateBackend, required: true }
+  - { type: cog_core::OrchestratorControl, required: true }
+  - { type: cog_core::Sender<AgentEvent>, required: true }
+  - { type: cog_core::ObservabilityGateway, required: true }
+  - { type: cog_core::MetaLearning, required: false }
+  - { type: cog_core::MessageBackend, required: false }
+
+- name: wiki
+  factory_crate: cog-wiki
+  factory_fn: plugin::factory
+  provides:
+  - { type: cog_core::WikiBackend }
+  consumes:
+  - { type: cog_core::ObjectBackend, required: false }
