@@ -39,7 +39,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: cogneva
-          image: localhost/cogneva:0.1.22
+          image: localhost/cogneva:0.1.49
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -74,6 +74,25 @@ spec:
                   key: db-password
             - name: COGNEVA_DATABASE_URL
               value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
+            # GitHub integration: tokens + webhook HMAC secret
+            - name: COGNEVA_GITHUB_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: github-token
+                  optional: true
+            - name: COGNEVA_GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: github-webhook-secret
+                  optional: true
+            # Patch-to-PR publishing clones/pushes over SSH on port 22
+            # (github.com HTTPS is unreachable from this network).
+            - name: COGNEVA_GITHUB_USE_SSH
+              value: "1"
+            - name: GIT_SSH_COMMAND
+              value: "ssh -i /etc/cogneva-keys/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/lib/sf-data/.ssh_known_hosts"
           livenessProbe:
             httpGet:
               path: /health/live
@@ -103,6 +122,9 @@ spec:
             - name: cogneva-json
               mountPath: /etc/cogneva
               readOnly: true
+            - name: deploy-key
+              mountPath: /etc/cogneva-keys
+              readOnly: true
       volumes:
         - name: data
           emptyDir: {}
@@ -110,6 +132,10 @@ spec:
           configMap:
             name: cogneva-json
             optional: true
+        - name: deploy-key
+          secret:
+            secretName: cogneva-deploy-key
+            defaultMode: 256
       securityContext:
         runAsNonRoot: true
         runAsUser: 1001

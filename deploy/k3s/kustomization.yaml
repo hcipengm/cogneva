@@ -8,6 +8,7 @@ resources:
   - cogneva-json-configmap.yaml
   - deployment.yaml
   - service.yaml
+  - github-webhook-service.yaml
   - gateway-deployment.yaml
   - gateway-service.yaml
   - evolution-configmap.yaml

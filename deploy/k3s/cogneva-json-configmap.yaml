@@ -445,6 +445,8 @@ data:
           "secret_env": "COGNEVA_GITHUB_WEBHOOK_SECRET",
           "path": "/webhooks/github"
         },
+        "pr_workdir": "",
+        "_comment_pr_workdir": "Local git clone used by the PR publisher (PatchSink). Empty disables patch-to-PR publishing. Set COGNEVA_GITHUB_USE_SSH=1 + GIT_SSH_COMMAND to clone over SSH when github.com HTTPS is unreachable.",
         "auto_create_pr": true,
         "auto_merge_policy": {
           "enabled": true,

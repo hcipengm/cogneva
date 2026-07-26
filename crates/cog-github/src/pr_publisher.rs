@@ -253,9 +253,12 @@ impl cog_core::PatchSink for GitHubPatchSink {
 
 /// Ensure `config.pr_workdir` is a usable git clone of the target repo.
 ///
-/// Missing directories are created by cloning; when a platform token is
-/// available the clone uses an `x-access-token` HTTPS remote so pushes work
-/// without SSH keys. Existing working copies are returned as-is.
+/// Missing directories are created by cloning. Remote selection:
+/// `COGNEVA_GITHUB_USE_SSH` set → `ssh://git@github.com:22/...` (for networks
+/// where github.com HTTPS is blocked; authentication comes from
+/// `GIT_SSH_COMMAND` in the process environment). Otherwise an
+/// `x-access-token` HTTPS remote when a platform token is available, falling
+/// back to anonymous HTTPS. Existing working copies are returned as-is.
 pub async fn ensure_workdir(
     config: &GitHubIntegrationConfig,
     token: Option<&str>,
@@ -267,9 +270,13 @@ pub async fn ensure_workdir(
     if let Some(parent) = workdir.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let url = match token {
-        Some(t) => format!("https://x-access-token:{t}@github.com/{}.git", config.repo),
-        None => format!("https://github.com/{}.git", config.repo),
+    let url = if std::env::var_os("COGNEVA_GITHUB_USE_SSH").is_some() {
+        format!("ssh://git@github.com:22/{}.git", config.repo)
+    } else {
+        match token {
+            Some(t) => format!("https://x-access-token:{t}@github.com/{}.git", config.repo),
+            None => format!("https://github.com/{}.git", config.repo),
+        }
     };
     let output = tokio::process::Command::new("git")
         .arg("clone")
