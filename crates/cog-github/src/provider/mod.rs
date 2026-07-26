@@ -41,6 +41,16 @@ pub trait CodePlatformProvider: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Poll recently completed CI workflow runs that ended in failure.
+    ///
+    /// Webhook fallback for environments without public inbound access
+    /// (e.g. cloud firewall blocking the NodePort).
+    ///
+    /// Default: unsupported — providers return an empty list.
+    async fn list_recent_ci_failures(&self, _max: usize) -> Result<Vec<CiFailureEvent>> {
+        Ok(Vec::new())
+    }
+
     /// Fetch the current state of a pull request for merge decisions and
     /// outcome recording.
     async fn get_pull_request(&self, pr_number: u64) -> Result<PullRequestDetail>;

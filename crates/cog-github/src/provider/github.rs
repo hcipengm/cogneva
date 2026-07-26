@@ -10,8 +10,8 @@ use cog_core::GitHubAccount;
 
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{
-    CiJobLog, CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue,
-    PlatformPullRequest, PullRequestDetail,
+    CiFailureEvent, CiJobLog, CodePlatformProvider, CreatePullRequest, PlatformComment,
+    PlatformIssue, PlatformPullRequest, PullRequestDetail,
 };
 
 /// Max failed jobs whose logs are fetched per run.
@@ -221,6 +221,31 @@ impl CodePlatformProvider for GitHubProvider {
             }
         }
         Ok(logs)
+    }
+
+    async fn list_recent_ci_failures(&self, max: usize) -> Result<Vec<CiFailureEvent>> {
+        let runs = self
+            .client
+            .workflows(&self.owner, &self.repo)
+            .list_all_runs()
+            .status("completed")
+            .per_page(max.min(100) as u8)
+            .send()
+            .await
+            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+
+        Ok(runs
+            .items
+            .into_iter()
+            .filter(|r| r.conclusion.as_deref() == Some("failure"))
+            .map(|r| CiFailureEvent {
+                run_id: r.id.into_inner(),
+                workflow_name: r.name,
+                head_sha: r.head_sha,
+                head_branch: r.head_branch,
+                html_url: r.html_url.to_string(),
+            })
+            .collect())
     }
 
     async fn get_pull_request(&self, pr_number: u64) -> Result<PullRequestDetail> {

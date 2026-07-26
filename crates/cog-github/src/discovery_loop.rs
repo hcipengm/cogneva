@@ -31,6 +31,10 @@ pub struct GitHubDiscoveryLoop {
     submitted: std::collections::HashSet<u64>,
     /// CI run ids that already produced a fix task this process lifetime.
     ci_submitted: std::collections::HashSet<u64>,
+    /// CI run ids seen by the polling fallback. `None` until the first poll,
+    /// which adopts all currently failed runs without submitting (so a pod
+    /// restart does not resubmit old failures).
+    ci_seen: Option<std::collections::HashSet<u64>>,
 }
 
 impl GitHubDiscoveryLoop {
@@ -55,6 +59,7 @@ impl GitHubDiscoveryLoop {
             recorder: OutcomeRecorder::new(),
             submitted: std::collections::HashSet::new(),
             ci_submitted: std::collections::HashSet::new(),
+            ci_seen: None,
         }
     }
 
@@ -91,7 +96,41 @@ impl GitHubDiscoveryLoop {
             }
         }
 
+        self.poll_ci_failures().await;
+
         Ok(scanned)
+    }
+
+    /// Polling fallback for CI failure detection when the webhook endpoint is
+    /// not publicly reachable. The first poll after boot only records the
+    /// currently failed runs; later polls submit fix tasks for new failures.
+    async fn poll_ci_failures(&mut self) {
+        let events = self
+            .provider
+            .list_recent_ci_failures(20)
+            .await
+            .unwrap_or_default();
+
+        match self.ci_seen {
+            None => {
+                self.ci_seen = Some(events.iter().map(|e| e.run_id).collect());
+                tracing::debug!(
+                    adopted = self.ci_seen.as_ref().map_or(0, |s| s.len()),
+                    "CI polling adopted pre-existing failed runs"
+                );
+            }
+            Some(ref mut seen) => {
+                let fresh: Vec<_> = events
+                    .into_iter()
+                    .filter(|e| seen.insert(e.run_id))
+                    .collect();
+                for event in fresh {
+                    if let Err(e) = self.process_ci_failure(event).await {
+                        tracing::warn!(error = %e, "CI failure processing failed");
+                    }
+                }
+            }
+        }
     }
 
     /// Run forever with the configured poll interval.
@@ -369,6 +408,7 @@ mod tests {
         issues: Vec<PlatformIssue>,
         comments: Mutex<Vec<(u64, String)>>,
         ci_logs: Vec<CiJobLog>,
+        ci_runs: Mutex<Vec<CiFailureEvent>>,
     }
 
     #[async_trait::async_trait]
@@ -394,6 +434,9 @@ mod tests {
         }
         async fn fetch_ci_failure_logs(&self, _run_id: u64) -> Result<Vec<CiJobLog>> {
             Ok(self.ci_logs.clone())
+        }
+        async fn list_recent_ci_failures(&self, _max: usize) -> Result<Vec<CiFailureEvent>> {
+            Ok(self.ci_runs.lock().unwrap().clone())
         }
     }
 
@@ -519,6 +562,7 @@ mod tests {
             )],
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
         });
         let orchestrator = Arc::new(MockOrchestrator {
             goals: Mutex::new(vec![]),
@@ -542,6 +586,7 @@ mod tests {
             issues: vec![issue(2, "too short")],
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
         });
 
         let mut loop_ = GitHubDiscoveryLoop::new(
@@ -566,6 +611,7 @@ mod tests {
             issues: vec![forbidden],
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
         });
         let orchestrator = Arc::new(MockOrchestrator {
             goals: Mutex::new(vec![]),
@@ -603,6 +649,7 @@ mod tests {
                 job_name: "Clippy".into(),
                 log_tail: "error: clippy::question_mark".into(),
             }],
+            ci_runs: Mutex::new(vec![]),
         });
         let orchestrator = Arc::new(MockOrchestrator {
             goals: Mutex::new(vec![]),
@@ -630,6 +677,7 @@ mod tests {
             issues: vec![],
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
         });
         let orchestrator = Arc::new(MockOrchestrator {
             goals: Mutex::new(vec![]),
@@ -654,11 +702,71 @@ mod tests {
             issues: vec![],
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
         });
 
         let mut loop_ =
             GitHubDiscoveryLoop::new(provider, IssueTriage::rules_only(), config(), None, None);
 
         assert!(!loop_.process_ci_failure(ci_event(3003)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn ci_polling_adopts_existing_failures_on_first_round() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![ci_event(4001), ci_event(4002)]),
+        });
+        let orchestrator = Arc::new(MockOrchestrator {
+            goals: Mutex::new(vec![]),
+        });
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        loop_.run_once().await.unwrap();
+        assert!(orchestrator.goals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ci_polling_submits_only_new_failures() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![ci_event(5001)]),
+        });
+        let orchestrator = Arc::new(MockOrchestrator {
+            goals: Mutex::new(vec![]),
+        });
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        // First round adopts run 5001 without submitting.
+        loop_.run_once().await.unwrap();
+        assert!(orchestrator.goals.lock().unwrap().is_empty());
+
+        // A new failure appears; the next round submits exactly one task.
+        provider.ci_runs.lock().unwrap().push(ci_event(5002));
+        loop_.run_once().await.unwrap();
+        assert_eq!(orchestrator.goals.lock().unwrap().len(), 1);
+        assert!(orchestrator.goals.lock().unwrap()[0].contains("run 5002"));
+
+        // Polling again with the same set submits nothing.
+        loop_.run_once().await.unwrap();
+        assert_eq!(orchestrator.goals.lock().unwrap().len(), 1);
     }
 }
