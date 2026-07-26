@@ -39,7 +39,7 @@ pub use discovery::IssueDiscovery;
 pub use discovery_loop::GitHubDiscoveryLoop;
 pub use merge_decider::{MergeDecider, MergeDecision};
 pub use outcome_recorder::OutcomeRecorder;
-pub use pr_publisher::GitHubPrPublisher;
+pub use pr_publisher::{GitHubPatchSink, GitHubPrPublisher};
 pub use provider::github::GitHubProvider;
 pub use provider::{
     CiFailureEvent, CiJobLog, CodePlatformProvider, CreatePullRequest, PlatformComment,

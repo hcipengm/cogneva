@@ -61,6 +61,32 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                 let provider: Arc<dyn CodePlatformProvider> = Arc::from(provider);
                 ctx.publish_service::<dyn CodePlatformProvider>(provider.clone());
                 info!(repo = %config.repo, "GitHubPlugin initialized");
+
+                // Patch-to-PR publishing (PatchSink) for autonomous fixes.
+                // Disabled when pr_workdir is not configured.
+                if !config.pr_workdir.is_empty() {
+                    let token = config
+                        .primary_account()
+                        .ok()
+                        .and_then(|a| a.resolve_token().ok());
+                    match crate::pr_publisher::ensure_workdir(&config, token.as_deref()).await {
+                        Ok(workdir) => {
+                            let sink = Arc::new(crate::pr_publisher::GitHubPatchSink::new(
+                                crate::pr_publisher::GitHubPrPublisher::new(
+                                    workdir.clone(),
+                                    config.clone(),
+                                ),
+                                provider.clone(),
+                            ));
+                            ctx.publish_service::<dyn cog_core::PatchSink>(sink);
+                            info!(workdir = %workdir.display(), "GitHub PatchSink published");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "GitHub PR workdir unavailable; PatchSink not published");
+                        }
+                    }
+                }
+
                 self.provider = Some(provider);
                 self.config = Some(config);
             }

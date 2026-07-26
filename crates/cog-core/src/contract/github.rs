@@ -224,6 +224,9 @@ pub struct GitHubIntegrationConfig {
     pub conversation: ConversationConfig,
     /// Webhook 事件入口（discovery_mode=events/both 时生效）。
     pub webhook: WebhookConfig,
+    /// Local git working copy used by the PR publisher. Empty disables
+    /// patch-to-PR publishing (the PatchSink is not registered).
+    pub pr_workdir: String,
 }
 
 impl Default for GitHubIntegrationConfig {
@@ -247,6 +250,7 @@ impl Default for GitHubIntegrationConfig {
             bot_identity: BotIdentityConfig::default(),
             conversation: ConversationConfig::default(),
             webhook: WebhookConfig::default(),
+            pr_workdir: String::new(),
         }
     }
 }

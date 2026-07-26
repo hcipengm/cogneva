@@ -39,7 +39,7 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             let hook_engine = ctx.consume_service::<dyn cog_core::HookEngine>();
             let squad_reflection = ctx.consume_service::<dyn cog_core::SquadReflection>();
             let meta_learning = ctx.consume_service::<dyn cog_core::MetaLearning>();
-            let patch_sink = ctx.consume_service::<dyn cog_core::PatchSink>();
+            let patch_sinks = ctx.consume_all_services::<dyn cog_core::PatchSink>();
             let reflection_engine = ctx.consume_service::<dyn cog_core::ReflectionEngine>();
             let agent_manager = ctx.consume_service::<dyn cog_core::AgentManager>();
             let knowledge_backend = ctx.consume_service::<dyn cog_core::KnowledgeBackend>();
@@ -66,8 +66,8 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             if let Some(ref meta) = meta_learning {
                 collab = collab.with_meta_learning(meta.clone());
             }
-            if let Some(ref sink) = patch_sink {
-                collab = collab.with_patch_sink(sink.clone());
+            for sink in patch_sinks {
+                collab = collab.with_patch_sink(sink);
             }
             if let Some(ref engine) = reflection_engine {
                 collab = collab.with_reflection_engine(engine.clone());
