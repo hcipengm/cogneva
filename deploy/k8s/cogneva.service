@@ -1,22 +1,24 @@
+# Cogneva 裸机 systemd 单元（生产周边参考，不进 bootstrap 一键路径——
+# 一键路径一律经 K3s/K8s 运行容器镜像）。适用于不用容器编排的裸机部署：
+# 二进制放 /opt/cogneva/bin/cogneva，配置 /etc/cogneva/cogneva.json，
+# 数据目录沿用 /var/lib/sf-data（与容器内挂载路径一致，便于互相迁移）。
 [Unit]
-Description=SF-Network AI Multi-Agent Collaboration Platform
-Documentation=https://github.com/sf-network/docs
-After=network-online.target redis.service
+Description=Cogneva AI Multi-Agent Collaboration Platform
+Documentation=https://github.com/hcipengm/cogneva
+After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=notify
-ExecStart=/opt/sf-network/bin/sf-network
+Type=simple
+ExecStart=/opt/cogneva/bin/cogneva
 ExecReload=/bin/kill -HUP $MAINPID
-ExecStop=/bin/kill -SIGTERM $MAINPID
-PIDFile=/run/sf-network/sf-network.pid
 
 # Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/sf-data /var/log/sf-network /run/sf-network
+ReadWritePaths=/var/lib/sf-data /var/log/cogneva
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -27,8 +29,7 @@ LimitNPROC=4096
 
 # Environment
 Environment="RUST_LOG=info"
-Environment="SF_CONFIG_DIR=/etc/sf-network"
-Environment="SF_DATA_DIR=/var/lib/sf-data"
+Environment="COGNEVA_CONFIG_DIR=/etc/cogneva"
 
 # Restart policy
 Restart=on-failure

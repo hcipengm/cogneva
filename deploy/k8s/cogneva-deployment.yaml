@@ -1,112 +1,35 @@
+# Cogneva 生产部署参考（K8s 多节点 + 外部镜像仓库 + 持久化存储）。
+# 与 deploy/k3s/deployment.yaml 的差异：数据卷从 emptyDir 换 Longhorn PVC，
+# 附带 Service（配合 ingress-nginx.yaml 暴露 api.cogneva.io）。
+# 镜像：默认引用分发器供给的 localhost/cogneva:local；使用外部仓库时
+# 设置为 COGNEVA_IMAGE_REGISTRY 并把 image 改为 <registry>/cogneva:<tag>。
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cogneva
+---
+# Secret 骨架：部署前用真实值替换（或交给 bootstrap 的 kubectl patch 注入）。
 apiVersion: v1
 kind: Secret
 metadata:
   name: cogneva-secrets
+  namespace: cogneva
 type: Opaque
 stringData:
-  OPENAI_API_KEY: "${OPENAI_API_KEY}"
-  COGNEVA_DATABASE_URL: "${COGNEVA_DATABASE_URL}"
-  LIVEKIT_API_KEY: "${LIVEKIT_API_KEY}"
-  LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET}"
-  LIVEKIT_SERVER_URL: "${LIVEKIT_SERVER_URL}"
-  REDIS_URL: "${REDIS_URL}"
-  QDRANT_URL: "${QDRANT_URL}"
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: cogneva-config
-data:
-  cogneva.json: |
-    {
-      "app": {
-        "name": "cogneva",
-        "version": "0.1.0",
-        "log_level": "info",
-        "data_dir": "/var/lib/cogneva-data",
-        "config_dir": "/etc/cogneva",
-        "app_dir": "/opt/cogneva"
-      },
-      "llm": {
-        "provider": "openai",
-        "api_key": "${OPENAI_API_KEY}",
-        "base_url": "https://api.openai.com/v1",
-        "model": "gpt-4o",
-        "embedding_model": "text-embedding-3-small",
-        "max_tokens": 4096,
-        "temperature": 0.7,
-        "timeout_secs": 60
-      },
-      "providers": {
-        "pg": {
-          "provider": "postgres",
-          "enabled": true,
-          "options": {
-            "connection": "${COGNEVA_DATABASE_URL}"
-          }
-        },
-        "vector": {
-          "provider": "qdrant",
-          "enabled": true,
-          "options": {
-            "uri": "${QDRANT_URL}"
-          }
-        },
-        "media": {
-          "provider": "livekit",
-          "enabled": true,
-          "options": {}
-        },
-        "storage": {
-          "provider": "s3",
-          "enabled": true,
-          "options": {
-            "endpoint": "${S3_ENDPOINT}",
-            "region": "${S3_REGION}",
-            "bucket": "${S3_BUCKET}",
-            "access_key": "${S3_ACCESS_KEY}",
-            "secret_key": "${S3_SECRET_KEY}"
-          }
-        }
-      },
-      "dag_executor": {
-        "redis_url": "${REDIS_URL}",
-        "workspace_id": "default",
-        "consumer_group": "cogneva-agents",
-        "max_retries": 3,
-        "retry_delay_ms": 1000
-      },
-      "gateway": {
-        "http_port": 8080,
-        "ws_port": 8081,
-        "metrics_port": 9090,
-        "cors_origins": ["*"],
-        "request_timeout_secs": 30,
-        "sandbox_task_timeout_secs": 30
-      },
-      "metrics": {
-        "enabled": true,
-        "endpoint": "/metrics",
-        "interval_secs": 15
-      },
-      "memory": {
-        "enabled": true,
-        "backend_type": "composite",
-        "base_dir": "/var/lib/cogneva-data/memory",
-        "embedding_dimension": 1024,
-        "auto_ingest": true
-      },
-      "tier_migrator": {
-        "enabled": true,
-        "hot_duration_secs": 604800,
-        "warm_duration_secs": 2592000
-      }
-    }
+  pg-password: "CHANGE_ME"
+  db-password: "CHANGE_ME"
+  openai-api-key: ""
+  anthropic-api-key: ""
+  github-token: ""
+  github-webhook-secret: ""
+  llm-api-key: ""
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: cogneva-data-pvc
+  namespace: cogneva
 spec:
   accessModes:
     - ReadWriteOnce
@@ -119,76 +42,140 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: cogneva
+  namespace: cogneva
   labels:
-    app: cogneva
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: gateway
 spec:
-  replicas: 1
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
-      app: cogneva
+      app.kubernetes.io/name: cogneva
+      app.kubernetes.io/component: gateway
   template:
     metadata:
       labels:
-        app: cogneva
+        app.kubernetes.io/name: cogneva
+        app.kubernetes.io/component: gateway
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values:
+                        - cogneva
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: cogneva
-          image: cogneva:v0.1.0
+          image: localhost/cogneva:local
+          imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8080
-              name: http
-            - containerPort: 8081
-              name: websocket
-            - containerPort: 9090
-              name: metrics
+            - name: http
+              containerPort: 8080
+              protocol: TCP
           envFrom:
-            - secretRef:
-                name: cogneva-secrets
+            - configMapRef:
+                name: cogneva-config
           env:
-            - name: COGNEVA_TRACE_STORE_BACKEND
-              value: "redis"
-            - name: RUST_LOG
-              value: "info"
-          volumeMounts:
-            - name: config
-              mountPath: /etc/cogneva
-            - name: data
-              mountPath: /var/lib/cogneva-data
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: openai-api-key
+                  optional: true
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: anthropic-api-key
+                  optional: true
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: pg-password
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: db-password
+            - name: COGNEVA_DATABASE_URL
+              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
+            - name: COGNEVA_GITHUB_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: github-token
+                  optional: true
+            - name: COGNEVA_GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: github-webhook-secret
+                  optional: true
           livenessProbe:
             httpGet:
-              path: /health
-              port: 8080
+              path: /health/live
+              port: http
             initialDelaySeconds: 10
             periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /health
-              port: 8080
+              path: /health/ready
+              port: http
             initialDelaySeconds: 5
-            periodSeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/sf-data
+            - name: cogneva-json
+              mountPath: /etc/cogneva
+              readOnly: true
       volumes:
-        - name: config
-          configMap:
-            name: cogneva-config
         - name: data
           persistentVolumeClaim:
             claimName: cogneva-data-pvc
+        - name: cogneva-json
+          configMap:
+            name: cogneva-json
+            optional: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: cogneva-service
+  namespace: cogneva
 spec:
   selector:
-    app: cogneva
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: gateway
   ports:
     - port: 8080
       targetPort: 8080
       name: http
-    - port: 8081
-      targetPort: 8081
-      name: websocket
-    - port: 9090
-      targetPort: 9090
-      name: metrics
   type: ClusterIP

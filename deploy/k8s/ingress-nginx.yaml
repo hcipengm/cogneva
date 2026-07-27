@@ -164,7 +164,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: cogneva-ingress
-  namespace: default
+  namespace: cogneva
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
@@ -182,6 +182,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: cogneva
+                name: cogneva-service
                 port:
                   number: 8080

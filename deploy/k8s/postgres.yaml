@@ -2,6 +2,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: postgres-secrets
+  namespace: cogneva
 type: Opaque
 stringData:
   password: "${POSTGRES_PASSWORD}"
@@ -10,6 +11,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: postgres-pvc
+  namespace: cogneva
 spec:
   accessModes:
     - ReadWriteOnce
@@ -22,6 +24,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: postgres
+  namespace: cogneva
 spec:
   serviceName: postgres-service
   replicas: 1
@@ -62,6 +65,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: postgres-service
+  namespace: cogneva
 spec:
   selector:
     app: postgres
