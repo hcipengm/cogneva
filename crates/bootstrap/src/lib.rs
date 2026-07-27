@@ -140,7 +140,7 @@ impl ManagementPlan {
             },
             spec: PlanSpec {
                 branch,
-                image_tag: "0.1.39".into(),
+                image_tag: env!("CARGO_PKG_VERSION").into(),
                 gateway_replicas: match branch {
                     PlanBranch::K3s => 1,
                     PlanBranch::K8s => 3,

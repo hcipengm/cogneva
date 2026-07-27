@@ -6,7 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva-evolution
     app.kubernetes.io/component: evolution
-    app.kubernetes.io/version: "0.1.39"
+    app.kubernetes.io/version: "0.1.20"
 spec:
   replicas: 1
   strategy:
@@ -20,7 +20,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution
-        app.kubernetes.io/version: "0.1.39"
+        app.kubernetes.io/version: "0.1.20"
     spec:
       serviceAccountName: cogneva-evolution
       # The evolution worker runs as root inside a privileged container so it
@@ -34,7 +34,7 @@ spec:
         # This gives the Pod an isolated working tree while still allowing bidirectional
         # sync through the bare repo (host <-> bare repo <-> Pod).
         - name: seed-source
-          image: localhost/cogneva:0.1.39
+          image: localhost/cogneva:local
           imagePullPolicy: IfNotPresent
           command:
             - sh
@@ -62,7 +62,7 @@ spec:
               mountPath: /host-git
       containers:
         - name: cogneva
-          image: localhost/cogneva:0.1.39
+          image: localhost/cogneva:local
           imagePullPolicy: IfNotPresent
           workingDir: /opt/cogneva/sandbox/src
           # Privileged container = filesystem sandbox boundary. All writes go
@@ -132,13 +132,14 @@ spec:
           persistentVolumeClaim:
             claimName: cogneva-evolution-source-pvc
         - name: git-remote
+          # 节点级标准路径：引导器部署前在此 git clone --bare 源码仓库
           hostPath:
-            path: /root/omc_workspace/cogneva.git
+            path: /var/lib/cogneva-data/git-remote
             type: Directory
         - name: cogneva-json
-          hostPath:
-            path: /root/omc_workspace/cogneva/cogneva.json
-            type: File
+          # 与主部署一致走 ConfigMap；hostPath 指开发机路径在空白机上必挂失败
+          configMap:
+            name: cogneva-json
         # - name: docker-sock
         #   hostPath:
         #     path: /var/run/docker.sock

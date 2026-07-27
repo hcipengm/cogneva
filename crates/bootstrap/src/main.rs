@@ -6,16 +6,39 @@
 //! 3. 规则引擎选择 K3s（轻量）或 K8s（生产）分支；
 //! 4. 生成 intent_config.yaml；
 //! 5. 安装 containerd / buildah / K3s（或复用现有集群）；
-//! 6. kubectl apply 部署清单并等待关键 Pod Ready；
-//! 7. 打印 WebUI 地址，清零内存中的 API Key 后退出（自毁）。
+//! 6. 供给运行时镜像：优先下载预构建 release 包（sha256 校验后导入集群），
+//!    不可用时回退从源码构建（K3s 分支；清单引用 localhost/cogneva:local）；
+//! 7. kubectl apply 部署清单并等待关键 Pod Ready；
+//! 8. 打印 WebUI 地址，清零内存中的 API Key 后退出（自毁）。
 //!
 //! 非交互模式：设置 COGNEVA_BOOTSTRAP_NONINTERACTIVE=1，并通过
 //! COGNEVA_LLM_PROVIDER / COGNEVA_LLM_API_KEY / COGNEVA_LLM_BASE_URL 传入配置。
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+
+/// 在 /var/tmp 下创建 0700 随机工作目录。/var/tmp 全局可写，固定文件名会被
+/// symlink 抢跑（root 写文件时被重定向到任意路径），故目录名带 urandom 熵
+/// 且用 create_dir 独占创建（已存在即失败，不跟随符号链接）。
+fn make_workdir(tag: &str) -> Result<PathBuf> {
+    let mut entropy = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .context("无法读取 /dev/urandom")?
+        .read_exact(&mut entropy)?;
+    let dir = PathBuf::from("/var/tmp").join(format!(
+        "cogneva-{tag}-{:016x}",
+        u64::from_le_bytes(entropy)
+    ));
+    std::fs::create_dir(&dir).with_context(|| format!("无法创建工作目录 {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -61,7 +84,43 @@ fn prompt(label: &str, default: &str) -> Result<String> {
     })
 }
 
-fn probe_hardware() -> Hardware {
+/// 节点数探测：env COGNEVA_NODES 显式覆盖优先；集群已存在时按实际节点数；
+/// 已声明 COGNEVA_CLUSTER_NODES 时按 server+agents 预期数；否则默认 1。
+async fn probe_nodes() -> usize {
+    if let Ok(v) = std::env::var("COGNEVA_NODES") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n >= 1 {
+                return n;
+            }
+        }
+        warn!("COGNEVA_NODES={v} 无法解析为正整数，按实际探测");
+    }
+    let out = Command::new("kubectl")
+        .args(["get", "nodes", "-o", "name"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    if let Ok(o) = out {
+        if o.status.success() {
+            let n = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+            if n >= 1 {
+                return n;
+            }
+        }
+    }
+    let declared = cluster_nodes_env().len();
+    if declared > 0 {
+        1 + declared
+    } else {
+        1
+    }
+}
+
+async fn probe_hardware() -> Hardware {
     let cpu_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -78,7 +137,7 @@ fn probe_hardware() -> Hardware {
         cpu_cores,
         mem_total_mb,
         arch: std::env::consts::ARCH.to_string(),
-        nodes: 1,
+        nodes: probe_nodes().await,
         kvm: Path::new("/dev/kvm").exists(),
     }
 }
@@ -177,10 +236,13 @@ async fn install_k3s() -> Result<()> {
         return Ok(());
     }
     info!("安装 K3s（官方脚本）...");
-    let status = Command::new("sh")
-        .args(["-c", "curl -fsSL https://get.k3s.io | sh -"])
-        .status()
-        .await?;
+    // 受限网络：get.k3s.io 的 GitHub releases 下载必挂，走 rancher 国内镜像站
+    let install = if cn_mirror() {
+        "curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -"
+    } else {
+        "curl -fsSL https://get.k3s.io | sh -"
+    };
+    let status = Command::new("sh").args(["-c", install]).status().await?;
     if !status.success() {
         bail!("K3s 安装失败");
     }
@@ -194,6 +256,166 @@ async fn install_k3s() -> Result<()> {
     bail!("K3s 安装后集群未就绪");
 }
 
+/// 多节点声明：COGNEVA_CLUSTER_NODES="user@ip[:port],user@ip2,..."。
+/// 要求本机到各目标 SSH 免密可达（key 认证）。
+fn cluster_nodes_env() -> Vec<String> {
+    std::env::var("COGNEVA_CLUSTER_NODES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 解析 SSH 目标："user@host:port" / "user@host" / "host:port" / "host"。
+fn parse_ssh_target(target: &str) -> (String, Option<String>) {
+    let (user_part, host_part) = match target.split_once('@') {
+        Some((u, h)) => (format!("{u}@"), h.to_string()),
+        None => (String::new(), target.to_string()),
+    };
+    match host_part.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
+            (format!("{user_part}{h}"), Some(p.to_string()))
+        }
+        _ => (format!("{user_part}{host_part}"), None),
+    }
+}
+
+fn target_host(target: &str) -> String {
+    let (ssh, _) = parse_ssh_target(target);
+    ssh.rsplit('@').next().unwrap_or(&ssh).to_string()
+}
+
+async fn first_ipv4() -> String {
+    let out = Command::new("sh")
+        .args(["-c", "hostname -I 2>/dev/null | awk '{print $1}'"])
+        .stdin(Stdio::null())
+        .output()
+        .await;
+    out.ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+async fn cluster_internal_ips() -> Vec<String> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "nodes",
+            "-o",
+            "jsonpath={.items[*].status.addresses[?(@.type==\"InternalIP\")].address}",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    out.ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// K8s 分支集群供给：多节点 K8s = 本机 K3s server + SSH 推送安装 agent
+/// （K3s 是 CNCF 认证 K8s，多节点 K3s 即多节点 K8s）。已有可用集群时
+/// 仅补齐声明中缺失的 agent；无集群且无节点声明 → 失败前置。
+async fn ensure_multi_node_cluster() -> Result<()> {
+    let agents = cluster_nodes_env();
+    if !cluster_ready().await {
+        if agents.is_empty() {
+            bail!(
+                "K8s 分支需要多节点集群：请用 COGNEVA_CLUSTER_NODES=user@ip[,user@ip2...] \
+                 声明工作节点（本机将作为 server，需 SSH 免密可达），或预先搭建集群"
+            );
+        }
+        install_k3s().await?;
+    }
+    if agents.is_empty() {
+        info!("未声明 COGNEVA_CLUSTER_NODES，使用现有集群节点");
+        return Ok(());
+    }
+    install_k3s_agents(&agents).await?;
+    wait_all_nodes_ready(1 + agents.len()).await
+}
+
+async fn install_k3s_agents(agents: &[String]) -> Result<()> {
+    let token = std::fs::read_to_string("/var/lib/rancher/k3s/server/node-token")
+        .context("读取 K3s server token 失败（本机不是 K3s server？多节点要求本机先成为 server）")?
+        .trim()
+        .to_string();
+    let server_url = match std::env::var("COGNEVA_K3S_URL") {
+        Ok(u) => u,
+        Err(_) => format!("https://{}:6443", first_ipv4().await),
+    };
+    let install = if cn_mirror() {
+        "curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -"
+    } else {
+        "curl -fsSL https://get.k3s.io | sh -"
+    };
+    let existing_ips = cluster_internal_ips().await;
+    for target in agents {
+        let host = target_host(target);
+        if existing_ips.iter().any(|ip| ip == &host) {
+            info!("节点已在集群中，跳过: {target}");
+            continue;
+        }
+        info!("安装 K3s agent: {target}（加入 {server_url}）...");
+        let (ssh_target, port) = parse_ssh_target(target);
+        let remote = format!("K3S_URL={server_url} K3S_TOKEN={token} {install}");
+        let mut args: Vec<String> = vec![
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=10".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
+        ];
+        if let Some(p) = port {
+            args.push("-p".into());
+            args.push(p);
+        }
+        args.push(ssh_target);
+        args.push(remote);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run("ssh", &arg_refs)
+            .await
+            .with_context(|| format!("agent 安装失败 {target}（需要本机到目标的 SSH 免密可达）"))?;
+    }
+    Ok(())
+}
+
+async fn wait_all_nodes_ready(expected: usize) -> Result<()> {
+    info!("等待 {expected} 个节点全部 Ready...");
+    for _ in 0..60 {
+        let out = Command::new("kubectl")
+            .args(["get", "nodes", "--no-headers"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await;
+        if let Ok(o) = out {
+            if o.status.success() {
+                let ready = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter(|l| l.split_whitespace().nth(1) == Some("Ready"))
+                    .count();
+                if ready >= expected {
+                    info!("全部 {ready} 个节点 Ready");
+                    return Ok(());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    bail!("agent 节点未在 5 分钟内全部 Ready，请检查各节点安装日志")
+}
+
 async fn ensure_buildah() -> Result<()> {
     if command_exists("buildah").await {
         info!("buildah 已安装");
@@ -205,9 +427,36 @@ async fn ensure_buildah() -> Result<()> {
     Ok(())
 }
 
-/// Firecracker/KVM 微虚拟机沙盒（审计 2.5.4）：KVM 可用且未安装时，从官方
-/// release 安装 firecracker。best-effort：无 KVM（无嵌套虚拟化的云主机）
-/// 或安装失败时告警并继续，沙盒保持 K8s Pod 形态，不阻塞主部署。
+/// 自进化 git 远程：evolution worker 的 hostPath bare 仓库（沙盒与宿主双向同步
+/// 通道，清单里写死 /var/lib/cogneva-data/git-remote）。空白机上该目录不存在
+/// 会导致 evolution Pod FailedMount，必须在部署清单前创建并 seed 源码。
+async fn ensure_git_remote() -> Result<()> {
+    let remote = Path::new("/var/lib/cogneva-data/git-remote");
+    if remote.join("HEAD").exists() {
+        info!("git-remote bare 仓库已存在，跳过");
+        return Ok(());
+    }
+    let src = repo_root()
+        .canonicalize()
+        .context("源码目录无法解析为绝对路径")?;
+    if let Some(parent) = remote.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    info!("初始化自进化 git 远程仓库: {} -> {}", src.display(), remote.display());
+    run(
+        "git",
+        &[
+            "clone",
+            "--bare",
+            &src.to_string_lossy(),
+            &remote.to_string_lossy(),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+
 async fn ensure_firecracker() -> Result<()> {
     if !Path::new("/dev/kvm").exists() {
         warn!("KVM 不可用（/dev/kvm 缺失），跳过 Firecracker 安装；沙盒保持 K8s Pod 形态");
@@ -224,7 +473,8 @@ async fn ensure_firecracker() -> Result<()> {
         "https://github.com/firecracker-microvm/firecracker/releases/download/{version}/firecracker-{version}-{arch}.tgz"
     );
     let script = format!(
-        "set -e; cd /tmp && curl -fsSL '{url}' -o firecracker.tgz && tar -xzf firecracker.tgz && \
+        "set -e; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; cd \"$d\" && \
+         curl -fsSL '{url}' -o firecracker.tgz && tar -xzf firecracker.tgz && \
          install -m 0755 release-{version}-{arch}/firecracker-{version}-{arch} /usr/local/bin/firecracker"
     );
     let status = Command::new("sh").args(["-c", &script]).status().await?;
@@ -236,12 +486,395 @@ async fn ensure_firecracker() -> Result<()> {
     Ok(())
 }
 
-fn manifest_dir(branch: Branch) -> PathBuf {
+/// 应用清单位置：K8s 分支同样复用 deploy/k3s（应用清单是集群无关的；
+/// deploy/k8s 仅存生产周边参考与分发器模板，见该目录 README）。
+fn manifest_dir(_branch: Branch) -> PathBuf {
     let root = std::env::var("COGNEVA_REPO_ROOT").unwrap_or_else(|_| ".".to_string());
-    match branch {
-        Branch::K3s => Path::new(&root).join("deploy/k3s"),
-        Branch::K8s => Path::new(&root).join("deploy/k8s"),
+    Path::new(&root).join("deploy/k3s")
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(std::env::var("COGNEVA_REPO_ROOT").unwrap_or_else(|_| ".".to_string()))
+}
+
+/// 受限网络（CN）模式：由 bootstrap.sh 探测后通过 COGNEVA_CN_MIRROR 传入。
+fn cn_mirror() -> bool {
+    std::env::var("COGNEVA_CN_MIRROR").ok().as_deref() == Some("1")
+}
+
+/// 受限网络下为 buildah 配置 docker.io 镜像（Docker Hub 被墙，基础镜像拉取必挂）。
+async fn ensure_buildah_mirror() -> Result<()> {
+    if !cn_mirror() {
+        return Ok(());
     }
+    let dir = Path::new("/etc/containers/registries.conf.d");
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(
+        dir.join("cn-mirror.conf"),
+        "unqualified-search-registries = [\"docker.io\"]\n\
+         [[registry]]\n\
+         prefix = \"docker.io\"\n\
+         location = \"docker.m.daocloud.io\"\n",
+    )?;
+    info!("已配置 buildah docker.io 镜像（daocloud）");
+    Ok(())
+}
+
+/// 运行时镜像供给（设计文档 §2.2 步骤 3 的前置）：清单引用 localhost/cogneva:local。
+/// 优先从 GitHub/Gitee release 下载预构建镜像（sha256 校验），失败回退源码构建
+/// （空白机全量 Rust release 构建需 1-3 小时，预构建下载仅需数分钟）。
+/// K3s 单节点导入本机 containerd；K8s 多节点经镜像分发器逐节点导入。
+async fn ensure_runtime_image(branch: Branch) -> Result<()> {
+    const IMAGE: &str = "localhost/cogneva:local";
+    if branch == Branch::K8s {
+        return distribute_image_to_nodes(IMAGE).await;
+    }
+    let present = Command::new("k3s")
+        .args(["ctr", "-n", "k8s.io", "images", "ls", "-q"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l == IMAGE)
+        })
+        .unwrap_or(false);
+    if present {
+        info!("运行时镜像已存在于集群: {IMAGE}");
+        return Ok(());
+    }
+    match try_import_prebuilt(IMAGE).await {
+        Ok(()) => {
+            info!("预构建镜像已导入集群: {IMAGE}");
+            return Ok(());
+        }
+        Err(e) => warn!("预构建镜像不可用（{e:#}），回退源码构建"),
+    }
+    build_runtime_image_from_source(IMAGE).await
+}
+
+/// 下载预构建镜像 tar.gz 并做 sha256 校验。返回（工作目录，tar 路径），
+/// 工作目录由调用方负责清理。任何失败（无 release、网络、sha 不匹配）返回 Err。
+async fn fetch_prebuilt_tar() -> Result<(PathBuf, String)> {
+    let version = env!("CARGO_PKG_VERSION");
+    let arch = std::env::consts::ARCH;
+    let name = format!("cogneva-image-v{version}-linux-{arch}.tar.gz");
+    let (url, expect_sha) = match std::env::var("COGNEVA_IMAGE_URL") {
+        Ok(u) => (u, std::env::var("COGNEVA_IMAGE_SHA256").ok()),
+        Err(_) => {
+            let base = if cn_mirror() {
+                format!("https://gitee.com/hcipengm/cogneva/releases/download/v{version}")
+            } else {
+                format!("https://github.com/hcipengm/cogneva/releases/download/v{version}")
+            };
+            let sha_body = download_string(&format!("{base}/{name}.sha256")).await?;
+            let sha = sha_body
+                .split_whitespace()
+                .next()
+                .context("sha256 文件格式异常")?
+                .to_string();
+            (format!("{base}/{name}"), Some(sha))
+        }
+    };
+    let expect_sha =
+        expect_sha.context("缺少预期 sha256（COGNEVA_IMAGE_SHA256 或 release .sha256 文件）")?;
+
+    let workdir = make_workdir("prebuilt")?;
+    let fetch = async {
+        let tar = workdir.join(&name).to_string_lossy().into_owned();
+        info!("下载预构建镜像 {url} ...");
+        run(
+            "curl",
+            &[
+                "-fsSL",
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                "3600",
+                "--retry",
+                "2",
+                "-o",
+                &tar,
+                &url,
+            ],
+        )
+        .await?;
+        let actual_sha = sha256_file(&tar).await?;
+        if !actual_sha.eq_ignore_ascii_case(&expect_sha) {
+            bail!("sha256 不匹配（期望 {expect_sha}，实际 {actual_sha}）");
+        }
+        info!("sha256 校验通过");
+        Ok(tar)
+    }
+    .await;
+    match fetch {
+        Ok(tar) => Ok((workdir, tar)),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&workdir);
+            Err(e)
+        }
+    }
+}
+
+/// K3s 路径：下载预构建镜像并导入本机 containerd。
+async fn try_import_prebuilt(image: &str) -> Result<()> {
+    let (workdir, tar) = fetch_prebuilt_tar().await?;
+    let result = async {
+        info!("导入 K3s containerd...");
+        // containerd import 原生识别 gzip 压缩 tar
+        run("k3s", &["ctr", "-n", "k8s.io", "images", "import", &tar]).await?;
+        // 确认导入后清单引用的标签存在
+        let present = Command::new("k3s")
+            .args(["ctr", "-n", "k8s.io", "images", "ls", "-q"])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l == image)
+            })
+            .unwrap_or(false);
+        if !present {
+            bail!("导入后集群中不存在标签 {image}（release 包内标签不符）");
+        }
+        Ok(())
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    result
+}
+
+/// K8s 多节点镜像供给：本机导入只覆盖单节点，多节点必须让每个节点的
+/// containerd 都拥有镜像。分发器模式：集群内起临时 HTTP 服务承载 tar.gz，
+/// DaemonSet 在每节点用宿主 ctr 二进制导入宿主 containerd，全部就绪后清理。
+/// COGNEVA_IMAGE_REGISTRY 已配置 = 生产仓库供给，直接跳过（清单镜像引用
+/// 由运维自行对齐，见 deploy/k8s/README.md）。
+async fn distribute_image_to_nodes(image: &str) -> Result<()> {
+    if std::env::var("COGNEVA_IMAGE_REGISTRY").is_ok() {
+        info!("COGNEVA_IMAGE_REGISTRY 已配置，假定生产仓库供给，跳过逐节点分发");
+        return Ok(());
+    }
+    let (workdir, tar) = match fetch_prebuilt_tar().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("预构建镜像不可用（{e:#}），回退本机源码构建后分发");
+            build_image_locally(image).await?;
+            export_image_tar(image).await?
+        }
+    };
+    let result = distribute_via_daemonset(&tar).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    result?;
+    info!("镜像已分发到全部节点: {image}");
+    Ok(())
+}
+
+/// 起临时镜像服务 Pod → kubectl cp 注入 tar → DaemonSet 逐节点导入 → 清理。
+async fn distribute_via_daemonset(tar: &str) -> Result<()> {
+    let manifest = render_distributor_manifest()?;
+    let mdir = make_workdir("distributor")?;
+    let mpath = mdir.join("image-distributor.yaml");
+    std::fs::write(&mpath, &manifest)?;
+    let mstr = mpath.to_string_lossy().into_owned();
+
+    let run_result = async {
+        // 命名空间可能尚不存在（K8s 分支在 deploy_manifests 之前执行）
+        run(
+            "sh",
+            &[
+                "-c",
+                "kubectl create namespace cogneva --dry-run=client -o yaml | kubectl apply -f -",
+            ],
+        )
+        .await?;
+        run("kubectl", &["apply", "-f", &mstr]).await?;
+        info!("注入镜像包到分发服务 Pod...");
+        // 等服务 Pod Ready 才能 cp
+        run(
+            "kubectl",
+            &[
+                "-n", "cogneva", "wait", "--for=condition=Ready", "pod/cogneva-image-server",
+                "--timeout=120s",
+            ],
+        )
+        .await?;
+        run(
+            "kubectl",
+            &[
+                "-n",
+                "cogneva",
+                "cp",
+                tar,
+                "cogneva-image-server:/share/image.tar.gz",
+            ],
+        )
+        .await?;
+        info!("触发/重发分发（rollout restart 保证重跑时重新导入）...");
+        run(
+            "kubectl",
+            &[
+                "-n",
+                "cogneva",
+                "rollout",
+                "restart",
+                "daemonset/cogneva-image-distributor",
+            ],
+        )
+        .await?;
+        info!("等待全部分发节点完成导入（DaemonSet rollout）...");
+        run(
+            "kubectl",
+            &[
+                "-n",
+                "cogneva",
+                "rollout",
+                "status",
+                "daemonset/cogneva-image-distributor",
+                "--timeout=900s",
+            ],
+        )
+        .await
+        .context("镜像分发超时：请检查节点 containerd socket 路径与 ctr 二进制（详见 deploy/k8s/README.md）")?;
+        Ok(())
+    }
+    .await;
+
+    // 分发器常设保留（增量升级复用：注入新 tar + rollout restart 即可，
+    // 见 deploy/scripts/distribute-image.sh）；失败时也保留现场便于排查
+    let _ = std::fs::remove_dir_all(&mdir);
+    run_result
+}
+
+/// 渲染镜像分发器清单（busybox 镜像名按网络模式替换后写出）。
+fn render_distributor_manifest() -> Result<String> {
+    let template = include_str!("../../../deploy/k8s/image-distributor.yaml");
+    let busybox = if cn_mirror() {
+        "docker.m.daocloud.io/library/busybox:latest"
+    } else {
+        "docker.io/library/busybox:latest"
+    };
+    Ok(template.replace("__BUSYBOX_IMAGE__", busybox))
+}
+
+async fn download_string(url: &str) -> Result<String> {
+    let body = reqwest::get(url)
+        .await
+        .with_context(|| format!("下载失败: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP 错误: {url}"))?
+        .text()
+        .await?;
+    Ok(body)
+}
+
+async fn sha256_file(path: &str) -> Result<String> {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("无法执行 sha256sum")?;
+    if !out.status.success() {
+        bail!("sha256sum 退出码 {:?}", out.status.code());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .next()
+        .map(|s| s.to_string())
+        .context("sha256sum 输出为空")
+}
+
+/// 按物理内存给 cargo 并行度：≤6G 返回 Some(2)，更大内存返回 None（按核数自动）。
+fn cargo_jobs_for_memory() -> Option<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    (kb / 1024 / 1024 <= 6).then_some(2)
+}
+
+/// 从源码 buildah 构建镜像到本机存储（首次需 1-3 小时）。
+async fn build_image_locally(image: &str) -> Result<()> {
+    let root = repo_root();
+    info!("从源码构建运行时镜像 {image}（首次需较长时间）...");
+    let mut build_args: Vec<String> = vec![
+        "build".into(),
+        "-t".into(),
+        image.into(),
+        "-f".into(),
+        root.join("Dockerfile").to_string_lossy().into_owned(),
+    ];
+    if cn_mirror() {
+        build_args.extend([
+            // TUNA 不镜像按版本 channel，CN 模式工具链只能用 stable
+            "--build-arg".into(),
+            "RUST_TOOLCHAIN=stable".into(),
+            "--build-arg".into(),
+            "RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup".into(),
+            "--build-arg".into(),
+            "RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup".into(),
+            "--build-arg".into(),
+            // crates 走 rsproxy 而非 TUNA：TUNA 稀疏索引的 dl 仍指向
+            // static.crates.io，crate 文件直连国外会超时，rsproxy 索引与文件都自托管
+            "CARGO_REGISTRY_SPARSE=https://rsproxy.cn/index/".into(),
+            "--build-arg".into(),
+            "APT_MIRROR_HOST=mirrors.tuna.tsinghua.edu.cn".into(),
+        ]);
+    }
+    // 低内存机器限制 cargo 并行度防 OOM（2-4G 空白机上 rustc 满核并行会爆内存）
+    if let Some(jobs) = cargo_jobs_for_memory() {
+        build_args.extend(["--build-arg".into(), format!("CARGO_BUILD_JOBS={jobs}")]);
+    }
+    build_args.push(root.to_string_lossy().into_owned());
+    let status = Command::new("buildah")
+        .args(&build_args)
+        .stdin(Stdio::null())
+        .status()
+        .await
+        .context("无法执行 buildah build")?;
+    if !status.success() {
+        bail!("运行时镜像构建失败（buildah 退出码 {:?}）", status.code());
+    }
+    Ok(())
+}
+
+/// 从本机 buildah 存储导出镜像为 tar.gz（供多节点分发）。返回（工作目录，tar 路径）。
+async fn export_image_tar(image: &str) -> Result<(PathBuf, String)> {
+    let workdir = make_workdir("image-export")?;
+    let tar = workdir.join("image.tar.gz").to_string_lossy().into_owned();
+    info!("导出镜像 {image} 为 tar.gz...");
+    let result = run(
+        "sh",
+        &[
+            "-c",
+            &format!(
+                "buildah push '{image}' 'docker-archive:/dev/stdout:{image}' | gzip -1 > '{tar}'"
+            ),
+        ],
+    )
+    .await;
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&workdir);
+        return Err(e);
+    }
+    Ok((workdir, tar))
+}
+
+/// K3s 兜底路径：源码构建 + 导出 + 导入本机 containerd。
+async fn build_runtime_image_from_source(image: &str) -> Result<()> {
+    build_image_locally(image).await?;
+    let (workdir, tar) = export_image_tar(image).await?;
+    let result = run("k3s", &["ctr", "-n", "k8s.io", "images", "import", &tar]).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    result?;
+    info!("运行时镜像已导入集群: {image}");
+    Ok(())
 }
 
 async fn deploy_manifests(branch: Branch) -> Result<()> {
@@ -249,9 +882,106 @@ async fn deploy_manifests(branch: Branch) -> Result<()> {
     if !dir.is_dir() {
         bail!("清单目录不存在: {}", dir.display());
     }
-    info!("apply 清单目录 {}", dir.display());
-    run("kubectl", &["apply", "-f", &dir.to_string_lossy()]).await
+    let rendered = render_manifests_for_cluster(&dir).await?;
+    info!("apply 清单（已按集群环境适配）");
+    run("kubectl", &["apply", "-f", &rendered.to_string_lossy()]).await
 }
+
+/// 按集群环境渲染清单副本：
+/// - 集群无 local-path provisioner（通用 K8s）→ 去掉 cogneva-local-retain
+///   引用，PVC 回落集群默认 StorageClass；
+/// - CN 模式 → 公开镜像统一加 daocloud 前缀（Docker Hub 被墙）。
+///
+/// 返回渲染后的目录（调用方不删，kubectl apply 后即弃）。
+async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
+    let has_local_path = Command::new("kubectl")
+        .args(["get", "sc", "local-path"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let cn = cn_mirror();
+    if has_local_path && !cn {
+        return Ok(dir.to_path_buf());
+    }
+    if !has_local_path {
+        info!("集群无 local-path provisioner，PVC 将使用集群默认 StorageClass");
+    }
+    let out = make_workdir("manifests")?;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let mut text = std::fs::read_to_string(&path)?;
+        if !has_local_path {
+            text = text
+                .lines()
+                .filter(|l| !l.contains("storageClassName: cogneva-local-retain"))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        if cn {
+            for (from, to) in CN_IMAGE_MAP {
+                text = text.replace(from, to);
+            }
+        }
+        std::fs::write(out.join(entry.file_name()), text)?;
+    }
+    // observability 子目录同样处理
+    let sub = dir.join("observability");
+    if sub.is_dir() {
+        let out_sub = out.join("observability");
+        std::fs::create_dir_all(&out_sub)?;
+        for entry in std::fs::read_dir(&sub)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let mut text = std::fs::read_to_string(&path)?;
+            if cn {
+                for (from, to) in CN_IMAGE_MAP {
+                    text = text.replace(from, to);
+                }
+            }
+            std::fs::write(out_sub.join(entry.file_name()), text)?;
+        }
+    }
+    Ok(out)
+}
+
+/// CN 模式公开镜像替换表（daocloud 镜像站）。
+const CN_IMAGE_MAP: &[(&str, &str)] = &[
+    (
+        "image: mysql:8.0",
+        "image: docker.m.daocloud.io/library/mysql:8.0",
+    ),
+    (
+        "image: nats:2.10-alpine",
+        "image: docker.m.daocloud.io/library/nats:2.10-alpine",
+    ),
+    (
+        "image: postgres:16-alpine",
+        "image: docker.m.daocloud.io/library/postgres:16-alpine",
+    ),
+    (
+        "image: redis:7-alpine",
+        "image: docker.m.daocloud.io/library/redis:7-alpine",
+    ),
+    (
+        "image: qdrant/qdrant:",
+        "image: docker.m.daocloud.io/qdrant/qdrant:",
+    ),
+    (
+        "image: quay.io/buildah/stable:",
+        "image: quay.m.daocloud.io/buildah/stable:",
+    ),
+];
 
 /// 将 LLM API Key 注入 K8s Secret（仅安全网关挂载，沙盒零凭证）。
 async fn inject_llm_secret(api_key: &str) -> Result<()> {
@@ -357,7 +1087,7 @@ async fn main() -> Result<()> {
     let (provider, base_url, mut api_key) = configure_llm(noninteractive).await?;
     verify_llm(&provider, &base_url, &api_key).await?;
 
-    let hw = probe_hardware();
+    let hw = probe_hardware().await;
     info!(
         "硬件探测: {} 核 / {} MiB / {} / {} 节点",
         hw.cpu_cores, hw.mem_total_mb, hw.arch, hw.nodes
@@ -393,14 +1123,13 @@ async fn main() -> Result<()> {
 
     match branch {
         Branch::K3s => install_k3s().await?,
-        Branch::K8s => {
-            if !cluster_ready().await {
-                bail!("K8s 分支要求已存在可用集群（kubectl 可连通）");
-            }
-        }
+        Branch::K8s => ensure_multi_node_cluster().await?,
     }
     ensure_buildah().await?;
+    ensure_buildah_mirror().await?;
     ensure_firecracker().await?;
+    ensure_git_remote().await?;
+    ensure_runtime_image(branch).await?;
     deploy_manifests(branch).await?;
     if !api_key.is_empty() {
         inject_llm_secret(&api_key).await?;

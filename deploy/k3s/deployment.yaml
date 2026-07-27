@@ -39,7 +39,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: cogneva
-          image: localhost/cogneva:0.1.49
+          image: localhost/cogneva:local
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

@@ -27,6 +27,8 @@ CLAUDE.md
 # Build artifacts
 target
 *.lock
+# Dockerfile 显式 COPY Cargo.lock（--locked 构建必需），不能被 *.lock 排除
+!Cargo.lock
 
 # IDE
 .vscode

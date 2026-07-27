@@ -69,8 +69,16 @@ ensure_rust() {
     if [ "$CN_MIRROR" = "1" ]; then
         export RUSTUP_DIST_SERVER="https://mirrors.tuna.tsinghua.edu.cn/rustup"
         export RUSTUP_UPDATE_ROOT="https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup"
+        # TUNA 不托管 rustup-init.sh 脚本（404），直接拉 rustup-init 二进制
+        arch="$(uname -m)"
+        curl --proto '=https' --tlsv1.2 -fsSL \
+            "$RUSTUP_UPDATE_ROOT/dist/$arch-unknown-linux-gnu/rustup-init" -o /tmp/rustup-init
+        chmod +x /tmp/rustup-init
+        /tmp/rustup-init -y --profile minimal
+        rm -f /tmp/rustup-init
+    else
+        curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
     fi
-    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
     # shellcheck disable=SC1091
     . "$HOME/.cargo/env"
 }
@@ -83,13 +91,21 @@ ensure_cargo_mirror() {
         echo "[bootstrap] cargo 已配置源替换，跳过镜像写入"
         return
     fi
+    # crates 用 rsproxy 而非 TUNA：TUNA 稀疏索引的 dl 仍指向 static.crates.io，
+    # crate 文件直连国外会超时；rsproxy 索引与文件都自托管（字节 CDN）
     cat >> "$cfg" <<'EOF'
 [source.crates-io]
-replace-with = "tuna"
-[source.tuna]
-registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+replace-with = "rsproxy"
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[http]
+multiplexing = false
+
+[net]
+retry = 10
 EOF
-    echo "[bootstrap] 已写入 cargo TUNA 镜像源: $cfg"
+    echo "[bootstrap] 已写入 cargo rsproxy 镜像源: $cfg"
 }
 
 build_bootstrap() {
@@ -134,6 +150,7 @@ main() {
     build_bootstrap
     echo "[bootstrap] 启动 Rust 引导器，移交控制权..."
     export COGNEVA_REPO_ROOT="$REPO_ROOT"
+    export COGNEVA_CN_MIRROR="$CN_MIRROR"
     exec "$REPO_ROOT/target/release/cogneva-bootstrap" "$@"
 }
 
