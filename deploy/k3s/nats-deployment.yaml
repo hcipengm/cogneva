@@ -31,6 +31,7 @@ spec:
             - "--jetstream"
             - "--store_dir=/data"
             - "--server_name=cogneva-nats"
+            - "--http_port=8222"
           ports:
             - name: client
               containerPort: 4222

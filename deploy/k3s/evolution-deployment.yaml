@@ -82,6 +82,13 @@ spec:
           env:
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: pg-password
+            - name: COGNEVA_DATABASE_URL
+              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
           lifecycle:
             postStart:
               exec:
