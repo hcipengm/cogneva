@@ -5,7 +5,9 @@
 set -eu
 
 REPO_URL="https://github.com/hcipengm/cogneva.git"
+GITEE_REPO_URL="https://gitee.com/hcipengm/cogneva.git"
 TARBALL_URL="https://codeload.github.com/hcipengm/cogneva/tar.gz/refs/heads/main"
+GITEE_TARBALL_URL="https://gitee.com/hcipengm/cogneva/repository/archive/main.tar.gz"
 DEFAULT_HOME="${COGNEVA_HOME:-$HOME/.cogneva}"
 
 fetch_source() {
@@ -29,10 +31,17 @@ fetch_source() {
     echo "[bootstrap] 空机器模式，获取 Cogneva 源码 → $REPO_ROOT"
     mkdir -p "$REPO_ROOT"
     if command -v git >/dev/null 2>&1; then
-        git clone --depth 1 "$REPO_URL" "$REPO_ROOT"
+        if ! git clone --depth 1 "$REPO_URL" "$REPO_ROOT"; then
+            echo "[bootstrap] GitHub 克隆失败，改用 Gitee 镜像..."
+            rm -rf "$REPO_ROOT"
+            git clone --depth 1 "$GITEE_REPO_URL" "$REPO_ROOT"
+        fi
     else
         echo "[bootstrap] 无 git，改用 tarball 下载..."
-        curl --proto '=https' --tlsv1.2 -fsSL "$TARBALL_URL" | tar -xz --strip-components=1 -C "$REPO_ROOT"
+        if ! curl --proto '=https' --tlsv1.2 -fsSL -m 120 "$TARBALL_URL" | tar -xz --strip-components=1 -C "$REPO_ROOT"; then
+            echo "[bootstrap] GitHub tarball 失败，改用 Gitee 归档..."
+            curl --proto '=https' --tlsv1.2 -fsSL "$GITEE_TARBALL_URL" | tar -xz --strip-components=1 -C "$REPO_ROOT"
+        fi
     fi
 }
 
