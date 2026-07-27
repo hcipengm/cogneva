@@ -531,8 +531,10 @@ Cogneva supports **Meta-bootstrap**: starting from a blank Linux machine, a sing
 ### ⚡ Recommended: bare-metal bootstrap
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh | sh
+(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL https://cdn.jsdelivr.net/gh/hcipengm/cogneva@main/bootstrap.sh) | sh
 ```
+
+> The first URL is GitHub's official raw endpoint; if it is unreachable (e.g. restricted networks), the command automatically falls back to the jsDelivr CDN mirror.
 
 The bootstrapper automatically:
 

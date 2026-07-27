@@ -527,8 +527,10 @@ Cogneva 支持**元启动（Meta-bootstrap）**：从一台空白 Linux 机器�
 ### ⚡ 推荐：裸机自举
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh | sh
+(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL https://cdn.jsdelivr.net/gh/hcipengm/cogneva@main/bootstrap.sh) | sh
 ```
+
+> 第一个地址是 GitHub 官方 raw 地址；如果访问不通（比如国内受限网络），命令会自动切换到 jsDelivr CDN 镜像下载，无需手动选择。
 
 引导器会自动：
 
