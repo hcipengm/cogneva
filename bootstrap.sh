@@ -114,10 +114,12 @@ build_bootstrap() {
 }
 
 ensure_cc() {
-    if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; then
+    # git 同样是硬依赖：ensure_git_remote 要对源码做 git clone --bare，
+    # tarball 方式取得的源码没有 .git，必须由本函数保证 git 可用
+    if command -v cc >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
         return
     fi
-    echo "[bootstrap] 未检测到 C 工具链（Rust 链接与部分依赖需要），尝试自动安装..."
+    echo "[bootstrap] 未检测到 C 工具链或 git（Rust 链接、依赖与自进化仓库需要），尝试自动安装..."
     SUDO=""
     if [ "$(id -u)" -ne 0 ]; then
         if command -v sudo >/dev/null 2>&1; then
@@ -128,13 +130,13 @@ ensure_cc() {
         fi
     fi
     if command -v apt-get >/dev/null 2>&1; then
-        $SUDO apt-get update -qq && $SUDO apt-get install -y build-essential
+        $SUDO apt-get update -qq && $SUDO apt-get install -y build-essential git
     elif command -v dnf >/dev/null 2>&1; then
-        $SUDO dnf install -y gcc gcc-c++ make
+        $SUDO dnf install -y gcc gcc-c++ make git
     elif command -v yum >/dev/null 2>&1; then
-        $SUDO yum install -y gcc gcc-c++ make
+        $SUDO yum install -y gcc gcc-c++ make git
     elif command -v apk >/dev/null 2>&1; then
-        $SUDO apk add build-base
+        $SUDO apk add build-base git
     else
         echo "[bootstrap] 不认识的包管理器，请手动安装 gcc 后重试" >&2
         exit 1

@@ -439,6 +439,16 @@ async fn ensure_git_remote() -> Result<()> {
     let src = repo_root()
         .canonicalize()
         .context("源码目录无法解析为绝对路径")?;
+    if !src.join(".git").exists() {
+        // tarball 方式取得的源码没有版本历史：就地初始化一个仓库作为同步起点，
+        // 否则 git clone --bare 必失败（evolution worker 的 hostPath 依赖它）
+        info!("源码目录无 .git（tarball 安装），就地初始化仓库: {}", src.display());
+        run("git", &["-C", &src.to_string_lossy(), "init", "-b", "main"]).await?;
+        run("git", &["-C", &src.to_string_lossy(), "config", "user.email", "evolution@cogneva.local"]).await?;
+        run("git", &["-C", &src.to_string_lossy(), "config", "user.name", "Cogneva Evolution"]).await?;
+        run("git", &["-C", &src.to_string_lossy(), "add", "-A"]).await?;
+        run("git", &["-C", &src.to_string_lossy(), "commit", "-m", "cogneva bootstrap: initial source snapshot"]).await?;
+    }
     if let Some(parent) = remote.parent() {
         std::fs::create_dir_all(parent)?;
     }
