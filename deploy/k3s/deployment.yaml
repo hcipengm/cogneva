@@ -136,6 +136,9 @@ spec:
           secret:
             secretName: cogneva-deploy-key
             defaultMode: 256
+            # 空白机一键部署时该 secret 尚未创建，置为可选避免主 Pod 永远
+            # 卡在 FailedMount；GitHub/Gitee 推送是部署后另行配置的能力
+            optional: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 1001

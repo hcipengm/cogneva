@@ -1,0 +1,161 @@
+# Cogneva K8s 多节点镜像分发器（常设、可重入）。
+# 用途：多节点集群里 `ctr images import` 只覆盖单节点，必须让每个节点的
+# containerd 都拥有 localhost/cogneva:local，应用清单才能零参数化。
+# 流程：镜像服务 Pod 承载 tar.gz → DaemonSet 每节点下载并用宿主 ctr 导入
+# 宿主 containerd → readiness 探针上报完成。
+# 增量升级：kubectl cp 新 tar 覆盖 → kubectl -n cogneva rollout restart
+# daemonset/cogneva-image-distributor（emptyDir 重建，重新下载导入新 tag）。
+# deploy/scripts/distribute-image.sh 封装了上述升级流程。
+# __BUSYBOX_IMAGE__ 由 bootstrap 按网络模式替换（CN 走 daocloud 镜像）。
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cogneva-image-server
+  namespace: cogneva
+  labels:
+    app: cogneva-image-server
+spec:
+  containers:
+    - name: httpd
+      image: __BUSYBOX_IMAGE__
+      command: ["sh", "-c", "httpd -f -p 8080 -h /share"]
+      ports:
+        - containerPort: 8080
+      volumeMounts:
+        - name: share
+          mountPath: /share
+      readinessProbe:
+        # 不能用 httpGet：/share 为空时 busybox httpd 对 / 返回 404，
+        # 而镜像包要等 Ready 后才 cp 进来——会死锁。端口通即代表 httpd 已起
+        tcpSocket:
+          port: 8080
+        initialDelaySeconds: 1
+        periodSeconds: 2
+  volumes:
+    - name: share
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-image-server
+  namespace: cogneva
+spec:
+  selector:
+    app: cogneva-image-server
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cogneva-image-distributor
+  namespace: cogneva
+spec:
+  selector:
+    matchLabels:
+      app: cogneva-image-distributor
+  template:
+    metadata:
+      labels:
+        app: cogneva-image-distributor
+    spec:
+      tolerations:
+        # 控制面节点也要能导入（taints 常见于自建/kubeadm 集群）
+        - operator: Exists
+      containers:
+        - name: importer
+          image: __BUSYBOX_IMAGE__
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "[distributor] 下载镜像包..."
+              wget -q -O /workspace/image.tar.gz http://cogneva-image-server.cogneva.svc:8080/image.tar.gz
+              CTR=""
+              # 优先独立的 ctr 符号链接（多调用二进制按 argv[0] 分发，直接调
+              # ctr 最可靠；部分 k3s 构建不认 'k3s ctr' 子命令形式）
+              for c in /host-local-bin/ctr /host-bin/ctr /host-obin/ctr /host-local-bin/k3s /host-obin/k3s; do
+                [ -x "$c" ] && CTR="$c" && break
+              done
+              [ -n "$CTR" ] || { echo "[distributor] 宿主 ctr 二进制未找到"; exit 1; }
+              # k3s 的 ctr 需要以 'k3s ctr' 形式调用
+              case "$CTR" in
+                */k3s) CTR="$CTR ctr" ;;
+              esac
+              SOCK=""
+              for s in /run/k3s/containerd/containerd.sock /run/containerd/containerd.sock; do
+                [ -S "$s" ] && SOCK="$s" && break
+              done
+              [ -n "$SOCK" ] || { echo "[distributor] containerd socket 未找到"; exit 1; }
+              echo "[distributor] 用 $CTR 经 $SOCK 导入镜像..."
+              $CTR --address "$SOCK" -n k8s.io images import /workspace/image.tar.gz
+              $CTR --address "$SOCK" -n k8s.io images ls -q | grep -q '^localhost/cogneva:local$' \
+                || { echo "[distributor] 导入后标签校验失败"; exit 1; }
+              rm -f /workspace/image.tar.gz
+              touch "/workspace/done-${NODE_NAME}"
+              echo "[distributor] 节点 $NODE_NAME 导入完成"
+              sleep infinity
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: containerd-sock-k3s
+              mountPath: /run/k3s/containerd
+            - name: containerd-sock-generic
+              mountPath: /run/containerd
+            - name: host-bin
+              mountPath: /host-bin
+              readOnly: true
+            - name: host-local-bin
+              mountPath: /host-local-bin
+              readOnly: true
+            - name: host-obin
+              mountPath: /host-obin
+              readOnly: true
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - test -f /workspace/done-${NODE_NAME}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: containerd-sock-k3s
+          hostPath:
+            path: /run/k3s/containerd
+            type: DirectoryOrCreate
+        - name: containerd-sock-generic
+          hostPath:
+            path: /run/containerd
+            type: DirectoryOrCreate
+        - name: host-bin
+          hostPath:
+            path: /usr/bin
+            type: Directory
+        - name: host-local-bin
+          hostPath:
+            path: /usr/local/bin
+            type: Directory
+        # 部分安装形态 k3s 落在 /bin（如 rancher/k3s 容器镜像），/bin 常是
+        # /usr/bin 的符号链接，hostPath 跟随符号链接，重复挂载无害
+        - name: host-obin
+          hostPath:
+            path: /bin
+            type: Directory

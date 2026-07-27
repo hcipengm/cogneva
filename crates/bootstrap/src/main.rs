@@ -442,17 +442,54 @@ async fn ensure_git_remote() -> Result<()> {
     if !src.join(".git").exists() {
         // tarball 方式取得的源码没有版本历史：就地初始化一个仓库作为同步起点，
         // 否则 git clone --bare 必失败（evolution worker 的 hostPath 依赖它）
-        info!("源码目录无 .git（tarball 安装），就地初始化仓库: {}", src.display());
+        info!(
+            "源码目录无 .git（tarball 安装），就地初始化仓库: {}",
+            src.display()
+        );
         run("git", &["-C", &src.to_string_lossy(), "init", "-b", "main"]).await?;
-        run("git", &["-C", &src.to_string_lossy(), "config", "user.email", "evolution@cogneva.local"]).await?;
-        run("git", &["-C", &src.to_string_lossy(), "config", "user.name", "Cogneva Evolution"]).await?;
+        run(
+            "git",
+            &[
+                "-C",
+                &src.to_string_lossy(),
+                "config",
+                "user.email",
+                "evolution@cogneva.local",
+            ],
+        )
+        .await?;
+        run(
+            "git",
+            &[
+                "-C",
+                &src.to_string_lossy(),
+                "config",
+                "user.name",
+                "Cogneva Evolution",
+            ],
+        )
+        .await?;
         run("git", &["-C", &src.to_string_lossy(), "add", "-A"]).await?;
-        run("git", &["-C", &src.to_string_lossy(), "commit", "-m", "cogneva bootstrap: initial source snapshot"]).await?;
+        run(
+            "git",
+            &[
+                "-C",
+                &src.to_string_lossy(),
+                "commit",
+                "-m",
+                "cogneva bootstrap: initial source snapshot",
+            ],
+        )
+        .await?;
     }
     if let Some(parent) = remote.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    info!("初始化自进化 git 远程仓库: {} -> {}", src.display(), remote.display());
+    info!(
+        "初始化自进化 git 远程仓库: {} -> {}",
+        src.display(),
+        remote.display()
+    );
     run(
         "git",
         &[
@@ -465,7 +502,6 @@ async fn ensure_git_remote() -> Result<()> {
     .await?;
     Ok(())
 }
-
 
 async fn ensure_firecracker() -> Result<()> {
     if !Path::new("/dev/kvm").exists() {
@@ -701,12 +737,13 @@ async fn distribute_via_daemonset(tar: &str) -> Result<()> {
         .await?;
         run("kubectl", &["apply", "-f", &mstr]).await?;
         info!("注入镜像包到分发服务 Pod...");
-        // 等服务 Pod Ready 才能 cp
+        // 等服务 Pod Ready 才能 cp。超时给足 10 分钟：空白机首拉 busybox
+        // 镜像（经镜像站）可能远超 2 分钟，超时不等于失败
         run(
             "kubectl",
             &[
                 "-n", "cogneva", "wait", "--for=condition=Ready", "pod/cogneva-image-server",
-                "--timeout=120s",
+                "--timeout=600s",
             ],
         )
         .await?;
@@ -914,17 +951,32 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
         .map(|s| s.success())
         .unwrap_or(false);
     let cn = cn_mirror();
-    if has_local_path && !cn {
-        return Ok(dir.to_path_buf());
-    }
     if !has_local_path {
         info!("集群无 local-path provisioner，PVC 将使用集群默认 StorageClass");
+    }
+    // 集群没有 Traefik CRD（禁装 traefik 或用 ingress-nginx 的集群）时，
+    // apply 含 traefik.io Middleware 的文档会直接报错，按需剔除
+    let has_traefik_crd = Command::new("kubectl")
+        .args(["get", "crd", "middlewares.traefik.io"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !has_traefik_crd {
+        info!("集群无 Traefik CRD，剔除 Middleware 文档（WebSocket 头中间件不生效）");
     }
     let out = make_workdir("manifests")?;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        // kustomization.yaml 不是 K8s 资源，kubectl apply -f <dir> 会直接报错
+        if entry.file_name() == "kustomization.yaml" {
             continue;
         }
         let mut text = std::fs::read_to_string(&path)?;
@@ -939,6 +991,13 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
             for (from, to) in CN_IMAGE_MAP {
                 text = text.replace(from, to);
             }
+        }
+        if !has_traefik_crd {
+            text = text
+                .split("\n---")
+                .filter(|doc| !(doc.contains("kind: Middleware") && doc.contains("traefik.io")))
+                .collect::<Vec<_>>()
+                .join("\n---");
         }
         std::fs::write(out.join(entry.file_name()), text)?;
     }
@@ -988,8 +1047,10 @@ const CN_IMAGE_MAP: &[(&str, &str)] = &[
         "image: docker.m.daocloud.io/qdrant/qdrant:",
     ),
     (
+        // daocloud 的 quay 镜像对 buildah/stable 返回 401/403（未收录该仓库），
+        // 改用南大 quay 镜像站
         "image: quay.io/buildah/stable:",
-        "image: quay.m.daocloud.io/buildah/stable:",
+        "image: quay.nju.edu.cn/buildah/stable:",
     ),
 ];
 
