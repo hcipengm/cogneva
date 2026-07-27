@@ -10,6 +10,21 @@ TARBALL_URL="https://codeload.github.com/hcipengm/cogneva/tar.gz/refs/heads/main
 GITEE_TARBALL_URL="https://gitee.com/hcipengm/cogneva/repository/archive/main.tar.gz"
 DEFAULT_HOME="${COGNEVA_HOME:-$HOME/.cogneva}"
 
+# 受限网络探测：直接探 rustup 分发域（国内被墙），不通即走 TUNA 镜像。
+# 可用 COGNEVA_CN_MIRROR=1/0 强制开关，跳过探测。
+detect_restricted_net() {
+    if [ -n "${COGNEVA_CN_MIRROR:-}" ]; then
+        [ "$COGNEVA_CN_MIRROR" = "1" ] && CN_MIRROR=1 || CN_MIRROR=0
+        return
+    fi
+    if curl --proto '=https' --tlsv1.2 -fsSL -m 5 -o /dev/null https://static.rust-lang.org/rustup/release-stable.toml 2>/dev/null; then
+        CN_MIRROR=0
+    else
+        CN_MIRROR=1
+        echo "[bootstrap] 检测到受限网络（rustup 分发域不可达），启用 TUNA 镜像..."
+    fi
+}
+
 fetch_source() {
     # 已在仓库内（克隆后执行 ./bootstrap.sh）则直接使用
     if [ -f "$(dirname "$0")/crates/bootstrap/Cargo.toml" ] 2>/dev/null; then
@@ -51,9 +66,30 @@ ensure_rust() {
         return
     fi
     echo "[bootstrap] 未检测到 Rust，安装 rustup..."
+    if [ "$CN_MIRROR" = "1" ]; then
+        export RUSTUP_DIST_SERVER="https://mirrors.tuna.tsinghua.edu.cn/rustup"
+        export RUSTUP_UPDATE_ROOT="https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup"
+    fi
     curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
     # shellcheck disable=SC1091
     . "$HOME/.cargo/env"
+}
+
+ensure_cargo_mirror() {
+    [ "$CN_MIRROR" = "1" ] || return
+    local cfg="$HOME/.cargo/config.toml"
+    mkdir -p "$HOME/.cargo"
+    if [ -f "$cfg" ] && grep -q 'source.crates-io' "$cfg"; then
+        echo "[bootstrap] cargo 已配置源替换，跳过镜像写入"
+        return
+    fi
+    cat >> "$cfg" <<'EOF'
+[source.crates-io]
+replace-with = "tuna"
+[source.tuna]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+EOF
+    echo "[bootstrap] 已写入 cargo TUNA 镜像源: $cfg"
 }
 
 build_bootstrap() {
@@ -90,9 +126,11 @@ ensure_cc() {
 }
 
 main() {
+    detect_restricted_net
     fetch_source
     ensure_rust
     ensure_cc
+    ensure_cargo_mirror
     build_bootstrap
     echo "[bootstrap] 启动 Rust 引导器，移交控制权..."
     export COGNEVA_REPO_ROOT="$REPO_ROOT"
