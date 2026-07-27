@@ -1,0 +1,49 @@
+# 资源配额与默认限额（元启动设计文档第三步：限制 Agent/沙盒资源耗尽节点）。
+# ResourceQuota 约束 cogneva 命名空间总量；LimitRange 为未声明资源的容器提供
+# 默认值并夹紧单容器上下限。数值按单节点 K3s（≥4C8G 空白机）设定，生产 K8s
+# 分支请按集群规模上调。
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: cogneva-quota
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: resource-governance
+spec:
+  hard:
+    requests.cpu: "6"
+    requests.memory: 12Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    pods: "40"
+    requests.storage: 100Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: cogneva-limits
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: resource-governance
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+      max:
+        cpu: "4"
+        memory: 8Gi
+      min:
+        cpu: 10m
+        memory: 16Mi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 50Gi
+      min:
+        storage: 1Gi
