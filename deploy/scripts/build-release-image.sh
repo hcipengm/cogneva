@@ -57,9 +57,16 @@ echo "==> 压缩并计算 sha256"
 gzip -9 -c "$WORKDIR/image.tar" > "$DIST_DIR/$NAME"
 (cd "$DIST_DIR" && sha256sum "$NAME" > "$NAME.sha256")
 
+# Gitee 附件单文件限 100MB，同步产出 95MB 分卷（part-aa/ab/...）；
+# bootstrap 整包下载失败时自动回退逐卷下载拼接，sha256 对拼接结果强校验
+echo "==> 生成 Gitee 分卷（95MB/卷）"
+rm -f "$DIST_DIR/$NAME".part-*
+split -b 95m "$DIST_DIR/$NAME" "$DIST_DIR/$NAME.part-"
+
 echo "==> 完成："
 echo "    $DIST_DIR/$NAME"
 echo "    $DIST_DIR/$NAME.sha256"
+echo "    $DIST_DIR/$NAME.part-*（Gitee 用）"
 echo
 echo "上传：gh release create v$VERSION '$DIST_DIR/$NAME' '$DIST_DIR/$NAME.sha256' --repo hcipengm/cogneva"
-echo "      Gitee Releases 页面手动上传同名两个文件（标签 v$VERSION）"
+echo "      Gitee 上传 .sha256 + 全部 .part-* 分卷（标签 v$VERSION）"

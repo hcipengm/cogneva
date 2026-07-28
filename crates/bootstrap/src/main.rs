@@ -600,6 +600,54 @@ async fn ensure_runtime_image(branch: Branch) -> Result<()> {
     build_runtime_image_from_source(IMAGE).await
 }
 
+/// 逐卷下载 {url}.part-aa/.part-ab... 并拼接为 tar。首卷不存在说明该
+/// release 没有分卷，返回 Err 让上层走源码构建回退；中间卷缺失视为损坏。
+async fn download_parts(url: &str, workdir: &Path, tar: &str) -> Result<()> {
+    let mut out = std::fs::File::create(tar)?;
+    for i in 0..usize::MAX {
+        let suffix = format!(
+            "{}{}",
+            (b'a' + (i / 26) as u8) as char,
+            (b'a' + (i % 26) as u8) as char
+        );
+        let part = workdir
+            .join(format!("part-{suffix}"))
+            .to_string_lossy()
+            .into_owned();
+        let got = run(
+            "curl",
+            &[
+                "-fsSL",
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                "1800",
+                "--retry",
+                "2",
+                "-o",
+                &part,
+                &format!("{url}.part-{suffix}"),
+            ],
+        )
+        .await;
+        match got {
+            Ok(()) => {
+                info!("分卷 part-{suffix} 下载完成");
+                let data = std::fs::read(&part)?;
+                std::io::Write::write_all(&mut out, &data)?;
+                let _ = std::fs::remove_file(&part);
+            }
+            Err(e) if i == 0 => bail!("首卷 part-aa 不存在，该 release 无分卷（{e}）"),
+            Err(_) => break,
+        }
+    }
+    use std::io::Seek;
+    if out.stream_position()? == 0 {
+        bail!("分卷下载结果为空");
+    }
+    Ok(())
+}
+
 /// 下载预构建镜像 tar.gz 并做 sha256 校验。返回（工作目录，tar 路径），
 /// 工作目录由调用方负责清理。任何失败（无 release、网络、sha 不匹配）返回 Err。
 async fn fetch_prebuilt_tar() -> Result<(PathBuf, String)> {
@@ -630,7 +678,7 @@ async fn fetch_prebuilt_tar() -> Result<(PathBuf, String)> {
     let fetch = async {
         let tar = workdir.join(&name).to_string_lossy().into_owned();
         info!("下载预构建镜像 {url} ...");
-        run(
+        let direct = run(
             "curl",
             &[
                 "-fsSL",
@@ -645,7 +693,13 @@ async fn fetch_prebuilt_tar() -> Result<(PathBuf, String)> {
                 &url,
             ],
         )
-        .await?;
+        .await;
+        if let Err(e) = direct {
+            // Gitee 附件单文件限 100MB，镜像包超限时按 .part-aa/.part-ab...
+            // 分卷发布；整包 404 时回退逐卷下载再拼接
+            info!("整包下载失败（{e}），尝试分卷下载...");
+            download_parts(&url, &workdir, &tar).await?;
+        }
         let actual_sha = sha256_file(&tar).await?;
         if !actual_sha.eq_ignore_ascii_case(&expect_sha) {
             bail!("sha256 不匹配（期望 {expect_sha}，实际 {actual_sha}）");
