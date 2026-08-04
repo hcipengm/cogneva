@@ -32,6 +32,15 @@ spec:
           port: 8080
         initialDelaySeconds: 1
         periodSeconds: 2
+      resources:
+        # 显式声明极小资源：不声明会吃 LimitRange 默认值（500m/512Mi），
+        # 命名空间 ResourceQuota 按业务负载+分发器开销总量设计，不能浪费
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
   volumes:
     - name: share
       emptyDir: {}
@@ -133,6 +142,9 @@ spec:
               cpu: 50m
               memory: 64Mi
             limits:
+              # 显式 cpu 上限：缺省会被 LimitRange 补成 500m，多节点下
+              # 叠加超过命名空间配额余量（2026-08-04 实测配额打满拒绝调度）
+              cpu: 200m
               memory: 1Gi
       volumes:
         - name: workspace

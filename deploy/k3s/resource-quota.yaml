@@ -1,7 +1,8 @@
 # 资源配额与默认限额（元启动设计文档第三步：限制 Agent/沙盒资源耗尽节点）。
 # ResourceQuota 约束 cogneva 命名空间总量；LimitRange 为未声明资源的容器提供
-# 默认值并夹紧单容器上下限。数值按单节点 K3s（≥4C8G 空白机）设定，生产 K8s
-# 分支请按集群规模上调。
+# 默认值并夹紧单容器上下限。数值按单节点 K3s（≥4C8G 空白机）设定，已计入
+# 常设镜像分发器开销（image-server 100m/64Mi + 每节点 importer 200m/1Gi）；
+# 多节点每增一个节点多 200m/1Gi，生产 K8s 分支请按集群规模上调。
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -14,8 +15,8 @@ spec:
   hard:
     requests.cpu: "6"
     requests.memory: 12Gi
-    limits.cpu: "16"
-    limits.memory: 32Gi
+    limits.cpu: "17"
+    limits.memory: "34Gi"
     pods: "40"
     requests.storage: 100Gi
 ---

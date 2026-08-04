@@ -84,8 +84,9 @@ fn prompt(label: &str, default: &str) -> Result<String> {
     })
 }
 
-/// 节点数探测：env COGNEVA_NODES 显式覆盖优先；集群已存在时按实际节点数；
-/// 已声明 COGNEVA_CLUSTER_NODES 时按 server+agents 预期数；否则默认 1。
+/// 节点数探测：env COGNEVA_NODES 显式覆盖优先；集群已存在时按预期最终数
+/// （现有节点 + 声明但未入群的 agent）；无集群但已声明 COGNEVA_CLUSTER_NODES
+/// 时按 server+agents 预期数；否则默认 1。
 async fn probe_nodes() -> usize {
     if let Ok(v) = std::env::var("COGNEVA_NODES") {
         if let Ok(n) = v.parse::<usize>() {
@@ -108,7 +109,15 @@ async fn probe_nodes() -> usize {
                 .filter(|l| !l.trim().is_empty())
                 .count();
             if n >= 1 {
-                return n;
+                // 分支决策看的是"预期最终节点数"：现有节点 + 声明但尚未
+                // 入群的 agent。只看现有数会把"已有多节点声明"错判成单节点
+                // K3s 分支，agent 永远装不上（2026-08-04 实测抓到）
+                let existing = cluster_internal_ips().await;
+                let new_agents = cluster_nodes_env()
+                    .iter()
+                    .filter(|t| !existing.iter().any(|ip| ip == &target_host(t)))
+                    .count();
+                return n + new_agents;
             }
         }
     }
@@ -353,10 +362,37 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
         Ok(u) => u,
         Err(_) => format!("https://{}:6443", first_ipv4().await),
     };
+    /// 查询 server 端 k3s 版本（如 v1.35.5+k3s1），查不到返回 None。
+    async fn server_k3s_version() -> Option<String> {
+        let out = Command::new("kubectl")
+            .args(["version", "-o", "json"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        v["serverVersion"]["gitVersion"]
+            .as_str()
+            .map(|s| s.to_string())
+    }
+    // agent 版本必须与 server 对齐：不钉版本安装脚本会拉最新 stable，
+    // kubelet 比 apiserver 新违反 K8s 版本偏移策略（2026-08-04 实测 agent
+    // 装上 v1.36.2 而 server 是 v1.35.5）
+    let version_env = match server_k3s_version().await {
+        Some(v) => format!(" INSTALL_K3S_VERSION={v}"),
+        None => String::new(),
+    };
+    // 管道左侧的变量前缀只对 curl 生效，K3S_URL/K3S_TOKEN 必须写在
+    // 管道右侧 sh 前面，否则安装脚本收不到会装成独立 server（脑裂），
+    // 2026-08-04 嵌套实测抓到：目标机起了 k3s.service 而非 k3s-agent
     let install = if cn_mirror() {
-        "curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -"
+        format!("curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | K3S_URL={server_url} K3S_TOKEN={token}{version_env} INSTALL_K3S_MIRROR=cn sh -")
     } else {
-        "curl -fsSL https://get.k3s.io | sh -"
+        format!("curl -fsSL https://get.k3s.io | K3S_URL={server_url} K3S_TOKEN={token}{version_env} sh -")
     };
     let existing_ips = cluster_internal_ips().await;
     for target in agents {
@@ -367,7 +403,7 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
         }
         info!("安装 K3s agent: {target}（加入 {server_url}）...");
         let (ssh_target, port) = parse_ssh_target(target);
-        let remote = format!("K3S_URL={server_url} K3S_TOKEN={token} {install}");
+        let remote = &install;
         let mut args: Vec<String> = vec![
             "-o".into(),
             "BatchMode=yes".into(),
@@ -381,7 +417,7 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
             args.push(p);
         }
         args.push(ssh_target);
-        args.push(remote);
+        args.push(remote.to_string());
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         run("ssh", &arg_refs)
             .await
