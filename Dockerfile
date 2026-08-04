@@ -146,6 +146,23 @@ RUN cargo build --release --locked --bin cogneva
 RUN strip target/release/cogneva
 
 # ------------------------------------------------------------------------------
+# Stage 1b: WebUI 构建（干净克隆也能产出 dist，不依赖本机预构建）
+# ------------------------------------------------------------------------------
+FROM node:22-slim AS webbuilder
+
+# 受限网络：npm  registry 镜像（如 https://registry.npmmirror.com）
+ARG NPM_REGISTRY=""
+
+WORKDIR /web
+
+COPY web/package.json web/package-lock.json ./
+RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi && \
+    npm ci
+
+COPY web/ ./
+RUN npm run build
+
+# ------------------------------------------------------------------------------
 # Stage 2: Runtime
 # ------------------------------------------------------------------------------
 FROM ubuntu:24.04
@@ -202,6 +219,9 @@ COPY --from=builder /build/target/release/cogneva /opt/cogneva/cogneva
 # Copy SQL migrations so the storage plugin can apply them at runtime
 COPY --from=builder /build/crates/cog-storage/migrations /opt/cogneva/crates/cog-storage/migrations
 
+# WebUI 静态资源（网关同源直接服务，浏览器打开即用）
+COPY --from=webbuilder /web/dist /opt/cogneva/web
+
 # Set ownership
 RUN chown -R cogneva:cogneva /opt/cogneva /var/lib/cogneva-data /etc/cogneva && \
     chmod +x /opt/cogneva/cogneva
@@ -222,6 +242,7 @@ ENV SF_APP_NAME=cogneva \
     SF_WORKSPACE_ID=default \
     SF_CONSUMER_GROUP=cogneva \
     SF_HTTP_PORT=8080 \
+    COGNEVA_WEB_DIR=/opt/cogneva/web \
     SF_WS_PORT=8081 \
     SF_METRICS_PORT=9090 \
     RUST_LOG=info

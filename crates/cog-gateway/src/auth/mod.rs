@@ -510,12 +510,56 @@ pub async fn login_handler(
     let store = match state.user_store.as_ref() {
         Some(s) => s,
         None => {
+            // 未配置用户库 = 单机/演示部署：登录必须开箱即用，否则一键拉起
+            // 的 WebUI 永远卡在认证墙（2026-08-04 用户明确要求）。直接授予
+            // 管理员 token；生产部署应配置用户库，届时本分支不会触发。
+            warn!(
+                "user store not configured; granting demo admin token to '{}'",
+                payload.username
+            );
+            let demo_user = User {
+                id: Uuid::nil(),
+                phone: None,
+                email: None,
+                username: payload.username.clone(),
+                display_name: Some(payload.username.clone()),
+                avatar_url: None,
+                status: UserStatus::Active,
+                user_type: UserType::Admin,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let token_pair = match state
+                .jwt_manager
+                .generate_token(
+                    &demo_user,
+                    vec!["default".into()],
+                    vec![
+                        Permission::AgentRead,
+                        Permission::AgentWrite,
+                        Permission::QuotaRead,
+                        Permission::QuotaAdmin,
+                        Permission::UserAdmin,
+                        Permission::WorkspaceManageMembers,
+                        Permission::WorkspaceConfig,
+                    ],
+                )
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            };
+            info!("Demo login (no user store): {}", payload.username);
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": "auth_unavailable",
-                    "message": "Authentication service is not configured"
-                })),
+                StatusCode::OK,
+                Json(AuthResponse {
+                    access_token: token_pair.access_token,
+                    refresh_token: token_pair.refresh_token,
+                    token_type: "Bearer".into(),
+                    expires_in: 900,
+                    user: UserResponse::from(&demo_user),
+                    session_token: None,
+                }),
             )
                 .into_response();
         }

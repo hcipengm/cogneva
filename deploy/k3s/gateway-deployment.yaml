@@ -64,6 +64,13 @@ spec:
                   name: cogneva-secrets
                   key: llm-api-key
                   optional: true
+            # cogneva.json 的 kimi backend api_key 占位是 ${KIMI_API_KEY}
+            - name: KIMI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: llm-api-key
+                  optional: true
           livenessProbe:
             httpGet:
               path: /health/live

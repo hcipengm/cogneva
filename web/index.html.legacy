@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SF-Network Dashboard</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --text: #e2e8f0; --muted: #94a3b8;
+    --accent: #38bdf8; --success: #22c55e; --warning: #f59e0b; --danger: #ef4444;
+    --info: #3b82f6; --border: #334155;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 1rem 1.5rem; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 1.25rem; color: var(--accent); }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    padding: 0.25rem 0.75rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600;
+    background: var(--border); color: var(--muted);
+  }
+  .status-badge.online { background: rgba(34,197,94,0.15); color: var(--success); }
+  .status-badge.offline { background: rgba(239,68,68,0.15); color: var(--danger); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .container { padding: 1.5rem; max-width: 1600px; margin: 0 auto; }
+  .nav-tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  .nav-tab {
+    padding: 0.5rem 1rem; border-radius: 0.375rem; font-size: 0.875rem; font-weight: 600;
+    background: transparent; color: var(--muted); border: none; cursor: pointer;
+  }
+  .nav-tab:hover { color: var(--text); }
+  .nav-tab.active { background: var(--accent); color: #0f172a; }
+  .grid { display: grid; gap: 1rem; }
+  .grid-4 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .grid-3 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .grid-2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 0.5rem; padding: 1rem;
+  }
+  .card h2 { font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 0.75rem; }
+  .stat { font-size: 1.75rem; font-weight: 700; }
+  .stat-label { font-size: 0.75rem; color: var(--muted); }
+  .health-up { color: var(--success); }
+  .health-down { color: var(--danger); }
+  .health-warn { color: var(--warning); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+  th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 0.75rem; text-transform: uppercase; }
+  tr:hover { background: rgba(255,255,255,0.03); }
+  .tag {
+    display: inline-block; padding: 0.15rem 0.5rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 600;
+  }
+  .tag-pending { background: rgba(59,130,246,0.15); color: var(--info); }
+  .tag-running { background: rgba(245,158,11,0.15); color: var(--warning); }
+  .tag-completed { background: rgba(34,197,94,0.15); color: var(--success); }
+  .tag-failed { background: rgba(239,68,68,0.15); color: var(--danger); }
+  .tag-scheduled { background: rgba(148,163,184,0.15); color: var(--muted); }
+  .tag-cancelled { background: rgba(100,116,139,0.15); color: var(--muted); }
+  .progress { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 0.5rem; }
+  .progress-bar { height: 100%; border-radius: 4px; transition: width 0.3s ease; }
+  .event-log { max-height: 300px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 0.8rem; }
+  .event-item { padding: 0.35rem 0; border-bottom: 1px solid var(--border); color: var(--muted); }
+  .event-item:last-child { border-bottom: none; }
+  .login-box { max-width: 360px; margin: 4rem auto; }
+  .login-box input {
+    width: 100%; padding: 0.6rem 0.8rem; margin-bottom: 0.75rem;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 0.375rem; color: var(--text);
+  }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0.5rem 1rem; border-radius: 0.375rem; font-weight: 600; font-size: 0.875rem;
+    border: none; cursor: pointer; background: var(--accent); color: #0f172a;
+  }
+  .btn:hover { opacity: 0.9; }
+  .btn-secondary { background: var(--border); color: var(--text); }
+  .btn-danger { background: var(--danger); color: #fff; }
+  .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+  .error { color: var(--danger); font-size: 0.875rem; margin-top: 0.5rem; }
+  .hidden { display: none !important; }
+  .refresh-hint { font-size: 0.75rem; color: var(--muted); text-align: right; margin-bottom: 0.5rem; }
+  .section { margin-bottom: 1.5rem; }
+  .flex-between { display: flex; justify-content: space-between; align-items: center; }
+  .control-group { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .empty-state { text-align: center; color: var(--muted); padding: 2rem; }
+  .filter-bar {
+    display: flex; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap;
+  }
+  .filter-bar input, .filter-bar select {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 0.375rem;
+    color: var(--text); padding: 0.35rem 0.5rem; font-size: 0.875rem;
+  }
+  .link-row { display: flex; gap: 0.5rem; align-items: center; font-size: 0.875rem; padding: 0.35rem 0; }
+  .link-arrow { color: var(--muted); }
+
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    display: none; align-items: center; justify-content: center; z-index: 1000;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 0.5rem;
+    width: 90%; max-width: 800px; max-height: 90vh; overflow-y: auto;
+    padding: 1.5rem; position: relative;
+  }
+  .modal h2 { margin-bottom: 1rem; color: var(--accent); }
+  .modal-close {
+    position: absolute; top: 0.75rem; right: 1rem; background: none; border: none;
+    color: var(--muted); font-size: 1.25rem; cursor: pointer;
+  }
+  .modal-section { margin-bottom: 1rem; }
+  .modal-section h4 { font-size: 0.875rem; color: var(--muted); margin-bottom: 0.25rem; }
+  .timeline-item { padding: 0.35rem 0; border-bottom: 1px solid var(--border); font-size: 0.875rem; }
+  .timeline-item:last-child { border-bottom: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SF-Network Dashboard</h1>
+  <div style="display:flex;align-items:center;gap:1rem;">
+    <span id="conn-badge" class="status-badge offline"><span class="dot"></span>WS Offline</span>
+    <button class="btn btn-secondary" onclick="logout()" id="logout-btn" style="display:none;">Logout</button>
+  </div>
+</header>
+
+<div id="login-view" class="container">
+  <div class="card login-box">
+    <h2 style="margin-bottom:1rem;text-align:center;">Sign In</h2>
+    <input type="text" id="username" placeholder="Username" value="admin">
+    <button class="btn" onclick="login()" style="width:100%;">Login</button>
+    <div id="login-error" class="error"></div>
+  </div>
+</div>
+
+<div id="dashboard-view" class="container hidden">
+  <div class="nav-tabs">
+    <button class="nav-tab active" data-tab="overview" onclick="switchTab('overview')">Overview</button>
+    <button class="nav-tab" data-tab="tasks" onclick="switchTab('tasks')">Tasks</button>
+    <button class="nav-tab" data-tab="agents" onclick="switchTab('agents')">Agents</button>
+    <button class="nav-tab" data-tab="collaboration" onclick="switchTab('collaboration')">Collaboration</button>
+    <button class="nav-tab" data-tab="events" onclick="switchTab('events')">Events</button>
+    <button class="nav-tab" data-tab="system" onclick="switchTab('system')">System</button>
+  </div>
+
+  <!-- ========== OVERVIEW TAB ========== -->
+  <div id="tab-overview" class="tab-content">
+    <div class="refresh-hint">Auto-refresh every 5s · Live events via WebSocket</div>
+
+    <div class="grid grid-4 section">
+      <div class="card"><div class="stat-label">Cluster Health</div><div class="stat" id="ov-health">-</div></div>
+      <div class="card"><div class="stat-label">Total Agents</div><div class="stat" id="ov-agents">-</div></div>
+      <div class="card"><div class="stat-label">Total Tasks</div><div class="stat" id="ov-tasks">-</div></div>
+      <div class="card"><div class="stat-label">Failed Tasks</div><div class="stat" id="ov-failed" style="color:var(--danger)">-</div></div>
+      <div class="card"><div class="stat-label">Active Crews</div><div class="stat" id="ov-crews">-</div></div>
+      <div class="card"><div class="stat-label">Active Squads</div><div class="stat" id="ov-squads">-</div></div>
+      <div class="card"><div class="stat-label">Pending</div><div class="stat" id="ov-pending" style="color:var(--info)">-</div></div>
+      <div class="card"><div class="stat-label">Running</div><div class="stat" id="ov-running" style="color:var(--warning)">-</div></div>
+      <div class="card"><div class="stat-label">Avg Duration</div><div class="stat" id="ov-duration">-</div></div>
+    </div>
+
+    <div class="grid grid-2 section">
+      <div class="card">
+        <h2>Supervisor Status</h2>
+        <div id="supervisor-status"><div class="empty-state">Loading...</div></div>
+      </div>
+      <div class="card">
+        <h2>HookEngine Health</h2>
+        <div id="hook-health"><div class="empty-state">Loading...</div></div>
+      </div>
+    </div>
+
+    <div class="grid grid-2 section">
+      <div class="card">
+        <div class="flex-between" style="margin-bottom:0.75rem;">
+          <h2>Queue Stats</h2>
+          <button class="btn btn-sm btn-secondary" onclick="loadSupervisorQueueStats()">Refresh</button>
+        </div>
+        <div id="queue-stats"><div class="empty-state">Loading...</div></div>
+      </div>
+      <div class="card">
+        <div class="flex-between" style="margin-bottom:0.75rem;">
+          <h2>Gate Status</h2>
+          <button class="btn btn-sm btn-secondary" onclick="loadSupervisorGate()">Refresh</button>
+        </div>
+        <div id="gate-status"><div class="empty-state">Loading...</div></div>
+      </div>
+    </div>
+
+    <div class="grid grid-2 section">
+      <div class="card">
+        <h2>Quota Usage</h2>
+        <div id="quota-info">
+          <div style="display:flex;justify-content:space-between;font-size:0.875rem;margin-bottom:0.25rem;">
+            <span id="quota-used">- used</span><span id="quota-total">- total</span>
+          </div>
+          <div class="progress"><div id="quota-bar" class="progress-bar" style="width:0%;background:var(--accent)"></div></div>
+          <div style="margin-top:0.5rem;font-size:0.875rem;color:var(--muted);" id="quota-remaining">- remaining</div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Live Events</h2>
+        <div id="event-log" class="event-log"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== TASKS TAB ========== -->
+  <div id="tab-tasks" class="tab-content hidden">
+    <div class="section">
+      <div class="card">
+        <div class="flex-between" style="margin-bottom:0.75rem;">
+          <h2>Tasks</h2>
+          <button class="btn btn-sm btn-secondary" onclick="loadTasks()">Refresh</button>
+        </div>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead><tr><th>ID</th><th>Type</th><th>Status</th><th>Priority</th><th>Retry</th><th>Created</th></tr></thead>
+            <tbody id="tasks-body"><tr><td colspan="6" style="text-align:center;color:var(--muted)">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== AGENTS TAB ========== -->
+  <div id="tab-agents" class="tab-content hidden">
+    <div class="section">
+      <div class="card">
+        <div class="flex-between" style="margin-bottom:0.75rem;">
+          <h2>Agents</h2>
+          <button class="btn btn-sm btn-secondary" onclick="loadAgents()">Refresh</button>
+        </div>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Last Heartbeat</th><th>Actions</th></tr></thead>
+            <tbody id="agents-body"><tr><td colspan="5" style="text-align:center;color:var(--muted)">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== COLLABORATION TAB ========== -->
+  <div id="tab-collaboration" class="tab-content hidden">
+    <div class="grid grid-4 section">
+      <div class="card"><div class="stat-label">Total Links</div><div class="stat" id="col-total">-</div></div>
+      <div class="card"><div class="stat-label">HandOffs</div><div class="stat" id="col-handoffs">-</div></div>
+      <div class="card"><div class="stat-label">Retries</div><div class="stat" id="col-retries" style="color:var(--warning)">-</div></div>
+      <div class="card"><div class="stat-label">Dead Letters</div><div class="stat" id="col-dead" style="color:var(--danger)">-</div></div>
+    </div>
+    <div class="card">
+      <div class="flex-between" style="margin-bottom:0.75rem;">
+        <h2>Collaboration Links</h2>
+        <button class="btn btn-sm btn-secondary" onclick="loadCollaboration()">Refresh</button>
+      </div>
+      <div id="collab-links"><div class="empty-state">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- ========== EVENTS TAB ========== -->
+  <div id="tab-events" class="tab-content hidden">
+    <div class="card section">
+      <h2>Historical Events</h2>
+      <div class="filter-bar">
+        <input type="text" id="ev-agent" placeholder="Agent ID">
+        <input type="text" id="ev-task" placeholder="Task ID">
+        <input type="text" id="ev-crew" placeholder="Crew ID">
+        <input type="text" id="ev-types" placeholder="Event types (comma sep)">
+        <select id="ev-level"><option value="">All levels</option><option value="error">Error</option><option value="warn">Warn</option><option value="info">Info</option></select>
+        <button class="btn btn-sm" onclick="loadEvents()">Query</button>
+      </div>
+      <div id="events-result" style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>Time</th><th>Type</th><th>Agent</th><th>Task</th><th>Details</th></tr></thead>
+          <tbody id="events-body"><tr><td colspan="5" style="text-align:center;color:var(--muted)">Click Query to load events</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== SYSTEM TAB ========== -->
+  <div id="tab-system" class="tab-content hidden">
+    <div class="grid grid-2 section">
+      <div class="card">
+        <div class="flex-between" style="margin-bottom:0.75rem;">
+          <h2>Backend Health</h2>
+          <button class="btn btn-sm btn-secondary" onclick="loadBackendHealth()">Refresh</button>
+        </div>
+        <div id="backend-health"><div class="empty-state">Loading...</div></div>
+      </div>
+      <div class="card">
+        <div class="flex-between" style="margin-bottom:0.75rem;">
+          <h2>Active Alerts</h2>
+          <button class="btn btn-sm btn-secondary" onclick="loadAlerts()">Refresh</button>
+        </div>
+        <div id="alerts-list"><div class="empty-state">Loading...</div></div>
+      </div>
+    </div>
+    <div class="grid grid-2 section">
+      <div class="card">
+        <div class="flex-between" style="margin-bottom:0.75rem;">
+          <h2>Snapshots</h2>
+          <button class="btn btn-sm btn-secondary" onclick="loadSnapshots()">Refresh</button>
+        </div>
+        <div id="snapshots-list"><div class="empty-state">Loading...</div></div>
+      </div>
+      <div class="card">
+        <h2>Raw Logs Index</h2>
+        <div class="filter-bar">
+          <input type="text" id="rl-stream" placeholder="Stream name" value="system_raw">
+          <input type="date" id="rl-date" placeholder="Date">
+          <button class="btn btn-sm" onclick="loadRawLogs()">Query</button>
+        </div>
+        <div id="raw-logs"><div class="empty-state">Enter stream and date to query</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API_BASE = '';
+let token = localStorage.getItem('sf_token');
+let ws = null;
+let refreshTimer = null;
+let currentTab = 'overview';
+
+function $(id) { return document.getElementById(id); }
+
+function showLogin() {
+  $('login-view').classList.remove('hidden');
+  $('dashboard-view').classList.add('hidden');
+  $('logout-btn').style.display = 'none';
+}
+
+function showDashboard() {
+  $('login-view').classList.add('hidden');
+  $('dashboard-view').classList.remove('hidden');
+  $('logout-btn').style.display = 'inline-flex';
+}
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('hidden', c.id !== 'tab-' + tab));
+  if (tab === 'tasks') loadTasks();
+  if (tab === 'agents') loadAgents();
+  if (tab === 'collaboration') loadCollaboration();
+  if (tab === 'events') loadEvents();
+  if (tab === 'system') { loadBackendHealth(); loadAlerts(); loadSnapshots(); }
+}
+
+async function login() {
+  const username = $('username').value || 'admin';
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username })
+    });
+    if (!res.ok) throw new Error('Login failed');
+    const data = await res.json();
+    token = data.access_token;
+    localStorage.setItem('sf_token', token);
+    $('login-error').textContent = '';
+    showDashboard();
+    start();
+  } catch (e) {
+    $('login-error').textContent = e.message;
+  }
+}
+
+function logout() {
+  localStorage.removeItem('sf_token');
+  token = null;
+  if (ws) { ws.close(); ws = null; }
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+  showLogin();
+}
+
+async function api(path) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+function statusClass(s) {
+  const map = { pending:'tag-pending', running:'tag-running', completed:'tag-completed', failed:'tag-failed', scheduled:'tag-scheduled', cancelled:'tag-cancelled' };
+  return map[s] || 'tag-pending';
+}
+
+function fmtDate(iso) {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  return d.toLocaleTimeString();
+}
+
+// ─── Overview ───
+
+async function loadClusterOverview() {
+  try {
+    const data = await api('/api/v1/cluster/overview');
+    $('ov-health').textContent = data.cluster_health || '-';
+    $('ov-health').className = 'stat ' + (data.cluster_health === 'healthy' ? 'health-up' : 'health-warn');
+    $('ov-agents').textContent = data.total_agents ?? '-';
+    $('ov-tasks').textContent = data.total_tasks ?? '-';
+    $('ov-failed').textContent = data.failed_tasks ?? '-';
+    $('ov-crews').textContent = data.active_crews ?? '-';
+    $('ov-squads').textContent = data.active_squads ?? '-';
+    $('ov-pending').textContent = data.queued_tasks ?? '-';
+    $('ov-running').textContent = data.active_tasks ?? '-';
+    $('ov-duration').textContent = data.avg_task_duration_ms ? (data.avg_task_duration_ms / 1000).toFixed(1) + 's' : '-';
+  } catch (e) { console.error('loadClusterOverview error', e); }
+}
+
+async function loadSupervisorStatus() {
+  try {
+    const data = await api('/api/v1/supervisor/status');
+    const el = $('supervisor-status');
+    el.innerHTML = `
+      <div class="grid grid-2">
+        <div><span class="stat-label">Healthy Agents</span><div class="stat health-up">${data.healthy_agents}</div></div>
+        <div><span class="stat-label">Dead Agents</span><div class="stat health-down">${data.dead_agents}</div></div>
+        <div><span class="stat-label">Suspect</span><div class="stat health-warn">${data.suspect_agents}</div></div>
+        <div><span class="stat-label">Stuck</span><div class="stat health-warn">${data.stuck_agents}</div></div>
+      </div>
+      <div style="margin-top:0.5rem;font-size:0.875rem;color:var(--muted);">
+        Scheduler: <span class="${data.scheduler_paused ? 'health-down' : 'health-up'}">${data.scheduler_paused ? 'PAUSED' : 'RUNNING'}</span>
+        <span style="margin-left:1rem;">Pending Handoffs: ${data.pending_handoffs}</span>
+      </div>
+    `;
+  } catch (e) {
+    $('supervisor-status').innerHTML = `<div class="empty-state">${e.message}</div>`;
+  }
+}
+
+async function loadHookHealth() {
+  try {
+    const data = await api('/api/v1/hooks/health');
+    const el = $('hook-health');
+    let html = `<div style="font-size:0.875rem;">Overall: <span class="${data.overall === 'up' ? 'health-up' : 'health-down'}">${data.overall.toUpperCase()}</span></div>`;
+    if (data.tiers) {
+      html += '<div style="margin-top:0.5rem;">';
+      for (const [name, tier] of Object.entries(data.tiers)) {
+        html += `<div style="display:flex;justify-content:space-between;padding:0.25rem 0;border-bottom:1px solid var(--border);">
+          <span>${name}</span><span class="${tier.status === 'up' ? 'health-up' : tier.status === 'disabled' ? '' : 'health-down'}">${tier.status}</span>
+        </div>`;
+      }
+      html += '</div>';
+    }
+    el.innerHTML = html;
+  } catch (e) {
+    $('hook-health').innerHTML = `<div class="empty-state">${e.message}</div>`;
+  }
+}
+
+async function loadQuota() {
+  try {
+    const data = await api('/api/v1/quota/usage');
+    const used = data.used_today || 0;
+    const total = data.total_quota || 1;
+    const remaining = data.remaining || 0;
+    const pct = Math.min(100, Math.round((used / total) * 100));
+    $('quota-used').textContent = `${used.toLocaleString()} used`;
+    $('quota-total').textContent = `${total.toLocaleString()} total`;
+    $('quota-remaining').textContent = `${remaining.toLocaleString()} remaining`;
+    const bar = $('quota-bar');
+    bar.style.width = pct + '%';
+    bar.style.background = pct > 90 ? 'var(--danger)' : pct > 70 ? 'var(--warning)' : 'var(--accent)';
+  } catch (e) { console.error('loadQuota error', e); }
+}
+
+// ─── Tasks ───
+
+async function loadTasks() {
+  try {
+    const summary = await api('/api/v1/tasks/status');
+    const list = await api('/api/v1/tasks/list');
+    const tbody = $('tasks-body');
+    const tasks = list.tasks || [];
+    if (!tasks.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted)">No tasks</td></tr>';
+      return;
+    }
+    tbody.innerHTML = tasks.slice(0, 100).map(t => `
+      <tr style="cursor:pointer;" onclick="showTaskDetail('${t.id}')">
+        <td>${t.id}</td>
+        <td>${t.task_type}</td>
+        <td><span class="tag ${statusClass(t.status)}">${t.status}</span></td>
+        <td>${t.priority ?? '-'}</td>
+        <td>${t.retry_count ?? 0}/${t.max_retries ?? 3}</td>
+        <td>${fmtDate(t.created_at)}</td>
+      </tr>
+    `).join('');
+  } catch (e) { console.error('loadTasks error', e); }
+}
+
+// ─── Agents ───
+
+async function showAgentDetail(agentId) {
+  try {
+    const [state, heartbeats] = await Promise.all([
+      api(`/api/v1/agents/${agentId}/state`).catch(() => null),
+      api(`/api/v1/agents/${agentId}/heartbeats`).catch(() => null),
+    ]);
+    let html = '<h2>Agent: ' + agentId + '</h2>';
+    if (state) {
+      html += '<div class="modal-section"><h4>State</h4><pre style="font-size:0.8rem;color:var(--muted);overflow:auto;max-height:200px;background:var(--bg);padding:0.5rem;border-radius:0.375rem;">' + JSON.stringify(state, null, 2) + '</pre></div>';
+    }
+    if (heartbeats && Array.isArray(heartbeats) && heartbeats.length) {
+      html += '<div class="modal-section"><h4>Recent Heartbeats (' + heartbeats.length + ')</h4>' + heartbeats.slice(-10).map(h => '<div class="timeline-item">[' + fmtDate(h.timestamp || h.ts) + '] ' + (h.status || 'heartbeat') + '</div>').join('') + '</div>';
+    } else {
+      html += '<div class="modal-section"><h4>Recent Heartbeats</h4><div class="empty-state">No heartbeat history</div></div>';
+    }
+    openModal(html);
+  } catch (e) { alert('Failed to load agent detail: ' + e.message); }
+}
+
+async function loadAgents() {
+  try {
+    const data = await api('/api/v1/agents');
+    const tbody = $('agents-body');
+    const agents = data.agents || [];
+    if (!agents.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted)">No agents registered</td></tr>';
+      return;
+    }
+    tbody.innerHTML = agents.map(a => `
+      <tr style="cursor:pointer;" onclick="showAgentDetail('${a.agent_id}')">
+        <td>${a.agent_id}</td>
+        <td>${a.agent_name || '-'}</td>
+        <td><span class="tag ${a.status === 'online' ? 'tag-completed' : 'tag-failed'}">${a.status}</span></td>
+        <td>${fmtDate(a.last_heartbeat)}</td>
+        <td><div class="control-group" onclick="event.stopPropagation();">
+          <button class="btn btn-sm btn-secondary" onclick="agentAction('${a.agent_id}', 'checkpoint')">Checkpoint</button>
+          <button class="btn btn-sm btn-secondary" onclick="agentAction('${a.agent_id}', 'restart')">Restart</button>
+          <button class="btn btn-sm btn-danger" onclick="agentAction('${a.agent_id}', 'kill')">Kill</button>
+        </div></td>
+      </tr>
+    `).join('');
+  } catch (e) { console.error('loadAgents error', e); }
+}
+
+function openModal(html) {
+  $('modal-content').innerHTML = html;
+  $('modal-overlay').classList.add('open');
+}
+function closeModal() {
+  $('modal-overlay').classList.remove('open');
+  $('modal-content').innerHTML = '';
+}
+
+async function showTaskDetail(taskId) {
+  try {
+    const [task, metrics, logs, checkpoint, timeline] = await Promise.all([
+      api(`/api/v1/tasks/${taskId}`).catch(() => null),
+      api(`/api/v1/tasks/${taskId}/metrics`).catch(() => null),
+      api(`/api/v1/tasks/${taskId}/logs`).catch(() => null),
+      api(`/api/v1/tasks/${taskId}/checkpoint`).catch(() => null),
+      api(`/api/v1/tasks/${taskId}/timeline`).catch(() => null),
+    ]);
+    let html = '<h2>Task: ' + taskId + '</h2>';
+    if (task) {
+      html += '<div class="modal-section"><h4>Task Info</h4><pre style="font-size:0.8rem;color:var(--muted);overflow:auto;max-height:200px;background:var(--bg);padding:0.5rem;border-radius:0.375rem;">' + JSON.stringify(task, null, 2) + '</pre></div>';
+    }
+    if (metrics) {
+      html += '<div class="modal-section"><h4>Metrics</h4><div style="font-size:0.875rem;">Tokens: ' + (metrics.total_tokens || 0) + ' | Tools: ' + (metrics.tool_calls || 0) + ' | Duration: ' + (metrics.duration_ms || 0) + 'ms</div></div>';
+    }
+    if (logs && logs.length) {
+      html += '<div class="modal-section"><h4>Recent Logs (' + logs.length + ')</h4>' + logs.slice(-5).map(l => '<div class="timeline-item">[' + fmtDate(l.timestamp) + '] ' + l.level + ': ' + l.message + '</div>').join('') + '</div>';
+    }
+    if (checkpoint && checkpoint.checkpoint) {
+      html += '<div class="modal-section"><h4>Checkpoint</h4><div style="font-size:0.875rem;color:var(--success);">Checkpoint present</div></div>';
+    }
+    if (timeline && Array.isArray(timeline.events) && timeline.events.length) {
+      html += '<div class="modal-section"><h4>Timeline</h4>' + timeline.events.map(ev => '<div class="timeline-item">[' + fmtDate(ev.timestamp) + '] ' + ev.status + (ev.message ? ' — ' + ev.message : '') + '</div>').join('') + '</div>';
+    }
+    openModal(html);
+  } catch (e) { alert('Failed to load task detail: ' + e.message); }
+}
+
+async function agentAction(agentId, action) {
+  if (!confirm(`Are you sure you want to ${action} agent ${agentId}?`)) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/agents/${agentId}/${action}`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    alert(`${action} sent to ${agentId}`);
+    loadAgents();
+  } catch (e) { alert(`Failed: ${e.message}`); }
+}
+
+// ─── Collaboration ───
+
+async function loadCollaboration() {
+  try {
+    const data = await api('/api/v1/collaboration/graph');
+    $('col-total').textContent = data.stats?.total_links ?? '-';
+    $('col-handoffs').textContent = data.stats?.handoffs ?? '-';
+    $('col-retries').textContent = data.stats?.retries ?? '-';
+    $('col-dead').textContent = data.stats?.dead_letters ?? '-';
+
+    const el = $('collab-links');
+    const links = data.links || [];
+    if (!links.length) {
+      el.innerHTML = '<div class="empty-state">No collaboration links yet</div>';
+      return;
+    }
+    el.innerHTML = links.slice(-50).map(l => `
+      <div class="link-row">
+        <span>${l.source_task_id}</span>
+        <span class="link-arrow">→</span>
+        <span>${l.target_task_id}</span>
+        <span class="tag ${l.link_type === 'hand_off' ? 'tag-completed' : l.link_type === 'retry' ? 'tag-warning' : 'tag-failed'}">${l.link_type}</span>
+        <span style="color:var(--muted);font-size:0.75rem;">${fmtDate(l.timestamp)}</span>
+      </div>
+    `).join('');
+  } catch (e) {
+    $('collab-links').innerHTML = `<div class="empty-state">${e.message}</div>`;
+  }
+}
+
+// ─── Events ───
+
+async function loadEvents() {
+  try {
+    const params = new URLSearchParams();
+    const agentId = $('ev-agent').value;
+    const taskId = $('ev-task').value;
+    const crewId = $('ev-crew').value;
+    const types = $('ev-types').value;
+    const level = $('ev-level').value;
+    if (agentId) params.append('agent_id', agentId);
+    if (taskId) params.append('task_id', taskId);
+    if (crewId) params.append('crew_id', crewId);
+    if (types) params.append('event_types', types);
+    if (level) params.append('level', level);
+
+    const data = await api(`/api/v1/events?${params.toString()}`);
+    const tbody = $('events-body');
+    if (!Array.isArray(data) || !data.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted)">No events</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.slice(0, 100).map(ev => {
+      const type = ev.event_type || ev.type || 'unknown';
+      const ts = ev.timestamp || ev.created_at;
+      return `<tr>
+        <td>${fmtDate(ts)}</td>
+        <td><span class="tag tag-pending">${type}</span></td>
+        <td>${ev.agent_id || '-'}</td>
+        <td>${ev.task_id || '-'}</td>
+        <td><pre style="margin:0;font-size:0.75rem;color:var(--muted);">${JSON.stringify(ev).slice(0, 200)}</pre></td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    $('events-body').innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--danger)">${e.message}</td></tr>`;
+  }
+}
+
+
+// ─── Supervisor Queue Stats ───
+
+async function loadSupervisorQueueStats() {
+  try {
+    const data = await api('/api/v1/supervisor/queue_stats');
+    const el = $('queue-stats');
+    el.innerHTML = '<div style="font-size:0.875rem;">' +
+      '<div style="display:flex;justify-content:space-between;padding:0.25rem 0;border-bottom:1px solid var(--border);"><span>Pending</span><span class="stat" style="font-size:1rem;">' + (data.pending || 0) + '</span></div>' +
+      '<div style="display:flex;justify-content:space-between;padding:0.25rem 0;border-bottom:1px solid var(--border);"><span>Running</span><span class="stat" style="font-size:1rem;color:var(--warning);">' + (data.running || 0) + '</span></div>' +
+      '<div style="display:flex;justify-content:space-between;padding:0.25rem 0;border-bottom:1px solid var(--border);"><span>Completed</span><span class="stat" style="font-size:1rem;color:var(--success);">' + (data.completed || 0) + '</span></div>' +
+      '<div style="display:flex;justify-content:space-between;padding:0.25rem 0;border-bottom:1px solid var(--border);"><span>Failed</span><span class="stat" style="font-size:1rem;color:var(--danger);">' + (data.failed || 0) + '</span></div>' +
+      '<div style="display:flex;justify-content:space-between;padding:0.25rem 0;"><span>Dead Letters</span><span class="stat" style="font-size:1rem;color:var(--danger);">' + (data.dead_letter || 0) + '</span></div>' +
+      '</div>';
+  } catch (e) { $('queue-stats').innerHTML = '<div class="empty-state">' + e.message + '</div>'; }
+}
+
+// ─── Supervisor Gate ───
+
+async function loadSupervisorGate() {
+  try {
+    const data = await api('/api/v1/supervisor/gate');
+    const el = $('gate-status');
+    const isOpen = data.open !== false;
+    el.innerHTML = '<div style="font-size:0.875rem;">' +
+      '<div style="margin-bottom:0.5rem;">Gate: <span class="' + (isOpen ? 'health-up' : 'health-down') + '">' + (isOpen ? 'OPEN' : 'CLOSED') + '</span></div>' +
+      '<div style="margin-bottom:0.5rem;">Reason: ' + (data.reason || '-') + '</div>' +
+      '<button class="btn btn-sm ' + (isOpen ? 'btn-danger' : 'btn-secondary') + '" onclick="gateAction(' + (!isOpen) + ')">' + (isOpen ? 'Close Gate' : 'Open Gate') + '</button>' +
+      '</div>';
+  } catch (e) { $('gate-status').innerHTML = '<div class="empty-state">' + e.message + '</div>'; }
+}
+
+async function gateAction(open) {
+  try {
+    const res = await fetch(API_BASE + '/api/v1/supervisor/gate', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ open })
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    loadSupervisorGate();
+  } catch (e) { alert('Gate action failed: ' + e.message); }
+}
+
+// ─── Backend Health ───
+
+async function loadBackendHealth() {
+  try {
+    const data = await api('/api/v1/health/backends');
+    const el = $('backend-health');
+    const backends = data.backends || [];
+    if (!backends.length) {
+      el.innerHTML = '<div class="empty-state">No backend health data</div>';
+      return;
+    }
+    el.innerHTML = '<table><thead><tr><th>Name</th><th>Status</th><th>Latency</th><th>Last Check</th></tr></thead><tbody>' +
+      backends.map(b => '<tr><td>' + b.name + '</td><td><span class="tag ' + (b.healthy ? 'tag-completed' : 'tag-failed') + '">' + (b.healthy ? 'Healthy' : 'Unhealthy') + '</span></td><td>' + (b.latency_ms || '-') + 'ms</td><td>' + fmtDate(b.last_check) + '</td></tr>').join('') +
+      '</tbody></table>';
+  } catch (e) { $('backend-health').innerHTML = '<div class="empty-state">' + e.message + '</div>'; }
+}
+
+// ─── Alerts ───
+
+async function loadAlerts() {
+  try {
+    const data = await api('/api/v1/alerts/active');
+    const el = $('alerts-list');
+    const alerts = data.alerts || [];
+    if (!alerts.length) {
+      el.innerHTML = '<div class="empty-state" style="color:var(--success);">No active alerts</div>';
+      return;
+    }
+    el.innerHTML = '<table><thead><tr><th>Severity</th><th>Source</th><th>Message</th><th>Time</th></tr></thead><tbody>' +
+      alerts.map(a => '<tr><td><span class="tag ' + (a.severity === 'critical' || a.severity === 'fatal' ? 'tag-failed' : a.severity === 'warning' ? 'tag-running' : 'tag-pending') + '">' + (a.severity || 'info') + '</span></td><td>' + (a.source || '-') + '</td><td>' + (a.message || '-') + '</td><td>' + fmtDate(a.timestamp || a.created_at) + '</td></tr>').join('') +
+      '</tbody></table>';
+  } catch (e) { $('alerts-list').innerHTML = '<div class="empty-state">' + e.message + '</div>'; }
+}
+
+// ─── Snapshots ───
+
+async function loadSnapshots() {
+  try {
+    const data = await api('/api/v1/snapshots');
+    const el = $('snapshots-list');
+    const snaps = data.snapshots || [];
+    if (!snaps.length) {
+      el.innerHTML = '<div class="empty-state">No snapshots</div>';
+      return;
+    }
+    el.innerHTML = '<table><thead><tr><th>ID</th><th>Agent</th><th>Status</th><th>Created</th></tr></thead><tbody>' +
+      snaps.map(s => '<tr><td>' + s.snapshot_id + '</td><td>' + (s.agent_id || '-') + '</td><td><span class="tag ' + (s.status === 'complete' ? 'tag-completed' : s.status === 'failed' ? 'tag-failed' : 'tag-pending') + '">' + (s.status || '-') + '</span></td><td>' + fmtDate(s.created_at) + '</td></tr>').join('') +
+      '</tbody></table>';
+  } catch (e) { $('snapshots-list').innerHTML = '<div class="empty-state">' + e.message + '</div>'; }
+}
+
+// ─── WebSocket ───
+
+function connectWebSocket() {
+  if (ws) { try { ws.close(); } catch(e){} }
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    const badge = $('conn-badge');
+    badge.classList.remove('offline');
+    badge.classList.add('online');
+    badge.innerHTML = '<span class="dot"></span>WS Online';
+    ws.send(JSON.stringify({ type: 'subscribe', channels: ['task:*', 'agent:*'] }));
+  };
+
+  ws.onclose = () => {
+    const badge = $('conn-badge');
+    badge.classList.remove('online');
+    badge.classList.add('offline');
+    badge.innerHTML = '<span class="dot"></span>WS Offline';
+  };
+
+  ws.onmessage = (ev) => {
+    try { const msg = JSON.parse(ev.data); appendEvent(msg); } catch (e) { appendEvent({ type: 'raw', data: ev.data }); }
+  };
+
+  ws.onerror = (e) => { console.error('WebSocket error', e); };
+}
+
+const MAX_EVENTS = 100;
+function appendEvent(msg) {
+  const log = $('event-log');
+  const item = document.createElement('div');
+  item.className = 'event-item';
+  const time = new Date().toLocaleTimeString();
+  let text = `[${time}] `;
+  if (msg.type) text += `${msg.type}`;
+  else if (msg.event_type) text += `${msg.event_type}`;
+  else text += JSON.stringify(msg).slice(0, 120);
+  if (msg.task_id) text += ` task=${msg.task_id}`;
+  if (msg.agent_id) text += ` agent=${msg.agent_id}`;
+  item.textContent = text;
+  log.prepend(item);
+  while (log.children.length > MAX_EVENTS) { log.removeChild(log.lastChild); }
+}
+
+// ─── Lifecycle ───
+
+async function loadRawLogs() {
+  try {
+    const stream = $("rl-stream").value || "system_raw";
+    const date = $("rl-date").value || new Date().toISOString().slice(0, 10);
+    const data = await api(`/api/v1/raw_logs/index?stream=${encodeURIComponent(stream)}&date=${date}`);
+    const el = $("raw-logs");
+    if (!Array.isArray(data) || !data.length) {
+      el.innerHTML = '<div class="empty-state">No raw log entries</div>';
+      return;
+    }
+    el.innerHTML = '<table><thead><tr><th>Stream</th><th>Date</th><th>Path</th><th>Records</th><th>Size</th></tr></thead><tbody>' +
+      data.map(r => `<tr><td>${r.stream}</td><td>${r.date}</td><td>${r.file_path}</td><td>${r.record_count}</td><td>${(r.byte_size/1024).toFixed(1)}KB</td></tr>`).join('') +
+      '</tbody></table>';
+  } catch (e) {
+    $("raw-logs").innerHTML = `<div class="empty-state">${e.message}</div>`;
+  }
+}
+
+async function loadCrewsAndSquads() {
+  // Placeholder: crews/squads require knowing IDs first
+}
+
+function loadAll() {
+  loadClusterOverview();
+  loadSupervisorStatus();
+  loadHookHealth();
+  loadQuota();
+  loadSupervisorQueueStats();
+  loadSupervisorGate();
+  if (currentTab === 'tasks') loadTasks();
+  if (currentTab === 'agents') loadAgents();
+  if (currentTab === 'collaboration') loadCollaboration();
+  if (currentTab === 'system') { loadBackendHealth(); loadAlerts(); loadSnapshots(); }
+}
+
+function start() {
+  loadAll();
+  connectWebSocket();
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(loadAll, 5000);
+}
+
+if (token) { showDashboard(); start(); } else { showLogin(); }
+</script>
+
+<div id="modal-overlay" class="modal-overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <div id="modal-content"></div>
+  </div>
+</div>
+</body>
+</html>

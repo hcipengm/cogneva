@@ -4,6 +4,8 @@
 
 # Node.js / TypeScript (legacy)
 node_modules
+web/node_modules
+web/dist
 npm-debug.log
 package-lock.json
 package.json

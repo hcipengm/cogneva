@@ -255,7 +255,14 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/ws", get(ws_handler))
         .route("/api/v1/evolution/stream", get(evolution::stream_handler))
         .route("/dashboard", get(dashboard::dashboard_handler))
-        .route("/takeover", get(takeover::takeover_handler));
+        .route("/takeover", get(takeover::takeover_handler))
+        // WebUI 单页应用：根路径直接给 index.html，/assets 给构建产物，
+        // 浏览器打开即用（一键拉起场景没有独立前端服务）
+        .route("/", get(dashboard::dashboard_handler))
+        .nest_service(
+            "/assets",
+            tower_http::services::ServeDir::new(dashboard::web_dir().join("assets")),
+        );
 
     // Helper closures for common middleware stacks
     let auth_layer = {

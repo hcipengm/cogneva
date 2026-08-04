@@ -82,6 +82,14 @@ spec:
           env:
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
+            # 配置里 LLM api_key 是 ${KIMI_API_KEY} 占位，必须从 secret 注入，
+            # 否则进化进程起不来（No LLM backends configured）
+            - name: KIMI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: llm-api-key
+                  optional: true
             - name: PG_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -111,7 +119,10 @@ spec:
               mountPath: /host-git
               readOnly: false
             - name: cogneva-json
-              mountPath: /etc/cogneva/cogneva.json
+              # 必须挂目录：挂成 /etc/cogneva/cogneva.json 且无 subPath 会把
+              # ConfigMap 挂成同名目录，进程读文件失败静默回退默认配置，
+              # 报"No LLM backends configured"（2026-08-04 实测定位）
+              mountPath: /etc/cogneva
               readOnly: true
             # Mount the Docker socket only if you plan to build container images
             # from inside the evolution Pod. Remove for pure self_exec mode.

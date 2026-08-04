@@ -36,6 +36,7 @@ if [ "${CN_MIRROR:-0}" = "1" ]; then
         --build-arg RUSTUP_INIT_URL=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup-init.sh
         --build-arg "CARGO_REGISTRY_SPARSE=${CRATES_SPARSE:-https://rsproxy.cn/index/}"
         --build-arg APT_MIRROR_HOST=mirrors.tuna.tsinghua.edu.cn
+        --build-arg NPM_REGISTRY=https://registry.npmmirror.com
     )
 fi
 BUILD_ARGS+=("$REPO_ROOT")
