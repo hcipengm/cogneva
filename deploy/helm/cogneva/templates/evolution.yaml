@@ -114,6 +114,14 @@ spec:
             - |
               set -e
               git config --global --add safe.directory /host-git
+              # gitRemote.mode=pvc 时首挂是空卷，从公开仓库 seed；
+              # hostPath 模式宿主已预 seed，本步自动跳过
+              if [ ! -f /host-git/HEAD ]; then
+                echo "git-remote is empty; seeding bare repo from {{ .Values.evolution.gitRemote.seedUrl }} ..."
+                git clone --bare {{ .Values.evolution.gitRemote.seedUrl }} /tmp/seed.git
+                cp -a /tmp/seed.git/. /host-git/
+                rm -rf /tmp/seed.git
+              fi
               if [ ! -d /opt/cogneva/sandbox/src/.git ] || [ ! -f /opt/cogneva/sandbox/src/Cargo.toml ]; then
                 echo "Source PVC is empty or incomplete; cloning from local bare repo..."
                 find /opt/cogneva/sandbox/src -mindepth 1 -delete 2>/dev/null || true
@@ -183,11 +191,33 @@ spec:
           persistentVolumeClaim:
             claimName: cogneva-evolution-source-pvc
         - name: git-remote
+          {{- if eq .Values.evolution.gitRemote.mode "pvc" }}
+          # 多节点/生产：hostPath 只存在于单个节点，必须走集群卷
+          persistentVolumeClaim:
+            claimName: cogneva-git-remote-pvc
+          {{- else }}
           hostPath:
-            path: {{ .Values.evolution.gitRemoteHostPath }}
+            path: {{ .Values.evolution.gitRemote.hostPath }}
             type: Directory
+          {{- end }}
         - name: cogneva-json
           hostPath:
             path: {{ .Values.evolution.configHostPath }}
             type: File
+{{- if eq .Values.evolution.gitRemote.mode "pvc" }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-git-remote-pvc
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: evolution
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.evolution.gitRemote.storage }}
+{{- end }}
 {{- end }}

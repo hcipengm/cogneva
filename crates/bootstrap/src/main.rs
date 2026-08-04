@@ -1041,6 +1041,18 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
         .map(|s| s.success())
         .unwrap_or(false);
     let cn = cn_mirror();
+    // 多节点（预期最终节点数 > 1）时 git-remote 用集群卷变体：hostPath 只存在于
+    // bootstrap 所在节点，evolution 调度到其他节点即 FailedMount/空仓库。
+    // 单节点保留 hostPath（宿主 <-> Pod 双向同步的开发通道）
+    let multi_node = probe_nodes().await > 1;
+    if multi_node {
+        info!("多节点集群：git-remote 渲染为 PVC 变体（空卷由 initContainer 从公开仓库 seed）");
+    }
+    let seed_url = if cn {
+        "https://gitee.com/hcipengm/cogneva.git"
+    } else {
+        "https://github.com/hcipengm/cogneva.git"
+    };
     if !has_local_path {
         info!("集群无 local-path provisioner，PVC 将使用集群默认 StorageClass");
     }
@@ -1082,6 +1094,8 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
                 text = text.replace(from, to);
             }
         }
+        text = filter_variant_blocks(&text, multi_node);
+        text = text.replace("__GIT_SEED_URL__", seed_url);
         if !has_traefik_crd {
             text = text
                 .split("\n---")
@@ -1112,6 +1126,36 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
         }
     }
     Ok(out)
+}
+
+/// 按集群形态保留/剔除清单里的变体标记块（# __NAME_BEGIN__ .. # __NAME_END__）。
+/// GIT_REMOTE_HOSTPATH 仅单节点保留（宿主同步通道）；GIT_REMOTE_PVC 仅多节点
+/// 保留（hostPath 跨节点不可达）。标记行本身总是剔除。
+fn filter_variant_blocks(text: &str, multi_node: bool) -> String {
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(name) = t
+            .strip_prefix("# __")
+            .and_then(|s| s.strip_suffix("_BEGIN__"))
+        {
+            skipping = !match name {
+                "GIT_REMOTE_HOSTPATH" => !multi_node,
+                "GIT_REMOTE_PVC" => multi_node,
+                _ => true,
+            };
+            continue;
+        }
+        if t.starts_with("# __") && t.ends_with("_END__") {
+            skipping = false;
+            continue;
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+    out.join("\n")
 }
 
 /// CN 模式公开镜像替换表（daocloud 镜像站）。
@@ -1289,7 +1333,12 @@ async fn main() -> Result<()> {
     ensure_buildah().await?;
     ensure_buildah_mirror().await?;
     ensure_firecracker().await?;
-    ensure_git_remote().await?;
+    if probe_nodes().await > 1 {
+        // 多节点：git-remote 走集群卷（渲染时选 PVC 变体），宿主 bare 仓库不再使用
+        info!("多节点集群：git-remote 走集群卷，跳过宿主 bare 仓库 seed");
+    } else {
+        ensure_git_remote().await?;
+    }
     ensure_runtime_image(branch).await?;
     deploy_manifests(branch).await?;
     if !api_key.is_empty() {
@@ -1308,4 +1357,35 @@ async fn main() -> Result<()> {
     api_key.zeroize();
     info!("引导器使命完成，退出");
     Ok(())
+}
+
+#[cfg(test)]
+mod variant_block_tests {
+    use super::filter_variant_blocks;
+
+    const SAMPLE: &str = "before\n\
+        # __GIT_REMOTE_HOSTPATH_BEGIN__\n\
+        hostPath-line\n\
+        # __GIT_REMOTE_HOSTPATH_END__\n\
+        # __GIT_REMOTE_PVC_BEGIN__\n\
+        pvc-line\n\
+        # __GIT_REMOTE_PVC_END__\n\
+        after";
+
+    #[test]
+    fn single_node_keeps_hostpath() {
+        let out = filter_variant_blocks(SAMPLE, false);
+        assert!(out.contains("hostPath-line"));
+        assert!(!out.contains("pvc-line"));
+        assert!(!out.contains("__GIT_REMOTE_"), "标记行必须剔除");
+        assert!(out.contains("before") && out.contains("after"));
+    }
+
+    #[test]
+    fn multi_node_keeps_pvc() {
+        let out = filter_variant_blocks(SAMPLE, true);
+        assert!(out.contains("pvc-line"));
+        assert!(!out.contains("hostPath-line"));
+        assert!(!out.contains("__GIT_REMOTE_"));
+    }
 }

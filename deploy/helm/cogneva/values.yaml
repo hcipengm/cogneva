@@ -26,8 +26,13 @@ securityGateway:
 # 自进化 worker（特权容器 = 文件系统沙盒边界；接 image-based 滚动更新后可关特权）
 evolution:
   enabled: true
-  # 宿主机 bare 仓库与主配置（开发态直挂；生产建议改用 PVC/镜像内置）
-  gitRemoteHostPath: /root/omc_workspace/cogneva.git
+  # git-remote 供给方式：pvc = 集群卷（多节点/生产，空卷自动从 seedUrl 拉 bare 仓库）；
+  # hostPath = 单节点开发态直挂宿主 bare 仓库（宿主 <-> Pod 双向同步通道）
+  gitRemote:
+    mode: pvc
+    hostPath: /root/omc_workspace/cogneva.git
+    seedUrl: https://github.com/hcipengm/cogneva.git
+    storage: 5Gi
   configHostPath: /root/omc_workspace/cogneva/cogneva.json
   sandboxStorage: 20Gi
   sourceStorage: 10Gi
