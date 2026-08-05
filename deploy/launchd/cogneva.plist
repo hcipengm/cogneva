@@ -1,23 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- 仅供开发态/Lima VM 内参考：生产一键路径由 bootstrap.sh（K3s）托管，无需本单元 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.sf-network.sf-network</string>
+    <string>com.cogneva.cogneva</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/sf-network/sf-network</string>
+        <string>/opt/cogneva/cogneva</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Applications/sf-network</string>
+    <string>/opt/cogneva</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/$USER/Library/Logs/sf-network/sf-network.log</string>
+    <string>/var/log/cogneva/cogneva.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/$USER/Library/Logs/sf-network/sf-network.error.log</string>
+    <string>/var/log/cogneva/cogneva.error.log</string>
 
     <key>KeepAlive</key>
     <dict>
@@ -35,10 +36,10 @@
 
     <key>EnvironmentVariables</key>
     <dict>
-        <key>SF_CONFIG_PATH</key>
-        <string>/Users/$USER/Library/Preferences/sf-network/sf-network.json</string>
-        <key>SF_DATA_DIR</key>
-        <string>/Users/$USER/Library/Application Support/sf-data</string>
+        <key>COGNEVA_CONFIG_PATH</key>
+        <string>/etc/cogneva/cogneva.json</string>
+        <key>COGNEVA_WEB_DIR</key>
+        <string>/opt/cogneva/web</string>
         <key>RUST_LOG</key>
         <string>info</string>
     </dict>

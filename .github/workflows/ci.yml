@@ -65,6 +65,33 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --workspace -- -D warnings
 
+  # 引导器跨平台编译保证：crates/bootstrap 须在三大 OS 均可 check 通过
+  # （运行时永远跑在 Linux 层内，但入口脚本/提示要求三平台可编译）
+  bootstrap-cross:
+    name: Bootstrap Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p cogneva-bootstrap
+
+  entry-scripts:
+    name: Entry Scripts Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck -S warning bootstrap.sh
+      - name: PowerShell parse check
+        run: |
+          pwsh -NoProfile -Command "\$errs = \$null; [void][System.Management.Automation.PSParser]::Tokenize((Get-Content -Raw bootstrap.ps1), [ref]\$errs); if (\$errs.Count -gt 0) { \$errs | ForEach-Object { Write-Error \$_ }; exit 1 }; 'bootstrap.ps1 parse OK'"
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

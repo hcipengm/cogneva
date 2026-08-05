@@ -1,24 +1,26 @@
 [Unit]
-Description=SF-Network 7x24 Autonomous Multi-Agent Collaboration Platform
-After=network-online.target redis.service mysql.service
+Description=Cogneva 7x24 Autonomous Multi-Agent Platform
+After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=notify
-ExecStart=/opt/sf-network/sf-network
+Type=simple
+ExecStart=/opt/cogneva/cogneva
 ExecReload=/bin/kill -HUP $MAINPID
-PIDFile=/run/sf-network/sf-network.pid
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=sf-network
+SyslogIdentifier=cogneva
+Environment=COGNEVA_CONFIG_PATH=/etc/cogneva/cogneva.json
+Environment=COGNEVA_WEB_DIR=/opt/cogneva/web
+Environment=RUST_LOG=info
 
 # Security hardening (optional — adjust for your environment)
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/sf-data /var/log/sf-network /run/sf-network
+ReadWritePaths=/var/lib/cogneva-data /var/log/cogneva /run/cogneva
 
 [Install]
 WantedBy=multi-user.target

@@ -245,6 +245,9 @@ async fn install_k3s() -> Result<()> {
         return Ok(());
     }
     info!("安装 K3s（官方脚本）...");
+    if cn_mirror() {
+        write_k3s_registries_cn()?;
+    }
     // 受限网络：get.k3s.io 的 GitHub releases 下载必挂，走 rancher 国内镜像站
     let install = if cn_mirror() {
         "curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -"
@@ -263,6 +266,20 @@ async fn install_k3s() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     bail!("K3s 安装后集群未就绪");
+}
+
+/// CN 模式预置 K3s containerd 镜像站配置。K3s 系统镜像（coredns /
+/// local-path-provisioner / pause 等）全走 docker.io，CN 空白机直连必爬
+/// （2026-08-05 嵌套回归实测：coredns 23MB 镜像直连拉 10 分钟）。
+/// 必须在 k3s 首次启动前写入；agent 侧由 install_k3s_agents 远程预置同一文件。
+fn write_k3s_registries_cn() -> Result<()> {
+    std::fs::create_dir_all("/etc/rancher/k3s")?;
+    std::fs::write(
+        "/etc/rancher/k3s/registries.yaml",
+        "mirrors:\n  docker.io:\n    endpoint:\n      - \"https://docker.m.daocloud.io\"\n",
+    )?;
+    info!("已预置 K3s registries.yaml（docker.io → daocloud）");
+    Ok(())
 }
 
 /// 多节点声明：COGNEVA_CLUSTER_NODES="user@ip[:port],user@ip2,..."。
@@ -390,7 +407,8 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
     // 管道右侧 sh 前面，否则安装脚本收不到会装成独立 server（脑裂），
     // 2026-08-04 嵌套实测抓到：目标机起了 k3s.service 而非 k3s-agent
     let install = if cn_mirror() {
-        format!("curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | K3S_URL={server_url} K3S_TOKEN={token}{version_env} INSTALL_K3S_MIRROR=cn sh -")
+        // agent 同样要在 k3s-agent 首启前预置 registries.yaml（pause 等系统镜像走 docker.io）
+        format!("mkdir -p /etc/rancher/k3s && printf 'mirrors:\\n  docker.io:\\n    endpoint:\\n      - \"https://docker.m.daocloud.io\"\\n' > /etc/rancher/k3s/registries.yaml && curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | K3S_URL={server_url} K3S_TOKEN={token}{version_env} INSTALL_K3S_MIRROR=cn sh -")
     } else {
         format!("curl -fsSL https://get.k3s.io | K3S_URL={server_url} K3S_TOKEN={token}{version_env} sh -")
     };
@@ -1021,6 +1039,17 @@ async fn deploy_manifests(branch: Branch) -> Result<()> {
     }
     let rendered = render_manifests_for_cluster(&dir).await?;
     info!("apply 清单（已按集群环境适配）");
+    // kubectl apply -f <dir> 按文件名字典序逐个处理，namespace.yaml 排在
+    // configmap/deployment 等之后，空白集群首轮会整批 namespace not found；
+    // 先幂等建命名空间再整目录 apply（K8s 分支分发器也做过，幂等无害）
+    run(
+        "sh",
+        &[
+            "-c",
+            "kubectl create namespace cogneva --dry-run=client -o yaml | kubectl apply -f -",
+        ],
+    )
+    .await?;
     run("kubectl", &["apply", "-f", &rendered.to_string_lossy()]).await
 }
 
@@ -1274,6 +1303,47 @@ async fn open_browser(url: &str) {
     }
 }
 
+/// 幂等后台 port-forward。Lima/WSL2 场景靠它把 svc 暴露到 VM 网络
+/// （--address 0.0.0.0），再经 Lima portForwards / WSL localhostForwarding
+/// 到达宿主浏览器；裸 Linux 上则直接对外提供 WebUI 入口。
+/// 端口已在监听则跳过；失败仅告警并打印手动命令，不影响自毁退出。
+async fn ensure_port_forward(webui: &str) {
+    let port = webui
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.trim_end_matches('/').parse::<u16>().ok())
+        .unwrap_or(8080);
+    if tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_ok()
+    {
+        info!("端口 {port} 已在监听，跳过 port-forward");
+        return;
+    }
+    let spec = format!("{port}:8080");
+    match Command::new("kubectl")
+        .args([
+            "-n",
+            "cogneva",
+            "port-forward",
+            "--address",
+            "0.0.0.0",
+            "svc/cogneva",
+            &spec,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(_) => info!("已后台建立 port-forward: 0.0.0.0:{port} → svc/cogneva:8080"),
+        Err(e) => warn!(
+            "自动 port-forward 失败（{e}），请手动执行: \
+             kubectl -n cogneva port-forward --address 0.0.0.0 svc/cogneva {spec}"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1288,6 +1358,13 @@ async fn main() -> Result<()> {
         == Some("1");
 
     info!("== Cogneva 元启动引导器 ==");
+
+    #[cfg(not(target_os = "linux"))]
+    warn!(
+        "引导器需在 Linux 运行层内执行，当前为 {}。\
+         macOS 请改用 bootstrap.sh（自动经 Lima 虚拟机），Windows 请改用 bootstrap.ps1（自动经 WSL2）",
+        std::env::consts::OS
+    );
 
     let (provider, base_url, mut api_key) = configure_llm(noninteractive).await?;
     verify_llm(&provider, &base_url, &api_key).await?;
@@ -1348,6 +1425,7 @@ async fn main() -> Result<()> {
 
     let webui =
         std::env::var("COGNEVA_WEBUI_URL").unwrap_or_else(|_| "http://localhost:8080".into());
+    ensure_port_forward(&webui).await;
     info!("部署完成，WebUI 地址: {webui}");
     if !noninteractive {
         open_browser(&webui).await;

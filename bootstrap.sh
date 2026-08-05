@@ -1,7 +1,9 @@
 #!/usr/bin/env sh
 # Cogneva 元启动入口（第一步：Shell 拉引导器）。
 # 用法: curl -fsSL https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh | sh
-# 职责仅三件：确保源码 → 确保 Rust 工具链 → 编译引导器并移交控制权。
+# Linux 裸机直接引导；macOS 自动经 Lima 虚拟机提供 Linux 运行层后走同一流程；
+# Windows 请用 bootstrap.ps1（WSL2）。
+# 职责仅三件：确保 Linux 运行层 → 确保源码 → 确保 Rust 工具链 → 编译引导器并移交控制权。
 set -eu
 
 REPO_URL="https://github.com/hcipengm/cogneva.git"
@@ -9,6 +11,22 @@ GITEE_REPO_URL="https://gitee.com/hcipengm/cogneva.git"
 TARBALL_URL="https://codeload.github.com/hcipengm/cogneva/tar.gz/refs/heads/main"
 GITEE_TARBALL_URL="https://gitee.com/hcipengm/cogneva/repository/archive/main.tar.gz"
 DEFAULT_HOME="${COGNEVA_HOME:-$HOME/.cogneva}"
+# 与 README 完全同一条入口命令（VM/WSL 内复用），CN 模式 Gitee 优先
+ENTRY_CMD_INTL='(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh'
+ENTRY_CMD_CN='(curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh || curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh) | sh'
+
+# COGNEVA_BOOTSTRAP_FAKE_OS 仅用于干跑测试（模拟 darwin 分支）
+detect_os() {
+    if [ -n "${COGNEVA_BOOTSTRAP_FAKE_OS:-}" ]; then
+        BOOTSTRAP_OS="$COGNEVA_BOOTSTRAP_FAKE_OS"
+        return
+    fi
+    case "$(uname -s)" in
+        Linux)  BOOTSTRAP_OS="linux" ;;
+        Darwin) BOOTSTRAP_OS="darwin" ;;
+        *)      BOOTSTRAP_OS="other" ;;
+    esac
+}
 
 # 受限网络探测：直接探 rustup 分发域（国内被墙），不通即走 TUNA 镜像。
 # 可用 COGNEVA_CN_MIRROR=1/0 强制开关，跳过探测。
@@ -85,7 +103,7 @@ ensure_rust() {
 
 ensure_cargo_mirror() {
     [ "$CN_MIRROR" = "1" ] || return
-    local cfg="$HOME/.cargo/config.toml"
+    cfg="$HOME/.cargo/config.toml"
     mkdir -p "$HOME/.cargo"
     if [ -f "$cfg" ] && grep -q 'source.crates-io' "$cfg"; then
         echo "[bootstrap] cargo 已配置源替换，跳过镜像写入"
@@ -143,7 +161,126 @@ ensure_cc() {
     fi
 }
 
+# ---------- macOS：Lima 虚拟机提供 Linux 运行层 ----------
+# K3s 不能原生运行于 macOS；Lima（CNCF 项目）是最小 Linux VM 方案。
+# 所有依赖都装在 VM 内，宿主只需 limactl。
+
+ensure_lima() {
+    if command -v limactl >/dev/null 2>&1; then
+        echo "[bootstrap] Lima 已安装: $(limactl --version 2>/dev/null | head -1)"
+        return
+    fi
+    if ! command -v brew >/dev/null 2>&1; then
+        echo "[bootstrap] macOS 需要 Lima 虚拟机，安装 Lima 需要 Homebrew：" >&2
+        echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' >&2
+        echo "  （国内可用 TUNA 镜像安装 Homebrew: https://mirrors.tuna.tsinghua.edu.cn/help/homebrew/）" >&2
+        exit 1
+    fi
+    echo "[bootstrap] 安装 Lima（brew install lima）..."
+    if [ "$CN_MIRROR" = "1" ]; then
+        export HOMEBREW_BOTTLE_DOMAIN="https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles"
+        export HOMEBREW_API_DOMAIN="https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api"
+    fi
+    brew install lima
+}
+
+write_lima_config() {
+    LIMA_CFG="$DEFAULT_HOME/lima-cogneva.yaml"
+    mkdir -p "$DEFAULT_HOME"
+    # 镜像文件名用 amd64/arm64，lima arch 字段用 x86_64/aarch64
+    case "$(uname -m)" in
+        arm64)  img_name_arch="arm64"; lima_arch="aarch64" ;;
+        *)      img_name_arch="amd64"; lima_arch="x86_64" ;;
+    esac
+    # 资源：默认 2 核 / 4GiB，小内存 Mac 收敛
+    host_cpus="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+    host_mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 8589934592)"
+    cpus=2
+    [ "$host_cpus" -lt 4 ] && cpus=1
+    mem_gib=4
+    [ $((host_mem_bytes / 1073741824)) -lt 8 ] && mem_gib=2
+    if [ "$CN_MIRROR" = "1" ]; then
+        img_base="https://mirrors.ustc.edu.cn/ubuntu-cloud-images/releases/24.04/release"
+    else
+        img_base="https://cloud-images.ubuntu.com/releases/24.04/release"
+    fi
+    cat > "$LIMA_CFG" <<EOF
+# Cogneva Linux 运行层（bootstrap.sh 生成；VM 已存在时本文件改动不生效，
+# 需 limactl delete cogneva 后重跑才会按新配置重建）
+images:
+  - location: "$img_base/ubuntu-24.04-server-cloudimg-$img_name_arch.img"
+    arch: "$lima_arch"
+cpus: $cpus
+memory: "${mem_gib}GiB"
+disk: "60GiB"
+containerd:
+  system: false
+  user: false
+mounts:
+  - location: "~"
+    writable: false
+portForwards:
+  - guestIP: "0.0.0.0"
+    guestPort: 8080
+    hostIP: "127.0.0.1"
+    hostPort: 8080
+EOF
+    echo "[bootstrap] Lima 配置: $LIMA_CFG（$cpus 核 / ${mem_gib}GiB / 60GiB 磁盘）"
+}
+
+start_lima_vm() {
+    if limactl list -q 2>/dev/null | grep -qx "cogneva"; then
+        if [ "$(limactl list 2>/dev/null | awk '$1=="cogneva" {print $2}')" = "Running" ]; then
+            echo "[bootstrap] Lima VM 'cogneva' 已在运行，复用"
+            return
+        fi
+        echo "[bootstrap] 启动已存在的 Lima VM 'cogneva'..."
+        limactl start cogneva
+        return
+    fi
+    echo "[bootstrap] 创建 Lima VM 'cogneva'（首次需下载 Ubuntu 镜像，约数百 MB）..."
+    limactl start --name=cogneva "$LIMA_CFG"
+}
+
+macos_bootstrap() {
+    echo "[bootstrap] 检测到 macOS：K3s 需 Linux 内核，将使用 Lima 虚拟机作为运行层（依赖全部装在 VM 内）..."
+    detect_restricted_net
+    ensure_lima
+    write_lima_config
+    start_lima_vm
+    if [ "$CN_MIRROR" = "1" ]; then
+        entry="$ENTRY_CMD_CN"
+    else
+        entry="$ENTRY_CMD_INTL"
+    fi
+    echo "[bootstrap] 在 VM 内执行与 Linux 完全相同的一键命令，COGNEVA_CN_MIRROR=$CN_MIRROR 已透传..."
+    # shellcheck disable=SC2086
+    limactl shell cogneva -- sh -c "COGNEVA_CN_MIRROR=$CN_MIRROR $entry"
+    echo ""
+    echo "[bootstrap] 完成！Cogneva 已在 VM 内运行，WebUI 经端口转发暴露到本机："
+    echo "  http://localhost:8080"
+    echo "常用命令: limactl shell cogneva（进 VM）| limactl stop cogneva | limactl delete cogneva（还原）"
+    if command -v open >/dev/null 2>&1; then
+        open http://localhost:8080 2>/dev/null || true
+    fi
+}
+
 main() {
+    detect_os
+    case "$BOOTSTRAP_OS" in
+        darwin)
+            macos_bootstrap
+            return
+            ;;
+        linux)
+            ;;
+        *)
+            echo "[bootstrap] 未支持的操作系统: $(uname -s)" >&2
+            echo "  Windows 请用管理员 PowerShell 运行:" >&2
+            echo "  iwr -useb https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.ps1 | iex" >&2
+            exit 1
+            ;;
+    esac
     detect_restricted_net
     fetch_source
     ensure_rust

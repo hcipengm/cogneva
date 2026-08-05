@@ -526,13 +526,34 @@ All storage layers are likewise abstracted through `cog-core` Backend Traits —
 
 ## 🚀 Quick Start
 
-Cogneva supports **Meta-bootstrap**: starting from a blank Linux machine, a single command completes environment probing, dependency self-repair, K3s/K8s adaptive deployment, security gateway configuration, and sandbox initialization, finally handing control over to the WebUI.
+Cogneva supports **Meta-bootstrap**: starting from a blank machine (Linux, macOS, or Windows), a single command completes environment probing, dependency self-repair, K3s/K8s adaptive deployment, security gateway configuration, and sandbox initialization, finally handing control over to the WebUI.
 
-### ⚡ Recommended: bare-metal bootstrap
+The entry script automatically detects whether your network is in mainland China (by probing the rustup distribution domain) and switches every dependency — source code, Rust toolchain, crates, container images, OS packages — to domestic mirrors (Gitee / TUNA / rsproxy / DaoCloud) when needed. No manual selection. Force with `COGNEVA_CN_MIRROR=1` (or `0`).
+
+### 🐧 Linux
 
 ```bash
 (curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh
 ```
+
+Runs directly on the bare metal.
+
+### 🍎 macOS
+
+```bash
+(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh
+```
+
+The **same command**. K3s needs a Linux kernel, so the script automatically installs [Lima](https://lima-vm.io) (via Homebrew) and creates an Ubuntu VM, then runs the exact same one-liner inside it. All dependencies live inside the VM; the host only gets `limactl`. When finished, the WebUI is forwarded to <http://localhost:8080>. Manage the VM with `limactl shell cogneva` / `limactl stop cogneva` / `limactl delete cogneva`.
+
+### 🪟 Windows
+
+```powershell
+# Administrator PowerShell
+iwr -useb https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.ps1 | iex
+```
+
+The script installs WSL2 + Ubuntu (prompts for a reboot if required — just re-run it afterwards, it is idempotent), then runs the same one-liner inside WSL. WSL2's default localhostForwarding exposes the WebUI at <http://localhost:8080>. Force China mirrors with `-CnMirror 1`: download the script first and pipe it, e.g. `& ([scriptblock]::Create((iwr -useb <url>).Content)) -CnMirror 1`.
 
 > The first URL is GitHub's official raw endpoint; if it is unreachable (e.g. restricted networks), the command automatically falls back to the Gitee mirror. The bootstrap script itself also falls back to the Gitee repo when fetching source code.
 

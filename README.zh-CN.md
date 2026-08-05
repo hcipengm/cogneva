@@ -522,13 +522,34 @@ Cogneva 有 20+ 业务 crate，如果让它们直接互相依赖，很快会变�
 
 ## 🚀 快速开始
 
-Cogneva 支持**元启动（Meta-bootstrap）**：从一台空白 Linux 机器出发，执行一行命令即可完成环境探测、依赖自修复、K3s/K8s 自适应部署、安全网关配置与沙盒初始化，最终把控制权交给 WebUI。
+Cogneva 支持**元启动（Meta-bootstrap）**：从一台空白机器（Linux / macOS / Windows）出发，执行一行命令即可完成环境探测、依赖自修复、K3s/K8s 自适应部署、安全网关配置与沙盒初始化，最终把控制权交给 WebUI。
 
-### ⚡ 推荐：裸机自举
+入口脚本会**自动判断国内/国外网络环境**（探测 rustup 分发域），国内环境自动把全部依赖切到国内镜像（Gitee 源码 / TUNA rustup 与 apt / rsproxy crates / DaoCloud 容器镜像 / npmmirror npm），无需手工选择。也可用 `COGNEVA_CN_MIRROR=1`（或 `0`）强制。
+
+### 🐧 Linux
 
 ```bash
 (curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh
 ```
+
+裸机直接引导。
+
+### 🍎 macOS
+
+```bash
+(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh
+```
+
+**同一条命令**。K3s 需要 Linux 内核，脚本会自动安装 [Lima](https://lima-vm.io)（经 Homebrew，国内走 TUNA 镜像）并创建 Ubuntu 虚拟机，然后在 VM 内执行完全相同的一键命令。所有依赖都装在 VM 内，宿主只多一个 `limactl`。完成后 WebUI 经端口转发到 <http://localhost:8080>。管理 VM：`limactl shell cogneva` / `limactl stop cogneva` / `limactl delete cogneva`。
+
+### 🪟 Windows
+
+```powershell
+# 管理员 PowerShell
+iwr -useb https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.ps1 | iex
+```
+
+脚本自动安装 WSL2 + Ubuntu（如需重启会提示，重启后重跑本脚本即可，幂等），然后在 WSL 内执行同一条一键命令。WSL2 默认开启 localhostForwarding，WebUI 直接在浏览器访问 <http://localhost:8080>。强制国内镜像：先下载脚本再传参，如 `& ([scriptblock]::Create((iwr -useb <地址>).Content)) -CnMirror 1`。
 
 > 第一个地址是 GitHub 官方 raw 地址；如果访问不通（比如国内受限网络），命令会自动切换到 Gitee 镜像下载，无需手动选择。脚本内部拉取源码时同样会自动回退到 Gitee 仓库。
 
