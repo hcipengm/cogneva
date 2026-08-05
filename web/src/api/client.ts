@@ -143,3 +143,42 @@ export async function sendMessage(
     content,
   });
 }
+
+export interface LlmBackend {
+  provider: string;
+  base_url: string;
+  model: string;
+  api_style: string;
+  enabled: boolean;
+  has_key: boolean;
+}
+
+export interface LlmStatus {
+  configured: boolean;
+  backends: LlmBackend[];
+}
+
+export interface LlmConfigPayload {
+  provider: string;
+  base_url: string;
+  model: string;
+  api_key: string;
+  api_style?: string;
+}
+
+export interface LlmConfigResult {
+  ok: boolean;
+  restarted: string[];
+  failed_restarts: string[];
+  message: string;
+}
+
+export async function getLlmStatus(): Promise<LlmStatus> {
+  return api.get<LlmStatus>('/api/v1/admin/llm-status');
+}
+
+export async function saveLlmConfig(
+  payload: LlmConfigPayload
+): Promise<LlmConfigResult> {
+  return api.post<LlmConfigResult>('/api/v1/admin/llm-config', payload);
+}

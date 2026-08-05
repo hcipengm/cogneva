@@ -35,6 +35,7 @@ pub mod files;
 pub mod heartbeat_history;
 pub mod hook_forwarder;
 pub mod hooks;
+pub mod llm_admin;
 pub mod memory;
 pub mod notifications;
 pub mod observability;
@@ -436,6 +437,14 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             post(evolution::rollback_handler),
         )
         .route("/api/v1/evolution/events", get(evolution::events_handler))
+        .route(
+            "/api/v1/admin/llm-status",
+            get(llm_admin::llm_status_handler),
+        )
+        .route(
+            "/api/v1/admin/llm-config",
+            post(llm_admin::llm_config_handler),
+        )
         .layer(quota_layer.clone())
         .layer(auth::middleware::require_role(
             cog_core::RoleRequirement::Admin,

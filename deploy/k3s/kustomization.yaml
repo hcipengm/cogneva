@@ -7,6 +7,7 @@ resources:
   - secret.yaml
   - cogneva-json-configmap.yaml
   - deployment.yaml
+  - llm-admin-rbac.yaml
   - service.yaml
   - github-webhook-service.yaml
   - gateway-deployment.yaml
