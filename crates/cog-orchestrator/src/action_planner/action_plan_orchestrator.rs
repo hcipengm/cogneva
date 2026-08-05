@@ -425,7 +425,11 @@ impl ActionPlanOrchestrator {
                     }))
                     .collect::<Vec<_>>());
             }
-            let task = Task::new(format!("decompose-{}", goal), TaskType::Planner, task_input);
+            let mut task = Task::new(format!("decompose-{}", goal), TaskType::Planner, task_input);
+            // CollaborationExecutor dispatches on is_executable: false routes to
+            // the decomposition path (output carries atomic_tasks); true would
+            // take the atomic-execution path and never produce a task list.
+            task.is_executable = false;
             match executor.execute(&task).await {
                 Ok(task_result) => {
                     if !task_result.success {

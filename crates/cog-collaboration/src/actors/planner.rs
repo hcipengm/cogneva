@@ -136,6 +136,29 @@ impl PlannerActor {
                  Emit ONLY a single JSON object matching the output_schema. No markdown, no XML, no code fences, no patch content. \
                  Do not output artifact tags or unified diffs; the Generator actor will create the patch later."
             );
+        } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
+            // Built-in contract for standard goal decomposition. Lowest
+            // precedence: operator schema > prompt skill > built-in.
+            ctx["response_format"] = serde_json::json!("json");
+            ctx["output_schema"] = serde_json::json!({
+                "summary": "string: one-sentence summary of the plan",
+                "plan": {"approach": "string", "steps": ["string"]},
+                "sub_tasks": [{
+                    "id": "string: unique task id like t1, t2",
+                    "name": "string: short task name",
+                    "task_type": "string: a skill id from task.input.skills, or a generic executor type",
+                    "input": {"query": "string: everything the executor needs to accomplish this task"},
+                    "blocked_by": ["string: ids of tasks that must finish first, empty if none"]
+                }]
+            });
+            ctx["instructions"] = serde_json::json!(
+                "You are the Planner actor in a Plan-Generate-Evaluate pipeline. \
+                 Read context.goal and decompose it into a small set of atomic, independently executable sub_tasks. \
+                 Every sub-task must be self-contained: its input.query carries everything the executor needs. \
+                 If the goal is trivially simple (e.g. a single question), return exactly ONE sub-task that directly addresses it. \
+                 Do NOT answer the goal yourself — your job is to produce the plan, the Generator executes it later. \
+                 Emit ONLY a single JSON object matching output_schema. No markdown, no code fences, no commentary."
+            );
         }
 
         // A configured output schema takes precedence over the built-in

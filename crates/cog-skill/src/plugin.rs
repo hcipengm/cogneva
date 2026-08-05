@@ -50,18 +50,39 @@ impl cog_core::SystemPlugin for SkillPlugin {
             Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()))
         };
         self.registry = Some(registry.clone());
+
+        let directories = vec![
+            std::path::PathBuf::from("/opt/cogneva/skills"),
+            std::path::PathBuf::from("/var/lib/cogneva/skills"),
+            dirs::home_dir()
+                .map(|h| h.join(".cogneva/skills"))
+                .unwrap_or_else(|| std::path::PathBuf::from("~/.cogneva/skills")),
+        ];
+
+        // 目标分解（action planner 的 decompose_goal）消费这份共享注册表；
+        // 把扁平 JSON 技能定义（planner/generator/evaluator 等）装进来，
+        // 否则注册表为空，自主执行流在调 LLM 前就失败。
+        {
+            let mut reg = registry.write().await;
+            for dir in &directories {
+                if !dir.is_dir() {
+                    continue;
+                }
+                match reg.load_skills_from_dir(dir) {
+                    Ok(()) => {
+                        info!(dir = %dir.display(), count = reg.get_all().len(), "skills loaded")
+                    }
+                    Err(e) => warn!(dir = %dir.display(), error = %e, "failed to load skills"),
+                }
+            }
+        }
+
         ctx.publish(registry);
         info!("SkillPlugin skill registry published");
 
         // Build external skill registry from configuration.
         let skill_config = crate::SkillConfig {
-            directories: vec![
-                std::path::PathBuf::from("/opt/cogneva/skills"),
-                std::path::PathBuf::from("/var/lib/cogneva/skills"),
-                dirs::home_dir()
-                    .map(|h| h.join(".cogneva/skills"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("~/.cogneva/skills")),
-            ],
+            directories,
             hot_reload_interval_secs: ctx.config().system.skill_hot_reload_interval_secs,
         };
 

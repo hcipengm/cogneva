@@ -222,6 +222,10 @@ COPY --from=builder /build/crates/cog-storage/migrations /opt/cogneva/crates/cog
 # WebUI 静态资源（网关同源直接服务，浏览器打开即用）
 COPY --from=webbuilder /web/dist /opt/cogneva/web
 
+# 内置技能（planner/generator/evaluator）——自主执行流按技能分解目标，
+# 缺失时 Skill registry 为空，任务在调 LLM 前就失败
+COPY skills /opt/cogneva/skills
+
 # Set ownership
 RUN chown -R cogneva:cogneva /opt/cogneva /var/lib/cogneva-data /etc/cogneva && \
     chmod +x /opt/cogneva/cogneva

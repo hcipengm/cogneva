@@ -142,6 +142,26 @@ impl EvaluatorActor {
             return output;
         }
 
+        // Built-in contract for standard evaluation. Lowest precedence:
+        // operator schema > prompt skill > built-in.
+        if self.output_schema.is_none() && self.prompt_skill.is_none() {
+            ctx["response_format"] = serde_json::json!("json");
+            ctx["output_schema"] = serde_json::json!({
+                "verdict": "pass | partial | fail",
+                "feedback": "string: what is good and what must improve",
+                "score": "integer 0-100",
+                "criteria": [{"name": "string", "score": "integer 0-100", "comment": "string"}]
+            });
+            ctx["instructions"] = serde_json::json!(
+                "You are the Evaluator actor in a Plan-Generate-Evaluate pipeline. \
+                 Judge whether context.generation correctly and completely accomplishes context.goal \
+                 following context.plan. Score 80-100 for correct and complete results, \
+                 60-79 for partially correct, below 60 for wrong or missing results. \
+                 verdict: pass when score >= 80, partial when 60-79, fail otherwise. \
+                 Emit ONLY a single JSON object matching output_schema. No markdown, no code fences, no commentary."
+            );
+        }
+
         // A configured output schema takes precedence over built-in prompt
         // contracts: operators own the contract.
         if let Some(ref schema) = self.output_schema {

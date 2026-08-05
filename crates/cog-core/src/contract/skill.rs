@@ -181,13 +181,28 @@ impl SkillRegistry {
     }
 
     /// Insert an agent skill configuration.
+    ///
+    /// Also mirrors the config into the planner-facing `skills` map so that
+    /// goal decomposition (`get_all`) sees every loaded agent skill — the two
+    /// maps must never drift apart ("Everything is a skill").
     pub fn insert_skill_config(&mut self, skill: SkillConfig) {
+        let mirrored = Skill {
+            id: skill.skill_id.clone(),
+            name: skill.name.clone(),
+            description: skill.role_type.clone(),
+            tools: skill.tools.clone(),
+            complexity_score: 0,
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+        };
+        self.skills.insert(mirrored.id.clone(), mirrored);
         self.agent_skills.insert(skill.skill_id.clone(), skill);
     }
 
     /// Remove an agent skill configuration by ID.
     pub fn remove_skill_config(&mut self, skill_id: &str) {
         self.agent_skills.remove(skill_id);
+        self.skills.remove(skill_id);
     }
 
     /// Load agent skill configurations from JSON files in a directory.

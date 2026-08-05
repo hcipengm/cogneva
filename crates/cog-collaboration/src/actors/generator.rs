@@ -134,6 +134,21 @@ impl GeneratorActor {
                 },
                 "artifact_instructions": "Output the code change as a single artifact with artifact_type='patch', name='changes.patch', content being a valid git unified diff starting with 'diff --git'. Do not wrap in markdown fences. This is a Rust workspace; include only source file modifications under src/ directories within crates/**/*.rs."
             });
+        } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
+            // Built-in contract for standard execution. Lowest precedence:
+            // operator schema > prompt skill > built-in.
+            ctx["response_format"] = serde_json::json!("json");
+            ctx["output_schema"] = serde_json::json!({
+                "content": "string: the produced result — the actual answer or deliverable for the goal",
+                "artifacts": [{"name": "string", "content": "string", "artifact_type": "string"}]
+            });
+            ctx["instructions"] = serde_json::json!(
+                "You are the Generator actor in a Plan-Generate-Evaluate pipeline. \
+                 Execute the plan in context.plan against the goal in context.goal and produce the deliverable. \
+                 Put the primary result in content (the real answer, not a description of what you would do). \
+                 Use artifacts only for named files/deliverables; an empty array is fine. \
+                 Emit ONLY a single JSON object matching output_schema. No markdown, no code fences, no commentary."
+            );
         }
 
         // A configured output schema takes precedence over built-in prompt
