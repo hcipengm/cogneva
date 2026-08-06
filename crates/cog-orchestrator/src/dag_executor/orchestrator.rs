@@ -113,6 +113,10 @@ impl DagExecutor {
     /// Best-effort fine-grained persistence of a single task.
     /// Errors are logged but never block the hot path.
     async fn persist_task_fine_grained(&self, task: &Task) {
+        // 存储权威模式下所有写入已直接落库，跳过快照/细粒度双写
+        if self.fg().is_some() {
+            return;
+        }
         if let Some(ref backend) = self.state_backend {
             let workspace_id = self.workspace_id.clone();
             let task_id = task.id.clone();
@@ -127,6 +131,9 @@ impl DagExecutor {
     }
 
     async fn do_persist(&self) {
+        if self.fg().is_some() {
+            return;
+        }
         if let Some(ref backend) = self.state_backend {
             let inner = self.inner.read().await;
             let snapshot = DagStateSnapshot {
@@ -219,6 +226,10 @@ impl DagExecutor {
 
     /// Load state from the configured backend, if any.
     pub async fn load_from_backend(&self) -> SFResult<bool> {
+        // 存储权威模式下内存无状态，快照加载无意义
+        if self.fg().is_some() {
+            return Ok(false);
+        }
         if let Some(ref backend) = self.state_backend {
             match backend.load_dag_state(&self.workspace_id).await {
                 Ok(Some(value)) => {
@@ -250,6 +261,9 @@ impl DagExecutor {
     pub async fn archive_terminated_tasks(&self) {
         if !self.archive_enabled || self.state_backend.is_none() {
             return;
+        }
+        if self.fg().is_some() {
+            return self.archive_terminated_tasks_store().await;
         }
         let threshold =
             chrono::Utc::now() - chrono::Duration::seconds(self.archive_after_secs as i64);
@@ -428,6 +442,9 @@ impl DagExecutor {
     /// state on cycle detection. Existing tasks with duplicate IDs are
     /// idempotently skipped.
     pub async fn add_tasks_batch(&self, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+        if self.fg().is_some() {
+            return self.add_tasks_batch_store(tasks).await;
+        }
         let mut inner = self.inner.write().await;
         // Phase 1: collect new tasks and their dependencies, skipping duplicates
         let mut validated: Vec<(String, HashSet<String>, Task)> = Vec::new();
@@ -507,6 +524,9 @@ impl DagExecutor {
     /// If the task already exists, returns a Validation error (use
     /// [`Self::add_tasks_batch`] for idempotent batch insertion).
     pub async fn add_task(&self, task: Task) -> SFResult<()> {
+        if self.fg().is_some() {
+            return self.add_task_store(task).await;
+        }
         let mut inner = self.inner.write().await;
         let task_id = task.id.clone();
         if inner.tasks.contains_key(&task_id) {
@@ -566,64 +586,334 @@ impl DagExecutor {
     }
 
     fn detect_cycle(inner: &Inner) -> Option<Vec<String>> {
-        let mut visited = HashSet::new();
-        let mut stack = HashSet::new();
-        let mut path = Vec::new();
-
-        for task_id in inner.dependencies.keys() {
-            if !visited.contains(task_id) {
-                if let Some(cycle) =
-                    Self::dfs_cycle(task_id, inner, &mut visited, &mut stack, &mut path)
-                {
-                    return Some(cycle);
-                }
-            }
-        }
-        None
+        detect_cycle_graph(&inner.dependencies)
     }
 
-    fn dfs_cycle(
-        node: &str,
-        inner: &Inner,
-        visited: &mut HashSet<String>,
-        stack: &mut HashSet<String>,
-        path: &mut Vec<String>,
-    ) -> Option<Vec<String>> {
-        visited.insert(node.to_string());
-        stack.insert(node.to_string());
-        path.push(node.to_string());
+    // ─── 存储权威模式（终态）─────────────────────────────────────
+    // 后端 dag_supports_fine_grained()=true 时，任务/依赖/重试历史的权威
+    // 副本在共享存储（postgres 事务保证跨 pod 原子），本结构只做编排
+    // （事件、熔断、DLQ、observable），Inner 的 tasks/dependencies/
+    // dependents 不再使用。无后端或后端只支持快照时走原有内存路径。
 
-        if let Some(deps) = inner.dependencies.get(node) {
-            for dep in deps {
-                if !visited.contains(dep) {
-                    if let Some(cycle) = Self::dfs_cycle(dep, inner, visited, stack, path) {
-                        return Some(cycle);
-                    }
-                } else if stack.contains(dep) {
-                    let idx = path.iter().position(|p| p == dep).unwrap_or(0);
-                    let cycle = path[idx..].to_vec();
-                    return Some(cycle);
+    /// 返回支持细粒度 DAG 的后端（存储权威模式开关）。
+    fn fg(&self) -> Option<&Arc<dyn cog_core::StateBackend>> {
+        self.state_backend
+            .as_ref()
+            .filter(|b| b.dag_supports_fine_grained())
+    }
+
+    /// 两种模式统一的任务集读取。
+    async fn all_tasks_unified(&self) -> Vec<Task> {
+        if let Some(be) = self.fg() {
+            be.dag_get_all_tasks(&self.workspace_id)
+                .await
+                .unwrap_or_default()
+        } else {
+            self.inner.read().await.tasks.values().cloned().collect()
+        }
+    }
+
+    /// 存储模式单任务读。
+    async fn store_task(&self, task_id: &str) -> SFResult<Task> {
+        let be = self.fg().expect("store mode");
+        be.dag_get_task(&self.workspace_id, task_id)
+            .await?
+            .ok_or_else(|| cog_core::SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: "Task not found".into(),
+            })
+    }
+
+    /// 存储模式单任务状态迁移：读出 → 校验/改写 → CAS 写回 → 发事件。
+    async fn store_transition<F>(
+        &self,
+        task_id: &str,
+        expected: &[TaskStatus],
+        reject_reason: &str,
+        mutate: F,
+        event: Option<cog_core::TaskEvent>,
+    ) -> SFResult<()>
+    where
+        F: FnOnce(&mut Task),
+    {
+        let be = self.fg().expect("store mode");
+        let mut task = self.store_task(task_id).await?;
+        if !expected.contains(&task.status) {
+            return Err(cog_core::SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: reject_reason.replace("{}", &format!("{:?}", task.status)),
+            });
+        }
+        mutate(&mut task);
+        task.updated_at = chrono::Utc::now();
+        be.dag_transition_task(&self.workspace_id, task_id, expected, &task)
+            .await?;
+        if let Some(ev) = event {
+            self.emit_event(ev);
+        }
+        Ok(())
+    }
+
+    async fn add_tasks_batch_store(&self, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+        let be = self.fg().expect("store mode");
+        let existing = be.dag_get_all_tasks(&self.workspace_id).await?;
+        let mut graph: HashMap<String, HashSet<String>> = existing
+            .iter()
+            .map(|t| (t.id.clone(), t.blocked_by.iter().cloned().collect()))
+            .collect();
+
+        let mut validated = Vec::new();
+        for task in tasks {
+            if graph.contains_key(&task.id) {
+                continue; // 幂等跳过
+            }
+            graph.insert(task.id.clone(), task.blocked_by.iter().cloned().collect());
+            validated.push(task);
+        }
+        if let Some(cycle) = detect_cycle_graph(&graph) {
+            return Err(cog_core::SFError::Validation(format!(
+                "Circular dependency detected: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        // 注意：跨 pod 并发 add 各自基于稍早的图做环检测，极端情况下可能
+        // 漏检环——任务提交通常来自单一 planner，接受该窗口（注释存档）。
+        let mut added = Vec::new();
+        for task in validated {
+            let task_id = task.id.clone();
+            be.dag_set_task(&self.workspace_id, &task_id, &task).await?;
+            self.emit_event(cog_core::TaskEvent::TaskCreated {
+                task_id: task_id.clone(),
+                timestamp: chrono::Utc::now(),
+            });
+            added.push(task_id);
+        }
+        Ok(added)
+    }
+
+    async fn add_task_store(&self, task: Task) -> SFResult<()> {
+        let be = self.fg().expect("store mode");
+        if be
+            .dag_get_task(&self.workspace_id, &task.id)
+            .await?
+            .is_some()
+        {
+            return Err(cog_core::SFError::Validation(format!(
+                "Task {} already exists",
+                task.id
+            )));
+        }
+        let added = self.add_tasks_batch_store(vec![task]).await?;
+        debug_assert_eq!(added.len(), 1);
+        Ok(())
+    }
+
+    async fn complete_task_store(
+        &self,
+        task_id: &str,
+        result: serde_json::Value,
+    ) -> SFResult<Vec<String>> {
+        let be = self.fg().expect("store mode");
+        let task = self.store_task(task_id).await?;
+        if task.status != TaskStatus::Running {
+            return Err(cog_core::SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: format!(
+                    "Cannot complete task in {:?} state — it may have been handled by timeout or retry",
+                    task.status
+                ),
+            });
+        }
+        if let Some(ref reg) = self.circuit_registry {
+            let _ = reg.record_success(&task.task_type);
+        }
+        let scheduled = be
+            .dag_complete_task(&self.workspace_id, task_id, result.clone())
+            .await?;
+        for dep_id in &scheduled {
+            self.emit_event(cog_core::TaskEvent::TaskScheduled {
+                task_id: dep_id.clone(),
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        self.emit_event(cog_core::TaskEvent::TaskCompleted {
+            task_id: task_id.into(),
+            result: Some(result),
+            scheduled_dependents: scheduled.clone(),
+            timestamp: chrono::Utc::now(),
+        });
+        crate::observable::global_observable().record_task(true);
+        Ok(scheduled)
+    }
+
+    async fn fail_task_store(
+        &self,
+        task_id: &str,
+        error: String,
+    ) -> SFResult<(bool, Vec<String>, bool)> {
+        let be = self.fg().expect("store mode");
+        let task = self.store_task(task_id).await?;
+        if let Some(ref reg) = self.circuit_registry {
+            reg.record_failure(&task.task_type)?;
+        }
+        be.dag_append_retry(
+            &self.workspace_id,
+            task_id,
+            &RetryAttempt {
+                attempt: task.retry_count + 1,
+                error: error.clone(),
+                timestamp: chrono::Utc::now(),
+            },
+        )
+        .await?;
+        let max_retries = self.retry_matrix.max_retries(&task.task_type);
+        let (retried, cancelled) = be
+            .dag_fail_task(&self.workspace_id, task_id, error.clone(), max_retries)
+            .await?;
+        for dep_id in &cancelled {
+            self.emit_event(cog_core::TaskEvent::TaskCancelled {
+                task_id: dep_id.clone(),
+                reason: format!(
+                    "Cascade cancelled: upstream task '{}' permanently failed",
+                    task_id
+                ),
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        self.emit_event(cog_core::TaskEvent::TaskFailed {
+            task_id: task_id.into(),
+            error,
+            retried,
+            cancelled: cancelled.clone(),
+            timestamp: chrono::Utc::now(),
+        });
+        crate::observable::global_observable().record_task(false);
+        let dlq_pushed = !retried && self.dlq.is_some();
+        Ok((retried, cancelled, dlq_pushed))
+    }
+
+    async fn cancel_task_store(&self, task_id: &str) -> SFResult<Vec<String>> {
+        let be = self.fg().expect("store mode");
+        let cancelled = be
+            .dag_cancel_task(&self.workspace_id, task_id, "Direct cancellation".into())
+            .await?;
+        self.emit_event(cog_core::TaskEvent::TaskCancelled {
+            task_id: task_id.into(),
+            reason: "Direct cancellation".into(),
+            timestamp: chrono::Utc::now(),
+        });
+        for dep_id in &cancelled {
+            self.emit_event(cog_core::TaskEvent::TaskCancelled {
+                task_id: dep_id.clone(),
+                reason: format!(
+                    "Cascade cancelled: upstream task '{}' was cancelled",
+                    task_id
+                ),
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        Ok(cancelled)
+    }
+
+    async fn check_timeouts_store(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+        let be = self.fg().expect("store mode");
+        let now = chrono::Utc::now();
+        let all = be
+            .dag_get_all_tasks(&self.workspace_id)
+            .await
+            .unwrap_or_default();
+        let timed_out: Vec<Task> = all
+            .into_iter()
+            .filter(|t| t.status == TaskStatus::Running)
+            .filter(|t| {
+                t.started_at
+                    .map(|s| (now - s).num_seconds() > t.timeout_seconds as i64)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        for t in timed_out {
+            // 再确认仍 Running：扫描到此间可能已被执行器完成
+            match be.dag_get_task(&self.workspace_id, &t.id).await {
+                Ok(Some(cur)) if cur.status == TaskStatus::Running => {}
+                _ => continue,
+            }
+            self.emit_event(cog_core::TaskEvent::TaskTimeout {
+                task_id: t.id.clone(),
+                timeout_seconds: t.timeout_seconds,
+                timestamp: chrono::Utc::now(),
+            });
+            if let Ok((retried, cancelled, dlq_pushed)) = self
+                .fail_task(
+                    &t.id,
+                    format!("Task timed out after {} seconds", t.timeout_seconds),
+                )
+                .await
+            {
+                if retried {
+                    let _ = self
+                        .store_transition(
+                            &t.id,
+                            &[TaskStatus::Pending],
+                            "Cannot transition task in {} state",
+                            |task| task.started_at = None,
+                            None,
+                        )
+                        .await;
                 }
+                results.push((t.id.clone(), retried, cancelled, dlq_pushed));
             }
         }
+        results
+    }
 
-        path.pop();
-        stack.remove(node);
-        None
+    async fn archive_terminated_tasks_store(&self) {
+        // 存储权威模式下终态任务本身就是持久记录，不做"内存→细粒度存储"
+        // 的搬迁（那是内存模式的归档语义）。保留行即保留审计轨迹。
+        let be = self.fg().expect("store mode");
+        let threshold =
+            chrono::Utc::now() - chrono::Duration::seconds(self.archive_after_secs as i64);
+        let all = be
+            .dag_get_all_tasks(&self.workspace_id)
+            .await
+            .unwrap_or_default();
+        let to_archive: Vec<String> = all
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                ) && t.updated_at < threshold
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for task_id in &to_archive {
+            if let Err(e) = be.dag_remove_task(&self.workspace_id, task_id).await {
+                tracing::warn!("archive: dag_remove_task failed for {}: {}", task_id, e);
+            }
+        }
+        if !to_archive.is_empty() {
+            tracing::info!(
+                "Archived {} terminated task(s) from store (workspace {})",
+                to_archive.len(),
+                self.workspace_id
+            );
+        }
     }
 
     pub async fn find_ready_tasks(&self) -> Vec<Task> {
-        let inner = self.inner.read().await;
-        let mut ready: Vec<Task> = inner
-            .tasks
-            .values()
+        let tasks = self.all_tasks_unified().await;
+        let by_id: std::collections::HashMap<&str, &Task> =
+            tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        let mut ready: Vec<Task> = tasks
+            .iter()
             .filter(|t| t.status == TaskStatus::Pending)
             .filter(|t| t.is_executable)
             .filter(|t| {
                 t.blocked_by.iter().all(|dep_id| {
-                    inner
-                        .tasks
-                        .get(dep_id)
+                    by_id
+                        .get(dep_id.as_str())
                         .map(|dep| dep.status == TaskStatus::Completed)
                         .unwrap_or(false)
                 })
@@ -638,16 +928,16 @@ impl DagExecutor {
     /// Unlike [`Self::find_ready_tasks`], this includes tasks that have already
     /// been transitioned to `Scheduled` — useful for query endpoints.
     pub async fn get_ready_tasks(&self) -> Vec<Task> {
-        let inner = self.inner.read().await;
-        let mut ready: Vec<Task> = inner
-            .tasks
-            .values()
+        let tasks = self.all_tasks_unified().await;
+        let by_id: std::collections::HashMap<&str, &Task> =
+            tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        let mut ready: Vec<Task> = tasks
+            .iter()
             .filter(|t| t.status == TaskStatus::Pending || t.status == TaskStatus::Scheduled)
             .filter(|t| {
                 t.blocked_by.iter().all(|dep_id| {
-                    inner
-                        .tasks
-                        .get(dep_id)
+                    by_id
+                        .get(dep_id.as_str())
                         .map(|dep| dep.status == TaskStatus::Completed)
                         .unwrap_or(false)
                 })
@@ -659,6 +949,20 @@ impl DagExecutor {
     }
 
     pub async fn schedule_task(&self, task_id: &str) -> SFResult<()> {
+        if self.fg().is_some() {
+            return self
+                .store_transition(
+                    task_id,
+                    &[TaskStatus::Pending],
+                    "Cannot schedule task in {} state",
+                    |t| t.status = TaskStatus::Scheduled,
+                    Some(cog_core::TaskEvent::TaskScheduled {
+                        task_id: task_id.into(),
+                        timestamp: chrono::Utc::now(),
+                    }),
+                )
+                .await;
+        }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
@@ -689,6 +993,20 @@ impl DagExecutor {
     }
 
     pub async fn assign_task(&self, task_id: &str, agent_id: &str) -> SFResult<()> {
+        if self.fg().is_some() {
+            return self
+                .store_transition(
+                    task_id,
+                    &[TaskStatus::Pending, TaskStatus::Scheduled],
+                    "Cannot assign task in {} state",
+                    |t| t.agent_id = Some(agent_id.into()),
+                    Some(cog_core::TaskEvent::TaskScheduled {
+                        task_id: task_id.into(),
+                        timestamp: chrono::Utc::now(),
+                    }),
+                )
+                .await;
+        }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
@@ -719,6 +1037,23 @@ impl DagExecutor {
     }
 
     pub async fn start_task(&self, task_id: &str) -> SFResult<()> {
+        if self.fg().is_some() {
+            return self
+                .store_transition(
+                    task_id,
+                    &[TaskStatus::Scheduled],
+                    "Cannot start task in {} state",
+                    |t| {
+                        t.status = TaskStatus::Running;
+                        t.started_at = Some(chrono::Utc::now());
+                    },
+                    Some(cog_core::TaskEvent::TaskStarted {
+                        task_id: task_id.into(),
+                        timestamp: chrono::Utc::now(),
+                    }),
+                )
+                .await;
+        }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
@@ -754,6 +1089,9 @@ impl DagExecutor {
         task_id: &str,
         result: serde_json::Value,
     ) -> SFResult<Vec<String>> {
+        if self.fg().is_some() {
+            return self.complete_task_store(task_id, result).await;
+        }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
@@ -876,6 +1214,9 @@ impl DagExecutor {
         task_id: &str,
         error: String,
     ) -> SFResult<(bool, Vec<String>, bool)> {
+        if self.fg().is_some() {
+            return self.fail_task_store(task_id, error).await;
+        }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let (task_type, retry_count) = {
@@ -1010,25 +1351,35 @@ impl DagExecutor {
     /// to ensure the DLQ entry is persisted.
     pub async fn push_to_dlq(&self, task_id: &str, error: String) -> SFResult<bool> {
         if let Some(ref dlq) = self.dlq {
-            self.ensure_task_present(task_id).await?;
-            let inner = self.inner.read().await;
-            let task = inner
-                .tasks
-                .get(task_id)
-                .ok_or_else(|| SFError::TaskFailed {
-                    task_id: task_id.into(),
-                    reason: "Task not found".into(),
-                })?;
-
-            let history = inner
-                .retry_history
-                .get(task_id)
-                .cloned()
-                .unwrap_or_default();
+            let (task, history) = if let Some(be) = self.fg() {
+                let task = self.store_task(task_id).await?;
+                let history = be
+                    .dag_get_retry_history(&self.workspace_id, task_id)
+                    .await
+                    .unwrap_or_default();
+                (task, history)
+            } else {
+                self.ensure_task_present(task_id).await?;
+                let inner = self.inner.read().await;
+                let task = inner
+                    .tasks
+                    .get(task_id)
+                    .ok_or_else(|| SFError::TaskFailed {
+                        task_id: task_id.into(),
+                        reason: "Task not found".into(),
+                    })?
+                    .clone();
+                let history = inner
+                    .retry_history
+                    .get(task_id)
+                    .cloned()
+                    .unwrap_or_default();
+                (task, history)
+            };
 
             let entry = DeadLetterEntry {
                 original_task_id: task_id.into(),
-                task: task.clone(),
+                task,
                 final_error: error,
                 retry_history: history,
                 enqueued_at: chrono::Utc::now(),
@@ -1043,6 +1394,9 @@ impl DagExecutor {
     }
 
     pub async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
+        if self.fg().is_some() {
+            return self.cancel_task_store(task_id).await;
+        }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
@@ -1107,6 +1461,26 @@ impl DagExecutor {
     }
 
     pub async fn retry_task(&self, task_id: &str) -> SFResult<()> {
+        if self.fg().is_some() {
+            return self
+                .store_transition(
+                    task_id,
+                    &[TaskStatus::Failed],
+                    "Cannot retry task in {} state; only Failed tasks can be retried",
+                    |t| {
+                        t.status = TaskStatus::Pending;
+                        t.retry_count = 0;
+                        t.error = None;
+                        t.started_at = None;
+                    },
+                    Some(cog_core::TaskEvent::TaskRetried {
+                        task_id: task_id.into(),
+                        retry_count: 0,
+                        timestamp: chrono::Utc::now(),
+                    }),
+                )
+                .await;
+        }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
 
@@ -1150,15 +1524,14 @@ impl DagExecutor {
     }
 
     pub async fn all_completed(&self) -> bool {
-        let inner = self.inner.read().await;
-        !inner.tasks.is_empty()
-            && inner
-                .tasks
-                .values()
-                .all(|t| t.status == TaskStatus::Completed)
+        let tasks = self.all_tasks_unified().await;
+        !tasks.is_empty() && tasks.iter().all(|t| t.status == TaskStatus::Completed)
     }
 
     pub async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+        if self.fg().is_some() {
+            return self.check_timeouts_store().await;
+        }
         let now = chrono::Utc::now();
         let task_ids: Vec<String> = {
             let inner = self.inner.read().await;
@@ -1228,17 +1601,36 @@ impl DagExecutor {
     }
 
     pub async fn get_task(&self, task_id: &str) -> Option<Task> {
+        if let Some(be) = self.fg() {
+            return be
+                .dag_get_task(&self.workspace_id, task_id)
+                .await
+                .ok()
+                .flatten();
+        }
         self.ensure_task_present(task_id).await.ok()?;
         let inner = self.inner.read().await;
         inner.tasks.get(task_id).cloned()
     }
 
     pub async fn get_all_tasks(&self) -> Vec<Task> {
-        let inner = self.inner.read().await;
-        inner.tasks.values().cloned().collect()
+        self.all_tasks_unified().await
     }
 
     pub async fn get_dependents(&self, task_id: &str) -> Option<Vec<Task>> {
+        if let Some(be) = self.fg() {
+            let ids = be
+                .dag_get_dependents(&self.workspace_id, task_id)
+                .await
+                .ok()?;
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Ok(Some(t)) = be.dag_get_task(&self.workspace_id, &id).await {
+                    out.push(t);
+                }
+            }
+            return Some(out);
+        }
         let inner = self.inner.read().await;
         inner.dependents.get(task_id).map(|ids| {
             ids.iter()
@@ -1248,6 +1640,18 @@ impl DagExecutor {
     }
 
     pub async fn get_dependencies(&self, task_id: &str) -> Option<Vec<Task>> {
+        if self.fg().is_some() {
+            let t = self.store_task(task_id).await.ok()?;
+            let tasks = self.all_tasks_unified().await;
+            let by_id: std::collections::HashMap<&str, &Task> =
+                tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+            return Some(
+                t.blocked_by
+                    .iter()
+                    .filter_map(|id| by_id.get(id.as_str()).map(|t| (*t).clone()))
+                    .collect(),
+            );
+        }
         let inner = self.inner.read().await;
         inner.dependencies.get(task_id).map(|ids| {
             ids.iter()
@@ -1257,18 +1661,21 @@ impl DagExecutor {
     }
 
     pub async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
-        let inner = self.inner.read().await;
-        let nodes: Vec<Task> = inner.tasks.values().cloned().collect();
+        let tasks = self.all_tasks_unified().await;
         let mut edges = Vec::new();
-        for (task_id, deps) in &inner.dependencies {
-            for dep_id in deps {
-                edges.push((dep_id.clone(), task_id.clone()));
+        for t in &tasks {
+            for dep_id in &t.blocked_by {
+                edges.push((dep_id.clone(), t.id.clone()));
             }
         }
-        (nodes, edges)
+        (tasks, edges)
     }
 
     pub async fn delete_task(&self, task_id: &str) -> SFResult<()> {
+        if let Some(be) = self.fg() {
+            self.store_task(task_id).await?;
+            return be.dag_remove_task(&self.workspace_id, task_id).await;
+        }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         if !inner.tasks.contains_key(task_id) {
@@ -1317,6 +1724,12 @@ impl DagExecutor {
 
     /// Get retry history for a task.
     pub async fn get_retry_history(&self, task_id: &str) -> Option<Vec<RetryAttempt>> {
+        if let Some(be) = self.fg() {
+            return be
+                .dag_get_retry_history(&self.workspace_id, task_id)
+                .await
+                .ok();
+        }
         let inner = self.inner.read().await;
         inner.retry_history.get(task_id).cloned()
     }
@@ -1327,9 +1740,11 @@ impl DagExecutor {
     /// returns `true` if *any* task in the given set is still
     /// retryable (has not exhausted its retries).
     pub async fn crew_can_retry(&self, task_ids: &[String]) -> bool {
-        let inner = self.inner.read().await;
+        let tasks = self.all_tasks_unified().await;
+        let by_id: std::collections::HashMap<&str, &Task> =
+            tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         task_ids.iter().any(|id| {
-            inner.tasks.get(id).is_some_and(|t| {
+            by_id.get(id.as_str()).is_some_and(|t| {
                 let max = self.retry_matrix.max_retries(&t.task_type);
                 t.retry_count < max && t.status != TaskStatus::Failed
             })
@@ -1368,6 +1783,50 @@ impl DagExecutor {
 }
 
 use async_trait::async_trait;
+
+/// 在依赖图（task → blocked_by 集合）上 DFS 检测环，两种模式共用。
+fn detect_cycle_graph(deps: &HashMap<String, HashSet<String>>) -> Option<Vec<String>> {
+    fn dfs(
+        node: &str,
+        deps: &HashMap<String, HashSet<String>>,
+        visited: &mut HashSet<String>,
+        stack: &mut HashSet<String>,
+        path: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        visited.insert(node.to_string());
+        stack.insert(node.to_string());
+        path.push(node.to_string());
+
+        if let Some(children) = deps.get(node) {
+            for dep in children {
+                if !visited.contains(dep) {
+                    if let Some(cycle) = dfs(dep, deps, visited, stack, path) {
+                        return Some(cycle);
+                    }
+                } else if stack.contains(dep) {
+                    let idx = path.iter().position(|p| p == dep).unwrap_or(0);
+                    return Some(path[idx..].to_vec());
+                }
+            }
+        }
+
+        path.pop();
+        stack.remove(node);
+        None
+    }
+
+    let mut visited = HashSet::new();
+    let mut stack = HashSet::new();
+    let mut path = Vec::new();
+    for task_id in deps.keys() {
+        if !visited.contains(task_id) {
+            if let Some(cycle) = dfs(task_id, deps, &mut visited, &mut stack, &mut path) {
+                return Some(cycle);
+            }
+        }
+    }
+    None
+}
 
 #[async_trait]
 impl cog_core::DagExecutor for DagExecutor {
@@ -1597,5 +2056,153 @@ mod tests {
         let pod = DagExecutor::new("ws-solo".into());
         let err = pod.schedule_task("nope").await.unwrap_err();
         assert!(err.to_string().contains("Task not found"));
+    }
+
+    /// 终态双副本：两个 DagExecutor 共享一个支持细粒度 dag_* 的后端，
+    /// 模拟双 pod —— 内存不再权威，所有读写直落共享存储。
+    fn fg_pods() -> (DagExecutor, DagExecutor) {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        (
+            DagExecutor::new("ws-fg".into()).with_state_backend(backend.clone()),
+            DagExecutor::new("ws-fg".into()).with_state_backend(backend),
+        )
+    }
+
+    fn chain(ids: &[&str]) -> Vec<Task> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut t = Task::new(*id, TaskType::Generator, serde_json::json!({}));
+                if i > 0 {
+                    t.blocked_by = vec![ids[i - 1].to_string()];
+                }
+                t
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_fg_add_visible_across_pods_without_load() {
+        let (pod_a, pod_b) = fg_pods();
+        pod_a.add_tasks_batch(chain(&["t1", "t2"])).await.unwrap();
+
+        // pod B 内存为空、不调 load_from_backend，依然全量可见
+        assert!(pod_b.inner.read().await.tasks.is_empty());
+        assert!(pod_b.get_task("t1").await.is_some());
+        assert_eq!(pod_b.get_all_tasks().await.len(), 2);
+        let (nodes, edges) = pod_b.get_graph().await;
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(edges, vec![("t1".to_string(), "t2".to_string())]);
+        let deps = pod_b.get_dependencies("t2").await.unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].id, "t1");
+        let dependents = pod_b.get_dependents("t1").await.unwrap();
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0].id, "t2");
+    }
+
+    #[tokio::test]
+    async fn test_fg_complete_cascades_ready_across_pods() {
+        let (pod_a, pod_b) = fg_pods();
+        pod_a.add_tasks_batch(chain(&["t1", "t2"])).await.unwrap();
+
+        // 跨 pod 接力：A 调度，B 启动并完成
+        pod_a.schedule_task("t1").await.unwrap();
+        pod_b.start_task("t1").await.unwrap();
+        let unlocked = pod_b
+            .complete_task("t1", serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        assert_eq!(unlocked, vec!["t2".to_string()]);
+
+        // complete 同事务已把 t2 翻为 Scheduled，pod A 立即可见
+        let t2_view = pod_a.get_task("t2").await.unwrap();
+        assert_eq!(t2_view.status, TaskStatus::Scheduled);
+        assert!(pod_a.get_ready_tasks().await.iter().any(|t| t.id == "t2"));
+        assert!(!pod_a.all_completed().await);
+    }
+
+    #[tokio::test]
+    async fn test_fg_fail_terminal_cascades_cancel_across_pods() {
+        let (pod_a, pod_b) = fg_pods();
+        let mut tasks = chain(&["root", "mid", "leaf"]);
+        tasks[0].retry_count = u32::MAX - 1; // 超过任何 max_retries，fail 必终败
+        pod_a.add_tasks_batch(tasks).await.unwrap();
+
+        pod_a.schedule_task("root").await.unwrap();
+        pod_b.start_task("root").await.unwrap();
+        let (retried, cancelled, _dlq) = pod_b.fail_task("root", "boom".into()).await.unwrap();
+        assert!(!retried);
+        assert!(cancelled.contains(&"mid".to_string()));
+        assert!(cancelled.contains(&"leaf".to_string()));
+
+        // 级联取消跨 pod 可见
+        assert_eq!(
+            pod_a.get_task("mid").await.unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            pod_a.get_task("leaf").await.unwrap().status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fg_cas_conflict_rejects_stale_transition() {
+        let (pod_a, pod_b) = fg_pods();
+        pod_a
+            .add_task(Task::new("t1", TaskType::Generator, serde_json::json!({})))
+            .await
+            .unwrap();
+        pod_a.schedule_task("t1").await.unwrap();
+        pod_b.start_task("t1").await.unwrap(); // Running
+
+        // pod A 持过期视图再 start：状态已不在 [Scheduled]，CAS 拒绝
+        let err = pod_a.start_task("t1").await.unwrap_err();
+        assert!(err.to_string().contains("Cannot start task"));
+    }
+
+    #[tokio::test]
+    async fn test_fg_retry_history_shared_across_pods() {
+        let (pod_a, pod_b) = fg_pods();
+        pod_a
+            .add_task(Task::new("t1", TaskType::Generator, serde_json::json!({})))
+            .await
+            .unwrap();
+        pod_a.schedule_task("t1").await.unwrap();
+        pod_b.start_task("t1").await.unwrap();
+        let (retried, _, _) = pod_b.fail_task("t1", "flaky".into()).await.unwrap();
+        assert!(retried);
+
+        // 重试历史写共享存储，pod A 直接可读
+        let history = pod_a.get_retry_history("t1").await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].error, "flaky");
+        // retry 后回 Pending（非 Scheduled），可重新走调度流程
+        assert_eq!(
+            pod_a.get_task("t1").await.unwrap().status,
+            TaskStatus::Pending
+        );
+        pod_a.schedule_task("t1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fg_delete_and_cancel_across_pods() {
+        let (pod_a, pod_b) = fg_pods();
+        pod_a
+            .add_tasks_batch(chain(&["root", "child"]))
+            .await
+            .unwrap();
+
+        let cancelled = pod_b.cancel_task("root").await.unwrap();
+        assert_eq!(cancelled, vec!["child".to_string()]);
+        assert_eq!(
+            pod_a.get_task("root").await.unwrap().status,
+            TaskStatus::Cancelled
+        );
+
+        pod_a.delete_task("child").await.unwrap();
+        assert!(pod_b.get_task("child").await.is_none());
+        assert_eq!(pod_b.get_all_tasks().await.len(), 1);
     }
 }

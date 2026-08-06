@@ -25,8 +25,7 @@ struct MemoryStore {
     boards: HashMap<String, ContextBoard>,
     dag_states: HashMap<String, serde_json::Value>,
     dag_tasks: HashMap<String, HashMap<String, cog_core::Task>>,
-    dag_deps: HashMap<String, HashMap<String, Vec<String>>>,
-    dag_dependents: HashMap<String, HashMap<String, Vec<String>>>,
+    dag_retries: HashMap<String, HashMap<String, Vec<cog_core::RetryAttempt>>>,
 }
 
 /// In-memory state backend for testing.
@@ -207,6 +206,10 @@ impl StateBackend for MemoryStateBackend {
         Ok(store.dag_states.get(workspace_id).cloned())
     }
 
+    fn dag_supports_fine_grained(&self) -> bool {
+        true
+    }
+
     async fn dag_get_task(
         &self,
         workspace_id: &str,
@@ -240,6 +243,32 @@ impl StateBackend for MemoryStateBackend {
         Ok(())
     }
 
+    async fn dag_transition_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        expected: &[cog_core::TaskStatus],
+        updated: &cog_core::Task,
+    ) -> SFResult<()> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        let tasks = store.dag_tasks.entry(workspace_id.into()).or_default();
+        let current = tasks.get(task_id).ok_or_else(|| SFError::TaskFailed {
+            task_id: task_id.into(),
+            reason: "Task not found".into(),
+        })?;
+        if !expected.contains(&current.status) {
+            return Err(SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: format!("Cannot transition task in {:?} state", current.status),
+            });
+        }
+        tasks.insert(task_id.into(), updated.clone());
+        Ok(())
+    }
+
     async fn dag_remove_task(&self, workspace_id: &str, task_id: &str) -> SFResult<()> {
         let mut store = self
             .store
@@ -248,10 +277,7 @@ impl StateBackend for MemoryStateBackend {
         if let Some(m) = store.dag_tasks.get_mut(workspace_id) {
             m.remove(task_id);
         }
-        if let Some(m) = store.dag_deps.get_mut(workspace_id) {
-            m.remove(task_id);
-        }
-        if let Some(m) = store.dag_dependents.get_mut(workspace_id) {
+        if let Some(m) = store.dag_retries.get_mut(workspace_id) {
             m.remove(task_id);
         }
         Ok(())
@@ -269,6 +295,18 @@ impl StateBackend for MemoryStateBackend {
             .unwrap_or_default())
     }
 
+    async fn dag_get_all_tasks(&self, workspace_id: &str) -> SFResult<Vec<cog_core::Task>> {
+        let store = self
+            .store
+            .read()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        Ok(store
+            .dag_tasks
+            .get(workspace_id)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
     async fn dag_get_dependencies(
         &self,
         workspace_id: &str,
@@ -279,28 +317,11 @@ impl StateBackend for MemoryStateBackend {
             .read()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         Ok(store
-            .dag_deps
+            .dag_tasks
             .get(workspace_id)
-            .and_then(|m| m.get(task_id).cloned())
+            .and_then(|m| m.get(task_id))
+            .map(|t| t.blocked_by.clone())
             .unwrap_or_default())
-    }
-
-    async fn dag_set_dependencies(
-        &self,
-        workspace_id: &str,
-        task_id: &str,
-        deps: &[String],
-    ) -> SFResult<()> {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        store
-            .dag_deps
-            .entry(workspace_id.into())
-            .or_default()
-            .insert(task_id.into(), deps.to_vec());
-        Ok(())
     }
 
     async fn dag_get_dependents(&self, workspace_id: &str, task_id: &str) -> SFResult<Vec<String>> {
@@ -309,28 +330,15 @@ impl StateBackend for MemoryStateBackend {
             .read()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         Ok(store
-            .dag_dependents
+            .dag_tasks
             .get(workspace_id)
-            .and_then(|m| m.get(task_id).cloned())
+            .map(|m| {
+                m.values()
+                    .filter(|t| t.blocked_by.iter().any(|b| b == task_id))
+                    .map(|t| t.id.clone())
+                    .collect()
+            })
             .unwrap_or_default())
-    }
-
-    async fn dag_set_dependents(
-        &self,
-        workspace_id: &str,
-        task_id: &str,
-        dependents: &[String],
-    ) -> SFResult<()> {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        store
-            .dag_dependents
-            .entry(workspace_id.into())
-            .or_default()
-            .insert(task_id.into(), dependents.to_vec());
-        Ok(())
     }
 
     async fn dag_complete_task(
@@ -343,52 +351,50 @@ impl StateBackend for MemoryStateBackend {
             .store
             .write()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-
-        // Clone dependency data before taking mutable borrow of tasks.
-        let dependents = store
-            .dag_dependents
-            .get(workspace_id)
-            .cloned()
-            .unwrap_or_default();
-        let deps = store
-            .dag_deps
-            .get(workspace_id)
-            .cloned()
-            .unwrap_or_default();
-
         let tasks = store.dag_tasks.entry(workspace_id.into()).or_default();
+
         let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
             task_id: task_id.into(),
             reason: "Task not found".into(),
         })?;
-
+        if task.status != cog_core::TaskStatus::Running {
+            return Err(SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: format!(
+                    "Cannot complete task in {:?} state — it may have been handled by timeout or retry",
+                    task.status
+                ),
+            });
+        }
         task.status = cog_core::TaskStatus::Completed;
         task.result = Some(result);
         task.updated_at = chrono::Utc::now();
 
+        let dependent_ids: Vec<String> = tasks
+            .values()
+            .filter(|t| t.blocked_by.iter().any(|b| b == task_id))
+            .map(|t| t.id.clone())
+            .collect();
+
         let mut ready = Vec::new();
-        if let Some(dep_ids) = dependents.get(task_id) {
-            for dep_id in dep_ids {
-                let all_ready = deps
-                    .get(dep_id)
-                    .map(|blocked| {
-                        blocked.iter().all(|b| {
+        for dep_id in dependent_ids {
+            let all_ready = tasks
+                .get(&dep_id)
+                .map(|d| {
+                    d.status == cog_core::TaskStatus::Pending
+                        && d.blocked_by.iter().all(|b| {
                             tasks
                                 .get(b)
-                                .map(|t| matches!(t.status, cog_core::TaskStatus::Completed))
+                                .map(|t| t.status == cog_core::TaskStatus::Completed)
                                 .unwrap_or(false)
                         })
-                    })
-                    .unwrap_or(true);
-
-                if all_ready {
-                    if let Some(dep_task) = tasks.get_mut(dep_id) {
-                        if matches!(dep_task.status, cog_core::TaskStatus::Pending) {
-                            dep_task.status = cog_core::TaskStatus::Scheduled;
-                            dep_task.updated_at = chrono::Utc::now();
-                            ready.push(dep_id.clone());
-                        }
-                    }
+                })
+                .unwrap_or(false);
+            if all_ready {
+                if let Some(dep_task) = tasks.get_mut(&dep_id) {
+                    dep_task.status = cog_core::TaskStatus::Scheduled;
+                    dep_task.updated_at = chrono::Utc::now();
+                    ready.push(dep_id);
                 }
             }
         }
@@ -407,48 +413,133 @@ impl StateBackend for MemoryStateBackend {
             .store
             .write()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-
-        // Clone dependency data before taking mutable borrow of tasks.
-        let dependents = store
-            .dag_dependents
-            .get(workspace_id)
-            .cloned()
-            .unwrap_or_default();
-
         let tasks = store.dag_tasks.entry(workspace_id.into()).or_default();
+
         let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
             task_id: task_id.into(),
             reason: "Task not found".into(),
         })?;
-
         task.error = Some(error.clone());
         task.updated_at = chrono::Utc::now();
 
-        let should_retry = task.retry_count < max_retries;
-        let mut cancelled = Vec::new();
-
-        if should_retry {
-            task.status = cog_core::TaskStatus::Scheduled;
+        if task.retry_count < max_retries {
             task.retry_count += 1;
-        } else {
-            task.status = cog_core::TaskStatus::Failed;
-            if let Some(dep_ids) = dependents.get(task_id) {
-                for dep_id in dep_ids {
-                    if let Some(dep_task) = tasks.get_mut(dep_id) {
-                        if matches!(
-                            dep_task.status,
-                            cog_core::TaskStatus::Pending | cog_core::TaskStatus::Scheduled
-                        ) {
-                            dep_task.status = cog_core::TaskStatus::Cancelled;
-                            dep_task.updated_at = chrono::Utc::now();
-                            cancelled.push(dep_id.clone());
-                        }
-                    }
+            task.status = cog_core::TaskStatus::Pending;
+            return Ok((true, Vec::new()));
+        }
+
+        task.status = cog_core::TaskStatus::Failed;
+        let downstream = collect_downstream_derived(tasks, task_id);
+        let mut cancelled = Vec::new();
+        for dep_id in downstream {
+            if let Some(t) = tasks.get_mut(&dep_id) {
+                if !matches!(
+                    t.status,
+                    cog_core::TaskStatus::Cancelled
+                        | cog_core::TaskStatus::Failed
+                        | cog_core::TaskStatus::Completed
+                ) {
+                    t.status = cog_core::TaskStatus::Cancelled;
+                    t.error = Some(format!(
+                        "Cascade cancelled: upstream task '{}' permanently failed with error: {}",
+                        task_id, error
+                    ));
+                    t.updated_at = chrono::Utc::now();
+                    cancelled.push(dep_id.clone());
                 }
             }
         }
+        Ok((false, cancelled))
+    }
 
-        Ok((should_retry, cancelled))
+    async fn dag_cancel_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        reason: String,
+    ) -> SFResult<Vec<String>> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        let tasks = store.dag_tasks.entry(workspace_id.into()).or_default();
+
+        let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
+            task_id: task_id.into(),
+            reason: "Task not found".into(),
+        })?;
+        if matches!(
+            task.status,
+            cog_core::TaskStatus::Cancelled
+                | cog_core::TaskStatus::Failed
+                | cog_core::TaskStatus::Completed
+        ) {
+            return Err(SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: format!("Cannot cancel task in {:?} state", task.status),
+            });
+        }
+        task.status = cog_core::TaskStatus::Cancelled;
+        task.error = Some(reason.clone());
+        task.updated_at = chrono::Utc::now();
+
+        let downstream = collect_downstream_derived(tasks, task_id);
+        let mut cancelled = Vec::new();
+        for dep_id in downstream {
+            if let Some(t) = tasks.get_mut(&dep_id) {
+                if !matches!(
+                    t.status,
+                    cog_core::TaskStatus::Cancelled
+                        | cog_core::TaskStatus::Failed
+                        | cog_core::TaskStatus::Completed
+                ) {
+                    t.status = cog_core::TaskStatus::Cancelled;
+                    t.error = Some(format!(
+                        "Cascade cancelled: upstream task '{}' was cancelled",
+                        task_id
+                    ));
+                    t.updated_at = chrono::Utc::now();
+                    cancelled.push(dep_id.clone());
+                }
+            }
+        }
+        Ok(cancelled)
+    }
+
+    async fn dag_append_retry(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        attempt: &cog_core::RetryAttempt,
+    ) -> SFResult<()> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        store
+            .dag_retries
+            .entry(workspace_id.into())
+            .or_default()
+            .entry(task_id.into())
+            .or_default()
+            .push(attempt.clone());
+        Ok(())
+    }
+
+    async fn dag_get_retry_history(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> SFResult<Vec<cog_core::RetryAttempt>> {
+        let store = self
+            .store
+            .read()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        Ok(store
+            .dag_retries
+            .get(workspace_id)
+            .and_then(|m| m.get(task_id).cloned())
+            .unwrap_or_default())
     }
 
     async fn dag_clear_workspace(&self, workspace_id: &str) -> SFResult<()> {
@@ -457,11 +548,31 @@ impl StateBackend for MemoryStateBackend {
             .write()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         store.dag_tasks.remove(workspace_id);
-        store.dag_deps.remove(workspace_id);
-        store.dag_dependents.remove(workspace_id);
+        store.dag_retries.remove(workspace_id);
         store.dag_states.remove(workspace_id);
         Ok(())
     }
+}
+
+/// BFS over derived dependents (blocked_by 反向)收集全部下游任务 id。
+fn collect_downstream_derived(
+    tasks: &HashMap<String, cog_core::Task>,
+    task_id: &str,
+) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut stack = vec![task_id.to_string()];
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(task_id.to_string());
+
+    while let Some(current) = stack.pop() {
+        for t in tasks.values() {
+            if t.blocked_by.iter().any(|b| b == &current) && visited.insert(t.id.clone()) {
+                result.push(t.id.clone());
+                stack.push(t.id.clone());
+            }
+        }
+    }
+    result
 }
 
 /// In-memory snapshot store for testing.

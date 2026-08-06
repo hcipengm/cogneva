@@ -126,7 +126,49 @@ impl PostgresStateBackend {
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
 
+        // 存储权威模式的单任务表：task 存完整序列化，status 冗余一列供
+        // CAS 与就绪扫描，依赖边不落地（从 task.blocked_by 派生查询，
+        // 消掉反向索引双写竞态），retry_history 随行原子追加。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cog_dag_tasks (
+                workspace_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                task JSONB NOT NULL,
+                status TEXT NOT NULL,
+                retry_history JSONB NOT NULL DEFAULT '[]'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (workspace_id, task_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_status
+            ON cog_dag_tasks(workspace_id, status)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
         Ok(())
+    }
+}
+
+/// TaskStatus 的 DB 文本形式（与 serde snake_case 一致）。
+fn status_str(status: &cog_core::TaskStatus) -> &'static str {
+    match status {
+        cog_core::TaskStatus::Pending => "pending",
+        cog_core::TaskStatus::Scheduled => "scheduled",
+        cog_core::TaskStatus::Running => "running",
+        cog_core::TaskStatus::Completed => "completed",
+        cog_core::TaskStatus::Failed => "failed",
+        cog_core::TaskStatus::Cancelled => "cancelled",
     }
 }
 
@@ -434,5 +476,526 @@ impl StateBackend for PostgresStateBackend {
             .await?;
 
         Ok(row.map(|r| r.0))
+    }
+
+    fn dag_supports_fine_grained(&self) -> bool {
+        true
+    }
+
+    async fn dag_get_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> SFResult<Option<cog_core::Task>> {
+        let row: Option<(serde_json::Value,)> = self
+            .retry(|| async {
+                sqlx::query_as(
+                    "SELECT task FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id = $2",
+                )
+                .bind(workspace_id)
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await
+            })
+            .await?;
+        row.map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .transpose()
+    }
+
+    async fn dag_set_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        task: &cog_core::Task,
+    ) -> SFResult<()> {
+        let value = serde_json::to_value(task)?;
+        let status = status_str(&task.status);
+        self.retry(|| async {
+            sqlx::query(
+                r#"
+                INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (workspace_id, task_id) DO UPDATE SET
+                    task = EXCLUDED.task,
+                    status = EXCLUDED.status,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(workspace_id)
+            .bind(task_id)
+            .bind(value.clone())
+            .bind(status)
+            .execute(&self.pool)
+            .await
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn dag_transition_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        expected: &[cog_core::TaskStatus],
+        updated: &cog_core::Task,
+    ) -> SFResult<()> {
+        let value = serde_json::to_value(updated)?;
+        let new_status = status_str(&updated.status);
+        let expected: Vec<&str> = expected.iter().map(status_str).collect();
+
+        let result = self
+            .retry(|| async {
+                sqlx::query(
+                    r#"
+                    UPDATE cog_dag_tasks
+                    SET task = $3, status = $4, updated_at = NOW()
+                    WHERE workspace_id = $1 AND task_id = $2 AND status = ANY($5)
+                    "#,
+                )
+                .bind(workspace_id)
+                .bind(task_id)
+                .bind(value.clone())
+                .bind(new_status)
+                .bind(expected.clone())
+                .execute(&self.pool)
+                .await
+            })
+            .await?;
+
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+        // CAS 失败：区分"不存在"与"状态不符"，报出当前状态
+        let current = self.dag_get_task(workspace_id, task_id).await?;
+        match current {
+            Some(t) => Err(SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: format!("Cannot transition task in {:?} state", t.status),
+            }),
+            None => Err(SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: "Task not found".into(),
+            }),
+        }
+    }
+
+    async fn dag_remove_task(&self, workspace_id: &str, task_id: &str) -> SFResult<()> {
+        self.retry(|| async {
+            sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id = $2")
+                .bind(workspace_id)
+                .bind(task_id)
+                .execute(&self.pool)
+                .await
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn dag_list_tasks(&self, workspace_id: &str) -> SFResult<Vec<String>> {
+        let rows: Vec<(String,)> = self
+            .retry(|| async {
+                sqlx::query_as("SELECT task_id FROM cog_dag_tasks WHERE workspace_id = $1")
+                    .bind(workspace_id)
+                    .fetch_all(&self.pool)
+                    .await
+            })
+            .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    async fn dag_get_all_tasks(&self, workspace_id: &str) -> SFResult<Vec<cog_core::Task>> {
+        let rows: Vec<(serde_json::Value,)> = self
+            .retry(|| async {
+                sqlx::query_as("SELECT task FROM cog_dag_tasks WHERE workspace_id = $1")
+                    .bind(workspace_id)
+                    .fetch_all(&self.pool)
+                    .await
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .collect()
+    }
+
+    async fn dag_get_dependencies(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> SFResult<Vec<String>> {
+        Ok(self
+            .dag_get_task(workspace_id, task_id)
+            .await?
+            .map(|t| t.blocked_by)
+            .unwrap_or_default())
+    }
+
+    async fn dag_get_dependents(&self, workspace_id: &str, task_id: &str) -> SFResult<Vec<String>> {
+        // jsonb `?` 算子：task->'blocked_by' 数组包含 task_id 元素
+        let rows: Vec<(String,)> = self
+            .retry(|| async {
+                sqlx::query_as(
+                    r#"
+                    SELECT task_id FROM cog_dag_tasks
+                    WHERE workspace_id = $1 AND task->'blocked_by' ? $2
+                    "#,
+                )
+                .bind(workspace_id)
+                .bind(task_id)
+                .fetch_all(&self.pool)
+                .await
+            })
+            .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    async fn dag_complete_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        result: serde_json::Value,
+    ) -> SFResult<Vec<String>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+
+        // 锁住本 workspace 全部任务行，整批读到一致快照后再算就绪翻转
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT task_id, task FROM cog_dag_tasks WHERE workspace_id = $1 FOR UPDATE",
+        )
+        .bind(workspace_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
+            .into_iter()
+            .map(|(id, v)| serde_json::from_value(v).map(|t: cog_core::Task| (id, t)))
+            .collect::<Result<_, _>>()
+            .map_err(SFError::Serialization)?;
+
+        let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
+            task_id: task_id.into(),
+            reason: "Task not found".into(),
+        })?;
+        if task.status != cog_core::TaskStatus::Running {
+            return Err(SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: format!(
+                    "Cannot complete task in {:?} state — it may have been handled by timeout or retry",
+                    task.status
+                ),
+            });
+        }
+        task.status = cog_core::TaskStatus::Completed;
+        task.result = Some(result);
+        task.updated_at = Utc::now();
+
+        let dependent_ids: Vec<String> = tasks
+            .values()
+            .filter(|t| t.blocked_by.iter().any(|b| b == task_id))
+            .map(|t| t.id.clone())
+            .collect();
+
+        let mut ready = Vec::new();
+        for dep_id in dependent_ids {
+            let all_ready = tasks
+                .get(&dep_id)
+                .map(|d| {
+                    d.status == cog_core::TaskStatus::Pending
+                        && d.blocked_by.iter().all(|b| {
+                            tasks
+                                .get(b)
+                                .map(|t| t.status == cog_core::TaskStatus::Completed)
+                                .unwrap_or(false)
+                        })
+                })
+                .unwrap_or(false);
+            if all_ready {
+                if let Some(dep_task) = tasks.get_mut(&dep_id) {
+                    dep_task.status = cog_core::TaskStatus::Scheduled;
+                    dep_task.updated_at = Utc::now();
+                    ready.push(dep_id);
+                }
+            }
+        }
+
+        // 回写根任务与翻转的下游
+        for id in std::iter::once(&task_id.to_string()).chain(ready.iter()) {
+            let t = &tasks[id];
+            sqlx::query(
+                "UPDATE cog_dag_tasks SET task = $3, status = $4, updated_at = NOW() WHERE workspace_id = $1 AND task_id = $2",
+            )
+            .bind(workspace_id)
+            .bind(id)
+            .bind(serde_json::to_value(t)?)
+            .bind(status_str(&t.status))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(ready)
+    }
+
+    async fn dag_fail_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        error: String,
+        max_retries: u32,
+    ) -> SFResult<(bool, Vec<String>)> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT task_id, task FROM cog_dag_tasks WHERE workspace_id = $1 FOR UPDATE",
+        )
+        .bind(workspace_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
+            .into_iter()
+            .map(|(id, v)| serde_json::from_value(v).map(|t: cog_core::Task| (id, t)))
+            .collect::<Result<_, _>>()
+            .map_err(SFError::Serialization)?;
+
+        let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
+            task_id: task_id.into(),
+            reason: "Task not found".into(),
+        })?;
+        task.error = Some(error.clone());
+        task.updated_at = Utc::now();
+
+        let mut dirty: Vec<String> = vec![task_id.to_string()];
+        let mut cancelled = Vec::new();
+        let should_retry = task.retry_count < max_retries;
+        if should_retry {
+            task.retry_count += 1;
+            task.status = cog_core::TaskStatus::Pending;
+        } else {
+            task.status = cog_core::TaskStatus::Failed;
+            // 递归级联取消全部非终态下游
+            let mut stack = vec![task_id.to_string()];
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(task_id.to_string());
+            while let Some(current) = stack.pop() {
+                let children: Vec<String> = tasks
+                    .values()
+                    .filter(|t| t.blocked_by.iter().any(|b| b == &current))
+                    .map(|t| t.id.clone())
+                    .collect();
+                for child in children {
+                    if !visited.insert(child.clone()) {
+                        continue;
+                    }
+                    if let Some(t) = tasks.get_mut(&child) {
+                        if !matches!(
+                            t.status,
+                            cog_core::TaskStatus::Cancelled
+                                | cog_core::TaskStatus::Failed
+                                | cog_core::TaskStatus::Completed
+                        ) {
+                            t.status = cog_core::TaskStatus::Cancelled;
+                            t.error = Some(format!(
+                                "Cascade cancelled: upstream task '{}' permanently failed with error: {}",
+                                task_id, error
+                            ));
+                            t.updated_at = Utc::now();
+                            cancelled.push(child.clone());
+                            dirty.push(child.clone());
+                        }
+                    }
+                    stack.push(child);
+                }
+            }
+        }
+
+        for id in &dirty {
+            let t = &tasks[id];
+            sqlx::query(
+                "UPDATE cog_dag_tasks SET task = $3, status = $4, updated_at = NOW() WHERE workspace_id = $1 AND task_id = $2",
+            )
+            .bind(workspace_id)
+            .bind(id)
+            .bind(serde_json::to_value(t)?)
+            .bind(status_str(&t.status))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok((should_retry, cancelled))
+    }
+
+    async fn dag_cancel_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        reason: String,
+    ) -> SFResult<Vec<String>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT task_id, task FROM cog_dag_tasks WHERE workspace_id = $1 FOR UPDATE",
+        )
+        .bind(workspace_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        let mut tasks: std::collections::HashMap<String, cog_core::Task> = rows
+            .into_iter()
+            .map(|(id, v)| serde_json::from_value(v).map(|t: cog_core::Task| (id, t)))
+            .collect::<Result<_, _>>()
+            .map_err(SFError::Serialization)?;
+
+        let task = tasks.get_mut(task_id).ok_or_else(|| SFError::TaskFailed {
+            task_id: task_id.into(),
+            reason: "Task not found".into(),
+        })?;
+        if matches!(
+            task.status,
+            cog_core::TaskStatus::Cancelled
+                | cog_core::TaskStatus::Failed
+                | cog_core::TaskStatus::Completed
+        ) {
+            return Err(SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: format!("Cannot cancel task in {:?} state", task.status),
+            });
+        }
+        task.status = cog_core::TaskStatus::Cancelled;
+        task.error = Some(reason);
+        task.updated_at = Utc::now();
+
+        let mut dirty: Vec<String> = vec![task_id.to_string()];
+        let mut cancelled = Vec::new();
+        let mut stack = vec![task_id.to_string()];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(task_id.to_string());
+        while let Some(current) = stack.pop() {
+            let children: Vec<String> = tasks
+                .values()
+                .filter(|t| t.blocked_by.iter().any(|b| b == &current))
+                .map(|t| t.id.clone())
+                .collect();
+            for child in children {
+                if !visited.insert(child.clone()) {
+                    continue;
+                }
+                if let Some(t) = tasks.get_mut(&child) {
+                    if !matches!(
+                        t.status,
+                        cog_core::TaskStatus::Cancelled
+                            | cog_core::TaskStatus::Failed
+                            | cog_core::TaskStatus::Completed
+                    ) {
+                        t.status = cog_core::TaskStatus::Cancelled;
+                        t.error = Some(format!(
+                            "Cascade cancelled: upstream task '{}' was cancelled",
+                            task_id
+                        ));
+                        t.updated_at = Utc::now();
+                        cancelled.push(child.clone());
+                        dirty.push(child.clone());
+                    }
+                }
+                stack.push(child);
+            }
+        }
+
+        for id in &dirty {
+            let t = &tasks[id];
+            sqlx::query(
+                "UPDATE cog_dag_tasks SET task = $3, status = $4, updated_at = NOW() WHERE workspace_id = $1 AND task_id = $2",
+            )
+            .bind(workspace_id)
+            .bind(id)
+            .bind(serde_json::to_value(t)?)
+            .bind(status_str(&t.status))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(cancelled)
+    }
+
+    async fn dag_append_retry(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        attempt: &cog_core::RetryAttempt,
+    ) -> SFResult<()> {
+        let value = serde_json::to_value(attempt)?;
+        self.retry(|| async {
+            sqlx::query(
+                r#"
+                UPDATE cog_dag_tasks
+                SET retry_history = retry_history || $3::jsonb, updated_at = NOW()
+                WHERE workspace_id = $1 AND task_id = $2
+                "#,
+            )
+            .bind(workspace_id)
+            .bind(task_id)
+            .bind(value.clone())
+            .execute(&self.pool)
+            .await
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn dag_get_retry_history(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> SFResult<Vec<cog_core::RetryAttempt>> {
+        let row: Option<(serde_json::Value,)> = self
+            .retry(|| async {
+                sqlx::query_as(
+                    "SELECT retry_history FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id = $2",
+                )
+                .bind(workspace_id)
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await
+            })
+            .await?;
+        match row {
+            Some((v,)) => serde_json::from_value(v).map_err(SFError::Serialization),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn dag_clear_workspace(&self, workspace_id: &str) -> SFResult<()> {
+        self.retry(|| async {
+            sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
+                .bind(workspace_id)
+                .execute(&self.pool)
+                .await
+        })
+        .await?;
+        Ok(())
     }
 }

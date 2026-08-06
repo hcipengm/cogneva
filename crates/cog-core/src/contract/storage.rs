@@ -297,6 +297,26 @@ pub trait StateBackend: Send + Sync {
     }
 
     // ─── Fine-grained DAG state operations (multi-instance support) ───
+    //
+    // 存储权威模式的契约面。DagExecutor 在后端 supports_fine_grained()=true
+    // 时把所有任务状态读写切到这组方法，内存不再持有权威副本。
+    // 语义钉死（所有实现必须一致，不得弱于此规格）：
+    // - 依赖边从 Task.blocked_by 派生，实现不得维护独立的反向索引双写
+    // - dag_complete_task：仅 Running → Completed，否则 TaskFailed；
+    //   同事务内把依赖全部就绪的 Pending 下游翻 Scheduled 并返回其 id
+    // - dag_fail_task：retry_count < max_retries 时 retry_count+1、回
+    //   Pending、记 error，返回 (true, [])；否则 Failed 并递归级联取消
+    //   全部非终态下游，返回 (false, cancelled_ids)
+    // - dag_cancel_task：根任务无条件 Cancelled（终态则 TaskFailed），
+    //   递归级联取消全部非终态下游，返回下游被取消 id（不含根）
+    // - dag_transition_task：单任务 CAS——当前状态不在 expected 里则
+    //   TaskFailed 且不写库，否则整体替换为 updated
+
+    /// Whether this backend implements the fine-grained DAG operations.
+    /// `false` means only the snapshot methods above are available.
+    fn dag_supports_fine_grained(&self) -> bool {
+        false
+    }
 
     /// Get a single task from the DAG state.
     async fn dag_get_task(
@@ -309,7 +329,7 @@ pub trait StateBackend: Send + Sync {
         Err(SFError::NotImplemented("dag_get_task".into()))
     }
 
-    /// Save or update a single task in the DAG state.
+    /// Save or update a single task in the DAG state (upsert).
     async fn dag_set_task(
         &self,
         workspace_id: &str,
@@ -319,6 +339,22 @@ pub trait StateBackend: Send + Sync {
         let _ = workspace_id;
         let _ = task_id;
         Err(SFError::NotImplemented("dag_set_task".into()))
+    }
+
+    /// Single-task compare-and-swap on status: replace the stored task with
+    /// `updated` only if its current status is in `expected`. Returns
+    /// `TaskFailed` (with the current status in the message) without writing
+    /// when the guard fails, `Task not found` when the task does not exist.
+    async fn dag_transition_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        _expected: &[crate::TaskStatus],
+        _updated: &crate::Task,
+    ) -> SFResult<()> {
+        let _ = workspace_id;
+        let _ = task_id;
+        Err(SFError::NotImplemented("dag_transition_task".into()))
     }
 
     /// Remove a task from the DAG state.
@@ -334,7 +370,22 @@ pub trait StateBackend: Send + Sync {
         Err(SFError::NotImplemented("dag_list_tasks".into()))
     }
 
+    /// List all tasks in a workspace. The default loops over
+    /// [`Self::dag_list_tasks`] + [`Self::dag_get_task`]; backends should
+    /// override with a single query.
+    async fn dag_get_all_tasks(&self, workspace_id: &str) -> SFResult<Vec<crate::Task>> {
+        let ids = self.dag_list_tasks(workspace_id).await?;
+        let mut tasks = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(t) = self.dag_get_task(workspace_id, &id).await? {
+                tasks.push(t);
+            }
+        }
+        Ok(tasks)
+    }
+
     /// Get dependency list (task IDs this task is blocked by).
+    /// Derived from the stored task's `blocked_by`.
     async fn dag_get_dependencies(
         &self,
         workspace_id: &str,
@@ -345,39 +396,18 @@ pub trait StateBackend: Send + Sync {
         Err(SFError::NotImplemented("dag_get_dependencies".into()))
     }
 
-    /// Set dependency list for a task.
-    async fn dag_set_dependencies(
-        &self,
-        workspace_id: &str,
-        task_id: &str,
-        _deps: &[String],
-    ) -> SFResult<()> {
-        let _ = workspace_id;
-        let _ = task_id;
-        Err(SFError::NotImplemented("dag_set_dependencies".into()))
-    }
-
     /// Get dependents list (task IDs blocked by this task).
+    /// Derived by scanning stored tasks' `blocked_by`.
     async fn dag_get_dependents(&self, workspace_id: &str, task_id: &str) -> SFResult<Vec<String>> {
         let _ = workspace_id;
         let _ = task_id;
         Err(SFError::NotImplemented("dag_get_dependents".into()))
     }
 
-    /// Set dependents list for a task.
-    async fn dag_set_dependents(
-        &self,
-        workspace_id: &str,
-        task_id: &str,
-        _dependents: &[String],
-    ) -> SFResult<()> {
-        let _ = workspace_id;
-        let _ = task_id;
-        Err(SFError::NotImplemented("dag_set_dependents".into()))
-    }
-
     /// Atomically complete a task and compute ready dependents.
-    /// Returns the list of task IDs that became Ready.
+    /// Guard: only `Running` tasks can complete (other states → TaskFailed).
+    /// In the same atomic unit, dependents whose dependencies are all
+    /// Completed flip `Pending` → `Scheduled`; their IDs are returned.
     async fn dag_complete_task(
         &self,
         workspace_id: &str,
@@ -390,7 +420,9 @@ pub trait StateBackend: Send + Sync {
     }
 
     /// Atomically fail a task.
-    /// Returns (should_retry, cancelled_task_ids).
+    /// `retry_count < max_retries`: bump retry_count, back to `Pending`,
+    /// returns `(true, [])`. Otherwise `Failed` + recursive cascade-cancel
+    /// of all non-terminal downstream tasks, returns `(false, cancelled)`.
     async fn dag_fail_task(
         &self,
         workspace_id: &str,
@@ -401,6 +433,43 @@ pub trait StateBackend: Send + Sync {
         let _ = workspace_id;
         let _ = task_id;
         Err(SFError::NotImplemented("dag_fail_task".into()))
+    }
+
+    /// Atomically cancel a task and recursive cascade-cancel all
+    /// non-terminal downstream tasks. Returns the downstream cancelled IDs
+    /// (excluding the root). Terminal root → TaskFailed.
+    async fn dag_cancel_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        _reason: String,
+    ) -> SFResult<Vec<String>> {
+        let _ = workspace_id;
+        let _ = task_id;
+        Err(SFError::NotImplemented("dag_cancel_task".into()))
+    }
+
+    /// Append one retry attempt to the task's shared retry history.
+    async fn dag_append_retry(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        _attempt: &crate::RetryAttempt,
+    ) -> SFResult<()> {
+        let _ = workspace_id;
+        let _ = task_id;
+        Err(SFError::NotImplemented("dag_append_retry".into()))
+    }
+
+    /// Get the shared retry history for a task.
+    async fn dag_get_retry_history(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> SFResult<Vec<crate::RetryAttempt>> {
+        let _ = workspace_id;
+        let _ = task_id;
+        Err(SFError::NotImplemented("dag_get_retry_history".into()))
     }
 
     /// Clear all DAG state for a workspace.

@@ -1704,6 +1704,7 @@ dependencies = [
  "blake3",
  "chrono",
  "cog-core",
+ "cog-storage",
  "futures",
  "schemars",
  "serde",
