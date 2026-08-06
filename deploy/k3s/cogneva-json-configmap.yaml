@@ -49,6 +49,7 @@ data:
         "COGNEVA_LLM_API_KEY": "llm.api_key",
         "COGNEVA_LLM_BASE_URL": "llm.base_url",
         "COGNEVA_LLM_ROUTING_BASE_URL": "llm_routing.backends.0.base_url",
+        "COGNEVA_LLM_ROUTING_API_STYLE": "llm_routing.backends.0.api_style",
         "COGNEVA_LLM_MODEL": "llm.model",
         "COGNEVA_LLM_EMBEDDING_MODEL": "llm.embedding_model",
         "COGNEVA_LLM_MAX_TOKENS": "llm.max_tokens",
@@ -158,7 +159,7 @@ data:
             "api_key": "${KIMI_API_KEY}",
             "base_url": "https://api.kimi.com/coding/v1",
             "model": "kimi-for-coding",
-            "api_style": "openai",
+            "api_style": "anthropic",
             "weight": 1,
             "enabled": true
           },

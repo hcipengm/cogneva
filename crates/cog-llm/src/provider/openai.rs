@@ -459,10 +459,11 @@ impl LLMProvider for OpenAIProvider {
                 }
 
                 let line = line.trim();
-                if !line.starts_with("data: ") {
+                // SSE 规范里 data 后的空格可选（有实现发 `data:{`）
+                let Some(data) = line.strip_prefix("data:") else {
                     continue;
-                }
-                let data = &line[6..];
+                };
+                let data = data.trim_start();
                 if data == "[DONE]" {
                     break;
                 }

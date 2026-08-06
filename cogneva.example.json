@@ -146,7 +146,7 @@
         "api_key": "${KIMI_API_KEY}",
         "base_url": "https://api.kimi.com/coding/v1",
         "model": "kimi-for-coding",
-        "api_style": "openai",
+        "api_style": "anthropic",
         "weight": 1,
         "enabled": true
       },

@@ -321,10 +321,11 @@ impl LLMProvider for AnthropicProvider {
 
             while let Ok(Some(line)) = lines.try_next().await {
                 let line = line.trim();
-                if !line.starts_with("data: ") {
+                // SSE 规范里 data 后的空格可选；kimi 的 anthropic 端点发 `data:{`
+                let Some(data) = line.strip_prefix("data:") else {
                     continue;
-                }
-                let data = &line[6..];
+                };
+                let data = data.trim_start();
 
                 let json: serde_json::Value = match serde_json::from_str(data) {
                     Ok(v) => v,

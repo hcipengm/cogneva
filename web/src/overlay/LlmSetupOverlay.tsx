@@ -20,7 +20,7 @@ const PRESETS: Preset[] = [
     provider: 'kimi',
     base_url: 'https://api.kimi.com/coding/v1',
     model: 'kimi-for-coding',
-    api_style: 'openai',
+    api_style: 'anthropic',
   },
   {
     label: 'DeepSeek',
