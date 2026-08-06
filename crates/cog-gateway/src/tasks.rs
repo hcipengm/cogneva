@@ -262,22 +262,36 @@ pub async fn create_task_handler(
         Vec::new()
     };
 
-    // Gateway 零判决：统一通过 submit_goal_auto 透传 goal + tasks。
-    // Orchestrator 内的 ActionPlanner 负责根据标记决定分解或直接执行。
-    let ids = state
-        .orchestrator
-        .submit_goal_auto(&req.goal, tasks)
-        .await
-        .map_err(|e| ApiError::internal(format!("submit_goal_auto failed: {}", e)))?;
+    // 异步受理：goal 分解需要多轮 LLM 调用（实测 50-90s），远超网关超时层。
+    // 同步等待会在超时后丢弃 future，分解结果永远注入不了 DAG（2026-08-06
+    // 双副本验证时两次裸 goal 提交均 408 丢任务）。改为立即 202 受理、
+    // 后台 spawn 完成分解+注入，客户端按 goal_id 轮询任务图。
+    let orchestrator = state.orchestrator.clone();
+    let goal = req.goal.clone();
+    let spawn_goal_id = goal_id.clone();
+    tokio::spawn(async move {
+        match orchestrator.submit_goal_auto(&goal, tasks).await {
+            Ok(ids) => {
+                tracing::info!(
+                    goal_id = %spawn_goal_id,
+                    task_count = ids.len(),
+                    "goal decomposed and injected"
+                );
+            }
+            Err(e) => {
+                tracing::error!(goal_id = %spawn_goal_id, "submit_goal_auto failed: {}", e);
+            }
+        }
+    });
     record_task_op(&state, "submit").await;
 
     Ok((
-        StatusCode::CREATED,
+        StatusCode::ACCEPTED,
         Json(CreateTaskResponse {
             goal: req.goal,
-            task_count: ids.len(),
-            task_ids: ids,
-            message_id: None,
+            task_count: 0,
+            task_ids: Vec::new(),
+            message_id: Some(goal_id),
         }),
     ))
 }

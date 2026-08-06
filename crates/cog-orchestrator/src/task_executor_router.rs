@@ -176,6 +176,20 @@ impl TaskExecutorRouter {
         // Notify orchestrator that task is now running.
         if let Some(ref orch) = self.orchestrator {
             if let Err(e) = orch.start_task(&task.id).await {
+                // 任务行已不存在（历史残留消息/已删除）：执行无意义，
+                // 结果也无法落库，ack 后直接丢弃，避免白跑 LLM 并被
+                // 清扫器反复认领。
+                if e.to_string().contains("Task not found") {
+                    tracing::warn!(task_id = %task.id, msg_id = %msg_id, "ready message references unknown task; dropping");
+                    if let Err(e) = pipe
+                        .task_backend
+                        .ack(pipe.ready_stream, pipe.group, std::slice::from_ref(&msg_id))
+                        .await
+                    {
+                        tracing::warn!(task_id = %task.id, msg_id = %msg_id, "Failed to ack stale ready message: {e}");
+                    }
+                    return;
+                }
                 tracing::warn!(task_id = %task.id, "Failed to start task via orchestrator: {e}");
             }
         }
