@@ -163,6 +163,10 @@ async fn spawn_app_full(
         websocket_client: None,
         evolution_admin: None,
         audit_stream: None,
+        llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        chat_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     });
 
     let app = create_router(gateway_state.clone());

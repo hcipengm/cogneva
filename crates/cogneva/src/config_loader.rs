@@ -533,38 +533,62 @@ pub fn apply_env_overrides(config: &mut AppConfig) {
 /// Walk a dot-separated path (`app.name`, `gateway.http_port`) inside a
 /// JSON object and overwrite the leaf with `new_val`.
 /// Intermediate objects are created automatically if missing.
+/// Numeric segments index into arrays (`llm_routing.backends.0.base_url`),
+/// but only into existing elements — arrays are never grown implicitly.
 fn set_json_path(value: &mut serde_json::Value, path: &str, new_val: &str) {
     let parts: Vec<&str> = path.split('.').collect();
     if parts.is_empty() {
         return;
     }
 
-    let mut current = value;
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
-            if let serde_json::Value::Object(map) = current {
-                let parsed = if let Ok(b) = new_val.parse::<bool>() {
-                    serde_json::Value::Bool(b)
-                } else if let Ok(n) = new_val.parse::<i64>() {
-                    serde_json::Value::Number(n.into())
-                } else if let Ok(f) = new_val.parse::<f64>() {
-                    serde_json::Value::Number(
-                        serde_json::Number::from_f64(f).unwrap_or_else(|| 0.into()),
-                    )
-                } else {
-                    serde_json::Value::String(new_val.into())
-                };
-                map.insert(part.to_string(), parsed);
+    let parsed = if let Ok(b) = new_val.parse::<bool>() {
+        serde_json::Value::Bool(b)
+    } else if let Ok(n) = new_val.parse::<i64>() {
+        serde_json::Value::Number(n.into())
+    } else if let Ok(f) = new_val.parse::<f64>() {
+        serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap_or_else(|| 0.into()))
+    } else {
+        serde_json::Value::String(new_val.into())
+    };
+
+    set_json_path_at(value, &parts, parsed);
+}
+
+fn set_json_path_at(current: &mut serde_json::Value, parts: &[&str], leaf: serde_json::Value) {
+    let Some((head, rest)) = parts.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        match current {
+            serde_json::Value::Object(map) => {
+                map.insert(head.to_string(), leaf);
             }
-            return;
+            serde_json::Value::Array(arr) => {
+                if let Ok(i) = head.parse::<usize>() {
+                    if i < arr.len() {
+                        arr[i] = leaf;
+                    }
+                }
+            }
+            _ => {}
         }
-        if let serde_json::Value::Object(map) = current {
-            current = map
-                .entry(part.to_string())
+        return;
+    }
+    match current {
+        serde_json::Value::Object(map) => {
+            let next = map
+                .entry(head.to_string())
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        } else {
-            return;
+            set_json_path_at(next, rest, leaf);
         }
+        serde_json::Value::Array(arr) => {
+            if let Ok(i) = head.parse::<usize>() {
+                if let Some(next) = arr.get_mut(i) {
+                    set_json_path_at(next, rest, leaf);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -790,6 +814,44 @@ impl Drop for EnvGuard {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_set_json_path_indexes_arrays() {
+        let mut value = serde_json::json!({
+            "llm_routing": {
+                "backends": [
+                    {"provider": "kimi", "base_url": "https://api.kimi.com/coding/v1"},
+                    {"provider": "doubao", "base_url": "https://ark.example/v3"}
+                ]
+            }
+        });
+
+        set_json_path(
+            &mut value,
+            "llm_routing.backends.0.base_url",
+            "http://cogneva-security-gateway:8081/v1",
+        );
+        assert_eq!(
+            value["llm_routing"]["backends"][0]["base_url"],
+            "http://cogneva-security-gateway:8081/v1"
+        );
+        // 其余元素不受影响
+        assert_eq!(
+            value["llm_routing"]["backends"][1]["base_url"],
+            "https://ark.example/v3"
+        );
+
+        // 越界下标不扩容、不 panic
+        set_json_path(&mut value, "llm_routing.backends.5.base_url", "x");
+        assert_eq!(
+            value["llm_routing"]["backends"].as_array().unwrap().len(),
+            2
+        );
+
+        // 对象路径语义不变
+        set_json_path(&mut value, "gateway.http_port", "9090");
+        assert_eq!(value["gateway"]["http_port"], 9090);
+    }
 
     #[test]
     fn test_load_without_files_uses_defaults() {

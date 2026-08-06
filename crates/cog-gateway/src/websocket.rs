@@ -102,6 +102,7 @@ async fn handle_type_message(
     state: &Arc<GatewayState>,
     connection_id: &str,
     text: &str,
+    out_tx: &tokio::sync::mpsc::Sender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -154,6 +155,24 @@ async fn handle_type_message(
         }
         ClientMessage::Typing { .. } => {
             // Typing indicator is accepted but produces no response.
+        }
+        ClientMessage::ChatMessage {
+            session_id,
+            content,
+            ..
+        } => {
+            let content = content.trim().to_string();
+            if content.is_empty() {
+                return Ok(());
+            }
+            // The LLM call can take tens of seconds — never block the socket
+            // loop (heartbeats, event forwarding) on a chat turn.
+            let state = state.clone();
+            let out = out_tx.clone();
+            let session = session_id.unwrap_or_else(|| "default".into());
+            tokio::spawn(async move {
+                crate::chat::run_chat_turn(state, out, session, content).await;
+            });
         }
     }
 
@@ -288,6 +307,9 @@ pub async fn handle_socket(
     let connection_id = uuid::Uuid::new_v4().to_string();
     let mut rx = state.event_tx.subscribe();
     let mut notif_rx = state.notification_tx.subscribe();
+    // Outbound queue for messages produced outside the event broadcast (e.g.
+    // chat replies from spawned LLM tasks).
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
 
     // Register connection and send "connected" event.
     if let Some(ref mgr) = state.connection_manager {
@@ -380,6 +402,12 @@ pub async fn handle_socket(
                     break;
                 }
             }
+            Some(outbound) = out_rx.recv() => {
+                last_activity = tokio::time::Instant::now();
+                if socket.send(WsMessage::Text(outbound.into())).await.is_err() {
+                    break;
+                }
+            }
             _ = heartbeat.tick() => {
                 if socket.send(WsMessage::Ping(vec![].into())).await.is_err() {
                     tracing::debug!("Heartbeat ping failed for {}; closing.", connection_id);
@@ -413,7 +441,7 @@ pub async fn handle_socket(
                         }
 
                         // Try type-based protocol first, then cmd-based.
-                        if handle_type_message(&mut socket, &state, &connection_id, &text).await.is_err() {
+                        if handle_type_message(&mut socket, &state, &connection_id, &text, &out_tx).await.is_err() {
                             if let Err(e) = handle_command(&mut socket, &state, &text).await {
                                 tracing::warn!("WebSocket command handling error: {}", e);
                             }

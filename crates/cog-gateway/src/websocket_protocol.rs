@@ -42,6 +42,17 @@ pub enum ClientMessage {
         #[serde(default)]
         timestamp: Option<String>,
     },
+    /// Web UI chat input — routed to the LLM; the reply is streamed back to
+    /// the requesting connection as `agent_event` envelopes
+    /// (message.start / message.text_delta / message.end).
+    #[serde(rename = "chat_message")]
+    ChatMessage {
+        #[serde(default)]
+        session_id: Option<String>,
+        content: String,
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
 }
 
 /// Server → Client WebSocket messages.

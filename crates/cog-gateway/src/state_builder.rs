@@ -131,6 +131,8 @@ pub async fn build_gateway_state(
         evolution_admin: evolution_admin.clone(),
         evolution_stream: evolution_stream.clone(),
         audit_stream: audit_stream.clone(),
+        llm_client: Arc::new(std::sync::RwLock::new(None)),
+        chat_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     Ok(gateway_state)

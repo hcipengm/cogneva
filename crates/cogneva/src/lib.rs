@@ -94,6 +94,18 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     plugin_runner.start_all(&ctx).await?;
 
+    // Wire the LLM client into the gateway's WebSocket chat handler. The llm
+    // plugin is not topologically ordered before gateway, so the slot is
+    // filled here after every plugin has initialised. The published client is
+    // the hot-swappable wrapper, so later config-driven swaps stay effective.
+    if let Some(gateway_state) = ctx.consume::<cog_gateway::GatewayState>() {
+        let llm = ctx.consume_service::<dyn cog_core::LlmClient>();
+        *gateway_state
+            .llm_client
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = llm;
+    }
+
     daemon.ready();
 
     // Spawn config hot-reload consumer (direct orchestration, not a plugin)

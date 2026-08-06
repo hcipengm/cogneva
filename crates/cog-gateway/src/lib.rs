@@ -26,6 +26,7 @@ pub mod approval_gate;
 pub mod audit;
 pub mod auth;
 pub mod backend_health;
+pub mod chat;
 pub mod collaboration;
 pub mod dashboard;
 pub mod error;
@@ -61,6 +62,15 @@ pub use approval_gate::{
     AgentAction, ApprovalRequest, ApprovalRule, ApprovalStatus, HumanApprovalGate,
 };
 pub use state::{AuthState, HttpState, InfraState, OpsState, RuntimeState};
+
+/// Shared slot for the LLM client used by the WebSocket chat handler.
+pub type SharedLlmClient = Arc<std::sync::RwLock<Option<Arc<dyn cog_core::LlmClient>>>>;
+/// Per-session chat histories: session_id → (messages oldest-first, last-touched).
+pub type ChatSessionStore = Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, (Vec<cog_core::Message>, chrono::DateTime<chrono::Utc>)>,
+    >,
+>;
 
 /// Gateway 应用状态，包含所有服务组件。
 pub struct GatewayState {
@@ -150,6 +160,14 @@ pub struct GatewayState {
     pub media_backend: Option<Arc<dyn cog_core::MediaBackend>>,
     /// WebSocket client for outbound connections (A2A, external services).
     pub websocket_client: Option<Arc<dyn cog_core::WebSocketClient>>,
+    /// LLM client backing the WebSocket `chat_message` handler. Injected
+    /// after all plugins start (the llm plugin is not ordered before
+    /// gateway); `None` until then — chat requests get an explicit error
+    /// reply instead of being dropped silently.
+    pub llm_client: SharedLlmClient,
+    /// Per-session chat history for the WebSocket chat handler
+    /// (session_id → messages, oldest first, capped).
+    pub chat_sessions: ChatSessionStore,
 }
 
 impl GatewayState {

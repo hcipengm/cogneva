@@ -105,6 +105,9 @@ impl LatencyStats {
 struct AppState {
     config: SecurityGatewayConfig,
     client: reqwest::Client,
+    /// No total timeout — SSE streams from reasoning models can run for
+    /// minutes; only connection establishment is bounded.
+    stream_client: reqwest::Client,
     egress_stats: std::sync::Arc<LatencyStats>,
     llm_stats: std::sync::Arc<LatencyStats>,
 }
@@ -339,6 +342,61 @@ async fn chat_handler(
     result
 }
 
+/// OpenAI 兼容透传端点：沙盒内完整的 cogneva 实例（PGE/RoutingProvider）讲
+/// OpenAI streaming 协议，本端点逐字节转发，凭证由网关代持注入。
+/// 不做意图封装、不强制系统提示词、不做凭证扫描——沙盒本身零凭证，
+/// 不存在可泄露的秘密，扫代码型 prompt 只会误伤。
+async fn chat_completions_passthrough(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    if state.config.llm_provider != "openai" {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "passthrough only supports openai-style upstreams".into(),
+        ));
+    }
+    if state.config.llm_api_key.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "网关未配置 LLM API Key".into(),
+        ));
+    }
+    let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let start = std::time::Instant::now();
+    let url = format!(
+        "{}/chat/completions",
+        state.config.llm_base_url.trim_end_matches('/')
+    );
+    let resp = state
+        .stream_client
+        .post(url)
+        .bearer_auth(&state.config.llm_api_key)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    state.llm_stats.record(start.elapsed().as_millis() as u64);
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let stream = resp.bytes_stream();
+    Ok(axum::response::Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
+}
+
 async fn call_llm(
     state: &AppState,
     messages: Vec<ChatMessage>,
@@ -465,6 +523,7 @@ fn router(state: AppState, llm_channel: bool) -> Router {
     let r = if llm_channel {
         r.route("/v1/intent", post(intent_handler))
             .route("/v1/chat", post(chat_handler))
+            .route("/v1/chat/completions", post(chat_completions_passthrough))
     } else {
         r.route("/proxy", post(proxy_handler))
     };
@@ -476,6 +535,9 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
     let state = AppState {
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
+            .build()?,
+        stream_client: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()?,
         egress_stats: std::sync::Arc::new(LatencyStats::default()),
         llm_stats: std::sync::Arc::new(LatencyStats::default()),
