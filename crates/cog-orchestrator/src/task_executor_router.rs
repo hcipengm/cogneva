@@ -176,11 +176,13 @@ impl TaskExecutorRouter {
         // Notify orchestrator that task is now running.
         if let Some(ref orch) = self.orchestrator {
             if let Err(e) = orch.start_task(&task.id).await {
-                // 任务行已不存在（历史残留消息/已删除）：执行无意义，
-                // 结果也无法落库，ack 后直接丢弃，避免白跑 LLM 并被
-                // 清扫器反复认领。
-                if e.to_string().contains("Task not found") {
-                    tracing::warn!(task_id = %task.id, msg_id = %msg_id, "ready message references unknown task; dropping");
+                // 领域拒绝（TaskFailed：任务不存在/已在跑/已终态）说明这条
+                // ready 消息是历史残留或重复投递——执行无意义，结果也无法
+                // 落库（complete 要求 Running），ack 后直接丢弃，避免白跑
+                // LLM 并被清扫器反复认领。非领域错误（基础设施抖动）保留
+                // 原行为：继续执行。
+                if matches!(e, cog_core::SFError::TaskFailed { .. }) {
+                    tracing::warn!(task_id = %task.id, msg_id = %msg_id, "ready message rejected by DAG ({e}); dropping");
                     if let Err(e) = pipe
                         .task_backend
                         .ack(pipe.ready_stream, pipe.group, std::slice::from_ref(&msg_id))
