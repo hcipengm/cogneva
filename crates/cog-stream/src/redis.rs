@@ -191,6 +191,38 @@ impl MessageBackend for RedisMessageBackend {
         }
     }
 
+    async fn claim_pending(
+        &self,
+        stream: &str,
+        group: &str,
+        min_idle_ms: u64,
+        count: usize,
+    ) -> SFResult<Vec<(String, Vec<u8>)>> {
+        // 认领对象固定为 subscribe 同款 "consumer-1"，保证认领回来的消息
+        // 后续 ack（同组同消费者语义）能对上。
+        let opts = redis::streams::StreamAutoClaimOptions::default().count(count);
+        let reply: redis::streams::StreamAutoClaimReply = self
+            .connection
+            .clone()
+            .xautoclaim_options(
+                stream,
+                group,
+                "consumer-1",
+                min_idle_ms as usize,
+                "0-0",
+                opts,
+            )
+            .await
+            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        let mut messages = Vec::new();
+        for item in reply.claimed {
+            if let Some(redis::Value::BulkString(b)) = item.map.get("payload") {
+                messages.push((item.id, b.clone()));
+            }
+        }
+        Ok(messages)
+    }
+
     async fn dlq(&self, stream: &str, msg_id: &str, reason: &str) -> SFResult<()> {
         let payload = serde_json::json!({
             "original_id": msg_id,

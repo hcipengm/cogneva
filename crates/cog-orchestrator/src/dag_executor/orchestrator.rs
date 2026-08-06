@@ -187,6 +187,36 @@ impl DagExecutor {
         inner.last_persist = Some(std::time::Instant::now());
     }
 
+    /// 多副本读穿修复：任务不在本 pod 内存时，从共享存储整体恢复快照后重查。
+    /// 修复多副本下结果消息被没有该任务内存态的 pod 消费时报
+    /// "Task not found"（2026-08-06 遗留断点）。
+    /// 注意此处故意不先 do_persist：本 pod 内存可能比共享快照旧，先刷会
+    /// 用过期快照覆盖其他副本写入的新任务。残余限制：批持久化窗口内
+    /// （默认 5s/10 变更）对端刚提交的任务仍可能查不到；彻底解法是让共享
+    /// 存储成为权威状态（trait 细粒度 dag_* 面已具备，postgres 尚未实现）。
+    async fn ensure_task_present(&self, task_id: &str) -> SFResult<()> {
+        if self.inner.read().await.tasks.contains_key(task_id) {
+            return Ok(());
+        }
+        if self.state_backend.is_none() {
+            return Err(cog_core::SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: "Task not found".into(),
+            });
+        }
+        if let Err(e) = self.load_from_backend().await {
+            tracing::warn!("ensure_task_present reload failed for {}: {}", task_id, e);
+        }
+        if self.inner.read().await.tasks.contains_key(task_id) {
+            Ok(())
+        } else {
+            Err(cog_core::SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: "Task not found".into(),
+            })
+        }
+    }
+
     /// Load state from the configured backend, if any.
     pub async fn load_from_backend(&self) -> SFResult<bool> {
         if let Some(ref backend) = self.state_backend {
@@ -629,6 +659,7 @@ impl DagExecutor {
     }
 
     pub async fn schedule_task(&self, task_id: &str) -> SFResult<()> {
+        self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
             .tasks
@@ -658,6 +689,7 @@ impl DagExecutor {
     }
 
     pub async fn assign_task(&self, task_id: &str, agent_id: &str) -> SFResult<()> {
+        self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
             .tasks
@@ -687,6 +719,7 @@ impl DagExecutor {
     }
 
     pub async fn start_task(&self, task_id: &str) -> SFResult<()> {
+        self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
             .tasks
@@ -721,6 +754,7 @@ impl DagExecutor {
         task_id: &str,
         result: serde_json::Value,
     ) -> SFResult<Vec<String>> {
+        self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
             .tasks
@@ -842,6 +876,7 @@ impl DagExecutor {
         task_id: &str,
         error: String,
     ) -> SFResult<(bool, Vec<String>, bool)> {
+        self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let (task_type, retry_count) = {
             let task =
@@ -975,6 +1010,7 @@ impl DagExecutor {
     /// to ensure the DLQ entry is persisted.
     pub async fn push_to_dlq(&self, task_id: &str, error: String) -> SFResult<bool> {
         if let Some(ref dlq) = self.dlq {
+            self.ensure_task_present(task_id).await?;
             let inner = self.inner.read().await;
             let task = inner
                 .tasks
@@ -1007,6 +1043,7 @@ impl DagExecutor {
     }
 
     pub async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
+        self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         let task = inner
             .tasks
@@ -1070,6 +1107,7 @@ impl DagExecutor {
     }
 
     pub async fn retry_task(&self, task_id: &str) -> SFResult<()> {
+        self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
 
         // Clear retry history on manual retry first (avoids double mutable borrow)
@@ -1190,6 +1228,7 @@ impl DagExecutor {
     }
 
     pub async fn get_task(&self, task_id: &str) -> Option<Task> {
+        self.ensure_task_present(task_id).await.ok()?;
         let inner = self.inner.read().await;
         inner.tasks.get(task_id).cloned()
     }
@@ -1230,6 +1269,7 @@ impl DagExecutor {
     }
 
     pub async fn delete_task(&self, task_id: &str) -> SFResult<()> {
+        self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
         if !inner.tasks.contains_key(task_id) {
             return Err(cog_core::SFError::TaskFailed {
@@ -1433,5 +1473,129 @@ impl cog_core::DagExecutor for DagExecutor {
 
     async fn crew_retry_all(&self, task_ids: &[String]) -> usize {
         self.crew_retry_all(task_ids).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::{AgentState, ContextBoard, Event, StateBackend, TaskCheckpoint, TaskType};
+
+    /// 只实现 DAG 快照存取的最小 StateBackend，模拟两个 pod 共享的存储。
+    #[derive(Default)]
+    struct StubStateBackend {
+        snapshots: tokio::sync::Mutex<HashMap<String, serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StateBackend for StubStateBackend {
+        async fn get_agent_state(&self, _agent_id: &str) -> SFResult<Option<AgentState>> {
+            Ok(None)
+        }
+        async fn set_agent_state(&self, _agent_id: &str, _state: &AgentState) -> SFResult<()> {
+            Ok(())
+        }
+        async fn cas_agent_state(
+            &self,
+            _agent_id: &str,
+            _expected: &AgentState,
+            _new: &AgentState,
+        ) -> SFResult<bool> {
+            Ok(true)
+        }
+        async fn get_checkpoint(&self, _task_id: &str) -> SFResult<Option<TaskCheckpoint>> {
+            Ok(None)
+        }
+        async fn save_checkpoint(&self, _checkpoint: &TaskCheckpoint) -> SFResult<()> {
+            Ok(())
+        }
+        async fn append_event(&self, _task_id: &str, _event: &Event) -> SFResult<u64> {
+            Ok(0)
+        }
+        async fn get_events(
+            &self,
+            _task_id: &str,
+            _offset: u64,
+            _limit: usize,
+        ) -> SFResult<Vec<Event>> {
+            Ok(Vec::new())
+        }
+        async fn get_board(&self, _task_id: &str) -> SFResult<Option<ContextBoard>> {
+            Ok(None)
+        }
+        async fn set_board_field(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+        async fn delete_checkpoint(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn delete_board(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn remove_board_field(&self, _task_id: &str, _field: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn save_dag_state(
+            &self,
+            workspace_id: &str,
+            state: &serde_json::Value,
+        ) -> SFResult<()> {
+            self.snapshots
+                .lock()
+                .await
+                .insert(workspace_id.to_string(), state.clone());
+            Ok(())
+        }
+        async fn load_dag_state(&self, workspace_id: &str) -> SFResult<Option<serde_json::Value>> {
+            Ok(self.snapshots.lock().await.get(workspace_id).cloned())
+        }
+    }
+
+    /// 多副本读穿：pod B 内存没有该任务（没走 load_from_backend 启动恢复），
+    /// get_task/状态迁移必须从共享快照回填而不是报 "Task not found"。
+    #[tokio::test]
+    async fn test_read_through_recovers_task_from_shared_snapshot() {
+        let backend = Arc::new(StubStateBackend::default());
+
+        let pod_a = DagExecutor::new("ws-rt".into()).with_state_backend(backend.clone());
+        let task = Task::new("t-rt-1", TaskType::Generator, serde_json::json!({}));
+        let task_id = task.id.clone();
+        pod_a.add_task(task).await.unwrap();
+        // do_persist 是 tokio::spawn 的异步落盘，等它写完
+        for _ in 0..100 {
+            if backend.snapshots.lock().await.contains_key("ws-rt") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(backend.snapshots.lock().await.contains_key("ws-rt"));
+
+        // pod B：同一共享存储、全新内存，故意不调 load_from_backend
+        let pod_b = DagExecutor::new("ws-rt".into()).with_state_backend(backend);
+        assert!(pod_b.inner.read().await.tasks.is_empty());
+
+        let found = pod_b.get_task(&task_id).await;
+        assert!(found.is_some(), "read-through should hydrate from snapshot");
+        assert!(pod_b.inner.read().await.tasks.contains_key(&task_id));
+
+        // 状态迁移同样读穿
+        pod_b.schedule_task(&task_id).await.unwrap();
+        assert_eq!(
+            pod_b.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Scheduled
+        );
+    }
+
+    /// 无共享存储时行为不变：仍然是 "Task not found"。
+    #[tokio::test]
+    async fn test_missing_task_without_backend_still_errors() {
+        let pod = DagExecutor::new("ws-solo".into());
+        let err = pod.schedule_task("nope").await.unwrap_err();
+        assert!(err.to_string().contains("Task not found"));
     }
 }

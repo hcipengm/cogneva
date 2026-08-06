@@ -56,6 +56,21 @@ pub trait MessageBackend: Send + Sync {
         Ok(())
     }
 
+    /// Claim pending messages that have been idle longer than `min_idle_ms`
+    /// (delivered to a consumer that never acked — e.g. the pod died
+    /// mid-processing). Returns the claimed `(message_id, payload)` tuples,
+    /// now owned by the calling consumer.
+    /// Default: backend has no pending-recovery support, returns empty.
+    async fn claim_pending(
+        &self,
+        _stream: &str,
+        _group: &str,
+        _min_idle_ms: u64,
+        _count: usize,
+    ) -> SFResult<Vec<(String, Vec<u8>)>> {
+        Ok(Vec::new())
+    }
+
     /// Publish a message to the dead-letter queue for the given stream.
     /// The default implementation appends to a `{stream}:dlq` subject.
     /// Backends may override this to use a native DLQ mechanism.
