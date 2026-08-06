@@ -104,12 +104,12 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             .consume::<cog_observability::plugin::LogFilterHandleHolder>()
             .map(|h| h.0.clone());
         let supervisor_config_tx = ctx
-            .consume::<Arc<cog_supervisor::plugin::SupervisorConfigTxHolder>>()
+            .consume::<cog_supervisor::plugin::SupervisorConfigTxHolder>()
             .expect("supervisor config tx")
             .0
             .clone();
         let gateway_state = ctx
-            .consume::<Arc<cog_gateway::GatewayState>>()
+            .consume::<cog_gateway::GatewayState>()
             .expect("gateway state");
         let llm_hot_swap = ctx.consume::<cog_llm::HotSwappableLlmClient>();
         let llm_http_client = ctx.consume_service::<dyn cog_core::HttpClient>();

@@ -45,6 +45,11 @@ impl ConfigWatcher {
         .map_err(|e| cog_core::SFError::Config(format!("notify error: {e}")))?;
 
         for path in &paths {
+            // Skip files that don't exist yet — their creation is caught by the
+            // parent-directory watch; a hard error here would kill the watcher.
+            if !path.exists() {
+                continue;
+            }
             watcher
                 .watch(path, notify::RecursiveMode::NonRecursive)
                 .map_err(|e| cog_core::SFError::Config(format!("watch error: {e}")))?;
@@ -54,11 +59,11 @@ impl ConfigWatcher {
     }
 
     /// Convenience constructor that watches the standard config locations:
-    /// 1. `cogneva.json`
+    /// 1. `$COGNEVA_CONFIG_PATH` (default `/etc/cogneva/cogneva.json`, same as the loader)
     /// 2. `cogneva.{env}.json`
     pub fn watch_default() -> SFResult<(Self, notify::RecommendedWatcher)> {
-        let base_path =
-            std::env::var("COGNEVA_CONFIG_PATH").unwrap_or_else(|_| "cogneva.json".into());
+        let base_path = std::env::var("COGNEVA_CONFIG_PATH")
+            .unwrap_or_else(|_| crate::config_loader::DEFAULT_CONFIG_PATH.into());
         let env = std::env::var("COGNEVA_ENV").unwrap_or_else(|_| "development".into());
         let env_path = base_path.replace(".json", &format!(".{}.json", env));
 
@@ -66,6 +71,18 @@ impl ConfigWatcher {
         if env_path != paths[0].to_string_lossy() {
             paths.push(PathBuf::from(env_path));
         }
+        // K8s configmap volumes swap a `..data` symlink on update — the watch on
+        // the file itself dies with the old inode. Watching the parent directory
+        // catches the swap (create/rename events) so hot reload actually fires.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for p in &paths {
+            if let Some(parent) = p.parent() {
+                if !dirs.iter().any(|d| d == parent) {
+                    dirs.push(parent.to_path_buf());
+                }
+            }
+        }
+        paths.extend(dirs);
         Self::new(paths)
     }
 
