@@ -713,22 +713,20 @@ impl StateBackend for PostgresStateBackend {
                 })
                 .unwrap_or(false);
             if all_ready {
-                if let Some(dep_task) = tasks.get_mut(&dep_id) {
-                    dep_task.status = cog_core::TaskStatus::Scheduled;
-                    dep_task.updated_at = Utc::now();
-                    ready.push(dep_id);
-                }
+                // 只报告就绪，不翻转状态（Scheduled = 已发布到 ready 流，
+                // 由发布方 schedule_task 翻转），同事务锁保证判定一致
+                ready.push(dep_id);
             }
         }
 
-        // 回写根任务与翻转的下游
-        for id in std::iter::once(&task_id.to_string()).chain(ready.iter()) {
-            let t = &tasks[id];
+        // 只回写根任务；就绪下游保持 Pending，等发布方 CAS 翻转
+        {
+            let t = &tasks[task_id];
             sqlx::query(
                 "UPDATE cog_dag_tasks SET task = $3, status = $4, updated_at = NOW() WHERE workspace_id = $1 AND task_id = $2",
             )
             .bind(workspace_id)
-            .bind(id)
+            .bind(task_id)
             .bind(serde_json::to_value(t)?)
             .bind(status_str(&t.status))
             .execute(&mut *tx)

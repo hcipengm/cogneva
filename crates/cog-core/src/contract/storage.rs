@@ -303,7 +303,9 @@ pub trait StateBackend: Send + Sync {
     // 语义钉死（所有实现必须一致，不得弱于此规格）：
     // - 依赖边从 Task.blocked_by 派生，实现不得维护独立的反向索引双写
     // - dag_complete_task：仅 Running → Completed，否则 TaskFailed；
-    //   同事务内把依赖全部就绪的 Pending 下游翻 Scheduled 并返回其 id
+    //   同事务内判定依赖全部就绪的 Pending 下游并返回其 id（不翻转状态——
+    //   Scheduled 的单一含义是"已发布到 ready 流"，翻转由发布方
+    //   schedule_task 完成，否则下游会卡在 Scheduled 永远不被发布）
     // - dag_fail_task：retry_count < max_retries 时 retry_count+1、回
     //   Pending、记 error，返回 (true, [])；否则 Failed 并递归级联取消
     //   全部非终态下游，返回 (false, cancelled_ids)
@@ -407,7 +409,9 @@ pub trait StateBackend: Send + Sync {
     /// Atomically complete a task and compute ready dependents.
     /// Guard: only `Running` tasks can complete (other states → TaskFailed).
     /// In the same atomic unit, dependents whose dependencies are all
-    /// Completed flip `Pending` → `Scheduled`; their IDs are returned.
+    /// Completed are identified and their IDs returned — they stay `Pending`;
+    /// flipping to `Scheduled` is the publisher's job (`Scheduled` means
+    /// "published to the ready stream", nothing else).
     async fn dag_complete_task(
         &self,
         workspace_id: &str,

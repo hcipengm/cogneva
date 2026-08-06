@@ -730,12 +730,8 @@ impl DagExecutor {
         let scheduled = be
             .dag_complete_task(&self.workspace_id, task_id, result.clone())
             .await?;
-        for dep_id in &scheduled {
-            self.emit_event(cog_core::TaskEvent::TaskScheduled {
-                task_id: dep_id.clone(),
-                timestamp: chrono::Utc::now(),
-            });
-        }
+        // 就绪下游保持 Pending，由 publish_ready_tasks → schedule_task 翻转
+        // 并发 TaskScheduled 事件；此处只发根任务完成事件
         self.emit_event(cog_core::TaskEvent::TaskCompleted {
             task_id: task_id.into(),
             result: Some(result),
@@ -1122,6 +1118,8 @@ impl DagExecutor {
         }
 
         // Auto-schedule dependents whose dependencies are now all completed.
+        // 只判定并返回就绪 id，不翻转状态：Scheduled 的单一含义是"已发布到
+        // ready 流"，翻转由 publish_ready_tasks → schedule_task 完成。
         let dependents_to_schedule: Vec<String> = inner
             .dependents
             .get(task_id)
@@ -1139,16 +1137,7 @@ impl DagExecutor {
                         .unwrap_or(false)
                 });
                 if all_deps_completed && dep_task.status == TaskStatus::Pending {
-                    if let Some(t) = inner.tasks.get_mut(&dep_id) {
-                        t.status = TaskStatus::Scheduled;
-                        scheduled.push(dep_id.clone());
-                        drop(inner);
-                        self.emit_event(cog_core::TaskEvent::TaskScheduled {
-                            task_id: dep_id,
-                            timestamp: chrono::Utc::now(),
-                        });
-                        inner = self.inner.write().await;
-                    }
+                    scheduled.push(dep_id.clone());
                 }
             }
         }
@@ -2115,11 +2104,21 @@ mod tests {
             .unwrap();
         assert_eq!(unlocked, vec!["t2".to_string()]);
 
-        // complete 同事务已把 t2 翻为 Scheduled，pod A 立即可见
+        // complete 同事务判定 t2 就绪并返回其 id，但保持 Pending——
+        // Scheduled 只表示"已发布到 ready 流"，由发布方 schedule_task 翻转
         let t2_view = pod_a.get_task("t2").await.unwrap();
-        assert_eq!(t2_view.status, TaskStatus::Scheduled);
+        assert_eq!(t2_view.status, TaskStatus::Pending);
         assert!(pod_a.get_ready_tasks().await.iter().any(|t| t.id == "t2"));
         assert!(!pod_a.all_completed().await);
+
+        // 模拟发布方：翻 Scheduled（跨 pod CAS），随后可启动并完成
+        pod_b.schedule_task("t2").await.unwrap();
+        pod_a.start_task("t2").await.unwrap();
+        pod_b
+            .complete_task("t2", serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        assert!(pod_a.all_completed().await);
     }
 
     #[tokio::test]

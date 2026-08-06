@@ -391,11 +391,10 @@ impl StateBackend for MemoryStateBackend {
                 })
                 .unwrap_or(false);
             if all_ready {
-                if let Some(dep_task) = tasks.get_mut(&dep_id) {
-                    dep_task.status = cog_core::TaskStatus::Scheduled;
-                    dep_task.updated_at = chrono::Utc::now();
-                    ready.push(dep_id);
-                }
+                // 只报告就绪，不翻转状态：Scheduled 的单一含义是"已发布到
+                // ready 流"，翻转由发布方（publish_ready_tasks → schedule_task）
+                // 完成，否则下游会卡在 Scheduled 永远不被发布。
+                ready.push(dep_id);
             }
         }
 
