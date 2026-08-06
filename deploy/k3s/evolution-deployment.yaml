@@ -159,19 +159,19 @@ spec:
             claimName: cogneva-evolution-source-pvc
         # __GIT_REMOTE_HOSTPATH_BEGIN__
         - name: git-remote
-          # 单节点：引导器部署前在宿主 git clone --bare 源码仓库
-          #（宿主 <-> bare <-> Pod 双向同步通道）
+          # 单节点（默认，本文件可直接 kubectl apply）：引导器部署前在宿主
+          # git clone --bare 源码仓库（宿主 <-> bare <-> Pod 双向同步通道）
           hostPath:
             path: /var/lib/cogneva-data/git-remote
             type: Directory
         # __GIT_REMOTE_HOSTPATH_END__
         # __GIT_REMOTE_PVC_BEGIN__
-        - name: git-remote
-          # 多节点：hostPath 只存在于 bootstrap 所在节点，evolution 调度到
-          # 其他节点即 FailedMount/空仓库，必须改集群卷；空卷由 initContainer
-          # 从公开仓库 seed
-          persistentVolumeClaim:
-            claimName: cogneva-git-remote-pvc
+        ## 多节点变体（bootstrap 渲染时取消注释本块并剔除上面的 hostPath 块）：
+        ## hostPath 只存在于 bootstrap 所在节点，evolution 调度到其他节点即
+        ## FailedMount/空仓库，必须改集群卷；空卷由 initContainer 从公开仓库 seed
+        # - name: git-remote
+        #   persistentVolumeClaim:
+        #     claimName: cogneva-git-remote-pvc
         # __GIT_REMOTE_PVC_END__
         - name: cogneva-json
           # 与主部署一致走 ConfigMap；hostPath 指开发机路径在空白机上必挂失败
@@ -182,20 +182,20 @@ spec:
         #     path: /var/run/docker.sock
         #     type: Socket
 # __GIT_REMOTE_PVC_BEGIN__
----
-# git-remote 集群卷（多节点变体；单节点 hostPath 变体渲染时本文档被剔除）
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: cogneva-git-remote-pvc
-  namespace: cogneva
-  labels:
-    app.kubernetes.io/name: cogneva
-    app.kubernetes.io/component: evolution
-spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: cogneva-local-retain
-  resources:
-    requests:
-      storage: 5Gi
+# ---
+## git-remote 集群卷（多节点变体；单节点 hostPath 变体渲染时本块被剔除）
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: cogneva-git-remote-pvc
+#   namespace: cogneva
+#   labels:
+#     app.kubernetes.io/name: cogneva
+#     app.kubernetes.io/component: evolution
+# spec:
+#   accessModes: ["ReadWriteOnce"]
+#   storageClassName: cogneva-local-retain
+#   resources:
+#     requests:
+#       storage: 5Gi
 # __GIT_REMOTE_PVC_END__

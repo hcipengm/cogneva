@@ -1157,34 +1157,60 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// 按集群形态保留/剔除清单里的变体标记块（# __NAME_BEGIN__ .. # __NAME_END__）。
-/// GIT_REMOTE_HOSTPATH 仅单节点保留（宿主同步通道）；GIT_REMOTE_PVC 仅多节点
-/// 保留（hostPath 跨节点不可达）。标记行本身总是剔除。
+/// 按集群形态渲染清单里的变体标记块（# __NAME_BEGIN__ .. # __NAME_END__）。
+/// 模板必须保证**原始文件本身就是合法可直接 kubectl apply 的 YAML**（默认
+/// = 单节点形态）：GIT_REMOTE_HOSTPATH 块是活跃行，单节点保留、多节点剔除；
+/// GIT_REMOTE_PVC 块整体是注释行（`# ` 前缀），单节点剔除、多节点取消注释
+/// 启用（hostPath 跨节点不可达）。块内 `## ` 开头的是说明文字，取消注释后
+/// 仍是注释。标记行本身总是剔除。
 fn filter_variant_blocks(text: &str, multi_node: bool) -> String {
+    #[derive(PartialEq)]
+    enum Mode {
+        Normal,
+        Drop,
+        Uncomment,
+    }
     let mut out = Vec::new();
-    let mut skipping = false;
+    let mut mode = Mode::Normal;
     for line in text.lines() {
         let t = line.trim();
         if let Some(name) = t
             .strip_prefix("# __")
             .and_then(|s| s.strip_suffix("_BEGIN__"))
         {
-            skipping = !match name {
-                "GIT_REMOTE_HOSTPATH" => !multi_node,
-                "GIT_REMOTE_PVC" => multi_node,
-                _ => true,
+            mode = match name {
+                "GIT_REMOTE_HOSTPATH" if multi_node => Mode::Drop,
+                "GIT_REMOTE_PVC" if multi_node => Mode::Uncomment,
+                "GIT_REMOTE_PVC" => Mode::Drop,
+                _ => Mode::Normal,
             };
             continue;
         }
         if t.starts_with("# __") && t.ends_with("_END__") {
-            skipping = false;
+            mode = Mode::Normal;
             continue;
         }
-        if !skipping {
-            out.push(line);
+        match mode {
+            Mode::Normal => out.push(line.to_string()),
+            Mode::Drop => {}
+            Mode::Uncomment => out.push(uncomment_line(line)),
         }
     }
     out.join("\n")
+}
+
+/// 去掉行首注释标记：`# ` 前缀剥一层（`## ` 剥后仍是 `# ` 注释）；行内首
+/// 个 `#` 之前有非空白内容时原样返回（不处理行尾注释）。
+fn uncomment_line(line: &str) -> String {
+    let Some(idx) = line.find('#') else {
+        return line.to_string();
+    };
+    if !line[..idx].trim().is_empty() {
+        return line.to_string();
+    }
+    let rest = &line[idx + 1..];
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    format!("{}{rest}", &line[..idx])
 }
 
 /// CN 模式公开镜像替换表（daocloud 镜像站）。
@@ -1441,12 +1467,16 @@ async fn main() -> Result<()> {
 mod variant_block_tests {
     use super::filter_variant_blocks;
 
+    // 模板约定：原始文本即合法 YAML（单节点形态）；PVC 块整体注释化，
+    // 块内 `## ` 是说明文字。
     const SAMPLE: &str = "before\n\
         # __GIT_REMOTE_HOSTPATH_BEGIN__\n\
         hostPath-line\n\
         # __GIT_REMOTE_HOSTPATH_END__\n\
         # __GIT_REMOTE_PVC_BEGIN__\n\
-        pvc-line\n\
+        ## pvc 说明注释\n\
+        # pvc-line\n\
+        #   pvc-nested\n\
         # __GIT_REMOTE_PVC_END__\n\
         after";
 
@@ -1455,6 +1485,7 @@ mod variant_block_tests {
         let out = filter_variant_blocks(SAMPLE, false);
         assert!(out.contains("hostPath-line"));
         assert!(!out.contains("pvc-line"));
+        assert!(!out.contains("pvc 说明注释"));
         assert!(!out.contains("__GIT_REMOTE_"), "标记行必须剔除");
         assert!(out.contains("before") && out.contains("after"));
     }
@@ -1462,7 +1493,12 @@ mod variant_block_tests {
     #[test]
     fn multi_node_keeps_pvc() {
         let out = filter_variant_blocks(SAMPLE, true);
-        assert!(out.contains("pvc-line"));
+        assert!(out.contains("\npvc-line\n") || out.starts_with("pvc-line"));
+        assert!(out.contains("  pvc-nested"), "嵌套行取消注释后缩进必须保留");
+        assert!(
+            out.contains("# pvc 说明注释"),
+            "## 说明文字取消注释后仍是注释"
+        );
         assert!(!out.contains("hostPath-line"));
         assert!(!out.contains("__GIT_REMOTE_"));
     }
