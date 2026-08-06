@@ -19,7 +19,7 @@ const PRESETS: Preset[] = [
     label: 'Kimi（月之暗面）',
     provider: 'kimi',
     base_url: 'https://api.kimi.com/coding/v1',
-    model: 'kimi-k2.6',
+    model: 'kimi-for-coding',
     api_style: 'openai',
   },
   {
@@ -277,7 +277,7 @@ export function LlmSetupOverlay({
               value={model}
               onChange={(e) => setModel(e.target.value)}
               className={inputCls}
-              placeholder="例如 kimi-k2.6"
+              placeholder="例如 kimi-for-coding"
               required
             />
           </div>

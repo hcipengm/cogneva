@@ -4,7 +4,8 @@
 //! backend，自然实现"主 API 恢复后切回"。
 
 use async_trait::async_trait;
-use cog_core::{Message, SFError, SFResult};
+use cog_core::{AssistantMessageEvent, Message, SFError, SFResult};
+use futures::StreamExt;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -31,7 +32,9 @@ pub fn is_rate_limit_or_quota_error(error_message: Option<&str>) -> bool {
 /// - 每次请求按 backends 数组顺序尝试。
 /// - `chat` 方法覆盖默认实现，在获取 `ChatResponse` 后检查 `error_message`，
 ///   匹配 429/402 时切换到下一个 backend。
-/// - `chat_stream` 仅对初始连接返回的 `Err` 做 failover；流内错误暂不支持自动切换。
+/// - `chat_stream` 对初始连接 `Err` 做 failover；连接成功后再包一层"首内容
+///   delta 之前的 Error 事件也可切换后端"（见 `wrap_with_failover`），内容
+///   一旦开始下发即锁定后端，避免用户看到两个模型拼出的半份答案。
 /// - `health_check` 只要任一 backend 健康即返回 `true`。
 pub struct RoutingProvider {
     backends: Vec<Arc<dyn LLMProvider>>,
@@ -80,6 +83,108 @@ impl RoutingProvider {
         }
         false
     }
+
+    /// Wrap a backend stream so a rate-limit/quota `Error` event that arrives
+    /// before the first content delta transparently fails over to the next
+    /// backend. Non-content marker events (Start/TextStart/...) seen before the
+    /// switch are discarded, so consumers observe one clean, well-formed stream.
+    /// Once any content delta has been forwarded the backend is committed —
+    /// switching then would show the user a half-answer from two models.
+    fn wrap_with_failover(
+        &self,
+        first: AssistantMessageEventStream,
+        first_idx: usize,
+        messages: &[Message],
+        options: &ChatOptions,
+    ) -> AssistantMessageEventStream {
+        let attempts = self.backends.len().min(self.max_attempts).max(1);
+        let backends = self.backends.clone();
+        let retry_on_429 = self.retry_on_429;
+        let retry_on_402 = self.retry_on_402;
+        let messages = messages.to_vec();
+        let options = options.clone();
+
+        let (out_stream, mut producer) = AssistantMessageEventStream::with_capacity(64);
+        tokio::spawn(async move {
+            let probe = RoutingProvider::new(backends, attempts as u32, retry_on_429, retry_on_402);
+            let mut current = first;
+            let mut idx = first_idx;
+
+            'backend: loop {
+                let result_fut = current.result();
+                let mut pending: Vec<AssistantMessageEvent> = Vec::new();
+                let mut committed = false;
+
+                while let Some(ev) = current.next().await {
+                    if committed {
+                        if producer.push(ev).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    match &ev {
+                        AssistantMessageEvent::Error { error, .. } => {
+                            let text = error.content();
+                            if probe.should_failover(Some(&text)) && idx + 1 < attempts {
+                                warn!(
+                                    "Backend {} stream failed pre-content ({}), failing over to backend {}",
+                                    idx, text, idx + 1
+                                );
+                                idx += 1;
+                                match probe.backends[idx].chat_stream(&messages, &options).await {
+                                    Ok(s) => {
+                                        current = s;
+                                        continue 'backend;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Backend {} connect failed during failover: {e}",
+                                            idx
+                                        );
+                                    }
+                                }
+                            }
+                            committed = true;
+                            for p in pending.drain(..) {
+                                if producer.push(p).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if producer.push(ev).await.is_err() {
+                                return;
+                            }
+                        }
+                        AssistantMessageEvent::TextDelta { .. }
+                        | AssistantMessageEvent::ThinkingDelta { .. }
+                        | AssistantMessageEvent::ToolCallDelta { .. } => {
+                            committed = true;
+                            for p in pending.drain(..) {
+                                if producer.push(p).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if producer.push(ev).await.is_err() {
+                                return;
+                            }
+                        }
+                        _ => pending.push(ev),
+                    }
+                }
+
+                // Stream ended: flush any markers of a delta-less reply, then
+                // propagate the final response.
+                for p in pending.drain(..) {
+                    if producer.push(p).await.is_err() {
+                        return;
+                    }
+                }
+                producer.end(result_fut.await);
+                return;
+            }
+        });
+
+        out_stream
+    }
 }
 
 #[async_trait]
@@ -94,7 +199,9 @@ impl LLMProvider for RoutingProvider {
         for i in 0..attempts {
             let backend = &self.backends[i];
             match backend.chat_stream(messages, options).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    return Ok(self.wrap_with_failover(stream, i, messages, options));
+                }
                 Err(e) => {
                     let err_str = format!("{e}");
                     warn!("Backend {} chat_stream failed: {}", i, err_str);
@@ -197,6 +304,9 @@ mod tests {
     struct MockProvider {
         response_text: String,
         error_msg: Option<String>,
+        /// When true, emit a TextDelta before the Error event (post-content
+        /// failure — must NOT trigger failover).
+        mid_stream_error: bool,
     }
 
     #[async_trait]
@@ -255,6 +365,16 @@ mod tests {
                 })
                 .await;
             if self.error_msg.is_some() {
+                if self.mid_stream_error {
+                    let _ = producer
+                        .push(AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: "partial".into(),
+                            partial: Message::assistant(content.clone()),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                }
                 let _ = producer
                     .push(AssistantMessageEvent::Error {
                         reason: StopReason::Error,
@@ -301,10 +421,12 @@ mod tests {
         let primary = Arc::new(MockProvider {
             response_text: "".into(),
             error_msg: Some("API error: 429 rate limit exceeded".into()),
+            mid_stream_error: false,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
+            mid_stream_error: false,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -325,10 +447,12 @@ mod tests {
         let primary = Arc::new(MockProvider {
             response_text: "".into(),
             error_msg: Some("API error: 402 payment required".into()),
+            mid_stream_error: false,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
+            mid_stream_error: false,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -349,10 +473,12 @@ mod tests {
         let primary = Arc::new(MockProvider {
             response_text: "".into(),
             error_msg: Some("API error: 429 rate limit exceeded".into()),
+            mid_stream_error: false,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
+            mid_stream_error: false,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, false, false);
@@ -368,10 +494,12 @@ mod tests {
         let primary = Arc::new(MockProvider {
             response_text: "".into(),
             error_msg: Some("API error: 429".into()),
+            mid_stream_error: false,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "".into(),
             error_msg: Some("API error: 402".into()),
+            mid_stream_error: false,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -386,10 +514,12 @@ mod tests {
         let primary = Arc::new(MockProvider {
             response_text: "hello from primary".into(),
             error_msg: None,
+            mid_stream_error: false,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
+            mid_stream_error: false,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -414,5 +544,77 @@ mod tests {
             "500 internal server error"
         )));
         assert!(!is_rate_limit_or_quota_error(None));
+    }
+
+    #[tokio::test]
+    async fn test_stream_failover_on_pre_content_error() {
+        let primary = Arc::new(MockProvider {
+            response_text: "".into(),
+            error_msg: Some("API error: 429 rate limit exceeded".into()),
+            mid_stream_error: false,
+        });
+        let secondary = Arc::new(MockProvider {
+            response_text: "hello from secondary".into(),
+            error_msg: None,
+            mid_stream_error: false,
+        });
+
+        let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
+        let mut stream = router
+            .chat_stream(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .unwrap();
+        let mut result_fut = stream.result();
+        let mut saw_error = false;
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AssistantMessageEvent::Error { .. }) {
+                saw_error = true;
+            }
+        }
+        let response = (&mut result_fut).await;
+        assert!(!saw_error, "pre-content error must be hidden by failover");
+        let text: String = response
+            .content
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect();
+        assert_eq!(text, "hello from secondary");
+    }
+
+    #[tokio::test]
+    async fn test_stream_no_failover_after_content() {
+        let primary = Arc::new(MockProvider {
+            response_text: "".into(),
+            error_msg: Some("API error: 429 rate limit exceeded".into()),
+            mid_stream_error: true,
+        });
+        let secondary = Arc::new(MockProvider {
+            response_text: "hello from secondary".into(),
+            error_msg: None,
+            mid_stream_error: false,
+        });
+
+        let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
+        let mut stream = router
+            .chat_stream(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .unwrap();
+        let mut result_fut = stream.result();
+        let mut deltas = String::new();
+        let mut saw_error = false;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AssistantMessageEvent::TextDelta { delta, .. } => deltas.push_str(&delta),
+                AssistantMessageEvent::Error { .. } => saw_error = true,
+                _ => {}
+            }
+        }
+        let response = (&mut result_fut).await;
+        assert_eq!(deltas, "partial");
+        assert!(saw_error, "post-content error must reach the consumer");
+        assert_eq!(
+            response.error_message.as_deref(),
+            Some("API error: 429 rate limit exceeded")
+        );
     }
 }

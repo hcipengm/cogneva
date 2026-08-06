@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::websocket_protocol::ServerMessage;
@@ -14,8 +15,12 @@ use crate::GatewayState;
 const SESSION_HISTORY_CAP: usize = 40;
 /// Hard bound on concurrent session histories; oldest-touched evicted first.
 const MAX_SESSIONS: usize = 256;
-/// A chat turn may wait on a reasoning model for well over a minute.
-const CHAT_TIMEOUT_SECS: u64 = 180;
+/// Connecting to the LLM backend should be fast; the failover pool handles
+/// slow backends by switching.
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+/// A reasoning model may think for a long while between deltas; only an idle
+/// gap beyond this aborts the turn. Matches the provider's own in-stream cap.
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -82,9 +87,10 @@ async fn emit_message_end(out: &mpsc::Sender<String>, session_id: &str, message_
     .await;
 }
 
-/// Run one chat turn: echo the user message, call the LLM with session
-/// history, stream the assistant reply back as a single delta, and record the
-/// turn in the session history.
+/// Run one chat turn: echo the user message, stream the LLM reply delta by
+/// delta (typewriter style — the routing layer still fails over transparently
+/// if a backend errors before the first content delta), and record the turn in
+/// the session history.
 pub async fn run_chat_turn(
     state: Arc<GatewayState>,
     out: mpsc::Sender<String>,
@@ -134,29 +140,99 @@ pub async fn run_chat_turn(
         ..Default::default()
     };
 
-    // 3. Call the LLM (non-streaming: the full failover pool applies).
-    let reply = match tokio::time::timeout(
-        std::time::Duration::from_secs(CHAT_TIMEOUT_SECS),
-        llm.chat(&messages, &options),
+    // 3. Stream the reply: deltas are forwarded as they arrive.
+    let mut stream = match tokio::time::timeout(
+        std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        llm.chat_stream(&messages, &options),
     )
     .await
     {
-        Ok(Ok(resp)) => resp
-            .content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join(""),
-        Ok(Err(e)) => format!("LLM 调用失败：{e}"),
-        Err(_) => format!("LLM 响应超时（>{CHAT_TIMEOUT_SECS}s），请稍后重试。"),
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            emit_delta(
+                &out,
+                &session_id,
+                &assistant_mid,
+                &format!("LLM 调用失败：{e}"),
+            )
+            .await;
+            emit_message_end(&out, &session_id, &assistant_mid).await;
+            return;
+        }
+        Err(_) => {
+            emit_delta(
+                &out,
+                &session_id,
+                &assistant_mid,
+                &format!("LLM 连接超时（>{CONNECT_TIMEOUT_SECS}s），请稍后重试。"),
+            )
+            .await;
+            emit_message_end(&out, &session_id, &assistant_mid).await;
+            return;
+        }
     };
 
-    emit_delta(&out, &session_id, &assistant_mid, &reply).await;
+    let mut reply = String::new();
+    let mut failure: Option<String> = None;
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+            stream.next(),
+        )
+        .await;
+        match next {
+            Ok(Some(cog_core::AssistantMessageEvent::TextDelta { delta, .. })) => {
+                reply.push_str(&delta);
+                emit_delta(&out, &session_id, &assistant_mid, &delta).await;
+            }
+            Ok(Some(cog_core::AssistantMessageEvent::Error { error, .. })) => {
+                failure = Some(error.content());
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                failure = Some(format!(
+                    "LLM 响应超时（>{STREAM_IDLE_TIMEOUT_SECS}s 无输出）"
+                ));
+                break;
+            }
+        }
+    }
+
+    // Reasoning-only replies can arrive with no text deltas at all; fall back
+    // to the final response payload so the user never sees an empty bubble.
+    if failure.is_none() && reply.is_empty() {
+        let final_resp = stream.result().await;
+        if let Some(err) = final_resp.error_message {
+            failure = Some(err);
+        } else {
+            reply = final_resp
+                .content
+                .iter()
+                .filter_map(|b| b.as_text())
+                .collect::<Vec<_>>()
+                .join("");
+            if !reply.is_empty() {
+                emit_delta(&out, &session_id, &assistant_mid, &reply).await;
+            }
+        }
+    }
+
+    if let Some(err) = &failure {
+        emit_delta(
+            &out,
+            &session_id,
+            &assistant_mid,
+            &format!("LLM 调用失败：{err}"),
+        )
+        .await;
+    }
     emit_message_end(&out, &session_id, &assistant_mid).await;
 
     // 4. Record the turn (skip failed/timeout replies — they are not useful
     //    context for later turns).
-    if !reply.starts_with("LLM 调用失败") && !reply.starts_with("LLM 响应超时") {
+    if failure.is_none() && !reply.is_empty() {
         let mut sessions = state.chat_sessions.lock().await;
         if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&session_id) {
             if let Some(oldest) = sessions

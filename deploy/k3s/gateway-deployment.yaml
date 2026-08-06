@@ -77,7 +77,7 @@ spec:
             - name: COGNEVA_LLM_BASE_URL
               value: "https://api.kimi.com/coding/v1"
             - name: COGNEVA_LLM_MODEL
-              value: "kimi-k2.6"
+              value: "kimi-for-coding"
           livenessProbe:
             httpGet:
               path: /health/live

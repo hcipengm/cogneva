@@ -157,7 +157,7 @@ data:
             "provider": "kimi",
             "api_key": "${KIMI_API_KEY}",
             "base_url": "https://api.kimi.com/coding/v1",
-            "model": "kimi-k2.6",
+            "model": "kimi-for-coding",
             "api_style": "openai",
             "weight": 1,
             "enabled": true
