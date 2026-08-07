@@ -314,21 +314,22 @@ impl GitOpsPuller {
                 }
                 Err(e) => {
                     // 镜像已换但滚动卡死（拉不到镜像/副本不起）：回滚。
+                    // resume 先于 undo（paused 部署 undo 会被 kubectl 拒绝）。
                     warn!(error = %e, "orphaned canary stuck; rolling back");
-                    let _ = self
-                        .run(
-                            &k,
-                            &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
-                            None,
-                            120,
-                        )
-                        .await;
                     let _ = self
                         .run(
                             &k,
                             &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                             None,
                             60,
+                        )
+                        .await;
+                    let _ = self
+                        .run(
+                            &k,
+                            &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
+                            None,
+                            120,
                         )
                         .await;
                     self.ledger
@@ -342,22 +343,22 @@ impl GitOpsPuller {
             }
         } else if self.deployment_paused().await.unwrap_or(false) {
             // 镜像不是目标且部署仍 paused：金丝雀未落地或已被 undo，
-            // 是 puller 中途死亡留下的现场——undo（无可回退时报错忽略）
-            // + resume 清理。
-            let _ = self
-                .run(
-                    &k,
-                    &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
-                    None,
-                    120,
-                )
-                .await;
+            // 是 puller 中途死亡留下的现场——resume 先于 undo（paused
+            // 部署 undo 会被 kubectl 拒绝）清理。
             let _ = self
                 .run(
                     &k,
                     &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                     None,
                     60,
+                )
+                .await;
+            let _ = self
+                .run(
+                    &k,
+                    &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
+                    None,
+                    120,
                 )
                 .await;
             self.ledger
@@ -700,21 +701,22 @@ impl GitOpsPuller {
                     // 与看护失败同等处理——回滚 + RolledBack。否则候选记
                     // Failed 下轮 poll 会反复金丝雀（重试风暴），部署也
                     // 停在坏镜像上（2026-08-07 cluster-2 实测）。
+                    // resume 先于 undo（paused 部署 undo 会被 kubectl 拒绝）。
                     warn!(error = %e, "rollout after canary failed; rolling back");
-                    let _ = self
-                        .run(
-                            &k,
-                            &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
-                            None,
-                            120,
-                        )
-                        .await;
                     let _ = self
                         .run(
                             &k,
                             &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                             None,
                             60,
+                        )
+                        .await;
+                    let _ = self
+                        .run(
+                            &k,
+                            &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
+                            None,
+                            120,
                         )
                         .await;
                     self.mark_rolled_back(candidate, &format!("rollout after canary: {e}"))
@@ -732,20 +734,24 @@ impl GitOpsPuller {
             }
             Err(e) => {
                 warn!(error = %e, "canary watch failed; rolling back");
-                let _ = self
-                    .run(
-                        &k,
-                        &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
-                        None,
-                        120,
-                    )
-                    .await;
+                // resume 必须先于 undo：kubectl 拒绝对 paused 部署 undo
+                // （"you cannot rollback a paused deployment"），先 undo 会
+                // 静默失败、resume 后反而把坏镜像全量滚出（2026-08-07
+                // cluster-2 实测）。未 pause 时 resume 报错忽略即可。
                 let _ = self
                     .run(
                         &k,
                         &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
                         60,
+                    )
+                    .await;
+                let _ = self
+                    .run(
+                        &k,
+                        &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
+                        None,
+                        120,
                     )
                     .await;
                 self.mark_rolled_back(candidate, &format!("canary regression: {e}"))
@@ -836,6 +842,8 @@ impl GitOpsPuller {
     async fn check_pods_healthy(&self, allow_pending: bool) -> SFResult<()> {
         // Pod 标签是 app.kubernetes.io/name=<deployment>；此前误用 app=<deployment>
         // 匹配零个 Pod，看护空转通过（2026-08-07 双集群实测）。
+        // kubectl 失败（API 抖动/凭证问题）必须向上传播走回滚，
+        // 不能吞成空输出当"零 Pod"（2026-08-07 cluster-2 实测）。
         let out = self
             .run(
                 &self.config.kubectl_bin.clone(),
@@ -852,8 +860,7 @@ impl GitOpsPuller {
                 None,
                 30,
             )
-            .await
-            .unwrap_or_default();
+            .await?;
         if out.trim().is_empty() {
             // 零 Pod 不是"健康"——选择器失效或副本被删光都不能空转通过。
             return Err(SFError::Agent(
