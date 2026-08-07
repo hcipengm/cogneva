@@ -855,7 +855,10 @@ impl GitOpsPuller {
                     "-l",
                     &format!("app.kubernetes.io/name={}", self.config.deployment),
                     "-o",
-                    "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{'\n'}{end}",
+                    // 行分隔必须是 {"\n"} 双引号转义形式——单引号里放真实
+                    // 换行符 kubectl jsonpath 直接解析失败（unterminated
+                    // quoted string），旧代码靠吞错误空转掩盖了它。
+                    "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}",
                 ],
                 None,
                 30,
