@@ -340,9 +340,10 @@ impl GitOpsPuller {
                         .await?;
                 }
             }
-        } else {
-            // 镜像还是旧版：金丝雀未落地或已被 undo。可能留下 paused
-            // 部署——undo（无可回退时报错忽略）+ resume 清理。
+        } else if self.deployment_paused().await.unwrap_or(false) {
+            // 镜像不是目标且部署仍 paused：金丝雀未落地或已被 undo，
+            // 是 puller 中途死亡留下的现场——undo（无可回退时报错忽略）
+            // + resume 清理。
             let _ = self
                 .run(
                     &k,
@@ -366,8 +367,40 @@ impl GitOpsPuller {
                     "orphaned canary cleaned up after puller restart",
                 )
                 .await?;
+        } else {
+            // 镜像不是目标且部署未 paused：晋级之后又有新的滚动（正常
+            // 换版/人工处置），世界已向前——绝不能 undo（会把合法的新
+            // 部署回退掉），只把台账尾巴终结掉。
+            self.ledger
+                .update_status(
+                    &rec.id,
+                    PromotionStatus::RolledBack,
+                    "superseded by a newer rollout after puller restart",
+                )
+                .await?;
         }
         Ok(true)
+    }
+
+    /// 部署是否处于 rollout pause 状态（金丝雀中途死亡的现场特征）。
+    async fn deployment_paused(&self) -> SFResult<bool> {
+        let out = self
+            .run(
+                &self.config.kubectl_bin.clone(),
+                &[
+                    "-n",
+                    &self.config.namespace,
+                    "get",
+                    "deployment",
+                    &self.config.deployment,
+                    "-o",
+                    "jsonpath={.spec.paused}",
+                ],
+                None,
+                30,
+            )
+            .await?;
+        Ok(out.trim() == "true")
     }
 
     /// 当前部署在跑的容器镜像。
