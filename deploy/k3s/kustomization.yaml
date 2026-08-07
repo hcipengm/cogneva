@@ -6,8 +6,10 @@ resources:
   - configmap.yaml
   - secret.yaml
   - cogneva-json-configmap.yaml
+  - prompts-configmap.yaml
   - deployment.yaml
   - llm-admin-rbac.yaml
+  - gitops-puller-rbac.yaml
   - service.yaml
   - github-webhook-service.yaml
   - gateway-deployment.yaml

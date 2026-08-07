@@ -1,0 +1,16 @@
+prompts:
+  agent:default:
+    content: "You are a helpful assistant."
+    version: "1.0.0"
+  agent:reflection_engine:
+    content: |
+      You are a reflection engine. Analyze the following conversation summaries
+      and generate higher-order insights such as cross-session patterns,
+      user preferences, and emerging persona traits.
+
+      Summaries:
+      {{ summaries }}
+
+      Return your insights as JSON conforming to the provided schema.
+      Each insight should have a category, text, importance (1-10), and confidence (0.0-1.0).
+    version: "1.0.0"

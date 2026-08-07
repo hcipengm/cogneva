@@ -1,0 +1,50 @@
+# GitOps 拉取端（docs/2026-08-06_真自治全进化无人值守方案.md 路线 B）最小权限：
+# 主应用 Pod 内的 puller 需要 apply L0 配置 configmap、重建 prompts configmap、
+# 对 cogneva 部署做金丝雀（set image / rollout pause|resume|undo|status）
+# 并读取 pod 健康信号。全部限定 namespace 内、resourceNames 白名单。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cogneva-gitops-puller
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: gateway
+rules:
+  # L0：kubectl apply cogneva-json（热更新）+ 重建 cogneva-prompts。
+  # apply 首次需要 create，后续 get+patch。
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cogneva-json", "cogneva-prompts"]
+    verbs: ["get", "patch", "create"]
+  # L1 金丝雀：set image / rollout pause|resume|undo 都是 patch；
+  # rollout status 需要 get+watch。
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cogneva"]
+    verbs: ["get", "list", "watch", "patch"]
+  # rollout undo 要从历史 ReplicaSet 还原 PodTemplate。
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
+  # 金丝雀看护：readiness 与 restart count。
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cogneva-gitops-puller
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: gateway
+subjects:
+  - kind: ServiceAccount
+    name: cogneva
+    namespace: cogneva
+roleRef:
+  kind: Role
+  name: cogneva-gitops-puller
+  apiGroup: rbac.authorization.k8s.io

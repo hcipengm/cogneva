@@ -55,6 +55,18 @@ CTR="$(buildah from "${IMAGE}:${PREV_TAG}")"
 trap 'buildah rm "$CTR" >/dev/null 2>&1 || true' EXIT
 buildah copy "$CTR" target/release/cogneva /opt/cogneva/cogneva
 buildah copy "$CTR" crates/cog-storage/migrations /opt/cogneva/crates/cog-storage/migrations
+# kubectl 自愈层：GitOps 拉取端（主 Pod 内）apply L0 配置/金丝雀编排需要。
+# 叠层流不经过全量构建，基镜像可能还没有 kubectl。首选宿主 k3s 二进制
+# （多调用，拷为 kubectl 即用，版本与集群一致）；宿主没有就跳过——
+# deployment.yaml 的 hostPath 文件挂载会在运行时兜底提供。
+if ! buildah run "$CTR" -- test -x /usr/local/bin/kubectl 2>/dev/null; then
+  if [ -x /usr/local/bin/k3s ]; then
+    echo "==> 拷入宿主 k3s 作为镜像内 kubectl（多调用二进制）"
+    buildah copy "$CTR" /usr/local/bin/k3s /usr/local/bin/kubectl
+  else
+    echo "==> 宿主无 k3s，kubectl 由部署清单 hostPath 挂载兜底，跳过镜像层"
+  fi
+fi
 if [ -f web/dist/index.html ]; then
   # web/dist 是 git 忽略的构建产物——拷的是磁盘现状，要新鲜前端先加 --web
   buildah copy "$CTR" web/dist /opt/cogneva/web
@@ -76,6 +88,20 @@ rm -f "$TAR"
 k3s ctr -n k8s.io images tag --force "${IMAGE}:${NEW_TAG}" "${IMAGE}:local"
 
 if [ "$DO_DEPLOY" = 1 ]; then
+  # 结构性变更随版本滚动（幂等 apply）：GitOps 拉取端 RBAC、进化配置、
+  # 主部署（GitOps env/git-remote 挂载/prompts 挂载等）。apply 用的是
+  # 仓库 yaml 的 :local pin，此时 :local 已重打到新版本，不会打回旧版。
+  echo "==> 应用 GitOps RBAC / 进化 configmap / 主部署结构"
+  kubectl apply -f deploy/k3s/gitops-puller-rbac.yaml
+  kubectl apply -f deploy/k3s/evolution-configmap.yaml
+  kubectl apply -f deploy/k3s/deployment.yaml
+
+  # prompts configmap 随换版重建：挂载的旧 prompts 会遮蔽新镜像的更新，
+  # 每次换版从仓库 prompts/ 全量刷新（与 GitOps 拉取端 L0/L1 重建同源）
+  echo "==> 重建 cogneva-prompts configmap"
+  kubectl create configmap cogneva-prompts -n "$NS" \
+    --from-file=prompts/ --dry-run=client -o yaml | kubectl apply -f -
+
   echo "==> 三部署滚动到 ${NEW_TAG}"
   kubectl set image -n "$NS" deployment/cogneva "cogneva=${IMAGE}:${NEW_TAG}"
   kubectl set image -n "$NS" deployment/cogneva-evolution "cogneva=${IMAGE}:${NEW_TAG}"

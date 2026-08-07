@@ -382,6 +382,11 @@ data:
         "low_watermark": 100,
         "max_summaries": 10
       },
+      "prompts": {
+        "_comment": "外部 prompt 模板目录，由 cogneva-prompts configmap 挂载；hot_reload 捕捉 configmap 交换（L0 配置晋级热更新通道）。",
+        "dir": "/etc/cogneva/prompts",
+        "hot_reload": true
+      },
       "agent_pool": {
         "enabled": true,
         "worker_count": 3,

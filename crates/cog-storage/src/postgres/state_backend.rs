@@ -156,6 +156,38 @@ impl PostgresStateBackend {
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
 
+        // 晋级台账：每次晋级（推送端与各集群拉取端）全字段留档，
+        // 配额/熔断/审计共用一份事实源。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cog_evolution_promotions (
+                id TEXT PRIMARY KEY,
+                patch_id TEXT NOT NULL,
+                level TEXT NOT NULL,
+                decision_reason TEXT NOT NULL,
+                cluster TEXT NOT NULL,
+                status TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                eval_summary TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_cog_evolution_promotions_updated
+            ON cog_evolution_promotions(updated_at DESC)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
         Ok(())
     }
 }
@@ -995,5 +1027,135 @@ impl StateBackend for PostgresStateBackend {
         })
         .await?;
         Ok(())
+    }
+}
+
+// ─── PromotionLedger (Postgres) ───
+
+#[async_trait]
+impl cog_core::PromotionLedger for PostgresStateBackend {
+    async fn record(&self, rec: cog_core::PromotionRecord) -> SFResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO cog_evolution_promotions
+                (id, patch_id, level, decision_reason, cluster, status, outcome, eval_summary, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(&rec.id)
+        .bind(&rec.patch_id)
+        .bind(&rec.level)
+        .bind(&rec.decision_reason)
+        .bind(&rec.cluster)
+        .bind(rec.status.as_str())
+        .bind(&rec.outcome)
+        .bind(&rec.eval_summary)
+        .bind(rec.created_at)
+        .bind(rec.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn update_status(
+        &self,
+        id: &str,
+        status: cog_core::PromotionStatus,
+        outcome: &str,
+    ) -> SFResult<()> {
+        let result = sqlx::query(
+            r#"
+            UPDATE cog_evolution_promotions
+            SET status = $1, outcome = $2, updated_at = NOW()
+            WHERE id = $3
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(outcome)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(SFError::Validation(format!(
+                "promotion record {id} not found"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn count_promoted_since(&self, since: chrono::DateTime<Utc>) -> SFResult<u64> {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM cog_evolution_promotions
+            WHERE status = 'promoted' AND updated_at >= $1
+            "#,
+        )
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(row.0 as u64)
+    }
+
+    async fn recent(&self, limit: usize) -> SFResult<Vec<cog_core::PromotionRecord>> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            chrono::DateTime<Utc>,
+            chrono::DateTime<Utc>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, patch_id, level, decision_reason, cluster, status, outcome,
+                   eval_summary, created_at, updated_at
+            FROM cog_evolution_promotions
+            ORDER BY updated_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    patch_id,
+                    level,
+                    decision_reason,
+                    cluster,
+                    status,
+                    outcome,
+                    eval_summary,
+                    created_at,
+                    updated_at,
+                )| {
+                    cog_core::PromotionRecord {
+                        id,
+                        patch_id,
+                        level,
+                        decision_reason,
+                        cluster,
+                        status: cog_core::PromotionStatus::parse(&status)
+                            .unwrap_or(cog_core::PromotionStatus::Failed),
+                        outcome,
+                        eval_summary,
+                        created_at,
+                        updated_at,
+                    }
+                },
+            )
+            .collect())
     }
 }

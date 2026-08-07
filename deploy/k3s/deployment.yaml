@@ -103,6 +103,17 @@ spec:
               value: "1"
             - name: GIT_SSH_COMMAND
               value: "ssh -i /etc/cogneva-keys/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/lib/sf-data/.ssh_known_hosts"
+            # GitOps 拉取端：poll 中央 bare 仓库（宿主 /var/lib/cogneva-data/
+            # git-remote 挂入 /host-git）的 evolution-release 分支，L0 配置
+            # 热更 / L1 金丝雀各自在本集群闭环。沙盒推送端只写该仓库。
+            - name: COGNEVA_GITOPS_ENABLED
+              value: "true"
+            - name: COGNEVA_GITOPS_REPO_URL
+              value: "/host-git"
+            - name: COGNEVA_CLUSTER_NAME
+              value: "main"
+            - name: COGNEVA_GITOPS_METRICS_URL
+              value: "http://localhost:8080/metrics"
           livenessProbe:
             httpGet:
               path: /health/live
@@ -132,8 +143,20 @@ spec:
             - name: cogneva-json
               mountPath: /etc/cogneva
               readOnly: true
+            - name: prompts
+              mountPath: /etc/cogneva/prompts
+              readOnly: true
             - name: deploy-key
               mountPath: /etc/cogneva-keys
+              readOnly: true
+            - name: git-remote
+              mountPath: /host-git
+              readOnly: true
+            # GitOps 拉取端的 kubectl：k3s 是多调用二进制，argv[0]=kubectl
+            # 时就是 kubectl，版本与集群天然一致，零下载（CN 网络 dl.k8s.io
+            # 限速到不可用，2026-08-06 实测 1.4KB/s）。
+            - name: kubectl-bin
+              mountPath: /usr/local/bin/kubectl
               readOnly: true
       volumes:
         - name: data
@@ -142,6 +165,12 @@ spec:
           configMap:
             name: cogneva-json
             optional: true
+        - name: prompts
+          configMap:
+            name: cogneva-prompts
+            # 空白机首启时 GitOps 拉取端尚未建过该 configmap，置可选
+            # 避免主 Pod 卡 FailedMount；建好后挂载自动生效
+            optional: true
         - name: deploy-key
           secret:
             secretName: cogneva-deploy-key
@@ -149,6 +178,18 @@ spec:
             # 空白机一键部署时该 secret 尚未创建，置为可选避免主 Pod 永远
             # 卡在 FailedMount；GitHub/Gitee 推送是部署后另行配置的能力
             optional: true
+        - name: git-remote
+          # GitOps 中央 bare 仓库（与进化部署的 git-remote 同一 hostPath，
+          # bootstrap 部署前已 seed）。主 Pod 只读克隆/fetch，沙盒推送端读写。
+          hostPath:
+            path: /var/lib/cogneva-data/git-remote
+            type: Directory
+        - name: kubectl-bin
+          # 宿主 k3s 二进制文件挂载为 Pod 内 kubectl（见 volumeMount 注释）。
+          # bootstrap 流程先装 k3s 再部署，文件必然存在。
+          hostPath:
+            path: /usr/local/bin/k3s
+            type: File
       securityContext:
         runAsNonRoot: true
         runAsUser: 1001

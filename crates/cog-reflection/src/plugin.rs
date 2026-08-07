@@ -307,7 +307,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     // the admin API, even when auto_apply is enabled.
                     self_evolution.auto_apply && !self_evolution.manual_approve,
                 )
-                .with_test_timeout(self_evolution.test_timeout_secs);
+                .with_test_timeout(self_evolution.test_timeout_secs)
+                .with_promotion_policy(self_evolution.promotion.clone());
 
                 let deployer = crate::EvolutionDeployer::new(
                     &project_root,
@@ -355,6 +356,87 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 ctx.publish_service(admin_service);
                 info!("ReflectionPlugin evolution admin service published");
 
+                // 晋级触发器：沙盒验证全过的 patch 由它决定去向
+                // （GitOps 自动晋级 / 审批台待办），配额/熔断/暂停全在
+                // 其中判定。推送端只跟 Git 中央仓库说话，不持集群凭证。
+                let promotion_channel: Option<Arc<dyn crate::PromotionChannel>> =
+                    if self_evolution.promotion.gitops.enabled {
+                        info!(
+                            repo = %self_evolution.promotion.gitops.repo_url,
+                            branch = %self_evolution.promotion.gitops.branch,
+                            "GitOps promotion publisher enabled"
+                        );
+                        Some(Arc::new(crate::GitOpsPublisher::new(
+                            self_evolution.promotion.gitops.clone(),
+                            &project_root,
+                            &self_evolution.binary_dir,
+                        )))
+                    } else {
+                        None
+                    };
+                let promoter: Option<Arc<crate::AutoPromoter>> = ctx
+                    .consume_service::<dyn cog_core::PromotionLedger>()
+                    .map(|ledger| {
+                        Arc::new(crate::AutoPromoter::new(
+                            self_evolution.promotion.clone(),
+                            ledger,
+                            promotion_channel,
+                            engine.clone(),
+                        ))
+                    });
+                if promoter.is_none() {
+                    warn!("PromotionLedger not published; auto-promotion disabled");
+                }
+
+                // GitOps 拉取端：gitops.enabled 且 puller_enabled 时本进程
+                // 所在集群各跑一个，poll 中央仓库 release 分支，各自金丝雀/
+                // 回滚/熔断（台账 cluster 字段区分集群，单集群故障不影响
+                // 其他集群）。沙盒推送端置 puller_enabled=false 只推不拉。
+                if self_evolution.promotion.gitops.enabled
+                    && self_evolution.promotion.gitops.puller_enabled
+                {
+                    if let Some(ledger) = ctx.consume_service::<dyn cog_core::PromotionLedger>() {
+                        let cluster = std::env::var("COGNEVA_CLUSTER_NAME")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .or_else(|| {
+                                std::env::var("HOSTNAME")
+                                    .ok()
+                                    .filter(|s| !s.trim().is_empty())
+                            })
+                            .unwrap_or_else(|| "default".into());
+                        let metrics_url = std::env::var("COGNEVA_GITOPS_METRICS_URL")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty());
+                        let puller = Arc::new(
+                            crate::GitOpsPuller::new(
+                                self_evolution.promotion.gitops.clone(),
+                                ledger,
+                                cluster.clone(),
+                            )
+                            .with_metrics_url(metrics_url),
+                        );
+                        let puller_shutdown = cog_core::ShutdownSignal::new();
+                        if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                            let shutdown = puller_shutdown.clone();
+                            let mut rx = broadcast_tx.0.subscribe();
+                            tokio::spawn(async move {
+                                let _ = rx.recv().await;
+                                shutdown.trigger();
+                            });
+                        }
+                        info!(
+                            cluster = %cluster,
+                            repo = %self_evolution.promotion.gitops.repo_url,
+                            branch = %self_evolution.promotion.gitops.branch,
+                            "GitOps promotion puller enabled for this cluster"
+                        );
+                        tokio::spawn(crate::run_puller_loop(puller, puller_shutdown));
+                    } else {
+                        warn!("PromotionLedger not published; GitOps puller disabled");
+                    }
+                }
+
                 let poll_interval =
                     std::time::Duration::from_secs(self_evolution.poll_interval_secs);
 
@@ -369,6 +451,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             &engine,
                             &self_evolution,
                             evolution_metrics.as_ref(),
+                            promoter.as_ref(),
                         )
                         .await
                         {
@@ -813,10 +896,17 @@ async fn run_evolution_cycle(
     engine: &Arc<crate::ReflectionEngine>,
     config: &cog_core::SelfEvolutionConfig,
     evolution_metrics: Option<&Arc<dyn cog_core::EvolutionMetrics>>,
+    promoter: Option<&Arc<crate::AutoPromoter>>,
 ) -> cog_core::SFResult<()> {
     let Some(evo_engine) = engine.evolution.as_ref() else {
         return Ok(());
     };
+
+    // 先对齐上游主线再处理 patch：沙盒树陈旧会让 GitOps 拉取端应用晋级
+    // 产物时连带回退无关文件。同步失败不阻塞本轮（用当前树继续）。
+    if let Err(e) = pipeline.sync_with_upstream().await {
+        warn!(error = %e, "Sandbox source sync failed; continuing with current tree");
+    }
 
     let patches = pipeline.pending_patches(Some(evo_engine)).await?;
     if patches.is_empty() {
@@ -953,6 +1043,14 @@ async fn run_evolution_cycle(
                 if let Some(m) = evolution_metrics {
                     m.record_patch_applied().await;
                     m.record_event(false).await;
+                }
+                // 沙盒部署成功 → 交晋级触发器（soak → 分级 → GitOps/审批台）。
+                if let Some(p) = promoter {
+                    let p = p.clone();
+                    let promoted_patch = patch.clone();
+                    tokio::spawn(async move {
+                        p.on_sandbox_deployed(promoted_patch).await;
+                    });
                 }
                 continue;
             }

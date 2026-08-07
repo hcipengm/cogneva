@@ -22,6 +22,7 @@
 //! - **`cog-llm`** — `SkillExtractor` uses an `LLMProvider` to generate `SkillConfig` from mature patterns.
 //! - **`cog-core`** — `SkillRegistry` receives promoted `SkillConfig` entries.
 
+pub mod auto_promoter;
 pub mod crew;
 pub mod detector;
 pub mod discovery;
@@ -33,18 +34,22 @@ pub mod evolution_deployer;
 pub mod extractor;
 pub mod firecracker;
 pub mod flywheel;
+pub mod gitops_publisher;
+pub mod gitops_puller;
 pub mod image_rollout;
 pub mod matcher;
 pub mod meta_learning;
 pub mod patch_pipeline;
 pub mod policy_store;
 pub mod promoter;
+pub mod promotion_gate;
 pub mod recorder;
 pub mod reviewer;
 pub mod sandbox;
 pub mod squad;
 pub mod types;
 
+pub use auto_promoter::{AutoPromoter, PromotionChannel};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
 pub use detector::{DefaultLearningDetector, LearningDetector};
 pub use discovery::DiscoveryEngine;
@@ -59,6 +64,8 @@ pub use evolution_deployer::{BuildArtifact, EvolutionDeployer};
 pub use extractor::SkillExtractor;
 pub use firecracker::{FirecrackerSandbox, MicroVm, MicroVmOutcome};
 pub use flywheel::{JsonlFileSink, LearningSink, WarehouseRecorder};
+pub use gitops_publisher::GitOpsPublisher;
+pub use gitops_puller::{parse_tag_message, run_puller_loop, GitOpsPuller, PromotionCandidate};
 pub use image_rollout::ImageRollout;
 pub use matcher::{DefaultLearningMatcher, LearningMatcher};
 pub use meta_learning::MetaLearningEngine;
@@ -67,6 +74,7 @@ pub use policy_store::{
     ArtifactEvolution, PolicyArtifact, PolicyCandidate, PolicyProposal, PolicyStore,
 };
 pub use promoter::{DefaultLearningPromoter, LearningPromoter};
+pub use promotion_gate::{classify, count_diff_lines, GateVerdict};
 pub use recorder::{InMemoryRecorder, LearningRecorder, MemoryBackendRecorder};
 pub use reviewer::PeriodicReviewer;
 pub use sandbox::{enforce_sandbox_boundary, BoundaryDecision, SandboxKind, SandboxSignals};

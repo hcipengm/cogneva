@@ -26,6 +26,7 @@ struct MemoryStore {
     dag_states: HashMap<String, serde_json::Value>,
     dag_tasks: HashMap<String, HashMap<String, cog_core::Task>>,
     dag_retries: HashMap<String, HashMap<String, Vec<cog_core::RetryAttempt>>>,
+    promotions: Vec<cog_core::PromotionRecord>,
 }
 
 /// In-memory state backend for testing.
@@ -1353,6 +1354,64 @@ impl RawLogIndexStore for MemoryRawLogIndexStore {
         if let Some(limit) = q.limit {
             out.truncate(limit);
         }
+        Ok(out)
+    }
+}
+
+// ─── PromotionLedger (in-memory) ───
+
+#[async_trait]
+impl cog_core::PromotionLedger for MemoryStateBackend {
+    async fn record(&self, rec: cog_core::PromotionRecord) -> SFResult<()> {
+        let mut guard = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("promotion ledger lock poisoned".into()))?;
+        guard.promotions.push(rec);
+        Ok(())
+    }
+
+    async fn update_status(
+        &self,
+        id: &str,
+        status: cog_core::PromotionStatus,
+        outcome: &str,
+    ) -> SFResult<()> {
+        let mut guard = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("promotion ledger lock poisoned".into()))?;
+        let Some(rec) = guard.promotions.iter_mut().find(|r| r.id == id) else {
+            return Err(SFError::Validation(format!(
+                "promotion record {id} not found"
+            )));
+        };
+        rec.status = status;
+        rec.outcome = outcome.to_string();
+        rec.updated_at = Utc::now();
+        Ok(())
+    }
+
+    async fn count_promoted_since(&self, since: DateTime<Utc>) -> SFResult<u64> {
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| SFError::Agent("promotion ledger lock poisoned".into()))?;
+        Ok(guard
+            .promotions
+            .iter()
+            .filter(|r| r.status == cog_core::PromotionStatus::Promoted && r.updated_at >= since)
+            .count() as u64)
+    }
+
+    async fn recent(&self, limit: usize) -> SFResult<Vec<cog_core::PromotionRecord>> {
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| SFError::Agent("promotion ledger lock poisoned".into()))?;
+        let mut out = guard.promotions.clone();
+        out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+        out.truncate(limit);
         Ok(out)
     }
 }

@@ -1791,6 +1791,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "cog-core",
+ "cog-storage",
  "schemars",
  "serde",
  "serde_json",

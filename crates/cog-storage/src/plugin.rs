@@ -298,6 +298,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
         }
 
         // ── State backend (for supervisor / orchestrator) ──
+        let mut state_backend_pg = false;
         let state_backend: Arc<dyn cog_core::StateBackend> = if let Some(ref pool) = config_pool {
             let backend = crate::PostgresStateBackend::new(pool.clone());
             if let Err(e) = backend.init_schema().await {
@@ -314,6 +315,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 Arc::new(crate::MemoryStateBackend::new())
             } else {
                 info!("PostgresStateBackend initialized");
+                state_backend_pg = true;
                 Arc::new(backend)
             }
         } else {
@@ -327,6 +329,18 @@ impl cog_core::SystemPlugin for StoragePlugin {
         };
         ctx.publish_service(state_backend.clone());
         info!("StoragePlugin state backend published");
+
+        // ── Promotion ledger（晋级台账：配额/熔断/审计事实源，与 state
+        //    backend 同一存储，避免双副本读到不同账本） ──
+        let promotion_ledger: Arc<dyn cog_core::PromotionLedger> = if state_backend_pg {
+            Arc::new(crate::PostgresStateBackend::new(
+                config_pool.as_ref().expect("checked").clone(),
+            ))
+        } else {
+            Arc::new(crate::MemoryStateBackend::new())
+        };
+        ctx.publish_service(promotion_ledger);
+        info!("StoragePlugin promotion ledger published");
 
         // ── ObservabilityGateway (must happen before explain_pool is moved into ExplainPool) ──
         let observability_gateway: Arc<dyn cog_core::ObservabilityGateway> = if let Some(ref pool) =

@@ -21,6 +21,17 @@ data:
   COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS: "300"
   COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS: "600"
   COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS: "1800"
+  # 晋级门（推送端）：沙盒验证全过的 patch 经分级策略判定后，L0/L1 自动
+  # 晋级走 GitOps 发布（annotated tag + evolution-release 分支推到中央
+  # 仓库），L2 留审批台。中央仓库即本 Pod 挂载的宿主 bare 仓库 /host-git
+  # （宿主 <-> bare <-> 各集群拉取端 的既有同步通道，沙盒零凭证成立：
+  # 推送只写 bare 仓库，不持任何集群凭证）。
+  COGNEVA_SELF_EVOLUTION_PROMOTION_ENABLED: "true"
+  COGNEVA_GITOPS_ENABLED: "true"
+  COGNEVA_GITOPS_REPO_URL: "/host-git"
+  # 沙盒只推不拉：拉取端（poll/金丝雀/回滚）跑在主部署 Pod，那里有
+  # kubectl 与 RBAC；本 Pod 起拉取端只会每轮报错。
+  COGNEVA_GITOPS_PULLER_ENABLED: "false"
   # Disable memory/vector backends in the evolution worker to avoid downloading
   # embedding models inside the sandbox on every boot.
   COGNEVA_MEMORY_ENABLED: "false"
