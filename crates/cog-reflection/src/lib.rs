@@ -23,6 +23,7 @@
 //! - **`cog-core`** — `SkillRegistry` receives promoted `SkillConfig` entries.
 
 pub mod auto_promoter;
+pub mod config;
 pub mod crew;
 pub mod detector;
 pub mod discovery;
@@ -51,6 +52,7 @@ pub mod types;
 
 pub use auto_promoter::{AutoPromoter, PromotionChannel};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
+pub use config::{GitOpsConfig, PromotionGateConfig};
 pub use detector::{DefaultLearningDetector, LearningDetector};
 pub use discovery::DiscoveryEngine;
 pub use effectiveness::SkillEffectivenessTracker;

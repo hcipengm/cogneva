@@ -14,8 +14,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::GitOpsConfig;
 use async_trait::async_trait;
-use cog_core::{GitOpsConfig, SFError, SFResult};
+use cog_core::{SFError, SFResult};
 use tracing::info;
 
 use crate::auto_promoter::PromotionChannel;

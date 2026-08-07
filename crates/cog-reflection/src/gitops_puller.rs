@@ -23,9 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cog_core::{
-    GitOpsConfig, PromotionLedger, PromotionRecord, PromotionStatus, SFError, SFResult,
-};
+use crate::GitOpsConfig;
+use cog_core::{PromotionLedger, PromotionRecord, PromotionStatus, SFError, SFResult};
 use tracing::{info, warn};
 
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。

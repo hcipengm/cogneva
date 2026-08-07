@@ -8,9 +8,9 @@
 //! - 全部落在 L1 白名单且 diff 不超限 → 自动金丝雀晋级；
 //! - 其余模糊地带一律按 L2 转人工（宁严勿宽，fail-closed）。
 //!
-//! 纯函数无 IO，配置来自 [`cog_core::PromotionGateConfig`]。
+//! 纯函数无 IO，配置来自 [`crate::PromotionGateConfig`]。
 
-use cog_core::PromotionGateConfig;
+use crate::PromotionGateConfig;
 
 /// 晋级门判定结果。
 #[derive(Debug, Clone, PartialEq, Eq)]

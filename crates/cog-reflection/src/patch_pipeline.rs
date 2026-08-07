@@ -34,7 +34,7 @@ pub struct PatchPipeline {
     patch_dir: PathBuf,
     auto_apply: bool,
     test_timeout_secs: u64,
-    promotion_policy: Option<cog_core::PromotionGateConfig>,
+    promotion_policy: Option<crate::PromotionGateConfig>,
 }
 
 impl PatchPipeline {
@@ -64,7 +64,7 @@ impl PatchPipeline {
 
     /// 晋级门入口校验：黑名单文件（依赖清单/密钥材料）在应用前直接
     /// 拒收，连沙盒执行管线都不让进。
-    pub fn with_promotion_policy(mut self, policy: cog_core::PromotionGateConfig) -> Self {
+    pub fn with_promotion_policy(mut self, policy: crate::PromotionGateConfig) -> Self {
         self.promotion_policy = Some(policy);
         self
     }
@@ -792,7 +792,7 @@ index 1111111..2222222 100644
     async fn apply_and_test_rejects_forbidden_files_at_gate() {
         let temp = tempfile::tempdir().unwrap();
         let pipeline = PatchPipeline::new(temp.path(), temp.path().join("patches"), true)
-            .with_promotion_policy(cog_core::PromotionGateConfig::default());
+            .with_promotion_policy(crate::PromotionGateConfig::default());
 
         let patch = crate::types::EvolutionResult {
             kind: crate::types::EvolutionKind::CodePatch,

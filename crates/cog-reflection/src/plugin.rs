@@ -209,6 +209,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         {
             let self_evolution = ctx.config().self_evolution.clone();
             if self_evolution.enabled {
+                // 晋级门配置是 cog-reflection 自有配置段（不进 core
+                // config.rs）：本 crate 自己从 cogneva.json
+                // self_evolution.promotion 段 + env 覆盖加载。
+                let promotion = crate::PromotionGateConfig::load()?;
                 let evolution_metrics: Option<Arc<dyn cog_core::EvolutionMetrics>> =
                     ctx.consume_service::<dyn cog_core::EvolutionMetrics>();
 
@@ -308,7 +312,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     self_evolution.auto_apply && !self_evolution.manual_approve,
                 )
                 .with_test_timeout(self_evolution.test_timeout_secs)
-                .with_promotion_policy(self_evolution.promotion.clone());
+                .with_promotion_policy(promotion.clone());
 
                 let deployer = crate::EvolutionDeployer::new(
                     &project_root,
@@ -360,14 +364,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // （GitOps 自动晋级 / 审批台待办），配额/熔断/暂停全在
                 // 其中判定。推送端只跟 Git 中央仓库说话，不持集群凭证。
                 let promotion_channel: Option<Arc<dyn crate::PromotionChannel>> =
-                    if self_evolution.promotion.gitops.enabled {
+                    if promotion.gitops.enabled {
                         info!(
-                            repo = %self_evolution.promotion.gitops.repo_url,
-                            branch = %self_evolution.promotion.gitops.branch,
+                            repo = %promotion.gitops.repo_url,
+                            branch = %promotion.gitops.branch,
                             "GitOps promotion publisher enabled"
                         );
                         Some(Arc::new(crate::GitOpsPublisher::new(
-                            self_evolution.promotion.gitops.clone(),
+                            promotion.gitops.clone(),
                             &project_root,
                             &self_evolution.binary_dir,
                         )))
@@ -378,7 +382,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     .consume_service::<dyn cog_core::PromotionLedger>()
                     .map(|ledger| {
                         Arc::new(crate::AutoPromoter::new(
-                            self_evolution.promotion.clone(),
+                            promotion.clone(),
                             ledger,
                             promotion_channel,
                             engine.clone(),
@@ -392,9 +396,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // 所在集群各跑一个，poll 中央仓库 release 分支，各自金丝雀/
                 // 回滚/熔断（台账 cluster 字段区分集群，单集群故障不影响
                 // 其他集群）。沙盒推送端置 puller_enabled=false 只推不拉。
-                if self_evolution.promotion.gitops.enabled
-                    && self_evolution.promotion.gitops.puller_enabled
-                {
+                if promotion.gitops.enabled && promotion.gitops.puller_enabled {
                     if let Some(ledger) = ctx.consume_service::<dyn cog_core::PromotionLedger>() {
                         let cluster = std::env::var("COGNEVA_CLUSTER_NAME")
                             .ok()
@@ -410,7 +412,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             .filter(|s| !s.trim().is_empty());
                         let puller = Arc::new(
                             crate::GitOpsPuller::new(
-                                self_evolution.promotion.gitops.clone(),
+                                promotion.gitops.clone(),
                                 ledger,
                                 cluster.clone(),
                             )
@@ -427,8 +429,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         }
                         info!(
                             cluster = %cluster,
-                            repo = %self_evolution.promotion.gitops.repo_url,
-                            branch = %self_evolution.promotion.gitops.branch,
+                            repo = %promotion.gitops.repo_url,
+                            branch = %promotion.gitops.branch,
                             "GitOps promotion puller enabled for this cluster"
                         );
                         tokio::spawn(crate::run_puller_loop(puller, puller_shutdown));

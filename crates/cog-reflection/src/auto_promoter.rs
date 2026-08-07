@@ -42,7 +42,7 @@ pub trait PromotionChannel: Send + Sync {
 
 /// 晋级触发器。无状态时序：配额与熔断全部从台账推导，进程重启不丢。
 pub struct AutoPromoter {
-    policy: cog_core::PromotionGateConfig,
+    policy: crate::PromotionGateConfig,
     ledger: Arc<dyn PromotionLedger>,
     channel: Option<Arc<dyn PromotionChannel>>,
     engine: Arc<ReflectionEngine>,
@@ -52,7 +52,7 @@ pub struct AutoPromoter {
 
 impl AutoPromoter {
     pub fn new(
-        policy: cog_core::PromotionGateConfig,
+        policy: crate::PromotionGateConfig,
         ledger: Arc<dyn PromotionLedger>,
         channel: Option<Arc<dyn PromotionChannel>>,
         engine: Arc<ReflectionEngine>,
@@ -408,7 +408,7 @@ mod tests {
     }
 
     fn promoter(
-        policy: cog_core::PromotionGateConfig,
+        policy: crate::PromotionGateConfig,
         ledger: Arc<cog_storage::MemoryStateBackend>,
         channel: Option<Arc<dyn PromotionChannel>>,
     ) -> AutoPromoter {
@@ -422,7 +422,7 @@ mod tests {
             published: Mutex::new(Vec::new()),
             fail: false,
         });
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
@@ -444,7 +444,7 @@ mod tests {
             published: Mutex::new(Vec::new()),
             fail: false,
         });
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
@@ -460,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn core_path_waits_for_approval() {
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
@@ -485,7 +485,7 @@ mod tests {
         });
         // enabled=false（一键暂停）
         let p = promoter(
-            cog_core::PromotionGateConfig::default(),
+            crate::PromotionGateConfig::default(),
             ledger.clone(),
             Some(channel.clone()),
         );
@@ -523,7 +523,7 @@ mod tests {
             published: Mutex::new(Vec::new()),
             fail: false,
         });
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
@@ -558,7 +558,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
@@ -595,7 +595,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
@@ -610,7 +610,7 @@ mod tests {
             published: Mutex::new(Vec::new()),
             fail: true,
         });
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
@@ -629,7 +629,7 @@ mod tests {
             published: Mutex::new(Vec::new()),
             fail: false,
         });
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
@@ -649,7 +649,7 @@ mod tests {
             published: Mutex::new(Vec::new()),
             fail: false,
         });
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
@@ -663,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn missing_channel_downgrades_to_approval() {
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
-        let policy = cog_core::PromotionGateConfig {
+        let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
         };
