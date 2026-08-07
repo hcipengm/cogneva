@@ -226,6 +226,172 @@ impl GitOpsPuller {
         }))
     }
 
+    /// Pending 尾巴自愈。上一个 puller 进程在金丝雀中途被自家滚动
+    /// 替换时，台账停在 Pending：新 puller 的 already_processed 把它
+    /// 当"已处理"跳过，候选永远不会终结。这里对超过看护+滚动窗口
+    /// （另一个活着的 puller 一定已完结）的 Pending 做幂等收尾：
+    /// L0 补做 apply（幂等）；L1 镜像已是目标则按 rollout 现状补记
+    /// Promoted 或回滚，镜像还是旧版则清理并记 RolledBack。
+    /// 返回 true 表示本候选已终结，本周期不再处理。
+    async fn reconcile_pending(&self, candidate: &PromotionCandidate) -> SFResult<bool> {
+        let recent = self.ledger.recent(50).await?;
+        let Some(rec) = recent.iter().find(|r| {
+            r.patch_id == candidate.patch_id
+                && r.cluster == self.cluster
+                && r.status == PromotionStatus::Pending
+        }) else {
+            return Ok(false);
+        };
+        // 并发护栏：另一副本里活着的 puller 可能正在跑这条金丝雀，
+        // 看护+滚动窗口内绝不插手。
+        let age = (chrono::Utc::now() - rec.updated_at).num_seconds().max(0) as u64;
+        let guard = self.config.canary_watch_secs + 300;
+        if age < guard {
+            return Ok(false);
+        }
+        info!(
+            patch_id = %candidate.patch_id,
+            cluster = %self.cluster,
+            age_secs = age,
+            "Reconciling orphaned Pending promotion"
+        );
+
+        if candidate.level == "l0_config" {
+            let note = self.apply_config(candidate).await?;
+            self.ledger
+                .update_status(
+                    &rec.id,
+                    PromotionStatus::Promoted,
+                    &format!("finalized after puller restart: {note}"),
+                )
+                .await?;
+            return Ok(true);
+        }
+
+        // L1 源码模式：镜像构建昂贵，标 Failed 让下轮 poll 完整重试。
+        if self.config.registry.is_none() {
+            self.ledger
+                .update_status(
+                    &rec.id,
+                    PromotionStatus::Failed,
+                    "puller restarted mid-canary; retry next poll",
+                )
+                .await?;
+            return Ok(true);
+        }
+
+        let expected = self.obtain_image(candidate).await?;
+        let current = self.current_deployment_image().await?;
+        let d = self.config.deployment.clone();
+        let n = self.config.namespace.clone();
+        let k = self.config.kubectl_bin.clone();
+        if current == expected {
+            let status = self
+                .run(
+                    &k,
+                    &[
+                        "-n",
+                        &n,
+                        "rollout",
+                        "status",
+                        &format!("deployment/{d}"),
+                        "--timeout",
+                        "20s",
+                    ],
+                    None,
+                    40,
+                )
+                .await;
+            match status {
+                Ok(_) => {
+                    self.ledger
+                        .update_status(
+                            &rec.id,
+                            PromotionStatus::Promoted,
+                            "finalized after puller restart: rollout already complete",
+                        )
+                        .await?;
+                }
+                Err(e) => {
+                    // 镜像已换但滚动卡死（拉不到镜像/副本不起）：回滚。
+                    warn!(error = %e, "orphaned canary stuck; rolling back");
+                    let _ = self
+                        .run(
+                            &k,
+                            &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
+                            None,
+                            120,
+                        )
+                        .await;
+                    let _ = self
+                        .run(
+                            &k,
+                            &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
+                            None,
+                            60,
+                        )
+                        .await;
+                    self.ledger
+                        .update_status(
+                            &rec.id,
+                            PromotionStatus::RolledBack,
+                            &format!("orphaned canary rolled back after puller restart: {e}"),
+                        )
+                        .await?;
+                }
+            }
+        } else {
+            // 镜像还是旧版：金丝雀未落地或已被 undo。可能留下 paused
+            // 部署——undo（无可回退时报错忽略）+ resume 清理。
+            let _ = self
+                .run(
+                    &k,
+                    &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
+                    None,
+                    120,
+                )
+                .await;
+            let _ = self
+                .run(
+                    &k,
+                    &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
+                    None,
+                    60,
+                )
+                .await;
+            self.ledger
+                .update_status(
+                    &rec.id,
+                    PromotionStatus::RolledBack,
+                    "orphaned canary cleaned up after puller restart",
+                )
+                .await?;
+        }
+        Ok(true)
+    }
+
+    /// 当前部署在跑的容器镜像。
+    async fn current_deployment_image(&self) -> SFResult<String> {
+        self.run(
+            &self.config.kubectl_bin.clone(),
+            &[
+                "-n",
+                &self.config.namespace,
+                "get",
+                "deployment",
+                &self.config.deployment,
+                "-o",
+                &format!(
+                    "jsonpath={{.spec.template.spec.containers[?(@.name==\"{}\")].image}}",
+                    self.config.container
+                ),
+            ],
+            None,
+            30,
+        )
+        .await
+    }
+
     /// 一轮拉取。返回是否有新晋级被处理。
     pub async fn poll_once(&self) -> SFResult<bool> {
         let head = self.sync_repo().await?;
@@ -237,6 +403,12 @@ impl GitOpsPuller {
             return Ok(false);
         };
         if self.already_processed(&candidate.patch_id).await? {
+            // Pending 尾巴自愈：上一个 puller 进程可能在金丝雀中途被自家
+            // 滚动替换，台账停在 Pending 永远不会终结（2026-08-07 双集群
+            // 实测）。超过看护+滚动窗口的 Pending 记录做幂等 reconcile。
+            if self.reconcile_pending(&candidate).await? {
+                return Ok(true);
+            }
             info!(patch_id = %candidate.patch_id, cluster = %self.cluster, "Promotion already processed by this cluster");
             return Ok(false);
         }
@@ -474,21 +646,48 @@ impl GitOpsPuller {
                     60,
                 )
                 .await?;
-                self.run(
-                    &k,
-                    &[
-                        "-n",
-                        &n,
-                        "rollout",
-                        "status",
-                        &format!("deployment/{d}"),
-                        "--timeout",
-                        &format!("{}s", self.config.canary_watch_secs.max(300)),
-                    ],
-                    None,
-                    self.config.canary_watch_secs.max(300) + 60,
-                )
-                .await?;
+                let status = self
+                    .run(
+                        &k,
+                        &[
+                            "-n",
+                            &n,
+                            "rollout",
+                            "status",
+                            &format!("deployment/{d}"),
+                            "--timeout",
+                            &format!("{}s", self.config.canary_watch_secs.max(300)),
+                        ],
+                        None,
+                        self.config.canary_watch_secs.max(300) + 60,
+                    )
+                    .await;
+                if let Err(e) = status {
+                    // 看护通过但全量滚动失败（新副本后续拉不到镜像/不起）：
+                    // 与看护失败同等处理——回滚 + RolledBack。否则候选记
+                    // Failed 下轮 poll 会反复金丝雀（重试风暴），部署也
+                    // 停在坏镜像上（2026-08-07 cluster-2 实测）。
+                    warn!(error = %e, "rollout after canary failed; rolling back");
+                    let _ = self
+                        .run(
+                            &k,
+                            &["-n", &n, "rollout", "undo", &format!("deployment/{d}")],
+                            None,
+                            120,
+                        )
+                        .await;
+                    let _ = self
+                        .run(
+                            &k,
+                            &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
+                            None,
+                            60,
+                        )
+                        .await;
+                    self.mark_rolled_back(candidate, &format!("rollout after canary: {e}"))
+                        .await;
+                    return Err(e);
+                }
                 // 镜像换了但 prompts configmap 不重建的话，挂载的旧
                 // prompts 会遮蔽新镜像里的更新——本提交触及 prompts/
                 // 时随金丝雀成功一并重建。
@@ -516,21 +715,24 @@ impl GitOpsPuller {
                         60,
                     )
                     .await;
-                // 回滚情形台账记 RolledBack（poll_once 会识别不再改 Failed）。
-                let recent = self.ledger.recent(1).await?;
-                if let Some(rec) = recent.first() {
-                    if rec.patch_id == candidate.patch_id && rec.cluster == self.cluster {
-                        let _ = self
-                            .ledger
-                            .update_status(
-                                &rec.id,
-                                PromotionStatus::RolledBack,
-                                &format!("canary regression: {e}"),
-                            )
-                            .await;
-                    }
-                }
+                self.mark_rolled_back(candidate, &format!("canary regression: {e}"))
+                    .await;
                 Err(e)
+            }
+        }
+    }
+
+    /// 回滚情形台账记 RolledBack（poll_once 会识别不再改 Failed，
+    /// already_processed 也会挡住后续重试）。
+    async fn mark_rolled_back(&self, candidate: &PromotionCandidate, reason: &str) {
+        if let Ok(recent) = self.ledger.recent(1).await {
+            if let Some(rec) = recent.first() {
+                if rec.patch_id == candidate.patch_id && rec.cluster == self.cluster {
+                    let _ = self
+                        .ledger
+                        .update_status(&rec.id, PromotionStatus::RolledBack, reason)
+                        .await;
+                }
             }
         }
     }
@@ -579,11 +781,15 @@ impl GitOpsPuller {
         let watch_secs = self.config.canary_watch_secs;
         let interval = std::cmp::max(watch_secs / 20, 5);
         let baseline = self.scrape_metrics().await.ok().flatten();
-        let deadline = std::time::Instant::now() + Duration::from_secs(watch_secs);
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(watch_secs);
+        // 宽限期：金丝雀刚 set image 时新副本还在 ContainerCreating，
+        // not-ready 属正常；宽限过后仍不 ready 才算异常。
+        let grace = Duration::from_secs(std::cmp::max(90, watch_secs / 4));
 
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(interval)).await;
-            self.check_pods_healthy().await?;
+            self.check_pods_healthy(started.elapsed() < grace).await?;
             if let (Some(base), Ok(Some(current))) = (&baseline, self.scrape_metrics().await) {
                 self.compare_metrics(base, &current)?;
             }
@@ -592,7 +798,11 @@ impl GitOpsPuller {
     }
 
     /// k8s 信号：deployment 任一 pod 处于非 Ready/重启次数上升即异常。
-    async fn check_pods_healthy(&self) -> SFResult<()> {
+    /// `allow_pending` 为宽限期标志：true 时容忍 not-ready（容器还在拉起），
+    /// 但致命等待态（拉不到镜像、配置错误）无论是否在宽限期都立即异常。
+    async fn check_pods_healthy(&self, allow_pending: bool) -> SFResult<()> {
+        // Pod 标签是 app.kubernetes.io/name=<deployment>；此前误用 app=<deployment>
+        // 匹配零个 Pod，看护空转通过（2026-08-07 双集群实测）。
         let out = self
             .run(
                 &self.config.kubectl_bin.clone(),
@@ -602,20 +812,39 @@ impl GitOpsPuller {
                     "get",
                     "pods",
                     "-l",
-                    &format!("app={}", self.config.deployment),
+                    &format!("app.kubernetes.io/name={}", self.config.deployment),
                     "-o",
-                    "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{'\n'}{end}",
+                    "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{'\n'}{end}",
                 ],
                 None,
                 30,
             )
             .await
             .unwrap_or_default();
+        if out.trim().is_empty() {
+            // 零 Pod 不是"健康"——选择器失效或副本被删光都不能空转通过。
+            return Err(SFError::Agent(
+                "no pods found for canary watch (selector/deployment mismatch?)".into(),
+            ));
+        }
         for line in out.lines() {
             let mut parts = line.split_whitespace();
             let restarts: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
             let ready = parts.next().unwrap_or("false");
-            if ready != "true" {
+            let waiting_reason = parts.next().unwrap_or("");
+            if matches!(
+                waiting_reason,
+                "ImagePullBackOff"
+                    | "ErrImagePull"
+                    | "InvalidImageName"
+                    | "CreateContainerConfigError"
+                    | "CrashLoopBackOff"
+            ) {
+                return Err(SFError::Agent(format!(
+                    "pod in fatal waiting state {waiting_reason} during canary: {line}"
+                )));
+            }
+            if ready != "true" && !allow_pending {
                 return Err(SFError::Agent(format!(
                     "pod not ready during canary: {line}"
                 )));
