@@ -404,6 +404,38 @@ impl GitOpsPuller {
         Ok(out.trim() == "true")
     }
 
+    /// 全量滚动是否完成：observedGeneration 追上 generation 且更新后
+    /// 副本数与就绪副本数都达到期望。短查询（相对 rollout status 长等）
+    /// 不怕 puller 所在旧副本被杀——每次调用都是独立命令。
+    async fn rollout_complete(&self) -> SFResult<bool> {
+        let out = self
+            .run(
+                &self.config.kubectl_bin.clone(),
+                &[
+                    "-n",
+                    &self.config.namespace,
+                    "get",
+                    "deployment",
+                    &self.config.deployment,
+                    "-o",
+                    "jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas}",
+                ],
+                None,
+                30,
+            )
+            .await?;
+        let parts: Vec<&str> = out.split_whitespace().collect();
+        if parts.len() < 5 {
+            return Ok(false);
+        }
+        let gen: u64 = parts[0].parse().unwrap_or(0);
+        let obs: u64 = parts[1].parse().unwrap_or(0);
+        let spec: u32 = parts[2].parse().unwrap_or(0);
+        let updated: u32 = parts[3].parse().unwrap_or(0);
+        let ready: u32 = parts[4].parse().unwrap_or(0);
+        Ok(obs >= gen && gen > 0 && updated == spec && ready == spec)
+    }
+
     /// 当前部署在跑的容器镜像。
     async fn current_deployment_image(&self) -> SFResult<String> {
         self.run(
@@ -661,47 +693,63 @@ impl GitOpsPuller {
             60,
         )
         .await?;
-        // 起第一个新副本后立即暂停，进入看护。
-        self.run(
-            &k,
-            &["-n", &n, "rollout", "pause", &format!("deployment/{d}")],
-            None,
-            60,
-        )
-        .await?;
+        // 起第一个新副本后立即暂停，进入看护。"already paused" 容忍：
+        // 上一个 puller 在金丝雀中途死亡会留下 paused 部署（孤儿现场），
+        // 此时本次金丝雀就是恢复路径，不能因为 pause 报错卡死重试循环
+        // （2026-08-07 cluster-2 实测）。
+        if let Err(e) = self
+            .run(
+                &k,
+                &["-n", &n, "rollout", "pause", &format!("deployment/{d}")],
+                None,
+                60,
+            )
+            .await
+        {
+            if !e.to_string().contains("already paused") {
+                return Err(e);
+            }
+            info!("deployment already paused (orphaned canary scene); continuing");
+        }
 
         let watch = self.watch_canary().await;
         match watch {
             Ok(()) => {
-                self.run(
-                    &k,
-                    &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
-                    None,
-                    60,
-                )
-                .await?;
-                let status = self
+                if let Err(e) = self
                     .run(
                         &k,
-                        &[
-                            "-n",
-                            &n,
-                            "rollout",
-                            "status",
-                            &format!("deployment/{d}"),
-                            "--timeout",
-                            &format!("{}s", self.config.canary_watch_secs.max(300)),
-                        ],
+                        &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
                         None,
-                        self.config.canary_watch_secs.max(300) + 60,
+                        60,
                     )
-                    .await;
-                if let Err(e) = status {
+                    .await
+                {
+                    if !e.to_string().contains("is not paused") {
+                        return Err(e);
+                    }
+                }
+                // 等全量滚动完成。不用 `rollout status --timeout`：puller
+                // 跑在被滚动的部署里，长连接命令会随旧副本被杀而失败，
+                // 把成功的滚动误判成失败进而 undo 掉好版本。改为短查询
+                // 轮询完成条件；puller 中途被杀则台账留 Pending，由
+                // reconcile_pending 收尾。
+                let rollout_deadline = std::time::Instant::now()
+                    + Duration::from_secs(self.config.canary_watch_secs.max(300));
+                let mut rolled_out = false;
+                while std::time::Instant::now() < rollout_deadline {
+                    if self.rollout_complete().await.unwrap_or(false) {
+                        rolled_out = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+                if !rolled_out {
                     // 看护通过但全量滚动失败（新副本后续拉不到镜像/不起）：
                     // 与看护失败同等处理——回滚 + RolledBack。否则候选记
                     // Failed 下轮 poll 会反复金丝雀（重试风暴），部署也
                     // 停在坏镜像上（2026-08-07 cluster-2 实测）。
                     // resume 先于 undo（paused 部署 undo 会被 kubectl 拒绝）。
+                    let e = SFError::Agent("rollout did not complete in time".into());
                     warn!(error = %e, "rollout after canary failed; rolling back");
                     let _ = self
                         .run(
