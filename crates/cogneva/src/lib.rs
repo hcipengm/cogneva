@@ -127,9 +127,13 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let llm_http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
 
         let initial_config = watcher.current();
+        // llm_routing / tuning 已下沉 cog-llm（core Config 不再聚合）：
+        // 初始与每轮热重载都经 cog-llm 自载器读 cogneva.json。
+        let initial_llm_routing = cog_llm::LLMRoutingConfig::load()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         tokio::spawn(async move {
             let mut active_llm = initial_config.llm.clone();
-            let mut active_llm_routing = initial_config.llm_routing.clone();
+            let mut active_llm_routing = initial_llm_routing;
             while rx.changed().await.is_ok() {
                 let new_config = rx.borrow_and_update().clone();
                 let mut applied = Vec::new();
@@ -175,12 +179,26 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // 4. LLM provider hot-swap
-                if active_llm != new_config.llm || active_llm_routing != new_config.llm_routing {
+                let new_llm_routing = match cog_llm::LLMRoutingConfig::load() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("llm_routing reload skipped: {}", e);
+                        continue;
+                    }
+                };
+                if active_llm != new_config.llm || active_llm_routing != new_llm_routing {
+                    let new_stream_capacity = match cog_llm::TuningConfig::load() {
+                        Ok(t) => t.stream_capacity,
+                        Err(e) => {
+                            tracing::warn!("tuning reload skipped: {}", e);
+                            continue;
+                        }
+                    };
                     if let Some(ref llm_hot_swap) = llm_hot_swap {
                         let new_provider = match cog_llm::plugin::build_llm_provider(
-                            new_config.tuning.stream_capacity,
+                            new_stream_capacity,
                             new_config.system.anthropic_default_max_tokens,
-                            &new_config.llm_routing,
+                            &new_llm_routing,
                             &new_config.llm,
                             llm_http_client.clone(),
                         ) {
@@ -193,7 +211,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(new_provider) = new_provider {
                             llm_hot_swap.swap(new_provider).await;
                             active_llm = new_config.llm.clone();
-                            active_llm_routing = new_config.llm_routing.clone();
+                            active_llm_routing = new_llm_routing.clone();
                             applied.push("llm_provider_swapped".to_string());
                         }
                     } else {

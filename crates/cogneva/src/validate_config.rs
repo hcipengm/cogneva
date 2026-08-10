@@ -73,7 +73,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. LLM 依赖：优先校验 llm_routing.backends（多后端故障转移），
     // 无 backends 时回退校验 legacy llm 单后端配置。
-    if config.llm_routing.backends.is_empty() {
+    // llm_routing 已下沉 cog-llm，经其自载器读取。
+    let llm_routing = match cog_llm::LLMRoutingConfig::load() {
+        Ok(r) => r,
+        Err(e) => {
+            report.error(format!("llm_routing load failed: {e}"));
+            cog_llm::LLMRoutingConfig::default()
+        }
+    };
+    if llm_routing.backends.is_empty() {
         if config.llm.provider.trim().is_empty() {
             report.error("llm.provider is empty — no LLM provider configured");
         } else {
@@ -100,12 +108,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             report.error("llm.timeout_secs must be > 0");
         }
     } else {
-        let enabled: Vec<_> = config
-            .llm_routing
-            .backends
-            .iter()
-            .filter(|b| b.enabled)
-            .collect();
+        let enabled: Vec<_> = llm_routing.backends.iter().filter(|b| b.enabled).collect();
         if enabled.is_empty() {
             report.error("llm_routing.backends has no enabled backend");
         }

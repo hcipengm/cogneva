@@ -7,7 +7,7 @@
 
 use chrono::Utc;
 
-use cog_core::AutoMergePolicy;
+use crate::config::AutoMergePolicy;
 
 use crate::provider::PullRequestDetail;
 

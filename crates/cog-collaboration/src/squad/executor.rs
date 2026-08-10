@@ -29,7 +29,7 @@ pub struct SquadConfig {
     /// 可选的任务 profile，用于在没有 MetaLearningEngine 时通过静态规则选择 PGE 模式。
     pub profile: Option<crate::profile::TaskProfile>,
     /// 可选的 BoundaryConfig，注入到 Evaluator Agent 用于动态边界维度评估。
-    pub boundary_config: Option<cog_core::BoundaryConfig>,
+    pub boundary_config: Option<crate::BoundaryConfig>,
     /// true = 原子任务执行模式（Planner 制定执行方案而非分解任务）。
     pub execution_mode: bool,
     /// true = 这是一个 self_evolution 任务；使用更激进的短路径以控制延迟。

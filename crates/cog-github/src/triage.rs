@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use cog_core::{ChatOptions, GitHubIntegrationConfig, LlmClient, Message};
+use crate::config::GitHubIntegrationConfig;
+use cog_core::{ChatOptions, LlmClient, Message};
 
 use crate::provider::PlatformIssue;
 

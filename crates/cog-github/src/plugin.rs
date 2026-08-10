@@ -21,7 +21,7 @@ struct LoopState {
 
 /// GitHub integration plugin.
 pub struct GitHubPlugin {
-    config: Option<cog_core::GitHubIntegrationConfig>,
+    config: Option<crate::config::GitHubIntegrationConfig>,
     provider: Option<Arc<dyn CodePlatformProvider>>,
     loop_state: Mutex<Option<LoopState>>,
 }
@@ -50,7 +50,8 @@ impl cog_core::SystemPlugin for GitHubPlugin {
     }
 
     async fn init(&mut self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
-        let config = ctx.config().github_integration.clone();
+        // github_integration 是 cog-github 自有配置段，自读 cogneva.json。
+        let config = crate::config::GitHubIntegrationConfig::load()?;
         if !config.enabled {
             info!("GitHubPlugin disabled (github_integration.enabled=false)");
             return Ok(());

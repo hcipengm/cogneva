@@ -15,7 +15,6 @@
 use cog_core::{Config, SFResult, SecretProvider};
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::path::Path;
 
 /// Default system-wide config path (FHS).
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/cogneva/cogneva.json";
@@ -139,20 +138,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "raw_logger.max_buffer_size".into(),
     );
     // memory
-    m.insert("COGNEVA_MEMORY_ENABLED".into(), "memory.enabled".into());
-    m.insert(
-        "COGNEVA_MEMORY_BACKEND_TYPE".into(),
-        "memory.backend_type".into(),
-    );
-    m.insert("COGNEVA_MEMORY_BASE_DIR".into(), "memory.base_dir".into());
-    m.insert(
-        "COGNEVA_MEMORY_EMBEDDING_DIMENSION".into(),
-        "memory.embedding_dimension".into(),
-    );
-    m.insert(
-        "COGNEVA_MEMORY_AUTO_INGEST".into(),
-        "memory.auto_ingest".into(),
-    );
     // tier_migrator
     m.insert(
         "COGNEVA_TIER_MIGRATOR_ENABLED".into(),
@@ -175,42 +160,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "tier_migrator.cold_key_prefix".into(),
     );
     // observability exporters
-    m.insert(
-        "COGNEVA_LOKI_ENABLED".into(),
-        "observability.loki.enabled".into(),
-    );
-    m.insert(
-        "COGNEVA_LOKI_ENDPOINT".into(),
-        "observability.loki.endpoint".into(),
-    );
-    m.insert(
-        "COGNEVA_JAEGER_ENABLED".into(),
-        "observability.jaeger.enabled".into(),
-    );
-    m.insert(
-        "COGNEVA_JAEGER_ENDPOINT".into(),
-        "observability.jaeger.endpoint".into(),
-    );
-    m.insert(
-        "COGNEVA_CLICKHOUSE_ENABLED".into(),
-        "observability.clickhouse.enabled".into(),
-    );
-    m.insert(
-        "COGNEVA_CLICKHOUSE_BASE_URL".into(),
-        "observability.clickhouse.base_url".into(),
-    );
-    m.insert(
-        "COGNEVA_CLICKHOUSE_DATABASE".into(),
-        "observability.clickhouse.database".into(),
-    );
-    m.insert(
-        "COGNEVA_ALERTMANAGER_ENABLED".into(),
-        "observability.alertmanager.enabled".into(),
-    );
-    m.insert(
-        "COGNEVA_ALERTMANAGER_WEBHOOK_URL".into(),
-        "observability.alertmanager.webhook_url".into(),
-    );
     // business-specific
     m.insert("COGNEVA_METRICS_ENABLED".into(), "metrics.enabled".into());
     m.insert(
@@ -224,19 +173,6 @@ fn default_env_mappings() -> HashMap<String, String> {
     m.insert(
         "COGNEVA_HOOK_ENGINE_DEDUP_WINDOW_SECS".into(),
         "hook_engine.dedup_window_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_AGENT_LOOP_MAX_ITERATIONS".into(),
-        "agent_loop.max_iterations".into(),
-    );
-    m.insert(
-        "COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE".into(),
-        "agent_loop.context_window_size".into(),
-    );
-    m.insert("COGNEVA_AGENT_LOOP_ROLE".into(), "agent_loop.role".into());
-    m.insert(
-        "COGNEVA_AGENT_LOOP_SKILL_CACHE_TTL_SECS".into(),
-        "agent_loop.skill_cache_ttl_secs".into(),
     );
     // self_evolution
     m.insert(
@@ -350,35 +286,7 @@ fn default_env_mappings() -> HashMap<String, String> {
         "gateway.notification_webhook_url".into(),
     );
     // tuning
-    m.insert(
-        "COGNEVA_STREAM_CAPACITY".into(),
-        "tuning.stream_capacity".into(),
-    );
-    m.insert(
-        "COGNEVA_HIGH_WATERMARK".into(),
-        "tuning.high_watermark".into(),
-    );
-    m.insert(
-        "COGNEVA_LOW_WATERMARK".into(),
-        "tuning.low_watermark".into(),
-    );
-    m.insert(
-        "COGNEVA_MAX_SUMMARIES".into(),
-        "tuning.max_summaries".into(),
-    );
     // agent_pool
-    m.insert(
-        "COGNEVA_AGENT_POOL_ENABLED".into(),
-        "agent_pool.enabled".into(),
-    );
-    m.insert(
-        "COGNEVA_AGENT_POOL_WORKER_COUNT".into(),
-        "agent_pool.worker_count".into(),
-    );
-    m.insert(
-        "COGNEVA_AGENT_POOL_WORKER_ROLE".into(),
-        "agent_pool.worker_role".into(),
-    );
     // multi_backend_consumer
     m.insert(
         "COGNEVA_MULTI_BACKEND_CONSUMER_ENABLED".into(),
@@ -397,14 +305,6 @@ fn default_env_mappings() -> HashMap<String, String> {
         "multi_backend_consumer.retry_interval_secs".into(),
     );
     // github_integration
-    m.insert(
-        "COGNEVA_GITHUB_REPO".into(),
-        "github_integration.repo".into(),
-    );
-    m.insert(
-        "COGNEVA_GITHUB_BASE_BRANCH".into(),
-        "github_integration.base_branch".into(),
-    );
     m
 }
 
@@ -507,7 +407,7 @@ pub fn apply_env_overrides(config: &mut AppConfig) {
 
     for (env_key, path) in mappings {
         if let Ok(env_val) = std::env::var(&env_key) {
-            set_json_path(&mut value, &path, &env_val);
+            cog_core::config::set_json_path(&mut value, &path, &env_val);
         }
     }
 
@@ -530,83 +430,11 @@ pub fn apply_env_overrides(config: &mut AppConfig) {
     }
 }
 
-/// Walk a dot-separated path (`app.name`, `gateway.http_port`) inside a
-/// JSON object and overwrite the leaf with `new_val`.
-/// Intermediate objects are created automatically if missing.
-/// Numeric segments index into arrays (`llm_routing.backends.0.base_url`),
-/// but only into existing elements — arrays are never grown implicitly.
-fn set_json_path(value: &mut serde_json::Value, path: &str, new_val: &str) {
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.is_empty() {
-        return;
-    }
-
-    let parsed = if let Ok(b) = new_val.parse::<bool>() {
-        serde_json::Value::Bool(b)
-    } else if let Ok(n) = new_val.parse::<i64>() {
-        serde_json::Value::Number(n.into())
-    } else if let Ok(f) = new_val.parse::<f64>() {
-        serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap_or_else(|| 0.into()))
-    } else {
-        serde_json::Value::String(new_val.into())
-    };
-
-    set_json_path_at(value, &parts, parsed);
-}
-
-fn set_json_path_at(current: &mut serde_json::Value, parts: &[&str], leaf: serde_json::Value) {
-    let Some((head, rest)) = parts.split_first() else {
-        return;
-    };
-    if rest.is_empty() {
-        match current {
-            serde_json::Value::Object(map) => {
-                map.insert(head.to_string(), leaf);
-            }
-            serde_json::Value::Array(arr) => {
-                if let Ok(i) = head.parse::<usize>() {
-                    if i < arr.len() {
-                        arr[i] = leaf;
-                    }
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
-    match current {
-        serde_json::Value::Object(map) => {
-            let next = map
-                .entry(head.to_string())
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-            set_json_path_at(next, rest, leaf);
-        }
-        serde_json::Value::Array(arr) => {
-            if let Ok(i) = head.parse::<usize>() {
-                if let Some(next) = arr.get_mut(i) {
-                    set_json_path_at(next, rest, leaf);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Load configuration from a TOML file.
-#[allow(dead_code)]
-pub fn from_file<P: AsRef<Path>>(path: P) -> SFResult<AppConfig> {
-    let content = std::fs::read_to_string(path)?;
-    let config: AppConfig =
-        toml::from_str(&content).map_err(|e| cog_core::SFError::Config(e.to_string()))?;
-    Ok(config)
-}
-
 /// Load configuration from a JSON file.
 /// Partial configs are supported: missing fields use hard-coded defaults.
 /// `${ENV_VAR}` placeholders inside string values are resolved at load time.
 #[allow(dead_code)]
-pub fn from_json_file<P: AsRef<Path>>(path: P) -> SFResult<AppConfig> {
-    #[allow(dead_code)]
+pub fn from_json_file<P: AsRef<std::path::Path>>(path: P) -> SFResult<AppConfig> {
     let content = std::fs::read_to_string(path)?;
     let mut file_value: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| cog_core::SFError::Config(e.to_string()))?;
@@ -621,8 +449,6 @@ pub fn from_json_file<P: AsRef<Path>>(path: P) -> SFResult<AppConfig> {
     Ok(config)
 }
 
-/// Deep-merge two JSON values. For objects, keys in `b` override keys in `a`
-/// recursively. For non-objects, `b` completely replaces `a`.
 fn merge_config_value(a: serde_json::Value, b: serde_json::Value) -> SFResult<serde_json::Value> {
     match (a, b) {
         (serde_json::Value::Object(mut a_map), serde_json::Value::Object(b_map)) => {
@@ -826,7 +652,7 @@ mod tests {
             }
         });
 
-        set_json_path(
+        cog_core::config::set_json_path(
             &mut value,
             "llm_routing.backends.0.base_url",
             "http://cogneva-security-gateway:8081/v1",
@@ -842,14 +668,14 @@ mod tests {
         );
 
         // 越界下标不扩容、不 panic
-        set_json_path(&mut value, "llm_routing.backends.5.base_url", "x");
+        cog_core::config::set_json_path(&mut value, "llm_routing.backends.5.base_url", "x");
         assert_eq!(
             value["llm_routing"]["backends"].as_array().unwrap().len(),
             2
         );
 
         // 对象路径语义不变
-        set_json_path(&mut value, "gateway.http_port", "9090");
+        cog_core::config::set_json_path(&mut value, "gateway.http_port", "9090");
         assert_eq!(value["gateway"]["http_port"], 9090);
     }
 
@@ -965,8 +791,7 @@ mod tests {
                 "health_interval_secs": 5,
                 "health_checker": { "suspect_after_secs": 10 }
             },
-            "hook_engine": { "dedup_window_secs": 2, "default_rate_limit": { "burst": 50 } },
-            "agent_loop": { "role": "evaluator", "max_iterations": 3 }
+            "hook_engine": { "dedup_window_secs": 2, "default_rate_limit": { "burst": 50 } }
         }"#;
         tmpfile.write_all(json.as_bytes()).unwrap();
 
@@ -977,8 +802,6 @@ mod tests {
         assert_eq!(config.supervisor.health_checker.suspect_after_secs, 10);
         assert_eq!(config.hook_engine.dedup_window_secs, 2);
         assert_eq!(config.hook_engine.default_rate_limit.burst, 50);
-        assert_eq!(config.agent_loop.role, "evaluator");
-        assert_eq!(config.agent_loop.max_iterations, 3);
     }
 
     #[test]
@@ -1028,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_agent_loop_config_conversion() {
-        let cfg = cog_core::AgentLoopConfig {
+        let cfg = cog_agent::AgentLoopConfig {
             agent_id: "agent-42".into(),
             role: "generator".into(),
             max_iterations: 7,

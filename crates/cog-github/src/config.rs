@@ -1,8 +1,6 @@
-//! GitHub integration configuration contract.
-//!
-//! These types live in `cog-core` so the central `cogneva.json` [`Config`]
-//! can carry the `github_integration` section while the behavior stays in
-//! `cog-github`.
+//! GitHub integration 配置——cog-github 自有配置段（core config.rs 不
+//! 聚合单 crate 配置，审计文档 §7.3）。自读 cogneva.json
+//! `github_integration` 段并叠加 `COGNEVA_GITHUB_*` env 覆盖。
 //!
 //! Security rule: **tokens never enter the evolution sandbox**. They are
 //! resolved from environment variables or K8s secrets by the gateway/main
@@ -10,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{SFError, SFResult};
+use cog_core::{SFError, SFResult};
 
 /// A registered GitHub account used by Cogneva to interact with GitHub.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -359,6 +357,39 @@ impl Default for BotIdentityConfig {
     }
 }
 
+const GITHUB_ENV: &[(&str, &str)] = &[
+    ("COGNEVA_GITHUB_REPO", "repo"),
+    ("COGNEVA_GITHUB_BASE_BRANCH", "base_branch"),
+];
+
+impl GitHubIntegrationConfig {
+    /// 自读 cogneva.json `github_integration` 段 + env 覆盖。
+    /// 文件/段缺失回退默认（enabled=false）；段存在但解析失败响亮报错。
+    pub fn load() -> SFResult<Self> {
+        let path = std::env::var("COGNEVA_CONFIG_PATH")
+            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        Self::load_from(std::path::Path::new(&path))
+    }
+
+    /// 从指定文件加载（测试与自定义路径用）。
+    pub fn load_from(path: &std::path::Path) -> SFResult<Self> {
+        let mut section = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let root: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| SFError::Config(format!("{}: {e}", path.display())))?;
+                root.pointer("/github_integration")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
+        };
+        cog_core::config::apply_env_paths(&mut section, GITHUB_ENV);
+        serde_json::from_value(section)
+            .map_err(|e| SFError::Config(format!("{} github_integration: {e}", path.display())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +437,29 @@ mod tests {
         std::env::set_var("COG_GITHUB_TEST_TOKEN_HUMAN", "env_token");
         assert_eq!(account.resolve_token().unwrap(), "env_token");
         std::env::remove_var("COG_GITHUB_TEST_TOKEN_HUMAN");
+    }
+
+    #[test]
+    fn missing_file_returns_default() {
+        let cfg = GitHubIntegrationConfig::load_from(std::path::Path::new("/nonexistent/x.json"))
+            .unwrap();
+        assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn reads_section() {
+        let dir = std::env::temp_dir().join(format!("cog-github-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        std::fs::write(
+            &path,
+            r#"{"github_integration": {"enabled": true, "repo": "a/b", "poll_interval_secs": 45}}"#,
+        )
+        .unwrap();
+        let cfg = GitHubIntegrationConfig::load_from(&path).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.repo, "a/b");
+        assert_eq!(cfg.poll_interval_secs, 45);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

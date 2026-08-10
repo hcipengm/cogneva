@@ -1,3 +1,4 @@
+pub mod config;
 pub mod hot_swap;
 pub mod model;
 pub mod observable;
@@ -21,6 +22,7 @@ pub use cog_core::{
     ChatResponse, CompleteOptions, Cost, LlmClient, LlmModelInfo, ResponseFormat, SFError,
     SFResult, StopReason, ThinkingLevel, ToolCall, Transport, Usage,
 };
+pub use config::{LLMBackendConfig, LLMRoutingConfig, TuningConfig};
 pub use hot_swap::HotSwappableLlmClient;
 pub use model::{ApiType, Model, ModelCost, Provider};
 pub use observable::LlmObservable;

@@ -14,6 +14,7 @@
 pub mod backend;
 pub mod causal;
 pub mod composite;
+pub mod config;
 pub mod consolidator;
 pub mod embedding_provider;
 pub mod entry_store;
@@ -44,3 +45,5 @@ pub use reranker::{FastEmbedRerankerProvider, RerankResult, RerankerProvider};
 pub use schema_backend::MemorySchemaBackend;
 pub use vector_summary_backend::{VectorSummaryBackend, DEFAULT_SUMMARY_COLLECTION};
 pub mod plugin;
+
+pub use config::MemoryConfig;

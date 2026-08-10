@@ -110,13 +110,6 @@ fn default_true() -> bool {
     true
 }
 
-/// Boundary rule configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
-pub struct BoundaryConfig {
-    #[serde(default)]
-    pub rules: Vec<BoundaryRule>,
-}
-
 /// Legacy enum for built-in dimensions (kept for backwards compatibility).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -451,12 +444,6 @@ mod tests {
         assert_eq!(rule.name, "OutputQuality");
         assert_eq!(rule.rule_type, RuleType::Soft);
         assert!(rule.enabled);
-    }
-
-    #[test]
-    fn test_boundary_config_default() {
-        let config = BoundaryConfig::default();
-        assert!(config.rules.is_empty());
     }
 
     #[test]

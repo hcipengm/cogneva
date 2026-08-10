@@ -200,7 +200,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 ));
             }
         };
-        let agent_loop_config: cog_core::RuntimeConfig = ctx.config().agent_loop.clone().into();
+        // agent_loop / agent_pool 是 cog-agent 自有配置段，自读 cogneva.json。
+        let agent_loop_config: cog_core::RuntimeConfig = crate::AgentLoopConfig::load()?.into();
         let mut pool_builder = crate::GlobalAgentManager::new(
             agent_registry.clone(),
             pool_backend,
@@ -231,14 +232,15 @@ impl cog_core::SystemPlugin for AgentPlugin {
             {
                 if let Some(llm) = ctx.consume_service::<dyn cog_core::LlmClient>() {
                     let config = ctx.config();
-                    let role = config.agent_pool.worker_role.clone();
-                    for i in 0..config.agent_pool.worker_count {
+                    let agent_pool = crate::AgentManagerConfig::load()?;
+                    let role = agent_pool.worker_role.clone();
+                    for i in 0..agent_pool.worker_count {
                         let agent_id = format!("cogneva-worker-{}", i);
                         let registration = cog_core::AgentRegistration::new(
                             agent_id.clone(),
                             "localhost",
                             "127.0.0.1",
-                            &config.agent_pool.worker_role,
+                            &agent_pool.worker_role,
                             &config.dag_executor.workspace_id,
                             vec!["plan".into(), "generate".into(), "evaluate".into()],
                             cog_core::ResourceInfo::default(),

@@ -1,5 +1,6 @@
 pub mod alerts;
 pub mod analytics;
+pub mod config;
 pub mod explainability;
 pub mod explainability_pg;
 pub mod jaeger;
@@ -316,3 +317,10 @@ impl ObservabilityHandle {
         }
     }
 }
+
+// JaegerConfig 与本文件既有追踪配置类型同名，不重复导出；需要时用
+// crate::config::JaegerConfig 全路径。
+pub use config::{
+    AlertmanagerConfig, ClickHouseConfig, ElasticsearchConfig, LokiConfig,
+    ObservabilityExportersConfig,
+};

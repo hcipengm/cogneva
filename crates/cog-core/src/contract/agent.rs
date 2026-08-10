@@ -66,21 +66,6 @@ impl Default for RuntimeConfig {
     }
 }
 
-impl From<crate::config::AgentLoopConfig> for RuntimeConfig {
-    fn from(c: crate::config::AgentLoopConfig) -> Self {
-        Self {
-            agent_id: c.agent_id,
-            role: c.role,
-            max_iterations: c.max_iterations,
-            context_window_size: c.context_window_size,
-            skill_cache_ttl_secs: c.skill_cache_ttl_secs,
-            skill_config: None,
-            crew_id: None,
-            squad_id: None,
-        }
-    }
-}
-
 /// High-level agent trait — abstracts the concrete [`cog_agent::Agent`] so
 /// that downstream crates (e.g. `cog-collaboration`) can create and drive
 /// agents without depending on `cog-agent`.

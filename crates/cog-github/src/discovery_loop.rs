@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cog_core::{GitHubIntegrationConfig, OrchestratorControl, Task, TaskType};
+use crate::config::GitHubIntegrationConfig;
+use cog_core::{OrchestratorControl, Task, TaskType};
 
 use crate::conversation::{ConversationState, IssueConversation};
 use crate::discovery::IssueDiscovery;

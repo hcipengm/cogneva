@@ -52,54 +52,6 @@ impl HttpStreamResponse {
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
-/// Configuration for building an HTTP client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpClientConfig {
-    /// Overall request timeout (including connection + transfer).
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-    /// TCP connect timeout.
-    #[serde(default = "default_connect_timeout_secs")]
-    pub connect_timeout_secs: u64,
-    /// Max idle connections to keep per host.
-    #[serde(default = "default_pool_max_idle_per_host")]
-    pub pool_max_idle_per_host: usize,
-    /// Whether to accept invalid certificates (dev only).
-    #[serde(default)]
-    pub danger_accept_invalid_certs: bool,
-    /// Optional HTTP proxy URL.
-    pub proxy_url: Option<String>,
-    /// Default User-Agent header.
-    #[serde(default = "default_user_agent")]
-    pub user_agent: String,
-}
-
-impl Default for HttpClientConfig {
-    fn default() -> Self {
-        Self {
-            timeout_secs: default_timeout_secs(),
-            connect_timeout_secs: default_connect_timeout_secs(),
-            pool_max_idle_per_host: default_pool_max_idle_per_host(),
-            danger_accept_invalid_certs: false,
-            proxy_url: None,
-            user_agent: default_user_agent(),
-        }
-    }
-}
-
-fn default_timeout_secs() -> u64 {
-    30
-}
-fn default_connect_timeout_secs() -> u64 {
-    10
-}
-fn default_pool_max_idle_per_host() -> usize {
-    32
-}
-fn default_user_agent() -> String {
-    "cogneva-http-client/0.1".into()
-}
-
 // ─── Request / Response ─────────────────────────────────────────────────────
 
 /// An HTTP request description.

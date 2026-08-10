@@ -11,7 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cog_core::{BotIdentityConfig, GeneratedPatch, GitHubIntegrationConfig};
+use crate::config::{BotIdentityConfig, GitHubIntegrationConfig};
+use cog_core::GeneratedPatch;
 
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{CodePlatformProvider, CreatePullRequest, PlatformPullRequest};

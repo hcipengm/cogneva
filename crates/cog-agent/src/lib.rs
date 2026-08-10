@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_kernel;
+pub mod config;
 pub mod consumer;
 pub mod context;
 pub mod hooks;
@@ -10,6 +11,8 @@ pub mod tools;
 pub mod wal;
 pub mod working_memory;
 pub mod worktree;
+
+pub use config::{AgentLoopConfig, AgentManagerConfig};
 
 pub use agent::Agent;
 pub use consumer::{AgentInboxConsumer, InboxMessage};

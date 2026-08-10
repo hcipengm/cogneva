@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use octocrab::Octocrab;
 
-use cog_core::GitHubAccount;
+use crate::config::GitHubAccount;
 
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{

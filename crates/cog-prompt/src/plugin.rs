@@ -6,7 +6,7 @@ use tracing::info;
 /// Prompt plugin that manages the global prompt manager.
 pub struct PromptPlugin {
     #[allow(dead_code)]
-    config: Option<cog_core::PromptConfig>,
+    config: Option<crate::PromptConfig>,
     manager: Option<Arc<crate::PromptManager>>,
 }
 
@@ -49,8 +49,9 @@ impl cog_core::SystemPlugin for PromptPlugin {
             return Ok(());
         }
 
+        // prompts 是 cog-prompt 自有配置段，自读 cogneva.json。
         let (dir, hot_reload) = {
-            let c = &ctx.config().prompts;
+            let c = crate::PromptConfig::load()?;
             (c.dir.clone(), c.hot_reload)
         };
         let pm = Arc::new(

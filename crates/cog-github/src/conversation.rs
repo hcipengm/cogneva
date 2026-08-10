@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Utc};
 
-use cog_core::{ConversationConfig, GitHubIntegrationConfig};
+use crate::config::{ConversationConfig, GitHubIntegrationConfig};
 
 use crate::error::Result;
 use crate::provider::{CodePlatformProvider, PlatformComment};

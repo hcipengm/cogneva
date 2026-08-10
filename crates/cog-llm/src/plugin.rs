@@ -34,9 +34,10 @@ impl cog_core::SystemPlugin for LlmPlugin {
         }
 
         let config = ctx.config();
-        let stream_capacity = config.tuning.stream_capacity;
+        // tuning / llm_routing 是 cog-llm 自有配置段，自读 cogneva.json。
+        let stream_capacity = crate::TuningConfig::load()?.stream_capacity;
         let anthropic_default_max_tokens = config.system.anthropic_default_max_tokens;
-        let llm_routing = config.llm_routing.clone();
+        let llm_routing = crate::LLMRoutingConfig::load()?;
         let llm = config.llm.clone();
         // Drop config borrow before publishing
         let _ = config;
@@ -164,7 +165,7 @@ pub fn default_model_for(provider: crate::Provider) -> crate::Model {
 }
 
 pub fn build_single_provider(
-    backend: &cog_core::LLMBackendConfig,
+    backend: &crate::LLMBackendConfig,
     stream_capacity: usize,
     anthropic_default_max_tokens: u32,
     http_client: Option<Arc<dyn cog_core::HttpClient>>,
@@ -222,7 +223,7 @@ pub fn build_single_provider(
 pub fn build_llm_provider(
     stream_capacity: usize,
     anthropic_default_max_tokens: u32,
-    llm_routing: &cog_core::LLMRoutingConfig,
+    llm_routing: &crate::LLMRoutingConfig,
     llm: &cog_core::LLMConfig,
     http_client: Option<Arc<dyn cog_core::HttpClient>>,
 ) -> cog_core::SFResult<Arc<dyn cog_core::LlmClient>> {
@@ -256,7 +257,7 @@ pub fn build_llm_provider(
             "LLM fallback: using legacy single-provider config (provider={})",
             llm.provider
         );
-        let fallback = cog_core::LLMBackendConfig {
+        let fallback = crate::LLMBackendConfig {
             provider: llm.provider.clone(),
             api_key: llm.api_key.clone(),
             base_url: llm.base_url.clone(),

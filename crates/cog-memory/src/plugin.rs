@@ -43,11 +43,13 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             strict_persistence,
         ) = {
             let config = ctx.config();
+            // memory 是 cog-memory 自有配置段，自读 cogneva.json。
+            let memory = crate::MemoryConfig::load()?;
             (
-                config.memory.enabled,
-                config.memory.backend_type.clone(),
-                config.memory.base_dir.clone(),
-                config.memory.embedding_dimension,
+                memory.enabled,
+                memory.backend_type.clone(),
+                memory.base_dir.clone(),
+                memory.embedding_dimension,
                 config.system.strict_persistence,
             )
         };
@@ -199,8 +201,9 @@ impl cog_core::SystemPlugin for MemoryPlugin {
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
-        let config = ctx.config();
-        if !config.memory.enabled || !config.memory.auto_ingest {
+        // memory 是 cog-memory 自有配置段，自读 cogneva.json。
+        let memory = crate::MemoryConfig::load()?;
+        if !memory.enabled || !memory.auto_ingest {
             return Ok(());
         }
 
@@ -212,19 +215,18 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             .map(|h| (*h).clone());
 
         if let Some(backend) = memory_backend {
-            let extractor: Arc<dyn cog_core::MemoryExtractor> =
-                if let Some(ref provider) = llm_provider {
-                    let mut extractor = crate::LlmMemoryExtractor::new(
-                        provider.clone(),
-                        config.memory.embedding_dimension,
-                    );
-                    if let Some(ref embedder) = embed_provider {
-                        extractor = extractor.with_embedder(embedder.clone());
-                    }
-                    Arc::new(extractor)
-                } else {
-                    Arc::new(crate::RuleBasedExtractor::new())
-                };
+            let extractor: Arc<dyn cog_core::MemoryExtractor> = if let Some(ref provider) =
+                llm_provider
+            {
+                let mut extractor =
+                    crate::LlmMemoryExtractor::new(provider.clone(), memory.embedding_dimension);
+                if let Some(ref embedder) = embed_provider {
+                    extractor = extractor.with_embedder(embedder.clone());
+                }
+                Arc::new(extractor)
+            } else {
+                Arc::new(crate::RuleBasedExtractor::new())
+            };
             let ingestor = crate::MemoryIngestor::new(backend, extractor);
             info!("Memory auto-ingest enabled");
             if let Some(tx) = event_tx {

@@ -18,7 +18,7 @@ pub struct CollaborationExecutor {
     hook_engine: Option<Arc<dyn cog_core::HookEngine>>,
     object_backend: Option<Arc<dyn cog_core::ObjectBackend>>,
     squad_reflection: Option<Arc<dyn cog_core::SquadReflection>>,
-    boundary_config: Option<cog_core::BoundaryConfig>,
+    boundary_config: Option<crate::BoundaryConfig>,
     knowledge_backend: Option<Arc<dyn cog_core::KnowledgeBackend>>,
     patch_sinks: Vec<Arc<dyn cog_core::PatchSink>>,
     reflection_engine: Option<Arc<dyn cog_core::ReflectionEngine>>,
@@ -84,7 +84,7 @@ impl CollaborationExecutor {
     }
 
     /// Set the boundary configuration for dynamic boundary rule evaluation.
-    pub fn with_boundary_config(mut self, cfg: cog_core::BoundaryConfig) -> Self {
+    pub fn with_boundary_config(mut self, cfg: crate::BoundaryConfig) -> Self {
         self.boundary_config = Some(cfg);
         self
     }

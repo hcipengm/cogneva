@@ -15,6 +15,7 @@
 
 #![deny(missing_docs)]
 
+pub mod config;
 pub mod conversation;
 pub mod discovery;
 pub mod discovery_loop;
@@ -27,10 +28,6 @@ pub mod provider;
 pub mod triage;
 pub mod webhook;
 
-pub use cog_core::{
-    AutoMergePolicy, BotAccount, BotIdentityConfig, ConversationConfig, GitHubAccount,
-    GitHubIntegrationConfig, HumanAccount, WebhookConfig,
-};
 pub use error::{CogGitHubError, Result};
 pub use webhook::{run_webhook_server, verify_signature, webhook_router, WebhookState};
 
@@ -65,3 +62,8 @@ pub fn default_provider(config: &GitHubIntegrationConfig) -> Result<Box<dyn Code
     );
     Ok(Box::new(GitHubProvider::new(account, &config.repo)?))
 }
+
+pub use config::{
+    AutoMergePolicy, BotAccount, BotIdentityConfig, ConversationConfig, GitHubAccount,
+    GitHubIntegrationConfig, HumanAccount, WebhookConfig,
+};

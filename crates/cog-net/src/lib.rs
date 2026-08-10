@@ -3,6 +3,7 @@
 //! [`ReqwestHttpClient`] so that timeouts, connection pools, and proxy settings
 //! are consistent across the system.
 
+pub mod config;
 pub mod factory;
 pub mod plugin;
 pub mod vault;
@@ -12,3 +13,5 @@ pub use factory::build_client;
 pub use factory::ReqwestHttpClient;
 pub use vault::VaultSecretProvider;
 pub use websocket::TungsteniteWebSocketClient;
+
+pub use config::HttpClientConfig;

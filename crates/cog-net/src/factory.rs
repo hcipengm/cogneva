@@ -2,7 +2,8 @@
 //! Use [`build_client`] for a one-off client, or [`ReqwestHttpClient`] when you
 //! need to satisfy [`cog_core::HttpClient`] in tests or generic code.
 
-use cog_core::{HttpClient, HttpClientConfig, HttpRequest, HttpResponse, SFError, SFResult};
+use crate::HttpClientConfig;
+use cog_core::{HttpClient, HttpRequest, HttpResponse, SFError, SFResult};
 use futures::TryStreamExt;
 use reqwest::Client;
 use std::time::Duration;

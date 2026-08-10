@@ -11,6 +11,7 @@
 
 pub mod ab_test;
 pub mod builder;
+pub mod config;
 pub mod loader;
 pub mod plugin;
 pub mod registry;
@@ -19,6 +20,7 @@ pub mod version;
 
 pub use ab_test::{AbTestConfig, AbTestGroup, PromptVariant};
 pub use builder::PromptBuilder;
+pub use config::PromptConfig;
 pub use loader::{FileSystemLoader, PromptLoader, WatchMode};
 pub use registry::{PromptEntry, PromptRegistry, PromptSource};
 pub use template::{TemplateEngine, TemplateVars};

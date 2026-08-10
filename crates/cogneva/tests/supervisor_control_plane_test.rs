@@ -37,7 +37,7 @@ async fn http_client_posts_json_to_mock_server() {
     });
 
     let http: Arc<dyn HttpClient> = Arc::new(cog_net::ReqwestHttpClient::from_config(
-        &cog_core::HttpClientConfig::default(),
+        &cog_net::HttpClientConfig::default(),
     ));
     let client = HttpControlPlaneClient::new(endpoint).with_client(http);
     let status = SupervisorStatus {
@@ -70,7 +70,7 @@ async fn http_client_returns_error_on_non_2xx() {
     });
 
     let http: Arc<dyn HttpClient> = Arc::new(cog_net::ReqwestHttpClient::from_config(
-        &cog_core::HttpClientConfig::default(),
+        &cog_net::HttpClientConfig::default(),
     ));
     let client = HttpControlPlaneClient::new(endpoint).with_client(http);
     let status = SupervisorStatus {

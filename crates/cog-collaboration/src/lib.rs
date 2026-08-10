@@ -4,6 +4,7 @@
 
 pub mod actors;
 pub mod collaboration_executor;
+pub mod config;
 pub mod hierarchy;
 pub mod ipc;
 pub mod observable;
@@ -12,6 +13,7 @@ pub mod squad;
 
 pub use actors::{ModeratorDecision, ModeratorOutput};
 pub use collaboration_executor::CollaborationExecutor;
+pub use config::{BoundaryConfig, PgeSettings, SelfReviewSettings};
 pub use hierarchy::{
     cross_squad_notify, AgentIdent, BroadcastRouter, HierarchicalCommunication,
     HierarchicalMessage, InterSquadMessage, RoutingStrategy, SquadId, TopicName,

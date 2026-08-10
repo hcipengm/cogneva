@@ -57,7 +57,8 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 config.app.name.clone(),
                 config.app.version.clone(),
                 config.app.log_level.clone(),
-                config.observability.clone(),
+                // observability 是 cog-observability 自有配置段，自读 cogneva.json。
+                crate::ObservabilityExportersConfig::load()?,
                 config.metrics.clone(),
                 (config.tier_migrator.hot_duration_secs / 86400) as u32,
                 (config.tier_migrator.warm_duration_secs / 86400) as u32,
@@ -296,10 +297,10 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         }
 
         // ── Alertmanager bridge ──
-        let config = ctx.config();
-        if config.observability.alertmanager.enabled {
-            let webhook_url = config.observability.alertmanager.webhook_url.clone();
-            let timeout_secs = config.observability.alertmanager.timeout_secs;
+        let obs_cfg = crate::ObservabilityExportersConfig::load()?;
+        if obs_cfg.alertmanager.enabled {
+            let webhook_url = obs_cfg.alertmanager.webhook_url.clone();
+            let timeout_secs = obs_cfg.alertmanager.timeout_secs;
             if !webhook_url.is_empty() {
                 if let Some(http_client) = ctx.consume_service::<dyn cog_core::HttpClient>() {
                     if let Some(supervisor) = ctx.consume_service::<dyn cog_core::Supervisor>() {

@@ -45,16 +45,19 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             let knowledge_backend = ctx.consume_service::<dyn cog_core::KnowledgeBackend>();
             let skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
 
+            // self_review / pge / boundary 是 cog-collaboration 自有配置段，
+            // 自读 cogneva.json（core config.rs 不聚合单 crate 配置）。
             let mut collab = crate::CollaborationExecutor::new()
                 .with_llm_provider(llm.clone())
-                .with_boundary_config(ctx.config().boundary.clone());
+                .with_boundary_config(crate::BoundaryConfig::load()?);
 
-            if let Some(self_review) = ctx.config().self_review.to_config() {
+            if let Some(self_review) = crate::SelfReviewSettings::load()?.to_config() {
                 collab = collab.with_self_review(self_review);
             }
 
-            if !ctx.config().pge.schemas.is_empty() {
-                collab = collab.with_pge_schemas(ctx.config().pge.schemas.clone());
+            let pge = crate::PgeSettings::load()?;
+            if !pge.schemas.is_empty() {
+                collab = collab.with_pge_schemas(pge.schemas.clone());
             }
 
             if let Some(ref hook) = hook_engine {

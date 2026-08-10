@@ -29,35 +29,16 @@ pub struct Config {
     pub dag_executor: DagExecutorConfig,
     pub gateway: GatewayConfig,
     pub raw_logger: crate::storage::RawLoggerConfig,
-    pub memory: MemoryConfig,
     #[serde(default)]
     pub tier_migrator: TierMigratorConfig,
-    #[serde(default)]
-    pub prompts: PromptConfig,
-    #[serde(default)]
-    pub llm_routing: LLMRoutingConfig,
-    #[serde(default)]
-    pub boundary: crate::types::BoundaryConfig,
-    #[serde(default)]
-    pub tuning: TuningConfig,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
-    pub observability: ObservabilityExportersConfig,
-    #[serde(default)]
     pub supervisor: SupervisorConfig,
     #[serde(default)]
     pub hook_engine: HookEngineConfig,
-    #[serde(default)]
-    pub agent_loop: AgentLoopConfig,
-    #[serde(default)]
-    pub self_review: SelfReviewSettings,
-    #[serde(default)]
-    pub pge: PgeSettings,
-    #[serde(default)]
-    pub github_integration: crate::contract::github::GitHubIntegrationConfig,
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
     #[serde(default)]
@@ -65,11 +46,7 @@ pub struct Config {
     #[serde(default)]
     pub self_evolution: SelfEvolutionConfig,
     #[serde(default)]
-    pub agent_pool: AgentManagerConfig,
-    #[serde(default)]
     pub multi_backend_consumer: MultiBackendConsumerConfig,
-    #[serde(default)]
-    pub http_client: crate::net::HttpClientConfig,
     #[serde(default)]
     pub env: HashMap<String, String>,
 }
@@ -106,7 +83,7 @@ impl std::fmt::Debug for LLMConfig {
     }
 }
 
-fn redacted(value: &str) -> &str {
+pub fn redacted(value: &str) -> &str {
     if value.is_empty() {
         ""
     } else {
@@ -135,68 +112,6 @@ impl Default for LLMConfig {
         }
     }
 }
-
-/// Backend entry for LLM routing / failover.
-/// `api_key` 在 Debug 输出中脱敏。
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LLMBackendConfig {
-    pub provider: String,
-    pub api_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    pub model: String,
-    /// API 兼容风格：`openai` 或 `anthropic`。默认 `openai`。
-    #[serde(default = "default_api_style")]
-    pub api_style: String,
-    pub weight: u32,
-    pub enabled: bool,
-}
-
-fn default_api_style() -> String {
-    "openai".into()
-}
-
-impl std::fmt::Debug for LLMBackendConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LLMBackendConfig")
-            .field("provider", &self.provider)
-            .field("api_key", &redacted(&self.api_key))
-            .field("base_url", &self.base_url)
-            .field("model", &self.model)
-            .field("api_style", &self.api_style)
-            .field("weight", &self.weight)
-            .field("enabled", &self.enabled)
-            .finish()
-    }
-}
-
-impl Default for LLMBackendConfig {
-    fn default() -> Self {
-        Self {
-            provider: String::new(),
-            api_key: String::new(),
-            base_url: None,
-            model: String::new(),
-            api_style: default_api_style(),
-            weight: 1,
-            enabled: true,
-        }
-    }
-}
-
-/// LLM routing / failover configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-pub struct LLMRoutingConfig {
-    pub strategy: String,
-    pub backends: Vec<LLMBackendConfig>,
-    pub retry_on_429: bool,
-    pub retry_on_402: bool,
-    pub max_failover_attempts: u32,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -432,21 +347,6 @@ fn default_archive_poll_interval_secs() -> u64 {
     300
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-pub struct MemoryConfig {
-    pub enabled: bool,
-    /// Backend type: `memory`, `file`, or `composite`.
-    pub backend_type: String,
-    /// Base directory for file-backed memory layers (raw/schema/summary).
-    pub base_dir: String,
-    /// Embedding dimension for summary vectors.
-    pub embedding_dimension: usize,
-    /// Auto-ingest AgentEnd events into memory.
-    pub auto_ingest: bool,
-}
-
 /// Configuration for the Hot/Warm/Cold tier migrator.
 /// `enabled = false` skips the migrator entirely and leaves files untouched
 /// in the hot tier. Durations are seconds so the JSON config stays compact.
@@ -461,31 +361,6 @@ pub struct TierMigratorConfig {
     pub cold_compression_level: i32,
     pub scan_interval_secs: u64,
     pub cold_key_prefix: String,
-}
-
-// ---------------------------------------------------------------------------
-// Missing component config sections (ch5_part2)
-// ---------------------------------------------------------------------------
-
-/// Prompt configuration — directory for external prompt templates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-pub struct PromptConfig {
-    pub dir: String,
-    #[serde(default)]
-    pub hot_reload: bool,
-}
-
-/// Domain-level tuning constants used across the system.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-pub struct TuningConfig {
-    pub stream_capacity: usize,
-    pub high_watermark: usize,
-    pub low_watermark: usize,
-    pub max_summaries: usize,
 }
 
 /// Agent registration and heartbeat configuration.
@@ -518,156 +393,6 @@ impl Default for MetricsConfig {
             enabled: true,
             endpoint: "/metrics".into(),
             interval_secs: 15,
-        }
-    }
-}
-
-/// Observability exporters configuration (Loki / Jaeger / ClickHouse / Alertmanager).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ObservabilityExportersConfig {
-    pub loki: LokiConfig,
-    pub jaeger: JaegerConfig,
-    pub clickhouse: ClickHouseConfig,
-    pub alertmanager: AlertmanagerConfig,
-    pub elasticsearch: ElasticsearchConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LokiConfig {
-    pub enabled: bool,
-    pub endpoint: String,
-    pub max_retries: u32,
-    pub timeout_secs: u64,
-    pub flush_interval_sec: u64,
-    pub max_batch_size: usize,
-}
-
-impl Default for LokiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            endpoint: "http://localhost:3100".into(),
-            max_retries: 3,
-            timeout_secs: 10,
-            flush_interval_sec: 5,
-            max_batch_size: 100,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct JaegerConfig {
-    pub enabled: bool,
-    pub endpoint: String,
-    pub service_name: String,
-}
-
-impl Default for JaegerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            endpoint: "http://localhost:14268/api/traces".into(),
-            service_name: "cogneva".into(),
-        }
-    }
-}
-
-/// `password` 在 Debug 输出中脱敏。
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ClickHouseConfig {
-    pub enabled: bool,
-    pub base_url: String,
-    pub database: String,
-    pub table: String,
-    pub username: String,
-    pub password: String,
-    pub flush_interval_sec: u64,
-    pub max_batch_size: usize,
-}
-
-impl std::fmt::Debug for ClickHouseConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClickHouseConfig")
-            .field("enabled", &self.enabled)
-            .field("base_url", &self.base_url)
-            .field("database", &self.database)
-            .field("table", &self.table)
-            .field("username", &self.username)
-            .field("password", &redacted(&self.password))
-            .field("flush_interval_sec", &self.flush_interval_sec)
-            .field("max_batch_size", &self.max_batch_size)
-            .finish()
-    }
-}
-
-impl Default for ClickHouseConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: "http://localhost:8123".into(),
-            database: "cogneva".into(),
-            table: "events".into(),
-            username: "default".into(),
-            password: "".into(),
-            flush_interval_sec: 10,
-            max_batch_size: 500,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AlertmanagerConfig {
-    pub enabled: bool,
-    pub webhook_url: String,
-    pub timeout_secs: u64,
-}
-
-impl Default for AlertmanagerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            webhook_url: "http://localhost:9093/api/v1/alerts".into(),
-            timeout_secs: 10,
-        }
-    }
-}
-
-/// `password` / `api_key` 在 Debug 输出中脱敏。
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ElasticsearchConfig {
-    pub enabled: bool,
-    pub base_url: String,
-    pub username: String,
-    pub password: String,
-    pub api_key: String,
-}
-
-impl std::fmt::Debug for ElasticsearchConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ElasticsearchConfig")
-            .field("enabled", &self.enabled)
-            .field("base_url", &self.base_url)
-            .field("username", &self.username)
-            .field("password", &redacted(&self.password))
-            .field("api_key", &redacted(&self.api_key))
-            .finish()
-    }
-}
-
-impl Default for ElasticsearchConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: "http://localhost:9200".into(),
-            username: "".into(),
-            password: "".into(),
-            api_key: "".into(),
         }
     }
 }
@@ -788,92 +513,6 @@ impl Default for RateLimitConfig {
     }
 }
 
-/// Agent loop configuration (JSON representation).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AgentLoopConfig {
-    pub agent_id: String,
-    pub role: String,
-    pub max_iterations: u32,
-    pub context_window_size: usize,
-    /// TTL for the available_skills cache in AgentRuntime (seconds).
-    pub skill_cache_ttl_secs: u64,
-}
-
-impl Default for AgentLoopConfig {
-    fn default() -> Self {
-        Self {
-            agent_id: "agent-001".into(),
-            role: "planner".into(),
-            max_iterations: 10,
-            context_window_size: 4000,
-            skill_cache_ttl_secs: 30,
-        }
-    }
-}
-
-/// Self-review quality gate configuration for PGE actors.
-/// Disabled by default so existing behavior is unchanged unless opted in.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SelfReviewSettings {
-    pub enabled: bool,
-    pub max_iterations: u32,
-    pub quality_threshold: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spec: Option<String>,
-    pub best_practices: Vec<String>,
-}
-
-impl Default for SelfReviewSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_iterations: 2,
-            quality_threshold: 0.8,
-            spec: None,
-            best_practices: Vec::new(),
-        }
-    }
-}
-
-impl SelfReviewSettings {
-    /// Convert to the runtime [`crate::SelfReviewConfig`] when enabled.
-    pub fn to_config(&self) -> Option<crate::SelfReviewConfig> {
-        if !self.enabled {
-            return None;
-        }
-        Some(crate::SelfReviewConfig {
-            max_iterations: self.max_iterations,
-            quality_threshold: self.quality_threshold,
-            spec: self.spec.clone(),
-            best_practices: self.best_practices.clone(),
-        })
-    }
-}
-
-/// PGE pipeline configuration: optional JSON Schemas constraining actor
-/// outputs. Empty by default so existing behavior is unchanged.
-///
-/// When a schema is configured for an actor (keyed by actor name:
-/// "planner", "generator", "evaluator", "moderator", "merger"), the actor
-/// injects it into the prompt context as `output_schema` and validates the
-/// raw LLM output against it. Validation failures are logged and the legacy
-/// lenient parsing still applies, so a bad schema can never break the
-/// pipeline.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PgeSettings {
-    pub schemas: HashMap<String, serde_json::Value>,
-}
-
-impl PgeSettings {
-    /// Return the configured schema for `actor`, if any.
-    pub fn schema_for(&self, actor: &str) -> Option<serde_json::Value> {
-        self.schemas.get(actor).cloned()
-    }
-}
-
 /// Lifecycle management configuration (heartbeat, thresholds).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -985,25 +624,6 @@ impl Default for SystemConfig {
             vector_backend_required: true,
             enabled_plugins: None,
             disabled_plugins: Vec::new(),
-        }
-    }
-}
-
-/// Global agent manager configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AgentManagerConfig {
-    pub enabled: bool,
-    pub worker_count: usize,
-    pub worker_role: String,
-}
-
-impl Default for AgentManagerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            worker_count: 3,
-            worker_role: "planner".into(),
         }
     }
 }
@@ -1186,36 +806,99 @@ impl Default for Config {
             dag_executor: DagExecutorConfig::default(),
             gateway: GatewayConfig::default(),
             raw_logger: crate::storage::RawLoggerConfig::default(),
-            memory: MemoryConfig::default(),
             tier_migrator: TierMigratorConfig::default(),
-            prompts: PromptConfig::default(),
-            llm_routing: LLMRoutingConfig::default(),
-            tuning: TuningConfig {
-                stream_capacity: 256,
-                high_watermark: 1000,
-                low_watermark: 100,
-                max_summaries: 10,
-            },
             agent: AgentConfig {
                 registration_ttl_secs: 30,
                 heartbeat_interval_secs: 10,
             },
             metrics: MetricsConfig::default(),
-            observability: ObservabilityExportersConfig::default(),
             supervisor: SupervisorConfig::default(),
             hook_engine: HookEngineConfig::default(),
-            agent_loop: AgentLoopConfig::default(),
-            self_review: SelfReviewSettings::default(),
-            pge: PgeSettings::default(),
-            github_integration: crate::contract::github::GitHubIntegrationConfig::default(),
             lifecycle: LifecycleConfig::default(),
             system: SystemConfig::default(),
             self_evolution: SelfEvolutionConfig::default(),
-            agent_pool: AgentManagerConfig::default(),
             multi_backend_consumer: MultiBackendConsumerConfig::default(),
-            http_client: crate::net::HttpClientConfig::default(),
             env: HashMap::new(),
-            boundary: crate::types::BoundaryConfig::default(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 专业配置段 env 覆盖（纯函数，零 IO）
+// ---------------------------------------------------------------------------
+//
+// 专业配置段归实现 crate 所有（docs/cog_core_boundary_and_interface_audit.md
+// §7.3）。各 crate 自读 cogneva.json 取段后，用本函数叠加 env 覆盖再反序
+// 列化；cogneva config_loader 对 core 聚合段也走同一函数，语义全系统统一。
+
+/// 把 env 变量按点路径写入 JSON 值。`entries` 为 (env 变量名, 点路径) 表，
+/// 未设置的变量跳过。类型推断顺序 bool → i64 → f64 → string。
+pub fn apply_env_paths(value: &mut serde_json::Value, entries: &[(&str, &str)]) {
+    for (env_name, path) in entries {
+        if let Ok(raw) = std::env::var(env_name) {
+            set_json_path(value, path, &raw);
+        }
+    }
+}
+
+/// Walk a dot-separated path (`app.name`, `gateway.http_port`) inside a
+/// JSON object and overwrite the leaf with `new_val`.
+/// Intermediate objects are created automatically if missing.
+/// Numeric segments index into arrays (`llm_routing.backends.0.base_url`),
+/// but only into existing elements — arrays are never grown implicitly.
+pub fn set_json_path(value: &mut serde_json::Value, path: &str, new_val: &str) {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() {
+        return;
+    }
+
+    let parsed = if let Ok(b) = new_val.parse::<bool>() {
+        serde_json::Value::Bool(b)
+    } else if let Ok(n) = new_val.parse::<i64>() {
+        serde_json::Value::Number(n.into())
+    } else if let Ok(f) = new_val.parse::<f64>() {
+        serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap_or_else(|| 0.into()))
+    } else {
+        serde_json::Value::String(new_val.into())
+    };
+
+    set_json_path_at(value, &parts, parsed);
+}
+
+fn set_json_path_at(current: &mut serde_json::Value, parts: &[&str], leaf: serde_json::Value) {
+    let Some((head, rest)) = parts.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        match current {
+            serde_json::Value::Object(map) => {
+                map.insert(head.to_string(), leaf);
+            }
+            serde_json::Value::Array(arr) => {
+                if let Ok(i) = head.parse::<usize>() {
+                    if i < arr.len() {
+                        arr[i] = leaf;
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    match current {
+        serde_json::Value::Object(map) => {
+            let next = map
+                .entry(head.to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            set_json_path_at(next, rest, leaf);
+        }
+        serde_json::Value::Array(arr) => {
+            if let Ok(i) = head.parse::<usize>() {
+                if let Some(next) = arr.get_mut(i) {
+                    set_json_path_at(next, rest, leaf);
+                }
+            }
+        }
+        _ => {}
     }
 }
