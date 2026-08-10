@@ -40,8 +40,6 @@ pub struct Config {
     #[serde(default)]
     pub hook_engine: HookEngineConfig,
     #[serde(default)]
-    pub lifecycle: LifecycleConfig,
-    #[serde(default)]
     pub system: SystemConfig,
     #[serde(default)]
     pub self_evolution: SelfEvolutionConfig,
@@ -513,29 +511,6 @@ impl Default for RateLimitConfig {
     }
 }
 
-/// Lifecycle management configuration (heartbeat, thresholds).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LifecycleConfig {
-    pub heartbeat_interval_secs: u64,
-    pub suspect_threshold: u32,
-    pub dead_threshold: u32,
-    pub registration_ttl_secs: u64,
-    pub cleanup_interval_secs: u64,
-}
-
-impl Default for LifecycleConfig {
-    fn default() -> Self {
-        Self {
-            heartbeat_interval_secs: 5,
-            suspect_threshold: 2,
-            dead_threshold: 5,
-            registration_ttl_secs: 60,
-            cleanup_interval_secs: 300,
-        }
-    }
-}
-
 /// System-wide runtime tunables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -814,7 +789,6 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             supervisor: SupervisorConfig::default(),
             hook_engine: HookEngineConfig::default(),
-            lifecycle: LifecycleConfig::default(),
             system: SystemConfig::default(),
             self_evolution: SelfEvolutionConfig::default(),
             multi_backend_consumer: MultiBackendConsumerConfig::default(),

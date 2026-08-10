@@ -8,7 +8,7 @@
 //! This module lives in the binary crate because file I/O does not belong in
 //! `cog-core`.
 //! **架构定位**：`cog-core::Config` 只保留领域层通用配置；业务 crate 特有的
-//! 配置（supervisor、hook_engine、agent_loop、metrics、lifecycle）定义在
+//! 配置（supervisor、hook_engine、metrics）定义在
 //! 本模块的 `AppConfig` 中，通过 `#[serde(flatten)]` 与 core 配置平铺共存，
 //! 既保持了 `cog-core` 的纯净，又保留了 `cogneva.json` 的动态丰富配置能力。
 
