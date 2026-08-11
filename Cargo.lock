@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "cog-agent"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "cog-auth"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "cog-collaboration"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "cog-core"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "cog-eval"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "cog-extension"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "cog-gateway"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "cog-github"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -1574,7 +1574,7 @@ dependencies = [
 
 [[package]]
 name = "cog-guardrail"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "cog-llm"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "cog-memory"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "cog-net"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "cog-notification"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1670,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "cog-observability"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "cog-orchestrator"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "cog-prompt"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "cog-protocol"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "cog-quota"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "cog-reflection"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "cog-skill"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cog-core",
@@ -1824,7 +1824,7 @@ dependencies = [
 
 [[package]]
 name = "cog-storage"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-nats 0.35.1",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "cog-stream"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-nats 0.40.0",
  "async-trait",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "cog-supervisor"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "cog-wiki"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1914,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "cogneva"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "cogneva-bootstrap"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
