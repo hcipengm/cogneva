@@ -1,0 +1,68 @@
+name: Auto Release
+
+# Version-as-release: merging a workspace version bump to main automatically
+# tags both remotes. The GitHub tag push then cascades into release.yml
+# (compile + GitHub release + GHCR image); the Gitee tag enables the
+# gitee-release job in release.yml.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    name: Tag both remotes when workspace version changed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read workspace version
+        id: ver
+        run: |
+          VER=$(awk '/^\[workspace\.package\]/{f=1} f && /^version/{gsub(/[" ]/,"",$2); print $2; exit}' FS='=' Cargo.toml)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if tag already exists
+        id: check
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if git ls-remote --exit-code --tags https://github.com/${{ github.repository }}.git "$TAG" >/dev/null 2>&1; then
+            echo "exists=yes" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists, nothing to do"
+          else
+            echo "exists=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag
+        if: steps.check.outputs.exists == 'no'
+        run: |
+          git config user.name "cogneva-bot"
+          git config user.email "bot@cogneva.local"
+          git tag -a "${{ steps.ver.outputs.tag }}" -m "Release ${{ steps.ver.outputs.tag }}"
+
+      - name: Push tag to GitHub (triggers release.yml)
+        if: steps.check.outputs.exists == 'no'
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p 22 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            git push ssh://git@github.com:22/${{ github.repository }}.git "${{ steps.ver.outputs.tag }}"
+
+      - name: Push tag to Gitee (enables gitee-release job)
+        if: steps.check.outputs.exists == 'no'
+        env:
+          GITEE_SSH_KEY: ${{ secrets.GITEE_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$GITEE_SSH_KEY" > ~/.ssh/gitee_key && chmod 600 ~/.ssh/gitee_key
+          ssh-keyscan gitee.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/gitee_key -o StrictHostKeyChecking=yes" \
+            git push git@gitee.com:hcipengm/cogneva.git "${{ steps.ver.outputs.tag }}"
