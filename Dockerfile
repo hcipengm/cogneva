@@ -156,7 +156,10 @@ ARG NPM_REGISTRY=""
 WORKDIR /web
 
 COPY web/package.json web/package-lock.json ./
-RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi && \
+# node:22-slim 自带 npm 版本有 "Exit handler never called!" bug（npm/cli 已知
+# 问题，CI 容器内稳定复现），先升级 npm 再 ci。
+RUN npm install -g npm@latest && \
+    if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi && \
     npm ci
 
 COPY web/ ./
