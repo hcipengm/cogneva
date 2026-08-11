@@ -678,7 +678,7 @@ pub struct MicroVmConfig {
     /// rootfs 镜像（ext4）；冷启动时复制为 COW 副本，原镜像只读复用。
     pub rootfs_image: String,
     /// 持久化卷镜像（ext4，Retain）：进化产物与状态的唯一持久层，
-    /// VM 销毁后保留（docs/2026-06-26_21-23-41_agent沙盒安全.md §4）。
+    /// VM 销毁后保留。
     pub pv_image: String,
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
@@ -801,9 +801,9 @@ impl Default for Config {
 // 专业配置段 env 覆盖（纯函数，零 IO）
 // ---------------------------------------------------------------------------
 //
-// 专业配置段归实现 crate 所有（docs/cog_core_boundary_and_interface_audit.md
-// §7.3）。各 crate 自读 cogneva.json 取段后，用本函数叠加 env 覆盖再反序
-// 列化；cogneva config_loader 对 core 聚合段也走同一函数，语义全系统统一。
+// 专业配置段归实现 crate 所有。各 crate 自读 cogneva.json 取段后，用
+// 本函数叠加 env 覆盖再反序列化；cogneva config_loader 对 core 聚合段
+// 也走同一函数，语义全系统统一。
 
 /// 把 env 变量按点路径写入 JSON 值。`entries` 为 (env 变量名, 点路径) 表，
 /// 未设置的变量跳过。类型推断顺序 bool → i64 → f64 → string。

@@ -1,7 +1,6 @@
 //! `cog-github` — GitHub integration for Cogneva self-evolution.
 //!
-//! This crate implements the autonomous GitHub sensor loop described in
-//! `docs/2026-06-28_github_issue_to_pr_integration_design.md`:
+//! This crate implements the autonomous GitHub sensor loop:
 //!
 //! ```text
 //! IssueDiscovery → IssueTriage → IssueConversation → Task

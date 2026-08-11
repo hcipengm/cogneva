@@ -1,7 +1,6 @@
 //! Standard [`cog_core::TaskContextBuilder`] implementation for PGE actors.
 //!
-//! Design: `docs/20250607_context_engineering_action_plan.md` P0-2 / P1-4 /
-//! P1-5. Centralizes the prompt context JSON that Planner / Generator /
+//! Centralizes the prompt context JSON that Planner / Generator /
 //! Evaluator previously hand-assembled inline. The per-role field sets below
 //! are the standardized context schemas; actor-specific extras
 //! (self-evolution mode, output schema overrides, prompt skills, knowledge

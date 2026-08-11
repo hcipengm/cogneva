@@ -1,5 +1,5 @@
 //! Agent 自有配置段（agent_loop / agent_pool）——core config.rs 不聚合
-//! 单 crate 配置（审计文档 §7.3）。自读 cogneva.json 对应段并叠加
+//! 单 crate 配置。自读 cogneva.json 对应段并叠加
 //! `COGNEVA_AGENT_LOOP_*` / `COGNEVA_AGENT_POOL_*` env 覆盖。
 
 use serde::{Deserialize, Serialize};

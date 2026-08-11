@@ -1,6 +1,5 @@
 //! Prompt context construction contract for PGE actors.
 //!
-//! Design: `docs/20250607_context_engineering_action_plan.md` P0-2.
 //! Before this contract existed, every PGE actor hand-assembled its prompt
 //! context with inline `serde_json::json!` blocks, so the per-role context
 //! schema was implicit and inconsistent. [`TaskContextBuilder`] centralizes

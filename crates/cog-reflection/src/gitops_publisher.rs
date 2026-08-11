@@ -1,4 +1,4 @@
-//! GitOps 推送端（docs/2026-08-06_真自治全进化无人值守方案.md 路线 B）。
+//! GitOps 推送端。
 //!
 //! 晋级放行后把沙盒工作区当前 HEAD 推到中央仓库 release 分支，
 //! 并打 `promote/<patch_id>` annotated tag（tag message 带审计元数据：

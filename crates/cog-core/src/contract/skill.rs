@@ -41,8 +41,7 @@ pub struct SkillDef {
     pub frontmatter: SkillFrontmatter,
 }
 
-/// Prompt-layer skill definition — PGE 输出格式技能化的载体
-/// （docs/20250605_squad_pge_architecture_refactor.md §4.3）。
+/// Prompt-layer skill definition — PGE 输出格式技能化的载体。
 ///
 /// 把角色的 prompt 模板与输出 schema 从 Rust 代码硬编码迁移为可配置数据：
 /// schema 仅作为指导而非紧箍咒，校验失败时调用方回退宽松解析。

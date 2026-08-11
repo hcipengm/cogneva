@@ -79,7 +79,7 @@ pub struct DataGap {
 }
 
 /// LLM-driven wiki maintainer.
-/// Responsible for the Ingest / Query / Lint workflows described in LLM_WIKI.md.
+/// Responsible for the Ingest / Query / Lint workflows.
 #[async_trait]
 pub trait WikiMaintainer: Send + Sync {
     /// Ingest a new raw source into the wiki.

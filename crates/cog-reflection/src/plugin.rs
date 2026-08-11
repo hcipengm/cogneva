@@ -82,7 +82,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         ));
         info!(dir = %warehouse_dir, "learning warehouse flywheel enabled");
 
-        // 产物级进化（open_source_strategy.md §14.3）：策略产物版本化存储 +
+        // 产物级进化：策略产物版本化存储 +
         // 哈希链完整性 + 热替换。MetaLearningEngine 的推荐参数从策略产物
         // active 版本读取；ArtifactEvolution 供评估侧在统计显著时升级策略。
         let policy_dir = format!("{}/policies", ctx.config().app.data_dir);

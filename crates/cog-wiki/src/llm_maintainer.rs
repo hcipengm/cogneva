@@ -1,5 +1,4 @@
-//! LLM 驱动的 Wiki 维护者 — LLM_WIKI 理念的核心落地
-//! (docs/20250607_cog_wiki_vs_llm_wiki_gap_analysis.md 方向 A)。
+//! LLM 驱动的 Wiki 维护者 — LLM_WIKI 理念的核心落地。
 //!
 //! 页面持久化策略：
 //! - `raw/{source}` 原始来源（不可变，ingest 时写入）

@@ -123,7 +123,7 @@ impl PromptGuard {
         }
     }
 
-    /// 角色感知检查（docs/2026-06-27 guardrail 决策 阶段一 + 阶段二结构校验）：
+    /// 角色感知检查：
     /// - system/user 命中注入模式 → Block（与历史行为一致）；
     /// - assistant/tool 命中 → Warn（不可信数据可能被间接注入，但直接 Block 误杀高）；
     /// - 非 system 消息逐字重复 system 规则长行 → Warn（疑似覆盖/重声明系统指令）；

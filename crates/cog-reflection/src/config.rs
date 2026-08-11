@@ -1,7 +1,7 @@
 //! 晋级门 / GitOps 分发配置——cog-reflection 自有配置段。
 //!
 //! schema、解析、env 覆盖全部内聚在本 crate（core config.rs 不聚合单
-//! crate 配置，见 docs/cog_core_boundary_and_interface_audit.md §7.3）。
+//! crate 配置）。
 //! 配置文件与主程序共用 cogneva.json 的 `self_evolution.promotion` 段，
 //! env 覆盖变量保持 `COGNEVA_SELF_EVOLUTION_PROMOTION_*` /
 //! `COGNEVA_GITOPS_*` 不变。
@@ -11,7 +11,7 @@ use std::path::Path;
 
 use cog_core::{SFError, SFResult};
 
-/// 晋级门配置（docs/2026-08-06_真自治全进化无人值守方案.md）：
+/// 晋级门配置：
 /// patch 闯过沙盒验证后，按触及文件决定晋级通道（L0 热更新 /
 /// L1 金丝雀自动 / L2 人工审批 / 黑名单拒收）。
 #[derive(Debug, Clone, Serialize, Deserialize)]

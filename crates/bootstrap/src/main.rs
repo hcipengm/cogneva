@@ -1,6 +1,6 @@
 //! Cogneva 元启动引导器（第二步：Rust 引导器配 LLM + 探测环境）。
 //!
-//! 职责（docs/2026-06-27_14-37-48_元启动实施计划.md §2.2 / §5）：
+//! 职责：
 //! 1. 交互式配置 LLM（API Key 或本地模型路径）并验证连通性；
 //! 2. 静默探测 CPU/内存/架构/节点；
 //! 3. 规则引擎选择 K3s（轻量）或 K8s（生产）分支；
@@ -620,7 +620,7 @@ async fn ensure_buildah_mirror() -> Result<()> {
     Ok(())
 }
 
-/// 运行时镜像供给（设计文档 §2.2 步骤 3 的前置）：清单引用 localhost/cogneva:local。
+/// 运行时镜像供给：清单引用 localhost/cogneva:local。
 /// 优先从 GitHub/Gitee release 下载预构建镜像（sha256 校验），失败回退源码构建
 /// （空白机全量 Rust release 构建需 1-3 小时，预构建下载仅需数分钟）。
 /// K3s 单节点导入本机 containerd；K8s 多节点经镜像分发器逐节点导入。

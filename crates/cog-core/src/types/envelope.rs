@@ -1,5 +1,4 @@
-//! 指令与数据隔离：MessageEnvelope + 外部材料标记。
-//! 依据 docs/2026-06-27_guardrail_analysis_and_improvement_decision.md 阶段二：
+//! 指令与数据隔离：MessageEnvelope + 外部材料标记：
 //! - 所有消息经统一入口封装，携带信任级别与来源；
 //! - 不可信外部材料（RAG/网页/文件/工具返回）统一包装为
 //!   `<external-data source="...">...</external-data>`，与系统指令不平级；

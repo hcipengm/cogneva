@@ -1,5 +1,5 @@
 //! Collaboration 自有配置段（self_review / pge / boundary）——core
-//! config.rs 不聚合单 crate 配置（审计文档 §7.3）。自读 cogneva.json
+//! config.rs 不聚合单 crate 配置。自读 cogneva.json
 //! 对应段，无 env 映射的段保持 JSON 驱动。
 
 use serde::{Deserialize, Serialize};

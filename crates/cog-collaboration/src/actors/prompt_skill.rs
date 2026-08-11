@@ -1,4 +1,4 @@
-//! Prompt skill 解析（docs/20250605_squad_pge_architecture_refactor.md §4.2/4.3）。
+//! Prompt skill 解析。
 //!
 //! 把 PGE 角色的 prompt 模板与输出 schema 从代码硬编码迁移为 skill 配置：
 //! - `resolve_prompt_skill` 从 `ExternalSkillRegistry` 解析 SKILL.md 正文作为

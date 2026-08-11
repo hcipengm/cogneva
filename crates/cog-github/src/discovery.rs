@@ -1,8 +1,8 @@
 //! Issue discovery — actively scans the configured repository for issues
 //! that should enter the self-evolution pipeline.
 //!
-//! Filtering follows `docs/2026-06-28_github_issue_to_pr_integration_design.md`:
-//! only issues whose state is in `allowed_issue_states`, that carry none of
+//! Filtering: only issues whose state is in `allowed_issue_states`, that
+//! carry none of
 //! the `forbidden_labels`, and that were updated since the last poll are
 //! returned, capped at `max_issues_per_scan`.
 

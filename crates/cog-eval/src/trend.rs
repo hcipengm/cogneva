@@ -1,4 +1,4 @@
-//! 进化趋势可视化（docs/2026-06-29_16-00 cog-eval 增强方案 §2.2 模块 6）。
+//! 进化趋势可视化。
 //! - TrendReport/TrendPoint：多轮进化指标序列；
 //! - ConvergenceAnalysis：平台期检测（收敛轮数 + 收敛速率）；
 //! - render_trend_chart：多指标 SVG 折线图；

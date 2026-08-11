@@ -1,5 +1,5 @@
 //! Observability exporters 配置——cog-observability 自有配置段（core
-//! config.rs 不聚合单 crate 配置，审计文档 §7.3）。自读 cogneva.json
+//! config.rs 不聚合单 crate 配置）。自读 cogneva.json
 //! `observability` 段并叠加 `COGNEVA_LOKI_*` / `COGNEVA_JAEGER_*` /
 //! `COGNEVA_CLICKHOUSE_*` / `COGNEVA_ALERTMANAGER_*` env 覆盖。
 

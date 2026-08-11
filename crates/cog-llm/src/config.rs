@@ -1,5 +1,5 @@
 //! LLM 路由与调优配置——cog-llm 自有配置段（core config.rs 不聚合单
-//! crate 配置，审计文档 §7.3）。自读 cogneva.json `llm_routing` /
+//! crate 配置）。自读 cogneva.json `llm_routing` /
 //! `tuning` 段；`tuning` 叠加 `COGNEVA_STREAM_CAPACITY` 等 env 覆盖。
 
 use serde::{Deserialize, Serialize};

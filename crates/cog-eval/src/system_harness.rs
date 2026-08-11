@@ -1,4 +1,4 @@
-//! 系统部署测试 Harness（docs/2026-06-29_16-00 cog-eval 增强方案 §2.2 模块 3）。
+//! 系统部署测试 Harness。
 //! 负责 D10（部署）/ D13（防御）指标的采集编排：
 //! - 端到端部署时间（curl|sh → WebUI ready）、部署步数、一次成功率；
 //! - 故障注入 + MTTR 测量（PodCrash / NodeOffline / DiskFull）；

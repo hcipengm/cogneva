@@ -1,5 +1,5 @@
 //! GitHub integration 配置——cog-github 自有配置段（core config.rs 不
-//! 聚合单 crate 配置，审计文档 §7.3）。自读 cogneva.json
+//! 聚合单 crate 配置）。自读 cogneva.json
 //! `github_integration` 段并叠加 `COGNEVA_GITHUB_*` env 覆盖。
 //!
 //! Security rule: **tokens never enter the evolution sandbox**. They are
