@@ -1,4 +1,4 @@
-# GitOps 拉取端（docs/2026-08-06_真自治全进化无人值守方案.md 路线 B）最小权限：
+# GitOps 拉取端最小权限：
 # 主应用 Pod 内的 puller 需要 apply L0 配置 configmap、重建 prompts configmap、
 # 对 cogneva 部署做金丝雀（set image / rollout pause|resume|undo|status）
 # 并读取 pod 健康信号。全部限定 namespace 内、resourceNames 白名单。

@@ -1,6 +1,6 @@
 # 独立安全网关：代持全部敏感凭证（LLM API Key 等），沙盒 Pod 零凭证。
 # 两个通道：8080 外网代理（脱敏审查后出站）、8081 LLM 代理（意图封装后代调）。
-# 依赖：主程序需以 security-gateway 模式运行（见 docs/2026-06-27_14-37-48_元启动实施计划.md §2.6.1）。
+# 依赖：主程序需以 security-gateway 模式运行。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
