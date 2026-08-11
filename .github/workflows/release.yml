@@ -23,13 +23,17 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          # Keep in sync with RUST_TOOLCHAIN in the root Dockerfile — the
+          # committed Cargo.lock contains crates requiring rustc >= 1.91.
+          toolchain: "1.95.0"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --workspace --release
+        # --locked: resolve from the committed Cargo.lock; fresh resolution
+        # pulls crate releases that may require a newer rustc than pinned.
+        run: cargo build --workspace --release --locked
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
@@ -89,7 +93,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./deploy/docker/Dockerfile
+          file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
