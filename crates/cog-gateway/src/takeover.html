@@ -264,6 +264,44 @@
   }
   .trend-col .rt { font-family: var(--font-mono); font-size: 10px; color: var(--text-1); height: 12px; }
 
+  /* ── Process view ── */
+  .bar-outer {
+    width: 110px; height: 6px; border-radius: 3px;
+    background: var(--bg-3); overflow: hidden; display: inline-block; vertical-align: middle;
+  }
+  .bar-inner { height: 100%; border-radius: 3px; background: var(--accent); transition: width .3s ease; }
+  .bar-inner.ok { background: var(--ok); }
+  .bar-inner.warn { background: var(--warn); }
+  .bar-inner.err { background: var(--err); }
+
+  /* ── LLM setup modal ── */
+  .modal-mask {
+    position: fixed; inset: 0; z-index: 50; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(8, 9, 10, .9); backdrop-filter: blur(6px);
+  }
+  .modal-mask.show { display: flex; }
+  .modal {
+    width: 100%; max-width: 430px; max-height: 90vh; overflow-y: auto;
+    background: var(--bg-1); border: 1px solid var(--line); border-radius: 12px;
+    padding: 24px 26px; box-shadow: 0 24px 64px rgba(0, 0, 0, .6);
+  }
+  .modal h3 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+  .modal .sub { color: var(--text-1); font-size: 12.5px; margin-bottom: 16px; }
+  .modal label { display: block; font-size: 11px; color: var(--text-2); margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .06em; }
+  .modal input[type=text], .modal input[type=password], .modal select {
+    width: 100%; background: var(--bg-2); border: 1px solid var(--line); color: var(--text-0);
+    border-radius: 6px; padding: 7px 10px; font: inherit; font-size: 12.5px; outline: none;
+  }
+  .modal input:focus, .modal select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .modal .actions { margin-top: 18px; display: flex; gap: 8px; }
+  .modal .actions button { flex: 1; padding: 8px 12px; }
+  .modal .err-box {
+    display: none; margin-top: 12px; padding: 8px 10px; border-radius: 6px;
+    background: var(--err-soft); color: var(--err); font-size: 12.5px;
+  }
+  .modal .fine { font-size: 11px; color: var(--text-2); margin-top: 4px; }
+
   @media (max-width: 860px) {
     .sidebar { display: none; }
     .content { margin-left: 0; }
@@ -281,6 +319,10 @@
     <a class="active" data-target="sec-pipeline">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4h12M2 8h8M2 12h10"/></svg>
       Patch Pipeline
+    </a>
+    <a data-target="sec-process">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 2"/></svg>
+      Process
     </a>
     <a data-target="sec-promotions">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13l4-6 4 3 4-8"/></svg>
@@ -315,6 +357,7 @@
     <span style="flex:1"></span>
     <input id="token" type="password" placeholder="Admin Bearer Token" />
     <button id="saveToken" class="ghost">Save Token</button>
+    <button id="llmBtn" class="ghost">LLM</button>
     <span id="promoBadge" class="pill">auto-promo …</span>
     <button id="promoToggle" class="ghost">…</button>
     <button id="refresh">Refresh</button>
@@ -338,6 +381,36 @@
       <table>
         <thead><tr><th></th><th>ID</th><th>Kind</th><th>Status</th><th>Description</th><th>Eval Verdict</th><th>Created</th></tr></thead>
         <tbody id="patches"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </section>
+
+    <section id="sec-process">
+      <h2>
+        Process
+        <span class="hint">DAG 状态 · Squad 进度 · Agent 负载 · 10s 自动刷新</span>
+        <span class="spacer"></span>
+        <span class="pill" id="procDlq">DLQ …</span>
+      </h2>
+      <div class="stats" style="margin-bottom:12px">
+        <div class="stat good"><div class="v" id="p-healthy">–</div><div class="k">Healthy</div></div>
+        <div class="stat"><div class="v" id="p-suspect" style="color:var(--warn)">–</div><div class="k">Suspect</div></div>
+        <div class="stat"><div class="v" id="p-stuck" style="color:var(--warn)">–</div><div class="k">Stuck</div></div>
+        <div class="stat bad"><div class="v" id="p-dead">–</div><div class="k">Dead</div></div>
+      </div>
+      <h2>Goals / DAGs</h2>
+      <table>
+        <thead><tr><th>Goal</th><th>Progress</th><th>Run</th><th>Pend</th><th>Done</th><th>Fail</th><th>Tasks</th></tr></thead>
+        <tbody id="procGoals"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+      </table>
+      <h2 style="margin-top:14px">Squads / Crews</h2>
+      <table>
+        <thead><tr><th>Crew</th><th>Progress</th><th>Tasks</th><th>Done</th><th>Fail</th><th>Crew Retries</th><th>Agents</th><th>Updated</th></tr></thead>
+        <tbody id="procCrews"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+      </table>
+      <h2 style="margin-top:14px">Agents</h2>
+      <table>
+        <thead><tr><th>Agent</th><th>Role</th><th>Health</th><th>Load</th><th>Running</th><th>Capabilities</th><th>Heartbeat</th></tr></thead>
+        <tbody id="procAgents"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
       </table>
     </section>
 
@@ -373,6 +446,44 @@
   </main>
 </div>
 <div id="toast"></div>
+
+<div class="modal-mask" id="llmMask">
+  <form class="modal" id="llmForm">
+    <h3>LLM 设置</h3>
+    <div class="sub" id="llmSub">系统尚未连接 LLM，自治与进化能力不可用。请填写模型服务信息完成接入。</div>
+    <label>服务商预设</label>
+    <select id="llmPreset">
+      <option value="0">自定义</option>
+      <option value="1">Kimi（月之暗面）</option>
+      <option value="2">DeepSeek</option>
+      <option value="3">OpenAI</option>
+      <option value="4">Anthropic</option>
+      <option value="5">豆包（火山方舟）</option>
+      <option value="6">Ollama（本地）</option>
+    </select>
+    <label>Provider 名称</label>
+    <input type="text" id="llmProvider" placeholder="例如 kimi" required />
+    <label>Base URL</label>
+    <input type="text" id="llmBaseUrl" placeholder="https://api.example.com/v1" required />
+    <label>模型</label>
+    <input type="text" id="llmModel" placeholder="例如 kimi-for-coding" required />
+    <label>API 风格</label>
+    <select id="llmApiStyle">
+      <option value="openai">openai（兼容接口，大多数服务商）</option>
+      <option value="anthropic">anthropic</option>
+      <option value="google">google</option>
+      <option value="ollama">ollama（本地）</option>
+    </select>
+    <label>API Key</label>
+    <input type="password" id="llmApiKey" placeholder="sk-..." required style="width:100%" />
+    <div class="fine">密钥只写入集群 Secret，不会回显到界面。</div>
+    <div class="err-box" id="llmErr"></div>
+    <div class="actions">
+      <button type="submit" id="llmSubmit">保存并生效</button>
+      <button type="button" class="ghost" id="llmClose" style="display:none">关闭</button>
+    </div>
+  </form>
+</div>
 <script>
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = 'cogneva_admin_token';
@@ -839,9 +950,161 @@ async function loadTrend() {
   }
 }
 
+// ── Process view ──
+function bar(pct, cls) {
+  const c = cls || (pct >= 100 ? 'ok' : pct > 0 ? '' : '');
+  return `<span class="bar-outer"><span class="bar-inner ${c}" style="width:${Math.min(100, pct)}%"></span></span> ${pct.toFixed(0)}%`;
+}
+
+function healthPill(h) {
+  const cls = h === 'healthy' ? 'ok' : h === 'dead' ? 'err' : h === 'unknown' ? '' : 'warn';
+  return `<span class="pill ${cls}">${h}</span>`;
+}
+
+async function loadProcess() {
+  if (!$('token').value.trim()) return;
+  try {
+    const p = await api('/api/v1/processes');
+    animateValue($('p-healthy'), p.health.healthy);
+    animateValue($('p-suspect'), p.health.suspect);
+    animateValue($('p-stuck'), p.health.stuck);
+    animateValue($('p-dead'), p.health.dead);
+    $('procDlq').textContent = 'DLQ ' + p.dlq_len;
+    $('procDlq').className = 'pill ' + (p.dlq_len > 0 ? 'err' : 'ok');
+
+    $('procGoals').innerHTML = p.goals.length === 0
+      ? '<tr><td colspan="7" class="muted">No goals in the DAG</td></tr>'
+      : p.goals.map((g) => `<tr>
+          <td class="mono ellipsis" title="${g.goal_id}">${g.goal_id}</td>
+          <td>${bar(g.progress_pct)}</td>
+          <td class="mono">${g.running}</td>
+          <td class="mono">${g.pending}</td>
+          <td class="mono" style="color:var(--ok)">${g.completed}</td>
+          <td class="mono" style="color:${g.failed ? 'var(--err)' : 'inherit'}">${g.failed}</td>
+          <td class="mono">${g.total}</td>
+        </tr>`).join('');
+
+    $('procCrews').innerHTML = p.crews.length === 0
+      ? '<tr><td colspan="8" class="muted">No crews tracked by the supervisor</td></tr>'
+      : p.crews.map((c) => `<tr>
+          <td class="mono ellipsis" title="${c.crew_id}">${c.crew_id}</td>
+          <td>${bar(c.progress_pct)}</td>
+          <td class="mono">${c.total_tasks}</td>
+          <td class="mono" style="color:var(--ok)">${c.completed_tasks}</td>
+          <td class="mono" style="color:${c.failed_tasks ? 'var(--err)' : 'inherit'}">${c.failed_tasks}</td>
+          <td class="mono" style="color:${c.crew_retry_count ? 'var(--warn)' : 'inherit'}">${c.crew_retry_count}</td>
+          <td class="mono">${c.agent_ids.length}</td>
+          <td class="dim">${relTime(c.updated_at)}</td>
+        </tr>`).join('');
+
+    $('procAgents').innerHTML = p.agents.length === 0
+      ? '<tr><td colspan="7" class="muted">No agents registered</td></tr>'
+      : p.agents.map((a) => `<tr>
+          <td class="mono ellipsis" title="${a.agent_id}">${a.agent_id}</td>
+          <td>${a.role}</td>
+          <td>${healthPill(a.health)}</td>
+          <td>${a.load_score === null ? '<span class="muted">–</span>' : bar(a.load_score * 100, a.load_score > 0.85 ? 'err' : a.load_score > 0.6 ? 'warn' : 'ok')}</td>
+          <td class="mono">${a.running_tasks}</td>
+          <td>${a.capabilities.map((c) => `<span class="tag">${c}</span>`).join(' ')}</td>
+          <td class="dim">${relTime(a.last_heartbeat)}</td>
+        </tr>`).join('');
+  } catch (e) {
+    if (!String(e.message).includes('HTTP 401') && !String(e.message).includes('HTTP 403')) {
+      toast('Failed to load process view: ' + e.message, 'err');
+    }
+  }
+}
+
+// ── LLM setup wizard (mandatory until configured) ──
+const LLM_PRESETS = [
+  { provider: '', base_url: '', model: '', api_style: 'openai' },
+  { provider: 'kimi', base_url: 'https://api.kimi.com/coding/v1', model: 'kimi-for-coding', api_style: 'anthropic' },
+  { provider: 'deepseek', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', api_style: 'openai' },
+  { provider: 'openai', base_url: 'https://api.openai.com/v1', model: 'gpt-4o', api_style: 'openai' },
+  { provider: 'anthropic', base_url: 'https://api.anthropic.com', model: 'claude-sonnet-4-6', api_style: 'anthropic' },
+  { provider: 'doubao', base_url: 'https://ark.cn-beijing.volces.com/api/v3', model: 'doubao-seed-2.0-code', api_style: 'openai' },
+  { provider: 'ollama', base_url: 'http://host.docker.internal:11434', model: 'qwen2.5-coder', api_style: 'ollama' },
+];
+let llmMandatory = false;
+let llmWaiting = false;
+
+function showLlmModal(mandatory) {
+  llmMandatory = mandatory;
+  $('llmSub').textContent = mandatory
+    ? '系统尚未连接 LLM，自治与进化能力不可用。请填写模型服务信息完成接入。'
+    : '修改后系统将滚动重启相关组件，约一分钟后生效。';
+  $('llmClose').style.display = mandatory ? 'none' : '';
+  $('llmMask').classList.add('show');
+}
+
+async function checkLlmStatus() {
+  if (!$('token').value.trim() || llmWaiting) return;
+  try {
+    const s = await api('/api/v1/admin/llm-status');
+    if (!s.configured) showLlmModal(true);
+  } catch { /* no token yet or endpoint unreachable — stay silent */ }
+}
+
+$('llmPreset').onchange = () => {
+  const p = LLM_PRESETS[Number($('llmPreset').value)];
+  if (!p.provider) return;
+  $('llmProvider').value = p.provider;
+  $('llmBaseUrl').value = p.base_url;
+  $('llmModel').value = p.model;
+  $('llmApiStyle').value = p.api_style;
+};
+
+$('llmBtn').onclick = () => showLlmModal(false);
+$('llmClose').onclick = () => $('llmMask').classList.remove('show');
+
+$('llmForm').onsubmit = async (e) => {
+  e.preventDefault();
+  $('llmErr').style.display = 'none';
+  $('llmSubmit').disabled = true;
+  try {
+    await api('/api/v1/admin/llm-config', 'POST', {
+      provider: $('llmProvider').value.trim(),
+      base_url: $('llmBaseUrl').value.trim(),
+      model: $('llmModel').value.trim(),
+      api_key: $('llmApiKey').value.trim(),
+      api_style: $('llmApiStyle').value,
+    });
+    llmWaiting = true;
+    $('llmSub').textContent = '配置已保存，系统正在滚动重启，期间页面可能短暂断开……';
+    const deadline = Date.now() + 3 * 60 * 1000;
+    const timer = setInterval(async () => {
+      try {
+        const s = await api('/api/v1/admin/llm-status');
+        if (s.configured) {
+          clearInterval(timer);
+          llmWaiting = false;
+          $('llmMask').classList.remove('show');
+          toast('LLM 已接入', 'ok');
+          refreshAll();
+        }
+      } catch { /* pod restarting */ }
+      if (Date.now() > deadline) {
+        clearInterval(timer);
+        llmWaiting = false;
+        $('llmSub').textContent = '仍在等待生效，请稍后重新检测。';
+        llmMandatory = false;
+        $('llmClose').style.display = '';
+      }
+    }, 5000);
+  } catch (err) {
+    $('llmErr').textContent = err.message;
+    $('llmErr').style.display = 'block';
+  } finally {
+    $('llmSubmit').disabled = false;
+  }
+};
+
+setInterval(loadProcess, 10000);
+
 function refreshAll() {
   loadMetrics(); loadPatches(); loadEvents(); loadAudit();
   loadPromotionSwitch(); loadPromotions(); loadTrend();
+  loadProcess();
 }
 
 $('saveToken').onclick = () => {
@@ -882,6 +1145,7 @@ document.addEventListener('keydown', (e) => {
 
 refreshAll();
 connectStream();
+checkLlmStatus();
 </script>
 </body>
 </html>

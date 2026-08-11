@@ -156,10 +156,11 @@ data:
         "backends": [
           {
             "provider": "kimi",
+            "_comment": "主应用与沙盒一致零凭证：api_key 是非敏感占位（见 deployment env KIMI_API_KEY=via-security-gateway），流量经安全网关 8081 透传，真 key 只在网关 Pod。api_style 钉 openai 匹配透传面。",
             "api_key": "${KIMI_API_KEY}",
-            "base_url": "https://api.kimi.com/coding/v1",
+            "base_url": "http://cogneva-security-gateway:8081/v1",
             "model": "kimi-for-coding",
-            "api_style": "anthropic",
+            "api_style": "openai",
             "weight": 1,
             "enabled": true
           },

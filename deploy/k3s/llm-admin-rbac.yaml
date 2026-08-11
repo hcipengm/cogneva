@@ -1,6 +1,7 @@
 # LLM 设置界面（WebUI 系统设置）所需的最小权限：
-# 主应用通过 in-cluster ServiceAccount 把用户在设置页填写的 provider/key
-# 写入 cogneva-secrets 与 cogneva-json，并滚动重启消费方 Deployment。
+# 主应用通过 in-cluster ServiceAccount 把用户在设置页填写的 key 写入
+# cogneva-secrets，并把 provider/base_url/model 写进安全网关 Deployment
+# 的 env（模板变更自动滚网关）。真 key 只在安全网关 Pod。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -23,13 +24,9 @@ rules:
     resources: ["secrets"]
     resourceNames: ["cogneva-secrets"]
     verbs: ["get", "patch"]
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    resourceNames: ["cogneva-json"]
-    verbs: ["get", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    resourceNames: ["cogneva", "cogneva-evolution", "cogneva-security-gateway"]
+    resourceNames: ["cogneva-security-gateway"]
     verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

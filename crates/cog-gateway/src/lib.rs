@@ -41,6 +41,7 @@ pub mod memory;
 pub mod notifications;
 pub mod observability;
 pub mod plugin;
+pub mod processes;
 pub mod prometheus_render;
 pub mod quota_middleware;
 pub mod raw_logs;
@@ -489,6 +490,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/tasks/ready", get(tasks::get_ready_tasks_handler))
         .route("/api/v1/tasks/status", get(tasks::task_summary_handler))
         .route("/api/v1/tasks/graph", get(tasks::get_task_graph_handler))
+        .route(
+            "/api/v1/processes",
+            get(processes::process_overview_handler),
+        )
         .route(
             "/api/v1/tasks/{id}/dependents",
             get(tasks::get_task_dependents_handler),

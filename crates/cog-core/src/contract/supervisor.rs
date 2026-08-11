@@ -29,10 +29,28 @@ pub struct HeartbeatRecord {
     pub task_count: u32,
 }
 
+/// Snapshot of a crew (squad-level execution group) tracked by the supervisor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CrewSummary {
+    pub crew_id: String,
+    pub agent_ids: Vec<String>,
+    pub task_ids: Vec<String>,
+    /// Crew-level retries already attempted (capped by the supervisor).
+    pub crew_retry_count: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Registry that tracks heartbeat history for agents.
 pub trait HeartbeatRegistry: Send + Sync {
     /// Get the full heartbeat history for an agent.
     fn get_heartbeat_history(&self, agent_id: &str) -> Vec<HeartbeatRecord>;
+
+    /// List every crew currently tracked by the supervisor.
+    /// Default empty so test doubles only stub what they use.
+    fn list_crews(&self) -> Vec<CrewSummary> {
+        Vec::new()
+    }
 }
 
 /// Health report returned by a supervisor health pass.

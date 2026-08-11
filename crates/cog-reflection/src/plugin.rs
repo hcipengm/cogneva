@@ -123,6 +123,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             .clone()
             .unwrap_or_else(|| Arc::new(crate::MetaLearningEngine::new(engine.recorder.clone())));
         ctx.publish_service(meta_learning);
+
+        let fault_classifier: Arc<dyn cog_core::FaultClassifier> =
+            Arc::new(crate::RuleBasedFaultClassifier::new());
+        ctx.publish_service(fault_classifier);
         info!("ReflectionPlugin reflection trait objects published");
 
         // Spawn evolution bridges.
@@ -1140,6 +1144,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         "SquadReflection",
         "MetaLearning",
         "EvolutionAdmin",
+        "FaultClassifier",
     ],
     consumes: &[
         cog_core::ConsumeSpec {

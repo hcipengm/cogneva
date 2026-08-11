@@ -41,6 +41,11 @@ pub struct Respawner {
     registry: Arc<AgentRegistry>,
     orchestrator: Arc<dyn OrchestratorControl>,
     event_tx: Option<broadcast::Sender<SupervisorEvent>>,
+    /// Optional root-cause classifier: when a crew's retries are exhausted,
+    /// the failure reason is classified so the recovery recommendation
+    /// matches the cause (retry/backoff, scale, evolve, fix config, alert)
+    /// instead of blindly respawning.
+    fault_classifier: Option<Arc<dyn cog_core::FaultClassifier>>,
 }
 
 impl Respawner {
@@ -49,12 +54,37 @@ impl Respawner {
             registry,
             orchestrator,
             event_tx: None,
+            fault_classifier: None,
         }
     }
 
     pub fn with_event_tx(mut self, tx: broadcast::Sender<SupervisorEvent>) -> Self {
         self.event_tx = Some(tx);
         self
+    }
+
+    pub fn set_fault_classifier(&mut self, classifier: Arc<dyn cog_core::FaultClassifier>) {
+        self.fault_classifier = Some(classifier);
+    }
+
+    pub fn with_fault_classifier(mut self, classifier: Arc<dyn cog_core::FaultClassifier>) -> Self {
+        self.set_fault_classifier(classifier);
+        self
+    }
+
+    /// Append a root-cause annotation to a terminal failure reason when a
+    /// classifier is available; without one the reason is returned unchanged.
+    fn annotate(&self, reason: &str) -> String {
+        match &self.fault_classifier {
+            Some(c) => {
+                let f = c.classify(reason);
+                format!(
+                    "{reason} [root_cause={:?} strategy={:?} rule={} confidence={:.2}]",
+                    f.category, f.strategy, f.matched_rule, f.confidence
+                )
+            }
+            None => reason.to_string(),
+        }
     }
 
     /// Process the set of dead agent ids reported by the HealthChecker.
@@ -107,25 +137,24 @@ impl Respawner {
             if info.crew_retry_count >= CrewInfo::MAX_CREW_RETRIES {
                 let retried = self.orchestrator.crew_retry_all(&task_ids).await;
 
+                let reason = self.annotate(&format!(
+                    "crew exceeded max supervisor retries ({}); respawn executed",
+                    CrewInfo::MAX_CREW_RETRIES
+                ));
+                tracing::warn!(crew_id=%crew_id, %reason, "crew retries exhausted");
                 report.respawn_requested.push(RespawnAction {
                     crew_id: crew_id.clone(),
                     task_ids,
                     retried,
                     crew_retry_count: info.crew_retry_count,
-                    reason: format!(
-                        "crew exceeded max supervisor retries ({}); respawn executed",
-                        CrewInfo::MAX_CREW_RETRIES
-                    ),
+                    reason: reason.clone(),
                     executed: true,
                 });
 
                 if let Some(ref tx) = self.event_tx {
                     let _ = tx.send(SupervisorEvent::SquadRespawnExecuted {
                         crew_id: crew_id.clone(),
-                        reason: format!(
-                            "crew exceeded max supervisor retries ({})",
-                            CrewInfo::MAX_CREW_RETRIES
-                        ),
+                        reason,
                         timestamp: Utc::now(),
                     });
                 }
@@ -135,19 +164,21 @@ impl Respawner {
             if !self.orchestrator.crew_can_retry(&task_ids).await {
                 let retried = self.orchestrator.crew_retry_all(&task_ids).await;
 
+                let reason = self.annotate("all tasks exhausted retry budget; respawn executed");
+                tracing::warn!(crew_id=%crew_id, %reason, "task retry budget exhausted");
                 report.respawn_requested.push(RespawnAction {
                     crew_id: crew_id.clone(),
                     task_ids,
                     retried,
                     crew_retry_count: info.crew_retry_count,
-                    reason: "all tasks exhausted retry budget; respawn executed".into(),
+                    reason: reason.clone(),
                     executed: true,
                 });
 
                 if let Some(ref tx) = self.event_tx {
                     let _ = tx.send(SupervisorEvent::SquadRespawnExecuted {
                         crew_id: crew_id.clone(),
-                        reason: "all tasks exhausted retry budget".into(),
+                        reason,
                         timestamp: Utc::now(),
                     });
                 }

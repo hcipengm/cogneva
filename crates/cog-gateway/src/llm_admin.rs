@@ -2,9 +2,11 @@
 //!
 //! The WebUI setup wizard uses these endpoints to connect the system to an
 //! LLM after installation. Saving writes the API key into the
-//! `cogneva-secrets` Secret, updates the `cogneva-json` ConfigMap's
-//! `llm_routing.backends[0]`, and rolls the LLM-consuming deployments so the
-//! new configuration takes effect.
+//! `cogneva-secrets` Secret and points the security gateway's upstream env
+//! (`COGNEVA_LLM_PROVIDER/BASE_URL/MODEL`) at the chosen provider. Only the
+//! gateway holds credentials; the main app and sandbox talk to the gateway,
+//! so the deployment env patch (which rolls the gateway) is the only restart
+//! needed.
 
 use axum::{
     extract::State,
@@ -20,11 +22,9 @@ const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 const API_BASE: &str = "https://kubernetes.default.svc";
 const SECRET_NAME: &str = "cogneva-secrets";
 const SECRET_KEY: &str = "llm-api-key";
-const CONFIGMAP_NAME: &str = "cogneva-json";
-const CONFIGMAP_KEY: &str = "cogneva.json";
-const KEY_PLACEHOLDER: &str = "${KIMI_API_KEY}";
+const GATEWAY_DEPLOYMENT: &str = "cogneva-security-gateway";
+const GATEWAY_CONTAINER: &str = "security-gateway";
 const VALID_API_STYLES: [&str; 4] = ["openai", "anthropic", "google", "ollama"];
-const RESTART_DEPLOYMENTS: [&str; 3] = ["cogneva", "cogneva-evolution", "cogneva-security-gateway"];
 
 #[derive(Debug, Deserialize)]
 pub struct LlmConfigRequest {
@@ -35,12 +35,37 @@ pub struct LlmConfigRequest {
     pub api_style: Option<String>,
 }
 
-/// GET /api/v1/admin/llm-status — which backends exist and whether any
-/// enabled one has a resolvable API key. Never returns key material.
+/// GET /api/v1/admin/llm-status — whether the security gateway holds a
+/// resolvable API key. Never returns key material. In-cluster the source of
+/// truth is the `llm-api-key` Secret entry (the main app is credential-free);
+/// outside the cluster we fall back to inspecting local cogneva.json.
 pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) -> Response {
+    if let Ok(kube) = KubeClient::in_cluster() {
+        if let Ok(configured) = kube.secret_has_key().await {
+            return (
+                StatusCode::OK,
+                Json(json!({ "configured": configured, "backends": local_backends() })),
+            )
+                .into_response();
+        }
+    }
+    let backends = local_backends();
+    let configured = backends
+        .iter()
+        .any(|b| b["enabled"] == json!(true) && b["has_key"] == json!(true));
+    (
+        StatusCode::OK,
+        Json(json!({ "configured": configured, "backends": backends })),
+    )
+        .into_response()
+}
+
+/// Backends declared in the local cogneva.json (informational only — after
+/// credential narrowing the primary backend points at the security gateway).
+fn local_backends() -> Vec<serde_json::Value> {
     let path = std::env::var("COGNEVA_CONFIG_PATH")
         .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".to_string());
-    let backends = match std::fs::read_to_string(&path)
+    match std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|cfg| cfg.get("llm_routing")?.get("backends")?.as_array().cloned())
@@ -60,15 +85,7 @@ pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) 
             })
             .collect::<Vec<_>>(),
         None => Vec::new(),
-    };
-    let configured = backends
-        .iter()
-        .any(|b| b["enabled"] == json!(true) && b["has_key"] == json!(true));
-    (
-        StatusCode::OK,
-        Json(json!({ "configured": configured, "backends": backends })),
-    )
-        .into_response()
+    }
 }
 
 /// A key "resolves" when it is either a literal non-empty value or a
@@ -151,49 +168,23 @@ pub async fn llm_config_handler(
     }
 
     if let Err(e) = kube
-        .update_llm_backend(provider, base_url, model, api_style)
+        .update_gateway_upstream(provider, base_url, model, api_style)
         .await
     {
         return (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "configmap_patch_failed", "message": e})),
+            Json(json!({"error": "gateway_patch_failed", "message": e})),
         )
             .into_response();
     }
 
-    let mut restarted = Vec::new();
-    let mut failed = Vec::new();
-    for name in RESTART_DEPLOYMENTS {
-        let body = json!({
-            "spec": {"template": {"metadata": {"annotations": {
-                "kubectl.kubernetes.io/restartedAt": chrono::Utc::now().to_rfc3339()
-            }}}}
-        });
-        match kube
-            .patch(
-                &format!(
-                    "/apis/apps/v1/namespaces/{}/deployments/{}",
-                    kube.namespace, name
-                ),
-                body,
-            )
-            .await
-        {
-            Ok(()) => restarted.push(name),
-            Err(e) => {
-                tracing::warn!(deployment = name, error = %e, "rollout restart failed");
-                failed.push(name);
-            }
-        }
-    }
-
+    // 部署 env 变更本身触发网关滚动重启，无需额外 restartedAt 注解。
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
-            "restarted": restarted,
-            "failed_restarts": failed,
-            "message": "配置已保存，相关组件正在滚动重启，约一分钟后生效",
+            "restarted": [GATEWAY_DEPLOYMENT],
+            "message": "配置已保存，安全网关正在滚动重启，约一分钟后生效",
         })),
     )
         .into_response()
@@ -253,69 +244,67 @@ impl KubeClient {
     /// Rewrite `llm_routing.backends[0]` inside the cogneva.json ConfigMap,
     /// keeping the `${KIMI_API_KEY}` placeholder (the key itself lives in the
     /// Secret and is injected via env).
-    async fn update_llm_backend(
+    /// 真 key 是否已写入集群 Secret（网关凭证的唯一事实源）。
+    async fn secret_has_key(&self) -> Result<bool, String> {
+        let resp = self
+            .http
+            .get(format!(
+                "{API_BASE}/api/v1/namespaces/{}/secrets/{}",
+                self.namespace, SECRET_NAME
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("读取 secret 失败: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("读取 secret 返回 {}", resp.status()));
+        }
+        let secret: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("secret 响应解析失败: {e}"))?;
+        let has = secret
+            .get("data")
+            .and_then(|d| d.get(SECRET_KEY))
+            .and_then(|v| v.as_str())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        Ok(has)
+    }
+
+    /// 把用户选择的 provider 写入安全网关 Deployment 的 env（strategic
+    /// merge：containers 按 name 合并、env 按 name 合并），模板变更自动
+    /// 触发网关滚动重启。网关只区分 openai/anthropic 两种协议面，
+    /// google/ollama 等其余风格都走 openai 兼容面。
+    async fn update_gateway_upstream(
         &self,
         provider: &str,
         base_url: &str,
         model: &str,
         api_style: &str,
     ) -> Result<(), String> {
-        let cm_path = format!(
-            "/api/v1/namespaces/{}/configmaps/{}",
-            self.namespace, CONFIGMAP_NAME
-        );
-        let resp = self
-            .http
-            .get(format!("{API_BASE}{cm_path}"))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| format!("读取 configmap 失败: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("读取 configmap 返回 {status}: {text}"));
-        }
-        let cm: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("configmap 响应解析失败: {e}"))?;
-        let raw = cm
-            .get("data")
-            .and_then(|d| d.get(CONFIGMAP_KEY))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("configmap 缺少 data.{CONFIGMAP_KEY}"))?;
-        let mut cfg: serde_json::Value =
-            serde_json::from_str(raw).map_err(|e| format!("cogneva.json 解析失败: {e}"))?;
-
-        let new_backend = json!({
-            "provider": provider,
-            "api_key": KEY_PLACEHOLDER,
-            "base_url": base_url,
-            "model": model,
-            "api_style": api_style,
-            "weight": 1,
-            "enabled": true,
-        });
-        let routing = cfg
-            .as_object_mut()
-            .ok_or("cogneva.json 不是 JSON 对象")?
-            .entry("llm_routing")
-            .or_insert_with(|| json!({}));
-        let backends = routing
-            .as_object_mut()
-            .ok_or("llm_routing 不是 JSON 对象")?
-            .entry("backends")
-            .or_insert_with(|| json!([]));
-        match backends.as_array_mut() {
-            Some(arr) if !arr.is_empty() => arr[0] = new_backend,
-            Some(arr) => arr.push(new_backend),
-            None => *backends = json!([new_backend]),
-        }
-
-        let rendered = serde_json::to_string_pretty(&cfg)
-            .map_err(|e| format!("cogneva.json 序列化失败: {e}"))?;
-        self.patch(&cm_path, json!({"data": {CONFIGMAP_KEY: rendered}}))
-            .await
+        let gateway_provider = if api_style == "anthropic" {
+            "anthropic"
+        } else {
+            "openai"
+        };
+        let _ = provider; // provider 名仅用于 UI 展示，网关按协议面路由
+        self.patch(
+            &format!(
+                "/apis/apps/v1/namespaces/{}/deployments/{}",
+                self.namespace, GATEWAY_DEPLOYMENT
+            ),
+            json!({
+                "spec": {"template": {"spec": {"containers": [{
+                    "name": GATEWAY_CONTAINER,
+                    "env": [
+                        {"name": "COGNEVA_LLM_PROVIDER", "value": gateway_provider},
+                        {"name": "COGNEVA_LLM_BASE_URL", "value": base_url},
+                        {"name": "COGNEVA_LLM_MODEL", "value": model},
+                    ],
+                }]}}}}
+            ),
+        )
+        .await
     }
 }

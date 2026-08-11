@@ -206,6 +206,13 @@ impl Supervisor {
         self
     }
 
+    /// Attach a root-cause classifier so exhausted-retry decisions carry a
+    /// cause-matched recovery recommendation.
+    pub fn with_fault_classifier(mut self, classifier: Arc<dyn cog_core::FaultClassifier>) -> Self {
+        self.respawner.set_fault_classifier(classifier);
+        self
+    }
+
     /// Subscribe to the Supervisor's event broadcast channel.
     pub fn subscribe(&self) -> broadcast::Receiver<SupervisorEvent> {
         self.event_tx.subscribe()

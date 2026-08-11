@@ -599,4 +599,18 @@ impl cog_core::HeartbeatRegistry for AgentRegistry {
             })
             .unwrap_or_default()
     }
+
+    fn list_crews(&self) -> Vec<cog_core::CrewSummary> {
+        self.crews()
+            .into_iter()
+            .map(|c| cog_core::CrewSummary {
+                crew_id: c.crew_id,
+                agent_ids: c.agent_ids,
+                task_ids: c.task_ids,
+                crew_retry_count: c.crew_retry_count,
+                created_at: c.created_at,
+                updated_at: c.updated_at,
+            })
+            .collect()
+    }
 }

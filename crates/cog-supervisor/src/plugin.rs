@@ -76,6 +76,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
             .expect("event sender");
         let event_tx = (*event_tx).clone();
         let meta_learning = ctx.consume_service::<dyn cog_core::MetaLearning>();
+        let fault_classifier = ctx.consume_service::<dyn cog_core::FaultClassifier>();
 
         // ── Consume observability gateway ──
         let gateway = ctx
@@ -97,20 +98,22 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
 
         let scheduler_gate = Arc::new(crate::SchedulerGate::new());
 
-        let supervisor = Arc::new(
-            crate::Supervisor::new(
-                supervisor_config.into(),
-                supervisor_registry.clone(),
-                state_backend.clone(),
-                supervisor_orchestrator,
-                quota_manager,
-                gateway,
-                scheduler_gate.clone(),
-                event_tx.subscribe(),
-                meta_learning,
-            )
-            .with_config_watch(supervisor_config_rx),
-        );
+        let mut supervisor = crate::Supervisor::new(
+            supervisor_config.into(),
+            supervisor_registry.clone(),
+            state_backend.clone(),
+            supervisor_orchestrator,
+            quota_manager,
+            gateway,
+            scheduler_gate.clone(),
+            event_tx.subscribe(),
+            meta_learning,
+        )
+        .with_config_watch(supervisor_config_rx);
+        if let Some(classifier) = fault_classifier {
+            supervisor = supervisor.with_fault_classifier(classifier);
+        }
+        let supervisor = Arc::new(supervisor);
         info!("Supervisor created");
         supervisor.track_workspace(dag_executor_workspace_id);
 
@@ -259,6 +262,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "MetaLearning",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "FaultClassifier",
             required: false,
         },
         cog_core::ConsumeSpec {

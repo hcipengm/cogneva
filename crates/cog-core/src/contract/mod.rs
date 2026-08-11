@@ -8,6 +8,7 @@ pub mod embedding;
 pub mod eval;
 pub mod event;
 pub mod evolution_admin;
+pub mod fault;
 pub mod guardrail;
 pub mod hook;
 pub mod knowledge;

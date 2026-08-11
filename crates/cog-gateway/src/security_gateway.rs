@@ -41,16 +41,23 @@ impl SecurityGatewayConfig {
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
         };
-        let provider = std::env::var("COGNEVA_LLM_PROVIDER").unwrap_or_else(|_| "openai".into());
+        let api_key = std::env::var("LLM_API_KEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+            .unwrap_or_default();
+        // provider 未显式配置时按 key 前缀推断：sk-ant- → anthropic，其余默认 openai。
+        let provider = std::env::var("COGNEVA_LLM_PROVIDER").unwrap_or_else(|_| {
+            if api_key.starts_with("sk-ant-") {
+                "anthropic".into()
+            } else {
+                "openai".into()
+            }
+        });
         let default_base = if provider == "anthropic" {
             "https://api.anthropic.com"
         } else {
             "https://api.openai.com/v1"
         };
-        let api_key = std::env::var("LLM_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .unwrap_or_default();
         Self {
             egress_port: env_u16("COGNEVA_SG_EGRESS_PORT", 8080),
             llm_port: env_u16("COGNEVA_SG_LLM_PORT", 8081),
@@ -356,6 +363,45 @@ async fn chat_completions_passthrough(
             "passthrough only supports openai-style upstreams".into(),
         ));
     }
+    let url = format!(
+        "{}/chat/completions",
+        state.config.llm_base_url.trim_end_matches('/')
+    );
+    stream_forward(state, req, &url, AuthStyle::Bearer).await
+}
+
+/// Anthropic 透传端点：与 OpenAI 透传对称，转发 `/v1/messages`，
+/// 出站凭证换成 `x-api-key` + `anthropic-version`。
+async fn anthropic_messages_passthrough(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    if state.config.llm_provider != "anthropic" {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "passthrough only supports anthropic upstreams".into(),
+        ));
+    }
+    let url = format!(
+        "{}/v1/messages",
+        state.config.llm_base_url.trim_end_matches('/')
+    );
+    stream_forward(state, req, &url, AuthStyle::Anthropic).await
+}
+
+enum AuthStyle {
+    Bearer,
+    Anthropic,
+}
+
+/// 透传共用实现：只取请求 body 重建出站请求（入站 Authorization 天然丢弃），
+/// 由网关代持注入真凭证，逐字节流式回传。
+async fn stream_forward(
+    state: AppState,
+    req: axum::extract::Request,
+    url: &str,
+    auth: AuthStyle,
+) -> Result<axum::response::Response, (StatusCode, String)> {
     if state.config.llm_api_key.is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -367,16 +413,18 @@ async fn chat_completions_passthrough(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let start = std::time::Instant::now();
-    let url = format!(
-        "{}/chat/completions",
-        state.config.llm_base_url.trim_end_matches('/')
-    );
-    let resp = state
+    let builder = state
         .stream_client
         .post(url)
-        .bearer_auth(&state.config.llm_api_key)
         .header("Content-Type", "application/json")
-        .body(body)
+        .body(body);
+    let builder = match auth {
+        AuthStyle::Bearer => builder.bearer_auth(&state.config.llm_api_key),
+        AuthStyle::Anthropic => builder
+            .header("x-api-key", &state.config.llm_api_key)
+            .header("anthropic-version", "2023-06-01"),
+    };
+    let resp = builder
         .send()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
@@ -524,6 +572,7 @@ fn router(state: AppState, llm_channel: bool) -> Router {
         r.route("/v1/intent", post(intent_handler))
             .route("/v1/chat", post(chat_handler))
             .route("/v1/chat/completions", post(chat_completions_passthrough))
+            .route("/v1/messages", post(anthropic_messages_passthrough))
     } else {
         r.route("/proxy", post(proxy_handler))
     };
