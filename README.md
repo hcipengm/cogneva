@@ -2,8 +2,8 @@
 
 # 🌌 Cogneva
 
-**Cognition emerges like a nova, awakening the soul of AI.**
-*认知如新星般涌现，赋予 AI 以觉醒的灵魂。*
+**Cognition emerges like a nova, awakening the taste of AI.**
+*认知如新星般涌现，赋予 AI 以觉醒的品味。*
 
 [![License: Modified MIT](https://img.shields.io/badge/License-Modified%20MIT-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)

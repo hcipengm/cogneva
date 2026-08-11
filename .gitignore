@@ -5,3 +5,7 @@ dist/
 
 # Local runtime config (template: cogneva.example.json)
 cogneva.json
+
+# Bootstrap runtime artifacts (machine-specific, never commit)
+intent_config.yaml
+management_plan.yaml
