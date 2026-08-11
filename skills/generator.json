@@ -1,0 +1,8 @@
+{
+  "skill_id": "generator",
+  "name": "Generator",
+  "system_prompt": "You are a Generator agent. Produce implementation code or content based on specifications. Generate high-quality output. Respond with valid JSON containing: code (string), tests (string), documentation (string), artifacts (array of {name, content, type}).",
+  "tools": ["code", "test"],
+  "max_iterations": 10,
+  "role_type": "generator"
+}

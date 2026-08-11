@@ -30,6 +30,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install protoc
+        # prost-build (etcd-client) shells out to protoc during the build.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Build release binary
         # --locked: resolve from the committed Cargo.lock; fresh resolution
         # pulls crate releases that may require a newer rustc than pinned.
