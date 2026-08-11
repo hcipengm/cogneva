@@ -44,6 +44,8 @@ pub mod patch_pipeline;
 pub mod policy_store;
 pub mod promoter;
 pub mod promotion_gate;
+pub mod promotion_switch;
+pub mod promotion_trend;
 pub mod recorder;
 pub mod reviewer;
 pub mod sandbox;
@@ -77,6 +79,8 @@ pub use policy_store::{
 };
 pub use promoter::{DefaultLearningPromoter, LearningPromoter};
 pub use promotion_gate::{classify, count_diff_lines, GateVerdict};
+pub use promotion_switch::PromotionSwitch;
+pub use promotion_trend::PromotionTrendReporter;
 pub use recorder::{InMemoryRecorder, LearningRecorder, MemoryBackendRecorder};
 pub use reviewer::PeriodicReviewer;
 pub use sandbox::{enforce_sandbox_boundary, BoundaryDecision, SandboxKind, SandboxSignals};

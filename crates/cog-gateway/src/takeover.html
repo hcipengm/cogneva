@@ -236,6 +236,34 @@
   #toast.err { border-left-color: var(--err); }
   #toast.ok { border-left-color: var(--ok); }
 
+  /* ── Promotion trend & alert ── */
+  .promo-alert {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--err-soft); border: 1px solid rgba(229, 72, 77, .3);
+    color: var(--err); border-radius: 8px; padding: 9px 12px;
+    font-size: 12.5px; font-weight: 500; margin-bottom: 12px;
+  }
+  .trend-chart {
+    display: flex; align-items: flex-end; gap: 8px;
+    padding: 10px 4px 4px; margin-bottom: 12px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .trend-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; }
+  .trend-col .bar {
+    width: 100%; max-width: 44px; border-radius: 4px 4px 0 0;
+    background: var(--bg-3); min-height: 3px;
+    transition: height .3s ease;
+  }
+  .trend-col .bar.ok { background: rgba(76, 195, 138, .55); }
+  .trend-col .bar.warn { background: rgba(229, 161, 60, .55); }
+  .trend-col .bar.err { background: rgba(229, 72, 77, .55); }
+  .trend-col .bar.none { background: var(--bg-3); }
+  .trend-col .wk {
+    font-family: var(--font-mono); font-size: 10px; color: var(--text-2);
+    white-space: nowrap; overflow: hidden;
+  }
+  .trend-col .rt { font-family: var(--font-mono); font-size: 10px; color: var(--text-1); height: 12px; }
+
   @media (max-width: 860px) {
     .sidebar { display: none; }
     .content { margin-left: 0; }
@@ -253,6 +281,10 @@
     <a class="active" data-target="sec-pipeline">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4h12M2 8h8M2 12h10"/></svg>
       Patch Pipeline
+    </a>
+    <a data-target="sec-promotions">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13l4-6 4 3 4-8"/></svg>
+      Promotions
     </a>
     <a data-target="sec-events">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 2v12M2 8h12"/></svg>
@@ -283,6 +315,8 @@
     <span style="flex:1"></span>
     <input id="token" type="password" placeholder="Admin Bearer Token" />
     <button id="saveToken" class="ghost">Save Token</button>
+    <span id="promoBadge" class="pill">auto-promo …</span>
+    <button id="promoToggle" class="ghost">…</button>
     <button id="refresh">Refresh</button>
   </div>
 
@@ -304,6 +338,20 @@
       <table>
         <thead><tr><th></th><th>ID</th><th>Kind</th><th>Status</th><th>Description</th><th>Eval Verdict</th><th>Created</th></tr></thead>
         <tbody id="patches"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </section>
+
+    <section id="sec-promotions">
+      <h2>
+        Promotion Ledger
+        <span class="hint">auto-promotion decisions &amp; outcomes · weekly trend aggregated from the ledger</span>
+        <span class="spacer"></span>
+      </h2>
+      <div id="trendAlert" class="promo-alert" style="display:none"></div>
+      <div id="trendChart" class="trend-chart"></div>
+      <table>
+        <thead><tr><th>Patch</th><th>Level</th><th>Cluster</th><th>Status</th><th>Decision Reason</th><th>Outcome</th><th>Eval</th><th>Time</th></tr></thead>
+        <tbody id="promotions"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
       </table>
     </section>
 
@@ -344,20 +392,23 @@ function toast(msg, kind) {
   t._h = setTimeout(() => (t.style.display = 'none'), 4000);
 }
 
-async function api(path, method = 'GET') {
+async function api(path, method = 'GET', body) {
   const token = $('token').value.trim();
+  const headers = token ? { Authorization: 'Bearer ' + token } : {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
   const resp = await fetch(path, {
     method,
-    headers: token ? { Authorization: 'Bearer ' + token } : {},
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await resp.text();
-  let body;
-  try { body = JSON.parse(text); } catch { body = text; }
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { parsed = text; }
   if (!resp.ok) {
-    const msg = (body && body.message) || (body && body.error) || ('HTTP ' + resp.status);
+    const msg = (parsed && parsed.message) || (parsed && parsed.error) || ('HTTP ' + resp.status);
     throw new Error(msg);
   }
-  return body;
+  return parsed;
 }
 
 function show(obj) { $('output').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
@@ -622,7 +673,176 @@ async function act(path, label) {
   }
 }
 
-function refreshAll() { loadMetrics(); loadPatches(); loadEvents(); loadAudit(); }
+// ── Promotion switch (one-click pause) ──
+let promoState = null;
+
+function renderPromoSwitch() {
+  const badge = $('promoBadge');
+  const btn = $('promoToggle');
+  if (!promoState) {
+    badge.className = 'pill';
+    badge.textContent = 'auto-promo n/a';
+    btn.textContent = '—';
+    btn.disabled = true;
+    return;
+  }
+  btn.disabled = false;
+  if (!promoState.config_enabled) {
+    badge.className = 'pill err';
+    badge.textContent = 'auto-promo off (config)';
+    btn.textContent = 'Enable via config';
+    btn.disabled = true;
+  } else if (promoState.paused) {
+    badge.className = 'pill warn';
+    badge.textContent = 'auto-promo PAUSED';
+    badge.title = promoState.note || '';
+    btn.textContent = 'Resume';
+  } else {
+    badge.className = 'pill ok';
+    badge.textContent = 'auto-promo live';
+    btn.textContent = 'Pause';
+  }
+}
+
+async function loadPromotionSwitch() {
+  try {
+    promoState = await api('/api/v1/evolution/promotion/switch');
+  } catch {
+    promoState = null;
+  }
+  renderPromoSwitch();
+}
+
+async function togglePromotion() {
+  if (!promoState || !promoState.config_enabled) return;
+  const target = !promoState.paused;
+  const note = prompt(
+    (target ? 'Pause' : 'Resume') + ' auto-promotion — note for the audit trail:',
+    target ? 'manual intervention' : 'resume');
+  if (note === null) return;
+  try {
+    promoState = await api('/api/v1/evolution/promotion/switch', 'PUT', { paused: target, note });
+    renderPromoSwitch();
+    toast((target ? 'Auto-promotion paused' : 'Auto-promotion resumed'), 'ok');
+  } catch (e) {
+    toast('Switch failed: ' + e.message, 'err');
+  }
+}
+
+// ── Promotion ledger & weekly trend ──
+function promoStatusPill(s) {
+  const v = (s || '').toLowerCase();
+  if (v === 'promoted') return 'ok';
+  if (v === 'rolled_back' || v === 'failed') return 'err';
+  if (v === 'awaiting_approval') return 'warn';
+  return '';
+}
+
+async function loadPromotions() {
+  try {
+    const { promotions } = await api('/api/v1/evolution/promotions?limit=100');
+    const tb = $('promotions');
+    tb.innerHTML = '';
+    if (!promotions.length) {
+      tb.innerHTML = '<tr><td colspan="8" class="muted">No promotion records</td></tr>';
+      return;
+    }
+    for (const r of promotions) {
+      const tr = document.createElement('tr');
+      const cells = [
+        { t: r.patch_id, cls: 'mono dim ellipsis', title: r.patch_id },
+        { t: r.level, cls: 'mono' },
+        { t: r.cluster, cls: 'dim' },
+      ];
+      for (const c of cells) {
+        const td = document.createElement('td');
+        td.className = c.cls;
+        td.textContent = c.t || '—';
+        if (c.title) td.title = c.title;
+        tr.appendChild(td);
+      }
+      const tdStatus = document.createElement('td');
+      const pill = document.createElement('span');
+      pill.className = 'pill ' + promoStatusPill(r.status);
+      pill.textContent = r.status;
+      tdStatus.appendChild(pill);
+      tr.appendChild(tdStatus);
+      const tdReason = document.createElement('td');
+      tdReason.className = 'dim ellipsis';
+      tdReason.textContent = r.decision_reason || '—';
+      tdReason.title = r.decision_reason || '';
+      tr.appendChild(tdReason);
+      const tdOutcome = document.createElement('td');
+      tdOutcome.className = 'dim ellipsis';
+      tdOutcome.textContent = r.outcome || '—';
+      tdOutcome.title = r.outcome || '';
+      tr.appendChild(tdOutcome);
+      const tdEval = document.createElement('td');
+      tdEval.className = 'mono dim ellipsis';
+      tdEval.textContent = r.eval_summary || '—';
+      tr.appendChild(tdEval);
+      const tdTime = document.createElement('td');
+      tdTime.className = 'mono dim';
+      tdTime.textContent = relTime(r.created_at);
+      tdTime.title = r.created_at || '';
+      tr.appendChild(tdTime);
+      tb.appendChild(tr);
+    }
+  } catch (e) {
+    $('promotions').innerHTML = `<tr><td colspan="8" class="muted">Load failed: ${e.message}</td></tr>`;
+  }
+}
+
+async function loadTrend() {
+  try {
+    const report = await api('/api/v1/evolution/promotion/trend');
+    const alertBox = $('trendAlert');
+    if (report.alert) {
+      alertBox.textContent = '⚠ ' + report.alert;
+      alertBox.style.display = 'flex';
+    } else {
+      alertBox.style.display = 'none';
+    }
+    const chart = $('trendChart');
+    chart.innerHTML = '';
+    if (!report.weeks || !report.weeks.length) {
+      chart.innerHTML = '<span class="muted">No trend report yet — the weekly reporter has not produced its first issue</span>';
+      return;
+    }
+    for (const w of report.weeks) {
+      const col = document.createElement('div');
+      col.className = 'trend-col';
+      const rate = w.success_rate;
+      const rt = document.createElement('div');
+      rt.className = 'rt';
+      rt.textContent = rate === null || rate === undefined ? '' : Math.round(rate * 100) + '%';
+      const bar = document.createElement('div');
+      let cls = 'none', h = 3;
+      if (rate !== null && rate !== undefined) {
+        h = Math.max(3, Math.round(rate * 44));
+        cls = rate >= 0.8 ? 'ok' : rate >= 0.5 ? 'warn' : 'err';
+      }
+      bar.className = 'bar ' + cls;
+      bar.style.height = h + 'px';
+      const decided = (w.promoted || 0) + (w.rolled_back || 0) + (w.failed || 0);
+      bar.title = `${w.week}: promoted ${w.promoted}, rolled back ${w.rolled_back}, failed ${w.failed}, awaiting ${w.awaiting_review} (decided ${decided})`;
+      const wk = document.createElement('div');
+      wk.className = 'wk';
+      wk.textContent = (w.week || '').replace(/^\d+-/, '');
+      col.appendChild(rt);
+      col.appendChild(bar);
+      col.appendChild(wk);
+      chart.appendChild(col);
+    }
+  } catch (e) {
+    $('trendChart').innerHTML = `<span class="muted">Load failed: ${e.message}</span>`;
+  }
+}
+
+function refreshAll() {
+  loadMetrics(); loadPatches(); loadEvents(); loadAudit();
+  loadPromotionSwitch(); loadPromotions(); loadTrend();
+}
 
 $('saveToken').onclick = () => {
   localStorage.setItem(TOKEN_KEY, $('token').value.trim());
@@ -637,6 +857,7 @@ $('refresh').onclick = () => {
 $('rollbackBtn').onclick = () => {
   if (confirm('Roll back to the previous version?')) act('/api/v1/evolution/rollback', 'Rollback');
 };
+$('promoToggle').onclick = togglePromotion;
 
 document.querySelectorAll('nav a').forEach((a) => {
   a.onclick = () => {

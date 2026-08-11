@@ -39,6 +39,11 @@ pub struct PromotionGateConfig {
     pub forbidden_names: Vec<String>,
     /// 直接拒收的扩展名。
     pub forbidden_extensions: Vec<String>,
+    /// 晋级周报（eval 长期趋势）开关：周期聚合台账写报告文件 + 趋势向
+    /// 下告警。
+    pub trend_report_enabled: bool,
+    /// 周报生成间隔（秒），默认一周。
+    pub trend_report_interval_secs: u64,
     /// GitOps 分发配置。
     pub gitops: GitOpsConfig,
 }
@@ -84,6 +89,8 @@ impl Default for PromotionGateConfig {
                 ".envrc".into(),
             ],
             forbidden_extensions: vec!["pem".into(), "key".into(), "crt".into(), "p12".into()],
+            trend_report_enabled: true,
+            trend_report_interval_secs: 604_800,
             gitops: GitOpsConfig::default(),
         }
     }
@@ -144,6 +151,16 @@ impl PromotionGateConfig {
         if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_FAILURE_BREAKER") {
             self.failure_breaker_threshold =
                 parse("COGNEVA_SELF_EVOLUTION_PROMOTION_FAILURE_BREAKER", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_ENABLED") {
+            self.trend_report_enabled =
+                parse("COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_ENABLED", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_INTERVAL_SECS") {
+            self.trend_report_interval_secs = parse(
+                "COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_INTERVAL_SECS",
+                &v,
+            )?;
         }
         let g = &mut self.gitops;
         if let Some(v) = get("COGNEVA_GITOPS_ENABLED") {

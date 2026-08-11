@@ -88,6 +88,48 @@ pub struct EvolutionRollbackResponse {
     pub message: String,
 }
 
+/// 自动晋级运行时开关快照。`effective_enabled = config_enabled && !paused`：
+/// 配置文件给持久默认值，admin API 的运行时暂停立即生效、重启后回落
+/// 到配置值（持久停用改 cogneva.json / env）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotionSwitchInfo {
+    /// 配置文件里的总开关（promotion.enabled）。
+    pub config_enabled: bool,
+    /// 运行时暂停标志（admin API 设置）。
+    pub paused: bool,
+    /// 实际生效状态：两者相与。
+    pub effective_enabled: bool,
+    /// 最近一次运行时切换时间；从未切换过为 None。
+    pub updated_at: Option<DateTime<Utc>>,
+    /// 切换备注（谁在干什么，进审计）。
+    pub note: String,
+}
+
+/// 晋级周报快照（eval 长期趋势）：按 ISO 周聚合晋级台账。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotionTrendReport {
+    /// 报告生成时间。
+    pub generated_at: DateTime<Utc>,
+    /// 逐周桶（旧在前）。
+    pub weeks: Vec<PromotionTrendWeek>,
+    /// 趋势向下告警：连续多周成功率下降且样本足够时非空。
+    pub alert: Option<String>,
+}
+
+/// 单周晋级聚合。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotionTrendWeek {
+    /// ISO 周标签，如 2026-W32。
+    pub week: String,
+    pub promoted: u64,
+    pub rolled_back: u64,
+    pub failed: u64,
+    pub awaiting_review: u64,
+    /// 成功率 = promoted / (promoted + rolled_back + failed)；无完结对
+    /// 决样本（全在审批中）时为 None。
+    pub success_rate: Option<f64>,
+}
+
 /// Admin operations for the self-evolution subsystem.
 #[async_trait::async_trait]
 pub trait EvolutionAdmin: Send + Sync {
@@ -129,5 +171,35 @@ pub trait EvolutionAdmin: Send + Sync {
         _req: PolicyEvalRequest,
     ) -> crate::SFResult<EvolutionPatchInfo> {
         Err(crate::SFError::NotImplemented("policy evaluate".into()))
+    }
+
+    /// 读取自动晋级运行时开关快照（一键暂停）。
+    /// Default: not supported by this implementation.
+    async fn promotion_switch(&self) -> crate::SFResult<PromotionSwitchInfo> {
+        Err(crate::SFError::NotImplemented("promotion switch".into()))
+    }
+
+    /// 设置运行时暂停标志：true = 立即停摆自动晋级（排队中的全部转
+    /// 人工，已生效补丁不受影响），false = 恢复。运行时生效，重启后
+    /// 回落到配置文件值。
+    /// Default: not supported by this implementation.
+    async fn set_promotion_paused(
+        &self,
+        _paused: bool,
+        _note: &str,
+    ) -> crate::SFResult<PromotionSwitchInfo> {
+        Err(crate::SFError::NotImplemented("promotion switch".into()))
+    }
+
+    /// 晋级台账历史（新在前），供接管台晋级历史页展示。
+    /// Default: not supported by this implementation.
+    async fn list_promotions(&self, _limit: usize) -> crate::SFResult<Vec<crate::PromotionRecord>> {
+        Err(crate::SFError::NotImplemented("promotion list".into()))
+    }
+
+    /// 最新晋级周报（eval 长期趋势）；尚未生成过报告时返回空报告。
+    /// Default: not supported by this implementation.
+    async fn promotion_trend(&self) -> crate::SFResult<PromotionTrendReport> {
+        Err(crate::SFError::NotImplemented("promotion trend".into()))
     }
 }

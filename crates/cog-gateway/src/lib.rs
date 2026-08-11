@@ -456,6 +456,18 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/v1/evolution/events", get(evolution::events_handler))
         .route(
+            "/api/v1/evolution/promotion/switch",
+            get(evolution::promotion_switch_handler).put(evolution::set_promotion_switch_handler),
+        )
+        .route(
+            "/api/v1/evolution/promotions",
+            get(evolution::promotions_handler),
+        )
+        .route(
+            "/api/v1/evolution/promotion/trend",
+            get(evolution::promotion_trend_handler),
+        )
+        .route(
             "/api/v1/admin/llm-status",
             get(llm_admin::llm_status_handler),
         )

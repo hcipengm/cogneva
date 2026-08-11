@@ -282,3 +282,96 @@ pub async fn events_handler(
             .into_response(),
     }
 }
+
+/// 自动晋级运行时开关快照（一键暂停状态）。
+pub async fn promotion_switch_handler(State(state): State<Arc<crate::GatewayState>>) -> Response {
+    match state.evolution_admin {
+        Some(ref admin) => match admin.promotion_switch().await {
+            Ok(info) => (StatusCode::OK, Json(info)).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "promotion_switch_failed", "message": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "evolution_admin_not_configured"})),
+        )
+            .into_response(),
+    }
+}
+
+/// 一键暂停/恢复请求体。
+#[derive(Debug, serde::Deserialize)]
+pub struct PromotionSwitchRequest {
+    pub paused: bool,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// 设置自动晋级运行时暂停标志：立即生效，重启后回落到配置文件值。
+pub async fn set_promotion_switch_handler(
+    State(state): State<Arc<crate::GatewayState>>,
+    Json(req): Json<PromotionSwitchRequest>,
+) -> Response {
+    match state.evolution_admin {
+        Some(ref admin) => match admin.set_promotion_paused(req.paused, &req.note).await {
+            Ok(info) => (StatusCode::OK, Json(info)).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "promotion_switch_failed", "message": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "evolution_admin_not_configured"})),
+        )
+            .into_response(),
+    }
+}
+
+/// 晋级台账历史（新在前），接管台晋级历史页数据源。
+pub async fn promotions_handler(
+    State(state): State<Arc<crate::GatewayState>>,
+    axum::extract::Query(query): axum::extract::Query<EventsQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(100);
+    match state.evolution_admin {
+        Some(ref admin) => match admin.list_promotions(limit).await {
+            Ok(promotions) => {
+                (StatusCode::OK, Json(json!({ "promotions": promotions }))).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "promotions_failed", "message": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "evolution_admin_not_configured"})),
+        )
+            .into_response(),
+    }
+}
+
+/// 最新晋级周报（eval 长期趋势），含趋势向下告警。
+pub async fn promotion_trend_handler(State(state): State<Arc<crate::GatewayState>>) -> Response {
+    match state.evolution_admin {
+        Some(ref admin) => match admin.promotion_trend().await {
+            Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "promotion_trend_failed", "message": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "evolution_admin_not_configured"})),
+        )
+            .into_response(),
+    }
+}

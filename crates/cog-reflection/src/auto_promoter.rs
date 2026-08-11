@@ -46,6 +46,8 @@ pub struct AutoPromoter {
     ledger: Arc<dyn PromotionLedger>,
     channel: Option<Arc<dyn PromotionChannel>>,
     engine: Arc<ReflectionEngine>,
+    /// 运行时一键暂停开关；未接线时退化为只看配置文件开关。
+    switch: Option<Arc<crate::PromotionSwitch>>,
     /// 台账 cluster 字段标识；推送端固定为 "publisher"。
     cluster: String,
 }
@@ -62,8 +64,15 @@ impl AutoPromoter {
             ledger,
             channel,
             engine,
+            switch: None,
             cluster: "publisher".into(),
         }
+    }
+
+    /// 接线运行时一键暂停开关（admin API 侧共享同一实例）。
+    pub fn with_switch(mut self, switch: Arc<crate::PromotionSwitch>) -> Self {
+        self.switch = Some(switch);
+        self
     }
 
     pub fn with_cluster(mut self, cluster: impl Into<String>) -> Self {
@@ -143,6 +152,8 @@ impl AutoPromoter {
         let decision_reason = format!("{verdict:?}");
         let downgrade = if !auto {
             Some("分级判定需人工审批".to_string())
+        } else if self.switch.as_ref().is_some_and(|s| s.is_paused()) {
+            Some("运行时一键暂停（admin API）".to_string())
         } else if !self.policy.enabled {
             Some("自动晋级总开关关闭（一键暂停）".to_string())
         } else if let Some(reason) = self.breaker_tripped().await? {
@@ -496,6 +507,39 @@ mod tests {
         assert_eq!(records[0].status, PromotionStatus::AwaitingApproval);
         assert!(records[0].outcome.contains("一键暂停"));
         assert!(channel.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_paused_switch_downgrades_to_approval() {
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        // 配置文件总开关开着，但运行时开关被 admin API 暂停：排队晋级转人工。
+        let switch = Arc::new(crate::PromotionSwitch::new());
+        switch.set_paused(true, "人工介入");
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone())).with_switch(switch.clone());
+        p.decide_and_promote(&patch("p4b", "crates/cog-agent/src/tools.rs"))
+            .await
+            .unwrap();
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records[0].status, PromotionStatus::AwaitingApproval);
+        assert!(records[0].outcome.contains("运行时一键暂停"));
+        assert!(channel.published.lock().unwrap().is_empty());
+
+        // 恢复后同一 patch 可自动晋级（幂等跳过仅限已有记录，新 patch 走全自动）。
+        switch.set_paused(false, "恢复");
+        p.decide_and_promote(&patch("p4c", "crates/cog-agent/src/tools.rs"))
+            .await
+            .unwrap();
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records[0].status, PromotionStatus::Promoted);
+        assert_eq!(channel.published.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

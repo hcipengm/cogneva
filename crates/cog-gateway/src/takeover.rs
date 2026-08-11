@@ -22,6 +22,9 @@ mod tests {
             "/api/v1/evolution/rollback",
             "/api/v1/evolution/metrics",
             "/api/v1/evolution/events",
+            "/api/v1/evolution/promotion/switch",
+            "/api/v1/evolution/promotions",
+            "/api/v1/evolution/promotion/trend",
             "/api/v1/audit/events",
             "/approve",
         ] {

@@ -26,6 +26,14 @@ pub struct EvolutionAdminService {
         Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::types::EvolutionResult>>>,
     /// 补丁行变更广播：接管台 SSE 订阅此通道，状态翻转即时推送而非轮询。
     stream: Option<tokio::sync::broadcast::Sender<EvolutionPatchInfo>>,
+    /// 自动晋级运行时开关（与 AutoPromoter 共享同一实例）。
+    switch: Option<Arc<crate::PromotionSwitch>>,
+    /// 晋级台账（晋级历史页数据源）。
+    promotion_ledger: Option<Arc<dyn cog_core::PromotionLedger>>,
+    /// 配置文件里的自动晋级总开关快照（开关快照的 config_enabled 一列）。
+    promotion_config_enabled: bool,
+    /// 最新晋级周报（周期报表器写入，admin 端点读取）。
+    trend_latest: Option<Arc<tokio::sync::RwLock<Option<cog_core::PromotionTrendReport>>>>,
 }
 
 /// 从 unified diff 文本提取一行摘要（"3 files, +42 -17"）；非 diff 内容返回 None。
@@ -76,6 +84,10 @@ impl EvolutionAdminService {
             artifact_evolution: None,
             policy_results: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             stream: None,
+            switch: None,
+            promotion_ledger: None,
+            promotion_config_enabled: false,
+            trend_latest: None,
         }
     }
 
@@ -105,6 +117,31 @@ impl EvolutionAdminService {
     /// 接入不可篡改审计流（审计 3.5）：patch 操作写入哈希链。
     pub fn with_audit_stream(mut self, stream: Arc<dyn cog_core::AuditStream>) -> Self {
         self.audit_stream = Some(stream);
+        self
+    }
+
+    /// 接入自动晋级运行时状态：开关（与 AutoPromoter 共享）、台账与配置
+    /// 文件总开关快照。接入后启用 promotion_switch / set_promotion_paused /
+    /// list_promotions 契约方法。
+    pub fn with_promotion_state(
+        mut self,
+        switch: Arc<crate::PromotionSwitch>,
+        ledger: Arc<dyn cog_core::PromotionLedger>,
+        config_enabled: bool,
+    ) -> Self {
+        self.switch = Some(switch);
+        self.promotion_ledger = Some(ledger);
+        self.promotion_config_enabled = config_enabled;
+        self
+    }
+
+    /// 接入最新晋级周报句柄（周期报表器写入侧）。接入后启用
+    /// promotion_trend 契约方法。
+    pub fn with_trend_latest(
+        mut self,
+        latest: Arc<tokio::sync::RwLock<Option<cog_core::PromotionTrendReport>>>,
+    ) -> Self {
+        self.trend_latest = Some(latest);
         self
     }
 
@@ -524,6 +561,58 @@ impl EvolutionAdmin for EvolutionAdminService {
                 created_at: r.created_at,
             })
             .collect())
+    }
+
+    async fn promotion_switch(&self) -> SFResult<cog_core::PromotionSwitchInfo> {
+        let Some(ref switch) = self.switch else {
+            return Err(SFError::NotImplemented("promotion switch".into()));
+        };
+        Ok(switch.snapshot(self.promotion_config_enabled))
+    }
+
+    async fn set_promotion_paused(
+        &self,
+        paused: bool,
+        note: &str,
+    ) -> SFResult<cog_core::PromotionSwitchInfo> {
+        let Some(ref switch) = self.switch else {
+            return Err(SFError::NotImplemented("promotion switch".into()));
+        };
+        switch.set_paused(paused, note);
+        let snapshot = switch.snapshot(self.promotion_config_enabled);
+        // 谁在什么时间暂停/恢复了自动晋级，必须进审计（运行时状态进程
+        // 重启即丢，审计是唯一的持久留痕）。
+        self.audit(
+            "promotion-switch",
+            if paused { "pause" } else { "resume" },
+            serde_json::json!({ "note": note, "effective_enabled": snapshot.effective_enabled }),
+        )
+        .await;
+        info!(paused = paused, note = %note, "Promotion switch toggled via admin API");
+        Ok(snapshot)
+    }
+
+    async fn list_promotions(&self, limit: usize) -> SFResult<Vec<cog_core::PromotionRecord>> {
+        let Some(ref ledger) = self.promotion_ledger else {
+            return Err(SFError::NotImplemented("promotion list".into()));
+        };
+        ledger.list(limit).await
+    }
+
+    async fn promotion_trend(&self) -> SFResult<cog_core::PromotionTrendReport> {
+        let Some(ref latest) = self.trend_latest else {
+            return Err(SFError::NotImplemented("promotion trend".into()));
+        };
+        // 报表器尚未产出第一期时返回空报告，admin 端点永远可用。
+        Ok(latest
+            .read()
+            .await
+            .clone()
+            .unwrap_or(cog_core::PromotionTrendReport {
+                generated_at: chrono::Utc::now(),
+                weeks: Vec::new(),
+                alert: None,
+            }))
     }
 }
 

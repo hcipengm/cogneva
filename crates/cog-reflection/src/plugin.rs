@@ -328,6 +328,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 }
                 let engine = engine.clone();
 
+                // 自动晋级运行时一键暂停开关：admin API 与 AutoPromoter
+                // 共享同一实例，暂停立即对排队晋级生效。
+                let promotion_switch = Arc::new(crate::PromotionSwitch::new());
+                let promotion_ledger: Option<Arc<dyn cog_core::PromotionLedger>> =
+                    ctx.consume_service::<dyn cog_core::PromotionLedger>();
+
                 // 接管台 SSE 推送通道：补丁行变更即时广播。
                 let (stream_tx, _) =
                     tokio::sync::broadcast::channel::<cog_core::EvolutionPatchInfo>(64);
@@ -342,10 +348,35 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     evolution_metrics.clone(),
                 )
                 .with_evolution_stream(stream_tx);
-                if let Some(stream) = audit_stream {
-                    admin = admin.with_audit_stream(stream);
+                if let Some(ref stream) = audit_stream {
+                    admin = admin.with_audit_stream(stream.clone());
                 }
                 admin = admin.with_artifact_evolution(artifact_evolution.clone());
+                if let Some(ref ledger) = promotion_ledger {
+                    admin = admin.with_promotion_state(
+                        promotion_switch.clone(),
+                        ledger.clone(),
+                        promotion.enabled,
+                    );
+                }
+                // 晋级周报（eval 长期趋势）：周期聚合台账写报告文件，趋势
+                // 向下时写审计告警。latest 句柄同时交给 admin 端点。
+                let mut trend_reporter = None;
+                if promotion.trend_report_enabled {
+                    if let Some(ref ledger) = promotion_ledger {
+                        let reporter = crate::PromotionTrendReporter::new(
+                            ledger.clone(),
+                            std::path::PathBuf::from(format!(
+                                "{}/reports",
+                                ctx.config().app.data_dir
+                            )),
+                            std::time::Duration::from_secs(promotion.trend_report_interval_secs),
+                            audit_stream.clone(),
+                        );
+                        admin = admin.with_trend_latest(reporter.latest());
+                        trend_reporter = Some(reporter);
+                    }
+                }
                 if self_evolution.image_rollout.enabled {
                     admin = admin.with_image_rollout(Arc::new(crate::ImageRollout::new(
                         self_evolution.image_rollout.clone(),
@@ -381,15 +412,32 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let promoter: Option<Arc<crate::AutoPromoter>> = ctx
                     .consume_service::<dyn cog_core::PromotionLedger>()
                     .map(|ledger| {
-                        Arc::new(crate::AutoPromoter::new(
-                            promotion.clone(),
-                            ledger,
-                            promotion_channel,
-                            engine.clone(),
-                        ))
+                        Arc::new(
+                            crate::AutoPromoter::new(
+                                promotion.clone(),
+                                ledger,
+                                promotion_channel,
+                                engine.clone(),
+                            )
+                            .with_switch(promotion_switch.clone()),
+                        )
                     });
                 if promoter.is_none() {
                     warn!("PromotionLedger not published; auto-promotion disabled");
+                }
+
+                // 晋级周报后台循环：立即生成一期，之后按间隔周期生成。
+                if let Some(reporter) = trend_reporter {
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                    if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                        let mut rx = broadcast_tx.0.subscribe();
+                        tokio::spawn(async move {
+                            let _ = rx.recv().await;
+                            let _ = shutdown_tx.send(true);
+                        });
+                    }
+                    info!("Promotion trend reporter enabled");
+                    tokio::spawn(reporter.run(shutdown_rx));
                 }
 
                 // GitOps 拉取端：gitops.enabled 且 puller_enabled 时本进程
