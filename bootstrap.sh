@@ -28,7 +28,7 @@ detect_os() {
     esac
 }
 
-# 受限网络探测：直接探 rustup 分发域（国内被墙），不通即走 TUNA 镜像。
+# 受限网络探测：直接探 rustup 分发域（国内被墙），不通即走国内镜像。
 # 可用 COGNEVA_CN_MIRROR=1/0 强制开关，跳过探测。
 detect_restricted_net() {
     if [ -n "${COGNEVA_CN_MIRROR:-}" ]; then
@@ -39,8 +39,22 @@ detect_restricted_net() {
         CN_MIRROR=0
     else
         CN_MIRROR=1
-        echo "[bootstrap] 检测到受限网络（rustup 分发域不可达），启用 TUNA 镜像..."
+        echo "[bootstrap] 检测到受限网络（rustup 分发域不可达），启用国内镜像..."
     fi
+}
+
+# 多镜像候选探测：按顺序探活（5s 超时），返回第一个可达的地址，
+# 全部不可达时回退第一个候选（保持与写死单镜像相同的下限行为，
+# 后续下载层的重试机制仍会兜底）。
+pick_first_ok() {
+    for url in "$@"; do
+        if curl --proto '=https' --tlsv1.2 -fsSL -m 5 -o /dev/null "$url" 2>/dev/null; then
+            echo "$url"
+            return
+        fi
+        echo "[bootstrap] 镜像不可达，换下一个: $url" >&2
+    done
+    echo "$1"
 }
 
 fetch_source() {
@@ -85,12 +99,22 @@ ensure_rust() {
     fi
     echo "[bootstrap] 未检测到 Rust，安装 rustup..."
     if [ "$CN_MIRROR" = "1" ]; then
-        export RUSTUP_DIST_SERVER="https://mirrors.tuna.tsinghua.edu.cn/rustup"
-        export RUSTUP_UPDATE_ROOT="https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup"
-        # TUNA 不托管 rustup-init.sh 脚本（404），直接拉 rustup-init 二进制
+        # rustup 候选：TUNA → USTC（两家布局不同，探活 rustup-init 二进制路径）
         arch="$(uname -m)"
-        curl --proto '=https' --tlsv1.2 -fsSL \
-            "$RUSTUP_UPDATE_ROOT/dist/$arch-unknown-linux-gnu/rustup-init" -o /tmp/rustup-init
+        init_url=$(pick_first_ok \
+            "https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup/dist/$arch-unknown-linux-gnu/rustup-init" \
+            "https://mirrors.ustc.edu.cn/rust-static/rustup/dist/$arch-unknown-linux-gnu/rustup-init")
+        case "$init_url" in
+            *ustc*)
+                export RUSTUP_DIST_SERVER="https://mirrors.ustc.edu.cn/rust-static"
+                export RUSTUP_UPDATE_ROOT="https://mirrors.ustc.edu.cn/rust-static/rustup" ;;
+            *)
+                export RUSTUP_DIST_SERVER="https://mirrors.tuna.tsinghua.edu.cn/rustup"
+                export RUSTUP_UPDATE_ROOT="https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup" ;;
+        esac
+        echo "[bootstrap] rustup 镜像: $RUSTUP_DIST_SERVER"
+        # 镜像站都不托管 rustup-init.sh 脚本（404），直接拉 rustup-init 二进制
+        curl --proto '=https' --tlsv1.2 -fsSL "$init_url" -o /tmp/rustup-init
         chmod +x /tmp/rustup-init
         /tmp/rustup-init -y --profile minimal
         rm -f /tmp/rustup-init
@@ -109,13 +133,17 @@ ensure_cargo_mirror() {
         echo "[bootstrap] cargo 已配置源替换，跳过镜像写入"
         return
     fi
-    # crates 用 rsproxy 而非 TUNA：TUNA 稀疏索引的 dl 仍指向 static.crates.io，
-    # crate 文件直连国外会超时；rsproxy 索引与文件都自托管（字节 CDN）
-    cat >> "$cfg" <<'EOF'
+    # crates 候选：rsproxy（字节 CDN）→ USTC。不能用 TUNA——其稀疏索引的 dl
+    # 仍指向 static.crates.io，crate 文件直连国外会超时；这两家索引与文件都自托管
+    sparse=$(pick_first_ok \
+        "https://rsproxy.cn/index/config.json" \
+        "https://mirrors.ustc.edu.cn/crates.io-index/config.json")
+    sparse="sparse+${sparse%/config.json}/"
+    cat >> "$cfg" <<EOF
 [source.crates-io]
-replace-with = "rsproxy"
-[source.rsproxy]
-registry = "sparse+https://rsproxy.cn/index/"
+replace-with = "mirror"
+[source.mirror]
+registry = "$sparse"
 
 [http]
 multiplexing = false
@@ -123,7 +151,7 @@ multiplexing = false
 [net]
 retry = 10
 EOF
-    echo "[bootstrap] 已写入 cargo rsproxy 镜像源: $cfg"
+    echo "[bootstrap] 已写入 cargo 镜像源 $sparse: $cfg"
 }
 
 build_bootstrap() {
@@ -178,8 +206,15 @@ ensure_lima() {
     fi
     echo "[bootstrap] 安装 Lima（brew install lima）..."
     if [ "$CN_MIRROR" = "1" ]; then
-        export HOMEBREW_BOTTLE_DOMAIN="https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles"
-        export HOMEBREW_API_DOMAIN="https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api"
+        # brew bottle 候选：TUNA → USTC → 阿里云
+        bottle=$(pick_first_ok \
+            "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api/formula.json" \
+            "https://mirrors.ustc.edu.cn/homebrew-bottles/api/formula.json" \
+            "https://mirrors.aliyun.com/homebrew/homebrew-bottles/api/formula.json")
+        bottle="${bottle%/api/formula.json}"
+        export HOMEBREW_BOTTLE_DOMAIN="$bottle"
+        export HOMEBREW_API_DOMAIN="$bottle/api"
+        echo "[bootstrap] Homebrew bottle 镜像: $bottle"
     fi
     brew install lima
 }
@@ -200,7 +235,19 @@ write_lima_config() {
     mem_gib=4
     [ $((host_mem_bytes / 1073741824)) -lt 8 ] && mem_gib=2
     if [ "$CN_MIRROR" = "1" ]; then
-        img_base="https://mirrors.ustc.edu.cn/ubuntu-cloud-images/releases/24.04/release"
+        # ubuntu cloudimg 国内候选只有 USTC 收录完整目录（TUNA/阿里无此路径）；
+        # 不可达时回退官方站（直连慢但可用）。img 文件数百 MB，探测用 Range 取 1 字节
+        img_name="ubuntu-24.04-server-cloudimg-$img_name_arch.img"
+        img_base=""
+        for base in "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/releases/24.04/release" \
+                    "https://cloud-images.ubuntu.com/releases/24.04/release"; do
+            if curl --proto '=https' --tlsv1.2 -fsSL -m 8 -r 0-0 -o /dev/null "$base/$img_name" 2>/dev/null; then
+                img_base="$base"
+                break
+            fi
+            echo "[bootstrap] cloudimg 镜像不可达，换下一个: $base" >&2
+        done
+        [ -z "$img_base" ] && img_base="https://mirrors.ustc.edu.cn/ubuntu-cloud-images/releases/24.04/release"
     else
         img_base="https://cloud-images.ubuntu.com/releases/24.04/release"
     fi

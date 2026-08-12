@@ -528,7 +528,7 @@ All storage layers are likewise abstracted through `cog-core` Backend Traits —
 
 Cogneva supports **Meta-bootstrap**: starting from a blank machine (Linux, macOS, or Windows), a single command completes environment probing, dependency self-repair, K3s/K8s adaptive deployment, security gateway configuration, and sandbox initialization, finally handing control over to the WebUI.
 
-The entry script automatically detects whether your network is in mainland China (by probing the rustup distribution domain) and switches every dependency — source code, Rust toolchain, crates, container images, OS packages — to domestic mirrors (Gitee / TUNA / rsproxy / DaoCloud) when needed. No manual selection. Force with `COGNEVA_CN_MIRROR=1` (or `0`).
+The entry script automatically detects whether your network is in mainland China (by probing the rustup distribution domain) and switches every dependency — source code, Rust toolchain, crates, container images, OS packages — to domestic mirrors when needed. Each stage carries **multiple mirror candidates with liveness probing** (e.g. rustup: TUNA→USTC; container images: DaoCloud→1ms.run→1Panel→rat.dev), so a single mirror outage fails over automatically, with the default candidate as final fallback. No manual selection. Force with `COGNEVA_CN_MIRROR=1` (or `0`).
 
 ### 🐧 Linux
 

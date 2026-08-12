@@ -92,8 +92,18 @@ function Ensure-Ubuntu {
 }
 
 function Set-UbuntuCnApt {
-    Write-Step '国内模式：Ubuntu 内换 TUNA apt 源...'
-    $sed = "sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list; if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources; fi"
+    Write-Step '国内模式：Ubuntu 内换国内 apt 源（多候选探活）...'
+    # apt 候选：TUNA → USTC → 阿里云。探测在 Windows 侧做（WSL 裸机无 curl，
+    # 而 CN 下默认 archive.ubuntu.com 不可达装不了 curl——先有鸡先有蛋问题）
+    $aptHost = 'mirrors.tuna.tsinghua.edu.cn'
+    foreach ($h in @('mirrors.tuna.tsinghua.edu.cn', 'mirrors.ustc.edu.cn', 'mirrors.aliyun.com')) {
+        try {
+            Invoke-WebRequest -Uri "https://$h/ubuntu/dists/noble/Release" -TimeoutSec 5 -UseBasicParsing -OutFile $null
+            $aptHost = $h; break
+        } catch { Write-Host "[bootstrap] apt 镜像不可达，换下一个: $h" }
+    }
+    Write-Host "[bootstrap] apt 镜像: $aptHost"
+    $sed = "sed -i 's|http://archive.ubuntu.com/ubuntu|https://$aptHost/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://$aptHost/ubuntu|g' /etc/apt/sources.list; if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then sed -i 's|http://archive.ubuntu.com/ubuntu|https://$aptHost/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://$aptHost/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources; fi"
     wsl.exe -d Ubuntu -u root -- sh -c "$sed; apt-get update -qq; apt-get install -y curl ca-certificates"
     if ($LASTEXITCODE -ne 0) { throw 'Ubuntu 内 apt 换源/装 curl 失败' }
 }

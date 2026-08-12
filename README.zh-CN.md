@@ -524,7 +524,7 @@ Cogneva 有 20+ 业务 crate，如果让它们直接互相依赖，很快会变�
 
 Cogneva 支持**元启动（Meta-bootstrap）**：从一台空白机器（Linux / macOS / Windows）出发，执行一行命令即可完成环境探测、依赖自修复、K3s/K8s 自适应部署、安全网关配置与沙盒初始化，最终把控制权交给 WebUI。
 
-入口脚本会**自动判断国内/国外网络环境**（探测 rustup 分发域），国内环境自动把全部依赖切到国内镜像（Gitee 源码 / TUNA rustup 与 apt / rsproxy crates / DaoCloud 容器镜像 / npmmirror npm），无需手工选择。也可用 `COGNEVA_CN_MIRROR=1`（或 `0`）强制。
+入口脚本会**自动判断国内/国外网络环境**（探测 rustup 分发域），国内环境自动把全部依赖切到国内镜像（Gitee 源码 / rustup / apt / crates / 容器镜像 / npm），无需手工选择。每个环节都内置**多家镜像候选并自动探活**（如 rustup 走 TUNA→USTC、容器镜像走 DaoCloud→1ms.run→1Panel→rat.dev），单家镜像站故障会自动切换，全部不可达时回退默认候选重试。也可用 `COGNEVA_CN_MIRROR=1`（或 `0`）强制。
 
 ### 🐧 Linux
 

@@ -272,13 +272,11 @@ async fn install_k3s() -> Result<()> {
 /// local-path-provisioner / pause 等）全走 docker.io，CN 空白机直连必爬
 /// （2026-08-05 嵌套回归实测：coredns 23MB 镜像直连拉 10 分钟）。
 /// 必须在 k3s 首次启动前写入；agent 侧由 install_k3s_agents 远程预置同一文件。
+/// endpoint 多列几家，containerd 按序自动回退，单站故障不阻塞装机。
 fn write_k3s_registries_cn() -> Result<()> {
     std::fs::create_dir_all("/etc/rancher/k3s")?;
-    std::fs::write(
-        "/etc/rancher/k3s/registries.yaml",
-        "mirrors:\n  docker.io:\n    endpoint:\n      - \"https://docker.m.daocloud.io\"\n",
-    )?;
-    info!("已预置 K3s registries.yaml（docker.io → daocloud）");
+    std::fs::write("/etc/rancher/k3s/registries.yaml", k3s_registries_yaml())?;
+    info!("已预置 K3s registries.yaml（docker.io 多镜像站候选）");
     Ok(())
 }
 
@@ -408,7 +406,10 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
     // 2026-08-04 嵌套实测抓到：目标机起了 k3s.service 而非 k3s-agent
     let install = if cn_mirror() {
         // agent 同样要在 k3s-agent 首启前预置 registries.yaml（pause 等系统镜像走 docker.io）
-        format!("mkdir -p /etc/rancher/k3s && printf 'mirrors:\\n  docker.io:\\n    endpoint:\\n      - \"https://docker.m.daocloud.io\"\\n' > /etc/rancher/k3s/registries.yaml && curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | K3S_URL={server_url} K3S_TOKEN={token}{version_env} INSTALL_K3S_MIRROR=cn sh -")
+        let reg = k3s_registries_yaml()
+            .replace('\n', "\\n")
+            .replace('"', "\\\"");
+        format!("mkdir -p /etc/rancher/k3s && printf '{reg}' > /etc/rancher/k3s/registries.yaml && curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | K3S_URL={server_url} K3S_TOKEN={token}{version_env} INSTALL_K3S_MIRROR=cn sh -")
     } else {
         format!("curl -fsSL https://get.k3s.io | K3S_URL={server_url} K3S_TOKEN={token}{version_env} sh -")
     };
@@ -602,21 +603,91 @@ fn cn_mirror() -> bool {
     std::env::var("COGNEVA_CN_MIRROR").ok().as_deref() == Some("1")
 }
 
+// ---------- CN 镜像多候选自动选择 ----------
+// 每个环节给多家候选，按顺序探活（5s 超时），第一家能用的胜出；
+// 全部不可达时回退第一个候选（不低于过去写死单镜像的行为，
+// 后续下载层的重试机制仍会兜底）。
+
+/// docker.io 镜像站候选（CN 模式）。
+const DOCKER_MIRROR_CANDIDATES: &[&str] = &[
+    "docker.m.daocloud.io",
+    "docker.1ms.run",
+    "docker.1panel.live",
+    "hub.rat.dev",
+];
+
+/// 探活：5s 内拿到任何 HTTP 响应即算存活（docker registry 未认证
+/// 返回 401 也是健康），连接失败/超时才算不可达。
+async fn probe_alive(url: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client.get(url).send().await.is_ok()
+}
+
+/// 候选表按顺序探活，返回第一个可用项的值；全挂回退第一项。
+/// 表项为（选用值，探活 URL）。
+async fn pick_alive(candidates: &[(&str, &str)]) -> String {
+    for (value, probe) in candidates {
+        if probe_alive(probe).await {
+            return (*value).to_string();
+        }
+        warn!("镜像不可达，换下一个: {probe}");
+    }
+    candidates[0].0.to_string()
+}
+
+static DOCKER_MIRROR: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
+/// 选定 docker.io 镜像站（全进程一次探测，后续复用结果）。
+async fn docker_mirror_host() -> &'static str {
+    DOCKER_MIRROR
+        .get_or_init(|| async {
+            for host in DOCKER_MIRROR_CANDIDATES {
+                if probe_alive(&format!("https://{host}/v2/")).await {
+                    info!("docker.io 镜像站选定: {host}");
+                    return host.to_string();
+                }
+                warn!("docker 镜像站不可达，换下一个: {host}");
+            }
+            DOCKER_MIRROR_CANDIDATES[0].to_string()
+        })
+        .await
+}
+
+/// K3s containerd registries.yaml：endpoint 全列，containerd 自己按序回退，
+/// 无需探活；全部 endpoint 失败后 containerd 还会回源 docker.io 直连。
+fn k3s_registries_yaml() -> String {
+    let mut s = String::from("mirrors:\n  docker.io:\n    endpoint:\n");
+    for h in DOCKER_MIRROR_CANDIDATES {
+        s.push_str(&format!("      - \"https://{h}\"\n"));
+    }
+    s
+}
+
 /// 受限网络下为 buildah 配置 docker.io 镜像（Docker Hub 被墙，基础镜像拉取必挂）。
+/// 多家候选全列进 [[registry.mirror]]，buildah 按序自动回退。
 async fn ensure_buildah_mirror() -> Result<()> {
     if !cn_mirror() {
         return Ok(());
     }
     let dir = Path::new("/etc/containers/registries.conf.d");
     std::fs::create_dir_all(dir)?;
-    std::fs::write(
-        dir.join("cn-mirror.conf"),
+    let mut conf = String::from(
         "unqualified-search-registries = [\"docker.io\"]\n\
          [[registry]]\n\
          prefix = \"docker.io\"\n\
-         location = \"docker.m.daocloud.io\"\n",
-    )?;
-    info!("已配置 buildah docker.io 镜像（daocloud）");
+         location = \"docker.io\"\n",
+    );
+    for h in DOCKER_MIRROR_CANDIDATES {
+        conf.push_str(&format!("\n[[registry.mirror]]\nlocation = \"{h}\"\n"));
+    }
+    std::fs::write(dir.join("cn-mirror.conf"), conf)?;
+    info!("已配置 buildah docker.io 镜像站候选");
     Ok(())
 }
 
@@ -827,7 +898,7 @@ async fn distribute_image_to_nodes(image: &str) -> Result<()> {
 
 /// 起临时镜像服务 Pod → kubectl cp 注入 tar → DaemonSet 逐节点导入 → 清理。
 async fn distribute_via_daemonset(tar: &str) -> Result<()> {
-    let manifest = render_distributor_manifest()?;
+    let manifest = render_distributor_manifest().await?;
     let mdir = make_workdir("distributor")?;
     let mpath = mdir.join("image-distributor.yaml");
     std::fs::write(&mpath, &manifest)?;
@@ -903,14 +974,14 @@ async fn distribute_via_daemonset(tar: &str) -> Result<()> {
 }
 
 /// 渲染镜像分发器清单（busybox 镜像名按网络模式替换后写出）。
-fn render_distributor_manifest() -> Result<String> {
+async fn render_distributor_manifest() -> Result<String> {
     let template = include_str!("../../../deploy/k8s/image-distributor.yaml");
     let busybox = if cn_mirror() {
-        "docker.m.daocloud.io/library/busybox:latest"
+        format!("{}/library/busybox:latest", docker_mirror_host().await)
     } else {
-        "docker.io/library/busybox:latest"
+        "docker.io/library/busybox:latest".to_string()
     };
-    Ok(template.replace("__BUSYBOX_IMAGE__", busybox))
+    Ok(template.replace("__BUSYBOX_IMAGE__", &busybox))
 }
 
 async fn download_string(url: &str) -> Result<String> {
@@ -966,20 +1037,91 @@ async fn build_image_locally(image: &str) -> Result<()> {
         root.join("Dockerfile").to_string_lossy().into_owned(),
     ];
     if cn_mirror() {
+        // 各环节多候选探活选择，单站故障自动换站
+        let rustup_arch = match std::env::consts::ARCH {
+            "aarch64" => "aarch64",
+            _ => "x86_64",
+        };
+        let rustup = pick_alive(&[
+            (
+                "tuna",
+                // TUNA 不托管 rustup-init.sh（404），探二进制路径
+                &format!("https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup/dist/{rustup_arch}-unknown-linux-gnu/rustup-init"),
+            ),
+            (
+                "ustc",
+                &format!("https://mirrors.ustc.edu.cn/rust-static/rustup/dist/{rustup_arch}-unknown-linux-gnu/rustup-init"),
+            ),
+        ])
+        .await;
+        let (dist_server, update_root) = if rustup == "ustc" {
+            (
+                "https://mirrors.ustc.edu.cn/rust-static",
+                "https://mirrors.ustc.edu.cn/rust-static/rustup",
+            )
+        } else {
+            (
+                "https://mirrors.tuna.tsinghua.edu.cn/rustup",
+                "https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup",
+            )
+        };
+        // crates 候选必须索引与文件都自托管：TUNA 稀疏索引的 dl 仍指向
+        // static.crates.io，crate 文件直连国外会超时
+        let crates_sparse = pick_alive(&[
+            (
+                "https://rsproxy.cn/index/",
+                "https://rsproxy.cn/index/config.json",
+            ),
+            (
+                "https://mirrors.ustc.edu.cn/crates.io-index/",
+                "https://mirrors.ustc.edu.cn/crates.io-index/config.json",
+            ),
+        ])
+        .await;
+        let apt_host = pick_alive(&[
+            (
+                "mirrors.tuna.tsinghua.edu.cn",
+                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/dists/noble/Release",
+            ),
+            (
+                "mirrors.ustc.edu.cn",
+                "https://mirrors.ustc.edu.cn/ubuntu/dists/noble/Release",
+            ),
+            (
+                "mirrors.aliyun.com",
+                "https://mirrors.aliyun.com/ubuntu/dists/noble/Release",
+            ),
+        ])
+        .await;
+        let npm_registry = pick_alive(&[
+            (
+                "https://registry.npmmirror.com",
+                "https://registry.npmmirror.com/react",
+            ),
+            (
+                "https://mirrors.cloud.tencent.com/npm",
+                "https://mirrors.cloud.tencent.com/npm/react",
+            ),
+            (
+                "https://repo.huaweicloud.com/repository/npm",
+                "https://repo.huaweicloud.com/repository/npm/react",
+            ),
+        ])
+        .await;
         build_args.extend([
-            // TUNA 不镜像按版本 channel，CN 模式工具链只能用 stable
+            // TUNA/USTC 都不镜像按版本 channel，CN 模式工具链只能用 stable
             "--build-arg".into(),
             "RUST_TOOLCHAIN=stable".into(),
             "--build-arg".into(),
-            "RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup".into(),
+            format!("RUSTUP_DIST_SERVER={dist_server}"),
             "--build-arg".into(),
-            "RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup".into(),
+            format!("RUSTUP_UPDATE_ROOT={update_root}"),
             "--build-arg".into(),
-            // crates 走 rsproxy 而非 TUNA：TUNA 稀疏索引的 dl 仍指向
-            // static.crates.io，crate 文件直连国外会超时，rsproxy 索引与文件都自托管
-            "CARGO_REGISTRY_SPARSE=https://rsproxy.cn/index/".into(),
+            format!("CARGO_REGISTRY_SPARSE={crates_sparse}"),
             "--build-arg".into(),
-            "APT_MIRROR_HOST=mirrors.tuna.tsinghua.edu.cn".into(),
+            format!("APT_MIRROR_HOST={apt_host}"),
+            "--build-arg".into(),
+            format!("NPM_REGISTRY={npm_registry}"),
         ]);
     }
     // 低内存机器限制 cargo 并行度防 OOM（2-4G 空白机上 rustc 满核并行会爆内存）
@@ -1100,6 +1242,11 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
         info!("集群无 Traefik CRD，剔除 Middleware 文档（WebSocket 头中间件不生效）");
     }
     let out = make_workdir("manifests")?;
+    let image_map = if cn {
+        cn_image_map(docker_mirror_host().await)
+    } else {
+        Vec::new()
+    };
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -1118,10 +1265,8 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
                 .collect::<Vec<_>>()
                 .join("\n");
         }
-        if cn {
-            for (from, to) in CN_IMAGE_MAP {
-                text = text.replace(from, to);
-            }
+        for (from, to) in &image_map {
+            text = text.replace(from.as_str(), to.as_str());
         }
         text = filter_variant_blocks(&text, multi_node);
         text = text.replace("__GIT_SEED_URL__", seed_url);
@@ -1146,10 +1291,8 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
                 continue;
             }
             let mut text = std::fs::read_to_string(&path)?;
-            if cn {
-                for (from, to) in CN_IMAGE_MAP {
-                    text = text.replace(from, to);
-                }
+            for (from, to) in &image_map {
+                text = text.replace(from.as_str(), to.as_str());
             }
             std::fs::write(out_sub.join(entry.file_name()), text)?;
         }
@@ -1213,35 +1356,31 @@ fn uncomment_line(line: &str) -> String {
     format!("{}{rest}", &line[..idx])
 }
 
-/// CN 模式公开镜像替换表（daocloud 镜像站）。
-const CN_IMAGE_MAP: &[(&str, &str)] = &[
-    (
-        "image: mysql:8.0",
-        "image: docker.m.daocloud.io/library/mysql:8.0",
-    ),
-    (
-        "image: nats:2.10-alpine",
-        "image: docker.m.daocloud.io/library/nats:2.10-alpine",
-    ),
-    (
-        "image: postgres:16-alpine",
-        "image: docker.m.daocloud.io/library/postgres:16-alpine",
-    ),
-    (
-        "image: redis:7-alpine",
-        "image: docker.m.daocloud.io/library/redis:7-alpine",
-    ),
-    (
-        "image: qdrant/qdrant:",
-        "image: docker.m.daocloud.io/qdrant/qdrant:",
-    ),
-    (
-        // daocloud 的 quay 镜像对 buildah/stable 返回 401/403（未收录该仓库），
-        // 改用南大 quay 镜像站
-        "image: quay.io/buildah/stable:",
-        "image: quay.nju.edu.cn/buildah/stable:",
-    ),
-];
+/// CN 模式公开镜像替换表：按探活选定的 docker 镜像站生成前缀，
+/// 单站故障时下次安装自动换站（清单内嵌完整主机名，不走 containerd 回退）。
+fn cn_image_map(mirror: &str) -> Vec<(String, String)> {
+    [
+        ("mysql:8.0", "library/mysql:8.0"),
+        ("nats:2.10-alpine", "library/nats:2.10-alpine"),
+        ("postgres:16-alpine", "library/postgres:16-alpine"),
+        ("redis:7-alpine", "library/redis:7-alpine"),
+    ]
+    .into_iter()
+    .map(|(from, to)| (format!("image: {from}"), format!("image: {mirror}/{to}")))
+    .chain([
+        (
+            "image: qdrant/qdrant:".to_string(),
+            format!("image: {mirror}/qdrant/qdrant:"),
+        ),
+        (
+            // daocloud 系镜像站的 quay 镜像对 buildah/stable 返回 401/403
+            //（未收录该仓库），改用南大 quay 镜像站
+            "image: quay.io/buildah/stable:".to_string(),
+            "image: quay.nju.edu.cn/buildah/stable:".to_string(),
+        ),
+    ])
+    .collect()
+}
 
 /// 将 LLM API Key 注入 K8s Secret（仅安全网关挂载，沙盒零凭证）。
 async fn inject_llm_secret(api_key: &str) -> Result<()> {
