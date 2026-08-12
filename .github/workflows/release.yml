@@ -128,7 +128,8 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
             | python3 -c "import json,sys; print(json.load(sys.stdin).get('body') or '')" || true)
           [ -z "$BODY" ] && BODY="版本 $TAG 已发布，亮点说明见 GitHub Release。"
-          PAYLOAD=$(TAG="$TAG" BODY="$BODY" GITEE_TOKEN="$GITEE_TOKEN" python3 -c "import json,os; print(json.dumps({'access_token': os.environ['GITEE_TOKEN'], 'tag_name': os.environ['TAG'], 'name': os.environ['TAG'], 'body': os.environ['BODY']}))")
+          # target_commitish 必填（Gitee API 缺省不给默认），否则 400
+          PAYLOAD=$(TAG="$TAG" BODY="$BODY" GITEE_TOKEN="$GITEE_TOKEN" python3 -c "import json,os; print(json.dumps({'access_token': os.environ['GITEE_TOKEN'], 'tag_name': os.environ['TAG'], 'name': os.environ['TAG'], 'target_commitish': 'main', 'body': os.environ['BODY']}))")
           HTTP=$(curl -s -o /tmp/gitee_release.json -w "%{http_code}" -X POST \
             "https://gitee.com/api/v5/repos/hcipengm/cogneva/releases" \
             -H "Content-Type: application/json" -d "$PAYLOAD")
@@ -141,5 +142,14 @@ jobs:
             if [ -n "$RID" ]; then
               curl -sf -X PATCH "https://gitee.com/api/v5/repos/hcipengm/cogneva/releases/$RID" \
                 -H "Content-Type: application/json" -d "$PAYLOAD" && echo "Gitee release updated"
+            else
+              # release 已存在时 POST 返回体里没有 id，需按 tag 反查
+              RID=$(curl -sf "https://gitee.com/api/v5/repos/hcipengm/cogneva/releases/tags/$TAG?access_token=$GITEE_TOKEN" \
+                | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
+              [ -n "$RID" ] && curl -sf -X PATCH "https://gitee.com/api/v5/repos/hcipengm/cogneva/releases/$RID" \
+                -H "Content-Type: application/json" -d "$PAYLOAD" && echo "Gitee release updated"
             fi
           fi
+          # 附件不在 CI 传：Gitee 分卷与 GitHub 镜像包都由本机
+          # deploy/scripts/build-release-image.sh 产物上传（本机是唯一 release 源）
+
