@@ -553,15 +553,16 @@ iwr -useb https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.ps1 
 
 > 第一个地址是 GitHub 官方 raw 地址；如果访问不通（比如国内受限网络），命令会自动切换到 Gitee 镜像下载，无需手动选择。脚本内部拉取源码时同样会自动回退到 Gitee 仓库。
 
-引导器会自动：
+引导器全程零问答、全自动：
 
 1. 探测 CPU / 内存 / 节点 / 架构；
-2. 配置并验证 LLM API Key（或本地模型）；
-3. 自动选择 K3s 轻量分支或 K8s 生产分支；
-4. 安装容器运行时、K3s/buildah；
-5. 部署安全网关、NetworkPolicy、沙盒环境；
-6. 启动 Cogneva 并打印 WebUI 地址；
-7. 引导器退出，内存中 API Key 清零。
+2. 自动选择 K3s 轻量分支或 K8s 生产分支；
+3. 安装容器运行时、K3s/buildah；
+4. 部署安全网关、NetworkPolicy、沙盒环境；
+5. 启动 Cogneva 并打印 WebUI 地址；
+6. 引导器退出。
+
+首次打开 WebUI 会弹出强制 LLM 配置向导（未接入前不可关闭），选择服务商预设填入 API Key 即可，密钥只写入集群 Secret。无人值守场景也可通过 `COGNEVA_LLM_API_KEY` 等环境变量预置，引导器只注入 Secret、不做连通验证。
 
 ### ☸️ 已有集群
 

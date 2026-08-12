@@ -1,20 +1,21 @@
-//! Cogneva 元启动引导器（第二步：Rust 引导器配 LLM + 探测环境）。
+//! Cogneva 元启动引导器（第二步：Rust 引导器全自动部署）。
 //!
 //! 职责：
-//! 1. 交互式配置 LLM（API Key 或本地模型路径）并验证连通性；
-//! 2. 静默探测 CPU/内存/架构/节点；
-//! 3. 规则引擎选择 K3s（轻量）或 K8s（生产）分支；
-//! 4. 生成 intent_config.yaml；
-//! 5. 安装 containerd / buildah / K3s（或复用现有集群）；
-//! 6. 供给运行时镜像：优先下载预构建 release 包（sha256 校验后导入集群），
+//! 1. 静默探测 CPU/内存/架构/节点；
+//! 2. 规则引擎选择 K3s（轻量）或 K8s（生产）分支；
+//! 3. 生成 intent_config.yaml；
+//! 4. 安装 containerd / buildah / K3s（或复用现有集群）；
+//! 5. 供给运行时镜像：优先下载预构建 release 包（sha256 校验后导入集群），
 //!    不可用时回退从源码构建（K3s 分支；清单引用 localhost/cogneva:local）；
-//! 7. kubectl apply 部署清单并等待关键 Pod Ready；
-//! 8. 打印 WebUI 地址，清零内存中的 API Key 后退出（自毁）。
+//! 6. kubectl apply 部署清单并等待关键 Pod Ready；
+//! 7. 打印 WebUI 地址并自动打开浏览器，清零内存中的 API Key 后退出（自毁）。
 //!
-//! 非交互模式：设置 COGNEVA_BOOTSTRAP_NONINTERACTIVE=1，并通过
-//! COGNEVA_LLM_PROVIDER / COGNEVA_LLM_API_KEY / COGNEVA_LLM_BASE_URL 传入配置。
+//! 全程零问答。LLM 接入不在引导器做：部署完成后 WebUI 强制向导
+//! （未配置不可关闭）收集 provider/key 并写入集群 Secret。
+//! 无人值守自动化可用 COGNEVA_LLM_PROVIDER / COGNEVA_LLM_API_KEY /
+//! COGNEVA_LLM_BASE_URL 预置（仅注入 Secret，不做连通验证）。
 
-use std::io::{self, BufRead, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -65,23 +66,13 @@ struct Hardware {
 
 #[derive(Debug, Serialize)]
 struct IntentConfig {
-    llm_provider: String,
-    llm_base_url: String,
+    /// env 预置时记录；默认 None（LLM 由 WebUI 强制向导配置，此处不落字段）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    llm_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    llm_base_url: Option<String>,
     branch: Branch,
     hardware: Hardware,
-}
-
-fn prompt(label: &str, default: &str) -> Result<String> {
-    print!("{label} [{default}]: ");
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
-    let line = line.trim();
-    Ok(if line.is_empty() {
-        default.to_string()
-    } else {
-        line.to_string()
-    })
 }
 
 /// 节点数探测：env COGNEVA_NODES 显式覆盖优先；集群已存在时按预期最终数
@@ -158,47 +149,6 @@ fn decide_branch(hw: &Hardware) -> Branch {
     } else {
         Branch::K8s
     }
-}
-
-async fn verify_llm(provider: &str, base_url: &str, api_key: &str) -> Result<()> {
-    if api_key.is_empty() {
-        warn!("未提供 API Key（本地模型模式），跳过连通性验证");
-        return Ok(());
-    }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
-    let base = base_url.trim_end_matches('/');
-    match provider {
-        "anthropic" => {
-            let resp = client
-                .post(format!("{base}/v1/messages"))
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&serde_json::json!({
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "ping"}]
-                }))
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                bail!("Anthropic 连通性验证失败: HTTP {}", resp.status());
-            }
-        }
-        _ => {
-            let resp = client
-                .get(format!("{base}/models"))
-                .bearer_auth(api_key)
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                bail!("OpenAI 兼容端点连通性验证失败: HTTP {}", resp.status());
-            }
-        }
-    }
-    info!("LLM 连通性验证通过");
-    Ok(())
 }
 
 async fn run(cmd: &str, args: &[&str]) -> Result<()> {
@@ -1422,23 +1372,18 @@ async fn wait_ready() -> Result<()> {
     Ok(())
 }
 
-async fn configure_llm(noninteractive: bool) -> Result<(String, String, String)> {
-    if noninteractive {
-        let provider = std::env::var("COGNEVA_LLM_PROVIDER").unwrap_or_else(|_| "openai".into());
-        let base_url = std::env::var("COGNEVA_LLM_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        let api_key = std::env::var("COGNEVA_LLM_API_KEY").unwrap_or_default();
-        return Ok((provider, base_url, api_key));
+/// 可选 LLM 预配置：仅认环境变量（无人值守自动化注入用），从不交互提问。
+/// 默认不配 LLM——接入由 WebUI 强制向导完成（未配置时向导不可关闭），
+/// 引导器全程零问答、全自动。
+fn llm_env_config() -> Option<(String, String, String)> {
+    let api_key = std::env::var("COGNEVA_LLM_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        return None;
     }
-    let provider = prompt("LLM provider (openai/anthropic/local)", "openai")?;
-    let default_base = match provider.as_str() {
-        "anthropic" => "https://api.anthropic.com",
-        "local" => "http://localhost:11434/v1",
-        _ => "https://api.openai.com/v1",
-    };
-    let base_url = prompt("LLM base URL", default_base)?;
-    let api_key = prompt("LLM API Key（本地模型可留空）", "")?;
-    Ok((provider, base_url, api_key))
+    let provider = std::env::var("COGNEVA_LLM_PROVIDER").unwrap_or_else(|_| "openai".into());
+    let base_url = std::env::var("COGNEVA_LLM_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    Some((provider, base_url, api_key))
 }
 
 /// 尝试用系统默认浏览器打开 WebUI（2.5.6）；失败仅告警，不影响自毁退出。
@@ -1531,8 +1476,10 @@ async fn main() -> Result<()> {
         std::env::consts::OS
     );
 
-    let (provider, base_url, mut api_key) = configure_llm(noninteractive).await?;
-    verify_llm(&provider, &base_url, &api_key).await?;
+    let mut llm = llm_env_config();
+    if llm.is_none() {
+        info!("未预置 LLM 配置：部署完成后由 WebUI 强制向导接入（全自动路径）");
+    }
 
     let hw = probe_hardware().await;
     info!(
@@ -1542,10 +1489,14 @@ async fn main() -> Result<()> {
     let branch = decide_branch(&hw);
     info!("规则引擎决策: {:?} 分支", branch);
 
-    // API Key 只存在于内存，绝不落盘；稍后通过 kubectl 注入 K8s Secret
+    // API Key 只存在于内存，绝不落盘；env 预置时稍后通过 kubectl 注入 K8s Secret
+    let (llm_provider, llm_base_url) = match &llm {
+        Some((p, b, _)) => (Some(p.clone()), Some(b.clone())),
+        None => (None, None),
+    };
     let intent = IntentConfig {
-        llm_provider: provider,
-        llm_base_url: base_url,
+        llm_provider,
+        llm_base_url,
         branch,
         hardware: hw.clone(),
     };
@@ -1583,8 +1534,8 @@ async fn main() -> Result<()> {
     }
     ensure_runtime_image(branch).await?;
     deploy_manifests(branch).await?;
-    if !api_key.is_empty() {
-        inject_llm_secret(&api_key).await?;
+    if let Some((_, _, api_key)) = &llm {
+        inject_llm_secret(api_key).await?;
     }
     wait_ready().await?;
 
@@ -1596,8 +1547,10 @@ async fn main() -> Result<()> {
         open_browser(&webui).await;
     }
 
-    // 自毁：清零内存中的 API Key
-    api_key.zeroize();
+    // 自毁：清零内存中的 API Key（env 预置路径）
+    if let Some((_, _, api_key)) = &mut llm {
+        api_key.zeroize();
+    }
     info!("引导器使命完成，退出");
     Ok(())
 }

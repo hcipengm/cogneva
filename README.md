@@ -557,15 +557,16 @@ The script installs WSL2 + Ubuntu (prompts for a reboot if required — just re-
 
 > The first URL is GitHub's official raw endpoint; if it is unreachable (e.g. restricted networks), the command automatically falls back to the Gitee mirror. The bootstrap script itself also falls back to the Gitee repo when fetching source code.
 
-The bootstrapper automatically:
+The bootstrapper runs fully unattended — no prompts at all:
 
 1. Probes CPU / memory / nodes / architecture;
-2. Configures and verifies the LLM API Key (or a local model);
-3. Automatically selects the lightweight K3s branch or the production K8s branch;
-4. Installs the container runtime, K3s/buildah;
-5. Deploys the security gateway, NetworkPolicy, and sandbox environment;
-6. Starts Cogneva and prints the WebUI address;
-7. Exits, zeroing the API Key from memory.
+2. Automatically selects the lightweight K3s branch or the production K8s branch;
+3. Installs the container runtime, K3s/buildah;
+4. Deploys the security gateway, NetworkPolicy, and sandbox environment;
+5. Starts Cogneva and prints the WebUI address;
+6. Exits.
+
+On first visit the WebUI shows a mandatory LLM setup wizard (it cannot be dismissed until a model is connected) — pick a provider preset, paste your API key, and the key is written to a cluster Secret only. For unattended automation you can also preset `COGNEVA_LLM_API_KEY` and related env vars; the bootstrapper only injects the Secret and performs no connectivity check.
 
 ### ☸️ Existing cluster
 
