@@ -44,6 +44,27 @@ const PRESETS: Preset[] = [
     api_style: 'anthropic',
   },
   {
+    label: 'Qwen（通义千问）',
+    provider: 'qwen',
+    base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen3-max',
+    api_style: 'openai',
+  },
+  {
+    label: '智谱 GLM',
+    provider: 'zhipu',
+    base_url: 'https://open.bigmodel.cn/api/paas/v4',
+    model: 'glm-4.6',
+    api_style: 'openai',
+  },
+  {
+    label: 'MiniMax',
+    provider: 'minimax',
+    base_url: 'https://api.minimaxi.com/v1',
+    model: 'MiniMax-M2',
+    api_style: 'openai',
+  },
+  {
     label: '豆包（火山方舟）',
     provider: 'doubao',
     base_url: 'https://ark.cn-beijing.volces.com/api/v3',
