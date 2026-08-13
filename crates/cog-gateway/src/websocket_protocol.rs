@@ -407,26 +407,28 @@ mod tests {
     #[tokio::test]
     async fn wildcard_subscription_matches_prefixed_channels() {
         let mgr = ConnectionManager::new();
-        mgr.register("c1".into(), "u1".into(), None, None, None).await;
+        mgr.register("c1".into(), "u1".into(), None, None, None)
+            .await;
         mgr.subscribe("c1", &["agent:*".to_string(), "hooks".to_string()])
             .await;
 
-        assert!(mgr
-            .should_deliver("c1", &["agent:worker-1".to_string()])
-            .await);
+        assert!(
+            mgr.should_deliver("c1", &["agent:worker-1".to_string()])
+                .await
+        );
         assert!(mgr.should_deliver("c1", &["hooks".to_string()]).await);
-        assert!(!mgr
-            .should_deliver("c1", &["task:t1".to_string()])
-            .await);
+        assert!(!mgr.should_deliver("c1", &["task:t1".to_string()]).await);
         assert!(!mgr.should_deliver("unknown", &["hooks".to_string()]).await);
     }
 
     #[tokio::test]
     async fn empty_subscription_receives_everything() {
         let mgr = ConnectionManager::new();
-        mgr.register("c1".into(), "u1".into(), None, None, None).await;
-        assert!(mgr
-            .should_deliver("c1", &["agent:worker-1".to_string()])
-            .await);
+        mgr.register("c1".into(), "u1".into(), None, None, None)
+            .await;
+        assert!(
+            mgr.should_deliver("c1", &["agent:worker-1".to_string()])
+                .await
+        );
     }
 }
