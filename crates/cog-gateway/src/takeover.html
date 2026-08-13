@@ -387,6 +387,7 @@
     <h1 data-i18n="navPipeline">Patch Pipeline</h1>
     <span class="sub" data-i18n="topSub">Bootstrap has exited — this console operates the self-evolution system</span>
     <span style="flex:1"></span>
+    <button id="loginBtn" class="ghost" data-i18n="loginBtn">Sign in</button>
     <input id="token" type="password" data-i18n-ph="tokenPh" placeholder="Admin Bearer Token" />
     <button id="saveToken" class="ghost" data-i18n="saveToken">Save Token</button>
     <button id="langToggle" class="ghost">中文</button>
@@ -514,6 +515,22 @@
       <button type="submit" id="llmSubmit" data-i18n="save">Save &amp; apply</button>
       <button type="button" class="ghost" id="llmForceSave" style="display:none" data-i18n="forceSave">Save anyway</button>
       <button type="button" class="ghost" id="llmClose" style="display:none" data-i18n="close">Close</button>
+    </div>
+  </form>
+</div>
+
+<div class="modal-mask" id="loginMask">
+  <form class="modal" id="loginForm">
+    <h3 data-i18n="loginTitle">Sign in</h3>
+    <div class="sub" data-i18n="loginSub">This deployment has a user store configured — sign in with your admin account.</div>
+    <label data-i18n="loginUserLbl">Username</label>
+    <input type="text" id="loginUser" autocomplete="username" required />
+    <label data-i18n="loginPassLbl">Password</label>
+    <input type="password" id="loginPass" autocomplete="current-password" required />
+    <div class="err-box" id="loginErr"></div>
+    <div class="actions">
+      <button type="submit" id="loginSubmit" data-i18n="loginSubmit">Sign in</button>
+      <button type="button" class="ghost" id="loginClose" data-i18n="close">Close</button>
     </div>
   </form>
 </div>
@@ -1067,8 +1084,17 @@ const I18N = {
   sendBtn:        { en: 'Send', zh: '发送' },
   liveEmpty:      { en: 'Send an intent below to start a live session',
                     zh: '在下方发送一条意图，开始实时会话' },
-  liveNoToken:    { en: 'Save an admin token above to connect the live stream',
-                    zh: '先在上方保存管理员令牌以连接实时流' },
+  liveNoToken:    { en: 'Connecting… if this persists, sign in above',
+                    zh: '正在连接……若长时间停留请在上方登录' },
+  loginBtn:       { en: 'Sign in', zh: '登录' },
+  loginTitle:     { en: 'Sign in', zh: '登录' },
+  loginSub:       { en: 'This deployment has a user store configured — sign in with your admin account.',
+                    zh: '当前部署配置了用户库，请使用管理员账号登录。' },
+  loginUserLbl:   { en: 'Username', zh: '用户名' },
+  loginPassLbl:   { en: 'Password', zh: '密码' },
+  loginSubmit:    { en: 'Sign in', zh: '登录' },
+  loginFailed:    { en: 'Sign-in failed: wrong username or password', zh: '登录失败：用户名或密码错误' },
+  loginOk:        { en: 'Signed in', zh: '登录成功' },
   topoTitle:      { en: 'CLUSTER TOPOLOGY', zh: '集群拓扑' },
   pipeTitle:      { en: 'GOAL PIPELINE', zh: '目标流水线' },
   noActiveGoals:  { en: 'No active goals', zh: '暂无活动目标' },
@@ -1352,6 +1378,72 @@ $('saveToken').onclick = () => {
   connectStream();
   if (window.liveReconnect) window.liveReconnect();
 };
+
+// ── auth: token stays invisible to the user ──
+// Single-machine/demo installs have no user store: the login endpoint issues
+// an admin token for any username without checking the password, so the page
+// can sign itself in silently. Deployments with a real user store reject the
+// silent attempt and get the manual sign-in modal instead.
+function openLogin() { $('loginErr').textContent = ''; $('loginMask').classList.add('show'); }
+function closeLogin() { $('loginMask').classList.remove('show'); }
+
+async function doLogin(username, password) {
+  const r = await fetch('/api/v1/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || !d.access_token) return false;
+  $('token').value = d.access_token;
+  localStorage.setItem(TOKEN_KEY, d.access_token);
+  return true;
+}
+
+function afterLogin() {
+  refreshAll();
+  connectStream();
+  checkLlmStatus();
+  if (window.liveReconnect) window.liveReconnect();
+}
+
+async function ensureToken() {
+  if ($('token').value.trim()) return true;
+  try {
+    if (await doLogin('admin', '')) return true;
+  } catch { /* endpoint unreachable — fall through to manual sign-in */ }
+  return false;
+}
+
+let reauthing = false;
+async function reauth() {
+  if (reauthing) return;
+  reauthing = true;
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+    $('token').value = '';
+    if (!(await ensureToken())) openLogin();
+  } finally { reauthing = false; }
+}
+
+$('loginBtn').onclick = openLogin;
+$('loginClose').onclick = closeLogin;
+$('loginForm').onsubmit = async (e) => {
+  e.preventDefault();
+  $('loginErr').textContent = '';
+  $('loginSubmit').disabled = true;
+  try {
+    const ok = await doLogin($('loginUser').value.trim(), $('loginPass').value);
+    if (!ok) { $('loginErr').textContent = t('loginFailed'); return; }
+    closeLogin();
+    toast(t('loginOk'), 'ok');
+    afterLogin();
+  } catch {
+    $('loginErr').textContent = t('loginFailed');
+  } finally {
+    $('loginSubmit').disabled = false;
+  }
+};
 $('refresh').onclick = () => {
   refreshAll();
   if (!eventSource || eventSource.readyState === EventSource.CLOSED) connectStream();
@@ -1536,6 +1628,7 @@ checkLlmStatus();
     if (!token) return;
     try {
       const r = await fetch('/api/v1/cluster/components', { headers: { Authorization: 'Bearer ' + token } });
+      if (r.status === 401) { reauth(); return; }
       if (!r.ok) return;
       const data = await r.json();
       for (const c of data.components || []) liveComponents[c.id] = c.status;
@@ -1546,6 +1639,7 @@ checkLlmStatus();
     if (!token) return;
     try {
       const r = await fetch('/api/v1/processes', { headers: { Authorization: 'Bearer ' + token } });
+      if (r.status === 401) { reauth(); return; }
       if (!r.ok) return;
       const data = await r.json();
       const seen = new Set();
@@ -1872,6 +1966,9 @@ checkLlmStatus();
     ws.onclose = () => {
       stopPing();
       if (connectionStatus !== 'error') connectionStatus = 'closed';
+      // The token may have expired (15 min JWT TTL) — refresh it silently so
+      // the next reconnect attempt authenticates.
+      reauth();
       scheduleReconnect();
     };
     ws.onerror = () => { connectionStatus = 'error'; };
@@ -1922,9 +2019,15 @@ checkLlmStatus();
   }, { passive: false });
 
   setInterval(() => { if (liveVisible) { pollComponents(); pollProcesses(); } }, 10000);
-  pollComponents();
-  pollProcesses();
-  liveConnect();
+  (async () => {
+    // Silent sign-in first (demo installs issue a token for any username);
+    // only deployments with a real user store fall back to the modal.
+    const had = !!$('token').value.trim();
+    const ok = await ensureToken();
+    if (!ok) openLogin();
+    if (ok && !had) afterLogin();
+    else { pollComponents(); pollProcesses(); liveConnect(); }
+  })();
 })();
 </script>
 </body>
