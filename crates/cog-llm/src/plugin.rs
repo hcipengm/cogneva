@@ -38,7 +38,6 @@ impl cog_core::SystemPlugin for LlmPlugin {
         let stream_capacity = crate::TuningConfig::load()?.stream_capacity;
         let anthropic_default_max_tokens = config.system.anthropic_default_max_tokens;
         let llm_routing = crate::LLMRoutingConfig::load()?;
-        let llm = config.llm.clone();
         // Drop config borrow before publishing
         let _ = config;
 
@@ -46,7 +45,6 @@ impl cog_core::SystemPlugin for LlmPlugin {
             stream_capacity,
             anthropic_default_max_tokens,
             &llm_routing,
-            &llm,
             ctx.consume_service::<dyn cog_core::HttpClient>(),
         )?;
         let hot_swap = Arc::new(crate::HotSwappableLlmClient::new(provider));
@@ -224,7 +222,6 @@ pub fn build_llm_provider(
     stream_capacity: usize,
     anthropic_default_max_tokens: u32,
     llm_routing: &crate::LLMRoutingConfig,
-    llm: &cog_core::LLMConfig,
     http_client: Option<Arc<dyn cog_core::HttpClient>>,
 ) -> cog_core::SFResult<Arc<dyn cog_core::LlmClient>> {
     let backends: Vec<Arc<dyn cog_core::LlmClient>> = llm_routing
@@ -241,43 +238,22 @@ pub fn build_llm_provider(
         })
         .collect();
 
-    let provider: Arc<dyn cog_core::LlmClient> = if !backends.is_empty() {
-        info!(
-            "LLM RoutingProvider created with {} backend(s)",
-            backends.len()
-        );
-        Arc::new(crate::RoutingProvider::new(
-            backends,
-            llm_routing.max_failover_attempts,
-            llm_routing.retry_on_429,
-            llm_routing.retry_on_402,
-        ))
-    } else if !llm.provider.is_empty() {
-        info!(
-            "LLM fallback: using legacy single-provider config (provider={})",
-            llm.provider
-        );
-        let fallback = crate::LLMBackendConfig {
-            provider: llm.provider.clone(),
-            api_key: llm.api_key.clone(),
-            base_url: llm.base_url.clone(),
-            model: llm.model.clone(),
-            api_style: "openai".into(),
-            weight: 1,
-            enabled: true,
-        };
-        build_single_provider(
-            &fallback,
-            stream_capacity,
-            anthropic_default_max_tokens,
-            http_client,
-        )
-    } else {
+    if backends.is_empty() {
         return Err(cog_core::SFError::Config(
-            "No LLM backends configured. Please set llm_routing.backends or llm in cogneva.json"
-                .into(),
+            "No LLM backends configured. Please set llm_routing.backends in cogneva.json".into(),
         ));
-    };
+    }
+
+    info!(
+        "LLM RoutingProvider created with {} backend(s)",
+        backends.len()
+    );
+    let provider: Arc<dyn cog_core::LlmClient> = Arc::new(crate::RoutingProvider::new(
+        backends,
+        llm_routing.max_failover_attempts,
+        llm_routing.retry_on_429,
+        llm_routing.retry_on_402,
+    ));
 
     Ok(Arc::new(crate::ObservedLlmClient::new(provider)))
 }

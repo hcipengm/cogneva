@@ -51,18 +51,6 @@ fn default_env_mappings() -> HashMap<String, String> {
     m.insert("COGNEVA_DATA_DIR".into(), "app.data_dir".into());
     m.insert("COGNEVA_CONFIG_DIR".into(), "app.config_dir".into());
     m.insert("COGNEVA_APP_DIR".into(), "app.app_dir".into());
-    // llm
-    m.insert("COGNEVA_LLM_PROVIDER".into(), "llm.provider".into());
-    m.insert("COGNEVA_LLM_API_KEY".into(), "llm.api_key".into());
-    m.insert("COGNEVA_LLM_BASE_URL".into(), "llm.base_url".into());
-    m.insert("COGNEVA_LLM_MODEL".into(), "llm.model".into());
-    m.insert(
-        "COGNEVA_LLM_EMBEDDING_MODEL".into(),
-        "llm.embedding_model".into(),
-    );
-    m.insert("COGNEVA_LLM_MAX_TOKENS".into(), "llm.max_tokens".into());
-    m.insert("COGNEVA_LLM_TEMPERATURE".into(), "llm.temperature".into());
-    m.insert("COGNEVA_LLM_TIMEOUT_SECS".into(), "llm.timeout_secs".into());
     // providers
     m.insert("COGNEVA_DB_PROVIDER".into(), "providers.db.provider".into());
     m.insert("COGNEVA_PG_PROVIDER".into(), "providers.pg.provider".into());
@@ -908,9 +896,9 @@ mod tests {
         };
 
         let mut config = AppConfig::default();
-        config.core.llm.api_key = "secret://env/TEST_SECRET_API_KEY".into();
+        config.core.dag_executor.redis_url = "secret://env/TEST_SECRET_API_KEY".into();
         resolve_secret_refs(&mut config).await.unwrap();
-        assert_eq!(config.core.llm.api_key, "resolved-key-123");
+        assert_eq!(config.core.dag_executor.redis_url, "resolved-key-123");
     }
 
     #[tokio::test]
@@ -919,9 +907,9 @@ mod tests {
         tmpfile.write_all(b"file-secret-456\n").unwrap();
 
         let mut config = AppConfig::default();
-        config.core.llm.api_key = format!("secret://file/{}", tmpfile.path().display());
+        config.core.dag_executor.redis_url = format!("secret://file/{}", tmpfile.path().display());
         resolve_secret_refs(&mut config).await.unwrap();
-        assert_eq!(config.core.llm.api_key, "file-secret-456");
+        assert_eq!(config.core.dag_executor.redis_url, "file-secret-456");
     }
 
     #[tokio::test]
@@ -932,10 +920,10 @@ mod tests {
         };
 
         let mut config = AppConfig::default();
-        config.core.llm.api_key = "secret://env/DEFINITELY_MISSING_SECRET".into();
+        config.core.dag_executor.redis_url = "secret://env/DEFINITELY_MISSING_SECRET".into();
         resolve_secret_refs(&mut config).await.unwrap();
         assert_eq!(
-            config.core.llm.api_key,
+            config.core.dag_executor.redis_url,
             "secret://env/DEFINITELY_MISSING_SECRET"
         );
     }

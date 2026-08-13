@@ -97,14 +97,6 @@ spec:
             # 非空值，网关收到请求后会丢弃入站 Authorization 换成真凭证。
             - name: KIMI_API_KEY
               value: "via-security-gateway"
-            # 经 configmap env 映射覆写 llm_routing.backends.0.base_url，
-            # 指向安全网关 LLM 通道（仅限集群内网，network-policy 已放行）
-            - name: COGNEVA_LLM_ROUTING_BASE_URL
-              value: "http://cogneva-security-gateway:8081/v1"
-            # 透传端点是 OpenAI 兼容面——主配置 backends[0] 已切 anthropic，
-            # 沙盒必须显式钉回 openai，否则会向网关 POST /v1/messages（404）
-            - name: COGNEVA_LLM_ROUTING_API_STYLE
-              value: "openai"
             - name: PG_PASSWORD
               valueFrom:
                 secretKeyRef:

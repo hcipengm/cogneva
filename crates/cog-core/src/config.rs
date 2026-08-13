@@ -24,7 +24,6 @@ pub trait PromptProvider: Send + Sync {
 #[serde(default)]
 pub struct Config {
     pub app: AppInfo,
-    pub llm: LLMConfig,
     pub providers: ProviderConfigs,
     pub dag_executor: DagExecutorConfig,
     pub gateway: GatewayConfig,
@@ -49,38 +48,6 @@ pub struct Config {
     pub env: HashMap<String, String>,
 }
 
-/// LLM API configuration.
-/// `api_key` 在 Debug 输出中脱敏，防止泄漏到日志。
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LLMConfig {
-    pub provider: String,
-    pub api_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_model: Option<String>,
-    pub max_tokens: u32,
-    pub temperature: f32,
-    pub timeout_secs: u64,
-}
-
-impl std::fmt::Debug for LLMConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LLMConfig")
-            .field("provider", &self.provider)
-            .field("api_key", &redacted(&self.api_key))
-            .field("base_url", &self.base_url)
-            .field("model", &self.model)
-            .field("embedding_model", &self.embedding_model)
-            .field("max_tokens", &self.max_tokens)
-            .field("temperature", &self.temperature)
-            .field("timeout_secs", &self.timeout_secs)
-            .finish()
-    }
-}
-
 pub fn redacted(value: &str) -> &str {
     if value.is_empty() {
         ""
@@ -96,20 +63,6 @@ fn redacted_opt(value: &Option<String>) -> &str {
     }
 }
 
-impl Default for LLMConfig {
-    fn default() -> Self {
-        Self {
-            provider: String::new(),
-            api_key: String::new(),
-            base_url: None,
-            model: String::new(),
-            embedding_model: None,
-            max_tokens: 0,
-            temperature: 0.0,
-            timeout_secs: 0,
-        }
-    }
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -776,7 +729,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             app: AppInfo::default(),
-            llm: LLMConfig::default(),
             providers: ProviderConfigs::default(),
             dag_executor: DagExecutorConfig::default(),
             gateway: GatewayConfig::default(),

@@ -71,9 +71,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => report.error(format!("secret:// reference resolution failed: {e}")),
     }
 
-    // 3. LLM 依赖：优先校验 llm_routing.backends（多后端故障转移），
-    // 无 backends 时回退校验 legacy llm 单后端配置。
-    // llm_routing 已下沉 cog-llm，经其自载器读取。
+    // 3. LLM 依赖：llm_routing.backends 是唯一配置面（生产指向安全网关
+    // 透传，本地开发可直连 provider）。llm_routing 已下沉 cog-llm，
+    // 经其自载器读取。
     let llm_routing = match cog_llm::LLMRoutingConfig::load() {
         Ok(r) => r,
         Err(e) => {
@@ -82,31 +82,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     if llm_routing.backends.is_empty() {
-        if config.llm.provider.trim().is_empty() {
-            report.error("llm.provider is empty — no LLM provider configured");
-        } else {
-            report.ok(format!("llm.provider = {}", config.llm.provider));
-        }
-        if config.llm.model.trim().is_empty() {
-            report.error("llm.model is empty");
-        } else {
-            report.ok(format!("llm.model = {}", config.llm.model));
-        }
-        if config.llm.api_key.trim().is_empty()
-            && std::env::var("COGNEVA_LLM_API_KEY")
-                .unwrap_or_default()
-                .is_empty()
-        {
-            report.error("llm.api_key is empty and COGNEVA_LLM_API_KEY is not set");
-        } else {
-            report.ok("llm.api_key resolved");
-        }
-        if config.llm.max_tokens == 0 {
-            report.error("llm.max_tokens must be > 0");
-        }
-        if config.llm.timeout_secs == 0 {
-            report.error("llm.timeout_secs must be > 0");
-        }
+        report.error("llm_routing.backends is empty — no LLM backend configured");
     } else {
         let enabled: Vec<_> = llm_routing.backends.iter().filter(|b| b.enabled).collect();
         if enabled.is_empty() {
@@ -120,11 +96,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ));
                 continue;
             }
-            if backend.api_key.trim().is_empty()
-                && std::env::var("COGNEVA_LLM_API_KEY")
-                    .unwrap_or_default()
-                    .is_empty()
-            {
+            if backend.api_key.trim().is_empty() {
                 report.error(format!(
                     "llm_routing backend {} has empty api_key",
                     backend.provider
