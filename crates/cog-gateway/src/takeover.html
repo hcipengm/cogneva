@@ -854,7 +854,6 @@ function renderPromoSwitch() {
     badge.className = 'pill err';
     badge.textContent = t('promoOffConfig');
     btn.textContent = t('promoEnableViaConfig');
-    btn.disabled = true;
   } else if (promoState.paused) {
     badge.className = 'pill warn';
     badge.textContent = t('promoPaused');
@@ -877,7 +876,32 @@ async function loadPromotionSwitch() {
 }
 
 async function togglePromotion() {
-  if (!promoState || !promoState.config_enabled) return;
+  if (!promoState) return;
+  if (!promoState.config_enabled) {
+    // Config-level gate: the one sanctioned WebUI path to flip it — the
+    // backend edits the ConfigMap and rolls the main app (~1 min).
+    if (!confirm(t('promoGateConfirm'))) return;
+    try {
+      await api('/api/v1/admin/promotion-gate', 'POST', { enabled: true });
+      toast(t('promoGateRolling'), 'ok');
+      const deadline = Date.now() + 3 * 60 * 1000;
+      const timer = setInterval(async () => {
+        try {
+          const s = await api('/api/v1/evolution/promotion/switch');
+          if (s.config_enabled) {
+            clearInterval(timer);
+            promoState = s;
+            renderPromoSwitch();
+            toast(t('promoGateOn'), 'ok');
+          }
+        } catch { /* main app rolling */ }
+        if (Date.now() > deadline) { clearInterval(timer); loadPromotionSwitch(); }
+      }, 5000);
+    } catch (e) {
+      toast(t('switchFailed') + e.message, 'err');
+    }
+    return;
+  }
   const target = !promoState.paused;
   const note = prompt(
     (target ? t('promoPause') : t('promoResume')) + t('promoPromptNote'),
@@ -1184,7 +1208,11 @@ const I18N = {
   actFail:        { en: ' failed: ', zh: ' 失败：' },
   promoNa:        { en: 'auto-promo n/a', zh: '自动晋级 不可用' },
   promoOffConfig: { en: 'auto-promo off (config)', zh: '自动晋级 关（配置）' },
-  promoEnableViaConfig: { en: 'Enable via config', zh: '需在配置开启' },
+  promoEnableViaConfig: { en: 'Enable…', zh: '开启…' },
+  promoGateConfirm: { en: 'Enable config-level auto-promotion? Sandbox-verified patches on whitelisted paths will promote and deploy without manual approval (quota 3/day, breakers armed; core paths still require humans). The main app rolls to apply, ~1 minute.',
+                      zh: '确定开启配置级自动晋级？此后沙盒验证通过且命中白名单路径的补丁将不再等人审批直接晋级部署（配额每天 3 条、熔断在位；核心路径仍需人工）。主应用滚动生效约 1 分钟。' },
+  promoGateRolling: { en: 'Gate config written, rolling the main app…', zh: '总闸配置已写入，正在滚动主应用…' },
+  promoGateOn:    { en: 'auto-promo gate enabled', zh: '自动晋级总闸已开启' },
   promoPaused:    { en: 'auto-promo PAUSED', zh: '自动晋级 已暂停' },
   promoResume:    { en: 'Resume', zh: '恢复' },
   promoLive:      { en: 'auto-promo live', zh: '自动晋级 运行中' },

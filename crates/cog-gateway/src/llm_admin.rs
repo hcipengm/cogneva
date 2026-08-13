@@ -382,7 +382,7 @@ impl KubeClient {
         &self.namespace
     }
 
-    async fn patch(&self, path: &str, body: serde_json::Value) -> Result<(), String> {
+    pub(crate) async fn patch(&self, path: &str, body: serde_json::Value) -> Result<(), String> {
         let resp = self
             .http
             .patch(format!("{API_BASE}{path}"))

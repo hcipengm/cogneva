@@ -44,6 +44,7 @@ pub mod observability;
 pub mod plugin;
 pub mod processes;
 pub mod prometheus_render;
+pub mod promotion_gate;
 pub mod quota_middleware;
 pub mod raw_logs;
 pub mod security_gateway;
@@ -476,6 +477,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/admin/llm-config",
             post(llm_admin::llm_config_handler),
+        )
+        .route(
+            "/api/v1/admin/promotion-gate",
+            post(promotion_gate::set_promotion_gate_handler),
         )
         .layer(quota_layer.clone())
         .layer(auth::middleware::require_role(
