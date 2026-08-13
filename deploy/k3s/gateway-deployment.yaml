@@ -45,46 +45,18 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
-            # 凭证仅注入网关，沙盒 Pod 不挂载任何 Secret
-            - name: OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: openai-api-key
-                  optional: true
-            - name: ANTHROPIC_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: anthropic-api-key
-                  optional: true
-            - name: LLM_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: llm-api-key
-                  optional: true
-            # cogneva.json 的 kimi backend api_key 占位是 ${KIMI_API_KEY}
-            - name: KIMI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: llm-api-key
-                  optional: true
-            # 多上游池（主上游 + 故障转移上游）整体存 Secret 的 llm-upstreams
-            # 条目，JSON 数组：每元素 {api_style, base_url, model, api_key}。
-            # 网关按声明顺序在 429/402/连接失败时切下一个上游。
+            # LLM 上游池（LLM 通道唯一配置来源）：Secret llm-upstreams 条目，
+            # JSON 数组，每元素 {api_style, base_url, model, api_key}。
+            # 单 LLM 即单元素数组；多上游时按声明顺序在 429/402/连接失败时
+            # 故障转移。凭证仅注入网关，沙盒 Pod 不挂载任何 Secret。
+            # WebUI 向导 / llm-config API 写 Secret 后用 restartedAt 注解
+            # 滚动本 Deployment 生效。
             - name: COGNEVA_LLM_UPSTREAMS
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: llm-upstreams
                   optional: true
-            # LLM 通道上游（/v1/intent、/v1/chat、/v1/chat/completions 透传）。
-            # 不写死任何服务商：COGNEVA_LLM_UPSTREAMS 为空时回退下面这组
-            # 旧版单上游 env（WebUI 向导 / llm-config API 会 patch 主上游到此处）。
-            # LLM_API_KEY 由上方 secretKeyRef 注入，COGNEVA_LLM_PROVIDER/
-            # BASE_URL/MODEL 由管理接口 patch。
           livenessProbe:
             httpGet:
               path: /health/live

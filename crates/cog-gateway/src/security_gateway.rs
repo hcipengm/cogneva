@@ -78,24 +78,18 @@ impl SecurityGatewayConfig {
     }
 }
 
-/// 上游池来源优先级：COGNEVA_LLM_UPSTREAMS（JSON 数组，多上游，由
-/// llm-config 管理接口写入 Secret）→ 旧版单上游 env 组合（LLM_API_KEY +
-/// COGNEVA_LLM_PROVIDER/BASE_URL/MODEL，手工部署与滚动升级过渡期兼容）。
+/// 上游池唯一来源：COGNEVA_LLM_UPSTREAMS（JSON 数组，由 llm-config 管理
+/// 接口写入 Secret）。单 LLM 即单元素数组，池为空视为未配置。
 fn upstreams_from_env() -> Vec<LlmUpstream> {
-    if let Ok(raw) = std::env::var("COGNEVA_LLM_UPSTREAMS") {
-        let parsed = parse_upstreams(&raw);
-        if !parsed.is_empty() {
-            return parsed;
-        }
-    }
-    legacy_upstream().into_iter().collect()
+    std::env::var("COGNEVA_LLM_UPSTREAMS")
+        .map(|raw| parse_upstreams(&raw))
+        .unwrap_or_default()
 }
 
-/// 解析上游池 JSON：字段缺失/为空的条目丢弃，整体不是合法 JSON 数组时
-/// 返回空（调用方回退旧版单上游）。
+/// 解析上游池 JSON：字段缺失/为空的条目丢弃，整体不是合法 JSON 数组时返回空。
 fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
     let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
-        tracing::warn!("COGNEVA_LLM_UPSTREAMS 不是合法 JSON 数组，回退单上游 env");
+        tracing::warn!("COGNEVA_LLM_UPSTREAMS 不是合法 JSON 数组，按未配置处理");
         return Vec::new();
     };
     list.iter()
@@ -131,38 +125,6 @@ fn normalize_style(raw: &str) -> String {
     } else {
         "openai".into()
     }
-}
-
-/// 旧版单上游 env：provider 未显式配置时按 key 前缀推断（sk-ant- → anthropic，
-/// 其余默认 openai）。key 或 model 缺失视为未配置。
-fn legacy_upstream() -> Option<LlmUpstream> {
-    let api_key = std::env::var("LLM_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-        .unwrap_or_default();
-    let api_style = normalize_style(&std::env::var("COGNEVA_LLM_PROVIDER").unwrap_or_else(|_| {
-        if api_key.starts_with("sk-ant-") {
-            "anthropic".into()
-        } else {
-            "openai".into()
-        }
-    }));
-    let default_base = if api_style == "anthropic" {
-        "https://api.anthropic.com"
-    } else {
-        "https://api.openai.com/v1"
-    };
-    let base_url = std::env::var("COGNEVA_LLM_BASE_URL").unwrap_or_else(|_| default_base.into());
-    let model = std::env::var("COGNEVA_LLM_MODEL").unwrap_or_default();
-    if api_key.is_empty() || model.is_empty() {
-        return None;
-    }
-    Some(LlmUpstream {
-        api_style,
-        base_url,
-        model,
-        api_key,
-    })
 }
 
 /// 429（限流）/ 402（额度耗尽）判定为可转移：池内还有上游就切下一个。

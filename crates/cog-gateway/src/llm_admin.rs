@@ -1,13 +1,12 @@
 //! Admin API for LLM provider configuration.
 //!
 //! The WebUI setup wizard uses these endpoints to connect the system to an
-//! LLM after installation. Saving writes the upstream pool (primary plus
-//! optional failover upstreams) into the `cogneva-secrets` Secret as the
-//! `llm-upstreams` JSON entry and points the security gateway's legacy
-//! single-upstream env at the primary. Only the gateway holds credentials;
-//! the main app and sandbox talk to the gateway, so the deployment env
-//! patch (which rolls the gateway) is the only restart needed. The gateway
-//! fails over across the pool on 429 (rate limit) / 402 (quota exhausted).
+//! LLM after installation. Saving writes the upstream pool (one entry for a
+//! single LLM, more for failover) into the `cogneva-secrets` Secret as the
+//! `llm-upstreams` JSON entry — the gateway's only upstream source. Only the
+//! gateway holds credentials; the main app and sandbox talk to the gateway,
+//! so rolling the gateway is the only restart needed. The gateway fails over
+//! across the pool on 429 (rate limit) / 402 (quota exhausted).
 
 use axum::{
     extract::State,
@@ -22,11 +21,9 @@ use std::sync::Arc;
 const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 const API_BASE: &str = "https://kubernetes.default.svc";
 const SECRET_NAME: &str = "cogneva-secrets";
-const SECRET_KEY: &str = "llm-api-key";
-/// 多上游池条目：JSON 数组，每元素 {api_style, base_url, model, api_key}。
+/// 上游池条目：JSON 数组，每元素 {api_style, base_url, model, api_key}。
 const SECRET_UPSTREAMS_KEY: &str = "llm-upstreams";
 const GATEWAY_DEPLOYMENT: &str = "cogneva-security-gateway";
-const GATEWAY_CONTAINER: &str = "security-gateway";
 
 #[derive(Debug, Deserialize)]
 pub struct LlmUpstreamRequest {
@@ -53,9 +50,10 @@ pub struct LlmConfigRequest {
 }
 
 /// GET /api/v1/admin/llm-status — whether the security gateway holds a
-/// resolvable API key. Never returns key material. In-cluster the source of
-/// truth is the `llm-api-key` Secret entry (the main app is credential-free);
-/// outside the cluster we fall back to inspecting local cogneva.json.
+/// configured upstream pool. Never returns key material. In-cluster the
+/// source of truth is the `llm-upstreams` Secret entry (the main app is
+/// credential-free); outside the cluster we fall back to inspecting local
+/// cogneva.json.
 pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) -> Response {
     if let Ok(kube) = KubeClient::in_cluster() {
         if let Ok(configured) = kube.secret_has_key().await {
@@ -168,12 +166,7 @@ pub async fn llm_config_handler(
                 "/api/v1/namespaces/{}/secrets/{}",
                 kube.namespace, SECRET_NAME
             ),
-            json!({"stringData": {
-                SECRET_UPSTREAMS_KEY: pool_json,
-                // 旧版单上游条目继续写主上游 key：滚动升级窗口内旧代码 Pod
-                // 与 llm-status 的 configured 判定都靠它。
-                SECRET_KEY: req.api_key.trim(),
-            }}),
+            json!({"stringData": {SECRET_UPSTREAMS_KEY: pool_json}}),
         )
         .await
     {
@@ -184,11 +177,7 @@ pub async fn llm_config_handler(
             .into_response();
     }
 
-    let primary_style = pool[0]["api_style"].as_str().unwrap_or("openai");
-    if let Err(e) = kube
-        .update_gateway_upstream(req.base_url.trim(), req.model.trim(), primary_style)
-        .await
-    {
+    if let Err(e) = kube.restart_gateway().await {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "gateway_patch_failed", "message": e})),
@@ -196,7 +185,7 @@ pub async fn llm_config_handler(
             .into_response();
     }
 
-    // restartedAt 注解保证网关滚动重启，新代码 Pod 启动时从 Secret 读
+    // restartedAt 注解触发网关滚动重启，新 Pod 启动时从 Secret 读
     // COGNEVA_LLM_UPSTREAMS 拿到完整上游池。
     (
         StatusCode::OK,
@@ -392,9 +381,7 @@ impl KubeClient {
         Ok(())
     }
 
-    /// 真 key 是否已写入集群 Secret（网关凭证的唯一事实源）。
-    /// 新版多上游条目 `llm-upstreams` 与旧版单上游条目 `llm-api-key`
-    /// 任一存在即视为已配置。
+    /// 上游池是否已写入集群 Secret（网关凭证的唯一事实源）。
     async fn secret_has_key(&self) -> Result<bool, String> {
         let resp = self
             .http
@@ -413,28 +400,19 @@ impl KubeClient {
             .json()
             .await
             .map_err(|e| format!("secret 响应解析失败: {e}"))?;
-        let has = [SECRET_UPSTREAMS_KEY, SECRET_KEY].iter().any(|k| {
-            secret
-                .get("data")
-                .and_then(|d| d.get(k))
-                .and_then(|v| v.as_str())
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-        });
+        let has = secret
+            .get("data")
+            .and_then(|d| d.get(SECRET_UPSTREAMS_KEY))
+            .and_then(|v| v.as_str())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
         Ok(has)
     }
 
-    /// 把主上游写入安全网关 Deployment 的旧版单上游 env（strategic merge：
-    /// containers 按 name 合并、env 按 name 合并）。这层 env 对运行新代码的
-    /// 网关是惰性兜底（COGNEVA_LLM_UPSTREAMS 优先）；restartedAt 注解保证
-    /// 即使主上游三元组没变（比如只增删了故障转移上游）也必定滚动重启，
-    /// 让新 Pod 读取新 Secret 里的上游池。
-    async fn update_gateway_upstream(
-        &self,
-        base_url: &str,
-        model: &str,
-        api_style: &str,
-    ) -> Result<(), String> {
+    /// 滚动重启安全网关：上游池整体在 Secret 里（env 引用 Secret 条目，
+    /// 内容变化不会触发重启），restartedAt 注解保证每次保存都滚出新 Pod
+    /// 读取新池。
+    async fn restart_gateway(&self) -> Result<(), String> {
         let restarted_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
@@ -447,14 +425,6 @@ impl KubeClient {
             json!({
                 "spec": {"template": {
                     "metadata": {"annotations": {"cogneva.io/restartedAt": restarted_at}},
-                    "spec": {"containers": [{
-                        "name": GATEWAY_CONTAINER,
-                        "env": [
-                            {"name": "COGNEVA_LLM_PROVIDER", "value": api_style},
-                            {"name": "COGNEVA_LLM_BASE_URL", "value": base_url},
-                            {"name": "COGNEVA_LLM_MODEL", "value": model},
-                        ],
-                    }]},
                 }}
             }),
         )
