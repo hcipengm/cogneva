@@ -574,7 +574,16 @@ TOKEN=$(curl -sX POST http://localhost:8080/api/v1/auth/login \
   -d '{"username":"ci","password":"ci"}' | jq -r .access_token)
 curl -X POST http://localhost:8080/api/v1/admin/llm-config \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://api.deepseek.com/v1","model":"deepseek-chat","api_key":"sk-..."}'
+  -d '{"base_url":"https://api.deepseek.com/v1","model":"deepseek-v4-flash","api_key":"sk-..."}'
+```
+
+The security gateway holds a failover pool of upstreams: on 429 (rate limit) / 402 (quota exhausted) it switches to the next upstream. Add backups via `extra_upstreams` — all keys stay in the gateway Secret only:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/llm-config \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"base_url":"https://api.kimi.com/coding/v1","model":"k3","api_key":"sk-...",
+       "extra_upstreams":[{"base_url":"https://api.deepseek.com/v1","model":"deepseek-v4-flash","api_key":"sk-..."}]}'
 ```
 
 ### ☸️ Existing cluster

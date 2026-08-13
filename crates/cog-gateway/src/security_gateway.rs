@@ -17,6 +17,34 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+/// 单个 LLM 上游：凭证只从环境变量读取（K8s Secret 仅注入本服务），永不转发给沙盒。
+#[derive(Clone)]
+pub struct LlmUpstream {
+    /// 协议面：openai 或 anthropic。
+    pub api_style: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for LlmUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmUpstream")
+            .field("api_style", &self.api_style)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    ""
+                } else {
+                    "[redacted]"
+                },
+            )
+            .finish()
+    }
+}
+
 /// 安全网关配置（全部来自环境变量）。
 #[derive(Debug, Clone)]
 pub struct SecurityGatewayConfig {
@@ -25,10 +53,9 @@ pub struct SecurityGatewayConfig {
     /// 域名白名单；空 = 不限制（仅黑名单生效）。
     pub domain_allowlist: Vec<String>,
     pub domain_denylist: Vec<String>,
-    pub llm_provider: String,
-    pub llm_base_url: String,
-    pub llm_model: String,
-    pub llm_api_key: String,
+    /// LLM 上游池：按声明顺序故障转移（429 限流 / 402 额度耗尽 / 连接失败
+    /// 切下一个）。空 = 未配置，LLM 通道一律 503。
+    pub llm_upstreams: Vec<LlmUpstream>,
 }
 
 impl SecurityGatewayConfig {
@@ -41,35 +68,106 @@ impl SecurityGatewayConfig {
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
         };
-        let api_key = std::env::var("LLM_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .unwrap_or_default();
-        // provider 未显式配置时按 key 前缀推断：sk-ant- → anthropic，其余默认 openai。
-        let provider = std::env::var("COGNEVA_LLM_PROVIDER").unwrap_or_else(|_| {
-            if api_key.starts_with("sk-ant-") {
-                "anthropic".into()
-            } else {
-                "openai".into()
-            }
-        });
-        let default_base = if provider == "anthropic" {
-            "https://api.anthropic.com"
-        } else {
-            "https://api.openai.com/v1"
-        };
         Self {
             egress_port: env_u16("COGNEVA_SG_EGRESS_PORT", 8080),
             llm_port: env_u16("COGNEVA_SG_LLM_PORT", 8081),
             domain_allowlist: list("COGNEVA_SG_DOMAIN_ALLOWLIST"),
             domain_denylist: list("COGNEVA_SG_DOMAIN_DENYLIST"),
-            llm_provider: provider,
-            llm_base_url: std::env::var("COGNEVA_LLM_BASE_URL")
-                .unwrap_or_else(|_| default_base.into()),
-            llm_model: std::env::var("COGNEVA_LLM_MODEL").unwrap_or_default(),
-            llm_api_key: api_key,
+            llm_upstreams: upstreams_from_env(),
         }
     }
+}
+
+/// 上游池来源优先级：COGNEVA_LLM_UPSTREAMS（JSON 数组，多上游，由
+/// llm-config 管理接口写入 Secret）→ 旧版单上游 env 组合（LLM_API_KEY +
+/// COGNEVA_LLM_PROVIDER/BASE_URL/MODEL，手工部署与滚动升级过渡期兼容）。
+fn upstreams_from_env() -> Vec<LlmUpstream> {
+    if let Ok(raw) = std::env::var("COGNEVA_LLM_UPSTREAMS") {
+        let parsed = parse_upstreams(&raw);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    legacy_upstream().into_iter().collect()
+}
+
+/// 解析上游池 JSON：字段缺失/为空的条目丢弃，整体不是合法 JSON 数组时
+/// 返回空（调用方回退旧版单上游）。
+fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
+    let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
+        tracing::warn!("COGNEVA_LLM_UPSTREAMS 不是合法 JSON 数组，回退单上游 env");
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|v| {
+            let get = |k: &str| {
+                v.get(k)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            let upstream = LlmUpstream {
+                api_style: normalize_style(&get("api_style")),
+                base_url: get("base_url"),
+                model: get("model"),
+                api_key: get("api_key"),
+            };
+            if upstream.base_url.is_empty()
+                || upstream.model.is_empty()
+                || upstream.api_key.is_empty()
+            {
+                tracing::warn!(base_url = %upstream.base_url, "上游条目字段不全，已丢弃");
+                return None;
+            }
+            Some(upstream)
+        })
+        .collect()
+}
+
+fn normalize_style(raw: &str) -> String {
+    if raw == "anthropic" {
+        "anthropic".into()
+    } else {
+        "openai".into()
+    }
+}
+
+/// 旧版单上游 env：provider 未显式配置时按 key 前缀推断（sk-ant- → anthropic，
+/// 其余默认 openai）。key 或 model 缺失视为未配置。
+fn legacy_upstream() -> Option<LlmUpstream> {
+    let api_key = std::env::var("LLM_API_KEY")
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+        .unwrap_or_default();
+    let api_style = normalize_style(&std::env::var("COGNEVA_LLM_PROVIDER").unwrap_or_else(|_| {
+        if api_key.starts_with("sk-ant-") {
+            "anthropic".into()
+        } else {
+            "openai".into()
+        }
+    }));
+    let default_base = if api_style == "anthropic" {
+        "https://api.anthropic.com"
+    } else {
+        "https://api.openai.com/v1"
+    };
+    let base_url = std::env::var("COGNEVA_LLM_BASE_URL").unwrap_or_else(|_| default_base.into());
+    let model = std::env::var("COGNEVA_LLM_MODEL").unwrap_or_default();
+    if api_key.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some(LlmUpstream {
+        api_style,
+        base_url,
+        model,
+        api_key,
+    })
+}
+
+/// 429（限流）/ 402（额度耗尽）判定为可转移：池内还有上游就切下一个。
+fn retryable_status(status: u16) -> bool {
+    status == 429 || status == 402
 }
 
 fn env_u16(key: &str, default: u16) -> u16 {
@@ -357,17 +455,7 @@ async fn chat_completions_passthrough(
     State(state): State<AppState>,
     req: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    if state.config.llm_provider != "openai" {
-        return Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "passthrough only supports openai-style upstreams".into(),
-        ));
-    }
-    let url = format!(
-        "{}/chat/completions",
-        state.config.llm_base_url.trim_end_matches('/')
-    );
-    stream_forward(state, req, &url, AuthStyle::Bearer).await
+    stream_forward(state, req, "openai").await
 }
 
 /// Anthropic 透传端点：与 OpenAI 透传对称，转发 `/v1/messages`，
@@ -376,102 +464,150 @@ async fn anthropic_messages_passthrough(
     State(state): State<AppState>,
     req: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    if state.config.llm_provider != "anthropic" {
-        return Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "passthrough only supports anthropic upstreams".into(),
-        ));
-    }
-    let url = format!(
-        "{}/v1/messages",
-        state.config.llm_base_url.trim_end_matches('/')
-    );
-    stream_forward(state, req, &url, AuthStyle::Anthropic).await
-}
-
-enum AuthStyle {
-    Bearer,
-    Anthropic,
+    stream_forward(state, req, "anthropic").await
 }
 
 /// 透传共用实现：只取请求 body 重建出站请求（入站 Authorization 天然丢弃），
 /// 由网关代持注入真凭证，逐字节流式回传。
-/// body 里的 model 一律改写为网关上游配置的模型：主应用/沙盒零凭证同时也
-/// 零上游知识，真实模型名只有网关知道（WebUI 向导或引导器 env 预置写入），
+/// body 里的 model 一律改写为当前上游配置的模型：主应用/沙盒零凭证同时也
+/// 零上游知识，真实模型名只有网关知道（WebUI 向导或管理 API 写入），
 /// 调用方配置里的 model 只是占位。
+/// 多上游故障转移：只在"还没开始回流的阶段"切换——连接失败或上游在
+/// 首字节前返回 429/402 时切下一个同协议面上游；一旦开始流式回传就不再
+/// 切换（字节已发给调用方，无法换人）。
 async fn stream_forward(
     state: AppState,
     req: axum::extract::Request,
-    url: &str,
-    auth: AuthStyle,
+    style: &str,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    if state.config.llm_api_key.is_empty() || state.config.llm_model.is_empty() {
+    if state.config.llm_upstreams.is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "网关未配置 LLM（缺 API Key 或模型）".into(),
+            "网关未配置 LLM 上游".into(),
+        ));
+    }
+    let candidates: Vec<&LlmUpstream> = state
+        .config
+        .llm_upstreams
+        .iter()
+        .filter(|u| u.api_style == style)
+        .collect();
+    if candidates.is_empty() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            format!("passthrough has no {style}-style upstream configured"),
         ));
     }
     let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let body = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(mut v) => {
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert(
-                    "model".into(),
-                    serde_json::Value::String(state.config.llm_model.clone()),
-                );
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+
+    let mut last_err = String::new();
+    for upstream in candidates {
+        let base = upstream.base_url.trim_end_matches('/');
+        let url = match style {
+            "anthropic" => format!("{base}/v1/messages"),
+            _ => format!("{base}/chat/completions"),
+        };
+        let body = match &parsed {
+            Some(v) => {
+                let mut v = v.clone();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "model".into(),
+                        serde_json::Value::String(upstream.model.clone()),
+                    );
+                }
+                serde_json::to_vec(&v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
             }
-            serde_json::to_vec(&v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+            None => body.to_vec(),
+        };
+
+        let start = std::time::Instant::now();
+        let builder = state
+            .stream_client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body);
+        let builder = match upstream.api_style.as_str() {
+            "anthropic" => builder
+                .header("x-api-key", &upstream.api_key)
+                .header("anthropic-version", "2023-06-01"),
+            _ => builder.bearer_auth(&upstream.api_key),
+        };
+        let resp = match builder.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                last_err = format!("连接上游 {base} 失败: {e}");
+                continue;
+            }
+        };
+        if retryable_status(resp.status().as_u16()) {
+            last_err = format!("上游 {base} 返回 HTTP {}", resp.status());
+            continue;
         }
-        Err(_) => body.to_vec(),
-    };
+        state.llm_stats.record(start.elapsed().as_millis() as u64);
 
-    let start = std::time::Instant::now();
-    let builder = state
-        .stream_client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .body(body);
-    let builder = match auth {
-        AuthStyle::Bearer => builder.bearer_auth(&state.config.llm_api_key),
-        AuthStyle::Anthropic => builder
-            .header("x-api-key", &state.config.llm_api_key)
-            .header("anthropic-version", "2023-06-01"),
-    };
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    state.llm_stats.record(start.elapsed().as_millis() as u64);
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        let stream = resp.bytes_stream();
+        return Ok(axum::response::Response::builder()
+            .status(status)
+            .header("content-type", content_type)
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
+    }
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("全部 {style} 协议面上游均不可用，最后错误：{last_err}"),
+    ))
+}
 
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let stream = resp.bytes_stream();
-    Ok(axum::response::Response::builder()
-        .status(status)
-        .header("content-type", content_type)
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
+/// 单上游调用失败的归类：可转移（429/402/连接失败，切下一个上游）与
+/// 终态（鉴权失败、参数错误等，换上游也大概率一样错，直接返回）。
+enum UpstreamFail {
+    Retryable(String),
+    Fatal(String),
 }
 
 async fn call_llm(
     state: &AppState,
     messages: Vec<ChatMessage>,
 ) -> Result<Json<LlmResponse>, (StatusCode, String)> {
-    if state.config.llm_api_key.is_empty() || state.config.llm_model.is_empty() {
+    if state.config.llm_upstreams.is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "网关未配置 LLM（缺 API Key 或模型）".into(),
+            "网关未配置 LLM 上游".into(),
         ));
     }
-    let base = state.config.llm_base_url.trim_end_matches('/');
-    if state.config.llm_provider == "anthropic" {
+    let mut last_err = String::new();
+    for upstream in &state.config.llm_upstreams {
+        match call_one_upstream(state, upstream, &messages).await {
+            Ok(resp) => return Ok(resp),
+            Err(UpstreamFail::Retryable(msg)) => last_err = msg,
+            Err(UpstreamFail::Fatal(msg)) => return Err((StatusCode::BAD_GATEWAY, msg)),
+        }
+    }
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("全部 LLM 上游均不可用，最后错误：{last_err}"),
+    ))
+}
+
+async fn call_one_upstream(
+    state: &AppState,
+    upstream: &LlmUpstream,
+    messages: &[ChatMessage],
+) -> Result<Json<LlmResponse>, UpstreamFail> {
+    let base = upstream.base_url.trim_end_matches('/');
+    if upstream.api_style == "anthropic" {
         let (system, msgs): (String, Vec<&ChatMessage>) = {
             let sys = messages
                 .iter()
@@ -487,65 +623,71 @@ async fn call_llm(
         let resp = state
             .client
             .post(format!("{base}/v1/messages"))
-            .header("x-api-key", &state.config.llm_api_key)
+            .header("x-api-key", &upstream.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&serde_json::json!({
-                "model": state.config.llm_model,
+                "model": upstream.model,
                 "max_tokens": 4096,
                 "system": system,
                 "messages": msgs.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
             }))
             .send()
             .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!("LLM HTTP {}", resp.status()),
-            ));
+            .map_err(|e| UpstreamFail::Retryable(format!("连接上游 {base} 失败: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let msg = format!("上游 {base} 返回 HTTP {status}");
+            return Err(if retryable_status(status.as_u16()) {
+                UpstreamFail::Retryable(msg)
+            } else {
+                UpstreamFail::Fatal(msg)
+            });
         }
         let v: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            .map_err(|e| UpstreamFail::Fatal(e.to_string()))?;
         let content = v["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
             .to_string();
         return Ok(Json(LlmResponse {
             content,
-            model: state.config.llm_model.clone(),
+            model: upstream.model.clone(),
         }));
     }
 
     let resp = state
         .client
         .post(format!("{base}/chat/completions"))
-        .bearer_auth(&state.config.llm_api_key)
+        .bearer_auth(&upstream.api_key)
         .json(&serde_json::json!({
-            "model": state.config.llm_model,
+            "model": upstream.model,
             "messages": messages,
         }))
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("LLM HTTP {}", resp.status()),
-        ));
+        .map_err(|e| UpstreamFail::Retryable(format!("连接上游 {base} 失败: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let msg = format!("上游 {base} 返回 HTTP {status}");
+        return Err(if retryable_status(status.as_u16()) {
+            UpstreamFail::Retryable(msg)
+        } else {
+            UpstreamFail::Fatal(msg)
+        });
     }
     let v: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        .map_err(|e| UpstreamFail::Fatal(e.to_string()))?;
     let content = v["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default()
         .to_string();
     Ok(Json(LlmResponse {
         content,
-        model: state.config.llm_model.clone(),
+        model: upstream.model.clone(),
     }))
 }
 
@@ -643,11 +785,50 @@ mod tests {
             llm_port: 8081,
             domain_allowlist: allow.iter().map(|s| s.to_string()).collect(),
             domain_denylist: deny.iter().map(|s| s.to_string()).collect(),
-            llm_provider: "openai".into(),
-            llm_base_url: "https://api.openai.com/v1".into(),
-            llm_model: "test-model".into(),
-            llm_api_key: String::new(),
+            llm_upstreams: Vec::new(),
         }
+    }
+
+    #[test]
+    fn upstreams_json_parsed() {
+        let list = parse_upstreams(
+            r#"[
+                {"api_style": "anthropic", "base_url": "https://a.example.com", "model": "m1", "api_key": "k1"},
+                {"base_url": "https://b.example.com", "model": "m2", "api_key": "k2"}
+            ]"#,
+        );
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].api_style, "anthropic");
+        assert_eq!(list[0].model, "m1");
+        assert_eq!(list[1].api_style, "openai");
+    }
+
+    #[test]
+    fn upstreams_incomplete_entries_dropped() {
+        let list = parse_upstreams(
+            r#"[
+                {"base_url": "https://a.example.com", "model": "m1", "api_key": ""},
+                {"base_url": "https://b.example.com", "model": "", "api_key": "k2"},
+                {"base_url": "https://c.example.com", "model": "m3", "api_key": "k3"}
+            ]"#,
+        );
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].base_url, "https://c.example.com");
+    }
+
+    #[test]
+    fn upstreams_malformed_json_falls_back() {
+        assert!(parse_upstreams("not json").is_empty());
+        assert!(parse_upstreams("").is_empty());
+        assert!(parse_upstreams(r#"{"not": "an array"}"#).is_empty());
+    }
+
+    #[test]
+    fn retryable_status_only_429_402() {
+        assert!(retryable_status(429));
+        assert!(retryable_status(402));
+        assert!(!retryable_status(401));
+        assert!(!retryable_status(500));
     }
 
     #[test]

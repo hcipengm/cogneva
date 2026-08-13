@@ -570,7 +570,16 @@ TOKEN=$(curl -sX POST http://localhost:8080/api/v1/auth/login \
   -d '{"username":"ci","password":"ci"}' | jq -r .access_token)
 curl -X POST http://localhost:8080/api/v1/admin/llm-config \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://api.deepseek.com/v1","model":"deepseek-chat","api_key":"sk-..."}'
+  -d '{"base_url":"https://api.deepseek.com/v1","model":"deepseek-v4-flash","api_key":"sk-..."}'
+```
+
+安全网关持有上游故障转移池：主上游 429（限流）/ 402（额度耗尽）时自动切下一个上游。通过 `extra_upstreams` 追加备用上游——所有 key 只落在网关 Secret：
+
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/llm-config \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"base_url":"https://api.kimi.com/coding/v1","model":"k3","api_key":"sk-...",
+       "extra_upstreams":[{"base_url":"https://api.deepseek.com/v1","model":"deepseek-v4-flash","api_key":"sk-..."}]}'
 ```
 
 ### ☸️ 已有集群

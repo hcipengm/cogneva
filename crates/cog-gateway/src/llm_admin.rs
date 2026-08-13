@@ -1,12 +1,13 @@
 //! Admin API for LLM provider configuration.
 //!
 //! The WebUI setup wizard uses these endpoints to connect the system to an
-//! LLM after installation. Saving writes the API key into the
-//! `cogneva-secrets` Secret and points the security gateway's upstream env
-//! (`COGNEVA_LLM_PROVIDER/BASE_URL/MODEL`) at the chosen provider. Only the
-//! gateway holds credentials; the main app and sandbox talk to the gateway,
-//! so the deployment env patch (which rolls the gateway) is the only restart
-//! needed.
+//! LLM after installation. Saving writes the upstream pool (primary plus
+//! optional failover upstreams) into the `cogneva-secrets` Secret as the
+//! `llm-upstreams` JSON entry and points the security gateway's legacy
+//! single-upstream env at the primary. Only the gateway holds credentials;
+//! the main app and sandbox talk to the gateway, so the deployment env
+//! patch (which rolls the gateway) is the only restart needed. The gateway
+//! fails over across the pool on 429 (rate limit) / 402 (quota exhausted).
 
 use axum::{
     extract::State,
@@ -22,8 +23,20 @@ const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 const API_BASE: &str = "https://kubernetes.default.svc";
 const SECRET_NAME: &str = "cogneva-secrets";
 const SECRET_KEY: &str = "llm-api-key";
+/// 多上游池条目：JSON 数组，每元素 {api_style, base_url, model, api_key}。
+const SECRET_UPSTREAMS_KEY: &str = "llm-upstreams";
 const GATEWAY_DEPLOYMENT: &str = "cogneva-security-gateway";
 const GATEWAY_CONTAINER: &str = "security-gateway";
+
+#[derive(Debug, Deserialize)]
+pub struct LlmUpstreamRequest {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    /// 协议面首猜（openai/anthropic）：探测按此顺序优先，失败自动换另一种。
+    pub api_style: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LlmConfigRequest {
     /// 可选，仅作展示；网关按协议面路由，不消费该字段。
@@ -35,6 +48,8 @@ pub struct LlmConfigRequest {
     pub api_style: Option<String>,
     /// 探测失败后的"仍然保存"：跳过连通验证直接落库。
     pub skip_verify: Option<bool>,
+    /// 追加的故障转移上游：主上游 429/402 时按声明顺序顶上。
+    pub extra_upstreams: Option<Vec<LlmUpstreamRequest>>,
 }
 
 /// GET /api/v1/admin/llm-status — whether the security gateway holds a
@@ -106,50 +121,24 @@ pub async fn llm_config_handler(
     State(_state): State<Arc<crate::GatewayState>>,
     Json(req): Json<LlmConfigRequest>,
 ) -> Response {
-    let base_url = req.base_url.trim();
-    let model = req.model.trim();
-    let api_key = req.api_key.trim();
-    let style_hint = req
-        .api_style
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    if model.is_empty() || api_key.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_request", "message": "model、api_key 不能为空"})),
-        )
-            .into_response();
-    }
-    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_request", "message": "base_url 必须是 http(s):// 开头的完整地址"})),
-        )
-            .into_response();
-    }
-
-    // 双协议实证探测：按首猜顺序先试，失败自动换另一种协议面，
-    // 胜出者即为写入网关的 api_style（Kimi 这类 base_url 看不出协议的
-    // 端点也能当场测出来）。skip_verify 时采信首猜，缺省 openai。
-    let api_style = if req.skip_verify.unwrap_or(false) {
-        match style_hint {
-            Some("anthropic") => "anthropic",
-            _ => "openai",
-        }
-    } else {
-        match detect_api_style(base_url, model, api_key, style_hint).await {
-            Ok(style) => style,
-            Err(message) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": "llm_verify_failed", "message": message})),
-                )
-                    .into_response();
-            }
-        }
+    let skip_verify = req.skip_verify.unwrap_or(false);
+    let primary = LlmUpstreamRequest {
+        base_url: req.base_url.clone(),
+        model: req.model.clone(),
+        api_key: req.api_key.clone(),
+        api_style: req.api_style.clone(),
     };
+    let mut requests = vec![primary];
+    requests.extend(req.extra_upstreams.unwrap_or_default());
+
+    // 逐条校验 + 实证探测：任一上游验证失败则整单拒绝，避免落下半残池。
+    let mut pool: Vec<serde_json::Value> = Vec::with_capacity(requests.len());
+    for item in &requests {
+        match resolve_upstream(item, skip_verify).await {
+            Ok(entry) => pool.push(entry),
+            Err(resp) => return resp,
+        }
+    }
 
     let kube = match KubeClient::in_cluster() {
         Ok(k) => k,
@@ -162,13 +151,29 @@ pub async fn llm_config_handler(
         }
     };
 
+    let pool_json = match serde_json::to_string(&pool) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "serialize_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
     if let Err(e) = kube
         .patch(
             &format!(
                 "/api/v1/namespaces/{}/secrets/{}",
                 kube.namespace, SECRET_NAME
             ),
-            json!({"stringData": {SECRET_KEY: api_key}}),
+            json!({"stringData": {
+                SECRET_UPSTREAMS_KEY: pool_json,
+                // 旧版单上游条目继续写主上游 key：滚动升级窗口内旧代码 Pod
+                // 与 llm-status 的 configured 判定都靠它。
+                SECRET_KEY: req.api_key.trim(),
+            }}),
         )
         .await
     {
@@ -179,8 +184,9 @@ pub async fn llm_config_handler(
             .into_response();
     }
 
+    let primary_style = pool[0]["api_style"].as_str().unwrap_or("openai");
     if let Err(e) = kube
-        .update_gateway_upstream(base_url, model, api_style)
+        .update_gateway_upstream(req.base_url.trim(), req.model.trim(), primary_style)
         .await
     {
         return (
@@ -190,16 +196,77 @@ pub async fn llm_config_handler(
             .into_response();
     }
 
-    // 部署 env 变更本身触发网关滚动重启，无需额外 restartedAt 注解。
+    // restartedAt 注解保证网关滚动重启，新代码 Pod 启动时从 Secret 读
+    // COGNEVA_LLM_UPSTREAMS 拿到完整上游池。
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "restarted": [GATEWAY_DEPLOYMENT],
+            "upstreams": pool.len(),
             "message": "配置已保存，安全网关正在滚动重启，约一分钟后生效",
         })),
     )
         .into_response()
+}
+
+/// 校验单条上游并定协议面：返回可写入池的 JSON 条目；验证失败返回
+/// 直接可回给前端的错误响应。
+async fn resolve_upstream(
+    item: &LlmUpstreamRequest,
+    skip_verify: bool,
+) -> Result<serde_json::Value, Response> {
+    let base_url = item.base_url.trim();
+    let model = item.model.trim();
+    let api_key = item.api_key.trim();
+    let style_hint = item
+        .api_style
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if model.is_empty() || api_key.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_request", "message": "model、api_key 不能为空"})),
+        )
+            .into_response());
+    }
+    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_request", "message": "base_url 必须是 http(s):// 开头的完整地址"})),
+        )
+            .into_response());
+    }
+
+    // 双协议实证探测：按首猜顺序先试，失败自动换另一种协议面，
+    // 胜出者即为写入网关的 api_style（Kimi 这类 base_url 看不出协议的
+    // 端点也能当场测出来）。skip_verify 时采信首猜，缺省 openai。
+    let api_style = if skip_verify {
+        match style_hint {
+            Some("anthropic") => "anthropic",
+            _ => "openai",
+        }
+    } else {
+        match detect_api_style(base_url, model, api_key, style_hint).await {
+            Ok(style) => style,
+            Err(message) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "llm_verify_failed", "message": message})),
+                )
+                    .into_response());
+            }
+        }
+    };
+
+    Ok(json!({
+        "api_style": api_style,
+        "base_url": base_url,
+        "model": model,
+        "api_key": api_key,
+    }))
 }
 
 /// 保存前用用户手填的真 key 做实证协议探测（每种协议超时 8 秒）：
@@ -325,10 +392,9 @@ impl KubeClient {
         Ok(())
     }
 
-    /// Rewrite `llm_routing.backends[0]` inside the cogneva.json ConfigMap,
-    /// keeping the `${KIMI_API_KEY}` placeholder (the key itself lives in the
-    /// Secret and is injected via env).
     /// 真 key 是否已写入集群 Secret（网关凭证的唯一事实源）。
+    /// 新版多上游条目 `llm-upstreams` 与旧版单上游条目 `llm-api-key`
+    /// 任一存在即视为已配置。
     async fn secret_has_key(&self) -> Result<bool, String> {
         let resp = self
             .http
@@ -347,39 +413,50 @@ impl KubeClient {
             .json()
             .await
             .map_err(|e| format!("secret 响应解析失败: {e}"))?;
-        let has = secret
-            .get("data")
-            .and_then(|d| d.get(SECRET_KEY))
-            .and_then(|v| v.as_str())
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+        let has = [SECRET_UPSTREAMS_KEY, SECRET_KEY].iter().any(|k| {
+            secret
+                .get("data")
+                .and_then(|d| d.get(k))
+                .and_then(|v| v.as_str())
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        });
         Ok(has)
     }
 
-    /// 把实证探测胜出的上游写入安全网关 Deployment 的 env（strategic
-    /// merge：containers 按 name 合并、env 按 name 合并），模板变更自动
-    /// 触发网关滚动重启。网关只区分 openai/anthropic 两种协议面。
+    /// 把主上游写入安全网关 Deployment 的旧版单上游 env（strategic merge：
+    /// containers 按 name 合并、env 按 name 合并）。这层 env 对运行新代码的
+    /// 网关是惰性兜底（COGNEVA_LLM_UPSTREAMS 优先）；restartedAt 注解保证
+    /// 即使主上游三元组没变（比如只增删了故障转移上游）也必定滚动重启，
+    /// 让新 Pod 读取新 Secret 里的上游池。
     async fn update_gateway_upstream(
         &self,
         base_url: &str,
         model: &str,
         api_style: &str,
     ) -> Result<(), String> {
+        let restarted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
         self.patch(
             &format!(
                 "/apis/apps/v1/namespaces/{}/deployments/{}",
                 self.namespace, GATEWAY_DEPLOYMENT
             ),
             json!({
-                "spec": {"template": {"spec": {"containers": [{
-                    "name": GATEWAY_CONTAINER,
-                    "env": [
-                        {"name": "COGNEVA_LLM_PROVIDER", "value": api_style},
-                        {"name": "COGNEVA_LLM_BASE_URL", "value": base_url},
-                        {"name": "COGNEVA_LLM_MODEL", "value": model},
-                    ],
-                }]}}}}
-            ),
+                "spec": {"template": {
+                    "metadata": {"annotations": {"cogneva.io/restartedAt": restarted_at}},
+                    "spec": {"containers": [{
+                        "name": GATEWAY_CONTAINER,
+                        "env": [
+                            {"name": "COGNEVA_LLM_PROVIDER", "value": api_style},
+                            {"name": "COGNEVA_LLM_BASE_URL", "value": base_url},
+                            {"name": "COGNEVA_LLM_MODEL", "value": model},
+                        ],
+                    }]},
+                }}
+            }),
         )
         .await
     }
