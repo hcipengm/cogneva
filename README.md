@@ -19,7 +19,7 @@
 
 ---
 
-Cogneva (pronounced /kɒɡˈneɪvə/), from **Cognition** + **Emerge** + **Nova**, is a **distributed AI multi-agent autonomous system** written in Rust.
+Cogneva (pronounced /kɒɡˈneɪvə/), from **Cognition** + **Emerge** + **Nova**, is a **distributed AI multi-agent autonomous system**.
 
 These three are not isolated features, but three consecutive stages of the same cognitive infrastructure:
 
