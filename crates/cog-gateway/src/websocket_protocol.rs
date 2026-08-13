@@ -343,6 +343,8 @@ impl ConnectionManager {
     /// Check whether an event should be delivered to a given connection
     /// based on its subscribed channels. If the connection has no subscriptions,
     /// all events are delivered (backward-compatible behaviour).
+    /// A subscription ending in `*` matches by prefix (e.g. `agent:*` receives
+    /// every `agent:<id>` channel).
     pub async fn should_deliver(&self, connection_id: &str, event_channels: &[String]) -> bool {
         let conns = self.connections.read().await;
         let Some(conn) = conns.get(connection_id) else {
@@ -351,9 +353,14 @@ impl ConnectionManager {
         if conn.subscribed_channels.is_empty() {
             return true;
         }
-        event_channels
-            .iter()
-            .any(|ch| conn.subscribed_channels.contains(ch))
+        event_channels.iter().any(|ch| {
+            conn.subscribed_channels.iter().any(|sub| {
+                sub == ch
+                    || sub
+                        .strip_suffix('*')
+                        .is_some_and(|prefix| ch.starts_with(prefix))
+            })
+        })
     }
 }
 
@@ -390,5 +397,36 @@ pub fn event_channels(event: &cog_core::AgentEvent) -> Vec<String> {
         | AgentEvent::CheckpointSaved { agent_id, .. } => {
             vec![format!("agent:{}", agent_id)]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wildcard_subscription_matches_prefixed_channels() {
+        let mgr = ConnectionManager::new();
+        mgr.register("c1".into(), "u1".into(), None, None, None).await;
+        mgr.subscribe("c1", &["agent:*".to_string(), "hooks".to_string()])
+            .await;
+
+        assert!(mgr
+            .should_deliver("c1", &["agent:worker-1".to_string()])
+            .await);
+        assert!(mgr.should_deliver("c1", &["hooks".to_string()]).await);
+        assert!(!mgr
+            .should_deliver("c1", &["task:t1".to_string()])
+            .await);
+        assert!(!mgr.should_deliver("unknown", &["hooks".to_string()]).await);
+    }
+
+    #[tokio::test]
+    async fn empty_subscription_receives_everything() {
+        let mgr = ConnectionManager::new();
+        mgr.register("c1".into(), "u1".into(), None, None, None).await;
+        assert!(mgr
+            .should_deliver("c1", &["agent:worker-1".to_string()])
+            .await);
     }
 }

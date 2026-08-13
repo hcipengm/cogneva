@@ -1069,24 +1069,11 @@ const I18N = {
                     zh: '在下方发送一条意图，开始实时会话' },
   liveNoToken:    { en: 'Save an admin token above to connect the live stream',
                     zh: '先在上方保存管理员令牌以连接实时流' },
-  thinkingTxt:    { en: 'Analyzing intent and planning tool calls…',
-                    zh: '分析意图并规划工具调用…' },
   topoTitle:      { en: 'CLUSTER TOPOLOGY', zh: '集群拓扑' },
-  pipeTitle:      { en: 'SANDBOX PIPELINE', zh: '沙盒流水线' },
+  pipeTitle:      { en: 'GOAL PIPELINE', zh: '目标流水线' },
+  noActiveGoals:  { en: 'No active goals', zh: '暂无活动目标' },
   nodeGateway:    { en: 'Gateway', zh: '网关' },
   nodeCore:       { en: 'Cogneva Core', zh: 'Cogneva 核心' },
-  nodeAgentA:     { en: 'Agent Alpha', zh: '智能体 Alpha' },
-  nodeAgentB:     { en: 'Agent Beta', zh: '智能体 Beta' },
-  nodeSandbox:    { en: 'Sandbox', zh: '沙盒' },
-  stageBootstrap: { en: 'Bootstrap', zh: '引导' },
-  stageProbe:     { en: 'Environment Probe', zh: '环境探测' },
-  stageDeploy:    { en: 'K3s Deploy', zh: 'K3s 部署' },
-  stageEvolve:    { en: 'Self Evolution', zh: '自进化' },
-  stageHandoff:   { en: 'WebUI Handoff', zh: 'WebUI 交接' },
-  stPending:      { en: 'PENDING', zh: '等待' },
-  stRunning:      { en: 'RUNNING', zh: '运行' },
-  stDone:         { en: 'DONE', zh: '完成' },
-  stError:        { en: 'ERROR', zh: '失败' },
   csOpen:         { en: 'open', zh: '已连接' },
   csConnecting:   { en: 'connecting', zh: '连接中' },
   csClosed:       { en: 'closed', zh: '已断开' },
@@ -1519,63 +1506,63 @@ checkLlmStatus();
     }
   }
 
-  // ── thinking / tool-call painters ──
-  function drawThinking(text, x, y, w) {
-    const h = 42;
-    ctx.save();
-    ctx.fillStyle = 'rgba(30,41,59,.6)';
-    rr(ctx, x, y, w, h, 12);
-    ctx.fill();
-    ctx.restore();
-    const alpha = 0.5 + 0.5 * Math.sin(Date.now() / 1000 * 3);
-    ctx.save();
-    ctx.shadowColor = '#a855f7';
-    ctx.shadowBlur = 8;
-    ctx.fillStyle = 'rgba(168,85,247,' + alpha + ')';
-    ctx.beginPath();
-    ctx.arc(x + 18, y + 21, 4, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-    ctx.fillStyle = '#c084fc';
-    ctx.font = '500 13px Inter, sans-serif';
-    ctx.fillText(text, x + 34, y + 25);
-    return h;
+  // ── real cluster state: /api/v1/processes poll (10s) + live bus events ──
+  // Topology: gateway node = this WS connection, core node = processes
+  // endpoint reachability, agent nodes = supervisor-reported agents, with
+  // state_change events from the bus updating node colors between polls.
+  const liveAgents = new Map();
+  let coreHealthy = false;
+  let liveGoals = [];
+
+  function healthToStatus(h) {
+    return { healthy: 'healthy', suspect: 'running', stuck: 'error', dead: 'error' }[h] || 'idle';
   }
-  const TOOL_COLORS = { pending: '#64748b', running: '#3b82f6', done: '#22c55e', error: '#ef4444' };
-  const TOOL_ICONS = { pending: '⏸', running: '⚙', done: '✓', error: '✕' };
-  function drawToolCard(tool, x, y, w) {
-    const h = 56;
-    ctx.save();
-    ctx.fillStyle = 'rgba(15,23,42,.8)';
-    rr(ctx, x, y, w, h, 12);
-    ctx.fill();
-    rr(ctx, x, y, w, h, 12);
-    ctx.clip();
-    ctx.fillStyle = TOOL_COLORS[tool.status];
-    ctx.fillRect(x, y, 4, h);
-    ctx.restore();
+  function runtimeStateToStatus(s) {
+    if (s === 'error') return 'error';
+    if (s === 'idle' || s === 'complete') return 'idle';
+    return 'running';
+  }
+  function shortLabel(s, n) {
+    s = String(s || '');
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+  }
+  async function pollProcesses() {
+    const token = $('token').value.trim();
+    if (!token) return;
+    try {
+      const r = await fetch('/api/v1/processes', { headers: { Authorization: 'Bearer ' + token } });
+      if (!r.ok) { coreHealthy = false; return; }
+      const data = await r.json();
+      coreHealthy = true;
+      const seen = new Set();
+      (data.agents || []).forEach((a) => {
+        seen.add(a.agent_id);
+        liveAgents.set(a.agent_id, { label: shortLabel(a.role || a.agent_id, 14), status: healthToStatus(a.health) });
+      });
+      for (const id of liveAgents.keys()) if (!seen.has(id)) liveAgents.delete(id);
+      liveGoals = (data.goals || []).slice(0, 5).map((g) => ({
+        label: shortLabel(g.goal_id, 16),
+        status: g.running > 0 ? 'running'
+          : g.failed > 0 ? 'error'
+          : (g.total > 0 && g.completed === g.total) ? 'done' : 'pending',
+        statusText: g.completed + '/' + g.total,
+      }));
+    } catch (e) { coreHealthy = false; }
+  }
 
-    ctx.fillStyle = TOOL_COLORS[tool.status];
-    ctx.font = '16px Inter, sans-serif';
-    ctx.fillText(TOOL_ICONS[tool.status], x + 18, y + 24);
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = '600 13px Inter, sans-serif';
-    ctx.fillText(tool.name, x + 44, y + 24);
-    ctx.fillStyle = TOOL_COLORS[tool.status];
-    ctx.font = '10px Inter, sans-serif';
-    ctx.fillText(tool.status.toUpperCase(), x + 44, y + 42);
-
-    if (tool.status === 'running') {
-      const barX = x + w - 80, barY = y + 34, barW = 60, barH = 4;
-      ctx.fillStyle = 'rgba(100,116,139,.4)';
-      rr(ctx, barX, barY, barW, barH, 2);
-      ctx.fill();
-      const progress = 0.3 + 0.4 * Math.sin(Date.now() / 1000 * 2);
-      ctx.fillStyle = TOOL_COLORS.running;
-      rr(ctx, barX, barY, barW * progress, barH, 2);
-      ctx.fill();
+  function buildTopology() {
+    const nodes = [
+      { id: 'gateway', label: t('nodeGateway'), x: 140, y: 60, status: connectionStatus === 'open' ? 'healthy' : 'error', type: 'gateway' },
+      { id: 'core', label: t('nodeCore'), x: 140, y: 120, status: coreHealthy ? 'running' : 'idle', type: 'core' },
+    ];
+    const edges = [{ from: 'gateway', to: 'core', active: connectionStatus === 'open' }];
+    let i = 0;
+    for (const [id, a] of liveAgents) {
+      nodes.push({ id, label: a.label, x: 70 + (i % 2) * 130, y: 185 + Math.floor(i / 2) * 48, status: a.status, type: 'agent' });
+      edges.push({ from: 'core', to: id, active: a.status === 'running' });
+      i++;
     }
-    return h;
+    return { nodes, edges, height: Math.max(230, 215 + Math.ceil(i / 2) * 48) };
   }
 
   // ── topology / pipeline panels (demo data, same as the React renderer) ──
@@ -1631,9 +1618,10 @@ checkLlmStatus();
   }
   const STAGE_COLORS = { pending: '#64748b', running: '#3b82f6', done: '#22c55e', error: '#ef4444' };
   function drawPipeline(stages, px, py, pw) {
+    const rows = Math.max(stages.length, 1);
     ctx.save();
     ctx.fillStyle = 'rgba(15,23,42,.6)';
-    rr(ctx, px, py, pw, 44 + stages.length * 42, 16);
+    rr(ctx, px, py, pw, 44 + rows * 42, 16);
     ctx.fill();
     ctx.strokeStyle = 'rgba(148,163,184,.15)';
     ctx.lineWidth = 1;
@@ -1645,6 +1633,12 @@ checkLlmStatus();
     ctx.fillText(t('pipeTitle'), px + 16, py + 24);
 
     const startY = py + 48, lineX = px + 28;
+    if (stages.length === 0) {
+      ctx.fillStyle = 'rgba(148,163,184,.6)';
+      ctx.font = '12px Inter, sans-serif';
+      ctx.fillText(t('noActiveGoals'), lineX + 18, startY + 4);
+      return;
+    }
     stages.forEach((s, i) => {
       const y = startY + i * 42;
       if (i < stages.length - 1) {
@@ -1668,7 +1662,9 @@ checkLlmStatus();
       ctx.fillText(s.label, lineX + 18, y + 4);
       ctx.fillStyle = STAGE_COLORS[s.status];
       ctx.font = '10px Inter, sans-serif';
-      ctx.fillText(s.statusText, px + pw - 52, y + 4);
+      ctx.textAlign = 'right';
+      ctx.fillText(s.statusText, px + pw - 16, y + 4);
+      ctx.textAlign = 'left';
     });
   }
 
@@ -1728,20 +1724,9 @@ checkLlmStatus();
       }
       const offY = -this.scrollY;
 
-      let lastAssistantY = 0;
       items.forEach((it) => {
         drawBubble(it.m, it.lay, it.x, it.y + offY);
-        if (it.m.role === 'assistant') lastAssistantY = it.y + offY + it.lay.bh + 12;
       });
-
-      const last = messages[messages.length - 1];
-      if (last && last.role === 'assistant' && last.status === 'streaming' && lastAssistantY > 0) {
-        const cardX = marginX, cardW = Math.min(400, contentW - marginX * 2);
-        let cardY = lastAssistantY;
-        cardY += drawThinking(t('thinkingTxt'), cardX, cardY, cardW);
-        cardY += 10;
-        cardY += drawToolCard({ name: 'health_latency_profiler', status: 'running' }, cardX, cardY, cardW);
-      }
 
       // empty state
       if (messages.length === 0) {
@@ -1753,29 +1738,11 @@ checkLlmStatus();
         ctx.textAlign = 'left';
       }
 
-      // right-side panels
+      // right-side panels — real data: processes poll + bus state_change events
       const px = vw - PANEL_W - PANEL_M, py = 28;
-      drawTopology([
-        { id: 'gateway', label: t('nodeGateway'), x: 140, y: 70, status: 'healthy', type: 'gateway' },
-        { id: 'core', label: t('nodeCore'), x: 80, y: 130, status: 'running', type: 'core' },
-        { id: 'agent1', label: t('nodeAgentA'), x: 180, y: 180, status: 'running', type: 'agent' },
-        { id: 'agent2', label: t('nodeAgentB'), x: 60, y: 220, status: 'idle', type: 'agent' },
-        { id: 'sandbox', label: t('nodeSandbox'), x: 130, y: 270, status: 'healthy', type: 'sandbox' },
-      ], [
-        { from: 'gateway', to: 'core', active: true },
-        { from: 'core', to: 'agent1', active: true },
-        { from: 'core', to: 'agent2', active: false },
-        { from: 'agent1', to: 'sandbox', active: true },
-      ], px, py, PANEL_W, 320);
-
-      const stText = { pending: t('stPending'), running: t('stRunning'), done: t('stDone'), error: t('stError') };
-      drawPipeline([
-        { id: 'bootstrap', label: t('stageBootstrap'), status: 'done' },
-        { id: 'probe', label: t('stageProbe'), status: 'done' },
-        { id: 'deploy', label: t('stageDeploy'), status: 'running' },
-        { id: 'evolve', label: t('stageEvolve'), status: 'pending' },
-        { id: 'handoff', label: t('stageHandoff'), status: 'pending' },
-      ].map((s) => Object.assign({ statusText: stText[s.status] }, s)), px, py + 340, PANEL_W);
+      const topo = buildTopology();
+      drawTopology(topo.nodes, topo.edges, px, py, PANEL_W, topo.height);
+      drawPipeline(liveGoals, px, py + topo.height + 20, PANEL_W);
 
       // connection status dot
       const csColors = { open: '#22c55e', connecting: '#f59e0b', closed: '#64748b', error: '#ef4444' };
@@ -1805,18 +1772,47 @@ checkLlmStatus();
     if (typeof data !== 'string') return;
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
-    if (!['agent_event', 'task_update', 'notification'].includes(msg.type) || !msg.payload) return;
-    const p = msg.payload;
-    const inner = p.payload || p;
-    switch (p.type) {
-      case 'message.start':
-        if (inner.message_id) startMessage(inner.message_id, inner.role || 'assistant');
+    // Connection-level envelopes (chat stream, notifications).
+    if (['agent_event', 'task_update', 'notification'].includes(msg.type) && msg.payload) {
+      const p = msg.payload;
+      const inner = p.payload || p;
+      switch (p.type) {
+        case 'message.start':
+          if (inner.message_id) startMessage(inner.message_id, inner.role || 'assistant');
+          break;
+        case 'message.text_delta':
+          if (inner.message_id) appendDelta(inner.message_id, inner.delta || '');
+          break;
+        case 'message.end':
+          if (inner.message_id) endMessage(inner.message_id);
+          break;
+        default:
+          break;
+      }
+      return;
+    }
+    // Raw AgentEvent forwarded from the bus on agent:<id> channels.
+    switch (msg.type) {
+      case 'state_change':
+        if (msg.agent_id) {
+          const cur = liveAgents.get(msg.agent_id);
+          liveAgents.set(msg.agent_id, {
+            label: (cur && cur.label) || shortLabel(msg.agent_id, 14),
+            status: runtimeStateToStatus(msg.to),
+          });
+        }
         break;
-      case 'message.text_delta':
-        if (inner.message_id) appendDelta(inner.message_id, inner.delta || '');
+      case 'agent_start':
+        if (msg.agent_id && !liveAgents.has(msg.agent_id)) {
+          liveAgents.set(msg.agent_id, { label: shortLabel(msg.agent_id, 14), status: 'running' });
+        }
         break;
-      case 'message.end':
-        if (inner.message_id) endMessage(inner.message_id);
+      case 'agent_end':
+        if (msg.agent_id && liveAgents.has(msg.agent_id)) liveAgents.get(msg.agent_id).status = 'idle';
+        break;
+      case 'agent_error':
+      case 'resource_alert':
+        if (msg.agent_id && liveAgents.has(msg.agent_id)) liveAgents.get(msg.agent_id).status = 'error';
         break;
       default:
         break;
@@ -1862,7 +1858,7 @@ checkLlmStatus();
     };
     ws.onerror = () => { connectionStatus = 'error'; };
   }
-  window.liveReconnect = () => { reconnectAttempts = 0; liveConnect(); };
+  window.liveReconnect = () => { reconnectAttempts = 0; pollProcesses(); liveConnect(); };
 
   // ── input bar ──
   function liveSend() {
@@ -1907,6 +1903,8 @@ checkLlmStatus();
     renderer.setScroll(renderer.scrollY + e.deltaY);
   }, { passive: false });
 
+  setInterval(() => { if (liveVisible) pollProcesses(); }, 10000);
+  pollProcesses();
   liveConnect();
 })();
 </script>
