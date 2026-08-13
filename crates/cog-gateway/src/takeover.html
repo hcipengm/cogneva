@@ -302,6 +302,34 @@
   }
   .modal .fine { font-size: 11px; color: var(--text-2); margin-top: 4px; }
 
+  /* ── Live canvas dashboard (zero-dependency port of the main UI) ── */
+  .live-stage {
+    position: relative; height: min(72vh, 760px); min-height: 440px;
+    border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+    background: #020617;
+  }
+  .live-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .live-input {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 12px;
+    display: flex; justify-content: center; pointer-events: none;
+  }
+  .live-input .box {
+    pointer-events: auto; display: flex; gap: 8px; width: min(720px, 92%);
+    background: rgba(15, 23, 42, .85); border: 1px solid rgba(100, 116, 139, .5);
+    border-radius: 14px; padding: 6px; backdrop-filter: blur(8px);
+  }
+  .live-input input {
+    flex: 1; background: transparent; border: none; outline: none;
+    color: #fff; padding: 8px 12px; font-size: 14px; font-family: var(--font-ui);
+  }
+  .live-input input::placeholder { color: #64748b; }
+  .live-input button {
+    border: none; border-radius: 10px; padding: 8px 22px; font-size: 13px;
+    font-weight: 500; color: #fff; cursor: pointer;
+    background: linear-gradient(90deg, #2563eb, #4f46e5);
+  }
+  .live-input button:disabled { opacity: .5; cursor: not-allowed; }
+
   @media (max-width: 860px) {
     .sidebar { display: none; }
     .content { margin-left: 0; }
@@ -310,138 +338,159 @@
 </head>
 <body>
 <aside class="sidebar">
-  <div class="brand">
+    <div class="brand">
     <div class="logo"></div>
-    <div class="name">Cogneva<span>Takeover Console</span></div>
+    <div class="name">Cogneva<span data-i18n="brandSub">Takeover Console</span></div>
   </div>
   <nav>
-    <div class="label">Operate</div>
+    <div class="label" data-i18n="navOperate">Operate</div>
+    <a data-target="sec-live">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="1.8" fill="currentColor" stroke="none"/></svg>
+      <span data-i18n="navLive">Live</span>
+    </a>
     <a class="active" data-target="sec-pipeline">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4h12M2 8h8M2 12h10"/></svg>
-      Patch Pipeline
+      <span data-i18n="navPipeline">Patch Pipeline</span>
     </a>
     <a data-target="sec-process">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 2"/></svg>
-      Process
+      <span data-i18n="navProcess">Process</span>
     </a>
     <a data-target="sec-promotions">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13l4-6 4 3 4-8"/></svg>
-      Promotions
+      <span data-i18n="navPromotions">Promotions</span>
     </a>
     <a data-target="sec-events">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 2v12M2 8h12"/></svg>
-      Evolution Events
+      <span data-i18n="navEvents">Evolution Events</span>
     </a>
     <a data-target="sec-audit">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="2" width="10" height="12" rx="1.5"/><path d="M6 6h4M6 9h4"/></svg>
-      Audit Trail
+      <span data-i18n="navAudit">Audit Trail</span>
     </a>
     <a data-target="sec-result">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 4l8 8M12 4l-8 8"/></svg>
-      Operation Result
+      <span data-i18n="navResult">Operation Result</span>
     </a>
   </nav>
   <div class="foot">
-    <span id="live" class="live">offline</span>
+    <span id="live" class="live" data-i18n="offline">offline</span>
     <div class="hints">
-      <div><span class="kbd">⌘K</span> focus token</div>
-      <div><span class="kbd">R</span> refresh all</div>
+      <div><span class="kbd">⌘K</span> <span data-i18n="hintFocus">focus token</span></div>
+      <div><span class="kbd">R</span> <span data-i18n="hintRefresh">refresh all</span></div>
     </div>
   </div>
 </aside>
 
 <div class="content">
   <div class="topbar">
-    <h1>Patch Pipeline</h1>
-    <span class="sub">Bootstrap has exited — this console operates the self-evolution system</span>
+    <h1 data-i18n="navPipeline">Patch Pipeline</h1>
+    <span class="sub" data-i18n="topSub">Bootstrap has exited — this console operates the self-evolution system</span>
     <span style="flex:1"></span>
-    <input id="token" type="password" placeholder="Admin Bearer Token" />
-    <button id="saveToken" class="ghost">Save Token</button>
+    <input id="token" type="password" data-i18n-ph="tokenPh" placeholder="Admin Bearer Token" />
+    <button id="saveToken" class="ghost" data-i18n="saveToken">Save Token</button>
+    <button id="langToggle" class="ghost">中文</button>
     <button id="llmBtn" class="ghost">LLM</button>
-    <span id="promoBadge" class="pill">auto-promo …</span>
+    <span id="promoBadge" class="pill" data-i18n="promoInit">auto-promo …</span>
     <button id="promoToggle" class="ghost">…</button>
-    <button id="refresh">Refresh</button>
+    <button id="refresh" data-i18n="refresh">Refresh</button>
   </div>
 
   <main>
+    <section id="sec-live">
+      <h2>
+        <span data-i18n="navLive">Live</span>
+        <span class="hint" data-i18n="liveHint">agent event stream on canvas · zero-dependency port of the main dashboard</span>
+      </h2>
+      <div class="live-stage" id="liveStage">
+        <canvas id="liveCanvas"></canvas>
+        <div class="live-input">
+          <div class="box">
+            <input id="liveInput" type="text" data-i18n-ph="liveInputPh" placeholder="Type an intent…" autocomplete="off" />
+            <button id="liveSend" data-i18n="sendBtn">Send</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <div class="stats" id="sec-metrics">
-      <div class="stat"><div class="v" id="m-events">–</div><div class="k">Total Events</div></div>
-      <div class="stat bad"><div class="v" id="m-events-failed">–</div><div class="k">Failed Events</div></div>
-      <div class="stat good"><div class="v" id="m-applied">–</div><div class="k">Patches Applied</div></div>
-      <div class="stat bad"><div class="v" id="m-failed">–</div><div class="k">Patches Failed</div></div>
+      <div class="stat"><div class="v" id="m-events">–</div><div class="k" data-i18n="statTotalEvents">Total Events</div></div>
+      <div class="stat bad"><div class="v" id="m-events-failed">–</div><div class="k" data-i18n="statFailedEvents">Failed Events</div></div>
+      <div class="stat good"><div class="v" id="m-applied">–</div><div class="k" data-i18n="statApplied">Patches Applied</div></div>
+      <div class="stat bad"><div class="v" id="m-failed">–</div><div class="k" data-i18n="statFailed">Patches Failed</div></div>
     </div>
 
     <section id="sec-pipeline">
       <h2>
-        Patch Pipeline
-        <span class="hint">click a row for detail · live via SSE, polling resumes if the stream drops</span>
+        <span data-i18n="navPipeline">Patch Pipeline</span>
+        <span class="hint" data-i18n="pipelineHint">click a row for detail · live via SSE, polling resumes if the stream drops</span>
         <span class="spacer"></span>
-        <button class="danger sm" id="rollbackBtn">Roll Back to Previous Version</button>
+        <button class="danger sm" id="rollbackBtn" data-i18n="rollback">Roll Back to Previous Version</button>
       </h2>
       <table>
-        <thead><tr><th></th><th>ID</th><th>Kind</th><th>Status</th><th>Description</th><th>Eval Verdict</th><th>Created</th></tr></thead>
-        <tbody id="patches"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+        <thead><tr><th></th><th>ID</th><th data-i18n="thKind">Kind</th><th data-i18n="thStatus">Status</th><th data-i18n="thDesc">Description</th><th data-i18n="thEval">Eval Verdict</th><th data-i18n="thCreated">Created</th></tr></thead>
+        <tbody id="patches"><tr><td colspan="7" class="muted" data-i18n="loading">Loading…</td></tr></tbody>
       </table>
     </section>
 
     <section id="sec-process">
       <h2>
-        Process
-        <span class="hint">DAG 状态 · Squad 进度 · Agent 负载 · 10s 自动刷新</span>
+        <span data-i18n="navProcess">Process</span>
+        <span class="hint" data-i18n="processHint">DAG status · squad progress · agent load · auto-refresh every 10s</span>
         <span class="spacer"></span>
         <span class="pill" id="procDlq">DLQ …</span>
       </h2>
       <div class="stats" style="margin-bottom:12px">
-        <div class="stat good"><div class="v" id="p-healthy">–</div><div class="k">Healthy</div></div>
-        <div class="stat"><div class="v" id="p-suspect" style="color:var(--warn)">–</div><div class="k">Suspect</div></div>
-        <div class="stat"><div class="v" id="p-stuck" style="color:var(--warn)">–</div><div class="k">Stuck</div></div>
-        <div class="stat bad"><div class="v" id="p-dead">–</div><div class="k">Dead</div></div>
+        <div class="stat good"><div class="v" id="p-healthy">–</div><div class="k" data-i18n="healthy">Healthy</div></div>
+        <div class="stat"><div class="v" id="p-suspect" style="color:var(--warn)">–</div><div class="k" data-i18n="suspect">Suspect</div></div>
+        <div class="stat"><div class="v" id="p-stuck" style="color:var(--warn)">–</div><div class="k" data-i18n="stuck">Stuck</div></div>
+        <div class="stat bad"><div class="v" id="p-dead">–</div><div class="k" data-i18n="dead">Dead</div></div>
       </div>
-      <h2>Goals / DAGs</h2>
+      <h2 data-i18n="goalsTitle">Goals / DAGs</h2>
       <table>
-        <thead><tr><th>Goal</th><th>Progress</th><th>Run</th><th>Pend</th><th>Done</th><th>Fail</th><th>Tasks</th></tr></thead>
-        <tbody id="procGoals"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+        <thead><tr><th data-i18n="thGoal">Goal</th><th data-i18n="thProgress">Progress</th><th data-i18n="thRun">Run</th><th data-i18n="thPend">Pend</th><th data-i18n="thDone">Done</th><th data-i18n="thFail">Fail</th><th data-i18n="thTasks">Tasks</th></tr></thead>
+        <tbody id="procGoals"><tr><td colspan="7" class="muted" data-i18n="loading">Loading…</td></tr></tbody>
       </table>
-      <h2 style="margin-top:14px">Squads / Crews</h2>
+      <h2 style="margin-top:14px" data-i18n="crewsTitle">Squads / Crews</h2>
       <table>
-        <thead><tr><th>Crew</th><th>Progress</th><th>Tasks</th><th>Done</th><th>Fail</th><th>Crew Retries</th><th>Agents</th><th>Updated</th></tr></thead>
-        <tbody id="procCrews"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+        <thead><tr><th data-i18n="thCrew">Crew</th><th data-i18n="thProgress">Progress</th><th data-i18n="thTasks">Tasks</th><th data-i18n="thDone">Done</th><th data-i18n="thFail">Fail</th><th data-i18n="thCrewRetries">Crew Retries</th><th data-i18n="thAgents">Agents</th><th data-i18n="thUpdated">Updated</th></tr></thead>
+        <tbody id="procCrews"><tr><td colspan="8" class="muted" data-i18n="loading">Loading…</td></tr></tbody>
       </table>
-      <h2 style="margin-top:14px">Agents</h2>
+      <h2 style="margin-top:14px" data-i18n="agentsTitle">Agents</h2>
       <table>
-        <thead><tr><th>Agent</th><th>Role</th><th>Health</th><th>Load</th><th>Running</th><th>Capabilities</th><th>Heartbeat</th></tr></thead>
-        <tbody id="procAgents"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+        <thead><tr><th>Agent</th><th data-i18n="thRole">Role</th><th data-i18n="thHealth">Health</th><th data-i18n="thLoad">Load</th><th data-i18n="thRunning">Running</th><th data-i18n="thCapabilities">Capabilities</th><th data-i18n="thHeartbeat">Heartbeat</th></tr></thead>
+        <tbody id="procAgents"><tr><td colspan="7" class="muted" data-i18n="loading">Loading…</td></tr></tbody>
       </table>
     </section>
 
     <section id="sec-promotions">
       <h2>
-        Promotion Ledger
-        <span class="hint">auto-promotion decisions &amp; outcomes · weekly trend aggregated from the ledger</span>
+        <span data-i18n="promoTitle">Promotion Ledger</span>
+        <span class="hint" data-i18n="promoHint">auto-promotion decisions &amp; outcomes · weekly trend aggregated from the ledger</span>
         <span class="spacer"></span>
       </h2>
       <div id="trendAlert" class="promo-alert" style="display:none"></div>
       <div id="trendChart" class="trend-chart"></div>
       <table>
-        <thead><tr><th>Patch</th><th>Level</th><th>Cluster</th><th>Status</th><th>Decision Reason</th><th>Outcome</th><th>Eval</th><th>Time</th></tr></thead>
-        <tbody id="promotions"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+        <thead><tr><th data-i18n="thPatch">Patch</th><th data-i18n="thLevel">Level</th><th data-i18n="thCluster">Cluster</th><th data-i18n="thStatus">Status</th><th data-i18n="thReason">Decision Reason</th><th data-i18n="thOutcome">Outcome</th><th data-i18n="thEval">Eval</th><th data-i18n="thTime">Time</th></tr></thead>
+        <tbody id="promotions"><tr><td colspan="8" class="muted" data-i18n="loading">Loading…</td></tr></tbody>
       </table>
     </section>
 
     <div class="split">
       <section id="sec-events">
-        <h2>Evolution Events</h2>
-        <ul class="events" id="events"><li class="muted">Loading…</li></ul>
+        <h2 data-i18n="navEvents">Evolution Events</h2>
+        <ul class="events" id="events"><li class="muted" data-i18n="loading">Loading…</li></ul>
       </section>
       <section id="sec-audit">
-        <h2>Audit Trail</h2>
-        <ul class="events" id="audit"><li class="muted">Loading…</li></ul>
+        <h2 data-i18n="navAudit">Audit Trail</h2>
+        <ul class="events" id="audit"><li class="muted" data-i18n="loading">Loading…</li></ul>
       </section>
     </div>
 
     <section id="sec-result">
-      <h2>Operation Result</h2>
-      <pre id="output">(none)</pre>
+      <h2 data-i18n="navResult">Operation Result</h2>
+      <pre id="output" data-i18n="nonePre">(none)</pre>
     </section>
   </main>
 </div>
@@ -511,13 +560,13 @@ async function api(path, method = 'GET', body) {
 function show(obj) { $('output').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
 
 function relTime(iso) {
-  const t = Date.parse(iso);
-  if (isNaN(t)) return iso || '—';
-  const s = Math.max(0, (Date.now() - t) / 1000);
-  if (s < 60) return Math.floor(s) + 's ago';
-  if (s < 3600) return Math.floor(s / 60) + 'm ago';
-  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-  return Math.floor(s / 86400) + 'd ago';
+  const ts = Date.parse(iso);
+  if (isNaN(ts)) return iso || '—';
+  const s = Math.max(0, (Date.now() - ts) / 1000);
+  if (s < 60) return Math.floor(s) + t('agoS');
+  if (s < 3600) return Math.floor(s / 60) + t('agoM');
+  if (s < 86400) return Math.floor(s / 3600) + t('agoH');
+  return Math.floor(s / 86400) + t('agoD');
 }
 
 // ── Metrics with count-up animation ──
@@ -541,7 +590,7 @@ async function loadMetrics() {
     animateValue($('m-events-failed'), m.events_failed);
     animateValue($('m-applied'), m.patches_applied);
     animateValue($('m-failed'), m.patches_failed);
-  } catch (e) { toast('Failed to load metrics: ' + e.message, 'err'); }
+  } catch (e) { toast(t('metricsFailed') + e.message, 'err'); }
 }
 
 // ── Patch table ──
@@ -565,10 +614,10 @@ function actionButtons(p, sizeCls) {
   };
   const awaiting = (p.status || '').toLowerCase() === 'awaitingreview';
   const isPolicy = p.kind === 'policy_update';
-  if (awaiting) mk('Approve', `/api/v1/evolution/patches/${p.id}/approve`);
+  if (awaiting) mk(t('approve'), `/api/v1/evolution/patches/${p.id}/approve`);
   if (!isPolicy) {
-    mk('Apply', `/api/v1/evolution/patches/${p.id}/apply`, 'ghost');
-    mk('Deploy', `/api/v1/evolution/patches/${p.id}/deploy`, 'ghost');
+    mk(t('apply'), `/api/v1/evolution/patches/${p.id}/apply`, 'ghost');
+    mk(t('deploy'), `/api/v1/evolution/patches/${p.id}/deploy`, 'ghost');
   }
   return wrap;
 }
@@ -590,7 +639,7 @@ function renderPatches(flashId) {
   const tb = $('patches');
   tb.innerHTML = '';
   if (!patchRows.size) {
-    tb.innerHTML = '<tr><td colspan="7" class="muted">No patches</td></tr>';
+    tb.innerHTML = `<tr><td colspan="7" class="muted">${t('noPatches')}</td></tr>`;
     return;
   }
   const rows = [...patchRows.values()].sort((a, b) =>
@@ -658,11 +707,11 @@ function renderPatches(flashId) {
       wrap.className = 'detail-wrap';
       const grid = document.createElement('div');
       grid.className = 'detail-grid';
-      grid.appendChild(field('Patch ID', p.id, true));
-      grid.appendChild(field('Description', p.description));
-      grid.appendChild(field('Diff Summary', p.diff_summary, true));
-      grid.appendChild(field('Eval Verdict', p.eval_summary, true));
-      grid.appendChild(field('Created At', p.created_at, true));
+      grid.appendChild(field(t('fPatchId'), p.id, true));
+      grid.appendChild(field(t('fDesc'), p.description));
+      grid.appendChild(field(t('fDiff'), p.diff_summary, true));
+      grid.appendChild(field(t('fEval'), p.eval_summary, true));
+      grid.appendChild(field(t('fCreated'), p.created_at, true));
       wrap.appendChild(grid);
       const actions = document.createElement('div');
       actions.className = 'detail-actions';
@@ -687,7 +736,7 @@ async function loadPatches() {
     for (const p of patches) patchRows.set(p.id, p);
     renderPatches(null);
   } catch (e) {
-    $('patches').innerHTML = `<tr><td colspan="7" class="muted">Load failed: ${e.message}</td></tr>`;
+    $('patches').innerHTML = `<tr><td colspan="7" class="muted">${t('loadFailed')}${e.message}</td></tr>`;
   }
 }
 
@@ -695,7 +744,7 @@ async function loadPatches() {
 function setLive(state) {
   const el = $('live');
   el.className = 'live' + (state === 'live' ? ' on' : state === 'connecting' ? ' connecting' : '');
-  el.textContent = state === 'live' ? 'Live' : state === 'connecting' ? 'Connecting' : 'Polling';
+  el.textContent = state === 'live' ? t('liveOn') : state === 'connecting' ? t('liveConnecting') : t('livePolling');
 }
 
 function startPolling() {
@@ -733,7 +782,7 @@ function connectStream() {
 // ── Events & audit ──
 function renderEvents(el, items, fmt) {
   el.innerHTML = '';
-  if (!items.length) { el.innerHTML = '<li class="muted">No events</li>'; return; }
+  if (!items.length) { el.innerHTML = `<li class="muted">${t('noEvents')}</li>`; return; }
   for (const it of items) {
     const li = document.createElement('li');
     li.textContent = fmt(it);
@@ -746,7 +795,7 @@ async function loadEvents() {
     const { events } = await api('/api/v1/evolution/events?limit=50');
     renderEvents($('events'), events, (e) =>
       `[${e.kind || e.event || 'event'}] ${e.patch_id || ''} ${e.message || e.detail || JSON.stringify(e)}`);
-  } catch (e) { $('events').innerHTML = `<li class="muted">Load failed: ${e.message}</li>`; }
+  } catch (e) { $('events').innerHTML = `<li class="muted">${t('loadFailed')}${e.message}</li>`; }
 }
 
 async function loadAudit() {
@@ -755,18 +804,18 @@ async function loadAudit() {
     const events = body.events || body;
     renderEvents($('audit'), events, (e) =>
       `[${e.kind || e.action || 'audit'}] ${e.actor || ''} ${e.target || e.resource || ''} ${e.timestamp || e.created_at || ''}`);
-  } catch (e) { $('audit').innerHTML = `<li class="muted">Load failed: ${e.message}</li>`; }
+  } catch (e) { $('audit').innerHTML = `<li class="muted">${t('loadFailed')}${e.message}</li>`; }
 }
 
 async function act(path, label) {
   try {
     const r = await api(path, 'POST');
     show(r);
-    toast(label + ' succeeded', 'ok');
+    toast(label + t('actOk'), 'ok');
     refreshAll();
   } catch (e) {
     show(String(e.message));
-    toast(label + ' failed: ' + e.message, 'err');
+    toast(label + t('actFail') + e.message, 'err');
   }
 }
 
@@ -778,7 +827,7 @@ function renderPromoSwitch() {
   const btn = $('promoToggle');
   if (!promoState) {
     badge.className = 'pill';
-    badge.textContent = 'auto-promo n/a';
+    badge.textContent = t('promoNa');
     btn.textContent = '—';
     btn.disabled = true;
     return;
@@ -786,18 +835,18 @@ function renderPromoSwitch() {
   btn.disabled = false;
   if (!promoState.config_enabled) {
     badge.className = 'pill err';
-    badge.textContent = 'auto-promo off (config)';
-    btn.textContent = 'Enable via config';
+    badge.textContent = t('promoOffConfig');
+    btn.textContent = t('promoEnableViaConfig');
     btn.disabled = true;
   } else if (promoState.paused) {
     badge.className = 'pill warn';
-    badge.textContent = 'auto-promo PAUSED';
+    badge.textContent = t('promoPaused');
     badge.title = promoState.note || '';
-    btn.textContent = 'Resume';
+    btn.textContent = t('promoResume');
   } else {
     badge.className = 'pill ok';
-    badge.textContent = 'auto-promo live';
-    btn.textContent = 'Pause';
+    badge.textContent = t('promoLive');
+    btn.textContent = t('promoPause');
   }
 }
 
@@ -814,15 +863,15 @@ async function togglePromotion() {
   if (!promoState || !promoState.config_enabled) return;
   const target = !promoState.paused;
   const note = prompt(
-    (target ? 'Pause' : 'Resume') + ' auto-promotion — note for the audit trail:',
-    target ? 'manual intervention' : 'resume');
+    (target ? t('promoPause') : t('promoResume')) + t('promoPromptNote'),
+    target ? t('noteManual') : t('noteResume'));
   if (note === null) return;
   try {
     promoState = await api('/api/v1/evolution/promotion/switch', 'PUT', { paused: target, note });
     renderPromoSwitch();
-    toast((target ? 'Auto-promotion paused' : 'Auto-promotion resumed'), 'ok');
+    toast(target ? t('promoPausedToast') : t('promoResumedToast'), 'ok');
   } catch (e) {
-    toast('Switch failed: ' + e.message, 'err');
+    toast(t('switchFailed') + e.message, 'err');
   }
 }
 
@@ -841,7 +890,7 @@ async function loadPromotions() {
     const tb = $('promotions');
     tb.innerHTML = '';
     if (!promotions.length) {
-      tb.innerHTML = '<tr><td colspan="8" class="muted">No promotion records</td></tr>';
+      tb.innerHTML = `<tr><td colspan="8" class="muted">${t('noPromotions')}</td></tr>`;
       return;
     }
     for (const r of promotions) {
@@ -886,7 +935,7 @@ async function loadPromotions() {
       tb.appendChild(tr);
     }
   } catch (e) {
-    $('promotions').innerHTML = `<tr><td colspan="8" class="muted">Load failed: ${e.message}</td></tr>`;
+    $('promotions').innerHTML = `<tr><td colspan="8" class="muted">${t('loadFailed')}${e.message}</td></tr>`;
   }
 }
 
@@ -903,7 +952,7 @@ async function loadTrend() {
     const chart = $('trendChart');
     chart.innerHTML = '';
     if (!report.weeks || !report.weeks.length) {
-      chart.innerHTML = '<span class="muted">No trend report yet — the weekly reporter has not produced its first issue</span>';
+      chart.innerHTML = `<span class="muted">${t('noTrend')}</span>`;
       return;
     }
     for (const w of report.weeks) {
@@ -922,7 +971,9 @@ async function loadTrend() {
       bar.className = 'bar ' + cls;
       bar.style.height = h + 'px';
       const decided = (w.promoted || 0) + (w.rolled_back || 0) + (w.failed || 0);
-      bar.title = `${w.week}: promoted ${w.promoted}, rolled back ${w.rolled_back}, failed ${w.failed}, awaiting ${w.awaiting_review} (decided ${decided})`;
+      bar.title = LANG === 'zh'
+        ? `${w.week}：晋级 ${w.promoted}，回滚 ${w.rolled_back}，失败 ${w.failed}，待审 ${w.awaiting_review}（已决 ${decided}）`
+        : `${w.week}: promoted ${w.promoted}, rolled back ${w.rolled_back}, failed ${w.failed}, awaiting ${w.awaiting_review} (decided ${decided})`;
       const wk = document.createElement('div');
       wk.className = 'wk';
       wk.textContent = (w.week || '').replace(/^\d+-/, '');
@@ -932,7 +983,7 @@ async function loadTrend() {
       chart.appendChild(col);
     }
   } catch (e) {
-    $('trendChart').innerHTML = `<span class="muted">Load failed: ${e.message}</span>`;
+    $('trendChart').innerHTML = `<span class="muted">${t('loadFailed')}${e.message}</span>`;
   }
 }
 
@@ -959,7 +1010,7 @@ async function loadProcess() {
     $('procDlq').className = 'pill ' + (p.dlq_len > 0 ? 'err' : 'ok');
 
     $('procGoals').innerHTML = p.goals.length === 0
-      ? '<tr><td colspan="7" class="muted">No goals in the DAG</td></tr>'
+      ? `<tr><td colspan="7" class="muted">${t('noGoals')}</td></tr>`
       : p.goals.map((g) => `<tr>
           <td class="mono ellipsis" title="${g.goal_id}">${g.goal_id}</td>
           <td>${bar(g.progress_pct)}</td>
@@ -971,7 +1022,7 @@ async function loadProcess() {
         </tr>`).join('');
 
     $('procCrews').innerHTML = p.crews.length === 0
-      ? '<tr><td colspan="8" class="muted">No crews tracked by the supervisor</td></tr>'
+      ? `<tr><td colspan="8" class="muted">${t('noCrews')}</td></tr>`
       : p.crews.map((c) => `<tr>
           <td class="mono ellipsis" title="${c.crew_id}">${c.crew_id}</td>
           <td>${bar(c.progress_pct)}</td>
@@ -984,7 +1035,7 @@ async function loadProcess() {
         </tr>`).join('');
 
     $('procAgents').innerHTML = p.agents.length === 0
-      ? '<tr><td colspan="7" class="muted">No agents registered</td></tr>'
+      ? `<tr><td colspan="7" class="muted">${t('noAgents')}</td></tr>`
       : p.agents.map((a) => `<tr>
           <td class="mono ellipsis" title="${a.agent_id}">${a.agent_id}</td>
           <td>${a.role}</td>
@@ -996,15 +1047,158 @@ async function loadProcess() {
         </tr>`).join('');
   } catch (e) {
     if (!String(e.message).includes('HTTP 401') && !String(e.message).includes('HTTP 403')) {
-      toast('Failed to load process view: ' + e.message, 'err');
+      toast(t('procFailed') + e.message, 'err');
     }
   }
 }
 
-// ── LLM setup wizard (mandatory until configured) ──
-// 向导文案随浏览器语言：中文环境出中文，其余出英文（takeover 主界面是英文）。
-const LLM_LANG = String(navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
-const LLM_I18N = {
+// ── i18n：全页面中英文，顶栏按钮手动切换，选择存 localStorage。
+// 首次访问按浏览器语言猜一次默认，之后以用户选择为准。
+const LANG_KEY = 'cogneva_lang';
+let LANG = localStorage.getItem(LANG_KEY)
+  || (String(navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+const I18N = {
+  brandSub:       { en: 'Takeover Console', zh: '接管控制台' },
+  navOperate:     { en: 'Operate', zh: '运维' },
+  navLive:        { en: 'Live', zh: '实时' },
+  liveHint:       { en: 'agent event stream on canvas · zero-dependency port of the main dashboard',
+                    zh: '画布上的 Agent 事件流 · 主仪表盘的零依赖移植' },
+  liveInputPh:    { en: 'Type an intent…', zh: '输入意图…' },
+  sendBtn:        { en: 'Send', zh: '发送' },
+  liveEmpty:      { en: 'Send an intent below to start a live session',
+                    zh: '在下方发送一条意图，开始实时会话' },
+  liveNoToken:    { en: 'Save an admin token above to connect the live stream',
+                    zh: '先在上方保存管理员令牌以连接实时流' },
+  thinkingTxt:    { en: 'Analyzing intent and planning tool calls…',
+                    zh: '分析意图并规划工具调用…' },
+  topoTitle:      { en: 'CLUSTER TOPOLOGY', zh: '集群拓扑' },
+  pipeTitle:      { en: 'SANDBOX PIPELINE', zh: '沙盒流水线' },
+  nodeGateway:    { en: 'Gateway', zh: '网关' },
+  nodeCore:       { en: 'Cogneva Core', zh: 'Cogneva 核心' },
+  nodeAgentA:     { en: 'Agent Alpha', zh: '智能体 Alpha' },
+  nodeAgentB:     { en: 'Agent Beta', zh: '智能体 Beta' },
+  nodeSandbox:    { en: 'Sandbox', zh: '沙盒' },
+  stageBootstrap: { en: 'Bootstrap', zh: '引导' },
+  stageProbe:     { en: 'Environment Probe', zh: '环境探测' },
+  stageDeploy:    { en: 'K3s Deploy', zh: 'K3s 部署' },
+  stageEvolve:    { en: 'Self Evolution', zh: '自进化' },
+  stageHandoff:   { en: 'WebUI Handoff', zh: 'WebUI 交接' },
+  stPending:      { en: 'PENDING', zh: '等待' },
+  stRunning:      { en: 'RUNNING', zh: '运行' },
+  stDone:         { en: 'DONE', zh: '完成' },
+  stError:        { en: 'ERROR', zh: '失败' },
+  csOpen:         { en: 'open', zh: '已连接' },
+  csConnecting:   { en: 'connecting', zh: '连接中' },
+  csClosed:       { en: 'closed', zh: '已断开' },
+  csError:        { en: 'error', zh: '错误' },
+  navPipeline:    { en: 'Patch Pipeline', zh: '补丁流水线' },
+  navProcess:     { en: 'Process', zh: '进程' },
+  navPromotions:  { en: 'Promotions', zh: '晋级' },
+  navEvents:      { en: 'Evolution Events', zh: '进化事件' },
+  navAudit:       { en: 'Audit Trail', zh: '审计轨迹' },
+  navResult:      { en: 'Operation Result', zh: '操作结果' },
+  hintFocus:      { en: 'focus token', zh: '聚焦令牌' },
+  hintRefresh:    { en: 'refresh all', zh: '全部刷新' },
+  offline:        { en: 'offline', zh: '离线' },
+  topSub:         { en: 'Bootstrap has exited — this console operates the self-evolution system',
+                    zh: '引导器已退出——本控制台用于操作自进化系统' },
+  tokenPh:        { en: 'Admin Bearer Token', zh: '管理员 Bearer Token' },
+  saveToken:      { en: 'Save Token', zh: '保存令牌' },
+  refresh:        { en: 'Refresh', zh: '刷新' },
+  promoInit:      { en: 'auto-promo …', zh: '自动晋级 …' },
+  statTotalEvents:{ en: 'Total Events', zh: '总事件' },
+  statFailedEvents:{ en: 'Failed Events', zh: '失败事件' },
+  statApplied:    { en: 'Patches Applied', zh: '已应用补丁' },
+  statFailed:     { en: 'Patches Failed', zh: '失败补丁' },
+  pipelineHint:   { en: 'click a row for detail · live via SSE, polling resumes if the stream drops',
+                    zh: '点击行查看详情 · SSE 实时推送，断流自动回退轮询' },
+  rollback:       { en: 'Roll Back to Previous Version', zh: '回滚到上一版本' },
+  thKind:         { en: 'Kind', zh: '类型' },
+  thStatus:       { en: 'Status', zh: '状态' },
+  thDesc:         { en: 'Description', zh: '描述' },
+  thEval:         { en: 'Eval Verdict', zh: '评估结论' },
+  thCreated:      { en: 'Created', zh: '创建时间' },
+  loading:        { en: 'Loading…', zh: '加载中…' },
+  processHint:    { en: 'DAG status · squad progress · agent load · auto-refresh every 10s',
+                    zh: 'DAG 状态 · Squad 进度 · Agent 负载 · 10s 自动刷新' },
+  healthy:        { en: 'Healthy', zh: '健康' },
+  suspect:        { en: 'Suspect', zh: '可疑' },
+  stuck:          { en: 'Stuck', zh: '卡死' },
+  dead:           { en: 'Dead', zh: '死亡' },
+  goalsTitle:     { en: 'Goals / DAGs', zh: '目标 / DAG' },
+  thGoal:         { en: 'Goal', zh: '目标' },
+  thProgress:     { en: 'Progress', zh: '进度' },
+  thRun:          { en: 'Run', zh: '运行' },
+  thPend:         { en: 'Pend', zh: '等待' },
+  thDone:         { en: 'Done', zh: '完成' },
+  thFail:         { en: 'Fail', zh: '失败' },
+  thTasks:        { en: 'Tasks', zh: '任务' },
+  crewsTitle:     { en: 'Squads / Crews', zh: 'Squad / 协作组' },
+  thCrew:         { en: 'Crew', zh: '协作组' },
+  thCrewRetries:  { en: 'Crew Retries', zh: '组重试' },
+  thAgents:       { en: 'Agents', zh: 'Agent 数' },
+  thUpdated:      { en: 'Updated', zh: '更新时间' },
+  agentsTitle:    { en: 'Agents', zh: 'Agent 列表' },
+  thRole:         { en: 'Role', zh: '角色' },
+  thHealth:       { en: 'Health', zh: '健康' },
+  thLoad:         { en: 'Load', zh: '负载' },
+  thRunning:      { en: 'Running', zh: '运行中' },
+  thCapabilities: { en: 'Capabilities', zh: '能力' },
+  thHeartbeat:    { en: 'Heartbeat', zh: '心跳' },
+  promoTitle:     { en: 'Promotion Ledger', zh: '晋级台账' },
+  promoHint:      { en: 'auto-promotion decisions & outcomes · weekly trend aggregated from the ledger',
+                    zh: '自动晋级决策与结果 · 周趋势由台账聚合' },
+  thPatch:        { en: 'Patch', zh: '补丁' },
+  thLevel:        { en: 'Level', zh: '级别' },
+  thCluster:      { en: 'Cluster', zh: '集群' },
+  thReason:       { en: 'Decision Reason', zh: '决策理由' },
+  thOutcome:      { en: 'Outcome', zh: '结果' },
+  thTime:         { en: 'Time', zh: '时间' },
+  nonePre:        { en: '(none)', zh: '（无）' },
+  agoS:           { en: 's ago', zh: ' 秒前' },
+  agoM:           { en: 'm ago', zh: ' 分钟前' },
+  agoH:           { en: 'h ago', zh: ' 小时前' },
+  agoD:           { en: 'd ago', zh: ' 天前' },
+  metricsFailed:  { en: 'Failed to load metrics: ', zh: '指标加载失败：' },
+  noPatches:      { en: 'No patches', zh: '暂无补丁' },
+  loadFailed:     { en: 'Load failed: ', zh: '加载失败：' },
+  liveOn:         { en: 'Live', zh: '实时' },
+  liveConnecting: { en: 'Connecting', zh: '连接中' },
+  livePolling:    { en: 'Polling', zh: '轮询' },
+  noEvents:       { en: 'No events', zh: '暂无事件' },
+  actOk:          { en: ' succeeded', zh: ' 成功' },
+  actFail:        { en: ' failed: ', zh: ' 失败：' },
+  promoNa:        { en: 'auto-promo n/a', zh: '自动晋级 不可用' },
+  promoOffConfig: { en: 'auto-promo off (config)', zh: '自动晋级 关（配置）' },
+  promoEnableViaConfig: { en: 'Enable via config', zh: '需在配置开启' },
+  promoPaused:    { en: 'auto-promo PAUSED', zh: '自动晋级 已暂停' },
+  promoResume:    { en: 'Resume', zh: '恢复' },
+  promoLive:      { en: 'auto-promo live', zh: '自动晋级 运行中' },
+  promoPause:     { en: 'Pause', zh: '暂停' },
+  promoPromptNote:{ en: ' auto-promotion — note for the audit trail:', zh: '自动晋级——请填写审计备注：' },
+  noteManual:     { en: 'manual intervention', zh: '人工干预' },
+  noteResume:     { en: 'resume', zh: '恢复' },
+  promoPausedToast:  { en: 'Auto-promotion paused', zh: '自动晋级已暂停' },
+  promoResumedToast: { en: 'Auto-promotion resumed', zh: '自动晋级已恢复' },
+  switchFailed:   { en: 'Switch failed: ', zh: '切换失败：' },
+  noPromotions:   { en: 'No promotion records', zh: '暂无晋级记录' },
+  noTrend:        { en: 'No trend report yet — the weekly reporter has not produced its first issue',
+                    zh: '暂无趋势报告——周报器尚未产出第一期' },
+  fPatchId:       { en: 'Patch ID', zh: '补丁 ID' },
+  fDesc:          { en: 'Description', zh: '描述' },
+  fDiff:          { en: 'Diff Summary', zh: 'Diff 摘要' },
+  fEval:          { en: 'Eval Verdict', zh: '评估结论' },
+  fCreated:       { en: 'Created At', zh: '创建时间' },
+  approve:        { en: 'Approve', zh: '批准' },
+  apply:          { en: 'Apply', zh: '应用' },
+  deploy:         { en: 'Deploy', zh: '部署' },
+  noGoals:        { en: 'No goals in the DAG', zh: 'DAG 中暂无目标' },
+  noCrews:        { en: 'No crews tracked by the supervisor', zh: '监督器暂未跟踪到协作组' },
+  noAgents:       { en: 'No agents registered', zh: '暂无注册的 Agent' },
+  procFailed:     { en: 'Failed to load process view: ', zh: '进程视图加载失败：' },
+  tokenSaved:     { en: 'Token saved', zh: '令牌已保存' },
+  rollbackConfirm:{ en: 'Roll back to the previous version?', zh: '确定回滚到上一版本？' },
+  rollbackLabel:  { en: 'Rollback', zh: '回滚' },
   title:        { en: 'LLM Setup', zh: 'LLM 设置' },
   preset:       { en: 'Provider preset', zh: '服务商预设' },
   model:        { en: 'Model', zh: '模型' },
@@ -1023,7 +1217,7 @@ const LLM_I18N = {
                   zh: '仍在等待生效，请稍后重新检测。' },
   connected:    { en: 'LLM connected', zh: 'LLM 已接入' },
 };
-const t = (key) => LLM_I18N[key][LLM_LANG];
+const t = (key) => I18N[key][LANG];
 
 // api_style 只是探测首猜：保存时后端用真 key 做双协议实证探测，猜错会被纠正。
 const LLM_PRESETS = [
@@ -1042,7 +1236,10 @@ let llmMandatory = false;
 let llmWaiting = false;
 let llmStyleHint = 'openai';
 
-function initLlmWizard() {
+function applyI18n() {
+  document.documentElement.lang = LANG === 'zh' ? 'zh-CN' : 'en';
+  document.title = LANG === 'zh' ? 'Cogneva 接管控制台' : 'Cogneva Takeover Console';
+  $('langToggle').textContent = LANG === 'zh' ? 'EN' : '中文';
   document.querySelectorAll('[data-i18n]').forEach((el) => {
     el.textContent = t(el.dataset.i18n);
   });
@@ -1050,9 +1247,14 @@ function initLlmWizard() {
     el.placeholder = t(el.dataset.i18nPh);
   });
   $('llmPreset').innerHTML = LLM_PRESETS
-    .map((p, i) => `<option value="${i}">${p.label[LLM_LANG]}</option>`)
+    .map((p, i) => `<option value="${i}">${p.label[LANG]}</option>`)
     .join('');
 }
+
+$('langToggle').onclick = () => {
+  localStorage.setItem(LANG_KEY, LANG === 'zh' ? 'en' : 'zh');
+  location.reload();
+};
 
 function showLlmModal(mandatory) {
   llmMandatory = mandatory;
@@ -1157,16 +1359,17 @@ function refreshAll() {
 
 $('saveToken').onclick = () => {
   localStorage.setItem(TOKEN_KEY, $('token').value.trim());
-  toast('Token saved', 'ok');
+  toast(t('tokenSaved'), 'ok');
   refreshAll();
   connectStream();
+  if (window.liveReconnect) window.liveReconnect();
 };
 $('refresh').onclick = () => {
   refreshAll();
   if (!eventSource || eventSource.readyState === EventSource.CLOSED) connectStream();
 };
 $('rollbackBtn').onclick = () => {
-  if (confirm('Roll back to the previous version?')) act('/api/v1/evolution/rollback', 'Rollback');
+  if (confirm(t('rollbackConfirm'))) act('/api/v1/evolution/rollback', t('rollbackLabel'));
 };
 $('promoToggle').onclick = togglePromotion;
 
@@ -1193,8 +1396,519 @@ document.addEventListener('keydown', (e) => {
 
 refreshAll();
 connectStream();
-initLlmWizard();
+applyI18n();
 checkLlmStatus();
+</script>
+<script>
+// ── Live canvas dashboard — zero-dependency vanilla port of the main web UI.
+// Canvas 2D + WebSocket only; painter/render logic mirrors web/src/renderer.
+(function () {
+  const stage = $('liveStage');
+  const canvas = $('liveCanvas');
+  const input = $('liveInput');
+  const sendBtn = $('liveSend');
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  // ── store (port of streamStore) ──
+  const messages = [];
+  let connectionStatus = 'closed';
+  let autoScroll = true;
+  let userScrollTimer = 0;
+
+  function startMessage(id, role) { messages.push({ id, role, text: '', status: 'streaming' }); }
+  function appendDelta(id, delta) {
+    const m = messages.find((x) => x.id === id);
+    if (m) m.text += delta;
+  }
+  function endMessage(id) {
+    const m = messages.find((x) => x.id === id);
+    if (m) m.status = 'done';
+  }
+
+  // ── text engine: canvas-measure wrapping (replaces @chenglou/pretext) ──
+  const FONT = '500 15px Inter, "PingFang SC", "Microsoft YaHei", sans-serif';
+  const FS = 15, LINE_H = 1.55;
+  const mctx = document.createElement('canvas').getContext('2d');
+  function wrapLines(text, maxWidth) {
+    mctx.font = FONT;
+    const out = [];
+    for (const raw of String(text).split('\n')) {
+      let line = '';
+      for (const ch of raw) {
+        const next = line + ch;
+        if (line && mctx.measureText(next).width > maxWidth) {
+          const sp = line.lastIndexOf(' ');
+          if (sp > 0 && /[A-Za-z0-9]/.test(ch)) {
+            out.push(line.slice(0, sp));
+            line = line.slice(sp + 1) + ch;
+          } else {
+            out.push(line);
+            line = ch;
+          }
+        } else {
+          line = next;
+        }
+      }
+      out.push(line);
+    }
+    return out;
+  }
+  function tightWidth(text, maxWidth) {
+    mctx.font = FONT;
+    let w = 0;
+    for (const l of wrapLines(text, maxWidth)) w = Math.max(w, mctx.measureText(l).width);
+    return Math.ceil(w);
+  }
+
+  // ── shared path helper ──
+  function rr(c, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.lineTo(x + w - r, y);
+    c.quadraticCurveTo(x + w, y, x + w, y + r);
+    c.lineTo(x + w, y + h - r);
+    c.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    c.lineTo(x + r, y + h);
+    c.quadraticCurveTo(x, y + h, x, y + h - r);
+    c.lineTo(x, y + r);
+    c.quadraticCurveTo(x, y, x + r, y);
+    c.closePath();
+  }
+
+  // ── message painter ──
+  const PAD_X = 18, PAD_Y = 14, MAX_BW = 520, MIN_BW = 80, BUBBLE_R = 18, MSG_GAP = 20;
+  function layoutMessage(text, availW) {
+    const maxTextW = Math.min(MAX_BW, availW - 96) - PAD_X * 2;
+    const bw = Math.max(MIN_BW, Math.min(tightWidth(text, maxTextW) + PAD_X * 2, maxTextW + PAD_X * 2));
+    const textW = bw - PAD_X * 2;
+    const lines = wrapLines(text, textW);
+    return { bw, bh: lines.length * FS * LINE_H + PAD_Y * 2, lines, textW };
+  }
+  function drawBubble(m, lay, x, y) {
+    const isUser = m.role === 'user';
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,.35)';
+    ctx.shadowBlur = 16;
+    ctx.shadowOffsetY = 6;
+    const g = ctx.createLinearGradient(x, y, x, y + lay.bh);
+    if (isUser) { g.addColorStop(0, '#3b82f6'); g.addColorStop(1, '#2563eb'); }
+    else { g.addColorStop(0, '#1e293b'); g.addColorStop(1, '#0f172a'); }
+    ctx.fillStyle = g;
+    rr(ctx, x, y, lay.bw, lay.bh, BUBBLE_R);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.fillStyle = isUser ? '#ffffff' : '#e2e8f0';
+    ctx.font = FONT;
+    ctx.textBaseline = 'alphabetic';
+    const lh = FS * LINE_H, startY = y + PAD_Y + 13;
+    lay.lines.forEach((line, i) => ctx.fillText(line, x + PAD_X, startY + i * lh));
+
+    if (m.role === 'assistant' && m.text.length > 0) {
+      const tm = Date.now() / 1000;
+      const alpha = 0.5 + 0.5 * Math.sin(tm * 4);
+      ctx.save();
+      ctx.shadowColor = '#38bdf8';
+      ctx.shadowBlur = 8;
+      ctx.fillStyle = 'rgba(56,189,248,' + alpha + ')';
+      ctx.beginPath();
+      ctx.arc(x + lay.bw - 22, y + lay.bh - 12, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // ── thinking / tool-call painters ──
+  function drawThinking(text, x, y, w) {
+    const h = 42;
+    ctx.save();
+    ctx.fillStyle = 'rgba(30,41,59,.6)';
+    rr(ctx, x, y, w, h, 12);
+    ctx.fill();
+    ctx.restore();
+    const alpha = 0.5 + 0.5 * Math.sin(Date.now() / 1000 * 3);
+    ctx.save();
+    ctx.shadowColor = '#a855f7';
+    ctx.shadowBlur = 8;
+    ctx.fillStyle = 'rgba(168,85,247,' + alpha + ')';
+    ctx.beginPath();
+    ctx.arc(x + 18, y + 21, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = '#c084fc';
+    ctx.font = '500 13px Inter, sans-serif';
+    ctx.fillText(text, x + 34, y + 25);
+    return h;
+  }
+  const TOOL_COLORS = { pending: '#64748b', running: '#3b82f6', done: '#22c55e', error: '#ef4444' };
+  const TOOL_ICONS = { pending: '⏸', running: '⚙', done: '✓', error: '✕' };
+  function drawToolCard(tool, x, y, w) {
+    const h = 56;
+    ctx.save();
+    ctx.fillStyle = 'rgba(15,23,42,.8)';
+    rr(ctx, x, y, w, h, 12);
+    ctx.fill();
+    rr(ctx, x, y, w, h, 12);
+    ctx.clip();
+    ctx.fillStyle = TOOL_COLORS[tool.status];
+    ctx.fillRect(x, y, 4, h);
+    ctx.restore();
+
+    ctx.fillStyle = TOOL_COLORS[tool.status];
+    ctx.font = '16px Inter, sans-serif';
+    ctx.fillText(TOOL_ICONS[tool.status], x + 18, y + 24);
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '600 13px Inter, sans-serif';
+    ctx.fillText(tool.name, x + 44, y + 24);
+    ctx.fillStyle = TOOL_COLORS[tool.status];
+    ctx.font = '10px Inter, sans-serif';
+    ctx.fillText(tool.status.toUpperCase(), x + 44, y + 42);
+
+    if (tool.status === 'running') {
+      const barX = x + w - 80, barY = y + 34, barW = 60, barH = 4;
+      ctx.fillStyle = 'rgba(100,116,139,.4)';
+      rr(ctx, barX, barY, barW, barH, 2);
+      ctx.fill();
+      const progress = 0.3 + 0.4 * Math.sin(Date.now() / 1000 * 2);
+      ctx.fillStyle = TOOL_COLORS.running;
+      rr(ctx, barX, barY, barW * progress, barH, 2);
+      ctx.fill();
+    }
+    return h;
+  }
+
+  // ── topology / pipeline panels (demo data, same as the React renderer) ──
+  const NODE_STATUS_COLORS = { healthy: '#22c55e', running: '#3b82f6', error: '#ef4444', idle: '#64748b' };
+  const NODE_TYPE_COLORS = { core: '#a855f7', agent: '#3b82f6', sandbox: '#f59e0b', gateway: '#14b8a6' };
+  function drawTopology(nodes, edges, px, py, pw, ph) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(15,23,42,.6)';
+    rr(ctx, px, py, pw, ph, 16);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(148,163,184,.15)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '12px Inter, sans-serif';
+    ctx.fillText(t('topoTitle'), px + 16, py + 24);
+
+    const map = new Map(nodes.map((n) => [n.id, n]));
+    const tm = Date.now() / 1000;
+    edges.forEach((e) => {
+      const a = map.get(e.from), b = map.get(e.to);
+      if (!a || !b) return;
+      ctx.beginPath();
+      ctx.moveTo(px + a.x, py + a.y);
+      ctx.lineTo(px + b.x, py + b.y);
+      ctx.strokeStyle = e.active
+        ? 'rgba(59,130,246,' + (0.3 + 0.2 * Math.sin(tm * 3)) + ')'
+        : 'rgba(148,163,184,.15)';
+      ctx.lineWidth = e.active ? 2 : 1;
+      ctx.stroke();
+    });
+    nodes.forEach((n) => {
+      const x = px + n.x, y = py + n.y;
+      ctx.save();
+      ctx.shadowColor = NODE_STATUS_COLORS[n.status];
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = NODE_STATUS_COLORS[n.status];
+      ctx.beginPath();
+      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      ctx.strokeStyle = NODE_TYPE_COLORS[n.type];
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, 9, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '11px Inter, sans-serif';
+      ctx.fillText(n.label, x + 16, y + 4);
+    });
+  }
+  const STAGE_COLORS = { pending: '#64748b', running: '#3b82f6', done: '#22c55e', error: '#ef4444' };
+  function drawPipeline(stages, px, py, pw) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(15,23,42,.6)';
+    rr(ctx, px, py, pw, 44 + stages.length * 42, 16);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(148,163,184,.15)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '12px Inter, sans-serif';
+    ctx.fillText(t('pipeTitle'), px + 16, py + 24);
+
+    const startY = py + 48, lineX = px + 28;
+    stages.forEach((s, i) => {
+      const y = startY + i * 42;
+      if (i < stages.length - 1) {
+        ctx.strokeStyle = s.status === 'done' ? STAGE_COLORS.done : 'rgba(100,116,139,.4)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(lineX, y + 6);
+        ctx.lineTo(lineX, y + 42);
+        ctx.stroke();
+      }
+      ctx.save();
+      ctx.shadowColor = STAGE_COLORS[s.status];
+      ctx.shadowBlur = 10;
+      ctx.fillStyle = STAGE_COLORS[s.status];
+      ctx.beginPath();
+      ctx.arc(lineX, y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '12px Inter, sans-serif';
+      ctx.fillText(s.label, lineX + 18, y + 4);
+      ctx.fillStyle = STAGE_COLORS[s.status];
+      ctx.font = '10px Inter, sans-serif';
+      ctx.fillText(s.statusText, px + pw - 52, y + 4);
+    });
+  }
+
+  // ── renderer (port of CanvasRenderer) ──
+  const PANEL_W = 280, PANEL_M = 24;
+  const renderer = {
+    vw: 0, vh: 0, dpr: 1, scrollY: 0, contentH: 0,
+    cache: new Map(),
+    setScroll(y) {
+      const max = Math.max(0, this.contentH - this.vh + 120);
+      this.scrollY = Math.max(0, Math.min(y, max));
+    },
+    render() {
+      const vw = this.vw, vh = this.vh;
+      if (vw < 10 || vh < 10) return;
+      ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+
+      // background
+      const g = ctx.createRadialGradient(vw / 2, vh / 2, 0, vw / 2, vh / 2, vw * 0.8);
+      g.addColorStop(0, '#0b1221');
+      g.addColorStop(1, '#020617');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, vw, vh);
+      ctx.strokeStyle = 'rgba(148,163,184,.04)';
+      ctx.lineWidth = 1;
+      const grid = 48, offGrid = -this.scrollY % grid;
+      ctx.beginPath();
+      for (let x = 0; x < vw; x += grid) { ctx.moveTo(x, 0); ctx.lineTo(x, vh); }
+      for (let y = offGrid; y < vh; y += grid) { ctx.moveTo(0, y); ctx.lineTo(vw, y); }
+      ctx.stroke();
+      const fade = ctx.createLinearGradient(0, 0, 0, 80);
+      fade.addColorStop(0, 'rgba(2,6,23,.7)');
+      fade.addColorStop(1, 'rgba(2,6,23,0)');
+      ctx.fillStyle = fade;
+      ctx.fillRect(0, 0, vw, 80);
+
+      // layout messages
+      const contentW = vw - PANEL_W - PANEL_M * 2;
+      const marginX = 28;
+      let curY = 28;
+      const items = messages.map((m) => {
+        const key = m.id + ':' + m.text.length + ':' + m.status + ':' + contentW;
+        let lay = this.cache.get(key);
+        if (!lay || lay.text !== m.text) {
+          lay = Object.assign({ text: m.text }, layoutMessage(m.text, contentW));
+          this.cache.set(key, lay);
+        }
+        const x = m.role === 'user' ? contentW - marginX - lay.bw : marginX;
+        const item = { m, lay, x, y: curY };
+        curY += lay.bh + MSG_GAP;
+        return item;
+      });
+      this.contentH = curY;
+
+      if (autoScroll && this.contentH > vh) {
+        this.scrollY = Math.max(0, this.contentH - vh + 120);
+      }
+      const offY = -this.scrollY;
+
+      let lastAssistantY = 0;
+      items.forEach((it) => {
+        drawBubble(it.m, it.lay, it.x, it.y + offY);
+        if (it.m.role === 'assistant') lastAssistantY = it.y + offY + it.lay.bh + 12;
+      });
+
+      const last = messages[messages.length - 1];
+      if (last && last.role === 'assistant' && last.status === 'streaming' && lastAssistantY > 0) {
+        const cardX = marginX, cardW = Math.min(400, contentW - marginX * 2);
+        let cardY = lastAssistantY;
+        cardY += drawThinking(t('thinkingTxt'), cardX, cardY, cardW);
+        cardY += 10;
+        cardY += drawToolCard({ name: 'health_latency_profiler', status: 'running' }, cardX, cardY, cardW);
+      }
+
+      // empty state
+      if (messages.length === 0) {
+        ctx.fillStyle = 'rgba(148,163,184,.65)';
+        ctx.font = '14px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        const hint = $('token').value.trim() ? t('liveEmpty') : t('liveNoToken');
+        ctx.fillText(hint, contentW / 2, vh / 2 - 20);
+        ctx.textAlign = 'left';
+      }
+
+      // right-side panels
+      const px = vw - PANEL_W - PANEL_M, py = 28;
+      drawTopology([
+        { id: 'gateway', label: t('nodeGateway'), x: 140, y: 70, status: 'healthy', type: 'gateway' },
+        { id: 'core', label: t('nodeCore'), x: 80, y: 130, status: 'running', type: 'core' },
+        { id: 'agent1', label: t('nodeAgentA'), x: 180, y: 180, status: 'running', type: 'agent' },
+        { id: 'agent2', label: t('nodeAgentB'), x: 60, y: 220, status: 'idle', type: 'agent' },
+        { id: 'sandbox', label: t('nodeSandbox'), x: 130, y: 270, status: 'healthy', type: 'sandbox' },
+      ], [
+        { from: 'gateway', to: 'core', active: true },
+        { from: 'core', to: 'agent1', active: true },
+        { from: 'core', to: 'agent2', active: false },
+        { from: 'agent1', to: 'sandbox', active: true },
+      ], px, py, PANEL_W, 320);
+
+      const stText = { pending: t('stPending'), running: t('stRunning'), done: t('stDone'), error: t('stError') };
+      drawPipeline([
+        { id: 'bootstrap', label: t('stageBootstrap'), status: 'done' },
+        { id: 'probe', label: t('stageProbe'), status: 'done' },
+        { id: 'deploy', label: t('stageDeploy'), status: 'running' },
+        { id: 'evolve', label: t('stageEvolve'), status: 'pending' },
+        { id: 'handoff', label: t('stageHandoff'), status: 'pending' },
+      ].map((s) => Object.assign({ statusText: stText[s.status] }, s)), px, py + 340, PANEL_W);
+
+      // connection status dot
+      const csColors = { open: '#22c55e', connecting: '#f59e0b', closed: '#64748b', error: '#ef4444' };
+      const csText = { open: t('csOpen'), connecting: t('csConnecting'), closed: t('csClosed'), error: t('csError') };
+      const cx = vw - 28, cy = 28;
+      const col = csColors[connectionStatus] || '#64748b';
+      ctx.save();
+      ctx.shadowColor = col;
+      ctx.shadowBlur = 10;
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      ctx.fillStyle = 'rgba(226,232,240,.7)';
+      ctx.font = '11px Inter, sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(csText[connectionStatus] || connectionStatus, cx - 14, cy + 4);
+      ctx.textAlign = 'left';
+    },
+  };
+
+  // ── websocket client (port of EventStreamClient) ──
+  let ws = null, reconnectAttempts = 0, reconnectTimer = null, pingTimer = null, pingSeq = 0, manualClose = false;
+  function stopPing() { if (pingTimer) { clearInterval(pingTimer); pingTimer = null; } }
+  function handleLiveMessage(data) {
+    if (typeof data !== 'string') return;
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+    if (!['agent_event', 'task_update', 'notification'].includes(msg.type) || !msg.payload) return;
+    const p = msg.payload;
+    const inner = p.payload || p;
+    switch (p.type) {
+      case 'message.start':
+        if (inner.message_id) startMessage(inner.message_id, inner.role || 'assistant');
+        break;
+      case 'message.text_delta':
+        if (inner.message_id) appendDelta(inner.message_id, inner.delta || '');
+        break;
+      case 'message.end':
+        if (inner.message_id) endMessage(inner.message_id);
+        break;
+      default:
+        break;
+    }
+  }
+  function scheduleReconnect() {
+    if (manualClose || reconnectAttempts >= 10) return;
+    reconnectAttempts += 1;
+    reconnectTimer = setTimeout(liveConnect, 3000 * Math.min(reconnectAttempts, 5));
+  }
+  function liveDisconnect() {
+    manualClose = true;
+    stopPing();
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws) { ws.onclose = null; try { ws.close(); } catch (e) { /* already closed */ } ws = null; }
+  }
+  function liveConnect() {
+    liveDisconnect();
+    manualClose = false;
+    const token = $('token').value.trim();
+    if (!token) { connectionStatus = 'closed'; return; }
+    connectionStatus = 'connecting';
+    const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host
+      + '/ws?token=' + encodeURIComponent(token);
+    try { ws = new WebSocket(url); } catch (e) { connectionStatus = 'error'; scheduleReconnect(); return; }
+    ws.onopen = () => {
+      reconnectAttempts = 0;
+      connectionStatus = 'open';
+      ws.send(JSON.stringify({ type: 'subscribe', channels: ['agent:*', 'hooks'], timestamp: new Date().toISOString() }));
+      pingSeq = 0;
+      stopPing();
+      pingTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ping', seq: pingSeq++, timestamp: new Date().toISOString() }));
+        }
+      }, 30000);
+    };
+    ws.onmessage = (ev) => handleLiveMessage(ev.data);
+    ws.onclose = () => {
+      stopPing();
+      if (connectionStatus !== 'error') connectionStatus = 'closed';
+      scheduleReconnect();
+    };
+    ws.onerror = () => { connectionStatus = 'error'; };
+  }
+  window.liveReconnect = () => { reconnectAttempts = 0; liveConnect(); };
+
+  // ── input bar ──
+  function liveSend() {
+    const v = input.value.trim();
+    if (!v) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'chat_message', session_id: 'default', content: v }));
+    }
+    input.value = '';
+    sendBtn.disabled = true;
+  }
+  sendBtn.onclick = liveSend;
+  input.onkeydown = (e) => { if (e.key === 'Enter') liveSend(); };
+  input.oninput = () => { sendBtn.disabled = !input.value.trim(); };
+  sendBtn.disabled = true;
+
+  // ── sizing, scroll, render loop ──
+  function liveResize() {
+    const r = stage.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(r.width * dpr));
+    canvas.height = Math.max(1, Math.round(r.height * dpr));
+    renderer.vw = r.width;
+    renderer.vh = r.height;
+    renderer.dpr = dpr;
+  }
+  new ResizeObserver(liveResize).observe(stage);
+  liveResize();
+
+  let liveVisible = false;
+  new IntersectionObserver((es) => { liveVisible = es[0].isIntersecting; }, { threshold: 0.02 }).observe(stage);
+  (function loop() {
+    if (liveVisible) renderer.render();
+    requestAnimationFrame(loop);
+  })();
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    autoScroll = false;
+    clearTimeout(userScrollTimer);
+    userScrollTimer = setTimeout(() => { autoScroll = true; }, 1500);
+    renderer.setScroll(renderer.scrollY + e.deltaY);
+  }, { passive: false });
+
+  liveConnect();
+})();
 </script>
 </body>
 </html>
