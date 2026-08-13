@@ -1270,6 +1270,12 @@ $('langToggle').onclick = () => {
   location.reload();
 };
 
+// The wizard is the sole LLM config entry and is strictly mandatory: it
+// pops on every load while no LLM is configured, cannot be dismissed in
+// that state, and also reappears when the user tries to chat. The only
+// way out is a working LLM config.
+let llmConfigured = null;
+
 function showLlmModal(mandatory) {
   llmMandatory = mandatory;
   $('llmSub').textContent = t(mandatory ? 'subMandatory' : 'subEdit');
@@ -1281,6 +1287,7 @@ async function checkLlmStatus() {
   if (!$('token').value.trim() || llmWaiting) return;
   try {
     const s = await api('/api/v1/admin/llm-status');
+    llmConfigured = !!s.configured;
     if (!s.configured) showLlmModal(true);
   } catch { /* no token yet or endpoint unreachable — stay silent */ }
 }
@@ -1331,6 +1338,7 @@ function afterLlmSaved() {
       if (s.configured) {
         clearInterval(timer);
         llmWaiting = false;
+        llmConfigured = true;
         $('llmMask').classList.remove('show');
         toast(t('connected'), 'ok');
         refreshAll();
@@ -1979,6 +1987,9 @@ checkLlmStatus();
   function liveSend() {
     const v = input.value.trim();
     if (!v) return;
+    // Chat needs the LLM — if we know it is not configured, surface the
+    // wizard at the moment of need instead of sending into a 503.
+    if (llmConfigured === false) { showLlmModal(true); return; }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'chat_message', session_id: 'default', content: v }));
     }
