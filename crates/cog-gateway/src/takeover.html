@@ -1072,8 +1072,9 @@ const I18N = {
   topoTitle:      { en: 'CLUSTER TOPOLOGY', zh: '集群拓扑' },
   pipeTitle:      { en: 'GOAL PIPELINE', zh: '目标流水线' },
   noActiveGoals:  { en: 'No active goals', zh: '暂无活动目标' },
-  nodeGateway:    { en: 'Gateway', zh: '网关' },
-  nodeCore:       { en: 'Cogneva Core', zh: 'Cogneva 核心' },
+  nodeMain:       { en: 'Main App', zh: '主应用' },
+  nodeSecGw:      { en: 'Security Gateway', zh: '安全网关' },
+  nodeEvo:        { en: 'Evolution Sandbox', zh: '进化沙盒' },
   csOpen:         { en: 'open', zh: '已连接' },
   csConnecting:   { en: 'connecting', zh: '连接中' },
   csClosed:       { en: 'closed', zh: '已断开' },
@@ -1506,16 +1507,20 @@ checkLlmStatus();
     }
   }
 
-  // ── real cluster state: /api/v1/processes poll (10s) + live bus events ──
-  // Topology: gateway node = this WS connection, core node = processes
-  // endpoint reachability, agent nodes = supervisor-reported agents, with
-  // state_change events from the bus updating node colors between polls.
+  // ── real cluster state: /api/v1/processes + /api/v1/cluster/components ──
+  // Topology: three fixed deployment nodes (main app, security gateway,
+  // evolution sandbox) from the components endpoint, plus dynamic agent
+  // nodes from the processes poll, with bus state_change events updating
+  // agent node colors between polls.
   const liveAgents = new Map();
-  let coreHealthy = false;
+  let liveComponents = { main: 'up', 'security-gateway': 'unknown', evolution: 'unknown' };
   let liveGoals = [];
 
   function healthToStatus(h) {
     return { healthy: 'healthy', suspect: 'running', stuck: 'error', dead: 'error' }[h] || 'idle';
+  }
+  function componentToStatus(s) {
+    return s === 'up' ? 'healthy' : s === 'down' ? 'error' : 'idle';
   }
   function runtimeStateToStatus(s) {
     if (s === 'error') return 'error';
@@ -1526,14 +1531,23 @@ checkLlmStatus();
     s = String(s || '');
     return s.length > n ? s.slice(0, n - 1) + '…' : s;
   }
+  async function pollComponents() {
+    const token = $('token').value.trim();
+    if (!token) return;
+    try {
+      const r = await fetch('/api/v1/cluster/components', { headers: { Authorization: 'Bearer ' + token } });
+      if (!r.ok) return;
+      const data = await r.json();
+      for (const c of data.components || []) liveComponents[c.id] = c.status;
+    } catch (e) { /* keep last known component state */ }
+  }
   async function pollProcesses() {
     const token = $('token').value.trim();
     if (!token) return;
     try {
       const r = await fetch('/api/v1/processes', { headers: { Authorization: 'Bearer ' + token } });
-      if (!r.ok) { coreHealthy = false; return; }
+      if (!r.ok) return;
       const data = await r.json();
-      coreHealthy = true;
       const seen = new Set();
       (data.agents || []).forEach((a) => {
         seen.add(a.agent_id);
@@ -1547,22 +1561,26 @@ checkLlmStatus();
           : (g.total > 0 && g.completed === g.total) ? 'done' : 'pending',
         statusText: g.completed + '/' + g.total,
       }));
-    } catch (e) { coreHealthy = false; }
+    } catch (e) { /* keep last known state */ }
   }
 
   function buildTopology() {
     const nodes = [
-      { id: 'gateway', label: t('nodeGateway'), x: 140, y: 60, status: connectionStatus === 'open' ? 'healthy' : 'error', type: 'gateway' },
-      { id: 'core', label: t('nodeCore'), x: 140, y: 120, status: coreHealthy ? 'running' : 'idle', type: 'core' },
+      { id: 'main', label: t('nodeMain'), x: 140, y: 52, status: componentToStatus(liveComponents.main), type: 'core' },
+      { id: 'security-gateway', label: t('nodeSecGw'), x: 140, y: 104, status: componentToStatus(liveComponents['security-gateway']), type: 'gateway' },
+      { id: 'evolution', label: t('nodeEvo'), x: 140, y: 156, status: componentToStatus(liveComponents.evolution), type: 'sandbox' },
     ];
-    const edges = [{ from: 'gateway', to: 'core', active: connectionStatus === 'open' }];
+    const edges = [
+      { from: 'main', to: 'security-gateway', active: liveComponents['security-gateway'] === 'up' },
+      { from: 'main', to: 'evolution', active: liveComponents.evolution === 'up' },
+    ];
     let i = 0;
     for (const [id, a] of liveAgents) {
-      nodes.push({ id, label: a.label, x: 70 + (i % 2) * 130, y: 185 + Math.floor(i / 2) * 48, status: a.status, type: 'agent' });
-      edges.push({ from: 'core', to: id, active: a.status === 'running' });
+      nodes.push({ id, label: a.label, x: 70 + (i % 2) * 130, y: 200 + Math.floor(i / 2) * 48, status: a.status, type: 'agent' });
+      edges.push({ from: 'main', to: id, active: a.status === 'running' });
       i++;
     }
-    return { nodes, edges, height: Math.max(230, 215 + Math.ceil(i / 2) * 48) };
+    return { nodes, edges, height: Math.max(230, 230 + Math.ceil(i / 2) * 48) };
   }
 
   // ── topology / pipeline panels (demo data, same as the React renderer) ──
@@ -1858,7 +1876,7 @@ checkLlmStatus();
     };
     ws.onerror = () => { connectionStatus = 'error'; };
   }
-  window.liveReconnect = () => { reconnectAttempts = 0; pollProcesses(); liveConnect(); };
+  window.liveReconnect = () => { reconnectAttempts = 0; pollComponents(); pollProcesses(); liveConnect(); };
 
   // ── input bar ──
   function liveSend() {
@@ -1903,7 +1921,8 @@ checkLlmStatus();
     renderer.setScroll(renderer.scrollY + e.deltaY);
   }, { passive: false });
 
-  setInterval(() => { if (liveVisible) pollProcesses(); }, 10000);
+  setInterval(() => { if (liveVisible) { pollComponents(); pollProcesses(); } }, 10000);
+  pollComponents();
   pollProcesses();
   liveConnect();
 })();

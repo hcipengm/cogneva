@@ -331,14 +331,14 @@ async fn detect_api_style(
 }
 
 /// Minimal in-cluster Kubernetes API client (service account token + CA).
-struct KubeClient {
+pub(crate) struct KubeClient {
     http: reqwest::Client,
     token: String,
     namespace: String,
 }
 
 impl KubeClient {
-    fn in_cluster() -> Result<Self, String> {
+    pub(crate) fn in_cluster() -> Result<Self, String> {
         let read = |name: &str| {
             std::fs::read(format!("{SA_DIR}/{name}"))
                 .map_err(|e| format!("无法读取 {SA_DIR}/{name}（不在 K8s 集群内？）: {e}"))
@@ -358,6 +358,28 @@ impl KubeClient {
             token,
             namespace,
         })
+    }
+
+    /// GET an apiserver path and return the parsed JSON body.
+    pub(crate) async fn get_json(&self, path: &str) -> Result<serde_json::Value, String> {
+        let resp = self
+            .http
+            .get(format!("{API_BASE}{path}"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("请求 apiserver 失败: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("apiserver 返回 {}", resp.status()));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("apiserver 响应解析失败: {e}"))
+    }
+
+    /// 当前命名空间。
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
     }
 
     async fn patch(&self, path: &str, body: serde_json::Value) -> Result<(), String> {

@@ -27,6 +27,7 @@ pub mod audit;
 pub mod auth;
 pub mod backend_health;
 pub mod chat;
+pub mod cluster;
 pub mod collaboration;
 pub mod dashboard;
 pub mod error;
@@ -493,6 +494,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/processes",
             get(processes::process_overview_handler),
+        )
+        .route(
+            "/api/v1/cluster/components",
+            get(cluster::cluster_components_handler),
         )
         .route(
             "/api/v1/tasks/{id}/dependents",

@@ -28,6 +28,11 @@ rules:
     resources: ["deployments"]
     resourceNames: ["cogneva-security-gateway"]
     verbs: ["get", "patch"]
+  # 集群组件健康端点（/api/v1/cluster/components）读取三组件副本状态。
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cogneva", "cogneva-evolution", "cogneva-security-gateway"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
