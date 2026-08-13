@@ -18,55 +18,55 @@ const PRESETS: Preset[] = [
   {
     label: 'Kimi（月之暗面）',
     base_url: 'https://api.kimi.com/coding/v1',
-    model: 'kimi-for-coding',
+    model: 'k3',
     api_style: 'anthropic',
   },
   {
     label: 'DeepSeek',
     base_url: 'https://api.deepseek.com/v1',
-    model: 'deepseek-chat',
+    model: 'deepseek-v4-flash',
     api_style: 'openai',
   },
   {
     label: 'OpenAI',
     base_url: 'https://api.openai.com/v1',
-    model: 'gpt-4o',
+    model: 'gpt-5.6-sol',
     api_style: 'openai',
   },
   {
     label: 'Anthropic',
     base_url: 'https://api.anthropic.com',
-    model: 'claude-sonnet-4-6',
+    model: 'claude-opus-5',
     api_style: 'anthropic',
   },
   {
     label: 'Qwen（通义千问）',
     base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    model: 'qwen3-max',
+    model: 'qwen3.8-max',
     api_style: 'openai',
   },
   {
     label: '智谱 GLM',
     base_url: 'https://open.bigmodel.cn/api/paas/v4',
-    model: 'glm-4.6',
+    model: 'glm-5.2',
     api_style: 'openai',
   },
   {
     label: 'MiniMax',
     base_url: 'https://api.minimaxi.com/v1',
-    model: 'MiniMax-M2',
+    model: 'MiniMax-M3',
     api_style: 'openai',
   },
   {
     label: '豆包（火山方舟）',
     base_url: 'https://ark.cn-beijing.volces.com/api/v3',
-    model: 'doubao-seed-2.0-code',
+    model: 'doubao-seed-evolving',
     api_style: 'openai',
   },
   {
     label: 'Ollama（本地）',
     base_url: 'http://host.docker.internal:11434/v1',
-    model: 'qwen2.5-coder',
+    model: 'qwen3',
     api_style: 'openai',
   },
 ];
@@ -304,7 +304,7 @@ export function LlmSetupOverlay({
               value={model}
               onChange={(e) => setModel(e.target.value)}
               className={inputCls}
-              placeholder="例如 kimi-for-coding"
+              placeholder="例如 k3"
               required
             />
           </div>

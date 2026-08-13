@@ -66,7 +66,7 @@ impl SecurityGatewayConfig {
             llm_provider: provider,
             llm_base_url: std::env::var("COGNEVA_LLM_BASE_URL")
                 .unwrap_or_else(|_| default_base.into()),
-            llm_model: std::env::var("COGNEVA_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
+            llm_model: std::env::var("COGNEVA_LLM_MODEL").unwrap_or_default(),
             llm_api_key: api_key,
         }
     }
@@ -405,10 +405,10 @@ async fn stream_forward(
     url: &str,
     auth: AuthStyle,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    if state.config.llm_api_key.is_empty() {
+    if state.config.llm_api_key.is_empty() || state.config.llm_model.is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "网关未配置 LLM API Key".into(),
+            "网关未配置 LLM（缺 API Key 或模型）".into(),
         ));
     }
     let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
@@ -464,10 +464,10 @@ async fn call_llm(
     state: &AppState,
     messages: Vec<ChatMessage>,
 ) -> Result<Json<LlmResponse>, (StatusCode, String)> {
-    if state.config.llm_api_key.is_empty() {
+    if state.config.llm_api_key.is_empty() || state.config.llm_model.is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "网关未配置 LLM API Key".into(),
+            "网关未配置 LLM（缺 API Key 或模型）".into(),
         ));
     }
     let base = state.config.llm_base_url.trim_end_matches('/');
@@ -645,7 +645,7 @@ mod tests {
             domain_denylist: deny.iter().map(|s| s.to_string()).collect(),
             llm_provider: "openai".into(),
             llm_base_url: "https://api.openai.com/v1".into(),
-            llm_model: "gpt-4o-mini".into(),
+            llm_model: "test-model".into(),
             llm_api_key: String::new(),
         }
     }

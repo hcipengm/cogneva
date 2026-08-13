@@ -456,7 +456,7 @@
     <label>Base URL</label>
     <input type="text" id="llmBaseUrl" placeholder="https://api.example.com/v1" required />
     <label data-i18n="model">Model</label>
-    <input type="text" id="llmModel" data-i18n-ph="modelPh" placeholder="e.g. kimi-for-coding" required />
+    <input type="text" id="llmModel" data-i18n-ph="modelPh" placeholder="e.g. k3" required />
     <label>API Key</label>
     <input type="password" id="llmApiKey" placeholder="sk-..." required style="width:100%" />
     <div class="fine" data-i18n="keyNote">The key is written to the cluster Secret only and never echoed back.</div>
@@ -1008,7 +1008,7 @@ const LLM_I18N = {
   title:        { en: 'LLM Setup', zh: 'LLM 设置' },
   preset:       { en: 'Provider preset', zh: '服务商预设' },
   model:        { en: 'Model', zh: '模型' },
-  modelPh:      { en: 'e.g. kimi-for-coding', zh: '例如 kimi-for-coding' },
+  modelPh:      { en: 'e.g. k3', zh: '例如 k3' },
   keyNote:      { en: 'The key is written to the cluster Secret only and never echoed back. API style is detected automatically on save.', zh: '密钥只写入集群 Secret，不会回显到界面。API 风格保存时自动探测。' },
   save:         { en: 'Save & apply', zh: '保存并生效' },
   forceSave:    { en: 'Save anyway', zh: '仍然保存' },
@@ -1028,15 +1028,15 @@ const t = (key) => LLM_I18N[key][LLM_LANG];
 // api_style 只是探测首猜：保存时后端用真 key 做双协议实证探测，猜错会被纠正。
 const LLM_PRESETS = [
   { label: { en: 'Custom', zh: '自定义' }, base_url: '', model: '', api_style: 'openai' },
-  { label: { en: 'Kimi (Moonshot)', zh: 'Kimi（月之暗面）' }, base_url: 'https://api.kimi.com/coding/v1', model: 'kimi-for-coding', api_style: 'anthropic' },
-  { label: { en: 'DeepSeek', zh: 'DeepSeek' }, base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', api_style: 'openai' },
-  { label: { en: 'OpenAI', zh: 'OpenAI' }, base_url: 'https://api.openai.com/v1', model: 'gpt-4o', api_style: 'openai' },
-  { label: { en: 'Anthropic', zh: 'Anthropic' }, base_url: 'https://api.anthropic.com', model: 'claude-sonnet-4-6', api_style: 'anthropic' },
-  { label: { en: 'Qwen (DashScope)', zh: 'Qwen（通义千问）' }, base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen3-max', api_style: 'openai' },
-  { label: { en: 'Zhipu GLM', zh: '智谱 GLM' }, base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4.6', api_style: 'openai' },
-  { label: { en: 'MiniMax', zh: 'MiniMax' }, base_url: 'https://api.minimaxi.com/v1', model: 'MiniMax-M2', api_style: 'openai' },
-  { label: { en: 'Doubao (Volcano Ark)', zh: '豆包（火山方舟）' }, base_url: 'https://ark.cn-beijing.volces.com/api/v3', model: 'doubao-seed-2.0-code', api_style: 'openai' },
-  { label: { en: 'Ollama (local)', zh: 'Ollama（本地）' }, base_url: 'http://host.docker.internal:11434/v1', model: 'qwen2.5-coder', api_style: 'openai' },
+  { label: { en: 'Kimi (Moonshot)', zh: 'Kimi（月之暗面）' }, base_url: 'https://api.kimi.com/coding/v1', model: 'k3', api_style: 'anthropic' },
+  { label: { en: 'DeepSeek', zh: 'DeepSeek' }, base_url: 'https://api.deepseek.com/v1', model: 'deepseek-v4-flash', api_style: 'openai' },
+  { label: { en: 'OpenAI', zh: 'OpenAI' }, base_url: 'https://api.openai.com/v1', model: 'gpt-5.6-sol', api_style: 'openai' },
+  { label: { en: 'Anthropic', zh: 'Anthropic' }, base_url: 'https://api.anthropic.com', model: 'claude-opus-5', api_style: 'anthropic' },
+  { label: { en: 'Qwen (DashScope)', zh: 'Qwen（通义千问）' }, base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen3.8-max', api_style: 'openai' },
+  { label: { en: 'Zhipu GLM', zh: '智谱 GLM' }, base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-5.2', api_style: 'openai' },
+  { label: { en: 'MiniMax', zh: 'MiniMax' }, base_url: 'https://api.minimaxi.com/v1', model: 'MiniMax-M3', api_style: 'openai' },
+  { label: { en: 'Doubao (Volcano Ark)', zh: '豆包（火山方舟）' }, base_url: 'https://ark.cn-beijing.volces.com/api/v3', model: 'doubao-seed-evolving', api_style: 'openai' },
+  { label: { en: 'Ollama (local)', zh: 'Ollama（本地）' }, base_url: 'http://host.docker.internal:11434/v1', model: 'qwen3', api_style: 'openai' },
 ];
 let llmMandatory = false;
 let llmWaiting = false;

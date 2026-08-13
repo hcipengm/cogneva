@@ -145,7 +145,7 @@
         "provider": "kimi",
         "api_key": "${KIMI_API_KEY}",
         "base_url": "https://api.kimi.com/coding/v1",
-        "model": "kimi-for-coding",
+        "model": "k3",
         "api_style": "anthropic",
         "weight": 1,
         "enabled": true
@@ -154,7 +154,7 @@
         "provider": "doubao",
         "api_key": "${ARK_API_KEY}",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-        "model": "doubao-seed-2.0-code",
+        "model": "doubao-seed-evolving",
         "api_style": "openai",
         "weight": 1,
         "enabled": false
