@@ -7,76 +7,67 @@ import {
 
 interface Preset {
   label: string;
-  provider: string;
   base_url: string;
   model: string;
+  /** 协议面首猜：保存时后端用真 key 做双协议实证探测，猜错会被纠正 */
   api_style: string;
 }
 
 const PRESETS: Preset[] = [
-  { label: '自定义', provider: '', base_url: '', model: '', api_style: 'openai' },
+  { label: '自定义', base_url: '', model: '', api_style: 'openai' },
   {
     label: 'Kimi（月之暗面）',
-    provider: 'kimi',
     base_url: 'https://api.kimi.com/coding/v1',
     model: 'kimi-for-coding',
     api_style: 'anthropic',
   },
   {
     label: 'DeepSeek',
-    provider: 'deepseek',
     base_url: 'https://api.deepseek.com/v1',
     model: 'deepseek-chat',
     api_style: 'openai',
   },
   {
     label: 'OpenAI',
-    provider: 'openai',
     base_url: 'https://api.openai.com/v1',
     model: 'gpt-4o',
     api_style: 'openai',
   },
   {
     label: 'Anthropic',
-    provider: 'anthropic',
     base_url: 'https://api.anthropic.com',
     model: 'claude-sonnet-4-6',
     api_style: 'anthropic',
   },
   {
     label: 'Qwen（通义千问）',
-    provider: 'qwen',
     base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     model: 'qwen3-max',
     api_style: 'openai',
   },
   {
     label: '智谱 GLM',
-    provider: 'zhipu',
     base_url: 'https://open.bigmodel.cn/api/paas/v4',
     model: 'glm-4.6',
     api_style: 'openai',
   },
   {
     label: 'MiniMax',
-    provider: 'minimax',
     base_url: 'https://api.minimaxi.com/v1',
     model: 'MiniMax-M2',
     api_style: 'openai',
   },
   {
     label: '豆包（火山方舟）',
-    provider: 'doubao',
     base_url: 'https://ark.cn-beijing.volces.com/api/v3',
     model: 'doubao-seed-2.0-code',
     api_style: 'openai',
   },
   {
     label: 'Ollama（本地）',
-    provider: 'ollama',
-    base_url: 'http://host.docker.internal:11434',
+    base_url: 'http://host.docker.internal:11434/v1',
     model: 'qwen2.5-coder',
-    api_style: 'ollama',
+    api_style: 'openai',
   },
 ];
 
@@ -100,13 +91,13 @@ export function LlmSetupOverlay({
   onClose,
 }: LlmSetupOverlayProps) {
   const [presetIdx, setPresetIdx] = useState(0);
-  const [provider, setProvider] = useState(initial?.provider ?? '');
   const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? '');
   const [model, setModel] = useState(initial?.model ?? '');
-  const [apiStyle, setApiStyle] = useState(initial?.api_style ?? 'openai');
+  const [styleHint, setStyleHint] = useState('openai');
   const [apiKey, setApiKey] = useState('');
   const [phase, setPhase] = useState<Phase>('form');
   const [error, setError] = useState<string | null>(null);
+  const [verifyFailed, setVerifyFailed] = useState(false);
   const [timedOut, setTimedOut] = useState(false);
   const deadlineRef = useRef(0);
 
@@ -136,26 +127,54 @@ export function LlmSetupOverlay({
   const applyPreset = (idx: number) => {
     setPresetIdx(idx);
     const p = PRESETS[idx];
-    if (p.provider) {
-      setProvider(p.provider);
+    setStyleHint(p.api_style);
+    if (p.base_url) {
       setBaseUrl(p.base_url);
       setModel(p.model);
-      setApiStyle(p.api_style);
     }
+  };
+
+  const doSave = async (skipVerify: boolean) => {
+    await saveLlmConfig({
+      base_url: baseUrl.trim(),
+      model: model.trim(),
+      api_key: apiKey.trim(),
+      api_style: styleHint,
+      skip_verify: skipVerify,
+    });
   };
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setVerifyFailed(false);
     setPhase('saving');
     try {
-      await saveLlmConfig({
-        provider: provider.trim(),
-        base_url: baseUrl.trim(),
-        model: model.trim(),
-        api_key: apiKey.trim(),
-        api_style: apiStyle,
-      });
+      await doSave(false);
+      setPhase('waiting');
+    } catch (err) {
+      const apiErr = err as { status?: number; message?: string };
+      let code = '';
+      let msg = apiErr.message ?? '保存失败';
+      try {
+        const parsed = JSON.parse(msg) as { error?: string; message?: string };
+        code = parsed.error ?? '';
+        msg = parsed.message ?? msg;
+      } catch {
+        // 非 JSON 错误体，原样展示
+      }
+      setError(msg);
+      setVerifyFailed(code === 'llm_verify_failed');
+      setPhase('form');
+    }
+  };
+
+  const forceSave = async () => {
+    setError(null);
+    setVerifyFailed(false);
+    setPhase('saving');
+    try {
+      await doSave(true);
       setPhase('waiting');
     } catch (err) {
       const msg = (err as { message?: string }).message ?? '保存失败';
@@ -265,19 +284,6 @@ export function LlmSetupOverlay({
           </div>
           <div>
             <label className="mb-1 block text-sm font-medium text-slate-300">
-              Provider 名称
-            </label>
-            <input
-              type="text"
-              value={provider}
-              onChange={(e) => setProvider(e.target.value)}
-              className={inputCls}
-              placeholder="例如 kimi"
-              required
-            />
-          </div>
-          <div>
-            <label className="mb-1 block text-sm font-medium text-slate-300">
               Base URL
             </label>
             <input
@@ -304,21 +310,6 @@ export function LlmSetupOverlay({
           </div>
           <div>
             <label className="mb-1 block text-sm font-medium text-slate-300">
-              API 风格
-            </label>
-            <select
-              value={apiStyle}
-              onChange={(e) => setApiStyle(e.target.value)}
-              className={inputCls}
-            >
-              <option value="openai">openai（兼容接口，大多数服务商）</option>
-              <option value="anthropic">anthropic</option>
-              <option value="google">google</option>
-              <option value="ollama">ollama（本地）</option>
-            </select>
-          </div>
-          <div>
-            <label className="mb-1 block text-sm font-medium text-slate-300">
               API Key
             </label>
             <input
@@ -331,14 +322,13 @@ export function LlmSetupOverlay({
               autoFocus={mandatory}
             />
             <p className="mt-1 text-xs text-slate-500">
-              密钥只写入集群 Secret，不会回显到界面。
+              密钥只写入集群 Secret，不会回显到界面。API 风格保存时自动探测。
             </p>
           </div>
           <button
             type="submit"
             disabled={
               phase === 'saving' ||
-              !provider.trim() ||
               !baseUrl.trim() ||
               !model.trim() ||
               !apiKey.trim()
@@ -347,6 +337,15 @@ export function LlmSetupOverlay({
           >
             {phase === 'saving' ? '保存中...' : '保存并生效'}
           </button>
+          {verifyFailed && (
+            <button
+              type="button"
+              onClick={forceSave}
+              className="w-full rounded-xl border border-amber-600/50 py-3 font-medium text-amber-400 transition hover:bg-amber-600/10"
+            >
+              仍然保存（跳过连通验证）
+            </button>
+          )}
         </div>
       </form>
     </div>

@@ -396,6 +396,9 @@ enum AuthStyle {
 
 /// 透传共用实现：只取请求 body 重建出站请求（入站 Authorization 天然丢弃），
 /// 由网关代持注入真凭证，逐字节流式回传。
+/// body 里的 model 一律改写为网关上游配置的模型：主应用/沙盒零凭证同时也
+/// 零上游知识，真实模型名只有网关知道（WebUI 向导或引导器 env 预置写入），
+/// 调用方配置里的 model 只是占位。
 async fn stream_forward(
     state: AppState,
     req: axum::extract::Request,
@@ -411,6 +414,18 @@ async fn stream_forward(
     let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let body = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "model".into(),
+                    serde_json::Value::String(state.config.llm_model.clone()),
+                );
+            }
+            serde_json::to_vec(&v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+        }
+        Err(_) => body.to_vec(),
+    };
 
     let start = std::time::Instant::now();
     let builder = state

@@ -453,25 +453,17 @@
     <div class="sub" id="llmSub"></div>
     <label data-i18n="preset">Provider preset</label>
     <select id="llmPreset"></select>
-    <label data-i18n="provider">Provider name</label>
-    <input type="text" id="llmProvider" data-i18n-ph="providerPh" placeholder="e.g. kimi" required />
     <label>Base URL</label>
     <input type="text" id="llmBaseUrl" placeholder="https://api.example.com/v1" required />
     <label data-i18n="model">Model</label>
     <input type="text" id="llmModel" data-i18n-ph="modelPh" placeholder="e.g. kimi-for-coding" required />
-    <label data-i18n="apiStyle">API style</label>
-    <select id="llmApiStyle">
-      <option value="openai" data-i18n="styleOpenai">openai (compatible endpoint, most providers)</option>
-      <option value="anthropic">anthropic</option>
-      <option value="google">google</option>
-      <option value="ollama" data-i18n="styleOllama">ollama (local)</option>
-    </select>
     <label>API Key</label>
     <input type="password" id="llmApiKey" placeholder="sk-..." required style="width:100%" />
     <div class="fine" data-i18n="keyNote">The key is written to the cluster Secret only and never echoed back.</div>
     <div class="err-box" id="llmErr"></div>
     <div class="actions">
       <button type="submit" id="llmSubmit" data-i18n="save">Save &amp; apply</button>
+      <button type="button" class="ghost" id="llmForceSave" style="display:none" data-i18n="forceSave">Save anyway</button>
       <button type="button" class="ghost" id="llmClose" style="display:none" data-i18n="close">Close</button>
     </div>
   </form>
@@ -509,7 +501,9 @@ async function api(path, method = 'GET', body) {
   try { parsed = JSON.parse(text); } catch { parsed = text; }
   if (!resp.ok) {
     const msg = (parsed && parsed.message) || (parsed && parsed.error) || ('HTTP ' + resp.status);
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.code = (parsed && parsed.error) || ('http_' + resp.status);
+    throw err;
   }
   return parsed;
 }
@@ -1013,15 +1007,11 @@ const LLM_LANG = String(navigator.language || '').toLowerCase().startsWith('zh')
 const LLM_I18N = {
   title:        { en: 'LLM Setup', zh: 'LLM 设置' },
   preset:       { en: 'Provider preset', zh: '服务商预设' },
-  provider:     { en: 'Provider name', zh: 'Provider 名称' },
-  providerPh:   { en: 'e.g. kimi', zh: '例如 kimi' },
   model:        { en: 'Model', zh: '模型' },
   modelPh:      { en: 'e.g. kimi-for-coding', zh: '例如 kimi-for-coding' },
-  apiStyle:     { en: 'API style', zh: 'API 风格' },
-  styleOpenai:  { en: 'openai (compatible endpoint, most providers)', zh: 'openai（兼容接口，大多数服务商）' },
-  styleOllama:  { en: 'ollama (local)', zh: 'ollama（本地）' },
-  keyNote:      { en: 'The key is written to the cluster Secret only and never echoed back.', zh: '密钥只写入集群 Secret，不会回显到界面。' },
+  keyNote:      { en: 'The key is written to the cluster Secret only and never echoed back. API style is detected automatically on save.', zh: '密钥只写入集群 Secret，不会回显到界面。API 风格保存时自动探测。' },
   save:         { en: 'Save & apply', zh: '保存并生效' },
+  forceSave:    { en: 'Save anyway', zh: '仍然保存' },
   close:        { en: 'Close', zh: '关闭' },
   subMandatory: { en: 'No LLM connected yet — autonomy and evolution are unavailable. Fill in your model service to finish setup.',
                   zh: '系统尚未连接 LLM，自治与进化能力不可用。请填写模型服务信息完成接入。' },
@@ -1035,20 +1025,22 @@ const LLM_I18N = {
 };
 const t = (key) => LLM_I18N[key][LLM_LANG];
 
+// api_style 只是探测首猜：保存时后端用真 key 做双协议实证探测，猜错会被纠正。
 const LLM_PRESETS = [
-  { label: { en: 'Custom', zh: '自定义' }, provider: '', base_url: '', model: '', api_style: 'openai' },
-  { label: { en: 'Kimi (Moonshot)', zh: 'Kimi（月之暗面）' }, provider: 'kimi', base_url: 'https://api.kimi.com/coding/v1', model: 'kimi-for-coding', api_style: 'anthropic' },
-  { label: { en: 'DeepSeek', zh: 'DeepSeek' }, provider: 'deepseek', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', api_style: 'openai' },
-  { label: { en: 'OpenAI', zh: 'OpenAI' }, provider: 'openai', base_url: 'https://api.openai.com/v1', model: 'gpt-4o', api_style: 'openai' },
-  { label: { en: 'Anthropic', zh: 'Anthropic' }, provider: 'anthropic', base_url: 'https://api.anthropic.com', model: 'claude-sonnet-4-6', api_style: 'anthropic' },
-  { label: { en: 'Qwen (DashScope)', zh: 'Qwen（通义千问）' }, provider: 'qwen', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen3-max', api_style: 'openai' },
-  { label: { en: 'Zhipu GLM', zh: '智谱 GLM' }, provider: 'zhipu', base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4.6', api_style: 'openai' },
-  { label: { en: 'MiniMax', zh: 'MiniMax' }, provider: 'minimax', base_url: 'https://api.minimaxi.com/v1', model: 'MiniMax-M2', api_style: 'openai' },
-  { label: { en: 'Doubao (Volcano Ark)', zh: '豆包（火山方舟）' }, provider: 'doubao', base_url: 'https://ark.cn-beijing.volces.com/api/v3', model: 'doubao-seed-2.0-code', api_style: 'openai' },
-  { label: { en: 'Ollama (local)', zh: 'Ollama（本地）' }, provider: 'ollama', base_url: 'http://host.docker.internal:11434', model: 'qwen2.5-coder', api_style: 'ollama' },
+  { label: { en: 'Custom', zh: '自定义' }, base_url: '', model: '', api_style: 'openai' },
+  { label: { en: 'Kimi (Moonshot)', zh: 'Kimi（月之暗面）' }, base_url: 'https://api.kimi.com/coding/v1', model: 'kimi-for-coding', api_style: 'anthropic' },
+  { label: { en: 'DeepSeek', zh: 'DeepSeek' }, base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', api_style: 'openai' },
+  { label: { en: 'OpenAI', zh: 'OpenAI' }, base_url: 'https://api.openai.com/v1', model: 'gpt-4o', api_style: 'openai' },
+  { label: { en: 'Anthropic', zh: 'Anthropic' }, base_url: 'https://api.anthropic.com', model: 'claude-sonnet-4-6', api_style: 'anthropic' },
+  { label: { en: 'Qwen (DashScope)', zh: 'Qwen（通义千问）' }, base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen3-max', api_style: 'openai' },
+  { label: { en: 'Zhipu GLM', zh: '智谱 GLM' }, base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4.6', api_style: 'openai' },
+  { label: { en: 'MiniMax', zh: 'MiniMax' }, base_url: 'https://api.minimaxi.com/v1', model: 'MiniMax-M2', api_style: 'openai' },
+  { label: { en: 'Doubao (Volcano Ark)', zh: '豆包（火山方舟）' }, base_url: 'https://ark.cn-beijing.volces.com/api/v3', model: 'doubao-seed-2.0-code', api_style: 'openai' },
+  { label: { en: 'Ollama (local)', zh: 'Ollama（本地）' }, base_url: 'http://host.docker.internal:11434/v1', model: 'qwen2.5-coder', api_style: 'openai' },
 ];
 let llmMandatory = false;
 let llmWaiting = false;
+let llmStyleHint = 'openai';
 
 function initLlmWizard() {
   document.querySelectorAll('[data-i18n]').forEach((el) => {
@@ -1079,53 +1071,77 @@ async function checkLlmStatus() {
 
 $('llmPreset').onchange = () => {
   const p = LLM_PRESETS[Number($('llmPreset').value)];
-  if (!p.provider) return;
-  $('llmProvider').value = p.provider;
+  llmStyleHint = p.api_style;
+  if (!p.base_url) return;
   $('llmBaseUrl').value = p.base_url;
   $('llmModel').value = p.model;
-  $('llmApiStyle').value = p.api_style;
 };
 
 $('llmBtn').onclick = () => showLlmModal(false);
 $('llmClose').onclick = () => $('llmMask').classList.remove('show');
 
+async function submitLlmConfig(skipVerify) {
+  await api('/api/v1/admin/llm-config', 'POST', {
+    base_url: $('llmBaseUrl').value.trim(),
+    model: $('llmModel').value.trim(),
+    api_key: $('llmApiKey').value.trim(),
+    api_style: llmStyleHint,
+    skip_verify: skipVerify === true,
+  });
+}
+
+$('llmForceSave').onclick = async () => {
+  $('llmForceSave').disabled = true;
+  try {
+    await submitLlmConfig(true);
+    $('llmForceSave').style.display = 'none';
+    $('llmErr').style.display = 'none';
+    afterLlmSaved();
+  } catch (e2) {
+    $('llmErr').textContent = e2.message;
+    $('llmErr').style.display = '';
+  } finally {
+    $('llmForceSave').disabled = false;
+  }
+};
+
+function afterLlmSaved() {
+  llmWaiting = true;
+  $('llmSub').textContent = t('subSaved');
+  const deadline = Date.now() + 3 * 60 * 1000;
+  const timer = setInterval(async () => {
+    try {
+      const s = await api('/api/v1/admin/llm-status');
+      if (s.configured) {
+        clearInterval(timer);
+        llmWaiting = false;
+        $('llmMask').classList.remove('show');
+        toast(t('connected'), 'ok');
+        refreshAll();
+      }
+    } catch { /* pod restarting */ }
+    if (Date.now() > deadline) {
+      clearInterval(timer);
+      llmWaiting = false;
+      $('llmSub').textContent = t('subTimeout');
+      llmMandatory = false;
+      $('llmClose').style.display = '';
+    }
+  }, 5000);
+}
+
 $('llmForm').onsubmit = async (e) => {
   e.preventDefault();
   $('llmErr').style.display = 'none';
+  $('llmForceSave').style.display = 'none';
   $('llmSubmit').disabled = true;
   try {
-    await api('/api/v1/admin/llm-config', 'POST', {
-      provider: $('llmProvider').value.trim(),
-      base_url: $('llmBaseUrl').value.trim(),
-      model: $('llmModel').value.trim(),
-      api_key: $('llmApiKey').value.trim(),
-      api_style: $('llmApiStyle').value,
-    });
-    llmWaiting = true;
-    $('llmSub').textContent = t('subSaved');
-    const deadline = Date.now() + 3 * 60 * 1000;
-    const timer = setInterval(async () => {
-      try {
-        const s = await api('/api/v1/admin/llm-status');
-        if (s.configured) {
-          clearInterval(timer);
-          llmWaiting = false;
-          $('llmMask').classList.remove('show');
-          toast(t('connected'), 'ok');
-          refreshAll();
-        }
-      } catch { /* pod restarting */ }
-      if (Date.now() > deadline) {
-        clearInterval(timer);
-        llmWaiting = false;
-        $('llmSub').textContent = t('subTimeout');
-        llmMandatory = false;
-        $('llmClose').style.display = '';
-      }
-    }, 5000);
+    await submitLlmConfig(false);
+    afterLlmSaved();
   } catch (err) {
     $('llmErr').textContent = err.message;
     $('llmErr').style.display = 'block';
+    if (err.code === 'llm_verify_failed') $('llmForceSave').style.display = '';
   } finally {
     $('llmSubmit').disabled = false;
   }

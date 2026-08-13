@@ -8,12 +8,11 @@
 //! 5. 供给运行时镜像：优先下载预构建 release 包（sha256 校验后导入集群），
 //!    不可用时回退从源码构建（K3s 分支；清单引用 localhost/cogneva:local）；
 //! 6. kubectl apply 部署清单并等待关键 Pod Ready；
-//! 7. 打印 WebUI 地址并自动打开浏览器，清零内存中的 API Key 后退出（自毁）。
+//! 7. 打印 WebUI 地址并自动打开浏览器，退出（自毁）。
 //!
-//! 全程零问答。LLM 接入不在引导器做：部署完成后 WebUI 强制向导
-//! （未配置不可关闭）收集 provider/key 并写入集群 Secret。
-//! 无人值守自动化可用 COGNEVA_LLM_PROVIDER / COGNEVA_LLM_API_KEY /
-//! COGNEVA_LLM_BASE_URL 预置（仅注入 Secret，不做连通验证）。
+//! 全程零问答，引导器完全不接触 LLM：接入由部署完成后的 WebUI 强制向导
+//! （未配置不可关闭）完成，无人值守自动化直接调向导背后的
+//! POST /api/v1/admin/llm-config（先登录拿 admin token）。
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -45,7 +44,6 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use tokio::process::Command;
 use tracing::{info, warn};
-use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,11 +64,6 @@ struct Hardware {
 
 #[derive(Debug, Serialize)]
 struct IntentConfig {
-    /// env 预置时记录；默认 None（LLM 由 WebUI 强制向导配置，此处不落字段）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    llm_provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    llm_base_url: Option<String>,
     branch: Branch,
     hardware: Hardware,
 }
@@ -1332,26 +1325,6 @@ fn cn_image_map(mirror: &str) -> Vec<(String, String)> {
     .collect()
 }
 
-/// 将 LLM API Key 注入 K8s Secret（仅安全网关挂载，沙盒零凭证）。
-async fn inject_llm_secret(api_key: &str) -> Result<()> {
-    info!("注入 LLM API Key 到 cogneva-secrets");
-    let patch = format!(r#"{{"stringData":{{"llm-api-key":"{api_key}"}}}}"#);
-    run(
-        "kubectl",
-        &[
-            "-n",
-            "cogneva",
-            "patch",
-            "secret",
-            "cogneva-secrets",
-            "--type=merge",
-            "-p",
-            &patch,
-        ],
-    )
-    .await
-}
-
 async fn wait_ready() -> Result<()> {
     for deploy in ["cogneva", "cogneva-security-gateway"] {
         let status = Command::new("kubectl")
@@ -1370,20 +1343,6 @@ async fn wait_ready() -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// 可选 LLM 预配置：仅认环境变量（无人值守自动化注入用），从不交互提问。
-/// 默认不配 LLM——接入由 WebUI 强制向导完成（未配置时向导不可关闭），
-/// 引导器全程零问答、全自动。
-fn llm_env_config() -> Option<(String, String, String)> {
-    let api_key = std::env::var("COGNEVA_LLM_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        return None;
-    }
-    let provider = std::env::var("COGNEVA_LLM_PROVIDER").unwrap_or_else(|_| "openai".into());
-    let base_url = std::env::var("COGNEVA_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    Some((provider, base_url, api_key))
 }
 
 /// 尝试用系统默认浏览器打开 WebUI（2.5.6）；失败仅告警，不影响自毁退出。
@@ -1476,10 +1435,7 @@ async fn main() -> Result<()> {
         std::env::consts::OS
     );
 
-    let mut llm = llm_env_config();
-    if llm.is_none() {
-        info!("未预置 LLM 配置：部署完成后由 WebUI 强制向导接入（全自动路径）");
-    }
+    info!("LLM 接入不在引导器做：部署完成后由 WebUI 强制向导完成（全自动零问答）");
 
     let hw = probe_hardware().await;
     info!(
@@ -1489,14 +1445,7 @@ async fn main() -> Result<()> {
     let branch = decide_branch(&hw);
     info!("规则引擎决策: {:?} 分支", branch);
 
-    // API Key 只存在于内存，绝不落盘；env 预置时稍后通过 kubectl 注入 K8s Secret
-    let (llm_provider, llm_base_url) = match &llm {
-        Some((p, b, _)) => (Some(p.clone()), Some(b.clone())),
-        None => (None, None),
-    };
     let intent = IntentConfig {
-        llm_provider,
-        llm_base_url,
         branch,
         hardware: hw.clone(),
     };
@@ -1534,9 +1483,6 @@ async fn main() -> Result<()> {
     }
     ensure_runtime_image(branch).await?;
     deploy_manifests(branch).await?;
-    if let Some((_, _, api_key)) = &llm {
-        inject_llm_secret(api_key).await?;
-    }
     wait_ready().await?;
 
     let webui =
@@ -1547,10 +1493,6 @@ async fn main() -> Result<()> {
         open_browser(&webui).await;
     }
 
-    // 自毁：清零内存中的 API Key（env 预置路径）
-    if let Some((_, _, api_key)) = &mut llm {
-        api_key.zeroize();
-    }
     info!("引导器使命完成，退出");
     Ok(())
 }

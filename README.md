@@ -566,7 +566,16 @@ The bootstrapper runs fully unattended — no prompts at all:
 5. Starts Cogneva and prints the WebUI address;
 6. Exits.
 
-On first visit the WebUI shows a mandatory LLM setup wizard (it cannot be dismissed until a model is connected) — pick a provider preset, paste your API key, and the key is written to a cluster Secret only. For unattended automation you can also preset `COGNEVA_LLM_API_KEY` and related env vars; the bootstrapper only injects the Secret and performs no connectivity check.
+On first visit the WebUI shows a mandatory LLM setup wizard (it cannot be dismissed until a model is connected): pick a provider preset or go custom — only Base URL, model and API key are needed; the API style is auto-detected on save by probing both protocols with your key. The key is written to a cluster Secret only. For unattended automation (CI, batch installs) call the same API the wizard uses once deployment is done:
+
+```bash
+TOKEN=$(curl -sX POST http://localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"ci","password":"ci"}' | jq -r .access_token)
+curl -X POST http://localhost:8080/api/v1/admin/llm-config \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"base_url":"https://api.deepseek.com/v1","model":"deepseek-chat","api_key":"sk-..."}'
+```
 
 ### ☸️ Existing cluster
 

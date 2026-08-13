@@ -562,7 +562,16 @@ iwr -useb https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.ps1 
 5. 启动 Cogneva 并打印 WebUI 地址；
 6. 引导器退出。
 
-首次打开 WebUI 会弹出强制 LLM 配置向导（未接入前不可关闭），选择服务商预设填入 API Key 即可，密钥只写入集群 Secret。无人值守场景也可通过 `COGNEVA_LLM_API_KEY` 等环境变量预置，引导器只注入 Secret、不做连通验证。
+首次打开 WebUI 会弹出强制 LLM 配置向导（未接入前不可关闭）：选服务商预设或自定义，只需填 Base URL、模型、API Key 三项，API 风格保存时自动用真 key 双协议探测；密钥只写入集群 Secret。无人值守场景（CI、批量装机）部署完成后直接调向导背后的接口：
+
+```bash
+TOKEN=$(curl -sX POST http://localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"ci","password":"ci"}' | jq -r .access_token)
+curl -X POST http://localhost:8080/api/v1/admin/llm-config \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"base_url":"https://api.deepseek.com/v1","model":"deepseek-chat","api_key":"sk-..."}'
+```
 
 ### ☸️ 已有集群
 

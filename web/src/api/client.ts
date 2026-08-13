@@ -159,11 +159,13 @@ export interface LlmStatus {
 }
 
 export interface LlmConfigPayload {
-  provider: string;
   base_url: string;
   model: string;
   api_key: string;
+  /** 协议面首猜，后端保存时做双协议实证探测，猜错会被纠正 */
   api_style?: string;
+  /** 探测失败后的"仍然保存"：跳过连通验证直接落库 */
+  skip_verify?: boolean;
 }
 
 export interface LlmConfigResult {

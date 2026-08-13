@@ -71,13 +71,9 @@ spec:
                   name: cogneva-secrets
                   key: llm-api-key
                   optional: true
-            # LLM 通道上游（/v1/intent、/v1/chat、/v1/chat/completions 透传）
-            - name: COGNEVA_LLM_PROVIDER
-              value: "openai"
-            - name: COGNEVA_LLM_BASE_URL
-              value: "https://api.kimi.com/coding/v1"
-            - name: COGNEVA_LLM_MODEL
-              value: "kimi-for-coding"
+            # LLM 通道上游（/v1/intent、/v1/chat、/v1/chat/completions 透传）。
+            # 不写死任何服务商：未配置时走代码内官方默认，WebUI 向导或引导器
+            # env 预置会把 COGNEVA_LLM_PROVIDER/BASE_URL/MODEL patch 到此处。
           livenessProbe:
             httpGet:
               path: /health/live
