@@ -349,7 +349,9 @@
     font: 500 15px/1.55 Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
     white-space: pre-wrap; word-break: break-word; box-shadow: 0 6px 16px rgba(0,0,0,.35);
   }
-  .msg.user { align-self: flex-end; background: linear-gradient(#3b82f6, #2563eb); color: #fff; }
+  .msg.user { align-self: flex-end; background: linear-gradient(#3b82f6, #2563eb); color: #fff; padding: 9px 15px; }
+  /* Blue selection on the blue bubble is invisible — use a light wash instead. */
+  .msg.user ::selection { background: rgba(255,255,255,.35); color: #fff; }
   .msg.assistant { align-self: flex-start; background: linear-gradient(#1e293b, #0f172a); color: #e2e8f0; }
   .think-label { color: rgba(125,211,252,.75); font-size: 12px; }
   .think-body { color: rgba(148,163,184,.85); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
