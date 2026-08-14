@@ -22,6 +22,13 @@ const CONNECT_TIMEOUT_SECS: u64 = 30;
 /// gap beyond this aborts the turn. Matches the provider's own in-stream cap.
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 
+/// Persona for the Web UI chat. Raw history + user text without a system
+/// prompt makes coding-tuned endpoints answer terse and generic.
+const CHAT_SYSTEM_PROMPT: &str =
+    "你是 Cogneva 多智能体协作平台的内置助手，正在通过平台 Live 面板与用户对话。\
+用用户的语言回答（中文提问用中文，英文提问用英文）。\
+回答要具体、有实质内容，适当展开但不要啰嗦；不知道就直说不知道，不要编造。";
+
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -133,6 +140,7 @@ pub async fn run_chat_turn(
             .map(|(msgs, _)| msgs.clone())
             .unwrap_or_default()
     };
+    messages.insert(0, cog_core::Message::system(CHAT_SYSTEM_PROMPT));
     messages.push(cog_core::Message::user(content.clone()));
 
     let options = cog_core::ChatOptions {
@@ -184,6 +192,37 @@ pub async fn run_chat_turn(
             Ok(Some(cog_core::AssistantMessageEvent::TextDelta { delta, .. })) => {
                 reply.push_str(&delta);
                 emit_delta(&out, &session_id, &assistant_mid, &delta).await;
+            }
+            // Reasoning models (thinking forced on at some endpoints) can
+            // think for tens of seconds before the first text delta. Forward
+            // the thinking stream so the UI shows progress instead of an
+            // empty bubble for the whole reasoning window.
+            Ok(Some(cog_core::AssistantMessageEvent::ThinkingStart { .. })) => {
+                emit(
+                    &out,
+                    &session_id,
+                    "message.thinking_start",
+                    serde_json::json!({ "message_id": assistant_mid }),
+                )
+                .await;
+            }
+            Ok(Some(cog_core::AssistantMessageEvent::ThinkingDelta { delta, .. })) => {
+                emit(
+                    &out,
+                    &session_id,
+                    "message.thinking_delta",
+                    serde_json::json!({ "message_id": assistant_mid, "delta": delta }),
+                )
+                .await;
+            }
+            Ok(Some(cog_core::AssistantMessageEvent::ThinkingEnd { .. })) => {
+                emit(
+                    &out,
+                    &session_id,
+                    "message.thinking_end",
+                    serde_json::json!({ "message_id": assistant_mid }),
+                )
+                .await;
             }
             Ok(Some(cog_core::AssistantMessageEvent::Error { error, .. })) => {
                 failure = Some(error.content());

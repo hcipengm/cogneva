@@ -480,6 +480,16 @@ async fn stream_forward(
                         "model".into(),
                         serde_json::Value::String(upstream.model.clone()),
                     );
+                    // 调用方按最新 OpenAI 约定可能把 system 写成 developer，
+                    // 部分上游（Kimi coding 等）不认该角色直接 400。网关是
+                    // 协议适配点，统一回退为 system，保护所有调用方。
+                    if let Some(serde_json::Value::Array(msgs)) = obj.get_mut("messages") {
+                        for m in msgs.iter_mut() {
+                            if m.get("role").and_then(|r| r.as_str()) == Some("developer") {
+                                m["role"] = serde_json::Value::String("system".into());
+                            }
+                        }
+                    }
                 }
                 serde_json::to_vec(&v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
             }

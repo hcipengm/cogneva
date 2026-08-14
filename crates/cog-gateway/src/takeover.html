@@ -1140,6 +1140,8 @@ const I18N = {
   csConnecting:   { en: 'connecting', zh: '连接中' },
   csClosed:       { en: 'closed', zh: '已断开' },
   csError:        { en: 'error', zh: '错误' },
+  thinkingLabel:  { en: 'Thinking…', zh: '思考中…' },
+  thoughtLabel:   { en: 'Thought process', zh: '思考过程' },
   navPipeline:    { en: 'Patch Pipeline', zh: '补丁流水线' },
   navProcess:     { en: 'Process', zh: '进程' },
   navPromotions:  { en: 'Promotions', zh: '晋级' },
@@ -1549,22 +1551,30 @@ checkLlmStatus();
   let autoScroll = true;
   let userScrollTimer = 0;
 
-  function startMessage(id, role) { messages.push({ id, role, text: '', status: 'streaming' }); }
+  function startMessage(id, role) { messages.push({ id, role, text: '', thinking: '', thinkingDone: false, status: 'streaming' }); }
   function appendDelta(id, delta) {
     const m = messages.find((x) => x.id === id);
     if (m) m.text += delta;
   }
+  function appendThinking(id, delta) {
+    const m = messages.find((x) => x.id === id);
+    if (m) m.thinking += delta;
+  }
+  function endThinking(id) {
+    const m = messages.find((x) => x.id === id);
+    if (m) m.thinkingDone = true;
+  }
   function endMessage(id) {
     const m = messages.find((x) => x.id === id);
-    if (m) m.status = 'done';
+    if (m) { m.status = 'done'; m.thinkingDone = true; }
   }
 
   // ── text engine: canvas-measure wrapping (replaces @chenglou/pretext) ──
   const FONT = '500 15px Inter, "PingFang SC", "Microsoft YaHei", sans-serif';
   const FS = 15, LINE_H = 1.55;
   const mctx = document.createElement('canvas').getContext('2d');
-  function wrapLines(text, maxWidth) {
-    mctx.font = FONT;
+  function wrapLines(text, maxWidth, font) {
+    mctx.font = font || FONT;
     const out = [];
     for (const raw of String(text).split('\n')) {
       let line = '';
@@ -1587,10 +1597,10 @@ checkLlmStatus();
     }
     return out;
   }
-  function tightWidth(text, maxWidth) {
-    mctx.font = FONT;
+  function tightWidth(text, maxWidth, font) {
+    mctx.font = font || FONT;
     let w = 0;
-    for (const l of wrapLines(text, maxWidth)) w = Math.max(w, mctx.measureText(l).width);
+    for (const l of wrapLines(text, maxWidth, font)) w = Math.max(w, mctx.measureText(l).width);
     return Math.ceil(w);
   }
 
@@ -1612,12 +1622,32 @@ checkLlmStatus();
 
   // ── message painter ──
   const PAD_X = 18, PAD_Y = 14, MAX_BW = 520, MIN_BW = 80, BUBBLE_R = 18, MSG_GAP = 20;
-  function layoutMessage(text, availW) {
+  const TH_FONT = '500 12px Inter, "PingFang SC", "Microsoft YaHei", sans-serif';
+  const TH_FS = 12, TH_CAP = 800;
+  // Long reasoning streams would swamp the bubble — show the tail only.
+  function thinkingView(m) {
+    if (!m.thinking) return '';
+    return m.thinking.length > TH_CAP ? '…' + m.thinking.slice(-TH_CAP) : m.thinking;
+  }
+  function layoutMessage(m, availW) {
     const maxTextW = Math.min(MAX_BW, availW - 96) - PAD_X * 2;
-    const bw = Math.max(MIN_BW, Math.min(tightWidth(text, maxTextW) + PAD_X * 2, maxTextW + PAD_X * 2));
+    const th = thinkingView(m);
+    const thLabel = th ? (m.thinkingDone ? t('thoughtLabel') : t('thinkingLabel')) : '';
+    const need = Math.max(
+      tightWidth(m.text, maxTextW),
+      th ? tightWidth(th, maxTextW, TH_FONT) : 0,
+      thLabel ? tightWidth(thLabel, maxTextW, TH_FONT) : 0
+    );
+    const bw = Math.max(MIN_BW, Math.min(need + PAD_X * 2, maxTextW + PAD_X * 2));
     const textW = bw - PAD_X * 2;
-    const lines = wrapLines(text, textW);
-    return { bw, bh: lines.length * FS * LINE_H + PAD_Y * 2, lines, textW };
+    const thLines = th ? wrapLines(th, textW, TH_FONT) : [];
+    const lines = wrapLines(m.text, textW);
+    const showText = !(m.text === '' && thLines.length > 0);
+    let bh = PAD_Y * 2 + thLines.length * TH_FS * LINE_H;
+    if (thLabel) bh += TH_FS * LINE_H;
+    if (thLines.length > 0 && showText) bh += 10;
+    if (showText) bh += lines.length * FS * LINE_H;
+    return { bw, bh, lines, thLines, thLabel, showText, textW };
   }
   function drawBubble(m, lay, x, y) {
     const isUser = m.role === 'user';
@@ -1633,13 +1663,35 @@ checkLlmStatus();
     ctx.fill();
     ctx.restore();
 
-    ctx.fillStyle = isUser ? '#ffffff' : '#e2e8f0';
-    ctx.font = FONT;
-    ctx.textBaseline = 'alphabetic';
-    const lh = FS * LINE_H, startY = y + PAD_Y + 13;
-    lay.lines.forEach((line, i) => ctx.fillText(line, x + PAD_X, startY + i * lh));
+    let lineY = y + PAD_Y + 13;
+    if (lay.thLines.length > 0) {
+      const thLh = TH_FS * LINE_H;
+      ctx.fillStyle = 'rgba(125,211,252,.75)';
+      ctx.font = TH_FONT;
+      ctx.fillText(lay.thLabel, x + PAD_X, lineY);
+      lineY += thLh;
+      ctx.fillStyle = 'rgba(148,163,184,.85)';
+      lay.thLines.forEach((line) => { ctx.fillText(line, x + PAD_X, lineY); lineY += thLh; });
+      if (lay.showText) {
+        lineY += 4;
+        ctx.strokeStyle = 'rgba(148,163,184,.18)';
+        ctx.beginPath();
+        ctx.moveTo(x + PAD_X, lineY);
+        ctx.lineTo(x + lay.bw - PAD_X, lineY);
+        ctx.stroke();
+        lineY += 9;
+      }
+    }
+    if (lay.showText) {
+      ctx.fillStyle = isUser ? '#ffffff' : '#e2e8f0';
+      ctx.font = FONT;
+      ctx.textBaseline = 'alphabetic';
+      const lh = FS * LINE_H;
+      if (lay.thLines.length === 0) lineY = y + PAD_Y + 13;
+      lay.lines.forEach((line, i) => ctx.fillText(line, x + PAD_X, lineY + i * lh));
+    }
 
-    if (m.role === 'assistant' && m.text.length > 0) {
+    if (m.role === 'assistant' && m.status === 'streaming' && (m.text.length > 0 || m.thinking.length > 0)) {
       const tm = Date.now() / 1000;
       const alpha = 0.5 + 0.5 * Math.sin(tm * 4);
       ctx.save();
@@ -1872,10 +1924,10 @@ checkLlmStatus();
       const marginX = 28;
       let curY = 28;
       const items = messages.map((m) => {
-        const key = m.id + ':' + m.text.length + ':' + m.status + ':' + contentW;
+        const key = m.id + ':' + m.text.length + ':' + m.thinking.length + ':' + m.thinkingDone + ':' + m.status + ':' + contentW;
         let lay = this.cache.get(key);
-        if (!lay || lay.text !== m.text) {
-          lay = Object.assign({ text: m.text }, layoutMessage(m.text, contentW));
+        if (!lay || lay.text !== m.text || lay.thinking !== m.thinking) {
+          lay = Object.assign({ text: m.text, thinking: m.thinking }, layoutMessage(m, contentW));
           this.cache.set(key, lay);
         }
         const x = m.role === 'user' ? contentW - marginX - lay.bw : marginX;
@@ -1948,6 +2000,12 @@ checkLlmStatus();
           break;
         case 'message.text_delta':
           if (inner.message_id) appendDelta(inner.message_id, inner.delta || '');
+          break;
+        case 'message.thinking_delta':
+          if (inner.message_id) appendThinking(inner.message_id, inner.delta || '');
+          break;
+        case 'message.thinking_end':
+          if (inner.message_id) endThinking(inner.message_id);
           break;
         case 'message.end':
           if (inner.message_id) endMessage(inner.message_id);
