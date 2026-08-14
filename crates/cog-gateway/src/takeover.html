@@ -309,6 +309,31 @@
     background: #020617;
   }
   .live-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  /* Chat bubbles are real DOM text: selectable/copyable, subpixel-sharp,
+     natively scrolled. The canvas below only paints the background grid,
+     side panels, and the connection dot. */
+  .chat-scroll {
+    position: absolute; left: 0; top: 0; bottom: 76px; right: 328px;
+    overflow-y: auto; padding: 28px; display: flex; flex-direction: column; gap: 20px;
+    scrollbar-width: thin; scrollbar-color: rgba(148,163,184,.3) transparent;
+  }
+  .chat-empty { margin: auto; color: rgba(148,163,184,.65); font-size: 14px; text-align: center; }
+  .msg {
+    position: relative; max-width: 520px; min-width: 80px; padding: 14px 18px; border-radius: 18px;
+    font: 500 15px/1.55 Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+    white-space: pre-wrap; word-break: break-word; box-shadow: 0 6px 16px rgba(0,0,0,.35);
+  }
+  .msg.user { align-self: flex-end; background: linear-gradient(#3b82f6, #2563eb); color: #fff; }
+  .msg.assistant { align-self: flex-start; background: linear-gradient(#1e293b, #0f172a); color: #e2e8f0; }
+  .think-label { color: rgba(125,211,252,.75); font-size: 12px; }
+  .think-body { color: rgba(148,163,184,.85); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  .think + .msg-text:not(:empty) { border-top: 1px solid rgba(148,163,184,.18); margin-top: 10px; padding-top: 10px; }
+  .msg.assistant.streaming::after {
+    content: ''; position: absolute; right: 16px; bottom: 10px; width: 6px; height: 6px;
+    border-radius: 50%; background: #38bdf8; box-shadow: 0 0 8px #38bdf8;
+    animation: livePulse 1.2s ease-in-out infinite;
+  }
+  @keyframes livePulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
   .live-input {
     position: absolute; left: 0; right: 0; bottom: 0; padding: 12px;
     display: flex; justify-content: center; pointer-events: none;
@@ -406,6 +431,7 @@
       </h2>
       <div class="live-stage" id="liveStage">
         <canvas id="liveCanvas"></canvas>
+        <div class="chat-scroll" id="chatScroll"><div class="chat-empty" id="chatEmpty"></div></div>
         <div class="live-input">
           <div class="box">
             <input id="liveInput" type="text" data-i18n-ph="liveInputPh" placeholder="Type an intent…" autocomplete="off" />
@@ -1460,6 +1486,7 @@ function afterLogin() {
   refreshAll();
   connectStream();
   checkLlmStatus();
+  if (window.liveUpdateEmpty) window.liveUpdateEmpty();
   if (window.liveReconnect) window.liveReconnect();
 }
 
@@ -1545,62 +1572,76 @@ checkLlmStatus();
   const sendBtn = $('liveSend');
   const ctx = canvas.getContext('2d', { alpha: false });
 
-  // ── store (port of streamStore) ──
-  const messages = [];
+  // ── store: chat bubbles are DOM nodes (selectable, copyable, native
+  // scroll). The canvas only paints background/panels/status dot.
+  const chatScroll = $('chatScroll');
+  const chatEmpty = $('chatEmpty');
+  const msgEls = new Map();
+  const thinkingBuf = new Map();
+  const TH_CAP = 800;
   let connectionStatus = 'closed';
   let autoScroll = true;
 
-  function startMessage(id, role) { messages.push({ id, role, text: '', thinking: '', thinkingDone: false, status: 'streaming' }); }
+  function maybeScroll() {
+    if (autoScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
+  }
+  chatScroll.addEventListener('scroll', () => {
+    autoScroll = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 40;
+  });
+  function updateChatEmpty() {
+    chatEmpty.textContent = $('token').value.trim() ? t('liveEmpty') : t('liveNoToken');
+  }
+  updateChatEmpty();
+
+  function startMessage(id, role) {
+    const el = document.createElement('div');
+    el.className = 'msg ' + role + ' streaming';
+    const think = document.createElement('div');
+    think.className = 'think';
+    think.style.display = 'none';
+    const thinkLabel = document.createElement('div');
+    thinkLabel.className = 'think-label';
+    const thinkBody = document.createElement('div');
+    thinkBody.className = 'think-body';
+    think.appendChild(thinkLabel);
+    think.appendChild(thinkBody);
+    const text = document.createElement('div');
+    text.className = 'msg-text';
+    el.appendChild(think);
+    el.appendChild(text);
+    chatScroll.appendChild(el);
+    msgEls.set(id, el);
+    chatEmpty.style.display = 'none';
+    maybeScroll();
+  }
   function appendDelta(id, delta) {
-    const m = messages.find((x) => x.id === id);
-    if (m) m.text += delta;
+    const el = msgEls.get(id);
+    if (el) {
+      el.querySelector('.msg-text').appendChild(document.createTextNode(delta));
+      maybeScroll();
+    }
   }
   function appendThinking(id, delta) {
-    const m = messages.find((x) => x.id === id);
-    if (m) m.thinking += delta;
+    const el = msgEls.get(id);
+    if (!el) return;
+    const buf = (thinkingBuf.get(id) || '') + delta;
+    thinkingBuf.set(id, buf);
+    const think = el.querySelector('.think');
+    think.style.display = '';
+    think.querySelector('.think-label').textContent = t('thinkingLabel');
+    think.querySelector('.think-body').textContent = buf.length > TH_CAP ? '…' + buf.slice(-TH_CAP) : buf;
+    maybeScroll();
   }
   function endThinking(id) {
-    const m = messages.find((x) => x.id === id);
-    if (m) m.thinkingDone = true;
+    const el = msgEls.get(id);
+    if (el && thinkingBuf.has(id)) el.querySelector('.think-label').textContent = t('thoughtLabel');
   }
   function endMessage(id) {
-    const m = messages.find((x) => x.id === id);
-    if (m) { m.status = 'done'; m.thinkingDone = true; }
-  }
-
-  // ── text engine: canvas-measure wrapping (replaces @chenglou/pretext) ──
-  const FONT = '500 15px Inter, "PingFang SC", "Microsoft YaHei", sans-serif';
-  const FS = 15, LINE_H = 1.55;
-  const mctx = document.createElement('canvas').getContext('2d');
-  function wrapLines(text, maxWidth, font) {
-    mctx.font = font || FONT;
-    const out = [];
-    for (const raw of String(text).split('\n')) {
-      let line = '';
-      for (const ch of raw) {
-        const next = line + ch;
-        if (line && mctx.measureText(next).width > maxWidth) {
-          const sp = line.lastIndexOf(' ');
-          if (sp > 0 && /[A-Za-z0-9]/.test(ch)) {
-            out.push(line.slice(0, sp));
-            line = line.slice(sp + 1) + ch;
-          } else {
-            out.push(line);
-            line = ch;
-          }
-        } else {
-          line = next;
-        }
-      }
-      out.push(line);
+    const el = msgEls.get(id);
+    if (el) {
+      el.classList.remove('streaming');
+      if (thinkingBuf.has(id)) el.querySelector('.think-label').textContent = t('thoughtLabel');
     }
-    return out;
-  }
-  function tightWidth(text, maxWidth, font) {
-    mctx.font = font || FONT;
-    let w = 0;
-    for (const l of wrapLines(text, maxWidth, font)) w = Math.max(w, mctx.measureText(l).width);
-    return Math.ceil(w);
   }
 
   // ── shared path helper ──
@@ -1617,104 +1658,6 @@ checkLlmStatus();
     c.lineTo(x, y + r);
     c.quadraticCurveTo(x, y, x + r, y);
     c.closePath();
-  }
-
-  // Snap a logical (CSS px) coordinate to the physical device-pixel grid.
-  // CSS-pixel snapping is not enough on 125%/150% scaled screens (DPR 1.25/
-  // 1.5): glyph origins must land on whole device pixels or text smears.
-  function qsnap(v) {
-    const s = renderer.vw > 0 ? canvas.width / renderer.vw : (window.devicePixelRatio || 1);
-    return Math.round(v * s) / s;
-  }
-
-  // ── message painter ──
-  const PAD_X = 18, PAD_Y = 14, MAX_BW = 520, MIN_BW = 80, BUBBLE_R = 18, MSG_GAP = 20;
-  const TH_FONT = '500 12px Inter, "PingFang SC", "Microsoft YaHei", sans-serif';
-  const TH_FS = 12, TH_CAP = 800;
-  // Long reasoning streams would swamp the bubble — show the tail only.
-  function thinkingView(m) {
-    if (!m.thinking) return '';
-    return m.thinking.length > TH_CAP ? '…' + m.thinking.slice(-TH_CAP) : m.thinking;
-  }
-  function layoutMessage(m, availW) {
-    const maxTextW = Math.min(MAX_BW, availW - 96) - PAD_X * 2;
-    const th = thinkingView(m);
-    const thLabel = th ? (m.thinkingDone ? t('thoughtLabel') : t('thinkingLabel')) : '';
-    const need = Math.max(
-      tightWidth(m.text, maxTextW),
-      th ? tightWidth(th, maxTextW, TH_FONT) : 0,
-      thLabel ? tightWidth(thLabel, maxTextW, TH_FONT) : 0
-    );
-    const bw = Math.max(MIN_BW, Math.min(need + PAD_X * 2, maxTextW + PAD_X * 2));
-    const textW = bw - PAD_X * 2;
-    const thLines = th ? wrapLines(th, textW, TH_FONT) : [];
-    const lines = wrapLines(m.text, textW);
-    const showText = !(m.text === '' && thLines.length > 0);
-    let bh = PAD_Y * 2 + thLines.length * TH_FS * LINE_H;
-    if (thLabel) bh += TH_FS * LINE_H;
-    if (thLines.length > 0 && showText) bh += 10;
-    if (showText) bh += lines.length * FS * LINE_H;
-    return { bw, bh, lines, thLines, thLabel, showText, textW };
-  }
-  function drawBubble(m, lay, x, y) {
-    const isUser = m.role === 'user';
-    // Snap geometry to the device-pixel grid — fractional bubble/text
-    // origins smear glyphs (CSS-pixel rounding alone is not enough on
-    // 125%/150% scaled screens).
-    const rx = qsnap(x), ry = qsnap(y);
-    const rbw = qsnap(lay.bw), rbh = qsnap(lay.bh);
-    ctx.save();
-    ctx.shadowColor = 'rgba(0,0,0,.35)';
-    ctx.shadowBlur = 16;
-    ctx.shadowOffsetY = 6;
-    const g = ctx.createLinearGradient(rx, ry, rx, ry + rbh);
-    if (isUser) { g.addColorStop(0, '#3b82f6'); g.addColorStop(1, '#2563eb'); }
-    else { g.addColorStop(0, '#1e293b'); g.addColorStop(1, '#0f172a'); }
-    ctx.fillStyle = g;
-    rr(ctx, rx, ry, rbw, rbh, BUBBLE_R);
-    ctx.fill();
-    ctx.restore();
-
-    let lineY = ry + PAD_Y + 13;
-    if (lay.thLines.length > 0) {
-      const thLh = TH_FS * LINE_H;
-      ctx.fillStyle = 'rgba(125,211,252,.75)';
-      ctx.font = TH_FONT;
-      ctx.fillText(lay.thLabel, qsnap(rx + PAD_X), qsnap(lineY));
-      lineY += thLh;
-      ctx.fillStyle = 'rgba(148,163,184,.85)';
-      lay.thLines.forEach((line) => { ctx.fillText(line, qsnap(rx + PAD_X), qsnap(lineY)); lineY += thLh; });
-      if (lay.showText) {
-        lineY += 4;
-        ctx.strokeStyle = 'rgba(148,163,184,.18)';
-        ctx.beginPath();
-        ctx.moveTo(rx + PAD_X, qsnap(lineY) + 1 / (2 * (canvas.width / renderer.vw)));
-        ctx.lineTo(rx + rbw - PAD_X, qsnap(lineY) + 1 / (2 * (canvas.width / renderer.vw)));
-        ctx.stroke();
-        lineY += 9;
-      }
-    }
-    if (lay.showText) {
-      ctx.fillStyle = isUser ? '#ffffff' : '#e2e8f0';
-      ctx.font = FONT;
-      ctx.textBaseline = 'alphabetic';
-      const lh = FS * LINE_H;
-      if (lay.thLines.length === 0) lineY = ry + PAD_Y + 13;
-      lay.lines.forEach((line, i) => ctx.fillText(line, qsnap(rx + PAD_X), qsnap(lineY + i * lh)));
-    }
-
-    if (m.role === 'assistant' && m.status === 'streaming' && (m.text.length > 0 || m.thinking.length > 0)) {
-      const tm = Date.now() / 1000;
-      const alpha = 0.5 + 0.5 * Math.sin(tm * 4);
-      ctx.save();
-      ctx.shadowColor = '#38bdf8';
-      ctx.shadowBlur = 8;
-      ctx.fillStyle = 'rgba(56,189,248,' + alpha + ')';
-      ctx.beginPath();
-      ctx.arc(rx + rbw - 22, ry + rbh - 12, 3, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    }
   }
 
   // ── real cluster state: /api/v1/processes + /api/v1/cluster/components ──
@@ -1901,12 +1844,7 @@ checkLlmStatus();
   // ── renderer (port of CanvasRenderer) ──
   const PANEL_W = 280, PANEL_M = 24;
   const renderer = {
-    vw: 0, vh: 0, dpr: 1, scrollY: 0, contentH: 0,
-    cache: new Map(),
-    setScroll(y) {
-      const max = Math.max(0, this.contentH - this.vh + 120);
-      this.scrollY = Math.max(0, Math.min(y, max));
-    },
+    vw: 0, vh: 0, dpr: 1,
     render() {
       const vw = this.vw, vh = this.vh;
       if (vw < 10 || vh < 10) return;
@@ -1922,53 +1860,16 @@ checkLlmStatus();
       ctx.fillRect(0, 0, vw, vh);
       ctx.strokeStyle = 'rgba(148,163,184,.04)';
       ctx.lineWidth = 1;
-      const grid = 48, offGrid = -this.scrollY % grid;
+      const grid = 48;
       ctx.beginPath();
       for (let x = 0; x < vw; x += grid) { ctx.moveTo(x, 0); ctx.lineTo(x, vh); }
-      for (let y = offGrid; y < vh; y += grid) { ctx.moveTo(0, y); ctx.lineTo(vw, y); }
+      for (let y = 0; y < vh; y += grid) { ctx.moveTo(0, y); ctx.lineTo(vw, y); }
       ctx.stroke();
       const fade = ctx.createLinearGradient(0, 0, 0, 80);
       fade.addColorStop(0, 'rgba(2,6,23,.7)');
       fade.addColorStop(1, 'rgba(2,6,23,0)');
       ctx.fillStyle = fade;
       ctx.fillRect(0, 0, vw, 80);
-
-      // layout messages
-      const contentW = vw - PANEL_W - PANEL_M * 2;
-      const marginX = 28;
-      let curY = 28;
-      const items = messages.map((m) => {
-        const key = m.id + ':' + m.text.length + ':' + m.thinking.length + ':' + m.thinkingDone + ':' + m.status + ':' + contentW;
-        let lay = this.cache.get(key);
-        if (!lay || lay.text !== m.text || lay.thinking !== m.thinking) {
-          lay = Object.assign({ text: m.text, thinking: m.thinking }, layoutMessage(m, contentW));
-          this.cache.set(key, lay);
-        }
-        const x = m.role === 'user' ? contentW - marginX - lay.bw : marginX;
-        const item = { m, lay, x, y: curY };
-        curY += lay.bh + MSG_GAP;
-        return item;
-      });
-      this.contentH = curY;
-
-      if (autoScroll && this.contentH > vh) {
-        this.scrollY = Math.max(0, this.contentH - vh + 120);
-      }
-      const offY = -qsnap(this.scrollY);
-
-      items.forEach((it) => {
-        drawBubble(it.m, it.lay, it.x, it.y + offY);
-      });
-
-      // empty state
-      if (messages.length === 0) {
-        ctx.fillStyle = 'rgba(148,163,184,.65)';
-        ctx.font = '14px Inter, sans-serif';
-        ctx.textAlign = 'center';
-        const hint = $('token').value.trim() ? t('liveEmpty') : t('liveNoToken');
-        ctx.fillText(hint, qsnap(contentW / 2), qsnap(vh / 2 - 20));
-        ctx.textAlign = 'left';
-      }
 
       // right-side panels — real data: processes poll + bus state_change events
       const px = vw - PANEL_W - PANEL_M, py = 28;
@@ -2099,6 +2000,7 @@ checkLlmStatus();
     };
     ws.onerror = () => { connectionStatus = 'error'; };
   }
+  window.liveUpdateEmpty = updateChatEmpty;
   window.liveReconnect = () => { reconnectAttempts = 0; pollComponents(); pollProcesses(); liveConnect(); };
 
   // ── input bar ──
@@ -2139,17 +2041,6 @@ checkLlmStatus();
     if (liveVisible) renderer.render();
     requestAnimationFrame(loop);
   })();
-
-  canvas.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    // Chat-app scroll semantics: scrolling up detaches from the tail and
-    // stays detached while a reply streams; auto-scroll only re-engages
-    // when the user scrolls back to near the bottom (or sends a message).
-    if (e.deltaY < 0) autoScroll = false;
-    renderer.setScroll(renderer.scrollY + e.deltaY);
-    const max = Math.max(0, renderer.contentH - renderer.vh + 120);
-    if (e.deltaY > 0 && max - renderer.scrollY < 40) autoScroll = true;
-  }, { passive: false });
 
   setInterval(() => { if (liveVisible) { pollComponents(); pollProcesses(); } }, 10000);
   (async () => {
