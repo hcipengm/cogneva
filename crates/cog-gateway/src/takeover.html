@@ -1549,7 +1549,6 @@ checkLlmStatus();
   const messages = [];
   let connectionStatus = 'closed';
   let autoScroll = true;
-  let userScrollTimer = 0;
 
   function startMessage(id, role) { messages.push({ id, role, text: '', thinking: '', thinkingDone: false, status: 'streaming' }); }
   function appendDelta(id, delta) {
@@ -1651,33 +1650,37 @@ checkLlmStatus();
   }
   function drawBubble(m, lay, x, y) {
     const isUser = m.role === 'user';
+    // Snap geometry to whole CSS pixels — fractional bubble/text origins
+    // smear glyphs on non-integer DPR screens (and dpr=1 most of all).
+    const rx = Math.round(x), ry = Math.round(y);
+    const rbw = Math.round(lay.bw), rbh = Math.round(lay.bh);
     ctx.save();
     ctx.shadowColor = 'rgba(0,0,0,.35)';
     ctx.shadowBlur = 16;
     ctx.shadowOffsetY = 6;
-    const g = ctx.createLinearGradient(x, y, x, y + lay.bh);
+    const g = ctx.createLinearGradient(rx, ry, rx, ry + rbh);
     if (isUser) { g.addColorStop(0, '#3b82f6'); g.addColorStop(1, '#2563eb'); }
     else { g.addColorStop(0, '#1e293b'); g.addColorStop(1, '#0f172a'); }
     ctx.fillStyle = g;
-    rr(ctx, x, y, lay.bw, lay.bh, BUBBLE_R);
+    rr(ctx, rx, ry, rbw, rbh, BUBBLE_R);
     ctx.fill();
     ctx.restore();
 
-    let lineY = y + PAD_Y + 13;
+    let lineY = ry + PAD_Y + 13;
     if (lay.thLines.length > 0) {
       const thLh = TH_FS * LINE_H;
       ctx.fillStyle = 'rgba(125,211,252,.75)';
       ctx.font = TH_FONT;
-      ctx.fillText(lay.thLabel, x + PAD_X, lineY);
+      ctx.fillText(lay.thLabel, rx + PAD_X, lineY);
       lineY += thLh;
       ctx.fillStyle = 'rgba(148,163,184,.85)';
-      lay.thLines.forEach((line) => { ctx.fillText(line, x + PAD_X, lineY); lineY += thLh; });
+      lay.thLines.forEach((line) => { ctx.fillText(line, rx + PAD_X, Math.round(lineY)); lineY += thLh; });
       if (lay.showText) {
         lineY += 4;
         ctx.strokeStyle = 'rgba(148,163,184,.18)';
         ctx.beginPath();
-        ctx.moveTo(x + PAD_X, lineY);
-        ctx.lineTo(x + lay.bw - PAD_X, lineY);
+        ctx.moveTo(rx + PAD_X, Math.round(lineY) + 0.5);
+        ctx.lineTo(rx + rbw - PAD_X, Math.round(lineY) + 0.5);
         ctx.stroke();
         lineY += 9;
       }
@@ -1687,8 +1690,8 @@ checkLlmStatus();
       ctx.font = FONT;
       ctx.textBaseline = 'alphabetic';
       const lh = FS * LINE_H;
-      if (lay.thLines.length === 0) lineY = y + PAD_Y + 13;
-      lay.lines.forEach((line, i) => ctx.fillText(line, x + PAD_X, lineY + i * lh));
+      if (lay.thLines.length === 0) lineY = ry + PAD_Y + 13;
+      lay.lines.forEach((line, i) => ctx.fillText(line, rx + PAD_X, Math.round(lineY + i * lh)));
     }
 
     if (m.role === 'assistant' && m.status === 'streaming' && (m.text.length > 0 || m.thinking.length > 0)) {
@@ -1699,7 +1702,7 @@ checkLlmStatus();
       ctx.shadowBlur = 8;
       ctx.fillStyle = 'rgba(56,189,248,' + alpha + ')';
       ctx.beginPath();
-      ctx.arc(x + lay.bw - 22, y + lay.bh - 12, 3, 0, Math.PI * 2);
+      ctx.arc(rx + rbw - 22, ry + rbh - 12, 3, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
     }
@@ -1940,7 +1943,7 @@ checkLlmStatus();
       if (autoScroll && this.contentH > vh) {
         this.scrollY = Math.max(0, this.contentH - vh + 120);
       }
-      const offY = -this.scrollY;
+      const offY = -Math.round(this.scrollY);
 
       items.forEach((it) => {
         drawBubble(it.m, it.lay, it.x, it.y + offY);
@@ -2097,6 +2100,7 @@ checkLlmStatus();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'chat_message', session_id: 'default', content: v }));
     }
+    autoScroll = true;
     input.value = '';
     sendBtn.disabled = true;
   }
@@ -2127,10 +2131,13 @@ checkLlmStatus();
 
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
-    autoScroll = false;
-    clearTimeout(userScrollTimer);
-    userScrollTimer = setTimeout(() => { autoScroll = true; }, 1500);
+    // Chat-app scroll semantics: scrolling up detaches from the tail and
+    // stays detached while a reply streams; auto-scroll only re-engages
+    // when the user scrolls back to near the bottom (or sends a message).
+    if (e.deltaY < 0) autoScroll = false;
     renderer.setScroll(renderer.scrollY + e.deltaY);
+    const max = Math.max(0, renderer.contentH - renderer.vh + 120);
+    if (e.deltaY > 0 && max - renderer.scrollY < 40) autoScroll = true;
   }, { passive: false });
 
   setInterval(() => { if (liveVisible) { pollComponents(); pollProcesses(); } }, 10000);
