@@ -394,6 +394,7 @@
     <button id="llmBtn" class="ghost">LLM</button>
     <span id="promoBadge" class="pill" data-i18n="promoInit">auto-promo …</span>
     <button id="promoToggle" class="ghost">…</button>
+    <button id="gateToggle" class="ghost" style="display:none" data-i18n="gateOff">Disable gate</button>
     <button id="refresh" data-i18n="refresh">Refresh</button>
   </div>
 
@@ -842,6 +843,7 @@ let promoState = null;
 function renderPromoSwitch() {
   const badge = $('promoBadge');
   const btn = $('promoToggle');
+  $('gateToggle').style.display = promoState && promoState.config_enabled ? '' : 'none';
   if (!promoState) {
     badge.className = 'pill';
     badge.textContent = t('promoNa');
@@ -875,31 +877,40 @@ async function loadPromotionSwitch() {
   renderPromoSwitch();
 }
 
-async function togglePromotion() {
-  if (!promoState) return;
-  if (!promoState.config_enabled) {
-    // Config-level gate: the one sanctioned WebUI path to flip it — the
-    // backend edits the ConfigMap and rolls the main app (~1 min).
-    if (!confirm(t('promoGateConfirm'))) return;
-    try {
-      await api('/api/v1/admin/promotion-gate', 'POST', { enabled: true });
-      toast(t('promoGateRolling'), 'ok');
+// Flip the config-level gate via the admin endpoint (writes the ConfigMap,
+// rolls the main app), then poll the switch until the rolled pod reports
+// the target state.
+function setGate(enabled) {
+  const msgs = enabled
+    ? { confirm: 'promoGateConfirm', rolling: 'promoGateRolling', done: 'promoGateOn' }
+    : { confirm: 'gateOffConfirm', rolling: 'promoGateRolling', done: 'promoGateOff' };
+  if (!confirm(t(msgs.confirm))) return;
+  api('/api/v1/admin/promotion-gate', 'POST', { enabled })
+    .then(() => {
+      toast(t(msgs.rolling), 'ok');
       const deadline = Date.now() + 3 * 60 * 1000;
       const timer = setInterval(async () => {
         try {
           const s = await api('/api/v1/evolution/promotion/switch');
-          if (s.config_enabled) {
+          if (s.config_enabled === enabled) {
             clearInterval(timer);
             promoState = s;
             renderPromoSwitch();
-            toast(t('promoGateOn'), 'ok');
+            toast(t(msgs.done), 'ok');
           }
         } catch { /* main app rolling */ }
         if (Date.now() > deadline) { clearInterval(timer); loadPromotionSwitch(); }
       }, 5000);
-    } catch (e) {
-      toast(t('switchFailed') + e.message, 'err');
-    }
+    })
+    .catch((e) => toast(t('switchFailed') + e.message, 'err'));
+}
+
+$('gateToggle').onclick = () => setGate(false);
+
+async function togglePromotion() {
+  if (!promoState) return;
+  if (!promoState.config_enabled) {
+    setGate(true);
     return;
   }
   const target = !promoState.paused;
@@ -1213,6 +1224,10 @@ const I18N = {
                       zh: '确定开启配置级自动晋级？此后沙盒验证通过且命中白名单路径的补丁将不再等人审批直接晋级部署（配额每天 3 条、熔断在位；核心路径仍需人工）。主应用滚动生效约 1 分钟。' },
   promoGateRolling: { en: 'Gate config written, rolling the main app…', zh: '总闸配置已写入，正在滚动主应用…' },
   promoGateOn:    { en: 'auto-promo gate enabled', zh: '自动晋级总闸已开启' },
+  gateOff:        { en: 'Disable gate', zh: '关总闸' },
+  gateOffConfirm: { en: 'Disable the config-level auto-promotion gate? All patches will go back to manual approval. The main app rolls to apply, ~1 minute.',
+                    zh: '确定关闭配置级自动晋级总闸？此后所有补丁回到人工审批。主应用滚动生效约 1 分钟。' },
+  promoGateOff:   { en: 'auto-promo gate disabled', zh: '自动晋级总闸已关闭' },
   promoPaused:    { en: 'auto-promo PAUSED', zh: '自动晋级 已暂停' },
   promoResume:    { en: 'Resume', zh: '恢复' },
   promoLive:      { en: 'auto-promo live', zh: '自动晋级 运行中' },
@@ -1400,6 +1415,9 @@ $('llmForm').onsubmit = async (e) => {
 };
 
 setInterval(loadProcess, 10000);
+// Badge/switch state must track rolls triggered elsewhere (other tab, API,
+// GitOps) instead of only refreshing on page load.
+setInterval(loadPromotionSwitch, 15000);
 
 function refreshAll() {
   loadMetrics(); loadPatches(); loadEvents(); loadAudit();
