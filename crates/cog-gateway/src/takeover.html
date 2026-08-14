@@ -1619,6 +1619,14 @@ checkLlmStatus();
     c.closePath();
   }
 
+  // Snap a logical (CSS px) coordinate to the physical device-pixel grid.
+  // CSS-pixel snapping is not enough on 125%/150% scaled screens (DPR 1.25/
+  // 1.5): glyph origins must land on whole device pixels or text smears.
+  function qsnap(v) {
+    const s = renderer.vw > 0 ? canvas.width / renderer.vw : (window.devicePixelRatio || 1);
+    return Math.round(v * s) / s;
+  }
+
   // ── message painter ──
   const PAD_X = 18, PAD_Y = 14, MAX_BW = 520, MIN_BW = 80, BUBBLE_R = 18, MSG_GAP = 20;
   const TH_FONT = '500 12px Inter, "PingFang SC", "Microsoft YaHei", sans-serif';
@@ -1650,10 +1658,11 @@ checkLlmStatus();
   }
   function drawBubble(m, lay, x, y) {
     const isUser = m.role === 'user';
-    // Snap geometry to whole CSS pixels — fractional bubble/text origins
-    // smear glyphs on non-integer DPR screens (and dpr=1 most of all).
-    const rx = Math.round(x), ry = Math.round(y);
-    const rbw = Math.round(lay.bw), rbh = Math.round(lay.bh);
+    // Snap geometry to the device-pixel grid — fractional bubble/text
+    // origins smear glyphs (CSS-pixel rounding alone is not enough on
+    // 125%/150% scaled screens).
+    const rx = qsnap(x), ry = qsnap(y);
+    const rbw = qsnap(lay.bw), rbh = qsnap(lay.bh);
     ctx.save();
     ctx.shadowColor = 'rgba(0,0,0,.35)';
     ctx.shadowBlur = 16;
@@ -1671,16 +1680,16 @@ checkLlmStatus();
       const thLh = TH_FS * LINE_H;
       ctx.fillStyle = 'rgba(125,211,252,.75)';
       ctx.font = TH_FONT;
-      ctx.fillText(lay.thLabel, rx + PAD_X, lineY);
+      ctx.fillText(lay.thLabel, qsnap(rx + PAD_X), qsnap(lineY));
       lineY += thLh;
       ctx.fillStyle = 'rgba(148,163,184,.85)';
-      lay.thLines.forEach((line) => { ctx.fillText(line, rx + PAD_X, Math.round(lineY)); lineY += thLh; });
+      lay.thLines.forEach((line) => { ctx.fillText(line, qsnap(rx + PAD_X), qsnap(lineY)); lineY += thLh; });
       if (lay.showText) {
         lineY += 4;
         ctx.strokeStyle = 'rgba(148,163,184,.18)';
         ctx.beginPath();
-        ctx.moveTo(rx + PAD_X, Math.round(lineY) + 0.5);
-        ctx.lineTo(rx + rbw - PAD_X, Math.round(lineY) + 0.5);
+        ctx.moveTo(rx + PAD_X, qsnap(lineY) + 1 / (2 * (canvas.width / renderer.vw)));
+        ctx.lineTo(rx + rbw - PAD_X, qsnap(lineY) + 1 / (2 * (canvas.width / renderer.vw)));
         ctx.stroke();
         lineY += 9;
       }
@@ -1691,7 +1700,7 @@ checkLlmStatus();
       ctx.textBaseline = 'alphabetic';
       const lh = FS * LINE_H;
       if (lay.thLines.length === 0) lineY = ry + PAD_Y + 13;
-      lay.lines.forEach((line, i) => ctx.fillText(line, rx + PAD_X, Math.round(lineY + i * lh)));
+      lay.lines.forEach((line, i) => ctx.fillText(line, qsnap(rx + PAD_X), qsnap(lineY + i * lh)));
     }
 
     if (m.role === 'assistant' && m.status === 'streaming' && (m.text.length > 0 || m.thinking.length > 0)) {
@@ -1901,7 +1910,9 @@ checkLlmStatus();
     render() {
       const vw = this.vw, vh = this.vh;
       if (vw < 10 || vh < 10) return;
-      ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      // Exact backing-store ratio (not raw DPR) so rounding in liveResize
+      // cannot introduce a sub-percent scale error.
+      ctx.setTransform(canvas.width / vw, 0, 0, canvas.height / vh, 0, 0);
 
       // background
       const g = ctx.createRadialGradient(vw / 2, vh / 2, 0, vw / 2, vh / 2, vw * 0.8);
@@ -1943,7 +1954,7 @@ checkLlmStatus();
       if (autoScroll && this.contentH > vh) {
         this.scrollY = Math.max(0, this.contentH - vh + 120);
       }
-      const offY = -Math.round(this.scrollY);
+      const offY = -qsnap(this.scrollY);
 
       items.forEach((it) => {
         drawBubble(it.m, it.lay, it.x, it.y + offY);
@@ -1955,7 +1966,7 @@ checkLlmStatus();
         ctx.font = '14px Inter, sans-serif';
         ctx.textAlign = 'center';
         const hint = $('token').value.trim() ? t('liveEmpty') : t('liveNoToken');
-        ctx.fillText(hint, contentW / 2, vh / 2 - 20);
+        ctx.fillText(hint, qsnap(contentW / 2), qsnap(vh / 2 - 20));
         ctx.textAlign = 'left';
       }
 
