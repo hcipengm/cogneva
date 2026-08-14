@@ -302,22 +302,48 @@
   }
   .modal .fine { font-size: 11px; color: var(--text-2); margin-top: 4px; }
 
-  /* ── Live canvas dashboard (zero-dependency port of the main UI) ── */
+  /* ── Live dashboard (all-DOM: every label is selectable text) ── */
   .live-stage {
     position: relative; height: min(72vh, 760px); min-height: 440px;
     border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
-    background: #020617;
+    background: var(--bg-0);
   }
-  .live-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
   /* Chat bubbles are real DOM text: selectable/copyable, subpixel-sharp,
-     natively scrolled. The canvas below only paints the background grid,
-     side panels, and the connection dot. */
+     natively scrolled. */
   .chat-scroll {
     position: absolute; left: 0; top: 0; bottom: 76px; right: 328px;
     overflow-y: auto; padding: 28px; display: flex; flex-direction: column; gap: 20px;
     scrollbar-width: thin; scrollbar-color: rgba(148,163,184,.3) transparent;
   }
   .chat-empty { margin: auto; color: rgba(148,163,184,.65); font-size: 14px; text-align: center; }
+  .live-panels {
+    position: absolute; right: 0; top: 0; bottom: 76px; width: 328px;
+    overflow-y: auto; padding: 20px 24px 20px 0; display: flex; flex-direction: column;
+    gap: 16px; scrollbar-width: thin; scrollbar-color: rgba(148,163,184,.3) transparent;
+  }
+  .live-status {
+    display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+    font-size: 11px; color: rgba(226,232,240,.7);
+  }
+  .live-status .cs-dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; }
+  .panel {
+    background: var(--bg-1); border: 1px solid rgba(148,163,184,.15);
+    border-radius: 16px; padding: 14px 16px;
+  }
+  .panel-title { color: #94a3b8; font-size: 12px; letter-spacing: .06em; margin-bottom: 12px; }
+  .tnode { display: flex; align-items: center; gap: 10px; padding: 7px 0; }
+  .tnode .ring {
+    width: 8px; height: 8px; border-radius: 50%; flex: none;
+    border: 2px solid transparent; background-clip: padding-box;
+  }
+  .tnode .lbl { color: #e2e8f0; font-size: 12.5px; }
+  .tnode.agents-head { padding-top: 10px; margin-top: 6px; border-top: 1px solid rgba(148,163,184,.12); }
+  .tnode.agents-head .lbl { color: #94a3b8; font-size: 11px; letter-spacing: .05em; }
+  .prow { display: flex; align-items: center; gap: 10px; padding: 7px 0; position: relative; }
+  .prow .pdot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .prow .lbl { color: #e2e8f0; font-size: 12.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .prow .st { font-size: 10.5px; }
+  .pempty { color: rgba(148,163,184,.6); font-size: 12px; padding: 4px 0; }
   .msg {
     position: relative; max-width: 520px; min-width: 80px; padding: 14px 18px; border-radius: 18px;
     font: 500 15px/1.55 Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -427,11 +453,21 @@
     <section id="sec-live">
       <h2>
         <span data-i18n="navLive">Live</span>
-        <span class="hint" data-i18n="liveHint">agent event stream on canvas · zero-dependency port of the main dashboard</span>
+        <span class="hint" data-i18n="liveHint">agent event stream · zero-dependency live dashboard, all selectable text</span>
       </h2>
       <div class="live-stage" id="liveStage">
-        <canvas id="liveCanvas"></canvas>
         <div class="chat-scroll" id="chatScroll"><div class="chat-empty" id="chatEmpty"></div></div>
+        <div class="live-panels">
+          <div class="live-status"><span id="liveCsText"></span><span class="cs-dot" id="liveCsDot"></span></div>
+          <div class="panel">
+            <div class="panel-title" data-i18n="topoTitle">CLUSTER TOPOLOGY</div>
+            <div id="topoNodes"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-title" data-i18n="pipeTitle">GOAL PIPELINE</div>
+            <div id="pipeRows"></div>
+          </div>
+        </div>
         <div class="live-input">
           <div class="box">
             <input id="liveInput" type="text" data-i18n-ph="liveInputPh" placeholder="Type an intent…" autocomplete="off" />
@@ -1139,8 +1175,8 @@ const I18N = {
   brandSub:       { en: 'Takeover Console', zh: '接管控制台' },
   navOperate:     { en: 'Operate', zh: '运维' },
   navLive:        { en: 'Live', zh: '实时' },
-  liveHint:       { en: 'agent event stream on canvas · zero-dependency port of the main dashboard',
-                    zh: '画布上的 Agent 事件流 · 主仪表盘的零依赖移植' },
+  liveHint:       { en: 'agent event stream · zero-dependency live dashboard, all selectable text',
+                    zh: 'Agent 事件流 · 零依赖实时仪表盘，全部文字可选中' },
   liveInputPh:    { en: 'Type an intent…', zh: '输入意图…' },
   sendBtn:        { en: 'Send', zh: '发送' },
   liveEmpty:      { en: 'Send an intent below to start a live session',
@@ -1162,6 +1198,7 @@ const I18N = {
   nodeMain:       { en: 'Main App', zh: '主应用' },
   nodeSecGw:      { en: 'Security Gateway', zh: '安全网关' },
   nodeEvo:        { en: 'Evolution Sandbox', zh: '进化沙盒' },
+  agentsTitle:    { en: 'AGENTS', zh: '智能体' },
   csOpen:         { en: 'open', zh: '已连接' },
   csConnecting:   { en: 'connecting', zh: '连接中' },
   csClosed:       { en: 'closed', zh: '已断开' },
@@ -1563,17 +1600,15 @@ applyI18n();
 checkLlmStatus();
 </script>
 <script>
-// ── Live canvas dashboard — zero-dependency vanilla port of the main web UI.
-// Canvas 2D + WebSocket only; painter/render logic mirrors web/src/renderer.
+// ── Live dashboard — zero-dependency vanilla port of the main web UI.
+// All-DOM: every label is real selectable text; no canvas anywhere.
 (function () {
   const stage = $('liveStage');
-  const canvas = $('liveCanvas');
   const input = $('liveInput');
   const sendBtn = $('liveSend');
-  const ctx = canvas.getContext('2d', { alpha: false });
 
   // ── store: chat bubbles are DOM nodes (selectable, copyable, native
-  // scroll). The canvas only paints background/panels/status dot.
+  // scroll).
   const chatScroll = $('chatScroll');
   const chatEmpty = $('chatEmpty');
   const msgEls = new Map();
@@ -1644,22 +1679,6 @@ checkLlmStatus();
     }
   }
 
-  // ── shared path helper ──
-  function rr(c, x, y, w, h, r) {
-    r = Math.min(r, w / 2, h / 2);
-    c.beginPath();
-    c.moveTo(x + r, y);
-    c.lineTo(x + w - r, y);
-    c.quadraticCurveTo(x + w, y, x + w, y + r);
-    c.lineTo(x + w, y + h - r);
-    c.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-    c.lineTo(x + r, y + h);
-    c.quadraticCurveTo(x, y + h, x, y + h - r);
-    c.lineTo(x, y + r);
-    c.quadraticCurveTo(x, y, x + r, y);
-    c.closePath();
-  }
-
   // ── real cluster state: /api/v1/processes + /api/v1/cluster/components ──
   // Topology: three fixed deployment nodes (main app, security gateway,
   // evolution sandbox) from the components endpoint, plus dynamic agent
@@ -1693,6 +1712,7 @@ checkLlmStatus();
       if (!r.ok) return;
       const data = await r.json();
       for (const c of data.components || []) liveComponents[c.id] = c.status;
+      renderPanels();
     } catch (e) { /* keep last known component state */ }
   }
   async function pollProcesses() {
@@ -1716,187 +1736,86 @@ checkLlmStatus();
           : (g.total > 0 && g.completed === g.total) ? 'done' : 'pending',
         statusText: g.completed + '/' + g.total,
       }));
+      renderPanels();
     } catch (e) { /* keep last known state */ }
   }
 
-  function buildTopology() {
-    const nodes = [
-      { id: 'main', label: t('nodeMain'), x: 140, y: 52, status: componentToStatus(liveComponents.main), type: 'core' },
-      { id: 'security-gateway', label: t('nodeSecGw'), x: 140, y: 104, status: componentToStatus(liveComponents['security-gateway']), type: 'gateway' },
-      { id: 'evolution', label: t('nodeEvo'), x: 140, y: 156, status: componentToStatus(liveComponents.evolution), type: 'sandbox' },
-    ];
-    const edges = [
-      { from: 'main', to: 'security-gateway', active: liveComponents['security-gateway'] === 'up' },
-      { from: 'main', to: 'evolution', active: liveComponents.evolution === 'up' },
-    ];
-    let i = 0;
-    for (const [id, a] of liveAgents) {
-      nodes.push({ id, label: a.label, x: 70 + (i % 2) * 130, y: 200 + Math.floor(i / 2) * 48, status: a.status, type: 'agent' });
-      edges.push({ from: 'main', to: id, active: a.status === 'running' });
-      i++;
-    }
-    return { nodes, edges, height: Math.max(230, 230 + Math.ceil(i / 2) * 48) };
-  }
-
-  // ── topology / pipeline panels (demo data, same as the React renderer) ──
+  // ── panels: topology + goal pipeline as DOM text (selectable/copyable) ──
   const NODE_STATUS_COLORS = { healthy: '#22c55e', running: '#3b82f6', error: '#ef4444', idle: '#64748b' };
   const NODE_TYPE_COLORS = { core: '#a855f7', agent: '#3b82f6', sandbox: '#f59e0b', gateway: '#14b8a6' };
-  function drawTopology(nodes, edges, px, py, pw, ph) {
-    ctx.save();
-    ctx.fillStyle = 'rgba(15,23,42,.6)';
-    rr(ctx, px, py, pw, ph, 16);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(148,163,184,.15)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-    ctx.restore();
-
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '12px Inter, sans-serif';
-    ctx.fillText(t('topoTitle'), px + 16, py + 24);
-
-    const map = new Map(nodes.map((n) => [n.id, n]));
-    const tm = Date.now() / 1000;
-    edges.forEach((e) => {
-      const a = map.get(e.from), b = map.get(e.to);
-      if (!a || !b) return;
-      ctx.beginPath();
-      ctx.moveTo(px + a.x, py + a.y);
-      ctx.lineTo(px + b.x, py + b.y);
-      ctx.strokeStyle = e.active
-        ? 'rgba(59,130,246,' + (0.3 + 0.2 * Math.sin(tm * 3)) + ')'
-        : 'rgba(148,163,184,.15)';
-      ctx.lineWidth = e.active ? 2 : 1;
-      ctx.stroke();
-    });
-    nodes.forEach((n) => {
-      const x = px + n.x, y = py + n.y;
-      ctx.save();
-      ctx.shadowColor = NODE_STATUS_COLORS[n.status];
-      ctx.shadowBlur = 12;
-      ctx.fillStyle = NODE_STATUS_COLORS[n.status];
-      ctx.beginPath();
-      ctx.arc(x, y, 6, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-      ctx.strokeStyle = NODE_TYPE_COLORS[n.type];
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(x, y, 9, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = '#e2e8f0';
-      ctx.font = '11px Inter, sans-serif';
-      ctx.fillText(n.label, x + 16, y + 4);
-    });
-  }
   const STAGE_COLORS = { pending: '#64748b', running: '#3b82f6', done: '#22c55e', error: '#ef4444' };
-  function drawPipeline(stages, px, py, pw) {
-    const rows = Math.max(stages.length, 1);
-    ctx.save();
-    ctx.fillStyle = 'rgba(15,23,42,.6)';
-    rr(ctx, px, py, pw, 44 + rows * 42, 16);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(148,163,184,.15)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-    ctx.restore();
+  const CS_COLORS = { open: '#22c55e', connecting: '#f59e0b', closed: '#64748b', error: '#ef4444' };
 
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '12px Inter, sans-serif';
-    ctx.fillText(t('pipeTitle'), px + 16, py + 24);
-
-    const startY = py + 48, lineX = px + 28;
-    if (stages.length === 0) {
-      ctx.fillStyle = 'rgba(148,163,184,.6)';
-      ctx.font = '12px Inter, sans-serif';
-      ctx.fillText(t('noActiveGoals'), lineX + 18, startY + 4);
-      return;
-    }
-    stages.forEach((s, i) => {
-      const y = startY + i * 42;
-      if (i < stages.length - 1) {
-        ctx.strokeStyle = s.status === 'done' ? STAGE_COLORS.done : 'rgba(100,116,139,.4)';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(lineX, y + 6);
-        ctx.lineTo(lineX, y + 42);
-        ctx.stroke();
-      }
-      ctx.save();
-      ctx.shadowColor = STAGE_COLORS[s.status];
-      ctx.shadowBlur = 10;
-      ctx.fillStyle = STAGE_COLORS[s.status];
-      ctx.beginPath();
-      ctx.arc(lineX, y, 5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-      ctx.fillStyle = '#e2e8f0';
-      ctx.font = '12px Inter, sans-serif';
-      ctx.fillText(s.label, lineX + 18, y + 4);
-      ctx.fillStyle = STAGE_COLORS[s.status];
-      ctx.font = '10px Inter, sans-serif';
-      ctx.textAlign = 'right';
-      ctx.fillText(s.statusText, px + pw - 16, y + 4);
-      ctx.textAlign = 'left';
-    });
+  function nodeRow(label, status, type) {
+    const row = document.createElement('div');
+    row.className = 'tnode';
+    const ring = document.createElement('span');
+    ring.className = 'ring';
+    ring.style.background = NODE_STATUS_COLORS[status] || '#64748b';
+    ring.style.borderColor = NODE_TYPE_COLORS[type] || '#64748b';
+    ring.style.boxShadow = '0 0 8px ' + (NODE_STATUS_COLORS[status] || '#64748b');
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl';
+    lbl.textContent = label;
+    row.appendChild(ring);
+    row.appendChild(lbl);
+    return row;
   }
 
-  // ── renderer (port of CanvasRenderer) ──
-  const PANEL_W = 280, PANEL_M = 24;
-  const renderer = {
-    vw: 0, vh: 0, dpr: 1,
-    render() {
-      const vw = this.vw, vh = this.vh;
-      if (vw < 10 || vh < 10) return;
-      // Exact backing-store ratio (not raw DPR) so rounding in liveResize
-      // cannot introduce a sub-percent scale error.
-      ctx.setTransform(canvas.width / vw, 0, 0, canvas.height / vh, 0, 0);
+  function renderPanels() {
+    // connection status
+    $('liveCsDot').style.background = CS_COLORS[connectionStatus] || '#64748b';
+    $('liveCsDot').style.boxShadow = '0 0 8px ' + (CS_COLORS[connectionStatus] || '#64748b');
+    const csText = { open: t('csOpen'), connecting: t('csConnecting'), closed: t('csClosed'), error: t('csError') };
+    $('liveCsText').textContent = csText[connectionStatus] || connectionStatus;
 
-      // background
-      const g = ctx.createRadialGradient(vw / 2, vh / 2, 0, vw / 2, vh / 2, vw * 0.8);
-      g.addColorStop(0, '#0b1221');
-      g.addColorStop(1, '#020617');
-      ctx.fillStyle = g;
-      ctx.fillRect(0, 0, vw, vh);
-      ctx.strokeStyle = 'rgba(148,163,184,.04)';
-      ctx.lineWidth = 1;
-      const grid = 48;
-      ctx.beginPath();
-      for (let x = 0; x < vw; x += grid) { ctx.moveTo(x, 0); ctx.lineTo(x, vh); }
-      for (let y = 0; y < vh; y += grid) { ctx.moveTo(0, y); ctx.lineTo(vw, y); }
-      ctx.stroke();
-      const fade = ctx.createLinearGradient(0, 0, 0, 80);
-      fade.addColorStop(0, 'rgba(2,6,23,.7)');
-      fade.addColorStop(1, 'rgba(2,6,23,0)');
-      ctx.fillStyle = fade;
-      ctx.fillRect(0, 0, vw, 80);
+    // topology: three fixed deployments, then dynamic agents
+    const topo = $('topoNodes');
+    topo.textContent = '';
+    topo.appendChild(nodeRow(t('nodeMain'), componentToStatus(liveComponents.main), 'core'));
+    topo.appendChild(nodeRow(t('nodeSecGw'), componentToStatus(liveComponents['security-gateway']), 'gateway'));
+    topo.appendChild(nodeRow(t('nodeEvo'), componentToStatus(liveComponents.evolution), 'sandbox'));
+    if (liveAgents.size > 0) {
+      const head = document.createElement('div');
+      head.className = 'tnode agents-head';
+      const hl = document.createElement('span');
+      hl.className = 'lbl';
+      hl.textContent = t('agentsTitle');
+      head.appendChild(hl);
+      topo.appendChild(head);
+      for (const [id, a] of liveAgents) topo.appendChild(nodeRow(a.label, a.status, 'agent'));
+    }
 
-      // right-side panels — real data: processes poll + bus state_change events
-      const px = vw - PANEL_W - PANEL_M, py = 28;
-      const topo = buildTopology();
-      drawTopology(topo.nodes, topo.edges, px, py, PANEL_W, topo.height);
-      drawPipeline(liveGoals, px, py + topo.height + 20, PANEL_W);
-
-      // connection status dot
-      const csColors = { open: '#22c55e', connecting: '#f59e0b', closed: '#64748b', error: '#ef4444' };
-      const csText = { open: t('csOpen'), connecting: t('csConnecting'), closed: t('csClosed'), error: t('csError') };
-      const cx = vw - 28, cy = 28;
-      const col = csColors[connectionStatus] || '#64748b';
-      ctx.save();
-      ctx.shadowColor = col;
-      ctx.shadowBlur = 10;
-      ctx.fillStyle = col;
-      ctx.beginPath();
-      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-      ctx.fillStyle = 'rgba(226,232,240,.7)';
-      ctx.font = '11px Inter, sans-serif';
-      ctx.textAlign = 'right';
-      ctx.fillText(csText[connectionStatus] || connectionStatus, cx - 14, cy + 4);
-      ctx.textAlign = 'left';
-    },
-  };
+    // goal pipeline
+    const pipe = $('pipeRows');
+    pipe.textContent = '';
+    if (liveGoals.length === 0) {
+      const em = document.createElement('div');
+      em.className = 'pempty';
+      em.textContent = t('noActiveGoals');
+      pipe.appendChild(em);
+    } else {
+      liveGoals.forEach((g) => {
+        const row = document.createElement('div');
+        row.className = 'prow';
+        const dot = document.createElement('span');
+        dot.className = 'pdot';
+        dot.style.background = STAGE_COLORS[g.status] || '#64748b';
+        dot.style.boxShadow = '0 0 8px ' + (STAGE_COLORS[g.status] || '#64748b');
+        const lbl = document.createElement('span');
+        lbl.className = 'lbl';
+        lbl.textContent = g.label;
+        const st = document.createElement('span');
+        st.className = 'st';
+        st.style.color = STAGE_COLORS[g.status] || '#64748b';
+        st.textContent = g.statusText;
+        row.appendChild(dot);
+        row.appendChild(lbl);
+        row.appendChild(st);
+        pipe.appendChild(row);
+      });
+    }
+  }
 
   // ── websocket client (port of EventStreamClient) ──
   let ws = null, reconnectAttempts = 0, reconnectTimer = null, pingTimer = null, pingSeq = 0, manualClose = false;
@@ -1956,6 +1875,7 @@ checkLlmStatus();
       default:
         break;
     }
+    renderPanels();
   }
   function scheduleReconnect() {
     if (manualClose || reconnectAttempts >= 10) return;
@@ -1968,18 +1888,19 @@ checkLlmStatus();
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (ws) { ws.onclose = null; try { ws.close(); } catch (e) { /* already closed */ } ws = null; }
   }
+  function setCs(s) { connectionStatus = s; renderPanels(); }
   function liveConnect() {
     liveDisconnect();
     manualClose = false;
     const token = $('token').value.trim();
-    if (!token) { connectionStatus = 'closed'; return; }
-    connectionStatus = 'connecting';
+    if (!token) { setCs('closed'); return; }
+    setCs('connecting');
     const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host
       + '/ws?token=' + encodeURIComponent(token);
-    try { ws = new WebSocket(url); } catch (e) { connectionStatus = 'error'; scheduleReconnect(); return; }
+    try { ws = new WebSocket(url); } catch (e) { setCs('error'); scheduleReconnect(); return; }
     ws.onopen = () => {
       reconnectAttempts = 0;
-      connectionStatus = 'open';
+      setCs('open');
       ws.send(JSON.stringify({ type: 'subscribe', channels: ['agent:*', 'hooks'], timestamp: new Date().toISOString() }));
       pingSeq = 0;
       stopPing();
@@ -1992,13 +1913,13 @@ checkLlmStatus();
     ws.onmessage = (ev) => handleLiveMessage(ev.data);
     ws.onclose = () => {
       stopPing();
-      if (connectionStatus !== 'error') connectionStatus = 'closed';
+      if (connectionStatus !== 'error') setCs('closed');
       // The token may have expired (15 min JWT TTL) — refresh it silently so
       // the next reconnect attempt authenticates.
       reauth();
       scheduleReconnect();
     };
-    ws.onerror = () => { connectionStatus = 'error'; };
+    ws.onerror = () => { setCs('error'); };
   }
   window.liveUpdateEmpty = updateChatEmpty;
   window.liveReconnect = () => { reconnectAttempts = 0; pollComponents(); pollProcesses(); liveConnect(); };
@@ -2022,26 +1943,11 @@ checkLlmStatus();
   input.oninput = () => { sendBtn.disabled = !input.value.trim(); };
   sendBtn.disabled = true;
 
-  // ── sizing, scroll, render loop ──
-  function liveResize() {
-    const r = stage.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.round(r.width * dpr));
-    canvas.height = Math.max(1, Math.round(r.height * dpr));
-    renderer.vw = r.width;
-    renderer.vh = r.height;
-    renderer.dpr = dpr;
-  }
-  new ResizeObserver(liveResize).observe(stage);
-  liveResize();
-
+  // ── visibility-gated polling ──
   let liveVisible = false;
   new IntersectionObserver((es) => { liveVisible = es[0].isIntersecting; }, { threshold: 0.02 }).observe(stage);
-  (function loop() {
-    if (liveVisible) renderer.render();
-    requestAnimationFrame(loop);
-  })();
 
+  renderPanels();
   setInterval(() => { if (liveVisible) { pollComponents(); pollProcesses(); } }, 10000);
   (async () => {
     // Silent sign-in first (demo installs issue a token for any username);
