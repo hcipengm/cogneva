@@ -33,6 +33,46 @@ pub fn spawn_timeout_checker(
     })
 }
 
+/// Bridges orchestrator TaskEvents onto the AgentEvent bus as
+/// `TaskStatusChange`, so WebSocket clients subscribed to `task:*` see goal
+/// progress in real time instead of waiting for the next /processes poll.
+pub fn spawn_task_event_bridge(
+    state: Arc<crate::GatewayState>,
+    mut shutdown: broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut task_event_rx = state.subscribe_task_events();
+        loop {
+            tokio::select! {
+                Ok(event) = task_event_rx.recv() => {
+                    use cog_core::TaskEvent as TE;
+                    let (task_id, status, timestamp) = match event {
+                        TE::TaskCreated { task_id, timestamp } => (task_id, "pending", timestamp),
+                        TE::TaskScheduled { task_id, timestamp } => (task_id, "scheduled", timestamp),
+                        TE::TaskStarted { task_id, timestamp } => (task_id, "running", timestamp),
+                        TE::TaskCompleted { task_id, timestamp, .. } => (task_id, "completed", timestamp),
+                        TE::TaskFailed { task_id, timestamp, .. } => (task_id, "failed", timestamp),
+                        TE::TaskCancelled { task_id, timestamp, .. } => (task_id, "cancelled", timestamp),
+                        TE::TaskRetried { task_id, timestamp, .. } => (task_id, "retried", timestamp),
+                        TE::TaskTimeout { task_id, timestamp, .. } => (task_id, "timeout", timestamp),
+                    };
+                    let _ = state.event_tx.send(cog_core::AgentEvent::TaskStatusChange {
+                        task_id,
+                        status: status.to_string(),
+                        agent_id: None,
+                        crew_id: None,
+                        squad_id: None,
+                        timestamp,
+                    });
+                }
+                _ = shutdown.recv() => {
+                    break;
+                }
+            }
+        }
+    })
+}
+
 /// Spawns the collaboration graph listener background task.
 pub fn spawn_collaboration_listener(
     state: Arc<crate::GatewayState>,

@@ -379,9 +379,11 @@ impl ActionPlanOrchestrator {
     ) -> SFResult<ActionPlan> {
         let skills = skill_registry.get_all();
         if skills.is_empty() {
-            return Err(SFError::Agent(
-                "Skill registry is empty; cannot decompose goal".into(),
-            ));
+            // A fresh system has no distilled skills yet — that must not
+            // block its first goal. Decomposition proceeds with an empty
+            // capability list; skill-gap filling distills new skills from
+            // the execution results afterwards.
+            tracing::info!("Skill registry is empty; decomposing without skill context");
         }
 
         // Step 1.1: pattern retrieval (top-3 similar cases).

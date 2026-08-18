@@ -1821,6 +1821,7 @@ checkLlmStatus();
 
   // ── websocket client (port of EventStreamClient) ──
   let ws = null, reconnectAttempts = 0, reconnectTimer = null, pingTimer = null, pingSeq = 0, manualClose = false;
+  let taskNudgeTimer = null;
   function stopPing() { if (pingTimer) { clearInterval(pingTimer); pingTimer = null; } }
   function handleLiveMessage(data) {
     if (typeof data !== 'string') return;
@@ -1874,6 +1875,13 @@ checkLlmStatus();
       case 'resource_alert':
         if (msg.agent_id && liveAgents.has(msg.agent_id)) liveAgents.get(msg.agent_id).status = 'error';
         break;
+      case 'task_status_change':
+        // Goal progress is polled; nudge an early refresh so a chat-submitted
+        // goal shows movement within a second instead of at the next tick.
+        if (!taskNudgeTimer) {
+          taskNudgeTimer = setTimeout(() => { taskNudgeTimer = null; pollProcesses(); }, 1000);
+        }
+        break;
       default:
         break;
     }
@@ -1903,7 +1911,7 @@ checkLlmStatus();
     ws.onopen = () => {
       reconnectAttempts = 0;
       setCs('open');
-      ws.send(JSON.stringify({ type: 'subscribe', channels: ['agent:*', 'hooks'], timestamp: new Date().toISOString() }));
+      ws.send(JSON.stringify({ type: 'subscribe', channels: ['agent:*', 'task:*', 'hooks'], timestamp: new Date().toISOString() }));
       pingSeq = 0;
       stopPing();
       pingTimer = setInterval(() => {

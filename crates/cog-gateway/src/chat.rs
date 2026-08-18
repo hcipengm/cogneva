@@ -21,6 +21,20 @@ const CONNECT_TIMEOUT_SECS: u64 = 30;
 /// A reasoning model may think for a long while between deltas; only an idle
 /// gap beyond this aborts the turn. Matches the provider's own in-stream cap.
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
+/// Intent classification is a one-word answer; anything slower means the
+/// backend is struggling and we fall back to the plain chat path.
+const CLASSIFY_TIMEOUT_SECS: u64 = 20;
+
+/// Intent router prompt. The Web UI chat is an entry point into the system,
+/// not a side channel: actionable messages must reach the orchestrator so
+/// they flow through decompose → DAG → squad like every other intent, with
+/// progress coming back on the event stream. Pure Q&A keeps the direct
+/// streaming path.
+const INTENT_CLASSIFY_PROMPT: &str =
+    "判断用户消息属于哪一类。\
+ACT = 可执行意图：要求系统做事情（构建、修改、修复、实现、运行、部署、排查、分析、优化等会产生实际动作或代码变更的请求）。\
+CHAT = 纯问答：聊天、知识提问、解释概念、询问系统状态等只需要文字回答的消息。\
+只回答一个词：ACT 或 CHAT，不要任何其他内容。";
 
 /// Persona for the Web UI chat. Identity follows the project definition:
 /// Cogneva is a distributed AI multi-agent autonomous system, not a Q&A
@@ -35,6 +49,33 @@ const CHAT_SYSTEM_PROMPT: &str =
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Route a chat message: ACT (system should do something) or CHAT (answer
+/// directly). Classification failure defaults to CHAT — answering is always
+/// safe, silently dropping an intent into a goal is not.
+async fn is_actionable_intent(llm: &Arc<dyn cog_core::LlmClient>, content: &str) -> bool {
+    let messages = [
+        cog_core::Message::system(INTENT_CLASSIFY_PROMPT),
+        cog_core::Message::user(content),
+    ];
+    let options = cog_core::ChatOptions::default();
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(CLASSIFY_TIMEOUT_SECS),
+        llm.chat(&messages, &options),
+    )
+    .await;
+    match res {
+        Ok(Ok(resp)) => resp
+            .content
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect::<String>()
+            .trim()
+            .to_ascii_uppercase()
+            .starts_with("ACT"),
+        _ => false,
+    }
 }
 
 fn envelope(session_id: &str, event_type: &str, inner: serde_json::Value) -> String {
@@ -136,7 +177,45 @@ pub async fn run_chat_turn(
         return;
     };
 
-    // 2. Build the request from session history + the new user message.
+    // 2. Route the intent. Actionable messages go to the orchestrator as a
+    //    goal (decompose → DAG → squad); progress returns on the event
+    //    stream, which the UI renders live. Decomposition takes 50-90s of
+    //    LLM planning, so it runs detached and reports back on this
+    //    connection when it lands.
+    if is_actionable_intent(&llm, &content).await {
+        emit_delta(
+            &out,
+            &session_id,
+            &assistant_mid,
+            "收到，这是可执行意图。已作为目标提交给编排器：分解为任务后由 squad 接管执行，进度会实时出现在右侧目标流水线；分解完成或失败我都会在这里回报。",
+        )
+        .await;
+        emit_message_end(&out, &session_id, &assistant_mid).await;
+
+        let orchestrator = state.orchestrator.clone();
+        let out2 = out.clone();
+        let sid = session_id.clone();
+        let goal = content.clone();
+        tokio::spawn(async move {
+            // message.start is emitted only when there is content — the
+            // decomposition takes minutes, and an empty bubble that whole
+            // time reads as broken.
+            let text = match orchestrator.submit_goal_auto(&goal, Vec::new()).await {
+                Ok(ids) => format!(
+                    "目标分解完成，已注入 {} 个任务进入执行图。squad 正在执行，进度见右侧目标流水线。",
+                    ids.len()
+                ),
+                Err(e) => format!("目标分解失败：{e}。可以换个更具体的描述再试一次。"),
+            };
+            let mid = format!("assistant-{}", uuid::Uuid::new_v4());
+            emit_message_start(&out2, &sid, &mid, "assistant").await;
+            emit_delta(&out2, &sid, &mid, &text).await;
+            emit_message_end(&out2, &sid, &mid).await;
+        });
+        return;
+    }
+
+    // 3. Build the request from session history + the new user message.
     let mut messages = {
         let sessions = state.chat_sessions.lock().await;
         sessions
@@ -152,7 +231,7 @@ pub async fn run_chat_turn(
         ..Default::default()
     };
 
-    // 3. Stream the reply: deltas are forwarded as they arrive.
+    // 4. Stream the reply: deltas are forwarded as they arrive.
     let mut stream = match tokio::time::timeout(
         std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
         llm.chat_stream(&messages, &options),
@@ -273,7 +352,7 @@ pub async fn run_chat_turn(
     }
     emit_message_end(&out, &session_id, &assistant_mid).await;
 
-    // 4. Record the turn (skip failed/timeout replies — they are not useful
+    // 5. Record the turn (skip failed/timeout replies — they are not useful
     //    context for later turns).
     if failure.is_none() && !reply.is_empty() {
         let mut sessions = state.chat_sessions.lock().await;
