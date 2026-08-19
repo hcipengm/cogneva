@@ -57,7 +57,6 @@ pub mod takeover;
 pub mod tasks;
 pub mod websocket;
 pub mod websocket_protocol;
-pub mod websocket_streams;
 pub mod wiki;
 pub mod workspaces;
 
@@ -580,18 +579,6 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(observability::events_live_handler),
         )
         .route("/api/v1/search", get(observability::search_handler))
-        .route(
-            "/api/v1/agents/{id}/stream",
-            get(websocket_streams::agent_stream_handler),
-        )
-        .route(
-            "/api/v1/tasks/{id}/stream",
-            get(websocket_streams::task_stream_handler),
-        )
-        .route(
-            "/api/v1/cluster/stream",
-            get(websocket_streams::cluster_stream_handler),
-        )
         .route(
             "/api/v1/tasks/{id}/checkpoint",
             get(observability::task_checkpoint_handler),
