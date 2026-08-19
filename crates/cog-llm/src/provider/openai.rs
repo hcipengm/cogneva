@@ -97,7 +97,27 @@ impl OpenAIProvider {
                         })
                         .collect::<Vec<_>>()
                         .join("");
-                    json!({"role": "assistant", "content": text})
+                    let mut m = json!({"role": "assistant", "content": text});
+                    // Tool calls must accompany the assistant message on the wire:
+                    // strict providers (Kimi/OpenAI) reject any later role:"tool"
+                    // message whose tool_call_id was never declared here.
+                    let calls = msg.tool_calls();
+                    if !calls.is_empty() {
+                        m["tool_calls"] = calls
+                            .iter()
+                            .map(|c| {
+                                json!({
+                                    "id": c.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": c.name,
+                                        "arguments": c.arguments.to_string(),
+                                    }
+                                })
+                            })
+                            .collect();
+                    }
+                    m
                 }
                 Message::ToolResult {
                     tool_call_id,
@@ -376,21 +396,17 @@ impl LLMProvider for OpenAIProvider {
             let mut current_tool_args_buffer: Option<String> = None;
 
             // Some providers (e.g. kimi-k2.6 under high load) open the SSE stream
-            // but then stall without sending data. Per-event timeout lets us fail
-            // fast and gives the RoutingProvider a chance to failover. A hard total
-            // duration cap prevents a single slow reasoning stream from blocking
-            // the whole squad execution indefinitely.
-            //
-            // Note: tokio::time::timeout is applied to the read future. The
-            // consumer (agent runtime / chat()) is responsible for its own
-            // higher-level timeout so that a stuck producer cannot block the
-            // whole task indefinitely.
-            // Reasoning-first models can emit long silent windows while they
-            // think. Use the same value for the per-event timeout as the total
-            // cap so that short stalls are not misclassified as failures; the
-            // hard total duration limit still prevents indefinite hangs.
-            let total_timeout = Duration::from_secs(180);
-            let event_timeout = total_timeout;
+            // but then stall without sending data. A per-event timeout lets us fail
+            // fast and gives the RoutingProvider a chance to failover, while a hard
+            // total duration cap (matching the HTTP request timeout) prevents a
+            // single slow reasoning stream from blocking the whole squad execution
+            // indefinitely. The per-event timeout resets after the first event so
+            // that long initial reasoning windows are tolerated without masking
+            // mid-stream stalls.
+            let total_timeout = Duration::from_secs(600);
+            // Before the first event, tolerate long reasoning windows up to the
+            // total cap; tightened to 60s once bytes start flowing.
+            let mut event_timeout = total_timeout;
             let stream_start = std::time::Instant::now();
             let mut first_event_logged = false;
 
@@ -412,7 +428,7 @@ impl LLMProvider for OpenAIProvider {
                 }
 
                 let remaining = total_timeout - elapsed;
-                let timeout = event_timeout.min(remaining);
+                let timeout = event_timeout.min(remaining).max(Duration::from_secs(1));
 
                 tracing::debug!(
                     provider = "openai",
@@ -456,6 +472,9 @@ impl LLMProvider for OpenAIProvider {
                         "OpenAIProvider SSE stream received first event"
                     );
                     first_event_logged = true;
+                    // After the first event we can use a stricter per-event
+                    // timeout to detect mid-stream stalls.
+                    event_timeout = Duration::from_secs(60);
                 }
 
                 let line = line.trim();
@@ -969,5 +988,73 @@ fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
             StopReason::Error,
             Some(format!("Provider finish_reason: {}", reason)),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ApiType, ModelCost, Provider};
+    use std::collections::HashMap;
+
+    fn test_model() -> Model {
+        Model {
+            id: "k3".into(),
+            name: "k3".into(),
+            api: ApiType::OpenAICompletions,
+            provider: Provider::OpenAI,
+            base_url: "http://gateway-internal:8081/v1".into(),
+            context_window: 128_000,
+            max_tokens: 8192,
+            supports_tools: true,
+            supports_streaming: true,
+            supports_vision: false,
+            supports_reasoning: true,
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            headers: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn assistant_tool_calls_are_serialized() {
+        let provider = OpenAIProvider::new(test_model(), "key");
+        let assistant = Message::assistant(vec![
+            ContentBlock::text("我先请求一下"),
+            ContentBlock::tool_call(
+                "call_123",
+                "http_request",
+                json!({"url": "https://example.com"}),
+            ),
+        ]);
+        let tool_result = Message::tool_result_text("call_123", "http_request", "{\"status\":200}");
+        let messages = vec![Message::system("sys"), assistant, tool_result];
+
+        let body = provider.build_request_body(&messages, &ChatOptions::default());
+        let msgs = body["messages"].as_array().unwrap();
+        let wire_calls = msgs[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(wire_calls.len(), 1);
+        assert_eq!(wire_calls[0]["id"], "call_123");
+        assert_eq!(wire_calls[0]["type"], "function");
+        assert_eq!(wire_calls[0]["function"]["name"], "http_request");
+        assert_eq!(
+            wire_calls[0]["function"]["arguments"],
+            serde_json::Value::String("{\"url\":\"https://example.com\"}".into())
+        );
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "call_123");
+    }
+
+    #[test]
+    fn assistant_without_tool_calls_has_no_tool_calls_field() {
+        let provider = OpenAIProvider::new(test_model(), "key");
+        let messages = vec![Message::system("sys"), Message::assistant_text("plain")];
+        let body = provider.build_request_body(&messages, &ChatOptions::default());
+        let msgs = body["messages"].as_array().unwrap();
+        assert!(msgs[1].get("tool_calls").is_none());
     }
 }

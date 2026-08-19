@@ -191,10 +191,7 @@ mod tests {
     #[tokio::test]
     async fn http_request_tool_executes_via_client() {
         let registry = ToolRegistry::new();
-        cog_core::ToolRegistry::register(
-            &registry,
-            builtins::http_request(Arc::new(StubHttp)),
-        );
+        cog_core::ToolRegistry::register(&registry, builtins::http_request(Arc::new(StubHttp)));
         let out = registry
             .execute(
                 "http_request",
@@ -237,7 +234,10 @@ mod tests {
         let registry = ToolRegistry::new();
         cog_core::ToolRegistry::register(&registry, builtins::run_command());
         assert!(registry
-            .execute("run_command", serde_json::json!({"command": "ls; rm -rf /"}))
+            .execute(
+                "run_command",
+                serde_json::json!({"command": "ls; rm -rf /"})
+            )
             .await
             .is_err());
         let out = registry
@@ -406,7 +406,10 @@ pub mod builtins {
                     let url = args["url"]
                         .as_str()
                         .ok_or_else(|| cog_core::SFError::Validation("url required".into()))?;
-                    let method = args["method"].as_str().unwrap_or("GET").to_ascii_uppercase();
+                    let method = args["method"]
+                        .as_str()
+                        .unwrap_or("GET")
+                        .to_ascii_uppercase();
                     let mut req = cog_core::HttpRequest::new(method, url);
                     req.timeout_secs = Some(30);
                     if let Some(headers) = args["headers"].as_object() {

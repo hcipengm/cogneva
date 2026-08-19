@@ -74,6 +74,28 @@ impl ContextWindow {
                 break;
             }
         }
+        // 裁剪可能把 assistant 删掉却留下它的 tool result；严格校验的供应商
+        // （Kimi/OpenAI）会拒绝找不到对应 tool_calls 声明的 tool 消息。
+        // 把失去上下文的头部 tool result 一并摘掉。
+        while self.messages.len() > 1 {
+            let orphan = self
+                .messages
+                .iter()
+                .position(|m| !matches!(m, Message::System { .. }))
+                .is_some_and(|idx| matches!(self.messages[idx], Message::ToolResult { .. }));
+            if !orphan {
+                break;
+            }
+            let idx = self
+                .messages
+                .iter()
+                .position(|m| !matches!(m, Message::System { .. }))
+                .unwrap();
+            let removed = self.messages.remove(idx);
+            self.current_tokens = self
+                .current_tokens
+                .saturating_sub(estimate_tokens(&removed.content()));
+        }
     }
 }
 
@@ -101,4 +123,33 @@ pub fn estimate_tokens(text: &str) -> usize {
         }
     }
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_never_leaves_orphan_tool_result_at_head() {
+        let mut ctx = ContextWindow::new(50);
+        ctx.add_message(Message::system("sys"));
+        ctx.add_message(Message::user(
+            "用户消息占额度 用户消息占额度 用户消息占额度 用户消息占额度",
+        ));
+        ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+            "call_1",
+            "http_request",
+            serde_json::json!({"url": "https://example.com"}),
+        )]));
+        ctx.add_message(Message::tool_result_text("call_1", "http_request", "ok"));
+
+        let msgs = ctx.messages();
+        let first_non_system = msgs.iter().find(|m| !matches!(m, Message::System { .. }));
+        if let Some(m) = first_non_system {
+            assert!(
+                !matches!(m, Message::ToolResult { .. }),
+                "oldest non-system message must never be an orphaned tool result"
+            );
+        }
+    }
 }
