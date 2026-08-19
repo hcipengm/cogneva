@@ -170,6 +170,85 @@ impl Default for ToolRegistry {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct StubHttp;
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for StubHttp {
+        async fn execute(&self, req: cog_core::HttpRequest) -> SFResult<cog_core::HttpResponse> {
+            Ok(cog_core::HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: format!("{} {}", req.method, req.url).into_bytes(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn http_request_tool_executes_via_client() {
+        let registry = ToolRegistry::new();
+        cog_core::ToolRegistry::register(
+            &registry,
+            builtins::http_request(Arc::new(StubHttp)),
+        );
+        let out = registry
+            .execute(
+                "http_request",
+                serde_json::json!({"url": "http://example/x", "method": "post"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["status"], 200);
+        assert_eq!(out["body"], "POST http://example/x");
+    }
+
+    #[tokio::test]
+    async fn file_tools_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        let path = path.to_str().unwrap();
+
+        let registry = ToolRegistry::new();
+        cog_core::ToolRegistry::register(&registry, builtins::read_file());
+        cog_core::ToolRegistry::register(&registry, builtins::write_file());
+
+        registry
+            .execute(
+                "write_file",
+                serde_json::json!({"path": path, "content": "hello"}),
+            )
+            .await
+            .unwrap();
+        let out = registry
+            .execute("read_file", serde_json::json!({"path": path}))
+            .await
+            .unwrap();
+        assert_eq!(out["content"], "hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_shell_metacharacters() {
+        let registry = ToolRegistry::new();
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+        assert!(registry
+            .execute("run_command", serde_json::json!({"command": "ls; rm -rf /"}))
+            .await
+            .is_err());
+        let out = registry
+            .execute("run_command", serde_json::json!({"command": "echo hi"}))
+            .await
+            .unwrap();
+        assert_eq!(out["code"], 0);
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), "hi");
+    }
+}
+
 impl cog_core::ToolRegistry for ToolRegistry {
     fn register(&self, tool: cog_core::Tool) {
         self.tools.write().unwrap().insert(tool.name.clone(), tool);
@@ -299,6 +378,52 @@ pub mod builtins {
                         .ok_or_else(|| cog_core::SFError::Validation("query required".into()))?;
                     // Placeholder - actual implementation would use ripgrep or similar
                     Ok(serde_json::json!({ "results": [], "query": query }))
+                })
+            })),
+        }
+    }
+
+    /// HTTP request tool. Goes through the system's [`cog_core::HttpClient`]
+    /// so proxy/TLS policy is applied uniformly; pods hold no credentials, so
+    /// there is nothing in the environment for a request to exfiltrate.
+    pub fn http_request(client: Arc<dyn cog_core::HttpClient>) -> Tool {
+        Tool {
+            name: "http_request".into(),
+            description: "Make an HTTP request and return the status and body".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Request URL" },
+                    "method": { "type": "string", "description": "HTTP method (default GET)" },
+                    "headers": { "type": "object", "description": "Optional header map" },
+                    "body": { "type": "string", "description": "Optional request body" }
+                },
+                "required": ["url"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let client = client.clone();
+                Box::pin(async move {
+                    let url = args["url"]
+                        .as_str()
+                        .ok_or_else(|| cog_core::SFError::Validation("url required".into()))?;
+                    let method = args["method"].as_str().unwrap_or("GET").to_ascii_uppercase();
+                    let mut req = cog_core::HttpRequest::new(method, url);
+                    req.timeout_secs = Some(30);
+                    if let Some(headers) = args["headers"].as_object() {
+                        for (k, v) in headers {
+                            if let Some(v) = v.as_str() {
+                                req.headers.insert(k.clone(), v.to_string());
+                            }
+                        }
+                    }
+                    if let Some(body) = args["body"].as_str() {
+                        req.body = Some(body.as_bytes().to_vec());
+                    }
+                    let resp = client.execute(req).await?;
+                    Ok(serde_json::json!({
+                        "status": resp.status,
+                        "body": String::from_utf8_lossy(&resp.body),
+                    }))
                 })
             })),
         }

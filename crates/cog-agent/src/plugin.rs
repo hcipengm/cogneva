@@ -158,6 +158,25 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 .with_guardrail(guardrail)
                 .with_plugin_registry(plugin_registry),
         );
+        // Built-in execution tools. Without these the registry advertises zero
+        // tool definitions and squads can plan but never act on the
+        // environment. search_code stays unregistered until it really
+        // searches — an always-empty tool teaches agents to distrust tools.
+        cog_core::ToolRegistry::register(&*tool_registry, crate::tools::builtins::read_file());
+        cog_core::ToolRegistry::register(&*tool_registry, crate::tools::builtins::write_file());
+        cog_core::ToolRegistry::register(&*tool_registry, crate::tools::builtins::run_command());
+        if let Some(http_client) = ctx.consume_service::<dyn cog_core::HttpClient>() {
+            cog_core::ToolRegistry::register(
+                &*tool_registry,
+                crate::tools::builtins::http_request(http_client),
+            );
+        } else {
+            warn!("HttpClient unavailable; http_request tool not registered");
+        }
+        info!(
+            tools = ?tool_registry.names(),
+            "AgentPlugin built-in tools registered"
+        );
         ctx.publish(tool_registry.clone());
         let tool_registry_dyn: Arc<dyn cog_core::ToolRegistry> = tool_registry.clone();
         ctx.publish_service(tool_registry_dyn);
@@ -433,7 +452,7 @@ async fn event_upload_task(
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "agent",
     requires: &["storage", "extension", "guardrail"],
-    optional_requires: &["stream", "skill"],
+    optional_requires: &["stream", "skill", "net"],
     provides: &[
         "HookEngine",
         "ToolRegistry",
@@ -480,6 +499,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "TaskExecutionCallback",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "HttpClient",
             required: false,
         },
     ],
