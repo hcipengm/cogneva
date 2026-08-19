@@ -276,10 +276,6 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                 state.clone(),
                 broadcast_tx.0.subscribe(),
             );
-            let _bridge_handle = crate::executor::spawn_task_event_bridge(
-                state.clone(),
-                broadcast_tx.0.subscribe(),
-            );
             let _timeout_handle = crate::executor::spawn_timeout_checker(
                 state.clone(),
                 broadcast_tx.0.subscribe(),

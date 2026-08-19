@@ -295,6 +295,44 @@ async fn handle_command(
     Ok(())
 }
 
+/// Filter, record, and forward one agent event to this connection.
+/// Returns false only when the socket itself is broken.
+async fn forward_agent_event(
+    socket: &mut WebSocket,
+    state: &Arc<GatewayState>,
+    connection_id: &str,
+    trace_ctx: &TraceContext,
+    event: &cog_core::AgentEvent,
+) -> bool {
+    // Channel filtering
+    if let Some(ref mgr) = state.connection_manager {
+        let channels = event_channels(event);
+        if !mgr.should_deliver(connection_id, &channels).await {
+            return true;
+        }
+    }
+
+    let payload = match serde_json::to_string(event) {
+        Ok(json) => json,
+        Err(_) => return true,
+    };
+
+    if let Ok(value) = serde_json::to_value(event) {
+        // Record in global missed-events cache
+        if let Some(ref mgr) = state.connection_manager {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            mgr.record_event(event_id.clone(), value.clone()).await;
+        }
+
+        let record = websocket_record("session_raw", "outbound", value, Some(trace_ctx));
+        if let Err(e) = state.raw_logger.write(record).await {
+            tracing::warn!("RawLogger write failed (outbound): {}", e);
+        }
+    }
+
+    socket.send(WsMessage::Text(payload.into())).await.is_ok()
+}
+
 pub async fn handle_socket(
     mut socket: WebSocket,
     state: Arc<GatewayState>,
@@ -306,6 +344,7 @@ pub async fn handle_socket(
 ) {
     let connection_id = uuid::Uuid::new_v4().to_string();
     let mut rx = state.event_tx.subscribe();
+    let mut task_rx = state.subscribe_task_events();
     let mut notif_rx = state.notification_tx.subscribe();
     // Outbound queue for messages produced outside the event broadcast (e.g.
     // chat replies from spawned LLM tasks).
@@ -355,35 +394,17 @@ pub async fn handle_socket(
         tokio::select! {
             Ok(event) = rx.recv() => {
                 last_activity = tokio::time::Instant::now();
-
-                // Channel filtering
-                if let Some(ref mgr) = state.connection_manager {
-                    let channels = event_channels(&event);
-                    let should = mgr.should_deliver(&connection_id, &channels).await;
-                    if !should {
-                        continue;
-                    }
+                if !forward_agent_event(&mut socket, &state, &connection_id, &trace_ctx, &event).await {
+                    break;
                 }
-
-                let payload = match serde_json::to_string(&event) {
-                    Ok(json) => json,
-                    Err(_) => continue,
-                };
-
-                if let Ok(value) = serde_json::to_value(&event) {
-                    // Record in global missed-events cache
-                    if let Some(ref mgr) = state.connection_manager {
-                        let event_id = uuid::Uuid::new_v4().to_string();
-                        mgr.record_event(event_id.clone(), value.clone()).await;
-                    }
-
-                    let record = websocket_record("session_raw", "outbound", value, Some(&trace_ctx));
-                    if let Err(e) = state.raw_logger.write(record).await {
-                        tracing::warn!("RawLogger write failed (outbound): {}", e);
-                    }
-                }
-
-                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+            }
+            // Task lifecycle events are translated at this edge (same shape
+            // and channel filtering as agent events) — no re-injection into
+            // the agent bus.
+            Ok(task_event) = task_rx.recv() => {
+                last_activity = tokio::time::Instant::now();
+                let event = crate::websocket_protocol::task_event_as_status_change(&task_event);
+                if !forward_agent_event(&mut socket, &state, &connection_id, &trace_ctx, &event).await {
                     break;
                 }
             }

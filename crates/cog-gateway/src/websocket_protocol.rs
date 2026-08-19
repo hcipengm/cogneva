@@ -364,6 +364,32 @@ impl ConnectionManager {
     }
 }
 
+/// Translate a `TaskEvent` into the `AgentEvent::TaskStatusChange` wire shape
+/// so subscribers of `task:<id>` channels see goal progress. Pure protocol
+/// mapping: the task lifecycle bus stays internal, the WebSocket edge renders
+/// it in the event vocabulary clients already understand.
+pub fn task_event_as_status_change(event: &cog_core::TaskEvent) -> cog_core::AgentEvent {
+    use cog_core::TaskEvent as TE;
+    let (task_id, status, timestamp) = match event {
+        TE::TaskCreated { task_id, timestamp } => (task_id, "pending", timestamp),
+        TE::TaskScheduled { task_id, timestamp } => (task_id, "scheduled", timestamp),
+        TE::TaskStarted { task_id, timestamp } => (task_id, "running", timestamp),
+        TE::TaskCompleted { task_id, timestamp, .. } => (task_id, "completed", timestamp),
+        TE::TaskFailed { task_id, timestamp, .. } => (task_id, "failed", timestamp),
+        TE::TaskCancelled { task_id, timestamp, .. } => (task_id, "cancelled", timestamp),
+        TE::TaskRetried { task_id, timestamp, .. } => (task_id, "retried", timestamp),
+        TE::TaskTimeout { task_id, timestamp, .. } => (task_id, "timeout", timestamp),
+    };
+    cog_core::AgentEvent::TaskStatusChange {
+        task_id: task_id.clone(),
+        status: status.to_string(),
+        agent_id: None,
+        crew_id: None,
+        squad_id: None,
+        timestamp: *timestamp,
+    }
+}
+
 /// Derive the logical channel names for an `AgentEvent`.
 pub fn event_channels(event: &cog_core::AgentEvent) -> Vec<String> {
     match event {
