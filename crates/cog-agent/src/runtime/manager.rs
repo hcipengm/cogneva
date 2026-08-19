@@ -30,6 +30,7 @@ pub struct GlobalAgentManager {
     default_runtime_config: cog_core::RuntimeConfig,
     default_tools: Option<Arc<crate::ToolRegistry>>,
     external_skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
+    event_bus: Option<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>,
 }
 
 impl GlobalAgentManager {
@@ -56,7 +57,20 @@ impl GlobalAgentManager {
             },
             default_tools: None,
             external_skill_registry: None,
+            event_bus: None,
         }
+    }
+
+    /// Publish every spawned worker onto the shared cluster-wide event bus so
+    /// live observers see turns, streaming output, and tool executions in real
+    /// time. Without this each agent broadcasts on a private channel nobody
+    /// outside the agent can reach.
+    pub fn with_event_bus(
+        mut self,
+        tx: tokio::sync::broadcast::Sender<cog_core::AgentEvent>,
+    ) -> Self {
+        self.event_bus = Some(tx);
+        self
     }
 
     /// Override the default runtime config used when spawning workers.
@@ -117,6 +131,9 @@ impl GlobalAgentManager {
             }
             if let Some(ref esr) = self.external_skill_registry {
                 a = a.with_external_skill_registry(esr.clone());
+            }
+            if let Some(ref bus) = self.event_bus {
+                a = a.with_event_bus(bus.clone());
             }
             a
         };
@@ -205,6 +222,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
             }
             if let Some(ref esr) = self.external_skill_registry {
                 a = a.with_external_skill_registry(esr.clone());
+            }
+            if let Some(ref bus) = self.event_bus {
+                a = a.with_event_bus(bus.clone());
             }
             a
         };

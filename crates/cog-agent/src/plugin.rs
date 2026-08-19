@@ -228,6 +228,15 @@ impl cog_core::SystemPlugin for AgentPlugin {
         )
         .with_default_runtime_config(agent_loop_config)
         .with_tools(tool_registry);
+        // Workers publish onto the cluster-wide bus (stream plugin) so live
+        // observers see every turn/tool call in real time. Without the stream
+        // plugin agents keep their private buses — tests and embedded use.
+        if let Some(event_tx) =
+            ctx.consume::<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>()
+        {
+            pool_builder = pool_builder.with_event_bus((*event_tx).clone());
+            info!("AgentPlugin workers attached to shared event bus");
+        }
         if let Some(ref esr) = external_skill_registry {
             pool_builder = pool_builder.with_external_skill_registry(esr.clone());
         }
@@ -503,6 +512,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "HttpClient",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "Sender<AgentEvent>",
             required: false,
         },
     ],

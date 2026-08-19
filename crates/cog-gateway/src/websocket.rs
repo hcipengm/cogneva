@@ -317,16 +317,22 @@ async fn forward_agent_event(
         Err(_) => return true,
     };
 
-    if let Ok(value) = serde_json::to_value(event) {
-        // Record in global missed-events cache
-        if let Some(ref mgr) = state.connection_manager {
-            let event_id = uuid::Uuid::new_v4().to_string();
-            mgr.record_event(event_id.clone(), value.clone()).await;
-        }
+    // message_update fires per token delta; recording and raw-logging each one
+    // would write-amplify the audit path by orders of magnitude. Stream
+    // details are observable live and worthless as replay/audit entries.
+    let is_stream_detail = matches!(event, cog_core::AgentEvent::MessageUpdate { .. });
+    if !is_stream_detail {
+        if let Ok(value) = serde_json::to_value(event) {
+            // Record in global missed-events cache
+            if let Some(ref mgr) = state.connection_manager {
+                let event_id = uuid::Uuid::new_v4().to_string();
+                mgr.record_event(event_id.clone(), value.clone()).await;
+            }
 
-        let record = websocket_record("session_raw", "outbound", value, Some(trace_ctx));
-        if let Err(e) = state.raw_logger.write(record).await {
-            tracing::warn!("RawLogger write failed (outbound): {}", e);
+            let record = websocket_record("session_raw", "outbound", value, Some(trace_ctx));
+            if let Err(e) = state.raw_logger.write(record).await {
+                tracing::warn!("RawLogger write failed (outbound): {}", e);
+            }
         }
     }
 

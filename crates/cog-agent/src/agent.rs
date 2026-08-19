@@ -164,6 +164,16 @@ impl Agent {
         self
     }
 
+    /// Publish onto the shared cluster-wide event bus instead of a private
+    /// per-agent channel, so live observers (WebSocket clients) see this
+    /// agent's turns, streaming output, and tool executions as they happen.
+    /// Must be called before `start` — subscribers of the old channel would
+    /// silently stop receiving events afterwards.
+    pub fn with_event_bus(mut self, tx: broadcast::Sender<AgentEvent>) -> Self {
+        self.event_tx = tx;
+        self
+    }
+
     /// Set mpsc channel capacity for agent commands.
     pub fn with_cmd_channel_capacity(mut self, capacity: usize) -> Self {
         self.cmd_channel_capacity = capacity;

@@ -339,6 +339,7 @@
   .tnode .lbl { color: #e2e8f0; font-size: 12.5px; }
   .tnode.agents-head { padding-top: 10px; margin-top: 6px; border-top: 1px solid rgba(148,163,184,.12); }
   .tnode.agents-head .lbl { color: #94a3b8; font-size: 11px; letter-spacing: .05em; }
+  .tact { padding: 0 0 6px 26px; color: #7d8da3; font-size: 11px; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .prow { display: flex; align-items: center; gap: 10px; padding: 7px 0; position: relative; }
   .prow .pdot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
   .prow .lbl { color: #e2e8f0; font-size: 12.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1207,6 +1208,15 @@ const I18N = {
   csError:        { en: 'error', zh: '错误' },
   thinkingLabel:  { en: 'Thinking…', zh: '思考中…' },
   thoughtLabel:   { en: 'Thought process', zh: '思考过程' },
+  actThinking:    { en: 'thinking…', zh: '思考中…' },
+  actWriting:     { en: 'writing: ', zh: '生成：' },
+  actThinkOf:     { en: 'thinking: ', zh: '思考：' },
+  actTool:        { en: 'tool: ', zh: '调用工具：' },
+  actToolDone:    { en: 'tool finished', zh: '工具完成' },
+  actToolErr:     { en: 'tool failed', zh: '工具出错' },
+  actReview:      { en: 'self-reviewing…', zh: '自审中…' },
+  actStep:        { en: 'step ', zh: '步骤 ' },
+  decomposing:    { en: 'Decomposing: ', zh: '分解中：' },
   navPipeline:    { en: 'Patch Pipeline', zh: '补丁流水线' },
   navProcess:     { en: 'Process', zh: '进程' },
   navPromotions:  { en: 'Promotions', zh: '晋级' },
@@ -1728,9 +1738,21 @@ checkLlmStatus();
       const seen = new Set();
       (data.agents || []).forEach((a) => {
         seen.add(a.agent_id);
-        liveAgents.set(a.agent_id, { label: shortLabel(a.role || a.agent_id, 14), status: healthToStatus(a.health) });
+        const prev = liveAgents.get(a.agent_id) || {};
+        liveAgents.set(a.agent_id, {
+          label: shortLabel(a.role || a.agent_id, 14),
+          status: healthToStatus(a.health),
+          activity: prev.activity || '',
+          buf: prev.buf || '',
+          lastEvent: prev.lastEvent || 0,
+        });
       });
-      for (const id of liveAgents.keys()) if (!seen.has(id)) liveAgents.delete(id);
+      // Event-known agents (e.g. a decompose squad mid-run) may lag the
+      // registry poll; keep anything that produced an event in the last 30s.
+      const now = Date.now();
+      for (const [id, a] of liveAgents) {
+        if (!seen.has(id) && now - (a.lastEvent || 0) > 30000) liveAgents.delete(id);
+      }
       liveGoals = (data.goals || []).slice(0, 5).map((g) => ({
         label: shortLabel(g.goal_id, 16),
         status: g.running > 0 ? 'running'
@@ -1748,6 +1770,34 @@ checkLlmStatus();
   const STAGE_COLORS = { pending: '#64748b', running: '#3b82f6', done: '#22c55e', error: '#ef4444' };
   const CS_COLORS = { open: '#22c55e', connecting: '#f59e0b', closed: '#64748b', error: '#ef4444' };
 
+  // Streaming agents emit an event per token delta; rebuilding the panels per
+  // delta would thrash the DOM. Events mutate state immediately, rendering is
+  // throttled to a trailing 250ms tick.
+  let renderTimer = null;
+  function scheduleRenderPanels() {
+    if (renderTimer) return;
+    renderTimer = setTimeout(() => { renderTimer = null; renderPanels(); }, 250);
+  }
+
+  function touchAgent(id) {
+    let a = liveAgents.get(id);
+    if (!a) {
+      a = { label: shortLabel(id, 14), status: 'running', activity: '', buf: '' };
+      liveAgents.set(id, a);
+    }
+    a.lastEvent = Date.now();
+    return a;
+  }
+  function setActivity(id, text) {
+    const a = touchAgent(id);
+    a.activity = text;
+    if (a.status === 'idle') a.status = 'running';
+  }
+  function tailSnippet(s, n) {
+    s = String(s || '').replace(/\s+/g, ' ').trim();
+    return s.length > n ? '…' + s.slice(-n) : s;
+  }
+
   function nodeRow(label, status, type) {
     const row = document.createElement('div');
     row.className = 'tnode';
@@ -1762,6 +1812,18 @@ checkLlmStatus();
     row.appendChild(ring);
     row.appendChild(lbl);
     return row;
+  }
+
+  function agentNode(a) {
+    const wrap = document.createElement('div');
+    wrap.appendChild(nodeRow(a.label, a.status, 'agent'));
+    if (a.activity) {
+      const act = document.createElement('div');
+      act.className = 'tact';
+      act.textContent = a.activity;
+      wrap.appendChild(act);
+    }
+    return wrap;
   }
 
   function renderPanels() {
@@ -1785,13 +1847,36 @@ checkLlmStatus();
       hl.textContent = t('agentsTitle');
       head.appendChild(hl);
       topo.appendChild(head);
-      for (const [id, a] of liveAgents) topo.appendChild(nodeRow(a.label, a.status, 'agent'));
+      for (const [id, a] of liveAgents) topo.appendChild(agentNode(a));
     }
 
     // goal pipeline
     const pipe = $('pipeRows');
     pipe.textContent = '';
-    if (liveGoals.length === 0) {
+    // Goals in decomposition have no tasks yet, so the poll cannot see them;
+    // the decompose squad's live agents are the evidence. Show one row per
+    // goal being decomposed until its tasks land in the poll.
+    const decomposeGoals = new Set();
+    for (const [id, a] of liveAgents) {
+      if (!id.startsWith('squad:decompose-') || a.status !== 'running') continue;
+      const goal = id.slice('squad:decompose-'.length).replace(/-(planner|generator|evaluator|moderator|merger)$/, '');
+      if (goal) decomposeGoals.add(goal);
+    }
+    for (const goal of decomposeGoals) {
+      const row = document.createElement('div');
+      row.className = 'prow';
+      const dot = document.createElement('span');
+      dot.className = 'pdot';
+      dot.style.background = STAGE_COLORS.running;
+      dot.style.boxShadow = '0 0 8px ' + STAGE_COLORS.running;
+      const lbl = document.createElement('span');
+      lbl.className = 'lbl';
+      lbl.textContent = t('decomposing') + shortLabel(goal, 16);
+      row.appendChild(dot);
+      row.appendChild(lbl);
+      pipe.appendChild(row);
+    }
+    if (liveGoals.length === 0 && decomposeGoals.size === 0) {
       const em = document.createElement('div');
       em.className = 'pempty';
       em.textContent = t('noActiveGoals');
@@ -1856,20 +1941,52 @@ checkLlmStatus();
     switch (msg.type) {
       case 'state_change':
         if (msg.agent_id) {
-          const cur = liveAgents.get(msg.agent_id);
-          liveAgents.set(msg.agent_id, {
-            label: (cur && cur.label) || shortLabel(msg.agent_id, 14),
-            status: runtimeStateToStatus(msg.to),
-          });
+          const cur = touchAgent(msg.agent_id);
+          cur.status = runtimeStateToStatus(msg.to);
         }
         break;
       case 'agent_start':
-        if (msg.agent_id && !liveAgents.has(msg.agent_id)) {
-          liveAgents.set(msg.agent_id, { label: shortLabel(msg.agent_id, 14), status: 'running' });
+        if (msg.agent_id) {
+          const a = touchAgent(msg.agent_id);
+          a.status = 'running';
+          a.activity = '';
+          a.buf = '';
         }
         break;
+      case 'turn_start':
+        if (msg.agent_id) setActivity(msg.agent_id, t('actThinking'));
+        break;
+      case 'react_step_start':
+        if (msg.agent_id) setActivity(msg.agent_id, t('actStep') + ((msg.iteration || 0) + 1));
+        break;
+      case 'message_update': {
+        // Live output tail, chat-thinking style: accumulate deltas, show the
+        // last snippet so each agent node reads like a status line.
+        const ae = msg.assistant_event;
+        if (msg.agent_id && ae && typeof ae.delta === 'string' && ae.delta) {
+          const a = touchAgent(msg.agent_id);
+          a.buf = (a.buf + ae.delta).slice(-400);
+          const phase = ae.type === 'thinking_delta' ? t('actThinkOf') : t('actWriting');
+          setActivity(msg.agent_id, phase + tailSnippet(a.buf, 72));
+        }
+        break;
+      }
+      case 'tool_execution_start':
+        if (msg.agent_id) setActivity(msg.agent_id, t('actTool') + (msg.tool_name || ''));
+        break;
+      case 'tool_execution_end':
+        if (msg.agent_id) setActivity(msg.agent_id, msg.is_error ? t('actToolErr') : t('actToolDone'));
+        break;
+      case 'self_review':
+        if (msg.agent_id) setActivity(msg.agent_id, t('actReview'));
+        break;
       case 'agent_end':
-        if (msg.agent_id && liveAgents.has(msg.agent_id)) liveAgents.get(msg.agent_id).status = 'idle';
+        if (msg.agent_id && liveAgents.has(msg.agent_id)) {
+          const a = liveAgents.get(msg.agent_id);
+          a.status = 'idle';
+          a.activity = '';
+          a.buf = '';
+        }
         break;
       case 'agent_error':
       case 'resource_alert':
@@ -1885,7 +2002,7 @@ checkLlmStatus();
       default:
         break;
     }
-    renderPanels();
+    scheduleRenderPanels();
   }
   function scheduleReconnect() {
     if (manualClose || reconnectAttempts >= 10) return;
