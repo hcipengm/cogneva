@@ -230,22 +230,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_rejects_shell_metacharacters() {
+    async fn run_command_supports_full_shell_syntax() {
         let registry = ToolRegistry::new();
         cog_core::ToolRegistry::register(&registry, builtins::run_command());
-        assert!(registry
+        let out = registry
             .execute(
                 "run_command",
-                serde_json::json!({"command": "ls; rm -rf /"})
+                serde_json::json!({"command": "echo hello world | tr 'a-z' 'A-Z'"}),
             )
-            .await
-            .is_err());
-        let out = registry
-            .execute("run_command", serde_json::json!({"command": "echo hi"}))
             .await
             .unwrap();
         assert_eq!(out["code"], 0);
-        assert_eq!(out["stdout"].as_str().unwrap().trim(), "hi");
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), "HELLO WORLD");
+
+        let dir = std::env::temp_dir().join(format!("cog-tool-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("task.py");
+        std::fs::write(&script, "print(sum(range(10)))").unwrap();
+        let out = registry
+            .execute(
+                "run_command",
+                serde_json::json!({"command": format!("python3 {}", script.display())}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), "45");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(registry
+            .execute("run_command", serde_json::json!({"command": "   "}))
+            .await
+            .is_err());
     }
 }
 
@@ -316,7 +331,10 @@ pub mod builtins {
     pub fn run_command() -> Tool {
         Tool {
             name: "run_command".into(),
-            description: "Run a shell command".into(),
+            description: "Run a shell command with full shell syntax: pipes, redirects, \
+                          variable expansion, and scripts written via write_file are all \
+                          supported."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -329,24 +347,17 @@ pub mod builtins {
                     let command = args["command"]
                         .as_str()
                         .ok_or_else(|| cog_core::SFError::Validation("command required".into()))?;
-                    // Security: reject shell metacharacters to prevent command injection.
-                    // Only simple single-command execution is allowed.
-                    const SHELL_META: &[char] = &[';', '&', '|', '`', '$', '<', '>', '(', ')'];
-                    if command.chars().any(|c| SHELL_META.contains(&c)) {
-                        return Err(cog_core::SFError::Validation(
-                            "Command contains shell metacharacters. Only simple commands are allowed.".into()
-                        ));
-                    }
-                    tracing::warn!(command = %command, "run_command executing");
-                    let parts: Vec<&str> = command.split_whitespace().collect();
-                    if parts.is_empty() {
+                    if command.trim().is_empty() {
                         return Err(cog_core::SFError::Validation("empty command".into()));
                     }
-                    let mut cmd = tokio::process::Command::new(parts[0]);
-                    for part in &parts[1..] {
-                        cmd.arg(part);
-                    }
-                    let output = cmd
+                    // Full shell by design: agents are expected to pipe, redirect,
+                    // expand variables and run scripts they just wrote. Capability
+                    // is intentionally not restricted; audit happens at the
+                    // guardrail layer, isolation at the container layer.
+                    tracing::warn!(command = %command, "run_command executing");
+                    let output = tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(command)
                         .output()
                         .await
                         .map_err(|e| cog_core::SFError::IO(e.to_string()))?;
