@@ -123,6 +123,13 @@ pub fn router() -> Router {
 /// Entry point for the `sandbox-executor` subcommand.
 /// Port from `SANDBOX_EXECUTOR_PORT`, default 9090.
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    // 独立子命令不经 run_app，需自行初始化日志，否则请求审计行不落地。
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let port: u16 = std::env::var("SANDBOX_EXECUTOR_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
