@@ -382,7 +382,11 @@ impl Agent {
             if let Some(ref registration) = self.registration {
                 let _ = registry.register(registration).await;
                 // Spawn periodic heartbeat to keep the registration alive.
+                // A lost key (TTL expiry, Redis flush, another replica's
+                // shutdown) must not silence this agent forever: re-register
+                // on the next beat instead of warning until restart.
                 let agent_id = registration.agent_id.clone();
+                let registration = registration.clone();
                 let registry = registry.clone();
                 let interval = std::time::Duration::from_secs(self.heartbeat_interval_secs);
                 let heartbeat_handle = tokio::spawn(async move {
@@ -391,7 +395,14 @@ impl Agent {
                     loop {
                         ticker.tick().await;
                         if let Err(e) = registry.heartbeat(&agent_id).await {
-                            tracing::warn!("Registry heartbeat failed for {}: {}", agent_id, e);
+                            if let Err(re) = registry.register(&registration).await {
+                                tracing::warn!(
+                                    "Registry heartbeat+re-register failed for {}: {} / {}",
+                                    agent_id,
+                                    e,
+                                    re
+                                );
+                            }
                         }
                     }
                 });

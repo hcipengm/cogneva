@@ -153,6 +153,18 @@ impl GlobalAgentManager {
         Ok(handle)
     }
 
+    /// Agent ids of workers spawned by this manager instance. Used on
+    /// shutdown to deregister only our own entries — the registry is shared
+    /// cluster-wide, so list-and-flush would wipe other replicas' agents.
+    pub async fn worker_ids(&self) -> Vec<String> {
+        self.workers
+            .read()
+            .await
+            .iter()
+            .map(|w| w.agent_id.clone())
+            .collect()
+    }
+
     /// Dispatch an [`InboxMessage`] to a worker using round-robin selection.
     pub async fn dispatch(&self, message: InboxMessage) -> SFResult<()> {
         let workers = self.workers.read().await;

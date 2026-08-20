@@ -349,17 +349,14 @@ impl cog_core::SystemPlugin for AgentPlugin {
     }
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
-        if let Some(ref registry) = self.agent_registry {
-            match registry.list().await {
-                Ok(agents) => {
-                    for a in agents {
-                        if let Err(e) = registry.deregister(&a.agent_id).await {
-                            warn!("registry deregister({}) failed: {}", a.agent_id, e);
-                        }
-                    }
-                    info!("AgentRegistry flushed on shutdown");
+        // 注册表是全集群共享的（多副本同名 worker、其他 pod 的 squad 智能体
+        // 都在里面），只能注销本进程自己拉起的 worker；其余条目交给 TTL 自然
+        // 过期，心跳侧遇到 key 丢失会自行重新注册。
+        if let (Some(ref registry), Some(ref pool)) = (&self.agent_registry, &self.pool) {
+            for agent_id in pool.worker_ids().await {
+                if let Err(e) = registry.deregister(&agent_id).await {
+                    warn!("registry deregister({}) failed: {}", agent_id, e);
                 }
-                Err(e) => warn!("registry list on shutdown failed: {}", e),
             }
         }
         info!("AgentPlugin shutdown");
