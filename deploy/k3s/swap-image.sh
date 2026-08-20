@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cogneva K3s 快速换版：增量构建 → buildah 叠层 → :local 同步重打 → 导入 k3s → 三部署滚动
+# cogneva K3s 快速换版：增量构建 → buildah 叠层 → :local 同步重打 → 导入 k3s → 四部署滚动
 #
 # 用法：
 #   deploy/k3s/swap-image.sh <新版本号> [--prev <基镜像tag>] [--web] [--no-deploy]
@@ -67,6 +67,20 @@ if ! buildah run "$CTR" -- test -x /usr/local/bin/kubectl 2>/dev/null; then
     echo "==> 宿主无 k3s，kubectl 由部署清单 hostPath 挂载兜底，跳过镜像层"
   fi
 fi
+# python3 是工具执行面（sandbox-executor / run_command 写脚本再跑）的硬依赖，
+# 老基镜像没有。叠层流补装；全量构建由 Containerfile.local 运行阶段保证。
+# CN 模式下 ubuntu 24.04 的 deb822 源换成 TUNA，避免 archive.ubuntu.com 超时。
+if ! buildah run "$CTR" -- python3 --version >/dev/null 2>&1; then
+  echo "==> 基镜像缺 python3，叠层补装"
+  buildah run -e "COGNEVA_CN_MIRROR=${COGNEVA_CN_MIRROR:-0}" "$CTR" --user root -- sh -c '
+    if [ "${COGNEVA_CN_MIRROR:-0}" = "1" ]; then
+      sed -i -e "s|//archive.ubuntu.com|//mirrors.tuna.tsinghua.edu.cn|" \
+             -e "s|//security.ubuntu.com|//mirrors.tuna.tsinghua.edu.cn|" \
+             /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+    fi
+    apt-get update && apt-get install -y --no-install-recommends python3 \
+      && rm -rf /var/lib/apt/lists/*'
+fi
 if [ -f web/dist/index.html ]; then
   # web/dist 是 git 忽略的构建产物——拷的是磁盘现状，要新鲜前端先加 --web
   buildah copy "$CTR" web/dist /opt/cogneva/web
@@ -95,6 +109,12 @@ if [ "$DO_DEPLOY" = 1 ]; then
   kubectl apply -f deploy/k3s/gitops-puller-rbac.yaml
   kubectl apply -f deploy/k3s/evolution-configmap.yaml
   kubectl apply -f deploy/k3s/deployment.yaml
+  # 主配置（sandbox_executor_url 等 system 段）随版本幂等 apply；
+  # 下方 set image 触发的滚动会让新 Pod 启动时读到新值。
+  kubectl apply -f deploy/k3s/cogneva-json-configmap.yaml
+  # 沙箱执行器（第 5 Pod）：deployment+service 幂等 apply，主应用经
+  # system.sandbox_executor_url 路由 run_command/read_file/write_file 到此。
+  kubectl apply -f deploy/k3s/sandbox-executor-deployment.yaml
 
   # prompts configmap 随换版重建：挂载的旧 prompts 会遮蔽新镜像的更新，
   # 每次换版从仓库 prompts/ 全量刷新（与 GitOps 拉取端 L0/L1 重建同源）
@@ -102,13 +122,15 @@ if [ "$DO_DEPLOY" = 1 ]; then
   kubectl create configmap cogneva-prompts -n "$NS" \
     --from-file=prompts/ --dry-run=client -o yaml | kubectl apply -f -
 
-  echo "==> 三部署滚动到 ${NEW_TAG}"
+  echo "==> 四部署滚动到 ${NEW_TAG}"
   kubectl set image -n "$NS" deployment/cogneva "cogneva=${IMAGE}:${NEW_TAG}"
   kubectl set image -n "$NS" deployment/cogneva-evolution "cogneva=${IMAGE}:${NEW_TAG}"
   kubectl set image -n "$NS" deployment/cogneva-security-gateway "security-gateway=${IMAGE}:${NEW_TAG}"
+  kubectl set image -n "$NS" deployment/cogneva-sandbox-executor "sandbox-executor=${IMAGE}:${NEW_TAG}"
   kubectl rollout status -n "$NS" deployment/cogneva --timeout=180s
   kubectl rollout status -n "$NS" deployment/cogneva-security-gateway --timeout=180s
   kubectl rollout status -n "$NS" deployment/cogneva-evolution --timeout=300s
+  kubectl rollout status -n "$NS" deployment/cogneva-sandbox-executor --timeout=180s
 fi
 
 echo "==> 完成：${IMAGE}:${NEW_TAG}（:local 已同步）"

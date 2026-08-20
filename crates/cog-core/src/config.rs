@@ -482,6 +482,12 @@ pub struct SystemConfig {
     pub trace_migrator_interval_secs: u64,
     /// WASM tool execution timeout (seconds).
     pub tool_timeout_secs: u64,
+    /// URL of the remote sandbox executor (e.g.
+    /// `http://cogneva-sandbox-executor.cogneva.svc:9090`). When set, shell
+    /// command tools execute in the isolated executor pod; when absent,
+    /// commands run in-process (embedded/development mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_executor_url: Option<String>,
     /// gRPC client reconnect interval (seconds).
     pub grpc_reconnect_interval_secs: u64,
     /// Health probe default timeout (seconds).
@@ -534,6 +540,7 @@ impl Default for SystemConfig {
             stale_task_detector_poll_secs: 15,
             trace_migrator_interval_secs: 3600,
             tool_timeout_secs: 30,
+            sandbox_executor_url: None,
             grpc_reconnect_interval_secs: 5,
             probe_timeout_secs: 5,
             http_timeout_secs: 10,

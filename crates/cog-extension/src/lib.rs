@@ -7,6 +7,7 @@
 //! | `wasm`  | Wasmtime | Untrusted third-party code (plugins) |
 //! | `rhai`  | Rhai     | Trusted inline scripting (prompt logic, glue) |
 
+pub mod command_server;
 pub mod executor;
 pub mod plugin;
 pub mod registry;
@@ -16,6 +17,7 @@ pub mod runtime;
 pub use runtime::script::RhaiRuntime;
 #[cfg(feature = "wasm")]
 pub use runtime::wasm::WasmRuntime;
+pub use runtime::{CompositeSandbox, LocalExecutor, RemoteExecutor};
 
 use std::sync::Arc;
 

@@ -25,10 +25,43 @@ pub struct SandboxRequest {
     pub limits: ResourceLimits,
 }
 
-#[derive(Debug, Clone)]
+/// Sandbox payload. Serializable: it is also the wire format between the
+/// remote executor client and the executor pod (`POST /execute`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum SandboxPayload {
-    Wasm { bytes: Vec<u8>, entry: String },
+    Wasm {
+        bytes: Vec<u8>,
+        entry: String,
+    },
+    /// Shell command executed by a command-capable backend (remote executor
+    /// in cluster deployments, in-process for embedded use).
+    Command {
+        command: String,
+    },
+    /// Read a file from the executor's filesystem.
+    ReadFile {
+        path: String,
+    },
+    /// Write a file on the executor's filesystem.
+    WriteFile {
+        path: String,
+        content: String,
+    },
 }
+
+/// One chunk of streaming command output. Also serves as the wire format
+/// between executor server and client (NDJSON, one event per line).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum CommandEvent {
+    Stdout { data: String },
+    Stderr { data: String },
+    Exit { code: i32 },
+}
+
+/// Stream of command output events, boxed for object safety.
+pub type CommandEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = CommandEvent> + Send>>;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourceLimits {
@@ -39,7 +72,7 @@ pub struct ResourceLimits {
 }
 
 /// Sandbox execution result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SandboxResult {
     pub stdout: String,
     pub stderr: String,
@@ -73,6 +106,24 @@ pub trait SandboxBackend: Send + Sync {
     async fn execute(&self, req: &SandboxRequest) -> crate::SFResult<SandboxResult>;
     /// Pre-compile WASM module and cache, reducing repeated compilation cost.
     async fn precompile(&self, bytes: &[u8]) -> crate::SFResult<String>;
+
+    /// Stream command output as it happens. The default implementation
+    /// buffers `execute` into a single terminal sequence so existing
+    /// non-streaming backends (WASM) compile unchanged.
+    async fn execute_stream(&self, req: &SandboxRequest) -> crate::SFResult<CommandEventStream> {
+        let result = self.execute(req).await?;
+        Ok(Box::pin(futures::stream::iter(vec![
+            CommandEvent::Stdout {
+                data: result.stdout,
+            },
+            CommandEvent::Stderr {
+                data: result.stderr,
+            },
+            CommandEvent::Exit {
+                code: result.exit_code,
+            },
+        ])))
+    }
 }
 
 // ==========================================================================

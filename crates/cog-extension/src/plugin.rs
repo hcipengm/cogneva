@@ -40,9 +40,25 @@ impl cog_core::SystemPlugin for ExtensionPlugin {
         }
 
         let app_dir = ctx.config().app.app_dir.clone();
+        let executor_url = ctx.config().system.sandbox_executor_url.clone();
 
+        // Environment tools (shell commands, file IO) and WASM modules are
+        // different payload kinds: WASM stays on the local wasmtime runtime,
+        // environment payloads go to the remote executor pod when configured
+        // (production) or run in-process (embedded/development).
+        let wasm_backend: Arc<dyn cog_core::SandboxBackend> = Arc::new(crate::WasmRuntime::new());
+        let executor_backend: Arc<dyn cog_core::SandboxBackend> = match executor_url {
+            Some(url) => {
+                info!(url = %url, "environment tools routed to remote sandbox executor");
+                Arc::new(crate::RemoteExecutor::new(url))
+            }
+            None => {
+                info!("no sandbox executor configured; environment tools run in-process");
+                Arc::new(crate::LocalExecutor::new())
+            }
+        };
         let sandbox_backend: Arc<dyn cog_core::SandboxBackend> =
-            Arc::new(crate::WasmRuntime::new());
+            Arc::new(crate::CompositeSandbox::new(wasm_backend, executor_backend));
         ctx.publish_service(sandbox_backend.clone());
         info!("ExtensionPlugin sandbox backend published");
 

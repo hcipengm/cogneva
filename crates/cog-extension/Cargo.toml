@@ -25,6 +25,9 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
 urlencoding = "2.1"
+futures = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
 
 # Signature verification (ed25519)
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

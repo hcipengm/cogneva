@@ -1,5 +1,6 @@
-use cog_core::{SFResult, SandboxBackend, SandboxPayload, SandboxRequest};
+use cog_core::{CommandEvent, SFResult, SandboxBackend, SandboxPayload, SandboxRequest};
 use cog_core::{Tool, ToolImplementation};
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -145,6 +146,91 @@ impl ToolRegistry {
                 let result = backend.execute(&req).await?;
                 Ok(result.into_json())
             }
+            ToolImplementation::Shell(op) => {
+                let backend = self.sandbox_backend.as_ref().ok_or_else(|| {
+                    cog_core::SFError::Agent("SandboxBackend not configured for shell tool".into())
+                })?;
+                let payload =
+                    match op {
+                        cog_core::ShellOp::Command => {
+                            let command = arguments
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    cog_core::SFError::Validation("command required".into())
+                                })?;
+                            if command.trim().is_empty() {
+                                return Err(cog_core::SFError::Validation("empty command".into()));
+                            }
+                            SandboxPayload::Command {
+                                command: command.to_string(),
+                            }
+                        }
+                        cog_core::ShellOp::ReadFile => {
+                            let path = arguments.get("path").and_then(|v| v.as_str()).ok_or_else(
+                                || cog_core::SFError::Validation("path required".into()),
+                            )?;
+                            SandboxPayload::ReadFile {
+                                path: path.to_string(),
+                            }
+                        }
+                        cog_core::ShellOp::WriteFile => {
+                            let path = arguments.get("path").and_then(|v| v.as_str()).ok_or_else(
+                                || cog_core::SFError::Validation("path required".into()),
+                            )?;
+                            let content = arguments
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    cog_core::SFError::Validation("content required".into())
+                                })?;
+                            SandboxPayload::WriteFile {
+                                path: path.to_string(),
+                                content: content.to_string(),
+                            }
+                        }
+                    };
+                let req = SandboxRequest {
+                    task_id: format!("shell-{}", uuid::Uuid::new_v4()),
+                    agent_id: format!("tool-{}", name),
+                    payload,
+                    input: arguments,
+                    timeout: self.wasm_timeout,
+                    limits: Default::default(),
+                };
+                let mut stream = backend.execute_stream(&req).await?;
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                let mut code = 0;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        CommandEvent::Stdout { data } => stdout.push_str(&data),
+                        CommandEvent::Stderr { data } => stderr.push_str(&data),
+                        CommandEvent::Exit { code: c } => code = c,
+                    }
+                }
+                match op {
+                    cog_core::ShellOp::Command => Ok(serde_json::json!({
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "code": code,
+                    })),
+                    cog_core::ShellOp::ReadFile => {
+                        if code == 0 {
+                            Ok(serde_json::json!({ "content": stdout }))
+                        } else {
+                            Err(cog_core::SFError::IO(stderr))
+                        }
+                    }
+                    cog_core::ShellOp::WriteFile => {
+                        if code == 0 {
+                            Ok(serde_json::json!({ "success": true }))
+                        } else {
+                            Err(cog_core::SFError::IO(stderr))
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -210,7 +296,7 @@ mod tests {
         let path = dir.join("a.txt");
         let path = path.to_str().unwrap();
 
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::read_file());
         cog_core::ToolRegistry::register(&registry, builtins::write_file());
 
@@ -229,9 +315,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// In-process backend for tests: mirrors the production executor for all
+    /// environment payloads (commands via `sh -c`, file IO via tokio::fs).
+    struct LocalShellBackend;
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for LocalShellBackend {
+        async fn execute(&self, req: &SandboxRequest) -> SFResult<cog_core::SandboxResult> {
+            let result = match &req.payload {
+                SandboxPayload::Command { command } => {
+                    let output = tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(command)
+                        .output()
+                        .await
+                        .map_err(|e| cog_core::SFError::IO(e.to_string()))?;
+                    cog_core::SandboxResult {
+                        stdout: String::from_utf8_lossy(&output.stdout).into(),
+                        stderr: String::from_utf8_lossy(&output.stderr).into(),
+                        exit_code: output.status.code().unwrap_or(-1),
+                        output: None,
+                        duration_ms: 0,
+                        resource_usage: Default::default(),
+                    }
+                }
+                SandboxPayload::ReadFile { path } => match tokio::fs::read_to_string(path).await {
+                    Ok(content) => cog_core::SandboxResult {
+                        stdout: content,
+                        exit_code: 0,
+                        ..Default::default()
+                    },
+                    Err(e) => cog_core::SandboxResult {
+                        stderr: e.to_string(),
+                        exit_code: 1,
+                        ..Default::default()
+                    },
+                },
+                SandboxPayload::WriteFile { path, content } => {
+                    match tokio::fs::write(path, content).await {
+                        Ok(()) => cog_core::SandboxResult {
+                            exit_code: 0,
+                            ..Default::default()
+                        },
+                        Err(e) => cog_core::SandboxResult {
+                            stderr: e.to_string(),
+                            exit_code: 1,
+                            ..Default::default()
+                        },
+                    }
+                }
+                SandboxPayload::Wasm { .. } => {
+                    return Err(cog_core::SFError::Agent("unsupported payload".into()));
+                }
+            };
+            Ok(result)
+        }
+
+        async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
+            Err(cog_core::SFError::Agent("unsupported".into()))
+        }
+    }
+
     #[tokio::test]
     async fn run_command_supports_full_shell_syntax() {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
         cog_core::ToolRegistry::register(&registry, builtins::run_command());
         let out = registry
             .execute(
@@ -262,6 +409,17 @@ mod tests {
             .await
             .is_err());
     }
+
+    #[tokio::test]
+    async fn run_command_requires_sandbox_backend() {
+        let registry = ToolRegistry::new();
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+        let err = registry
+            .execute("run_command", serde_json::json!({"command": "echo hi"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("SandboxBackend not configured"));
+    }
 }
 
 impl cog_core::ToolRegistry for ToolRegistry {
@@ -285,17 +443,7 @@ pub mod builtins {
                 },
                 "required": ["path"]
             }),
-            implementation: ToolImplementation::Native(Arc::new(|args| {
-                Box::pin(async move {
-                    let path = args["path"]
-                        .as_str()
-                        .ok_or_else(|| cog_core::SFError::Validation("path required".into()))?;
-                    let content = tokio::fs::read_to_string(path)
-                        .await
-                        .map_err(|e| cog_core::SFError::IO(e.to_string()))?;
-                    Ok(serde_json::json!({ "content": content }))
-                })
-            })),
+            implementation: ToolImplementation::Shell(cog_core::ShellOp::ReadFile),
         }
     }
 
@@ -311,20 +459,7 @@ pub mod builtins {
                 },
                 "required": ["path", "content"]
             }),
-            implementation: ToolImplementation::Native(Arc::new(|args| {
-                Box::pin(async move {
-                    let path = args["path"]
-                        .as_str()
-                        .ok_or_else(|| cog_core::SFError::Validation("path required".into()))?;
-                    let content = args["content"]
-                        .as_str()
-                        .ok_or_else(|| cog_core::SFError::Validation("content required".into()))?;
-                    tokio::fs::write(path, content)
-                        .await
-                        .map_err(|e| cog_core::SFError::IO(e.to_string()))?;
-                    Ok(serde_json::json!({ "success": true }))
-                })
-            })),
+            implementation: ToolImplementation::Shell(cog_core::ShellOp::WriteFile),
         }
     }
 
@@ -342,32 +477,7 @@ pub mod builtins {
                 },
                 "required": ["command"]
             }),
-            implementation: ToolImplementation::Native(Arc::new(|args| {
-                Box::pin(async move {
-                    let command = args["command"]
-                        .as_str()
-                        .ok_or_else(|| cog_core::SFError::Validation("command required".into()))?;
-                    if command.trim().is_empty() {
-                        return Err(cog_core::SFError::Validation("empty command".into()));
-                    }
-                    // Full shell by design: agents are expected to pipe, redirect,
-                    // expand variables and run scripts they just wrote. Capability
-                    // is intentionally not restricted; audit happens at the
-                    // guardrail layer, isolation at the container layer.
-                    tracing::warn!(command = %command, "run_command executing");
-                    let output = tokio::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(command)
-                        .output()
-                        .await
-                        .map_err(|e| cog_core::SFError::IO(e.to_string()))?;
-                    Ok(serde_json::json!({
-                        "stdout": String::from_utf8_lossy(&output.stdout),
-                        "stderr": String::from_utf8_lossy(&output.stderr),
-                        "code": output.status.code()
-                    }))
-                })
-            })),
+            implementation: ToolImplementation::Shell(cog_core::ShellOp::Command),
         }
     }
 

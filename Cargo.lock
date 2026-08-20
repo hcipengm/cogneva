@@ -1500,10 +1500,13 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.8.9",
  "chrono",
  "cog-core",
  "ed25519-dalek",
+ "futures",
  "hex",
+ "reqwest 0.12.28",
  "rhai",
  "serde",
  "serde_json",

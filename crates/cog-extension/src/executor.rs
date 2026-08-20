@@ -27,6 +27,11 @@ impl ExtensionExecutor {
                     .ok_or_else(|| cog_core::SFError::Agent("WASM runtime not available".into()))?;
                 backend.execute(req).await
             }
+            SandboxPayload::Command { .. }
+            | SandboxPayload::ReadFile { .. }
+            | SandboxPayload::WriteFile { .. } => Err(cog_core::SFError::Agent(
+                "ExtensionExecutor only dispatches WASM payloads".into(),
+            )),
         }
     }
 }

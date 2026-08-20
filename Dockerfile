@@ -189,6 +189,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     openssh-client \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install rustup/stable toolchain for the self-evolution worker.

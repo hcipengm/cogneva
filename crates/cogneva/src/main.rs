@@ -15,6 +15,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(1).as_deref() == Some("security-gateway") {
         return cog_gateway::security_gateway::run_from_env().await;
     }
+    // 独立沙箱执行器模式（deploy/k3s/sandbox-executor-deployment.yaml 的启动命令）。
+    if std::env::args().nth(1).as_deref() == Some("sandbox-executor") {
+        return cog_extension::command_server::run_from_env().await;
+    }
     // 启动前配置与依赖校验（审计 Phase 2 任务 2.5）。
     if std::env::args().nth(1).as_deref() == Some("validate-config") {
         return cogneva::validate_config::run().await;
