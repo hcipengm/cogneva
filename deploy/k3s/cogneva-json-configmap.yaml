@@ -214,7 +214,7 @@ data:
         }
       },
       "dag_executor": {
-        "redis_url": "redis://redis-0.redis.cogneva.svc.cluster.local:6379",
+        "redis_url": "redis://:${REDIS_PASSWORD}@redis-0.redis.cogneva.svc.cluster.local:6379",
         "nats": {
           "urls": [],
           "auth": {

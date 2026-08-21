@@ -71,6 +71,16 @@ impl MessageBackend for RedisMessageBackend {
         let subject = subject.to_string();
         let group = group.to_string();
 
+        // XREADGROUP fails with NOGROUP when the group does not exist yet
+        // (fresh stream or first consumer after a restart). Group creation is
+        // idempotent (BUSYGROUP tolerated), so always ensure it up front.
+        if let Err(e) = self.create_consumer_group(&subject, &group).await {
+            tracing::warn!(
+                "create consumer group failed, trying XREADGROUP anyway: {}",
+                e
+            );
+        }
+
         let opts = redis::streams::StreamReadOptions::default()
             .group(&group, "consumer-1")
             .count(1)

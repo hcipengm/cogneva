@@ -29,12 +29,17 @@ spec:
             - name: redis
               containerPort: 6379
               protocol: TCP
+          env:
+            # 认证密码：secret cogneva-secrets/redis-password，由运维带外写入。
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: redis-password
           command:
-            - redis-server
-            - --appendonly
-            - "yes"
-            - --dir
-            - /data
+            - sh
+            - -c
+            - redis-server --appendonly yes --dir /data --requirepass "$REDIS_PASSWORD"
           livenessProbe:
             tcpSocket:
               port: redis
@@ -45,8 +50,9 @@ spec:
           readinessProbe:
             exec:
               command:
-                - redis-cli
-                - ping
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3

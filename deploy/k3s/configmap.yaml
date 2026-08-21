@@ -29,9 +29,8 @@ data:
   # Storage provider (local-fs / cos)
   COGNEVA_STORAGE_PROVIDER: "local-fs"
 
-  # Redis
-  COGNEVA_REDIS_URL: "redis://redis-0.redis.cogneva.svc.cluster.local:6379"
-
+  # Redis URL 由 cogneva.json 的 dag_executor.redis_url 给出（含 ${REDIS_PASSWORD}
+  # 插值占位），不在此明文配置；env 映射优先级高于 json，置在这里会盖掉认证。
   # DagExecutor
   COGNEVA_WORKSPACE_ID: "default"
   COGNEVA_CONSUMER_GROUP: "cogneva"
