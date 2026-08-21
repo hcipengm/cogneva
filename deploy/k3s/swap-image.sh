@@ -72,7 +72,7 @@ fi
 # CN 模式下 ubuntu 24.04 的 deb822 源换成 TUNA，避免 archive.ubuntu.com 超时。
 if ! buildah run "$CTR" -- python3 --version >/dev/null 2>&1; then
   echo "==> 基镜像缺 python3，叠层补装"
-  buildah run -e "COGNEVA_CN_MIRROR=${COGNEVA_CN_MIRROR:-0}" "$CTR" --user root -- sh -c '
+  buildah run --user root -e "COGNEVA_CN_MIRROR=${COGNEVA_CN_MIRROR:-0}" "$CTR" -- sh -c '
     if [ "${COGNEVA_CN_MIRROR:-0}" = "1" ]; then
       sed -i -e "s|//archive.ubuntu.com|//mirrors.tuna.tsinghua.edu.cn|" \
              -e "s|//security.ubuntu.com|//mirrors.tuna.tsinghua.edu.cn|" \
