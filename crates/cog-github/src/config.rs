@@ -225,6 +225,11 @@ pub struct GitHubIntegrationConfig {
     /// Local git working copy used by the PR publisher. Empty disables
     /// patch-to-PR publishing (the PatchSink is not registered).
     pub pr_workdir: String,
+    /// GitHub API 基址覆盖：指向安全网关透传端点（如
+    /// `http://cogneva-security-gateway:8081/github`）。设置后本进程不再
+    /// 解析平台 token，凭证由网关出口注入；不设置则直连 api.github.com
+    /// 并走 token_env/inline token 解析。
+    pub api_base: Option<String>,
 }
 
 impl Default for GitHubIntegrationConfig {
@@ -249,6 +254,7 @@ impl Default for GitHubIntegrationConfig {
             conversation: ConversationConfig::default(),
             webhook: WebhookConfig::default(),
             pr_workdir: String::new(),
+            api_base: None,
         }
     }
 }
@@ -360,8 +366,8 @@ impl Default for BotIdentityConfig {
 const GITHUB_ENV: &[(&str, &str)] = &[
     ("COGNEVA_GITHUB_REPO", "repo"),
     ("COGNEVA_GITHUB_BASE_BRANCH", "base_branch"),
+    ("COGNEVA_GITHUB_API_BASE", "api_base"),
 ];
-
 impl GitHubIntegrationConfig {
     /// 自读 cogneva.json `github_integration` 段 + env 覆盖。
     /// 文件/段缺失回退默认（enabled=false）；段存在但解析失败响亮报错。
@@ -387,6 +393,81 @@ impl GitHubIntegrationConfig {
         cog_core::config::apply_env_paths(&mut section, GITHUB_ENV);
         serde_json::from_value(section)
             .map_err(|e| SFError::Config(format!("{} github_integration: {e}", path.display())))
+    }
+}
+
+/// Gitee 集成配置（cogneva.json `gitee_integration` 段）。
+///
+/// Gitee 与 GitHub 地位平等：issue 即外部意图进化入口。只承载平台特有
+/// 字段（仓库/基址/轮询节奏）；分诊标签、澄清对话、自动合并等策略与
+/// `github_integration` 共享同一份，由插件合成循环配置，避免两端漂移。
+/// 凭证约定同 GitHub：`api_base` 指向安全网关透传端点（`/gitee`）时
+/// 本进程零 token；直连 gitee.com 时才用 `token_env`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GiteeIntegrationConfig {
+    /// Master switch for the Gitee integration.
+    pub enabled: bool,
+    /// Target repository in `owner/repo` format.
+    pub repo: String,
+    /// Base branch for PRs (e.g. `main`).
+    pub base_branch: String,
+    /// Gitee API 基址覆盖：指向安全网关 `/gitee` 透传端点；不设置则直连
+    /// `https://gitee.com/api/v5`。
+    pub api_base: Option<String>,
+    /// Polling interval in seconds.
+    pub poll_interval_secs: u64,
+    /// Maximum number of issues to scan per polling round.
+    pub max_issues_per_scan: usize,
+    /// 直连模式 token 环境变量名（网关模式留空）。
+    pub token_env: Option<String>,
+}
+
+impl Default for GiteeIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repo: String::new(),
+            base_branch: "main".into(),
+            api_base: None,
+            poll_interval_secs: 300,
+            max_issues_per_scan: 50,
+            token_env: None,
+        }
+    }
+}
+
+const GITEE_ENV: &[(&str, &str)] = &[
+    ("COGNEVA_GITEE_REPO", "repo"),
+    ("COGNEVA_GITEE_BASE_BRANCH", "base_branch"),
+    ("COGNEVA_GITEE_API_BASE", "api_base"),
+];
+
+impl GiteeIntegrationConfig {
+    /// 自读 cogneva.json `gitee_integration` 段 + env 覆盖，语义同
+    /// [`GitHubIntegrationConfig::load`]。
+    pub fn load() -> SFResult<Self> {
+        let path = std::env::var("COGNEVA_CONFIG_PATH")
+            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        Self::load_from(std::path::Path::new(&path))
+    }
+
+    /// 从指定文件加载（测试与自定义路径用）。
+    pub fn load_from(path: &std::path::Path) -> SFResult<Self> {
+        let mut section = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let root: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| SFError::Config(format!("{}: {e}", path.display())))?;
+                root.pointer("/gitee_integration")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
+        };
+        cog_core::config::apply_env_paths(&mut section, GITEE_ENV);
+        serde_json::from_value(section)
+            .map_err(|e| SFError::Config(format!("{} gitee_integration: {e}", path.display())))
     }
 }
 
@@ -461,5 +542,27 @@ mod tests {
         assert_eq!(cfg.repo, "a/b");
         assert_eq!(cfg.poll_interval_secs, 45);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gitee_section_defaults_and_parse() {
+        let dir = std::env::temp_dir().join(format!("cog-gitee-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        std::fs::write(
+            &path,
+            r#"{"gitee_integration": {"enabled": true, "repo": "o/r", "api_base": "http://gw:8081/gitee"}}"#,
+        )
+        .unwrap();
+        let cfg = GiteeIntegrationConfig::load_from(&path).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.repo, "o/r");
+        assert_eq!(cfg.base_branch, "main");
+        assert_eq!(cfg.api_base.as_deref(), Some("http://gw:8081/gitee"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let missing =
+            GiteeIntegrationConfig::load_from(std::path::Path::new("/nonexistent/x.json")).unwrap();
+        assert!(!missing.enabled);
     }
 }

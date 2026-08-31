@@ -28,28 +28,45 @@ pub struct GitHubProvider {
     owner: String,
     repo: String,
     account: GitHubAccount,
+    /// API 基址覆盖（安全网关透传端点）。None = 直连 api.github.com。
+    api_base: Option<String>,
 }
 
 impl GitHubProvider {
     /// Build a new GitHub provider from an account and a `owner/repo` string.
     ///
-    /// The token is resolved from the environment or the inline config field at
-    /// this moment and is held in memory only.  It is not written to disk or
-    /// passed to the sandbox.
-    pub fn new(account: &GitHubAccount, repo: &str) -> Result<Self> {
-        let token = account
-            .resolve_token()
-            .map_err(|e| CogGitHubError::MissingToken(e.to_string()))?;
-        let client = Octocrab::builder()
-            .personal_token(token)
-            .build()
-            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+    /// When `api_base` points at the security gateway passthrough endpoint the
+    /// token is not resolved at all — the gateway injects the real credential
+    /// on egress and this process stays token-free.  Otherwise the token is
+    /// resolved from the environment or the inline config field at this moment
+    /// and is held in memory only; it is not written to disk or passed to the
+    /// sandbox.
+    pub fn new(account: &GitHubAccount, repo: &str, api_base: Option<&str>) -> Result<Self> {
+        let client = match api_base {
+            Some(base) => Octocrab::builder()
+                .base_uri(base)
+                .map_err(|e| {
+                    CogGitHubError::InvalidConfig(format!("invalid github api_base: {e}"))
+                })?
+                .build()
+                .map_err(|e| CogGitHubError::Provider(e.to_string()))?,
+            None => {
+                let token = account
+                    .resolve_token()
+                    .map_err(|e| CogGitHubError::MissingToken(e.to_string()))?;
+                Octocrab::builder()
+                    .personal_token(token)
+                    .build()
+                    .map_err(|e| CogGitHubError::Provider(e.to_string()))?
+            }
+        };
         let (owner, repo_name) = split_repo(repo)?;
         Ok(Self {
             client,
             owner,
             repo: repo_name,
             account: account.clone(),
+            api_base: api_base.map(|s| s.trim_end_matches('/').to_string()),
         })
     }
 
@@ -177,10 +194,13 @@ impl CodePlatformProvider for GitHubProvider {
             return Ok(Vec::new());
         }
 
-        let token = self
-            .account
-            .resolve_token()
-            .map_err(|e| CogGitHubError::MissingToken(e.to_string()))?;
+        // 网关模式本进程零 token：凭证由透传端点出口注入；直连模式才解析。
+        let token = self.account.resolve_token().ok();
+        if token.is_none() && self.api_base.is_none() {
+            tracing::warn!("no github token and no gateway api_base; CI job logs unavailable");
+            return Ok(Vec::new());
+        }
+        let base = self.api_base.as_deref().unwrap_or("https://api.github.com");
         let http = reqwest::Client::new();
 
         let mut logs = Vec::new();
@@ -190,12 +210,16 @@ impl CodePlatformProvider for GitHubProvider {
                 break;
             }
             let url = format!(
-                "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
+                "{base}/repos/{}/{}/actions/jobs/{}/logs",
                 self.owner, self.repo, job.id
             );
             // The endpoint answers 302 to a signed download URL; reqwest
             // follows it and drops the Authorization header cross-origin.
-            match http.get(&url).bearer_auth(&token).send().await {
+            let mut req = http.get(&url);
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let text = resp.text().await.unwrap_or_default();
                     let remaining = MAX_TOTAL_LOG_BYTES - total_bytes;
@@ -310,7 +334,7 @@ impl CodePlatformProvider for GitHubProvider {
     }
 }
 
-fn split_repo(repo: &str) -> Result<(String, String)> {
+pub(crate) fn split_repo(repo: &str) -> Result<(String, String)> {
     let parts: Vec<&str> = repo.split('/').collect();
     if parts.len() != 2 {
         return Err(CogGitHubError::InvalidConfig(format!(
@@ -344,6 +368,21 @@ mod tests {
             ("cogneva".into(), "cogneva".into())
         );
         assert!(split_repo("bad-format").is_err());
+    }
+
+    #[tokio::test]
+    async fn gateway_mode_builds_without_token() {
+        let account = GitHubAccount::Bot(crate::config::BotAccount {
+            username: "bot".into(),
+            token_env: Some("COG_TEST_DEFINITELY_UNSET_TOKEN".into()),
+            token: None,
+            ..Default::default()
+        });
+        // 直连模式：无 token 拒绝构建（凭证缺失响亮报错）。
+        assert!(GitHubProvider::new(&account, "o/r", None).is_err());
+        // 网关模式：本进程零 token，凭证由透传端点出口注入。
+        let p = GitHubProvider::new(&account, "o/r", Some("http://gw:8081/github/")).unwrap();
+        assert_eq!(p.api_base.as_deref(), Some("http://gw:8081/github"));
     }
 
     #[test]

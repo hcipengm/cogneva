@@ -36,6 +36,7 @@ pub use discovery_loop::GitHubDiscoveryLoop;
 pub use merge_decider::{MergeDecider, MergeDecision};
 pub use outcome_recorder::OutcomeRecorder;
 pub use pr_publisher::{GitHubPatchSink, GitHubPrPublisher};
+pub use provider::gitee::GiteeProvider;
 pub use provider::github::GitHubProvider;
 pub use provider::{
     CiFailureEvent, CiJobLog, CodePlatformProvider, CreatePullRequest, PlatformComment,
@@ -47,22 +48,48 @@ use tracing::debug;
 
 /// Build a default GitHub provider from the integration config.
 ///
-/// The token is resolved from the primary account's environment variable or
-/// inline field and is held only in the calling process's memory.  It is not
-/// passed to the sandbox.
+/// When `config.api_base` points at the security gateway passthrough the
+/// provider is built token-free (the gateway injects credentials on egress);
+/// otherwise the token is resolved from the primary account's environment
+/// variable or inline field and held only in the calling process's memory.
 pub fn default_provider(config: &GitHubIntegrationConfig) -> Result<Box<dyn CodePlatformProvider>> {
     let account = config
         .primary_account()
         .map_err(|e| CogGitHubError::InvalidConfig(e.to_string()))?;
     debug!(
-        "initializing GitHub provider for account={} kind={}",
+        "initializing GitHub provider for account={} kind={} via_gateway={}",
         account.username(),
-        if account.is_bot() { "bot" } else { "human" }
+        if account.is_bot() { "bot" } else { "human" },
+        config.api_base.is_some(),
     );
-    Ok(Box::new(GitHubProvider::new(account, &config.repo)?))
+    Ok(Box::new(GitHubProvider::new(
+        account,
+        &config.repo,
+        config.api_base.as_deref(),
+    )?))
+}
+
+/// Build a Gitee provider from the gitee_integration config：网关模式
+/// （api_base 已设）零 token；直连模式才解析 token_env。
+pub fn gitee_provider(
+    config: &config::GiteeIntegrationConfig,
+) -> Result<Box<dyn CodePlatformProvider>> {
+    let token = match config.api_base {
+        Some(_) => None,
+        None => config
+            .token_env
+            .as_deref()
+            .and_then(|env| std::env::var(env).ok())
+            .filter(|s| !s.is_empty()),
+    };
+    Ok(Box::new(GiteeProvider::new(
+        &config.repo,
+        config.api_base.as_deref(),
+        token,
+    )?))
 }
 
 pub use config::{
     AutoMergePolicy, BotAccount, BotIdentityConfig, ConversationConfig, GitHubAccount,
-    GitHubIntegrationConfig, HumanAccount, WebhookConfig,
+    GitHubIntegrationConfig, GiteeIntegrationConfig, HumanAccount, WebhookConfig,
 };

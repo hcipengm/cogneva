@@ -1,7 +1,9 @@
 //! 独立安全网关。
 //! 代持全部敏感凭证，沙盒零凭证。两个通道：
 //! - 外网代理（默认 8080）：`POST /proxy` 转发沙盒出站请求，域名白/黑名单 + 凭证脱敏审查；
-//! - LLM 代理（默认 8081）：`POST /v1/intent` 意图封装代调 LLM，`POST /v1/chat` 透传对话。
+//! - LLM 代理（默认 8081）：`POST /v1/intent` 意图封装代调 LLM，`POST /v1/chat` 透传对话；
+//!   同通道另挂代码平台透传 `/github/*`→api.github.com、`/gitee/*`→gitee.com/api/v5，
+//!   出口注入平台 token，业务 Pod 只见占位符。
 //!
 //! 凭证只从环境变量读取（K8s Secret 仅注入本服务），永不转发给沙盒。
 
@@ -56,6 +58,12 @@ pub struct SecurityGatewayConfig {
     /// LLM 上游池：按声明顺序故障转移（429 限流 / 402 额度耗尽 / 连接失败
     /// 切下一个）。空 = 未配置，LLM 通道一律 503。
     pub llm_upstreams: Vec<LlmUpstream>,
+    /// GitHub API 透传出口注入的 token（COGNEVA_GITHUB_TOKEN）。未配置时
+    /// `/github/*` 一律 503。
+    pub github_token: Option<String>,
+    /// Gitee API 透传出口注入的 token（COGNEVA_GITEE_TOKEN），以
+    /// `access_token` query 参数注入（Gitee API v5 官方认证方式）。
+    pub gitee_token: Option<String>,
 }
 
 impl SecurityGatewayConfig {
@@ -68,12 +76,15 @@ impl SecurityGatewayConfig {
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
         };
+        let token = |key: &str| std::env::var(key).ok().filter(|s| !s.is_empty());
         Self {
             egress_port: env_u16("COGNEVA_SG_EGRESS_PORT", 8080),
             llm_port: env_u16("COGNEVA_SG_LLM_PORT", 8081),
             domain_allowlist: list("COGNEVA_SG_DOMAIN_ALLOWLIST"),
             domain_denylist: list("COGNEVA_SG_DOMAIN_DENYLIST"),
             llm_upstreams: upstreams_from_env(),
+            github_token: token("COGNEVA_GITHUB_TOKEN"),
+            gitee_token: token("COGNEVA_GITEE_TOKEN"),
         }
     }
 }
@@ -177,6 +188,7 @@ struct AppState {
     stream_client: reqwest::Client,
     egress_stats: std::sync::Arc<LatencyStats>,
     llm_stats: std::sync::Arc<LatencyStats>,
+    code_stats: std::sync::Arc<LatencyStats>,
 }
 
 /// 凭证泄露模式：命中即拦截并记日志。
@@ -663,6 +675,122 @@ async fn call_one_upstream(
     }))
 }
 
+// ─── 代码平台透传（GitHub / Gitee）─────────────────────────────
+
+/// 代码平台标识：决定上游基址与凭证注入方式。
+#[derive(Clone, Copy)]
+enum CodePlatform {
+    GitHub,
+    Gitee,
+}
+
+async fn github_passthrough(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    code_platform_forward(state, req, CodePlatform::GitHub).await
+}
+
+async fn gitee_passthrough(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    code_platform_forward(state, req, CodePlatform::Gitee).await
+}
+
+/// 构造平台上游 URL：剥离 `/github`/`/gitee` 前缀后拼到平台基址，
+/// 保留原 query；Gitee 额外把 token 以 access_token query 参数注入。
+fn code_platform_url(
+    platform: CodePlatform,
+    path: &str,
+    query: Option<&str>,
+    token: &str,
+) -> Result<String, (StatusCode, String)> {
+    let base = match platform {
+        CodePlatform::GitHub => "https://api.github.com",
+        CodePlatform::Gitee => "https://gitee.com/api/v5",
+    };
+    let raw = match query {
+        Some(q) if !q.is_empty() => format!("{base}{path}?{q}"),
+        _ => format!("{base}{path}"),
+    };
+    let mut url = reqwest::Url::parse(&raw)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("非法上游路径: {e}")))?;
+    if matches!(platform, CodePlatform::Gitee) {
+        url.query_pairs_mut().append_pair("access_token", token);
+    }
+    Ok(url.into())
+}
+
+/// 平台透传共用实现：复刻 LLM 透传的"只取 method/path/query/body 重建
+/// 出站请求"模式——入站凭证头天然丢弃，真 token 由网关出口注入。
+/// 302 重定向由 reqwest 默认跟随（GitHub job 日志下载即 302 到签名 URL，
+/// 跨源跳转时 reqwest 自动丢弃 Authorization，签名 URL 自带凭证）。
+async fn code_platform_forward(
+    state: AppState,
+    req: axum::extract::Request,
+    platform: CodePlatform,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let (name, token) = match platform {
+        CodePlatform::GitHub => ("github", state.config.github_token.as_deref()),
+        CodePlatform::Gitee => ("gitee", state.config.gitee_token.as_deref()),
+    };
+    let Some(token) = token else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("网关未配置 {name} token"),
+        ));
+    };
+
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let prefix = format!("/{name}");
+    let upstream_path = path.strip_prefix(&prefix).unwrap_or(&path).to_string();
+    let query = req.uri().query().map(|q| q.to_string());
+    let headers = req.headers().clone();
+    let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let url = code_platform_url(platform, &upstream_path, query.as_deref(), token)?;
+    let start = std::time::Instant::now();
+    let mut builder = state.stream_client.request(method, &url);
+    // 只透传内容协商头；认证头由网关注入，入站一律丢弃。
+    for key in ["content-type", "accept"] {
+        if let Some(v) = headers.get(key) {
+            builder = builder.header(key, v);
+        }
+    }
+    builder = builder.header("User-Agent", "cogneva-security-gateway");
+    if matches!(platform, CodePlatform::GitHub) {
+        builder = builder.bearer_auth(token);
+    }
+    if !body.is_empty() {
+        builder = builder.body(body.to_vec());
+    }
+    let resp = builder.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("连接 {name} 上游失败: {e}"),
+        )
+    })?;
+    state.code_stats.record(start.elapsed().as_millis() as u64);
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let stream = resp.bytes_stream();
+    Ok(axum::response::Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
+}
+
 // ─── 健康与指标 ───────────────────────────────────────────────
 
 async fn health_live() -> &'static str {
@@ -688,6 +816,11 @@ async fn metrics_handler(State(state): State<AppState>) -> Json<serde_json::Valu
             "blocked": state.llm_stats.blocked.load(Ordering::Relaxed),
             "latency_p50_ms": state.llm_stats.percentile(0.50),
             "latency_p99_ms": state.llm_stats.percentile(0.99),
+        },
+        "code_platform": {
+            "requests": state.code_stats.requests.load(Ordering::Relaxed),
+            "latency_p50_ms": state.code_stats.percentile(0.50),
+            "latency_p99_ms": state.code_stats.percentile(0.99),
         }
     }))
 }
@@ -702,6 +835,8 @@ fn router(state: AppState, llm_channel: bool) -> Router {
             .route("/v1/chat", post(chat_handler))
             .route("/v1/chat/completions", post(chat_completions_passthrough))
             .route("/v1/messages", post(anthropic_messages_passthrough))
+            .route("/github/{*path}", axum::routing::any(github_passthrough))
+            .route("/gitee/{*path}", axum::routing::any(gitee_passthrough))
     } else {
         r.route("/proxy", post(proxy_handler))
     };
@@ -719,6 +854,7 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
             .build()?,
         egress_stats: std::sync::Arc::new(LatencyStats::default()),
         llm_stats: std::sync::Arc::new(LatencyStats::default()),
+        code_stats: std::sync::Arc::new(LatencyStats::default()),
         config: config.clone(),
     };
     let egress_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.egress_port));
@@ -758,7 +894,51 @@ mod tests {
             domain_allowlist: allow.iter().map(|s| s.to_string()).collect(),
             domain_denylist: deny.iter().map(|s| s.to_string()).collect(),
             llm_upstreams: Vec::new(),
+            github_token: None,
+            gitee_token: None,
         }
+    }
+
+    #[test]
+    fn code_platform_url_github_preserves_query() {
+        let url = code_platform_url(
+            CodePlatform::GitHub,
+            "/repos/o/r/issues",
+            Some("state=open&per_page=100"),
+            "tok",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://api.github.com/repos/o/r/issues?state=open&per_page=100"
+        );
+    }
+
+    #[test]
+    fn code_platform_url_gitee_appends_access_token() {
+        let url = code_platform_url(
+            CodePlatform::Gitee,
+            "/repos/o/r/issues",
+            Some("state=open"),
+            "tok",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://gitee.com/api/v5/repos/o/r/issues?state=open&access_token=tok"
+        );
+        let url = code_platform_url(CodePlatform::Gitee, "/repos/o/r/issues", None, "tok").unwrap();
+        assert_eq!(
+            url,
+            "https://gitee.com/api/v5/repos/o/r/issues?access_token=tok"
+        );
+    }
+
+    #[test]
+    fn code_platform_url_cannot_escape_platform_host() {
+        // 双斜杠开头的恶意路径也必须留在平台域名内。
+        let url = code_platform_url(CodePlatform::GitHub, "//evil.com/x", None, "t").unwrap();
+        assert!(url.starts_with("https://api.github.com/"));
     }
 
     #[test]

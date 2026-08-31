@@ -1,9 +1,10 @@
 //! Code platform provider abstraction.
 //!
 //! `CodePlatformProvider` defines a generic interface for interacting with code
-//! hosting platforms.  `cog-github` currently ships a GitHub implementation; a
-//! Gitee implementation is reserved for future work.
+//! hosting platforms.  `cog-github` ships GitHub and Gitee implementations;
+//! Gitee 与 GitHub 地位平等，issue 即外部意图进化入口。
 
+pub mod gitee;
 pub mod github;
 
 use async_trait::async_trait;

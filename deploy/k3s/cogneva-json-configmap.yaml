@@ -480,5 +480,13 @@ data:
           "name": "Cogneva Bot",
           "email": "bot@cogneva.ai"
         }
+      },
+      "gitee_integration": {
+        "_comment": "Gitee integration, equal in status to GitHub: issues are external-intent evolution entries. Platform fields only; triage/conversation/auto-merge policies are inherited from github_integration. api_base defaults to the security gateway passthrough (COGNEVA_GITEE_API_BASE env); token lives only in the gateway.",
+        "enabled": false,
+        "repo": "owner/cogneva",
+        "base_branch": "main",
+        "poll_interval_secs": 300,
+        "max_issues_per_scan": 50
       }
     }

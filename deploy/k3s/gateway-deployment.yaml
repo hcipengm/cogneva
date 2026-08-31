@@ -57,6 +57,20 @@ spec:
                   name: cogneva-secrets
                   key: llm-upstreams
                   optional: true
+            # 代码平台透传凭证：/github/* 出口注入 Bearer token，
+            # /gitee/* 出口注入 access_token query 参数。业务 Pod 只见占位符。
+            - name: COGNEVA_GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: github-token
+                  optional: true
+            - name: COGNEVA_GITEE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: gitee-token
+                  optional: true
           livenessProbe:
             httpGet:
               path: /health/live
