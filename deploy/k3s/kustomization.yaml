@@ -24,8 +24,6 @@ resources:
   - postgres-service.yaml
   - redis-deployment.yaml
   - redis-service.yaml
-  - mysql-deployment.yaml
-  - mysql-service.yaml
   - qdrant-pvc.yaml
   - qdrant-deployment.yaml
   - qdrant-service.yaml

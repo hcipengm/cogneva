@@ -68,11 +68,6 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: pg-password
-            - name: DB_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: db-password
             # Redis 认证：cogneva.json 的 dag_executor.redis_url 经 ${REDIS_PASSWORD} 插值
             - name: REDIS_PASSWORD
               valueFrom:
