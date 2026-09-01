@@ -16,3 +16,9 @@ spec:
       port: 8080
       targetPort: http
       protocol: TCP
+    # 网关验签 webhook 转发入口（gateway_verified 模式）：安全网关 8082
+    # 验平台签名后附内部 HMAC 转发到本端口。
+    - name: webhook
+      port: 9091
+      targetPort: 9091
+      protocol: TCP

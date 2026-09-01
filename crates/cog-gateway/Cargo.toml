@@ -28,6 +28,9 @@ argon2 = { workspace = true }
 async-trait = "0.1"
 reqwest = { workspace = true }
 regex = "1.10"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tokio-test = "0.4"

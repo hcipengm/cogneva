@@ -31,6 +31,32 @@ pub struct GitHubPlugin {
     loop_state: Mutex<Option<LoopState>>,
 }
 
+type SharedLoop = Arc<tokio::sync::Mutex<crate::discovery_loop::GitHubDiscoveryLoop>>;
+
+/// 平台轮询任务：间隔触发 run_once，shutdown 信号退出。
+fn spawn_polling_loop(
+    platform: &'static str,
+    shared: SharedLoop,
+    interval_secs: u64,
+    mut rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let interval = std::time::Duration::from_secs(interval_secs.max(30));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = rx.changed() => {
+                    info!(platform, "discovery polling loop shutting down");
+                    return;
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
+            if let Err(e) = shared.lock().await.run_once().await {
+                warn!(platform, error = %e, "discovery round failed");
+            }
+        }
+    })
+}
+
 impl GitHubPlugin {
     /// Create a new GitHub plugin instance.
     pub fn new() -> Self {
@@ -39,99 +65,6 @@ impl GitHubPlugin {
             provider: None,
             gitee: None,
             loop_state: Mutex::new(None),
-        }
-    }
-
-    /// GitHub 侧启动：轮询 + webhook（discovery_mode 决定），与 Gitee 侧
-    /// 共享同一 shutdown channel。
-    #[allow(clippy::too_many_arguments)]
-    fn start_github_side(
-        &self,
-        config: crate::config::GitHubIntegrationConfig,
-        provider: Arc<dyn CodePlatformProvider>,
-        llm: &Option<Arc<dyn cog_core::LlmClient>>,
-        orchestrator: &Option<Arc<dyn cog_core::OrchestratorControl>>,
-        reflection: &Option<Arc<dyn cog_core::ReflectionEngine>>,
-        rx: &tokio::sync::watch::Receiver<bool>,
-        handles: &mut Vec<tokio::task::JoinHandle<()>>,
-    ) {
-        let mode = config.discovery_mode.as_str();
-        let use_polling = mode == "polling" || mode == "both";
-        let use_events = mode == "events" || mode == "both";
-        if !use_polling && !use_events {
-            warn!(
-                mode,
-                "GitHub discovery_mode 无法识别（polling/events/both），集成不启动"
-            );
-            return;
-        }
-
-        let triage = match llm {
-            Some(l) => crate::triage::IssueTriage::with_llm(l.clone()),
-            None => crate::triage::IssueTriage::rules_only(),
-        };
-
-        let discovery_loop = crate::discovery_loop::GitHubDiscoveryLoop::new(
-            provider,
-            triage,
-            config.clone(),
-            orchestrator.clone(),
-            reflection.clone(),
-        );
-        // 轮询与 webhook 共享同一实例（事件驱动与周期兜底互补）。
-        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(discovery_loop));
-
-        if use_polling {
-            let shared = shared.clone();
-            let mut rx = rx.clone();
-            let interval = std::time::Duration::from_secs(config.poll_interval_secs.max(30));
-            handles.push(tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = rx.changed() => {
-                            info!("GitHub discovery polling loop shutting down");
-                            return;
-                        }
-                        _ = tokio::time::sleep(interval) => {}
-                    }
-                    if let Err(e) = shared.lock().await.run_once().await {
-                        warn!(error = %e, "GitHub discovery round failed");
-                    }
-                }
-            }));
-            info!("GitHub discovery polling loop started");
-        }
-
-        if use_events {
-            match crate::webhook::resolve_secret(&config.webhook.secret_env) {
-                Some(secret) => {
-                    let state = crate::webhook::WebhookState {
-                        discovery_loop: shared,
-                        secret: secret.into(),
-                    };
-                    let port = config.webhook.port;
-                    let path = config.webhook.path.clone();
-                    let rx = rx.clone();
-                    handles.push(tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::webhook::run_webhook_server(state, port, path, rx).await
-                        {
-                            warn!(error = %e, "GitHub webhook server exited");
-                        }
-                    }));
-                    info!(
-                        port = config.webhook.port,
-                        "GitHub webhook event entry started"
-                    );
-                }
-                None => {
-                    // 无 secret 启动 webhook 等于接受伪造事件 —— 拒绝启动。
-                    warn!(
-                        secret_env = %config.webhook.secret_env,
-                        "GitHub webhook secret 未配置，事件入口不启动（fail-closed）"
-                    );
-                }
-            }
         }
     }
 }
@@ -215,6 +148,10 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     loop_cfg.max_issues_per_scan = gitee_config.max_issues_per_scan;
                     self.gitee = Some((loop_cfg, Arc::from(provider)));
                     info!(repo = %gitee_config.repo, "Gitee integration initialized");
+                    // Gitee 无开放 CI API：CI 信号按 trait 默认降级为空，
+                    // merge 决策的 require_ci_pass 在 Gitee PR 上恒不自动
+                    // 合并（保守方向），issue/评论驱动不受影响。
+                    info!("Gitee 侧无开放 CI API，CI 失败信号按 trait 默认降级（返回空），issue/评论驱动不受影响");
                 }
                 Err(e) => {
                     warn!(error = %e, "Gitee provider unavailable; integration inactive");
@@ -235,49 +172,142 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        if let (Some(config), Some(provider)) = (self.config.clone(), self.provider.clone()) {
-            self.start_github_side(
-                config,
-                provider,
-                &llm,
-                &orchestrator,
-                &reflection,
-                &rx,
-                &mut handles,
-            );
-        }
-
-        // Gitee 轮询入口：webhook 验签随下一轮整体迁网关，本轮仅轮询。
-        if let Some((loop_cfg, provider)) = self.gitee.clone() {
+        // GitHub / Gitee 两个平台的 discovery loop 集中创建，轮询与事件
+        // 入口共享同一实例（事件驱动与周期兜底互补）。
+        let mk_loop = |config: &crate::config::GitHubIntegrationConfig,
+                       provider: &Arc<dyn CodePlatformProvider>|
+         -> SharedLoop {
             let triage = match &llm {
                 Some(l) => crate::triage::IssueTriage::with_llm(l.clone()),
                 None => crate::triage::IssueTriage::rules_only(),
             };
-            let gitee_loop = crate::discovery_loop::GitHubDiscoveryLoop::new(
-                provider,
-                triage,
-                loop_cfg.clone(),
-                orchestrator.clone(),
-                reflection.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::discovery_loop::GitHubDiscoveryLoop::new(
+                    provider.clone(),
+                    triage,
+                    config.clone(),
+                    orchestrator.clone(),
+                    reflection.clone(),
+                ),
+            ))
+        };
+        let github_shared = match (&self.config, &self.provider) {
+            (Some(c), Some(p)) => Some(mk_loop(c, p)),
+            _ => None,
+        };
+        let gitee_shared = self.gitee.as_ref().map(|(cfg, p)| mk_loop(cfg, p));
+        if github_shared.is_none() && gitee_shared.is_none() {
+            return Ok(());
+        }
+
+        // discovery_mode 由 github_integration 承载，Gitee 继承同一策略。
+        let loop_cfg = self
+            .config
+            .clone()
+            .or_else(|| self.gitee.as_ref().map(|(c, _)| c.clone()))
+            .unwrap_or_default();
+        let mode = loop_cfg.discovery_mode.as_str();
+        let use_polling = mode == "polling" || mode == "both";
+        let use_events = mode == "events" || mode == "both";
+        if !use_polling && !use_events {
+            warn!(
+                mode,
+                "discovery_mode 无法识别（polling/events/both），集成不启动"
             );
-            let shared = std::sync::Arc::new(tokio::sync::Mutex::new(gitee_loop));
-            let mut rx = rx.clone();
-            let interval = std::time::Duration::from_secs(loop_cfg.poll_interval_secs.max(30));
-            handles.push(tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = rx.changed() => {
-                            info!("Gitee discovery polling loop shutting down");
-                            return;
-                        }
-                        _ = tokio::time::sleep(interval) => {}
+            return Ok(());
+        }
+
+        if use_polling {
+            if let (Some(shared), Some(cfg)) = (github_shared.clone(), self.config.clone()) {
+                handles.push(spawn_polling_loop(
+                    "github",
+                    shared,
+                    cfg.poll_interval_secs,
+                    rx.clone(),
+                ));
+                info!("GitHub discovery polling loop started");
+            }
+            if let Some(shared) = gitee_shared.clone() {
+                let interval = self
+                    .gitee
+                    .as_ref()
+                    .map(|(c, _)| c.poll_interval_secs)
+                    .unwrap_or(300);
+                handles.push(spawn_polling_loop("gitee", shared, interval, rx.clone()));
+                info!("Gitee discovery polling loop started");
+            }
+        }
+
+        if use_events {
+            let webhook_cfg = loop_cfg.webhook.clone();
+            if webhook_cfg.gateway_verified {
+                // 网关验签模式：平台签名在安全网关完成，本进程只验内部
+                // HMAC，GitHub 与 Gitee 事件共用同一入口。
+                match crate::webhook::resolve_secret("COGNEVA_WEBHOOK_INTERNAL_SECRET") {
+                    Some(secret) => {
+                        let state = crate::webhook::VerifiedWebhookState {
+                            github_loop: github_shared.clone(),
+                            gitee_loop: gitee_shared.clone(),
+                            internal_secret: secret.into(),
+                        };
+                        let port = webhook_cfg.port;
+                        let github_path = webhook_cfg.path.clone();
+                        let gitee_path = crate::webhook::GITEE_WEBHOOK_PATH.to_string();
+                        let rx = rx.clone();
+                        handles.push(tokio::spawn(async move {
+                            if let Err(e) = crate::webhook::run_verified_webhook_server(
+                                state,
+                                port,
+                                github_path,
+                                gitee_path,
+                                rx,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "verified webhook server exited");
+                            }
+                        }));
+                        info!(
+                            port,
+                            "verified webhook event entry started (GitHub + Gitee)"
+                        );
                     }
-                    if let Err(e) = shared.lock().await.run_once().await {
-                        warn!(error = %e, "Gitee discovery round failed");
+                    None => {
+                        // 无内部 secret 启动事件入口等于接受伪造事件 —— 拒绝启动。
+                        warn!(
+                            "COGNEVA_WEBHOOK_INTERNAL_SECRET 未配置，网关验签事件入口不启动（fail-closed）"
+                        );
                     }
                 }
-            }));
-            info!(repo = %loop_cfg.repo, "Gitee discovery polling loop started");
+            } else if let Some(shared) = github_shared.clone() {
+                // legacy 直连验签（仅 GitHub），供未迁网关的部署使用。
+                match crate::webhook::resolve_secret(&webhook_cfg.secret_env) {
+                    Some(secret) => {
+                        let state = crate::webhook::WebhookState {
+                            discovery_loop: shared,
+                            secret: secret.into(),
+                        };
+                        let port = webhook_cfg.port;
+                        let path = webhook_cfg.path.clone();
+                        let rx = rx.clone();
+                        handles.push(tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::webhook::run_webhook_server(state, port, path, rx).await
+                            {
+                                warn!(error = %e, "GitHub webhook server exited");
+                            }
+                        }));
+                        info!(port, "GitHub webhook event entry started (legacy direct)");
+                    }
+                    None => {
+                        // 无 secret 启动 webhook 等于接受伪造事件 —— 拒绝启动。
+                        warn!(
+                            secret_env = %webhook_cfg.secret_env,
+                            "GitHub webhook secret 未配置，事件入口不启动（fail-closed）"
+                        );
+                    }
+                }
+            }
         }
 
         if handles.is_empty() {

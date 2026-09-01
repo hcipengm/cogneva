@@ -254,31 +254,42 @@ impl cog_core::PatchSink for GitHubPatchSink {
 
 /// Ensure `config.pr_workdir` is a usable git clone of the target repo.
 ///
-/// Missing directories are created by cloning. Remote selection:
-/// `COGNEVA_GITHUB_USE_SSH` set → `ssh://git@github.com:22/...` (for networks
-/// where github.com HTTPS is blocked; authentication comes from
-/// `GIT_SSH_COMMAND` in the process environment). Otherwise an
-/// `x-access-token` HTTPS remote when a platform token is available, falling
-/// back to anonymous HTTPS. Existing working copies are returned as-is.
+/// Missing directories are created by cloning. Remote selection (first match
+/// wins): `COGNEVA_GIT_PROXY_BASE` set → `{base}/github/{repo}.git` via the
+/// security gateway, which injects credentials on egress so no secret enters
+/// this process or the remote URL; `COGNEVA_GITHUB_USE_SSH` set →
+/// `ssh://git@github.com:22/...` (authentication from `GIT_SSH_COMMAND`);
+/// otherwise an `x-access-token` HTTPS remote when a platform token is
+/// available, falling back to anonymous HTTPS.
+///
+/// In gateway-proxy mode an existing working copy's `origin` is rewritten to
+/// the proxy URL (idempotent), so clones made with SSH/token remotes migrate
+/// without a re-clone. Other modes leave existing remotes untouched.
 pub async fn ensure_workdir(
     config: &GitHubIntegrationConfig,
     token: Option<&str>,
 ) -> Result<PathBuf> {
     let workdir = PathBuf::from(&config.pr_workdir);
+    let url = remote_url(config, token);
     if is_git_workdir(&workdir).await {
+        if git_proxy_base().is_some() {
+            let output = tokio::process::Command::new("git")
+                .args(["remote", "set-url", "origin", &url])
+                .current_dir(&workdir)
+                .output()
+                .await?;
+            if !output.status.success() {
+                return Err(CogGitHubError::Provider(format!(
+                    "git remote set-url failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+        }
         return Ok(workdir);
     }
     if let Some(parent) = workdir.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let url = if std::env::var_os("COGNEVA_GITHUB_USE_SSH").is_some() {
-        format!("ssh://git@github.com:22/{}.git", config.repo)
-    } else {
-        match token {
-            Some(t) => format!("https://x-access-token:{t}@github.com/{}.git", config.repo),
-            None => format!("https://github.com/{}.git", config.repo),
-        }
-    };
     let output = tokio::process::Command::new("git")
         .arg("clone")
         .arg(&url)
@@ -298,6 +309,39 @@ pub async fn ensure_workdir(
     Ok(workdir)
 }
 
+fn git_proxy_base() -> Option<String> {
+    std::env::var("COGNEVA_GIT_PROXY_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn remote_url(config: &GitHubIntegrationConfig, token: Option<&str>) -> String {
+    select_remote_url(
+        config,
+        token,
+        git_proxy_base().as_deref(),
+        std::env::var_os("COGNEVA_GITHUB_USE_SSH").is_some(),
+    )
+}
+
+fn select_remote_url(
+    config: &GitHubIntegrationConfig,
+    token: Option<&str>,
+    proxy_base: Option<&str>,
+    use_ssh: bool,
+) -> String {
+    if let Some(base) = proxy_base {
+        return format!("{}/github/{}.git", base.trim_end_matches('/'), config.repo);
+    }
+    if use_ssh {
+        return format!("ssh://git@github.com:22/{}.git", config.repo);
+    }
+    match token {
+        Some(t) => format!("https://x-access-token:{t}@github.com/{}.git", config.repo),
+        None => format!("https://github.com/{}.git", config.repo),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +349,36 @@ mod tests {
     #[test]
     fn sanitize_strips_unsafe_chars() {
         assert_eq!(sanitize("patch-AB_12/.."), "patch-AB_12");
+    }
+
+    #[test]
+    fn remote_url_selection_priority() {
+        let config = GitHubIntegrationConfig {
+            repo: "o/r".into(),
+            ..Default::default()
+        };
+        // 网关代理优先于一切，URL 不含任何凭证。
+        assert_eq!(
+            select_remote_url(&config, Some("tok"), Some("http://gw:8081/git"), false),
+            "http://gw:8081/git/github/o/r.git"
+        );
+        // 尾斜杠归一。
+        assert_eq!(
+            select_remote_url(&config, None, Some("http://gw:8081/git/"), true),
+            "http://gw:8081/git/github/o/r.git"
+        );
+        // 无代理时 SSH 优先于 token HTTPS。
+        assert_eq!(
+            select_remote_url(&config, Some("tok"), None, true),
+            "ssh://git@github.com:22/o/r.git"
+        );
+        assert_eq!(
+            select_remote_url(&config, Some("tok"), None, false),
+            "https://x-access-token:tok@github.com/o/r.git"
+        );
+        assert_eq!(
+            select_remote_url(&config, None, None, false),
+            "https://github.com/o/r.git"
+        );
     }
 }

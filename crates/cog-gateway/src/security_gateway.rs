@@ -64,6 +64,20 @@ pub struct SecurityGatewayConfig {
     /// Gitee API 透传出口注入的 token（COGNEVA_GITEE_TOKEN），以
     /// `access_token` query 参数注入（Gitee API v5 官方认证方式）。
     pub gitee_token: Option<String>,
+    /// Webhook 入口通道监听端口（第三通道，面向集群外平台回调）。
+    pub webhook_port: u16,
+    /// GitHub webhook HMAC-SHA256 验签 secret（COGNEVA_GITHUB_WEBHOOK_SECRET）。
+    /// 未配置时 /webhooks/github 一律 503（fail-closed）。
+    pub github_webhook_secret: Option<String>,
+    /// Gitee webhook 口令（COGNEVA_GITEE_WEBHOOK_TOKEN）：匹配
+    /// X-Gitee-Token 头或 password query 参数。未配置一律 503。
+    pub gitee_webhook_token: Option<String>,
+    /// 网关→主应用内部转发的 HMAC 签名密钥（COGNEVA_WEBHOOK_INTERNAL_SECRET）。
+    /// 主应用只认这个签名，平台 secret 不出本进程。未配置时 webhook
+    /// 端点一律 503（验了平台签名也无法安全转发）。
+    pub webhook_internal_secret: Option<String>,
+    /// 验签通过后的转发基址（COGNEVA_WEBHOOK_FORWARD_URL）。
+    pub webhook_forward_url: String,
 }
 
 impl SecurityGatewayConfig {
@@ -85,6 +99,12 @@ impl SecurityGatewayConfig {
             llm_upstreams: upstreams_from_env(),
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
+            webhook_port: env_u16("COGNEVA_SG_WEBHOOK_PORT", 8082),
+            github_webhook_secret: token("COGNEVA_GITHUB_WEBHOOK_SECRET"),
+            gitee_webhook_token: token("COGNEVA_GITEE_WEBHOOK_TOKEN"),
+            webhook_internal_secret: token("COGNEVA_WEBHOOK_INTERNAL_SECRET"),
+            webhook_forward_url: std::env::var("COGNEVA_WEBHOOK_FORWARD_URL")
+                .unwrap_or_else(|_| "http://cogneva:9091".into()),
         }
     }
 }
@@ -791,6 +811,238 @@ async fn code_platform_forward(
         .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
 }
 
+// ─── git 传输透传（GitHub / Gitee）────────────────────────────
+
+/// git smart HTTP 透传：业务 Pod 的 git clone/push 指向网关
+/// `/git/{platform}/owner/repo.git`，凭证以 Basic auth 出口注入
+/// （GitHub: x-access-token:<token>；Gitee: oauth2:<token>）。
+/// 请求体带缓冲上限（pack 数据），响应体流式回传。
+async fn git_forward(
+    state: AppState,
+    req: axum::extract::Request,
+    platform: CodePlatform,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let (name, token) = match platform {
+        CodePlatform::GitHub => ("github", state.config.github_token.as_deref()),
+        CodePlatform::Gitee => ("gitee", state.config.gitee_token.as_deref()),
+    };
+    let Some(token) = token else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("网关未配置 {name} token"),
+        ));
+    };
+
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let prefix = format!("/git/{name}");
+    let upstream_path = path.strip_prefix(&prefix).unwrap_or(&path).to_string();
+    let query = req.uri().query().map(|q| q.to_string());
+    let headers = req.headers().clone();
+    // pack 数据带 256MB 上限缓冲：cogneva 仓库量级下远低于此，
+    // 缓冲换取 Content-Length 完整（git 服务器对 chunked 支持不一）。
+    let body = axum::body::to_bytes(req.into_body(), 256 * 1024 * 1024)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let base = match platform {
+        CodePlatform::GitHub => "https://github.com",
+        CodePlatform::Gitee => "https://gitee.com",
+    };
+    let url = match &query {
+        Some(q) if !q.is_empty() => format!("{base}{upstream_path}?{q}"),
+        _ => format!("{base}{upstream_path}"),
+    };
+
+    // Basic auth 注入：GitHub 认 x-access-token 用户名，Gitee 认 oauth2。
+    let user = match platform {
+        CodePlatform::GitHub => "x-access-token",
+        CodePlatform::Gitee => "oauth2",
+    };
+    use base64::Engine;
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{token}"));
+
+    let start = std::time::Instant::now();
+    let mut builder = state.stream_client.request(method, &url);
+    // git 协议头原样透传（含 Git-Protocol: version=2），认证头一律丢弃。
+    for key in ["content-type", "accept", "git-protocol", "user-agent"] {
+        if let Some(v) = headers.get(key) {
+            builder = builder.header(key, v);
+        }
+    }
+    builder = builder.header("Authorization", format!("Basic {basic}"));
+    if !body.is_empty() {
+        builder = builder.body(body.to_vec());
+    }
+    let resp = builder.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("连接 {name} git 上游失败: {e}"),
+        )
+    })?;
+    state.code_stats.record(start.elapsed().as_millis() as u64);
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let stream = resp.bytes_stream();
+    Ok(axum::response::Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
+}
+
+async fn git_github_passthrough(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    git_forward(state, req, CodePlatform::GitHub).await
+}
+
+async fn git_gitee_passthrough(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    git_forward(state, req, CodePlatform::Gitee).await
+}
+
+// ─── webhook 入口通道（第三通道，面向集群外平台回调）────────────
+
+use hmac::{Hmac, Mac};
+
+type HmacSha256 = Hmac<sha2::Sha256>;
+
+/// `sha256=<hex HMAC-SHA256(secret, body)>`，与主应用内部验签同款格式。
+fn hmac_hex(secret: &str, body: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts any key");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// 验证 GitHub webhook 的 X-Hub-Signature-256。
+fn verify_github_signature(secret: &str, body: &[u8], header: &str) -> bool {
+    let Some(hex_sig) = header.strip_prefix("sha256=") else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(hex_sig) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
+/// webhook 验签通过后转发主应用：附内部 HMAC 签名头，主应用只认它。
+/// 平台事件头原样透传（x-github-event / x-gitee-event）。
+async fn webhook_forward(
+    state: &AppState,
+    path: &str,
+    event_header: (&str, String),
+    body: &[u8],
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let internal = state
+        .config
+        .webhook_internal_secret
+        .as_deref()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "网关未配置内部转发凭证".into(),
+            )
+        })?;
+    let url = format!("{}{}", state.config.webhook_forward_url, path);
+    let resp = state
+        .client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header(event_header.0, event_header.1)
+        .header("X-Cogneva-Signature-256", hmac_hex(internal, body))
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("转发主应用失败: {e}")))?;
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let text = resp.text().await.unwrap_or_default();
+    Ok(axum::response::Response::builder()
+        .status(status)
+        .header("content-type", "text/plain")
+        .body(axum::body::Body::from(text))
+        .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
+}
+
+async fn github_webhook_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let secret = state
+        .config
+        .github_webhook_secret
+        .as_deref()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "网关未配置 github webhook secret".into(),
+            )
+        })?;
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !verify_github_signature(secret, &body, signature) {
+        tracing::warn!("GitHub webhook 签名验证失败，已拒绝");
+        return Err((StatusCode::UNAUTHORIZED, "invalid signature".into()));
+    }
+    let event = headers
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    webhook_forward(&state, "/webhooks/github", ("x-github-event", event), &body).await
+}
+
+async fn gitee_webhook_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let expected = state.config.gitee_webhook_token.as_deref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "网关未配置 gitee webhook token".into(),
+        )
+    })?;
+    // Gitee 两种认证：X-Gitee-Token 头 或 ?password= query 参数。
+    let presented = headers
+        .get("x-gitee-token")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .or_else(|| {
+            uri.query().and_then(|q| {
+                q.split('&')
+                    .find_map(|kv| kv.strip_prefix("password=").map(String::from))
+            })
+        });
+    if presented.as_deref() != Some(expected) {
+        tracing::warn!("Gitee webhook 口令不匹配，已拒绝");
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".into()));
+    }
+    let event = headers
+        .get("x-gitee-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    webhook_forward(&state, "/webhooks/gitee", ("x-gitee-event", event), &body).await
+}
+
 // ─── 健康与指标 ───────────────────────────────────────────────
 
 async fn health_live() -> &'static str {
@@ -837,13 +1089,30 @@ fn router(state: AppState, llm_channel: bool) -> Router {
             .route("/v1/messages", post(anthropic_messages_passthrough))
             .route("/github/{*path}", axum::routing::any(github_passthrough))
             .route("/gitee/{*path}", axum::routing::any(gitee_passthrough))
+            .route(
+                "/git/github/{*path}",
+                axum::routing::any(git_github_passthrough),
+            )
+            .route(
+                "/git/gitee/{*path}",
+                axum::routing::any(git_gitee_passthrough),
+            )
     } else {
         r.route("/proxy", post(proxy_handler))
     };
     r.with_state(state)
 }
 
-/// 启动安全网关（两个通道各自监听）。
+/// webhook 入口通道路由（面向集群外平台回调，验签后转发主应用）。
+fn webhook_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health/live", get(health_live))
+        .route("/webhooks/github", post(github_webhook_handler))
+        .route("/webhooks/gitee", post(gitee_webhook_handler))
+        .with_state(state)
+}
+
+/// 启动安全网关（三个通道各自监听）。
 pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         client: reqwest::Client::builder()
@@ -859,9 +1128,11 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
     };
     let egress_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.egress_port));
     let llm_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.llm_port));
+    let webhook_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.webhook_port));
     tracing::info!(
         egress = %egress_addr,
         llm = %llm_addr,
+        webhook = %webhook_addr,
         allowlist = ?config.domain_allowlist,
         denylist = ?config.domain_denylist,
         "安全网关启动（凭证仅存在本进程内存）"
@@ -872,9 +1143,13 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
     );
     let llm = axum::serve(
         tokio::net::TcpListener::bind(llm_addr).await?,
-        router(state, true),
+        router(state.clone(), true),
     );
-    tokio::try_join!(egress, llm)?;
+    let webhook = axum::serve(
+        tokio::net::TcpListener::bind(webhook_addr).await?,
+        webhook_router(state),
+    );
+    tokio::try_join!(egress, llm, webhook)?;
     Ok(())
 }
 
@@ -896,7 +1171,23 @@ mod tests {
             llm_upstreams: Vec::new(),
             github_token: None,
             gitee_token: None,
+            webhook_port: 8082,
+            github_webhook_secret: None,
+            gitee_webhook_token: None,
+            webhook_internal_secret: None,
+            webhook_forward_url: "http://cogneva:9091".into(),
         }
+    }
+
+    #[test]
+    fn github_signature_roundtrip() {
+        let body = br#"{"action":"opened"}"#;
+        let sig = hmac_hex("s3cret", body);
+        assert!(verify_github_signature("s3cret", body, &sig));
+        assert!(!verify_github_signature("wrong", body, &sig));
+        assert!(!verify_github_signature("s3cret", b"tampered", &sig));
+        assert!(!verify_github_signature("s3cret", body, "sha256=zzzz"));
+        assert!(!verify_github_signature("s3cret", body, "no-prefix"));
     }
 
     #[test]

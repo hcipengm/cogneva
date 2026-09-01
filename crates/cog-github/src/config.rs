@@ -175,6 +175,10 @@ pub struct WebhookConfig {
     pub secret_env: String,
     /// 监听路径。
     pub path: String,
+    /// 网关验签模式：true 时平台签名由安全网关完成，本进程只验网关
+    /// 转发的内部 HMAC（COGNEVA_WEBHOOK_INTERNAL_SECRET），GitHub 与
+    /// Gitee 事件共用同一入口；false 保持 legacy 直连验签（仅 GitHub）。
+    pub gateway_verified: bool,
 }
 
 impl Default for WebhookConfig {
@@ -183,6 +187,7 @@ impl Default for WebhookConfig {
             port: 9090,
             secret_env: "COGNEVA_GITHUB_WEBHOOK_SECRET".into(),
             path: "/webhooks/github".into(),
+            gateway_verified: false,
         }
     }
 }
@@ -367,6 +372,10 @@ const GITHUB_ENV: &[(&str, &str)] = &[
     ("COGNEVA_GITHUB_REPO", "repo"),
     ("COGNEVA_GITHUB_BASE_BRANCH", "base_branch"),
     ("COGNEVA_GITHUB_API_BASE", "api_base"),
+    (
+        "COGNEVA_GITHUB_WEBHOOK_GATEWAY_VERIFIED",
+        "webhook.gateway_verified",
+    ),
 ];
 impl GitHubIntegrationConfig {
     /// 自读 cogneva.json `github_integration` 段 + env 覆盖。

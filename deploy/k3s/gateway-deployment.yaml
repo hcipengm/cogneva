@@ -1,5 +1,7 @@
-# 独立安全网关：代持全部敏感凭证（LLM API Key 等），沙盒 Pod 零凭证。
-# 两个通道：8080 外网代理（脱敏审查后出站）、8081 LLM 代理（意图封装后代调）。
+# 独立安全网关：代持全部敏感凭证（LLM API Key、代码平台 token、webhook secret），
+# 沙盒 Pod 零凭证。三个通道：8080 外网代理（脱敏审查后出站）、8081 LLM 与
+# 代码平台/git 透传（凭证出口注入）、8082 webhook 入口（验平台签名后附内部
+# HMAC 转发主应用）。
 # 依赖：主程序需以 security-gateway 模式运行。
 apiVersion: apps/v1
 kind: Deployment
@@ -41,6 +43,9 @@ spec:
             - name: llm-proxy
               containerPort: 8081
               protocol: TCP
+            - name: webhook
+              containerPort: 8082
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: cogneva-config
@@ -58,7 +63,8 @@ spec:
                   key: llm-upstreams
                   optional: true
             # 代码平台透传凭证：/github/* 出口注入 Bearer token，
-            # /gitee/* 出口注入 access_token query 参数。业务 Pod 只见占位符。
+            # /gitee/* 出口注入 access_token query 参数；/git/github|gitee/*
+            # 出口注入 Basic auth。业务 Pod 只见占位符。
             - name: COGNEVA_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -70,6 +76,28 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: gitee-token
+                  optional: true
+            # webhook 入口（8082）：验平台签名后附内部 HMAC 转发主应用
+            # （默认 http://cogneva:9091，可用 COGNEVA_WEBHOOK_FORWARD_URL
+            # 覆盖）。任一 secret 未配置时对应端点一律 503（fail-closed），
+            # 真实值带外写入（kubectl edit secret cogneva-secrets）。
+            - name: COGNEVA_GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: github-webhook-secret
+                  optional: true
+            - name: COGNEVA_GITEE_WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: gitee-webhook-token
+                  optional: true
+            - name: COGNEVA_WEBHOOK_INTERNAL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: webhook-internal
                   optional: true
           livenessProbe:
             httpGet:

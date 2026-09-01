@@ -431,13 +431,14 @@ data:
         "poll_interval_secs": 300,
         "max_issues_per_scan": 50,
         "webhook": {
-          "_comment": "Webhook event entry, used when discovery_mode=events/both. Secret resolved from env, never stored here.",
-          "port": 9090,
+          "_comment": "Webhook event entry, used when discovery_mode=events/both. gateway_verified=true: platform signatures are verified at the security gateway (8082); this process only verifies the gateway's internal HMAC (COGNEVA_WEBHOOK_INTERNAL_SECRET) and serves GitHub + Gitee events on the same port. Gitee events arrive at the fixed path /webhooks/gitee.",
+          "port": 9091,
           "secret_env": "COGNEVA_GITHUB_WEBHOOK_SECRET",
-          "path": "/webhooks/github"
+          "path": "/webhooks/github",
+          "gateway_verified": true
         },
         "pr_workdir": "",
-        "_comment_pr_workdir": "Local git clone used by the PR publisher (PatchSink). Empty disables patch-to-PR publishing. Set COGNEVA_GITHUB_USE_SSH=1 + GIT_SSH_COMMAND to clone over SSH when github.com HTTPS is unreachable.",
+        "_comment_pr_workdir": "Local git clone used by the PR publisher (PatchSink). Empty disables patch-to-PR publishing. Git transport goes through the security gateway HTTPS proxy (COGNEVA_GIT_PROXY_BASE, set in deployment env); no token or deploy key lives in this pod.",
         "auto_create_pr": true,
         "auto_merge_policy": {
           "enabled": true,

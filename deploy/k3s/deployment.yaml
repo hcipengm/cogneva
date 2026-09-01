@@ -46,6 +46,10 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            # 网关验签 webhook 转发入口（cogneva.json github_integration.webhook.port）。
+            - name: webhook
+              containerPort: 9091
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: cogneva-config
@@ -82,23 +86,23 @@ spec:
             - name: COGNEVA_DATABASE_URL
               value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
             # GitHub/Gitee API 走安全网关透传（凭证网关注入，本 Pod 零 token）。
-            # webhook 验签暂留本进程，随下一轮迁入网关后 secret 一并外移。
             - name: COGNEVA_GITHUB_API_BASE
               value: "http://cogneva-security-gateway:8081/github"
             - name: COGNEVA_GITEE_API_BASE
               value: "http://cogneva-security-gateway:8081/gitee"
-            - name: COGNEVA_GITHUB_WEBHOOK_SECRET
+            # git 传输（PR 发布 clone/push）走网关 HTTPS 代理，网关注入
+            # 凭证；本 Pod 不再持有 deploy key 或平台 token。
+            - name: COGNEVA_GIT_PROXY_BASE
+              value: "http://cogneva-security-gateway:8081/git"
+            # webhook 验签已在安全网关完成（gateway_verified=true，见
+            # cogneva.json github_integration.webhook），本进程只验网关
+            # 转发的内部 HMAC；未配置时事件入口不启动（fail-closed）。
+            - name: COGNEVA_WEBHOOK_INTERNAL_SECRET
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
-                  key: github-webhook-secret
+                  key: webhook-internal
                   optional: true
-            # Patch-to-PR publishing clones/pushes over SSH on port 22
-            # (github.com HTTPS is unreachable from this network).
-            - name: COGNEVA_GITHUB_USE_SSH
-              value: "1"
-            - name: GIT_SSH_COMMAND
-              value: "ssh -i /etc/cogneva-keys/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/lib/sf-data/.ssh_known_hosts"
             # GitOps 拉取端：poll 中央 bare 仓库（宿主 /var/lib/cogneva-data/
             # git-remote 挂入 /host-git）的 evolution-release 分支，L0 配置
             # 热更 / L1 金丝雀各自在本集群闭环。沙盒推送端只写该仓库。
@@ -142,9 +146,6 @@ spec:
             - name: prompts
               mountPath: /etc/cogneva/prompts
               readOnly: true
-            - name: deploy-key
-              mountPath: /etc/cogneva-keys
-              readOnly: true
             - name: git-remote
               mountPath: /host-git
               readOnly: true
@@ -166,13 +167,6 @@ spec:
             name: cogneva-prompts
             # 空白机首启时 GitOps 拉取端尚未建过该 configmap，置可选
             # 避免主 Pod 卡 FailedMount；建好后挂载自动生效
-            optional: true
-        - name: deploy-key
-          secret:
-            secretName: cogneva-deploy-key
-            defaultMode: 256
-            # 空白机一键部署时该 secret 尚未创建，置为可选避免主 Pod 永远
-            # 卡在 FailedMount；GitHub/Gitee 推送是部署后另行配置的能力
             optional: true
         - name: git-remote
           # GitOps 中央 bare 仓库（与进化部署的 git-remote 同一 hostPath，
