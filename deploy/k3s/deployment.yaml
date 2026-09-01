@@ -78,11 +78,9 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: redis-password
-            # 沙盒零凭证同款：主应用不再挂载真 key。cogneva.json 的
-            # llm_routing backend api_key 占位 ${KIMI_API_KEY} 需要非空值，
-            # 填非敏感占位串；真 key 只在安全网关 Pod，LLM 流量经网关 8081 透传。
-            - name: KIMI_API_KEY
-              value: "via-security-gateway"
+            # LLM 零凭证零上游知识：cogneva.json 的 llm_routing 只有网关透传
+            # 一个后端（api_key/model 是写死的非敏感占位），真 key 只在安全
+            # 网关 Pod，LLM 流量经网关 8081 透传。
             - name: COGNEVA_DATABASE_URL
               value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
             # GitHub/Gitee API 走安全网关透传（凭证网关注入，本 Pod 零 token）。

@@ -92,11 +92,9 @@ spec:
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
             # 沙盒零凭证（设计 §2.6.1）：LLM 调用经安全网关 8081 OpenAI 兼容
-            # 透传端点，真实 key 只存在于安全网关 Pod。此处 KIMI_API_KEY 是
-            # 非敏感占位——cogneva.json 的 ${KIMI_API_KEY} 插值与后端构建需要
-            # 非空值，网关收到请求后会丢弃入站 Authorization 换成真凭证。
-            - name: KIMI_API_KEY
-              value: "via-security-gateway"
+            # 透传端点，真实 key 只存在于安全网关 Pod；cogneva.json 的
+            # llm_routing 只有网关透传一个后端，api_key 为写死的非敏感占位，
+            # 网关收到请求后丢弃入站 Authorization 换成真凭证。
             - name: PG_PASSWORD
               valueFrom:
                 secretKeyRef:

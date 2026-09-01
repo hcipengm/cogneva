@@ -127,29 +127,20 @@
     "app_dir": "/opt/cogneva"
   },
   "llm_routing": {
-    "_comment": "多 LLM 故障转移。api_style 声明兼容的 API 风格：openai 或 anthropic。默认 openai。",
+    "_comment": "LLM 平等：业务侧只配置安全网关透传一个后端，不出现任何厂商名。api_key/model 是写死的非敏感占位（后端构建要求非空）；真实上游池（api_style/base_url/model/api_key，可多个按序故障转移）由 WebUI 向导 / llm-config API 写入网关侧的 llm-upstreams secret。api_style 声明网关透传面兼容的 API 风格：openai。",
     "strategy": "failover",
     "retry_on_429": true,
     "retry_on_402": true,
     "max_failover_attempts": 3,
     "backends": [
       {
-        "provider": "kimi",
-        "api_key": "${KIMI_API_KEY}",
-        "base_url": "https://api.kimi.com/coding/v1",
-        "model": "k3",
-        "api_style": "anthropic",
-        "weight": 1,
-        "enabled": true
-      },
-      {
-        "provider": "doubao",
-        "api_key": "${ARK_API_KEY}",
-        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-        "model": "doubao-seed-evolving",
+        "provider": "gateway",
+        "api_key": "via-security-gateway",
+        "base_url": "http://cogneva-security-gateway:8081/v1",
+        "model": "via-security-gateway",
         "api_style": "openai",
         "weight": 1,
-        "enabled": false
+        "enabled": true
       }
     ]
   },

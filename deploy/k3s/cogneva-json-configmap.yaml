@@ -147,9 +147,9 @@ data:
         "max_failover_attempts": 3,
         "backends": [
           {
-            "provider": "kimi",
-            "_comment": "主应用与沙盒一致零凭证零上游知识：api_key 是非敏感占位（见 deployment env KIMI_API_KEY=via-security-gateway），流量经安全网关 8081 透传，真 key 只在网关 Pod。api_style 钉 openai 匹配透传面；model 同样是占位，网关透传时改写为向导配置的真实模型。多 LLM 故障转移（429/402 切上游）由安全网关的上游池承担，主应用这里只保留网关一个后端。",
-            "api_key": "${KIMI_API_KEY}",
+            "provider": "gateway",
+            "_comment": "主应用与沙盒一致零凭证零上游知识：api_key 是写死的非敏感占位串（后端构建要求非空），流量经安全网关 8081 透传，真 key 只在网关 Pod。api_style 钉 openai 匹配透传面；model 同样是占位，网关透传时改写为向导配置的真实模型。多 LLM 故障转移（429/402 切上游）由安全网关的上游池承担，主应用这里只保留网关一个后端。LLM 平等：业务侧配置不出现任何厂商名。",
+            "api_key": "via-security-gateway",
             "base_url": "http://cogneva-security-gateway:8081/v1",
             "model": "via-security-gateway",
             "api_style": "openai",
@@ -404,10 +404,10 @@ data:
         "retry_interval_secs": 5
       },
       "github_integration": {
-        "_comment": "GitHub integration for self-evolution. Tokens are resolved from environment variables and never enter the sandbox.",
-        "enabled": false,
-        "discovery_mode": "polling",
-        "repo": "owner/cogneva",
+        "_comment": "GitHub integration for self-evolution. Tokens are resolved from environment variables and never enter the sandbox. discovery_mode=both: polling is the periodic fallback, webhook events (via the security gateway, gateway_verified) give second-level response.",
+        "enabled": true,
+        "discovery_mode": "both",
+        "repo": "hcipengm/cogneva",
         "base_branch": "main",
         "accounts": [
           {
@@ -484,8 +484,8 @@ data:
       },
       "gitee_integration": {
         "_comment": "Gitee integration, equal in status to GitHub: issues are external-intent evolution entries. Platform fields only; triage/conversation/auto-merge policies are inherited from github_integration. api_base defaults to the security gateway passthrough (COGNEVA_GITEE_API_BASE env); token lives only in the gateway.",
-        "enabled": false,
-        "repo": "owner/cogneva",
+        "enabled": true,
+        "repo": "hcipengm/cogneva",
         "base_branch": "main",
         "poll_interval_secs": 300,
         "max_issues_per_scan": 50

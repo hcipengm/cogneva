@@ -634,8 +634,8 @@ mod tests {
         let mut value = serde_json::json!({
             "llm_routing": {
                 "backends": [
-                    {"provider": "kimi", "base_url": "https://api.kimi.com/coding/v1"},
-                    {"provider": "doubao", "base_url": "https://ark.example/v3"}
+                    {"provider": "backend-a", "base_url": "https://a.example/v1"},
+                    {"provider": "backend-b", "base_url": "https://b.example/v3"}
                 ]
             }
         });
@@ -652,7 +652,7 @@ mod tests {
         // 其余元素不受影响
         assert_eq!(
             value["llm_routing"]["backends"][1]["base_url"],
-            "https://ark.example/v3"
+            "https://b.example/v3"
         );
 
         // 越界下标不扩容、不 panic
