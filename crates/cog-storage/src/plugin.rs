@@ -184,6 +184,20 @@ impl cog_core::SystemPlugin for StoragePlugin {
             .await
             .map_err(cog_core::SFError::Config)?;
 
+            // 所有池子指向同一个数据库；如果某个池子创建失败（连接抖动、
+            // 超时），复用任意一个成功的池子，避免部分后端落盘、部分后端
+            // 回退到内存的不一致状态。这是 self_evolution 任务持久化的关键。
+            let any_pool = users_pool
+                .as_ref()
+                .or(messages_pool.as_ref())
+                .or(config_pool.as_ref())
+                .or(explain_pool.as_ref())
+                .cloned();
+            let users_pool = users_pool.or_else(|| any_pool.clone());
+            let messages_pool = messages_pool.or_else(|| any_pool.clone());
+            let config_pool = config_pool.or_else(|| any_pool.clone());
+            let explain_pool = explain_pool.or_else(|| any_pool.clone());
+
             (users_pool, messages_pool, config_pool, explain_pool)
         } else {
             if strict_persistence {

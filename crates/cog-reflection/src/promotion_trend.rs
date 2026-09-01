@@ -147,14 +147,18 @@ impl PromotionTrendReporter {
 
     /// 后台循环：立即生成一次，之后按间隔周期生成。
     pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        // 防御配置错误导致的 busy-loop：最小周期 60 秒。
+        let interval = self.interval.max(std::time::Duration::from_secs(60));
         loop {
             if let Err(e) = self.generate_once().await {
                 error!(error = %e, "Promotion trend report generation failed");
             }
             tokio::select! {
-                _ = tokio::time::sleep(self.interval) => {}
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { break; }
+                _ = tokio::time::sleep(interval) => {}
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        break;
+                    }
                 }
             }
         }

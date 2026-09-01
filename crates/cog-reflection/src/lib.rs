@@ -200,6 +200,7 @@ impl ReflectionEngine {
         hook_sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
         tool_sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
         project_root: Option<std::path::PathBuf>,
+        patch_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
             memory_backend.clone(),
@@ -224,7 +225,8 @@ impl ReflectionEngine {
         let effectiveness_tracker = Arc::new(SkillEffectivenessTracker::new(recorder.clone()));
         let meta_learning = Arc::new(MetaLearningEngine::new(recorder.clone()));
         let mut evolution =
-            EvolutionEngine::new(llm.clone(), skill_registry.clone(), prompt_manager.clone());
+            EvolutionEngine::new(llm.clone(), skill_registry.clone(), prompt_manager.clone())
+                .with_patch_dir(patch_dir);
         if let Some(tx) = hook_sink {
             evolution = evolution.with_hook_sink(tx);
         }

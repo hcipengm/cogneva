@@ -49,6 +49,30 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
         let (tool_tx, mut tool_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
 
+        let project_root = std::env::current_dir().ok();
+        let patch_dir = ctx.config().self_evolution.patch_dir.clone();
+
+        // Build the evolution engine up-front. It is required both as a
+        // PatchSink for collaboration-generated patches and for the
+        // self-evolution auto-deploy pipeline. It does not depend on a
+        // persistent memory backend, so it is created whenever an LLM is
+        // available.
+        let evolution_engine: Option<Arc<crate::EvolutionEngine>> =
+            if let Some(ref llm) = llm_provider {
+                let mut evolution = crate::EvolutionEngine::new(
+                    llm.clone(),
+                    skill_registry.clone(),
+                    Some(prompt_manager.clone()),
+                )
+                .with_patch_dir(patch_dir.clone());
+                if let Some(ref root) = project_root {
+                    evolution = evolution.with_project_root(root.clone());
+                }
+                Some(Arc::new(evolution))
+            } else {
+                None
+            };
+
         let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
             crate::ReflectionEngine::new_self_evolution(
@@ -59,17 +83,20 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 Some(prompt_manager.clone()),
                 Some(hook_tx),
                 Some(tool_tx),
-                Some(std::env::current_dir().map_err(|e| {
-                    error!("Failed to get current working directory: {}", e);
-                    cog_core::SFError::IO(e.to_string())
-                })?),
+                project_root,
+                patch_dir.clone(),
             )
         } else {
             if strict_persistence {
                 warn!("ReflectionEngine falling back to in-memory mode (memory_backend or llm_provider unavailable)");
             }
             info!("ReflectionEngine initialized in in-memory mode");
-            crate::ReflectionEngine::new_in_memory(skill_registry.clone())
+            let mut engine = crate::ReflectionEngine::new_in_memory(skill_registry.clone());
+            if let Some(ref evo) = evolution_engine {
+                engine.evolution = Some(evo.clone());
+                info!("ReflectionEngine evolution engine attached in in-memory mode");
+            }
+            engine
         };
 
         // 学习数据飞轮（审计 4.4）：所有学习记录在本地持久化之外，
