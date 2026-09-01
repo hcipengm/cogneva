@@ -35,3 +35,5 @@ hex = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+# 测试进程不经 main.rs，需自装 rustls 进程级 CryptoProvider。
+rustls = { workspace = true }

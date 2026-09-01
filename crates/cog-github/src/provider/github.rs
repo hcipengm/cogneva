@@ -372,6 +372,9 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_mode_builds_without_token() {
+        // 测试进程不走 main.rs，rustls 无进程级默认 CryptoProvider，
+        // 构建 HTTPS client 会 panic——测试内自行安装（幂等）。
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let account = GitHubAccount::Bot(crate::config::BotAccount {
             username: "bot".into(),
             token_env: Some("COG_TEST_DEFINITELY_UNSET_TOKEN".into()),
