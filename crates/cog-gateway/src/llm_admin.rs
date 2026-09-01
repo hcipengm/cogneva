@@ -134,7 +134,7 @@ pub async fn llm_config_handler(
     for item in &requests {
         match resolve_upstream(item, skip_verify).await {
             Ok(entry) => pool.push(entry),
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         }
     }
 
@@ -204,7 +204,7 @@ pub async fn llm_config_handler(
 async fn resolve_upstream(
     item: &LlmUpstreamRequest,
     skip_verify: bool,
-) -> Result<serde_json::Value, Response> {
+) -> Result<serde_json::Value, Box<Response>> {
     let base_url = item.base_url.trim();
     let model = item.model.trim();
     let api_key = item.api_key.trim();
@@ -215,18 +215,22 @@ async fn resolve_upstream(
         .filter(|s| !s.is_empty());
 
     if model.is_empty() || api_key.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_request", "message": "model、api_key 不能为空"})),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_request", "message": "model、api_key 不能为空"})),
+            )
+                .into_response(),
+        ));
     }
     if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_request", "message": "base_url 必须是 http(s):// 开头的完整地址"})),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_request", "message": "base_url 必须是 http(s):// 开头的完整地址"})),
+            )
+                .into_response(),
+        ));
     }
 
     // 双协议实证探测：按首猜顺序先试，失败自动换另一种协议面，
@@ -241,11 +245,13 @@ async fn resolve_upstream(
         match detect_api_style(base_url, model, api_key, style_hint).await {
             Ok(style) => style,
             Err(message) => {
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": "llm_verify_failed", "message": message})),
-                )
-                    .into_response());
+                return Err(Box::new(
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": "llm_verify_failed", "message": message})),
+                    )
+                        .into_response(),
+                ));
             }
         }
     };
