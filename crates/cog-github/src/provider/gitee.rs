@@ -160,6 +160,20 @@ impl CodePlatformProvider for GiteeProvider {
         Ok(parse_pr(&v, &req))
     }
 
+    async fn list_open_pull_requests(&self) -> Result<Vec<PlatformPullRequest>> {
+        let v = self
+            .send(self.get("/pulls").query(&[
+                ("state", "open"),
+                ("per_page", "100"),
+                ("sort", "created"),
+                ("direction", "desc"),
+            ]))
+            .await?;
+        Ok(v.as_array()
+            .map(|a| a.iter().map(parse_pr_list_item).collect())
+            .unwrap_or_default())
+    }
+
     async fn comment_on_issue(&self, issue_number: u64, body: String) -> Result<()> {
         let number = self.issue_string_number(issue_number).await?;
         self.send(
@@ -278,7 +292,36 @@ fn parse_pr(v: &serde_json::Value, req: &CreatePullRequest) -> PlatformPullReque
         state: v["state"].as_str().unwrap_or("open").to_string(),
         head_branch: req.head_branch.clone(),
         base_branch: req.base_branch.clone(),
+        body: v["body"].as_str().unwrap_or_default().to_string(),
+        author: v["user"]["login"].as_str().unwrap_or_default().to_string(),
+        labels: parse_labels(v),
     }
+}
+
+/// Gitee v5 PR 列表条目（head/base 分支名在响应里而非请求里）。
+fn parse_pr_list_item(v: &serde_json::Value) -> PlatformPullRequest {
+    PlatformPullRequest {
+        number: v["number"].as_u64().unwrap_or_default(),
+        title: v["title"].as_str().unwrap_or_default().to_string(),
+        url: v["html_url"].as_str().unwrap_or_default().to_string(),
+        state: v["state"].as_str().unwrap_or("open").to_string(),
+        head_branch: v["head"]["ref"].as_str().unwrap_or_default().to_string(),
+        base_branch: v["base"]["ref"].as_str().unwrap_or_default().to_string(),
+        body: v["body"].as_str().unwrap_or_default().to_string(),
+        author: v["user"]["login"].as_str().unwrap_or_default().to_string(),
+        labels: parse_labels(v),
+    }
+}
+
+fn parse_labels(v: &serde_json::Value) -> Vec<String> {
+    v["labels"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

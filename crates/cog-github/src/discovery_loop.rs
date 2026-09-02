@@ -30,6 +30,8 @@ pub struct GitHubDiscoveryLoop {
     recorder: OutcomeRecorder,
     /// Issue numbers that already produced a task this process lifetime.
     submitted: std::collections::HashSet<u64>,
+    /// PR numbers that already produced an intent task this process lifetime.
+    submitted_prs: std::collections::HashSet<u64>,
     /// CI run ids that already produced a fix task this process lifetime.
     ci_submitted: std::collections::HashSet<u64>,
     /// CI run ids seen by the polling fallback. `None` until the first poll,
@@ -59,6 +61,7 @@ impl GitHubDiscoveryLoop {
             conversations: HashMap::new(),
             recorder: OutcomeRecorder::new(),
             submitted: std::collections::HashSet::new(),
+            submitted_prs: std::collections::HashSet::new(),
             ci_submitted: std::collections::HashSet::new(),
             ci_seen: None,
         }
@@ -84,6 +87,24 @@ impl GitHubDiscoveryLoop {
                     error = %e,
                     "Failed to process discovered issue"
                 );
+            }
+        }
+
+        // PR 与 issue 同为外部意图入口：PR 未必带解法，可能只是需求描述。
+        match self.provider.list_open_pull_requests().await {
+            Ok(prs) => {
+                for pr in prs {
+                    if let Err(e) = self.process_pr(&pr).await {
+                        tracing::warn!(
+                            pr = pr.number,
+                            error = %e,
+                            "Failed to process discovered pull request"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list open pull requests");
             }
         }
 
@@ -393,6 +414,107 @@ impl GitHubDiscoveryLoop {
             issue = issue.number,
             tasks = ?task_ids,
             "Submitted github_issue_fix task to orchestrator"
+        );
+        Ok(())
+    }
+
+    /// PR 意图处理：与 issue 同走 triage → orchestrator 主流程，但先做
+    /// 自循环防护——自家进化流水线产的 PR（`cogneva/` 分支前缀或机器人
+    /// 署名）绝不能回流成新意图，否则无限自我增殖。
+    async fn process_pr(&mut self, pr: &crate::provider::PlatformPullRequest) -> Result<()> {
+        if pr.head_branch.starts_with("cogneva/") || pr.author == self.config.bot_identity.username
+        {
+            tracing::debug!(pr = pr.number, "Skipping self-produced PR");
+            return Ok(());
+        }
+        if self.submitted_prs.contains(&pr.number) {
+            return Ok(());
+        }
+        if pr
+            .labels
+            .iter()
+            .any(|l| self.config.forbidden_labels.contains(l))
+        {
+            tracing::info!(pr = pr.number, "PR carries forbidden label; skipping");
+            self.submitted_prs.insert(pr.number);
+            return Ok(());
+        }
+
+        // 复用 issue triage 规则评估 PR 意图是否值得做：PR 与 issue 同为
+        // 外部意图，门禁标准一致。
+        let intent = PlatformIssue {
+            number: pr.number,
+            title: format!("[PR] {}", pr.title),
+            body: pr.body.clone(),
+            state: pr.state.clone(),
+            labels: pr.labels.clone(),
+            author: pr.author.clone(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let decision = self.triage.evaluate(&intent, &self.config).await;
+
+        match decision {
+            TriageDecision::Fix {
+                priority,
+                rationale,
+            } => {
+                tracing::info!(
+                    pr = pr.number,
+                    priority,
+                    rationale = %rationale,
+                    "Triage decided to pursue PR intent"
+                );
+                if self.config.auto_create_pr {
+                    self.submit_pr_intent_task(pr).await?;
+                    self.submitted_prs.insert(pr.number);
+                }
+            }
+            other => {
+                tracing::info!(pr = pr.number, decision = ?other, "PR intent not pursued");
+            }
+        }
+        Ok(())
+    }
+
+    async fn submit_pr_intent_task(&self, pr: &crate::provider::PlatformPullRequest) -> Result<()> {
+        let Some(ref orchestrator) = self.orchestrator else {
+            tracing::warn!(
+                pr = pr.number,
+                "Orchestrator not available; cannot submit platform_pr_intent task"
+            );
+            return Ok(());
+        };
+
+        let goal = format!(
+            "Evaluate and realize the intent of pull request #{}: {}\n\n{}\n\n\
+             The PR may or may not contain a solution. Assess the intent, \
+             decide the right end state, and implement it.",
+            pr.number, pr.title, pr.body
+        );
+
+        let task = Task::new(
+            format!("platform-pr-{}", pr.number),
+            TaskType::Custom("platform_pr_intent".into()),
+            serde_json::json!({
+                "goal": goal,
+                "pr_number": pr.number,
+                "pr_title": pr.title,
+                "pr_body": pr.body,
+                "pr_labels": pr.labels,
+                "pr_url": pr.url,
+                "evolution_mode": "generate_patch",
+            }),
+        );
+
+        let task_ids = orchestrator
+            .submit_goal_auto(&goal, vec![task])
+            .await
+            .map_err(|e| crate::error::CogGitHubError::Provider(e.to_string()))?;
+        tracing::info!(
+            pr = pr.number,
+            tasks = ?task_ids,
+            "Submitted platform_pr_intent task to orchestrator"
         );
         Ok(())
     }

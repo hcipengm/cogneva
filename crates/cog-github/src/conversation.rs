@@ -81,7 +81,16 @@ impl IssueConversation {
     ) -> Self {
         let mut convo = Self::new(issue_number);
         for comment in comments {
-            let role = if comment.author == bot_username {
+            // 机器人评论的两种身份：作者名匹配，或正文带机器人签名后缀。
+            // 后者覆盖"平台 token 属于人类账号"的场景——评论作者是人类
+            // 用户名，但内容是机器人发的；漏判会把机器人追问当用户回复，
+            // 每轮发现都重复追问（已在生产实证）。
+            let signed_by_bot = !config.bot_signature.is_empty()
+                && comment
+                    .body
+                    .trim_end()
+                    .ends_with(config.bot_signature.as_str());
+            let role = if comment.author == bot_username || signed_by_bot {
                 ConversationRole::Bot
             } else {
                 ConversationRole::User
@@ -214,6 +223,21 @@ mod tests {
             "cogneva-bot",
             &ConversationConfig::default(),
         );
+        assert_eq!(convo.state, ConversationState::AwaitingClarification);
+        assert_eq!(convo.rounds, 1);
+    }
+
+    #[test]
+    fn bot_comment_recognized_by_signature_when_author_is_human() {
+        // 平台 token 属于人类账号时，机器人评论的作者是人类用户名；
+        // 签名后缀必须把它判为 Bot，否则每轮发现都会重复追问。
+        let cfg = ConversationConfig::default();
+        let comments = vec![comment(
+            "hcipengm",
+            "Could you describe the problem?\n\n— Cogneva Bot",
+            now_ts(),
+        )];
+        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
         assert_eq!(convo.state, ConversationState::AwaitingClarification);
         assert_eq!(convo.rounds, 1);
     }

@@ -17,6 +17,15 @@ pub trait CodePlatformProvider: Send + Sync {
     /// List open issues from the configured repository.
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>>;
 
+    /// List open pull requests from the configured repository.
+    ///
+    /// PR 与 issue 同为进化意图入口（PR 未必带解法，可能只是需求描述）。
+    /// Default: unsupported — providers return an empty list so PR-intent
+    /// discovery degrades gracefully.
+    async fn list_open_pull_requests(&self) -> Result<Vec<PlatformPullRequest>> {
+        Ok(Vec::new())
+    }
+
     /// Create a pull request from a patch description.
     async fn create_pull_request(&self, req: CreatePullRequest) -> Result<PlatformPullRequest>;
 
@@ -124,6 +133,13 @@ pub struct PlatformPullRequest {
     pub head_branch: String,
     /// Base branch.
     pub base_branch: String,
+    /// PR body in markdown (intent description when PR is used as an
+    /// evolution input; empty when not fetched).
+    pub body: String,
+    /// Author login/username (empty when not fetched).
+    pub author: String,
+    /// Labels attached to the PR.
+    pub labels: Vec<String>,
 }
 
 /// A comment on an issue.

@@ -120,12 +120,61 @@ impl CodePlatformProvider for GitHubProvider {
 
         Ok(PlatformPullRequest {
             number: pr.number as u64,
-            title: pr.title.unwrap_or_default(),
-            url: pr.html_url.map(|u| u.to_string()).unwrap_or_default(),
+            title: pr.title.clone().unwrap_or_default(),
+            url: pr
+                .html_url
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
             state: pr.state.map(|s| format!("{:?}", s)).unwrap_or_default(),
             head_branch,
             base_branch,
+            body: pr.body.unwrap_or_default(),
+            author: pr.user.map(|u| u.login).unwrap_or_default(),
+            labels: pr
+                .labels
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| l.name)
+                .collect(),
         })
+    }
+
+    async fn list_open_pull_requests(&self) -> Result<Vec<PlatformPullRequest>> {
+        let page = self
+            .client
+            .pulls(&self.owner, &self.repo)
+            .list()
+            .state(octocrab::params::State::Open)
+            .per_page(100)
+            .send()
+            .await
+            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+
+        Ok(page
+            .items
+            .into_iter()
+            .map(|pr| PlatformPullRequest {
+                number: pr.number,
+                title: pr.title.clone().unwrap_or_default(),
+                url: pr
+                    .html_url
+                    .as_ref()
+                    .map(|u| u.to_string())
+                    .unwrap_or_default(),
+                state: pr.state.map(|s| format!("{:?}", s)).unwrap_or_default(),
+                head_branch: pr.head.ref_field,
+                base_branch: pr.base.ref_field,
+                body: pr.body.unwrap_or_default(),
+                author: pr.user.map(|u| u.login).unwrap_or_default(),
+                labels: pr
+                    .labels
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|l| l.name)
+                    .collect(),
+            })
+            .collect())
     }
 
     async fn comment_on_issue(&self, issue_number: u64, body: String) -> Result<()> {
