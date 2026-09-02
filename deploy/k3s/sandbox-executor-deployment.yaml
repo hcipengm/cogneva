@@ -1,4 +1,4 @@
-# 沙箱执行器：主应用的工具执行面（run_command / read_file / write_file）
+# 沙箱执行器：主应用与进化 Pod 共用的工具执行面（run_command / read_file / write_file）
 # 统一路由到本 Pod，命令与文件 IO 不再发生在持有凭证的主应用 Pod 内。
 # 本 Pod 不挂载任何 Secret、不自动挂载 ServiceAccount token——
 # Pod 边界即隔离边界，因此命令保留完整 shell 能力（管道/重定向/脚本）。

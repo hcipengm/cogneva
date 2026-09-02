@@ -50,7 +50,7 @@ impl cog_core::SystemPlugin for ExtensionPlugin {
         let executor_backend: Arc<dyn cog_core::SandboxBackend> = match executor_url {
             Some(url) => {
                 info!(url = %url, "environment tools routed to remote sandbox executor");
-                Arc::new(crate::RemoteExecutor::new(url))
+                Arc::new(crate::RemoteExecutor::new(url)?)
             }
             None => {
                 info!("no sandbox executor configured; environment tools run in-process");

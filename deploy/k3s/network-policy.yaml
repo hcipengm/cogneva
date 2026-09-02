@@ -1,4 +1,4 @@
-# 沙盒网络隔离：evolution Pod 默认拒绝出站，仅放行安全网关与集群 DNS。
+# 沙盒网络隔离：evolution Pod 默认拒绝出站，放行安全网关、命名空间内数据面与集群 DNS。
 # 原则：凭证绝对不入沙盒 —— 沙盒所有外网/LLM 流量必须经 security-gateway 脱敏代理。
 # 注意：K3s 默认 Flannel 从 v1.21 起支持 NetworkPolicy；其他 CNI 需自行确认支持。
 apiVersion: networking.k8s.io/v1
@@ -42,6 +42,10 @@ spec:
           port: 4222
         - protocol: TCP
           port: 6333
+        # 沙箱执行器（9090）：主应用与进化共用的零凭证工具执行面
+        # （run_command/read_file/write_file），该 Pod 不持有任何 Secret。
+        - protocol: TCP
+          port: 9090
     # 只允许访问集群 DNS
     - to:
         - namespaceSelector:

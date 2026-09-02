@@ -15,13 +15,21 @@ pub struct RemoteExecutor {
 }
 
 impl RemoteExecutor {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
+    pub fn new(base_url: impl Into<String>) -> SFResult<Self> {
+        Ok(Self {
             base_url: base_url.into(),
             // No total timeout: long-running commands are bounded by the
             // server-side timeout, the client must not cut the stream early.
-            http: reqwest::Client::new(),
-        }
+            // The connect phase is bounded separately: if the executor pod is
+            // down or unreachable (e.g. blocked by network policy), fail fast
+            // in 10s instead of leaving the caller hanging on SYN retries.
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| {
+                    cog_core::SFError::Agent(format!("sandbox executor client init failed: {}", e))
+                })?,
+        })
     }
 }
 
@@ -149,7 +157,7 @@ mod tests {
             serde_json::to_string(&CommandEvent::Exit { code: 0 }).unwrap(),
         ])
         .await;
-        let executor = RemoteExecutor::new(url);
+        let executor = RemoteExecutor::new(url).unwrap();
         let result = executor.execute(&cmd_req("echo hello")).await.unwrap();
         assert_eq!(result.stdout, "hello");
         assert_eq!(result.exit_code, 0);
@@ -169,14 +177,14 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let executor = RemoteExecutor::new(format!("http://{}", addr));
+        let executor = RemoteExecutor::new(format!("http://{}", addr)).unwrap();
         let err = executor.execute(&cmd_req("echo hi")).await.unwrap_err();
         assert!(err.to_string().contains("500"));
     }
 
     #[tokio::test]
     async fn remote_executor_rejects_wasm_payload() {
-        let executor = RemoteExecutor::new("http://127.0.0.1:1");
+        let executor = RemoteExecutor::new("http://127.0.0.1:1").unwrap();
         let mut req = cmd_req("echo hi");
         req.payload = SandboxPayload::Wasm {
             bytes: vec![],
