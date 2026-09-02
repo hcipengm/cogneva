@@ -107,6 +107,16 @@ spec:
                   key: redis-password
             - name: COGNEVA_DATABASE_URL
               value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
+            # GitHub/Gitee API 走安全网关透传（凭证网关注入，本 Pod 零 token）。
+            # 缺这三个 env 时 GiteeProvider 直连 gitee.com——集群仅网关在
+            # egress 白名单内，直连必败，轮询发现循环每轮空转。
+            - name: COGNEVA_GITHUB_API_BASE
+              value: "http://cogneva-security-gateway:8081/github"
+            - name: COGNEVA_GITEE_API_BASE
+              value: "http://cogneva-security-gateway:8081/gitee"
+            # git 传输（PR 发布 clone/push）走网关 HTTPS 代理。
+            - name: COGNEVA_GIT_PROXY_BASE
+              value: "http://cogneva-security-gateway:8081/git"
           lifecycle:
             postStart:
               exec:
