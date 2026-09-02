@@ -27,6 +27,7 @@ use tracing::warn;
 /// Pure wiring logic: initialize components and connect them together.
 pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = assembly::infra::load_and_normalize_config();
+    tracing::info!("Cogneva v{} starting", config.core.app.version);
     // 解析 secret://env|file|vault 引用（审计 3.3）。
     config_loader::resolve_secret_refs(&mut config).await?;
 
