@@ -10,7 +10,7 @@ export interface AuthState {
   isLoading: boolean;
   error: string | null;
 }
-
+// 此为自定义hooks文件 测试用注释
 export function useAuth() {
   const [state, setState] = useState<AuthState>(() => {
     const token = localStorage.getItem(TOKEN_KEY);
