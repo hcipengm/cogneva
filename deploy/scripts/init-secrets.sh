@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# cogneva 安装前置：幂等初始化 cogneva-secrets。
+# cogneva 密钥初始化：幂等初始化 cogneva-secrets。
 #
+# 元启动（bootstrap）在 apply 预渲染清单前自动调用本脚本，无需手动运行。
 # 内部实例密钥（数据库/缓存/内部签名）首次安装时自动生成强随机值，
 # 已存在则一律跳过、绝不覆盖（保护带外写入的平台 token 与既有密码）。
 # 平台 token、LLM 上游等带外凭证不在此生成，留空由 WebUI 向导或
 # kubectl edit secret 写入。
 #
-# 用法（在 kubectl apply 之前运行一次；重复运行安全）：
-#   bash deploy/k3s/init-secrets.sh
+# 手动部署时用法（在 kubectl apply 之前运行一次；重复运行安全）：
+#   bash deploy/scripts/init-secrets.sh
 set -euo pipefail
 
 NS="${COGNEVA_NS:-cogneva}"
@@ -72,8 +73,9 @@ ensure_blank github-webhook-secret
 ensure_blank gitee-webhook-token
 
 cat <<'EOF'
-==> 完成。接下来：
-    kubectl apply -k deploy/k3s/      # 或 kubectl apply -f deploy/k3s/
+==> 完成。元启动（bootstrap）会在 apply 清单前自动调用本脚本，无需手动运行。
+    手动部署时，密钥就绪后部署对应 profile 的预渲染清单：
+    kubectl apply -f deploy/rendered/k3s-single/   # 或 k3s-multi / k8s-standard
     平台 token / LLM 上游：经 WebUI 配置向导写入，或
     kubectl -n cogneva edit secret cogneva-secrets 后滚动对应 Deployment。
 EOF

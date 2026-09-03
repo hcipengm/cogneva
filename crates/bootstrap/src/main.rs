@@ -52,6 +52,29 @@ enum Branch {
     K8s,
 }
 
+/// 部署 profile：Helm chart 预渲染产物的环境形态。chart 是拓扑唯一权威源，
+/// 环境差异（containerd socket、StorageClass、git-remote 供给方式）在 CI
+/// 渲染时固化进各 profile，元启动探测环境后选定，用户不做选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    /// K3s 单节点：/run/k3s/containerd、local-path + Retain SC、git-remote 走宿主 hostPath。
+    K3sSingle,
+    /// K3s 多节点：同上，但 git-remote 走集群卷（hostPath 跨节点不可达）。
+    K3sMulti,
+    /// 标准 K8s（kubeadm/EKS 等）：标准 containerd socket、PVC 跟随集群默认 SC。
+    K8sStandard,
+}
+
+impl Profile {
+    fn dir_name(self) -> &'static str {
+        match self {
+            Profile::K3sSingle => "k3s-single",
+            Profile::K3sMulti => "k3s-multi",
+            Profile::K8sStandard => "k8s-standard",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct Hardware {
     cpu_cores: usize,
@@ -530,15 +553,93 @@ async fn ensure_firecracker() -> Result<()> {
     Ok(())
 }
 
-/// 应用清单位置：K8s 分支同样复用 deploy/k3s（应用清单是集群无关的；
-/// deploy/k8s 仅存生产周边参考与分发器模板，见该目录 README）。
-fn manifest_dir(_branch: Branch) -> PathBuf {
-    let root = std::env::var("COGNEVA_REPO_ROOT").unwrap_or_else(|_| ".".to_string());
-    Path::new(&root).join("deploy/k3s")
+/// 应用拓扑产物目录：chart 预渲染的 profile standalone YAML（元启动读目录
+/// kubectl apply，引导链零 helm 依赖）。
+fn rendered_manifest_dir(profile: Profile) -> PathBuf {
+    repo_root().join("deploy/rendered").join(profile.dir_name())
 }
 
 fn repo_root() -> PathBuf {
     PathBuf::from(std::env::var("COGNEVA_REPO_ROOT").unwrap_or_else(|_| ".".to_string()))
+}
+
+/// 探测集群是否 K3s 发行版：节点 label node.kubernetes.io/instance-type=k3s
+/// （K3s 安装时自动打）；取不到 label 时回看本机 /run/k3s（元启动自建
+/// K3s 的 server/agent 节点必有）。
+async fn probe_is_k3s() -> bool {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "nodes",
+            "-o",
+            "jsonpath={.items[*].metadata.labels.node\\.kubernetes\\.io/instance-type}",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    if let Ok(o) = out {
+        if o.status.success()
+            && String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .any(|t| t == "k3s")
+        {
+            return true;
+        }
+    }
+    Path::new("/run/k3s").exists()
+}
+
+/// 标准 K8s 路径的 PVC 全部跟随集群默认 StorageClass（不绑定 Longhorn 等
+/// 厂商），部署前硬校验默认 SC 存在；缺失即报错提示先装存储并设为默认。
+async fn ensure_default_storage_class() -> Result<()> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "sc",
+            "-o",
+            "jsonpath={.items[?(@.metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class==\"true\")].metadata.name}",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await?;
+    if String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .is_some()
+    {
+        return Ok(());
+    }
+    bail!(
+        "集群没有默认 StorageClass。标准 K8s 路径的 PVC 全部跟随集群默认 SC，\
+         请先安装 Longhorn 等存储供应并把它设为默认，例如：\n  \
+         kubectl patch sc <存储类名> -p '{{\"metadata\":{{\"annotations\":{{\
+         \"storageclass.kubernetes.io/is-default-class\":\"true\"}}}}}}'"
+    );
+}
+
+/// 探测部署 profile：发行版（K3s / 标准 K8s）× 节点数（单 / 多）。
+async fn detect_profile() -> Result<Profile> {
+    let nodes = probe_nodes().await;
+    let is_k3s = probe_is_k3s().await;
+    let profile = if is_k3s {
+        if nodes > 1 {
+            Profile::K3sMulti
+        } else {
+            Profile::K3sSingle
+        }
+    } else {
+        ensure_default_storage_class().await?;
+        Profile::K8sStandard
+    };
+    info!(
+        "环境探测: {} 发行版 / {} 节点 → {} profile",
+        if is_k3s { "K3s" } else { "标准 K8s" },
+        nodes,
+        profile.dir_name()
+    );
+    Ok(profile)
 }
 
 /// 受限网络（CN）模式：由 bootstrap.sh 探测后通过 COGNEVA_CN_MIRROR 传入。
@@ -1117,13 +1218,28 @@ async fn build_runtime_image_from_source(image: &str) -> Result<()> {
     Ok(())
 }
 
-async fn deploy_manifests(branch: Branch) -> Result<()> {
-    let dir = manifest_dir(branch);
-    if !dir.is_dir() {
-        bail!("清单目录不存在: {}", dir.display());
+/// 内部密钥（PostgreSQL/Redis/内部签名）安装时随机生成：预渲染产物不带
+/// Secret（secrets.create=false，避免每次 apply 轮换密码），这里幂等执行
+/// init-secrets 脚本，已存在的密钥（含带外写入的平台凭证）绝不覆盖。
+async fn ensure_internal_secrets() -> Result<()> {
+    let script = repo_root().join("deploy/scripts/init-secrets.sh");
+    if !script.is_file() {
+        bail!("密钥初始化脚本缺失: {}", script.display());
     }
+    let script = script.to_string_lossy().into_owned();
+    info!("初始化内部密钥（幂等，已有值不覆盖）");
+    run("bash", &[script.as_str()]).await
+}
+
+async fn deploy_manifests() -> Result<()> {
+    let profile = detect_profile().await?;
+    let dir = rendered_manifest_dir(profile);
+    if !dir.is_dir() {
+        bail!("渲染产物目录不存在: {}（源码不完整？请重新获取仓库）", dir.display());
+    }
+    ensure_internal_secrets().await?;
     let rendered = render_manifests_for_cluster(&dir).await?;
-    info!("apply 清单（已按集群环境适配）");
+    info!("apply {} profile 清单（已按网络环境适配）", profile.dir_name());
     // kubectl apply -f <dir> 按文件名字典序逐个处理，namespace.yaml 排在
     // configmap/deployment 等之后，空白集群首轮会整批 namespace not found；
     // 先幂等建命名空间再整目录 apply（K8s 分支分发器也做过，幂等无害）
@@ -1138,52 +1254,15 @@ async fn deploy_manifests(branch: Branch) -> Result<()> {
     run("kubectl", &["apply", "-f", &rendered.to_string_lossy()]).await
 }
 
-/// 按集群环境渲染清单副本：
-/// - 集群无 local-path provisioner（通用 K8s）→ 去掉 cogneva-local-retain
-///   引用，PVC 回落集群默认 StorageClass；
-/// - CN 模式 → 公开镜像统一加 daocloud 前缀（Docker Hub 被墙）。
+/// 按运行网络环境处理预渲染 profile 产物副本。环境差异（containerd socket、
+/// StorageClass、git-remote hostPath/PVC、ingress class）已在 CI 渲染时固化
+/// 进各 profile，这里只做与网络可达性相关的替换：
+/// - CN 模式 → 公开镜像加国内镜像站前缀（Docker Hub 被墙）；
+/// - CN 模式 → git-remote seed 地址改用 Gitee（GitHub 拉取受限）。
 ///
-/// 返回渲染后的目录（调用方不删，kubectl apply 后即弃）。
+/// 返回处理后的目录（kubectl apply 后即弃）。
 async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
-    let has_local_path = Command::new("kubectl")
-        .args(["get", "sc", "local-path"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false);
     let cn = cn_mirror();
-    // 多节点（预期最终节点数 > 1）时 git-remote 用集群卷变体：hostPath 只存在于
-    // bootstrap 所在节点，evolution 调度到其他节点即 FailedMount/空仓库。
-    // 单节点保留 hostPath（宿主 <-> Pod 双向同步的开发通道）
-    let multi_node = probe_nodes().await > 1;
-    if multi_node {
-        info!("多节点集群：git-remote 渲染为 PVC 变体（空卷由 initContainer 从公开仓库 seed）");
-    }
-    let seed_url = if cn {
-        "https://gitee.com/hcipengm/cogneva.git"
-    } else {
-        "https://github.com/hcipengm/cogneva.git"
-    };
-    if !has_local_path {
-        info!("集群无 local-path provisioner，PVC 将使用集群默认 StorageClass");
-    }
-    // 集群没有 Traefik CRD（禁装 traefik 或用 ingress-nginx 的集群）时，
-    // apply 含 traefik.io Middleware 的文档会直接报错，按需剔除
-    let has_traefik_crd = Command::new("kubectl")
-        .args(["get", "crd", "middlewares.traefik.io"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !has_traefik_crd {
-        info!("集群无 Traefik CRD，剔除 Middleware 文档（WebSocket 头中间件不生效）");
-    }
     let out = make_workdir("manifests")?;
     let image_map = if cn {
         cn_image_map(docker_mirror_host().await)
@@ -1196,107 +1275,20 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
             continue;
         }
-        // kustomization.yaml 不是 K8s 资源，kubectl apply -f <dir> 会直接报错
-        if entry.file_name() == "kustomization.yaml" {
-            continue;
-        }
         let mut text = std::fs::read_to_string(&path)?;
-        if !has_local_path {
-            text = text
-                .lines()
-                .filter(|l| !l.contains("storageClassName: cogneva-local-retain"))
-                .collect::<Vec<_>>()
-                .join("\n");
-        }
         for (from, to) in &image_map {
             text = text.replace(from.as_str(), to.as_str());
         }
-        text = filter_variant_blocks(&text, multi_node);
-        text = text.replace("__GIT_SEED_URL__", seed_url);
-        if !has_traefik_crd {
-            text = text
-                .split("\n---")
-                .filter(|doc| !(doc.contains("kind: Middleware") && doc.contains("traefik.io")))
-                .collect::<Vec<_>>()
-                .join("\n---");
+        if cn {
+            // profile 产物烘焙的是 GitHub seed 地址；CN 网络改用 Gitee。
+            text = text.replace(
+                "https://github.com/hcipengm/cogneva.git",
+                "https://gitee.com/hcipengm/cogneva.git",
+            );
         }
         std::fs::write(out.join(entry.file_name()), text)?;
     }
-    // observability 子目录同样处理
-    let sub = dir.join("observability");
-    if sub.is_dir() {
-        let out_sub = out.join("observability");
-        std::fs::create_dir_all(&out_sub)?;
-        for entry in std::fs::read_dir(&sub)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
-                continue;
-            }
-            let mut text = std::fs::read_to_string(&path)?;
-            for (from, to) in &image_map {
-                text = text.replace(from.as_str(), to.as_str());
-            }
-            std::fs::write(out_sub.join(entry.file_name()), text)?;
-        }
-    }
     Ok(out)
-}
-
-/// 按集群形态渲染清单里的变体标记块（# __NAME_BEGIN__ .. # __NAME_END__）。
-/// 模板必须保证**原始文件本身就是合法可直接 kubectl apply 的 YAML**（默认
-/// = 单节点形态）：GIT_REMOTE_HOSTPATH 块是活跃行，单节点保留、多节点剔除；
-/// GIT_REMOTE_PVC 块整体是注释行（`# ` 前缀），单节点剔除、多节点取消注释
-/// 启用（hostPath 跨节点不可达）。块内 `## ` 开头的是说明文字，取消注释后
-/// 仍是注释。标记行本身总是剔除。
-fn filter_variant_blocks(text: &str, multi_node: bool) -> String {
-    #[derive(PartialEq)]
-    enum Mode {
-        Normal,
-        Drop,
-        Uncomment,
-    }
-    let mut out = Vec::new();
-    let mut mode = Mode::Normal;
-    for line in text.lines() {
-        let t = line.trim();
-        if let Some(name) = t
-            .strip_prefix("# __")
-            .and_then(|s| s.strip_suffix("_BEGIN__"))
-        {
-            mode = match name {
-                "GIT_REMOTE_HOSTPATH" if multi_node => Mode::Drop,
-                "GIT_REMOTE_PVC" if multi_node => Mode::Uncomment,
-                "GIT_REMOTE_PVC" => Mode::Drop,
-                _ => Mode::Normal,
-            };
-            continue;
-        }
-        if t.starts_with("# __") && t.ends_with("_END__") {
-            mode = Mode::Normal;
-            continue;
-        }
-        match mode {
-            Mode::Normal => out.push(line.to_string()),
-            Mode::Drop => {}
-            Mode::Uncomment => out.push(uncomment_line(line)),
-        }
-    }
-    out.join("\n")
-}
-
-/// 去掉行首注释标记：`# ` 前缀剥一层（`## ` 剥后仍是 `# ` 注释）；行内首
-/// 个 `#` 之前有非空白内容时原样返回（不处理行尾注释）。
-fn uncomment_line(line: &str) -> String {
-    let Some(idx) = line.find('#') else {
-        return line.to_string();
-    };
-    if !line[..idx].trim().is_empty() {
-        return line.to_string();
-    }
-    let rest = &line[idx + 1..];
-    let rest = rest.strip_prefix(' ').unwrap_or(rest);
-    format!("{}{rest}", &line[..idx])
 }
 
 /// CN 模式公开镜像替换表：按探活选定的 docker 镜像站生成前缀，
@@ -1482,7 +1474,7 @@ async fn main() -> Result<()> {
         ensure_git_remote().await?;
     }
     ensure_runtime_image(branch).await?;
-    deploy_manifests(branch).await?;
+    deploy_manifests().await?;
     wait_ready().await?;
 
     let webui =
@@ -1498,42 +1490,14 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(test)]
-mod variant_block_tests {
-    use super::filter_variant_blocks;
-
-    // 模板约定：原始文本即合法 YAML（单节点形态）；PVC 块整体注释化，
-    // 块内 `## ` 是说明文字。
-    const SAMPLE: &str = "before\n\
-        # __GIT_REMOTE_HOSTPATH_BEGIN__\n\
-        hostPath-line\n\
-        # __GIT_REMOTE_HOSTPATH_END__\n\
-        # __GIT_REMOTE_PVC_BEGIN__\n\
-        ## pvc 说明注释\n\
-        # pvc-line\n\
-        #   pvc-nested\n\
-        # __GIT_REMOTE_PVC_END__\n\
-        after";
+mod profile_tests {
+    use super::Profile;
 
     #[test]
-    fn single_node_keeps_hostpath() {
-        let out = filter_variant_blocks(SAMPLE, false);
-        assert!(out.contains("hostPath-line"));
-        assert!(!out.contains("pvc-line"));
-        assert!(!out.contains("pvc 说明注释"));
-        assert!(!out.contains("__GIT_REMOTE_"), "标记行必须剔除");
-        assert!(out.contains("before") && out.contains("after"));
-    }
-
-    #[test]
-    fn multi_node_keeps_pvc() {
-        let out = filter_variant_blocks(SAMPLE, true);
-        assert!(out.contains("\npvc-line\n") || out.starts_with("pvc-line"));
-        assert!(out.contains("  pvc-nested"), "嵌套行取消注释后缩进必须保留");
-        assert!(
-            out.contains("# pvc 说明注释"),
-            "## 说明文字取消注释后仍是注释"
-        );
-        assert!(!out.contains("hostPath-line"));
-        assert!(!out.contains("__GIT_REMOTE_"));
+    fn profile_dir_names_match_rendered_tree() {
+        // 目录名必须与 deploy/scripts/render-deploy.sh 的 PROFILES 一一对应。
+        assert_eq!(Profile::K3sSingle.dir_name(), "k3s-single");
+        assert_eq!(Profile::K3sMulti.dir_name(), "k3s-multi");
+        assert_eq!(Profile::K8sStandard.dir_name(), "k8s-standard");
     }
 }
