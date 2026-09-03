@@ -1,0 +1,40 @@
+# 部署 profile：标准 K8s 生产集群（非 K3s：kubeadm/EKS/自管 containerd）。
+#
+# 渲染：bash deploy/scripts/render-deploy.sh
+# 产物：deploy/rendered/k8s-standard/
+#
+# 与 K3s profile 的环境差异全部固化在本文件：
+# - 不创建 cogneva-local-retain StorageClass（其 provisioner
+#   rancher.io/local-path 仅 K3s 自带）；所有 PVC 不写 storageClassName，
+#   跟随集群默认 SC。元启动在部署前硬校验默认 SC 存在，缺失即报错并提示
+#   先装 Longhorn 等并设为默认。
+# - buildah 挂标准 containerd socket /run/containerd（K3s 是
+#   /run/k3s/containerd）。
+# - git-remote 走集群卷（生产即多节点语义；PVC 空卷自动从公开仓库 seed）。
+# - GitOps 拉取端的 kubectl 二进制默认不挂宿主文件：标准节点没有 k3s
+#   多调用二进制，宿主 /usr/bin/kubectl 不一定存在。元启动探测到可用
+#   kubectl 时可在渲染/安装时覆盖 gitops.kubectlBin.enabled 与 hostPath。
+
+image:
+  tag: local
+
+secrets:
+  create: false
+
+storage:
+  localRetainClass:
+    create: false
+  # 空字符串 = 模板不输出 storageClassName，PVC 跟随集群默认 SC。
+  evolution: ""
+  retain: ""
+
+evolution:
+  gitRemote:
+    mode: pvc
+
+gitops:
+  kubectlBin:
+    enabled: false
+
+buildah:
+  containerdSocket: /run/containerd

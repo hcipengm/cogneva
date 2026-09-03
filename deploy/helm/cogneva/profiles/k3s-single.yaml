@@ -1,0 +1,37 @@
+# 部署 profile：K3s 单节点（元启动在单机 K3s 上的默认形态）。
+#
+# 渲染：bash deploy/scripts/render-deploy.sh
+# 产物：deploy/rendered/k3s-single/（元启动读目录 kubectl apply，零 helm 依赖）
+#
+# 本文件只声明与 chart 默认 values 的差异；未列出的项取 values.yaml 默认。
+# 渲染 apply 路径与 helm install 路径共用同一套 profile，能力完全一致。
+
+image:
+  # 元启动链路在节点内构建/导入 localhost/cogneva:local（buildah/分发器）；
+  # release 换版由 swap-image / 分发流程按版本重打 tag。
+  tag: local
+
+# apply 路径不携带 Secret：helm template 下 lookup 为空、randAlphaNum 每次
+# 随机，产物带 Secret 会导致每次 apply 轮换密码。内部密钥由 init-secrets.sh
+# 在 apply 前安装时随机生成（helm install 投递路径则用 chart 自带生成）。
+secrets:
+  create: false
+
+evolution:
+  gitRemote:
+    # 单节点：git-remote 直挂宿主 bare 仓库目录（宿主 <-> Pod 双向同步通道，
+    # bootstrap 在部署前已 seed）。
+    mode: hostPath
+    hostPath: /var/lib/cogneva-data/git-remote
+
+gitops:
+  kubectlBin:
+    # K3s 节点宿主 /usr/local/bin/k3s 是多调用二进制，argv[0]=kubectl 即
+    # kubectl，版本与集群天然一致，零下载。
+    enabled: true
+    hostPath: /usr/local/bin/k3s
+
+buildah:
+  # K3s 的 containerd socket 在 /run/k3s/containerd（标准 containerd 是
+  # /run/containerd，见 k8s-standard profile）。
+  containerdSocket: /run/k3s/containerd

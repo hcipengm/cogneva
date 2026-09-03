@@ -137,6 +137,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y python3-yaml
       - name: Check helm/kustomize parity
         run: bash deploy/scripts/check-deploy-parity.sh
+      - name: Check rendered profiles are fresh
+        run: bash deploy/scripts/render-deploy.sh --check
 
   bootstrap-cross-platform:
     name: Bootstrap Cross-Platform Check

@@ -1,0 +1,29 @@
+# 部署 profile：K3s 多节点（元启动声明 COGNEVA_CLUSTER_NODES 或探测到多节点）。
+#
+# 渲染：bash deploy/scripts/render-deploy.sh
+# 产物：deploy/rendered/k3s-multi/
+#
+# 与 k3s-single 的唯一拓扑差异：git-remote 用集群卷（PVC）而非宿主
+# hostPath——hostPath 只存在于元启动所在节点，evolution/主应用调度到
+# 其他节点即 FailedMount 或空仓库。空卷首挂由 initContainer 从公开
+# 仓库 seed bare 仓库（CN 网络下元启动把 seed 地址替换为 Gitee）。
+# 多节点镜像供给（image-server + 分发器 DaemonSet）由元启动按多节点
+# 流程单独投递，不在应用拓扑内。
+
+image:
+  tag: local
+
+secrets:
+  create: false
+
+evolution:
+  gitRemote:
+    mode: pvc
+
+gitops:
+  kubectlBin:
+    enabled: true
+    hostPath: /usr/local/bin/k3s
+
+buildah:
+  containerdSocket: /run/k3s/containerd
