@@ -3,10 +3,12 @@ use std::path::PathBuf;
 
 /// WebUI 静态资源目录（含 index.html 与 assets/）。
 /// 优先级：COGNEVA_WEB_DIR > COGNEVA_DASHBOARD_PATH 的父目录
-/// > $COGNEVA_APP_DIR/web（容器镜像内的标准位置，默认 /opt/cogneva/web）
-/// > 源码树 web/dist（开发态从仓库根目录运行时命中）。
-/// 注意：最后一档不能依赖编译期内嵌的构建机绝对路径——二进制发到任何别的
-/// 机器上该路径都不存在或不可读。
+/// > 运行时自定位（从当前二进制位置向上逐级查找含 index.html 的
+/// web 目录：容器内命中同级 web/，开发态从 target/debug 向上爬到
+/// 仓库根的 web/dist/）。
+///
+/// 不内嵌任何编译期绝对路径：二进制随整个目录树搬迁到任何位置，只要
+/// web 与二进制的相对布局不变就能找到；显式 env 仍是第一优先级。
 pub fn web_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("COGNEVA_WEB_DIR") {
         return PathBuf::from(dir);
@@ -16,12 +18,37 @@ pub fn web_dir() -> PathBuf {
             return parent.to_path_buf();
         }
     }
-    let app_dir = std::env::var("COGNEVA_APP_DIR").unwrap_or_else(|_| "/opt/cogneva".to_string());
-    let container_dir = PathBuf::from(app_dir).join("web");
-    if container_dir.join("index.html").is_file() {
-        return container_dir;
+    if let Some(dir) = locate_web_dir() {
+        return dir;
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/dist")
+    // 全部未命中：返回二进制同级 web 作为最后位置，让报错路径指向真实
+    // 查找目标，而不是一个与运行环境无关的编译期路径。
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join("web")))
+        .unwrap_or_else(|| PathBuf::from("web"))
+}
+
+/// 从当前可执行文件位置出发，向上逐级查找含 index.html 的 web 目录。
+/// 每一级先查 `<dir>/web`（容器布局），再查 `<dir>/web/dist`（源码树
+/// 布局），命中即返回。
+fn locate_web_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?;
+    loop {
+        let container_layout = dir.join("web");
+        if container_layout.join("index.html").is_file() {
+            return Some(container_layout);
+        }
+        let source_layout = dir.join("web/dist");
+        if source_layout.join("index.html").is_file() {
+            return Some(source_layout);
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return None,
+        }
+    }
 }
 
 fn index_path() -> PathBuf {
