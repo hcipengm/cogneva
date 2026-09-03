@@ -1,0 +1,71 @@
+# 标准 K8s 生产 overlay（路径 C）。
+#
+# 应用拓扑单一来源是 deploy/k3s/（主应用、安全网关、进化 Pod、沙盒执行器、
+# buildah DaemonSet、nats、postgres/redis/qdrant、NetworkPolicy、Ingress）。
+# 本 overlay 只叠加标准 K8s 与 K3s 的环境差异，不重复定义任何工作负载——
+# 这样路径 C 永远与路径 B 能力对齐，不会再出现缺网关/进化/沙盒的半残清单。
+#
+# 存储：不使用 K3s 专有的 local-path / cogneva-local-retain StorageClass
+# （其 provisioner rancher.io/local-path 仅 K3s 自带）。所有 PVC 不写死
+# storageClassName，回落集群默认 StorageClass——部署前把 Longhorn 等设为
+# 默认 SC（kubectl patch sc <name> -p '{"metadata":{"annotations":
+# {"storageclass.kubernetes.io/is-default-class":"true"}}}')。
+#
+# 部署：
+#   bash deploy/k3s/init-secrets.sh    # 自动随机生成内部密钥（通用脚本）
+#   kubectl apply -k deploy/k8s/       # 本 overlay = 全套应用拓扑
+# 基础设施（Longhorn/ingress-nginx/monitoring 等）见同目录 *.yaml，按需单独 apply。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../k3s
+
+patches:
+  # K3s 专有的 Retain StorageClass 依赖 local-path provisioner，标准 K8s 不创建。
+  - target:
+      kind: StorageClass
+      name: cogneva-local-retain
+    patch: |
+      $patch: delete
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: cogneva-local-retain
+  # 写死了 K3s 存储类的 PVC（进化源码/数据、事件总线）：按语义标签选中，
+  # 移除 storageClassName，回落集群默认 SC（Longhorn/Ceph/EBS 任意）。
+  # 用 labelSelector 而非资源名——base 中同角色新增 PVC 会自动被覆盖，无需改这里。
+  - target:
+      kind: PersistentVolumeClaim
+      labelSelector: "app.kubernetes.io/component in (evolution,evolution-source,event-bus)"
+    patch: '[{"op":"remove","path":"/spec/storageClassName"}]'
+  # buildah DaemonSet：容器运行时 socket 路径是发行版相关的环境事实——
+  # 标准 containerd（kubeadm）在 /run/containerd，K3s 在 /run/k3s/containerd
+  # （见 deploy/k3s/buildah-daemonset.yaml）；Helm 路径由 values.buildah.containerdSocket
+  # 参数化。宿主源路径（hostPath）与容器内挂载点（mountPath）一起改到标准路径，
+  # 二者在同一发行版上本就同值，避免在非 K3s 节点容器内残留误导性的 /run/k3s 路径。
+  - target:
+      kind: DaemonSet
+      labelSelector: "app.kubernetes.io/component=image-builder"
+    patch: |
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: cogneva-buildah
+      spec:
+        template:
+          spec:
+            containers:
+              - name: buildah
+                volumeMounts:
+                  # volumeMounts 的合并键是 mountPath：先按旧挂载点删除，
+                  # 再以标准路径补回同名挂载（readOnly 省略即默认 false）。
+                  - mountPath: /run/k3s/containerd
+                    $patch: delete
+                  - name: containerd-socket
+                    mountPath: /run/containerd
+            volumes:
+              - name: containerd-socket
+                hostPath:
+                  path: /run/containerd
+                  type: Directory

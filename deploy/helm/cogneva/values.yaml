@@ -45,6 +45,37 @@ evolution:
       cpu: 4000m
       memory: 8Gi
 
+# 沙箱执行器：主应用与进化共用的零凭证工具执行面（run_command/read_file/write_file）。
+# 不挂 Secret、不挂 ServiceAccount token；关掉后主应用/进化的工具调用将无执行面。
+sandboxExecutor:
+  enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+# 节点镜像构建（buildah DaemonSet）：每节点构建/导入 localhost/cogneva:* 镜像。
+# containerdSocket 是容器运行时 socket 在宿主的路径，随发行版不同：
+#   标准 containerd（kubeadm/EKS 等）= /run/containerd
+#   K3s  = /run/k3s/containerd
+#   k0s  = /run/k0s/containerd （按实际核对）
+# 生产多节点改用外部镜像仓库时可关闭（镜像走 registry 拉取而非节点内构建）。
+buildah:
+  enabled: true
+  image: quay.io/buildah/stable:latest
+  containerdSocket: /run/containerd
+  storageHostPath: /var/lib/cogneva-buildah
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+
 # 可选后端；禁用即假定使用外部服务（在 config 中指向外部地址）
 backends:
   postgres:

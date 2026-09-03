@@ -593,14 +593,14 @@ bash deploy/k3s/init-secrets.sh   # 幂等：自动随机生成数据库/缓存/
 kubectl apply -k deploy/k3s/
 ```
 
-**标准 K8s 生产集群 —— 静态清单。** 面向多节点 + Longhorn + 外部镜像仓库；同样先初始化随机密钥（Secret 不由清单 apply），再部署：
+**标准 K8s 生产集群 —— kustomize overlay。** 与 K3s **同一份拓扑源**（主应用、安全网关、进化 Pod、沙箱执行器、buildah、nats/pg/redis/qdrant、NetworkPolicy、Ingress 全套），overlay 只把存储回落集群默认 StorageClass。前置：装好 Longhorn 等并设为默认 SC，再初始化密钥、部署：
 
 ```bash
 bash deploy/k3s/init-secrets.sh   # 通用脚本、仅依赖 kubectl，自动随机生成内部密钥，幂等
-kubectl apply -f deploy/k8s/
+kubectl apply -k deploy/k8s/      # overlay：复用 deploy/k3s 全套拓扑 + 生产存储适配
 ```
 
-**Helm —— 推荐用于生产 / 多环境。** 把整套资源打包成可参数化、可升级回滚的 Chart（K8s 的包管理器，类比 `apt`/`brew`），密钥在安装时自动随机生成，无需先跑脚本：
+**Helm —— 推荐用于生产 / 多环境。** 把整套资源（含安全网关、进化、沙箱执行器、buildah）打包成可参数化、可升级回滚的 Chart（K8s 的包管理器，类比 `apt`/`brew`），密钥在安装时自动随机生成，无需先跑脚本：
 
 ```bash
 helm install cogneva deploy/helm/cogneva
@@ -609,9 +609,9 @@ helm rollback cogneva                        # 回滚
 helm uninstall cogneva                       # 卸载
 ```
 
-参数（镜像版本、副本、资源、域名、存储类等）集中在 `deploy/helm/cogneva/values.yaml`，用 `--set key=value` 覆盖。
+参数（镜像版本、副本、资源、域名、存储类、buildah 的 containerd socket 路径等）集中在 `deploy/helm/cogneva/values.yaml`，用 `--set key=value` 覆盖；沙箱执行器与 buildah 可分别用 `--set sandboxExecutor.enabled=false`、`--set buildah.enabled=false` 关闭。
 
-仓库与配置**不携带任何可用密码**：内部密钥（PostgreSQL / Redis / 内部签名）在安装时自动随机生成——K3s 与标准 K8s 静态清单路径先运行 `init-secrets.sh`（幂等，重跑或升级不覆盖已有值），Helm 路径在 `helm install` 时自动随机（升级时复用已部署 Secret、保持不变）。平台 token、LLM 上游等带外凭证不随部署下发，首次打开 WebUI 经配置向导写入，且只注入安全网关——主应用与沙盒零持有。
+三条路径部署出的能力**完全对齐**：都含主应用、安全网关、进化 Pod、沙箱执行器、buildah 与完整数据面。仓库与配置**不携带任何可用密码**：内部密钥（PostgreSQL / Redis / 内部签名）安装时自动随机生成——K3s 与标准 K8s 路径先运行 `init-secrets.sh`（幂等，重跑或升级不覆盖已有值），Helm 路径在 `helm install` 时自动随机（升级时复用已部署 Secret、保持不变）。平台 token、LLM 上游等带外凭证不随部署下发，首次打开 WebUI 经配置向导写入，且只注入安全网关——主应用与沙盒零持有。
 
 ### 🔧 传统手动部署
 

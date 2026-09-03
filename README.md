@@ -597,14 +597,14 @@ bash deploy/k3s/init-secrets.sh   # idempotent: randomizes DB/cache/signing secr
 kubectl apply -k deploy/k3s/
 ```
 
-**Standard K8s production cluster — static manifests.** Aimed at multi-node + Longhorn + an external image registry; initialize random secrets first (the manifests do not apply a Secret), then deploy:
+**Standard K8s production cluster — kustomize overlay.** Uses the **same topology source** as K3s (full stack: main app, security gateway, evolution pods, sandbox executor, buildah, nats/pg/redis/qdrant, NetworkPolicy, Ingress); the overlay only drops storage onto the cluster's default StorageClass. Prerequisite: install Longhorn (or equivalent) and make it the default SC, then initialize secrets and deploy:
 
 ```bash
 bash deploy/k3s/init-secrets.sh   # generic script, only needs kubectl; randomizes internal secrets, idempotent
-kubectl apply -f deploy/k8s/
+kubectl apply -k deploy/k8s/      # overlay: reuses the full deploy/k3s topology + production storage adaptation
 ```
 
-**Helm — recommended for production / multi-environment.** Packages the whole stack into a parameterizable, upgradeable/rollbackable Chart (Kubernetes' package manager, akin to `apt`/`brew`); secrets are randomized at install time, no script needed first:
+**Helm — recommended for production / multi-environment.** Packages the whole stack (including the security gateway, evolution, sandbox executor, and buildah) into a parameterizable, upgradeable/rollbackable Chart (Kubernetes' package manager, akin to `apt`/`brew`); secrets are randomized at install time, no script needed first:
 
 ```bash
 helm install cogneva deploy/helm/cogneva
@@ -613,9 +613,9 @@ helm rollback cogneva                        # roll back
 helm uninstall cogneva                       # uninstall
 ```
 
-Tunables (image tag, replicas, resources, host, storage class, …) live in `deploy/helm/cogneva/values.yaml` and can be overridden with `--set key=value`.
+Tunables (image tag, replicas, resources, host, storage class, the buildah containerd socket path, …) live in `deploy/helm/cogneva/values.yaml` and can be overridden with `--set key=value`; the sandbox executor and buildah can be disabled with `--set sandboxExecutor.enabled=false` and `--set buildah.enabled=false`.
 
-The repository and its configs **carry no usable password**: internal secrets (PostgreSQL / Redis / internal signing) are randomized at install time — on the K3s and standard-K8s static-manifest paths by running `init-secrets.sh` first (idempotent; re-runs and upgrades never overwrite existing values), and on the Helm path at `helm install` (the deployed Secret is reused on upgrade and left unchanged). Out-of-band credentials such as platform tokens and LLM upstreams are never shipped with the deployment — they are written through the WebUI setup wizard on first launch and injected only into the security gateway, leaving the main app and sandboxes with zero credentials.
+All three paths deploy the **same capabilities**: main app, security gateway, evolution pods, sandbox executor, buildah, and the full data plane. The repository and its configs **carry no usable password**: internal secrets (PostgreSQL / Redis / internal signing) are randomized at install time — on the K3s and standard-K8s paths by running `init-secrets.sh` first (idempotent; re-runs and upgrades never overwrite existing values), and on the Helm path at `helm install` (the deployed Secret is reused on upgrade and left unchanged). Out-of-band credentials such as platform tokens and LLM upstreams are never shipped with the deployment — they are written through the WebUI setup wizard on first launch and injected only into the security gateway, leaving the main app and sandboxes with zero credentials.
 
 ### 🔧 Traditional manual deployment
 

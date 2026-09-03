@@ -1,0 +1,142 @@
+{{- if .Values.sandboxExecutor.enabled }}
+# 沙箱执行器：主应用与进化 Pod 共用的零凭证工具执行面（run_command/read_file/
+# write_file）统一路由到本 Pod，命令与文件 IO 不发生在持有凭证的业务 Pod 内。
+# 不挂载任何 Secret、不自动挂载 ServiceAccount token——Pod 边界即隔离边界。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cogneva-sandbox-executor
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-executor
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cogneva
+      app.kubernetes.io/component: sandbox-executor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cogneva
+        app.kubernetes.io/component: sandbox-executor
+        app.kubernetes.io/version: {{ .Values.image.tag | quote }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      containers:
+        - name: sandbox-executor
+          image: {{ include "cogneva.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/opt/cogneva/cogneva"]
+          args: ["sandbox-executor"]
+          ports:
+            - name: executor
+              containerPort: 9090
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: cogneva-config
+          env:
+            - name: SANDBOX_EXECUTOR_PORT
+              value: "9090"
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: executor
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: executor
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.sandboxExecutor.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-sandbox-executor
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-executor
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: sandbox-executor
+  ports:
+    - name: executor
+      port: 9090
+      targetPort: executor
+      protocol: TCP
+{{- end }}
+{{- if .Values.buildah.enabled }}
+---
+# 容器构建沙盒：每个节点提供 buildah 镜像构建能力（K3s/最小化 K8s 不带镜像构建）。
+# 构建产物经 buildah push docker-archive + ctr images import 进入节点 containerd，
+# 供 localhost/cogneva:* 镜像本地使用（imagePullPolicy: IfNotPresent）。
+# 挂载节点容器存储与 containerd socket，仅应在受控节点运行；未来迁移 MicroVM
+# 构建后可移除 privileged。
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cogneva-buildah
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: image-builder
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cogneva
+      app.kubernetes.io/component: image-builder
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cogneva
+        app.kubernetes.io/component: image-builder
+    spec:
+      hostPID: true
+      containers:
+        - name: buildah
+          image: {{ .Values.buildah.image }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sleep", "infinity"]
+          securityContext:
+            privileged: true
+          resources:
+            {{- toYaml .Values.buildah.resources | nindent 12 }}
+          volumeMounts:
+            - name: containers-storage
+              mountPath: /var/lib/containers
+            - name: containerd-socket
+              mountPath: {{ .Values.buildah.containerdSocket }}
+            - name: build-workspace
+              mountPath: /workspace
+      volumes:
+        - name: containers-storage
+          hostPath:
+            path: {{ .Values.buildah.storageHostPath }}
+            type: DirectoryOrCreate
+        - name: containerd-socket
+          hostPath:
+            path: {{ .Values.buildah.containerdSocket }}
+            type: Directory
+        - name: build-workspace
+          emptyDir: {}
+      tolerations:
+        - operator: Exists
+{{- end }}
