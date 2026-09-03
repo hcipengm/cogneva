@@ -584,34 +584,15 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
 
 ### ☸️ 已有集群
 
-已有 K3s 或标准 K8s 集群时，三种方式三选一：
+**不需要任何手动部署步骤，也不用在 K3s、标准 K8s、Helm 之间做选择**——这些只是内部材料形态。元启动检测到可连通的集群会跳过安装、直接复用，全程无人值守，自动探测环境决定用哪份材料、怎么投递：
 
-**K3s —— kustomize 静态清单。** 先初始化随机密钥，再部署：
+- **发行版**：节点带 K3s 标记（`node.kubernetes.io/instance-type=k3s`）→ K3s 形态（`/run/k3s/containerd` socket、local-path / Retain 存储类）；否则按标准 K8s（`/run/containerd`，PVC 跟随集群默认 StorageClass——没有默认 SC 会**提前报错**并提示先装 Longhorn 等，而不是静默挂出一堆无法绑定的卷）。
+- **节点数**：单节点 git-remote 走宿主目录；多节点走集群卷（hostPath 跨节点不可达）。
+- **投递方式**：元启动自建的集群用 chart 预渲染清单 `kubectl apply`（引导链零 helm 依赖，命门链路最稳）；**复用的既有生产集群自动改用 `helm install`**，留下可被 ArgoCD 等接管的 release、获得升级回滚管理——本机没有 helm 时元启动会自行安装（国内网络走华为云镜像、海外走 get.helm.sh，多候选自动换源，不依赖 GitHub），装不上才回落 apply。已有 helm release 则自动 `helm upgrade`；已由 apply 部署的系统保持 apply，不中途换轨。
 
-```bash
-bash deploy/k3s/init-secrets.sh   # 幂等：自动随机生成数据库/缓存/内部签名密钥，不覆盖已有值
-kubectl apply -k deploy/k3s/
-```
+两种投递底层是**同一份 Helm chart + 同一套 profile values**（`deploy/helm/cogneva/profiles/` 下 `k3s-single` / `k3s-multi` / `k8s-standard` 三个形态），能力完全一致，区别仅在有无 release 元数据；CN 网络的镜像站前缀、Gitee seed 等适配在两条路径上同源同义。密钥初始化（预渲染路径自动跑 `init-secrets.sh`、Helm 路径安装时随机生成）也都在元启动内部完成，无需人工介入；两种投递机制的维护者说明见 `deploy/README.md`。
 
-**标准 K8s 生产集群 —— kustomize overlay。** 与 K3s **同一份拓扑源**（主应用、安全网关、进化 Pod、沙箱执行器、buildah、nats/pg/redis/qdrant、NetworkPolicy、Ingress 全套），overlay 只把存储回落集群默认 StorageClass。前置：装好 Longhorn 等并设为默认 SC，再初始化密钥、部署：
-
-```bash
-bash deploy/k3s/init-secrets.sh   # 通用脚本、仅依赖 kubectl，自动随机生成内部密钥，幂等
-kubectl apply -k deploy/k8s/      # overlay：复用 deploy/k3s 全套拓扑 + 生产存储适配
-```
-
-**Helm —— 推荐用于生产 / 多环境。** 把整套资源（含安全网关、进化、沙箱执行器、buildah）打包成可参数化、可升级回滚的 Chart（K8s 的包管理器，类比 `apt`/`brew`），密钥在安装时自动随机生成，无需先跑脚本：
-
-```bash
-helm install cogneva deploy/helm/cogneva
-helm upgrade cogneva deploy/helm/cogneva     # 升级
-helm rollback cogneva                        # 回滚
-helm uninstall cogneva                       # 卸载
-```
-
-参数（镜像版本、副本、资源、域名、存储类、buildah 的 containerd socket 路径等）集中在 `deploy/helm/cogneva/values.yaml`，用 `--set key=value` 覆盖；沙箱执行器与 buildah 可分别用 `--set sandboxExecutor.enabled=false`、`--set buildah.enabled=false` 关闭。
-
-三条路径部署出的能力**完全对齐**：都含主应用、安全网关、进化 Pod、沙箱执行器、buildah 与完整数据面。仓库与配置**不携带任何可用密码**：内部密钥（PostgreSQL / Redis / 内部签名）安装时自动随机生成——K3s 与标准 K8s 路径先运行 `init-secrets.sh`（幂等，重跑或升级不覆盖已有值），Helm 路径在 `helm install` 时自动随机（升级时复用已部署 Secret、保持不变）。平台 token、LLM 上游等带外凭证不随部署下发，首次打开 WebUI 经配置向导写入，且只注入安全网关——主应用与沙盒零持有。
+无论哪种形态，部署出的能力**完全对齐**：都含主应用、安全网关、进化 Pod、沙箱执行器、buildah 与完整数据面。仓库与配置**不携带任何可用密码**：内部密钥（PostgreSQL / Redis / 内部签名）安装时自动随机生成（重跑或升级不覆盖已有值）。平台 token、LLM 上游等带外凭证不随部署下发，首次打开 WebUI 经配置向导写入，且只注入安全网关——主应用与沙盒零持有。
 
 ### 🔧 传统手动部署
 

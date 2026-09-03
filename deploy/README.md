@@ -4,38 +4,44 @@ Cross-platform deployment instructions for Linux (systemd), macOS (launchd), and
 
 ---
 
-## Kubernetes（Helm / Kustomize）
+## Kubernetes
 
-### Helm（推荐）
+**正常使用只需跑元启动**（仓库根 `bootstrap.sh` / Windows `bootstrap.ps1`）：
+它探测集群发行版（K3s / 标准 K8s）、节点数、默认 StorageClass，自动选 profile
+并完成密钥初始化与部署，不需要在 Helm / 静态清单之间手动选择。投递方式也自动
+决定：元启动自建的集群走预渲染清单 `kubectl apply`（零 helm 依赖）；复用的既有
+生产集群自动 `helm install`（release 可被 ArgoCD 接管）——本机没有 helm 时元启动
+自行安装（CN 走华为云镜像、海外走 get.helm.sh，多候选自动换源），装不上才回落
+apply；已有 release 自动 `helm upgrade`，已 apply 部署的保持 apply 不换轨。
+
+元启动内部使用的两种投递机制（同源同能力，无需人工执行；CI / 自动化流水线可直接
+复用这两条等价命令）：
 
 ```bash
-# 渲染检查
-helm template cogneva deploy/helm/cogneva
+# 机制 1：预渲染清单（无需本机装 helm；CI 从 chart 渲染、随仓库提交）
+bash deploy/scripts/init-secrets.sh                     # 幂等随机生成内部密钥
+kubectl apply -f deploy/rendered/k3s-single/            # 或 k3s-multi / k8s-standard
 
-# 安装（开发默认值）
-helm install cogneva deploy/helm/cogneva
-
-# 生产：覆盖镜像与口令
+# 机制 2：Helm 直接安装（本机有 helm；元启动缺 helm 时自动安装）
 helm install cogneva deploy/helm/cogneva \
-  --set image.tag=0.1.39 \
-  --set secrets.pgPassword=<strong-password> \
-  --set gateway.replicas=2
+  -f deploy/helm/cogneva/profiles/k3s-single.yaml       # 或 k3s-multi / k8s-standard
 ```
 
-关键 values：`backends.{postgres,redis,qdrant,nats}.enabled` 控制是否随 chart 部署后端（禁用即使用外部服务）；`evolution.enabled` 控制自进化 worker，`evolution.gitRemote.mode`（`hostPath` 单节点 / `pvc` 多节点）控制中央 bare 仓库供给；`sandboxExecutor.enabled` / `buildah.enabled` 控制沙盒执行器与节点镜像构建 DaemonSet；`buildah.containerdSocket` 适配发行版（K3s 为 `/run/k3s/containerd`，标准 containerd 为 `/run/containerd`）；`storage.localRetainClass.create`（K3s 专有 Retain StorageClass，标准 K8s 置 false）与 `storage.evolution`/`storage.retain` 控制各卷存储类（留空跟随集群默认 SC）；`gitops.kubectlBin.enabled`+`gitops.kubectlBin.hostPath` 控制主应用 GitOps 拉取端的 Pod 内 kubectl（K3s 挂宿主 k3s 二进制，节点无可用二进制时置 false）；`webhook.nodePort` 为平台 webhook 入口；`ingress.className`（`nginx` 默认 / `traefik` 自动附带 WebSocket Middleware）；`networkPolicy.enabled` 控制沙盒出站隔离。内部密钥留空即安装时自动随机生成；渲染清单 apply 的场景（如引导器）用 `--set secrets.create=false`，密钥改由 init-secrets.sh 生成。
+三种 profile：`k3s-single`（单节点 K3s，local-path 存储、hostPath git-remote、
+挂宿主 k3s 二进制）、`k3s-multi`（多节点 K3s，git-remote 走 PVC）、
+`k8s-standard`（标准 K8s：不建 K3s 专有 StorageClass、PVC 跟随集群默认 SC、
+containerd socket `/run/containerd`、不挂宿主 kubectl；前置：集群须有默认
+StorageClass，如 Longhorn）。渲染检查：`helm template cogneva deploy/helm/cogneva
+-f deploy/helm/cogneva/profiles/<profile>.yaml`。
 
-> **维护者注意**：应用拓扑正在收敛为 Helm chart 单一权威源（`deploy/helm/cogneva/`），`deploy/k3s/` 静态清单是引导器消费的渲染产物。chart 的 k3s profile 渲染结果与 `deploy/k3s/` 必须资源集合与工作负载字段（env/卷/挂载/端口/SA）全对齐——CI 的 Deploy Manifest Parity 任务与 `deploy/scripts/check-deploy-parity.sh` 强制校验，改任一侧后本地必须跑通该脚本。详见 `deploy/k3s/README.md` 的"应用拓扑在哪改"。
+关键 values：`backends.{postgres,redis,qdrant,nats}.enabled` 控制是否随 chart 部署后端（禁用即使用外部服务）；`evolution.enabled` 控制自进化 worker，`evolution.gitRemote.mode`（`hostPath` 单节点 / `pvc` 多节点）控制中央 bare 仓库供给；`sandboxExecutor.enabled` / `buildah.enabled` 控制沙盒执行器与节点镜像构建 DaemonSet；`buildah.containerdSocket` 适配发行版（K3s 为 `/run/k3s/containerd`，标准 containerd 为 `/run/containerd`）；`storage.localRetainClass.create`（K3s 专有 Retain StorageClass，标准 K8s 置 false）与 `storage.evolution`/`storage.retain` 控制各卷存储类（留空跟随集群默认 SC）；`gitops.kubectlBin.enabled`+`gitops.kubectlBin.hostPath` 控制主应用 GitOps 拉取端的 Pod 内 kubectl（K3s 挂宿主 k3s 二进制，节点无可用二进制时置 false）；`webhook.nodePort` 为平台 webhook 入口；`ingress.className`（`nginx` 默认 / `traefik` 自动附带 WebSocket Middleware）；`networkPolicy.enabled` 控制沙盒出站隔离。内部密钥留空即安装时自动随机生成；预渲染清单路径用 `secrets.create=false`，密钥改由 init-secrets.sh 生成（bootstrap 自动调用）。
 
-### Kustomize
-
-```bash
-# 直接应用原始 k3s 清单
-kubectl apply -k deploy/k3s
-
-# overlay：dev（单副本 + dev 镜像 tag）/ prod（3 副本 + 固定发布 tag）
-kubectl apply -k deploy/kustomize/overlays/dev
-kubectl apply -k deploy/kustomize/overlays/prod
-```
+> **维护者注意**：应用拓扑唯一权威源是 Helm chart（`deploy/helm/cogneva/`）。
+> `deploy/rendered/<profile>/` 是 chart 的 CI 渲染产物（`bash
+> deploy/scripts/render-deploy.sh` 重新生成，CI 新鲜度门禁防漂移）；
+> `deploy/k3s/` 静态清单是 parity 基线兼集群内 GitOps 拉取端的运行时消费物，
+> 必须与 chart k3s profile 字段级对齐，由 CI 与 `deploy/scripts/check-deploy-parity.sh`
+> 强制（38 资源基线）。改拓扑的顺序见 `deploy/k3s/README.md`。
 
 ---
 

@@ -1,8 +1,8 @@
 //! k8m 多集群管理计划（审计 2.5.2）+ backend 自动部署规划（审计 2.5.3）。
 //!
 //! `ManagementPlan` 是 K3s 与 K8s 共用的声明式部署抽象：AI 只生成/调用
-//! 统一计划，框架按环境标签把同一计划渲染为 Helm values（或 kustomize
-//! overlay）并同步到目标集群。backend 选择规则内聚于此，无需业务代码改动。
+//! 统一计划，框架按环境标签把同一计划渲染为 Helm values（profile）并同步
+//! 到目标集群。backend 选择规则内聚于此，无需业务代码改动。
 
 use serde::{Deserialize, Serialize};
 

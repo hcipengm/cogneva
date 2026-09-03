@@ -1,33 +1,36 @@
-# deploy/k3s —— 现行集群清单
-
-本目录是当前 k3s 集群的权威清单来源，`kubectl apply` 直接可用。
+# deploy/k3s —— K3s 静态清单（parity 基线 + GitOps 运行时消费）
 
 ## 维护者：应用拓扑在哪改（单一数据源）
 
-本目录是**应用工作负载拓扑的唯一权威来源**：主应用、安全网关、进化 Pod、沙箱执行器、
-buildah DaemonSet、nats/postgres/redis/qdrant、NetworkPolicy、Ingress 都定义在这里。
-其余部署路径全部复用本目录，**不要在别处另写一份应用 Deployment/StatefulSet**：
+**应用工作负载拓扑的唯一权威源是 Helm chart `deploy/helm/cogneva/`**：主应用、
+安全网关、进化 Pod、沙箱执行器、buildah DaemonSet、nats/postgres/redis/qdrant、
+NetworkPolicy、Ingress 都在 chart templates 里定义，环境差异（containerd socket、
+StorageClass、git-remote 模式、kubectl 二进制路径）走 values。三种部署形态由
+profile values 表达：`deploy/helm/cogneva/profiles/k3s-single.yaml`、
+`k3s-multi.yaml`、`k8s-standard.yaml`。
 
-- `deploy/k8s/`（标准 K8s 生产）是 kustomize **overlay**：`resources: [../k3s]` 复用本目录
-  全套拓扑，只 patch 环境差异（PVC 回落集群默认 StorageClass、buildah 的 containerd
-  socket 改 `/run/containerd`）。加环境差异用 overlay patch，不要往 `deploy/k8s/` 放独立应用清单。
-- `deploy/kustomize/`（base + overlays/dev|prod）同样 `resources: [../../k3s]` 指向本目录，
-  只叠加副本数 / 镜像 tag 变体。
+本目录的静态清单**不是**权威源，不能手改后不回写 chart。它保留两个消费方：
 
-**Helm Chart** `deploy/helm/cogneva/templates/` 正在收敛为拓扑的唯一权威源（本目录
-静态清单将成为 chart k3s profile 的渲染产物，供引导器消费）。过渡期内两边并存，
-**在任何一侧新增或改动工作负载时，必须同步改另一侧与 `deploy/helm/cogneva/values.yaml`**
-（开关、资源、镜像、环境差异走 values），改完必须跑 parity 校验（CI 同名任务也强制）：
+1. **bootstrap 的 apply 物不直接是本目录**——bootstrap 消费的是 chart 经 CI
+   预渲染的 `deploy/rendered/<profile>/`（`bash deploy/scripts/render-deploy.sh`
+   生成，CI 新鲜度门禁防漂移），按环境探测自动选 profile。
+2. **集群内 GitOps 拉取端**（cog-reflection）在进化流水线里 apply 克隆仓库中的
+   本目录文件（如 `cogneva-json-configmap.yaml`、`evolution-deployment.yaml`），
+   换版脚本 `swap-image.sh` 也直接操作本目录清单。
+
+因此本目录必须与 chart 的 k3s profile **字段级对齐**，由 parity 门禁强制
+（CI deploy-parity job 同名脚本）：
 
 ```bash
 bash deploy/scripts/check-deploy-parity.sh
-# 渲染 chart 的 k3s profile 与本目录 kustomize 结果对比：资源集合 + 每个工作负载的
-# env/卷/挂载/端口/ServiceAccount 字段必须全对齐，差异即失败（38 个资源基线）。
+# 对比 kubectl kustomize deploy/k3s 与 chart k3s profile 渲染结果：
+# 资源集合 + 每个工作负载的 env/卷/挂载/端口/ServiceAccount 必须全对齐
+# （38 个资源基线），差异即失败。
 ```
 
-kustomize overlay 改容器挂载路径时注意：strategic-merge 中 `volumes` 按 `name` 合并，
-而 `volumeMounts` 按 **`mountPath`** 合并（不是 name）——改挂载点路径要先 `$patch: delete`
-旧 mountPath 再补新值，否则会追加出重复挂载（见 `deploy/k8s/kustomization.yaml` 内注释）。
+**改动拓扑的正确顺序**：改 chart templates / values.yaml → 跑
+`render-deploy.sh` 重新生成 `deploy/rendered/` → 同步本目录对应静态清单 →
+`check-deploy-parity.sh` 绿。三者同提一个 commit。
 
 ## 不在本目录的两类东西
 

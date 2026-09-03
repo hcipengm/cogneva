@@ -588,34 +588,15 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
 
 ### ☸️ Existing cluster
 
-With an existing K3s or standard K8s cluster, pick one of three options:
+**There are no manual deployment steps, and no choice to make between K3s, standard K8s, and Helm** — those are internal material forms; from the user's side there is only the meta-bootstrapper. When it finds a reachable cluster it skips installation and reuses the cluster, fully unattended, probing the environment to decide both which material to use and how to deliver it:
 
-**K3s — kustomize static manifests.** Generate random secrets first, then deploy:
+- **Distro**: a node carrying the K3s mark (`node.kubernetes.io/instance-type=k3s`) selects the K3s form (`/run/k3s/containerd` socket, local-path / Retain StorageClasses); otherwise standard K8s (`/run/containerd`; PVCs follow the cluster's default StorageClass — with no default SC it **fails up front** telling you to install Longhorn etc., rather than silently leaving unbound PVCs).
+- **Node count**: single node puts git-remote on a host directory; multiple nodes use a cluster volume (hostPath is unreachable across nodes).
+- **Delivery**: on a cluster the bootstrapper built itself it applies the pre-rendered manifests with `kubectl apply` (no helm dependency in the bootstrap chain — the most reliable critical path); **on a reused existing production cluster it automatically switches to `helm install`**, leaving a release that ArgoCD etc. can take over with upgrade/rollback management. If the helm binary is missing, the bootstrapper installs it itself (Huawei Cloud mirror on CN networks, get.helm.sh overseas — multiple candidates with automatic failover, no GitHub dependency), falling back to apply only if every candidate fails. An existing helm release is upgraded in place; a system previously deployed with `kubectl apply` stays on apply — no mid-stream switch.
 
-```bash
-bash deploy/k3s/init-secrets.sh   # idempotent: randomizes DB/cache/signing secrets, never overwrites existing values
-kubectl apply -k deploy/k3s/
-```
+Both deliveries sit on the **same Helm chart and the same profile values** (`k3s-single` / `k3s-multi` / `k8s-standard` under `deploy/helm/cogneva/profiles/`); the capabilities are identical — only release metadata differs. CN-network adaptations (mirror-prefixed images, Gitee seed URL) are applied equivalently on both paths. Secret initialization is likewise fully internal — the pre-rendered path runs `init-secrets.sh` automatically, the Helm path randomizes secrets at install time — with no human step involved; maintainer-level notes on the two delivery mechanisms live in `deploy/README.md`.
 
-**Standard K8s production cluster — kustomize overlay.** Uses the **same topology source** as K3s (full stack: main app, security gateway, evolution pods, sandbox executor, buildah, nats/pg/redis/qdrant, NetworkPolicy, Ingress); the overlay only drops storage onto the cluster's default StorageClass. Prerequisite: install Longhorn (or equivalent) and make it the default SC, then initialize secrets and deploy:
-
-```bash
-bash deploy/k3s/init-secrets.sh   # generic script, only needs kubectl; randomizes internal secrets, idempotent
-kubectl apply -k deploy/k8s/      # overlay: reuses the full deploy/k3s topology + production storage adaptation
-```
-
-**Helm — recommended for production / multi-environment.** Packages the whole stack (including the security gateway, evolution, sandbox executor, and buildah) into a parameterizable, upgradeable/rollbackable Chart (Kubernetes' package manager, akin to `apt`/`brew`); secrets are randomized at install time, no script needed first:
-
-```bash
-helm install cogneva deploy/helm/cogneva
-helm upgrade cogneva deploy/helm/cogneva     # upgrade
-helm rollback cogneva                        # roll back
-helm uninstall cogneva                       # uninstall
-```
-
-Tunables (image tag, replicas, resources, host, storage class, the buildah containerd socket path, …) live in `deploy/helm/cogneva/values.yaml` and can be overridden with `--set key=value`; the sandbox executor and buildah can be disabled with `--set sandboxExecutor.enabled=false` and `--set buildah.enabled=false`.
-
-All three paths deploy the **same capabilities**: main app, security gateway, evolution pods, sandbox executor, buildah, and the full data plane. The repository and its configs **carry no usable password**: internal secrets (PostgreSQL / Redis / internal signing) are randomized at install time — on the K3s and standard-K8s paths by running `init-secrets.sh` first (idempotent; re-runs and upgrades never overwrite existing values), and on the Helm path at `helm install` (the deployed Secret is reused on upgrade and left unchanged). Out-of-band credentials such as platform tokens and LLM upstreams are never shipped with the deployment — they are written through the WebUI setup wizard on first launch and injected only into the security gateway, leaving the main app and sandboxes with zero credentials.
+Every form deploys the **same capabilities**: main app, security gateway, evolution pods, sandbox executor, buildah, and the full data plane. The repository and its configs **carry no usable password**: internal secrets (PostgreSQL / Redis / internal signing) are randomized at install time (re-runs and upgrades never overwrite existing values). Out-of-band credentials such as platform tokens and LLM upstreams are never shipped with the deployment — they are written through the WebUI setup wizard on first launch and injected only into the security gateway, leaving the main app and sandboxes with zero credentials.
 
 ### 🔧 Traditional manual deployment
 

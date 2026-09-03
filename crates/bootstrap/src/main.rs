@@ -1231,15 +1231,138 @@ async fn ensure_internal_secrets() -> Result<()> {
     run("bash", &[script.as_str()]).await
 }
 
-async fn deploy_manifests() -> Result<()> {
+/// 投递方式：预渲染清单 kubectl apply（引导链零 helm 依赖，命门链路最稳），
+/// 或 helm upgrade --install（release 可被 ArgoCD 等 GitOps 工具链接管）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Apply,
+    Helm,
+}
+
+/// 探测投递方式。规则按"既有管理状态优先、不中途换轨"设计：
+/// - 已有同名 helm release → helm upgrade（release 生命周期不能被 apply 接管）；
+/// - 工作负载已存在但无 release → 保持 apply（helm install 会撞已存在资源）；
+/// - 绿地 + 复用的既有集群 → helm install（release 可被 GitOps 接管，获得升级
+///   回滚管理）；本机没有 helm 就自动装（CN 走国内镜像，见 ensure_helm），
+///   装不上才回落 apply；
+/// - 元启动自建集群 → 预渲染清单 apply（命门链路零额外下载，最稳）。
+async fn detect_delivery(cluster_existed: bool) -> Delivery {
+    let helm = command_exists("helm").await;
+    if helm && helm_release_exists().await {
+        info!("投递探测: 检测到既有 helm release cogneva → helm upgrade（保持 release 管理）");
+        return Delivery::Helm;
+    }
+    if cogneva_workload_exists().await {
+        info!(
+            "投递探测: 工作负载已由 apply 部署且无 helm release → 保持 apply（避免资源归属冲突）"
+        );
+        return Delivery::Apply;
+    }
+    if cluster_existed {
+        if helm || ensure_helm().await {
+            info!("投递探测: 复用既有集群 → helm install（release 可被 GitOps 接管）");
+            return Delivery::Helm;
+        }
+        info!("投递探测: 复用既有集群但 helm 不可用 → 预渲染清单 apply（引导链零 helm 依赖）");
+        return Delivery::Apply;
+    }
+    info!("投递探测: 元启动自建集群 → 预渲染清单 apply（命门链路零额外依赖）");
+    Delivery::Apply
+}
+
+/// 确保 helm 客户端可用。仅在"复用既有集群、绿地部署、需要 helm 投递"时调用——
+/// 元启动自建集群的命门链路永远走预渲染 apply，不下载 helm。
+/// 下载候选：CN 首选华为云 helm 镜像（get.helm.sh 背后是 GitHub releases，
+/// CN 直连不稳），海外首选 get.helm.sh；逐候选尝试，全失败返回 false 由调用方回落。
+async fn ensure_helm() -> bool {
+    if command_exists("helm").await {
+        return true;
+    }
+    // 钉版本：与本机实测一致的 v4 稳定版；helm 3/4 包内布局相同（linux-<arch>/helm）。
+    let version = "v4.2.4";
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => {
+            warn!("helm 自动安装不支持架构 {other}，回落 apply");
+            return false;
+        }
+    };
+    let huawei = format!(
+        "https://mirrors.huaweicloud.com/helm/{version}/helm-{version}-linux-{arch}.tar.gz"
+    );
+    let official = format!("https://get.helm.sh/helm-{version}-linux-{arch}.tar.gz");
+    let candidates = if cn_mirror() {
+        [huawei, official]
+    } else {
+        [official, huawei]
+    };
+    info!("未检测到 helm，自动安装（多候选，失败自动换下一个）...");
+    for url in candidates {
+        let script = format!(
+            "set -e; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; cd \"$d\" && \
+             curl -fsSL --connect-timeout 10 '{url}' -o helm.tgz && \
+             tar -xzf helm.tgz && install -m 0755 linux-{arch}/helm /usr/local/bin/helm"
+        );
+        match Command::new("sh").args(["-c", &script]).status().await {
+            Ok(s) if s.success() => {
+                info!("helm 安装完成（来源 {url}）");
+                return true;
+            }
+            _ => warn!("helm 下载/安装失败，换下一个候选: {url}"),
+        }
+    }
+    warn!("helm 自动安装失败（所有候选不可达），回落预渲染清单 apply");
+    false
+}
+
+/// 集群里是否已有同名 helm release（helm 3，release 存为集群内 Secret）。
+async fn helm_release_exists() -> bool {
+    let out = Command::new("helm")
+        .args(["list", "-n", "cogneva", "-q"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    matches!(out, Ok(o) if o.status.success()
+        && String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "cogneva"))
+}
+
+/// 工作负载是否已存在（用于判定"此前由 apply 部署"，helm release 检测先于此）。
+async fn cogneva_workload_exists() -> bool {
+    Command::new("kubectl")
+        .args(["-n", "cogneva", "get", "deployment", "cogneva"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn deploy_manifests(cluster_existed: bool) -> Result<()> {
     let profile = detect_profile().await?;
+    match detect_delivery(cluster_existed).await {
+        Delivery::Apply => deploy_via_apply(profile).await,
+        Delivery::Helm => deploy_via_helm(profile).await,
+    }
+}
+
+async fn deploy_via_apply(profile: Profile) -> Result<()> {
     let dir = rendered_manifest_dir(profile);
     if !dir.is_dir() {
-        bail!("渲染产物目录不存在: {}（源码不完整？请重新获取仓库）", dir.display());
+        bail!(
+            "渲染产物目录不存在: {}（源码不完整？请重新获取仓库）",
+            dir.display()
+        );
     }
     ensure_internal_secrets().await?;
     let rendered = render_manifests_for_cluster(&dir).await?;
-    info!("apply {} profile 清单（已按网络环境适配）", profile.dir_name());
+    info!(
+        "apply {} profile 清单（已按网络环境适配）",
+        profile.dir_name()
+    );
     // kubectl apply -f <dir> 按文件名字典序逐个处理，namespace.yaml 排在
     // configmap/deployment 等之后，空白集群首轮会整批 namespace not found；
     // 先幂等建命名空间再整目录 apply（K8s 分支分发器也做过，幂等无害）
@@ -1252,6 +1375,106 @@ async fn deploy_manifests() -> Result<()> {
     )
     .await?;
     run("kubectl", &["apply", "-f", &rendered.to_string_lossy()]).await
+}
+
+/// helm 投递：chart + 同一套 profile values。profile 为渲染 apply 固化了
+/// secrets.create=false，这里改回 true——helm install 时 lookup+randAlphaNum
+/// 安装时生成密钥（升级复用既有 Secret，不轮换），无需 init-secrets.sh。
+/// CN 网络用 --post-renderer 复用与 apply 路径同一张镜像/seed 替换表。
+async fn deploy_via_helm(profile: Profile) -> Result<()> {
+    let chart = repo_root().join("deploy/helm/cogneva");
+    let values = repo_root().join(format!(
+        "deploy/helm/cogneva/profiles/{}.yaml",
+        profile.dir_name()
+    ));
+    if !chart.is_dir() || !values.is_file() {
+        bail!(
+            "Helm chart 或 profile values 缺失（源码不完整？请重新获取仓库）: {} / {}",
+            chart.display(),
+            values.display()
+        );
+    }
+    let mut args: Vec<String> = vec![
+        "upgrade".into(),
+        "--install".into(),
+        "cogneva".into(),
+        chart.to_string_lossy().into_owned(),
+        "-n".into(),
+        "cogneva".into(),
+        "--create-namespace".into(),
+        "-f".into(),
+        values.to_string_lossy().into_owned(),
+        "--set".into(),
+        "secrets.create=true".into(),
+    ];
+    if cn_mirror() {
+        // CN 适配走 values 覆盖（镜像站前缀 + seed 地址），不依赖 helm
+        // 版本相关的 post-renderer 机制，release 元数据完整保留。
+        for (key, val) in cn_helm_value_overrides(docker_mirror_host().await)? {
+            args.push("--set".into());
+            args.push(format!("{key}={val}"));
+        }
+    }
+    info!(
+        "helm 投递 {} profile（upgrade --install，幂等）",
+        profile.dir_name()
+    );
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run("helm", &refs).await
+}
+
+/// 公开镜像引用加国内镜像站前缀，规则与 K3s containerd registries / apply 路径
+/// 的镜像站前缀同源：docker hub 官方镜像（无 `/`）补 `library/`，docker hub
+/// 用户镜像（首段无 `.`）直接加前缀，quay.io 走南大 quay 站（daocloud 系未收录）。
+fn cn_mirror_image(image: &str, mirror: &str) -> String {
+    if let Some(rest) = image.strip_prefix("quay.io/") {
+        return format!("quay.nju.edu.cn/{rest}");
+    }
+    if image.contains('/') {
+        format!("{mirror}/{image}")
+    } else {
+        format!("{mirror}/library/{image}")
+    }
+}
+
+/// CN 网络下的 helm values 覆盖：镜像 tag 直接从 chart values.yaml 读取再改
+/// 前缀（不硬编码 tag，chart 升版不漂移），seed 地址改 Gitee——与
+/// render_manifests_for_cluster 的文本替换同义，两条投递路径网络适配一致。
+fn cn_helm_value_overrides(mirror: &str) -> Result<Vec<(String, String)>> {
+    let values_path = repo_root().join("deploy/helm/cogneva/values.yaml");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&values_path)?)?;
+    let image_at = |path: &[&str]| -> Result<String> {
+        let mut cur = &parsed;
+        for k in path {
+            cur = cur
+                .get(k)
+                .with_context(|| format!("values.yaml 缺字段 {}", path.join(".")))?;
+        }
+        cur.as_str()
+            .map(String::from)
+            .with_context(|| format!("values.yaml 字段 {} 非字符串", path.join(".")))
+    };
+    let mut out = Vec::new();
+    for (key, path) in [
+        (
+            "backends.postgres.image",
+            &["backends", "postgres", "image"][..],
+        ),
+        ("backends.redis.image", &["backends", "redis", "image"][..]),
+        (
+            "backends.qdrant.image",
+            &["backends", "qdrant", "image"][..],
+        ),
+        ("backends.nats.image", &["backends", "nats", "image"][..]),
+        ("buildah.image", &["buildah", "image"][..]),
+    ] {
+        out.push((key.to_string(), cn_mirror_image(&image_at(path)?, mirror)));
+    }
+    out.push((
+        "evolution.gitRemote.seedUrl".into(),
+        "https://gitee.com/hcipengm/cogneva.git".into(),
+    ));
+    Ok(out)
 }
 
 /// 按运行网络环境处理预渲染 profile 产物副本。环境差异（containerd socket、
@@ -1460,6 +1683,8 @@ async fn main() -> Result<()> {
     std::fs::write(&plan_path, plan.to_yaml()?)?;
     info!("已生成 {plan_path}（backend 自动选择已内嵌）");
 
+    // 投递方式探测需要知道集群是"本次安装"还是"复用既有"：安装前取样。
+    let cluster_existed = cluster_ready().await;
     match branch {
         Branch::K3s => install_k3s().await?,
         Branch::K8s => ensure_multi_node_cluster().await?,
@@ -1474,7 +1699,7 @@ async fn main() -> Result<()> {
         ensure_git_remote().await?;
     }
     ensure_runtime_image(branch).await?;
-    deploy_manifests().await?;
+    deploy_manifests(cluster_existed).await?;
     wait_ready().await?;
 
     let webui =
@@ -1499,5 +1724,25 @@ mod profile_tests {
         assert_eq!(Profile::K3sSingle.dir_name(), "k3s-single");
         assert_eq!(Profile::K3sMulti.dir_name(), "k3s-multi");
         assert_eq!(Profile::K8sStandard.dir_name(), "k8s-standard");
+    }
+
+    #[test]
+    fn cn_mirror_image_rewrite_rules() {
+        let m = "docker.m.daocloud.io";
+        // docker hub 官方镜像补 library/
+        assert_eq!(
+            super::cn_mirror_image("postgres:16-alpine", m),
+            "docker.m.daocloud.io/library/postgres:16-alpine"
+        );
+        // docker hub 用户镜像（首段无点）直接加前缀，tag 原样保留
+        assert_eq!(
+            super::cn_mirror_image("qdrant/qdrant:v1.13.4", m),
+            "docker.m.daocloud.io/qdrant/qdrant:v1.13.4"
+        );
+        // quay.io 固定走南大 quay 站（daocloud 系未收录 buildah）
+        assert_eq!(
+            super::cn_mirror_image("quay.io/buildah/stable:latest", m),
+            "quay.nju.edu.cn/buildah/stable:latest"
+        );
     }
 }
