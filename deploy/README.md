@@ -12,11 +12,9 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 形态**，不是用户路径。
 
 所以 `deploy/` 下的文件夹是**按"权威源 / 产物 / 参考 / 工具 / 非容器部署"分类组织
-的，不是一条路径一个文件夹**——不要用"几条部署路径就该有几个文件夹"去数它。早期
-文档曾把"裸机自举 + K3s / 标准 K8s / Helm 三条集群路径"讲成 4 条并列路径，那套说法
-已废弃：K8s 场景下用户路径只有元启动 1 条（内部 2 种投递机制），`systemd`/`launchd`
-则是"完全不用 K8s、直接在宿主机跑二进制"的另一种传统部署，与 K8s 路线互斥。当前 7
-个文件夹各管一件事：
+的，不是一条路径一个文件夹**，不要用"几条部署路径就该有几个文件夹"去数它。K8s
+场景下用户路径只有元启动 1 条（内部 2 种投递机制）；`systemd`/`launchd` 则是"完全
+不用 K8s、直接在宿主机跑二进制"的传统部署，与 K8s 路线互斥。各文件夹职责如下：
 
 | 目录 | 做什么 / 实现什么功能 | 角色与消费方 |
 |---|---|---|
@@ -45,11 +43,9 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
   静态基线 + 自进化运行时消费物——三者是"源 → 产物 → 基线/消费物"的关系，不是三选一。
 - **`k8s/` 不放应用清单**，只放标准 K8s 集群周边的基础设施参考；标准 K8s 部署应用走
   chart 的 `k8s-standard` profile。
-- **`deploy/kustomize/` 已删除**：那是早期用 kustomize overlay（base + dev/prod、
-  以及 `deploy/k8s/kustomization.yaml` 复用 `../k3s` 的生产 overlay）做拓扑复用的
-  尝试；单一数据源收敛后，环境差异全部下沉为 chart 的 profile values，overlay 整体
-  退出（2026-09-04，commit 3f6ca0b）。现在看到任何"kustomize overlay / dev/prod
-  变体"的说法都是历史，改拓扑统一改 chart。
+- **环境差异全部通过 chart 的 profile values 表达**（containerd socket、存储类、
+  git-remote 模式、kubectl 二进制等），不维护 kustomize overlay 或第二份应用清单；
+  改应用拓扑统一改 `helm/cogneva/`。
 
 ---
 
