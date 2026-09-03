@@ -32,6 +32,11 @@ pub struct GitHubDiscoveryLoop {
     submitted: std::collections::HashSet<u64>,
     /// PR numbers that already produced an intent task this process lifetime.
     submitted_prs: std::collections::HashSet<u64>,
+    /// Issues with a bot clarification question already posted and no
+    /// substantive user reply seen yet. In-memory guard so concurrent triggers
+    /// (webhook + polling, or the bot's own comment event arriving before the
+    /// just-posted comment is re-read) cannot post a second question.
+    awaiting_clarification: std::collections::HashSet<u64>,
     /// CI run ids that already produced a fix task this process lifetime.
     ci_submitted: std::collections::HashSet<u64>,
     /// CI run ids seen by the polling fallback. `None` until the first poll,
@@ -63,6 +68,7 @@ impl GitHubDiscoveryLoop {
             submitted: std::collections::HashSet::new(),
             submitted_prs: std::collections::HashSet::new(),
             ci_submitted: std::collections::HashSet::new(),
+            awaiting_clarification: std::collections::HashSet::new(),
             ci_seen: None,
         }
     }
@@ -187,6 +193,64 @@ impl GitHubDiscoveryLoop {
         }
     }
 
+    /// Whether a webhook event is the bot's OWN comment on an issue. Such
+    /// events must not retrigger issue processing — the bot answering itself
+    /// is what caused duplicate clarification in production.
+    pub fn is_self_comment_event(
+        &self,
+        is_gitee: bool,
+        event: &str,
+        action: &str,
+        payload: &serde_json::Value,
+    ) -> bool {
+        let (body, author) = if is_gitee {
+            // Gitee Note Hook on an issue: payload.note.body / .user.login.
+            let ev = event.trim_end_matches(" Hook").to_ascii_lowercase();
+            let is_note = ev == "note" && payload["noteable_type"].as_str() == Some("Issue");
+            if !is_note {
+                return false;
+            }
+            let note = payload
+                .get("note")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            (
+                note["body"].as_str().unwrap_or_default().to_string(),
+                note["user"]["login"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        } else {
+            if !(event == "issue_comment" && action == "created") {
+                return false;
+            }
+            (
+                payload["comment"]["body"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                payload["comment"]["user"]["login"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+
+        if body.is_empty() && author.is_empty() {
+            return false;
+        }
+        // 机器人自己发的评论：要么正文带机器人签名（token 属于人类账号时
+        // 作者是人类用户名），要么作者就是配置的行动账号。
+        let sig = &self.config.conversation.bot_signature;
+        let signed = !sig.is_empty() && body.trim_end().ends_with(sig.as_str());
+        let actor = self.config.primary_account().ok().map(|a| a.username());
+        let self_actor = actor.is_some_and(|u| !u.is_empty() && u == author)
+            || (!self.config.bot_identity.username.is_empty()
+                && self.config.bot_identity.username == author);
+        signed || self_actor
+    }
+
     /// 处理 CI 失败事件（webhook 驱动）：拉取失败 job 日志尾部并提交
     /// `github_ci_fix` 修复任务。重复 run 或无法提交时返回 false。
     pub async fn process_ci_failure(&mut self, event: CiFailureEvent) -> Result<bool> {
@@ -291,9 +355,19 @@ impl GitHubDiscoveryLoop {
                 return Ok(());
             }
             ConversationState::AwaitingClarification => {
-                // Still waiting for the reporter; nothing to do this round.
+                // Still waiting for a substantive reply; nothing to do this
+                // round. Also arm the in-memory guard so a concurrent trigger
+                // (webhook + polling, or self-comment event before the post is
+                // re-read) cannot post a second question.
+                self.awaiting_clarification.insert(issue.number);
                 self.conversations.insert(issue.number, conversation);
                 return Ok(());
+            }
+            ConversationState::Clarified => {
+                // A substantive user reply arrived; release the guard so the
+                // next clarification round (if triage still needs one) is
+                // allowed, subject to the round budget.
+                self.awaiting_clarification.remove(&issue.number);
             }
             _ => {}
         }
@@ -321,14 +395,30 @@ impl GitHubDiscoveryLoop {
                 if self.config.auto_create_pr {
                     self.submit_fix_task(issue, &conversation).await?;
                     self.submitted.insert(issue.number);
+                    self.awaiting_clarification.remove(&issue.number);
                 }
             }
             TriageDecision::AskForClarification { question } => {
                 let mut convo = conversation;
+                // Hard in-memory guard: a question is already outstanding for
+                // this issue (posted this process lifetime) and no substantive
+                // reply has arrived — never post a duplicate, even if the
+                // comment re-read raced or a webhook+poll fired together.
+                if self.awaiting_clarification.contains(&issue.number) {
+                    tracing::info!(
+                        issue = issue.number,
+                        "Clarification already outstanding; not re-asking"
+                    );
+                    self.conversations.insert(issue.number, convo);
+                    return Ok(());
+                }
                 if let Some(body) = convo.ask(&question, &self.config.conversation) {
                     let posted = convo
                         .post_reply(self.provider.as_ref(), &body, &self.config.conversation)
                         .await?;
+                    if posted {
+                        self.awaiting_clarification.insert(issue.number);
+                    }
                     tracing::info!(
                         issue = issue.number,
                         posted,
@@ -724,6 +814,83 @@ mod tests {
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].0, 2);
         assert!(comments[0].1.contains("— Cogneva Bot"));
+    }
+
+    #[tokio::test]
+    async fn unclear_issue_asks_only_once_across_repeated_triggers() {
+        // 同一 issue 被重复触发（webhook + 轮询，或自己发的评论事件在读到
+        // 之前就到达——mock 默认不回传已发评论）时，只能问一次。
+        let provider = Arc::new(MockProvider {
+            issues: vec![issue(20, "too short")],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+        });
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            config(),
+            None,
+            None,
+        );
+        loop_.run_once().await.unwrap();
+        // 第二次触发：没有任何新的实质性用户回复。
+        loop_.run_once().await.unwrap();
+        let comments = provider.comments.lock().unwrap();
+        assert_eq!(
+            comments.len(),
+            1,
+            "bot must ask only once, posted {comments:?}"
+        );
+        assert_eq!(comments[0].0, 20);
+    }
+
+    #[test]
+    fn self_comment_webhook_event_is_ignored() {
+        // 机器人用人类账号 token 发评论：作者是人类用户名，但正文带签名。
+        let mut cfg = config();
+        cfg.bot_identity.username = "cogneva-bot".into();
+        cfg.accounts = vec![crate::config::GitHubAccount::Human(
+            crate::config::HumanAccount {
+                username: "hcipengm".into(),
+                ..Default::default()
+            },
+        )];
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+        });
+        let loop_ = GitHubDiscoveryLoop::new(provider, IssueTriage::rules_only(), cfg, None, None);
+
+        let payload = serde_json::json!({
+            "action": "created",
+            "comment": {
+                "body": "Could you describe the problem?\n\n— Cogneva Bot",
+                "user": { "login": "hcipengm" }
+            },
+            "issue": { "number": 5 }
+        });
+        assert!(loop_.is_self_comment_event(false, "issue_comment", "created", &payload));
+
+        // 别人的真实回复：不应被当成自发事件。
+        let human = serde_json::json!({
+            "action": "created",
+            "comment": {
+                "body": "it crashes on startup, here are the steps",
+                "user": { "login": "alice" }
+            },
+            "issue": { "number": 5 }
+        });
+        assert!(!loop_.is_self_comment_event(false, "issue_comment", "created", &human));
+
+        // issue 本身的 opened 事件不是评论事件，不该判自发。
+        let opened = serde_json::json!({
+            "action": "opened",
+            "issue": { "number": 5, "body": "hi" }
+        });
+        assert!(!loop_.is_self_comment_event(false, "issues", "opened", &opened));
     }
 
     #[tokio::test]

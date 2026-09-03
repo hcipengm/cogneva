@@ -107,8 +107,11 @@ impl IssueConversation {
             .filter(|t| t.role == ConversationRole::Bot)
             .count() as u32;
 
-        // Derive state: a bot question with no later user reply means we are
-        // still waiting (or stale); a later user reply means clarified.
+        // Derive state: a bot question with no later substantive user reply
+        // means we are still waiting (or stale); a later user reply that
+        // actually carries text means clarified. A picture-only / empty /
+        // link-only comment is NOT an answer — treating it as one made the bot
+        // re-ask on every such comment (observed in production).
         let last_bot = convo
             .turns
             .iter()
@@ -116,7 +119,7 @@ impl IssueConversation {
         if let Some(idx) = last_bot {
             let user_replied = convo.turns[idx + 1..]
                 .iter()
-                .any(|t| t.role == ConversationRole::User);
+                .any(|t| t.role == ConversationRole::User && is_substantive_reply(&t.body));
             convo.state = if user_replied {
                 ConversationState::Clarified
             } else if convo.timed_out(config) {
@@ -196,6 +199,37 @@ impl IssueConversation {
         }
         None
     }
+}
+
+/// A user comment counts as an answer only if it carries readable text.
+///
+/// A screenshot pasted with no description, an empty comment, or a bare link
+/// gives the triage model nothing to work with, so the bot must keep waiting
+/// rather than treat it as "replied" and ask again. Markdown image embeds
+/// (`![alt](url)`) and bare URLs are removed before counting; a comment is
+/// substantive when at least one letter/digit/CJK character remains.
+pub(crate) fn is_substantive_reply(body: &str) -> bool {
+    let mut s = body.to_string();
+    // Remove markdown image embeds ![alt](url) (alt text like "image" carries
+    // no answer content).
+    while let Some(start) = s.find("![") {
+        let after = &s[start + 2..];
+        let Some(rel_open) = after.find("](") else {
+            break;
+        };
+        let open_abs = start + 2 + rel_open + 2;
+        let Some(rel_close) = s[open_abs..].find(')') else {
+            break;
+        };
+        let close_abs = open_abs + rel_close + 1;
+        s.replace_range(start..close_abs, " ");
+    }
+    // Drop bare URL tokens, then count any real characters (CJK counts as
+    // alphanumeric via Unicode Letter category).
+    s.split_whitespace()
+        .filter(|w| !w.starts_with("http://") && !w.starts_with("https://"))
+        .flat_map(|w| w.chars())
+        .any(|c| c.is_alphanumeric())
 }
 
 #[cfg(test)]
@@ -288,5 +322,74 @@ mod tests {
         let body = convo.ask("what version?", &cfg).unwrap();
         assert!(body.contains("what version?"));
         assert!(body.contains(&cfg.bot_signature));
+    }
+
+    #[test]
+    fn image_only_reply_keeps_waiting() {
+        // 图片-only 评论（截图无文字说明）不是有效回答：状态应保持
+        // AwaitingClarification，而不是翻成 Clarified 触发再追问。
+        let cfg = ConversationConfig::default();
+        let comments = vec![
+            comment(
+                "hcipengm",
+                "Could you describe the problem?\n\n— Cogneva Bot",
+                now_ts() - 200,
+            ),
+            comment(
+                "hcipengm",
+                "![image](https://github.com/user-attachments/assets/abc)",
+                now_ts(),
+            ),
+        ];
+        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
+        assert_eq!(convo.state, ConversationState::AwaitingClarification);
+        assert_eq!(convo.rounds, 1);
+    }
+
+    #[test]
+    fn empty_and_link_only_replies_keep_waiting() {
+        let cfg = ConversationConfig::default();
+        let mk = |body: &str| {
+            let comments = vec![
+                comment("cogneva-bot", "please clarify", now_ts() - 200),
+                comment("alice", body, now_ts()),
+            ];
+            IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg).state
+        };
+        assert_eq!(mk("   "), ConversationState::AwaitingClarification);
+        assert_eq!(
+            mk("https://example.com/thing"),
+            ConversationState::AwaitingClarification
+        );
+    }
+
+    #[test]
+    fn text_reply_after_question_is_clarified() {
+        let cfg = ConversationConfig::default();
+        let comments = vec![
+            comment("cogneva-bot", "please clarify", now_ts() - 200),
+            comment(
+                "alice",
+                "it crashes on startup, see trace: https://x/y",
+                now_ts(),
+            ),
+        ];
+        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
+        assert_eq!(convo.state, ConversationState::Clarified);
+    }
+
+    #[test]
+    fn substantive_reply_detection() {
+        assert!(!is_substantive_reply(
+            "![image](https://github.com/x/y.png)"
+        ));
+        assert!(!is_substantive_reply(""));
+        assert!(!is_substantive_reply("   \n\t "));
+        assert!(!is_substantive_reply("https://example.com"));
+        assert!(is_substantive_reply(
+            "see this screenshot ![](https://x/y.png)"
+        ));
+        assert!(is_substantive_reply("复现：启动即崩溃"));
+        assert!(is_substantive_reply("v0.2.0"));
     }
 }

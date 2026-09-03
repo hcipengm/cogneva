@@ -133,8 +133,19 @@ async fn dispatch_platform_event(
         PlatformKind::Gitee => extract_gitee_issue_number(event, &action, &payload),
     };
     if let Some(issue_number) = issue_number {
-        tracing::info!(issue = issue_number, event = %event, action = %action, "Webhook 事件驱动 issue 处理");
         let mut loop_ = discovery_loop.lock().await;
+        // 机器人自己发评论也会触发 webhook；忽略这种自发事件，避免 bot
+        // 应答自己导致重复追问。
+        if loop_.is_self_comment_event(
+            matches!(platform, PlatformKind::Gitee),
+            event,
+            &action,
+            &payload,
+        ) {
+            tracing::info!(issue = issue_number, "忽略机器人自发评论事件");
+            return (StatusCode::OK, "self event ignored").into_response();
+        }
+        tracing::info!(issue = issue_number, event = %event, action = %action, "Webhook 事件驱动 issue 处理");
         return match loop_.process_issue_event(issue_number).await {
             Ok(true) => (StatusCode::OK, "processed").into_response(),
             Ok(false) => (StatusCode::OK, "issue not found").into_response(),
