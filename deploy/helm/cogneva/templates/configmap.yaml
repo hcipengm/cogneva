@@ -13,6 +13,8 @@ data:
   COGNEVA_DATA_DIR: "/var/lib/cogneva-data"
   COGNEVA_CONFIG_DIR: "/etc/cogneva"
   COGNEVA_APP_DIR: "/opt/cogneva"
+  # WebUI 静态资源目录（镜像内 web 构建产物位置），不设会回退到构建机源码路径
+  COGNEVA_WEB_DIR: "/opt/cogneva/web"
 
   COGNEVA_DB_PROVIDER: "mysql"
   COGNEVA_PG_PROVIDER: "postgres"

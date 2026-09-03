@@ -1,0 +1,45 @@
+# ingress-nginx controller 参数 — 单节点 k3s 形态
+#
+# 背景：k3s 安装时 --disable=traefik，集群入口统一走 ingress-nginx。
+# 采用 hostNetwork：controller 直接在节点上绑定 80/443，源地址路径最短；
+# 也是为家用主机无公网 IP 的场景预留——隧道（frp/rathole 等）出口直接
+# 打节点 80/443，无需 NodePort 映射。
+#
+# 注意：hostNetwork 形态下，依赖"按标签匹配 ingress controller"的
+# NetworkPolicy 放行规则匹配不到该流量（源是节点 IP），参见
+# deploy/k3s/observability/manifests/02-networkpolicy.yaml 头注。
+
+controller:
+  replicaCount: 1
+
+  hostNetwork: true
+  service:
+    type: ClusterIP    # 入口由 hostNetwork 提供，不再需要 NodePort/LoadBalancer
+
+  ingressClassResource:
+    name: nginx
+    default: true      # 设为默认 ingressClass
+  ingressClass: nginx
+
+  config:
+    use-forwarded-headers: "true"   # 隧道/前置代理携带 X-Forwarded-* 时透传
+    proxy-body-size: 64m
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 384Mi
+
+  admissionWebhooks:
+    enabled: true
+    patch:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi

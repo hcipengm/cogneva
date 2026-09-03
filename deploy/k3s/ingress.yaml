@@ -1,3 +1,14 @@
+# Ingress — 主应用对外入口
+#
+# 历史：最初按 traefik 编写（k3s 自带），但本机 k3s 以 --disable=traefik 安装，
+# traefik Middleware CRD 不存在，该清单从未生效（2026-07-28 嵌套测试中因无 CRD
+# 被探测剔除）。现集群入口统一由 ingress-nginx 承担（见
+# deploy/k3s/ingress-nginx-values.yaml），本清单随之改为 nginx 形态。
+#
+# 不设 host 作为兜底路由：任意 Host 头（含隧道直连）都进主应用；
+# 监控组件按各自域名路由（见 observability/manifests/07-ingress-monitoring.yaml）。
+# WebSocket：nginx 原生支持 Upgrade，加长读写超时避免长连接被掐断。
+
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -7,15 +18,13 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: gateway
   annotations:
-    # Traefik is the default ingress controller in K3s
-    traefik.ingress.kubernetes.io/router.entrypoints: web
-    # Enable WebSocket support for the Ugents layer
-    traefik.ingress.kubernetes.io/router.middlewares: "cogneva-websocket-headers@kubernetescrd"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: 64m
 spec:
-  ingressClassName: traefik
+  ingressClassName: nginx
   rules:
-    - host: cogneva.local
-      http:
+    - http:
         paths:
           - path: /
             pathType: Prefix
@@ -24,16 +33,3 @@ spec:
                 name: cogneva
                 port:
                   number: 8080
----
-# Middleware to ensure WebSocket upgrade headers are preserved
-apiVersion: traefik.io/v1alpha1
-kind: Middleware
-metadata:
-  name: websocket-headers
-  namespace: cogneva
-spec:
-  headers:
-    customRequestHeaders:
-      X-Forwarded-Proto: "https"
-    customResponseHeaders:
-      X-Frame-Options: "SAMEORIGIN"

@@ -14,6 +14,9 @@ data:
   COGNEVA_DATA_DIR: "/var/lib/cogneva-data"
   COGNEVA_CONFIG_DIR: "/etc/cogneva"
   COGNEVA_APP_DIR: "/opt/cogneva"
+  # WebUI 静态资源目录（镜像内 web 构建产物位置）。不设则回退到构建机源码路径，
+  # 容器内必然不可读，必须显式指定。
+  COGNEVA_WEB_DIR: "/opt/cogneva/web"
 
   # Database / persistence
   COGNEVA_DB_PROVIDER: "mysql"
