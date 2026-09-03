@@ -584,19 +584,34 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
 
 ### ☸️ 已有集群
 
+已有 K3s 或标准 K8s 集群时，三种方式三选一：
+
+**K3s —— kustomize 静态清单。** 先初始化随机密钥，再部署：
+
 ```bash
-# 已有 K3s 集群：先初始化随机密钥（幂等），再部署清单
-bash deploy/k3s/init-secrets.sh
+bash deploy/k3s/init-secrets.sh   # 幂等：自动随机生成数据库/缓存/内部签名密钥，不覆盖已有值
 kubectl apply -k deploy/k3s/
-
-# 已有标准 K8s 生产集群
-kubectl apply -f deploy/k8s/
-
-# 或使用 Helm（Secret 同样在安装时自动随机生成）
-helm install cogneva deploy/helm/cogneva
 ```
 
-内部实例密钥（PostgreSQL / Redis / 内部签名）在**安装时自动随机生成**，仓库与配置里不携带任何可用密码：K3s 走 `init-secrets.sh`（幂等，重复运行不会覆盖已存在或带外写入的值），Helm 安装时自动复用集群中已有的 Secret、全新安装则随机生成。平台 token、LLM 上游等带外凭证不随部署下发，首次打开 WebUI 经配置向导写入，且只注入安全网关——主应用与沙盒零持有。
+**标准 K8s 生产集群 —— 静态清单。** 面向多节点 + Longhorn + 外部镜像仓库；同样先初始化随机密钥（Secret 不由清单 apply），再部署：
+
+```bash
+bash deploy/k3s/init-secrets.sh   # 通用脚本、仅依赖 kubectl，自动随机生成内部密钥，幂等
+kubectl apply -f deploy/k8s/
+```
+
+**Helm —— 推荐用于生产 / 多环境。** 把整套资源打包成可参数化、可升级回滚的 Chart（K8s 的包管理器，类比 `apt`/`brew`），密钥在安装时自动随机生成，无需先跑脚本：
+
+```bash
+helm install cogneva deploy/helm/cogneva
+helm upgrade cogneva deploy/helm/cogneva     # 升级
+helm rollback cogneva                        # 回滚
+helm uninstall cogneva                       # 卸载
+```
+
+参数（镜像版本、副本、资源、域名、存储类等）集中在 `deploy/helm/cogneva/values.yaml`，用 `--set key=value` 覆盖。
+
+仓库与配置**不携带任何可用密码**：内部密钥（PostgreSQL / Redis / 内部签名）在安装时自动随机生成——K3s 与标准 K8s 静态清单路径先运行 `init-secrets.sh`（幂等，重跑或升级不覆盖已有值），Helm 路径在 `helm install` 时自动随机（升级时复用已部署 Secret、保持不变）。平台 token、LLM 上游等带外凭证不随部署下发，首次打开 WebUI 经配置向导写入，且只注入安全网关——主应用与沙盒零持有。
 
 ### 🔧 传统手动部署
 

@@ -49,3 +49,17 @@ cogneva-deployment.yaml 已对齐当前现实（namespace/探针/secret 键名�
 deploy/k3s 一致，数据卷换 Longhorn PVC，附 ClusterIP Service），可作
 多副本生产部署的起点。cogneva.service 为裸机 systemd 参考（不走容器编排
 时使用），二进制 /opt/cogneva/bin/cogneva、配置 /etc/cogneva。
+
+## 密钥与凭证（生产参考清单）
+
+- 本目录清单**不 apply 任何 Secret**，仓库不含可用密码。部署前先运行
+  `bash deploy/k3s/init-secrets.sh`（脚本通用、仅依赖 kubectl，与 kustomize
+  无关）：自动随机生成 PostgreSQL/Redis/内部签名密钥并创建 cogneva-secrets，
+  幂等、不覆盖已有值；生产也可用 Vault/Sealed Secrets 等外部管理器注入同名键。
+  参考键结构见 `../k3s/examples/secret.yaml`。
+- postgres / redis 已统一引用 cogneva-secrets 的 `pg-password` / `redis-password`，
+  不再单独维护 postgres-secrets。
+- 主应用**零带外凭证**：不挂 OPENAI/ANTHROPIC/GitHub/Gitee 任何 token，LLM 与
+  代码平台凭证只注入安全网关，主应用经 `COGNEVA_GITHUB_API_BASE` /
+  `COGNEVA_GITEE_API_BASE` / `COGNEVA_GIT_PROXY_BASE` 走网关代理。本参考骨架
+  未含安全网关与进化沙盒，完整生产拓扑请用 Helm chart（`deploy/helm/cogneva`）。

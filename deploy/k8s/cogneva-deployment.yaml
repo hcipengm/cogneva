@@ -3,27 +3,21 @@
 # 附带 Service（配合 ingress-nginx.yaml 暴露 api.cogneva.io）。
 # 镜像：默认引用分发器供给的 localhost/cogneva:local；使用外部仓库时
 # 设置为 COGNEVA_IMAGE_REGISTRY 并把 image 改为 <registry>/cogneva:<tag>。
+#
+# 凭证与安全模型（与 k3s / Helm 路径一致）：
+#   - Secret 不由本清单 apply：先运行 bash deploy/k3s/init-secrets.sh（脚本通用，
+#     仅依赖 kubectl，自动随机生成 pg/redis/webhook-internal 内部密钥并创建
+#     cogneva-secrets，幂等、不覆盖已有值）；生产也可用外部 Secret 管理器注入
+#     同名键。参考结构见 deploy/k3s/examples/secret.yaml。
+#   - 主应用零带外凭证：LLM 与 GitHub/Gitee token 只注入安全网关，本 Deployment
+#     不挂任何 OPENAI/ANTHROPIC/平台 token，经网关代理访问外部 API 与 git。
+#   - 本目录是核心工作负载 + 生产基础设施的参考骨架；安全网关、进化沙盒等完整
+#     拓扑请用 Helm chart（deploy/helm/cogneva）。
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: cogneva
----
-# Secret 骨架：部署前用真实值替换（或交给 bootstrap 的 kubectl patch 注入）。
-apiVersion: v1
-kind: Secret
-metadata:
-  name: cogneva-secrets
-  namespace: cogneva
-type: Opaque
-stringData:
-  pg-password: "CHANGE_ME"
-  db-password: "CHANGE_ME"
-  openai-api-key: ""
-  anthropic-api-key: ""
-  github-token: ""
-  github-webhook-secret: ""
-  llm-api-key: ""
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -88,41 +82,33 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
-            - name: OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: openai-api-key
-                  optional: true
-            - name: ANTHROPIC_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: anthropic-api-key
-                  optional: true
+            # 内部实例密钥（init-secrets.sh 安装时自动随机生成）。
             - name: PG_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: pg-password
-            - name: DB_PASSWORD
+            - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
-                  key: db-password
+                  key: redis-password
             - name: COGNEVA_DATABASE_URL
               value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
-            - name: COGNEVA_GITHUB_BOT_TOKEN
+            # LLM 与代码平台凭证只注入安全网关，主应用零持有、经网关代理访问。
+            # 需配合安全网关（本参考骨架未含，完整拓扑见 deploy/helm/cogneva）。
+            - name: COGNEVA_GITHUB_API_BASE
+              value: "http://cogneva-security-gateway:8081/github"
+            - name: COGNEVA_GITEE_API_BASE
+              value: "http://cogneva-security-gateway:8081/gitee"
+            - name: COGNEVA_GIT_PROXY_BASE
+              value: "http://cogneva-security-gateway:8081/git"
+            # webhook 验签在网关完成，本进程只验网关转发的内部 HMAC。
+            - name: COGNEVA_WEBHOOK_INTERNAL_SECRET
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
-                  key: github-token
-                  optional: true
-            - name: COGNEVA_GITHUB_WEBHOOK_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: github-webhook-secret
+                  key: webhook-internal
                   optional: true
           livenessProbe:
             httpGet:

@@ -37,6 +37,7 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: MEILI_MASTER_KEY
+                  optional: true
             - name: MEILI_HTTP_ADDR
               value: "0.0.0.0:7700"
           volumeMounts:

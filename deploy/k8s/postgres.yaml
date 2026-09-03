@@ -1,12 +1,5 @@
-apiVersion: v1
-kind: Secret
-metadata:
-  name: postgres-secrets
-  namespace: cogneva
-type: Opaque
-stringData:
-  password: "${POSTGRES_PASSWORD}"
----
+# PostgreSQL 凭证统一使用 cogneva-secrets/pg-password（由 init-secrets.sh 安装时
+# 自动随机生成），不再单独维护 postgres-secrets。Secret 不由本清单 apply。
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -26,7 +19,7 @@ metadata:
   name: postgres
   namespace: cogneva
 spec:
-  serviceName: postgres-service
+  serviceName: postgres
   replicas: 1
   selector:
     matchLabels:
@@ -43,14 +36,14 @@ spec:
             - containerPort: 5432
           env:
             - name: POSTGRES_USER
-              value: "cogneva"
+              value: "cog_user"
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: postgres-secrets
-                  key: password
+                  name: cogneva-secrets
+                  key: pg-password
             - name: POSTGRES_DB
-              value: "cogneva_users"
+              value: "cogneva"
             - name: PGDATA
               value: "/var/lib/postgresql/data/pgdata"
           volumeMounts:
@@ -64,7 +57,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: postgres-service
+  name: postgres
   namespace: cogneva
 spec:
   selector:

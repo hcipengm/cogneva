@@ -49,6 +49,7 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: GRAFANA_ADMIN_PASSWORD
+                  optional: true
           volumeMounts:
             - name: data
               mountPath: /var/lib/grafana

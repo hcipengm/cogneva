@@ -588,19 +588,34 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
 
 ### ☸️ Existing cluster
 
+With an existing K3s or standard K8s cluster, pick one of three options:
+
+**K3s — kustomize static manifests.** Generate random secrets first, then deploy:
+
 ```bash
-# Existing K3s cluster: generate random secrets first (idempotent), then deploy
-bash deploy/k3s/init-secrets.sh
+bash deploy/k3s/init-secrets.sh   # idempotent: randomizes DB/cache/signing secrets, never overwrites existing values
 kubectl apply -k deploy/k3s/
-
-# Existing standard K8s production cluster
-kubectl apply -f deploy/k8s/
-
-# Or use Helm (Secrets are likewise randomized at install time)
-helm install cogneva deploy/helm/cogneva
 ```
 
-Internal instance secrets (PostgreSQL / Redis / internal signing) are **randomly generated at install time** — the repository and its configs carry no usable password. On K3s this is done by `init-secrets.sh` (idempotent; re-running never overwrites existing or out-of-band values); on Helm, an already-deployed Secret is reused and a fresh install gets random secrets. Out-of-band credentials such as platform tokens and LLM upstreams are never shipped with the deployment — they are written through the WebUI setup wizard on first launch and injected only into the security gateway, leaving the main app and sandboxes with zero credentials.
+**Standard K8s production cluster — static manifests.** Aimed at multi-node + Longhorn + an external image registry; initialize random secrets first (the manifests do not apply a Secret), then deploy:
+
+```bash
+bash deploy/k3s/init-secrets.sh   # generic script, only needs kubectl; randomizes internal secrets, idempotent
+kubectl apply -f deploy/k8s/
+```
+
+**Helm — recommended for production / multi-environment.** Packages the whole stack into a parameterizable, upgradeable/rollbackable Chart (Kubernetes' package manager, akin to `apt`/`brew`); secrets are randomized at install time, no script needed first:
+
+```bash
+helm install cogneva deploy/helm/cogneva
+helm upgrade cogneva deploy/helm/cogneva     # upgrade
+helm rollback cogneva                        # roll back
+helm uninstall cogneva                       # uninstall
+```
+
+Tunables (image tag, replicas, resources, host, storage class, …) live in `deploy/helm/cogneva/values.yaml` and can be overridden with `--set key=value`.
+
+The repository and its configs **carry no usable password**: internal secrets (PostgreSQL / Redis / internal signing) are randomized at install time — on the K3s and standard-K8s static-manifest paths by running `init-secrets.sh` first (idempotent; re-runs and upgrades never overwrite existing values), and on the Helm path at `helm install` (the deployed Secret is reused on upgrade and left unchanged). Out-of-band credentials such as platform tokens and LLM upstreams are never shipped with the deployment — they are written through the WebUI setup wizard on first launch and injected only into the security gateway, leaving the main app and sandboxes with zero credentials.
 
 ### 🔧 Traditional manual deployment
 
