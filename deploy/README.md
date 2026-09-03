@@ -19,11 +19,12 @@ helm install cogneva deploy/helm/cogneva
 helm install cogneva deploy/helm/cogneva \
   --set image.tag=0.1.39 \
   --set secrets.pgPassword=<strong-password> \
-  --set secrets.dbPassword=<strong-password> \
-  --set gateway.replicas=3
+  --set gateway.replicas=2
 ```
 
-关键 values：`backends.{postgres,redis,qdrant,nats}.enabled` 控制是否随 chart 部署后端（禁用即使用外部服务）；`evolution.enabled` 控制自进化 worker；`networkPolicy.enabled` 控制沙盒出站隔离。
+关键 values：`backends.{postgres,redis,qdrant,nats}.enabled` 控制是否随 chart 部署后端（禁用即使用外部服务）；`evolution.enabled` 控制自进化 worker；`sandboxExecutor.enabled` / `buildah.enabled` 控制沙盒执行器与节点镜像构建 DaemonSet；`buildah.containerdSocket` 适配发行版（K3s 为 `/run/k3s/containerd`，标准 containerd 为 `/run/containerd`）；`networkPolicy.enabled` 控制沙盒出站隔离。内部密钥留空即安装时自动随机生成。
+
+> **维护者注意**：应用拓扑权威来源是 `deploy/k3s/`；kustomize 各 overlay（`deploy/k8s/`、`deploy/kustomize/`）都复用它。Helm chart 的 `templates/` 是**独立的平行定义**，在 `deploy/k3s/` 增改工作负载时必须同步改 Helm templates + values。详见 `deploy/k3s/README.md` 的"应用拓扑在哪改"。
 
 ### Kustomize
 
