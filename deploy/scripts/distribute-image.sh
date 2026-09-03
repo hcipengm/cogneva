@@ -12,6 +12,13 @@ TAR="${1:?用法: distribute-image.sh <image.tar.gz>}"
 NS=cogneva
 
 echo "==> 注入新镜像包到分发服务 Pod"
+# 镜像服务是裸 Pod（无控制器），被删后不会自动重建，这里先检查并给出恢复路径
+kubectl -n "$NS" get pod cogneva-image-server >/dev/null 2>&1 || {
+    echo "错误: 镜像服务 Pod cogneva-image-server 不存在。"
+    echo "恢复: 重跑 bootstrap，或从 deploy/k8s/image-distributor.yaml 提取镜像服务段、"
+    echo "      把 __BUSYBOX_IMAGE__ 替换为可用 busybox 镜像后 kubectl apply。"
+    exit 1
+}
 kubectl -n "$NS" wait --for=condition=Ready pod/cogneva-image-server --timeout=600s
 kubectl -n "$NS" cp "$TAR" cogneva-image-server:/share/image.tar.gz
 
@@ -21,7 +28,7 @@ kubectl -n "$NS" rollout status daemonset/cogneva-image-distributor --timeout=90
 
 if [ "${SKIP_RESTART:-0}" != "1" ]; then
     echo "==> 滚动重启应用负载"
-    kubectl -n "$NS" rollout restart deployment/cogneva deployment/cogneva-security-gateway deployment/cogneva-evolution 2>/dev/null || \
+    kubectl -n "$NS" rollout restart deployment/cogneva deployment/cogneva-security-gateway deployment/cogneva-evolution deployment/cogneva-sandbox-executor 2>/dev/null || \
     kubectl -n "$NS" rollout restart deployment
     kubectl -n "$NS" rollout status deployment/cogneva --timeout=300s
 fi

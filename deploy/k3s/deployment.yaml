@@ -8,7 +8,9 @@ metadata:
     app.kubernetes.io/component: gateway
     app.kubernetes.io/version: "0.1.22"
 spec:
-  replicas: 2
+  # 单副本：当前集群为单节点，双副本共享同一故障域没有可用性收益，
+  # 只放大内存占用与凭证副本数。扩到多节点后再调回 2。
+  replicas: 1
   strategy:
     type: RollingUpdate
     rollingUpdate:

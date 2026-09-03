@@ -9,7 +9,8 @@ image:
   pullPolicy: IfNotPresent
 
 gateway:
-  replicas: 2
+  # 单副本：单节点集群双副本无可用性收益，只放大内存与凭证副本；多节点后调回 2
+  replicas: 1
   resources:
     requests:
       cpu: 250m
