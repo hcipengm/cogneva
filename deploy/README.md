@@ -4,6 +4,55 @@ Cross-platform deployment instructions for Linux (systemd), macOS (launchd), and
 
 ---
 
+## 先看清：用户路径只有一条，目录不是按路径分的
+
+**正常使用只跑元启动**（仓库根 `bootstrap.sh` / Windows `bootstrap.ps1`），全程无人
+值守：裸机它自动装 K3s，已有集群它直接复用，然后自动选材料、选投递方式（见下文
+Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择——那些是**内部材料
+形态**，不是用户路径。
+
+所以 `deploy/` 下的文件夹是**按"权威源 / 产物 / 参考 / 工具 / 非容器部署"分类组织
+的，不是一条路径一个文件夹**——不要用"几条部署路径就该有几个文件夹"去数它。早期
+文档曾把"裸机自举 + K3s / 标准 K8s / Helm 三条集群路径"讲成 4 条并列路径，那套说法
+已废弃：K8s 场景下用户路径只有元启动 1 条（内部 2 种投递机制），`systemd`/`launchd`
+则是"完全不用 K8s、直接在宿主机跑二进制"的另一种传统部署，与 K8s 路线互斥。当前 7
+个文件夹各管一件事：
+
+| 目录 | 做什么 / 实现什么功能 | 角色与消费方 |
+|---|---|---|
+| **`helm/cogneva/`** | **应用拓扑唯一权威源（Helm chart）**：`values.yaml` 默认参数、`profiles/` 三种形态（`k3s-single`/`k3s-multi`/`k8s-standard`）、`templates/` 全部 K8s 资源、`files/` ConfigMap 原文（cogneva.json、prompts） | **唯一手改入口**；改应用拓扑只改这里 |
+| **`rendered/<profile>/`** | chart 的 **CI 预渲染产物**（38/39/38 个 standalone YAML），由 `scripts/render-deploy.sh` 生成、随仓库提交 | 元启动 **apply 投递**消费；CI 新鲜度门禁防漂移；**不要手改** |
+| **`k3s/`** | **K3s 静态清单**：完整应用拓扑的静态 YAML + `observability/` 监控栈（Prometheus/Grafana/Loki/Jaeger 的 helm values 与装卸脚本）+ `examples/`、`swap-image.sh`、`sync-git-remote.sh` | **不是权威源**：是 chart k3s profile 的 **parity 基线**，兼集群内自进化 GitOps 拉取端的**运行时消费物**（cog-reflection 运行时 apply 克隆仓库里的这些文件）；由 `scripts/check-deploy-parity.sh` 字段级门禁对齐 |
+| **`k8s/`** | **标准 K8s 的基础设施参考清单**（不是应用拓扑）：`longhorn`/`argocd`/`cert-manager`/`ingress-nginx`/`metallb`/`velero`/`monitoring/` 集群级组件按需单独 apply；`image-distributor.yaml` 多节点镜像分发器（**元启动 `include_str!` 内嵌模板**）；`meilisearch.yaml` 可选搜索参考；`cogneva.service` systemd 参考副本 | 标准 K8s 的**应用拓扑不在这里**——走 chart 的 `k8s-standard` profile（渲染在 `rendered/k8s-standard/`）；本目录只有集群周边设施 |
+| **`scripts/`** | 部署工具脚本（见下表） | CI 与元启动调用 |
+| **`systemd/`** | **Linux 裸机（不用 K8s）传统部署**的 systemd unit，直接把二进制跑成宿主服务 | 非容器路线 |
+| **`launchd/`** | **macOS 裸机传统部署**的 launchd plist | 非容器路线（Windows 服务用 `sc.exe`，命令见后文，无独立文件夹） |
+
+`scripts/` 内各脚本：
+
+| 脚本 | 功能 |
+|---|---|
+| `render-deploy.sh` | 用 `helm template -f profiles/<p>.yaml` 把 chart 渲染进 `rendered/<profile>/`；`--check` 做 CI 新鲜度门禁（重渲染有 diff 即红） |
+| `check-deploy-parity.sh` | chart k3s profile 渲染 vs `k3s/` 静态清单的**字段级 parity** 门禁（38 资源基线，env/卷/挂载/端口/SA 全比对），CI 强制 |
+| `init-secrets.sh` | 安装时**随机生成**内部密钥（pg/redis/内部签名）并创建 Secret；幂等不覆盖已有值；元启动 apply 前自动跑 |
+| `distribute-image.sh` | 多节点镜像增量升级：把镜像 tar 分发到全部节点并滚动重启 |
+| `build-release-image.sh` | release 预构建运行时镜像的**本机单源**构建（产物 tar.gz + sha256） |
+| `verify-firecracker.sh` | Firecracker 微虚拟机沙盒的真机端到端验证 |
+
+### 关于 `k3s/` `k8s/` `helm/` 三个文件夹（不是三条可选路径）
+
+- **`helm/` 是权威源**，`rendered/` 是它渲染出来的产物，`k3s/` 是它在 K3s 形态下的
+  静态基线 + 自进化运行时消费物——三者是"源 → 产物 → 基线/消费物"的关系，不是三选一。
+- **`k8s/` 不放应用清单**，只放标准 K8s 集群周边的基础设施参考；标准 K8s 部署应用走
+  chart 的 `k8s-standard` profile。
+- **`deploy/kustomize/` 已删除**：那是早期用 kustomize overlay（base + dev/prod、
+  以及 `deploy/k8s/kustomization.yaml` 复用 `../k3s` 的生产 overlay）做拓扑复用的
+  尝试；单一数据源收敛后，环境差异全部下沉为 chart 的 profile values，overlay 整体
+  退出（2026-09-04，commit 3f6ca0b）。现在看到任何"kustomize overlay / dev/prod
+  变体"的说法都是历史，改拓扑统一改 chart。
+
+---
+
 ## Kubernetes
 
 **正常使用只需跑元启动**（仓库根 `bootstrap.sh` / Windows `bootstrap.ps1`）：
