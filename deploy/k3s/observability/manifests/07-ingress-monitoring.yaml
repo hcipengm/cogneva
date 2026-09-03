@@ -1,0 +1,46 @@
+# Ingress — 监控组件入口（grafana / prometheus），按域名路由
+#
+# 访问方式：在客户端 /etc/hosts 或内网 DNS 把两个域名指到承载
+# ingress-nginx 的节点（或隧道出口），例如：
+#   <节点IP>  grafana.cogneva.local prometheus.cogneva.local
+# 家用主机无公网 IP 场景下，节点地址即隧道本机出口。
+#
+# 安全提示：prometheus 未做鉴权，此入口只应暴露给内网/隧道，勿对公网开放。
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: grafana.cogneva.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kube-prometheus-stack-grafana   # grafana 子 chart 不吃 fullnameOverride，名随 release
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: prometheus.cogneva.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cog-observability-prometheus
+                port:
+                  number: 9090

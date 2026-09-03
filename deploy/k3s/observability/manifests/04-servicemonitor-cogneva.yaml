@@ -1,11 +1,6 @@
 # ServiceMonitor — 让 Prometheus 自动发现 cogneva 指标端点
-# 要求 cogneva Deployment 的 Pod 带有以下标签和注解：
-#   labels:
-#     app: cogneva
-#   annotations:
-#     prometheus.io/scrape: "true"
-#     prometheus.io/port: "8080"
-#     prometheus.io/path: "/metrics"
+# 匹配 cogneva 命名空间内标签为 app.kubernetes.io/name=cogneva 的 Service
+# （主应用 Service 的 8080 端口名为 http，/metrics 已验证可用）。
 
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -17,13 +12,13 @@ metadata:
 spec:
   namespaceSelector:
     matchNames:
-      - default
+      - cogneva
   selector:
     matchLabels:
-      app: cogneva
+      app.kubernetes.io/name: cogneva
   endpoints:
     - port: http
       path: /metrics
-      interval: 10s
-      scrapeTimeout: 5s
+      interval: 30s
+      scrapeTimeout: 10s
       honorLabels: true

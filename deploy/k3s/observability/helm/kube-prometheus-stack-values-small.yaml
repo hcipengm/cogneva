@@ -1,0 +1,175 @@
+# kube-prometheus-stack 缩配 Values —— 单节点 4C/7.5Gi、兼跑构建的本机可落地版本
+#
+# 与商用全量版（kube-prometheus-stack-values.yaml）的差异：
+#   - Prometheus 单副本、保留 7 天 / 8Gi、内存上限 1.5Gi（全量版是双副本 30 天 / 50GB / 4Gi）
+#   - alertmanager 关闭：本机没有告警出口（无 SMTP/Slack），装了也是空转；
+#     上生产有告警渠道后按全量版打开
+#   - 不配 loki / jaeger 数据源（日志与链路追踪本轮不部署）
+#   - 不挂 grafana 插件（启动时要去 grafana.com 下载，国内网络不稳定）
+#   - ingress 对象一律不在 values 里开，统一由 deploy/k3s/ingress.yaml 与
+#     manifests/07-ingress-monitoring.yaml 管理（ingress-nginx 作为 ingressClass）
+#   - k3s 不暴露 etcd/controller-manager/scheduler/proxy 指标，关掉对应服务发现
+#     避免 Targets 页面出现成片 DOWN；coredns 同理（k3s 未开 prometheus 插件）
+#
+# 安装方式见 scripts/install.sh（--profile small）。
+
+nameOverride: "cog-observability"
+fullnameOverride: "cog-observability"
+
+namespaceOverride: "monitoring"
+
+# ─── Prometheus ────────────────────────────────────────────────────
+prometheus:
+  enabled: true
+
+  prometheusSpec:
+    replicas: 1
+    retention: 7d
+    retentionSize: "8GiB"   # CRD 正则要求带 B 后缀
+    walCompression: true
+
+    resources:
+      requests:
+        cpu: 200m
+        memory: 768Mi
+      limits:
+        cpu: "1"
+        memory: 1536Mi
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: "local-path"
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+    # 拾取任意命名空间的 ServiceMonitor / PodMonitor / PrometheusRule
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelector: {}
+    serviceMonitorNamespaceSelector: {}
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelector: {}
+    podMonitorNamespaceSelector: {}
+    ruleSelectorNilUsesHelmValues: false
+    ruleSelector: {}
+    ruleNamespaceSelector: {}
+
+  service:
+    type: ClusterIP
+    port: 9090
+
+  ingress:
+    enabled: false
+
+# ─── Alertmanager（本机关闭）──────────────────────────────────────
+alertmanager:
+  enabled: false
+
+# ─── Grafana ───────────────────────────────────────────────────────
+grafana:
+  enabled: true
+  replicas: 1
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      cpu: 300m
+      memory: 384Mi
+
+  persistence:
+    enabled: true
+    storageClassName: "local-path"
+    accessModes: ["ReadWriteOnce"]
+    size: 2Gi
+
+  admin:
+    existingSecret: "grafana-admin-credentials"
+    userKey: admin-user
+    passwordKey: admin-password
+
+  ingress:
+    enabled: false
+
+  # sidecar 自动注入本 chart 的 Prometheus 数据源，无需手写
+  sidecar:
+    dashboards:
+      enabled: false
+
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        # dashboardsConfigMaps 会把 configmap 挂到 /var/lib/grafana/dashboards/<provider 名>，
+        # 因此这里 type 必须是 file（Grafana 不认识 configmap 类型）
+        - name: 'cogneva'
+          orgId: 1
+          folder: 'Cogneva'
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/cogneva
+  dashboardsConfigMaps:
+    cogneva: "cogneva-dashboards"
+
+# ─── node-exporter / kube-state-metrics ───────────────────────────
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 30m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 30m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# ─── prometheusOperator ──────────────────────────────────────────
+prometheusOperator:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 384Mi
+
+  admissionWebhooks:
+    patch:
+      enabled: true
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+
+# ─── k3s 组件服务发现 ────────────────────────────────────────────
+coreDns:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+# ─── 告警/记录规则 ────────────────────────────────────────────────
+# 全量保留：规则只是 ConfigMap，被停用的组件（etcd 等）对应规则自然无数据
+defaultRules:
+  create: true

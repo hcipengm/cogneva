@@ -1,5 +1,12 @@
 # NetworkPolicy — 商用网络隔离
 # 限制 monitoring namespace 内外的网络访问
+#
+# 注意：首条策略对 monitoring 全体 Pod 做 ingress 默认拒绝，放行来源按标签匹配
+# ingress controller。若 ingress controller 以 hostNetwork 模式运行（如本机
+# ingress-nginx 的部署方式），其流量源地址是节点 IP，无法被
+# namespaceSelector+podSelector 匹配，会把反代流量全部拦下。
+# 因此：hostNetwork 形态暂不应用本文件（见 scripts/install.sh），
+# 生产形态（controller 以 Pod 网络运行）再启用。
 
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -12,7 +19,7 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # 允许 Ingress Controller (Traefik) 访问 Grafana/Prometheus/Jaeger/Alertmanager
+    # 允许 Ingress Controller 访问 Grafana/Prometheus/Jaeger/Alertmanager
     - from:
         - namespaceSelector:
             matchLabels:
@@ -20,6 +27,12 @@ spec:
           podSelector:
             matchLabels:
               app.kubernetes.io/name: traefik
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
       ports:
         - protocol: TCP
           port: 3000    # Grafana
@@ -52,7 +65,7 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              name: default
+              kubernetes.io/metadata.name: cogneva
       ports:
         - protocol: TCP
           port: 9090

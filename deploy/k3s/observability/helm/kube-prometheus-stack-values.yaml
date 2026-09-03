@@ -326,10 +326,12 @@ grafana:
     dashboardproviders.yaml:
       apiVersion: 1
       providers:
+        # dashboardsConfigMaps 会把 configmap 挂到 /var/lib/grafana/dashboards/<provider 名>，
+        # provider type 必须是 file（Grafana 不识别 configmap 类型）
         - name: 'cogneva'
           orgId: 1
           folder: 'Cogneva'
-          type: configmap
+          type: file
           disableDeletion: false
           editable: true
           options:

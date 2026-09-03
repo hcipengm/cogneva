@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# SF-Network 可观测性栈 — K3s 生产环境一键安装脚本
-# 部署全部 16 项 DevOps 组件
+# Cogneva 可观测性栈一键安装脚本
 #
 # 用法:
-#   chmod +x install.sh
-#   ./install.sh
+#   ./install.sh            # 默认 small 档：prometheus+grafana+node-exporter+kube-state-metrics，
+#                           # 适配 4C/7.5G 单节点（本机）
+#   PROFILE=full ./install.sh   # 全量档：加 alertmanager+loki+jaeger，面向多节点生产
 
 set -euo pipefail
+
+PROFILE="${PROFILE:-small}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELM_DIR="${SCRIPT_DIR}/../helm"
@@ -57,10 +59,20 @@ add_helm_repos() {
 
 # ─── 部署基础 Manifests ───────────────────────────────────────────
 deploy_manifests() {
-    log_info "部署 K8s 基础资源 (Namespace / NetworkPolicy / Secrets / ServiceMonitor)..."
+    log_info "部署 K8s 基础资源 (Namespace / Secrets / ServiceMonitor / Dashboard)..."
 
-    # 按文件名排序顺序应用
+    # 不应用的两个文件及原因：
+    #   02-networkpolicy — 首条策略对 monitoring 全体 Pod 做 ingress 默认拒绝，
+    #     但放行来源按 Pod 标签匹配 ingress controller；hostNetwork 模式的
+    #     ingress-nginx 源地址是节点 IP，匹配不上，会把反代流量全拦下。
+    #     生产形态（controller 非 hostNetwork）再启用。
+    #   05-podmonitor — 与 04-servicemonitor 二选一的替代方案，避免双份抓取。
     for f in "${MANIFESTS_DIR}"/*.yaml; do
+        case "$(basename "$f")" in
+            02-networkpolicy.yaml|05-podmonitor-cogneva.yaml)
+                log_warn "跳过: $(basename "$f")"
+                continue ;;
+        esac
         log_info "应用: $(basename "$f")"
         kubectl apply -f "$f"
     done
@@ -70,12 +82,18 @@ deploy_manifests() {
 
 # ─── 部署 kube-prometheus-stack ───────────────────────────────────
 deploy_prometheus_stack() {
-    log_info "部署 kube-prometheus-stack (Prometheus + Grafana + Alertmanager + node-exporter + kube-state-metrics)..."
+    if [ "${PROFILE}" = "full" ]; then
+        VALUES_FILE="${HELM_DIR}/kube-prometheus-stack-values.yaml"
+        log_info "部署 kube-prometheus-stack 全量档（含 alertmanager 双副本）..."
+    else
+        VALUES_FILE="${HELM_DIR}/kube-prometheus-stack-values-small.yaml"
+        log_info "部署 kube-prometheus-stack 缩配档（Prometheus + Grafana + node-exporter + kube-state-metrics）..."
+    fi
 
     helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         --namespace "${NAMESPACE}" \
         --create-namespace \
-        --values "${HELM_DIR}/kube-prometheus-stack-values.yaml" \
+        --values "${VALUES_FILE}" \
         --wait \
         --timeout 600s
 
@@ -143,8 +161,12 @@ main() {
     add_helm_repos
     deploy_manifests
     deploy_prometheus_stack
-    deploy_loki
-    deploy_jaeger
+    if [ "${PROFILE}" = "full" ]; then
+        deploy_loki
+        deploy_jaeger
+    else
+        log_info "缩配档跳过 Loki / Jaeger（日志与链路追踪生产档再上）"
+    fi
     verify_deployment
 
     echo ""
