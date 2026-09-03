@@ -67,16 +67,18 @@ backends:
 # 明文默认值仅用于开发；生产请用 --set-file 或外部 Secret（然后 secrets.create=false）
 secrets:
   create: true
-  pgPassword: "changeme"
+  # 内部实例密钥留空：全新安装时自动随机生成，升级时复用已部署 Secret 中的值。
+  # 仅在需要跨实例固定同一密码时才显式填写；勿在 values 里提交可用密码。
+  pgPassword: ""
   redisPassword: ""
+  webhookInternal: ""
   llmApiKey: ""
-  # 网关凭证：真实值带外写入，默认空（未配置时对应功能 fail-closed）。
+  # 带外凭证（网关专用）：真实值带外写入，默认空（未配置时对应功能 fail-closed）。
   llmUpstreams: ""
   githubToken: ""
   giteeToken: ""
   githubWebhookSecret: ""
   giteeWebhookToken: ""
-  webhookInternal: ""
 
 ingress:
   enabled: true

@@ -4,7 +4,8 @@ resources:
   - namespace.yaml
   - storage-class.yaml
   - configmap.yaml
-  - secret.yaml
+  # Secret 不在此 apply：内部密钥由 init-secrets.sh 随机生成，带外凭证由向导写入，
+  # 避免仓库弱密码下发与 apply 空占位覆盖真值。参考结构见 examples/secret.yaml。
   - cogneva-json-configmap.yaml
   - prompts-configmap.yaml
   - deployment.yaml
