@@ -22,9 +22,9 @@ helm install cogneva deploy/helm/cogneva \
   --set gateway.replicas=2
 ```
 
-关键 values：`backends.{postgres,redis,qdrant,nats}.enabled` 控制是否随 chart 部署后端（禁用即使用外部服务）；`evolution.enabled` 控制自进化 worker；`sandboxExecutor.enabled` / `buildah.enabled` 控制沙盒执行器与节点镜像构建 DaemonSet；`buildah.containerdSocket` 适配发行版（K3s 为 `/run/k3s/containerd`，标准 containerd 为 `/run/containerd`）；`networkPolicy.enabled` 控制沙盒出站隔离。内部密钥留空即安装时自动随机生成。
+关键 values：`backends.{postgres,redis,qdrant,nats}.enabled` 控制是否随 chart 部署后端（禁用即使用外部服务）；`evolution.enabled` 控制自进化 worker，`evolution.gitRemote.mode`（`hostPath` 单节点 / `pvc` 多节点）控制中央 bare 仓库供给；`sandboxExecutor.enabled` / `buildah.enabled` 控制沙盒执行器与节点镜像构建 DaemonSet；`buildah.containerdSocket` 适配发行版（K3s 为 `/run/k3s/containerd`，标准 containerd 为 `/run/containerd`）；`storage.localRetainClass.create`（K3s 专有 Retain StorageClass，标准 K8s 置 false）与 `storage.evolution`/`storage.retain` 控制各卷存储类（留空跟随集群默认 SC）；`gitops.kubectlBin.enabled`+`gitops.kubectlBin.hostPath` 控制主应用 GitOps 拉取端的 Pod 内 kubectl（K3s 挂宿主 k3s 二进制，节点无可用二进制时置 false）；`webhook.nodePort` 为平台 webhook 入口；`ingress.className`（`nginx` 默认 / `traefik` 自动附带 WebSocket Middleware）；`networkPolicy.enabled` 控制沙盒出站隔离。内部密钥留空即安装时自动随机生成；渲染清单 apply 的场景（如引导器）用 `--set secrets.create=false`，密钥改由 init-secrets.sh 生成。
 
-> **维护者注意**：应用拓扑权威来源是 `deploy/k3s/`；kustomize 各 overlay（`deploy/k8s/`、`deploy/kustomize/`）都复用它。Helm chart 的 `templates/` 是**独立的平行定义**，在 `deploy/k3s/` 增改工作负载时必须同步改 Helm templates + values。详见 `deploy/k3s/README.md` 的"应用拓扑在哪改"。
+> **维护者注意**：应用拓扑正在收敛为 Helm chart 单一权威源（`deploy/helm/cogneva/`），`deploy/k3s/` 静态清单是引导器消费的渲染产物。chart 的 k3s profile 渲染结果与 `deploy/k3s/` 必须资源集合与工作负载字段（env/卷/挂载/端口/SA）全对齐——CI 的 Deploy Manifest Parity 任务与 `deploy/scripts/check-deploy-parity.sh` 强制校验，改任一侧后本地必须跑通该脚本。详见 `deploy/k3s/README.md` 的"应用拓扑在哪改"。
 
 ### Kustomize
 

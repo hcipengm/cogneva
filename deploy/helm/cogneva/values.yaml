@@ -1,7 +1,18 @@
 global:
   namespace: cogneva
-  # K3s 默认 local-path；生产可换 longhorn 等
-  storageClass: local-path
+
+# 存储类适配（空字符串 = 不设置 storageClassName，跟随集群默认 SC）：
+# postgres/redis/qdrant 一律跟随默认 SC（K3s 默认 local-path，生产设 Longhorn 为默认）；
+# evolution 卷显式 local-path；nats 与多节点 git-remote 用 Retain SC 防误删。
+storage:
+  # K3s 专有 Retain StorageClass（provisioner rancher.io/local-path，标准 K8s 无此
+  # provisioner）：k3s profile 开启；标准 K8s 置 create:false 并把 retain 置空。
+  localRetainClass:
+    create: true
+    name: cogneva-local-retain
+    provisioner: rancher.io/local-path
+  evolution: "local-path"
+  retain: "cogneva-local-retain"
 
 image:
   repository: localhost/cogneva
@@ -31,10 +42,9 @@ evolution:
   # hostPath = 单节点开发态直挂宿主 bare 仓库（宿主 <-> Pod 双向同步通道）
   gitRemote:
     mode: pvc
-    hostPath: /root/omc_workspace/cogneva.git
+    hostPath: /var/lib/cogneva-data/git-remote
     seedUrl: https://github.com/hcipengm/cogneva.git
     storage: 5Gi
-  configHostPath: /root/omc_workspace/cogneva/cogneva.json
   sandboxStorage: 20Gi
   sourceStorage: 10Gi
   resources:
@@ -111,10 +121,29 @@ secrets:
   githubWebhookSecret: ""
   giteeWebhookToken: ""
 
+# 主应用 GitOps 拉取端：poll 中央 bare 仓库的 evolution-release 分支，
+# L0 配置热更 / L1 金丝雀在本集群闭环（沙盒推送端只写 bare 仓库，零集群凭证）。
+gitops:
+  enabled: true
+  clusterName: main
+  # 拉取端在 Pod 内调 kubectl（L0 apply / L1 set image、rollout）。K3s 节点挂宿主
+  # k3s 二进制即可（argv[0]=kubectl 的多调用二进制，版本与集群天然一致）；标准 K8s
+  # 节点挂 /usr/bin/kubectl；节点无可复用二进制时置 false（拉取端同步关闭，避免空转报错）。
+  kubectlBin:
+    enabled: false
+    hostPath: /usr/local/bin/k3s
+
+# 平台 webhook 集群入口（GitHub + Gitee 共用）：NodePort 转发安全网关 8082。
+webhook:
+  nodePort: 30991
+
 ingress:
   enabled: true
-  className: traefik
-  host: cogneva.local
+  # nginx 为默认（k3s 现网入口统一 ingress-nginx）；traefik 时自动附带
+  # WebSocket Middleware 与注解（需集群存在 traefik CRD）。
+  className: nginx
+  # 空 = 兜底路由（任意 Host 头进主应用）；设值后按 host 匹配。
+  host: ""
 
 networkPolicy:
   enabled: true

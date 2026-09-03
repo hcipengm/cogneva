@@ -39,6 +39,9 @@ spec:
             - name: llm-proxy
               containerPort: 8081
               protocol: TCP
+            - name: webhook
+              containerPort: 8082
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: cogneva-config

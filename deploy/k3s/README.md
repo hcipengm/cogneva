@@ -14,15 +14,15 @@ buildah DaemonSet、nats/postgres/redis/qdrant、NetworkPolicy、Ingress 都定�
 - `deploy/kustomize/`（base + overlays/dev|prod）同样 `resources: [../../k3s]` 指向本目录，
   只叠加副本数 / 镜像 tag 变体。
 
-**唯一的平行定义是 Helm Chart** `deploy/helm/cogneva/templates/`：它不引用本目录，而是
-独立模板化了同一套拓扑。因此**在本目录新增或改动一个工作负载时，必须同步改 Helm
-templates 与 `deploy/helm/cogneva/values.yaml`**（开关、资源、镜像等参数走 values），
-否则 Helm 路径会与 kustomize 路径能力分叉。改完用下面两条命令自检工作负载集合一致：
+**Helm Chart** `deploy/helm/cogneva/templates/` 正在收敛为拓扑的唯一权威源（本目录
+静态清单将成为 chart k3s profile 的渲染产物，供引导器消费）。过渡期内两边并存，
+**在任何一侧新增或改动工作负载时，必须同步改另一侧与 `deploy/helm/cogneva/values.yaml`**
+（开关、资源、镜像、环境差异走 values），改完必须跑 parity 校验（CI 同名任务也强制）：
 
 ```bash
-kubectl kustomize deploy/k8s | grep -E '^kind:' | sort | uniq -c   # kustomize 侧
-helm template deploy/helm/cogneva | grep -E '^kind:' | sort | uniq -c  # helm 侧
-# 两者的 DaemonSet/Deployment/StatefulSet 数量应一致（1 DS / 6 Deploy / 2 STS）
+bash deploy/scripts/check-deploy-parity.sh
+# 渲染 chart 的 k3s profile 与本目录 kustomize 结果对比：资源集合 + 每个工作负载的
+# env/卷/挂载/端口/ServiceAccount 字段必须全对齐，差异即失败（38 个资源基线）。
 ```
 
 kustomize overlay 改容器挂载路径时注意：strategic-merge 中 `volumes` 按 `name` 合并，

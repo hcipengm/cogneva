@@ -22,7 +22,6 @@ data:
   QDRANT_URL: "http://qdrant.{{ include "cogneva.namespace" . }}.svc.cluster.local:6334"
   COGNEVA_MEDIA_PROVIDER: "local-sfu"
   COGNEVA_STORAGE_PROVIDER: "local-fs"
-  COGNEVA_REDIS_URL: "redis://redis-0.redis.{{ include "cogneva.namespace" . }}.svc.cluster.local:6379"
 
   COGNEVA_WORKSPACE_ID: "default"
   COGNEVA_CONSUMER_GROUP: "cogneva"

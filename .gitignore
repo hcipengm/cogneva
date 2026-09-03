@@ -5,6 +5,8 @@ dist/
 
 # Local runtime config (template: cogneva.example.json)
 cogneva.json
+# Exception: the Helm chart ships its default cogneva.json via .Files.Get
+!deploy/helm/cogneva/files/cogneva.json
 
 # Bootstrap runtime artifacts (machine-specific, never commit)
 intent_config.yaml

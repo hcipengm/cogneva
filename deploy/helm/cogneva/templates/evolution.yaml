@@ -13,7 +13,9 @@ spec:
   resources:
     requests:
       storage: {{ .Values.evolution.sandboxStorage }}
-  storageClassName: {{ .Values.global.storageClass }}
+  {{- with .Values.storage.evolution }}
+  storageClassName: {{ . }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -29,7 +31,9 @@ spec:
   resources:
     requests:
       storage: {{ .Values.evolution.sourceStorage }}
-  storageClassName: {{ .Values.global.storageClass }}
+  {{- with .Values.storage.evolution }}
+  storageClassName: {{ . }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -157,6 +161,26 @@ spec:
           env:
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
+            # 沙盒零凭证：LLM/平台流量经安全网关透传，真实 key 只在网关 Pod。
+            # 缺这三个 env 时 Provider 直连公网平台——集群仅网关在 egress 白名单，直连必败。
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: pg-password
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: redis-password
+            - name: COGNEVA_DATABASE_URL
+              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+            - name: COGNEVA_GITHUB_API_BASE
+              value: "http://cogneva-security-gateway:8081/github"
+            - name: COGNEVA_GITEE_API_BASE
+              value: "http://cogneva-security-gateway:8081/gitee"
+            - name: COGNEVA_GIT_PROXY_BASE
+              value: "http://cogneva-security-gateway:8081/git"
           lifecycle:
             postStart:
               exec:
@@ -179,7 +203,9 @@ spec:
               mountPath: /host-git
               readOnly: false
             - name: cogneva-json
-              mountPath: /etc/cogneva/cogneva.json
+              # 必须挂目录：挂成 /etc/cogneva/cogneva.json 且无 subPath 会把
+              # ConfigMap 挂成同名目录，进程读文件失败静默回退默认配置
+              mountPath: /etc/cogneva
               readOnly: true
           resources:
             {{- toYaml .Values.evolution.resources | nindent 12 }}
@@ -201,9 +227,8 @@ spec:
             type: Directory
           {{- end }}
         - name: cogneva-json
-          hostPath:
-            path: {{ .Values.evolution.configHostPath }}
-            type: File
+          configMap:
+            name: cogneva-json
 {{- if eq .Values.evolution.gitRemote.mode "pvc" }}
 ---
 apiVersion: v1
@@ -216,6 +241,9 @@ metadata:
     app.kubernetes.io/component: evolution
 spec:
   accessModes: ["ReadWriteOnce"]
+  {{- with .Values.storage.retain }}
+  storageClassName: {{ . }}
+  {{- end }}
   resources:
     requests:
       storage: {{ .Values.evolution.gitRemote.storage }}

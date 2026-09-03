@@ -67,7 +67,6 @@ spec:
         resources:
           requests:
             storage: {{ .Values.backends.postgres.storage }}
-        storageClassName: {{ .Values.global.storageClass }}
 ---
 apiVersion: v1
 kind: Service

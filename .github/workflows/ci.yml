@@ -123,6 +123,21 @@ jobs:
           files: ./cobertura.xml
           fail_ci_if_error: false
 
+  # 部署拓扑 parity：Helm chart 是唯一权威源，其 k3s profile 渲染结果必须与
+  # deploy/k3s/ 静态清单（bootstrap 消费）资源集合与工作负载字段全对齐，
+  # 防止 chart 与静态清单静默分叉（deploy/scripts/check-deploy-parity.sh）。
+  deploy-parity:
+    name: Deploy Manifest Parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
+      - name: Check helm/kustomize parity
+        run: bash deploy/scripts/check-deploy-parity.sh
+
   bootstrap-cross-platform:
     name: Bootstrap Cross-Platform Check
     strategy:

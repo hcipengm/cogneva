@@ -1,0 +1,239 @@
+# Cogneva System Prompts
+# 所有 system prompt 集中管理，支持运行时热加载。
+# 代码中禁止出现任何硬编码 prompt 字符串。
+
+prompts:
+  # ==========================================================================
+  # cog-agent
+  # ==========================================================================
+  agent:default:
+    content: |
+      You are a helpful assistant.
+    version: "1.0.0"
+    description: "Default system prompt for generic agent tasks"
+    tags: ["agent", "default"]
+    active: true
+
+  agent:reflection_engine:
+    content: |
+      You are a reflection engine. Analyze the following conversation summaries
+      and generate higher-order insights such as cross-session patterns,
+      user preferences, and emerging persona traits.
+
+      Summaries:
+      {{ summaries }}
+
+      Return your insights as JSON conforming to the provided schema.
+      Each insight should have a category, text, importance (1-10), and confidence (0.0-1.0).
+    version: "1.0.0"
+    description: "Reflection engine prompt for cross-session insight generation"
+    tags: ["agent", "reflection"]
+    active: true
+
+  agent:planner:
+    content: |
+      You are a custom planning expert.
+    version: "1.0.0"
+    description: "Planner agent system prompt"
+    tags: ["agent", "planning"]
+    active: true
+
+  agent:evaluator:
+    content: |
+      Evaluate quickly.
+    version: "1.0.0"
+    description: "Fast evaluator system prompt"
+    tags: ["agent", "evaluation"]
+    active: true
+
+  # ==========================================================================
+  # cog-memory
+  # ==========================================================================
+  memory:extract:
+    content: |
+      Extract structured information from the following conversation or text.
+      Identify entities, relations between them, and any events mentioned.
+      Rate the importance of each extracted item on a scale of 1-10,
+      where 10 is critical information that will be valuable in future conversations,
+      and 1 is trivial.
+
+      {{ text }}
+    version: "1.0.0"
+    description: "Memory extractor prompt for structured information extraction"
+    tags: ["memory", "extraction"]
+    active: true
+
+  memory:summarize:
+    content: |
+      Summarize the following conversation or text, focusing on key decisions,
+      lessons learned, user preferences, and actionable insights.
+      Keep the summary concise (1-3 sentences).
+      Rate the importance of the summary on a scale of 1-10,
+      where 10 is critical information that will be valuable in future conversations,
+      and 1 is trivial.
+
+      {{ text }}
+    version: "1.0.0"
+    description: "Memory summarizer prompt for concise summary generation"
+    tags: ["memory", "summarization"]
+    active: true
+
+  # ==========================================================================
+  # cog-reflection
+  # ==========================================================================
+  reflection:skill_extractor:
+    content: |
+      You are a skill extraction assistant. Respond with valid JSON only.
+    version: "1.0.0"
+    description: "SkillExtractor system prompt"
+    tags: ["reflection", "extraction"]
+    active: true
+
+  reflection:evolution_refinement:
+    content: |
+      You are evolving an existing agent skill based on production feedback.
+
+      Current skill:
+      {{ skill_json }}
+
+      Generate an improved version as valid JSON with the same schema:
+      - skill_id (keep identical: '{{ skill_id }}')
+      - name (improved if needed)
+      - tools (add/remove based on learnings)
+      - max_iterations (tune if needed)
+      - role_type (keep or refine)
+      - system_prompt (the actual prompt text that guides the agent)
+    version: "1.0.0"
+    description: "EvolutionEngine skill refinement prompt"
+    tags: ["reflection", "evolution"]
+    active: true
+
+  reflection:evolution_refinement_system:
+    content: |
+      Respond with valid JSON SkillConfig only.
+    version: "1.0.0"
+    description: "EvolutionEngine skill refinement system instruction"
+    tags: ["reflection", "evolution"]
+    active: true
+
+  reflection:evolution_patch:
+    content: |
+      You are an expert Rust engineer improving an AI agent system.
+
+      Context:
+      {{ learning_context }}
+
+      Requirement:
+      {{ module_description }}
+
+      Generate a Rust code patch (or a complete small module) that
+      addresses the requirement. Output the result as a Markdown code block
+      with the filename as the header.
+    version: "1.0.0"
+    description: "EvolutionEngine code patch generation prompt"
+    tags: ["reflection", "evolution"]
+    active: true
+
+  reflection:evolution_patch_system:
+    content: |
+      Respond with a Markdown code block containing the patch.
+    version: "1.0.0"
+    description: "EvolutionEngine patch system instruction"
+    tags: ["reflection", "evolution"]
+    active: true
+
+  reflection:detector_correction:
+    content: |
+      Review the corrected output and update best practices or system prompts accordingly.
+    version: "1.0.0"
+    description: "LearningDetector correction action prompt"
+    tags: ["reflection", "detection"]
+    active: true
+
+  reflection:detector_insight:
+    content: |
+      Document the missing knowledge or add it to the skill registry / system prompts.
+    version: "1.0.0"
+    description: "LearningDetector insight action prompt"
+    tags: ["reflection", "detection"]
+    active: true
+
+  reflection:detector_feature:
+    content: |
+      Evaluate feasibility and prioritize in the product backlog.
+    version: "1.0.0"
+    description: "LearningDetector feature request action prompt"
+    tags: ["reflection", "detection"]
+    active: true
+
+  reflection:detector_tool_error:
+    content: |
+      Review tool usage pattern; consider adding a tool-use best practice or improving tool descriptions.
+    version: "1.0.0"
+    description: "LearningDetector tool error action prompt"
+    tags: ["reflection", "detection"]
+    active: true
+
+  reflection:discovery_success:
+    content: |
+      Produces a coherent result
+    version: "1.0.0"
+    description: "DiscoveryEngine success criterion"
+    tags: ["reflection", "discovery"]
+    active: true
+
+  reflection:discovery_failure:
+    content: |
+      Produces a meaningful error or fallback
+    version: "1.0.0"
+    description: "DiscoveryEngine failure criterion"
+    tags: ["reflection", "discovery"]
+    active: true
+
+  reflection:discovery_evaluate:
+    content: |
+      Extract as new skill or best practice
+    version: "1.0.0"
+    description: "DiscoveryEngine evaluation action"
+    tags: ["reflection", "discovery"]
+    active: true
+
+  reflection:squad_misalignment:
+    content: |
+      Review planner instructions or add constraints to align generator with planner intent.
+    version: "1.0.0"
+    description: "SquadReflection misalignment action prompt"
+    tags: ["reflection", "squad"]
+    active: true
+
+  # ==========================================================================
+  # cog-collaboration
+  # ==========================================================================
+  collaboration:evaluator:
+    content: |
+      You are an Evaluator agent. Assess the generated output against the specification.
+      Also evaluate the following boundary dimensions:
+      {% for rule in boundary_rules %}
+      - {{ rule.name }}: {{ rule.description }}{% if rule.threshold %} (threshold: {{ rule.threshold }}){% endif %}
+      {% endfor %}
+      - OutputQuality: 生成输出必须满足以下质量标准——1) 代码必须包含单元测试 2) 文档必须完整 3) 无已知安全漏洞
+      Respond with valid JSON containing: score (number 0-100), passed (boolean),
+      feedback (string), criteria (array of {name, score, comment}).
+    version: "2.1.0"
+    description: "EvaluatorActor system prompt with dynamic hard rules + embedded soft quality criteria"
+    tags: ["collaboration", "evaluation", "boundary"]
+    active: true
+
+  collaboration:generator:
+    content: |
+      You are a Generator agent. Produce implementation based on the specification.
+      Respond with valid JSON containing: code (string), tests (string),
+      documentation (string), artifacts (array of {name, content, type}).
+    version: "1.0.0"
+    description: "GeneratorActor system prompt"
+    tags: ["collaboration", "generation"]
+    active: true
+kind: ConfigMap
+metadata:
+  name: cogneva-prompts
+  namespace: cogneva

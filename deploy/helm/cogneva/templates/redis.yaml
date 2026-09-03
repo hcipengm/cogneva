@@ -28,22 +28,33 @@ spec:
             - name: redis
               containerPort: 6379
               protocol: TCP
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: redis-password
           command:
-            - redis-server
-            - --appendonly
-            - "yes"
-            - --dir
-            - /data
+            - sh
+            - -c
+            - redis-server --appendonly yes --dir /data --requirepass "$REDIS_PASSWORD"
           livenessProbe:
             tcpSocket:
               port: redis
             initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             exec:
-              command: ["redis-cli", "ping"]
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             requests:
               cpu: 100m
@@ -63,7 +74,6 @@ spec:
         resources:
           requests:
             storage: {{ .Values.backends.redis.storage }}
-        storageClassName: {{ .Values.global.storageClass }}
 ---
 apiVersion: v1
 kind: Service

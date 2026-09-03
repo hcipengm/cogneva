@@ -13,7 +13,6 @@ spec:
   resources:
     requests:
       storage: {{ .Values.backends.qdrant.storage }}
-  storageClassName: {{ .Values.global.storageClass }}
 ---
 apiVersion: apps/v1
 kind: Deployment

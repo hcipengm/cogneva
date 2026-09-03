@@ -80,6 +80,12 @@ spec:
           port: 8080
         - protocol: TCP
           port: 8081
+    # webhook 入口（8082）：NodePort 面向集群外平台回调，源 IP 经 SNAT 为节点
+    # 地址，无法用 podSelector 限定；平台签名验签在网关完成（未配置 secret 时
+    # 一律 503，fail-closed），故可对集群外开放。
+    - ports:
+        - protocol: TCP
+          port: 8082
   egress:
     - {}
 {{- end }}

@@ -13,7 +13,9 @@ spec:
   resources:
     requests:
       storage: {{ .Values.backends.nats.storage }}
-  storageClassName: {{ .Values.global.storageClass }}
+  {{- with .Values.storage.retain }}
+  storageClassName: {{ . }}
+  {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -45,6 +47,7 @@ spec:
             - "--jetstream"
             - "--store_dir=/data"
             - "--server_name=cogneva-nats"
+            - "--http_port=8222"
           ports:
             - name: client
               containerPort: 4222
