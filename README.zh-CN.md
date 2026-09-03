@@ -585,12 +585,18 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
 ### ☸️ 已有集群
 
 ```bash
-# 已有 K3s 集群
-kubectl apply -f deploy/k3s/
+# 已有 K3s 集群：先初始化随机密钥（幂等），再部署清单
+bash deploy/k3s/init-secrets.sh
+kubectl apply -k deploy/k3s/
 
 # 已有标准 K8s 生产集群
 kubectl apply -f deploy/k8s/
+
+# 或使用 Helm（Secret 同样在安装时自动随机生成）
+helm install cogneva deploy/helm/cogneva
 ```
+
+内部实例密钥（PostgreSQL / Redis / 内部签名）在**安装时自动随机生成**，仓库与配置里不携带任何可用密码：K3s 走 `init-secrets.sh`（幂等，重复运行不会覆盖已存在或带外写入的值），Helm 安装时自动复用集群中已有的 Secret、全新安装则随机生成。平台 token、LLM 上游等带外凭证不随部署下发，首次打开 WebUI 经配置向导写入，且只注入安全网关——主应用与沙盒零持有。
 
 ### 🔧 传统手动部署
 

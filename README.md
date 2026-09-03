@@ -589,12 +589,18 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
 ### ☸️ Existing cluster
 
 ```bash
-# Existing K3s cluster
-kubectl apply -f deploy/k3s/
+# Existing K3s cluster: generate random secrets first (idempotent), then deploy
+bash deploy/k3s/init-secrets.sh
+kubectl apply -k deploy/k3s/
 
 # Existing standard K8s production cluster
 kubectl apply -f deploy/k8s/
+
+# Or use Helm (Secrets are likewise randomized at install time)
+helm install cogneva deploy/helm/cogneva
 ```
+
+Internal instance secrets (PostgreSQL / Redis / internal signing) are **randomly generated at install time** — the repository and its configs carry no usable password. On K3s this is done by `init-secrets.sh` (idempotent; re-running never overwrites existing or out-of-band values); on Helm, an already-deployed Secret is reused and a fresh install gets random secrets. Out-of-band credentials such as platform tokens and LLM upstreams are never shipped with the deployment — they are written through the WebUI setup wizard on first launch and injected only into the security gateway, leaving the main app and sandboxes with zero credentials.
 
 ### 🔧 Traditional manual deployment
 
