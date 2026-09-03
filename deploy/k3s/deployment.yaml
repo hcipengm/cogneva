@@ -56,19 +56,9 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
-            # Secret overrides — must use env names that apply_env_overrides() recognises
-            - name: OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: openai-api-key
-                  optional: true
-            - name: ANTHROPIC_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cogneva-secrets
-                  key: anthropic-api-key
-                  optional: true
+            # Secret overrides — must use env names that apply_env_overrides() recognises.
+            # LLM 与代码平台凭证只注入安全网关，主应用零持有、经网关代理访问，
+            # 因此这里不再挂 OPENAI/ANTHROPIC/GitHub/Gitee 任何凭证。
             - name: PG_PASSWORD
               valueFrom:
                 secretKeyRef:

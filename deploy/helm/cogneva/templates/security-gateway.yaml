@@ -43,17 +43,45 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
-            - name: OPENAI_API_KEY
+            # 网关代持全部敏感凭证：LLM 上游唯一来源 COGNEVA_LLM_UPSTREAMS
+            # （JSON 数组，llm-config 管理）；GitHub/Gitee token 用于 API 与
+            # git 透传出口注入；webhook 凭证验平台签名。业务 Pod 零持有。
+            # 均 optional：未配置时对应功能 fail-closed，真值带外写入 Secret。
+            - name: COGNEVA_LLM_UPSTREAMS
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
-                  key: openai-api-key
+                  key: llm-upstreams
                   optional: true
-            - name: ANTHROPIC_API_KEY
+            - name: COGNEVA_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
-                  key: anthropic-api-key
+                  key: github-token
+                  optional: true
+            - name: COGNEVA_GITEE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: gitee-token
+                  optional: true
+            - name: COGNEVA_GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: github-webhook-secret
+                  optional: true
+            - name: COGNEVA_GITEE_WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: gitee-webhook-token
+                  optional: true
+            - name: COGNEVA_WEBHOOK_INTERNAL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: webhook-internal
                   optional: true
 ---
 apiVersion: v1

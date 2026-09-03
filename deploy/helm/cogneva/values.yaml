@@ -67,10 +67,16 @@ backends:
 # 明文默认值仅用于开发；生产请用 --set-file 或外部 Secret（然后 secrets.create=false）
 secrets:
   create: true
-  dbPassword: "changeme"
   pgPassword: "changeme"
   redisPassword: ""
   llmApiKey: ""
+  # 网关凭证：真实值带外写入，默认空（未配置时对应功能 fail-closed）。
+  llmUpstreams: ""
+  githubToken: ""
+  giteeToken: ""
+  githubWebhookSecret: ""
+  giteeWebhookToken: ""
+  webhookInternal: ""
 
 ingress:
   enabled: true
