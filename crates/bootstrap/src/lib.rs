@@ -6,12 +6,23 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 集群供给分支（与 main.rs 的探测规则一致）。元启动**新建集群时两个分支装的
-/// 都是 K3s**，区别只在节点形态：`K3sSingle` = K3s 单节点，`K3sMulti` = K3s
-/// 多节点（server + agents）。标准 Kubernetes（即 K8s，kubeadm / EKS 等）
-/// 元启动不新建、只复用用户已搭好的集群；不新建不是技术不可行，而是成本收益
-/// 不对等（见 main.rs 的 `ensure_multi_node_cluster`）。序列化名与部署 profile
-/// 对齐（`k3s-single` / `k3s-multi`）。
+/// 集群供给发行版：元启动新建集群时装什么。`K3s` = 装 K3s（单节点或多节点）；
+/// `Kubespray` = 用 kubespray 官方镜像新建标准 Kubernetes（即 K8s）。标准 K8s
+/// 也可能由用户自行搭好、元启动只复用——那种情况不经过这里的供给选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Distro {
+    /// K3s（零决策、单二进制，默认）。
+    #[default]
+    K3s,
+    /// kubespray 新建标准 Kubernetes。
+    Kubespray,
+}
+
+/// 部署分支（与 main.rs 的部署 profile 同名对齐）。它描述"往什么形态的集群上
+/// 部署应用"，序列化名与 Helm profile / 渲染目录一一对应：`k3s-single` /
+/// `k3s-multi` / `k8s-standard`。前两者由 K3s 供给产出，`K8sStandard` 由
+/// kubespray 新建的标准 K8s 或用户既有标准集群产出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanBranch {
     /// K3s 单节点。
@@ -20,6 +31,9 @@ pub enum PlanBranch {
     /// K3s 多节点（server + agents）。
     #[serde(rename = "k3s-multi")]
     K3sMulti,
+    /// 标准 Kubernetes（kubeadm / kubespray / EKS 等）。
+    #[serde(rename = "k8s-standard")]
+    K8sStandard,
 }
 
 /// 计划元信息。
@@ -76,24 +90,36 @@ pub struct HardwareProfile {
     pub nodes: u32,
 }
 
-/// 分支规则：内存 < 2GB 或单节点 → K3s 单节点；多节点高配 → K3s 多节点
-/// （server + agents）。两个分支新建的都是 K3s；标准 Kubernetes 不在新建
-/// 范围内，只复用用户既有集群（见 main.rs `ensure_multi_node_cluster`）。
-pub fn decide_branch(hw: &HardwareProfile) -> PlanBranch {
-    if hw.memory_gb < 2 || hw.nodes <= 1 {
-        PlanBranch::K3sSingle
-    } else {
-        PlanBranch::K3sMulti
+/// 分支规则：kubespray 供给的是标准 Kubernetes → `K8sStandard`；K3s 供给按
+/// 规模——内存 < 2GB 或单节点 → K3s 单节点，多节点高配 → K3s 多节点
+/// （server + agents）。用户既有标准集群同样落 `K8sStandard`（部署探测阶段
+/// 判定，不经此函数）。
+pub fn decide_branch(hw: &HardwareProfile, distro: Distro) -> PlanBranch {
+    match distro {
+        Distro::Kubespray => PlanBranch::K8sStandard,
+        Distro::K3s => {
+            if hw.memory_gb < 2 || hw.nodes <= 1 {
+                PlanBranch::K3sSingle
+            } else {
+                PlanBranch::K3sMulti
+            }
+        }
     }
+}
+
+/// 是否多节点形态：K3s 多节点与标准 Kubernetes 都按多节点/生产形态配事件总线。
+fn is_multi_node(branch: PlanBranch) -> bool {
+    matches!(branch, PlanBranch::K3sMulti | PlanBranch::K8sStandard)
 }
 
 /// backend 自动选择规则（审计 2.5.3）：
 /// - postgres：持久层必选；
 /// - redis：单节点/低内存消息与配额缓存；
-/// - nats：仅多节点分支（K3s 多节点用 JetStream 事件总线，单节点由 Redis Streams 覆盖）；
+/// - nats：多节点形态启用 JetStream 事件总线（K3s 多节点、标准 K8s），单节点由 Redis Streams 覆盖；
 /// - qdrant：内存 ≥ 4GB 才本地部署，否则禁用（走外部向量库）；
 /// - mysql/meilisearch：默认禁用，显式需要时由 AI 在计划里开启。
 pub fn decide_backends(hw: &HardwareProfile, branch: PlanBranch) -> Vec<BackendSpec> {
+    let multi = is_multi_node(branch);
     vec![
         BackendSpec {
             kind: "postgres".into(),
@@ -107,11 +133,11 @@ pub fn decide_backends(hw: &HardwareProfile, branch: PlanBranch) -> Vec<BackendS
         },
         BackendSpec {
             kind: "nats".into(),
-            enabled: branch == PlanBranch::K3sMulti,
-            reason: if branch == PlanBranch::K3sMulti {
-                "多节点分支：JetStream 事件总线".into()
+            enabled: multi,
+            reason: if multi {
+                "多节点形态：JetStream 事件总线".into()
             } else {
-                "单节点分支：Redis Streams 已覆盖".into()
+                "单节点形态：Redis Streams 已覆盖".into()
             },
         },
         BackendSpec {
@@ -137,10 +163,14 @@ pub fn decide_backends(hw: &HardwareProfile, branch: PlanBranch) -> Vec<BackendS
 }
 
 impl ManagementPlan {
-    /// 依据硬件画像与环境标签生成声明式计划。
-    pub fn for_environment(environment: impl Into<String>, hw: &HardwareProfile) -> Self {
+    /// 依据硬件画像、环境标签与供给发行版生成声明式计划。
+    pub fn for_environment(
+        environment: impl Into<String>,
+        hw: &HardwareProfile,
+        distro: Distro,
+    ) -> Self {
         let environment = environment.into();
-        let branch = decide_branch(hw);
+        let branch = decide_branch(hw, distro);
         Self {
             api_version: "k8m.cogneva/v1alpha1".into(),
             kind: "ManagementPlan".into(),
@@ -153,7 +183,7 @@ impl ManagementPlan {
                 image_tag: env!("CARGO_PKG_VERSION").into(),
                 gateway_replicas: match branch {
                     PlanBranch::K3sSingle => 1,
-                    PlanBranch::K3sMulti => 3,
+                    PlanBranch::K3sMulti | PlanBranch::K8sStandard => 3,
                 },
                 backends: decide_backends(hw, branch),
                 sync_targets: Vec::new(),
@@ -252,9 +282,21 @@ mod tests {
 
     #[test]
     fn branch_rules_match_bootstrap() {
-        assert_eq!(decide_branch(&hw(1, 1)), PlanBranch::K3sSingle);
-        assert_eq!(decide_branch(&hw(16, 1)), PlanBranch::K3sSingle);
-        assert_eq!(decide_branch(&hw(16, 3)), PlanBranch::K3sMulti);
+        assert_eq!(decide_branch(&hw(1, 1), Distro::K3s), PlanBranch::K3sSingle);
+        assert_eq!(
+            decide_branch(&hw(16, 1), Distro::K3s),
+            PlanBranch::K3sSingle
+        );
+        assert_eq!(decide_branch(&hw(16, 3), Distro::K3s), PlanBranch::K3sMulti);
+        // kubespray 供给的一律是标准 K8s 形态，与规模无关。
+        assert_eq!(
+            decide_branch(&hw(16, 1), Distro::Kubespray),
+            PlanBranch::K8sStandard
+        );
+        assert_eq!(
+            decide_branch(&hw(16, 3), Distro::Kubespray),
+            PlanBranch::K8sStandard
+        );
     }
 
     #[test]
@@ -269,11 +311,15 @@ mod tests {
         assert!(prod.iter().find(|b| b.kind == "nats").unwrap().enabled);
         assert!(prod.iter().find(|b| b.kind == "qdrant").unwrap().enabled);
         assert!(!prod.iter().find(|b| b.kind == "mysql").unwrap().enabled);
+
+        // 标准 K8s 形态同样按多节点启用 nats。
+        let stdk8s = decide_backends(&hw(16, 3), PlanBranch::K8sStandard);
+        assert!(stdk8s.iter().find(|b| b.kind == "nats").unwrap().enabled);
     }
 
     #[test]
     fn plan_yaml_roundtrip() {
-        let plan = ManagementPlan::for_environment("prod", &hw(16, 3));
+        let plan = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::K3s);
         let yaml = plan.to_yaml().unwrap();
         assert!(yaml.contains("k8m.cogneva/v1alpha1"));
         assert!(yaml.contains("ManagementPlan"));
@@ -283,19 +329,36 @@ mod tests {
     }
 
     #[test]
+    fn kubespray_plan_is_k8s_standard() {
+        let plan = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::Kubespray);
+        assert_eq!(plan.spec.branch, PlanBranch::K8sStandard);
+        assert_eq!(plan.spec.gateway_replicas, 3);
+        let yaml = plan.to_yaml().unwrap();
+        assert!(yaml.contains("k8s-standard"));
+        assert!(
+            plan.spec
+                .backends
+                .iter()
+                .find(|b| b.kind == "nats")
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
     fn branch_serialization_uses_profile_names() {
-        let single = ManagementPlan::for_environment("edge", &hw(1, 1));
-        let multi = ManagementPlan::for_environment("prod", &hw(16, 3));
+        let single = ManagementPlan::for_environment("edge", &hw(1, 1), Distro::K3s);
+        let multi = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::K3s);
         assert!(single.to_yaml().unwrap().contains("k3s-single"));
         assert!(multi.to_yaml().unwrap().contains("k3s-multi"));
-        // 不再出现把 K3s 多节点标成 k8s 的歧义序列化值。
-        assert!(!single.to_yaml().unwrap().contains("branch: k8s"));
-        assert!(!multi.to_yaml().unwrap().contains("branch: k8s"));
+        // 标准 K8s 形态序列化为 k8s-standard，与 Helm profile 同名。
+        let stdk8s = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::Kubespray);
+        assert!(stdk8s.to_yaml().unwrap().contains("k8s-standard"));
     }
 
     #[test]
     fn helm_values_reflect_enabled_backends() {
-        let plan = ManagementPlan::for_environment("edge", &hw(1, 1));
+        let plan = ManagementPlan::for_environment("edge", &hw(1, 1), Distro::K3s);
         let values = plan.to_helm_values();
         assert_eq!(values["gateway"]["replicas"], serde_json::json!(1));
         assert_eq!(

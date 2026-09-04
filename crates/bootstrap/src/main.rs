@@ -2,13 +2,15 @@
 //!
 //! 职责：
 //! 1. 静默探测 CPU/内存/架构/节点；
-//! 2. 规则引擎按规模选集群供给分支：K3s 单节点 或 K3s 多节点（新建集群只装
-//!    K3s；标准 Kubernetes（即 K8s，kubeadm/EKS 等）不新建、仅复用用户既有
-//!    集群）；
+//! 2. 按环境变量与规模选集群供给：默认装 K3s（单节点 / 多节点 server+agents）；
+//!    `COGNEVA_CLUSTER_DISTRO=kubespray` 且资源门禁通过时，用 kubespray 官方
+//!    镜像新建标准 Kubernetes（即 K8s），门禁不过则告警并自动回落 K3s。用户
+//!    既有集群（K3s 或标准 K8s）只复用、不重建；
 //! 3. 生成 intent_config.yaml；
-//! 4. 安装 containerd / buildah / K3s（或复用现有集群）；
+//! 4. 安装容器运行时 / buildah，并按供给装 K3s 或跑 kubespray（或复用现有集群）；
 //! 5. 供给运行时镜像：优先下载预构建 release 包（sha256 校验后导入集群），
-//!    不可用时回退从源码构建（单节点本地导入；清单引用 localhost/cogneva:local）；
+//!    不可用时回退从源码构建（K3s 单节点本地导入，K3s 多节点与标准 K8s 经
+//!    DaemonSet 逐节点分发；清单引用 localhost/cogneva:local）；
 //! 6. kubectl apply 部署清单并等待关键 Pod Ready；
 //! 7. 打印 WebUI 地址并自动打开浏览器，退出（自毁）。
 //!
@@ -43,24 +45,78 @@ fn make_workdir(tag: &str) -> Result<PathBuf> {
 }
 
 use anyhow::{bail, Context, Result};
+use cogneva_bootstrap::Distro;
 use serde::Serialize;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-/// 集群供给分支：元启动需要**新建集群**时装什么。两个分支装的都是 K3s，
-/// 区别只在节点形态——`K3sSingle` = K3s 单节点，`K3sMulti` = K3s 多节点
-/// （本机 server + 工作节点 agents）。标准 Kubernetes（kubeadm / EKS 等）
-/// 元启动不新建、只复用用户已搭好的集群（那种环境的部署形态是
-/// `Profile::K8sStandard`）；不新建标准 K8s 不是技术不可行，而是成本收益
-/// 不对等，见 `ensure_multi_node_cluster`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-enum Branch {
-    /// K3s 单节点。
-    #[serde(rename = "k3s-single")]
-    K3sSingle,
-    /// K3s 多节点（server + agents）。
-    #[serde(rename = "k3s-multi")]
-    K3sMulti,
+mod kubespray;
+
+/// 集群供给决策：发行版 + 是否多节点 +（若有）从 kubespray 回落 K3s 的原因。
+#[derive(Debug, Clone)]
+struct ProvisionDecision {
+    distro: Distro,
+    multi: bool,
+    fallback_reason: Option<String>,
+}
+
+/// 读取 `COGNEVA_CLUSTER_DISTRO=k3s|kubespray`（默认 k3s）。非法值告警回落 k3s。
+fn requested_distro() -> Distro {
+    match std::env::var("COGNEVA_CLUSTER_DISTRO")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("kubespray") => Distro::Kubespray,
+        Some("k3s") | None => Distro::K3s,
+        Some(other) => {
+            warn!("未知 COGNEVA_CLUSTER_DISTRO={other}，按默认 k3s 处理");
+            Distro::K3s
+        }
+    }
+}
+
+/// 决定集群供给：用户选 kubespray 时先过资源门禁（本机控制面内存 ≥2GB；多节点
+/// 要求工作节点 SSH 免密可达），不过则告警并**自动回落 K3s**，元启动不中断。
+/// K3s 路径维持现状（内存 <2GB 或单节点 → 单节点，否则多节点）。
+async fn decide_provision(hw: &Hardware) -> ProvisionDecision {
+    let workers = cluster_nodes_env();
+    let k3s_multi = hw.mem_total_mb >= 2048 && hw.nodes > 1;
+    let fallback = |reason: String| {
+        warn!("{reason}：自动回落 K3s 供给");
+        ProvisionDecision {
+            distro: Distro::K3s,
+            multi: k3s_multi,
+            fallback_reason: Some(reason),
+        }
+    };
+
+    match requested_distro() {
+        Distro::K3s => ProvisionDecision {
+            distro: Distro::K3s,
+            multi: k3s_multi,
+            fallback_reason: None,
+        },
+        Distro::Kubespray => {
+            if hw.mem_total_mb < 2048 {
+                return fallback(format!(
+                    "kubespray 标准 K8s 控制面需要 ≥2GB 内存，当前 {}MB",
+                    hw.mem_total_mb
+                ));
+            }
+            for w in &workers {
+                if !kubespray::node_ssh_reachable(w).await {
+                    return fallback(format!("kubespray 工作节点 {w} SSH 免密不可达"));
+                }
+            }
+            info!("资源门禁通过：使用 kubespray 新建标准 Kubernetes");
+            ProvisionDecision {
+                distro: Distro::Kubespray,
+                multi: !workers.is_empty(),
+                fallback_reason: None,
+            }
+        }
+    }
 }
 
 /// 部署 profile：Helm chart 预渲染产物的环境形态。chart 是拓扑唯一权威源，
@@ -98,7 +154,12 @@ struct Hardware {
 
 #[derive(Debug, Serialize)]
 struct IntentConfig {
-    branch: Branch,
+    /// 实际供给的发行版（k3s / kubespray）；资源门禁回落时记的是回落结果。
+    distro: Distro,
+    /// 是否多节点形态（决定 K3s server+agents 与应用副本/事件总线）。
+    multi: bool,
+    /// 请求 kubespray 但门禁不过、自动回落 K3s 时的原因。
+    fallback_reason: Option<String>,
     hardware: Hardware,
 }
 
@@ -166,17 +227,6 @@ async fn probe_hardware() -> Hardware {
         arch: std::env::consts::ARCH.to_string(),
         nodes: probe_nodes().await,
         kvm: Path::new("/dev/kvm").exists(),
-    }
-}
-
-/// 规则引擎：内存 < 2GB 或单节点 → K3s 单节点；多节点高配 → K3s 多节点
-/// （server + agents）。两个分支新建的都是 K3s；标准 Kubernetes 不在新建范围
-/// 内，只复用用户既有集群（见 `ensure_multi_node_cluster`）。
-fn decide_branch(hw: &Hardware) -> Branch {
-    if hw.mem_total_mb < 2048 || hw.nodes <= 1 {
-        Branch::K3sSingle
-    } else {
-        Branch::K3sMulti
     }
 }
 
@@ -325,25 +375,18 @@ async fn cluster_internal_ips() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 多节点分支的集群供给。
+/// K3s 多节点供给：本机作 server，再经 SSH 给声明的工作节点推装 agent。
 ///
-/// 新建只装 K3s：本机作 server，再经 SSH 给声明的工作节点推装 agent。不新建
-/// 标准 Kubernetes——这不是技术上做不到，而是成本收益不对等。标准 K8s 的新建
-/// 是一串没有通用正确答案的决策：etcd 拓扑（单节点 / 三节点 HA / 外置）、
-/// CNI 选型（Calico / Cilium / Flannel 与网络策略、CIDR 规划）、默认存储类
-/// （Longhorn / Rook-Ceph / NFS）、证书 PKI 与轮换、入口（MetalLB + Ingress
-/// 还是云厂商 LB）、kubeadm token 与 CRI 版本对齐。把这些自动化等于在元启动
-/// 里再塞一个 kubespray；而项目目标是从零跑到一个 AI 自治系统，不是从零搭
-/// Kubernetes 发行版。默认值一旦选错，生产环境排查比 K3s 难得多。
+/// 这是 **K3s 发行版**的多节点路径。K3s 能一键多节点，是因为它替用户做完了
+/// 那一整套集群底座决策（内置 CNI、embedded etcd、local-path 存储、自管证书），
+/// 代价是它是裁剪过的单二进制发行版、不是上游标准 Kubernetes。
 ///
-/// K3s 能一键多节点，恰恰因为它替用户做完了上述全部默认选择（内置 Flannel、
-/// SQLite/etcd 自动选、local-path 存储、自管证书），代价是牺牲可定制性。元
-/// 启动借这条"零决策、零配置"的路径完成自举。
+/// 要新建**上游标准 Kubernetes（即 K8s）**不走这里——那是 `kubespray::run_kubespray`：
+/// 跑 kubespray 官方容器镜像，由 Ansible 承载 etcd 拓扑 / CNI / PKI / kubeadm
+/// token / CRI 版本对齐这整套决策（见 `kubespray` 模块）。用户既有集群（K3s
+/// 或标准 K8s）则只复用、不重建。
 ///
-/// 所以边界是：新建 → 只覆盖 K3s（单节点 / 多节点），这是唯一零决策路径；
-/// 标准 Kubernetes → 用户自行搭好，元启动探测到即复用、只负责往上部署
-/// Cogneva。已有可用集群时仅补齐声明中缺失的 agent；无集群且无节点声明 →
-/// 失败前置。
+/// 已有可用集群时仅补齐声明中缺失的 agent；无集群且无节点声明 → 失败前置。
 async fn ensure_multi_node_cluster() -> Result<()> {
     let agents = cluster_nodes_env();
     if !cluster_ready().await {
@@ -767,10 +810,13 @@ async fn ensure_buildah_mirror() -> Result<()> {
 /// 运行时镜像供给：清单引用 localhost/cogneva:local。
 /// 优先从 GitHub/Gitee release 下载预构建镜像（sha256 校验），失败回退源码构建
 /// （空白机全量 Rust release 构建需 1-3 小时，预构建下载仅需数分钟）。
-/// K3s 单节点导入本机 containerd；K3s 多节点经镜像分发器逐节点导入。
-async fn ensure_runtime_image(branch: Branch) -> Result<()> {
+/// 仅 K3s 单节点走本机 `k3s ctr import` 快路径；K3s 多节点与 kubespray 标准
+/// K8s（单/多节点）都没有"本机即唯一节点"的前提，统一经镜像分发器 DaemonSet
+/// 逐节点导入宿主 containerd（分发器自动探测 ctr 二进制与 containerd socket）。
+async fn ensure_runtime_image(distro: Distro, multi: bool) -> Result<()> {
     const IMAGE: &str = "localhost/cogneva:local";
-    if branch == Branch::K3sMulti {
+    let local_fast_path = matches!(distro, Distro::K3s) && !multi;
+    if !local_fast_path {
         return distribute_image_to_nodes(IMAGE).await;
     }
     let present = Command::new("k3s")
@@ -1686,11 +1732,16 @@ async fn main() -> Result<()> {
         "硬件探测: {} 核 / {} MiB / {} / {} 节点",
         hw.cpu_cores, hw.mem_total_mb, hw.arch, hw.nodes
     );
-    let branch = decide_branch(&hw);
-    info!("规则引擎决策: {:?} 分支", branch);
+    let decision = decide_provision(&hw).await;
+    info!(
+        "供给决策: distro={:?} 多节点={} 回落={:?}",
+        decision.distro, decision.multi, decision.fallback_reason
+    );
 
     let intent = IntentConfig {
-        branch,
+        distro: decision.distro,
+        multi: decision.multi,
+        fallback_reason: decision.fallback_reason.clone(),
         hardware: hw.clone(),
     };
     let intent_path =
@@ -1706,6 +1757,7 @@ async fn main() -> Result<()> {
             cpu_cores: hw.cpu_cores as u32,
             nodes: hw.nodes as u32,
         },
+        decision.distro,
     );
     let plan_path =
         std::env::var("COGNEVA_MANAGEMENT_PLAN").unwrap_or_else(|_| "management_plan.yaml".into());
@@ -1714,9 +1766,12 @@ async fn main() -> Result<()> {
 
     // 投递方式探测需要知道集群是"本次安装"还是"复用既有"：安装前取样。
     let cluster_existed = cluster_ready().await;
-    match branch {
-        Branch::K3sSingle => install_k3s().await?,
-        Branch::K3sMulti => ensure_multi_node_cluster().await?,
+    match decision.distro {
+        // K3s：单节点本机装 server；多节点 server + agents。
+        Distro::K3s if !decision.multi => install_k3s().await?,
+        Distro::K3s => ensure_multi_node_cluster().await?,
+        // kubespray：跑官方镜像新建标准 Kubernetes（本机为控制面，声明节点作 worker）。
+        Distro::Kubespray => kubespray::run_kubespray(&cluster_nodes_env()).await?,
     }
     ensure_buildah().await?;
     ensure_buildah_mirror().await?;
@@ -1727,7 +1782,7 @@ async fn main() -> Result<()> {
     } else {
         ensure_git_remote().await?;
     }
-    ensure_runtime_image(branch).await?;
+    ensure_runtime_image(decision.distro, decision.multi).await?;
     deploy_manifests(cluster_existed).await?;
     wait_ready().await?;
 

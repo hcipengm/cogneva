@@ -69,10 +69,70 @@ bootstrap 按集群环境自动适配：检测发行版（K3s 节点标签 / `/r
 
 ## 多节点集群从哪来
 
-- **空白多机**：`COGNEVA_CLUSTER_NODES="user@ip2,user@ip3"`（SSH 免密可达），
-  bootstrap 在本机装 K3s server、向各节点推送安装 agent。K3s 是 CNCF 认证
-  K8s，多节点 K3s 即多节点 K8s。
+- **空白多机（默认，K3s）**：`COGNEVA_CLUSTER_NODES="user@ip2,user@ip3"`
+  （SSH 免密可达），bootstrap 在本机装 K3s server、向各节点推送装 agent，
+  得到的是 **K3s 集群**。K3s 是轻量 Kubernetes 发行版——单二进制、裁剪并替换了
+  部分组件（内置精简 containerd、SQLite/embedded etcd、非标准 `/run/k3s` 路径），
+  它通过 Kubernetes 一致性认证、能跑标准工作负载，但**不是上游标准 Kubernetes**。
+- **空白多机（标准 Kubernetes）**：设 `COGNEVA_CLUSTER_DISTRO=kubespray`，
+  bootstrap 用 kubespray 官方镜像新建标准 Kubernetes（即 k8s），见下节。
 - **已有集群**：kubectl 可连通即可，profile 按发行版与节点数自动判定。
+
+## 元启动新建标准 Kubernetes（kubespray）
+
+默认元启动新建集群装的是 K3s（零决策、单二进制）。要在空白机上新建**上游一致的
+标准 Kubernetes（即 k8s）**时，显式选用 kubespray——kubernetes-sigs 官方项目，
+以容器镜像分发，用 Ansible 承载集群生命周期。元启动只生成声明式
+inventory/group_vars 并跑官方镜像，不手写 kubeadm。
+
+```bash
+# 单节点 all-in-one（本机即控制面 + 工作节点）
+COGNEVA_CLUSTER_DISTRO=kubespray bash bootstrap.sh
+
+# 多节点：本机是唯一 control-plane，声明的节点作 worker
+COGNEVA_CLUSTER_DISTRO=kubespray \
+COGNEVA_CLUSTER_NODES="root@10.0.0.7,ubuntu@10.0.0.8:2200" \
+bash bootstrap.sh
+
+# 国内网络加镜像适配（系统镜像走 daocloud、kubespray 镜像走 quay 镜像站探活）
+COGNEVA_CLUSTER_DISTRO=kubespray COGNEVA_CN_MIRROR=1 bash bootstrap.sh
+```
+
+相关变量：
+
+- `COGNEVA_CLUSTER_DISTRO=k3s|kubespray`：集群供给发行版，默认 `k3s`。
+- `COGNEVA_CLUSTER_NODES="user@ip[:port],..."`：工作节点（kubespray 多节点时
+  本机固定为 control-plane，声明节点作 worker）；不设即单节点 all-in-one。
+- `COGNEVA_K8S_CNI=calico|flannel`：CNI 选择，默认 `calico`。
+- `COGNEVA_KUBESPRAY_IMAGE`：整体覆盖 kubespray 容器镜像引用（默认
+  `quay.io/kubespray/kubespray:<钉定 tag>`）。
+- `COGNEVA_CN_MIRROR=1`：国内网络，group_vars 注入 containerd registry mirror
+  与 `*_image_repo` 指向国内镜像站，kubespray 镜像本身走 quay 镜像站探活。
+
+前置与资源门禁（不满足则 `warn` 后**自动回落 K3s**，元启动不中断）：
+
+- 本机控制面内存 ≥ 2GB（kubespray 控制面下限）；
+- 多节点要求每个工作节点 SSH 免密可达（`BatchMode`，10s 超时）；
+- 本机与各节点需有 `python3`（缺失自动 `apt-get install`）；本机 sshd 允许
+  root 密钥登录（元启动自动装/启 openssh-server、生成并授权本机 root 密钥，
+  all-in-one 时 ansible 经 127.0.0.1 连本机）；
+- 需有容器运行时跑 kubespray 镜像（podman 或 docker，缺失自动装 podman）。
+
+零交互默认决策（写死在 group_vars / inventory，可被上述 env 覆盖）：etcd 与
+控制面堆叠（master 进 `[etcd]` 组）、containerd 作运行时、Calico CNI、
+local-path-provisioner 建默认 StorageClass、K8s 版本跟 kubespray 钉定的测试矩阵
+（保证 kubelet/apiserver/CRI 对齐）、证书由 kubespray 自签 CA 并在升级时自动轮换。
+入口流量不依赖 kubespray：cogneva 的 ingress-nginx 以 hostNetwork 占用 80/443。
+
+拓扑边界：多节点为 **1 个 control-plane（本机）+ N worker**，是 kubespray 一等
+支持、生产常用形态。多 control-plane HA（3 CP + 外置/kube-vip LB endpoint）需要
+用户提供控制面稳定 endpoint，暂不支持，inventory 已按角色建模但只启用单 CP。
+
+**唯一源不受影响**：kubespray 只供给集群底座（节点/控制面/CNI/运行时/默认
+StorageClass），完全不碰 cogneva 应用拓扑。应用拓扑仍只来自 Helm chart；
+kubespray 产出的集群被元启动探测为非 K3s → 自动选 `k8s-standard` profile →
+`deploy/rendered/k8s-standard/`，不新增任何应用清单。镜像供给走本目录的
+`image-distributor.yaml` DaemonSet（自动探测标准 containerd socket）。
 
 ## 增量升级（新版本镜像分发）
 
