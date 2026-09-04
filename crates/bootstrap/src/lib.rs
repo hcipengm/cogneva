@@ -6,16 +6,20 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 部署分支（与 main.rs 的探测规则一致）。分支名是历史命名：元启动新建集群时
-/// 两个分支装的都是 K3s——`K3s` = K3s 单节点，`K8s` = K3s 多节点（server +
-/// agents）。标准 Kubernetes（kubeadm / EKS 等）元启动不新建、只复用用户已
-/// 搭好的集群；原因不是技术不可行，而是成本收益不对等（见 main.rs 的
-/// `ensure_multi_node_cluster`）。
+/// 集群供给分支（与 main.rs 的探测规则一致）。元启动**新建集群时两个分支装的
+/// 都是 K3s**，区别只在节点形态：`K3sSingle` = K3s 单节点，`K3sMulti` = K3s
+/// 多节点（server + agents）。标准 Kubernetes（即 K8s，kubeadm / EKS 等）
+/// 元启动不新建、只复用用户已搭好的集群；不新建不是技术不可行，而是成本收益
+/// 不对等（见 main.rs 的 `ensure_multi_node_cluster`）。序列化名与部署 profile
+/// 对齐（`k3s-single` / `k3s-multi`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum PlanBranch {
-    K3s,
-    K8s,
+    /// K3s 单节点。
+    #[serde(rename = "k3s-single")]
+    K3sSingle,
+    /// K3s 多节点（server + agents）。
+    #[serde(rename = "k3s-multi")]
+    K3sMulti,
 }
 
 /// 计划元信息。
@@ -77,9 +81,9 @@ pub struct HardwareProfile {
 /// 范围内，只复用用户既有集群（见 main.rs `ensure_multi_node_cluster`）。
 pub fn decide_branch(hw: &HardwareProfile) -> PlanBranch {
     if hw.memory_gb < 2 || hw.nodes <= 1 {
-        PlanBranch::K3s
+        PlanBranch::K3sSingle
     } else {
-        PlanBranch::K8s
+        PlanBranch::K3sMulti
     }
 }
 
@@ -103,8 +107,8 @@ pub fn decide_backends(hw: &HardwareProfile, branch: PlanBranch) -> Vec<BackendS
         },
         BackendSpec {
             kind: "nats".into(),
-            enabled: branch == PlanBranch::K8s,
-            reason: if branch == PlanBranch::K8s {
+            enabled: branch == PlanBranch::K3sMulti,
+            reason: if branch == PlanBranch::K3sMulti {
                 "多节点分支：JetStream 事件总线".into()
             } else {
                 "单节点分支：Redis Streams 已覆盖".into()
@@ -148,8 +152,8 @@ impl ManagementPlan {
                 branch,
                 image_tag: env!("CARGO_PKG_VERSION").into(),
                 gateway_replicas: match branch {
-                    PlanBranch::K3s => 1,
-                    PlanBranch::K8s => 3,
+                    PlanBranch::K3sSingle => 1,
+                    PlanBranch::K3sMulti => 3,
                 },
                 backends: decide_backends(hw, branch),
                 sync_targets: Vec::new(),
@@ -248,20 +252,20 @@ mod tests {
 
     #[test]
     fn branch_rules_match_bootstrap() {
-        assert_eq!(decide_branch(&hw(1, 1)), PlanBranch::K3s);
-        assert_eq!(decide_branch(&hw(16, 1)), PlanBranch::K3s);
-        assert_eq!(decide_branch(&hw(16, 3)), PlanBranch::K8s);
+        assert_eq!(decide_branch(&hw(1, 1)), PlanBranch::K3sSingle);
+        assert_eq!(decide_branch(&hw(16, 1)), PlanBranch::K3sSingle);
+        assert_eq!(decide_branch(&hw(16, 3)), PlanBranch::K3sMulti);
     }
 
     #[test]
     fn backend_rules_follow_environment() {
-        let light = decide_backends(&hw(1, 1), PlanBranch::K3s);
+        let light = decide_backends(&hw(1, 1), PlanBranch::K3sSingle);
         let nats = light.iter().find(|b| b.kind == "nats").unwrap();
         assert!(!nats.enabled);
         let qdrant = light.iter().find(|b| b.kind == "qdrant").unwrap();
         assert!(!qdrant.enabled);
 
-        let prod = decide_backends(&hw(16, 3), PlanBranch::K8s);
+        let prod = decide_backends(&hw(16, 3), PlanBranch::K3sMulti);
         assert!(prod.iter().find(|b| b.kind == "nats").unwrap().enabled);
         assert!(prod.iter().find(|b| b.kind == "qdrant").unwrap().enabled);
         assert!(!prod.iter().find(|b| b.kind == "mysql").unwrap().enabled);
@@ -274,8 +278,19 @@ mod tests {
         assert!(yaml.contains("k8m.cogneva/v1alpha1"));
         assert!(yaml.contains("ManagementPlan"));
         let parsed = ManagementPlan::from_yaml(&yaml).unwrap();
-        assert_eq!(parsed.spec.branch, PlanBranch::K8s);
+        assert_eq!(parsed.spec.branch, PlanBranch::K3sMulti);
         assert_eq!(parsed.spec.gateway_replicas, 3);
+    }
+
+    #[test]
+    fn branch_serialization_uses_profile_names() {
+        let single = ManagementPlan::for_environment("edge", &hw(1, 1));
+        let multi = ManagementPlan::for_environment("prod", &hw(16, 3));
+        assert!(single.to_yaml().unwrap().contains("k3s-single"));
+        assert!(multi.to_yaml().unwrap().contains("k3s-multi"));
+        // 不再出现把 K3s 多节点标成 k8s 的歧义序列化值。
+        assert!(!single.to_yaml().unwrap().contains("branch: k8s"));
+        assert!(!multi.to_yaml().unwrap().contains("branch: k8s"));
     }
 
     #[test]

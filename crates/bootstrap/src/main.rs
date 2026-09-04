@@ -2,11 +2,13 @@
 //!
 //! 职责：
 //! 1. 静默探测 CPU/内存/架构/节点；
-//! 2. 规则引擎选择 K3s（轻量）或 K8s（生产）分支；
+//! 2. 规则引擎按规模选集群供给分支：K3s 单节点 或 K3s 多节点（新建集群只装
+//!    K3s；标准 Kubernetes（即 K8s，kubeadm/EKS 等）不新建、仅复用用户既有
+//!    集群）；
 //! 3. 生成 intent_config.yaml；
 //! 4. 安装 containerd / buildah / K3s（或复用现有集群）；
 //! 5. 供给运行时镜像：优先下载预构建 release 包（sha256 校验后导入集群），
-//!    不可用时回退从源码构建（K3s 分支；清单引用 localhost/cogneva:local）；
+//!    不可用时回退从源码构建（单节点本地导入；清单引用 localhost/cogneva:local）；
 //! 6. kubectl apply 部署清单并等待关键 Pod Ready；
 //! 7. 打印 WebUI 地址并自动打开浏览器，退出（自毁）。
 //!
@@ -45,15 +47,20 @@ use serde::Serialize;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-/// 部署分支（按硬件/规模选）。注意分支名是历史命名，元启动**新建集群时两个
-/// 分支装的都是 K3s**：`K3s` = K3s 单节点，`K8s` = K3s 多节点（server +
-/// agents）。标准 Kubernetes（kubeadm / EKS 等）元启动不新建、只复用用户已
-/// 搭好的集群——原因见 `ensure_multi_node_cluster`。
+/// 集群供给分支：元启动需要**新建集群**时装什么。两个分支装的都是 K3s，
+/// 区别只在节点形态——`K3sSingle` = K3s 单节点，`K3sMulti` = K3s 多节点
+/// （本机 server + 工作节点 agents）。标准 Kubernetes（kubeadm / EKS 等）
+/// 元启动不新建、只复用用户已搭好的集群（那种环境的部署形态是
+/// `Profile::K8sStandard`）；不新建标准 K8s 不是技术不可行，而是成本收益
+/// 不对等，见 `ensure_multi_node_cluster`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
 enum Branch {
-    K3s,
-    K8s,
+    /// K3s 单节点。
+    #[serde(rename = "k3s-single")]
+    K3sSingle,
+    /// K3s 多节点（server + agents）。
+    #[serde(rename = "k3s-multi")]
+    K3sMulti,
 }
 
 /// 部署 profile：Helm chart 预渲染产物的环境形态。chart 是拓扑唯一权威源，
@@ -167,9 +174,9 @@ async fn probe_hardware() -> Hardware {
 /// 内，只复用用户既有集群（见 `ensure_multi_node_cluster`）。
 fn decide_branch(hw: &Hardware) -> Branch {
     if hw.mem_total_mb < 2048 || hw.nodes <= 1 {
-        Branch::K3s
+        Branch::K3sSingle
     } else {
-        Branch::K8s
+        Branch::K3sMulti
     }
 }
 
@@ -342,7 +349,7 @@ async fn ensure_multi_node_cluster() -> Result<()> {
     if !cluster_ready().await {
         if agents.is_empty() {
             bail!(
-                "K8s 分支需要多节点集群：请用 COGNEVA_CLUSTER_NODES=user@ip[,user@ip2...] \
+                "K3s 多节点分支需要多节点集群：请用 COGNEVA_CLUSTER_NODES=user@ip[,user@ip2...] \
                  声明工作节点（本机将作为 server，需 SSH 免密可达），或预先搭建集群"
             );
         }
@@ -760,10 +767,10 @@ async fn ensure_buildah_mirror() -> Result<()> {
 /// 运行时镜像供给：清单引用 localhost/cogneva:local。
 /// 优先从 GitHub/Gitee release 下载预构建镜像（sha256 校验），失败回退源码构建
 /// （空白机全量 Rust release 构建需 1-3 小时，预构建下载仅需数分钟）。
-/// K3s 单节点导入本机 containerd；K8s 多节点经镜像分发器逐节点导入。
+/// K3s 单节点导入本机 containerd；K3s 多节点经镜像分发器逐节点导入。
 async fn ensure_runtime_image(branch: Branch) -> Result<()> {
     const IMAGE: &str = "localhost/cogneva:local";
-    if branch == Branch::K8s {
+    if branch == Branch::K3sMulti {
         return distribute_image_to_nodes(IMAGE).await;
     }
     let present = Command::new("k3s")
@@ -937,7 +944,7 @@ async fn try_import_prebuilt(image: &str) -> Result<()> {
     result
 }
 
-/// K8s 多节点镜像供给：本机导入只覆盖单节点，多节点必须让每个节点的
+/// K3s 多节点镜像供给：本机导入只覆盖单节点，多节点必须让每个节点的
 /// containerd 都拥有镜像。分发器模式：集群内起临时 HTTP 服务承载 tar.gz，
 /// DaemonSet 在每节点用宿主 ctr 二进制导入宿主 containerd，全部就绪后清理。
 /// COGNEVA_IMAGE_REGISTRY 已配置 = 生产仓库供给，直接跳过（清单镜像引用
@@ -971,7 +978,7 @@ async fn distribute_via_daemonset(tar: &str) -> Result<()> {
     let mstr = mpath.to_string_lossy().into_owned();
 
     let run_result = async {
-        // 命名空间可能尚不存在（K8s 分支在 deploy_manifests 之前执行）
+        // 命名空间可能尚不存在（K3s 多节点分支在 deploy_manifests 之前执行）
         run(
             "sh",
             &[
@@ -1387,7 +1394,7 @@ async fn deploy_via_apply(profile: Profile) -> Result<()> {
     );
     // kubectl apply -f <dir> 按文件名字典序逐个处理，namespace.yaml 排在
     // configmap/deployment 等之后，空白集群首轮会整批 namespace not found；
-    // 先幂等建命名空间再整目录 apply（K8s 分支分发器也做过，幂等无害）
+    // 先幂等建命名空间再整目录 apply（K3s 多节点分支的镜像分发器也做过，幂等无害）
     run(
         "sh",
         &[
@@ -1708,8 +1715,8 @@ async fn main() -> Result<()> {
     // 投递方式探测需要知道集群是"本次安装"还是"复用既有"：安装前取样。
     let cluster_existed = cluster_ready().await;
     match branch {
-        Branch::K3s => install_k3s().await?,
-        Branch::K8s => ensure_multi_node_cluster().await?,
+        Branch::K3sSingle => install_k3s().await?,
+        Branch::K3sMulti => ensure_multi_node_cluster().await?,
     }
     ensure_buildah().await?;
     ensure_buildah_mirror().await?;
