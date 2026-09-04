@@ -986,7 +986,11 @@ async fn try_import_prebuilt(image: &str) -> Result<()> {
         // 补不可变版本 tag：归档内只有浮动签 :local，版本 tag 供追溯与
         // 按版本引用（ManagementPlan 同步等路径）。失败不致命，:local 已就绪。
         let versioned = format!("localhost/cogneva:{}", env!("CARGO_PKG_VERSION"));
-        if let Err(e) = run("k3s", &["ctr", "-n", "k8s.io", "images", "tag", image, &versioned]).await
+        if let Err(e) = run(
+            "k3s",
+            &["ctr", "-n", "k8s.io", "images", "tag", image, &versioned],
+        )
+        .await
         {
             warn!("版本标签 {versioned} 打标失败（不影响 :local 部署）: {e:#}");
         }
@@ -1147,7 +1151,15 @@ async fn seed_cluster_registry() -> Result<()> {
     let object = "localhost/cogneva:local";
     for attempt in 1..=3 {
         let mut args: Vec<&str> = ctr_prefix.to_vec();
-        args.extend(["-n", "k8s.io", "images", "push", "--plain-http", remote, object]);
+        args.extend([
+            "-n",
+            "k8s.io",
+            "images",
+            "push",
+            "--plain-http",
+            remote,
+            object,
+        ]);
         match run(program, &args).await {
             Ok(()) => {
                 info!("集群内 registry 已播种基镜像 {remote}");
@@ -1625,10 +1637,7 @@ fn cn_helm_value_overrides(mirror: &str) -> Result<Vec<(String, String)>> {
         ),
         ("backends.nats.image", &["backends", "nats", "image"][..]),
         ("buildah.image", &["buildah", "image"][..]),
-        (
-            "clusterRegistry.image",
-            &["clusterRegistry", "image"][..],
-        ),
+        ("clusterRegistry.image", &["clusterRegistry", "image"][..]),
     ] {
         out.push((key.to_string(), cn_mirror_image(&image_at(path)?, mirror)));
     }
@@ -1721,6 +1730,86 @@ async fn wait_ready() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 三段语义化版本比较：a < b 返回 true；段数不齐补 0，非数字段按 0。
+fn version_lt(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split('.')
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
+            })
+            .collect()
+    };
+    let (va, vb) = (parse(a), parse(b));
+    for i in 0..va.len().max(vb.len()) {
+        let x = va.get(i).copied().unwrap_or(0);
+        let y = vb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x < y;
+        }
+    }
+    false
+}
+
+/// 装机完成后最佳努力检测官方是否已发布更新版本。只提示、绝不自动升级；
+/// 离线、超时、解析失败一律静默返回，不阻塞命门装机链路。
+/// （标准 `curl .../main/bootstrap.sh` 用户装的就是 main 最新，通常不触发；
+///  主要服务用了旧离线介质 / 旧脚本安装的场景。）
+async fn maybe_warn_outdated() {
+    let current = env!("CARGO_PKG_VERSION");
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    else {
+        return;
+    };
+    // CN 首选 Gitee（国内可达），GitHub API 兜底；拿到任一有效响应即止。
+    let endpoints = if cn_mirror() {
+        [
+            "https://gitee.com/api/v5/repos/hcipengm/cogneva/releases/latest",
+            "https://api.github.com/repos/hcipengm/cogneva/releases/latest",
+        ]
+    } else {
+        [
+            "https://api.github.com/repos/hcipengm/cogneva/releases/latest",
+            "https://gitee.com/api/v5/repos/hcipengm/cogneva/releases/latest",
+        ]
+    };
+    for url in endpoints {
+        let Ok(resp) = client.get(url).send().await else {
+            continue;
+        };
+        let Ok(body) = resp.text().await else {
+            continue;
+        };
+        let Some(tag) = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("tag_name")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+            })
+        else {
+            continue;
+        };
+        let latest = tag.trim_start_matches('v').trim();
+        if version_lt(current, latest) {
+            let page = if cn_mirror() {
+                "https://gitee.com/hcipengm/cogneva/releases"
+            } else {
+                "https://github.com/hcipengm/cogneva/releases"
+            };
+            info!(
+                "检测到新版本 v{latest}（当前安装 v{current}）。更新说明与镜像包见发布页：{page}"
+            );
+        }
+        return;
+    }
 }
 
 /// 尝试用系统默认浏览器打开 WebUI（2.5.6）；失败仅告警，不影响自毁退出。
@@ -1880,6 +1969,7 @@ async fn main() -> Result<()> {
         std::env::var("COGNEVA_WEBUI_URL").unwrap_or_else(|_| "http://localhost:8080".into());
     ensure_port_forward(&webui).await;
     info!("部署完成，WebUI 地址: {webui}");
+    maybe_warn_outdated().await;
     if !noninteractive {
         open_browser(&webui).await;
     }
@@ -1898,6 +1988,18 @@ mod profile_tests {
         assert_eq!(Profile::K3sSingle.dir_name(), "k3s-single");
         assert_eq!(Profile::K3sMulti.dir_name(), "k3s-multi");
         assert_eq!(Profile::K8sStandard.dir_name(), "k8s-standard");
+    }
+
+    #[test]
+    fn version_lt_compares_semver_segments() {
+        assert!(super::version_lt("0.5.7", "0.5.8"));
+        assert!(super::version_lt("0.5.7", "0.6.0"));
+        assert!(super::version_lt("0.5.7", "1.0.0"));
+        assert!(!super::version_lt("0.5.7", "0.5.7"));
+        assert!(!super::version_lt("0.5.8", "0.5.7"));
+        // 段数不齐补 0、非数字后缀按 0 处理
+        assert!(super::version_lt("0.5", "0.5.1"));
+        assert!(super::version_lt("0.5.7", "0.6.0-rc1"));
     }
 
     #[test]
