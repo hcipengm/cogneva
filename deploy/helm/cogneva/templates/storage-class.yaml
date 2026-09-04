@@ -1,0 +1,15 @@
+{{- if .Values.storage.localRetainClass.create }}
+# Retain 回收策略的 StorageClass：K3s 自带 local-path reclaimPolicy=Delete
+# 且不可变，进化源码/nats 数据等不可误删的卷用本类。标准 K8s 无
+# rancher.io/local-path provisioner，置 storage.localRetainClass.create=false。
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storage.localRetainClass.name }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: storage
+provisioner: {{ .Values.storage.localRetainClass.provisioner }}
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+{{- end }}

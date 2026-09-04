@@ -1138,11 +1138,7 @@ mod tests {
         // L1 晋级会打 overlay 镜像：staged 二进制桩 + 假构建器（不真跑 buildah）。
         std::fs::write(work.path().join("cogneva"), b"staged-binary").unwrap();
         let fake_builder = work.path().join("fake-buildah");
-        std::fs::write(
-            &fake_builder,
-            "#!/bin/sh\nexit 0\n",
-        )
-        .unwrap();
+        std::fs::write(&fake_builder, "#!/bin/sh\nexit 0\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake_builder, std::fs::Permissions::from_mode(0o755))

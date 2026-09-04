@@ -1,0 +1,98 @@
+{{- if .Values.clusterRegistry.enabled }}
+# 集群内镜像仓库：GitOps L1 金丝雀镜像的秒级分发通道。
+# publisher（进化 Pod）把 overlay 镜像（cogneva 基镜像 + 新二进制一个层）
+# 经集群 DNS push 到本 Service:5000（http，insecure）；节点 kubelet/containerd
+# 经 NodePort 以 localhost:<nodePort> pull——containerd 对 localhost 默认走
+# http 免 TLS，且每个节点的 NodePort 都由 kube-proxy 转发到本 Pod，
+# 单/多节点通吃，无需任何节点 registry 信任配置。
+# 存储跟随默认 StorageClass；基镜像层按 digest 去重，每次晋级只增一个二进制层。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-registry-pvc
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-registry
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.clusterRegistry.storage }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cogneva-registry
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-registry
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cogneva
+      app.kubernetes.io/component: cluster-registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cogneva
+        app.kubernetes.io/component: cluster-registry
+    spec:
+      containers:
+        - name: registry
+          image: {{ .Values.clusterRegistry.image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+              value: /var/lib/registry
+          ports:
+            - name: registry
+              containerPort: 5000
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /v2/
+              port: registry
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: registry
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.clusterRegistry.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: cogneva-registry-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-registry
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-registry
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: cluster-registry
+  ports:
+    - name: registry
+      port: 5000
+      targetPort: registry
+      nodePort: {{ .Values.clusterRegistry.nodePort }}
+      protocol: TCP
+{{- end }}

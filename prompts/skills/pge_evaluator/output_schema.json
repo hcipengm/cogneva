@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "required": ["verdict", "feedback"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["pass", "fail"] },
+    "feedback": { "type": "string", "description": "actionable feedback for the next iteration" },
+    "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "score", "comment"],
+        "properties": {
+          "name": { "type": "string" },
+          "score": { "type": "integer" },
+          "comment": { "type": "string" }
+        }
+      }
+    },
+    "details": { "type": "object" }
+  }
+}

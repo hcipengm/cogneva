@@ -202,7 +202,8 @@ impl GitOpsPublisher {
         let push_refs: Vec<&str> = push_args.iter().map(String::as_str).collect();
 
         // 冷构建首拉基镜像（解压 ~1.5GB）给 30 分钟；热构建只有 COPY 秒级。
-        self.run(&self.config.builder_bin, &build_refs, 1800).await?;
+        self.run(&self.config.builder_bin, &build_refs, 1800)
+            .await?;
         self.run(&self.config.builder_bin, &push_refs, 900).await?;
         info!(image = %image, "Promotion overlay image pushed to registry");
         Ok(())
@@ -272,10 +273,7 @@ mod tests {
     }
 
     /// L1 发布者：staged 二进制 + 假构建器齐备。
-    fn l1_publisher(
-        central: &std::path::Path,
-        work: &std::path::Path,
-    ) -> GitOpsPublisher {
+    fn l1_publisher(central: &std::path::Path, work: &std::path::Path) -> GitOpsPublisher {
         std::fs::write(work.join("cogneva"), b"staged-binary").unwrap();
         let builder = make_fake_builder(work);
         GitOpsPublisher::new(

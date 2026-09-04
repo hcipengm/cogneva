@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "required": ["content", "artifacts"],
+  "properties": {
+    "content": { "description": "primary output content" },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "content", "artifact_type"],
+        "properties": {
+          "name": { "type": "string" },
+          "content": { "type": "string" },
+          "artifact_type": { "type": "string" }
+        }
+      }
+    }
+  }
+}

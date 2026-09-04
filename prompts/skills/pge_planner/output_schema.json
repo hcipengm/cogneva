@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "required": ["summary", "plan", "sub_tasks"],
+  "properties": {
+    "summary": { "type": "string", "description": "concise plan summary" },
+    "plan": { "type": "object", "description": "structured plan details" },
+    "sub_tasks": { "type": "array", "description": "atom tasks decomposed from the goal" }
+  }
+}

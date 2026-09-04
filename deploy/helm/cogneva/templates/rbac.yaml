@@ -1,0 +1,107 @@
+# 主应用 Pod 使用的 ServiceAccount：LLM 设置页写 Secret/滚网关、GitOps 拉取端
+# apply 配置与金丝雀，都靠下面两个 Role 授权。网关/沙盒执行器不使用 SA。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cogneva
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+---
+# LLM 设置界面（WebUI 系统设置）最小权限：把用户填写的 key 写入 cogneva-secrets，
+# 把 provider/base_url/model 写进安全网关 Deployment env（模板变更自动滚网关），
+# 读集群组件健康与晋级门端点。真 key 只在安全网关 Pod。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cogneva-llm-admin
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["cogneva-secrets"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cogneva-security-gateway"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cogneva-json"]
+    verbs: ["get", "patch"]
+  # 集群组件健康端点读三组件副本状态；晋级门端点改配置后滚动主应用/进化/网关。
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cogneva", "cogneva-evolution", "cogneva-security-gateway"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cogneva-llm-admin
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+subjects:
+  - kind: ServiceAccount
+    name: cogneva
+    namespace: {{ include "cogneva.namespace" . }}
+roleRef:
+  kind: Role
+  name: cogneva-llm-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+# GitOps 拉取端最小权限：apply L0 配置 configmap、重建 prompts configmap、
+# 对 cogneva 部署做金丝雀（set image / rollout pause|resume|undo|status）
+# 并读取 pod 健康信号。全部限定 namespace 内、resourceNames 白名单。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cogneva-gitops-puller
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+rules:
+  # L0：kubectl apply cogneva-json（热更新）+ 重建 cogneva-prompts。
+  # apply 首次需要 create，后续 get+patch。
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cogneva-json", "cogneva-prompts"]
+    verbs: ["get", "patch", "create"]
+  # L1 金丝雀：set image / rollout pause|resume|undo 都是 patch；
+  # rollout status 需要 get+watch。
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cogneva"]
+    verbs: ["get", "list", "watch", "patch"]
+  # rollout undo 要从历史 ReplicaSet 还原 PodTemplate。
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
+  # 金丝雀看护：readiness 与 restart count。
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cogneva-gitops-puller
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+subjects:
+  - kind: ServiceAccount
+    name: cogneva
+    namespace: {{ include "cogneva.namespace" . }}
+roleRef:
+  kind: Role
+  name: cogneva-gitops-puller
+  apiGroup: rbac.authorization.k8s.io
