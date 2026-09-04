@@ -6,7 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 部署分支（与 main.rs 的探测规则一致）。
+/// 部署分支（与 main.rs 的探测规则一致）。分支名是历史命名：元启动新建集群时
+/// 两个分支装的都是 K3s——`K3s` = K3s 单节点，`K8s` = K3s 多节点（server +
+/// agents）。标准 Kubernetes（kubeadm / EKS 等）元启动不新建、只复用用户已
+/// 搭好的集群；原因不是技术不可行，而是成本收益不对等（见 main.rs 的
+/// `ensure_multi_node_cluster`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlanBranch {
@@ -68,7 +72,9 @@ pub struct HardwareProfile {
     pub nodes: u32,
 }
 
-/// 分支规则：内存 < 2GB 或单节点 → K3s；多节点高配 → K8s。
+/// 分支规则：内存 < 2GB 或单节点 → K3s 单节点；多节点高配 → K3s 多节点
+/// （server + agents）。两个分支新建的都是 K3s；标准 Kubernetes 不在新建
+/// 范围内，只复用用户既有集群（见 main.rs `ensure_multi_node_cluster`）。
 pub fn decide_branch(hw: &HardwareProfile) -> PlanBranch {
     if hw.memory_gb < 2 || hw.nodes <= 1 {
         PlanBranch::K3s
@@ -80,7 +86,7 @@ pub fn decide_branch(hw: &HardwareProfile) -> PlanBranch {
 /// backend 自动选择规则（审计 2.5.3）：
 /// - postgres：持久层必选；
 /// - redis：单节点/低内存消息与配额缓存；
-/// - nats：仅 K8s 生产分支（多节点事件总线）；
+/// - nats：仅多节点分支（K3s 多节点用 JetStream 事件总线，单节点由 Redis Streams 覆盖）；
 /// - qdrant：内存 ≥ 4GB 才本地部署，否则禁用（走外部向量库）；
 /// - mysql/meilisearch：默认禁用，显式需要时由 AI 在计划里开启。
 pub fn decide_backends(hw: &HardwareProfile, branch: PlanBranch) -> Vec<BackendSpec> {
@@ -99,9 +105,9 @@ pub fn decide_backends(hw: &HardwareProfile, branch: PlanBranch) -> Vec<BackendS
             kind: "nats".into(),
             enabled: branch == PlanBranch::K8s,
             reason: if branch == PlanBranch::K8s {
-                "生产分支：JetStream 事件总线".into()
+                "多节点分支：JetStream 事件总线".into()
             } else {
-                "轻量分支：Redis Streams 已覆盖".into()
+                "单节点分支：Redis Streams 已覆盖".into()
             },
         },
         BackendSpec {

@@ -45,6 +45,10 @@ use serde::Serialize;
 use tokio::process::Command;
 use tracing::{info, warn};
 
+/// 部署分支（按硬件/规模选）。注意分支名是历史命名，元启动**新建集群时两个
+/// 分支装的都是 K3s**：`K3s` = K3s 单节点，`K8s` = K3s 多节点（server +
+/// agents）。标准 Kubernetes（kubeadm / EKS 等）元启动不新建、只复用用户已
+/// 搭好的集群——原因见 `ensure_multi_node_cluster`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Branch {
@@ -158,7 +162,9 @@ async fn probe_hardware() -> Hardware {
     }
 }
 
-/// 规则引擎：内存 < 2GB 或单节点 → K3s 轻量分支；多节点高配 → K8s 生产分支。
+/// 规则引擎：内存 < 2GB 或单节点 → K3s 单节点；多节点高配 → K3s 多节点
+/// （server + agents）。两个分支新建的都是 K3s；标准 Kubernetes 不在新建范围
+/// 内，只复用用户既有集群（见 `ensure_multi_node_cluster`）。
 fn decide_branch(hw: &Hardware) -> Branch {
     if hw.mem_total_mb < 2048 || hw.nodes <= 1 {
         Branch::K3s
@@ -312,9 +318,25 @@ async fn cluster_internal_ips() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// K8s 分支集群供给：多节点 K8s = 本机 K3s server + SSH 推送安装 agent
-/// （K3s 是 CNCF 认证 K8s，多节点 K3s 即多节点 K8s）。已有可用集群时
-/// 仅补齐声明中缺失的 agent；无集群且无节点声明 → 失败前置。
+/// 多节点分支的集群供给。
+///
+/// 新建只装 K3s：本机作 server，再经 SSH 给声明的工作节点推装 agent。不新建
+/// 标准 Kubernetes——这不是技术上做不到，而是成本收益不对等。标准 K8s 的新建
+/// 是一串没有通用正确答案的决策：etcd 拓扑（单节点 / 三节点 HA / 外置）、
+/// CNI 选型（Calico / Cilium / Flannel 与网络策略、CIDR 规划）、默认存储类
+/// （Longhorn / Rook-Ceph / NFS）、证书 PKI 与轮换、入口（MetalLB + Ingress
+/// 还是云厂商 LB）、kubeadm token 与 CRI 版本对齐。把这些自动化等于在元启动
+/// 里再塞一个 kubespray；而项目目标是从零跑到一个 AI 自治系统，不是从零搭
+/// Kubernetes 发行版。默认值一旦选错，生产环境排查比 K3s 难得多。
+///
+/// K3s 能一键多节点，恰恰因为它替用户做完了上述全部默认选择（内置 Flannel、
+/// SQLite/etcd 自动选、local-path 存储、自管证书），代价是牺牲可定制性。元
+/// 启动借这条"零决策、零配置"的路径完成自举。
+///
+/// 所以边界是：新建 → 只覆盖 K3s（单节点 / 多节点），这是唯一零决策路径；
+/// 标准 Kubernetes → 用户自行搭好，元启动探测到即复用、只负责往上部署
+/// Cogneva。已有可用集群时仅补齐声明中缺失的 agent；无集群且无节点声明 →
+/// 失败前置。
 async fn ensure_multi_node_cluster() -> Result<()> {
     let agents = cluster_nodes_env();
     if !cluster_ready().await {
