@@ -811,6 +811,177 @@ async fn code_platform_forward(
         .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
 }
 
+// ─── 附件代理（issue/PR 评论里的图/音/视频/PDF）────────────────
+
+/// 附件下载允许的平台 host 白名单（防 SSRF）。GitHub 截图首跳常在
+/// `github.com/user-attachments/...`，302 跳到 `*.githubusercontent.com`
+/// 签名 CDN；Gitee 附件在 `gitee.com` 或 `*.gitee.com`。
+fn attach_platform(host: &str) -> Option<CodePlatform> {
+    let h = host.to_ascii_lowercase();
+    if h == "github.com" || h == "api.github.com" || h.ends_with(".githubusercontent.com") {
+        return Some(CodePlatform::GitHub);
+    }
+    if h == "gitee.com" || h.ends_with(".gitee.com") {
+        return Some(CodePlatform::Gitee);
+    }
+    None
+}
+
+/// 响应 Content-Type 为 octet-stream/缺失时，按 URL 后缀推断 MIME。
+fn ext_mime(url: &reqwest::Url) -> Option<&'static str> {
+    let path = url.path().to_ascii_lowercase();
+    match path.rsplit('.').next() {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("mp4") | Some("m4v") => Some("video/mp4"),
+        Some("webm") => Some("video/webm"),
+        Some("mov") => Some("video/quicktime"),
+        Some("mp3") => Some("audio/mpeg"),
+        Some("wav") => Some("audio/wav"),
+        Some("ogg") => Some("audio/ogg"),
+        Some("pdf") => Some("application/pdf"),
+        _ => None,
+    }
+}
+
+/// 判断 Content-Type 是否为允许的媒体类型。
+fn is_media_content_type(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    base.starts_with("image/")
+        || base.starts_with("audio/")
+        || base.starts_with("video/")
+        || base == "application/pdf"
+}
+
+/// `GET /attach?url=<percent-encoded 媒体地址>`：零凭证业务 Pod 经网关代取
+/// issue/PR 附件字节。仅允许平台白名单 host（逐跳重定向同样校验），首跳按
+/// 平台注入 token（reqwest 跨 host 重定向自动丢弃 Authorization，签名 CDN
+/// 自带凭证），限制大小与媒体 MIME，原样回传字节。
+async fn attach_proxy(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+    let raw = params
+        .get("url")
+        .ok_or((StatusCode::BAD_REQUEST, "缺少 url 参数".to_string()))?;
+    let mut url = reqwest::Url::parse(raw)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("非法 url: {e}")))?;
+    if url.scheme() != "https" {
+        return Err((StatusCode::BAD_REQUEST, "仅支持 https".into()));
+    }
+    let host = url
+        .host_str()
+        .map(|h| h.to_string())
+        .ok_or((StatusCode::BAD_REQUEST, "缺少 host".to_string()))?;
+    let platform = attach_platform(&host)
+        .ok_or_else(|| (StatusCode::FORBIDDEN, format!("host 不在白名单: {host}")))?;
+
+    // Gitee 凭证以 access_token query 注入（与 API 透传一致）；GitHub 用 Bearer。
+    match platform {
+        CodePlatform::Gitee => {
+            if let Some(token) = state.config.gitee_token.as_deref() {
+                url.query_pairs_mut().append_pair("access_token", token);
+            }
+        }
+        CodePlatform::GitHub => {}
+    }
+
+    // 逐跳重定向只允许白名单 https host，杜绝经平台开放重定向打到内网。
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let nxt = attempt.url();
+            let ok_host = nxt
+                .host_str()
+                .map(|h| attach_platform(h).is_some())
+                .unwrap_or(false);
+            if nxt.scheme() == "https" && ok_host && attempt.previous().len() < 5 {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut builder = client
+        .get(url.clone())
+        .header("User-Agent", "cogneva-security-gateway");
+    if matches!(platform, CodePlatform::GitHub)
+        && matches!(host.as_str(), "github.com" | "api.github.com")
+    {
+        if let Some(token) = state.config.github_token.as_deref() {
+            builder = builder.bearer_auth(token);
+        }
+    }
+
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("连接附件上游失败: {e}")))?;
+    if !resp.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("附件上游返回 {}", resp.status()),
+        ));
+    }
+
+    // Content-Type 白名单；octet-stream/缺失时按后缀推断。
+    let resp_ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_type = if is_media_content_type(&resp_ct) {
+        resp_ct.split(';').next().unwrap_or("").trim().to_string()
+    } else if let Some(m) = ext_mime(&url) {
+        m.to_string()
+    } else {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("非媒体附件，Content-Type={resp_ct}"),
+        ));
+    };
+
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_ATTACHMENT_BYTES {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "附件过大".into()));
+        }
+    }
+
+    // 流式累积并硬限大小，避免无 Content-Length 时 OOM。
+    use futures::TryStreamExt;
+    let mut total = 0usize;
+    let mut buf = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?
+    {
+        total += chunk.len();
+        if total > MAX_ATTACHMENT_BYTES {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "附件过大".into()));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .body(axum::body::Body::from(buf))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 // ─── git 传输透传（GitHub / Gitee）────────────────────────────
 
 /// git smart HTTP 透传：业务 Pod 的 git clone/push 指向网关
@@ -1097,6 +1268,7 @@ fn router(state: AppState, llm_channel: bool) -> Router {
                 "/git/gitee/{*path}",
                 axum::routing::any(git_gitee_passthrough),
             )
+            .route("/attach", get(attach_proxy))
     } else {
         r.route("/proxy", post(proxy_handler))
     };
@@ -1306,5 +1478,49 @@ mod tests {
         }
         assert_eq!(stats.percentile(0.5), 60.0);
         assert_eq!(stats.percentile(0.99), 100.0);
+    }
+
+    #[test]
+    fn attach_whitelist_allows_platform_hosts_only() {
+        // 平台域与其附件 CDN 放行。
+        assert!(attach_platform("github.com").is_some());
+        assert!(attach_platform("api.github.com").is_some());
+        assert!(attach_platform("objects.githubusercontent.com").is_some());
+        assert!(attach_platform("private-user-images.githubusercontent.com").is_some());
+        assert!(attach_platform("gitee.com").is_some());
+        assert!(attach_platform("foruda.gitee.com").is_some());
+        // 非平台域一律拒绝（防 SSRF，含内网/元数据地址）。
+        assert!(attach_platform("evil.com").is_none());
+        assert!(attach_platform("169.254.169.254").is_none());
+        assert!(attach_platform("localhost").is_none());
+        assert!(attach_platform("10.0.0.6").is_none());
+        // 大小写归一。
+        assert!(attach_platform("GitHub.com").is_some());
+    }
+
+    #[test]
+    fn attach_ext_mime_infers_media_types() {
+        let u = |p: &str| {
+            let mut url = reqwest::Url::parse("https://github.com/owner/repo/raw/HEAD/").unwrap();
+            url.set_path(p);
+            url
+        };
+        assert_eq!(ext_mime(&u("/a/b.png")), Some("image/png"));
+        assert_eq!(ext_mime(&u("/a/b.JPG")), Some("image/jpeg"));
+        assert_eq!(ext_mime(&u("/a/b.mp4")), Some("video/mp4"));
+        assert_eq!(ext_mime(&u("/a/b.mp3")), Some("audio/mpeg"));
+        assert_eq!(ext_mime(&u("/a/b.pdf")), Some("application/pdf"));
+        assert_eq!(ext_mime(&u("/a/b.exe")), None);
+    }
+
+    #[test]
+    fn attach_media_content_type_gate() {
+        assert!(is_media_content_type("image/png; charset=binary"));
+        assert!(is_media_content_type("video/mp4"));
+        assert!(is_media_content_type("audio/mpeg"));
+        assert!(is_media_content_type("application/pdf"));
+        assert!(!is_media_content_type("text/html"));
+        assert!(!is_media_content_type("application/json"));
+        assert!(!is_media_content_type("application/octet-stream"));
     }
 }

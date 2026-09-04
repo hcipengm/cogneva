@@ -151,6 +151,16 @@ impl cog_core::TaskExecutor for CollaborationExecutor {
     }
 
     async fn execute(&self, task: &Task) -> SFResult<TaskResult> {
+        // External-intent actionability assessment is a lightweight single-agent
+        // multimodal call, not the Squad→PGE→SelfReview codegen pipeline. It must
+        // be intercepted before the squad paths (the task carries no
+        // evolution_mode marker, but routing it through a squad would waste a full
+        // planner/generator/evaluator run on a one-shot JSON verdict).
+        if let TaskType::Custom(kind) = &task.task_type {
+            if kind == "platform_intent_assess" {
+                return self.execute_intent_assess(task).await;
+            }
+        }
         // is_executable == false means this is an original overall task
         // (placeholder injected by ActionPlanner) that needs decomposition.
         // is_executable == true means this is an atomic/executable task that
@@ -178,6 +188,199 @@ impl CollaborationExecutor {
             }
         }
         ms
+    }
+
+    /// Lightweight single-agent multimodal actionability verdict for an external
+    /// intent (a GitHub/Gitee issue or pull request).
+    ///
+    /// One multimodal agent reads the intent body, the follow-up comment thread,
+    /// and any attached screenshots/recordings (fed as real media content blocks
+    /// so a vision/audio-capable model actually sees them), and returns a single
+    /// JSON object: `{decision, question, priority, reason}` with
+    /// `decision ∈ fix|clarify|skip|escalate`. The verdict rides back on the task
+    /// result; cog-github acts on it (submit the heavy PGE fix task / ask exactly
+    /// one clarification / skip / escalate). This task produces no patch and never
+    /// enters the self-evolution pipeline.
+    async fn execute_intent_assess(&self, task: &Task) -> SFResult<TaskResult> {
+        let (Some(ref manager), Some(ref llm)) = (&self.agent_manager, &self.llm_provider) else {
+            // No agent/LLM wired: fail loudly so the router DLQs the task and the
+            // sensor side degrades to its local model-free heuristic instead of
+            // silently guessing.
+            return Err(SFError::Agent(
+                "platform_intent_assess requires an agent manager and an LLM provider".into(),
+            ));
+        };
+        let agent = manager
+            .create_agent(
+                &format!("intent-assessor-{}", task.id),
+                "intent_assessor",
+                llm.clone(),
+            )
+            .await?;
+
+        let input = &task.input;
+        let kind = input
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("issue");
+        let number = input.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+        let title = input.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let body = input.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let labels = input
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let thread = input
+            .get("reply_thread")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let mut prompt = String::new();
+        prompt.push_str(&format!(
+            "You are judging whether an external {kind} on a code platform is actionable for an autonomous coding agent.\n\n"
+        ));
+        prompt.push_str(&format!("#{number} {title}\n"));
+        if !labels.is_empty() {
+            prompt.push_str(&format!("Labels: {labels}\n"));
+        }
+        prompt.push_str("\n## Body\n");
+        prompt.push_str(if body.trim().is_empty() {
+            "(empty)"
+        } else {
+            body
+        });
+        prompt.push_str("\n\n## Follow-up conversation\n");
+        prompt.push_str(if thread.trim().is_empty() {
+            "(no comments)"
+        } else {
+            thread
+        });
+        prompt.push_str(
+            "\n\nAttached media (screenshots/recordings) are provided as separate content blocks; \
+             inspect them — a screenshot may contain the exact error and reproduction steps.\n\n\
+             Decide actionability from the WHOLE content above:\n\
+             - fix: the intent is clear enough to act on now (a reproducible bug, or a concrete \
+             request the agent can realize). Do NOT ask again once enough information is present.\n\
+             - clarify: essential information is still missing (expected vs actual behavior, \
+             reproduction steps, or version). Put the single most useful question in `question`.\n\
+             - skip: not worth acting on (out of scope, not a bug, a duplicate, etc.).\n\
+             - escalate: high-risk or sensitive, must be handled by a human.\n\n\
+             Reply with ONE JSON object only, no prose, no code fence:\n\
+             {\"decision\": \"fix|clarify|skip|escalate\", \"question\": \"\", \"priority\": 1-5, \"reason\": \"\"}\n\
+             priority is 1 (highest) to 5 (lowest). When decision is not `clarify`, leave question empty. \
+             Write the question in the same language the reporter used.",
+        );
+
+        let mut blocks = vec![cog_core::ContentBlock::text(prompt)];
+        if let Some(media) = input.get("media").and_then(|v| v.as_array()) {
+            for m in media {
+                let data = m.get("data_base64").and_then(|v| v.as_str()).unwrap_or("");
+                let mime = m
+                    .get("mime_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream");
+                if !data.is_empty() {
+                    blocks.push(cog_core::ContentBlock::media(data, mime));
+                }
+            }
+        }
+
+        let messages = vec![
+            cog_core::Message::system(
+                "You are a careful actionability judge for an autonomous software-engineering \
+                 agent. You output exactly one JSON verdict and nothing else.",
+            ),
+            cog_core::Message::user_blocks(blocks),
+        ];
+
+        let stream = agent
+            .chat_stream(&messages, &cog_core::ChatOptions::default())
+            .await?;
+        use futures::StreamExt;
+        let mut stream = stream;
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                cog_core::AssistantMessageEvent::TextDelta { delta, .. } => {
+                    text.push_str(&delta);
+                }
+                cog_core::AssistantMessageEvent::Done { message, .. } => {
+                    let final_text = message.content();
+                    if !final_text.trim().is_empty() {
+                        text = final_text;
+                    }
+                }
+                cog_core::AssistantMessageEvent::Error { error, .. } => {
+                    return Err(SFError::Agent(format!(
+                        "intent assess stream error: {}",
+                        error.content()
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        let verdict = Self::parse_intent_verdict(&text)?;
+        info!(
+            task_id = %task.id,
+            decision = %verdict.get("decision").and_then(|v| v.as_str()).unwrap_or("?"),
+            "platform_intent_assess verdict"
+        );
+        Ok(TaskResult {
+            success: true,
+            output: verdict,
+            metadata: TaskResultMetadata::new("intent_assess"),
+        })
+    }
+
+    /// Parse the model's JSON verdict, tolerating a trailing/leading code fence
+    /// and surrounding prose. Normalizes `decision` to lowercase and fills safe
+    /// defaults for the optional fields.
+    fn parse_intent_verdict(text: &str) -> SFResult<serde_json::Value> {
+        let trimmed = text.trim();
+        let json_str = if let Some(start) = trimmed.find('{') {
+            let end = trimmed.rfind('}').ok_or_else(|| {
+                SFError::Agent(format!("intent verdict has no closing brace: {trimmed}"))
+            })?;
+            trimmed[start..=end].trim()
+        } else {
+            return Err(SFError::Agent(format!(
+                "intent verdict is not JSON: {trimmed}"
+            )));
+        };
+        let mut v: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| SFError::Agent(format!("invalid intent verdict JSON: {e}: {json_str}")))?;
+
+        let decision = v
+            .get("decision")
+            .and_then(|d| d.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let decision = match decision.as_str() {
+            "fix" | "clarify" | "skip" | "escalate" => decision,
+            other => {
+                return Err(SFError::Agent(format!(
+                    "intent verdict has unknown decision: {other:?}"
+                )));
+            }
+        };
+        v["decision"] = serde_json::json!(decision);
+        if v.get("question").and_then(|q| q.as_str()).is_none() {
+            v["question"] = serde_json::json!("");
+        }
+        if v.get("priority").and_then(|p| p.as_u64()).is_none() {
+            v["priority"] = serde_json::json!(3);
+        }
+        if v.get("reason").and_then(|r| r.as_str()).is_none() {
+            v["reason"] = serde_json::json!("");
+        }
+        Ok(v)
     }
 
     /// Decomposition path: run the full Squad → PGE → SelfReview pipeline

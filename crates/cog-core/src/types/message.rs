@@ -52,7 +52,10 @@ pub enum Message {
         timestamp: DateTime<Utc>,
     },
     User {
-        content: String,
+        /// Content blocks: text plus optional multimodal media. Accepts the
+        /// legacy plain-string serialization for backward compatibility.
+        #[serde(default, deserialize_with = "deserialize_user_content")]
+        content: Vec<ContentBlock>,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
@@ -123,7 +126,15 @@ impl Message {
 
     pub fn user(content: impl Into<String>) -> Self {
         Message::User {
-            content: content.into(),
+            content: vec![ContentBlock::text(content)],
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Build a user message from explicit content blocks (text + media).
+    pub fn user_blocks(content: Vec<ContentBlock>) -> Self {
+        Message::User {
+            content,
             timestamp: Utc::now(),
         }
     }
@@ -177,13 +188,9 @@ impl Message {
     pub fn content(&self) -> String {
         match self {
             Message::System { content, .. } => content.clone(),
-            Message::User { content, .. } => content.clone(),
-            Message::Assistant { content, .. } => content
-                .iter()
-                .filter_map(|b| b.as_text())
-                .collect::<Vec<_>>()
-                .join(""),
-            Message::ToolResult { content, .. } => content
+            Message::User { content, .. }
+            | Message::Assistant { content, .. }
+            | Message::ToolResult { content, .. } => content
                 .iter()
                 .filter_map(|b| b.as_text())
                 .collect::<Vec<_>>()
@@ -248,5 +255,24 @@ impl Message {
             }
             _ => {}
         }
+    }
+}
+
+/// Accept either the new block array or a legacy plain string for a user
+/// message's `content`, so persisted messages from before multimodal blocks
+/// keep deserializing (a string becomes a single text block).
+fn deserialize_user_content<'de, D>(deserializer: D) -> Result<Vec<ContentBlock>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum UserContentRepr {
+        Blocks(Vec<ContentBlock>),
+        Text(String),
+    }
+    match UserContentRepr::deserialize(deserializer)? {
+        UserContentRepr::Blocks(blocks) => Ok(blocks),
+        UserContentRepr::Text(text) => Ok(vec![ContentBlock::text(text)]),
     }
 }

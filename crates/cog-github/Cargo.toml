@@ -32,6 +32,8 @@ axum = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# base64 for encoding fetched attachment bytes into multimodal content blocks.
+base64 = "0.22"
 
 [dev-dependencies]
 tokio-test = "0.4"

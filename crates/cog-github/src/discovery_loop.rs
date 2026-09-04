@@ -7,9 +7,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::config::GitHubIntegrationConfig;
-use cog_core::{OrchestratorControl, Task, TaskType};
+use cog_core::{
+    ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, Task, TaskStatus, TaskType,
+};
 
 use crate::conversation::{ConversationState, IssueConversation};
 use crate::discovery::IssueDiscovery;
@@ -17,6 +20,15 @@ use crate::error::Result;
 use crate::outcome_recorder::OutcomeRecorder;
 use crate::provider::{CiFailureEvent, CodePlatformProvider, PlatformIssue};
 use crate::triage::{IssueTriage, TriageDecision};
+
+/// DAG-side timeout for a single assess task (must exceed the wait budget
+/// below so the poller gives up around the same time the task would be killed).
+const ASSESS_TASK_TIMEOUT_SECS: u64 = 120;
+/// How long the discovery loop blocks waiting for an assess verdict before it
+/// gives up and falls back to the local heuristic this round.
+const ASSESS_WAIT_TIMEOUT_SECS: u64 = 100;
+/// Poll interval while waiting for the assess task to complete.
+const ASSESS_POLL_INTERVAL_MS: u64 = 500;
 
 /// The autonomous GitHub sensor loop.
 pub struct GitHubDiscoveryLoop {
@@ -26,23 +38,79 @@ pub struct GitHubDiscoveryLoop {
     orchestrator: Option<Arc<dyn OrchestratorControl>>,
     reflection: Option<Arc<dyn cog_core::ReflectionEngine>>,
     discovery: IssueDiscovery,
-    conversations: HashMap<u64, IssueConversation>,
+    /// Conversation state keyed by `"<kind>:<number>"` (e.g. `"issue:7"`,
+    /// `"pr:12"`). The kind prefix keeps issue and PR number spaces apart
+    /// (on Gitee they are independent sequences).
+    conversations: HashMap<String, IssueConversation>,
     recorder: OutcomeRecorder,
-    /// Issue numbers that already produced a task this process lifetime.
-    submitted: std::collections::HashSet<u64>,
-    /// PR numbers that already produced an intent task this process lifetime.
-    submitted_prs: std::collections::HashSet<u64>,
-    /// Issues with a bot clarification question already posted and no
-    /// substantive user reply seen yet. In-memory guard so concurrent triggers
-    /// (webhook + polling, or the bot's own comment event arriving before the
-    /// just-posted comment is re-read) cannot post a second question.
-    awaiting_clarification: std::collections::HashSet<u64>,
+    /// Intent guard keys (`"<kind>:<number>"`) that already produced a task
+    /// this process lifetime — covers both issues and PRs.
+    submitted: std::collections::HashSet<String>,
+    /// Intent guard keys with a bot clarification question already posted and
+    /// no substantive user reply seen yet. In-memory guard so concurrent
+    /// triggers (webhook + polling, or the bot's own comment event arriving
+    /// before the just-posted comment is re-read) cannot post a second
+    /// question.
+    awaiting_clarification: std::collections::HashSet<String>,
     /// CI run ids that already produced a fix task this process lifetime.
     ci_submitted: std::collections::HashSet<u64>,
     /// CI run ids seen by the polling fallback. `None` until the first poll,
     /// which adopts all currently failed runs without submitting (so a pod
     /// restart does not resubmit old failures).
     ci_seen: Option<std::collections::HashSet<u64>>,
+}
+
+/// Which external-intent surface a conversation belongs to. Issues and PRs
+/// are equal intent entry points and share the same actionability logic; the
+/// kind only selects the comment endpoints and the fix-task flavor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntentKind {
+    Issue,
+    Pr,
+}
+
+impl IntentKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            IntentKind::Issue => "issue",
+            IntentKind::Pr => "pr",
+        }
+    }
+
+    /// Guard-map key, namespaced so issue and PR number spaces never collide.
+    fn key(self, number: u64) -> String {
+        format!("{}:{number}", self.as_str())
+    }
+}
+
+/// Borrowed identifying + descriptive fields of one external intent (issue or
+/// PR) that needs an actionability verdict. Bundled so the judge/assess path
+/// takes a single argument instead of a long parameter list.
+struct IntentContext<'a> {
+    kind: IntentKind,
+    number: u64,
+    title: &'a str,
+    body: &'a str,
+    labels: &'a [String],
+    author: &'a str,
+}
+
+impl IntentContext<'_> {
+    /// Materialize the cross-crate issue view the local rules/heuristic read.
+    /// PRs are judged as issues with a `[PR]` title prefix, so the local path
+    /// reuses the same shape.
+    fn to_platform_issue(&self) -> PlatformIssue {
+        PlatformIssue {
+            number: self.number,
+            title: self.title.to_string(),
+            body: self.body.to_string(),
+            state: "open".to_string(),
+            labels: self.labels.to_vec(),
+            author: self.author.to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
 }
 
 impl GitHubDiscoveryLoop {
@@ -66,7 +134,6 @@ impl GitHubDiscoveryLoop {
             conversations: HashMap::new(),
             recorder: OutcomeRecorder::new(),
             submitted: std::collections::HashSet::new(),
-            submitted_prs: std::collections::HashSet::new(),
             ci_submitted: std::collections::HashSet::new(),
             awaiting_clarification: std::collections::HashSet::new(),
             ci_seen: None,
@@ -334,15 +401,60 @@ impl GitHubDiscoveryLoop {
     }
 
     async fn process_issue(&mut self, issue: &PlatformIssue) -> Result<()> {
-        // Rebuild conversation state from platform comments each round so
-        // user replies are picked up.
-        let comments = self
-            .provider
-            .list_issue_comments(issue.number)
-            .await
-            .unwrap_or_default();
+        let kind = IntentKind::Issue;
+        let key = kind.key(issue.number);
+
+        // Rebuild conversation state from platform comments and run the shared
+        // state-machine guards (stale / awaiting / already submitted). `None`
+        // means this round needs no action.
+        let Some(mut conversation) = self.prepare_conversation(kind, issue.number).await? else {
+            return Ok(());
+        };
+
+        // Judge actionability semantically from the whole thread plus any
+        // attached screenshots/recordings (fed as real media blocks via the
+        // multimodal assess task; falls back to the local rules heuristic when
+        // no orchestrator/LLM is available).
+        let intent = IntentContext {
+            kind,
+            number: issue.number,
+            title: &issue.title,
+            body: &issue.body,
+            labels: &issue.labels,
+            author: &issue.author,
+        };
+        let decision = self.judge_intent(&intent, &conversation).await;
+
+        let is_fix = self
+            .act_on_decision(kind, issue.number, &key, decision, &mut conversation)
+            .await?;
+        if is_fix && self.config.auto_create_pr {
+            self.submit_fix_task(issue, &conversation).await?;
+            self.submitted.insert(key.clone());
+        }
+
+        self.conversations.insert(key, conversation);
+        Ok(())
+    }
+
+    /// Pull the comment thread for the intent and run the shared conversation
+    /// state-machine guards. Returns the live conversation when actionability
+    /// should be judged this round, or `None` when the intent is stale, already
+    /// awaiting a reply, or already acted on (in which cases state is persisted
+    /// and no further work is needed).
+    async fn prepare_conversation(
+        &mut self,
+        kind: IntentKind,
+        number: u64,
+    ) -> Result<Option<IssueConversation>> {
+        let comments = match kind {
+            IntentKind::Issue => self.provider.list_issue_comments(number).await,
+            IntentKind::Pr => self.provider.list_pull_comments(number).await,
+        }
+        .unwrap_or_default();
+        let key = kind.key(number);
         let conversation = IssueConversation::from_comments(
-            issue.number,
+            number,
             &comments,
             &self.config.bot_identity.username,
             &self.config.conversation,
@@ -350,110 +462,333 @@ impl GitHubDiscoveryLoop {
 
         match conversation.state {
             ConversationState::Stale => {
-                tracing::info!(issue = issue.number, "Conversation stale; skipping");
-                self.conversations.insert(issue.number, conversation);
-                return Ok(());
+                tracing::info!(%key, "Conversation stale; skipping");
+                self.conversations.insert(key, conversation);
+                return Ok(None);
             }
             ConversationState::AwaitingClarification => {
-                // Still waiting for a substantive reply; nothing to do this
-                // round. Also arm the in-memory guard so a concurrent trigger
-                // (webhook + polling, or self-comment event before the post is
+                // Still waiting for a substantive reply; arm the in-memory guard
+                // so a concurrent trigger (webhook + polling, or the bot's own
+                // comment event arriving before the just-posted comment is
                 // re-read) cannot post a second question.
-                self.awaiting_clarification.insert(issue.number);
-                self.conversations.insert(issue.number, conversation);
-                return Ok(());
+                self.awaiting_clarification.insert(key.clone());
+                self.conversations.insert(key, conversation);
+                return Ok(None);
             }
             ConversationState::UserReplied => {
                 // The reporter sent a new turn (text, screenshot, or link).
-                // Release the guard so triage can re-judge actionability from
-                // the full thread; a further question (if still unclear) is
-                // allowed subject to the round budget.
-                self.awaiting_clarification.remove(&issue.number);
+                // Release the guard so the judge can re-decide actionability
+                // from the full thread; a further question (if still unclear)
+                // is allowed subject to the round budget.
+                self.awaiting_clarification.remove(&key);
             }
             _ => {}
         }
 
-        if conversation.state == ConversationState::UserReplied
-            && self.submitted.contains(&issue.number)
-        {
-            self.conversations.insert(issue.number, conversation);
-            return Ok(());
+        // Already acted on this intent and the reporter only replied afterwards:
+        // don't re-submit.
+        if conversation.state == ConversationState::UserReplied && self.submitted.contains(&key) {
+            self.conversations.insert(key, conversation);
+            return Ok(None);
         }
 
-        // Judge actionability from the whole conversation, not just the terse
-        // issue body: follow-up replies (and screenshots) can make it fixable.
-        let reply_thread = conversation.triage_context();
-        let decision = self
-            .triage
-            .evaluate(issue, &self.config, &reply_thread)
-            .await;
+        Ok(Some(conversation))
+    }
 
+    /// Decide actionability for one external intent. With an orchestrator wired,
+    /// a lightweight multimodal `platform_intent_assess` task reads the body,
+    /// the whole comment thread, and any fetched media blocks and returns a
+    /// semantic verdict (fix / clarify / skip / escalate). Without an
+    /// orchestrator, or when the assess task fails, this degrades to the local
+    /// model-free rules heuristic so the loop stays autonomous.
+    async fn judge_intent(
+        &self,
+        intent: &IntentContext<'_>,
+        conversation: &IssueConversation,
+    ) -> TriageDecision {
+        let key = intent.kind.key(intent.number);
+        let issue = intent.to_platform_issue();
+
+        // Deterministic label rules short-circuit before any model call: a
+        // forbidden/human-required label is certain, must not spend an assess
+        // round-trip, and must not depend on the model honoring it.
+        if let Some(decision) = IssueTriage::rules_decision(&issue, &self.config) {
+            return decision;
+        }
+
+        let reply_thread = conversation.triage_context();
+        let media = self.fetch_media_blocks(conversation).await;
+
+        if let Some(orchestrator) = &self.orchestrator {
+            match self
+                .run_assess_task(orchestrator, intent, &reply_thread, &media)
+                .await
+            {
+                Ok(decision) => {
+                    tracing::debug!(%key, "actionability verdict from multimodal assess task");
+                    return decision;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %key,
+                        error = %e,
+                        "assess task failed; falling back to local rules heuristic"
+                    );
+                }
+            }
+        } else {
+            tracing::info!(%key, "no orchestrator; judging actionability with local rules heuristic");
+        }
+
+        // No-LLM fallback: rules plus a readable-text heuristic. The label
+        // rules already short-circuited above, so re-running them here only
+        // repeats a cheap, side-effect-free check. Media cannot be read on this
+        // path, so a screenshot-only thread still asks the reporter for text.
+        self.triage
+            .evaluate(&issue, &self.config, &reply_thread)
+            .await
+    }
+
+    /// Download the intent's media attachments through the zero-credential
+    /// gateway proxy and encode them as base64 content blocks for the assessor.
+    /// Failures are logged and skipped — a missing attachment never blocks the
+    /// text-only judgement.
+    async fn fetch_media_blocks(&self, conversation: &IssueConversation) -> Vec<serde_json::Value> {
+        use base64::Engine as _;
+        let mut blocks = Vec::new();
+        for url in conversation.media_urls() {
+            match self.provider.fetch_attachment(&url).await {
+                Ok(att) => {
+                    let data_base64 = base64::engine::general_purpose::STANDARD.encode(&att.bytes);
+                    blocks.push(serde_json::json!({
+                        "data_base64": data_base64,
+                        "mime_type": att.mime_type,
+                        "url": url,
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        url = %url,
+                        error = %e,
+                        "Failed to fetch attachment; judging text-only"
+                    );
+                }
+            }
+        }
+        blocks
+    }
+
+    /// Submit the one-shot multimodal assess task and block (poll the DAG) until
+    /// its JSON verdict rides back on `task.result`, then map it to a
+    /// [`TriageDecision`]. The task is injected `verified` so it bypasses
+    /// ActionPlanner decomposition and routes straight to the single-agent
+    /// assessor.
+    async fn run_assess_task(
+        &self,
+        orchestrator: &Arc<dyn OrchestratorControl>,
+        intent: &IntentContext<'_>,
+        reply_thread: &str,
+        media: &[serde_json::Value],
+    ) -> Result<TriageDecision> {
+        let kind = intent.kind;
+        let number = intent.number;
+        // Unique per submission so a re-judgement after a user reply does not
+        // collide with an already-completed task id.
+        let task_id = format!(
+            "intent-assess-{}-{}-{}",
+            kind.as_str(),
+            number,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let goal = format!(
+            "Assess actionability of {} #{}: {}",
+            kind.as_str(),
+            number,
+            intent.title
+        );
+        let input = serde_json::json!({
+            "kind": kind.as_str(),
+            "number": number,
+            "title": intent.title,
+            "body": intent.body,
+            "labels": intent.labels,
+            "author": intent.author,
+            "reply_thread": reply_thread,
+            "media": media,
+        });
+        let mut task = Task::new(
+            task_id.clone(),
+            TaskType::Custom("platform_intent_assess".into()),
+            input,
+        );
+        task.action_planner_meta = Some(ActionPlannerMeta {
+            verified: true,
+            version: Some("1.0.0".into()),
+            note: Some("Multimodal actionability verdict; route to single-agent assessor".into()),
+            source: Some(ActionPlannerSource::UserProvided),
+            confidence: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        task.timeout_seconds = ASSESS_TASK_TIMEOUT_SECS;
+
+        let ids = orchestrator
+            .submit_goal_auto(&goal, vec![task])
+            .await
+            .map_err(|e| crate::error::CogGitHubError::Provider(e.to_string()))?;
+        let id = ids.into_iter().next().unwrap_or(task_id);
+
+        let deadline = Instant::now() + Duration::from_secs(ASSESS_WAIT_TIMEOUT_SECS);
+        loop {
+            if let Some(t) = orchestrator.get_task(&id).await {
+                match t.status {
+                    TaskStatus::Completed => {
+                        let verdict = t.result.unwrap_or_default();
+                        return Ok(Self::verdict_to_decision(&verdict));
+                    }
+                    TaskStatus::Failed => {
+                        return Err(crate::error::CogGitHubError::Provider(format!(
+                            "assess task {id} failed: {}",
+                            t.error.unwrap_or_default()
+                        )));
+                    }
+                    TaskStatus::Cancelled => {
+                        return Err(crate::error::CogGitHubError::Provider(format!(
+                            "assess task {id} cancelled"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(crate::error::CogGitHubError::Provider(format!(
+                    "assess task {id} timed out after {ASSESS_WAIT_TIMEOUT_SECS}s"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(ASSESS_POLL_INTERVAL_MS)).await;
+        }
+    }
+
+    /// Map the assessor's JSON verdict (`{decision, question, priority, reason}`)
+    /// onto the internal triage decision. Unknown/absent decisions degrade to
+    /// Skip so a malformed verdict never forces an unwanted fix.
+    fn verdict_to_decision(v: &serde_json::Value) -> TriageDecision {
+        let reason = v
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        let question = v
+            .get("question")
+            .and_then(|q| q.as_str())
+            .unwrap_or("")
+            .to_string();
+        let priority = v.get("priority").and_then(|p| p.as_u64()).unwrap_or(3) as u8;
+        match v.get("decision").and_then(|d| d.as_str()).unwrap_or("") {
+            "fix" => TriageDecision::Fix {
+                priority,
+                rationale: reason,
+            },
+            "clarify" => TriageDecision::AskForClarification {
+                question: if question.trim().is_empty() {
+                    "Could you share the expected vs actual behavior and the steps to reproduce?"
+                        .into()
+                } else {
+                    question
+                },
+            },
+            "escalate" => TriageDecision::EscalateHuman { reason },
+            other => TriageDecision::Skip {
+                reason: if reason.trim().is_empty() {
+                    format!("assessor decision: {other:?}")
+                } else {
+                    reason
+                },
+            },
+        }
+    }
+
+    /// Apply the side effects of a triage decision: post exactly one
+    /// clarification (guarded against duplicates and bounded by the round
+    /// budget), log skip/escalate, and clear the awaiting guard on a fix.
+    /// Returns `true` when the caller should submit the fix/intent task; the
+    /// caller sets the `submitted` guard only after the submit succeeds.
+    async fn act_on_decision(
+        &mut self,
+        kind: IntentKind,
+        number: u64,
+        key: &str,
+        decision: TriageDecision,
+        conversation: &mut IssueConversation,
+    ) -> Result<bool> {
         match decision {
             TriageDecision::Fix {
                 priority,
                 rationale,
             } => {
                 tracing::info!(
-                    issue = issue.number,
+                    %key,
                     priority,
                     rationale = %rationale,
-                    "Triage decided to fix issue"
+                    "Actionability judge: act now"
                 );
-                if self.config.auto_create_pr {
-                    self.submit_fix_task(issue, &conversation).await?;
-                    self.submitted.insert(issue.number);
-                    self.awaiting_clarification.remove(&issue.number);
-                }
+                self.awaiting_clarification.remove(key);
+                Ok(true)
             }
             TriageDecision::AskForClarification { question } => {
-                let mut convo = conversation;
-                // Hard in-memory guard: a question is already outstanding for
-                // this issue and no new user turn has arrived since — never post
-                // a duplicate, even if the comment re-read raced or a
-                // webhook+poll fired together. A further question after a real
-                // reply is bounded by max_clarification_rounds (convo.ask).
-                if self.awaiting_clarification.contains(&issue.number) {
-                    tracing::info!(
-                        issue = issue.number,
-                        "Clarification already outstanding; not re-asking"
-                    );
-                    self.conversations.insert(issue.number, convo);
-                    return Ok(());
+                // Hard in-memory guard: a question is already outstanding and no
+                // new user turn has arrived — never post a duplicate, even if
+                // the comment re-read raced or a webhook+poll fired together.
+                // A further question after a real reply is bounded by
+                // max_clarification_rounds (conversation.ask).
+                if self.awaiting_clarification.contains(key) {
+                    tracing::info!(%key, "Clarification already outstanding; not re-asking");
+                    return Ok(false);
                 }
-                if let Some(body) = convo.ask(&question, &self.config.conversation) {
-                    let posted = convo
-                        .post_reply(self.provider.as_ref(), &body, &self.config.conversation)
-                        .await?;
+                if let Some(body) = conversation.ask(&question, &self.config.conversation) {
+                    let posted = self.post_clarification(kind, number, &body).await?;
                     if posted {
-                        self.awaiting_clarification.insert(issue.number);
+                        self.awaiting_clarification.insert(key.to_string());
                     }
-                    tracing::info!(
-                        issue = issue.number,
-                        posted,
-                        "Posted clarification question"
-                    );
+                    tracing::info!(%key, posted, "Posted clarification question");
                 }
-                self.conversations.insert(issue.number, convo);
-                return Ok(());
+                Ok(false)
             }
             TriageDecision::EscalateHuman { reason } => {
-                tracing::warn!(
-                    issue = issue.number,
-                    reason = %reason,
-                    "Issue escalated to human"
-                );
+                tracing::warn!(%key, reason = %reason, "Escalated to human");
+                Ok(false)
             }
             TriageDecision::Skip { reason } => {
-                tracing::debug!(
-                    issue = issue.number,
-                    reason = %reason,
-                    "Issue skipped"
-                );
+                tracing::debug!(%key, reason = %reason, "Skipped");
+                Ok(false)
             }
         }
+    }
 
-        self.conversations.insert(issue.number, conversation);
-        Ok(())
+    /// Post a clarification comment to the right surface: issues use the issue
+    /// endpoint, PRs use the pull-request endpoint (Gitee serves these on
+    /// different paths; GitHub treats a PR as an issue).
+    async fn post_clarification(&self, kind: IntentKind, number: u64, body: &str) -> Result<bool> {
+        if !self.config.conversation.auto_reply {
+            tracing::info!(
+                kind = kind.as_str(),
+                number,
+                "auto_reply disabled; clarification question not posted"
+            );
+            return Ok(false);
+        }
+        match kind {
+            IntentKind::Issue => {
+                self.provider
+                    .comment_on_issue(number, body.to_string())
+                    .await?
+            }
+            IntentKind::Pr => {
+                self.provider
+                    .comment_on_pull(number, body.to_string())
+                    .await?
+            }
+        }
+        Ok(true)
     }
 
     async fn submit_fix_task(
@@ -525,7 +860,9 @@ impl GitHubDiscoveryLoop {
             tracing::debug!(pr = pr.number, "Skipping self-produced PR");
             return Ok(());
         }
-        if self.submitted_prs.contains(&pr.number) {
+        let kind = IntentKind::Pr;
+        let key = kind.key(pr.number);
+        if self.submitted.contains(&key) {
             return Ok(());
         }
         if pr
@@ -534,44 +871,38 @@ impl GitHubDiscoveryLoop {
             .any(|l| self.config.forbidden_labels.contains(l))
         {
             tracing::info!(pr = pr.number, "PR carries forbidden label; skipping");
-            self.submitted_prs.insert(pr.number);
+            self.submitted.insert(key);
             return Ok(());
         }
 
-        // 复用 issue triage 规则评估 PR 意图是否值得做：PR 与 issue 同为
-        // 外部意图，门禁标准一致。
-        let intent = PlatformIssue {
-            number: pr.number,
-            title: format!("[PR] {}", pr.title),
-            body: pr.body.clone(),
-            state: pr.state.clone(),
-            labels: pr.labels.clone(),
-            author: pr.author.clone(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+        // PRs and issues are equal external-intent entry points: same comment
+        // thread rebuild, same state-machine guards, same semantic actionability
+        // judge (multimodal assess task with local heuristic fallback). PRs can
+        // also receive a clarification question when the intent is unclear.
+        let Some(mut conversation) = self.prepare_conversation(kind, pr.number).await? else {
+            return Ok(());
         };
-        let decision = self.triage.evaluate(&intent, &self.config, "").await;
 
-        match decision {
-            TriageDecision::Fix {
-                priority,
-                rationale,
-            } => {
-                tracing::info!(
-                    pr = pr.number,
-                    priority,
-                    rationale = %rationale,
-                    "Triage decided to pursue PR intent"
-                );
-                if self.config.auto_create_pr {
-                    self.submit_pr_intent_task(pr).await?;
-                    self.submitted_prs.insert(pr.number);
-                }
-            }
-            other => {
-                tracing::info!(pr = pr.number, decision = ?other, "PR intent not pursued");
-            }
+        let title = format!("[PR] {}", pr.title);
+        let intent = IntentContext {
+            kind,
+            number: pr.number,
+            title: &title,
+            body: &pr.body,
+            labels: &pr.labels,
+            author: &pr.author,
+        };
+        let decision = self.judge_intent(&intent, &conversation).await;
+
+        let is_fix = self
+            .act_on_decision(kind, pr.number, &key, decision, &mut conversation)
+            .await?;
+        if is_fix && self.config.auto_create_pr {
+            self.submit_pr_intent_task(pr).await?;
+            self.submitted.insert(key.clone());
         }
+
+        self.conversations.insert(key, conversation);
         Ok(())
     }
 
@@ -663,6 +994,36 @@ mod tests {
 
     struct MockOrchestrator {
         goals: Mutex<Vec<String>>,
+        task_types: Mutex<Vec<String>>,
+        /// Verdict returned for a `platform_intent_assess` task. `None` reports
+        /// the task as Failed so the fallback path can be exercised without
+        /// waiting out the real poll timeout.
+        assess_verdict: Mutex<Option<serde_json::Value>>,
+    }
+
+    impl MockOrchestrator {
+        fn new() -> Self {
+            Self {
+                goals: Mutex::new(vec![]),
+                task_types: Mutex::new(vec![]),
+                assess_verdict: Mutex::new(Some(serde_json::json!({
+                    "decision": "fix",
+                    "question": "",
+                    "priority": 2,
+                    "reason": "mock assessor: actionable",
+                }))),
+            }
+        }
+
+        fn with_verdict(self, verdict: serde_json::Value) -> Self {
+            *self.assess_verdict.lock().unwrap() = Some(verdict);
+            self
+        }
+
+        fn with_failed_assess(self) -> Self {
+            *self.assess_verdict.lock().unwrap() = None;
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -673,10 +1034,19 @@ mod tests {
         async fn submit_goal_auto(
             &self,
             goal: &str,
-            _tasks: Vec<Task>,
+            tasks: Vec<Task>,
         ) -> cog_core::SFResult<Vec<String>> {
             self.goals.lock().unwrap().push(goal.to_string());
-            Ok(vec!["task-1".into()])
+            let mut ids = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                let type_name = match &task.task_type {
+                    TaskType::Custom(name) => name.clone(),
+                    other => format!("{other:?}"),
+                };
+                self.task_types.lock().unwrap().push(type_name);
+                ids.push(task.id);
+            }
+            Ok(ids)
         }
         async fn assign_task(&self, _t: &str, _a: &str) -> cog_core::SFResult<()> {
             unimplemented!()
@@ -725,8 +1095,29 @@ mod tests {
         async fn cancel_task(&self, _t: &str) -> cog_core::SFResult<Vec<String>> {
             unimplemented!()
         }
-        async fn get_task(&self, _t: &str) -> Option<Task> {
-            None
+        async fn get_task(&self, id: &str) -> Option<Task> {
+            // Only the assess task is polled; report it finished immediately so
+            // tests never wait out the real 100s poll timeout.
+            if !id.contains("intent-assess") {
+                return None;
+            }
+            let verdict = self.assess_verdict.lock().unwrap().clone();
+            let mut task = Task::new(
+                id,
+                TaskType::Custom("platform_intent_assess".into()),
+                serde_json::json!({}),
+            );
+            match verdict {
+                Some(result) => {
+                    task.status = TaskStatus::Completed;
+                    task.result = Some(result);
+                }
+                None => {
+                    task.status = TaskStatus::Failed;
+                    task.error = Some("mock assess failure".into());
+                }
+            }
+            Some(task)
         }
         async fn schedule_task(&self, _t: &str) -> cog_core::SFResult<()> {
             unimplemented!()
@@ -785,9 +1176,7 @@ mod tests {
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
         });
-        let orchestrator = Arc::new(MockOrchestrator {
-            goals: Mutex::new(vec![]),
-        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
 
         let mut loop_ = GitHubDiscoveryLoop::new(
             provider,
@@ -798,7 +1187,93 @@ mod tests {
         );
         let scanned = loop_.run_once().await.unwrap();
         assert_eq!(scanned, 1);
-        assert_eq!(orchestrator.goals.lock().unwrap().len(), 1);
+        // With an orchestrator the loop first submits the multimodal assess
+        // task; a `fix` verdict then submits the real github_issue_fix task.
+        let types = orchestrator.task_types.lock().unwrap();
+        assert!(
+            types.iter().any(|t| t == "platform_intent_assess"),
+            "assess task should be submitted before acting; got {types:?}"
+        );
+        assert!(
+            types.iter().any(|t| t == "github_issue_fix"),
+            "a fix verdict should submit the github_issue_fix task; got {types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assess_clarify_verdict_posts_question_and_no_fix() {
+        // The semantic assessor (mocked) judges a terse issue as still unclear:
+        // the loop posts the assessor's question once and must not submit a fix.
+        let provider = Arc::new(MockProvider {
+            issues: vec![issue(7, "it breaks")],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new().with_verdict(serde_json::json!({
+            "decision": "clarify",
+            "question": "Which release are you running, and what is the exact error?",
+            "priority": 3,
+            "reason": "no reproduction detail",
+        })));
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        loop_.run_once().await.unwrap();
+
+        let comments = provider.comments.lock().unwrap();
+        assert_eq!(comments.len(), 1, "exactly one clarification comment");
+        assert_eq!(comments[0].0, 7);
+        assert!(
+            comments[0].1.contains("Which release are you running"),
+            "comment should carry the assessor's question; got: {}",
+            comments[0].1
+        );
+        drop(comments);
+
+        let types = orchestrator.task_types.lock().unwrap();
+        assert!(types.iter().any(|t| t == "platform_intent_assess"));
+        assert!(
+            !types.iter().any(|t| t == "github_issue_fix"),
+            "a clarify verdict must not submit a fix task; got {types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assess_failure_falls_back_to_heuristic_fix() {
+        // When the assess task fails, the loop degrades to the local text
+        // heuristic: a clear, reproducible body is still fixed autonomously.
+        let provider = Arc::new(MockProvider {
+            issues: vec![issue(
+                8,
+                "The /health endpoint is slow. Expected under 50ms, actual 500ms. Reproduce: curl it.",
+            )],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new().with_failed_assess());
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        loop_.run_once().await.unwrap();
+
+        let types = orchestrator.task_types.lock().unwrap();
+        assert!(types.iter().any(|t| t == "platform_intent_assess"));
+        assert!(
+            types.iter().any(|t| t == "github_issue_fix"),
+            "heuristic fallback should still submit a fix for a clear issue; got {types:?}"
+        );
     }
 
     #[tokio::test]
@@ -911,9 +1386,7 @@ mod tests {
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
         });
-        let orchestrator = Arc::new(MockOrchestrator {
-            goals: Mutex::new(vec![]),
-        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
 
         let mut loop_ = GitHubDiscoveryLoop::new(
             provider.clone(),
@@ -949,9 +1422,7 @@ mod tests {
             }],
             ci_runs: Mutex::new(vec![]),
         });
-        let orchestrator = Arc::new(MockOrchestrator {
-            goals: Mutex::new(vec![]),
-        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
 
         let mut loop_ = GitHubDiscoveryLoop::new(
             provider,
@@ -977,9 +1448,7 @@ mod tests {
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
         });
-        let orchestrator = Arc::new(MockOrchestrator {
-            goals: Mutex::new(vec![]),
-        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
 
         let mut loop_ = GitHubDiscoveryLoop::new(
             provider,
@@ -1017,9 +1486,7 @@ mod tests {
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![ci_event(4001), ci_event(4002)]),
         });
-        let orchestrator = Arc::new(MockOrchestrator {
-            goals: Mutex::new(vec![]),
-        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
 
         let mut loop_ = GitHubDiscoveryLoop::new(
             provider,
@@ -1041,9 +1508,7 @@ mod tests {
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![ci_event(5001)]),
         });
-        let orchestrator = Arc::new(MockOrchestrator {
-            goals: Mutex::new(vec![]),
-        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
 
         let mut loop_ = GitHubDiscoveryLoop::new(
             provider.clone(),

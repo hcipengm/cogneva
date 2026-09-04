@@ -82,7 +82,10 @@ impl OpenAIProvider {
                     };
                     json!({"role": role, "content": content})
                 }
-                Message::User { content, .. } => json!({"role": "user", "content": content}),
+                Message::User { content, .. } => json!({
+                    "role": "user",
+                    "content": super::media::openai_content(content, &self.model)
+                }),
                 Message::Assistant { content, .. } => {
                     let text: String = content
                         .iter()

@@ -162,11 +162,13 @@ impl cog_core::SystemPlugin for GitHubPlugin {
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
-        let llm = ctx.consume_service::<dyn cog_core::LlmClient>();
         let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
         let reflection = ctx.consume_service::<dyn cog_core::ReflectionEngine>();
-        if llm.is_none() {
-            info!("GitHubPlugin: no LLM client; triage runs rules-only");
+        // 本 crate 是传感器/执行器，绝不直连 LLM。语义可行动性判定以
+        // platform_intent_assess 任务经 orchestrator 派给 cog-collaboration 的
+        // 单 agent 多模态分支；无 orchestrator 时 triage 退回本地规则启发式。
+        if orchestrator.is_none() {
+            info!("GitHubPlugin: no orchestrator; intent assessment falls back to local rules heuristic");
         }
 
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -177,10 +179,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         let mk_loop = |config: &crate::config::GitHubIntegrationConfig,
                        provider: &Arc<dyn CodePlatformProvider>|
          -> SharedLoop {
-            let triage = match &llm {
-                Some(l) => crate::triage::IssueTriage::with_llm(l.clone()),
-                None => crate::triage::IssueTriage::rules_only(),
-            };
+            let triage = crate::triage::IssueTriage::rules_only();
             Arc::new(tokio::sync::Mutex::new(
                 crate::discovery_loop::GitHubDiscoveryLoop::new(
                     provider.clone(),

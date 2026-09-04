@@ -47,7 +47,7 @@ impl GoogleProvider {
             .filter(|m| !matches!(m, Message::System { .. }))
             .map(|msg| match msg {
                 Message::User { content, .. } => {
-                    json!({"role": "user", "parts": [{"text": content}]})
+                    json!({"role": "user", "parts": super::media::gemini_parts(content, &self.model)})
                 }
                 Message::Assistant { content, .. } => {
                     let mut parts: Vec<serde_json::Value> = Vec::new();

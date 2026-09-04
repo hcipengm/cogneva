@@ -389,7 +389,7 @@ Respond with **only** a JSON object matching this schema:\n\
                 timestamp: chrono::Utc::now(),
             },
             cog_core::Message::User {
-                content: prompt,
+                content: vec![cog_core::ContentBlock::text(prompt)],
                 timestamp: chrono::Utc::now(),
             },
         ];

@@ -39,7 +39,14 @@ impl OllamaProvider {
             .iter()
             .map(|msg| match msg {
                 Message::System { content, .. } => json!({"role": "system", "content": content}),
-                Message::User { content, .. } => json!({"role": "user", "content": content}),
+                Message::User { content, .. } => {
+                    let (text, images) = super::media::ollama_content(content, &self.model);
+                    let mut m = json!({"role": "user", "content": text});
+                    if !images.is_empty() {
+                        m["images"] = json!(images);
+                    }
+                    m
+                }
                 Message::Assistant { content, .. } => {
                     let text: String = content
                         .iter()

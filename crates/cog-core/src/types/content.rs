@@ -29,10 +29,16 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         thought_signature: Option<String>,
     },
-    Image {
-        /// base64 encoded image data
+    /// Binary media attached to a message (image, audio, video, or PDF),
+    /// carried as base64 with a MIME type. Protocol adapters map this to the
+    /// provider's multimodal format and downgrade modalities the model cannot
+    /// accept. Serde alias accepts the legacy `image` tag.
+    #[serde(alias = "image")]
+    Media {
+        /// base64 encoded media bytes
         data: String,
-        /// e.g., "image/jpeg", "image/png"
+        /// e.g., "image/png", "image/jpeg", "audio/mpeg", "video/mp4",
+        /// "application/pdf"
         mime_type: String,
     },
 }
@@ -66,8 +72,19 @@ impl ContentBlock {
         }
     }
 
+    /// Build a media block from base64 data and a MIME type. Covers images,
+    /// audio, video, and PDFs; use [`ContentBlock::image`] for the common
+    /// image case.
+    pub fn media(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        ContentBlock::Media {
+            data: data.into(),
+            mime_type: mime_type.into(),
+        }
+    }
+
+    /// Convenience constructor for an image media block.
     pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
-        ContentBlock::Image {
+        ContentBlock::Media {
             data: data.into(),
             mime_type: mime_type.into(),
         }
@@ -85,8 +102,17 @@ impl ContentBlock {
         matches!(self, ContentBlock::ToolCall { .. })
     }
 
+    /// True for any media block (image, audio, video, or PDF).
+    pub fn is_media(&self) -> bool {
+        matches!(self, ContentBlock::Media { .. })
+    }
+
+    /// True for image media blocks specifically.
     pub fn is_image(&self) -> bool {
-        matches!(self, ContentBlock::Image { .. })
+        matches!(
+            self,
+            ContentBlock::Media { mime_type, .. } if mime_type.starts_with("image/")
+        )
     }
 
     /// Returns the text content if this is a Text block.
@@ -114,6 +140,14 @@ impl ContentBlock {
                 arguments,
                 ..
             } => Some((id, name, arguments)),
+            _ => None,
+        }
+    }
+
+    /// Returns the base64 data and MIME type if this is a Media block.
+    pub fn as_media(&self) -> Option<(&str, &str)> {
+        match self {
+            ContentBlock::Media { data, mime_type } => Some((data, mime_type)),
             _ => None,
         }
     }

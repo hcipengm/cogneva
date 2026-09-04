@@ -10,8 +10,9 @@ use crate::config::GitHubAccount;
 
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{
-    CiFailureEvent, CiJobLog, CodePlatformProvider, CreatePullRequest, PlatformComment,
-    PlatformIssue, PlatformPullRequest, PullRequestDetail,
+    gateway_attach_root, http_fetch_attachment, AttachmentData, CiFailureEvent, CiJobLog,
+    CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue, PlatformPullRequest,
+    PullRequestDetail,
 };
 
 /// Max failed jobs whose logs are fetched per run.
@@ -215,6 +216,14 @@ impl CodePlatformProvider for GitHubProvider {
                 created_at: c.created_at,
             })
             .collect())
+    }
+
+    async fn fetch_attachment(&self, url: &str) -> Result<AttachmentData> {
+        // Gateway mode (api_base like http://gw/github): fetch through the
+        // zero-credential /attach proxy; direct mode: fetch the public URL.
+        let root = self.api_base.as_deref().and_then(gateway_attach_root);
+        let http = reqwest::Client::new();
+        http_fetch_attachment(&http, root.as_deref(), url).await
     }
 
     async fn fetch_ci_failure_logs(&self, run_id: u64) -> Result<Vec<CiJobLog>> {

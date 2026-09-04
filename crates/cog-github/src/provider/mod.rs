@@ -43,6 +43,36 @@ pub trait CodePlatformProvider: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// List comments on a pull request (oldest first). PRs and issues are equal
+    /// external-intent entry points, so the clarification conversation runs on
+    /// both. On GitHub the issues-comments endpoint serves PRs too, so the
+    /// default delegates to [`list_issue_comments`](Self::list_issue_comments);
+    /// Gitee overrides with its `/pulls/{n}/comments` endpoint.
+    async fn list_pull_comments(&self, pr_number: u64) -> Result<Vec<PlatformComment>> {
+        self.list_issue_comments(pr_number).await
+    }
+
+    /// Post a comment on a pull request. Default delegates to
+    /// [`comment_on_issue`](Self::comment_on_issue) (GitHub treats PRs as
+    /// issues); Gitee overrides with its `/pulls/{n}/comments` endpoint.
+    async fn comment_on_pull(&self, pr_number: u64, body: String) -> Result<()> {
+        self.comment_on_issue(pr_number, body).await
+    }
+
+    /// Fetch a media attachment (screenshot / recording / video / PDF) as raw
+    /// bytes plus its MIME type. In gateway mode the bytes are fetched through
+    /// the security gateway's zero-credential `/attach` proxy (which injects
+    /// platform credentials on the first hop and validates host/size/MIME); in
+    /// direct mode the public media URL is fetched directly.
+    ///
+    /// Default: unsupported — providers without attachment access return an
+    /// error so multimodal triage degrades to text-only.
+    async fn fetch_attachment(&self, _url: &str) -> Result<AttachmentData> {
+        Err(crate::error::CogGitHubError::Provider(
+            "fetch_attachment not supported by this provider".into(),
+        ))
+    }
+
     /// Fetch log tails for failed CI jobs of a workflow run.
     ///
     /// Default: unsupported — providers without CI log access return an
@@ -151,6 +181,118 @@ pub struct PlatformComment {
     pub body: String,
     /// Creation timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A fetched media attachment: raw bytes and its MIME type. Used to feed
+/// screenshots / recordings / video / PDFs to the multimodal actionability
+/// judge as base64 content blocks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachmentData {
+    /// Raw media bytes.
+    pub bytes: Vec<u8>,
+    /// MIME type (e.g. `image/png`, `video/mp4`).
+    pub mime_type: String,
+}
+
+/// Cap on a single attachment's bytes (mirrors the gateway `/attach` limit;
+/// applied in direct mode too so a huge file cannot blow up memory).
+pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Derive the security-gateway root (where `/attach` lives) from a platform
+/// passthrough `api_base` such as `http://gw:8081/github` or
+/// `http://gw:8081/gitee`. Returns `None` for direct (public-platform) bases,
+/// in which case attachments are fetched directly from their public URL.
+pub fn gateway_attach_root(api_base: &str) -> Option<String> {
+    let trimmed = api_base.trim_end_matches('/');
+    for suffix in ["/github", "/gitee"] {
+        if let Some(root) = trimmed.strip_suffix(suffix) {
+            if !root.is_empty() {
+                return Some(root.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Fetch a media attachment, through the gateway `/attach` proxy when a
+/// gateway root is known (zero-credential egress, host/size/MIME validated
+/// there), else directly. Returns the bytes and a MIME type (from the
+/// response `Content-Type`, inferred from the URL extension when absent).
+pub(crate) async fn http_fetch_attachment(
+    client: &reqwest::Client,
+    gateway_root: Option<&str>,
+    url: &str,
+) -> Result<AttachmentData> {
+    // reqwest percent-encodes the `url` query parameter for us.
+    let req = match gateway_root {
+        Some(root) => client
+            .get(format!("{}/attach", root.trim_end_matches('/')))
+            .query(&[("url", url)]),
+        None => client.get(url),
+    };
+    let resp = req
+        .send()
+        .await
+        .map_err(crate::error::CogGitHubError::Http)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(crate::error::CogGitHubError::Provider(format!(
+            "attachment fetch returned HTTP {status} for {url}"
+        )));
+    }
+    let header_mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(crate::error::CogGitHubError::Http)?;
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(crate::error::CogGitHubError::Provider(format!(
+            "attachment too large ({} bytes) for {url}",
+            bytes.len()
+        )));
+    }
+    let mime_type = header_mime
+        .filter(|m| is_media_mime(m))
+        .or_else(|| ext_mime(url))
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok(AttachmentData {
+        bytes: bytes.to_vec(),
+        mime_type,
+    })
+}
+
+/// True when a MIME type is a media kind we accept as an attachment.
+fn is_media_mime(mime: &str) -> bool {
+    let m = mime.to_ascii_lowercase();
+    m.starts_with("image/")
+        || m.starts_with("audio/")
+        || m.starts_with("video/")
+        || m == "application/pdf"
+}
+
+/// Infer a media MIME type from a URL's file extension.
+fn ext_mime(url: &str) -> Option<String> {
+    let path = url.split('?').next().unwrap_or(url);
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "pdf" => "application/pdf",
+        _ => return None,
+    };
+    Some(mime.to_string())
 }
 
 /// A CI workflow-run failure observed on the platform.

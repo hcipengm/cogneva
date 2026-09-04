@@ -117,8 +117,7 @@ impl DefaultLearningDetector {
         messages
             .iter()
             .filter_map(|m| match m {
-                Message::User { content, .. } => Some(content.clone()),
-                Message::Assistant { content, .. } => {
+                Message::User { content, .. } | Message::Assistant { content, .. } => {
                     let text: String = content
                         .iter()
                         .filter_map(|b| b.as_text())

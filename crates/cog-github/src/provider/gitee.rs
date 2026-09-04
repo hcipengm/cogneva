@@ -12,8 +12,9 @@ use async_trait::async_trait;
 
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{
-    CiFailureEvent, CiJobLog, CodePlatformProvider, CreatePullRequest, PlatformComment,
-    PlatformIssue, PlatformPullRequest, PullRequestDetail,
+    gateway_attach_root, http_fetch_attachment, AttachmentData, CiFailureEvent, CiJobLog,
+    CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue, PlatformPullRequest,
+    PullRequestDetail,
 };
 
 /// Gitee code platform provider (API v5).
@@ -214,6 +215,44 @@ impl CodePlatformProvider for GiteeProvider {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    async fn list_pull_comments(&self, pr_number: u64) -> Result<Vec<PlatformComment>> {
+        // Gitee PR 评论端点与 issue 不同（PR 用数值 number，直接进路径）。
+        let v = self
+            .send(
+                self.get(&format!("/pulls/{pr_number}/comments"))
+                    .query(&[("per_page", "100")]),
+            )
+            .await?;
+        Ok(v.as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|c| PlatformComment {
+                        author: c["user"]["login"].as_str().unwrap_or_default().to_string(),
+                        body: c["body"].as_str().unwrap_or_default().to_string(),
+                        created_at: parse_time(&c["created_at"]),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn comment_on_pull(&self, pr_number: u64, body: String) -> Result<()> {
+        self.send(
+            self.http
+                .post(self.url(&format!("/pulls/{pr_number}/comments")))
+                .form(&[("body", body.as_str())]),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn fetch_attachment(&self, url: &str) -> Result<AttachmentData> {
+        // Gateway mode (base like http://gw/gitee): zero-credential /attach
+        // proxy; direct mode: fetch the public URL.
+        let root = gateway_attach_root(&self.base);
+        http_fetch_attachment(&self.http, root.as_deref(), url).await
     }
 
     async fn get_pull_request(&self, pr_number: u64) -> Result<PullRequestDetail> {

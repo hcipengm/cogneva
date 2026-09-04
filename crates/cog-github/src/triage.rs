@@ -1,15 +1,19 @@
-//! Issue triage — autonomous evaluation of whether an issue should be fixed
-//! by the agent, needs clarification, or must go to a human.
+//! Issue triage — local, rule-based pre-filters and the no-LLM fallback.
 //!
-//! Rule-based pre-filters always run (forbidden labels → Skip,
-//! human-required labels → EscalateHuman).  When an LLM client is available
-//! the remaining issues are evaluated semantically; without an LLM the
-//! fallback is a conservative heuristic so the loop stays autonomous.
-
-use std::sync::Arc;
+//! This crate is a sensor/actuator: it never calls an LLM directly. The
+//! semantic actionability judgment ("can we act on this issue/PR yet?") is
+//! dispatched to `cog-collaboration` through the orchestrator as a
+//! `platform_intent_assess` task, where a single multimodal agent reads the
+//! issue body plus follow-up replies (including screenshots/recordings) and
+//! returns a `{decision, question, priority}` JSON verdict.
+//!
+//! What stays local here by design (no model call):
+//! - deterministic label pre-filters (forbidden labels → Skip,
+//!   human-required labels → EscalateHuman);
+//! - a conservative text-count heuristic used only when no orchestrator is
+//!   wired (keeps the loop autonomous without any LLM).
 
 use crate::config::GitHubIntegrationConfig;
-use cog_core::{ChatOptions, LlmClient, Message};
 
 use crate::provider::PlatformIssue;
 
@@ -40,29 +44,38 @@ pub enum TriageDecision {
     },
 }
 
-/// Evaluates issues and renders triage decisions.
-pub struct IssueTriage {
-    llm: Option<Arc<dyn LlmClient>>,
-}
+/// Local, model-free triage: deterministic label pre-filters plus a text-count
+/// heuristic fallback. Semantic (multimodal) actionability is judged upstream
+/// in `cog-collaboration`; this type holds no LLM client.
+#[derive(Default)]
+pub struct IssueTriage;
 
 impl IssueTriage {
-    /// Create a triage evaluator without an LLM (rules + heuristics only).
+    /// Create the local (rules + heuristic) triage. This is the only mode in
+    /// this crate — semantic judgment runs in collaboration, not here.
     pub fn rules_only() -> Self {
-        Self { llm: None }
+        Self
     }
 
-    /// Create a triage evaluator backed by an LLM for semantic judgment.
-    pub fn with_llm(llm: Arc<dyn LlmClient>) -> Self {
-        Self { llm: Some(llm) }
+    /// Deterministic label pre-filters: forbidden labels → Skip,
+    /// human-required labels → EscalateHuman. `None` when no label short-circuits.
+    pub fn rules_decision(
+        issue: &PlatformIssue,
+        config: &GitHubIntegrationConfig,
+    ) -> Option<TriageDecision> {
+        Self::apply_rules(issue, config)
     }
 
-    /// Evaluate an issue and produce a triage decision.
-    ///
-    /// `reply_thread` is the rendered clarification conversation (bot questions
-    /// and the reporter's follow-up replies, including image/link attachments).
-    /// Actionability must be judged from the whole thread, not just the often
-    /// terse issue body — a screenshot or follow-up comment can carry the answer.
-    /// Pass an empty string when there is no conversation (e.g. a fresh PR intent).
+    /// No-LLM fallback: decide from readable text length only (screenshots and
+    /// links carry no text for this judge). Used when no orchestrator is wired
+    /// so the loop stays autonomous; the semantic path runs elsewhere.
+    pub fn heuristic_decision(issue: &PlatformIssue, reply_thread: &str) -> TriageDecision {
+        Self::heuristic(issue, reply_thread)
+    }
+
+    /// Evaluate locally (rules then heuristic). This is the model-free fallback
+    /// path. `reply_thread` is the rendered clarification conversation; pass an
+    /// empty string when there is none (e.g. a fresh PR intent).
     pub async fn evaluate(
         &self,
         issue: &PlatformIssue,
@@ -72,26 +85,7 @@ impl IssueTriage {
         if let Some(decision) = Self::apply_rules(issue, config) {
             return decision;
         }
-
-        match &self.llm {
-            Some(llm) => {
-                match self
-                    .evaluate_with_llm(llm.as_ref(), issue, reply_thread)
-                    .await
-                {
-                    Ok(decision) => decision,
-                    Err(e) => {
-                        tracing::warn!(
-                            issue = issue.number,
-                            error = %e,
-                            "LLM triage failed; falling back to heuristic"
-                        );
-                        Self::heuristic(issue, reply_thread)
-                    }
-                }
-            }
-            None => Self::heuristic(issue, reply_thread),
-        }
+        Self::heuristic(issue, reply_thread)
     }
 
     /// Deterministic pre-filters from the integration config.
@@ -139,113 +133,6 @@ impl IssueTriage {
             priority: 3,
             rationale: "rule-based triage: description or replies look actionable".into(),
         }
-    }
-
-    async fn evaluate_with_llm(
-        &self,
-        llm: &dyn LlmClient,
-        issue: &PlatformIssue,
-        reply_thread: &str,
-    ) -> cog_core::SFResult<TriageDecision> {
-        // The follow-up thread is appended verbatim when present: the reporter's
-        // comments — including screenshots/links — are part of the actionable
-        // picture. When a screenshot cannot be read and the issue is still not
-        // actionable, instruct the bot to ask for the key text rather than to
-        // treat the image as an answer or ignore it.
-        let thread_section = if reply_thread.trim().is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\nReporter follow-up replies (newest last; image/link attachments \
-                 may contain the answer — if you cannot read an attached screenshot and \
-                 the issue is not yet actionable, ask the reporter to paste the error text \
-                 and reproduction steps):\n{}",
-                reply_thread
-            )
-        };
-        let prompt = format!(
-            "You are the triage actor of an autonomous code-evolution system.\n\
-             Evaluate this GitHub issue together with the reporter's follow-up replies, and \
-             respond with ONLY a JSON object, no markdown fences:\n\
-             {{\"decision\": \"skip\"|\"clarify\"|\"fix\"|\"escalate\", \
-             \"reason\": \"short rationale\", \
-             \"question\": \"clarification question when decision=clarify\", \
-             \"priority\": 1-5}}\n\n\
-             Criteria: decide `fix` only when the combined information (issue body PLUS replies) \
-             is clearly actionable, valuable, and low-risk — a terse body can be fully clarified \
-             by follow-up replies or an attached screenshot.\n\
-             Escalate when it touches security, deployment, credentials, or data loss.\n\
-             Decide `clarify` when the combined information still lacks reproduction steps or \
-             expected behavior; phrase a SPECIFIC question about what is still missing.\n\n\
-             Issue #{}: {}\nLabels: {}\n\n{}{}",
-            issue.number,
-            issue.title,
-            issue.labels.join(", "),
-            issue.body,
-            thread_section
-        );
-
-        let messages = vec![
-            Message::system("Respond with a single JSON object and nothing else."),
-            Message::user(prompt),
-        ];
-        let response = llm.chat(&messages, &ChatOptions::default()).await?;
-        let text: String = response
-            .content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect();
-
-        Self::parse_llm_decision(&text)
-    }
-
-    /// Parse the LLM JSON verdict. Tolerates markdown fences.
-    fn parse_llm_decision(text: &str) -> cog_core::SFResult<TriageDecision> {
-        let trimmed = text.trim();
-        let stripped = if trimmed.starts_with("```") {
-            trimmed
-                .trim_start_matches("```json")
-                .trim_start_matches("```")
-                .trim_end_matches("```")
-                .trim()
-        } else {
-            trimmed
-        };
-
-        let value: serde_json::Value = serde_json::from_str(stripped).map_err(|e| {
-            cog_core::SFError::Validation(format!("triage LLM output is not JSON: {}", e))
-        })?;
-
-        let decision = value
-            .get("decision")
-            .and_then(|v| v.as_str())
-            .unwrap_or("skip");
-        let reason = value
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        Ok(match decision {
-            "fix" => TriageDecision::Fix {
-                priority: value
-                    .get("priority")
-                    .and_then(|v| v.as_u64())
-                    .map(|p| p.clamp(1, 5) as u8)
-                    .unwrap_or(3),
-                rationale: reason,
-            },
-            "clarify" => TriageDecision::AskForClarification {
-                question: value
-                    .get("question")
-                    .and_then(|v| v.as_str())
-                    .filter(|q| !q.is_empty())
-                    .unwrap_or("能否补充期望行为、实际行为与复现步骤？")
-                    .to_string(),
-            },
-            "escalate" => TriageDecision::EscalateHuman { reason },
-            _ => TriageDecision::Skip { reason },
-        })
     }
 }
 
@@ -361,18 +248,5 @@ mod tests {
             }
             other => panic!("expected clarify, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn parses_fenced_llm_json() {
-        let text = "```json\n{\"decision\": \"fix\", \"reason\": \"clear\", \"priority\": 2}\n```";
-        let decision = IssueTriage::parse_llm_decision(text).unwrap();
-        assert_eq!(
-            decision,
-            TriageDecision::Fix {
-                priority: 2,
-                rationale: "clear".into()
-            }
-        );
     }
 }

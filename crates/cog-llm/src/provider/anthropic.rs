@@ -53,7 +53,10 @@ impl AnthropicProvider {
             .iter()
             .filter(|m| !matches!(m, Message::System { .. }))
             .map(|msg| match msg {
-                Message::User { content, .. } => json!({"role": "user", "content": content}),
+                Message::User { content, .. } => json!({
+                    "role": "user",
+                    "content": super::media::anthropic_content(content, &self.model)
+                }),
                 Message::Assistant { content, .. } => {
                     let mut anthropic_content: Vec<serde_json::Value> = Vec::new();
 
