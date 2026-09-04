@@ -253,6 +253,18 @@ if [ "$DO_DEPLOY" = 1 ]; then
 import json,sys
 print(json.load(sys.stdin)["status"]["id"].rsplit(":",1)[-1])')"
   got_id="$(running_pod_info | awk '{print $2}')"
+  if [ -n "$got_id" ] && [ "$want_id" != "$got_id" ]; then
+    # 同版本号重跑（tag 字符串没变）时 set image 不触发滚动，Pod 仍跑旧镜像
+    # ID；强制重建让 :<tag> 解析到新 ID。
+    echo "==> 运行中仍是 ${got_id:0:12}（同版本重跑未触发滚动），强制重启四部署"
+    kubectl -n "$NS" rollout restart deployment/cogneva deployment/cogneva-evolution \
+      deployment/cogneva-security-gateway deployment/cogneva-sandbox-executor
+    kubectl rollout status -n "$NS" deployment/cogneva --timeout=180s
+    kubectl rollout status -n "$NS" deployment/cogneva-security-gateway --timeout=180s
+    kubectl rollout status -n "$NS" deployment/cogneva-evolution --timeout=300s
+    kubectl rollout status -n "$NS" deployment/cogneva-sandbox-executor --timeout=180s
+    got_id="$(running_pod_info | awk '{print $2}')"
+  fi
   if [ -z "$got_id" ] || [ "$want_id" != "$got_id" ]; then
     echo "滚动后镜像不符：期望 ${want_id:0:12}，实际 ${got_id:0:12}" >&2
     exit 1
