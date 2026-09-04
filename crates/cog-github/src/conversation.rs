@@ -39,8 +39,10 @@ pub enum ConversationState {
     Idle,
     /// Waiting for the reporter to reply.
     AwaitingClarification,
-    /// Clarified — ready to enter the fix pipeline.
-    Clarified,
+    /// Reporter has sent a new turn since the bot's last question. The turn may
+    /// be text, a screenshot, or a link — whether it makes the issue actionable
+    /// is triage's call, not decided here.
+    UserReplied,
     /// Timed out waiting for a reply.
     Stale,
     /// Escalated to a human.
@@ -107,21 +109,24 @@ impl IssueConversation {
             .filter(|t| t.role == ConversationRole::Bot)
             .count() as u32;
 
-        // Derive state: a bot question with no later substantive user reply
-        // means we are still waiting (or stale); a later user reply that
-        // actually carries text means clarified. A picture-only / empty /
-        // link-only comment is NOT an answer — treating it as one made the bot
-        // re-ask on every such comment (observed in production).
+        // Derive state from whether the reporter came back with a new turn
+        // after our last question. We do NOT judge actionability here — that is
+        // triage's job, and it now reads the full thread (including image/link
+        // attachments, which can carry a valid answer). A non-empty user turn
+        // (text, screenshot, or link) therefore marks `UserReplied` and triggers
+        // a triage re-evaluation; only an empty/whitespace comment leaves us
+        // waiting. This prevents re-asking when there is no new turn while still
+        // letting a screenshot-only reply be acted on when triage can use it.
         let last_bot = convo
             .turns
             .iter()
             .rposition(|t| t.role == ConversationRole::Bot);
         if let Some(idx) = last_bot {
-            let user_replied = convo.turns[idx + 1..]
+            let user_responded = convo.turns[idx + 1..]
                 .iter()
-                .any(|t| t.role == ConversationRole::User && is_substantive_reply(&t.body));
-            convo.state = if user_replied {
-                ConversationState::Clarified
+                .any(|t| t.role == ConversationRole::User && !t.body.trim().is_empty());
+            convo.state = if user_responded {
+                ConversationState::UserReplied
             } else if convo.timed_out(config) {
                 ConversationState::Stale
             } else {
@@ -199,37 +204,26 @@ impl IssueConversation {
         }
         None
     }
-}
 
-/// A user comment counts as an answer only if it carries readable text.
-///
-/// A screenshot pasted with no description, an empty comment, or a bare link
-/// gives the triage model nothing to work with, so the bot must keep waiting
-/// rather than treat it as "replied" and ask again. Markdown image embeds
-/// (`![alt](url)`) and bare URLs are removed before counting; a comment is
-/// substantive when at least one letter/digit/CJK character remains.
-pub(crate) fn is_substantive_reply(body: &str) -> bool {
-    let mut s = body.to_string();
-    // Remove markdown image embeds ![alt](url) (alt text like "image" carries
-    // no answer content).
-    while let Some(start) = s.find("![") {
-        let after = &s[start + 2..];
-        let Some(rel_open) = after.find("](") else {
-            break;
-        };
-        let open_abs = start + 2 + rel_open + 2;
-        let Some(rel_close) = s[open_abs..].find(')') else {
-            break;
-        };
-        let close_abs = open_abs + rel_close + 1;
-        s.replace_range(start..close_abs, " ");
+    /// Render the comment thread as triage context. Triage must judge
+    /// actionability from the whole conversation — issue body plus the
+    /// reporter's follow-up replies — not just the (often terse) original body.
+    /// Image/link attachments are kept verbatim so a capable judge can use
+    /// them; a judge that cannot read images is told to ask for the text.
+    pub fn triage_context(&self) -> String {
+        if self.turns.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for turn in &self.turns {
+            let who = match turn.role {
+                ConversationRole::User => "Reporter",
+                ConversationRole::Bot => "Cogneva bot (previous question)",
+            };
+            out.push_str(&format!("{}: {}\n", who, turn.body.trim()));
+        }
+        out.trim_end().to_string()
     }
-    // Drop bare URL tokens, then count any real characters (CJK counts as
-    // alphanumeric via Unicode Letter category).
-    s.split_whitespace()
-        .filter(|w| !w.starts_with("http://") && !w.starts_with("https://"))
-        .flat_map(|w| w.chars())
-        .any(|c| c.is_alphanumeric())
 }
 
 #[cfg(test)]
@@ -277,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn clarified_when_user_replied_after_bot() {
+    fn user_replied_after_bot_sets_user_replied() {
         let comments = vec![
             comment("cogneva-bot", "please clarify", now_ts() - 100),
             comment("alice", "here are the steps", now_ts()),
@@ -288,7 +282,7 @@ mod tests {
             "cogneva-bot",
             &ConversationConfig::default(),
         );
-        assert_eq!(convo.state, ConversationState::Clarified);
+        assert_eq!(convo.state, ConversationState::UserReplied);
     }
 
     #[test]
@@ -325,9 +319,10 @@ mod tests {
     }
 
     #[test]
-    fn image_only_reply_keeps_waiting() {
-        // 图片-only 评论（截图无文字说明）不是有效回答：状态应保持
-        // AwaitingClarification，而不是翻成 Clarified 触发再追问。
+    fn image_only_reply_is_a_user_turn() {
+        // 截图-only 评论也是报告者的一次发言：图片可能就装着答案。是否可行动
+        // 交给 triage（它现在能读到整段对话）判，状态机不再用"有没有文字"替它
+        // 决定，所以这里应翻成 UserReplied 触发一次 triage，而不是永远等待。
         let cfg = ConversationConfig::default();
         let comments = vec![
             comment(
@@ -342,12 +337,14 @@ mod tests {
             ),
         ];
         let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
-        assert_eq!(convo.state, ConversationState::AwaitingClarification);
+        assert_eq!(convo.state, ConversationState::UserReplied);
         assert_eq!(convo.rounds, 1);
     }
 
     #[test]
-    fn empty_and_link_only_replies_keep_waiting() {
+    fn empty_comment_keeps_waiting_but_link_counts() {
+        // 纯空白评论不是一次发言（继续等待）；而贴一个链接是非空发言——它可能
+        // 指向复现仓库/gist/截图，可行动性同样交给 triage，不在此丢弃。
         let cfg = ConversationConfig::default();
         let mk = |body: &str| {
             let comments = vec![
@@ -359,12 +356,12 @@ mod tests {
         assert_eq!(mk("   "), ConversationState::AwaitingClarification);
         assert_eq!(
             mk("https://example.com/thing"),
-            ConversationState::AwaitingClarification
+            ConversationState::UserReplied
         );
     }
 
     #[test]
-    fn text_reply_after_question_is_clarified() {
+    fn text_reply_after_question_is_user_replied() {
         let cfg = ConversationConfig::default();
         let comments = vec![
             comment("cogneva-bot", "please clarify", now_ts() - 200),
@@ -375,21 +372,21 @@ mod tests {
             ),
         ];
         let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
-        assert_eq!(convo.state, ConversationState::Clarified);
+        assert_eq!(convo.state, ConversationState::UserReplied);
     }
 
     #[test]
-    fn substantive_reply_detection() {
-        assert!(!is_substantive_reply(
-            "![image](https://github.com/x/y.png)"
-        ));
-        assert!(!is_substantive_reply(""));
-        assert!(!is_substantive_reply("   \n\t "));
-        assert!(!is_substantive_reply("https://example.com"));
-        assert!(is_substantive_reply(
-            "see this screenshot ![](https://x/y.png)"
-        ));
-        assert!(is_substantive_reply("复现：启动即崩溃"));
-        assert!(is_substantive_reply("v0.2.0"));
+    fn triage_context_includes_full_thread() {
+        let cfg = ConversationConfig::default();
+        let comments = vec![
+            comment("cogneva-bot", "please clarify", now_ts() - 200),
+            comment("alice", "复现：启动即崩溃 v0.2.0", now_ts()),
+        ];
+        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
+        let ctx = convo.triage_context();
+        assert!(ctx.contains("please clarify"));
+        assert!(ctx.contains("复现：启动即崩溃 v0.2.0"));
+        assert!(ctx.contains("Reporter"));
+        assert!(IssueConversation::new(3).triage_context().is_empty());
     }
 }

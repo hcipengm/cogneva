@@ -363,23 +363,30 @@ impl GitHubDiscoveryLoop {
                 self.conversations.insert(issue.number, conversation);
                 return Ok(());
             }
-            ConversationState::Clarified => {
-                // A substantive user reply arrived; release the guard so the
-                // next clarification round (if triage still needs one) is
-                // allowed, subject to the round budget.
+            ConversationState::UserReplied => {
+                // The reporter sent a new turn (text, screenshot, or link).
+                // Release the guard so triage can re-judge actionability from
+                // the full thread; a further question (if still unclear) is
+                // allowed subject to the round budget.
                 self.awaiting_clarification.remove(&issue.number);
             }
             _ => {}
         }
 
-        if conversation.state == ConversationState::Clarified
+        if conversation.state == ConversationState::UserReplied
             && self.submitted.contains(&issue.number)
         {
             self.conversations.insert(issue.number, conversation);
             return Ok(());
         }
 
-        let decision = self.triage.evaluate(issue, &self.config).await;
+        // Judge actionability from the whole conversation, not just the terse
+        // issue body: follow-up replies (and screenshots) can make it fixable.
+        let reply_thread = conversation.triage_context();
+        let decision = self
+            .triage
+            .evaluate(issue, &self.config, &reply_thread)
+            .await;
 
         match decision {
             TriageDecision::Fix {
@@ -401,9 +408,10 @@ impl GitHubDiscoveryLoop {
             TriageDecision::AskForClarification { question } => {
                 let mut convo = conversation;
                 // Hard in-memory guard: a question is already outstanding for
-                // this issue (posted this process lifetime) and no substantive
-                // reply has arrived — never post a duplicate, even if the
-                // comment re-read raced or a webhook+poll fired together.
+                // this issue and no new user turn has arrived since — never post
+                // a duplicate, even if the comment re-read raced or a
+                // webhook+poll fired together. A further question after a real
+                // reply is bounded by max_clarification_rounds (convo.ask).
                 if self.awaiting_clarification.contains(&issue.number) {
                     tracing::info!(
                         issue = issue.number,
@@ -542,7 +550,7 @@ impl GitHubDiscoveryLoop {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        let decision = self.triage.evaluate(&intent, &self.config).await;
+        let decision = self.triage.evaluate(&intent, &self.config, "").await;
 
         match decision {
             TriageDecision::Fix {

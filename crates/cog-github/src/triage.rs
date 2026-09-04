@@ -57,28 +57,40 @@ impl IssueTriage {
     }
 
     /// Evaluate an issue and produce a triage decision.
+    ///
+    /// `reply_thread` is the rendered clarification conversation (bot questions
+    /// and the reporter's follow-up replies, including image/link attachments).
+    /// Actionability must be judged from the whole thread, not just the often
+    /// terse issue body — a screenshot or follow-up comment can carry the answer.
+    /// Pass an empty string when there is no conversation (e.g. a fresh PR intent).
     pub async fn evaluate(
         &self,
         issue: &PlatformIssue,
         config: &GitHubIntegrationConfig,
+        reply_thread: &str,
     ) -> TriageDecision {
         if let Some(decision) = Self::apply_rules(issue, config) {
             return decision;
         }
 
         match &self.llm {
-            Some(llm) => match self.evaluate_with_llm(llm.as_ref(), issue).await {
-                Ok(decision) => decision,
-                Err(e) => {
-                    tracing::warn!(
-                        issue = issue.number,
-                        error = %e,
-                        "LLM triage failed; falling back to heuristic"
-                    );
-                    Self::heuristic(issue)
+            Some(llm) => {
+                match self
+                    .evaluate_with_llm(llm.as_ref(), issue, reply_thread)
+                    .await
+                {
+                    Ok(decision) => decision,
+                    Err(e) => {
+                        tracing::warn!(
+                            issue = issue.number,
+                            error = %e,
+                            "LLM triage failed; falling back to heuristic"
+                        );
+                        Self::heuristic(issue, reply_thread)
+                    }
                 }
-            },
-            None => Self::heuristic(issue),
+            }
+            None => Self::heuristic(issue, reply_thread),
         }
     }
 
@@ -109,18 +121,23 @@ impl IssueTriage {
     }
 
     /// Conservative fallback when no LLM is configured: only fix issues that
-    /// carry a clear, non-trivial description.
-    fn heuristic(issue: &PlatformIssue) -> TriageDecision {
-        let body_len = issue.body.trim().len();
-        if body_len < 40 {
+    /// carry a clear, non-trivial description. The reporter's follow-up replies
+    /// count too — a terse issue body can be fully clarified in the comments.
+    /// Image embeds and bare URLs carry no readable text for a non-vision judge,
+    /// so they are excluded; when readable information is still missing the
+    /// fallback asks for the specifics to be pasted as text.
+    fn heuristic(issue: &PlatformIssue, reply_thread: &str) -> TriageDecision {
+        let combined = format!("{}\n{}", issue.body, reply_thread);
+        if readable_len(&combined) < 40 {
             return TriageDecision::AskForClarification {
-                question: "能否补充更完整的问题描述（期望行为、实际行为、复现步骤、影响版本）？"
+                question: "能否补充更完整的问题描述（期望行为、实际行为、复现步骤、影响版本）？\
+                     如果信息在截图里，请把报错文字/复现步骤贴成文本，我当前无法读取图片内容。"
                     .into(),
             };
         }
         TriageDecision::Fix {
             priority: 3,
-            rationale: "rule-based triage: description looks actionable".into(),
+            rationale: "rule-based triage: description or replies look actionable".into(),
         }
     }
 
@@ -128,22 +145,44 @@ impl IssueTriage {
         &self,
         llm: &dyn LlmClient,
         issue: &PlatformIssue,
+        reply_thread: &str,
     ) -> cog_core::SFResult<TriageDecision> {
+        // The follow-up thread is appended verbatim when present: the reporter's
+        // comments — including screenshots/links — are part of the actionable
+        // picture. When a screenshot cannot be read and the issue is still not
+        // actionable, instruct the bot to ask for the key text rather than to
+        // treat the image as an answer or ignore it.
+        let thread_section = if reply_thread.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nReporter follow-up replies (newest last; image/link attachments \
+                 may contain the answer — if you cannot read an attached screenshot and \
+                 the issue is not yet actionable, ask the reporter to paste the error text \
+                 and reproduction steps):\n{}",
+                reply_thread
+            )
+        };
         let prompt = format!(
             "You are the triage actor of an autonomous code-evolution system.\n\
-             Evaluate this GitHub issue and respond with ONLY a JSON object, no markdown fences:\n\
+             Evaluate this GitHub issue together with the reporter's follow-up replies, and \
+             respond with ONLY a JSON object, no markdown fences:\n\
              {{\"decision\": \"skip\"|\"clarify\"|\"fix\"|\"escalate\", \
              \"reason\": \"short rationale\", \
              \"question\": \"clarification question when decision=clarify\", \
              \"priority\": 1-5}}\n\n\
-             Criteria: fix only when the issue is clearly actionable, valuable, and low-risk.\n\
+             Criteria: decide `fix` only when the combined information (issue body PLUS replies) \
+             is clearly actionable, valuable, and low-risk — a terse body can be fully clarified \
+             by follow-up replies or an attached screenshot.\n\
              Escalate when it touches security, deployment, credentials, or data loss.\n\
-             Ask for clarification when the description lacks reproduction steps or expected behavior.\n\n\
-             Issue #{}: {}\nLabels: {}\n\n{}",
+             Decide `clarify` when the combined information still lacks reproduction steps or \
+             expected behavior; phrase a SPECIFIC question about what is still missing.\n\n\
+             Issue #{}: {}\nLabels: {}\n\n{}{}",
             issue.number,
             issue.title,
             issue.labels.join(", "),
-            issue.body
+            issue.body,
+            thread_section
         );
 
         let messages = vec![
@@ -210,6 +249,31 @@ impl IssueTriage {
     }
 }
 
+/// Count readable characters (letter/digit/CJK) after stripping markdown image
+/// embeds (`![alt](url)`) and bare URL tokens. Used only by the rule-based
+/// fallback to decide whether the issue plus replies carry enough to act on —
+/// screenshots and links carry no text for a non-vision judge.
+fn readable_len(text: &str) -> usize {
+    let mut s = text.to_string();
+    while let Some(start) = s.find("![") {
+        let after = &s[start + 2..];
+        let Some(rel_open) = after.find("](") else {
+            break;
+        };
+        let open_abs = start + 2 + rel_open + 2;
+        let Some(rel_close) = s[open_abs..].find(')') else {
+            break;
+        };
+        let close_abs = open_abs + rel_close + 1;
+        s.replace_range(start..close_abs, " ");
+    }
+    s.split_whitespace()
+        .filter(|w| !w.starts_with("http://") && !w.starts_with("https://"))
+        .flat_map(|w| w.chars())
+        .filter(|c| c.is_alphanumeric())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,7 +297,7 @@ mod tests {
         let triage = IssueTriage::rules_only();
         let config = GitHubIntegrationConfig::default();
         let decision = triage
-            .evaluate(&issue(&["wontfix"], "x".repeat(100).as_str()), &config)
+            .evaluate(&issue(&["wontfix"], "x".repeat(100).as_str()), &config, "")
             .await;
         assert!(matches!(decision, TriageDecision::Skip { .. }));
     }
@@ -243,7 +307,7 @@ mod tests {
         let triage = IssueTriage::rules_only();
         let config = GitHubIntegrationConfig::default();
         let decision = triage
-            .evaluate(&issue(&["security"], "x".repeat(100).as_str()), &config)
+            .evaluate(&issue(&["security"], "x".repeat(100).as_str()), &config, "")
             .await;
         assert!(matches!(decision, TriageDecision::EscalateHuman { .. }));
     }
@@ -252,7 +316,7 @@ mod tests {
     async fn short_body_asks_for_clarification() {
         let triage = IssueTriage::rules_only();
         let config = GitHubIntegrationConfig::default();
-        let decision = triage.evaluate(&issue(&[], "too short"), &config).await;
+        let decision = triage.evaluate(&issue(&[], "too short"), &config, "").await;
         assert!(matches!(
             decision,
             TriageDecision::AskForClarification { .. }
@@ -265,8 +329,38 @@ mod tests {
         let config = GitHubIntegrationConfig::default();
         let body = "The /health endpoint responds slowly. Expected: under 50ms. \
                     Actual: 500ms. Reproduce: curl localhost:8080/health repeatedly.";
-        let decision = triage.evaluate(&issue(&[], body), &config).await;
+        let decision = triage.evaluate(&issue(&[], body), &config, "").await;
         assert!(matches!(decision, TriageDecision::Fix { .. }));
+    }
+
+    #[tokio::test]
+    async fn terse_body_with_substantive_replies_is_actionable() {
+        // 原始正文极短（"看代码"），但报告者在评论里补全了复现——heuristic
+        // 必须把回复一并计入，判 Fix 而不是对同一句短正文反复追问。
+        let triage = IssueTriage::rules_only();
+        let config = GitHubIntegrationConfig::default();
+        let replies = "Reporter: 启动就崩溃，期望正常起来，实际 panic。\n\
+                       Reporter: 复现：cargo run 后立即 panic，版本 v0.2.0，回溯在 init。";
+        let decision = triage
+            .evaluate(&issue(&[], "Read code"), &config, replies)
+            .await;
+        assert!(matches!(decision, TriageDecision::Fix { .. }));
+    }
+
+    #[tokio::test]
+    async fn image_only_replies_still_ask_for_text() {
+        // 只贴截图、没有可读文字时，非视觉 heuristic 无法据此行动，应追问把报错
+        // 贴成文本（且受轮次上限约束，不会无限追问）。
+        let triage = IssueTriage::rules_only();
+        let config = GitHubIntegrationConfig::default();
+        let replies = "Reporter: ![screenshot](https://github.com/u/a.png)";
+        let decision = triage.evaluate(&issue(&[], "bug"), &config, replies).await;
+        match decision {
+            TriageDecision::AskForClarification { question } => {
+                assert!(question.contains("文本") || question.contains("截图"));
+            }
+            other => panic!("expected clarify, got {:?}", other),
+        }
     }
 
     #[test]
