@@ -14,6 +14,10 @@ ARG APT_MIRROR_HOST=""
 # 低内存机器（如 2-4G 空白机）限制 cargo 并行度防 OOM；"default" = 按核数自动
 #（不能放空字符串，cargo 会解析报错）
 ARG CARGO_BUILD_JOBS="default"
+# 版本与来源：由构建脚本从 Cargo.toml / git 注入，写进二进制与镜像 LABEL，
+# 让线上镜像能回答"我是哪个版本、哪个 commit"，不依赖浮动 tag :local 追溯。
+ARG VERSION=""
+ARG GIT_REVISION=""
 
 # ------------------------------------------------------------------------------
 # Stage 1: Build
@@ -30,7 +34,9 @@ ARG RUSTUP_INIT_URL
 ARG CARGO_REGISTRY_SPARSE
 ARG APT_MIRROR_HOST
 ARG CARGO_BUILD_JOBS
+ARG GIT_REVISION
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
+    COGNEVA_GIT_REVISION=${GIT_REVISION} \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
@@ -171,16 +177,27 @@ RUN npm run build
 FROM ubuntu:24.04
 
 ARG APT_MIRROR_HOST
+ARG VERSION
+ARG GIT_REVISION
 
-# 受限网络：ubuntu 源替换为镜像主机
+LABEL org.opencontainers.image.title="cogneva" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_REVISION}"
+
+# 受限网络：ubuntu 源替换为镜像主机；buildah 在 universe 源，官方基础镜像
+# 可能只启用 main/restricted，显式补齐组件列表
 RUN if [ -n "$APT_MIRROR_HOST" ]; then \
     sed -i "s|archive.ubuntu.com|$APT_MIRROR_HOST|g; s|security.ubuntu.com|$APT_MIRROR_HOST|g" \
     /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
-    fi
+    fi; \
+    sed -i 's/^Components: main.*/Components: main restricted universe multiverse/' \
+    /etc/apt/sources.list.d/*.sources 2>/dev/null || true
 
 # Install runtime dependencies (ca-certificates for TLS, libssl3 for rustls)
 # and Rust toolchain so the self-evolution worker can build patches inside K3s.
 # libstdc++6：ONNX Runtime（fastembed/ort）动态链接依赖
+# buildah：自进化 publisher 打金丝雀 overlay 镜像并 push 到集群内 registry
+# （仅特权进化 Pod 用；主应用 Pod 非特权，装了也无法使用）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
@@ -190,6 +207,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     openssh-client \
     python3 \
+    buildah \
     && rm -rf /var/lib/apt/lists/*
 
 # Install rustup/stable toolchain for the self-evolution worker.
@@ -236,7 +254,7 @@ RUN chown -R cogneva:cogneva /opt/cogneva /var/lib/cogneva-data /etc/cogneva && 
 
 # Default environment variables (overridden by K8s ConfigMap/Secret)
 ENV SF_APP_NAME=cogneva \
-    SF_APP_VERSION=0.1.20 \
+    SF_APP_VERSION=${VERSION} \
     SF_LOG_LEVEL=info \
     SF_DATA_DIR=/var/lib/cogneva-data \
     SF_CONFIG_DIR=/etc/cogneva \

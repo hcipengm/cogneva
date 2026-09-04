@@ -6,7 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva-evolution
     app.kubernetes.io/component: evolution
-    app.kubernetes.io/version: "0.1.20"
+    app.kubernetes.io/version: "0.5.7"
 spec:
   replicas: 1
   strategy:
@@ -20,7 +20,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution
-        app.kubernetes.io/version: "0.1.20"
+        app.kubernetes.io/version: "0.5.7"
     spec:
       serviceAccountName: cogneva-evolution
       # The evolution worker runs as root inside a privileged container so it

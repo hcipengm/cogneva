@@ -7,9 +7,11 @@
 //! 安全边界：本模块只跟 Git 中央仓库说话（三仓库同步既有通道），
 //! 全程不持有、不使用任何集群凭证（kubeconfig / API token）。
 //!
-//! 镜像分发双态：`registry` 配置存在时，同时用 buildah 把沙盒编译
-//! 好的二进制打成镜像推到仓库（拉取端走镜像 pull）；缺省走纯源码
-//! 级分发（拉取端本地构建）。
+//! 镜像分发双态，拉取端永远只 pull 不构建：`registry` 配置外部仓库时
+//! push 外部仓库（跨集群生产形态）；缺省 push 到集群内 registry
+//!（cogneva-registry Service:5000，节点经 localhost NodePort pull）。
+//! 金丝雀镜像是最小 overlay（cogneva 基镜像 + 新编译二进制一个层），
+//! 构建无编译、push/pull 秒级。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -123,16 +125,18 @@ impl GitOpsPublisher {
             "Promoted patch published to GitOps release branch"
         );
 
-        // 镜像双态：registry 配置存在时把沙盒编译产物打镜像推仓库。
-        if let Some(registry) = &self.config.registry {
-            self.push_image(registry, &patch.artifact_id).await?;
+        // 只有 L1 镜像晋级需要产物镜像；L0 配置晋级走热更/ apply，不打镜像。
+        if level == "l1_rollout" {
+            self.publish_image(&patch.artifact_id).await?;
         }
 
         Ok(head)
     }
 
-    /// buildah 打最小镜像（base + 沙盒编译二进制）并推仓库。
-    async fn push_image(&self, registry: &str, patch_id: &str) -> SFResult<()> {
+    /// buildah 打最小 overlay 镜像（cogneva 基镜像 + 沙盒编译二进制）并推仓库。
+    /// 基镜像必须是正式 cogneva 镜像（WebUI/skills/migrations/动态库齐全），
+    /// overlay 只替换 /opt/cogneva/cogneva 一个层。
+    async fn publish_image(&self, patch_id: &str) -> SFResult<()> {
         let binary = self.binary_dir.join("cogneva");
         if !binary.exists() {
             return Err(SFError::IO(format!(
@@ -140,33 +144,67 @@ impl GitOpsPublisher {
                 binary.display()
             )));
         }
-        let image = format!("{}/cogneva:promote-{}", registry, sanitize(patch_id));
+        // push 目标与 base 同源同端点：外部 registry（https）或集群内
+        // registry（Service DNS，http + --tls-verify=false）。
+        let (endpoint, insecure) = match &self.config.registry {
+            Some(ext) => (ext.trim_end_matches('/').to_string(), false),
+            None => (
+                format!(
+                    "cogneva-registry.{}.svc.cluster.local:5000",
+                    self.config.namespace
+                ),
+                true,
+            ),
+        };
+        let tag = format!("cogneva:promote-{}", sanitize(patch_id));
+        let image = format!("{endpoint}/{tag}");
+        let base = format!("{endpoint}/cogneva:local");
         let containerfile = self.binary_dir.join("Containerfile.promote");
         tokio::fs::write(
             &containerfile,
             format!(
-                "FROM {}\nCOPY cogneva /opt/cogneva/cogneva\nENTRYPOINT [\"/opt/cogneva/cogneva\"]\n",
-                "debian:bookworm-slim"
+                "FROM {base}\nCOPY cogneva /opt/cogneva/cogneva\nENTRYPOINT [\"/opt/cogneva/cogneva\"]\n"
             ),
         )
         .await
         .map_err(|e| SFError::IO(format!("write Containerfile: {e}")))?;
 
-        self.run(
-            "buildah",
-            &[
-                "build",
-                "-f",
-                &containerfile.to_string_lossy(),
-                "-t",
-                &image,
-                &self.binary_dir.to_string_lossy(),
-            ],
-            600,
-        )
-        .await?;
-        self.run("buildah", &["push", &image], 600).await?;
-        info!(image = %image, "Promotion image pushed to registry");
+        // buildah 存储库放 sandbox PVC：基镜像层跨晋级缓存，Pod 重启不丢。
+        // 全局选项必须在子命令前；--tls-verify=false 允许集群内 http registry。
+        let storage = "/opt/cogneva/sandbox/containers";
+        let mut build_args: Vec<String> = vec![
+            "--root".into(),
+            format!("{storage}/storage"),
+            "--runroot".into(),
+            format!("{storage}/run"),
+            "build".into(),
+        ];
+        let mut push_args: Vec<String> = vec![
+            "--root".into(),
+            format!("{storage}/storage"),
+            "--runroot".into(),
+            format!("{storage}/run"),
+            "push".into(),
+        ];
+        if insecure {
+            build_args.push("--tls-verify=false".into());
+            push_args.push("--tls-verify=false".into());
+        }
+        build_args.extend([
+            "-f".into(),
+            containerfile.to_string_lossy().into_owned(),
+            "-t".into(),
+            image.clone(),
+            self.binary_dir.to_string_lossy().into_owned(),
+        ]);
+        push_args.push(image.clone());
+        let build_refs: Vec<&str> = build_args.iter().map(String::as_str).collect();
+        let push_refs: Vec<&str> = push_args.iter().map(String::as_str).collect();
+
+        // 冷构建首拉基镜像（解压 ~1.5GB）给 30 分钟；热构建只有 COPY 秒级。
+        self.run(&self.config.builder_bin, &build_refs, 1800).await?;
+        self.run(&self.config.builder_bin, &push_refs, 900).await?;
+        info!(image = %image, "Promotion overlay image pushed to registry");
         Ok(())
     }
 }
@@ -218,6 +256,39 @@ mod tests {
         (central, work)
     }
 
+    /// 假镜像构建器：L1 晋级会调 buildah 打 overlay 镜像，测试里记录参数后成功。
+    /// 日志路径直接写进脚本（测试线程共享进程 env，不能用 env 传日志路径）。
+    fn make_fake_builder(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-buildah");
+        let log = dir.join("builder.log");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// L1 发布者：staged 二进制 + 假构建器齐备。
+    fn l1_publisher(
+        central: &std::path::Path,
+        work: &std::path::Path,
+    ) -> GitOpsPublisher {
+        std::fs::write(work.join("cogneva"), b"staged-binary").unwrap();
+        let builder = make_fake_builder(work);
+        GitOpsPublisher::new(
+            GitOpsConfig {
+                repo_url: central.to_string_lossy().into_owned(),
+                builder_bin: builder.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            work,
+            work,
+        )
+    }
+
     fn patch(id: &str) -> EvolutionResult {
         EvolutionResult {
             kind: crate::types::EvolutionKind::CodePatch,
@@ -233,14 +304,7 @@ mod tests {
     #[tokio::test]
     async fn publish_pushes_branch_and_annotated_tag() {
         let (central, work) = setup_repo().await;
-        let publisher = GitOpsPublisher::new(
-            GitOpsConfig {
-                repo_url: central.path().to_string_lossy().to_string(),
-                ..Default::default()
-            },
-            work.path(),
-            work.path(),
-        );
+        let publisher = l1_publisher(central.path(), work.path());
 
         let head = publisher
             .publish(&patch("p-1"), "l1_rollout")
@@ -260,6 +324,21 @@ mod tests {
         assert!(tag_msg.contains("patch_id=p-1"), "{tag_msg}");
         assert!(tag_msg.contains("level=l1_rollout"), "{tag_msg}");
         assert!(tag_msg.contains("eval=Adopt z=2.0"), "{tag_msg}");
+
+        // overlay 基镜像必须是正式 cogneva 镜像（不是 debian 裸基底），
+        // 缺省（无外部 registry）推集群内 registry 且走 http。
+        let cf = std::fs::read_to_string(work.path().join("Containerfile.promote")).unwrap();
+        assert!(
+            cf.contains("FROM cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:local"),
+            "{cf}"
+        );
+        assert!(cf.contains("COPY cogneva /opt/cogneva/cogneva"));
+        let calls = std::fs::read_to_string(work.path().join("builder.log")).unwrap();
+        assert!(
+            calls.contains("cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:promote-p-1"),
+            "{calls}"
+        );
+        assert!(calls.contains("--tls-verify=false"), "{calls}");
     }
 
     #[tokio::test]
@@ -284,14 +363,7 @@ mod tests {
     #[tokio::test]
     async fn second_publish_fast_forwards() {
         let (central, work) = setup_repo().await;
-        let publisher = GitOpsPublisher::new(
-            GitOpsConfig {
-                repo_url: central.path().to_string_lossy().to_string(),
-                ..Default::default()
-            },
-            work.path(),
-            work.path(),
-        );
+        let publisher = l1_publisher(central.path(), work.path());
         publisher
             .publish(&patch("p-1"), "l1_rollout")
             .await

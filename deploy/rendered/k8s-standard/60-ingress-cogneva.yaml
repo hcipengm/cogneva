@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/instance: cogneva
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "local"
+    app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: gateway
   annotations:
     # nginx 原生支持 WebSocket Upgrade，加长读写超时避免长连接被掐断

@@ -11,7 +11,7 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: security-gateway
-    app.kubernetes.io/version: "0.1.22"
+    app.kubernetes.io/version: "0.5.7"
 spec:
   replicas: 1
   strategy:
@@ -28,7 +28,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
-        app.kubernetes.io/version: "0.1.22"
+        app.kubernetes.io/version: "0.5.7"
     spec:
       containers:
         - name: security-gateway

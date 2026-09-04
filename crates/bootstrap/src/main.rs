@@ -983,6 +983,13 @@ async fn try_import_prebuilt(image: &str) -> Result<()> {
         if !present {
             bail!("导入后集群中不存在标签 {image}（release 包内标签不符）");
         }
+        // 补不可变版本 tag：归档内只有浮动签 :local，版本 tag 供追溯与
+        // 按版本引用（ManagementPlan 同步等路径）。失败不致命，:local 已就绪。
+        let versioned = format!("localhost/cogneva:{}", env!("CARGO_PKG_VERSION"));
+        if let Err(e) = run("k3s", &["ctr", "-n", "k8s.io", "images", "tag", image, &versioned]).await
+        {
+            warn!("版本标签 {versioned} 打标失败（不影响 :local 部署）: {e:#}");
+        }
         Ok(())
     }
     .await;
@@ -1100,7 +1107,66 @@ async fn render_distributor_manifest() -> Result<String> {
     } else {
         "docker.io/library/busybox:latest".to_string()
     };
-    Ok(template.replace("__BUSYBOX_IMAGE__", &busybox))
+    Ok(template
+        .replace("__BUSYBOX_IMAGE__", &busybox)
+        .replace("__IMAGE_TAG__", env!("CARGO_PKG_VERSION")))
+}
+
+/// 把基镜像 localhost/cogneva:local 播种进集群内 registry：自进化金丝雀
+/// overlay 镜像 FROM 该基镜像，缺失则推送端构建必败。经宿主 containerd
+/// 客户端直推 NodePort（localhost http 免 TLS，多节点每节点都通）。
+/// 失败不致命——基座运行不依赖 registry，swap-image 换版时也会补播；
+/// 但首次金丝雀晋级前必须播种成功，故给足重试并明确告警。
+async fn seed_cluster_registry() -> Result<()> {
+    let waited = run(
+        "kubectl",
+        &[
+            "-n",
+            "cogneva",
+            "wait",
+            "--for=condition=Available",
+            "deployment/cogneva-registry",
+            "--timeout=300s",
+        ],
+    )
+    .await;
+    if let Err(e) = waited {
+        warn!(
+            "集群内 registry 未就绪，跳过基镜像播种（金丝雀晋级前需补播，\
+             见 swap-image.sh）: {e:#}"
+        );
+        return Ok(());
+    }
+    // k3s 是多调用二进制（argv0=ctr），标准 containerd 直接用 ctr。
+    let (program, ctr_prefix): (&str, &[&str]) = if command_exists("k3s").await {
+        ("k3s", &["ctr"][..])
+    } else {
+        ("ctr", &[][..])
+    };
+    let remote = "localhost:30500/cogneva:local";
+    let object = "localhost/cogneva:local";
+    for attempt in 1..=3 {
+        let mut args: Vec<&str> = ctr_prefix.to_vec();
+        args.extend(["-n", "k8s.io", "images", "push", "--plain-http", remote, object]);
+        match run(program, &args).await {
+            Ok(()) => {
+                info!("集群内 registry 已播种基镜像 {remote}");
+                return Ok(());
+            }
+            Err(e) if attempt < 3 => {
+                warn!("registry 播种第 {attempt} 次失败（重试）: {e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+            Err(e) => {
+                warn!(
+                    "registry 基镜像播种失败: {e:#}。金丝雀 overlay 推送会因此失败，\
+                     可在节点上手动执行 ctr -n k8s.io images push --plain-http {remote} {object}"
+                );
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn download_string(url: &str) -> Result<String> {
@@ -1148,12 +1214,29 @@ fn cargo_jobs_for_memory() -> Option<usize> {
 async fn build_image_locally(image: &str) -> Result<()> {
     let root = repo_root();
     info!("从源码构建运行时镜像 {image}（首次需较长时间）...");
+    // 同时打不可变版本 tag（:local 之外的追溯锚点，与 release 预构建流一致）
+    let versioned = format!("localhost/cogneva:{}", env!("CARGO_PKG_VERSION"));
+    // tarball 取码无 .git，revision 退化为 "source" 标识源码回退构建
+    let revision = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "source".into());
     let mut build_args: Vec<String> = vec![
         "build".into(),
         "-t".into(),
         image.into(),
+        "-t".into(),
+        versioned,
         "-f".into(),
         root.join("Dockerfile").to_string_lossy().into_owned(),
+        "--build-arg".into(),
+        format!("VERSION={}", env!("CARGO_PKG_VERSION")),
+        "--build-arg".into(),
+        format!("GIT_REVISION={revision}"),
     ];
     if cn_mirror() {
         // 各环节多候选探活选择，单站故障自动换站
@@ -1542,6 +1625,10 @@ fn cn_helm_value_overrides(mirror: &str) -> Result<Vec<(String, String)>> {
         ),
         ("backends.nats.image", &["backends", "nats", "image"][..]),
         ("buildah.image", &["buildah", "image"][..]),
+        (
+            "clusterRegistry.image",
+            &["clusterRegistry", "image"][..],
+        ),
     ] {
         out.push((key.to_string(), cn_mirror_image(&image_at(path)?, mirror)));
     }
@@ -1597,6 +1684,7 @@ fn cn_image_map(mirror: &str) -> Vec<(String, String)> {
         ("nats:2.10-alpine", "library/nats:2.10-alpine"),
         ("postgres:16-alpine", "library/postgres:16-alpine"),
         ("redis:7-alpine", "library/redis:7-alpine"),
+        ("registry:2", "library/registry:2"),
     ]
     .into_iter()
     .map(|(from, to)| (format!("image: {from}"), format!("image: {mirror}/{to}")))
@@ -1784,6 +1872,8 @@ async fn main() -> Result<()> {
     }
     ensure_runtime_image(decision.distro, decision.multi).await?;
     deploy_manifests(cluster_existed).await?;
+    // 清单 apply 后 registry 才存在；基镜像播种失败不阻断安装（best-effort）
+    seed_cluster_registry().await?;
     wait_ready().await?;
 
     let webui =

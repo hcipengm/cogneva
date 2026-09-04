@@ -11,11 +11,11 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/instance: cogneva
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "local"
+    app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: config
 data:
   COGNEVA_APP_NAME: "cogneva"
-  COGNEVA_APP_VERSION: "local"
+  COGNEVA_APP_VERSION: "0.5.7"
   COGNEVA_LOG_LEVEL: "info"
   COGNEVA_DATA_DIR: "/var/lib/cogneva-data"
   COGNEVA_CONFIG_DIR: "/etc/cogneva"

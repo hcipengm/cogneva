@@ -109,6 +109,11 @@ spec:
               $CTR --address "$SOCK" -n k8s.io images import /workspace/image.tar.gz
               $CTR --address "$SOCK" -n k8s.io images ls -q | grep -q '^localhost/cogneva:local$' \
                 || { echo "[distributor] 导入后标签校验失败"; exit 1; }
+              # 补不可变版本 tag（:local 是浮动签），供版本追溯与按版本引用；
+              # 失败不致命——部署面只 pin :local。__IMAGE_TAG__ 由 bootstrap 渲染替换。
+              $CTR --address "$SOCK" -n k8s.io images tag localhost/cogneva:local localhost/cogneva:__IMAGE_TAG__ 2>/dev/null \
+                && echo "[distributor] 已打版本标签 localhost/cogneva:__IMAGE_TAG__" \
+                || echo "[distributor] 警告: 版本标签打标失败（不影响 :local 部署）"
               rm -f /workspace/image.tar.gz
               touch "/workspace/done-${NODE_NAME}"
               echo "[distributor] 节点 $NODE_NAME 导入完成"

@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/instance: cogneva
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "local"
+    app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: evolution
 spec:
   replicas: 1
@@ -26,7 +26,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution
-        app.kubernetes.io/version: "local"
+        app.kubernetes.io/version: "0.5.7"
     spec:
       serviceAccountName: cogneva-evolution
       securityContext:

@@ -26,7 +26,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: sandbox-executor
-        app.kubernetes.io/version: {{ .Values.image.tag | quote }}
+        app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     spec:
       automountServiceAccountToken: false
       securityContext:

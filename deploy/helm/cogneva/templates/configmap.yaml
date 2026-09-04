@@ -8,7 +8,7 @@ metadata:
     app.kubernetes.io/component: config
 data:
   COGNEVA_APP_NAME: "cogneva"
-  COGNEVA_APP_VERSION: {{ .Values.image.tag | quote }}
+  COGNEVA_APP_VERSION: {{ .Chart.AppVersion | quote }}
   COGNEVA_LOG_LEVEL: "info"
   COGNEVA_DATA_DIR: "/var/lib/cogneva-data"
   COGNEVA_CONFIG_DIR: "/etc/cogneva"

@@ -14,7 +14,7 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/instance: cogneva
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "local"
+    app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: sandbox-executor
 spec:
   replicas: 1
@@ -32,7 +32,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: sandbox-executor
-        app.kubernetes.io/version: "local"
+        app.kubernetes.io/version: "0.5.7"
     spec:
       automountServiceAccountToken: false
       securityContext:

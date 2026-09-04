@@ -61,4 +61,36 @@ fn main() {
     fs::write(&out_path, lines.join("\n")).expect("write generated registry");
 
     println!("cargo:rerun-if-changed=Cargo.toml");
+
+    // 嵌入构建来源：容器全量构建时源码树无 .git，由 Dockerfile ARG
+    // GIT_REVISION 经 COGNEVA_GIT_REVISION 环境变量注入；本机构建直接查 git。
+    // 线上镜像必须能回答"我跑的是哪个 commit"，浮动 tag :local 不携带该信息。
+    let revision = std::env::var("COGNEVA_GIT_REVISION")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(git_revision)
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=COGNEVA_GIT_REVISION={revision}");
+    println!("cargo:rerun-if-env-changed=COGNEVA_GIT_REVISION");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+}
+
+fn git_revision() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false);
+    if dirty {
+        rev.push_str("-dirty");
+    }
+    Some(rev)
 }

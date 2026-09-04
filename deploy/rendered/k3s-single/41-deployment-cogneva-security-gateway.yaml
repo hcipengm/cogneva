@@ -12,7 +12,7 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/instance: cogneva
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "local"
+    app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: security-gateway
 spec:
   replicas: 1
@@ -30,7 +30,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
-        app.kubernetes.io/version: "local"
+        app.kubernetes.io/version: "0.5.7"
     spec:
       containers:
         - name: security-gateway

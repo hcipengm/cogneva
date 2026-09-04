@@ -2,8 +2,8 @@ apiVersion: v2
 name: cogneva
 description: Cogneva AI 多智能体协作平台（gateway + security-gateway + evolution worker + 可选后端）
 type: application
-version: 0.1.0
-appVersion: "0.1.39"
+version: 0.5.7
+appVersion: "0.5.7"
 keywords:
   - ai
   - multi-agent

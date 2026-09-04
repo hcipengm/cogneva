@@ -9,7 +9,7 @@ metadata:
 data:
   # Application
   COGNEVA_APP_NAME: "cogneva"
-  COGNEVA_APP_VERSION: "0.1.20"
+  COGNEVA_APP_VERSION: "0.5.7"
   COGNEVA_LOG_LEVEL: "info"
   COGNEVA_DATA_DIR: "/var/lib/cogneva-data"
   COGNEVA_CONFIG_DIR: "/etc/cogneva"

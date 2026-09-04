@@ -16,7 +16,9 @@ storage:
 
 image:
   repository: localhost/cogneva
-  tag: "0.1.39"
+  # 默认 tag = 应用版本（与 Cargo.toml workspace version 同源，发布脚本强制校验）。
+  # 自举部署的 profile values 覆盖为 local（浮动签，随导入的 release 镜像走）。
+  tag: "0.5.7"
   pullPolicy: IfNotPresent
 
 gateway:
@@ -85,6 +87,24 @@ buildah:
     limits:
       cpu: 2000m
       memory: 4Gi
+
+# 集群内镜像仓库：GitOps L1 金丝雀镜像秒级分发通道。
+# publisher（进化 Pod）把 overlay 镜像（cogneva 基镜像 + 新二进制）push 到
+# Service:5000（集群 DNS，http）；节点 kubelet 经 NodePort 以 localhost:<nodePort>
+# pull（containerd 对 localhost 默认 http 免 TLS），单/多节点通吃。
+# 外部仓库形态改配 COGNEVA_GITOPS_REGISTRY（跨集群生产），可置 enabled:false。
+clusterRegistry:
+  enabled: true
+  image: registry:2
+  nodePort: 30500
+  storage: 5Gi
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
 
 # 可选后端；禁用即假定使用外部服务（在 config 中指向外部地址）
 backends:

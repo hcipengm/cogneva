@@ -24,7 +24,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
-        app.kubernetes.io/version: {{ .Values.image.tag | quote }}
+        app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     spec:
       containers:
         - name: security-gateway

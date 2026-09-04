@@ -7,6 +7,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CryptoProvider，首次 TLS 调用会 panic——必须在任何 TLS 使用之前安装。
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "cogneva {} (rev {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("COGNEVA_GIT_REVISION")
+        );
+        return Ok(());
+    }
+
     #[cfg(windows)]
     if std::env::args().any(|a| a == "--service") {
         return cogneva::windows_service::run();

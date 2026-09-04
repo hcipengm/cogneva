@@ -6,7 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: gateway
-    app.kubernetes.io/version: "0.1.22"
+    app.kubernetes.io/version: "0.5.7"
 spec:
   # 单副本：当前集群为单节点，双副本共享同一故障域没有可用性收益，
   # 只放大内存占用与凭证副本数。扩到多节点后再调回 2。
@@ -25,7 +25,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
-        app.kubernetes.io/version: "0.1.22"
+        app.kubernetes.io/version: "0.5.7"
     spec:
       serviceAccountName: cogneva
       affinity:

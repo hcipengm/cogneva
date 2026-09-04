@@ -46,6 +46,9 @@ spec:
         # （run_command/read_file/write_file），该 Pod 不持有任何 Secret。
         - protocol: TCP
           port: 9090
+        # 集群内镜像仓库（5000）：publisher push 金丝雀 overlay 镜像
+        - protocol: TCP
+          port: 5000
     # 只允许访问集群 DNS
     - to:
         - namespaceSelector:

@@ -9,7 +9,8 @@
 //!   → L0（l0_config）：提取变化的配置文件
 //!       deploy/k3s/cogneva-json-configmap.yaml → kubectl apply（ConfigWatcher 热更新）
 //!       prompts/** → 重建 prompts configmap → kubectl apply（hot_reload 热更新）
-//!   → L1（l1_rollout）：构建/拉取镜像 → 金丝雀发布
+//!   → L1（l1_rollout）：拉取镜像（推送端已 push 到外部仓库或集群内
+//!       registry，拉取端只产出引用，绝不本地构建）→ 金丝雀发布
 //!       set image + rollout pause（新副本先起，旧副本不动）
 //!       → 看护（readiness + restart count + 可选 metrics URL 阈值比对）
 //!       → 通过：rollout resume 全量；异常：rollout undo 回滚 + 熔断计数
@@ -836,29 +837,18 @@ impl GitOpsPuller {
         Ok(changed.lines().any(|f| f.starts_with(prefix)))
     }
 
-    /// 镜像获取：registry 模式直接引用仓库镜像；源码模式本地 buildah 构建。
+    /// 镜像获取：拉取端永远只产出引用、不构建镜像（主应用 Pod 非特权也无法
+    /// 构建）。外部 registry 配置存在时引用外部仓库；缺省引用集群内
+    /// registry——节点 kubelet 经 localhost NodePort pull（containerd 对
+    /// localhost 默认 http 免 TLS；每个节点的 NodePort 都通，多节点天然
+    /// 分发），镜像由推送端 buildah push 就位，pull 秒级。
     async fn obtain_image(&self, candidate: &PromotionCandidate) -> SFResult<String> {
-        if let Some(registry) = &self.config.registry {
-            return Ok(format!(
-                "{}/cogneva:promote-{}",
-                registry,
-                sanitize(&candidate.patch_id)
-            ));
-        }
-        // 源码级：本地构建。复用仓库内 Containerfile.local（buildah 叠层流）。
-        let dir = self.work_dir();
-        let image = format!(
-            "localhost/cogneva:promote-{}",
-            sanitize(&candidate.patch_id)
-        );
-        self.run(
-            "buildah",
-            &["build", "-f", "Containerfile.local", "-t", &image, "."],
-            Some(&dir),
-            3600,
-        )
-        .await?;
-        Ok(image)
+        let tag = format!("cogneva:promote-{}", sanitize(&candidate.patch_id));
+        let endpoint = match &self.config.registry {
+            Some(registry) => registry.trim_end_matches('/'),
+            None => self.config.local_registry.trim_end_matches('/'),
+        };
+        Ok(format!("{endpoint}/{tag}"))
     }
 
     /// 金丝雀看护：watch 期内周期性检查新副本 readiness 与 restart
@@ -1145,10 +1135,25 @@ mod tests {
         git(work.path(), &["add", "."]).await;
         git(work.path(), &["commit", "-m", "initial"]).await;
 
+        // L1 晋级会打 overlay 镜像：staged 二进制桩 + 假构建器（不真跑 buildah）。
+        std::fs::write(work.path().join("cogneva"), b"staged-binary").unwrap();
+        let fake_builder = work.path().join("fake-buildah");
+        std::fs::write(
+            &fake_builder,
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_builder, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
         // publisher 推。
         let publisher = crate::GitOpsPublisher::new(
             GitOpsConfig {
                 repo_url: central.path().to_string_lossy().to_string(),
+                builder_bin: fake_builder.to_string_lossy().into_owned(),
                 ..Default::default()
             },
             work.path(),

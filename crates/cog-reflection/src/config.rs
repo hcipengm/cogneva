@@ -178,6 +178,9 @@ impl PromotionGateConfig {
         if let Some(v) = get("COGNEVA_GITOPS_REGISTRY") {
             g.registry = if v.is_empty() { None } else { Some(v) };
         }
+        if let Some(v) = get("COGNEVA_GITOPS_LOCAL_REGISTRY") {
+            g.local_registry = v;
+        }
         if let Some(v) = get("COGNEVA_GITOPS_WORK_DIR") {
             g.work_dir = v;
         }
@@ -195,6 +198,9 @@ impl PromotionGateConfig {
         }
         if let Some(v) = get("COGNEVA_GITOPS_KUBECTL_BIN") {
             g.kubectl_bin = v;
+        }
+        if let Some(v) = get("COGNEVA_GITOPS_BUILDER_BIN") {
+            g.builder_bin = v;
         }
         if let Some(v) = get("COGNEVA_GITOPS_CANARY_ERROR_RATE_MULTIPLIER") {
             g.canary_error_rate_multiplier =
@@ -228,12 +234,17 @@ pub struct GitOpsConfig {
     pub branch: String,
     /// 拉取端轮询间隔（秒）。
     pub poll_interval_secs: u64,
-    /// 镜像仓库（可选）：Some 时推送端 buildah push、拉取端镜像 pull；
-    /// None 时走源码级分发，拉取端本地 buildah 构建。
+    /// 外部镜像仓库（可选，跨集群生产形态）：Some 时推送端 push、拉取端 pull
+    /// 该仓库；None 时走集群内 registry（NodePort localhost 引用）。
     pub registry: Option<String>,
+    /// 集群内 registry 的节点侧 pull 引用（拉取端 set image 用）：
+    /// kubelet/containerd 在节点上经 localhost NodePort pull，http 免 TLS。
+    pub local_registry: String,
     /// 拉取端工作目录（checkout / 构建）。
     pub work_dir: String,
     pub kubectl_bin: String,
+    /// 推送端镜像构建器可执行文件（buildah / podman）。
+    pub builder_bin: String,
     pub namespace: String,
     pub deployment: String,
     pub container: String,
@@ -259,8 +270,10 @@ impl Default for GitOpsConfig {
             branch: "evolution-release".into(),
             poll_interval_secs: 120,
             registry: None,
+            local_registry: "localhost:30500".into(),
             work_dir: "/opt/cogneva/gitops".into(),
             kubectl_bin: "kubectl".into(),
+            builder_bin: "buildah".into(),
             namespace: "cogneva".into(),
             deployment: "cogneva".into(),
             container: "cogneva".into(),
