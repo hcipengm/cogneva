@@ -14,6 +14,7 @@ jobs:
   build-release:
     name: Build Release Binary
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -63,6 +64,9 @@ jobs:
   build-docker:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
+    # 双架构（arm64 经 QEMU）Rust 全量编译正常 40-90 分钟；超时即失败暴露，
+    # 不再无声挂到 runner 6 小时上限。
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -117,6 +121,7 @@ jobs:
     name: Mirror Release to Gitee
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Create or update Gitee release
         env:
