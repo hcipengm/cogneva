@@ -2,8 +2,8 @@ use axum::response::{Html, IntoResponse, Response};
 use std::path::PathBuf;
 
 /// WebUI 静态资源目录（含 index.html 与 assets/）。
-/// 优先级：COGNEVA_WEB_DIR > COGNEVA_DASHBOARD_PATH 的父目录
-/// > 运行时自定位（从当前二进制位置向上逐级查找含 index.html 的
+/// 优先级：COGNEVA_WEB_DIR，其次 COGNEVA_DASHBOARD_PATH 的父目录，
+/// 最后运行时自定位（从当前二进制位置向上逐级查找含 index.html 的
 /// web 目录：容器内命中同级 web/，开发态从 target/debug 向上爬到
 /// 仓库根的 web/dist/）。
 ///
@@ -44,10 +44,7 @@ fn locate_web_dir() -> Option<PathBuf> {
         if source_layout.join("index.html").is_file() {
             return Some(source_layout);
         }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => return None,
-        }
+        dir = dir.parent()?;
     }
 }
 
