@@ -170,16 +170,36 @@ if ! buildah run "$CTR" -- python3 --version >/dev/null 2>&1; then
     apt-get update && apt-get install -y --no-install-recommends python3 \
       && rm -rf /var/lib/apt/lists/*'
 fi
+# buildah 是 GitOps publisher 打金丝雀 overlay 镜像的硬依赖（仅特权进化
+# Pod 用；主应用 Pod 非特权装了也用不了）。老基镜像（Dockerfile runtime
+# 补装前的全量构建）没有，叠层流补装；全量构建由 Dockerfile 保证。
+# buildah 在 ubuntu 24.04 的 universe 源，官方基础镜像可能只开 main，
+# 先显式补齐 deb822 Components；CN 模式同步换 TUNA。
+if ! buildah run "$CTR" -- buildah --version >/dev/null 2>&1; then
+  echo "==> 基镜像缺 buildah，叠层补装（启用 universe 源）"
+  buildah run --user root -e "COGNEVA_CN_MIRROR=${COGNEVA_CN_MIRROR:-0}" "$CTR" -- sh -c '
+    if [ "${COGNEVA_CN_MIRROR:-0}" = "1" ]; then
+      sed -i -e "s|//archive.ubuntu.com|//mirrors.tuna.tsinghua.edu.cn|" \
+             -e "s|//security.ubuntu.com|//mirrors.tuna.tsinghua.edu.cn|" \
+             /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+    fi
+    sed -i "s/^Components: main.*/Components: main restricted universe multiverse/" \
+      /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+    apt-get update && apt-get install -y --no-install-recommends buildah \
+      && rm -rf /var/lib/apt/lists/*'
+fi
 if [ -f web/dist/index.html ]; then
   # web/dist 是 git 忽略的构建产物——拷的是磁盘现状，要新鲜前端先加 --web
   buildah copy "$CTR" web/dist /opt/cogneva/web
 fi
 # 换版即验证：新二进制必须能自报版本与 revision（追溯性的运行时证据）
 buildah run "$CTR" -- /opt/cogneva/cogneva --version
-buildah commit \
+# OCI label 经 config 写进容器配置再 commit（buildah commit 无 --label flag）。
+buildah config \
   --label "org.opencontainers.image.version=${NEW_TAG}" \
   --label "org.opencontainers.image.revision=${GIT_REVISION}" \
-  "$CTR" "${IMAGE}:${NEW_TAG}"
+  "$CTR"
+buildah commit "$CTR" "${IMAGE}:${NEW_TAG}"
 buildah rm "$CTR" >/dev/null
 trap - EXIT
 
