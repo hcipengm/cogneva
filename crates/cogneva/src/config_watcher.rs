@@ -5,7 +5,7 @@
 use crate::config_loader::AppConfig;
 use cog_core::SFResult;
 use notify::Watcher;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 use tokio::sync::watch;
 
 /// Watches configuration files for changes and broadcasts updated [`AppConfig`] values.
@@ -44,14 +44,25 @@ impl ConfigWatcher {
         )
         .map_err(|e| cog_core::SFError::Config(format!("notify error: {e}")))?;
 
+        // Watch parent directories rather than the files themselves. Besides
+        // allowing a config file that does not exist at startup to be created
+        // later, this also keeps the watch alive when Kubernetes updates a
+        // ConfigMap by replacing its `..data` symlink.
+        let mut watched_dirs = HashSet::new();
         for path in &paths {
-            // Skip files that don't exist yet — their creation is caught by the
-            // parent-directory watch; a hard error here would kill the watcher.
-            if !path.exists() {
+            let dir = if path.is_dir() {
+                path.clone()
+            } else {
+                path.parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .into()
+            };
+
+            if !watched_dirs.insert(dir.clone()) {
                 continue;
             }
             watcher
-                .watch(path, notify::RecursiveMode::NonRecursive)
+                .watch(&dir, notify::RecursiveMode::NonRecursive)
                 .map_err(|e| cog_core::SFError::Config(format!("watch error: {e}")))?;
         }
 
@@ -71,18 +82,6 @@ impl ConfigWatcher {
         if env_path != paths[0].to_string_lossy() {
             paths.push(PathBuf::from(env_path));
         }
-        // K8s configmap volumes swap a `..data` symlink on update — the watch on
-        // the file itself dies with the old inode. Watching the parent directory
-        // catches the swap (create/rename events) so hot reload actually fires.
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        for p in &paths {
-            if let Some(parent) = p.parent() {
-                if !dirs.iter().any(|d| d == parent) {
-                    dirs.push(parent.to_path_buf());
-                }
-            }
-        }
-        paths.extend(dirs);
         Self::new(paths)
     }
 
@@ -154,5 +153,37 @@ mod watcher_tests {
             .unwrap();
 
         assert_eq!(sub.borrow().app.name, "test-v2");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn watcher_reloads_when_missing_config_is_created() {
+        let _lock = crate::config_loader::ENV_LOCK.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("cogneva.json");
+        let _config_path = crate::config_loader::EnvGuard::set(
+            "COGNEVA_CONFIG_PATH",
+            &config_path.to_string_lossy(),
+        );
+        let _app_name = crate::config_loader::EnvGuard::remove("COGNEVA_APP_NAME");
+
+        let (watcher, _notify_watcher) = ConfigWatcher::new(vec![config_path.clone()]).unwrap();
+        let mut sub = watcher.subscribe();
+        assert_ne!(sub.borrow().app.name, "created-config");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(
+            &config_path,
+            br#"{"app": {"name": "created-config", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "config_dir": "/tmp", "app_dir": "/tmp"}}"#,
+        )
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), sub.changed())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(sub.borrow().app.name, "created-config");
     }
 }
