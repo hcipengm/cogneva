@@ -56,7 +56,8 @@ pub mod types;
 
 pub use auto_promoter::{AutoPromoter, PromotionChannel};
 pub use baseline_port::{
-    AbsorptionStatus, BaselinePorter, PortPlan, PortPlanItem, PromotedChange,
+    AbsorptionStatus, BaselinePorter, PortItemResult, PortOutcome, PortPlan, PortPlanItem,
+    PortReport, PortRoute, PromotedChange,
 };
 pub use change_pipeline::{ApplyResult, ChangePipeline};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
