@@ -25,6 +25,13 @@ pub enum CogGitHubError {
     #[error("provider error: {0}")]
     Provider(String),
 
+    /// A change was rejected before publishing because it touches paths
+    /// outside the contribution whitelist (configs, secrets, deploy
+    /// manifests, business data, or anything not under the allowed
+    /// generic-code paths).
+    #[error("contribution rejected by privacy gate: {0}")]
+    PrivacyRejected(String),
+
     /// An HTTP request failed.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),

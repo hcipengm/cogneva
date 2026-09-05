@@ -101,8 +101,7 @@ impl InstanceIdentity {
 /// 身份状态文件落点：`$COGNEVA_DATA_DIR/identity.json`，默认
 /// `/var/lib/cogneva-data/identity.json`。
 pub fn identity_state_path() -> PathBuf {
-    let dir = std::env::var("COGNEVA_DATA_DIR")
-        .unwrap_or_else(|_| "/var/lib/cogneva-data".into());
+    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
     PathBuf::from(dir).join("identity.json")
 }
 
@@ -296,7 +295,10 @@ mod tests {
         let first = InstanceIdentity::load_or_generate(&mut config)
             .await
             .unwrap();
-        assert_eq!(config.fingerprint.as_deref(), Some(first.fingerprint.as_str()));
+        assert_eq!(
+            config.fingerprint.as_deref(),
+            Some(first.fingerprint.as_str())
+        );
         assert_eq!(config.persona.as_deref(), Some(first.persona.as_str()));
 
         // 第二次：从持久化指纹恢复，身份完全一致（不重新生成）。
@@ -307,7 +309,9 @@ mod tests {
 
         // 人手改了人名也不影响：人名由指纹规范重算。
         config.persona = Some("Tampered".into());
-        let third = InstanceIdentity::load_or_generate(&mut config).await.unwrap();
+        let third = InstanceIdentity::load_or_generate(&mut config)
+            .await
+            .unwrap();
         assert_eq!(third.persona, first.persona);
     }
 
@@ -339,9 +343,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_prefers_explicit_config_fingerprint() {
         let mut config = crate::config::BotIdentityConfig::default();
-        config.fingerprint = Some(
-            "a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into(),
-        );
+        config.fingerprint =
+            Some("a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into());
         let id = resolve(&mut config).await;
         assert_eq!(id.short, "a3f9d2c1");
     }
@@ -354,9 +357,8 @@ mod tests {
         assert!(config.instance().is_none());
 
         let mut with_persona = crate::config::BotIdentityConfig::default();
-        with_persona.fingerprint = Some(
-            "a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into(),
-        );
+        with_persona.fingerprint =
+            Some("a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into());
         let instance = with_persona.instance().unwrap();
         assert_eq!(with_persona.git_author_name(), instance.git_name);
         assert!(with_persona.git_author_name().contains('#'));

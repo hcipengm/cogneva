@@ -293,8 +293,8 @@ impl BaselinePorter {
                 .git(&["tag", "-l", "--format=%(contents)", &tag])
                 .await?;
             let (change_id, level, eval_summary) = parse_tag_message(&message);
-            let change_id = change_id
-                .unwrap_or_else(|| tag.trim_start_matches("promote/").to_string());
+            let change_id =
+                change_id.unwrap_or_else(|| tag.trim_start_matches("promote/").to_string());
             changes.push(PromotedChange {
                 change_id,
                 tag,
@@ -312,7 +312,12 @@ impl BaselinePorter {
     /// 退化为最后一个晋级 tag（晋级历史线性，新 tag 是旧 tag 的后代）。
     async fn evolution_tip(&self, changes: &[PromotedChange]) -> SFResult<Option<String>> {
         if let Some(tip) = self
-            .git_opt(&["rev-parse", "--verify", "-q", "refs/remotes/local/evolution-release"])
+            .git_opt(&[
+                "rev-parse",
+                "--verify",
+                "-q",
+                "refs/remotes/local/evolution-release",
+            ])
             .await?
         {
             return Ok(Some(tip));
@@ -323,7 +328,11 @@ impl BaselinePorter {
     /// `git cherry <new_tag> <head>`：输出新基线..tip 范围每个提交一行，
     /// `- <sha>` = patch-id 命中（新基线已有等价 patch，已吸收），
     /// `+ <sha>` = 缺失（待移植）。返回 (absorbed, pending) 两个 sha 集合。
-    async fn cherry_sets(&self, new_tag: &str, head: &str) -> SFResult<(HashSet<String>, HashSet<String>)> {
+    async fn cherry_sets(
+        &self,
+        new_tag: &str,
+        head: &str,
+    ) -> SFResult<(HashSet<String>, HashSet<String>)> {
         let out = self.git(&["cherry", new_tag, head]).await?;
         let mut absorbed = HashSet::new();
         let mut pending = HashSet::new();
@@ -359,12 +368,7 @@ impl BaselinePorter {
         // 不在 cherry 输出里：不在 new_tag..tip 范围内。正常情况是该提交
         // 已是新基线祖先（新基线直接包含了它）→ 已吸收。
         match self
-            .git(&[
-                "merge-base",
-                "--is-ancestor",
-                &change.commit,
-                new_tag,
-            ])
+            .git(&["merge-base", "--is-ancestor", &change.commit, new_tag])
             .await
         {
             Ok(_) => Ok(AbsorptionStatus::Absorbed),
@@ -428,7 +432,9 @@ impl BaselinePorter {
 
         let mut items = Vec::with_capacity(changes.len());
         for change in changes {
-            let status = self.classify(&change, &new_tag, &absorbed, &pending).await?;
+            let status = self
+                .classify(&change, &new_tag, &absorbed, &pending)
+                .await?;
             info!(
                 change_id = %change.change_id,
                 tag = %change.tag,
@@ -501,12 +507,11 @@ impl BaselinePorter {
                     info!(change_id = %item.change.change_id, "change absorbed upstream; skipped");
                     PortOutcome::Absorbed
                 }
-                AbsorptionStatus::Pending => {
-                    self.port_one(&item.change, &plan.new_tag).await?
-                }
+                AbsorptionStatus::Pending => self.port_one(&item.change, &plan.new_tag).await?,
             };
             if let PortOutcome::NeedsRework { ref reason } = outcome {
-                self.submit_rework(&item.change, &plan.new_tag, reason).await;
+                self.submit_rework(&item.change, &plan.new_tag, reason)
+                    .await;
             }
             items.push(PortItemResult {
                 change_id: item.change.change_id.clone(),
@@ -523,7 +528,9 @@ impl BaselinePorter {
             .filter(|i| matches!(i.outcome, PortOutcome::NeedsRework { .. }))
             .count();
 
-        let gen_tag = self.tag_generation(&plan.new_tag, n_ported, n_rework).await?;
+        let gen_tag = self
+            .tag_generation(&plan.new_tag, n_ported, n_rework)
+            .await?;
         self.push_results(&branch, &gen_tag).await?;
 
         info!(
@@ -556,7 +563,10 @@ impl BaselinePorter {
         for round in 1u32..=3 {
             let need_agent = round > 1 || !cherry_ok;
             if need_agent {
-                match self.run_resolve_task(change, new_tag, round, &feedback).await? {
+                match self
+                    .run_resolve_task(change, new_tag, round, &feedback)
+                    .await?
+                {
                     Ok(()) => {
                         if !self.worktree_dirty().await? {
                             feedback = format!(
@@ -643,7 +653,10 @@ impl BaselinePorter {
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let mut evidence = format!("git cherry-pick did not apply cleanly:\n{}", tail(&stderr, 4000));
+        let mut evidence = format!(
+            "git cherry-pick did not apply cleanly:\n{}",
+            tail(&stderr, 4000)
+        );
 
         // 抓冲突文件列表与冲突标记规模（abort 后这些证据就没了）。
         if let Ok(names) = self.git(&["diff", "--name-only", "--diff-filter=U"]).await {
@@ -652,7 +665,10 @@ impl BaselinePorter {
                 for f in names.lines().filter(|l| !l.trim().is_empty()).take(20) {
                     let mut hunks = 0usize;
                     if let Ok(content) = tokio::fs::read_to_string(self.repo_dir.join(f)).await {
-                        hunks = content.lines().filter(|l| l.starts_with("<<<<<<< ")).count();
+                        hunks = content
+                            .lines()
+                            .filter(|l| l.starts_with("<<<<<<< "))
+                            .count();
                     }
                     evidence.push_str(&format!("- {f} ({hunks} conflict hunks)\n"));
                 }
@@ -822,7 +838,13 @@ impl BaselinePorter {
         }
     }
 
-    async fn fs_rework_dump(&self, change: &PromotedChange, new_tag: &str, reason: &str, goal: &str) {
+    async fn fs_rework_dump(
+        &self,
+        change: &PromotedChange,
+        new_tag: &str,
+        reason: &str,
+        goal: &str,
+    ) {
         let dir = self
             .repo_dir
             .parent()
@@ -844,14 +866,23 @@ impl BaselinePorter {
             "goal": goal,
             "dumped_at": chrono::Utc::now().to_rfc3339(),
         });
-        match tokio::fs::write(&path, serde_json::to_string_pretty(&payload).unwrap_or_default()).await
+        match tokio::fs::write(
+            &path,
+            serde_json::to_string_pretty(&payload).unwrap_or_default(),
+        )
+        .await
         {
             Ok(()) => warn!(path = %path.display(), "rework task dumped to file (no orchestrator)"),
             Err(e) => warn!(error = %e, "failed to dump rework task"),
         }
     }
 
-    async fn commit_ported(&self, change: &PromotedChange, new_tag: &str, round: u32) -> SFResult<()> {
+    async fn commit_ported(
+        &self,
+        change: &PromotedChange,
+        new_tag: &str,
+        round: u32,
+    ) -> SFResult<()> {
         let msg = format!(
             "port: {} onto {} (main-loop agent, round {})",
             change.change_id, new_tag, round
@@ -901,7 +932,10 @@ impl BaselinePorter {
         round: u32,
     ) -> SFResult<Result<(), String>> {
         let Some(orch) = &self.orchestrator else {
-            debug!("no orchestrator; eval A/B gate skipped for {}", change.change_id);
+            debug!(
+                "no orchestrator; eval A/B gate skipped for {}",
+                change.change_id
+            );
             return Ok(Ok(()));
         };
 
@@ -984,7 +1018,11 @@ impl BaselinePorter {
     }
 
     async fn worktree_dirty(&self) -> SFResult<bool> {
-        Ok(!self.git(&["status", "--porcelain"]).await?.trim().is_empty())
+        Ok(!self
+            .git(&["status", "--porcelain"])
+            .await?
+            .trim()
+            .is_empty())
     }
 
     /// 变更原始 patch（相对其父提交的纯 diff）。
@@ -1033,7 +1071,8 @@ impl BaselinePorter {
     /// 推送移植分支与代际 tag 到 `local` 远程（宿主 bare）。无 local 远程
     /// （非沙盒环境）时跳过。evol 分支为本流程独占，可 force 覆盖重建。
     async fn push_results(&self, branch: &str, gen_tag: &str) -> SFResult<()> {
-        if self.git_opt(&["remote", "get-url", "local"])
+        if self
+            .git_opt(&["remote", "get-url", "local"])
             .await?
             .is_none()
         {
@@ -1122,7 +1161,13 @@ fn eval_regression_feedback(result: &serde_json::Value) -> Result<(), String> {
 /// 任务 id / 文件名安全化：只留 [A-Za-z0-9-_]。
 fn sanitize_ref(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -1183,10 +1228,12 @@ mod tests {
         tokio::fs::write(dir.join(file), body).await.unwrap();
         git(dir, &["add", "."]).await;
         git(dir, &["commit", "-m", &format!("change {change_id}")]).await;
-        let msg = format!(
-            "change_id={change_id}\nlevel=l1_rollout\neval=Adopt z=2.3"
-        );
-        git(dir, &["tag", "-a", "-m", &msg, &format!("promote/{change_id}")]).await;
+        let msg = format!("change_id={change_id}\nlevel=l1_rollout\neval=Adopt z=2.3");
+        git(
+            dir,
+            &["tag", "-a", "-m", &msg, &format!("promote/{change_id}")],
+        )
+        .await;
     }
 
     /// 从指定 tag 起 detached 建新提交并打新 release tag（模拟上游演进）。
@@ -1229,13 +1276,7 @@ mod tests {
     async fn promoted_change_absorbed_when_upstream_has_same_patch() {
         let dir = setup_repo().await;
         // 私版晋级一条变更。
-        make_promoted(
-            dir.path(),
-            "chg-1",
-            "feature.rs",
-            "fn promoted() {}\n",
-        )
-        .await;
+        make_promoted(dir.path(), "chg-1", "feature.rs", "fn promoted() {}\n").await;
         // 上游独立合入了同一个 patch（cherry-pick 产生不同 commit、相同 patch-id）。
         git(dir.path(), &["checkout", "-q", "v0.5.7"]).await;
         git(dir.path(), &["cherry-pick", "promote/chg-1"]).await;
@@ -1252,13 +1293,7 @@ mod tests {
     #[tokio::test]
     async fn promoted_change_pending_when_upstream_lacks_it() {
         let dir = setup_repo().await;
-        make_promoted(
-            dir.path(),
-            "chg-1",
-            "feature.rs",
-            "fn promoted() {}\n",
-        )
-        .await;
+        make_promoted(dir.path(), "chg-1", "feature.rs", "fn promoted() {}\n").await;
         // 上游只做了无关改动。
         upstream_release(
             dir.path(),
@@ -1527,18 +1562,10 @@ mod tests {
         async fn start_task(&self, _t: &str) -> SFResult<()> {
             unimplemented!()
         }
-        async fn complete_task(
-            &self,
-            _t: &str,
-            _r: serde_json::Value,
-        ) -> SFResult<Vec<String>> {
+        async fn complete_task(&self, _t: &str, _r: serde_json::Value) -> SFResult<Vec<String>> {
             unimplemented!()
         }
-        async fn fail_task(
-            &self,
-            _t: &str,
-            _e: String,
-        ) -> SFResult<(bool, Vec<String>, bool)> {
+        async fn fail_task(&self, _t: &str, _e: String) -> SFResult<(bool, Vec<String>, bool)> {
             unimplemented!()
         }
         async fn cancel_task(&self, _t: &str) -> SFResult<Vec<String>> {
@@ -1599,7 +1626,14 @@ mod tests {
     async fn execute_ports_clean_cherry_pick_and_tags_generation() {
         let dir = setup_repo().await;
         make_promoted(dir.path(), "chg-clean", "feature.rs", "fn promoted() {}\n").await;
-        upstream_release(dir.path(), "v0.5.7", "v0.5.8", "other.rs", "fn other() {}\n").await;
+        upstream_release(
+            dir.path(),
+            "v0.5.7",
+            "v0.5.8",
+            "other.rs",
+            "fn other() {}\n",
+        )
+        .await;
 
         let porter = porter_for(dir.path()).with_instance_id("local");
         let plan = porter.plan("0.5.7").await.unwrap().unwrap();
@@ -1772,7 +1806,14 @@ mod tests {
     async fn execute_generation_tag_increments_over_existing_gens() {
         let dir = setup_repo().await;
         make_promoted(dir.path(), "chg-gen", "feature.rs", "fn promoted() {}\n").await;
-        upstream_release(dir.path(), "v0.5.7", "v0.5.8", "other.rs", "fn other() {}\n").await;
+        upstream_release(
+            dir.path(),
+            "v0.5.7",
+            "v0.5.8",
+            "other.rs",
+            "fn other() {}\n",
+        )
+        .await;
         // 预置一代。
         git(dir.path(), &["tag", "-a", "-m", "gen=1", "gen-1", "v0.5.8"]).await;
 
@@ -1837,11 +1878,16 @@ mod tests {
             .unwrap();
         git(&repo, &["add", "."]).await;
         git(&repo, &["commit", "-m", "change chg-dump"]).await;
-        git(&repo, &[
-            "tag", "-a",
-            "-m", "change_id=chg-dump\nlevel=l1_rollout\neval=Adopt z=2.3",
-            "promote/chg-dump",
-        ])
+        git(
+            &repo,
+            &[
+                "tag",
+                "-a",
+                "-m",
+                "change_id=chg-dump\nlevel=l1_rollout\neval=Adopt z=2.3",
+                "promote/chg-dump",
+            ],
+        )
         .await;
         // 上游同位置不同改动。
         git(&repo, &["checkout", "-q", "v0.5.7"]).await;
@@ -1859,10 +1905,7 @@ mod tests {
         assert_eq!(report.needs_rework().count(), 1);
 
         // 文件名经 sanitize_ref：点号转横线。
-        let dump = td
-            .path()
-            .join("port-rework")
-            .join("chg-dump-v0-5-8.json");
+        let dump = td.path().join("port-rework").join("chg-dump-v0-5-8.json");
         let body = tokio::fs::read_to_string(&dump).await.unwrap();
         assert!(body.contains("chg-dump"));
         assert!(body.contains("v0.5.8"));

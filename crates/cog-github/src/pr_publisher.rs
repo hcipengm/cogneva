@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::{BotIdentityConfig, GitHubIntegrationConfig};
-use cog_core::GeneratedChange;
+use cog_core::{parse_diff_affected_files, GeneratedChange};
 
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{CodePlatformProvider, CreatePullRequest, PlatformPullRequest};
@@ -45,6 +45,13 @@ impl GitHubPrPublisher {
     ) -> Result<PlatformPullRequest> {
         let branch = format!("cogneva/fix-{}-{}", issue_number, sanitize(change_id));
         let identity = &self.config.bot_identity;
+        let pr_body = format!(
+            "Fixes #{}\n\nChange `{}` generated autonomously by Cogneva.\n\n{}\n\n{}",
+            issue_number,
+            change_id,
+            self.config.conversation.bot_signature,
+            metadata_block(identity, None, None)
+        );
         self.publish(
             provider,
             change_content,
@@ -57,10 +64,7 @@ impl GitHubPrPublisher {
                 identity_signoff(identity)
             ),
             &format!("[Cogneva] fix issue #{}: {}", issue_number, issue_title),
-            &format!(
-                "Fixes #{}\n\nChange `{}` generated autonomously by Cogneva.\n\n{}",
-                issue_number, change_id, self.config.conversation.bot_signature
-            ),
+            &pr_body,
         )
         .await
     }
@@ -75,6 +79,11 @@ impl GitHubPrPublisher {
         pr_title: &str,
         pr_body: &str,
     ) -> Result<PlatformPullRequest> {
+        // Whitelist gate before any git operation: a change that touches
+        // configs, secrets, deploy manifests, or business data must never be
+        // pushed to the public repo. Fail closed — do not trust the generator.
+        ensure_contribution_allowed(change_content)?;
+
         let identity = &self.config.bot_identity;
         let base = self.config.base_branch.clone();
 
@@ -173,6 +182,122 @@ fn identity_signoff(identity: &BotIdentityConfig) -> String {
     )
 }
 
+/// Whitelist gate for public contributions. Every path the diff touches must
+/// fall inside the generic, shareable surface: Rust sources under
+/// `crates/**/src/`, files under `prompts/`, or the root README/CHANGELOG.
+/// Everything else — deploy manifests, configs, secrets, business data — is
+/// hard-rejected before anything is pushed. A diff from which no paths can be
+/// parsed is rejected as well (fail closed).
+pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
+    let files = parse_diff_affected_files(diff)
+        .map_err(|e| CogGitHubError::PrivacyRejected(e.to_string()))?;
+    let denied: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !is_allowed_path(p))
+        .collect();
+    if denied.is_empty() {
+        Ok(())
+    } else {
+        Err(CogGitHubError::PrivacyRejected(format!(
+            "change touches non-contributable paths: {} \
+             (whitelist: crates/**/src/**/*.rs, prompts/**, root README/CHANGELOG)",
+            denied.join(", ")
+        )))
+    }
+}
+
+/// Whether a single repo-relative path is inside the contribution whitelist.
+fn is_allowed_path(path: &str) -> bool {
+    let p = path.strip_prefix("./").unwrap_or(path);
+
+    if let Some(rest) = p.strip_prefix("crates/") {
+        // crates/<crate>/src/<...>.rs — the src segment is mandatory and the
+        // final path segment must be a Rust source file.
+        let mut segs = rest.split('/');
+        let crate_seg = segs.next();
+        if crate_seg.is_none_or(|s| s.is_empty()) || segs.next() != Some("src") {
+            return false;
+        }
+        return match segs.next_back() {
+            Some(file) if file.ends_with(".rs") => true,
+            _ => false,
+        };
+    }
+
+    if let Some(rest) = p.strip_prefix("prompts/") {
+        // Any file under prompts/, but no traversal/empty segments.
+        return !rest.is_empty()
+            && rest
+                .split('/')
+                .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
+    }
+
+    // Root-level README*/CHANGELOG* only (no slash => repository root).
+    if !p.contains('/') {
+        let name = p.to_ascii_lowercase();
+        return name.starts_with("readme") || name.starts_with("changelog");
+    }
+
+    false
+}
+
+/// Standard PR metadata block. Public-repo tooling parses the
+/// `cogneva-bot-meta` marker to build the bot contribution board and to
+/// attribute cross-validation comments; every line is single-valued and
+/// missing data is rendered as `n/a`.
+fn metadata_block(
+    identity: &BotIdentityConfig,
+    eval_note: Option<&str>,
+    related: Option<&str>,
+) -> String {
+    let bot = identity
+        .instance()
+        .map(|i| i.handle)
+        .unwrap_or_else(|| identity.git_author_name());
+    format!(
+        "<!-- cogneva-bot-meta -->\n\
+         bot: {bot}\n\
+         env: {env}\n\
+         eval: {eval}\n\
+         related: {related}",
+        env = environment_summary(),
+        eval = eval_note.unwrap_or("n/a"),
+        related = related.unwrap_or("n/a"),
+    )
+}
+
+/// One-line environment summary for the metadata block:
+/// `<env>, <N>c/<M>G[, <deploy-profile>]`.
+fn environment_summary() -> String {
+    let env = std::env::var("COGNEVA_ENV").unwrap_or_else(|_| "prod".into());
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "?".into());
+    let mem = mem_total_gib()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "?".into());
+    let mut summary = format!("{env}, {cpus}c/{mem}G");
+    if let Ok(profile) = std::env::var("COGNEVA_DEPLOY_PROFILE") {
+        if !profile.is_empty() {
+            summary.push_str(&format!(", {profile}"));
+        }
+    }
+    summary
+}
+
+/// Total RAM in whole GiB (rounded) from `/proc/meminfo`; `None` off Linux.
+fn mem_total_gib() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some((kb + 524_287) / 1_048_576);
+        }
+    }
+    None
+}
+
 /// True when `workdir` looks like a usable git working copy.
 pub async fn is_git_workdir(workdir: &Path) -> bool {
     workdir.join(".git").exists()
@@ -233,6 +358,13 @@ impl cog_core::ChangeSink for GitHubChangeSink {
         }
 
         let identity = &self.publisher.config.bot_identity;
+        let eval_note = change
+            .self_review_score
+            .map(|score| format!("self-review={score:.2}"));
+        body.push_str(&format!(
+            "\n\n{}",
+            metadata_block(identity, eval_note.as_deref(), None)
+        ));
         let commit_message = format!(
             "chore(cogneva): autonomous change {}\n\n{}\n\n{}",
             change.change_id,
@@ -353,6 +485,110 @@ mod tests {
     #[test]
     fn sanitize_strips_unsafe_chars() {
         assert_eq!(sanitize("change-AB_12/.."), "change-AB_12");
+    }
+
+    fn diff_touching(paths: &[&str]) -> String {
+        paths
+            .iter()
+            .map(|p| format!("--- a/{p}\n+++ b/{p}\n@@ -1 +1 @@\n-old\n+new\n"))
+            .collect()
+    }
+
+    #[test]
+    fn whitelist_allows_generic_code_prompt_and_root_docs() {
+        assert!(is_allowed_path("crates/cog-github/src/lib.rs"));
+        assert!(is_allowed_path(
+            "crates/cog-core/src/contract/reflection.rs"
+        ));
+        assert!(is_allowed_path("./crates/cog-github/src/webhook.rs"));
+        assert!(is_allowed_path("prompts/change-generator.md"));
+        assert!(is_allowed_path("prompts/roundtable/system.txt"));
+        assert!(is_allowed_path("README.md"));
+        assert!(is_allowed_path("README"));
+        assert!(is_allowed_path("CHANGELOG.md"));
+        assert!(is_allowed_path("changelog"));
+    }
+
+    #[test]
+    fn whitelist_rejects_private_infra_config_and_secrets() {
+        let denied = [
+            "deploy/helm/cogneva/values.yaml",
+            "deploy/k3s/cogneva.yaml",
+            ".github/workflows/release.yml",
+            "crates/cog-github/tests/it.rs",
+            "crates/cog-github/build.rs",
+            "crates/cog-github/Cargo.toml",
+            "Cargo.toml",
+            "cogneva.json",
+            "docs/setup.md",
+            "secrets/id_rsa",
+            "deploy/certs/server.pem",
+            "src/main.rs",
+            "crates/cog-github/src",
+            "prompts/../etc/passwd",
+        ];
+        for path in denied {
+            assert!(!is_allowed_path(path), "should deny {path}");
+        }
+    }
+
+    #[test]
+    fn privacy_gate_accepts_whitelisted_diff() {
+        let diff = diff_touching(&[
+            "crates/cog-github/src/pr_publisher.rs",
+            "crates/cog-core/src/lib.rs",
+            "prompts/evaluator.md",
+            "README.md",
+        ]);
+        ensure_contribution_allowed(&diff).unwrap();
+    }
+
+    #[test]
+    fn privacy_gate_rejects_diff_with_any_non_whitelisted_path() {
+        let diff = diff_touching(&[
+            "crates/cog-github/src/lib.rs",
+            "deploy/helm/cogneva/values.yaml",
+        ]);
+        let err = ensure_contribution_allowed(&diff).unwrap_err();
+        match err {
+            CogGitHubError::PrivacyRejected(msg) => {
+                assert!(msg.contains("deploy/helm/cogneva/values.yaml"));
+                assert!(msg.contains("whitelist"));
+            }
+            other => panic!("expected PrivacyRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn privacy_gate_fails_closed_on_unparseable_diff() {
+        let err = ensure_contribution_allowed("not a diff at all").unwrap_err();
+        assert!(matches!(err, CogGitHubError::PrivacyRejected(_)));
+    }
+
+    #[test]
+    fn metadata_block_uses_instance_handle_when_present() {
+        let mut identity = BotIdentityConfig::default();
+        identity.fingerprint =
+            Some("a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into());
+        let block = metadata_block(&identity, Some("self-review=0.87"), Some("#42 (by Bob)"));
+        assert!(block.starts_with("<!-- cogneva-bot-meta -->"));
+        assert!(block.contains(&format!("bot: {}", identity.git_author_name())));
+        assert!(block.contains("self-review=0.87"));
+        assert!(block.contains("#42 (by Bob)"));
+        assert_eq!(block.lines().count(), 5);
+        // env line shape: "<env>, <n>c/<m>G".
+        let env_line = block.lines().find(|l| l.starts_with("env: ")).unwrap();
+        assert!(env_line.contains("c/"));
+        assert!(env_line.ends_with('G') || env_line.contains("G,"));
+    }
+
+    #[test]
+    fn metadata_block_falls_back_to_static_identity_and_na_fields() {
+        let identity = BotIdentityConfig::default();
+        let block = metadata_block(&identity, None, None);
+        assert!(block.contains("bot: Cogneva Bot"));
+        assert!(block.contains("eval: n/a"));
+        assert!(block.contains("related: n/a"));
     }
 
     #[test]
