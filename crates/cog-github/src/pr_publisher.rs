@@ -219,10 +219,7 @@ fn is_allowed_path(path: &str) -> bool {
         if crate_seg.is_none_or(|s| s.is_empty()) || segs.next() != Some("src") {
             return false;
         }
-        return match segs.next_back() {
-            Some(file) if file.ends_with(".rs") => true,
-            _ => false,
-        };
+        return matches!(segs.next_back(), Some(file) if file.ends_with(".rs"));
     }
 
     if let Some(rest) = p.strip_prefix("prompts/") {

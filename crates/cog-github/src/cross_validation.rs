@@ -130,7 +130,7 @@ impl CrossValidationState {
     pub fn is_validated(&self, pr: u64, head_sha: &str) -> bool {
         self.validated
             .get(&pr)
-            .map_or(false, |e| e.head_sha == head_sha)
+            .is_some_and(|e| e.head_sha == head_sha)
     }
 }
 
