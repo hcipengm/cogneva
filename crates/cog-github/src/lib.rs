@@ -16,6 +16,7 @@
 
 pub mod config;
 pub mod conversation;
+pub mod cross_validation;
 pub mod discovery;
 pub mod discovery_loop;
 pub mod error;

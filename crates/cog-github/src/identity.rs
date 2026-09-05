@@ -217,6 +217,11 @@ pub async fn machine_fingerprint() -> std::io::Result<String> {
     Ok(hex::encode(digest))
 }
 
+/// `COGNEVA_DATA_DIR` 是进程级环境变量，用串行锁保护所有依赖它的测试
+/// （identity 与 cross_validation 的状态文件测试共用）。
+#[cfg(test)]
+pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,9 +319,6 @@ mod tests {
             .unwrap();
         assert_eq!(third.persona, first.persona);
     }
-
-    /// COGNEVA_DATA_DIR 是进程级环境变量，用串行锁保护依赖它的测试。
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn resolve_persists_state_file_and_reloads() {

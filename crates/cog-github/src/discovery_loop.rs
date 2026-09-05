@@ -29,6 +29,11 @@ const ASSESS_TASK_TIMEOUT_SECS: u64 = 120;
 const ASSESS_WAIT_TIMEOUT_SECS: u64 = 100;
 /// Poll interval while waiting for the assess task to complete.
 const ASSESS_POLL_INTERVAL_MS: u64 = 500;
+/// Maximum cross-validation tasks running concurrently for this instance.
+const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
+/// DAG-side timeout for one cross-validation task (apply + workspace tests +
+/// optional eval A/B in the sandbox).
+const CROSS_VALIDATE_TASK_TIMEOUT_SECS: u64 = 3600;
 
 /// The autonomous GitHub sensor loop.
 pub struct GitHubDiscoveryLoop {
@@ -58,6 +63,12 @@ pub struct GitHubDiscoveryLoop {
     /// which adopts all currently failed runs without submitting (so a pod
     /// restart does not resubmit old failures).
     ci_seen: Option<std::collections::HashSet<u64>>,
+    /// Cross-validation state (validated PR heads), lazily loaded from the
+    /// state file on first poll.
+    cv_state: Option<crate::cross_validation::CrossValidationState>,
+    /// PR number → in-flight cross-validation task (submitted, not yet
+    /// reaped). Keyed by PR number; at most one validation per PR at a time.
+    cv_inflight: HashMap<u64, crate::cross_validation::CvInflight>,
 }
 
 /// Which external-intent surface a conversation belongs to. Issues and PRs
@@ -137,6 +148,8 @@ impl GitHubDiscoveryLoop {
             ci_submitted: std::collections::HashSet::new(),
             awaiting_clarification: std::collections::HashSet::new(),
             ci_seen: None,
+            cv_state: None,
+            cv_inflight: HashMap::new(),
         }
     }
 
@@ -180,6 +193,9 @@ impl GitHubDiscoveryLoop {
                 tracing::warn!(error = %e, "Failed to list open pull requests");
             }
         }
+
+        // A2A 交叉验证：把公版上他人 bot PR 拉进本实例沙盒验证并回评。
+        self.poll_cross_validation().await;
 
         if let Some(ref reflection) = self.reflection {
             if let Err(e) = self
@@ -947,12 +963,239 @@ impl GitHubDiscoveryLoop {
         );
         Ok(())
     }
+
+    /// This instance's attribution handle for cross-validation comments:
+    /// the instance persona handle when an identity exists, else the static
+    /// git author name.
+    fn cv_handle(&self) -> String {
+        self.config
+            .bot_identity
+            .instance()
+            .map(|i| i.handle)
+            .unwrap_or_else(|| self.config.bot_identity.git_author_name())
+    }
+
+    /// One cross-validation round: reap finished validation tasks (posting
+    /// the verdict comment back onto the PR), then submit at most one new
+    /// validation task for a `cogneva-bot`-labelled PR this instance has not
+    /// validated at its current head. Pure outbound polling; without an
+    /// orchestrator or a configured PR workdir the feature stays dormant.
+    async fn poll_cross_validation(&mut self) {
+        let Some(orchestrator) = self.orchestrator.clone() else {
+            return;
+        };
+        if self.config.pr_workdir.is_empty() {
+            return;
+        }
+        if self.cv_state.is_none() {
+            self.cv_state = Some(crate::cross_validation::CrossValidationState::load().await);
+        }
+        let handle = self.cv_handle();
+
+        // 1. Reap in-flight tasks.
+        let inflight: Vec<(u64, String, String)> = self
+            .cv_inflight
+            .iter()
+            .map(|(pr, v)| (*pr, v.task_id.clone(), v.head_sha.clone()))
+            .collect();
+        for (pr, task_id, head_sha) in inflight {
+            let Some(task) = orchestrator.get_task(&task_id).await else {
+                continue;
+            };
+            match task.status {
+                TaskStatus::Completed => {
+                    self.cv_inflight.remove(&pr);
+                    let (verdict, commented) = match crate::cross_validation::extract_verdict(
+                        &task.result.unwrap_or_default(),
+                    ) {
+                        Some(v) => {
+                            // Scan the comment thread first: a verdict for
+                            // this instance+head may already exist (posted
+                            // before a state loss).
+                            let already = self
+                                .provider
+                                .list_pull_comments(pr)
+                                .await
+                                .map(|comments| {
+                                    crate::cross_validation::comment_already_posted(
+                                        &comments, pr, &head_sha, &handle,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            let posted = if already {
+                                true
+                            } else {
+                                let body = crate::cross_validation::render_verdict_comment(
+                                    &v, pr, &head_sha, &handle,
+                                );
+                                match self.provider.comment_on_pull(pr, body).await {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            pr,
+                                            error = %e,
+                                            "cross-validation verdict comment failed"
+                                        );
+                                        false
+                                    }
+                                }
+                            };
+                            (v.verdict, posted)
+                        }
+                        // Completed without a parseable verdict: record as
+                        // infra error so the round does not resubmit forever.
+                        None => ("error".to_string(), false),
+                    };
+                    if let Some(state) = self.cv_state.as_mut() {
+                        state.record(pr, head_sha, verdict, commented);
+                        state.save().await;
+                    }
+                }
+                TaskStatus::Failed | TaskStatus::Cancelled => {
+                    self.cv_inflight.remove(&pr);
+                    tracing::warn!(pr, task = %task_id, "cross-validation task ended unsuccessfully");
+                    if let Some(state) = self.cv_state.as_mut() {
+                        state.record(pr, head_sha, "error".into(), false);
+                        state.save().await;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Discover one new candidate per round (bounds load; in-flight cap
+        //    limits concurrent sandbox validation).
+        if self.cv_inflight.len() >= MAX_CROSS_VALIDATION_INFLIGHT {
+            return;
+        }
+        let prs = match self.provider.list_open_pull_requests().await {
+            Ok(prs) => prs,
+            Err(e) => {
+                tracing::warn!(error = %e, "cross-validation: list PRs failed");
+                return;
+            }
+        };
+        for pr in prs {
+            if self.cv_inflight.contains_key(&pr.number) {
+                continue;
+            }
+            if !pr
+                .labels
+                .iter()
+                .any(|l| l == crate::cross_validation::CROSS_VALIDATION_LABEL)
+            {
+                continue;
+            }
+            if crate::cross_validation::is_self_pr(
+                &pr,
+                Some(&handle),
+                &self.config.bot_identity.username,
+            ) {
+                continue;
+            }
+            let detail = match self.provider.get_pull_request(pr.number).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(pr = pr.number, error = %e, "cross-validation: PR detail fetch failed");
+                    continue;
+                }
+            };
+            if let Some(state) = self.cv_state.as_ref() {
+                if state.is_validated(pr.number, &detail.head_sha) {
+                    continue;
+                }
+            }
+            let diff = match crate::cross_validation::fetch_pr_diff(
+                std::path::Path::new(&self.config.pr_workdir),
+                &pr.base_branch,
+                &pr.head_branch,
+            )
+            .await
+            {
+                Ok(diff) => diff,
+                Err(e) => {
+                    tracing::warn!(pr = pr.number, error = %e, "cross-validation: diff fetch failed");
+                    continue;
+                }
+            };
+
+            let sha8: String = detail.head_sha.chars().take(8).collect();
+            let task_id = format!("pr-cross-validate-{}-{}", pr.number, sha8);
+            let goal = format!(
+                "Cross-validate pull request #{}: {} ({})\n\n\
+                 Another Cogneva instance opened this PR against the public repo. Decide whether \
+                 the change works in THIS private instance's repository worktree:\n\
+                 1. Apply the unified diff in this task's `diff` field onto the current worktree \
+                 with `git apply` (it is against base branch `{}`; your worktree being this \
+                 instance's own branch is intentional — that is the environment being validated).\n\
+                 2. Run `cargo test --workspace` and capture the result.\n\
+                 3. If the change touches eval-covered behavior, run the relevant eval A/B \
+                 (before/after) and report the comparison; otherwise say eval is not applicable.\n\
+                 4. Revert the worktree afterwards (`git apply -R` or `git checkout -- .`). Do \
+                 NOT commit, push, or open any pull request.\n\n\
+                 Your final result must be ONE JSON object, no prose:\n\
+                 {{\"verdict\": \"pass|fail|inconclusive\", \"tests\": \"cargo test summary\", \
+                 \"eval\": \"eval A/B summary, or not applicable\", \"summary\": \"one paragraph \
+                 with any failure details\"}}\n\
+                 verdict=pass only when the diff applies cleanly and the full workspace test run \
+                 passes (with no eval regression where eval applies).",
+                pr.number, pr.title, pr.url, pr.base_branch
+            );
+            let mut task = Task::new(
+                task_id.clone(),
+                TaskType::Custom(crate::cross_validation::CROSS_VALIDATE_TASK_KIND.into()),
+                serde_json::json!({
+                    "goal": goal,
+                    "pr_number": pr.number,
+                    "pr_title": pr.title,
+                    "pr_url": pr.url,
+                    "head_branch": pr.head_branch,
+                    "head_sha": detail.head_sha,
+                    "base_branch": pr.base_branch,
+                    "instance_handle": handle,
+                    "diff": diff,
+                }),
+            );
+            task.action_planner_meta = Some(ActionPlannerMeta {
+                verified: true,
+                version: Some("1.0.0".into()),
+                note: Some(
+                    "Cross-validation of an external bot PR: apply the diff in this instance's \
+                     worktree, run cargo test and applicable eval A/B, return a verdict JSON. \
+                     Do not commit, push, or open PRs."
+                        .into(),
+                ),
+                source: Some(ActionPlannerSource::UserProvided),
+                confidence: None,
+                timestamp: Some(chrono::Utc::now()),
+            });
+            task.timeout_seconds = CROSS_VALIDATE_TASK_TIMEOUT_SECS;
+
+            match orchestrator.submit_goal_auto(&goal, vec![task]).await {
+                Ok(ids) => {
+                    let id = ids.into_iter().next().unwrap_or(task_id);
+                    tracing::info!(pr = pr.number, head = %sha8, task = %id,
+                        "Submitted pr_cross_validate task");
+                    self.cv_inflight.insert(
+                        pr.number,
+                        crate::cross_validation::CvInflight::new(id, detail.head_sha),
+                    );
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(pr = pr.number, error = %e, "cross-validation task submit failed");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{CiJobLog, CreatePullRequest, PlatformPullRequest, PullRequestDetail};
+    use crate::provider::{
+        CiJobLog, CreatePullRequest, PlatformComment, PlatformPullRequest, PullRequestDetail,
+    };
     use chrono::Utc;
     use std::sync::Mutex;
 
@@ -961,12 +1204,17 @@ mod tests {
         comments: Mutex<Vec<(u64, String)>>,
         ci_logs: Vec<CiJobLog>,
         ci_runs: Mutex<Vec<CiFailureEvent>>,
+        prs: Vec<PlatformPullRequest>,
+        pr_details: HashMap<u64, PullRequestDetail>,
     }
 
     #[async_trait::async_trait]
     impl CodePlatformProvider for MockProvider {
         async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {
             Ok(self.issues.clone())
+        }
+        async fn list_open_pull_requests(&self) -> Result<Vec<PlatformPullRequest>> {
+            Ok(self.prs.clone())
         }
         async fn create_pull_request(
             &self,
@@ -978,11 +1226,28 @@ mod tests {
             self.comments.lock().unwrap().push((issue_number, body));
             Ok(())
         }
+        async fn list_issue_comments(&self, issue_number: u64) -> Result<Vec<PlatformComment>> {
+            Ok(self
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| *n == issue_number)
+                .map(|(_, body)| PlatformComment {
+                    author: "cogneva-bot".into(),
+                    body: body.clone(),
+                    created_at: Utc::now(),
+                })
+                .collect())
+        }
         async fn merge_pull_request(&self, _pr: u64, _sha: String) -> Result<()> {
             unimplemented!()
         }
-        async fn get_pull_request(&self, _pr: u64) -> Result<PullRequestDetail> {
-            unimplemented!()
+        async fn get_pull_request(&self, pr: u64) -> Result<PullRequestDetail> {
+            self.pr_details
+                .get(&pr)
+                .cloned()
+                .ok_or_else(|| crate::error::CogGitHubError::Provider(format!("pr {pr} not found")))
         }
         async fn fetch_ci_failure_logs(&self, _run_id: u64) -> Result<Vec<CiJobLog>> {
             Ok(self.ci_logs.clone())
@@ -999,6 +1264,9 @@ mod tests {
         /// the task as Failed so the fallback path can be exercised without
         /// waiting out the real poll timeout.
         assess_verdict: Mutex<Option<serde_json::Value>>,
+        /// Result returned for a `pr_cross_validate` task. `None` reports the
+        /// task as Failed; the default is a passing verdict JSON.
+        cv_verdict: Mutex<Option<serde_json::Value>>,
     }
 
     impl MockOrchestrator {
@@ -1012,6 +1280,12 @@ mod tests {
                     "priority": 2,
                     "reason": "mock assessor: actionable",
                 }))),
+                cv_verdict: Mutex::new(Some(serde_json::json!({
+                    "verdict": "pass",
+                    "summary": "mock sandbox: diff applies, workspace tests pass",
+                    "tests": "cargo test: 512 passed",
+                    "eval": "not applicable",
+                }))),
             }
         }
 
@@ -1022,6 +1296,11 @@ mod tests {
 
         fn with_failed_assess(self) -> Self {
             *self.assess_verdict.lock().unwrap() = None;
+            self
+        }
+
+        fn with_cv_verdict(self, verdict: serde_json::Value) -> Self {
+            *self.cv_verdict.lock().unwrap() = Some(verdict);
             self
         }
     }
@@ -1096,8 +1375,27 @@ mod tests {
             unimplemented!()
         }
         async fn get_task(&self, id: &str) -> Option<Task> {
-            // Only the assess task is polled; report it finished immediately so
-            // tests never wait out the real 100s poll timeout.
+            // Polled tasks are reported finished immediately so tests never wait
+            // out the real poll timeout.
+            if id.contains("pr-cross-validate") {
+                let verdict = self.cv_verdict.lock().unwrap().clone();
+                let mut task = Task::new(
+                    id,
+                    TaskType::Custom(crate::cross_validation::CROSS_VALIDATE_TASK_KIND.into()),
+                    serde_json::json!({}),
+                );
+                match verdict {
+                    Some(result) => {
+                        task.status = TaskStatus::Completed;
+                        task.result = Some(result);
+                    }
+                    None => {
+                        task.status = TaskStatus::Failed;
+                        task.error = Some("mock cross-validation failure".into());
+                    }
+                }
+                return Some(task);
+            }
             if !id.contains("intent-assess") {
                 return None;
             }
@@ -1175,6 +1473,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let orchestrator = Arc::new(MockOrchestrator::new());
 
@@ -1209,6 +1509,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let orchestrator = Arc::new(MockOrchestrator::new().with_verdict(serde_json::json!({
             "decision": "clarify",
@@ -1256,6 +1558,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let orchestrator = Arc::new(MockOrchestrator::new().with_failed_assess());
 
@@ -1283,6 +1587,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
 
         let mut loop_ = GitHubDiscoveryLoop::new(
@@ -1308,6 +1614,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let mut loop_ = GitHubDiscoveryLoop::new(
             provider.clone(),
@@ -1344,6 +1652,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let loop_ = GitHubDiscoveryLoop::new(provider, IssueTriage::rules_only(), cfg, None, None);
 
@@ -1385,6 +1695,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let orchestrator = Arc::new(MockOrchestrator::new());
 
@@ -1421,6 +1733,8 @@ mod tests {
                 log_tail: "error: clippy::question_mark".into(),
             }],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let orchestrator = Arc::new(MockOrchestrator::new());
 
@@ -1447,6 +1761,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let orchestrator = Arc::new(MockOrchestrator::new());
 
@@ -1470,6 +1786,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
 
         let mut loop_ =
@@ -1485,6 +1803,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![ci_event(4001), ci_event(4002)]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let orchestrator = Arc::new(MockOrchestrator::new());
 
@@ -1507,6 +1827,8 @@ mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![ci_event(5001)]),
+            prs: vec![],
+            pr_details: HashMap::new(),
         });
         let orchestrator = Arc::new(MockOrchestrator::new());
 
@@ -1531,5 +1853,299 @@ mod tests {
         // Polling again with the same set submits nothing.
         loop_.run_once().await.unwrap();
         assert_eq!(orchestrator.goals.lock().unwrap().len(), 1);
+    }
+
+    // --- Cross-validation (A2A) -------------------------------------------
+
+    /// Build a temp git repo that serves as its own `origin` (bare clone),
+    /// with a `cogneva/auto-bob` PR branch pushed on top of `main` — the
+    /// three-dot diff `fetch_pr_diff` expects. The repo is nested under the
+    /// tempdir so `../origin.git` resolves inside this test's unique dir
+    /// (parallel tests must not share `/tmp`). Returns the tempdir (kept alive
+    /// for the test) and the repo path to use as `pr_workdir`.
+    fn git_workdir_with_pr_branch() -> (tempfile::TempDir, std::path::PathBuf) {
+        let workdir = tempfile::tempdir().unwrap();
+        let root = workdir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        sh(&["init", "-q", "-b", "main", "."]);
+        sh(&["config", "user.email", "t@t"]);
+        sh(&["config", "user.name", "t"]);
+        std::fs::write(root.join("lib.txt"), "base\n").unwrap();
+        sh(&["add", "."]);
+        sh(&["commit", "-q", "-m", "base"]);
+        sh(&["clone", "-q", "--bare", ".", "../origin.git"]);
+        sh(&["remote", "add", "origin", "../origin.git"]);
+        sh(&["checkout", "-q", "-b", "cogneva/auto-bob"]);
+        std::fs::write(root.join("lib.txt"), "base\nchange\n").unwrap();
+        sh(&["commit", "-aq", "-m", "change"]);
+        sh(&["push", "-q", "origin", "cogneva/auto-bob"]);
+        sh(&["checkout", "-q", "main"]);
+        let repo_path = root.clone();
+        (workdir, repo_path)
+    }
+
+    fn cv_pr(number: u64, author: &str, bot_handle: &str) -> PlatformPullRequest {
+        PlatformPullRequest {
+            number,
+            title: format!("bot change {number}"),
+            url: format!("https://example.com/pr/{number}"),
+            state: "open".into(),
+            head_branch: "cogneva/auto-bob".into(),
+            base_branch: "main".into(),
+            body: format!("<!-- cogneva-bot-meta -->\nbot: {bot_handle}\nenv: prod\n"),
+            author: author.into(),
+            labels: vec![crate::cross_validation::CROSS_VALIDATION_LABEL.into()],
+        }
+    }
+
+    fn cv_detail(number: u64, head_sha: &str) -> PullRequestDetail {
+        PullRequestDetail {
+            number,
+            title: format!("bot change {number}"),
+            url: format!("https://example.com/pr/{number}"),
+            state: "open".into(),
+            labels: vec![crate::cross_validation::CROSS_VALIDATION_LABEL.into()],
+            changed_lines: 2,
+            affected_files: vec!["crates/x/src/lib.rs".into()],
+            ci_passed: None,
+            review_requested: false,
+            head_sha: head_sha.into(),
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Config with a PR workdir and a stable instance identity (handle derived
+    /// from the fingerprint, never hard-coded).
+    fn cv_config(workdir: &std::path::Path) -> GitHubIntegrationConfig {
+        let mut cfg = config();
+        cfg.pr_workdir = workdir.display().to_string();
+        cfg.bot_identity.fingerprint =
+            Some("a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into());
+        cfg
+    }
+
+    #[tokio::test]
+    async fn cross_validation_posts_verdict_for_external_pr() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let (_workdir_tmp, workdir) = git_workdir_with_pr_branch();
+        let cfg = cv_config(&workdir);
+        let own_handle = cfg.bot_identity.instance().unwrap().handle;
+
+        let head_sha = "deadbeefcafebabe000000000000000000000031";
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![cv_pr(31, "cogneva-bot", "Bob#b81c0e9f")],
+            pr_details: HashMap::from([(31u64, cv_detail(31, head_sha))]),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            cfg,
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        // Round 1: the external bot PR is submitted for validation; no comment
+        // until the sandbox task finishes.
+        loop_.run_once().await.unwrap();
+        let types = orchestrator.task_types.lock().unwrap();
+        assert!(
+            types
+                .iter()
+                .any(|t| t == crate::cross_validation::CROSS_VALIDATE_TASK_KIND),
+            "cross-validation task should be submitted; got {types:?}"
+        );
+        drop(types);
+        assert!(provider.comments.lock().unwrap().is_empty());
+
+        // Round 2: the task reports a pass verdict → one verdict comment.
+        loop_.run_once().await.unwrap();
+        let comments = provider.comments.lock().unwrap();
+        let cv: Vec<&(u64, String)> = comments.iter().filter(|(n, _)| *n == 31).collect();
+        assert_eq!(
+            cv.len(),
+            1,
+            "one verdict comment on PR 31; got {comments:?}"
+        );
+        assert!(
+            cv[0].1.contains("cogneva-cv"),
+            "comment carries the dedup marker"
+        );
+        assert!(cv[0].1.contains("Verdict: PASS"));
+        assert!(cv[0].1.contains(&own_handle));
+        drop(comments);
+
+        // Round 3: the validated head is skipped and the comment not duplicated.
+        loop_.run_once().await.unwrap();
+        assert_eq!(
+            provider
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| *n == 31)
+                .count(),
+            1
+        );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn cross_validation_skips_self_pr_and_unlabeled_pr() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let (_workdir_tmp, workdir) = git_workdir_with_pr_branch();
+        let cfg = cv_config(&workdir);
+        let own_handle = cfg.bot_identity.instance().unwrap().handle;
+
+        // PR 32 carries this instance's own meta handle; PR 33 is a bot PR
+        // without the cross-validation label.
+        let mut self_pr = cv_pr(32, "cogneva-bot", &own_handle);
+        self_pr.head_branch = "cogneva/auto-self".into();
+        let mut unlabeled = cv_pr(33, "cogneva-bot", "Bob#b81c0e9f");
+        unlabeled.labels = vec![];
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![self_pr, unlabeled],
+            pr_details: HashMap::from([
+                (
+                    32u64,
+                    cv_detail(32, "aaaa000000000000000000000000000000000032"),
+                ),
+                (
+                    33u64,
+                    cv_detail(33, "bbbb000000000000000000000000000000000033"),
+                ),
+            ]),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            cfg,
+            Some(orchestrator.clone()),
+            None,
+        );
+        loop_.run_once().await.unwrap();
+        let types = orchestrator.task_types.lock().unwrap();
+        assert!(
+            !types
+                .iter()
+                .any(|t| t == crate::cross_validation::CROSS_VALIDATE_TASK_KIND),
+            "own-instance and unlabeled PRs must not be validated; got {types:?}"
+        );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn cross_validation_dormant_without_orchestrator_or_workdir() {
+        let (_workdir_tmp, workdir) = git_workdir_with_pr_branch();
+
+        // No orchestrator: the loop must stay quiet and not panic.
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![cv_pr(41, "cogneva-bot", "Bob#b81c0e9f")],
+            pr_details: HashMap::from([(
+                41u64,
+                cv_detail(41, "cccc000000000000000000000000000000000041"),
+            )]),
+        });
+        let mut dormant = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            cv_config(&workdir),
+            None,
+            None,
+        );
+        dormant.run_once().await.unwrap();
+
+        // Orchestrator present but no PR workdir configured: still dormant.
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut no_workdir = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        no_workdir.run_once().await.unwrap();
+        assert!(
+            !orchestrator
+                .task_types
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t == crate::cross_validation::CROSS_VALIDATE_TASK_KIND),
+            "cross-validation must stay dormant without a configured workdir"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_validation_fail_verdict_comments_fail() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let (_workdir_tmp, workdir) = git_workdir_with_pr_branch();
+
+        let head_sha = "eedbeefcafebabe00000000000000000000000051";
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![cv_pr(51, "cogneva-bot", "Bob#b81c0e9f")],
+            pr_details: HashMap::from([(51u64, cv_detail(51, head_sha))]),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new().with_cv_verdict(serde_json::json!({
+            "verdict": "fail",
+            "summary": "cargo test: 2 failures in cog-core",
+            "tests": "cargo test: 510 passed, 2 failed",
+            "eval": "not applicable",
+        })));
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            cv_config(&workdir),
+            Some(orchestrator),
+            None,
+        );
+        loop_.run_once().await.unwrap();
+        loop_.run_once().await.unwrap();
+
+        let comments = provider.comments.lock().unwrap();
+        let cv: Vec<&(u64, String)> = comments.iter().filter(|(n, _)| *n == 51).collect();
+        assert_eq!(cv.len(), 1);
+        assert!(cv[0].1.contains("Verdict: FAIL"));
+        assert!(cv[0].1.contains("2 failures"));
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 }
