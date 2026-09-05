@@ -19,6 +19,7 @@ pub mod conversation;
 pub mod discovery;
 pub mod discovery_loop;
 pub mod error;
+pub mod identity;
 pub mod merge_decider;
 pub mod outcome_recorder;
 pub mod plugin;
@@ -33,6 +34,7 @@ pub use webhook::{run_webhook_server, verify_signature, webhook_router, WebhookS
 pub use conversation::{ConversationState, ConversationTurn, IssueConversation};
 pub use discovery::IssueDiscovery;
 pub use discovery_loop::GitHubDiscoveryLoop;
+pub use identity::{machine_fingerprint, InstanceIdentity, NAME_POOL};
 pub use merge_decider::{MergeDecider, MergeDecision};
 pub use outcome_recorder::OutcomeRecorder;
 pub use pr_publisher::{GitHubChangeSink, GitHubPrPublisher};

@@ -83,8 +83,18 @@ impl cog_core::SystemPlugin for GitHubPlugin {
 
     async fn init(&mut self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         // github/gitee_integration 是 cog-github 自有配置段，自读 cogneva.json。
-        let config = crate::config::GitHubIntegrationConfig::load()?;
+        let mut config = crate::config::GitHubIntegrationConfig::load()?;
         let gitee_config = crate::config::GiteeIntegrationConfig::load()?;
+
+        // 实例自治身份（Alice#a3f9d2c1 式）：首次进化时按机器指纹自动生成，
+        // 后续提交作者 / evol 分支 / PR 元数据统一引用；纯确定性，可重入。
+        let identity = crate::identity::resolve(&mut config.bot_identity).await;
+        info!(
+            handle = %identity.handle,
+            branch = %identity.branch_id,
+            "instance identity resolved"
+        );
+
         if !config.enabled && !gitee_config.enabled {
             info!("GitHubPlugin disabled (github/gitee integration both disabled)");
             return Ok(());

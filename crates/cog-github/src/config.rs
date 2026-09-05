@@ -352,10 +352,15 @@ impl Default for ConversationConfig {
 pub struct BotIdentityConfig {
     /// GitHub bot username.
     pub username: String,
-    /// Git commit author name.
+    /// Git commit author name (may be overridden by the instance persona once
+    /// generated; kept for backward-compatible static configuration).
     pub name: String,
     /// Git commit email.
     pub email: String,
+    /// 实例自治身份：人名池分配的名字（Alice/Ralph/…），首次进化时生成并持久化。
+    pub persona: Option<String>,
+    /// 实例机器指纹（SHA-256 hex）；身份的规范来源，缺失时首次使用自动生成。
+    pub fingerprint: Option<String>,
 }
 
 impl Default for BotIdentityConfig {
@@ -364,7 +369,33 @@ impl Default for BotIdentityConfig {
             username: "cogneva-bot".into(),
             name: "Cogneva Bot".into(),
             email: "bot@cogneva.ai".into(),
+            persona: None,
+            fingerprint: None,
         }
+    }
+}
+
+impl BotIdentityConfig {
+    /// 已解析的实例自治身份（配置里存在指纹时）；人名由指纹规范重算。
+    pub fn instance(&self) -> Option<crate::identity::InstanceIdentity> {
+        self.fingerprint
+            .as_ref()
+            .filter(|fp| !fp.is_empty())
+            .map(|fp| crate::identity::InstanceIdentity::from_fingerprint(fp))
+    }
+
+    /// 提交作者名：优先实例句柄（如 `Alice#a3f9d2c1`），回退静态配置。
+    pub fn git_author_name(&self) -> String {
+        self.instance()
+            .map(|i| i.git_name)
+            .unwrap_or_else(|| self.name.clone())
+    }
+
+    /// 提交作者邮箱：优先实例邮箱（per-instance，可归因），回退静态配置。
+    pub fn git_author_email(&self) -> String {
+        self.instance()
+            .map(|i| i.git_email)
+            .unwrap_or_else(|| self.email.clone())
     }
 }
 

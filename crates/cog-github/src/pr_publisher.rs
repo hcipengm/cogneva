@@ -98,9 +98,9 @@ impl GitHubPrPublisher {
         self.git(&["add", "-A"]).await?;
         self.git(&[
             "-c",
-            &format!("user.name={}", identity.name),
+            &format!("user.name={}", identity.git_author_name()),
             "-c",
-            &format!("user.email={}", identity.email),
+            &format!("user.email={}", identity.git_author_email()),
             "commit",
             "-m",
             commit_message,
@@ -166,7 +166,11 @@ fn sanitize(change_id: &str) -> String {
 }
 
 fn identity_signoff(identity: &BotIdentityConfig) -> String {
-    format!("Signed-off-by: {} <{}>", identity.name, identity.email)
+    format!(
+        "Signed-off-by: {} <{}>",
+        identity.git_author_name(),
+        identity.git_author_email()
+    )
 }
 
 /// True when `workdir` looks like a usable git working copy.
