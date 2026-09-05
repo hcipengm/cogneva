@@ -50,10 +50,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         let (tool_tx, mut tool_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
 
         let project_root = std::env::current_dir().ok();
-        let patch_dir = ctx.config().self_evolution.patch_dir.clone();
+        let change_dir = ctx.config().self_evolution.change_dir.clone();
 
         // Build the evolution engine up-front. It is required both as a
-        // PatchSink for collaboration-generated patches and for the
+        // ChangeSink for collaboration-generated changes and for the
         // self-evolution auto-deploy pipeline. It does not depend on a
         // persistent memory backend, so it is created whenever an LLM is
         // available.
@@ -64,7 +64,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     skill_registry.clone(),
                     Some(prompt_manager.clone()),
                 )
-                .with_patch_dir(patch_dir.clone());
+                .with_change_dir(change_dir.clone());
                 if let Some(ref root) = project_root {
                     evolution = evolution.with_project_root(root.clone());
                 }
@@ -84,7 +84,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 Some(hook_tx),
                 Some(tool_tx),
                 project_root,
-                patch_dir.clone(),
+                change_dir.clone(),
             )
         } else {
             if strict_persistence {
@@ -128,11 +128,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         ctx.publish(engine.clone());
         info!("ReflectionPlugin reflection engine published");
 
-        // Publish PatchSink when self-evolution is available.
+        // Publish ChangeSink when self-evolution is available.
         if let Some(ref evo) = engine.evolution {
-            let sink: Arc<dyn cog_core::PatchSink> = evo.clone();
+            let sink: Arc<dyn cog_core::ChangeSink> = evo.clone();
             ctx.publish_service(sink);
-            info!("ReflectionPlugin PatchSink published");
+            info!("ReflectionPlugin ChangeSink published");
         }
 
         // Publish reflection trait objects for downstream consumers.
@@ -273,7 +273,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 }
 
                 // Firecracker 微虚拟机编排（审计 2.5.4）：microvm.enabled 时
-                // host 不本地执行 patch pipeline，而是每个 cycle 冷启动一个
+                // host 不本地执行 change pipeline，而是每个 cycle 冷启动一个
                 // MicroVM（挂载 PV → 执行进化 → 阅后即焚）。preflight 失败
                 // 视为配置错误：显式报错并禁用 pipeline，绝不静默落到无沙盒
                 // 的本地执行。
@@ -334,10 +334,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     return Err(e);
                 }
 
-                let pipeline = crate::PatchPipeline::new(
+                let pipeline = crate::ChangePipeline::new(
                     &project_root,
-                    &self_evolution.patch_dir,
-                    // manual_approve holds test-passed patches at AwaitingReview
+                    &self_evolution.change_dir,
+                    // manual_approve holds test-passed changes at AwaitingReview
                     // (working tree rolled back) until an operator approves via
                     // the admin API, even when auto_apply is enabled.
                     self_evolution.auto_apply && !self_evolution.manual_approve,
@@ -355,7 +355,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let binary_switcher = ctx.consume_service::<dyn cog_core::BinarySwitcher>();
                 let audit_stream = ctx.consume_service::<dyn cog_core::AuditStream>();
                 if audit_stream.is_none() {
-                    warn!("AuditStream not published; patch operations will not be audited");
+                    warn!("AuditStream not published; change operations will not be audited");
                 }
                 let engine = engine.clone();
 
@@ -365,9 +365,9 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let promotion_ledger: Option<Arc<dyn cog_core::PromotionLedger>> =
                     ctx.consume_service::<dyn cog_core::PromotionLedger>();
 
-                // 接管台 SSE 推送通道：补丁行变更即时广播。
+                // 接管台 SSE 推送通道：变更行状态即时广播。
                 let (stream_tx, _) =
-                    tokio::sync::broadcast::channel::<cog_core::EvolutionPatchInfo>(64);
+                    tokio::sync::broadcast::channel::<cog_core::EvolutionChangeInfo>(64);
                 ctx.publish(Arc::new(stream_tx.clone()));
 
                 // Publish admin-facing evolution control surface.
@@ -422,7 +422,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 ctx.publish_service(admin_service);
                 info!("ReflectionPlugin evolution admin service published");
 
-                // 晋级触发器：沙盒验证全过的 patch 由它决定去向
+                // 晋级触发器：沙盒验证全过的 change 由它决定去向
                 // （GitOps 自动晋级 / 审批台待办），配额/熔断/暂停全在
                 // 其中判定。推送端只跟 Git 中央仓库说话，不持集群凭证。
                 let promotion_channel: Option<Arc<dyn crate::PromotionChannel>> =
@@ -598,7 +598,7 @@ async fn notify_sandbox_downgrade(ctx: &cog_core::PluginContext, reason: &str) {
 /// Checks / fixes:
 /// - Required CLI tools (`cargo`, `git`, `rustc`) are on PATH.
 /// - `project_root` exists and is a directory.
-/// - `patch_dir`, `binary_dir`, `backup_dir` exist and are writable.
+/// - `change_dir`, `binary_dir`, `backup_dir` exist and are writable.
 /// - The project is inside a git repository.
 /// - For `self_exec` switch mode, the current executable is installed at
 ///   the configured binary path.
@@ -649,12 +649,12 @@ async fn ensure_self_evolution_environment(
         }
     };
 
-    let patch_dir = resolve(&config.patch_dir);
+    let change_dir = resolve(&config.change_dir);
     let binary_dir = resolve(&config.binary_dir);
     let backup_dir = resolve(&config.backup_dir);
 
     // Create and ensure writable directories.
-    for dir in [&patch_dir, &binary_dir, &backup_dir] {
+    for dir in [&change_dir, &binary_dir, &backup_dir] {
         ensure_dir_writable(dir, config.sandbox_mode).await?;
     }
 
@@ -971,7 +971,7 @@ async fn ensure_binary_in_place(
 
 /// Run one pass of the self-evolution auto-deploy pipeline.
 async fn run_evolution_cycle(
-    pipeline: &crate::PatchPipeline,
+    pipeline: &crate::ChangePipeline,
     deployer: &crate::EvolutionDeployer,
     binary_switcher: Option<&Arc<dyn cog_core::BinarySwitcher>>,
     engine: &Arc<crate::ReflectionEngine>,
@@ -983,116 +983,116 @@ async fn run_evolution_cycle(
         return Ok(());
     };
 
-    // 先对齐上游主线再处理 patch：沙盒树陈旧会让 GitOps 拉取端应用晋级
+    // 先对齐上游主线再处理 change：沙盒树陈旧会让 GitOps 拉取端应用晋级
     // 产物时连带回退无关文件。同步失败不阻塞本轮（用当前树继续）。
     if let Err(e) = pipeline.sync_with_upstream().await {
         warn!(error = %e, "Sandbox source sync failed; continuing with current tree");
     }
 
-    let patches = pipeline.pending_patches(Some(evo_engine)).await?;
-    if patches.is_empty() {
+    let changes = pipeline.pending_changes(Some(evo_engine)).await?;
+    if changes.is_empty() {
         return Ok(());
     }
 
-    info!(count = patches.len(), "Pending evolution patches found");
+    info!(count = changes.len(), "Pending evolution changes found");
 
-    // Process patches serially. Each patch is applied, tested, committed,
+    // Process changes serially. Each change is applied, tested, committed,
     // built, and (when configured) deployed before moving to the next one.
-    for patch in patches {
-        let mut patch_failed = false;
+    for change in changes {
+        let mut change_failed = false;
 
-        let result = match pipeline.apply_and_test(&patch).await {
+        let result = match pipeline.apply_and_test(&change).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(error = %e, "Patch apply/test failed");
+                warn!(error = %e, "Change apply/test failed");
                 let _ = engine
-                    .record_patch_outcome(
-                        &patch.artifact_id,
+                    .record_change_outcome(
+                        &change.artifact_id,
                         false,
                         &format!("Pipeline error: {}", e),
                     )
                     .await;
                 if let Some(m) = evolution_metrics {
                     m.record_event(true).await;
-                    m.record_patch_failed().await;
+                    m.record_change_failed().await;
                 }
                 continue;
             }
         };
 
         evo_engine
-            .update_status(&result.patch_id, result.new_status)
+            .update_status(&result.change_id, result.new_status)
             .await;
 
         if !result.test_passed {
-            warn!(patch_id = %result.patch_id, "Patch failed tests; skipping deploy");
+            warn!(change_id = %result.change_id, "Change failed tests; skipping deploy");
             let _ = engine
-                .record_patch_outcome(&result.patch_id, false, &result.test_output)
+                .record_change_outcome(&result.change_id, false, &result.test_output)
                 .await;
-            patch_failed = true;
+            change_failed = true;
         } else if !config.auto_apply || config.manual_approve {
-            info!(patch_id = %result.patch_id, "Patch awaiting manual approval");
+            info!(change_id = %result.change_id, "Change awaiting manual approval");
         } else {
-            let artifact = match deployer.commit_and_build(&result.patch_id).await {
+            let artifact = match deployer.commit_and_build(&result.change_id).await {
                 Ok(a) => a,
                 Err(e) => {
-                    warn!(patch_id = %result.patch_id, error = %e, "Patch commit/build failed");
+                    warn!(change_id = %result.change_id, error = %e, "Change commit/build failed");
                     let _ = engine
-                        .record_patch_outcome(
-                            &result.patch_id,
+                        .record_change_outcome(
+                            &result.change_id,
                             false,
                             &format!("Build failed: {}", e),
                         )
                         .await;
                     if let Some(m) = evolution_metrics {
                         m.record_event(true).await;
-                        m.record_patch_failed().await;
+                        m.record_change_failed().await;
                     }
                     continue;
                 }
             };
 
             info!(
-                patch_id = %artifact.patch_id,
+                change_id = %artifact.change_id,
                 commit = %artifact.commit_hash,
-                "Patch committed and built"
+                "Change committed and built"
             );
 
             if !config.auto_deploy {
-                info!(patch_id = %artifact.patch_id, "Build artifact awaiting manual deploy");
+                info!(change_id = %artifact.change_id, "Build artifact awaiting manual deploy");
             } else {
                 let Some(switcher) = binary_switcher else {
                     warn!("auto_deploy enabled but no BinarySwitcher service available");
                     let _ = engine
-                        .record_patch_outcome(
-                            &artifact.patch_id,
+                        .record_change_outcome(
+                            &artifact.change_id,
                             false,
                             "No BinarySwitcher service available",
                         )
                         .await;
                     if let Some(m) = evolution_metrics {
                         m.record_event(true).await;
-                        m.record_patch_failed().await;
+                        m.record_change_failed().await;
                     }
                     continue;
                 };
 
                 if let Err(e) = switcher.stage_new_binary(&artifact.new_binary_path).await {
-                    warn!(patch_id = %artifact.patch_id, error = %e, "Staging failed");
+                    warn!(change_id = %artifact.change_id, error = %e, "Staging failed");
                     let _ = engine
-                        .record_patch_outcome(
-                            &artifact.patch_id,
+                        .record_change_outcome(
+                            &artifact.change_id,
                             false,
                             &format!("Staging failed: {}", e),
                         )
                         .await;
                     if let Some(m) = evolution_metrics {
                         m.record_event(true).await;
-                        m.record_patch_failed().await;
+                        m.record_change_failed().await;
                     }
                     continue;
                 }
-                info!(patch_id = %artifact.patch_id, "Staging new binary for switch");
+                info!(change_id = %artifact.change_id, "Staging new binary for switch");
 
                 // switch_and_restart may exec the current process and never return.
                 if let Err(e) = switcher.switch_and_restart().await {
@@ -1101,55 +1101,55 @@ async fn run_evolution_cycle(
                         warn!(error = %rb_e, "Rollback failed");
                     }
                     let _ = engine
-                        .record_patch_outcome(
-                            &artifact.patch_id,
+                        .record_change_outcome(
+                            &artifact.change_id,
                             false,
                             &format!("Switch failed: {}", e),
                         )
                         .await;
                     if let Some(m) = evolution_metrics {
                         m.record_event(true).await;
-                        m.record_patch_failed().await;
+                        m.record_change_failed().await;
                     }
                     return Err(e);
                 }
 
                 let _ = engine
-                    .record_patch_outcome(
-                        &artifact.patch_id,
+                    .record_change_outcome(
+                        &artifact.change_id,
                         true,
-                        "Patch applied, tested, built, and deployed",
+                        "Change applied, tested, built, and deployed",
                     )
                     .await;
                 if let Some(m) = evolution_metrics {
-                    m.record_patch_applied().await;
+                    m.record_change_applied().await;
                     m.record_event(false).await;
                 }
                 // 沙盒部署成功 → 交晋级触发器（soak → 分级 → GitOps/审批台）。
                 if let Some(p) = promoter {
                     let p = p.clone();
-                    let promoted_patch = patch.clone();
+                    let promoted_change = change.clone();
                     tokio::spawn(async move {
-                        p.on_sandbox_deployed(promoted_patch).await;
+                        p.on_sandbox_deployed(promoted_change).await;
                     });
                 }
                 continue;
             }
         }
 
-        if patch_failed {
+        if change_failed {
             if let Some(m) = evolution_metrics {
                 m.record_event(true).await;
-                m.record_patch_failed().await;
+                m.record_change_failed().await;
             }
         } else if !config.auto_deploy || config.manual_approve {
-            // Patch succeeded tests but is waiting for approval; count as
+            // Change succeeded tests but is waiting for approval; count as
             // a successful processing step without applying/deploying.
             let _ = engine
-                .record_patch_outcome(
-                    &result.patch_id,
+                .record_change_outcome(
+                    &result.change_id,
                     true,
-                    "Patch passed tests; awaiting manual approval",
+                    "Change passed tests; awaiting manual approval",
                 )
                 .await;
             if let Some(m) = evolution_metrics {
@@ -1219,7 +1219,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project_root = std::env::current_dir().unwrap();
         let config = cog_core::SelfEvolutionConfig {
-            patch_dir: temp.path().join("patches").to_string_lossy().to_string(),
+            change_dir: temp.path().join("changes").to_string_lossy().to_string(),
             binary_dir: temp.path().join("bin").to_string_lossy().to_string(),
             backup_dir: temp.path().join("backups").to_string_lossy().to_string(),
             switch_mode: "systemd".to_string(),
@@ -1261,7 +1261,7 @@ mod tests {
         assert!(init.status.success());
 
         let config = cog_core::SelfEvolutionConfig {
-            patch_dir: "patches".to_string(),
+            change_dir: "changes".to_string(),
             binary_dir: "bin".to_string(),
             backup_dir: "backups".to_string(),
             switch_mode: "systemd".to_string(),
@@ -1271,7 +1271,7 @@ mod tests {
         let result = ensure_self_evolution_environment(&project_root, &config).await;
         assert!(result.is_ok(), "expected ensure to pass: {:?}", result);
 
-        assert!(project_root.join("patches").is_dir());
+        assert!(project_root.join("changes").is_dir());
         assert!(project_root.join("bin").is_dir());
         assert!(project_root.join("backups").is_dir());
     }
@@ -1284,7 +1284,7 @@ mod tests {
 
         let config = cog_core::SelfEvolutionConfig {
             sandbox_mode: true,
-            patch_dir: temp.path().join("patches").to_string_lossy().to_string(),
+            change_dir: temp.path().join("changes").to_string_lossy().to_string(),
             binary_dir: temp.path().join("bin").to_string_lossy().to_string(),
             backup_dir: temp.path().join("backups").to_string_lossy().to_string(),
             switch_mode: "systemd".to_string(),
@@ -1310,7 +1310,7 @@ mod tests {
 
         let config = cog_core::SelfEvolutionConfig {
             sandbox_mode: false,
-            patch_dir: temp.path().join("patches").to_string_lossy().to_string(),
+            change_dir: temp.path().join("changes").to_string_lossy().to_string(),
             binary_dir: temp.path().join("bin").to_string_lossy().to_string(),
             backup_dir: temp.path().join("backups").to_string_lossy().to_string(),
             switch_mode: "systemd".to_string(),
@@ -1336,7 +1336,7 @@ mod tests {
         let project_root = std::env::current_dir().unwrap();
         let config = cog_core::SelfEvolutionConfig {
             sandbox_mode: true,
-            patch_dir: temp.path().join("patches").to_string_lossy().to_string(),
+            change_dir: temp.path().join("changes").to_string_lossy().to_string(),
             binary_dir: temp.path().join("bin").to_string_lossy().to_string(),
             backup_dir: temp.path().join("backups").to_string_lossy().to_string(),
             switch_mode: "self_exec".to_string(),

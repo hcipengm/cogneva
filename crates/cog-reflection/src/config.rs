@@ -12,12 +12,12 @@ use std::path::Path;
 use cog_core::{SFError, SFResult};
 
 /// 晋级门配置：
-/// patch 闯过沙盒验证后，按触及文件决定晋级通道（L0 热更新 /
+/// change 闯过沙盒验证后，按触及文件决定晋级通道（L0 热更新 /
 /// L1 金丝雀自动 / L2 人工审批 / 黑名单拒收）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromotionGateConfig {
-    /// 自动晋级总开关；false = 一键暂停，全部补丁转人工处理。
+    /// 自动晋级总开关；false = 一键暂停，全部变更转人工处理。
     pub enabled: bool,
     /// diff 超过该行数强制转人工审批。
     pub max_diff_lines: usize,
@@ -61,7 +61,7 @@ impl Default for PromotionGateConfig {
             // 未列出的路径一律按 L2 转人工。
             // `docs/` 是仓库内的外部/产品文档目录（可入库）；内部文档
             // （设计规格/审计/记录）存于仓库外的 internal-docs/，永不
-            // 入库也永不入本白名单——改内部规格的 patch 走"模糊从严"
+            // 入库也永不入本白名单——改内部规格的 change 走"模糊从严"
             // 自动落 L2，规格变更审批权归人。
             whitelist_prefixes: vec![
                 "crates/cog-agent/src/tools".into(),
@@ -98,7 +98,7 @@ impl Default for PromotionGateConfig {
 
 impl PromotionGateConfig {
     /// 从 cogneva.json 的 `self_evolution.promotion` 段加载，再叠加 env
-    /// 覆盖。文件或段缺失时返回 Default（enabled=false，全部补丁转人工，
+    /// 覆盖。文件或段缺失时返回 Default（enabled=false，全部变更转人工，
     /// 安全侧）；段存在但解析失败、或 env 值非法时返回 Err——配置写错
     /// 必须响亮失败，不许静默降级成默认。
     pub fn load() -> SFResult<Self> {

@@ -64,7 +64,7 @@ pub async fn build_gateway_state(
     notification_store: &Option<Arc<dyn cog_core::NotificationStore>>,
     websocket_client: &Option<Arc<dyn cog_core::WebSocketClient>>,
     evolution_admin: &Option<Arc<dyn cog_core::EvolutionAdmin>>,
-    evolution_stream: &Option<Arc<tokio::sync::broadcast::Sender<cog_core::EvolutionPatchInfo>>>,
+    evolution_stream: &Option<Arc<tokio::sync::broadcast::Sender<cog_core::EvolutionChangeInfo>>>,
     audit_stream: &Option<Arc<dyn cog_core::AuditStream>>,
 ) -> Result<Arc<crate::GatewayState>, Box<dyn std::error::Error>> {
     let gateway_state = Arc::new(crate::GatewayState {

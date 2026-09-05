@@ -1,6 +1,6 @@
 //! 晋级触发器。
 //!
-//! 沙盒内 patch 部署成功（apply → test → build → switch 全过）后，
+//! 沙盒内 change 部署成功（apply → test → build → switch 全过）后，
 //! 由本模块决定它的下一站：
 //!
 //! ```text
@@ -16,8 +16,8 @@
 //!       RequireApproval  → 状态 AwaitingReview + 台账 awaiting_approval（审批台待办）
 //! ```
 //!
-//! 晋级结果（含回滚原因）同时调 `record_patch_outcome` 回流
-//! Reflection，喂给下一轮补丁生成（全进化第六步的闭环回环）。
+//! 晋级结果（含回滚原因）同时调 `record_change_outcome` 回流
+//! Reflection，喂给下一轮变更生成（全进化第六步的闭环回环）。
 
 use std::sync::Arc;
 
@@ -35,9 +35,9 @@ use crate::ReflectionEngine;
 #[async_trait]
 pub trait PromotionChannel: Send + Sync {
     /// L0：仅配置/prompt 变化，发布到 release 分支供各集群拉取端热更新。
-    async fn publish_config(&self, patch: &EvolutionResult) -> SFResult<String>;
+    async fn publish_config(&self, change: &EvolutionResult) -> SFResult<String>;
     /// L1：代码变化，发布到 release 分支供各集群拉取端金丝雀。
-    async fn publish_rollout(&self, patch: &EvolutionResult) -> SFResult<String>;
+    async fn publish_rollout(&self, change: &EvolutionResult) -> SFResult<String>;
 }
 
 /// 晋级触发器。无状态时序：配额与熔断全部从台账推导，进程重启不丢。
@@ -82,40 +82,40 @@ impl AutoPromoter {
 
     /// 沙盒部署成功回调：等待 soak 后走完整晋级判定。
     /// 设计为在后台任务里调用（调用方 tokio::spawn）。
-    pub async fn on_sandbox_deployed(&self, patch: EvolutionResult) {
-        let patch_id = patch.artifact_id.clone();
+    pub async fn on_sandbox_deployed(&self, change: EvolutionResult) {
+        let change_id = change.artifact_id.clone();
         if self.policy.soak_secs > 0 {
             info!(
-                patch_id = %patch_id,
+                change_id = %change_id,
                 soak_secs = self.policy.soak_secs,
-                "Patch deployed in sandbox; soaking before promotion decision"
+                "Change deployed in sandbox; soaking before promotion decision"
             );
             tokio::time::sleep(std::time::Duration::from_secs(self.policy.soak_secs)).await;
         }
-        if let Err(e) = self.decide_and_promote(&patch).await {
-            warn!(patch_id = %patch_id, error = %e, "Promotion decision failed");
+        if let Err(e) = self.decide_and_promote(&change).await {
+            warn!(change_id = %change_id, error = %e, "Promotion decision failed");
         }
     }
 
     /// 完整晋级判定（测试可直接调用，跳过 soak）。
-    pub async fn decide_and_promote(&self, patch: &EvolutionResult) -> SFResult<()> {
-        let patch_id = patch.artifact_id.clone();
+    pub async fn decide_and_promote(&self, change: &EvolutionResult) -> SFResult<()> {
+        let change_id = change.artifact_id.clone();
 
-        // eval 门：评估明确否决的 patch 不晋级。
-        if let Some(summary) = &patch.eval_summary {
+        // eval 门：评估明确否决的 change 不晋级。
+        if let Some(summary) = &change.eval_summary {
             if summary.starts_with("Reject") || summary.starts_with("Inconclusive") {
                 self.record(
-                    &patch_id,
+                    &change_id,
                     "unknown",
                     PromotionStatus::Failed,
                     &format!("eval gate rejected: {summary}"),
-                    patch.eval_summary.as_deref(),
+                    change.eval_summary.as_deref(),
                 )
                 .await?;
                 let _ = self
                     .engine
-                    .record_patch_outcome(
-                        &patch_id,
+                    .record_change_outcome(
+                        &change_id,
                         false,
                         &format!("eval gate rejected: {summary}"),
                     )
@@ -124,22 +124,22 @@ impl AutoPromoter {
             }
         }
 
-        let files: Vec<String> = crate::PatchPipeline::parse_patch(&patch.content)?
+        let files: Vec<String> = crate::ChangePipeline::parse_diff(&change.content)?
             .iter()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .collect();
-        let diff_lines = count_diff_lines(&patch.content);
+        let diff_lines = count_diff_lines(&change.content);
         let verdict = classify(&files, diff_lines, &self.policy);
 
-        // 幂等：同一 patch 已有终态/进行中的晋级记录则跳过。
-        if self.always_recorded(&patch_id).await? {
-            info!(patch_id = %patch_id, "Patch already has a promotion record; skipping");
+        // 幂等：同一 change 已有终态/进行中的晋级记录则跳过。
+        if self.always_recorded(&change_id).await? {
+            info!(change_id = %change_id, "Change already has a promotion record; skipping");
             return Ok(());
         }
 
         let (level, auto) = match &verdict {
             GateVerdict::Reject { reason } => {
-                self.record(&patch_id, "unknown", PromotionStatus::Failed, reason, None)
+                self.record(&change_id, "unknown", PromotionStatus::Failed, reason, None)
                     .await?;
                 return Ok(());
             }
@@ -170,16 +170,16 @@ impl AutoPromoter {
         };
 
         if let Some(reason) = downgrade {
-            warn!(patch_id = %patch_id, reason = %reason, "Promotion downgraded to manual approval");
+            warn!(change_id = %change_id, reason = %reason, "Promotion downgraded to manual approval");
             self.record(
-                &patch_id,
+                &change_id,
                 level,
                 PromotionStatus::AwaitingApproval,
                 &reason,
-                patch.eval_summary.as_deref(),
+                change.eval_summary.as_deref(),
             )
             .await?;
-            self.set_patch_status(&patch_id, EvolutionStatus::AwaitingReview)
+            self.set_change_status(&change_id, EvolutionStatus::AwaitingReview)
                 .await;
             return Ok(());
         }
@@ -187,40 +187,40 @@ impl AutoPromoter {
         // 自动晋级。
         let record_id = self
             .record(
-                &patch_id,
+                &change_id,
                 level,
                 PromotionStatus::Pending,
                 &decision_reason,
-                patch.eval_summary.as_deref(),
+                change.eval_summary.as_deref(),
             )
             .await?;
 
         let channel = self.channel.as_ref().expect("checked above");
         let publish = if level == "l0_config" {
-            channel.publish_config(patch).await
+            channel.publish_config(change).await
         } else {
-            channel.publish_rollout(patch).await
+            channel.publish_rollout(change).await
         };
 
         match publish {
             Ok(reference) => {
-                info!(patch_id = %patch_id, reference = %reference, "Patch promoted");
+                info!(change_id = %change_id, reference = %reference, "Change promoted");
                 self.ledger
                     .update_status(&record_id, PromotionStatus::Promoted, &reference)
                     .await?;
                 let _ = self
                     .engine
-                    .record_patch_outcome(&patch_id, true, &format!("promoted: {reference}"))
+                    .record_change_outcome(&change_id, true, &format!("promoted: {reference}"))
                     .await;
             }
             Err(e) => {
-                warn!(patch_id = %patch_id, error = %e, "Promotion publish failed");
+                warn!(change_id = %change_id, error = %e, "Promotion publish failed");
                 self.ledger
                     .update_status(&record_id, PromotionStatus::Failed, &e.to_string())
                     .await?;
                 let _ = self
                     .engine
-                    .record_patch_outcome(&patch_id, false, &format!("promotion failed: {e}"))
+                    .record_change_outcome(&change_id, false, &format!("promotion failed: {e}"))
                     .await;
             }
         }
@@ -229,14 +229,14 @@ impl AutoPromoter {
 
     /// 人工审批通过后的晋级入口（审批台/admin API 调用）。
     /// 跳过配额（人本身就是配额），但仍走出口发布。
-    pub async fn promote_approved(&self, patch: &EvolutionResult) -> SFResult<String> {
-        let patch_id = patch.artifact_id.clone();
+    pub async fn promote_approved(&self, change: &EvolutionResult) -> SFResult<String> {
+        let change_id = change.artifact_id.clone();
         let Some(channel) = self.channel.as_ref() else {
             return Err(cog_core::SFError::Config(
                 "promotion channel not configured".into(),
             ));
         };
-        let files: Vec<String> = crate::PatchPipeline::parse_patch(&patch.content)?
+        let files: Vec<String> = crate::ChangePipeline::parse_diff(&change.content)?
             .iter()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .collect();
@@ -252,17 +252,17 @@ impl AutoPromoter {
         };
         let record_id = self
             .record(
-                &patch_id,
+                &change_id,
                 level,
                 PromotionStatus::Pending,
                 "人工审批通过",
-                patch.eval_summary.as_deref(),
+                change.eval_summary.as_deref(),
             )
             .await?;
         let publish = if level == "l0_config" {
-            channel.publish_config(patch).await
+            channel.publish_config(change).await
         } else {
-            channel.publish_rollout(patch).await
+            channel.publish_rollout(change).await
         };
         match publish {
             Ok(reference) => {
@@ -271,8 +271,8 @@ impl AutoPromoter {
                     .await?;
                 let _ = self
                     .engine
-                    .record_patch_outcome(
-                        &patch_id,
+                    .record_change_outcome(
+                        &change_id,
                         true,
                         &format!("promoted (approved): {reference}"),
                     )
@@ -323,10 +323,10 @@ impl AutoPromoter {
         Ok(count >= self.policy.quota_per_day as u64)
     }
 
-    async fn always_recorded(&self, patch_id: &str) -> SFResult<bool> {
+    async fn always_recorded(&self, change_id: &str) -> SFResult<bool> {
         let recent = self.ledger.recent(50).await?;
         Ok(recent.iter().any(|r| {
-            r.patch_id == patch_id
+            r.change_id == change_id
                 && r.cluster == self.cluster
                 && matches!(
                     r.status,
@@ -340,7 +340,7 @@ impl AutoPromoter {
     /// 追加台账记录，返回记录 id。
     async fn record(
         &self,
-        patch_id: &str,
+        change_id: &str,
         level: &str,
         status: PromotionStatus,
         reason: &str,
@@ -349,7 +349,7 @@ impl AutoPromoter {
         let now = Utc::now();
         let rec = PromotionRecord {
             id: uuid::Uuid::new_v4().to_string(),
-            patch_id: patch_id.to_string(),
+            change_id: change_id.to_string(),
             level: level.to_string(),
             decision_reason: reason.to_string(),
             cluster: self.cluster.clone(),
@@ -364,9 +364,9 @@ impl AutoPromoter {
         Ok(id)
     }
 
-    async fn set_patch_status(&self, patch_id: &str, status: EvolutionStatus) {
+    async fn set_change_status(&self, change_id: &str, status: EvolutionStatus) {
         if let Some(evo) = self.engine.evolution.as_ref() {
-            evo.update_status(patch_id, status).await;
+            evo.update_status(change_id, status).await;
         }
     }
 }
@@ -383,24 +383,24 @@ mod tests {
 
     #[async_trait]
     impl PromotionChannel for FakeChannel {
-        async fn publish_config(&self, patch: &EvolutionResult) -> SFResult<String> {
+        async fn publish_config(&self, change: &EvolutionResult) -> SFResult<String> {
             self.published
                 .lock()
                 .unwrap()
-                .push(patch.artifact_id.clone());
+                .push(change.artifact_id.clone());
             if self.fail {
                 return Err(cog_core::SFError::IO("publish boom".into()));
             }
-            Ok(format!("commit-{}", patch.artifact_id))
+            Ok(format!("commit-{}", change.artifact_id))
         }
-        async fn publish_rollout(&self, patch: &EvolutionResult) -> SFResult<String> {
-            self.publish_config(patch).await
+        async fn publish_rollout(&self, change: &EvolutionResult) -> SFResult<String> {
+            self.publish_config(change).await
         }
     }
 
-    fn patch(id: &str, file: &str) -> EvolutionResult {
+    fn change(id: &str, file: &str) -> EvolutionResult {
         EvolutionResult {
-            kind: crate::types::EvolutionKind::CodePatch,
+            kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: id.into(),
             description: "test".into(),
             content: format!(
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn l1_patch_auto_promotes_when_all_gates_pass() {
+    async fn l1_change_auto_promotes_when_all_gates_pass() {
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
@@ -438,7 +438,7 @@ mod tests {
             ..Default::default()
         };
         let p = promoter(policy, ledger.clone(), Some(channel.clone()));
-        p.decide_and_promote(&patch("p1", "crates/cog-agent/src/tools.rs"))
+        p.decide_and_promote(&change("p1", "crates/cog-agent/src/tools.rs"))
             .await
             .unwrap();
         let records = ledger.recent(10).await.unwrap();
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn l0_patch_goes_to_config_channel() {
+    async fn l0_change_goes_to_config_channel() {
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
@@ -460,7 +460,7 @@ mod tests {
             ..Default::default()
         };
         let p = promoter(policy, ledger.clone(), Some(channel));
-        p.decide_and_promote(&patch("p2", "prompts/default.yaml"))
+        p.decide_and_promote(&change("p2", "prompts/default.yaml"))
             .await
             .unwrap();
         let records = ledger.recent(10).await.unwrap();
@@ -476,7 +476,7 @@ mod tests {
             ..Default::default()
         };
         let p = promoter(policy, ledger.clone(), None);
-        p.decide_and_promote(&patch(
+        p.decide_and_promote(&change(
             "p3",
             "crates/cog-storage/src/postgres/state_backend.rs",
         ))
@@ -500,7 +500,7 @@ mod tests {
             ledger.clone(),
             Some(channel.clone()),
         );
-        p.decide_and_promote(&patch("p4", "crates/cog-agent/src/tools.rs"))
+        p.decide_and_promote(&change("p4", "crates/cog-agent/src/tools.rs"))
             .await
             .unwrap();
         let records = ledger.recent(10).await.unwrap();
@@ -524,7 +524,7 @@ mod tests {
             ..Default::default()
         };
         let p = promoter(policy, ledger.clone(), Some(channel.clone())).with_switch(switch.clone());
-        p.decide_and_promote(&patch("p4b", "crates/cog-agent/src/tools.rs"))
+        p.decide_and_promote(&change("p4b", "crates/cog-agent/src/tools.rs"))
             .await
             .unwrap();
         let records = ledger.recent(10).await.unwrap();
@@ -532,9 +532,9 @@ mod tests {
         assert!(records[0].outcome.contains("运行时一键暂停"));
         assert!(channel.published.lock().unwrap().is_empty());
 
-        // 恢复后同一 patch 可自动晋级（幂等跳过仅限已有记录，新 patch 走全自动）。
+        // 恢复后同一 change 可自动晋级（幂等跳过仅限已有记录，新 change 走全自动）。
         switch.set_paused(false, "恢复");
-        p.decide_and_promote(&patch("p4c", "crates/cog-agent/src/tools.rs"))
+        p.decide_and_promote(&change("p4c", "crates/cog-agent/src/tools.rs"))
             .await
             .unwrap();
         let records = ledger.recent(10).await.unwrap();
@@ -550,7 +550,7 @@ mod tests {
             ledger
                 .record(PromotionRecord {
                     id: format!("old-{i}"),
-                    patch_id: format!("old-{i}"),
+                    change_id: format!("old-{i}"),
                     level: "l1_rollout".into(),
                     decision_reason: "test".into(),
                     cluster: "publisher".into(),
@@ -572,11 +572,11 @@ mod tests {
             ..Default::default()
         };
         let p = promoter(policy, ledger.clone(), Some(channel.clone()));
-        p.decide_and_promote(&patch("p5", "crates/cog-agent/src/tools.rs"))
+        p.decide_and_promote(&change("p5", "crates/cog-agent/src/tools.rs"))
             .await
             .unwrap();
         let records = ledger.recent(10).await.unwrap();
-        let mine = records.iter().find(|r| r.patch_id == "p5").unwrap();
+        let mine = records.iter().find(|r| r.change_id == "p5").unwrap();
         assert_eq!(mine.status, PromotionStatus::AwaitingApproval);
         assert!(mine.outcome.contains("配额"));
         assert!(channel.published.lock().unwrap().is_empty());
@@ -589,7 +589,7 @@ mod tests {
             ledger
                 .record(PromotionRecord {
                     id: format!("rb-{i}"),
-                    patch_id: format!("rb-{i}"),
+                    change_id: format!("rb-{i}"),
                     level: "l1_rollout".into(),
                     decision_reason: "test".into(),
                     cluster: "publisher".into(),
@@ -626,7 +626,7 @@ mod tests {
             ledger
                 .record(PromotionRecord {
                     id: format!("s-{i}"),
-                    patch_id: format!("s-{i}"),
+                    change_id: format!("s-{i}"),
                     level: "l1_rollout".into(),
                     decision_reason: "test".into(),
                     cluster: "publisher".into(),
@@ -659,7 +659,7 @@ mod tests {
             ..Default::default()
         };
         let p = promoter(policy, ledger.clone(), Some(channel));
-        p.decide_and_promote(&patch("p6", "crates/cog-agent/src/tools.rs"))
+        p.decide_and_promote(&change("p6", "crates/cog-agent/src/tools.rs"))
             .await
             .unwrap();
         let records = ledger.recent(10).await.unwrap();
@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eval_rejected_patch_never_promotes() {
+    async fn eval_rejected_change_never_promotes() {
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
@@ -678,7 +678,7 @@ mod tests {
             ..Default::default()
         };
         let p = promoter(policy, ledger.clone(), Some(channel.clone()));
-        let mut pt = patch("p7", "crates/cog-agent/src/tools.rs");
+        let mut pt = change("p7", "crates/cog-agent/src/tools.rs");
         pt.eval_summary = Some("Reject z=-1.2 uplift -8%".into());
         p.decide_and_promote(&pt).await.unwrap();
         let records = ledger.recent(10).await.unwrap();
@@ -687,7 +687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_patch_not_promoted_twice() {
+    async fn duplicate_change_not_promoted_twice() {
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
@@ -698,7 +698,7 @@ mod tests {
             ..Default::default()
         };
         let p = promoter(policy, ledger.clone(), Some(channel.clone()));
-        let pt = patch("p8", "crates/cog-agent/src/tools.rs");
+        let pt = change("p8", "crates/cog-agent/src/tools.rs");
         p.decide_and_promote(&pt).await.unwrap();
         p.decide_and_promote(&pt).await.unwrap();
         assert_eq!(channel.published.lock().unwrap().len(), 1);
@@ -712,7 +712,7 @@ mod tests {
             ..Default::default()
         };
         let p = promoter(policy, ledger.clone(), None);
-        p.decide_and_promote(&patch("p9", "crates/cog-agent/src/tools.rs"))
+        p.decide_and_promote(&change("p9", "crates/cog-agent/src/tools.rs"))
             .await
             .unwrap();
         let records = ledger.recent(10).await.unwrap();

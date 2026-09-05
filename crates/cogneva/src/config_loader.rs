@@ -192,8 +192,8 @@ fn default_env_mappings() -> HashMap<String, String> {
         "self_evolution.switch_mode".into(),
     );
     m.insert(
-        "COGNEVA_SELF_EVOLUTION_PATCH_DIR".into(),
-        "self_evolution.patch_dir".into(),
+        "COGNEVA_SELF_EVOLUTION_CHANGE_DIR".into(),
+        "self_evolution.change_dir".into(),
     );
     m.insert(
         "COGNEVA_SELF_EVOLUTION_BINARY_DIR".into(),

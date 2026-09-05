@@ -1,5 +1,5 @@
 //! SWE-bench 数据加载器：instance JSONL → EvalDataset，支持 Rust 子集过滤。
-//! 兼容官方 SWE-bench 格式（instance_id / repo / base_commit / problem_statement / patch）。
+//! 兼容官方 SWE-bench 格式（instance_id / repo / base_commit / problem_statement / change）。
 
 use std::path::Path;
 
@@ -16,6 +16,7 @@ pub struct SweBenchInstance {
     pub base_commit: Option<String>,
     #[serde(default)]
     pub problem_statement: Option<String>,
+    /// SWE-bench 官方字段：gold patch（unified diff 文本）。外部数据集字段名，勿改。
     #[serde(default)]
     pub patch: Option<String>,
     /// 官方字段：修复后应通过的测试（JSON 字符串数组）。
@@ -83,7 +84,7 @@ impl SweBenchRunner {
                 "fail_to_pass": inst.fail_to_pass,
                 "pass_to_pass": inst.pass_to_pass,
             }),
-            // 参考 patch 用于评估比对（不作为 agent 输入）
+            // 参考 gold patch（diff）用于评估比对，不作为 agent 输入
             expected_output: inst.patch.clone().map(serde_json::Value::String),
             expected_tools: None,
             tags,
@@ -156,7 +157,7 @@ mod tests {
     #[test]
     fn loads_and_filters_rust_subset() {
         let path = write_jsonl(&[
-            r#"{"instance_id": "tokio-1", "repo": "tokio-rs/tokio", "problem_statement": "fix bug", "patch": "diff..."}"#,
+            r#"{"instance_id": "tokio-1", "repo": "tokio-rs/tokio", "problem_statement": "fix bug", "change": "diff..."}"#,
             r#"{"instance_id": "django-1", "repo": "django/django", "problem_statement": "fix bug"}"#,
         ]);
         let dataset = SweBenchRunner::load_instances(&path).unwrap();

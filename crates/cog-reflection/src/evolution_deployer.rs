@@ -1,7 +1,7 @@
 //! Deployment stage of L2 self-evolution.
 //!
 //! Responsibilities:
-//! - Commit applied patches to the local git repository.
+//! - Commit applied changes to the local git repository.
 //! - Build a new release binary with `cargo build --release --bin cogneva`.
 //! - If the build fails, roll back the git commit.
 //! - Stage the new binary for the supervisor's binary switcher.
@@ -15,7 +15,7 @@ use tracing::{info, warn};
 /// Artifact produced by a successful build.
 #[derive(Debug, Clone)]
 pub struct BuildArtifact {
-    pub patch_id: String,
+    pub change_id: String,
     pub commit_hash: String,
     pub new_binary_path: PathBuf,
     pub build_duration_secs: u64,
@@ -70,22 +70,22 @@ impl EvolutionDeployer {
     /// and stage it for the supervisor switcher.
     ///
     /// On build failure the git commit is rolled back with `git reset --hard HEAD~1`.
-    pub async fn commit_and_build(&self, patch_id: &str) -> SFResult<BuildArtifact> {
-        info!(patch_id = %patch_id, "Committing evolution changes");
+    pub async fn commit_and_build(&self, change_id: &str) -> SFResult<BuildArtifact> {
+        info!(change_id = %change_id, "Committing evolution changes");
         self.git_add_all().await?;
-        let commit_hash = self.git_commit(patch_id).await?;
+        let commit_hash = self.git_commit(change_id).await?;
 
-        info!(patch_id = %patch_id, "Building release binary");
+        info!(change_id = %change_id, "Building release binary");
         let start = Instant::now();
         let build_result = self.run_cargo_build().await;
         let duration = start.elapsed();
 
         match build_result {
             Ok(()) => {
-                info!(patch_id = %patch_id, "Release binary built successfully");
+                info!(change_id = %change_id, "Release binary built successfully");
                 let new_binary_path = self.stage_new_binary().await?;
                 Ok(BuildArtifact {
-                    patch_id: patch_id.to_string(),
+                    change_id: change_id.to_string(),
                     commit_hash,
                     new_binary_path,
                     build_duration_secs: duration.as_secs(),
@@ -93,7 +93,7 @@ impl EvolutionDeployer {
             }
             Err(e) => {
                 warn!(
-                    patch_id = %patch_id,
+                    change_id = %change_id,
                     error = %e,
                     "Release build failed; rolling back commit"
                 );
@@ -121,10 +121,10 @@ impl EvolutionDeployer {
         Ok(())
     }
 
-    async fn git_commit(&self, patch_id: &str) -> SFResult<String> {
+    async fn git_commit(&self, change_id: &str) -> SFResult<String> {
         let message = format!(
-            "feat(evolution): apply self-generated patch {}\n\nCo-Authored-By: {} <{}>",
-            patch_id, self.git_name, self.git_email
+            "feat(evolution): apply self-generated change {}\n\nCo-Authored-By: {} <{}>",
+            change_id, self.git_name, self.git_email
         );
 
         let output = tokio::process::Command::new("git")
@@ -248,12 +248,12 @@ mod tests {
     #[test]
     fn build_artifact_fields() {
         let artifact = BuildArtifact {
-            patch_id: "patch-123".into(),
+            change_id: "change-123".into(),
             commit_hash: "abc123".into(),
             new_binary_path: PathBuf::from("/tmp/cogneva.new"),
             build_duration_secs: 42,
         };
-        assert_eq!(artifact.patch_id, "patch-123");
+        assert_eq!(artifact.change_id, "change-123");
         assert_eq!(artifact.commit_hash, "abc123");
     }
 }

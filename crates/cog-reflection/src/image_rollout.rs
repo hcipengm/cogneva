@@ -1,12 +1,12 @@
 //! Image-based 滚动更新部署器（审计 3.2 剩余项）。
 //!
-//! 启用 `self_evolution.image_rollout` 后，patch 部署路径从特权 Pod
+//! 启用 `self_evolution.image_rollout` 后，change 部署路径从特权 Pod
 //! `self_exec` 二进制替换升级为：
 //!
 //! 1. 基于已编译 staged 二进制生成最小 Containerfile 并构建镜像
-//!    （tag = `{image_repo}:patch-{patch_id}`，patch_id 经字符白名单消毒）；
+//!    （tag = `{image_repo}:change-{change_id}`，change_id 经字符白名单消毒）；
 //! 2. 可选 `<builder> push`（k3s 节点本地镜像可关）；
-//! 3. `kubectl set image` patch 目标 Deployment；
+//! 3. `kubectl set image` change 目标 Deployment；
 //! 4. `kubectl rollout status` 等待滚动完成；失败自动 `rollout undo` 回滚。
 //!
 //! 所有外部命令带超时；任何一步失败都会尽量回滚滚动更新。
@@ -25,10 +25,10 @@ impl ImageRollout {
         Self { config }
     }
 
-    /// 镜像 tag：patch_id 只保留 [A-Za-z0-9-_]，其余替换为 '-'，
+    /// 镜像 tag：change_id 只保留 [A-Za-z0-9-_]，其余替换为 '-'，
     /// 避免命令注入与非法 tag 字符。
-    pub fn image_tag(&self, patch_id: &str) -> String {
-        let sanitized: String = patch_id
+    pub fn image_tag(&self, change_id: &str) -> String {
+        let sanitized: String = change_id
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -38,7 +38,7 @@ impl ImageRollout {
                 }
             })
             .collect();
-        format!("{}:patch-{}", self.config.image_repo, sanitized)
+        format!("{}:change-{}", self.config.image_repo, sanitized)
     }
 
     async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
@@ -96,7 +96,7 @@ impl ImageRollout {
         &self,
         artifact: &crate::evolution_deployer::BuildArtifact,
     ) -> SFResult<String> {
-        let tag = self.image_tag(&artifact.patch_id);
+        let tag = self.image_tag(&artifact.change_id);
         let context_dir = self.write_containerfile(&artifact.new_binary_path).await?;
         let context = context_dir.to_string_lossy().to_string();
         let containerfile_path = context_dir.join("Containerfile.rollout");
@@ -119,7 +119,7 @@ impl ImageRollout {
             info!(tag = %tag, "rollout image pushed");
         }
 
-        // 3. patch Deployment 镜像
+        // 3. change Deployment 镜像
         let deploy_ref = format!("deployment/{}", self.config.deployment);
         let image_arg = format!("{}={}", self.config.container, tag);
         self.run(
@@ -187,7 +187,7 @@ mod tests {
         let binary = dir.join("cogneva");
         std::fs::write(&binary, b"fake-binary").unwrap();
         crate::evolution_deployer::BuildArtifact {
-            patch_id: "p-1".into(),
+            change_id: "p-1".into(),
             commit_hash: "abc1234".into(),
             new_binary_path: binary,
             build_duration_secs: 1,
@@ -228,14 +228,14 @@ mod tests {
     }
 
     #[test]
-    fn image_tag_sanitizes_patch_id() {
+    fn image_tag_sanitizes_change_id() {
         let cfg = ImageRolloutConfig {
             image_repo: "reg/cog".into(),
             ..Default::default()
         };
         let r = ImageRollout::new(cfg);
-        assert_eq!(r.image_tag("abc-123_X"), "reg/cog:patch-abc-123_X");
-        assert_eq!(r.image_tag("a/b; rm -rf /"), "reg/cog:patch-a-b--rm--rf--");
+        assert_eq!(r.image_tag("abc-123_X"), "reg/cog:change-abc-123_X");
+        assert_eq!(r.image_tag("a/b; rm -rf /"), "reg/cog:change-a-b--rm--rf--");
     }
 
     #[tokio::test]
@@ -247,7 +247,7 @@ mod tests {
         let art = artifact(tmp.path());
 
         let tag = r.deploy(&art).await.unwrap();
-        assert_eq!(tag, "localhost/cogneva:patch-p-1");
+        assert_eq!(tag, "localhost/cogneva:change-p-1");
 
         // Containerfile 生成
         let cf = std::fs::read_to_string(tmp.path().join("Containerfile.rollout")).unwrap();
@@ -255,9 +255,9 @@ mod tests {
         assert!(cf.contains("COPY cogneva /opt/cogneva/cogneva"));
 
         let calls = std::fs::read_to_string(&log).unwrap();
-        assert!(calls.contains("build -t localhost/cogneva:patch-p-1"));
-        assert!(calls.contains("push localhost/cogneva:patch-p-1"));
-        assert!(calls.contains("set image deployment/cogneva cogneva=localhost/cogneva:patch-p-1"));
+        assert!(calls.contains("build -t localhost/cogneva:change-p-1"));
+        assert!(calls.contains("push localhost/cogneva:change-p-1"));
+        assert!(calls.contains("set image deployment/cogneva cogneva=localhost/cogneva:change-p-1"));
         assert!(calls.contains("rollout status deployment/cogneva"));
     }
 

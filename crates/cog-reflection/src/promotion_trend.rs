@@ -216,7 +216,7 @@ mod tests {
         let t = Utc::now() - chrono::Duration::weeks(weeks_ago);
         PromotionRecord {
             id: format!("id-{weeks_ago}-{}", status.as_str()),
-            patch_id: "p".into(),
+            change_id: "p".into(),
             level: "l1_rollout".into(),
             decision_reason: "test".into(),
             cluster: "publisher".into(),

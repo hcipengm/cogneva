@@ -105,9 +105,9 @@ impl PlannerActor {
         );
 
         // For self-evolution tasks, the planner must emit a JSON plan that the
-        // downstream PGE pipeline can parse. Patch artifacts are produced by the
+        // downstream PGE pipeline can parse. Change artifacts are produced by the
         // Generator later, so we explicitly tell the planner not to emit XML or
-        // patch content here.
+        // change content here.
         let is_self_evolution = matches!(
             &task.task_type,
             TaskType::Custom(s) if s == "self_evolution"
@@ -115,11 +115,11 @@ impl PlannerActor {
             .input
             .get("evolution_mode")
             .and_then(|v| v.as_str())
-            .map(|s| s == "generate_patch")
+            .map(|s| s == "generate_change")
             .unwrap_or(false);
 
         if is_self_evolution {
-            ctx["evolution_mode"] = serde_json::json!("generate_patch");
+            ctx["evolution_mode"] = serde_json::json!("generate_change");
             ctx["response_format"] = serde_json::json!("json");
             ctx["output_schema"] = serde_json::json!({
                 "summary": "string: concise plan summary",
@@ -132,9 +132,9 @@ impl PlannerActor {
                 "sub_tasks": []
             });
             ctx["instructions"] = serde_json::json!(
-                "You are the Planner actor. Your job is to produce a plan, NOT the patch. \
-                 Emit ONLY a single JSON object matching the output_schema. No markdown, no XML, no code fences, no patch content. \
-                 Do not output artifact tags or unified diffs; the Generator actor will create the patch later."
+                "You are the Planner actor. Your job is to produce a plan, NOT the change. \
+                 Emit ONLY a single JSON object matching the output_schema. No markdown, no XML, no code fences, no change content. \
+                 Do not output artifact tags or unified diffs; the Generator actor will create the change later."
             );
         } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
             // Built-in contract for standard goal decomposition. Lowest

@@ -1,4 +1,4 @@
-//! Controlled evolution engine — L1 soft-code evolution + L2 source-code patch
+//! Controlled evolution engine — L1 soft-code evolution + L2 source-code change
 //! generation (with human/CI gate).
 //! L1 (automatic, low risk):
 //!   - Refine an existing skill based on accumulated learnings/errors.
@@ -6,8 +6,8 @@
 //!   - Suggest tool variants from error signatures.
 //!
 //! L2 (semi-automatic, medium risk):
-//!   - Generate Rust code patches and write them to `evolution-patches/`.
-//!   - The system **never** auto-merges into `main`; patches await review.
+//!   - Generate Rust code changes and write them to `evolution-changes/`.
+//!   - The system **never** auto-merges into `main`; changes await review.
 
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ use crate::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
 pub struct EvolutionEngine {
     llm: Arc<dyn LlmClient>,
     skill_registry: Arc<RwLock<SkillRegistry>>,
-    patch_dir: std::path::PathBuf,
+    change_dir: std::path::PathBuf,
     prompt_manager: Option<Arc<dyn cog_core::PromptProvider>>,
     /// Optional channel to notify an external [`HookEngine`] that a new hook
     /// has been synthesized.  When present the hook JSON is sent immediately
@@ -34,7 +34,7 @@ pub struct EvolutionEngine {
     /// variant has been suggested.
     tool_sink: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
     /// Project root for project-context compilation checks.
-    /// When `Some`, `generate_code_patch` validates patches against the
+    /// When `Some`, `generate_code_change` validates changes against the
     /// real workspace instead of an isolated temp crate.
     project_root: Option<std::path::PathBuf>,
     /// In-memory log of all evolution attempts and their current status.
@@ -47,7 +47,7 @@ impl std::fmt::Debug for EvolutionEngine {
         let has_hook_sink = self.hook_sink.lock().map(|g| g.is_some()).unwrap_or(false);
         let has_tool_sink = self.tool_sink.lock().map(|g| g.is_some()).unwrap_or(false);
         f.debug_struct("EvolutionEngine")
-            .field("patch_dir", &self.patch_dir)
+            .field("change_dir", &self.change_dir)
             .field("has_hook_sink", &has_hook_sink)
             .field("has_tool_sink", &has_tool_sink)
             .field("project_root", &self.project_root)
@@ -64,7 +64,7 @@ impl EvolutionEngine {
         Self {
             llm,
             skill_registry,
-            patch_dir: std::path::PathBuf::from("evolution-patches"),
+            change_dir: std::path::PathBuf::from("evolution-changes"),
             prompt_manager,
             hook_sink: std::sync::Mutex::new(None),
             tool_sink: std::sync::Mutex::new(None),
@@ -73,10 +73,10 @@ impl EvolutionEngine {
         }
     }
 
-    /// Set the directory where code patches are written (default:
-    /// `./evolution-patches`).
-    pub fn with_patch_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
-        self.patch_dir = dir.into();
+    /// Set the directory where code changes are written (default:
+    /// `./evolution-changes`).
+    pub fn with_change_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.change_dir = dir.into();
         self
     }
 
@@ -106,7 +106,7 @@ impl EvolutionEngine {
 
     /// Register an externally-produced evolution result (e.g. artifact-level
     /// policy proposals from `ArtifactEvolution`) into the engine's registry
-    /// so it appears in `list_results` / the admin patch table.
+    /// so it appears in `list_results` / the admin change table.
     /// Same `artifact_id` re-registers (latest proposal wins).
     pub async fn register_result(&self, result: EvolutionResult) {
         let mut results = self.results.lock().await;
@@ -278,7 +278,7 @@ impl EvolutionEngine {
     // ========================================================================
 
     /// Synthesize a [`HookDef`] from a recurring event pattern using the LLM.
-    /// The generated hook is written to `patch_dir/hooks/{id}.json` and can be
+    /// The generated hook is written to `change_dir/hooks/{id}.json` and can be
     /// loaded by the caller into a [`HookEngine`].
     pub async fn synthesize_hook(
         &self,
@@ -402,7 +402,7 @@ impl EvolutionEngine {
         let artifact_id = id_str.to_string();
 
         // Write to hooks directory.
-        let hook_dir = self.patch_dir.join("hooks");
+        let hook_dir = self.change_dir.join("hooks");
         let filename = hook_dir.join(format!("{}.json", artifact_id));
         if let Some(parent) = filename.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -455,7 +455,7 @@ impl EvolutionEngine {
     // ========================================================================
 
     /// Suggest an improved tool variant based on error patterns using the LLM.
-    /// The generated tool schema is written to `patch_dir/tools/{name}.json` and
+    /// The generated tool schema is written to `change_dir/tools/{name}.json` and
     /// can be registered by the caller into a [`ToolRegistry`].
     pub async fn suggest_tool_variant(
         &self,
@@ -580,7 +580,7 @@ impl EvolutionEngine {
         let artifact_id = name_str.to_string();
 
         // Write to tools directory.
-        let tool_dir = self.patch_dir.join("tools");
+        let tool_dir = self.change_dir.join("tools");
         let filename = tool_dir.join(format!("{}.json", artifact_id));
         if let Some(parent) = filename.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -629,17 +629,17 @@ impl EvolutionEngine {
     }
 
     // ========================================================================
-    // L2 — Source Code Patch Generation (with compile validation)
+    // L2 — Source Code Change Generation (with compile validation)
     // ========================================================================
 
-    /// Generate a unified-diff patch, validate it with `git apply --check`,
-    /// and write it to the evolution-patches directory as `<patch_id>.patch`.
-    /// The patch goes through up to 3 LLM attempts. If validation fails, the
+    /// Generate a unified-diff change, validate it with `git apply --check`,
+    /// and write it to the evolution-changes directory as `<change_id>.diff`.
+    /// The change goes through up to 3 LLM attempts. If validation fails, the
     /// error output is fed back into the next prompt. Final statuses:
     /// - `"compile_checked"` — passed structural + `git apply --check` validation
     /// - `"compile_error"` — failed validation after 3 attempts
     /// - `"awaiting_review"` — no unified diff detected (conceptual answer)
-    pub async fn generate_code_patch(
+    pub async fn generate_code_change(
         &self,
         module_description: &str,
         learning_context: &str,
@@ -660,13 +660,13 @@ impl EvolutionEngine {
                 }
                 self.prompt_manager
                     .as_ref()
-                    .and_then(|pm| pm.render("reflection:evolution_patch", &vars).ok())
+                    .and_then(|pm| pm.render("reflection:evolution_change", &vars).ok())
                     .unwrap_or_else(|| {
                         let error_section = if validation_errors.is_empty() {
                             String::new()
                         } else {
                             format!(
-                                "\n\nPrevious attempt failed validation. Errors:\n{}\n\nPlease fix these errors and regenerate the patch.",
+                                "\n\nPrevious attempt failed validation. Errors:\n{}\n\nPlease fix these errors and regenerate the change.",
                                 validation_errors
                             )
                         };
@@ -675,7 +675,7 @@ impl EvolutionEngine {
                              Context:\n{}\n\n\
                              Requirement:\n{}\
                              {}\n\n\
-                             Generate a patch that addresses the requirement. Output ONLY a \
+                             Generate a change that addresses the requirement. Output ONLY a \
                              unified diff (starting with 'diff --git a/... b/...'), with no \
                              markdown fences and no prose. This is a Rust workspace; modify \
                              only source files under crates/**/*.rs.",
@@ -687,9 +687,9 @@ impl EvolutionEngine {
             let system_prompt = self
                 .prompt_manager
                 .as_ref()
-                .and_then(|pm| pm.get("reflection:evolution_patch_system"))
+                .and_then(|pm| pm.get("reflection:evolution_change_system"))
                 .unwrap_or_else(|| {
-                    "Respond with a single unified diff patch and nothing else.".into()
+                    "Respond with a single unified diff change and nothing else.".into()
                 });
 
             let messages = vec![Message::system(system_prompt), Message::user(prompt)];
@@ -707,14 +707,14 @@ impl EvolutionEngine {
             // Extract the unified diff from the response.
             let Some(diff) = Self::extract_unified_diff(&text) else {
                 // No diff found — treat as conceptual answer; record it in
-                // memory only (no .patch file, so the pipeline ignores it).
-                let patch_id = format!(
-                    "patch-{}",
+                // memory only (no .diff file, so the pipeline ignores it).
+                let change_id = format!(
+                    "change-{}",
                     uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
                 );
                 let result = EvolutionResult {
-                    kind: EvolutionKind::CodePatch,
-                    artifact_id: patch_id,
+                    kind: EvolutionKind::CodeChange,
+                    artifact_id: change_id,
                     description: module_description.into(),
                     content: text,
                     status: EvolutionStatus::AwaitingReview,
@@ -728,33 +728,33 @@ impl EvolutionEngine {
                 return Ok(Some(result));
             };
 
-            match self.validate_patch(&diff).await {
+            match self.validate_change(&diff).await {
                 (true, _) => {
-                    let patch_id = format!(
-                        "patch-{}",
+                    let change_id = format!(
+                        "change-{}",
                         uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
                     );
-                    let filename = self.patch_dir.join(format!("{}.patch", patch_id));
+                    let filename = self.change_dir.join(format!("{}.diff", change_id));
                     if let Some(parent) = filename.parent() {
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }
                     tokio::fs::write(&filename, &diff).await.map_err(|e| {
                         cog_core::SFError::Agent(format!(
-                            "Failed to write patch {}: {}",
+                            "Failed to write change {}: {}",
                             filename.display(),
                             e
                         ))
                     })?;
 
                     info!(
-                        patch_id = %patch_id,
+                        change_id = %change_id,
                         path = %filename.display(),
-                        "Generated code patch passed validation"
+                        "Generated code change passed validation"
                     );
 
                     let result = EvolutionResult {
-                        kind: EvolutionKind::CodePatch,
-                        artifact_id: patch_id,
+                        kind: EvolutionKind::CodeChange,
+                        artifact_id: change_id,
                         description: module_description.into(),
                         content: diff,
                         status: EvolutionStatus::CompileChecked,
@@ -769,25 +769,25 @@ impl EvolutionEngine {
                 }
                 (false, output) => {
                     validation_errors = output;
-                    warn!(attempt, "Patch failed validation, retrying");
+                    warn!(attempt, "Change failed validation, retrying");
                 }
             }
         }
 
         // All retries exhausted — record the failure in memory only; an
-        // invalid patch must never reach the patch directory.
-        let patch_id = format!(
-            "patch-{}",
+        // invalid change must never reach the change directory.
+        let change_id = format!(
+            "change-{}",
             uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
         );
         warn!(
-            patch_id = %patch_id,
-            "Patch failed validation after 3 attempts"
+            change_id = %change_id,
+            "Change failed validation after 3 attempts"
         );
 
         let result = EvolutionResult {
-            kind: EvolutionKind::CodePatch,
-            artifact_id: patch_id,
+            kind: EvolutionKind::CodeChange,
+            artifact_id: change_id,
             description: module_description.into(),
             content: format!(
                 "{}\n\n<!-- VALIDATION ERRORS AFTER 3 ATTEMPTS -->\n```\n{}\n```\n",
@@ -849,26 +849,26 @@ impl EvolutionEngine {
         }
 
         let diff = lines[start..end].join("\n");
-        cog_core::parse_patch_affected_files(&diff).ok()?;
+        cog_core::parse_diff_affected_files(&diff).ok()?;
         Some(diff)
     }
 
-    /// Validate a unified diff before it enters the patch pipeline.
+    /// Validate a unified diff before it enters the change pipeline.
     ///
     /// 1. The diff must reference at least one file and must not touch any
-    ///    protected path (see [`Self::validate_patch_paths`]).
-    /// 2. When a `project_root` git repository is configured, the patch must
+    ///    protected path (see [`Self::validate_change_paths`]).
+    /// 2. When a `project_root` git repository is configured, the change must
     ///    apply cleanly (`git apply --check`).
     ///
     /// Returns `(success, details)`; `details` feeds the retry loop on
     /// failure. When `git` is unavailable the structural checks alone decide.
-    async fn validate_patch(&self, diff: &str) -> (bool, String) {
-        let files: Vec<std::path::PathBuf> = match cog_core::parse_patch_affected_files(diff) {
+    async fn validate_change(&self, diff: &str) -> (bool, String) {
+        let files: Vec<std::path::PathBuf> = match cog_core::parse_diff_affected_files(diff) {
             Ok(f) => f.into_iter().map(std::path::PathBuf::from).collect(),
-            Err(e) => return (false, format!("Patch structure invalid: {}", e)),
+            Err(e) => return (false, format!("Change structure invalid: {}", e)),
         };
 
-        if let Err(e) = self.validate_patch_paths(&files, self.project_root.as_deref()) {
+        if let Err(e) = self.validate_change_paths(&files, self.project_root.as_deref()) {
             return (false, e.to_string());
         }
 
@@ -944,15 +944,15 @@ impl EvolutionEngine {
     }
 
     // ========================================================================
-    // PatchSink implementation — receive collaboration-generated .patch files
+    // ChangeSink implementation — receive collaboration-generated .diff files
     // ========================================================================
 
-    fn sanitize_artifact_id(&self, patch_id: &str) -> String {
-        let safe: String = patch_id
+    fn sanitize_artifact_id(&self, change_id: &str) -> String {
+        let safe: String = change_id
             .chars()
             .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
             .collect();
-        if safe.is_empty() || safe == ".patch" {
+        if safe.is_empty() || safe == ".diff" {
             let now = chrono::Utc::now();
             return format!(
                 "evo-{}-{}",
@@ -963,7 +963,7 @@ impl EvolutionEngine {
         safe
     }
 
-    fn validate_patch_paths(
+    fn validate_change_paths(
         &self,
         files: &[std::path::PathBuf],
         project_root: Option<&std::path::Path>,
@@ -999,14 +999,14 @@ impl EvolutionEngine {
                 .any(|c| matches!(c, std::path::Component::ParentDir))
             {
                 return Err(cog_core::SFError::Validation(format!(
-                    "Patch path contains parent directory traversal: {}",
+                    "Change path contains parent directory traversal: {}",
                     file.display()
                 )));
             }
 
             if path.is_absolute() {
                 return Err(cog_core::SFError::Validation(format!(
-                    "Patch path must be relative: {}",
+                    "Change path must be relative: {}",
                     file.display()
                 )));
             }
@@ -1046,7 +1046,7 @@ impl EvolutionEngine {
             if !path.to_string_lossy().replace('\\', "/").contains("/src/") {
                 tracing::warn!(
                     target = %file.display(),
-                    "Patch target is outside a src directory; allowed but unusual"
+                    "Change target is outside a src directory; allowed but unusual"
                 );
             }
         }
@@ -1054,46 +1054,46 @@ impl EvolutionEngine {
         Ok(())
     }
 
-    /// Write a collaboration-generated patch to disk and register it as an
+    /// Write a collaboration-generated change to disk and register it as an
     /// EvolutionResult with status `CompileChecked`.
-    async fn write_generated_patch(
+    async fn write_generated_change(
         &self,
-        patch: &cog_core::GeneratedPatch,
+        change: &cog_core::GeneratedChange,
     ) -> cog_core::SFResult<String> {
-        let artifact_id = self.sanitize_artifact_id(&patch.patch_id);
+        let artifact_id = self.sanitize_artifact_id(&change.change_id);
 
-        // Derive affected files from the patch content if not supplied.
-        let affected_files: Vec<std::path::PathBuf> = if patch.affected_files.is_empty() {
-            cog_core::parse_patch_affected_files(&patch.content)?
+        // Derive affected files from the change content if not supplied.
+        let affected_files: Vec<std::path::PathBuf> = if change.affected_files.is_empty() {
+            cog_core::parse_diff_affected_files(&change.content)?
                 .into_iter()
                 .map(std::path::PathBuf::from)
                 .collect()
         } else {
-            patch
+            change
                 .affected_files
                 .iter()
                 .map(std::path::PathBuf::from)
                 .collect()
         };
 
-        self.validate_patch_paths(&affected_files, self.project_root.as_deref())?;
+        self.validate_change_paths(&affected_files, self.project_root.as_deref())?;
 
-        let filename = self.patch_dir.join(format!("{}.patch", artifact_id));
+        let filename = self.change_dir.join(format!("{}.diff", artifact_id));
         if let Some(parent) = filename.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 cog_core::SFError::IO(format!(
-                    "Failed to create patch dir {}: {}",
+                    "Failed to create change dir {}: {}",
                     parent.display(),
                     e
                 ))
             })?;
         }
 
-        tokio::fs::write(&filename, &patch.content)
+        tokio::fs::write(&filename, &change.content)
             .await
             .map_err(|e| {
                 cog_core::SFError::IO(format!(
-                    "Failed to write patch {}: {}",
+                    "Failed to write change {}: {}",
                     filename.display(),
                     e
                 ))
@@ -1102,14 +1102,14 @@ impl EvolutionEngine {
         info!(
             artifact_id = %artifact_id,
             path = %filename.display(),
-            "Collaboration-generated patch written to disk"
+            "Collaboration-generated change written to disk"
         );
 
         let result = EvolutionResult {
-            kind: EvolutionKind::CodePatch,
+            kind: EvolutionKind::CodeChange,
             artifact_id: artifact_id.clone(),
-            description: patch.goal.clone(),
-            content: patch.content.clone(),
+            description: change.goal.clone(),
+            content: change.content.clone(),
             status: EvolutionStatus::CompileChecked,
             created_at: Utc::now(),
             eval_summary: None,
@@ -1124,9 +1124,9 @@ impl EvolutionEngine {
 }
 
 #[async_trait::async_trait]
-impl cog_core::PatchSink for EvolutionEngine {
-    async fn submit_patch(&self, patch: cog_core::GeneratedPatch) -> cog_core::SFResult<String> {
-        self.write_generated_patch(&patch).await
+impl cog_core::ChangeSink for EvolutionEngine {
+    async fn submit_change(&self, change: cog_core::GeneratedChange) -> cog_core::SFResult<String> {
+        self.write_generated_change(&change).await
     }
 }
 
@@ -1163,7 +1163,7 @@ mod tests {
 
     #[test]
     fn extract_unified_diff_fenced_with_prose() {
-        let text = "Here is the patch you asked for:\n\n\
+        let text = "Here is the change you asked for:\n\n\
                     ```diff\n\
                     diff --git a/crates/foo/src/lib.rs b/crates/foo/src/lib.rs\n\
                     --- a/crates/foo/src/lib.rs\n\

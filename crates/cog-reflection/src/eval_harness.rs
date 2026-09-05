@@ -1,6 +1,6 @@
 //! 进化效果评估 harness（审计 4.2）与 benchmark 报告框架（审计 4.5 代码侧）。
 //!
-//! 用固定任务集衡量 patch 前后的成功率、延迟、成本：
+//! 用固定任务集衡量 change 前后的成功率、延迟、成本：
 //! - 成功率差异用两比例 z 检验（α=0.05）判断统计显著性；
 //! - 仅当「显著更好」时给出 Adopt，显著更差 Reject，其余 Inconclusive ——
 //!   配合「拒绝无统计显著的改动」原则，只有 Adopt 应被部署流水线接受；
@@ -62,7 +62,7 @@ impl EvalSummary {
     }
 }
 
-/// patch 前后对比结论。
+/// change 前后对比结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvalVerdict {
@@ -102,7 +102,7 @@ pub fn two_proportion_z_test(s1: usize, n1: usize, s2: usize, n2: usize) -> (f64
     (z, z.abs() > 1.96)
 }
 
-/// 对比 patch 前后两组执行结果。
+/// 对比 change 前后两组执行结果。
 pub fn compare(before: &[EvalOutcome], after: &[EvalOutcome]) -> EvalComparison {
     let b = EvalSummary::from_outcomes(before);
     let a = EvalSummary::from_outcomes(after);

@@ -116,19 +116,19 @@ impl cog_core::SystemPlugin for AgentPlugin {
             hook_engine_config.into(),
         ));
 
-        // Load persisted hooks from evolution-patches/hooks/ on startup.
+        // Load persisted hooks from evolution-changes/hooks/ on startup.
         {
-            let hook_patch_dir =
-                std::path::PathBuf::from(format!("{}/evolution-patches/hooks", data_dir));
-            match hook_engine.load_from_dir(&hook_patch_dir).await {
+            let hook_change_dir =
+                std::path::PathBuf::from(format!("{}/evolution-changes/hooks", data_dir));
+            match hook_engine.load_from_dir(&hook_change_dir).await {
                 Ok(n) if n > 0 => info!(
                     "Loaded {} persisted hook(s) from {}",
                     n,
-                    hook_patch_dir.display()
+                    hook_change_dir.display()
                 ),
                 Ok(_) => debug!(
                     "No persisted hooks to load from {}",
-                    hook_patch_dir.display()
+                    hook_change_dir.display()
                 ),
                 Err(e) => warn!("Failed to load persisted hooks: {}", e),
             }

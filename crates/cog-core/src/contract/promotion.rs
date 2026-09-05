@@ -1,7 +1,7 @@
 //! 晋级台账契约。
 //!
 //! 每次晋级（无论推送端还是各集群拉取端）全字段留档：
-//! patch 级别、决策、结果、回滚原因。配额与熔断判定也基于台账：
+//! change 级别、决策、结果、回滚原因。配额与熔断判定也基于台账：
 //! - 配额：`count_since(24h 前)` 超 `quota_per_day` → 排队/转人工；
 //! - 熔断：`recent_outcomes` 连续 rollback 或 failure 超阈值 → 转人工模式。
 
@@ -55,8 +55,8 @@ impl PromotionStatus {
 pub struct PromotionRecord {
     /// 记录 id（uuid）。
     pub id: String,
-    /// 对应 patch 的 artifact_id。
-    pub patch_id: String,
+    /// 对应 change 的 artifact_id。
+    pub change_id: String,
     /// 晋级级别：l0_config / l1_rollout / l2_approval。
     pub level: String,
     /// 决策理由（分级引擎输出 / 人工审批备注）。

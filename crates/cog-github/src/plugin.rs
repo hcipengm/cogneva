@@ -97,7 +97,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     ctx.publish_service::<dyn CodePlatformProvider>(provider.clone());
                     info!(repo = %config.repo, "GitHubPlugin initialized");
 
-                    // Patch-to-PR publishing (PatchSink) for autonomous fixes.
+                    // Change-to-PR publishing (ChangeSink) for autonomous fixes.
                     // Disabled when pr_workdir is not configured.
                     if !config.pr_workdir.is_empty() {
                         let token = config
@@ -106,18 +106,18 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                             .and_then(|a| a.resolve_token().ok());
                         match crate::pr_publisher::ensure_workdir(&config, token.as_deref()).await {
                             Ok(workdir) => {
-                                let sink = Arc::new(crate::pr_publisher::GitHubPatchSink::new(
+                                let sink = Arc::new(crate::pr_publisher::GitHubChangeSink::new(
                                     crate::pr_publisher::GitHubPrPublisher::new(
                                         workdir.clone(),
                                         config.clone(),
                                     ),
                                     provider.clone(),
                                 ));
-                                ctx.publish_service::<dyn cog_core::PatchSink>(sink);
-                                info!(workdir = %workdir.display(), "GitHub PatchSink published");
+                                ctx.publish_service::<dyn cog_core::ChangeSink>(sink);
+                                info!(workdir = %workdir.display(), "GitHub ChangeSink published");
                             }
                             Err(e) => {
-                                warn!(error = %e, "GitHub PR workdir unavailable; PatchSink not published");
+                                warn!(error = %e, "GitHub PR workdir unavailable; ChangeSink not published");
                             }
                         }
                     }
@@ -135,7 +135,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
 
         // Gitee 与 GitHub 地位平等：issue 即外部意图进化入口。策略（分诊
         // 标签/澄清对话/自动合并）继承 github_integration，平台字段由
-        // gitee_integration 覆盖。Gitee 暂无开放 CI API 与 PatchSink，
+        // gitee_integration 覆盖。Gitee 暂无开放 CI API 与 ChangeSink，
         // 发现循环承担 scan→triage→clarify→submit 全链。
         if gitee_config.enabled {
             match crate::gitee_provider(&gitee_config) {

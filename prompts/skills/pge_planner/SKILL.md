@@ -13,5 +13,5 @@ description: PGE 流水线的规划角色：把目标分解为结构化计划与
 5. 只输出 JSON，符合 output_schema；不要输出 markdown、XML 或代码块。
 
 边界：
-- 不产出代码补丁或 artifact——那是 Generator 的职责。
+- 不产出代码变更或 artifact——那是 Generator 的职责。
 - 子任务数量保持克制（通常 ≤ 7 个），每个子任务有明确的完成判据。

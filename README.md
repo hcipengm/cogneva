@@ -54,7 +54,7 @@ This autonomy is not a single-point capability, but a **layered closed loop**:
 
 The key is **there is no preset DAG**. Agents do not mechanically execute a flowchart drawn in advance by humans; they collaborate in real time through the event bus: one Agent emits an event, other Agents or Hooks respond dynamically, and the topology unfolds adaptively with task complexity. When the unexpected happens, the system adjusts itself; when failures happen, the system heals itself.
 
-The runtime data produced by real-autonomy is the fuel for omni-evolution; the Patches and policies produced by omni-evolution in turn improve the decision quality of real-autonomy.
+The runtime data produced by real-autonomy is the fuel for omni-evolution; the code changes and policies produced by omni-evolution in turn improve the decision quality of real-autonomy.
 
 **In one sentence**: real-autonomy turns Cogneva from "a program that was started" into "an autonomous system with goals, collaboration, self-healing, and continuous learning".
 
@@ -69,13 +69,13 @@ Omni-evolution is Cogneva's **cognitive closure capability** — it lets the sys
 Evolution does not only wait for human commands. It simultaneously receives:
 
 - **External intent / goal input**: humans or other AIs inject requirements, problems, and goals through WebUI, API, GitHub issue/PR/comment, and other channels; `cog-github` collects this external feedback and feeds it into the omni-evolution feedback loop, making it an external feedback source driving system evolution. In future A2A scenarios, any AI agent can submit evolution intents directly.
-- **System self-discovery**: `cog-observability` continuously collects metrics, logs, and traces; `cog-supervisor` performs health checks and automatic recovery; `cog-reflection` distills the runtime results of Agents, Tools, Squads, and Patches into `Learning` / `ErrorEntry` / `SkillOutcome`. When a class of errors recurs, a skill's effectiveness degrades, or a pattern matures, Reflection proactively generates evolution tasks.
+- **System self-discovery**: `cog-observability` continuously collects metrics, logs, and traces; `cog-supervisor` performs health checks and automatic recovery; `cog-reflection` distills the runtime results of Agents, Tools, Squads, and code changes into `Learning` / `ErrorEntry` / `SkillOutcome`. When a class of errors recurs, a skill's effectiveness degrades, or a pattern matures, Reflection proactively generates evolution tasks.
 
 #### Dual-track evolution
 
 Cogneva's omni-evolution is not a single channel, but **source-level evolution + artifact-level evolution** running in parallel:
 
-- **Source-level evolution**: acts on the open-source engine framework (MIT), modifying `.rs` files via Patches — changing algorithms, frameworks, and data structures.
+- **Source-level evolution**: acts on the open-source engine framework (MIT), producing code changes against `.rs` files — new algorithms, frameworks, and data structures.
 - **Artifact-level evolution**: acts on private policy artifacts (Protobuf meta-policies, thresholds, rules, experience bases), hot-swapped at runtime — changing behavior without changing source code.
 
 #### The negative-feedback loop
@@ -89,9 +89,9 @@ Reflection distills errors/experience and triggers evolution tasks
         ↓
 Orchestrator unified decision-making and routing
         ↓
-Collaboration generates .patch
+Collaboration generates the change (.diff)
         ↓
-PatchPipeline apply → test → build → switch
+ChangePipeline apply → test → build → switch
         ↓
 Eval quantitatively evaluates evolution effect
         ↓
@@ -106,7 +106,7 @@ In this loop, every crate does its own job:
 - **Supervisor "stays alive"**: recovers immediately upon failure, keeping the system continuously available.
 - **Reflection "figures it out"**: structures scattered runtime results, identifies repeated patterns, decides "whether to change".
 - **Orchestrator "decides"**: based on reflection's learning output and observability's real-time signals, decides whether to retry, scale, alert, or trigger code evolution.
-- **Collaboration "generates the change"**: multi-Agent collaboration produces a standard `.patch`.
+- **Collaboration "generates the change"**: multi-Agent collaboration produces a standard unified diff (`.diff`) for the change.
 - **Eval "verifies the effect"**: evolution without eval is blind; A/B comparison + statistical significance testing ensures changes are genuinely better.
 
 #### Safety and rollback
@@ -421,14 +421,14 @@ Agentic Engineering = giving Agents the ability to autonomously plan, execute, c
 |-------|-----------|
 | L0 per-run self-review | automatic quality check after every Agent run |
 | L1 cross-session learning | distill Skills from successes/failures, write into Registry |
-| L2 code evolution | **automatically generate Rust code patches, verified by cargo check** |
+| L2 code evolution | **automatically generate Rust code changes, verified by cargo check** |
 | L3 meta-learning | autonomously discover new patterns, explore new capabilities |
 
 **The concrete L2 code-evolution flow**:
 1. Detect repeated error patterns
 2. LLM generates improved Rust code
 3. `cargo check` compilation verification (up to 3 iterations)
-4. After passing the quality gate, written to `evolution-patches/`
+4. After passing the quality gate, written to `evolution-changes/`
 5. Registered into the running system in real time via `hook_sink`/`tool_sink` channels
 
 ---

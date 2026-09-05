@@ -154,7 +154,7 @@ spec:
               git fetch local --tags
               # 基线对齐：工作源码首次 seed 后基线冻结，镜像升级不会自动跟随。启动时幂等对齐
               # 到当前运行版本的 release tag。工作区脏、或有未晋级 commit 时不重置（避免冲掉
-              # 在制 patch），仅告警，下次启动再判；已晋级成果在 bare 的 evolution-release/tag。
+              # 在制变更），仅告警，下次启动再判；已晋级成果在 bare 的 evolution-release/tag。
               TARGET_TAG="v${COGNEVA_VERSION}"
               if ! git rev-parse -q --verify "refs/tags/${TARGET_TAG}^{commit}" >/dev/null; then
                 echo "WARN: baseline tag ${TARGET_TAG} not found; skip alignment (dev/local build?)"
@@ -169,7 +169,7 @@ spec:
                 fi
                 if [ -n "$(git status --porcelain)" ] || [ -n "$(git log "${BASE_REF}..HEAD" --oneline)" ]; then
                   echo "WARN: deployed version is ${TARGET_TAG} but source has unpromoted in-flight work;"
-                  echo "WARN: keeping current baseline to avoid losing patches. Promote then restart,"
+                  echo "WARN: keeping current baseline to avoid losing in-flight changes. Promote then restart,"
                   echo "WARN: or force-refresh by deleting the source PVC / 'git reset --hard ${TARGET_TAG}'."
                 else
                   echo "Clean tree, no unpromoted work; aligning source baseline to ${TARGET_TAG}"

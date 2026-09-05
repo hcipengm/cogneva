@@ -4,16 +4,16 @@
 use std::sync::Arc;
 
 use cog_core::{
-    EvolutionAdmin, EvolutionApplyResponse, EvolutionDeployResponse, EvolutionPatchInfo, SFError,
+    EvolutionAdmin, EvolutionApplyResponse, EvolutionChangeInfo, EvolutionDeployResponse, SFError,
     SFResult,
 };
 use tracing::{info, warn};
 
 /// Service that implements [`EvolutionAdmin`] by delegating to the reflection
-/// engine, patch pipeline, and deployer.
+/// engine, change pipeline, and deployer.
 pub struct EvolutionAdminService {
     engine: Arc<crate::ReflectionEngine>,
-    pipeline: crate::PatchPipeline,
+    pipeline: crate::ChangePipeline,
     deployer: crate::EvolutionDeployer,
     binary_switcher: Option<Arc<dyn cog_core::BinarySwitcher>>,
     evolution_metrics: Option<Arc<dyn cog_core::EvolutionMetrics>>,
@@ -24,8 +24,8 @@ pub struct EvolutionAdminService {
     /// （in-memory 模式）产物级进化链路用本地存储兜底，与 LLM 可用性解耦。
     policy_results:
         Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::types::EvolutionResult>>>,
-    /// 补丁行变更广播：接管台 SSE 订阅此通道，状态翻转即时推送而非轮询。
-    stream: Option<tokio::sync::broadcast::Sender<EvolutionPatchInfo>>,
+    /// 变更行状态广播：接管台 SSE 订阅此通道，状态翻转即时推送而非轮询。
+    stream: Option<tokio::sync::broadcast::Sender<EvolutionChangeInfo>>,
     /// 自动晋级运行时开关（与 AutoPromoter 共享同一实例）。
     switch: Option<Arc<crate::PromotionSwitch>>,
     /// 晋级台账（晋级历史页数据源）。
@@ -60,7 +60,7 @@ fn kind_name(kind: &crate::types::EvolutionKind) -> &'static str {
         crate::types::EvolutionKind::SkillRefinement => "skill_refinement",
         crate::types::EvolutionKind::HookSynthesis => "hook_synthesis",
         crate::types::EvolutionKind::ToolVariant => "tool_variant",
-        crate::types::EvolutionKind::CodePatch => "code_patch",
+        crate::types::EvolutionKind::CodeChange => "code_change",
         crate::types::EvolutionKind::PolicyUpdate => "policy_update",
     }
 }
@@ -68,7 +68,7 @@ fn kind_name(kind: &crate::types::EvolutionKind) -> &'static str {
 impl EvolutionAdminService {
     pub fn new(
         engine: Arc<crate::ReflectionEngine>,
-        pipeline: crate::PatchPipeline,
+        pipeline: crate::ChangePipeline,
         deployer: crate::EvolutionDeployer,
         binary_switcher: Option<Arc<dyn cog_core::BinarySwitcher>>,
         evolution_metrics: Option<Arc<dyn cog_core::EvolutionMetrics>>,
@@ -91,10 +91,10 @@ impl EvolutionAdminService {
         }
     }
 
-    /// 接入补丁行变更广播通道（接管台 SSE 推送）。
+    /// 接入变更行状态广播通道（接管台 SSE 推送）。
     pub fn with_evolution_stream(
         mut self,
-        tx: tokio::sync::broadcast::Sender<EvolutionPatchInfo>,
+        tx: tokio::sync::broadcast::Sender<EvolutionChangeInfo>,
     ) -> Self {
         self.stream = Some(tx);
         self
@@ -108,13 +108,13 @@ impl EvolutionAdminService {
     }
 
     /// 审计 3.2：接入 image-based 滚动更新部署器。接入后 deploy 走
-    /// 「构建镜像 → patch Deployment → 滚动更新」，不再走二进制替换。
+    /// 「构建镜像 → change Deployment → 滚动更新」，不再走二进制替换。
     pub fn with_image_rollout(mut self, rollout: Arc<crate::ImageRollout>) -> Self {
         self.image_rollout = Some(rollout);
         self
     }
 
-    /// 接入不可篡改审计流（审计 3.5）：patch 操作写入哈希链。
+    /// 接入不可篡改审计流（审计 3.5）：change 操作写入哈希链。
     pub fn with_audit_stream(mut self, stream: Arc<dyn cog_core::AuditStream>) -> Self {
         self.audit_stream = Some(stream);
         self
@@ -145,13 +145,13 @@ impl EvolutionAdminService {
         self
     }
 
-    async fn audit(&self, patch_id: &str, action: &str, detail: serde_json::Value) {
+    async fn audit(&self, change_id: &str, action: &str, detail: serde_json::Value) {
         if let Some(ref stream) = self.audit_stream {
             if let Err(e) = stream
                 .append(
-                    cog_core::AuditKind::PatchOperation,
+                    cog_core::AuditKind::ChangeOperation,
                     "evolution-admin",
-                    patch_id,
+                    change_id,
                     action,
                     detail,
                 )
@@ -175,26 +175,26 @@ impl EvolutionAdminService {
         }
     }
 
-    async fn get_policy_result(&self, patch_id: &str) -> Option<crate::types::EvolutionResult> {
+    async fn get_policy_result(&self, change_id: &str) -> Option<crate::types::EvolutionResult> {
         if let Some(ref evo) = self.engine.evolution {
             evo.list_results()
                 .await
                 .into_iter()
-                .find(|r| r.artifact_id == patch_id)
+                .find(|r| r.artifact_id == change_id)
         } else {
-            self.policy_results.read().await.get(patch_id).cloned()
+            self.policy_results.read().await.get(change_id).cloned()
         }
     }
 
-    async fn set_policy_status(&self, patch_id: &str, status: crate::types::EvolutionStatus) {
+    async fn set_policy_status(&self, change_id: &str, status: crate::types::EvolutionStatus) {
         if let Some(ref evo) = self.engine.evolution {
-            evo.update_status(patch_id, status).await;
-        } else if let Some(r) = self.policy_results.write().await.get_mut(patch_id) {
+            evo.update_status(change_id, status).await;
+        } else if let Some(r) = self.policy_results.write().await.get_mut(change_id) {
             r.status = status;
         }
     }
 
-    async fn all_patch_results(&self) -> Vec<crate::types::EvolutionResult> {
+    async fn all_change_results(&self) -> Vec<crate::types::EvolutionResult> {
         if let Some(ref evo) = self.engine.evolution {
             evo.list_results().await
         } else {
@@ -202,8 +202,8 @@ impl EvolutionAdminService {
         }
     }
 
-    /// 将内部结果映射为 API 行（list_patches 与 SSE 推送共用同一映射）。
-    async fn row_for(&self, r: crate::types::EvolutionResult) -> EvolutionPatchInfo {
+    /// 将内部结果映射为 API 行（list_changes 与 SSE 推送共用同一映射）。
+    async fn row_for(&self, r: crate::types::EvolutionResult) -> EvolutionChangeInfo {
         let diff_summary = if matches!(r.kind, crate::types::EvolutionKind::PolicyUpdate) {
             // 产物级：展示版本跃迁（active 版 → 候选版）
             let name = r.artifact_id.strip_prefix("policy:").unwrap_or("");
@@ -217,7 +217,7 @@ impl EvolutionAdminService {
         } else {
             summarize_diff(&r.content)
         };
-        EvolutionPatchInfo {
+        EvolutionChangeInfo {
             id: r.artifact_id,
             kind: kind_name(&r.kind).to_string(),
             description: r.description,
@@ -229,23 +229,26 @@ impl EvolutionAdminService {
     }
 
     /// 向接管台广播行变更；无订阅者或无通道时静默丢弃。
-    fn emit(&self, row: EvolutionPatchInfo) {
+    fn emit(&self, row: EvolutionChangeInfo) {
         if let Some(ref tx) = self.stream {
             let _ = tx.send(row);
         }
     }
 
-    async fn find_pending_patch(&self, patch_id: &str) -> SFResult<crate::types::EvolutionResult> {
+    async fn find_pending_change(
+        &self,
+        change_id: &str,
+    ) -> SFResult<crate::types::EvolutionResult> {
         let evo_engine =
             self.engine.evolution.as_ref().ok_or_else(|| {
                 SFError::Validation("self-evolution engine not configured".into())
             })?;
 
-        let patches = self.pipeline.pending_patches(Some(evo_engine)).await?;
-        patches
+        let changes = self.pipeline.pending_changes(Some(evo_engine)).await?;
+        changes
             .into_iter()
-            .find(|p| p.artifact_id == patch_id)
-            .ok_or_else(|| SFError::Validation(format!("patch {} not found", patch_id)))
+            .find(|p| p.artifact_id == change_id)
+            .ok_or_else(|| SFError::Validation(format!("change {} not found", change_id)))
     }
 
     async fn record_event(&self, failed: bool) {
@@ -254,34 +257,34 @@ impl EvolutionAdminService {
         }
     }
 
-    async fn record_patch_applied(&self) {
+    async fn record_change_applied(&self) {
         if let Some(ref m) = self.evolution_metrics {
-            m.record_patch_applied().await;
+            m.record_change_applied().await;
         }
     }
 
-    async fn record_patch_failed(&self) {
+    async fn record_change_failed(&self) {
         if let Some(ref m) = self.evolution_metrics {
-            m.record_patch_failed().await;
+            m.record_change_failed().await;
         }
     }
 
-    /// Shared commit/build/switch flow used by both `deploy_patch` and
-    /// `approve_patch`. Ensures the patch is applied and tests pass first.
-    async fn deploy_inner(&self, patch_id: &str) -> SFResult<EvolutionDeployResponse> {
-        let apply_result = self.apply_patch(patch_id).await?;
+    /// Shared commit/build/switch flow used by both `deploy_change` and
+    /// `approve_change`. Ensures the change is applied and tests pass first.
+    async fn deploy_inner(&self, change_id: &str) -> SFResult<EvolutionDeployResponse> {
+        let apply_result = self.apply_change(change_id).await?;
         if !apply_result.test_passed {
             return Err(SFError::Validation(format!(
-                "patch {} did not pass tests; cannot deploy",
-                patch_id
+                "change {} did not pass tests; cannot deploy",
+                change_id
             )));
         }
 
-        let artifact = self.deployer.commit_and_build(patch_id).await?;
+        let artifact = self.deployer.commit_and_build(change_id).await?;
         info!(
-            patch_id = %artifact.patch_id,
+            change_id = %artifact.change_id,
             commit = %artifact.commit_hash,
-            "Admin-deployed patch committed and built"
+            "Admin-deployed change committed and built"
         );
 
         let mut switched = false;
@@ -290,20 +293,20 @@ impl EvolutionAdminService {
             // 审计 3.2：image-based 滚动更新路径（失败时 ImageRollout 内部已 undo）。
             match rollout.deploy(&artifact).await {
                 Ok(tag) => {
-                    info!(patch_id = %artifact.patch_id, tag = %tag, "Admin-deploy rolled out new image");
+                    info!(change_id = %artifact.change_id, tag = %tag, "Admin-deploy rolled out new image");
                     image_tag = Some(tag);
                     switched = true;
                 }
                 Err(e) => {
                     warn!(error = %e, "image rollout deploy failed");
                     self.record_event(true).await;
-                    self.record_patch_failed().await;
+                    self.record_change_failed().await;
                     return Err(e);
                 }
             }
         } else if let Some(ref switcher) = self.binary_switcher {
             switcher.stage_new_binary(&artifact.new_binary_path).await?;
-            info!(patch_id = %artifact.patch_id, "Admin-deploy staged new binary");
+            info!(change_id = %artifact.change_id, "Admin-deploy staged new binary");
 
             if let Err(e) = switcher.switch_and_restart().await {
                 warn!(error = %e, "Admin switch failed; attempting rollback");
@@ -311,17 +314,17 @@ impl EvolutionAdminService {
                     warn!(error = %rb_e, "Admin rollback failed");
                 }
                 self.record_event(true).await;
-                self.record_patch_failed().await;
+                self.record_change_failed().await;
                 return Err(e);
             }
             switched = true;
         }
 
-        self.record_patch_applied().await;
+        self.record_change_applied().await;
         self.record_event(false).await;
         self.audit(
-            patch_id,
-            "patch.deploy",
+            change_id,
+            "change.deploy",
             serde_json::json!({
                 "commit_hash": artifact.commit_hash,
                 "switched": switched,
@@ -331,7 +334,7 @@ impl EvolutionAdminService {
         .await;
 
         Ok(EvolutionDeployResponse {
-            patch_id: artifact.patch_id,
+            change_id: artifact.change_id,
             commit_hash: artifact.commit_hash,
             staged_binary_path: artifact.new_binary_path.to_string_lossy().to_string(),
             switched,
@@ -341,8 +344,8 @@ impl EvolutionAdminService {
 
 #[async_trait::async_trait]
 impl EvolutionAdmin for EvolutionAdminService {
-    async fn list_patches(&self) -> SFResult<Vec<EvolutionPatchInfo>> {
-        let results = self.all_patch_results().await;
+    async fn list_changes(&self) -> SFResult<Vec<EvolutionChangeInfo>> {
+        let results = self.all_change_results().await;
         let mut out = Vec::with_capacity(results.len());
         for r in results {
             out.push(self.row_for(r).await);
@@ -353,7 +356,7 @@ impl EvolutionAdmin for EvolutionAdminService {
     async fn evaluate_policy(
         &self,
         req: cog_core::PolicyEvalRequest,
-    ) -> SFResult<EvolutionPatchInfo> {
+    ) -> SFResult<EvolutionChangeInfo> {
         let artifact_evo = self
             .artifact_evolution
             .as_ref()
@@ -412,7 +415,7 @@ impl EvolutionAdmin for EvolutionAdminService {
         )
         .await;
 
-        let row = EvolutionPatchInfo {
+        let row = EvolutionChangeInfo {
             id: artifact_id,
             kind: "policy_update".into(),
             description,
@@ -425,24 +428,24 @@ impl EvolutionAdmin for EvolutionAdminService {
         Ok(row)
     }
 
-    async fn apply_patch(&self, patch_id: &str) -> SFResult<EvolutionApplyResponse> {
-        let patch = self.find_pending_patch(patch_id).await?;
-        let result = self.pipeline.apply_and_test(&patch).await?;
+    async fn apply_change(&self, change_id: &str) -> SFResult<EvolutionApplyResponse> {
+        let change = self.find_pending_change(change_id).await?;
+        let result = self.pipeline.apply_and_test(&change).await?;
 
         if let Some(ref evo) = self.engine.evolution {
-            evo.update_status(patch_id, result.new_status).await;
+            evo.update_status(change_id, result.new_status).await;
         }
 
         let failed = !result.test_passed;
         if failed {
             self.record_event(true).await;
-            self.record_patch_failed().await;
+            self.record_change_failed().await;
         } else {
             self.record_event(false).await;
         }
         self.audit(
-            patch_id,
-            "patch.apply",
+            change_id,
+            "change.apply",
             serde_json::json!({
                 "test_passed": result.test_passed,
                 "new_status": format!("{:?}", result.new_status).to_lowercase(),
@@ -451,7 +454,7 @@ impl EvolutionAdmin for EvolutionAdminService {
         .await;
 
         Ok(EvolutionApplyResponse {
-            patch_id: result.patch_id,
+            change_id: result.change_id,
             test_passed: result.test_passed,
             test_output: result.test_output,
             new_status: format!("{:?}", result.new_status).to_lowercase(),
@@ -463,38 +466,38 @@ impl EvolutionAdmin for EvolutionAdminService {
         })
     }
 
-    async fn deploy_patch(&self, patch_id: &str) -> SFResult<EvolutionDeployResponse> {
-        self.deploy_inner(patch_id).await
+    async fn deploy_change(&self, change_id: &str) -> SFResult<EvolutionDeployResponse> {
+        self.deploy_inner(change_id).await
     }
 
-    async fn approve_patch(&self, patch_id: &str) -> SFResult<EvolutionDeployResponse> {
+    async fn approve_change(&self, change_id: &str) -> SFResult<EvolutionDeployResponse> {
         // 产物级进化：审批 = 热替换策略版本，不走二进制部署。
-        if let Some(name) = patch_id.strip_prefix("policy:") {
+        if let Some(name) = change_id.strip_prefix("policy:") {
             let artifact_evo = self
                 .artifact_evolution
                 .as_ref()
                 .ok_or_else(|| SFError::Validation("artifact evolution not configured".into()))?;
             let row = self
-                .get_policy_result(patch_id)
+                .get_policy_result(change_id)
                 .await
-                .ok_or_else(|| SFError::Validation(format!("patch {patch_id} not found")))?;
+                .ok_or_else(|| SFError::Validation(format!("change {change_id} not found")))?;
             if !matches!(row.status, crate::types::EvolutionStatus::AwaitingReview) {
                 return Err(SFError::Validation(format!(
                     "policy proposal {} is not awaiting review (status: {:?})",
-                    patch_id, row.status
+                    change_id, row.status
                 )));
             }
             info!(policy = %name, "Operator approved policy update; hot-swapping");
             let artifact = artifact_evo.approve(name).await?;
-            self.set_policy_status(patch_id, crate::types::EvolutionStatus::Active)
+            self.set_policy_status(change_id, crate::types::EvolutionStatus::Active)
                 .await;
-            if let Some(updated) = self.get_policy_result(patch_id).await {
+            if let Some(updated) = self.get_policy_result(change_id).await {
                 self.emit(self.row_for(updated).await);
             }
-            self.record_patch_applied().await;
+            self.record_change_applied().await;
             self.record_event(false).await;
             self.audit(
-                patch_id,
+                change_id,
                 "policy.approve",
                 serde_json::json!({
                     "version": artifact.version,
@@ -503,24 +506,24 @@ impl EvolutionAdmin for EvolutionAdminService {
             )
             .await;
             return Ok(EvolutionDeployResponse {
-                patch_id: patch_id.to_string(),
+                change_id: change_id.to_string(),
                 commit_hash: artifact.hash,
                 staged_binary_path: String::new(),
                 switched: true,
             });
         }
 
-        let patch = self.find_pending_patch(patch_id).await?;
-        if !matches!(patch.status, crate::types::EvolutionStatus::AwaitingReview) {
+        let change = self.find_pending_change(change_id).await?;
+        if !matches!(change.status, crate::types::EvolutionStatus::AwaitingReview) {
             return Err(SFError::Validation(format!(
-                "patch {} is not awaiting review (status: {:?}); run apply first",
-                patch_id, patch.status
+                "change {} is not awaiting review (status: {:?}); run apply first",
+                change_id, change.status
             )));
         }
-        info!(patch_id = %patch_id, "Operator approved patch; proceeding to deploy");
-        self.audit(patch_id, "patch.approve", serde_json::json!({}))
+        info!(change_id = %change_id, "Operator approved change; proceeding to deploy");
+        self.audit(change_id, "change.approve", serde_json::json!({}))
             .await;
-        self.deploy_inner(patch_id).await
+        self.deploy_inner(change_id).await
     }
 
     async fn rollback(&self) -> SFResult<cog_core::EvolutionRollbackResponse> {
@@ -533,7 +536,7 @@ impl EvolutionAdmin for EvolutionAdminService {
             Ok(()) => {
                 info!("Admin-triggered rollback to previous binary succeeded");
                 self.record_event(false).await;
-                self.audit("binary", "patch.rollback", serde_json::json!({"ok": true}))
+                self.audit("binary", "change.rollback", serde_json::json!({"ok": true}))
                     .await;
                 Ok(cog_core::EvolutionRollbackResponse {
                     rolled_back: true,
@@ -549,7 +552,7 @@ impl EvolutionAdmin for EvolutionAdminService {
     }
 
     async fn list_events(&self, limit: usize) -> SFResult<Vec<cog_core::EvolutionEventInfo>> {
-        let results = self.all_patch_results().await;
+        let results = self.all_change_results().await;
         Ok(results
             .into_iter()
             .take(limit)
@@ -664,7 +667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_service_lists_patches_and_rejects_missing_apply() {
+    async fn admin_service_lists_changes_and_rejects_missing_apply() {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
         let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
         let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
@@ -675,15 +678,15 @@ mod tests {
         )));
 
         let project_root = std::env::current_dir().unwrap();
-        let patch_dir =
-            std::env::temp_dir().join(format!("cogneva-test-patches-{}", uuid::Uuid::new_v4()));
-        tokio::fs::create_dir_all(&patch_dir).await.unwrap();
+        let change_dir =
+            std::env::temp_dir().join(format!("cogneva-test-changes-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
         let binary_dir =
             std::env::temp_dir().join(format!("cogneva-test-bin-{}", uuid::Uuid::new_v4()));
         let backup_dir =
             std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
 
-        let pipeline = crate::PatchPipeline::new(&project_root, &patch_dir, false)
+        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false)
             .with_auto_apply(true)
             .with_test_timeout(30);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
@@ -691,10 +694,10 @@ mod tests {
         let admin =
             crate::EvolutionAdminService::new(Arc::new(engine), pipeline, deployer, None, None);
 
-        let patches = admin.list_patches().await.unwrap();
-        assert!(patches.is_empty());
+        let changes = admin.list_changes().await.unwrap();
+        assert!(changes.is_empty());
 
-        let err = admin.apply_patch("missing-patch").await.unwrap_err();
+        let err = admin.apply_change("missing-change").await.unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
@@ -733,11 +736,11 @@ mod tests {
 
         let project_root = std::env::current_dir().unwrap();
         let unique = uuid::Uuid::new_v4();
-        let patch_dir = std::env::temp_dir().join(format!("cogneva-test-patches-{}", unique));
+        let change_dir = std::env::temp_dir().join(format!("cogneva-test-changes-{}", unique));
         let binary_dir = std::env::temp_dir().join(format!("cogneva-test-bin-{}", unique));
         let backup_dir = std::env::temp_dir().join(format!("cogneva-test-backup-{}", unique));
 
-        let pipeline = crate::PatchPipeline::new(&project_root, &patch_dir, false);
+        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
 
         crate::EvolutionAdminService::new(Arc::new(engine), pipeline, deployer, switcher, None)
@@ -768,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_rejects_missing_and_not_awaiting_review_patches() {
+    async fn approve_rejects_missing_and_not_awaiting_review_changes() {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
         let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
         let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
@@ -780,18 +783,18 @@ mod tests {
 
         let project_root = std::env::current_dir().unwrap();
         let unique = uuid::Uuid::new_v4();
-        let patch_dir = std::env::temp_dir().join(format!("cogneva-test-patches-{}", unique));
-        tokio::fs::create_dir_all(&patch_dir).await.unwrap();
-        // Seed a pending patch file; the engine has no status record for it,
+        let change_dir = std::env::temp_dir().join(format!("cogneva-test-changes-{}", unique));
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        // Seed a pending change file; the engine has no status record for it,
         // so it surfaces as CompileChecked, not AwaitingReview.
         tokio::fs::write(
-            patch_dir.join("p1.patch"),
+            change_dir.join("p1.diff"),
             "diff --git a/crates/x/src/lib.rs b/crates/x/src/lib.rs\n--- a/crates/x/src/lib.rs\n+++ b/crates/x/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n",
         )
         .await
         .unwrap();
 
-        let pipeline = crate::PatchPipeline::new(&project_root, &patch_dir, false);
+        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
         let deployer = crate::EvolutionDeployer::new(
             &project_root,
             std::env::temp_dir().join(format!("cogneva-test-bin-{}", unique)),
@@ -800,10 +803,10 @@ mod tests {
         let admin =
             crate::EvolutionAdminService::new(Arc::new(engine), pipeline, deployer, None, None);
 
-        let err = admin.approve_patch("missing").await.unwrap_err();
+        let err = admin.approve_change("missing").await.unwrap_err();
         assert!(err.to_string().contains("not found"), "got {err}");
 
-        let err = admin.approve_patch("p1").await.unwrap_err();
+        let err = admin.approve_change("p1").await.unwrap_err();
         assert!(err.to_string().contains("not awaiting review"), "got {err}");
     }
 }

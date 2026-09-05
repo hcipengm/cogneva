@@ -55,7 +55,7 @@ Cogneva 的元启动，从一台空白 Linux 机器开始，执行 `bootstrap.sh
 
 关键在于**没有预设的 DAG**。Agent 不按照人类提前画好的流程图机械执行，而是通过事件总线实时协作：一个 Agent 产生事件，其他 Agent 或 Hook 动态响应，拓扑随任务复杂度自适应展开。遇到意外，系统自己调整；遇到故障，系统自己治愈。
 
-真自治产生的运行数据，是全进化的燃料；全进化生成的 Patch 和策略，又反过来增强真自治的决策质量。
+真自治产生的运行数据，是全进化的燃料；全进化生成的代码变更和策略，又反过来增强真自治的决策质量。
 
 **一句话**：真自治让 Cogneva 从一个“被启动的程序”，变成一个“有目标、能协作、会自愈、可持续学习”的自主系统。
 
@@ -72,13 +72,13 @@ Cogneva 的元启动，从一台空白 Linux 机器开始，执行 `bootstrap.sh
 进化不是只能等人下命令。它同时接收：
 
 - **外部意图 / 目标输入**：人类或其他 AI 通过 WebUI、API、GitHub issue/PR/comment 等渠道向系统注入需求、问题与目标；`cog-github` 采集这些外部反馈并汇入全进化反馈回路，使其成为驱动系统进化的外部反馈源。未来 A2A 场景下，任意 AI 智能体均可直接提交进化意图。
-- **系统自发现**：`cog-observability` 持续采集指标、日志、链路追踪；`cog-supervisor` 做健康检查与自动恢复；`cog-reflection` 把 Agent、Tool、Squad、Patch 的运行结果沉淀为 `Learning` / `ErrorEntry` / `SkillOutcome`。当某类错误反复出现、某个技能效果退化、某个模式成熟时，Reflection 会主动生成进化任务。
+- **系统自发现**：`cog-observability` 持续采集指标、日志、链路追踪；`cog-supervisor` 做健康检查与自动恢复；`cog-reflection` 把 Agent、Tool、Squad、代码变更的运行结果沉淀为 `Learning` / `ErrorEntry` / `SkillOutcome`。当某类错误反复出现、某个技能效果退化、某个模式成熟时，Reflection 会主动生成进化任务。
 
 #### 双轨进化
 
 Cogneva 的全进化不是单一通道，而是“源码级进化 + 产物级进化”双轨并行：
 
-- **源码级进化**：作用于开源的引擎框架（MIT），通过 Patch 修改 `.rs` 文件，改算法、改框架、改数据结构。
+- **源码级进化**：作用于开源的引擎框架（MIT），产出针对 `.rs` 文件的代码变更——改算法、改框架、改数据结构。
 - **产物级进化**：作用于私有的策略产物（Protobuf 元策略、阈值、规则、经验库），运行时热替换，不改源码即可改行为。
 
 
@@ -93,9 +93,9 @@ Reflection 沉淀错误/经验并触发进化任务
         ↓
 Orchestrator 统一决策与路由
         ↓
-Collaboration 生成 .patch
+Collaboration 生成变更（.diff）
         ↓
-PatchPipeline 应用 → 测试 → 构建 → 切换
+ChangePipeline 应用 → 测试 → 构建 → 切换
         ↓
 Eval 定量评估进化效果
         ↓
@@ -110,7 +110,7 @@ Reflection / MetaLearning 记录学习
 - **Supervisor 负责“活下去”**：发现故障立即恢复，保证系统持续可用。
 - **Reflection 负责“想明白”**：把分散的运行结果结构化，识别重复模式，决定“要不要改”。
 - **Orchestrator 负责“做决定”**：基于 reflection 的学习输出和 observability 的实时信号，决定是重试、扩容、告警，还是触发代码进化。
-- **Collaboration 负责“生成改动”**：多 Agent 协作生成标准 `.patch`。
+- **Collaboration 负责“生成改动”**：多 Agent 协作产出标准 unified diff（`.diff`）。
 - **Eval 负责“验证效果”**：没有 eval 的进化是盲目的，A/B 对比 + 统计显著性检验确保改动真的更好。
 
 #### 安全与回滚
@@ -419,14 +419,14 @@ Agentic Engineering = 让 Agent 具备自主规划、执行、协作、进化的
 |------|------|
 | L0 单次自审 | 每次 Agent 运行后自动质量检查 |
 | L1 跨会话学习 | 从成功/失败中提取 Skill，写入 Registry |
-| L2 代码进化 | **自动生成 Rust 代码补丁，cargo check 验证通过** |
+| L2 代码进化 | **自动生成 Rust 代码变更，cargo check 验证通过** |
 | L3 元学习 | 自主发现新模式、探索新能力 |
 
 **L2 代码进化的具体流程**：
 1. 检测重复错误模式
 2. LLM 生成改进的 Rust 代码
 3. `cargo check` 编译验证（最多 3 次迭代）
-4. 通过质量门后写入 `evolution-patches/`
+4. 通过质量门后写入 `evolution-changes/`
 5. 通过 `hook_sink`/`tool_sink` channel 实时注册到运行系统
 
 ---

@@ -66,20 +66,20 @@ pub trait ReflectionEngine: Send + Sync + std::fmt::Debug {
         latency_ms: u64,
     ) -> crate::SFResult<()>;
 
-    /// Record the outcome of a generated patch after it has been applied,
+    /// Record the outcome of a generated change after it has been applied,
     /// tested, built, or deployed.
-    async fn record_patch_outcome(
+    async fn record_change_outcome(
         &self,
-        patch_id: &str,
+        change_id: &str,
         success: bool,
         test_output: &str,
     ) -> crate::SFResult<()>;
 }
 
-/// A code patch produced by the collaboration pipeline for self-evolution.
+/// A code change produced by the collaboration pipeline for self-evolution.
 #[derive(Debug, Clone)]
-pub struct GeneratedPatch {
-    pub patch_id: String,
+pub struct GeneratedChange {
+    pub change_id: String,
     pub goal: String,
     pub content: String,
     pub affected_files: Vec<String>,
@@ -88,22 +88,22 @@ pub struct GeneratedPatch {
     pub self_review_score: Option<f32>,
 }
 
-/// Sink for collaboration-generated patches. Implemented by the reflection
+/// Sink for collaboration-generated changes. Implemented by the reflection
 /// layer so that collaboration does not depend on reflection concrete types.
 #[async_trait::async_trait]
-pub trait PatchSink: Send + Sync + std::fmt::Debug {
-    /// Submit a generated patch for persistence and downstream deployment.
+pub trait ChangeSink: Send + Sync + std::fmt::Debug {
+    /// Submit a generated change for persistence and downstream deployment.
     /// Returns the artifact id assigned by the sink.
-    async fn submit_patch(&self, patch: GeneratedPatch) -> crate::SFResult<String>;
+    async fn submit_change(&self, change: GeneratedChange) -> crate::SFResult<String>;
 }
 
-/// Parse a unified diff patch and return the list of files it touches.
+/// Parse a unified diff change and return the list of files it touches.
 ///
 /// Extracts paths from `+++ b/<path>` lines. New files appear as
 /// `+++ b/<path>` with `--- /dev/null`, so this also handles additions.
 /// This is a pure function shared by collaboration (static validation) and
-/// reflection (patch pipeline).
-pub fn parse_patch_affected_files(content: &str) -> crate::SFResult<Vec<String>> {
+/// reflection (change pipeline).
+pub fn parse_diff_affected_files(content: &str) -> crate::SFResult<Vec<String>> {
     let mut files = Vec::new();
 
     for line in content.lines() {
@@ -126,7 +126,7 @@ pub fn parse_patch_affected_files(content: &str) -> crate::SFResult<Vec<String>>
 
     if files.is_empty() {
         return Err(crate::SFError::Validation(
-            "No file paths found in patch (expected '+++ b/<path>' lines)".into(),
+            "No file paths found in change (expected '+++ b/<path>' lines)".into(),
         ));
     }
 

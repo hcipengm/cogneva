@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Summarized view of a single evolution artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvolutionPatchInfo {
+pub struct EvolutionChangeInfo {
     pub id: String,
     pub kind: String,
     pub description: String,
@@ -46,7 +46,7 @@ pub struct PolicyEvalRequest {
 /// Response from an explicit apply request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionApplyResponse {
-    pub patch_id: String,
+    pub change_id: String,
     pub test_passed: bool,
     pub test_output: String,
     pub new_status: String,
@@ -56,7 +56,7 @@ pub struct EvolutionApplyResponse {
 /// Response from an explicit deploy request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionDeployResponse {
-    pub patch_id: String,
+    pub change_id: String,
     pub commit_hash: String,
     pub staged_binary_path: String,
     pub switched: bool,
@@ -67,8 +67,8 @@ pub struct EvolutionDeployResponse {
 pub struct EvolutionMetricsSnapshot {
     pub events_total: u64,
     pub events_failed: u64,
-    pub patches_applied: u64,
-    pub patches_failed: u64,
+    pub changes_applied: u64,
+    pub changes_failed: u64,
 }
 
 /// A single entry in the evolution event stream (artifact lifecycle record).
@@ -134,19 +134,19 @@ pub struct PromotionTrendWeek {
 #[async_trait::async_trait]
 pub trait EvolutionAdmin: Send + Sync {
     /// List all known evolution artifacts (newest first).
-    async fn list_patches(&self) -> crate::SFResult<Vec<EvolutionPatchInfo>>;
+    async fn list_changes(&self) -> crate::SFResult<Vec<EvolutionChangeInfo>>;
 
-    /// Apply a single patch to the working tree and run the test suite.
-    async fn apply_patch(&self, patch_id: &str) -> crate::SFResult<EvolutionApplyResponse>;
+    /// Apply a single change to the working tree and run the test suite.
+    async fn apply_change(&self, change_id: &str) -> crate::SFResult<EvolutionApplyResponse>;
 
-    /// Commit and build a patch, then optionally stage and switch to the new binary.
-    async fn deploy_patch(&self, patch_id: &str) -> crate::SFResult<EvolutionDeployResponse>;
+    /// Commit and build a change, then optionally stage and switch to the new binary.
+    async fn deploy_change(&self, change_id: &str) -> crate::SFResult<EvolutionDeployResponse>;
 
     /// Human-in-the-loop gate release (Phase 3.1/4.3 `manual_approve`):
-    /// approve a patch that passed tests and is held at `AwaitingReview`,
-    /// then commit/build/deploy it. Rejects patches not awaiting review.
+    /// approve a change that passed tests and is held at `AwaitingReview`,
+    /// then commit/build/deploy it. Rejects changes not awaiting review.
     /// Default: not supported by this implementation.
-    async fn approve_patch(&self, _patch_id: &str) -> crate::SFResult<EvolutionDeployResponse> {
+    async fn approve_change(&self, _change_id: &str) -> crate::SFResult<EvolutionDeployResponse> {
         Err(crate::SFError::NotImplemented("evolution approve".into()))
     }
 
@@ -164,12 +164,12 @@ pub trait EvolutionAdmin: Send + Sync {
 
     /// Evaluate an artifact-level policy candidate (产物级进化).
     /// An `Adopt` verdict stages the candidate at `AwaitingReview`;
-    /// `approve_patch` on the returned artifact id hot-swaps the policy.
+    /// `approve_change` on the returned artifact id hot-swaps the policy.
     /// Default: not supported by this implementation.
     async fn evaluate_policy(
         &self,
         _req: PolicyEvalRequest,
-    ) -> crate::SFResult<EvolutionPatchInfo> {
+    ) -> crate::SFResult<EvolutionChangeInfo> {
         Err(crate::SFError::NotImplemented("policy evaluate".into()))
     }
 
@@ -180,7 +180,7 @@ pub trait EvolutionAdmin: Send + Sync {
     }
 
     /// 设置运行时暂停标志：true = 立即停摆自动晋级（排队中的全部转
-    /// 人工，已生效补丁不受影响），false = 恢复。运行时生效，重启后
+    /// 人工，已生效变更不受影响），false = 恢复。运行时生效，重启后
     /// 回落到配置文件值。
     /// Default: not supported by this implementation.
     async fn set_promotion_paused(

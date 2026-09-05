@@ -162,7 +162,7 @@ impl PostgresStateBackend {
             r#"
             CREATE TABLE IF NOT EXISTS cog_evolution_promotions (
                 id TEXT PRIMARY KEY,
-                patch_id TEXT NOT NULL,
+                change_id TEXT NOT NULL,
                 level TEXT NOT NULL,
                 decision_reason TEXT NOT NULL,
                 cluster TEXT NOT NULL,
@@ -182,6 +182,27 @@ impl PostgresStateBackend {
             r#"
             CREATE INDEX IF NOT EXISTS idx_cog_evolution_promotions_updated
             ON cog_evolution_promotions(updated_at DESC)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        // 迁移：旧库台账列名 patch_id → change_id（新库无 patch_id 列，自动跳过）。
+        sqlx::query(
+            r#"
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'cog_evolution_promotions' AND column_name = 'patch_id'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'cog_evolution_promotions' AND column_name = 'change_id'
+                ) THEN
+                    ALTER TABLE cog_evolution_promotions RENAME COLUMN patch_id TO change_id;
+                END IF;
+            END $$;
             "#,
         )
         .execute(&self.pool)
@@ -1038,13 +1059,13 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
         sqlx::query(
             r#"
             INSERT INTO cog_evolution_promotions
-                (id, patch_id, level, decision_reason, cluster, status, outcome, eval_summary, created_at, updated_at)
+                (id, change_id, level, decision_reason, cluster, status, outcome, eval_summary, created_at, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
         .bind(&rec.id)
-        .bind(&rec.patch_id)
+        .bind(&rec.change_id)
         .bind(&rec.level)
         .bind(&rec.decision_reason)
         .bind(&rec.cluster)
@@ -1114,7 +1135,7 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
             chrono::DateTime<Utc>,
         )> = sqlx::query_as(
             r#"
-            SELECT id, patch_id, level, decision_reason, cluster, status, outcome,
+            SELECT id, change_id, level, decision_reason, cluster, status, outcome,
                    eval_summary, created_at, updated_at
             FROM cog_evolution_promotions
             ORDER BY updated_at DESC
@@ -1131,7 +1152,7 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
             .map(
                 |(
                     id,
-                    patch_id,
+                    change_id,
                     level,
                     decision_reason,
                     cluster,
@@ -1143,7 +1164,7 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
                 )| {
                     cog_core::PromotionRecord {
                         id,
-                        patch_id,
+                        change_id,
                         level,
                         decision_reason,
                         cluster,

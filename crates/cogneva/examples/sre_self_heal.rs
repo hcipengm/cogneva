@@ -1,8 +1,8 @@
-//! 示例 4：SRE 自愈 — 沙盒边界探测 + patch 安全校验。
+//! 示例 4：SRE 自愈 — 沙盒边界探测 + change 安全校验。
 //! 运行：`cargo run -p cogneva --example sre_self_heal`
 
 use cog_reflection::sandbox::{detect_sandbox, enforce_sandbox_boundary, SandboxSignals};
-use cog_reflection::PatchPipeline;
+use cog_reflection::ChangePipeline;
 
 fn main() {
     // 1. 探测当前隔离环境
@@ -26,20 +26,20 @@ fn main() {
         effective.auto_apply, effective.auto_deploy
     );
 
-    // 3. 自愈 patch 的安全校验：路径必须在 workspace 内且不触碰受保护文件
-    let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
-    let files = PatchPipeline::parse_patch(patch).expect("valid unified diff");
-    println!("patch affects: {files:?}");
+    // 3. 自愈 change 的安全校验：路径必须在 workspace 内且不触碰受保护文件
+    let change = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+    let files = ChangePipeline::parse_diff(change).expect("valid unified diff");
+    println!("change affects: {files:?}");
 
     let evil = "diff --git a/../../etc/passwd b/../../etc/passwd\n--- a/../../etc/passwd\n+++ b/../../etc/passwd\n@@ -1 +1 @@\n-a\n+b\n";
-    match PatchPipeline::parse_patch(evil) {
+    match ChangePipeline::parse_diff(evil) {
         Ok(files) => {
             let root = std::env::temp_dir();
-            match PatchPipeline::validate_patch_files(&files, &root) {
-                Ok(()) => println!("unexpected: escape patch accepted"),
-                Err(e) => println!("escape patch rejected: {e}"),
+            match ChangePipeline::validate_change_files(&files, &root) {
+                Ok(()) => println!("unexpected: escape change accepted"),
+                Err(e) => println!("escape change rejected: {e}"),
             }
         }
-        Err(e) => println!("malformed patch rejected: {e}"),
+        Err(e) => println!("malformed change rejected: {e}"),
     }
 }

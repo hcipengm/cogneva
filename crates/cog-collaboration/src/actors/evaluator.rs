@@ -96,7 +96,7 @@ impl EvaluatorActor {
             },
         );
 
-        // Self-evolution patch validation: ensure generated artifacts are valid
+        // Self-evolution change validation: ensure generated artifacts are valid
         // unified diffs targeting safe source paths.
         let is_self_evolution = matches!(
             &task.task_type,
@@ -104,20 +104,20 @@ impl EvaluatorActor {
         ) || ctx
             .get("evolution_mode")
             .and_then(|v| v.as_str())
-            .map(|s| s == "generate_patch")
+            .map(|s| s == "generate_change")
             .unwrap_or(false);
 
         // For self-evolution tasks the only thing that matters is whether the
-        // generated patch artifact is a valid unified diff targeting safe paths.
+        // generated change artifact is a valid unified diff targeting safe paths.
         // Reasoning-only models often fail to return structured JSON, and the
         // LLM reformat step can hang for minutes. Use deterministic validation
         // and skip the semantic LLM evaluation entirely for this mode.
         if is_self_evolution {
-            let validation = Self::validate_patch_artifacts(generation);
+            let validation = Self::validate_change_artifacts(generation);
             let (verdict, score) =
-                if validation.starts_with("patch_validation: patch artifact(s) are valid") {
+                if validation.starts_with("change_validation: change artifact(s) are valid") {
                     (Verdict::Pass, 85)
-                } else if validation.contains("no patch artifact found") {
+                } else if validation.contains("no change artifact found") {
                     (Verdict::Fail, 0)
                 } else {
                     (Verdict::Fail, 10)
@@ -127,14 +127,14 @@ impl EvaluatorActor {
                 feedback: validation.clone(),
                 score: Some(score),
                 criteria: vec![Criterion {
-                    name: "patch_validation".into(),
+                    name: "change_validation".into(),
                     score,
                     comment: validation.clone(),
                 }],
                 details: None,
             };
             let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
-            // Self-review for self-evolution is skipped: the deterministic patch
+            // Self-review for self-evolution is skipped: the deterministic change
             // validation already gives a reliable verdict, and reasoning-only
             // models frequently fail structured JSON extraction, causing the
             // reformat step to hang for the full timeout.
@@ -236,45 +236,45 @@ impl EvaluatorActor {
         output
     }
 
-    /// Validate that self-evolution artifacts contain a valid patch.
+    /// Validate that self-evolution artifacts contain a valid change.
     /// Returns a criterion string describing the validation result.
-    fn validate_patch_artifacts(generation: &serde_json::Value) -> String {
+    fn validate_change_artifacts(generation: &serde_json::Value) -> String {
         let artifacts = generation
             .get("artifacts")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
 
-        let patch_artifacts: Vec<&serde_json::Value> = artifacts
+        let change_artifacts: Vec<&serde_json::Value> = artifacts
             .iter()
             .filter(|a| {
-                let is_patch_type = a
+                let is_change_type = a
                     .get("artifact_type")
                     .and_then(|v| v.as_str())
-                    .map(|s| s == "patch")
+                    .map(|s| s == "change")
                     .unwrap_or(false);
-                let is_patch_name = a
+                let is_change_name = a
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_lowercase().ends_with(".patch"))
+                    .map(|s| s.to_lowercase().ends_with(".diff"))
                     .unwrap_or(false);
-                is_patch_type || is_patch_name
+                is_change_type || is_change_name
             })
             .collect();
 
-        if patch_artifacts.is_empty() {
-            return "patch_validation: no patch artifact found (expected artifact_type='patch' or name ending in .patch)".into();
+        if change_artifacts.is_empty() {
+            return "change_validation: no change artifact found (expected artifact_type='change' or name ending in .diff)".into();
         }
 
-        for artifact in patch_artifacts {
+        for artifact in change_artifacts {
             let Some(content) = artifact.get("content").and_then(|v| v.as_str()) else {
-                return "patch_validation: patch artifact has no string content".into();
+                return "change_validation: change artifact has no string content".into();
             };
 
-            let files = match cog_core::parse_patch_affected_files(content) {
+            let files = match cog_core::parse_diff_affected_files(content) {
                 Ok(f) => f,
                 Err(e) => {
-                    return format!("patch_validation: failed to parse unified diff: {}", e);
+                    return format!("change_validation: failed to parse unified diff: {}", e);
                 }
             };
 
@@ -284,17 +284,17 @@ impl EvaluatorActor {
                     .components()
                     .any(|c| matches!(c, std::path::Component::ParentDir))
                 {
-                    return format!("patch_validation: path escapes project root: {}", file);
+                    return format!("change_validation: path escapes project root: {}", file);
                 }
                 if path.is_absolute() {
-                    return format!("patch_validation: absolute path not allowed: {}", file);
+                    return format!("change_validation: absolute path not allowed: {}", file);
                 }
                 if !path.to_string_lossy().replace('\\', "/").contains("/src/") {
-                    return format!("patch_validation: target must be under src/: {}", file);
+                    return format!("change_validation: target must be under src/: {}", file);
                 }
             }
         }
 
-        "patch_validation: patch artifact(s) are valid unified diffs targeting src/".into()
+        "change_validation: change artifact(s) are valid unified diffs targeting src/".into()
     }
 }

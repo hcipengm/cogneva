@@ -84,7 +84,7 @@ pub struct CreateTaskRequest {
 #[derive(Debug, Deserialize)]
 pub struct TaskItem {
     pub id: String,
-    /// Task type. Use "self_evolution" to trigger the collaborative patch
+    /// Task type. Use "self_evolution" to trigger the collaborative change
     /// generation and auto-deploy pipeline.
     pub task_type: String,
     pub input: serde_json::Value,

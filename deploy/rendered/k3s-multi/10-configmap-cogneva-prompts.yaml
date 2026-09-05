@@ -152,7 +152,7 @@ data:
         tags: ["reflection", "evolution"]
         active: true
     
-      reflection:evolution_patch:
+      reflection:evolution_change:
         content: |
           You are an expert Rust engineer improving an AI agent system.
     
@@ -162,19 +162,20 @@ data:
           Requirement:
           {{ module_description }}
     
-          Generate a Rust code patch (or a complete small module) that
+          Generate a Rust code change (or a complete small module) that
           addresses the requirement. Output the result as a Markdown code block
           with the filename as the header.
         version: "1.0.0"
-        description: "EvolutionEngine code patch generation prompt"
+        description: "EvolutionEngine code change generation prompt"
         tags: ["reflection", "evolution"]
         active: true
     
-      reflection:evolution_patch_system:
+      reflection:evolution_change_system:
         content: |
-          Respond with a Markdown code block containing the patch.
+          Respond with a Markdown code block containing the code change as a
+          unified git diff.
         version: "1.0.0"
-        description: "EvolutionEngine patch system instruction"
+        description: "EvolutionEngine change system instruction"
         tags: ["reflection", "evolution"]
         active: true
     

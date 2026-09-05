@@ -108,31 +108,31 @@ impl GeneratorActor {
             },
         );
 
-        // Inject self-evolution patch-generation instructions when requested.
+        // Inject self-evolution change-generation instructions when requested.
         let is_self_evolution = matches!(
             &task.task_type,
             cog_core::TaskType::Custom(s) if s == "self_evolution"
         ) || ctx
             .get("evolution_mode")
             .and_then(|v| v.as_str())
-            .map(|s| s == "generate_patch")
+            .map(|s| s == "generate_change")
             .unwrap_or(false);
 
         if is_self_evolution {
-            ctx["patch_generation"] = serde_json::json!({
+            ctx["change_generation"] = serde_json::json!({
                 "output_format": "unified_diff",
                 "response_format": "json",
                 "schema": {
                     "content": "string: concise summary of the change",
                     "artifacts": [
                         {
-                            "artifact_type": "patch",
-                            "name": "changes.patch",
+                            "artifact_type": "change",
+                            "name": "changes.diff",
                             "content": "valid git unified diff starting with 'diff --git'"
                         }
                     ]
                 },
-                "artifact_instructions": "Output the code change as a single artifact with artifact_type='patch', name='changes.patch', content being a valid git unified diff starting with 'diff --git'. Do not wrap in markdown fences. This is a Rust workspace; include only source file modifications under src/ directories within crates/**/*.rs."
+                "artifact_instructions": "Output the code change as a single artifact with artifact_type='change', name='changes.diff', content being a valid git unified diff starting with 'diff --git'. Do not wrap in markdown fences. This is a Rust workspace; include only source file modifications under src/ directories within crates/**/*.rs."
             });
         } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
             // Built-in contract for standard execution. Lowest precedence:
@@ -211,10 +211,10 @@ impl GeneratorActor {
             }
         };
         let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
-        // Skip self-review for self-evolution patch generation. Reasoning-only
+        // Skip self-review for self-evolution change generation. Reasoning-only
         // models often return natural-language explanations instead of strict
         // JSON, so the self-review reformat step can hang for the full timeout
-        // without adding value once the patch has been extracted.
+        // without adding value once the change has been extracted.
         if !is_self_evolution {
             if let Some(revised) = crate::actors::maybe_self_review(
                 self.agent.as_ref(),

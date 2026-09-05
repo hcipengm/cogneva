@@ -140,9 +140,9 @@ impl GitHubDiscoveryLoop {
         }
     }
 
-    /// Register a PR created for a patch so its outcome is recorded.
-    pub fn track_pr(&mut self, pr_number: u64, patch_id: impl Into<String>) {
-        self.recorder.track(pr_number, patch_id);
+    /// Register a PR created for a change so its outcome is recorded.
+    pub fn track_pr(&mut self, pr_number: u64, change_id: impl Into<String>) {
+        self.recorder.track(pr_number, change_id);
     }
 
     /// Run one discovery round. Returns the number of issues scanned.
@@ -382,7 +382,7 @@ impl GitHubDiscoveryLoop {
                         "log_tail": l.log_tail,
                     }))
                     .collect::<Vec<_>>(),
-                "evolution_mode": "generate_patch",
+                "evolution_mode": "generate_change",
             }),
         );
 
@@ -835,7 +835,7 @@ impl GitHubDiscoveryLoop {
                 "issue_labels": issue.labels,
                 "issue_url": format!("https://github.com/{}/issues/{}", self.config.repo, issue.number),
                 "conversation": history,
-                "evolution_mode": "generate_patch",
+                "evolution_mode": "generate_change",
             }),
         );
 
@@ -932,7 +932,7 @@ impl GitHubDiscoveryLoop {
                 "pr_body": pr.body,
                 "pr_labels": pr.labels,
                 "pr_url": pr.url,
-                "evolution_mode": "generate_patch",
+                "evolution_mode": "generate_change",
             }),
         );
 

@@ -130,8 +130,9 @@ pub struct GatewayState {
     pub eval_service: Option<Arc<dyn cog_core::EvalService>>,
     /// Evolution admin service — manual control over the self-evolution pipeline.
     pub evolution_admin: Option<Arc<dyn cog_core::EvolutionAdmin>>,
-    /// 补丁行变更广播（接管台 SSE `/api/v1/evolution/stream` 订阅源）。
-    pub evolution_stream: Option<Arc<tokio::sync::broadcast::Sender<cog_core::EvolutionPatchInfo>>>,
+    /// 变更行状态广播（接管台 SSE `/api/v1/evolution/stream` 订阅源）。
+    pub evolution_stream:
+        Option<Arc<tokio::sync::broadcast::Sender<cog_core::EvolutionChangeInfo>>>,
     /// 不可篡改审计流（审计 3.5/3.6）：配额执法等安全事件写入哈希链。
     pub audit_stream: Option<Arc<dyn cog_core::AuditStream>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
@@ -432,20 +433,20 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(eval_get_report_handler),
         )
         .route(
-            "/api/v1/evolution/patches",
-            get(evolution::list_patches_handler),
+            "/api/v1/evolution/changes",
+            get(evolution::list_changes_handler),
         )
         .route(
-            "/api/v1/evolution/patches/{id}/apply",
-            post(evolution::apply_patch_handler),
+            "/api/v1/evolution/changes/{id}/apply",
+            post(evolution::apply_change_handler),
         )
         .route(
-            "/api/v1/evolution/patches/{id}/deploy",
-            post(evolution::deploy_patch_handler),
+            "/api/v1/evolution/changes/{id}/deploy",
+            post(evolution::deploy_change_handler),
         )
         .route(
-            "/api/v1/evolution/patches/{id}/approve",
-            post(evolution::approve_patch_handler),
+            "/api/v1/evolution/changes/{id}/approve",
+            post(evolution::approve_change_handler),
         )
         .route(
             "/api/v1/evolution/policies/evaluate",

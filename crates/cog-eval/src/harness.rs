@@ -1,5 +1,5 @@
 //! 回归测试 harness — CI 集成。
-//! 在 `cargo test` 时自动运行 eval，进化 patch 不通过就拒掉。
+//! 在 `cargo test` 时自动运行 eval，进化 change 不通过就拒掉。
 
 use crate::comparator::AbComparator;
 use crate::dataset::EvalDataset;

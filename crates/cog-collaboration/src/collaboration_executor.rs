@@ -20,7 +20,7 @@ pub struct CollaborationExecutor {
     squad_reflection: Option<Arc<dyn cog_core::SquadReflection>>,
     boundary_config: Option<crate::BoundaryConfig>,
     knowledge_backend: Option<Arc<dyn cog_core::KnowledgeBackend>>,
-    patch_sinks: Vec<Arc<dyn cog_core::PatchSink>>,
+    change_sinks: Vec<Arc<dyn cog_core::ChangeSink>>,
     reflection_engine: Option<Arc<dyn cog_core::ReflectionEngine>>,
     self_review: Option<cog_core::SelfReviewConfig>,
     pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
@@ -39,7 +39,7 @@ impl CollaborationExecutor {
             squad_reflection: None,
             boundary_config: None,
             knowledge_backend: None,
-            patch_sinks: Vec::new(),
+            change_sinks: Vec::new(),
             reflection_engine: None,
             self_review: None,
             pge_schemas: None,
@@ -96,15 +96,15 @@ impl CollaborationExecutor {
         self
     }
 
-    /// Attach a patch sink for self-evolution generated patches.
-    /// Additive: every attached sink receives every generated patch
+    /// Attach a change sink for self-evolution generated changes.
+    /// Additive: every attached sink receives every generated change
     /// (e.g. EvolutionEngine approval console + GitHub PR publisher).
-    pub fn with_patch_sink(mut self, sink: Arc<dyn cog_core::PatchSink>) -> Self {
-        self.patch_sinks.push(sink);
+    pub fn with_change_sink(mut self, sink: Arc<dyn cog_core::ChangeSink>) -> Self {
+        self.change_sinks.push(sink);
         self
     }
 
-    /// Attach a reflection engine to record squad/patch outcomes.
+    /// Attach a reflection engine to record squad/change outcomes.
     pub fn with_reflection_engine(mut self, engine: Arc<dyn cog_core::ReflectionEngine>) -> Self {
         self.reflection_engine = Some(engine);
         self
@@ -199,7 +199,7 @@ impl CollaborationExecutor {
     /// JSON object: `{decision, question, priority, reason}` with
     /// `decision ∈ fix|clarify|skip|escalate`. The verdict rides back on the task
     /// result; cog-github acts on it (submit the heavy PGE fix task / ask exactly
-    /// one clarification / skip / escalate). This task produces no patch and never
+    /// one clarification / skip / escalate). This task produces no change and never
     /// enters the self-evolution pipeline.
     async fn execute_intent_assess(&self, task: &Task) -> SFResult<TaskResult> {
         let (Some(ref manager), Some(ref llm)) = (&self.agent_manager, &self.llm_provider) else {
@@ -621,27 +621,27 @@ impl CollaborationExecutor {
         let execution_output = Self::extract_execution_result(&result);
         let score = Self::extract_score(&result);
 
-        // If this is a self-evolution task, extract generated patches and
-        // hand them to every PatchSink (fan-out).
-        let mut patch_ids = Vec::new();
+        // If this is a self-evolution task, extract generated changes and
+        // hand them to every ChangeSink (fan-out).
+        let mut change_ids = Vec::new();
         if is_self_evolution {
-            if self.patch_sinks.is_empty() {
+            if self.change_sinks.is_empty() {
                 tracing::warn!(
                     task_id=%task.id,
-                    "Self-evolution task succeeded but no PatchSink is configured"
+                    "Self-evolution task succeeded but no ChangeSink is configured"
                 );
             } else {
-                let patches =
-                    Self::extract_patches(&result, &goal, &Self::pge_mode_str(&result.pge_mode));
-                for patch in patches {
-                    for sink in &self.patch_sinks {
-                        match sink.submit_patch(patch.clone()).await {
+                let changes =
+                    Self::extract_changes(&result, &goal, &Self::pge_mode_str(&result.pge_mode));
+                for change in changes {
+                    for sink in &self.change_sinks {
+                        match sink.submit_change(change.clone()).await {
                             Ok(artifact_id) => {
-                                info!(task_id=%task.id, %artifact_id, "Submitted generated patch");
-                                patch_ids.push(artifact_id);
+                                info!(task_id=%task.id, %artifact_id, "Submitted generated change");
+                                change_ids.push(artifact_id);
                             }
                             Err(e) => {
-                                tracing::warn!(task_id=%task.id, error=%e, "Failed to submit generated patch");
+                                tracing::warn!(task_id=%task.id, error=%e, "Failed to submit generated change");
                             }
                         }
                     }
@@ -649,7 +649,7 @@ impl CollaborationExecutor {
             }
         }
 
-        let output = if patch_ids.is_empty() {
+        let output = if change_ids.is_empty() {
             serde_json::json!({
                 "execution_result": execution_output,
                 "squad_result": &result,
@@ -658,7 +658,7 @@ impl CollaborationExecutor {
             serde_json::json!({
                 "execution_result": execution_output,
                 "squad_result": &result,
-                "patch_ids": patch_ids,
+                "change_ids": change_ids,
             })
         };
 
@@ -693,12 +693,12 @@ impl CollaborationExecutor {
 
     fn is_self_evolution_task(task: &Task) -> bool {
         // Explicit self-evolution task type, or any task that opts into the
-        // patch-generation flow via the evolution_mode marker in its input
+        // change-generation flow via the evolution_mode marker in its input
         // (e.g. github_ci_fix / github_issue_fix from the GitHub integration).
         matches!(
             &task.task_type,
             TaskType::Custom(s) if s == "self_evolution"
-        ) || task.input.get("evolution_mode").and_then(|v| v.as_str()) == Some("generate_patch")
+        ) || task.input.get("evolution_mode").and_then(|v| v.as_str()) == Some("generate_change")
     }
 
     fn pge_mode_str(mode: &crate::profile::PgeMode) -> String {
@@ -710,23 +710,23 @@ impl CollaborationExecutor {
 
     fn build_self_evolution_context(mut base: serde_json::Value, goal: &str) -> serde_json::Value {
         // Only mark the mode; generator/evaluator add their own role-specific
-        // schemas. Putting detailed patch instructions here leaks into the
+        // schemas. Putting detailed change instructions here leaks into the
         // planner and makes it emit XML/artifact markup instead of a plan.
-        base["evolution_mode"] = serde_json::json!("generate_patch");
+        base["evolution_mode"] = serde_json::json!("generate_change");
         if base.get("goal").is_none() {
             base["goal"] = serde_json::json!(goal);
         }
         base
     }
 
-    fn extract_patches(
+    fn extract_changes(
         squad_result: &crate::squad::SquadResult,
         goal: &str,
         pge_mode: &str,
-    ) -> Vec<cog_core::GeneratedPatch> {
-        let mut patches = Vec::new();
+    ) -> Vec<cog_core::GeneratedChange> {
+        let mut changes = Vec::new();
         let Some(ref result_val) = squad_result.result else {
-            return patches;
+            return changes;
         };
 
         let artifacts: Vec<crate::squad::pge::types::Artifact> = if let Ok(pipeline) =
@@ -742,26 +742,26 @@ impl CollaborationExecutor {
         };
 
         for artifact in artifacts {
-            let is_patch = artifact.artifact_type == "patch"
-                || artifact.name.to_lowercase().ends_with(".patch");
-            if !is_patch {
+            let is_change = artifact.artifact_type == "change"
+                || artifact.name.to_lowercase().ends_with(".diff");
+            if !is_change {
                 continue;
             }
 
-            let affected_files = match cog_core::parse_patch_affected_files(&artifact.content) {
+            let affected_files = match cog_core::parse_diff_affected_files(&artifact.content) {
                 Ok(files) => files,
                 Err(e) => {
                     tracing::warn!(
                         artifact=%artifact.name,
                         error=%e,
-                        "Generated patch artifact does not look like a valid unified diff"
+                        "Generated change artifact does not look like a valid unified diff"
                     );
                     Vec::new()
                 }
             };
 
-            patches.push(cog_core::GeneratedPatch {
-                patch_id: artifact.name.clone(),
+            changes.push(cog_core::GeneratedChange {
+                change_id: artifact.name.clone(),
                 goal: goal.into(),
                 content: artifact.content,
                 affected_files,
@@ -771,7 +771,7 @@ impl CollaborationExecutor {
             });
         }
 
-        patches
+        changes
     }
 
     fn extract_score(squad_result: &crate::squad::SquadResult) -> Option<f64> {
@@ -894,11 +894,11 @@ mod tests {
     }
 
     #[test]
-    fn evolution_mode_marker_routes_to_patch_flow() {
+    fn evolution_mode_marker_routes_to_change_flow() {
         let task = Task::new(
             "t2",
             TaskType::Custom("github_ci_fix".into()),
-            serde_json::json!({"evolution_mode": "generate_patch"}),
+            serde_json::json!({"evolution_mode": "generate_change"}),
         );
         assert!(CollaborationExecutor::is_self_evolution_task(&task));
     }

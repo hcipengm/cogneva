@@ -26,7 +26,7 @@ pub trait CodePlatformProvider: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Create a pull request from a patch description.
+    /// Create a pull request from a change description.
     async fn create_pull_request(&self, req: CreatePullRequest) -> Result<PlatformPullRequest>;
 
     /// Post a comment on an issue.

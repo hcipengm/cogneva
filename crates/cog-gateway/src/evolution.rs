@@ -14,10 +14,10 @@ use serde_json::json;
 use std::sync::Arc;
 
 /// List all known evolution artifacts.
-pub async fn list_patches_handler(State(state): State<Arc<crate::GatewayState>>) -> Response {
+pub async fn list_changes_handler(State(state): State<Arc<crate::GatewayState>>) -> Response {
     match state.evolution_admin {
-        Some(ref admin) => match admin.list_patches().await {
-            Ok(patches) => (StatusCode::OK, Json(json!({ "patches": patches }))).into_response(),
+        Some(ref admin) => match admin.list_changes().await {
+            Ok(changes) => (StatusCode::OK, Json(json!({ "changes": changes }))).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "list_failed", "message": e.to_string()})),
@@ -32,13 +32,13 @@ pub async fn list_patches_handler(State(state): State<Arc<crate::GatewayState>>)
     }
 }
 
-/// Apply a single patch and run the workspace test suite.
-pub async fn apply_patch_handler(
+/// Apply a single change and run the workspace test suite.
+pub async fn apply_change_handler(
     State(state): State<Arc<crate::GatewayState>>,
-    Path(patch_id): Path<String>,
+    Path(change_id): Path<String>,
 ) -> Response {
     match state.evolution_admin {
-        Some(ref admin) => match admin.apply_patch(&patch_id).await {
+        Some(ref admin) => match admin.apply_change(&change_id).await {
             Ok(result) => (StatusCode::OK, Json(result)).into_response(),
             Err(e) => (
                 StatusCode::BAD_REQUEST,
@@ -56,7 +56,7 @@ pub async fn apply_patch_handler(
 
 /// Evaluate an artifact-level policy candidate (产物级进化 §14.3).
 /// An Adopt verdict stages the candidate at AwaitingReview; approving the
-/// returned patch id hot-swaps the policy version.
+/// returned change id hot-swaps the policy version.
 pub async fn evaluate_policy_handler(
     State(state): State<Arc<crate::GatewayState>>,
     Json(req): Json<cog_core::PolicyEvalRequest>,
@@ -78,14 +78,14 @@ pub async fn evaluate_policy_handler(
     }
 }
 
-/// Approve a patch held at AwaitingReview (manual_approve human gate),
+/// Approve a change held at AwaitingReview (manual_approve human gate),
 /// then commit, build, and optionally switch to it.
-pub async fn approve_patch_handler(
+pub async fn approve_change_handler(
     State(state): State<Arc<crate::GatewayState>>,
-    Path(patch_id): Path<String>,
+    Path(change_id): Path<String>,
 ) -> Response {
     match state.evolution_admin {
-        Some(ref admin) => match admin.approve_patch(&patch_id).await {
+        Some(ref admin) => match admin.approve_change(&change_id).await {
             Ok(result) => (StatusCode::OK, Json(result)).into_response(),
             Err(e) => (
                 StatusCode::BAD_REQUEST,
@@ -101,13 +101,13 @@ pub async fn approve_patch_handler(
     }
 }
 
-/// Commit, build, and optionally switch to a patch.
-pub async fn deploy_patch_handler(
+/// Commit, build, and optionally switch to a change.
+pub async fn deploy_change_handler(
     State(state): State<Arc<crate::GatewayState>>,
-    Path(patch_id): Path<String>,
+    Path(change_id): Path<String>,
 ) -> Response {
     match state.evolution_admin {
-        Some(ref admin) => match admin.deploy_patch(&patch_id).await {
+        Some(ref admin) => match admin.deploy_change(&change_id).await {
             Ok(result) => (StatusCode::OK, Json(result)).into_response(),
             Err(e) => (
                 StatusCode::BAD_REQUEST,
@@ -128,8 +128,8 @@ pub async fn metrics_handler(State(state): State<Arc<crate::GatewayState>>) -> R
     let mut snapshot = EvolutionMetricsSnapshot {
         events_total: 0,
         events_failed: 0,
-        patches_applied: 0,
-        patches_failed: 0,
+        changes_applied: 0,
+        changes_failed: 0,
     };
 
     for observable in &state.observables {
@@ -139,10 +139,10 @@ pub async fn metrics_handler(State(state): State<Arc<crate::GatewayState>>) -> R
                     match m.name.as_str() {
                         "evolution_event_total" => snapshot.events_total = m.value as u64,
                         "evolution_event_failed_total" => snapshot.events_failed = m.value as u64,
-                        "evolution_patch_applied_total" => {
-                            snapshot.patches_applied = m.value as u64
+                        "evolution_change_applied_total" => {
+                            snapshot.changes_applied = m.value as u64
                         }
-                        "evolution_patch_failed_total" => snapshot.patches_failed = m.value as u64,
+                        "evolution_change_failed_total" => snapshot.changes_failed = m.value as u64,
                         _ => {}
                     }
                 }
@@ -156,11 +156,11 @@ pub async fn metrics_handler(State(state): State<Arc<crate::GatewayState>>) -> R
     (StatusCode::OK, Json(snapshot)).into_response()
 }
 
-/// SSE stream of patch-row changes for the takeover console.
+/// SSE stream of change-row changes for the takeover console.
 ///
 /// `EventSource` cannot set headers, so the JWT is accepted via the `token`
 /// query parameter (same convention as `/ws`); the Authorization header is
-/// also honored. Emits one JSON-encoded `EvolutionPatchInfo` per event.
+/// also honored. Emits one JSON-encoded `EvolutionChangeInfo` per event.
 pub async fn stream_handler(
     State(state): State<Arc<crate::GatewayState>>,
     req: axum::extract::Request,

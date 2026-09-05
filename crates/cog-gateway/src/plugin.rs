@@ -145,7 +145,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         let evolution_admin: Option<Arc<dyn cog_core::EvolutionAdmin>> =
             ctx.consume_service::<dyn cog_core::EvolutionAdmin>();
         let evolution_stream =
-            ctx.consume::<tokio::sync::broadcast::Sender<cog_core::EvolutionPatchInfo>>();
+            ctx.consume::<tokio::sync::broadcast::Sender<cog_core::EvolutionChangeInfo>>();
         let audit_stream: Option<Arc<dyn cog_core::AuditStream>> =
             ctx.consume_service::<dyn cog_core::AuditStream>();
 

@@ -20,14 +20,14 @@ fn demo_chain() -> Vec<AuditEvent> {
         events.push(AuditEvent::next(prev, kind, actor, target, action, detail));
     };
     push(
-        AuditKind::PatchOperation,
+        AuditKind::ChangeOperation,
         "reflection-engine",
         "policy:demo.sla_policy",
         "policy.genesis",
         serde_json::json!({"version": "v1", "max_retries": 3, "timeout_secs": 30}),
     );
     push(
-        AuditKind::PatchOperation,
+        AuditKind::ChangeOperation,
         "reflection-engine",
         "policy:demo.sla_policy",
         "policy.evaluate",
@@ -44,7 +44,7 @@ fn demo_chain() -> Vec<AuditEvent> {
         AuditKind::Authz,
         "admin",
         "policy:demo.sla_policy",
-        "patch.approve",
+        "change.approve",
         serde_json::json!({"version": "v3", "switched": true, "via": "takeover-console"}),
     );
     events

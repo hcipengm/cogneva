@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! IssueDiscovery → IssueTriage → IssueConversation → Task
-//!   → (Collaboration generates patch) → PrPublisher → MergeDecider
+//!   → (Collaboration generates change) → PrPublisher → MergeDecider
 //!   → OutcomeRecorder → ReflectionEngine
 //! ```
 //!
@@ -35,7 +35,7 @@ pub use discovery::IssueDiscovery;
 pub use discovery_loop::GitHubDiscoveryLoop;
 pub use merge_decider::{MergeDecider, MergeDecision};
 pub use outcome_recorder::OutcomeRecorder;
-pub use pr_publisher::{GitHubPatchSink, GitHubPrPublisher};
+pub use pr_publisher::{GitHubChangeSink, GitHubPrPublisher};
 pub use provider::gitee::GiteeProvider;
 pub use provider::github::GitHubProvider;
 pub use provider::{

@@ -3,7 +3,7 @@
 //! 核心思想：追加式哈希链。每条 [`AuditEvent`] 携带前一条记录的哈希，
 //! 任何对历史记录的篡改、删除或重排都会破坏链式校验（[`verify_chain`]）。
 //!
-//! - Agent 决策、Hook 触发、patch 操作统一抽象为 [`AuditKind`]
+//! - Agent 决策、Hook 触发、change 操作统一抽象为 [`AuditKind`]
 //! - 存储后端实现 [`AuditStream`]；`cog-storage` 提供文件追加实现，
 //!   其他后端（PG/远程 SIEM）可实现同一 trait
 
@@ -18,8 +18,9 @@ pub enum AuditKind {
     AgentDecision,
     /// Hook 触发
     HookTrigger,
-    /// 自进化 patch 操作（apply/test/commit/deploy/rollback/approve）
-    PatchOperation,
+    /// 自进化 change 操作（apply/test/commit/deploy/rollback/approve）
+    #[serde(alias = "patch_operation")]
+    ChangeOperation,
     /// 配额执法（拒绝/扣减）
     QuotaEnforcement,
     /// 认证/授权事件（登录、权限拒绝）
@@ -37,9 +38,9 @@ pub struct AuditEvent {
     pub kind: AuditKind,
     /// 操作主体（agent id / user id / "system"）。
     pub actor: String,
-    /// 关联对象（task id / patch id / hook id）。
+    /// 关联对象（task id / change id / hook id）。
     pub target: String,
-    /// 动作描述（如 "patch.apply"、"hook.pre_prompt"）。
+    /// 动作描述（如 "change.apply"、"hook.pre_prompt"）。
     pub action: String,
     /// 结构化详情（禁止包含密钥；写入前应经 `redact_secrets` 处理）。
     pub detail: serde_json::Value,
@@ -161,10 +162,10 @@ mod tests {
             let prev = events.last();
             events.push(AuditEvent::next(
                 prev,
-                AuditKind::PatchOperation,
+                AuditKind::ChangeOperation,
                 "system",
-                format!("patch-{i}"),
-                "patch.apply",
+                format!("change-{i}"),
+                "change.apply",
                 serde_json::json!({"i": i}),
             ));
         }

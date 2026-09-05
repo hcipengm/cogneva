@@ -1,8 +1,8 @@
 //! GitOps 推送端。
 //!
 //! 晋级放行后把沙盒工作区当前 HEAD 推到中央仓库 release 分支，
-//! 并打 `promote/<patch_id>` annotated tag（tag message 带审计元数据：
-//! patch_id、级别、eval 摘要）。各集群拉取端 poll 该分支各自金丝雀。
+//! 并打 `promote/<change_id>` annotated tag（tag message 带审计元数据：
+//! change_id、级别、eval 摘要）。各集群拉取端 poll 该分支各自金丝雀。
 //!
 //! 安全边界：本模块只跟 Git 中央仓库说话（三仓库同步既有通道），
 //! 全程不持有、不使用任何集群凭证（kubeconfig / API token）。
@@ -24,10 +24,10 @@ use tracing::info;
 use crate::auto_promoter::PromotionChannel;
 use crate::types::EvolutionResult;
 
-/// patch_id 只保留 [A-Za-z0-9-_]，其余替换为 '-'（git ref / 镜像 tag
+/// change_id 只保留 [A-Za-z0-9-_]，其余替换为 '-'（git ref / 镜像 tag
 /// 合法字符白名单，防注入）。
-fn sanitize(patch_id: &str) -> String {
-    patch_id
+fn sanitize(change_id: &str) -> String {
+    change_id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -83,22 +83,22 @@ impl GitOpsPublisher {
 
     /// 推送当前 HEAD 到 release 分支 + 打 promote tag。
     /// 返回 HEAD commit hash。
-    async fn publish(&self, patch: &EvolutionResult, level: &str) -> SFResult<String> {
+    async fn publish(&self, change: &EvolutionResult, level: &str) -> SFResult<String> {
         if self.config.repo_url.is_empty() {
             return Err(SFError::Config(
                 "gitops.repo_url 未配置，无法推送晋级产物".into(),
             ));
         }
         let head = self.git(&["rev-parse", "HEAD"]).await?;
-        let tag = format!("promote/{}", sanitize(&patch.artifact_id));
+        let tag = format!("promote/{}", sanitize(&change.artifact_id));
         let msg = format!(
-            "patch_id={}\nlevel={}\neval={}",
-            patch.artifact_id,
+            "change_id={}\nlevel={}\neval={}",
+            change.artifact_id,
             level,
-            patch.eval_summary.as_deref().unwrap_or("none")
+            change.eval_summary.as_deref().unwrap_or("none")
         );
 
-        // promote tag 是指针性质，重推同 patch 允许 -f 覆盖。
+        // promote tag 是指针性质，重推同 change 允许 -f 覆盖。
         self.git(&["tag", "-a", "-f", "-m", &msg, &tag, &head])
             .await?;
 
@@ -118,16 +118,16 @@ impl GitOpsPublisher {
         .await?;
 
         info!(
-            patch_id = %patch.artifact_id,
+            change_id = %change.artifact_id,
             level,
             commit = %head,
             branch = %self.config.branch,
-            "Promoted patch published to GitOps release branch"
+            "Promoted change published to GitOps release branch"
         );
 
         // 只有 L1 镜像晋级需要产物镜像；L0 配置晋级走热更/ apply，不打镜像。
         if level == "l1_rollout" {
-            self.publish_image(&patch.artifact_id).await?;
+            self.publish_image(&change.artifact_id).await?;
         }
 
         Ok(head)
@@ -136,7 +136,7 @@ impl GitOpsPublisher {
     /// buildah 打最小 overlay 镜像（cogneva 基镜像 + 沙盒编译二进制）并推仓库。
     /// 基镜像必须是正式 cogneva 镜像（WebUI/skills/migrations/动态库齐全），
     /// overlay 只替换 /opt/cogneva/cogneva 一个层。
-    async fn publish_image(&self, patch_id: &str) -> SFResult<()> {
+    async fn publish_image(&self, change_id: &str) -> SFResult<()> {
         let binary = self.binary_dir.join("cogneva");
         if !binary.exists() {
             return Err(SFError::IO(format!(
@@ -156,7 +156,7 @@ impl GitOpsPublisher {
                 true,
             ),
         };
-        let tag = format!("cogneva:promote-{}", sanitize(patch_id));
+        let tag = format!("cogneva:promote-{}", sanitize(change_id));
         let image = format!("{endpoint}/{tag}");
         let base = format!("{endpoint}/cogneva:local");
         let containerfile = self.binary_dir.join("Containerfile.promote");
@@ -212,12 +212,12 @@ impl GitOpsPublisher {
 
 #[async_trait]
 impl PromotionChannel for GitOpsPublisher {
-    async fn publish_config(&self, patch: &EvolutionResult) -> SFResult<String> {
-        self.publish(patch, "l0_config").await
+    async fn publish_config(&self, change: &EvolutionResult) -> SFResult<String> {
+        self.publish(change, "l0_config").await
     }
 
-    async fn publish_rollout(&self, patch: &EvolutionResult) -> SFResult<String> {
-        self.publish(patch, "l1_rollout").await
+    async fn publish_rollout(&self, change: &EvolutionResult) -> SFResult<String> {
+        self.publish(change, "l1_rollout").await
     }
 }
 
@@ -287,9 +287,9 @@ mod tests {
         )
     }
 
-    fn patch(id: &str) -> EvolutionResult {
+    fn change(id: &str) -> EvolutionResult {
         EvolutionResult {
-            kind: crate::types::EvolutionKind::CodePatch,
+            kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: id.into(),
             description: "test".into(),
             content: String::new(),
@@ -305,7 +305,7 @@ mod tests {
         let publisher = l1_publisher(central.path(), work.path());
 
         let head = publisher
-            .publish(&patch("p-1"), "l1_rollout")
+            .publish(&change("p-1"), "l1_rollout")
             .await
             .unwrap();
 
@@ -319,7 +319,7 @@ mod tests {
             &["tag", "-l", "--format=%(contents)", "promote/p-1"],
         )
         .await;
-        assert!(tag_msg.contains("patch_id=p-1"), "{tag_msg}");
+        assert!(tag_msg.contains("change_id=p-1"), "{tag_msg}");
         assert!(tag_msg.contains("level=l1_rollout"), "{tag_msg}");
         assert!(tag_msg.contains("eval=Adopt z=2.0"), "{tag_msg}");
 
@@ -340,7 +340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_sanitizes_patch_id_in_tag() {
+    async fn publish_sanitizes_change_id_in_tag() {
         let (central, work) = setup_repo().await;
         let publisher = GitOpsPublisher::new(
             GitOpsConfig {
@@ -351,7 +351,7 @@ mod tests {
             work.path(),
         );
         publisher
-            .publish(&patch("p/1; rm -rf"), "l0_config")
+            .publish(&change("p/1; rm -rf"), "l0_config")
             .await
             .unwrap();
         let tags = git(central.path(), &["tag", "-l"]).await;
@@ -363,7 +363,7 @@ mod tests {
         let (central, work) = setup_repo().await;
         let publisher = l1_publisher(central.path(), work.path());
         publisher
-            .publish(&patch("p-1"), "l1_rollout")
+            .publish(&change("p-1"), "l1_rollout")
             .await
             .unwrap();
 
@@ -374,7 +374,7 @@ mod tests {
         git(work.path(), &["commit", "-m", "second"]).await;
 
         publisher
-            .publish(&patch("p-2"), "l1_rollout")
+            .publish(&change("p-2"), "l1_rollout")
             .await
             .unwrap();
         let log = git(central.path(), &["log", "--format=%s", "evolution-release"]).await;
@@ -385,7 +385,7 @@ mod tests {
     async fn empty_repo_url_rejected() {
         let (_central, work) = setup_repo().await;
         let publisher = GitOpsPublisher::new(GitOpsConfig::default(), work.path(), work.path());
-        let err = publisher.publish(&patch("p-1"), "l1_rollout").await;
+        let err = publisher.publish(&change("p-1"), "l1_rollout").await;
         assert!(err.is_err());
     }
 
@@ -400,7 +400,7 @@ mod tests {
             work.path(),
             work.path(),
         );
-        PromotionChannel::publish_config(&publisher, &patch("cfg-1"))
+        PromotionChannel::publish_config(&publisher, &change("cfg-1"))
             .await
             .unwrap();
         let tag_msg = git(

@@ -166,9 +166,9 @@
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
   th { color: var(--text-2); font-weight: 560; font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; }
-  tbody tr.patch { cursor: pointer; transition: background .1s; }
-  tbody tr.patch:hover { background: rgba(255, 255, 255, .03); }
-  tbody tr.patch.open { background: rgba(94, 106, 210, .06); }
+  tbody tr.change { cursor: pointer; transition: background .1s; }
+  tbody tr.change:hover { background: rgba(255, 255, 255, .03); }
+  tbody tr.change.open { background: rgba(94, 106, 210, .06); }
   td.mono, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 12px; }
   td.dim { color: var(--text-1); }
   td.ellipsis { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -176,7 +176,7 @@
     display: inline-block; width: 14px; color: var(--text-2);
     transition: transform .15s; font-size: 10px;
   }
-  tr.patch.open .chev { transform: rotate(90deg); }
+  tr.change.open .chev { transform: rotate(90deg); }
 
   @keyframes rowflash { from { background: rgba(94, 106, 210, .22); } to { background: transparent; } }
   tr.flash > td { animation: rowflash 1.4s ease-out; }
@@ -404,7 +404,7 @@
     </a>
     <a class="active" data-target="sec-pipeline">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4h12M2 8h8M2 12h10"/></svg>
-      <span data-i18n="navPipeline">Patch Pipeline</span>
+      <span data-i18n="navPipeline">Change Pipeline</span>
     </a>
     <a data-target="sec-process">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 2"/></svg>
@@ -438,7 +438,7 @@
 
 <div class="content">
   <div class="topbar">
-    <h1 data-i18n="navPipeline">Patch Pipeline</h1>
+    <h1 data-i18n="navPipeline">Change Pipeline</h1>
     <span class="sub" data-i18n="topSub">Bootstrap has exited — this console operates the self-evolution system</span>
     <span style="flex:1"></span>
     <button id="loginBtn" class="ghost" data-i18n="loginBtn">Sign in</button>
@@ -483,20 +483,20 @@
     <div class="stats" id="sec-metrics">
       <div class="stat"><div class="v" id="m-events">–</div><div class="k" data-i18n="statTotalEvents">Total Events</div></div>
       <div class="stat bad"><div class="v" id="m-events-failed">–</div><div class="k" data-i18n="statFailedEvents">Failed Events</div></div>
-      <div class="stat good"><div class="v" id="m-applied">–</div><div class="k" data-i18n="statApplied">Patches Applied</div></div>
-      <div class="stat bad"><div class="v" id="m-failed">–</div><div class="k" data-i18n="statFailed">Patches Failed</div></div>
+      <div class="stat good"><div class="v" id="m-applied">–</div><div class="k" data-i18n="statApplied">Changes Applied</div></div>
+      <div class="stat bad"><div class="v" id="m-failed">–</div><div class="k" data-i18n="statFailed">Changes Failed</div></div>
     </div>
 
     <section id="sec-pipeline">
       <h2>
-        <span data-i18n="navPipeline">Patch Pipeline</span>
+        <span data-i18n="navPipeline">Change Pipeline</span>
         <span class="hint" data-i18n="pipelineHint">click a row for detail · live via SSE, polling resumes if the stream drops</span>
         <span class="spacer"></span>
         <button class="danger sm" id="rollbackBtn" data-i18n="rollback">Roll Back to Previous Version</button>
       </h2>
       <table>
         <thead><tr><th></th><th>ID</th><th data-i18n="thKind">Kind</th><th data-i18n="thStatus">Status</th><th data-i18n="thDesc">Description</th><th data-i18n="thEval">Eval Verdict</th><th data-i18n="thCreated">Created</th></tr></thead>
-        <tbody id="patches"><tr><td colspan="7" class="muted" data-i18n="loading">Loading…</td></tr></tbody>
+        <tbody id="changes"><tr><td colspan="7" class="muted" data-i18n="loading">Loading…</td></tr></tbody>
       </table>
     </section>
 
@@ -539,7 +539,7 @@
       <div id="trendAlert" class="promo-alert" style="display:none"></div>
       <div id="trendChart" class="trend-chart"></div>
       <table>
-        <thead><tr><th data-i18n="thPatch">Patch</th><th data-i18n="thLevel">Level</th><th data-i18n="thCluster">Cluster</th><th data-i18n="thStatus">Status</th><th data-i18n="thReason">Decision Reason</th><th data-i18n="thOutcome">Outcome</th><th data-i18n="thEval">Eval</th><th data-i18n="thTime">Time</th></tr></thead>
+        <thead><tr><th data-i18n="thChange">Change</th><th data-i18n="thLevel">Level</th><th data-i18n="thCluster">Cluster</th><th data-i18n="thStatus">Status</th><th data-i18n="thReason">Decision Reason</th><th data-i18n="thOutcome">Outcome</th><th data-i18n="thEval">Eval</th><th data-i18n="thTime">Time</th></tr></thead>
         <tbody id="promotions"><tr><td colspan="8" class="muted" data-i18n="loading">Loading…</td></tr></tbody>
       </table>
     </section>
@@ -605,7 +605,7 @@ const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = 'cogneva_admin_token';
 $('token').value = localStorage.getItem(TOKEN_KEY) || '';
 
-const patchRows = new Map();
+const changeRows = new Map();
 const expanded = new Set();
 let eventSource = null;
 let pollTimer = null;
@@ -671,12 +671,12 @@ async function loadMetrics() {
     const m = await api('/api/v1/evolution/metrics');
     animateValue($('m-events'), m.events_total);
     animateValue($('m-events-failed'), m.events_failed);
-    animateValue($('m-applied'), m.patches_applied);
-    animateValue($('m-failed'), m.patches_failed);
+    animateValue($('m-applied'), m.changes_applied);
+    animateValue($('m-failed'), m.changes_failed);
   } catch (e) { toast(t('metricsFailed') + e.message, 'err'); }
 }
 
-// ── Patch table ──
+// ── Change table ──
 function statusPillClass(s) {
   const v = (s || '').toLowerCase();
   if (v === 'awaitingreview') return 'warn';
@@ -697,10 +697,10 @@ function actionButtons(p, sizeCls) {
   };
   const awaiting = (p.status || '').toLowerCase() === 'awaitingreview';
   const isPolicy = p.kind === 'policy_update';
-  if (awaiting) mk(t('approve'), `/api/v1/evolution/patches/${p.id}/approve`);
+  if (awaiting) mk(t('approve'), `/api/v1/evolution/changes/${p.id}/approve`);
   if (!isPolicy) {
-    mk(t('apply'), `/api/v1/evolution/patches/${p.id}/apply`, 'ghost');
-    mk(t('deploy'), `/api/v1/evolution/patches/${p.id}/deploy`, 'ghost');
+    mk(t('apply'), `/api/v1/evolution/changes/${p.id}/apply`, 'ghost');
+    mk(t('deploy'), `/api/v1/evolution/changes/${p.id}/deploy`, 'ghost');
   }
   return wrap;
 }
@@ -718,22 +718,22 @@ function field(dk, dv, mono) {
   return box;
 }
 
-function renderPatches(flashId) {
-  const tb = $('patches');
+function renderChanges(flashId) {
+  const tb = $('changes');
   tb.innerHTML = '';
-  if (!patchRows.size) {
-    tb.innerHTML = `<tr><td colspan="7" class="muted">${t('noPatches')}</td></tr>`;
+  if (!changeRows.size) {
+    tb.innerHTML = `<tr><td colspan="7" class="muted">${t('noChanges')}</td></tr>`;
     return;
   }
-  const rows = [...patchRows.values()].sort((a, b) =>
+  const rows = [...changeRows.values()].sort((a, b) =>
     String(b.created_at || '').localeCompare(String(a.created_at || '')));
   for (const p of rows) {
     const tr = document.createElement('tr');
-    tr.className = 'patch' + (expanded.has(p.id) ? ' open' : '');
+    tr.className = 'change' + (expanded.has(p.id) ? ' open' : '');
     if (p.id === flashId) tr.classList.add('flash');
     tr.onclick = () => {
       if (expanded.has(p.id)) expanded.delete(p.id); else expanded.add(p.id);
-      renderPatches(null);
+      renderChanges(null);
     };
 
     const tdChev = document.createElement('td');
@@ -790,7 +790,7 @@ function renderPatches(flashId) {
       wrap.className = 'detail-wrap';
       const grid = document.createElement('div');
       grid.className = 'detail-grid';
-      grid.appendChild(field(t('fPatchId'), p.id, true));
+      grid.appendChild(field(t('fChangeId'), p.id, true));
       grid.appendChild(field(t('fDesc'), p.description));
       grid.appendChild(field(t('fDiff'), p.diff_summary, true));
       grid.appendChild(field(t('fEval'), p.eval_summary, true));
@@ -807,19 +807,19 @@ function renderPatches(flashId) {
   }
 }
 
-function upsertPatch(row) {
-  patchRows.set(row.id, row);
-  renderPatches(row.id);
+function upsertChange(row) {
+  changeRows.set(row.id, row);
+  renderChanges(row.id);
 }
 
-async function loadPatches() {
+async function loadChanges() {
   try {
-    const { patches } = await api('/api/v1/evolution/patches');
-    patchRows.clear();
-    for (const p of patches) patchRows.set(p.id, p);
-    renderPatches(null);
+    const { changes } = await api('/api/v1/evolution/changes');
+    changeRows.clear();
+    for (const p of changes) changeRows.set(p.id, p);
+    renderChanges(null);
   } catch (e) {
-    $('patches').innerHTML = `<tr><td colspan="7" class="muted">${t('loadFailed')}${e.message}</td></tr>`;
+    $('changes').innerHTML = `<tr><td colspan="7" class="muted">${t('loadFailed')}${e.message}</td></tr>`;
   }
 }
 
@@ -848,7 +848,7 @@ function connectStream() {
   es.onopen = () => { setLive('live'); stopPolling(); };
   es.onmessage = (ev) => {
     try {
-      upsertPatch(JSON.parse(ev.data));
+      upsertChange(JSON.parse(ev.data));
       loadMetrics();
     } catch { /* keep-alive / malformed frame */ }
   };
@@ -877,7 +877,7 @@ async function loadEvents() {
   try {
     const { events } = await api('/api/v1/evolution/events?limit=50');
     renderEvents($('events'), events, (e) =>
-      `[${e.kind || e.event || 'event'}] ${e.patch_id || ''} ${e.message || e.detail || JSON.stringify(e)}`);
+      `[${e.kind || e.event || 'event'}] ${e.id || ''} ${e.message || e.detail || JSON.stringify(e)}`);
   } catch (e) { $('events').innerHTML = `<li class="muted">${t('loadFailed')}${e.message}</li>`; }
 }
 
@@ -1013,7 +1013,7 @@ async function loadPromotions() {
     for (const r of promotions) {
       const tr = document.createElement('tr');
       const cells = [
-        { t: r.patch_id, cls: 'mono dim ellipsis', title: r.patch_id },
+        { t: r.change_id, cls: 'mono dim ellipsis', title: r.change_id },
         { t: r.level, cls: 'mono' },
         { t: r.cluster, cls: 'dim' },
       ];
@@ -1217,7 +1217,7 @@ const I18N = {
   actReview:      { en: 'self-reviewing…', zh: '自审中…' },
   actStep:        { en: 'step ', zh: '步骤 ' },
   decomposing:    { en: 'Decomposing: ', zh: '分解中：' },
-  navPipeline:    { en: 'Patch Pipeline', zh: '补丁流水线' },
+  navPipeline:    { en: 'Change Pipeline', zh: '变更流水线' },
   navProcess:     { en: 'Process', zh: '进程' },
   navPromotions:  { en: 'Promotions', zh: '晋级' },
   navEvents:      { en: 'Evolution Events', zh: '进化事件' },
@@ -1234,8 +1234,8 @@ const I18N = {
   promoInit:      { en: 'auto-promo …', zh: '自动晋级 …' },
   statTotalEvents:{ en: 'Total Events', zh: '总事件' },
   statFailedEvents:{ en: 'Failed Events', zh: '失败事件' },
-  statApplied:    { en: 'Patches Applied', zh: '已应用补丁' },
-  statFailed:     { en: 'Patches Failed', zh: '失败补丁' },
+  statApplied:    { en: 'Changes Applied', zh: '已应用变更' },
+  statFailed:     { en: 'Changes Failed', zh: '失败变更' },
   pipelineHint:   { en: 'click a row for detail · live via SSE, polling resumes if the stream drops',
                     zh: '点击行查看详情 · SSE 实时推送，断流自动回退轮询' },
   rollback:       { en: 'Roll Back to Previous Version', zh: '回滚到上一版本' },
@@ -1274,7 +1274,7 @@ const I18N = {
   promoTitle:     { en: 'Promotion Ledger', zh: '晋级台账' },
   promoHint:      { en: 'auto-promotion decisions & outcomes · weekly trend aggregated from the ledger',
                     zh: '自动晋级决策与结果 · 周趋势由台账聚合' },
-  thPatch:        { en: 'Patch', zh: '补丁' },
+  thChange:        { en: 'Change', zh: '变更' },
   thLevel:        { en: 'Level', zh: '级别' },
   thCluster:      { en: 'Cluster', zh: '集群' },
   thReason:       { en: 'Decision Reason', zh: '决策理由' },
@@ -1286,7 +1286,7 @@ const I18N = {
   agoH:           { en: 'h ago', zh: ' 小时前' },
   agoD:           { en: 'd ago', zh: ' 天前' },
   metricsFailed:  { en: 'Failed to load metrics: ', zh: '指标加载失败：' },
-  noPatches:      { en: 'No patches', zh: '暂无补丁' },
+  noChanges:      { en: 'No changes', zh: '暂无变更' },
   loadFailed:     { en: 'Load failed: ', zh: '加载失败：' },
   liveOn:         { en: 'Live', zh: '实时' },
   liveConnecting: { en: 'Connecting', zh: '连接中' },
@@ -1297,13 +1297,13 @@ const I18N = {
   promoNa:        { en: 'auto-promo n/a', zh: '自动晋级 不可用' },
   promoOffConfig: { en: 'auto-promo off (config)', zh: '自动晋级 关（配置）' },
   promoEnableViaConfig: { en: 'Enable…', zh: '开启…' },
-  promoGateConfirm: { en: 'Enable config-level auto-promotion? Sandbox-verified patches on whitelisted paths will promote and deploy without manual approval (quota 3/day, breakers armed; core paths still require humans). The main app rolls to apply, ~1 minute.',
-                      zh: '确定开启配置级自动晋级？此后沙盒验证通过且命中白名单路径的补丁将不再等人审批直接晋级部署（配额每天 3 条、熔断在位；核心路径仍需人工）。主应用滚动生效约 1 分钟。' },
+  promoGateConfirm: { en: 'Enable config-level auto-promotion? Sandbox-verified changes on whitelisted paths will promote and deploy without manual approval (quota 3/day, breakers armed; core paths still require humans). The main app rolls to apply, ~1 minute.',
+                      zh: '确定开启配置级自动晋级？此后沙盒验证通过且命中白名单路径的变更将不再等人审批直接晋级部署（配额每天 3 条、熔断在位；核心路径仍需人工）。主应用滚动生效约 1 分钟。' },
   promoGateRolling: { en: 'Gate config written, rolling the main app…', zh: '总闸配置已写入，正在滚动主应用…' },
   promoGateOn:    { en: 'auto-promo gate enabled', zh: '自动晋级总闸已开启' },
   gateOff:        { en: 'Disable gate', zh: '关总闸' },
-  gateOffConfirm: { en: 'Disable the config-level auto-promotion gate? All patches will go back to manual approval. The main app rolls to apply, ~1 minute.',
-                    zh: '确定关闭配置级自动晋级总闸？此后所有补丁回到人工审批。主应用滚动生效约 1 分钟。' },
+  gateOffConfirm: { en: 'Disable the config-level auto-promotion gate? All changes will go back to manual approval. The main app rolls to apply, ~1 minute.',
+                    zh: '确定关闭配置级自动晋级总闸？此后所有变更回到人工审批。主应用滚动生效约 1 分钟。' },
   promoGateOff:   { en: 'auto-promo gate disabled', zh: '自动晋级总闸已关闭' },
   promoPaused:    { en: 'auto-promo PAUSED', zh: '自动晋级 已暂停' },
   promoResume:    { en: 'Resume', zh: '恢复' },
@@ -1318,7 +1318,7 @@ const I18N = {
   noPromotions:   { en: 'No promotion records', zh: '暂无晋级记录' },
   noTrend:        { en: 'No trend report yet — the weekly reporter has not produced its first issue',
                     zh: '暂无趋势报告——周报器尚未产出第一期' },
-  fPatchId:       { en: 'Patch ID', zh: '补丁 ID' },
+  fChangeId:       { en: 'Change ID', zh: '变更 ID' },
   fDesc:          { en: 'Description', zh: '描述' },
   fDiff:          { en: 'Diff Summary', zh: 'Diff 摘要' },
   fEval:          { en: 'Eval Verdict', zh: '评估结论' },
@@ -1497,7 +1497,7 @@ setInterval(loadProcess, 10000);
 setInterval(loadPromotionSwitch, 15000);
 
 function refreshAll() {
-  loadMetrics(); loadPatches(); loadEvents(); loadAudit();
+  loadMetrics(); loadChanges(); loadEvents(); loadAudit();
   loadPromotionSwitch(); loadPromotions(); loadTrend();
   loadProcess();
 }

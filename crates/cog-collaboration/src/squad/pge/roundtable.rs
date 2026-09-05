@@ -703,7 +703,7 @@ pub fn parse_planner_output(value: &serde_json::Value, goal: &str) -> PlannerOut
 
 pub fn parse_generator_output(value: &serde_json::Value) -> GeneratorOutput {
     serde_json::from_value(value.clone()).unwrap_or_else(|_| {
-        if let Some(artifact) = try_extract_patch_artifact(value) {
+        if let Some(artifact) = try_extract_change_artifact(value) {
             return GeneratorOutput {
                 content: serde_json::Value::Null,
                 artifacts: vec![artifact],
@@ -716,16 +716,16 @@ pub fn parse_generator_output(value: &serde_json::Value) -> GeneratorOutput {
     })
 }
 
-/// Best-effort extraction of a patch artifact from a raw fallback result.
+/// Best-effort extraction of a change artifact from a raw fallback result.
 /// The reasoning-only model sometimes returns XML-wrapped, markdown-fenced,
 /// or free-text unified diffs instead of strict JSON; this lets the downstream
-/// pipeline still find the patch when `build_result` falls back to
+/// pipeline still find the change when `build_result` falls back to
 /// `{ "result": thought }`.
-fn try_extract_patch_artifact(value: &serde_json::Value) -> Option<Artifact> {
+fn try_extract_change_artifact(value: &serde_json::Value) -> Option<Artifact> {
     let text = value.get("result").and_then(|v| v.as_str())?;
 
     // Try several diff markers in order of preference.
-    let markers = ["diff --git", "```diff", "```patch", "--- a/", "--- a\\"];
+    let markers = ["diff --git", "```diff", "```change", "--- a/", "--- a\\"];
     let mut start = None;
     for marker in &markers {
         if let Some(pos) = text.find(marker) {
@@ -743,10 +743,10 @@ fn try_extract_patch_artifact(value: &serde_json::Value) -> Option<Artifact> {
     let mut content = rest[..end].trim().to_string();
 
     // Strip leading markdown fence marker if present.
-    if content.starts_with("```diff") || content.starts_with("```patch") {
+    if content.starts_with("```diff") || content.starts_with("```change") {
         content = content
             .trim_start_matches("```diff")
-            .trim_start_matches("```patch")
+            .trim_start_matches("```change")
             .trim_start()
             .to_string();
     }
@@ -764,9 +764,9 @@ fn try_extract_patch_artifact(value: &serde_json::Value) -> Option<Artifact> {
     }
 
     Some(Artifact {
-        name: "changes.patch".into(),
+        name: "changes.diff".into(),
         content,
-        artifact_type: "patch".into(),
+        artifact_type: "change".into(),
     })
 }
 

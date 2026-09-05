@@ -1,11 +1,11 @@
 //! Sandbox boundary detection for the self-evolution auto-deploy pipeline.
 //!
 //! `auto_apply` / `auto_deploy` default to `true` (real autonomy), but
-//! applying and deploying LLM-generated patches must only happen inside an
+//! applying and deploying LLM-generated changes must only happen inside an
 //! isolated environment (Kubernetes Pod, container, or an explicitly
 //! declared sandbox). When no isolation is detected and the operator has not
 //! set `force_autonomous`, the pipeline is downgraded to dry-run:
-//! patches are still applied and tested, but the working tree is rolled
+//! changes are still applied and tested, but the working tree is rolled
 //! back and no binary switch happens.
 
 use cog_core::SelfEvolutionConfig;
@@ -156,7 +156,7 @@ pub fn enforce_sandbox_boundary(
         );
     }
 
-    // Firecracker 编排者（审计 2.5.4）：host 不直接执行 patch，而是冷启动
+    // Firecracker 编排者（审计 2.5.4）：host 不直接执行 change，而是冷启动
     // 微虚拟机、由 VM 在硬件级隔离内执行进化；host 侧因此无需自身处于
     // 沙盒环境。
     if config.microvm.enabled {
@@ -198,7 +198,7 @@ pub fn enforce_sandbox_boundary(
             "auto_apply/auto_deploy requested but no isolated environment detected \
              (no Kubernetes Pod, container, dedicated sandbox directory, or \
              COGNEVA_SANDBOX marker). \
-             Downgraded to dry-run: patches are applied and tested but rolled back, \
+             Downgraded to dry-run: changes are applied and tested but rolled back, \
              and no binary switch will happen. Set self_evolution.sandbox_mode=true \
              when running in a dedicated sandbox, or self_evolution.force_autonomous=true \
              to bypass this check explicitly."

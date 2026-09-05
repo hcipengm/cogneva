@@ -105,7 +105,7 @@ data:
         "COGNEVA_SELF_EVOLUTION_FORCE_AUTONOMOUS": "self_evolution.force_autonomous",
         "COGNEVA_SELF_EVOLUTION_MANUAL_APPROVE": "self_evolution.manual_approve",
         "COGNEVA_SELF_EVOLUTION_SWITCH_MODE": "self_evolution.switch_mode",
-        "COGNEVA_SELF_EVOLUTION_PATCH_DIR": "self_evolution.patch_dir",
+        "COGNEVA_SELF_EVOLUTION_CHANGE_DIR": "self_evolution.change_dir",
         "COGNEVA_SELF_EVOLUTION_BINARY_DIR": "self_evolution.binary_dir",
         "COGNEVA_SELF_EVOLUTION_BACKUP_DIR": "self_evolution.backup_dir",
         "COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS": "self_evolution.poll_interval_secs",
@@ -387,14 +387,14 @@ data:
         "worker_role": "planner"
       },
       "self_evolution": {
-        "_comment": "Self-evolution auto-deploy pipeline. enabled/auto_apply/auto_deploy all true means fully autonomous: LLM generates patches, tests, commits, builds, and switches binary without human intervention. Sandbox boundary check: real apply/deploy requires a detected isolated environment (K8s Pod/container/COGNEVA_SANDBOX), sandbox_mode=true, or force_autonomous=true; otherwise the pipeline downgrades to dry-run.",
+        "_comment": "Self-evolution auto-deploy pipeline. enabled/auto_apply/auto_deploy all true means fully autonomous: LLM generates code changes, tests, commits, builds, and switches binary without human intervention. Sandbox boundary check: real apply/deploy requires a detected isolated environment (K8s Pod/container/COGNEVA_SANDBOX), sandbox_mode=true, or force_autonomous=true; otherwise the pipeline downgrades to dry-run.",
         "enabled": true,
         "auto_apply": true,
         "auto_deploy": true,
         "sandbox_mode": true,
         "force_autonomous": false,
         "manual_approve": false,
-        "patch_dir": "./evolution-patches",
+        "change_dir": "./evolution-changes",
         "binary_dir": "/opt/cogneva/bin",
         "backup_dir": "/opt/cogneva/bin/backups",
         "switch_mode": "self_exec",
@@ -448,7 +448,7 @@ data:
           "gateway_verified": true
         },
         "pr_workdir": "",
-        "_comment_pr_workdir": "Local git clone used by the PR publisher (PatchSink). Empty disables patch-to-PR publishing. Git transport goes through the security gateway HTTPS proxy (COGNEVA_GIT_PROXY_BASE, set in deployment env); no token or deploy key lives in this pod.",
+        "_comment_pr_workdir": "Local git clone used by the PR publisher (ChangeSink). Empty disables change-to-PR publishing. Git transport goes through the security gateway HTTPS proxy (COGNEVA_GIT_PROXY_BASE, set in deployment env); no token or deploy key lives in this pod.",
         "auto_create_pr": true,
         "auto_merge_policy": {
           "enabled": true,

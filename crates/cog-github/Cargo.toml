@@ -25,7 +25,7 @@ reqwest = { workspace = true }
 jsonwebtoken = { workspace = true }
 # For async trait in provider abstraction.
 async-trait = "0.1"
-# Temp files for git-apply of patches.
+# Temp files for git-apply of incoming change diffs.
 tempfile = "3"
 # Webhook 事件入口（discovery_mode=events/both）。
 axum = { workspace = true }

@@ -658,7 +658,7 @@ async fn ensure_default_storage_class() -> Result<()> {
     bail!(
         "集群没有默认 StorageClass。标准 K8s 路径的 PVC 全部跟随集群默认 SC，\
          请先安装 Longhorn 等存储供应并把它设为默认，例如：\n  \
-         kubectl patch sc <存储类名> -p '{{\"metadata\":{{\"annotations\":{{\
+         kubectl change sc <存储类名> -p '{{\"metadata\":{{\"annotations\":{{\
          \"storageclass.kubernetes.io/is-default-class\":\"true\"}}}}}}'"
     );
 }

@@ -4,8 +4,8 @@
 //!
 //! ```text
 //! poll 中央仓库 → 发现新 HEAD
-//!   → 找 HEAD 上的 promote/* tag，读 tag message（level / patch_id）
-//!   → 台账幂等：本集群已处理过该 patch 则跳过
+//!   → 找 HEAD 上的 promote/* tag，读 tag message（level / change_id）
+//!   → 台账幂等：本集群已处理过该 change 则跳过
 //!   → L0（l0_config）：提取变化的配置文件
 //!       deploy/k3s/cogneva-json-configmap.yaml → kubectl apply（ConfigWatcher 热更新）
 //!       prompts/** → 重建 prompts configmap → kubectl apply（hot_reload 热更新）
@@ -31,21 +31,21 @@ use tracing::{info, warn};
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromotionCandidate {
-    pub patch_id: String,
+    pub change_id: String,
     pub level: String,
     pub commit: String,
     pub eval_summary: Option<String>,
 }
 
-/// 解析 promote tag 的 message（`patch_id=..\nlevel=..\neval=..`）。
+/// 解析 promote tag 的 message（`change_id=..\nlevel=..\neval=..`）。
 pub fn parse_tag_message(message: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let mut patch_id = None;
+    let mut change_id = None;
     let mut level = None;
     let mut eval_summary = None;
     for line in message.lines() {
         if let Some((k, v)) = line.split_once('=') {
             match k.trim() {
-                "patch_id" => patch_id = Some(v.trim().to_string()),
+                "change_id" => change_id = Some(v.trim().to_string()),
                 "level" => level = Some(v.trim().to_string()),
                 "eval" => {
                     let v = v.trim();
@@ -55,7 +55,7 @@ pub fn parse_tag_message(message: &str) -> (Option<String>, Option<String>, Opti
             }
         }
     }
-    (patch_id, level, eval_summary)
+    (change_id, level, eval_summary)
 }
 
 pub struct GitOpsPuller {
@@ -193,28 +193,28 @@ impl GitOpsPuller {
                 30,
             )
             .await?;
-        let (patch_id, level, eval_summary) = parse_tag_message(&message);
-        match (patch_id, level) {
-            (Some(patch_id), Some(level)) => Ok(Some(PromotionCandidate {
-                patch_id,
+        let (change_id, level, eval_summary) = parse_tag_message(&message);
+        match (change_id, level) {
+            (Some(change_id), Some(level)) => Ok(Some(PromotionCandidate {
+                change_id,
                 level,
                 commit: head,
                 eval_summary,
             })),
             _ => {
-                warn!(tag = %tag, "promote tag missing patch_id/level metadata; skipping");
+                warn!(tag = %tag, "promote tag missing change_id/level metadata; skipping");
                 Ok(None)
             }
         }
     }
 
-    /// 幂等：本集群是否已处理过该 patch。RolledBack 也算已处理——
-    /// 已回滚的 patch 绝不能被下个 poll 周期重复金丝雀（会反复打挂
+    /// 幂等：本集群是否已处理过该 change。RolledBack 也算已处理——
+    /// 已回滚的 change 绝不能被下个 poll 周期重复金丝雀（会反复打挂
     /// 集群）；Failed 不在列，瞬时失败允许下轮重试。
-    async fn already_processed(&self, patch_id: &str) -> SFResult<bool> {
+    async fn already_processed(&self, change_id: &str) -> SFResult<bool> {
         let recent = self.ledger.recent(50).await?;
         Ok(recent.iter().any(|r| {
-            r.patch_id == *patch_id
+            r.change_id == *change_id
                 && r.cluster == self.cluster
                 && matches!(
                     r.status,
@@ -236,7 +236,7 @@ impl GitOpsPuller {
     async fn reconcile_pending(&self, candidate: &PromotionCandidate) -> SFResult<bool> {
         let recent = self.ledger.recent(50).await?;
         let Some(rec) = recent.iter().find(|r| {
-            r.patch_id == candidate.patch_id
+            r.change_id == candidate.change_id
                 && r.cluster == self.cluster
                 && r.status == PromotionStatus::Pending
         }) else {
@@ -250,7 +250,7 @@ impl GitOpsPuller {
             return Ok(false);
         }
         info!(
-            patch_id = %candidate.patch_id,
+            change_id = %candidate.change_id,
             cluster = %self.cluster,
             age_secs = age,
             "Reconciling orphaned Pending promotion"
@@ -468,19 +468,19 @@ impl GitOpsPuller {
         let Some(candidate) = self.candidate_at_head().await? else {
             return Ok(false);
         };
-        if self.already_processed(&candidate.patch_id).await? {
+        if self.already_processed(&candidate.change_id).await? {
             // Pending 尾巴自愈：上一个 puller 进程可能在金丝雀中途被自家
             // 滚动替换，台账停在 Pending 永远不会终结（2026-08-07 双集群
             // 实测）。超过看护+滚动窗口的 Pending 记录做幂等 reconcile。
             if self.reconcile_pending(&candidate).await? {
                 return Ok(true);
             }
-            info!(patch_id = %candidate.patch_id, cluster = %self.cluster, "Promotion already processed by this cluster");
+            info!(change_id = %candidate.change_id, cluster = %self.cluster, "Promotion already processed by this cluster");
             return Ok(false);
         }
 
         info!(
-            patch_id = %candidate.patch_id,
+            change_id = %candidate.change_id,
             level = %candidate.level,
             cluster = %self.cluster,
             "New promotion candidate pulled"
@@ -505,7 +505,7 @@ impl GitOpsPuller {
                 self.ledger
                     .update_status(&record_id, PromotionStatus::Promoted, &note)
                     .await?;
-                info!(patch_id = %candidate.patch_id, cluster = %self.cluster, "Promotion applied: {note}");
+                info!(change_id = %candidate.change_id, cluster = %self.cluster, "Promotion applied: {note}");
             }
             Err(e) => {
                 // canary_rollout 内部区分回滚与执行失败；这里统一记失败，
@@ -520,7 +520,7 @@ impl GitOpsPuller {
                         .update_status(&record_id, PromotionStatus::Failed, &e.to_string())
                         .await?;
                 }
-                warn!(patch_id = %candidate.patch_id, cluster = %self.cluster, error = %e, "Promotion failed");
+                warn!(change_id = %candidate.change_id, cluster = %self.cluster, error = %e, "Promotion failed");
                 return Err(e);
             }
         }
@@ -667,7 +667,7 @@ impl GitOpsPuller {
             &[
                 "-n",
                 &n,
-                "patch",
+                "change",
                 "deployment",
                 d,
                 "--type",
@@ -814,7 +814,7 @@ impl GitOpsPuller {
     async fn mark_rolled_back(&self, candidate: &PromotionCandidate, reason: &str) {
         if let Ok(recent) = self.ledger.recent(1).await {
             if let Some(rec) = recent.first() {
-                if rec.patch_id == candidate.patch_id && rec.cluster == self.cluster {
+                if rec.change_id == candidate.change_id && rec.cluster == self.cluster {
                     let _ = self
                         .ledger
                         .update_status(&rec.id, PromotionStatus::RolledBack, reason)
@@ -843,7 +843,7 @@ impl GitOpsPuller {
     /// localhost 默认 http 免 TLS；每个节点的 NodePort 都通，多节点天然
     /// 分发），镜像由推送端 buildah push 就位，pull 秒级。
     async fn obtain_image(&self, candidate: &PromotionCandidate) -> SFResult<String> {
-        let tag = format!("cogneva:promote-{}", sanitize(&candidate.patch_id));
+        let tag = format!("cogneva:promote-{}", sanitize(&candidate.change_id));
         let endpoint = match &self.config.registry {
             Some(registry) => registry.trim_end_matches('/'),
             None => self.config.local_registry.trim_end_matches('/'),
@@ -1009,7 +1009,7 @@ impl GitOpsPuller {
         let now = chrono::Utc::now();
         let rec = PromotionRecord {
             id: uuid::Uuid::new_v4().to_string(),
-            patch_id: candidate.patch_id.clone(),
+            change_id: candidate.change_id.clone(),
             level: candidate.level.clone(),
             decision_reason: format!("gitops pull ({})", self.cluster),
             cluster: self.cluster.clone(),
@@ -1025,8 +1025,8 @@ impl GitOpsPuller {
     }
 }
 
-fn sanitize(patch_id: &str) -> String {
-    patch_id
+fn sanitize(change_id: &str) -> String {
+    change_id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -1084,7 +1084,7 @@ mod tests {
 
     #[test]
     fn parse_tag_message_full() {
-        let (p, l, e) = parse_tag_message("patch_id=p-1\nlevel=l1_rollout\neval=Adopt z=2.0");
+        let (p, l, e) = parse_tag_message("change_id=p-1\nlevel=l1_rollout\neval=Adopt z=2.0");
         assert_eq!(p.as_deref(), Some("p-1"));
         assert_eq!(l.as_deref(), Some("l1_rollout"));
         assert_eq!(e.as_deref(), Some("Adopt z=2.0"));
@@ -1092,7 +1092,7 @@ mod tests {
 
     #[test]
     fn parse_tag_message_eval_none_becomes_none() {
-        let (_p, _l, e) = parse_tag_message("patch_id=p-1\nlevel=l0_config\neval=none");
+        let (_p, _l, e) = parse_tag_message("change_id=p-1\nlevel=l0_config\neval=none");
         assert!(e.is_none());
     }
 
@@ -1155,8 +1155,8 @@ mod tests {
             work.path(),
             work.path(),
         );
-        let patch = crate::types::EvolutionResult {
-            kind: crate::types::EvolutionKind::CodePatch,
+        let change = crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "p-42".into(),
             description: "test".into(),
             content: String::new(),
@@ -1164,7 +1164,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             eval_summary: None,
         };
-        crate::PromotionChannel::publish_rollout(&publisher, &patch)
+        crate::PromotionChannel::publish_rollout(&publisher, &change)
             .await
             .unwrap();
 
@@ -1183,7 +1183,7 @@ mod tests {
 
         puller.sync_repo().await.unwrap();
         let candidate = puller.candidate_at_head().await.unwrap().unwrap();
-        assert_eq!(candidate.patch_id, "p-42");
+        assert_eq!(candidate.change_id, "p-42");
         assert_eq!(candidate.level, "l1_rollout");
     }
 
@@ -1232,7 +1232,7 @@ mod tests {
         ledger
             .record(PromotionRecord {
                 id: "r1".into(),
-                patch_id: "p-1".into(),
+                change_id: "p-1".into(),
                 level: "l1_rollout".into(),
                 decision_reason: "test".into(),
                 cluster: "cluster-b".into(),

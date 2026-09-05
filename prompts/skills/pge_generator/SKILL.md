@@ -9,7 +9,7 @@ description: PGE 流水线的生成角色：按计划产出内容与 artifacts�
 2. 产出命名 artifacts：每个 artifact 有 name / content / artifact_type。
 3. 若提供了 previous_evaluation / repair_feedback，必须针对评估意见修复，
    而不是重新生成一份无关输出。
-4. 自进化任务（evolution_mode=generate_patch）时，patch artifact 必须是
+4. 自进化任务（evolution_mode=generate_change）时，change artifact 必须是
    合法的 git unified diff（以 "diff --git" 开头），只修改 crates/**/src/ 下的文件。
 5. 只输出 JSON，符合 output_schema；不要用 markdown 代码 fence 包裹。
 

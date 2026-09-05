@@ -211,7 +211,7 @@ pub struct GitHubIntegrationConfig {
     pub poll_interval_secs: u64,
     /// Maximum number of issues to scan per polling round.
     pub max_issues_per_scan: usize,
-    /// Whether to automatically create PRs when a patch is generated.
+    /// Whether to automatically create PRs when a change is generated.
     pub auto_create_pr: bool,
     /// Policy for deciding whether a PR can be automatically merged.
     pub auto_merge_policy: AutoMergePolicy,
@@ -228,7 +228,7 @@ pub struct GitHubIntegrationConfig {
     /// Webhook 事件入口（discovery_mode=events/both 时生效）。
     pub webhook: WebhookConfig,
     /// Local git working copy used by the PR publisher. Empty disables
-    /// patch-to-PR publishing (the PatchSink is not registered).
+    /// change-to-PR publishing (the ChangeSink is not registered).
     pub pr_workdir: String,
     /// GitHub API 基址覆盖：指向安全网关透传端点（如
     /// `http://cogneva-security-gateway:8081/github`）。设置后本进程不再

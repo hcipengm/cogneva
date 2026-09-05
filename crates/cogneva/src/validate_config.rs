@@ -121,7 +121,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let se = &config.self_evolution;
     if se.enabled {
         for (name, value) in [
-            ("patch_dir", &se.patch_dir),
+            ("change_dir", &se.change_dir),
             ("binary_dir", &se.binary_dir),
             ("backup_dir", &se.backup_dir),
         ] {

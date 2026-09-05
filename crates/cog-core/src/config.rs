@@ -584,8 +584,8 @@ impl Default for MultiBackendConsumerConfig {
     }
 }
 
-/// Image-based 滚动更新配置（审计 3.2）：启用后 patch 部署从特权 Pod
-/// `self_exec` 二进制替换升级为「构建镜像 → patch Deployment → 滚动更新」。
+/// Image-based 滚动更新配置（审计 3.2）：启用后 change 部署从特权 Pod
+/// `self_exec` 二进制替换升级为「构建镜像 → change Deployment → 滚动更新」。
 /// 默认关闭，保持既有 self_exec/systemd 行为不回退。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -681,13 +681,16 @@ pub struct SelfEvolutionConfig {
     /// auto apply/deploy run even if no isolated environment is detected.
     /// Never set this on a host you care about.
     pub force_autonomous: bool,
-    /// Optional human-in-the-loop gate: when true, patches that pass tests
+    /// Optional human-in-the-loop gate: when true, changes that pass tests
     /// are rolled back and held at `AwaitingReview` instead of being
     /// committed/deployed, until an operator approves them via the admin
-    /// API (`POST /admin/evolution/patches/:id/approve`). Default false
+    /// API (`POST /admin/evolution/changes/:id/approve`). Default false
     /// (fully autonomous).
     pub manual_approve: bool,
-    pub patch_dir: String,
+    /// Directory holding generated change artifacts. `patch_dir` is the
+    /// legacy key, accepted as an alias so older config files still load.
+    #[serde(alias = "patch_dir")]
+    pub change_dir: String,
     pub binary_dir: String,
     pub backup_dir: String,
     pub switch_mode: String,
@@ -714,7 +717,7 @@ impl Default for SelfEvolutionConfig {
             sandbox_mode: false,
             force_autonomous: false,
             manual_approve: false,
-            patch_dir: "./evolution-patches".into(),
+            change_dir: "./evolution-changes".into(),
             binary_dir: "/opt/cogneva/bin".into(),
             backup_dir: "/opt/cogneva/bin/backups".into(),
             switch_mode: "self_exec".into(),

@@ -24,8 +24,8 @@ pub struct ObservabilityObservable {
     rendering_latency_ms: AtomicU64,
     evolution_event_total: AtomicU64,
     evolution_event_failed_total: AtomicU64,
-    evolution_patch_applied_total: AtomicU64,
-    evolution_patch_failed_total: AtomicU64,
+    evolution_change_applied_total: AtomicU64,
+    evolution_change_failed_total: AtomicU64,
 }
 
 impl Default for ObservabilityObservable {
@@ -36,8 +36,8 @@ impl Default for ObservabilityObservable {
             rendering_latency_ms: AtomicU64::new(0),
             evolution_event_total: AtomicU64::new(0),
             evolution_event_failed_total: AtomicU64::new(0),
-            evolution_patch_applied_total: AtomicU64::new(0),
-            evolution_patch_failed_total: AtomicU64::new(0),
+            evolution_change_applied_total: AtomicU64::new(0),
+            evolution_change_failed_total: AtomicU64::new(0),
         }
     }
 }
@@ -67,13 +67,13 @@ impl ObservabilityObservable {
         }
     }
 
-    pub fn record_evolution_patch_applied(&self) {
-        self.evolution_patch_applied_total
+    pub fn record_evolution_change_applied(&self) {
+        self.evolution_change_applied_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_evolution_patch_failed(&self) {
-        self.evolution_patch_failed_total
+    pub fn record_evolution_change_failed(&self) {
+        self.evolution_change_failed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -104,12 +104,12 @@ impl Observable for ObservabilityObservable {
                 self.evolution_event_failed_total.load(Ordering::Relaxed) as f64,
             ));
             metrics.push(RawMetric::new(
-                "evolution_patch_applied_total",
-                self.evolution_patch_applied_total.load(Ordering::Relaxed) as f64,
+                "evolution_change_applied_total",
+                self.evolution_change_applied_total.load(Ordering::Relaxed) as f64,
             ));
             metrics.push(RawMetric::new(
-                "evolution_patch_failed_total",
-                self.evolution_patch_failed_total.load(Ordering::Relaxed) as f64,
+                "evolution_change_failed_total",
+                self.evolution_change_failed_total.load(Ordering::Relaxed) as f64,
             ));
         }
         Ok(metrics)
@@ -130,11 +130,11 @@ impl cog_core::EvolutionMetrics for ObservabilityObservable {
         self.record_evolution_event(failed);
     }
 
-    async fn record_patch_applied(&self) {
-        self.record_evolution_patch_applied();
+    async fn record_change_applied(&self) {
+        self.record_evolution_change_applied();
     }
 
-    async fn record_patch_failed(&self) {
-        self.record_evolution_patch_failed();
+    async fn record_change_failed(&self) {
+        self.record_evolution_change_failed();
     }
 }

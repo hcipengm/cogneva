@@ -109,10 +109,10 @@ mod tests {
         let stream = FileAuditStream::open(&path).await.unwrap();
         stream
             .append(
-                AuditKind::PatchOperation,
+                AuditKind::ChangeOperation,
                 "system",
-                "patch-1",
-                "patch.apply",
+                "change-1",
+                "change.apply",
                 serde_json::json!({"files": 2}),
             )
             .await
@@ -156,10 +156,10 @@ mod tests {
         let stream = FileAuditStream::open(&path).await.unwrap();
         stream
             .append(
-                AuditKind::PatchOperation,
+                AuditKind::ChangeOperation,
                 "system",
                 "p1",
-                "patch.apply",
+                "change.apply",
                 serde_json::json!({}),
             )
             .await
@@ -168,7 +168,7 @@ mod tests {
 
         // 篡改文件内容
         let content = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, content.replace("patch.apply", "patch.forged")).unwrap();
+        std::fs::write(&path, content.replace("change.apply", "change.forged")).unwrap();
 
         match FileAuditStream::open(&path).await {
             Ok(_) => panic!("corrupted chain should be rejected"),

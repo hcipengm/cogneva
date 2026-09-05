@@ -23,6 +23,7 @@
 //! - **`cog-core`** — `SkillRegistry` receives promoted `SkillConfig` entries.
 
 pub mod auto_promoter;
+pub mod change_pipeline;
 pub mod config;
 pub mod crew;
 pub mod detector;
@@ -41,7 +42,6 @@ pub mod gitops_puller;
 pub mod image_rollout;
 pub mod matcher;
 pub mod meta_learning;
-pub mod patch_pipeline;
 pub mod policy_store;
 pub mod promoter;
 pub mod promotion_gate;
@@ -54,6 +54,7 @@ pub mod squad;
 pub mod types;
 
 pub use auto_promoter::{AutoPromoter, PromotionChannel};
+pub use change_pipeline::{ApplyResult, ChangePipeline};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
 pub use config::{GitOpsConfig, PromotionGateConfig};
 pub use detector::{DefaultLearningDetector, LearningDetector};
@@ -75,7 +76,6 @@ pub use gitops_puller::{parse_tag_message, run_puller_loop, GitOpsPuller, Promot
 pub use image_rollout::ImageRollout;
 pub use matcher::{DefaultLearningMatcher, LearningMatcher};
 pub use meta_learning::MetaLearningEngine;
-pub use patch_pipeline::{ApplyResult, PatchPipeline};
 pub use policy_store::{
     ArtifactEvolution, PolicyArtifact, PolicyCandidate, PolicyProposal, PolicyStore,
 };
@@ -120,8 +120,8 @@ pub struct ReflectionEngine {
     tool_error_threshold: u32,
     /// How many recurrences before synthesizing a hook.
     hook_recurrence_threshold: u32,
-    /// How many recurrences before generating a code patch.
-    patch_recurrence_threshold: u32,
+    /// How many recurrences before generating a code change.
+    change_recurrence_threshold: u32,
 }
 
 impl std::fmt::Debug for ReflectionEngine {
@@ -144,8 +144,8 @@ impl std::fmt::Debug for ReflectionEngine {
             .field("tool_error_threshold", &self.tool_error_threshold)
             .field("hook_recurrence_threshold", &self.hook_recurrence_threshold)
             .field(
-                "patch_recurrence_threshold",
-                &self.patch_recurrence_threshold,
+                "change_recurrence_threshold",
+                &self.change_recurrence_threshold,
             )
             .finish()
     }
@@ -181,7 +181,7 @@ impl ReflectionEngine {
             tool_error_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             tool_error_threshold: 3,
             hook_recurrence_threshold: 3,
-            patch_recurrence_threshold: 5,
+            change_recurrence_threshold: 5,
         }
     }
 
@@ -200,7 +200,7 @@ impl ReflectionEngine {
         hook_sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
         tool_sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
         project_root: Option<std::path::PathBuf>,
-        patch_dir: impl Into<std::path::PathBuf>,
+        change_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
             memory_backend.clone(),
@@ -226,7 +226,7 @@ impl ReflectionEngine {
         let meta_learning = Arc::new(MetaLearningEngine::new(recorder.clone()));
         let mut evolution =
             EvolutionEngine::new(llm.clone(), skill_registry.clone(), prompt_manager.clone())
-                .with_patch_dir(patch_dir);
+                .with_change_dir(change_dir);
         if let Some(tx) = hook_sink {
             evolution = evolution.with_hook_sink(tx);
         }
@@ -257,7 +257,7 @@ impl ReflectionEngine {
             tool_error_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             tool_error_threshold: 3,
             hook_recurrence_threshold: 3,
-            patch_recurrence_threshold: 5,
+            change_recurrence_threshold: 5,
         }
     }
 
@@ -304,7 +304,7 @@ impl ReflectionEngine {
             tool_error_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             tool_error_threshold: 3,
             hook_recurrence_threshold: 3,
-            patch_recurrence_threshold: 5,
+            change_recurrence_threshold: 5,
         }
     }
 
@@ -347,7 +347,7 @@ impl ReflectionEngine {
             tool_error_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             tool_error_threshold: 3,
             hook_recurrence_threshold: 3,
-            patch_recurrence_threshold: 5,
+            change_recurrence_threshold: 5,
         }
     }
 
@@ -406,7 +406,7 @@ impl ReflectionEngine {
         Ok(())
     }
 
-    /// Given a mature learning, trigger synthesize_hook / generate_code_patch
+    /// Given a mature learning, trigger synthesize_hook / generate_code_change
     /// if recurrence thresholds are crossed and cooldown allows.
     async fn maybe_trigger_evolution_from_learning(&self, l: &cog_core::Learning) {
         if l.recurrence_count >= self.hook_recurrence_threshold {
@@ -438,13 +438,13 @@ impl ReflectionEngine {
         }
 
         let is_code_related = matches!(l.category, cog_core::LearningCategory::Correction);
-        if is_code_related && l.recurrence_count >= self.patch_recurrence_threshold {
-            let patch_key = format!(
-                "patch:{}:{:?}",
+        if is_code_related && l.recurrence_count >= self.change_recurrence_threshold {
+            let change_key = format!(
+                "change:{}:{:?}",
                 l.pattern_key.as_deref().unwrap_or("unknown"),
                 l.area
             );
-            if self.check_evolution_cooldown(&patch_key).await {
+            if self.check_evolution_cooldown(&change_key).await {
                 if let Some(ref evolution) = self.evolution {
                     let module_description = format!("{:?} module", l.area);
                     let learning_context = format!(
@@ -454,13 +454,13 @@ impl ReflectionEngine {
                     tracing::info!(
                         learning_id = %l.id,
                         recurrence = l.recurrence_count,
-                        "Triggering generate_code_patch for recurring code defect"
+                        "Triggering generate_code_change for recurring code defect"
                     );
                     if let Err(e) = evolution
-                        .generate_code_patch(&module_description, &learning_context)
+                        .generate_code_change(&module_description, &learning_context)
                         .await
                     {
-                        tracing::warn!("generate_code_patch failed: {}", e);
+                        tracing::warn!("generate_code_change failed: {}", e);
                     }
                 }
             }
@@ -524,7 +524,7 @@ impl ReflectionEngine {
 
     /// Process a full context window after a run completes.
     /// When learnings reach maturity (recurrence threshold), triggers
-    /// `synthesize_hook` and, for code-related issues, `generate_code_patch`.
+    /// `synthesize_hook` and, for code-related issues, `generate_code_change`.
     pub async fn process_context(&self, messages: &[cog_core::Message]) -> cog_core::SFResult<()> {
         let learnings = self.detector.detect_from_context(messages);
         for learning in learnings {
@@ -686,7 +686,7 @@ impl ReflectionEngine {
             cog_core::Area::Backend,
             summary,
             details,
-            "Use this outcome to improve future self-evolution patch generation",
+            "Use this outcome to improve future self-evolution change generation",
             cog_core::LearningSource::SelfReview,
         );
         learning.related_tasks.push(task_id.to_string());
@@ -709,11 +709,11 @@ impl ReflectionEngine {
         Ok(())
     }
 
-    /// Record the outcome of a generated patch after it has been applied,
+    /// Record the outcome of a generated change after it has been applied,
     /// tested, built, or deployed.
-    pub async fn record_patch_outcome(
+    pub async fn record_change_outcome(
         &self,
-        patch_id: &str,
+        change_id: &str,
         success: bool,
         test_output: &str,
     ) -> cog_core::SFResult<()> {
@@ -728,8 +728,8 @@ impl ReflectionEngine {
             cog_core::Priority::High
         };
         let summary = format!(
-            "Patch {} {}",
-            patch_id,
+            "Change {} {}",
+            change_id,
             if success {
                 "deployed successfully"
             } else {
@@ -748,17 +748,17 @@ impl ReflectionEngine {
             cog_core::Area::Backend,
             summary,
             details,
-            "Use this outcome to improve future patch generation and validation",
+            "Use this outcome to improve future change generation and validation",
             cog_core::LearningSource::SelfReview,
         );
-        learning.related_tasks.push(patch_id.to_string());
+        learning.related_tasks.push(change_id.to_string());
         self.recorder.record_learning(learning.clone()).await?;
         self.matcher.update_recurrence(&mut learning).await?;
 
         if let Some(ref tracker) = self.effectiveness_tracker {
             let outcome = cog_core::SkillOutcome {
-                skill_id: "patch_deployment".into(),
-                task_signature: format!("patch:{}", patch_id),
+                skill_id: "change_deployment".into(),
+                task_signature: format!("change:{}", change_id),
                 success,
                 score: if success { Some(1.0) } else { Some(0.0) },
                 latency_ms: 0,
@@ -782,15 +782,15 @@ impl ReflectionEngine {
         }
     }
 
-    /// Generate a code patch (L2 evolution) and write it to disk.
-    pub async fn generate_code_patch(
+    /// Generate a code change (L2 evolution) and write it to disk.
+    pub async fn generate_code_change(
         &self,
         module_description: &str,
         learning_context: &str,
     ) -> cog_core::SFResult<Option<crate::types::EvolutionResult>> {
         match self.evolution {
             Some(ref evo) => {
-                evo.generate_code_patch(module_description, learning_context)
+                evo.generate_code_change(module_description, learning_context)
                     .await
             }
             None => Ok(None),
@@ -867,13 +867,13 @@ impl cog_core::ReflectionEngine for ReflectionEngine {
         Self::record_squad_result(self, task_id, goal, success, pge_mode, score, latency_ms).await
     }
 
-    async fn record_patch_outcome(
+    async fn record_change_outcome(
         &self,
-        patch_id: &str,
+        change_id: &str,
         success: bool,
         test_output: &str,
     ) -> cog_core::SFResult<()> {
-        Self::record_patch_outcome(self, patch_id, success, test_output).await
+        Self::record_change_outcome(self, change_id, success, test_output).await
     }
 
     fn start_reviewer(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -1130,7 +1130,7 @@ mod tests {
         engine.evolution = Some(Arc::new(EvolutionEngine::new(llm, registry, None)));
         // Lower thresholds.
         engine.hook_recurrence_threshold = 2;
-        engine.patch_recurrence_threshold = 5;
+        engine.change_recurrence_threshold = 5;
         engine.set_cooldown_secs(0);
 
         // Seed the recorder with a similar learning so recurrence bumps to 2.

@@ -356,6 +356,6 @@ pub trait ObservabilityGateway: Send + Sync {
 #[async_trait::async_trait]
 pub trait EvolutionMetrics: Send + Sync {
     async fn record_event(&self, failed: bool);
-    async fn record_patch_applied(&self);
-    async fn record_patch_failed(&self);
+    async fn record_change_applied(&self);
+    async fn record_change_failed(&self);
 }

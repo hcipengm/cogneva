@@ -1,6 +1,6 @@
 //! 晋级分级策略引擎。
 //!
-//! patch 在沙盒闯过验证关后，按触及的文件决定晋级通道：
+//! change 在沙盒闯过验证关后，按触及的文件决定晋级通道：
 //!
 //! - 黑名单（依赖清单 / 密钥文件）→ 直接拒收，连沙盒都不让进；
 //! - 全部落在 L0 配置路径 → 热更新通道（不碰二进制）；
@@ -57,7 +57,7 @@ fn matches_any(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|p| path.starts_with(p.as_str()))
 }
 
-/// 对 patch 触及的文件清单做晋级分级。
+/// 对 change 触及的文件清单做晋级分级。
 ///
 /// 判定顺序（命中即返回）：
 /// 1. 空清单 → Reject（无法确认影响面，fail-closed）；
@@ -71,7 +71,7 @@ fn matches_any(path: &str, prefixes: &[String]) -> bool {
 pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfig) -> GateVerdict {
     if files.is_empty() {
         return GateVerdict::Reject {
-            reason: "patch 未触及任何文件，无法确认影响面".into(),
+            reason: "change 未触及任何文件，无法确认影响面".into(),
         };
     }
 
@@ -278,8 +278,9 @@ mod tests {
 
     #[test]
     fn count_diff_lines_ignores_headers() {
-        let patch = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n";
-        assert_eq!(count_diff_lines(patch), 2);
+        let change =
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n";
+        assert_eq!(count_diff_lines(change), 2);
     }
 
     #[test]

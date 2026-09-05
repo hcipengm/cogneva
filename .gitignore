@@ -11,3 +11,7 @@ cogneva.json
 # Bootstrap runtime artifacts (machine-specific, never commit)
 intent_config.yaml
 management_plan.yaml
+
+# Self-evolution runtime artifacts written by tests/local runs (sandbox uses a PVC)
+evolution-changes/
+evolution-patches/

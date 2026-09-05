@@ -1,10 +1,10 @@
-//! Patch application pipeline for L2 self-evolution.
+//! Change application pipeline for L2 self-evolution.
 //!
 //! Responsibilities:
-//! - Scan `patch_dir` for `.patch` files (unified diff format).
+//! - Scan `change_dir` for `.diff` files (unified diff format).
 //! - Validate every affected path: must exist, must live inside the workspace,
 //!   and must not point to build/config/deployment files.
-//! - Apply patches with `git apply`, run `cargo test --workspace`,
+//! - Apply changes with `git apply`, run `cargo test --workspace`,
 //!   and roll back on failure.
 //! - Report results by updating the evolution status.
 
@@ -17,35 +17,35 @@ use tracing::{info, warn};
 use crate::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
 use crate::EvolutionEngine;
 
-/// Result of applying and testing a single patch.
+/// Result of applying and testing a single change.
 #[derive(Debug, Clone)]
 pub struct ApplyResult {
-    pub patch_id: String,
+    pub change_id: String,
     pub files_changed: Vec<PathBuf>,
     pub test_passed: bool,
     pub test_output: String,
     pub new_status: EvolutionStatus,
 }
 
-/// Pipeline that turns validated code patches into tested source changes.
+/// Pipeline that turns validated code changes into tested source changes.
 #[derive(Debug, Clone)]
-pub struct PatchPipeline {
+pub struct ChangePipeline {
     project_root: PathBuf,
-    patch_dir: PathBuf,
+    change_dir: PathBuf,
     auto_apply: bool,
     test_timeout_secs: u64,
     promotion_policy: Option<crate::PromotionGateConfig>,
 }
 
-impl PatchPipeline {
+impl ChangePipeline {
     pub fn new(
         project_root: impl Into<PathBuf>,
-        patch_dir: impl Into<PathBuf>,
+        change_dir: impl Into<PathBuf>,
         auto_apply: bool,
     ) -> Self {
         Self {
             project_root: project_root.into(),
-            patch_dir: patch_dir.into(),
+            change_dir: change_dir.into(),
             auto_apply,
             test_timeout_secs: 600,
             promotion_policy: None,
@@ -69,19 +69,19 @@ impl PatchPipeline {
         self
     }
 
-    /// List code patches that are ready to be applied to the working tree.
-    /// Scans `patch_dir` for `.patch` files and treats each one as a unified diff.
+    /// List code changes that are ready to be applied to the working tree.
+    /// Scans `change_dir` for `.diff` files and treats each one as a unified diff.
     /// This survives process restarts better than the in-memory
     /// `EvolutionEngine` results map.
-    pub async fn pending_patches(
+    pub async fn pending_changes(
         &self,
         engine: Option<&EvolutionEngine>,
     ) -> SFResult<Vec<EvolutionResult>> {
         let mut results = Vec::new();
-        let mut entries = tokio::fs::read_dir(&self.patch_dir).await.map_err(|e| {
+        let mut entries = tokio::fs::read_dir(&self.change_dir).await.map_err(|e| {
             SFError::IO(format!(
-                "Failed to read patch dir {}: {}",
-                self.patch_dir.display(),
+                "Failed to read change dir {}: {}",
+                self.change_dir.display(),
                 e
             ))
         })?;
@@ -89,15 +89,15 @@ impl PatchPipeline {
         while let Some(entry) = entries
             .next_entry()
             .await
-            .map_err(|e| SFError::IO(format!("Failed to read patch dir entry: {}", e)))?
+            .map_err(|e| SFError::IO(format!("Failed to read change dir entry: {}", e)))?
         {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("patch") {
+            if path.extension().and_then(|e| e.to_str()) != Some("diff") {
                 continue;
             }
 
             let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
-                SFError::IO(format!("Failed to read patch {}: {}", path.display(), e))
+                SFError::IO(format!("Failed to read change {}: {}", path.display(), e))
             })?;
 
             let artifact_id = path
@@ -127,9 +127,9 @@ impl PatchPipeline {
             }
 
             results.push(EvolutionResult {
-                kind: EvolutionKind::CodePatch,
+                kind: EvolutionKind::CodeChange,
                 artifact_id,
-                description: format!("Code patch from {}", path.display()),
+                description: format!("Code change from {}", path.display()),
                 content,
                 status,
                 created_at: chrono::Utc::now(),
@@ -141,19 +141,19 @@ impl PatchPipeline {
         Ok(results)
     }
 
-    /// Apply a single patch to the working tree and run the workspace test suite.
+    /// Apply a single change to the working tree and run the workspace test suite.
     ///
     /// On success:
     /// - if `auto_apply` is true, the working tree is left dirty and ready for
     ///   `git commit` by the deployer;
     /// - if `auto_apply` is false, the working tree is rolled back to a clean
-    ///   state and the patch stays `AwaitingReview` for manual approval.
+    ///   state and the change stays `AwaitingReview` for manual approval.
     ///
     /// On test failure the working tree is always rolled back.
-    pub async fn apply_and_test(&self, patch: &EvolutionResult) -> SFResult<ApplyResult> {
-        info!(patch_id = %patch.artifact_id, "Applying evolution patch");
+    pub async fn apply_and_test(&self, change: &EvolutionResult) -> SFResult<ApplyResult> {
+        info!(change_id = %change.artifact_id, "Applying evolution change");
 
-        let files_changed = Self::parse_patch(&patch.content)?;
+        let files_changed = Self::parse_diff(&change.content)?;
 
         // 晋级门入口：黑名单命中（依赖清单/密钥材料）直接拒收，
         // 不做 apply、不跑测试，状态落 Rejected 留审计痕迹。
@@ -162,13 +162,13 @@ impl PatchPipeline {
                 .iter()
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .collect();
-            let diff_lines = crate::promotion_gate::count_diff_lines(&patch.content);
+            let diff_lines = crate::promotion_gate::count_diff_lines(&change.content);
             if let crate::GateVerdict::Reject { reason } =
                 crate::promotion_gate::classify(&files, diff_lines, policy)
             {
-                warn!(patch_id = %patch.artifact_id, reason = %reason, "Patch rejected by promotion gate");
+                warn!(change_id = %change.artifact_id, reason = %reason, "Change rejected by promotion gate");
                 return Ok(ApplyResult {
-                    patch_id: patch.artifact_id.clone(),
+                    change_id: change.artifact_id.clone(),
                     files_changed,
                     test_passed: false,
                     test_output: format!("Promotion gate rejected: {reason}"),
@@ -177,25 +177,25 @@ impl PatchPipeline {
             }
         }
 
-        Self::validate_patch_files(&files_changed, &self.project_root)?;
+        Self::validate_change_files(&files_changed, &self.project_root)?;
         self.ensure_clean_workspace().await?;
 
-        if let Err(e) = self.git_apply_check(&patch.content).await {
+        if let Err(e) = self.git_apply_check(&change.content).await {
             return Ok(ApplyResult {
-                patch_id: patch.artifact_id.clone(),
+                change_id: change.artifact_id.clone(),
                 files_changed,
                 test_passed: false,
-                test_output: format!("Patch pre-check failed: {}", e),
+                test_output: format!("Change pre-check failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
             });
         }
 
-        if let Err(e) = self.git_apply(&patch.content).await {
+        if let Err(e) = self.git_apply(&change.content).await {
             return Ok(ApplyResult {
-                patch_id: patch.artifact_id.clone(),
+                change_id: change.artifact_id.clone(),
                 files_changed,
                 test_passed: false,
-                test_output: format!("Patch application failed: {}", e),
+                test_output: format!("Change application failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
             });
         }
@@ -203,10 +203,10 @@ impl PatchPipeline {
         let (test_passed, test_output) = match self.run_cargo_test().await {
             Ok(result) => result,
             Err(e) => {
-                warn!(patch_id = %patch.artifact_id, error = %e, "cargo test execution failed");
+                warn!(change_id = %change.artifact_id, error = %e, "cargo test execution failed");
                 let _ = self.git_reset_hard().await;
                 return Ok(ApplyResult {
-                    patch_id: patch.artifact_id.clone(),
+                    change_id: change.artifact_id.clone(),
                     files_changed,
                     test_passed: false,
                     test_output: format!("Failed to execute cargo test: {}", e),
@@ -217,21 +217,21 @@ impl PatchPipeline {
 
         let new_status = if test_passed {
             if self.auto_apply {
-                info!(patch_id = %patch.artifact_id, "Patch applied and tests passed; waiting for commit");
+                info!(change_id = %change.artifact_id, "Change applied and tests passed; waiting for commit");
                 EvolutionStatus::Active
             } else {
-                info!(patch_id = %patch.artifact_id, "Patch tests passed; rolling back for manual review");
+                info!(change_id = %change.artifact_id, "Change tests passed; rolling back for manual review");
                 let _ = self.git_reset_hard().await;
                 EvolutionStatus::AwaitingReview
             }
         } else {
-            warn!(patch_id = %patch.artifact_id, "Patch tests failed; rolling back");
+            warn!(change_id = %change.artifact_id, "Change tests failed; rolling back");
             let _ = self.git_reset_hard().await;
             EvolutionStatus::ValidationFailed
         };
 
         Ok(ApplyResult {
-            patch_id: patch.artifact_id.clone(),
+            change_id: change.artifact_id.clone(),
             files_changed,
             test_passed,
             test_output,
@@ -239,12 +239,12 @@ impl PatchPipeline {
         })
     }
 
-    /// Parse a unified diff patch and return the list of files it touches.
+    /// Parse a unified diff change and return the list of files it touches.
     ///
     /// Extracts paths from `+++ b/<path>` lines. New files appear as
     /// `+++ b/<path>` with `--- /dev/null`, so this also handles additions.
-    pub fn parse_patch(content: &str) -> SFResult<Vec<PathBuf>> {
-        let files = cog_core::parse_patch_affected_files(content)?;
+    pub fn parse_diff(content: &str) -> SFResult<Vec<PathBuf>> {
+        let files = cog_core::parse_diff_affected_files(content)?;
         Ok(files.into_iter().map(PathBuf::from).collect())
     }
 
@@ -252,7 +252,7 @@ impl PatchPipeline {
     /// - Must resolve to a real file inside the project root.
     /// - Must not escape the project root.
     /// - Must not be a build/config/deployment/secret file.
-    pub fn validate_patch_files(files: &[PathBuf], project_root: &Path) -> SFResult<()> {
+    pub fn validate_change_files(files: &[PathBuf], project_root: &Path) -> SFResult<()> {
         let canonical_root = project_root.canonicalize().map_err(|e| {
             SFError::IO(format!(
                 "Failed to canonicalize project root {}: {}",
@@ -328,7 +328,7 @@ impl PatchPipeline {
             {
                 warn!(
                     target = %file.display(),
-                    "Patch target is outside a src directory; allowed but unusual"
+                    "Change target is outside a src directory; allowed but unusual"
                 );
             }
         }
@@ -348,25 +348,25 @@ impl PatchPipeline {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.trim().is_empty() {
             return Err(SFError::Validation(format!(
-                "Git workspace is not clean; refusing to apply patch:\n{}",
+                "Git workspace is not clean; refusing to apply change:\n{}",
                 stdout
             )));
         }
         Ok(())
     }
 
-    /// Run `git apply --check` on patch content without modifying the tree.
-    async fn git_apply_check(&self, patch_content: &str) -> SFResult<()> {
-        self.run_git_apply(patch_content, true).await
+    /// Run `git apply --check` on change content without modifying the tree.
+    async fn git_apply_check(&self, change_content: &str) -> SFResult<()> {
+        self.run_git_apply(change_content, true).await
     }
 
-    /// Apply patch content to the working tree with `git apply`.
-    async fn git_apply(&self, patch_content: &str) -> SFResult<()> {
-        self.run_git_apply(patch_content, false).await
+    /// Apply change content to the working tree with `git apply`.
+    async fn git_apply(&self, change_content: &str) -> SFResult<()> {
+        self.run_git_apply(change_content, false).await
     }
 
     /// Shared implementation for `git apply [--check]`.
-    async fn run_git_apply(&self, patch_content: &str, check_only: bool) -> SFResult<()> {
+    async fn run_git_apply(&self, change_content: &str, check_only: bool) -> SFResult<()> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg("apply").arg("-v").current_dir(&self.project_root);
         if check_only {
@@ -383,10 +383,10 @@ impl PatchPipeline {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             stdin
-                .write_all(patch_content.as_bytes())
+                .write_all(change_content.as_bytes())
                 .await
                 .map_err(|e| {
-                    SFError::IO(format!("Failed to write patch to git apply stdin: {}", e))
+                    SFError::IO(format!("Failed to write change to git apply stdin: {}", e))
                 })?;
         }
 
@@ -439,16 +439,16 @@ impl PatchPipeline {
     }
 
     /// 同步沙盒源码树到上游 bare 仓库最新 main（进化 Pod 内 `local` 远程
-    /// 指向宿主 bare 仓库 /host-git）。patch 必须基于新鲜主线生成，否则
+    /// 指向宿主 bare 仓库 /host-git）。change 必须基于新鲜主线生成，否则
     /// GitOps 拉取端应用晋级产物时会因基树陈旧连带回退无关文件。
     ///
     /// 安全规则（任一不满足即跳过本轮同步，绝不丢在途工作）：
     /// - 无 `local` 远程（非沙盒环境）→ 跳过
-    /// - 工作树脏（有在途 patch）→ 跳过
+    /// - 工作树脏（有在途 change）→ 跳过
     /// - HEAD 已是 local/main 祖先 → reset --hard local/main（快进/对齐）
-    /// - HEAD 已是 local/evolution-release 祖先（本地 patch commit 已全部
+    /// - HEAD 已是 local/evolution-release 祖先（本地 change commit 已全部
     ///   发布到晋级分支，可安全丢弃）→ reset --hard local/main 重新对齐主线
-    /// - 否则（有未发布的本地 patch commit，如 soak 期/推送失败熔断中）
+    /// - 否则（有未发布的本地 change commit，如 soak 期/推送失败熔断中）
     ///   → 跳过，等发布成功或人工处置后再同步
     pub async fn sync_with_upstream(&self) -> SFResult<()> {
         if self
@@ -474,7 +474,7 @@ impl PatchPipeline {
             .map(|s| !s.is_empty())
             .unwrap_or(true);
         if dirty {
-            info!("sync_with_upstream: working tree dirty (patch in flight); skip");
+            info!("sync_with_upstream: working tree dirty (change in flight); skip");
             return Ok(());
         }
 
@@ -510,7 +510,7 @@ impl PatchPipeline {
 
         if !on_mainline && !published {
             info!(
-                "sync_with_upstream: unpublished local patch commits present; \
+                "sync_with_upstream: unpublished local change commits present; \
                  skip until promoted (or operator resolves)"
             );
             return Ok(());
@@ -560,8 +560,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_patch_extracts_files_from_unified_diff() {
-        let patch = r#"diff --git a/crates/foo/src/bar.rs b/crates/foo/src/bar.rs
+    fn parse_diff_extracts_files_from_unified_diff() {
+        let change = r#"diff --git a/crates/foo/src/bar.rs b/crates/foo/src/bar.rs
 index 1234567..abcdefg 100644
 --- a/crates/foo/src/bar.rs
 +++ b/crates/foo/src/bar.rs
@@ -569,14 +569,14 @@ index 1234567..abcdefg 100644
  fn old() {}
 +fn new() {}
 "#;
-        let files = PatchPipeline::parse_patch(patch).unwrap();
+        let files = ChangePipeline::parse_diff(change).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0], PathBuf::from("crates/foo/src/bar.rs"));
     }
 
     #[test]
-    fn parse_patch_handles_new_file() {
-        let patch = r#"diff --git a/crates/foo/src/new.rs b/crates/foo/src/new.rs
+    fn parse_diff_handles_new_file() {
+        let change = r#"diff --git a/crates/foo/src/new.rs b/crates/foo/src/new.rs
 new file mode 100644
 index 0000000..1234567
 --- /dev/null
@@ -584,13 +584,13 @@ index 0000000..1234567
 @@ -0,0 +1 @@
 +fn new() {}
 "#;
-        let files = PatchPipeline::parse_patch(patch).unwrap();
+        let files = ChangePipeline::parse_diff(change).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0], PathBuf::from("crates/foo/src/new.rs"));
     }
 
     #[tokio::test]
-    async fn git_apply_and_check_apply_patch_to_working_tree() {
+    async fn git_apply_and_check_apply_change_to_working_tree() {
         use tokio::process::Command;
 
         let temp = tempfile::tempdir().unwrap();
@@ -635,7 +635,7 @@ index 0000000..1234567
             .await
             .unwrap();
 
-        let patch = r#"diff --git a/src/lib.rs b/src/lib.rs
+        let change = r#"diff --git a/src/lib.rs b/src/lib.rs
 index 1111111..2222222 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
@@ -644,25 +644,25 @@ index 1111111..2222222 100644
 +fn new() {}
 "#;
 
-        let pipeline = PatchPipeline::new(root, root.join("patches"), true);
-        pipeline.git_apply_check(patch).await.unwrap();
-        pipeline.git_apply(patch).await.unwrap();
+        let pipeline = ChangePipeline::new(root, root.join("changes"), true);
+        pipeline.git_apply_check(change).await.unwrap();
+        pipeline.git_apply(change).await.unwrap();
 
         let content = tokio::fs::read_to_string(&src_path).await.unwrap();
         assert!(content.contains("fn new()"));
     }
 
     #[test]
-    fn parse_patch_rejects_empty_patch() {
-        let patch = "This is not a unified diff\nJust some text\n";
-        assert!(PatchPipeline::parse_patch(patch).is_err());
+    fn parse_diff_rejects_empty_change() {
+        let change = "This is not a unified diff\nJust some text\n";
+        assert!(ChangePipeline::parse_diff(change).is_err());
     }
 
     #[test]
-    fn validate_patch_files_rejects_escape() {
+    fn validate_change_files_rejects_escape() {
         let root = PathBuf::from("/tmp/should-not-exist-for-test");
         let files = vec![PathBuf::from("../etc/passwd")];
-        assert!(PatchPipeline::validate_patch_files(&files, &root).is_err());
+        assert!(ChangePipeline::validate_change_files(&files, &root).is_err());
     }
 
     /// git 集成测试脚手架：造 upstream bare + 沙盒 work（remote local→bare）。
@@ -732,7 +732,7 @@ index 1111111..2222222 100644
         let (upstream, work) = scaffold_upstream().await;
         advance_upstream(upstream.path(), "b.txt").await;
 
-        let pipeline = PatchPipeline::new(work.path(), work.path().join("patches"), true);
+        let pipeline = ChangePipeline::new(work.path(), work.path().join("changes"), true);
         pipeline.sync_with_upstream().await.unwrap();
 
         assert!(work.path().join("b.txt").exists());
@@ -751,16 +751,16 @@ index 1111111..2222222 100644
     #[tokio::test]
     async fn sync_with_upstream_skips_unpublished_local_commits() {
         let (upstream, work) = scaffold_upstream().await;
-        // 沙盒本地产生一个未发布的 patch commit。
-        tokio::fs::write(work.path().join("patch.txt"), "p\n")
+        // 沙盒本地产生一个未发布的 change commit。
+        tokio::fs::write(work.path().join("change.txt"), "p\n")
             .await
             .unwrap();
         git_ok(work.path(), &["add", "."]).await;
-        git_ok(work.path(), &["commit", "-m", "patch"]).await;
+        git_ok(work.path(), &["commit", "-m", "change"]).await;
         let before = head_of(work.path()).await;
         advance_upstream(upstream.path(), "b.txt").await;
 
-        let pipeline = PatchPipeline::new(work.path(), work.path().join("patches"), true);
+        let pipeline = ChangePipeline::new(work.path(), work.path().join("changes"), true);
         pipeline.sync_with_upstream().await.unwrap();
 
         // 未发布 commit 在途：不同步，HEAD 不变（soak/熔断窗口保护）。
@@ -769,33 +769,33 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
-    async fn sync_with_upstream_resets_after_patch_published() {
+    async fn sync_with_upstream_resets_after_change_published() {
         let (upstream, work) = scaffold_upstream().await;
-        // 沙盒本地 patch commit 并推送到 evolution-release（模拟晋级发布）。
-        tokio::fs::write(work.path().join("patch.txt"), "p\n")
+        // 沙盒本地 change commit 并推送到 evolution-release（模拟晋级发布）。
+        tokio::fs::write(work.path().join("change.txt"), "p\n")
             .await
             .unwrap();
         git_ok(work.path(), &["add", "."]).await;
-        git_ok(work.path(), &["commit", "-m", "patch"]).await;
+        git_ok(work.path(), &["commit", "-m", "change"]).await;
         git_ok(work.path(), &["push", "local", "HEAD:evolution-release"]).await;
         advance_upstream(upstream.path(), "b.txt").await;
 
-        let pipeline = PatchPipeline::new(work.path(), work.path().join("patches"), true);
+        let pipeline = ChangePipeline::new(work.path(), work.path().join("changes"), true);
         pipeline.sync_with_upstream().await.unwrap();
 
         // 已发布的本地 commit 安全丢弃，树对齐最新主线。
         assert!(work.path().join("b.txt").exists());
-        assert!(!work.path().join("patch.txt").exists());
+        assert!(!work.path().join("change.txt").exists());
     }
 
     #[tokio::test]
     async fn apply_and_test_rejects_forbidden_files_at_gate() {
         let temp = tempfile::tempdir().unwrap();
-        let pipeline = PatchPipeline::new(temp.path(), temp.path().join("patches"), true)
+        let pipeline = ChangePipeline::new(temp.path(), temp.path().join("changes"), true)
             .with_promotion_policy(crate::PromotionGateConfig::default());
 
-        let patch = crate::types::EvolutionResult {
-            kind: crate::types::EvolutionKind::CodePatch,
+        let change = crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::CodeChange,
             artifact_id: "evil-1".into(),
             description: "touches Cargo.toml".into(),
             content: r#"diff --git a/Cargo.toml b/Cargo.toml
@@ -812,7 +812,7 @@ index 1111111..2222222 100644
             eval_summary: None,
         };
 
-        let result = pipeline.apply_and_test(&patch).await.unwrap();
+        let result = pipeline.apply_and_test(&change).await.unwrap();
         assert!(!result.test_passed);
         assert_eq!(result.new_status, crate::types::EvolutionStatus::Rejected);
         assert!(result.test_output.contains("Promotion gate rejected"));
@@ -821,9 +821,9 @@ index 1111111..2222222 100644
     #[tokio::test]
     async fn apply_and_test_without_policy_keeps_legacy_behavior() {
         // 未配置晋级策略时入口校验不生效（旧行为零回归）：
-        // Cargo.toml patch 会走到 validate_patch_files 的既有黑名单。
+        // Cargo.toml change 会走到 validate_change_files 的既有黑名单。
         let temp = tempfile::tempdir().unwrap();
-        let pipeline = PatchPipeline::new(temp.path(), temp.path().join("patches"), true);
+        let pipeline = ChangePipeline::new(temp.path(), temp.path().join("changes"), true);
         assert!(pipeline.promotion_policy.is_none());
     }
 }
