@@ -77,28 +77,39 @@ spec:
               git remote remove local 2>/dev/null || true
               git remote add local /host-git
               git fetch local --tags
-              # 基线对齐：工作源码首次 seed 后冻结，镜像升级不自动跟随；启动时幂等对齐到
-              # 当前运行版本的 release tag。工作区脏或有未晋级 commit 则不重置（避免冲掉
-              # 在制变更），仅告警，下次启动再判；已晋级成果在 bare 的 evolution-release/tag。
+              # 基线对齐：启动时幂等对齐到当前运行版本。对齐目标优先取基线移植器产出的
+              # evol/<id> 分支（= 新基线 + 全部移植成功的历史变更，gen-n tag 标记代际）；
+              # 该分支必须已包含目标 release tag（移植器已在新基线上跑过），否则退化为纯
+              # tag 重置——worker 启动后移植器会自行完成移植并把工作树切到 evol 分支。
+              # 工作区脏、或有目标 ref 之外的未晋级 commit 时不重置（避免冲掉在制变更），
+              # 仅告警，下次启动再判。
               TARGET_TAG="v${COGNEVA_VERSION}"
-              if ! git rev-parse -q --verify "refs/tags/${TARGET_TAG}^{commit}" >/dev/null; then
+              TARGET_COMMIT="refs/tags/${TARGET_TAG}^{commit}"
+              if ! git rev-parse -q --verify "$TARGET_COMMIT" >/dev/null; then
                 echo "WARN: baseline tag ${TARGET_TAG} not found; skip alignment (dev/local build?)"
-              elif [ "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${TARGET_TAG}^{commit}")" ]; then
-                echo "Source baseline already at ${TARGET_TAG}; nothing to do"
               else
-                # 晋级基线：已晋级过用 evolution-release，否则用 seed 基线 local/main
-                if git rev-parse -q --verify refs/remotes/local/evolution-release >/dev/null; then
-                  BASE_REF=local/evolution-release
+                # 移植成果分支：evol/* 中包含目标 tag 的一支（单实例只有一支，取排序最后）
+                PORT_REF=""
+                for ref in $(git for-each-ref --format='%(refname)' refs/remotes/local/evol/ | sort); do
+                  if git merge-base --is-ancestor "$TARGET_COMMIT" "$ref" 2>/dev/null; then
+                    PORT_REF="$ref"
+                  fi
+                done
+                if [ -n "$PORT_REF" ]; then
+                  DESIRED="$PORT_REF"
+                  echo "Found ported branch ${PORT_REF} carrying ${TARGET_TAG}; aligning to ported baseline"
                 else
-                  BASE_REF=local/main
+                  DESIRED="$TARGET_COMMIT"
                 fi
-                if [ -n "$(git status --porcelain)" ] || [ -n "$(git log "${BASE_REF}..HEAD" --oneline)" ]; then
+                if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$DESIRED")" ]; then
+                  echo "Source baseline already aligned (${DESIRED}); nothing to do"
+                elif [ -n "$(git status --porcelain)" ] || [ -n "$(git log "${DESIRED}..HEAD" --oneline)" ]; then
                   echo "WARN: deployed version is ${TARGET_TAG} but source has unpromoted in-flight work;"
                   echo "WARN: keeping current baseline to avoid losing in-flight changes. Promote then restart,"
                   echo "WARN: or force-refresh by deleting the source PVC / 'git reset --hard ${TARGET_TAG}'."
                 else
-                  echo "Clean tree, no unpromoted work; aligning source baseline to ${TARGET_TAG}"
-                  git reset --hard "refs/tags/${TARGET_TAG}^{commit}"
+                  echo "Clean tree, no unpromoted work; aligning source baseline to ${DESIRED}"
+                  git reset --hard "$DESIRED"
                 fi
               fi
           volumeMounts:
