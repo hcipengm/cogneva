@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      multi_arch:
+        description: "构建 amd64+arm64 双架构（arm64 走 QEMU 模拟，很慢，约数小时）"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -64,9 +70,11 @@ jobs:
   build-docker:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    # 双架构（arm64 经 QEMU）Rust 全量编译正常 40-90 分钟；超时即失败暴露，
-    # 不再无声挂到 runner 6 小时上限。
-    timeout-minutes: 120
+    # tag 自动发版只构建 amd64（原生编译，分钟级）；arm64 经 QEMU 模拟编译
+    # 整个 Rust workspace 实测三次均 2h+ 跑不完，改为仅 workflow_dispatch 手动
+    # 勾选 multi_arch 时构建双架构（给足 5 小时）。原生 arm runner 到位前 arm64
+    # 镜像处于空缺状态，bootstrap 走 release 附件 amd64 镜像包，不受影响。
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.multi_arch == 'true' && 300 || 90 }}
     permissions:
       contents: read
       packages: write
@@ -93,6 +101,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=tag
+            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
@@ -108,7 +117,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.multi_arch == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v2
@@ -120,6 +129,9 @@ jobs:
   gitee-release:
     name: Mirror Release to Gitee
     needs: build-release
+    # 仅 tag 发版时同步 Gitee；手动 dispatch（main 分支）不建 release，
+    # 避免 PATCH 把已有 release notes 覆盖成兜底文本。
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
