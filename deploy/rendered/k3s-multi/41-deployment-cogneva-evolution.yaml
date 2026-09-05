@@ -37,12 +37,18 @@ spec:
         - name: seed-source
           image: localhost/cogneva:local
           imagePullPolicy: IfNotPresent
+          # 当前运行镜像版本（= chart appVersion，与 Cargo.toml 同源）；基线对齐锚到
+          # 上游对应的 release tag v<版本>，保证进化改的是正在运行版本的代码。
+          env:
+            - name: COGNEVA_VERSION
+              value: "0.5.7"
           command:
             - sh
             - -c
             - |
               set -e
               git config --global --add safe.directory /host-git
+              git config --global --add safe.directory /opt/cogneva/sandbox/src
               # gitRemote.mode=pvc 时首挂是空卷，从公开仓库 seed；
               # hostPath 模式宿主已预 seed，本步自动跳过
               if [ ! -f /host-git/HEAD ]; then
@@ -50,6 +56,13 @@ spec:
                 git clone --bare https://github.com/hcipengm/cogneva.git /tmp/seed.git
                 cp -a /tmp/seed.git/. /host-git/
                 rm -rf /tmp/seed.git
+              fi
+              # bare 保持一个指向上游的 upstream remote，启动时拉最新 main 与 release tag。
+              # 失败不阻塞：离线时用 seed 已带的 tag（当前部署版本的 tag 在 seed 时就存在）。
+              git --git-dir=/host-git remote remove upstream 2>/dev/null || true
+              git --git-dir=/host-git remote add upstream https://github.com/hcipengm/cogneva.git
+              if ! git --git-dir=/host-git fetch upstream --tags --force; then
+                echo "WARN: fetch upstream tags failed (offline?); using tags present at seed"
               fi
               if [ ! -d /opt/cogneva/sandbox/src/.git ] || [ ! -f /opt/cogneva/sandbox/src/Cargo.toml ]; then
                 echo "Source PVC is empty or incomplete; cloning from local bare repo..."
@@ -63,7 +76,31 @@ spec:
               git config user.name "Cogneva Evolution"
               git remote remove local 2>/dev/null || true
               git remote add local /host-git
-              git fetch local
+              git fetch local --tags
+              # 基线对齐：工作源码首次 seed 后基线冻结，镜像升级不会自动跟随。启动时幂等对齐
+              # 到当前运行版本的 release tag。工作区脏、或有未晋级 commit 时不重置（避免冲掉
+              # 在制 patch），仅告警，下次启动再判；已晋级成果在 bare 的 evolution-release/tag。
+              TARGET_TAG="v${COGNEVA_VERSION}"
+              if ! git rev-parse -q --verify "refs/tags/${TARGET_TAG}^{commit}" >/dev/null; then
+                echo "WARN: baseline tag ${TARGET_TAG} not found; skip alignment (dev/local build?)"
+              elif [ "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${TARGET_TAG}^{commit}")" ]; then
+                echo "Source baseline already at ${TARGET_TAG}; nothing to do"
+              else
+                # 晋级基线：已晋级过用 evolution-release，否则用 seed 基线 local/main
+                if git rev-parse -q --verify refs/remotes/local/evolution-release >/dev/null; then
+                  BASE_REF=local/evolution-release
+                else
+                  BASE_REF=local/main
+                fi
+                if [ -n "$(git status --porcelain)" ] || [ -n "$(git log "${BASE_REF}..HEAD" --oneline)" ]; then
+                  echo "WARN: deployed version is ${TARGET_TAG} but source has unpromoted in-flight work;"
+                  echo "WARN: keeping current baseline to avoid losing patches. Promote then restart,"
+                  echo "WARN: or force-refresh by deleting the source PVC / 'git reset --hard ${TARGET_TAG}'."
+                else
+                  echo "Clean tree, no unpromoted work; aligning source baseline to ${TARGET_TAG}"
+                  git reset --hard "refs/tags/${TARGET_TAG}^{commit}"
+                fi
+              fi
           volumeMounts:
             - name: source
               mountPath: /opt/cogneva/sandbox/src
