@@ -23,6 +23,7 @@
 //! - **`cog-core`** — `SkillRegistry` receives promoted `SkillConfig` entries.
 
 pub mod auto_promoter;
+pub mod baseline_port;
 pub mod change_pipeline;
 pub mod config;
 pub mod crew;
@@ -54,6 +55,9 @@ pub mod squad;
 pub mod types;
 
 pub use auto_promoter::{AutoPromoter, PromotionChannel};
+pub use baseline_port::{
+    AbsorptionStatus, BaselinePorter, PortPlan, PortPlanItem, PromotedChange,
+};
 pub use change_pipeline::{ApplyResult, ChangePipeline};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
 pub use config::{GitOpsConfig, PromotionGateConfig};
