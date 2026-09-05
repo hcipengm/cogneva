@@ -5,11 +5,6 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      multi_arch:
-        description: "构建 amd64+arm64 双架构（arm64 走 QEMU 模拟，很慢，约数小时）"
-        type: boolean
-        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,11 +65,14 @@ jobs:
   build-docker:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    # tag 自动发版只构建 amd64（原生编译，分钟级）；arm64 经 QEMU 模拟编译
-    # 整个 Rust workspace 实测三次均 2h+ 跑不完，改为仅 workflow_dispatch 手动
-    # 勾选 multi_arch 时构建双架构（给足 5 小时）。原生 arm runner 到位前 arm64
-    # 镜像处于空缺状态，bootstrap 走 release 附件 amd64 镜像包，不受影响。
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.multi_arch == 'true' && 300 || 90 }}
+    # tag 发版自动构建双架构 linux/amd64 + linux/arm64。amd64 原生编译约 10 分钟；
+    # arm64 在 x86 runner 上经 QEMU 用户态模拟编译整个 Rust workspace，冷编译实测
+    # 约 4 小时（v0.2.0 那次 build+push 248 分钟成功），期间会长时间无日志输出——
+    # 这是 QEMU 慢，不是卡死，切勿在 2-3 小时取消（buildx gha 缓存只在构建成功后的
+    # 导出阶段上传，取消=缓存不上传=下次仍冷编译）。超时给满 runner 上限 360 分钟。
+    # 原生 arm runner / amd64 交叉编译到位前 arm64 就靠这条自动路径；
+    # bootstrap 走 release 附件 amd64 镜像包，不依赖 GHCR arm64。
+    timeout-minutes: 360
     permissions:
       contents: read
       packages: write
@@ -117,7 +115,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.multi_arch == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          platforms: linux/amd64,linux/arm64
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v2
