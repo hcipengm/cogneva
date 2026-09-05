@@ -523,77 +523,49 @@ async fn ensure_buildah() -> Result<()> {
 /// 自进化 git 远程：evolution worker 的 hostPath bare 仓库（沙盒与宿主双向同步
 /// 通道，清单里写死 /var/lib/cogneva-data/git-remote）。空白机上该目录不存在
 /// 会导致 evolution Pod FailedMount，必须在部署清单前创建并 seed 源码。
+///
+/// bare 仓库直接从上游公开仓库**完整** clone（含全部历史与 tag），与多节点/PVC
+/// 模式 initContainer 的 seed 行为一致。不能从节点源码 clone：bootstrap 取码是
+/// `--depth 1` 浅克隆、tarball 路径连 .git 都没有，会把进化中央仓库也变成浅/
+/// 零历史——进化需要完整历史做 log/blame/tag/基线对齐。节点源码（浅克隆）仍供
+/// 编译引导器与 apply 清单，与进化 bare 解耦。
 async fn ensure_git_remote() -> Result<()> {
     let remote = Path::new("/var/lib/cogneva-data/git-remote");
     if remote.join("HEAD").exists() {
         info!("git-remote bare 仓库已存在，跳过");
         return Ok(());
     }
-    let src = repo_root()
-        .canonicalize()
-        .context("源码目录无法解析为绝对路径")?;
-    if !src.join(".git").exists() {
-        // tarball 方式取得的源码没有版本历史：就地初始化一个仓库作为同步起点，
-        // 否则 git clone --bare 必失败（evolution worker 的 hostPath 依赖它）
-        info!(
-            "源码目录无 .git（tarball 安装），就地初始化仓库: {}",
-            src.display()
-        );
-        run("git", &["-C", &src.to_string_lossy(), "init", "-b", "main"]).await?;
-        run(
-            "git",
-            &[
-                "-C",
-                &src.to_string_lossy(),
-                "config",
-                "user.email",
-                "evolution@cogneva.local",
-            ],
-        )
-        .await?;
-        run(
-            "git",
-            &[
-                "-C",
-                &src.to_string_lossy(),
-                "config",
-                "user.name",
-                "Cogneva Evolution",
-            ],
-        )
-        .await?;
-        run("git", &["-C", &src.to_string_lossy(), "add", "-A"]).await?;
-        run(
-            "git",
-            &[
-                "-C",
-                &src.to_string_lossy(),
-                "commit",
-                "-m",
-                "cogneva bootstrap: initial source snapshot",
-            ],
-        )
-        .await?;
-    }
     if let Some(parent) = remote.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // 地址与 chart evolution.gitRemote.seedUrl 同源；CN 走 Gitee，失败回落另一地址。
+    let (primary, fallback) = if cn_mirror() {
+        (
+            "https://gitee.com/hcipengm/cogneva.git",
+            "https://github.com/hcipengm/cogneva.git",
+        )
+    } else {
+        (
+            "https://github.com/hcipengm/cogneva.git",
+            "https://gitee.com/hcipengm/cogneva.git",
+        )
+    };
     info!(
-        "初始化自进化 git 远程仓库: {} -> {}",
-        src.display(),
+        "初始化自进化 git 远程仓库（从上游完整 clone）→ {}",
         remote.display()
     );
-    run(
-        "git",
-        &[
-            "clone",
-            "--bare",
-            &src.to_string_lossy(),
-            &remote.to_string_lossy(),
-        ],
-    )
-    .await?;
-    Ok(())
+    for url in [primary, fallback] {
+        // 失败重试前清掉半截 clone 产物，避免下次 clone 因目录非空报错。
+        std::fs::remove_dir_all(remote).ok();
+        match run("git", &["clone", "--bare", url, &remote.to_string_lossy()]).await {
+            Ok(()) => {
+                info!("git-remote bare 已从 {url} seed");
+                return Ok(());
+            }
+            Err(e) => warn!("从 {url} clone git-remote bare 失败：{e}，尝试下一地址"),
+        }
+    }
+    bail!("无法从任一上游地址 clone git-remote bare 仓库");
 }
 
 async fn ensure_firecracker() -> Result<()> {
