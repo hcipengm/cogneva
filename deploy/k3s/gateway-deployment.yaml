@@ -107,10 +107,10 @@ spec:
               value: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
             - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
               value: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
-            # Gitee 严格校验 redirect_uri，code 只回跳注册载体地址；
-            # 向导引导用户粘贴跳转后的地址栏网址完成授权。
+            # Gitee 严格校验 redirect_uri，code 只回跳注册列表内地址；
+            # 默认落地页（静态回调页）用 postMessage 把 code 自动递回向导。
             - name: COGNEVA_GITEE_OAUTH_REDIRECT_URI
-              value: "https://github.com/hcipengm/cogneva"
+              value: "https://hcipengm.github.io/cogneva/oauth-callback.html"
           livenessProbe:
             httpGet:
               path: /health/live
