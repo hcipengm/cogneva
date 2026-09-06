@@ -41,6 +41,37 @@ jobs:
         # pulls crate releases that may require a newer rustc than pinned.
         run: cargo build --workspace --release --locked
 
+      - name: Build static bootstrap binaries (musl)
+        # bootstrap.sh defaults to downloading these musl-static binaries
+        # (deployment assets are embedded in the binary, so no source tree or
+        # Rust toolchain is needed on the target host). amd64 builds natively
+        # with musl-gcc; arm64 cross-builds via cargo-zigbuild (zig ships the
+        # aarch64 musl sysroot). Names must match bootstrap.sh:
+        # cogneva-bootstrap-<tag>-linux-<uname -m>[.sha256].
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          python3 -m pip install --quiet --user cargo-zigbuild ziglang
+          export PATH="$HOME/.local/bin:$PATH"
+          TAG="${GITHUB_REF_NAME:-dev}"
+          cargo build --release --locked \
+            --target x86_64-unknown-linux-musl -p cogneva-bootstrap
+          cargo zigbuild --release --locked \
+            --target aarch64-unknown-linux-musl -p cogneva-bootstrap
+          mkdir -p bootstrap-dist
+          cp target/x86_64-unknown-linux-musl/release/cogneva-bootstrap \
+            "bootstrap-dist/cogneva-bootstrap-${TAG}-linux-x86_64"
+          cp target/aarch64-unknown-linux-musl/release/cogneva-bootstrap \
+            "bootstrap-dist/cogneva-bootstrap-${TAG}-linux-aarch64"
+          (cd bootstrap-dist
+            for f in cogneva-bootstrap-${TAG}-linux-*; do
+              case "$f" in *.sha256) continue;; esac
+              sha256sum "$f" > "$f.sha256"
+            done)
+          file bootstrap-dist/* || true
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -50,6 +81,7 @@ jobs:
             target/release/*.so
             target/release/*.dll
             target/release/*.dylib
+            bootstrap-dist/cogneva-bootstrap-*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -60,6 +92,7 @@ jobs:
             target/release/*.so
             target/release/*.dll
             target/release/*.dylib
+            bootstrap-dist/cogneva-bootstrap-*
           generate_release_notes: true
 
   build-docker:

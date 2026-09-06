@@ -44,6 +44,26 @@ fn make_workdir(tag: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// 把二进制内嵌的部署资产解包到一次性工作目录，并将 COGNEVA_REPO_ROOT 指向它。
+/// 预编译引导器没有源码树，但 apply/helm 两条投递路径与密钥初始化都按
+/// repo_root()/deploy/... 读盘——解包后这些路径全部可用，磁盘读取逻辑零改动。
+fn materialize_assets() -> Result<PathBuf> {
+    let dir = make_workdir("assets")?;
+    for (rel, data) in embedded_assets::EMBEDDED_ASSETS {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, data)?;
+        #[cfg(unix)]
+        if rel.ends_with(".sh") {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(dir)
+}
+
 use anyhow::{bail, Context, Result};
 use cogneva_bootstrap::Distro;
 use serde::Serialize;
@@ -51,6 +71,12 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 mod kubespray;
+
+/// 构建期内嵌的部署资产（预渲染清单 / init-secrets 脚本 / helm chart），
+/// 由 build.rs 从 deploy/ 打包生成。
+mod embedded_assets {
+    include!(concat!(env!("OUT_DIR"), "/bootstrap_assets.rs"));
+}
 
 /// 集群供给决策：发行版 + 是否多节点 +（若有）从 kubespray 回落 K3s 的原因。
 #[derive(Debug, Clone)]
@@ -518,6 +544,35 @@ async fn ensure_buildah() -> Result<()> {
     run("apt-get", &["update"]).await?;
     run("apt-get", &["install", "-y", "buildah"]).await?;
     Ok(())
+}
+
+/// 预编译引导器不经 shell 装基础工具；自进化 bare 仓库 seed 与镜像源码回退
+/// 构建都要 git。源码构建回退路径由 bootstrap.sh 的 ensure_cc 兜底，这里覆盖
+/// 预编译路径：按包管理器自动安装，装不上报错提示手动安装。
+async fn ensure_git() -> Result<()> {
+    if command_exists("git").await {
+        return Ok(());
+    }
+    info!("未检测到 git，尝试自动安装...");
+    let managers: &[(&str, &[&str])] = &[
+        ("apt-get", &["apt-get", "install", "-y", "git"]),
+        ("dnf", &["dnf", "install", "-y", "git"]),
+        ("yum", &["yum", "install", "-y", "git"]),
+        ("apk", &["apk", "add", "git"]),
+    ];
+    for (mgr, args) in managers {
+        if !command_exists(mgr).await {
+            continue;
+        }
+        if *mgr == "apt-get" {
+            run("apt-get", &["update"]).await.ok();
+        }
+        if run(args[0], &args[1..]).await.is_ok() && command_exists("git").await {
+            info!("git 已安装");
+            return Ok(());
+        }
+    }
+    bail!("git 不可用且自动安装失败，请手动安装 git 后重新运行引导器");
 }
 
 /// 自进化 git 远程：evolution worker 的 hostPath bare 仓库（沙盒与宿主双向同步
@@ -1194,9 +1249,55 @@ fn cargo_jobs_for_memory() -> Option<usize> {
     (kb / 1024 / 1024 <= 6).then_some(2)
 }
 
+/// 镜像源码构建回退需要完整源码树（Dockerfile + 构建上下文）。预编译引导器
+/// 解包出的 repo_root 只有部署资产，按"本机进化 bare 仓库 → 上游克隆"顺序取
+/// 源码：单节点的 bare 仓库已从上游完整 clone（含全部历史），本地克隆秒级
+/// 完成且不耗外网；多节点（git-remote 走集群卷）或 bare 缺失时直接克隆上游。
+async fn ensure_source_tree() -> Result<PathBuf> {
+    let root = repo_root();
+    if root.join("Dockerfile").is_file() {
+        return Ok(root);
+    }
+    let dir = make_workdir("src")?;
+    let bare = Path::new("/var/lib/cogneva-data/git-remote");
+    let upstream = if cn_mirror() {
+        [
+            "https://gitee.com/hcipengm/cogneva.git",
+            "https://github.com/hcipengm/cogneva.git",
+        ]
+    } else {
+        [
+            "https://github.com/hcipengm/cogneva.git",
+            "https://gitee.com/hcipengm/cogneva.git",
+        ]
+    };
+    let mut attempts: Vec<Vec<&str>> = Vec::new();
+    if bare.join("HEAD").exists() {
+        attempts.push(vec![
+            "clone",
+            bare.to_str().unwrap(),
+            dir.to_str().unwrap(),
+        ]);
+    }
+    for url in upstream {
+        attempts.push(vec!["clone", "--depth", "1", url, dir.to_str().unwrap()]);
+    }
+    for args in &attempts {
+        std::fs::remove_dir_all(&dir).ok();
+        match run("git", args).await {
+            Ok(()) => {
+                info!("镜像源码回退树已就绪: {}", dir.display());
+                return Ok(dir);
+            }
+            Err(e) => warn!("源码获取失败（{e:#}），尝试下一来源"),
+        }
+    }
+    bail!("无法获取镜像构建源码树（本地 bare 仓库与上游克隆均失败）");
+}
+
 /// 从源码 buildah 构建镜像到本机存储（首次需 1-3 小时）。
 async fn build_image_locally(image: &str) -> Result<()> {
-    let root = repo_root();
+    let root = ensure_source_tree().await?;
     info!("从源码构建运行时镜像 {image}（首次需较长时间）...");
     // 同时打不可变版本 tag（:local 之外的追溯锚点，与 release 预构建流一致）
     let versioned = format!("localhost/cogneva:{}", env!("CARGO_PKG_VERSION"));
@@ -1867,6 +1968,17 @@ async fn main() -> Result<()> {
 
     info!("== Cogneva 元启动引导器 ==");
 
+    // 预编译路径：引导器自带全部部署资产，解包后把 repo_root 指向解包目录。
+    // 两种情况保持磁盘源码树优先：bootstrap.sh 源码构建会显式 export
+    // COGNEVA_REPO_ROOT；开发者在仓库根直接运行时 cwd 下就是 deploy/。
+    if std::env::var("COGNEVA_REPO_ROOT").is_err()
+        && !Path::new("deploy/helm/cogneva/Chart.yaml").is_file()
+    {
+        let assets = materialize_assets()?;
+        std::env::set_var("COGNEVA_REPO_ROOT", &assets);
+        info!("部署资产已从二进制内嵌内容解包 → {}", assets.display());
+    }
+
     #[cfg(not(target_os = "linux"))]
     warn!(
         "引导器需在 Linux 运行层内执行，当前为 {}。\
@@ -1925,6 +2037,7 @@ async fn main() -> Result<()> {
     ensure_buildah().await?;
     ensure_buildah_mirror().await?;
     ensure_firecracker().await?;
+    ensure_git().await?;
     if probe_nodes().await > 1 {
         // 多节点：git-remote 走集群卷（渲染时选 PVC 变体），宿主 bare 仓库不再使用
         info!("多节点集群：git-remote 走集群卷，跳过宿主 bare 仓库 seed");
@@ -1972,6 +2085,45 @@ mod profile_tests {
         // 段数不齐补 0、非数字后缀按 0 处理
         assert!(super::version_lt("0.5", "0.5.1"));
         assert!(super::version_lt("0.5.7", "0.6.0-rc1"));
+    }
+
+    #[test]
+    fn embedded_assets_cover_apply_and_helm_inputs() {
+        let assets: Vec<&str> = super::embedded_assets::EMBEDDED_ASSETS
+            .iter()
+            .map(|(p, _)| *p)
+            .collect();
+        for required in [
+            "deploy/scripts/init-secrets.sh",
+            "deploy/helm/cogneva/Chart.yaml",
+            "deploy/helm/cogneva/values.yaml",
+            "deploy/helm/cogneva/profiles/k3s-single.yaml",
+            "deploy/helm/cogneva/templates/secret.yaml",
+            "deploy/rendered/k3s-single/00-namespace-cogneva.yaml",
+            "deploy/rendered/k3s-single/41-deployment-cogneva.yaml",
+            "deploy/rendered/k3s-multi/20-persistentvolumeclaim-cogneva-git-remote-pvc.yaml",
+            "deploy/rendered/k8s-standard/60-ingress-cogneva.yaml",
+        ] {
+            assert!(assets.contains(&required), "内嵌资产缺失: {required}");
+        }
+        // 三个 profile 的渲染产物必须成套（38/39/37 量级，这里只断言下限防漏嵌）
+        for profile in ["k3s-single", "k3s-multi", "k8s-standard"] {
+            let n = assets
+                .iter()
+                .filter(|p| p.starts_with(&format!("deploy/rendered/{profile}/")))
+                .count();
+            assert!(n >= 30, "profile {profile} 内嵌清单数异常: {n}");
+        }
+    }
+
+    #[test]
+    fn materialized_assets_are_readable() {
+        let dir = super::materialize_assets().expect("资产解包成功");
+        assert!(dir.join("deploy/scripts/init-secrets.sh").is_file());
+        assert!(dir.join("deploy/helm/cogneva/Chart.yaml").is_file());
+        assert!(dir
+            .join("deploy/rendered/k3s-single/00-namespace-cogneva.yaml")
+            .is_file());
     }
 
     #[test]

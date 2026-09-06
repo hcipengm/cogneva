@@ -3,7 +3,9 @@
 # 用法: curl -fsSL https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh | sh
 # Linux 裸机直接引导；macOS 自动经 Lima 虚拟机提供 Linux 运行层后走同一流程；
 # Windows 请用 bootstrap.ps1（WSL2）。
-# 职责仅三件：确保 Linux 运行层 → 确保源码 → 确保 Rust 工具链 → 编译引导器并移交控制权。
+# Linux 上默认下载 release 预编译静态引导器（内嵌全部部署资产）直接运行；
+# 下载/校验失败或 COGNEVA_BOOTSTRAP_FROM_SOURCE=1 时回退源码构建路径
+# （取码 → 装 Rust 工具链 → 编译引导器），两条路径最终都移交 Rust 引导器。
 set -eu
 
 REPO_URL="https://github.com/hcipengm/cogneva.git"
@@ -189,6 +191,69 @@ ensure_cc() {
     fi
 }
 
+# ---------- 预编译静态引导器（默认路径） ----------
+# 下载 release 附件里的 musl 静态二进制（内嵌全部部署资产，无需源码/Rust），
+# sha256 校验通过后直接 exec，成功不返回。任何失败返回非零，由调用方回退到
+# 源码构建路径（fetch_source → cargo build），两条路径互不影响。
+fetch_prebuilt_bootstrap() {
+    case "$(uname -m)" in
+        x86_64|aarch64) arch="$(uname -m)" ;;
+        *) echo "[bootstrap] 预编译引导器无 $(uname -m) 架构产物，回退源码构建" >&2; return 1 ;;
+    esac
+    # 最新 release 标签与下载基址：CN 先 Gitee 后 GitHub，海外反之
+    if [ "$CN_MIRROR" = "1" ]; then
+        api_candidates="https://gitee.com/api/v5/repos/hcipengm/cogneva/releases/latest https://api.github.com/repos/hcipengm/cogneva/releases/latest"
+        dl_primary="https://gitee.com/hcipengm/cogneva/releases/download"
+        dl_secondary="https://github.com/hcipengm/cogneva/releases/download"
+    else
+        api_candidates="https://api.github.com/repos/hcipengm/cogneva/releases/latest https://gitee.com/api/v5/repos/hcipengm/cogneva/releases/latest"
+        dl_primary="https://github.com/hcipengm/cogneva/releases/download"
+        dl_secondary="https://gitee.com/hcipengm/cogneva/releases/download"
+    fi
+    tag=""
+    for api in $api_candidates; do
+        tag=$(curl --proto '=https' --tlsv1.2 -fsSL -m 10 "$api" 2>/dev/null \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -n1)
+        [ -n "$tag" ] && break
+    done
+    if [ -z "$tag" ]; then
+        echo "[bootstrap] 未能获取最新 release 标签（release 未发布或网络不可达），回退源码构建" >&2
+        return 1
+    fi
+    name="cogneva-bootstrap-${tag}-linux-${arch}"
+    bindir="$DEFAULT_HOME/bin"
+    binpath="$bindir/$name"
+    mkdir -p "$bindir"
+    if [ ! -x "$binpath" ]; then
+        tmp="$(mktemp -d)"
+        ok=0
+        for base in "$dl_primary" "$dl_secondary"; do
+            echo "[bootstrap] 下载预编译引导器 $name: $base/$tag/$name"
+            if curl --proto '=https' --tlsv1.2 -fsSL -m 300 --retry 2 \
+                    -o "$tmp/$name" "$base/$tag/$name" \
+                && curl --proto '=https' --tlsv1.2 -fsSL -m 30 \
+                    -o "$tmp/$name.sha256" "$base/$tag/$name.sha256"; then
+                if (cd "$tmp" && sha256sum -c "$name.sha256" >/dev/null 2>&1); then
+                    mv "$tmp/$name" "$binpath"
+                    chmod 0755 "$binpath"
+                    ok=1
+                    break
+                fi
+                echo "[bootstrap] sha256 校验失败，换下一个来源" >&2
+            else
+                echo "[bootstrap] 下载失败，换下一个来源: $base/$tag/$name" >&2
+            fi
+        done
+        rm -rf "$tmp"
+        [ "$ok" = "1" ] || return 1
+    fi
+    echo "[bootstrap] 使用预编译静态引导器 $tag（$arch），移交控制权..."
+    # 不 export COGNEVA_REPO_ROOT：二进制解包内嵌资产自取自用
+    export COGNEVA_CN_MIRROR="$CN_MIRROR"
+    exec "$binpath" "$@"
+}
+
 # ---------- macOS：Lima 虚拟机提供 Linux 运行层 ----------
 # K3s 不能原生运行于 macOS；Lima（CNCF 项目）是最小 Linux VM 方案。
 # 所有依赖都装在 VM 内，宿主只需 limactl。
@@ -329,6 +394,13 @@ main() {
             ;;
     esac
     detect_restricted_net
+    # 默认路径：预编译静态二进制（下载 → 校验 → 运行，无需源码与 Rust）；
+    # 失败自动回退源码构建路径（取码 → 装 Rust → cargo build）。
+    # COGNEVA_BOOTSTRAP_FROM_SOURCE=1 强制源码构建（离线介质 / 本地改动调试）。
+    if [ -z "${COGNEVA_BOOTSTRAP_FROM_SOURCE:-}" ] && fetch_prebuilt_bootstrap "$@"; then
+        exit 0
+    fi
+    echo "[bootstrap] 预编译引导器不可用，回退源码构建路径..."
     fetch_source
     ensure_rust
     ensure_cc
