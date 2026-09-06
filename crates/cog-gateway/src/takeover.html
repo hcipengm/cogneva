@@ -302,6 +302,41 @@
   }
   .modal .fine { font-size: 11px; color: var(--text-2); margin-top: 4px; }
 
+  /* ── Contribution channel: persistent banner + setup modal ── */
+  .contrib-banner {
+    display: none; align-items: center; gap: 10px; margin: 0 0 14px;
+    padding: 9px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--warn); background: var(--warn-soft);
+    color: var(--text-0); font-size: 12.5px; font-weight: 450;
+    transition: background .15s ease, transform .15s ease;
+  }
+  .contrib-banner:hover { background: rgba(229,161,60,.18); transform: translateY(-1px); }
+  .contrib-banner .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); flex: none; }
+  .contrib-banner .go { margin-left: auto; color: var(--warn); font-weight: 600; white-space: nowrap; }
+  .contrib-banner.configured { border-color: var(--ok); background: var(--ok-soft); cursor: default; }
+  .contrib-banner.configured .dot { background: var(--ok); }
+  .contrib-banner.configured .go { display: none; }
+
+  .seg { display: flex; gap: 4px; background: var(--bg-1); border: 1px solid var(--line); border-radius: 8px; padding: 3px; margin-bottom: 14px; }
+  .seg button {
+    flex: 1; padding: 7px 0; border: 0; border-radius: 6px; background: transparent;
+    color: var(--text-1); font-size: 12.5px; font-weight: 550; cursor: pointer; font-family: var(--font-ui);
+  }
+  .seg button.active { background: var(--accent); color: #fff; }
+  .pane { display: none; }
+  .pane.active { display: block; }
+
+  .device-code {
+    text-align: center; margin: 12px 0; padding: 14px; border: 1px dashed var(--accent);
+    border-radius: 8px; background: var(--accent-soft);
+  }
+  .device-code .code { font-family: var(--font-mono, monospace); font-size: 22px; font-weight: 700; letter-spacing: .18em; color: var(--text-0); }
+  .device-code .hint { font-size: 11px; color: var(--text-2); margin-top: 4px; }
+  .divider { display: flex; align-items: center; gap: 8px; margin: 14px 0 10px; color: var(--text-2); font-size: 11px; }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--text-2); border-top-color: var(--accent); border-radius: 50%; animation: cspin .7s linear infinite; vertical-align: -1px; margin-right: 6px; }
+  @keyframes cspin { to { transform: rotate(360deg); } }
+
   /* ── Live dashboard (all-DOM: every label is selectable text) ── */
   .live-stage {
     position: relative; height: min(72vh, 760px); min-height: 440px;
@@ -446,10 +481,17 @@
     <button id="saveToken" class="ghost" data-i18n="saveToken">Save Token</button>
     <button id="langToggle" class="ghost">中文</button>
     <button id="llmBtn" class="ghost">LLM</button>
+    <button id="contribBtn" class="ghost" data-i18n="contribBtn">Contribute</button>
     <span id="promoBadge" class="pill" data-i18n="promoInit">auto-promo …</span>
     <button id="promoToggle" class="ghost">…</button>
     <button id="gateToggle" class="ghost" style="display:none" data-i18n="gateOff">Disable gate</button>
     <button id="refresh" data-i18n="refresh">Refresh</button>
+  </div>
+
+  <div class="contrib-banner" id="contribBanner">
+    <span class="dot"></span>
+    <span id="contribBannerText"></span>
+    <span class="go" id="contribBannerGo" data-i18n="contribBannerGo">Configure →</span>
   </div>
 
   <main>
@@ -583,6 +625,55 @@
       <button type="button" class="ghost" id="llmClose" style="display:none" data-i18n="close">Close</button>
     </div>
   </form>
+</div>
+
+<div class="modal-mask" id="contribMask">
+  <div class="modal">
+    <h3 data-i18n="contribTitle">Contribution channel</h3>
+    <div class="sub" data-i18n="contribSub">Connect a public code account so evolved changes open pull requests. Until then, changes are staged locally and submitted automatically once connected.</div>
+
+    <div class="seg">
+      <button type="button" id="segGithub" class="active">GitHub</button>
+      <button type="button" id="segGitee">Gitee</button>
+    </div>
+
+    <div class="pane active" id="paneGithub">
+      <div id="ghDevice">
+        <button type="button" id="ghDeviceBtn" style="width:100%" data-i18n="ghDeviceBtn">Connect GitHub (device authorization)</button>
+        <div class="device-code" id="ghCodeBox" style="display:none">
+          <div class="code" id="ghUserCode"></div>
+          <div class="hint" data-i18n="ghCodeHint">Enter this code on the authorization page</div>
+          <div style="margin-top:10px">
+            <a id="ghVerifyLink" href="#" target="_blank" rel="noopener" style="color:var(--accent);font-size:12.5px;font-weight:600" data-i18n="ghOpenAuth">Open authorization page →</a>
+          </div>
+          <div class="fine" style="margin-top:8px"><span class="spin"></span><span id="ghPollText" data-i18n="ghPolling">Waiting for authorization…</span></div>
+        </div>
+        <div class="fine" id="ghDeviceUnavailable" style="display:none;margin-top:8px" data-i18n="ghDeviceUnavailable">Device flow needs an OAuth App; paste a personal access token below.</div>
+      </div>
+
+      <div class="divider" data-i18n="orPat">or paste a token</div>
+      <label>GitHub Personal Access Token</label>
+      <input type="password" id="ghPat" placeholder="ghp_..." style="width:100%" />
+      <div class="actions">
+        <button type="button" id="ghPatBtn" data-i18n="save">Save &amp; apply</button>
+      </div>
+    </div>
+
+    <div class="pane" id="paneGitee">
+      <div class="fine" style="margin-bottom:8px" data-i18n="giteeNote">Gitee has no device flow — create a personal access token (repo + pull_requests scopes) and paste it.</div>
+      <label>Gitee Personal Access Token</label>
+      <input type="password" id="giteePat" placeholder="gitee token" style="width:100%" />
+      <div class="actions">
+        <button type="button" id="giteePatBtn" data-i18n="save">Save &amp; apply</button>
+      </div>
+    </div>
+
+    <div class="err-box" id="contribErr"></div>
+    <div class="fine" data-i18n="contribKeyNote" style="margin-top:10px">The token is written to the cluster Secret only, held by the security gateway, and never echoed back. An SSH key is generated and its public half uploaded.</div>
+    <div class="actions">
+      <button type="button" class="ghost" id="contribClose" data-i18n="skipForNow">Skip for now</button>
+    </div>
+  </div>
 </div>
 
 <div class="modal-mask" id="loginMask">
@@ -1350,6 +1441,31 @@ const I18N = {
   subTimeout:   { en: 'Still waiting for it to take effect; please retry shortly.',
                   zh: '仍在等待生效，请稍后重新检测。' },
   connected:    { en: 'LLM connected', zh: 'LLM 已接入' },
+
+  // Contribution channel (wizard step 2)
+  contribBtn:       { en: 'Contribute', zh: '贡献通道' },
+  contribTitle:     { en: 'Contribution channel', zh: '贡献通道' },
+  contribSub:       { en: 'Connect a public code account so evolved changes open pull requests. Until then, changes are staged locally and submitted automatically once connected.',
+                      zh: '连接公开代码账户后，进化产生的变更会自动提 PR。未连接前变更暂存本地，连接后自动批量提交。' },
+  contribBannerOff: { en: 'Contribution channel not configured — evolved changes are staged locally.',
+                      zh: '贡献通道未配置，进化成果暂存本地。' },
+  contribBannerOn:  { en: 'Contribution channel connected.', zh: '贡献通道已连接。' },
+  contribBannerGo:  { en: 'Configure →', zh: '点击配置 →' },
+  ghDeviceBtn:      { en: 'Connect GitHub (device authorization)', zh: '连接 GitHub（设备授权）' },
+  ghCodeHint:       { en: 'Enter this code on the authorization page', zh: '在授权页输入此代码（链接已预填）' },
+  ghOpenAuth:       { en: 'Open authorization page →', zh: '打开授权页 →' },
+  ghPolling:        { en: 'Waiting for authorization…', zh: '等待授权中…' },
+  ghDeviceUnavailable: { en: 'Device flow needs an OAuth App; paste a personal access token below.',
+                         zh: '设备流需要 OAuth App；请在下方粘贴个人访问令牌。' },
+  orPat:            { en: 'or paste a token', zh: '或粘贴令牌' },
+  giteeNote:        { en: 'Gitee has no device flow — create a personal access token (repo scope) and paste it.',
+                      zh: 'Gitee 无设备流——创建个人访问令牌（repo 权限）后粘贴。' },
+  skipForNow:       { en: 'Skip for now', zh: '暂时跳过' },
+  contribKeyNote:   { en: 'The token is written to the cluster Secret only, held by the security gateway, and never echoed back. An SSH key is generated and its public half uploaded.',
+                      zh: '令牌只写入集群 Secret、由安全网关代持，不会回显。同时生成 SSH 密钥并自动上传公钥。' },
+  contribConnected: { en: 'Contribution channel connected', zh: '贡献通道已连接' },
+  contribSaving:    { en: 'Connecting…', zh: '正在连接…' },
+  contribNeedPat:   { en: 'Please paste a token first.', zh: '请先粘贴令牌。' },
 };
 const t = (key) => I18N[key][LANG];
 
@@ -1491,6 +1607,159 @@ $('llmForm').onsubmit = async (e) => {
   }
 };
 
+// ── Contribution channel (wizard step 2) ──
+// Skippable (unlike the mandatory LLM step): an unconfigured channel stages
+// changes locally; a persistent banner nudges the user and disappears once a
+// token is held by the gateway.
+let contribPollTimer = null;
+
+function contribErr(msg) {
+  const box = $('contribErr');
+  if (!msg) { box.style.display = 'none'; return; }
+  box.textContent = msg;
+  box.style.display = 'block';
+}
+
+function switchProvider(which) {
+  const gh = which === 'github';
+  $('segGithub').classList.toggle('active', gh);
+  $('segGitee').classList.toggle('active', !gh);
+  $('paneGithub').classList.toggle('active', gh);
+  $('paneGitee').classList.toggle('active', !gh);
+  contribErr('');
+}
+$('segGithub').onclick = () => switchProvider('github');
+$('segGitee').onclick = () => switchProvider('gitee');
+
+function openContrib() {
+  contribErr('');
+  $('contribMask').classList.add('show');
+  // Device flow is only offered once an OAuth App client id is configured.
+  api('/api/v1/admin/contribution-status')
+    .then((s) => {
+      const available = !!s.device_flow_available;
+      $('ghDeviceBtn').style.display = available ? '' : 'none';
+      $('ghDeviceUnavailable').style.display = available ? 'none' : '';
+    })
+    .catch(() => {});
+}
+function closeContrib() {
+  $('contribMask').classList.remove('show');
+  stopContribPoll();
+}
+$('contribBtn').onclick = openContrib;
+$('contribClose').onclick = closeContrib;
+$('contribBanner').onclick = () => {
+  if (!$('contribBanner').classList.contains('configured')) openContrib();
+};
+
+function stopContribPoll() {
+  if (contribPollTimer) { clearInterval(contribPollTimer); contribPollTimer = null; }
+}
+
+async function checkContributionStatus() {
+  try {
+    const s = await api('/api/v1/admin/contribution-status');
+    const banner = $('contribBanner');
+    if (s.configured) {
+      banner.classList.add('configured');
+      $('contribBannerText').textContent = t('contribBannerOn');
+    } else {
+      banner.classList.remove('configured');
+      $('contribBannerText').textContent = t('contribBannerOff');
+    }
+    banner.style.display = 'flex';
+  } catch { /* endpoint unavailable / no token yet — stay hidden */ }
+}
+
+// After a token is saved the gateway rolls (~1 min); poll status until it is
+// live, mirroring the LLM wizard's wait.
+function afterContribSaved() {
+  stopContribPoll();
+  contribErr('');
+  $('ghPollText').textContent = t('contribSaving');
+  const deadline = Date.now() + 3 * 60 * 1000;
+  const timer = setInterval(async () => {
+    try {
+      const s = await api('/api/v1/admin/contribution-status');
+      if (s.configured) {
+        clearInterval(timer);
+        closeContrib();
+        toast(t('contribConnected'), 'ok');
+        checkContributionStatus();
+      }
+    } catch { /* pod restarting */ }
+    if (Date.now() > deadline) { clearInterval(timer); closeContrib(); }
+  }, 5000);
+}
+
+async function savePat(provider, token) {
+  await api('/api/v1/admin/contribution-config', 'POST', { provider, token });
+  afterContribSaved();
+}
+
+$('ghPatBtn').onclick = async () => {
+  const token = $('ghPat').value.trim();
+  if (!token) { contribErr(t('contribNeedPat')); return; }
+  $('ghPatBtn').disabled = true; contribErr('');
+  try { await savePat('github', token); }
+  catch (e) { contribErr(e.message); }
+  finally { $('ghPatBtn').disabled = false; }
+};
+
+$('giteePatBtn').onclick = async () => {
+  const token = $('giteePat').value.trim();
+  if (!token) { contribErr(t('contribNeedPat')); return; }
+  $('giteePatBtn').disabled = true; contribErr('');
+  try { await savePat('gitee', token); }
+  catch (e) { contribErr(e.message); }
+  finally { $('giteePatBtn').disabled = false; }
+};
+
+$('ghDeviceBtn').onclick = async () => {
+  $('ghDeviceBtn').disabled = true; contribErr('');
+  try {
+    const start = await api('/api/v1/admin/contribution/device/start', 'POST', {});
+    $('ghUserCode').textContent = start.user_code;
+    $('ghVerifyLink').href = start.verification_uri;
+    $('ghCodeBox').style.display = '';
+    $('ghPollText').textContent = t('ghPolling');
+    pollDevice(start.client_id, start.device_code, start.interval || 5);
+  } catch (e) {
+    contribErr(e.message);
+    $('ghDeviceBtn').style.display = 'none';
+    $('ghDeviceUnavailable').style.display = '';
+  } finally {
+    $('ghDeviceBtn').disabled = false;
+  }
+};
+
+function pollDevice(clientId, deviceCode, intervalSecs) {
+  stopContribPoll();
+  const tick = async () => {
+    try {
+      const r = await api('/api/v1/admin/contribution/device/poll', 'POST', {
+        client_id: clientId, device_code: deviceCode,
+      });
+      if (r.ok) { stopContribPoll(); afterContribSaved(); return; }
+      if (r.status === 'error') {
+        stopContribPoll();
+        contribErr(r.message || 'device flow failed');
+        $('ghCodeBox').style.display = 'none';
+        return;
+      }
+      // pending / slow_down: reschedule with the returned interval.
+      const wait = Math.max(3, (r.interval || intervalSecs)) * 1000;
+      contribPollTimer = setTimeout(tick, wait);
+    } catch (e) {
+      stopContribPoll();
+      contribErr(e.message);
+      $('ghCodeBox').style.display = 'none';
+    }
+  };
+  contribPollTimer = setTimeout(tick, intervalSecs * 1000);
+}
+
 setInterval(loadProcess, 10000);
 // Badge/switch state must track rolls triggered elsewhere (other tab, API,
 // GitOps) instead of only refreshing on page load.
@@ -1535,6 +1804,7 @@ function afterLogin() {
   refreshAll();
   connectStream();
   checkLlmStatus();
+  checkContributionStatus();
   if (window.liveUpdateEmpty) window.liveUpdateEmpty();
   if (window.liveReconnect) window.liveReconnect();
 }

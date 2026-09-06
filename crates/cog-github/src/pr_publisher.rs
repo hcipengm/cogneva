@@ -165,6 +165,22 @@ impl GitHubPrPublisher {
         }
         Ok(())
     }
+
+    /// Whether a branch already exists on the push remote (idempotency guard
+    /// for the staged-change flush after the contribution channel comes up).
+    /// Network errors are treated as "unknown → not published" so a transient
+    /// failure still lets the normal publish path retry and fail loudly.
+    pub(crate) async fn remote_branch_exists(&self, branch: &str) -> bool {
+        let Ok(output) = tokio::process::Command::new("git")
+            .args(["ls-remote", "--heads", "origin", branch])
+            .current_dir(&self.workdir)
+            .output()
+            .await
+        else {
+            return false;
+        };
+        output.status.success() && !output.stdout.trim_ascii().is_empty()
+    }
 }
 
 fn sanitize(change_id: &str) -> String {
@@ -323,12 +339,31 @@ impl GitHubChangeSink {
             provider,
         }
     }
+
+    /// Whether `change_id` was already pushed as a `cogneva/auto-*` PR branch.
+    pub(crate) async fn already_published(&self, change_id: &str) -> bool {
+        let branch = format!("cogneva/auto-{}", sanitize(change_id));
+        self.publisher.remote_branch_exists(&branch).await
+    }
 }
 
 #[async_trait::async_trait]
 impl cog_core::ChangeSink for GitHubChangeSink {
     async fn submit_change(&self, change: GeneratedChange) -> cog_core::SFResult<String> {
         let branch = format!("cogneva/auto-{}", sanitize(&change.change_id));
+        // Idempotency for the staged-change flush: a change re-submitted after a
+        // restart (crash between push and housekeeping) already has its branch on
+        // the remote. Re-pushing is rejected by --force-with-lease and re-opening
+        // the PR errors, so an existing branch means "already published" — return
+        // Ok so the staged file is dropped instead of looping the same failure.
+        if self.already_published(&change.change_id).await {
+            tracing::info!(
+                change_id = %change.change_id,
+                %branch,
+                "change already published (remote branch exists); skipping duplicate PR"
+            );
+            return Ok(format!("existing:{branch}"));
+        }
         let title = change
             .goal
             .lines()

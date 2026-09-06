@@ -23,6 +23,7 @@ pub mod error;
 pub mod identity;
 pub mod merge_decider;
 pub mod outcome_recorder;
+pub mod pending_changes;
 pub mod plugin;
 pub mod pr_publisher;
 pub mod provider;

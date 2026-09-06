@@ -57,6 +57,45 @@ fn spawn_polling_loop(
     })
 }
 
+/// 后台周期补发暂存变更。初始化时的 drain 只覆盖"启动时通道已就绪"；向导在
+/// 进程运行期间补配 token 时只有网关滚动重启、本进程不重启，暂存变更会靠这个
+/// 周期任务在下一轮自动提交。补发幂等：成功的变更由 drain 删除暂存文件，
+/// 已推送的分支有 `already_published` 守卫，失败留到下一轮。
+fn spawn_staged_drain(
+    config: crate::config::GitHubIntegrationConfig,
+    provider: Arc<dyn CodePlatformProvider>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        interval.tick().await; // 消费立即触发的首拍，让启动 drain 先跑
+        loop {
+            interval.tick().await;
+            if crate::pending_changes::load_pending().await.is_empty() {
+                continue;
+            }
+            let token = config
+                .primary_account()
+                .ok()
+                .and_then(|a| a.resolve_token().ok());
+            match crate::pr_publisher::ensure_workdir(&config, token.as_deref()).await {
+                Ok(workdir) => {
+                    let sink = crate::pr_publisher::GitHubChangeSink::new(
+                        crate::pr_publisher::GitHubPrPublisher::new(workdir, config.clone()),
+                        provider.clone(),
+                    );
+                    let n = crate::pending_changes::drain_into(&sink).await;
+                    if n > 0 {
+                        info!(count = n, "staged changes flushed by background drain");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "background staged-change drain skipped (channel not ready)");
+                }
+            }
+        }
+    });
+}
+
 impl GitHubPlugin {
     /// Create a new GitHub plugin instance.
     pub fn new() -> Self {
@@ -101,6 +140,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         }
 
         if config.enabled {
+            let mut pr_sink_published = false;
             match crate::default_provider(&config) {
                 Ok(provider) => {
                     let provider: Arc<dyn CodePlatformProvider> = Arc::from(provider);
@@ -123,13 +163,29 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                                     ),
                                     provider.clone(),
                                 ));
+                                // The channel is live: flush changes staged
+                                // before it was connected (best effort;
+                                // failures stay staged for the next start).
+                                let flushed =
+                                    crate::pending_changes::drain_into(sink.as_ref()).await;
+                                if flushed > 0 {
+                                    info!(count = flushed, "flushed staged changes to PRs");
+                                }
                                 ctx.publish_service::<dyn cog_core::ChangeSink>(sink);
+                                pr_sink_published = true;
                                 info!(workdir = %workdir.display(), "GitHub ChangeSink published");
                             }
                             Err(e) => {
                                 warn!(error = %e, "GitHub PR workdir unavailable; ChangeSink not published");
                             }
                         }
+                    }
+
+                    // 向导在进程运行期间补配 token（写入网关 Secret 后滚动重启
+                    // 网关，本进程并不重启）时，上面的启动 drain 不会重跑；
+                    // 后台周期补发让暂存变更在通道接通后的下一个周期自动提交。
+                    if !config.pr_workdir.is_empty() {
+                        spawn_staged_drain(config.clone(), provider.clone());
                     }
 
                     self.provider = Some(provider);
@@ -140,6 +196,15 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     // integration simply stays inactive.
                     warn!(error = %e, "GitHubPlugin provider unavailable; integration inactive");
                 }
+            }
+            // No PR path yet (channel unconfigured, no workdir, or no
+            // provider): stage generated changes locally so they survive until
+            // the contribution channel is connected and drained.
+            if !pr_sink_published {
+                ctx.publish_service::<dyn cog_core::ChangeSink>(Arc::new(
+                    crate::pending_changes::PendingChangeSink,
+                ));
+                info!("contribution channel not ready; generated changes stage to pending dir");
             }
         }
 

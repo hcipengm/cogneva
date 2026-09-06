@@ -439,8 +439,9 @@ impl KubeClient {
 
     /// 滚动重启安全网关：上游池整体在 Secret 里（env 引用 Secret 条目，
     /// 内容变化不会触发重启），restartedAt 注解保证每次保存都滚出新 Pod
-    /// 读取新池。
-    async fn restart_gateway(&self) -> Result<(), String> {
+    /// 读取新池。贡献通道 token 同理（env 从 Secret 注入），保存后同样
+    /// 需要滚动重启才能生效。
+    pub(crate) async fn restart_gateway(&self) -> Result<(), String> {
         let restarted_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())

@@ -77,7 +77,8 @@ pub trait ReflectionEngine: Send + Sync + std::fmt::Debug {
 }
 
 /// A code change produced by the collaboration pipeline for self-evolution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GeneratedChange {
     pub change_id: String,
     pub goal: String,

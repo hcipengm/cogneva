@@ -29,6 +29,7 @@ pub mod backend_health;
 pub mod chat;
 pub mod cluster;
 pub mod collaboration;
+pub mod contribution_admin;
 pub mod dashboard;
 pub mod error;
 pub mod evolution;
@@ -477,6 +478,22 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/admin/llm-config",
             post(llm_admin::llm_config_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution-status",
+            get(contribution_admin::contribution_status_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution-config",
+            post(contribution_admin::contribution_config_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/device/start",
+            post(contribution_admin::device_start_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/device/poll",
+            post(contribution_admin::device_poll_handler),
         )
         .route(
             "/api/v1/admin/promotion-gate",

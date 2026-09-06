@@ -141,6 +141,12 @@ secrets:
   githubWebhookSecret: ""
   giteeWebhookToken: ""
 
+# 贡献通道（向导第二步）：GitHub OAuth 设备流的 client_id 是 OAuth App 的
+# 公开标识（非密钥），留空时设备流不可用、向导自动回退手动 PAT；真实 token
+# 由向导写入 cogneva-secrets，只进网关。
+contribution:
+  githubOauthClientId: ""
+
 # 主应用 GitOps 拉取端：poll 中央 bare 仓库的 evolution-release 分支，
 # L0 配置热更 / L1 金丝雀在本集群闭环（沙盒推送端只写 bare 仓库，零集群凭证）。
 gitops:

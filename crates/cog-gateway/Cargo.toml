@@ -31,6 +31,9 @@ regex = "1.10"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# Ed25519 SSH keypair for the contribution channel (pubkey auto-upload).
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand_core = "0.6"
 
 [dev-dependencies]
 tokio-test = "0.4"
