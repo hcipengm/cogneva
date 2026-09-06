@@ -9,7 +9,13 @@ use axum::response::{Html, IntoResponse, Response};
 const TAKEOVER_HTML: &str = include_str!("takeover.html");
 
 pub async fn takeover_handler() -> Response {
-    Html(TAKEOVER_HTML).into_response()
+    // no-cache：页面 JS 随版本演进，禁止浏览器启发式缓存旧页面
+    // （OAuth 向导等新逻辑必须立即生效）
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-cache")],
+        Html(TAKEOVER_HTML),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

@@ -765,7 +765,7 @@
             <div style="margin:10px 0">
               <a id="giAuthLink" href="#" target="_blank" rel="noopener" style="color:var(--accent);font-size:12.5px;font-weight:600" data-i18n="giOpenAuth">Open Gitee authorization page →</a>
             </div>
-            <div class="fine"><span class="spin"></span><span data-i18n="giWaiting">Waiting for authorization…</span></div>
+            <div class="fine" id="giWaitingLine"><span class="spin" id="giWaitingSpin"></span><span id="giWaitingText" data-i18n="giWaiting">Waiting for authorization…</span></div>
             <input type="text" id="giCode" data-i18n-ph="giPastePh" placeholder="Paste the full redirect URL from the address bar, or just the code" style="width:100%;margin-top:10px" autocomplete="off" />
             <div class="actions">
               <button type="button" id="giCodeBtn" data-i18n="giCodeBtn">Finish connection</button>
@@ -1598,9 +1598,11 @@ const I18N = {
                       zh: '在刚打开的 Gitee 页面完成登录（或注册），然后点同意授权' },
   giOauthStep2:     { en: 'After you approve, the popup lands on our callback page and hands the code back automatically — nothing else to do. If it stays open showing a code, copy that code',
                       zh: '点同意授权后，弹窗会落到我们的回调页并自动把授权码送回来，无需其他操作；若弹窗停留在展示授权码的页面，复制那段授权码' },
-  giOauthStep3:     { en: 'Paste it below and finish the connection', zh: '粘贴到下面，完成连接' },
+  giOauthStep3:     { en: 'Only if the automatic hand-off does not happen (popup unreachable or closed too early): paste it below and finish', zh: '仅当自动递送没发生（弹窗打不开或过早关闭）时：粘贴到下面完成连接' },
   giOpenAuth:       { en: 'Open Gitee authorization page →', zh: '打开 Gitee 授权页 →' },
   giWaiting:        { en: 'Waiting for authorization…', zh: '等待授权中…' },
+  giAuto:           { en: 'Code received — finishing the connection automatically…', zh: '已收到授权码，正在自动完成连接…' },
+  giAutoDone:       { en: 'Connection finished.', zh: '连接已完成。' },
   giPastePh:        { en: 'Paste the full redirect URL from the address bar, or just the code',
                       zh: '粘贴地址栏的完整网址，或只粘贴其中的 code' },
   giCodeBtn:        { en: 'Finish connection', zh: '完成连接' },
@@ -1939,6 +1941,13 @@ function pollDevice(clientId, deviceCode, intervalSecs) {
 // redirect URL from the address bar. While the flow is open we poll the
 // status endpoint so a completed callback closes the wizard by itself.
 let giOAuthState = null;
+// 并发保护：postMessage 与手动粘贴可能同时触发交换，重复提交会浪费一次性 code
+let giOAuthBusy = false;
+
+function giWaitingSet(key) {
+  $('giWaitingText').textContent = t(key);
+  $('giWaitingSpin').style.display = key === 'giAutoDone' ? 'none' : '';
+}
 
 $('giOauthBtn').onclick = async () => {
   $('giOauthBtn').disabled = true; contribErr('');
@@ -1947,9 +1956,11 @@ $('giOauthBtn').onclick = async () => {
       redirect_origin: window.location.origin,
     });
     giOAuthState = r.state;
+    giOAuthBusy = false;
     $('giAuthLink').href = r.authorize_url;
     $('giCode').value = '';
     $('giOauthBox').style.display = '';
+    giWaitingSet('giWaiting');
     // 保留 opener：回调落地页靠 window.opener.postMessage 把 code 递回来
     window.open(r.authorize_url, 'cognevaGiteeOAuth');
     pollGiteeOAuthStatus(Date.now() + 15 * 60 * 1000);
@@ -1967,22 +1978,28 @@ window.addEventListener('message', (e) => {
   if (!d || d.type !== 'cogneva-gitee-oauth' || !d.code) return;
   if (!giOAuthState || d.state !== giOAuthState) return;
   $('giCode').value = d.code;
+  giWaitingSet('giAuto');
   finishGiteeOAuth(d.code);
 });
 
 async function finishGiteeOAuth(pasted) {
   if (!giOAuthState) { contribErr(t('giNeedStart')); return; }
+  if (giOAuthBusy) return;
+  giOAuthBusy = true;
   $('giCodeBtn').disabled = true; contribErr('');
   try {
     await api('/api/v1/admin/contribution/gitee/oauth/exchange', 'POST', {
       state: giOAuthState,
       redirect_url: pasted,
     });
+    giWaitingSet('giAutoDone');
     stopContribPoll();
     afterContribSaved();
   } catch (e) {
     contribErr(e.message);
+    giWaitingSet('giWaiting');
   } finally {
+    giOAuthBusy = false;
     $('giCodeBtn').disabled = false;
   }
 }
