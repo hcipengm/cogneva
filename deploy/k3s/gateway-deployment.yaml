@@ -99,6 +99,14 @@ spec:
                   name: cogneva-secrets
                   key: webhook-internal
                   optional: true
+            # 贡献通道 OAuth 应用标识（随 chart 公开的客户端身份，非用户凭证）；
+            # Gitee secret 泄露处置见网关轮换流程，用户 token 不受影响。
+            - name: COGNEVA_GITHUB_OAUTH_CLIENT_ID
+              value: "Ov23liz35yGbAC5vO0OP"
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_ID
+              value: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
+              value: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
           livenessProbe:
             httpGet:
               path: /health/live

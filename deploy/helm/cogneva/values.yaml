@@ -148,9 +148,9 @@ secrets:
 # giteeOauthRedirectUri 留空时回调地址取向导页面所在源，适合 localhost 安装。
 # 真实 token 由向导写入 cogneva-secrets，只进网关。
 contribution:
-  githubOauthClientId: ""
-  giteeOauthClientId: ""
-  giteeOauthClientSecret: ""
+  githubOauthClientId: "Ov23liz35yGbAC5vO0OP"
+  giteeOauthClientId: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
+  giteeOauthClientSecret: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
   giteeOauthRedirectUri: ""
 
 # 主应用 GitOps 拉取端：poll 中央 bare 仓库的 evolution-release 分支，
