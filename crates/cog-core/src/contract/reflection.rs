@@ -87,6 +87,10 @@ pub struct GeneratedChange {
     pub rationale: Option<String>,
     pub pge_mode: String,
     pub self_review_score: Option<f32>,
+    /// Public issue this change resolves, when the intent came from a tracked
+    /// issue. Sinks use it to link the PR back (`Fixes #N`) so competing
+    /// solutions for the same issue can be grouped.
+    pub issue_number: Option<u64>,
 }
 
 /// Sink for collaboration-generated changes. Implemented by the reflection

@@ -334,6 +334,47 @@
   .device-code .hint { font-size: 11px; color: var(--text-2); margin-top: 4px; }
   .divider { display: flex; align-items: center; gap: 8px; margin: 14px 0 10px; color: var(--text-2); font-size: 11px; }
   .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+  /* Contribution wizard: account track cards + numbered step guides */
+  .modal.wide { max-width: 520px; }
+  .acct-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 14px; }
+  .acct-card {
+    text-align: left; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg-2); cursor: pointer; font-family: var(--font-ui);
+    transition: border-color .12s, background .12s;
+  }
+  .acct-card:hover { border-color: var(--accent); background: var(--bg-3); }
+  .acct-card.active { border-color: var(--accent); background: var(--accent-soft); }
+  .acct-card.active:hover { background: var(--accent-soft); }
+  .acct-card .acct-t { font-size: 12.5px; font-weight: 600; color: var(--text-0); }
+  .acct-card .acct-d { font-size: 11px; color: var(--text-1); margin-top: 2px; }
+  .register-hint {
+    border: 1px dashed var(--line); border-radius: 8px; padding: 4px 14px 12px;
+    margin: 0 0 12px; background: var(--bg-2);
+  }
+  .register-hint .actions { margin-top: 10px; }
+  .steps { display: grid; gap: 9px; margin: 12px 0; }
+  .steps .step { display: flex; gap: 9px; align-items: baseline; font-size: 12.5px; color: var(--text-1); line-height: 1.45; }
+  .steps .n {
+    flex: none; width: 17px; height: 17px; border-radius: 50%; transform: translateY(3px);
+    border: 1px solid var(--accent); color: var(--accent); background: var(--accent-soft);
+    font-size: 10px; font-weight: 700; font-family: var(--font-mono);
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .steps a { color: var(--accent); font-weight: 600; text-decoration: none; white-space: nowrap; }
+  .steps a:hover { color: var(--accent-hover); text-decoration: underline; }
+  .scope-chip {
+    font-family: var(--font-mono); font-size: 10.5px; padding: 0 7px; margin: 0 1px;
+    border-radius: 999px; border: 1px solid var(--line); background: var(--bg-3); color: var(--text-0);
+    white-space: nowrap;
+  }
+  .why-strip {
+    display: flex; gap: 9px; align-items: flex-start; margin: 0 0 14px; padding: 9px 12px;
+    border: 1px solid var(--line-soft); border-radius: 8px; background: var(--bg-2);
+    font-size: 12px; color: var(--text-1); line-height: 1.5;
+  }
+  .why-strip svg { flex: none; width: 14px; height: 14px; margin-top: 2px; color: var(--accent); }
+  .pat-guide { margin-top: 2px; }
   .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--text-2); border-top-color: var(--accent); border-radius: 50%; animation: cspin .7s linear infinite; vertical-align: -1px; margin-right: 6px; }
   @keyframes cspin { to { transform: rotate(360deg); } }
 
@@ -628,9 +669,14 @@
 </div>
 
 <div class="modal-mask" id="contribMask">
-  <div class="modal">
+  <div class="modal wide">
     <h3 data-i18n="contribTitle">Contribution channel</h3>
     <div class="sub" data-i18n="contribSub">Connect a public code account so evolved changes open pull requests. Until then, changes are staged locally and submitted automatically once connected.</div>
+
+    <div class="why-strip">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <span data-i18n="contribWhy">Your token never leaves the cluster: it is written to a Secret held by the security gateway, and every platform call goes through it. This process stays credential-free.</span>
+    </div>
 
     <div class="seg">
       <button type="button" id="segGithub" class="active">GitHub</button>
@@ -638,33 +684,86 @@
     </div>
 
     <div class="pane active" id="paneGithub">
-      <div id="ghDevice">
-        <button type="button" id="ghDeviceBtn" style="width:100%" data-i18n="ghDeviceBtn">Connect GitHub (device authorization)</button>
-        <div class="device-code" id="ghCodeBox" style="display:none">
-          <div class="code" id="ghUserCode"></div>
-          <div class="hint" data-i18n="ghCodeHint">Enter this code on the authorization page</div>
-          <div style="margin-top:10px">
-            <a id="ghVerifyLink" href="#" target="_blank" rel="noopener" style="color:var(--accent);font-size:12.5px;font-weight:600" data-i18n="ghOpenAuth">Open authorization page →</a>
-          </div>
-          <div class="fine" style="margin-top:8px"><span class="spin"></span><span id="ghPollText" data-i18n="ghPolling">Waiting for authorization…</span></div>
+      <div class="acct-row">
+        <button type="button" class="acct-card active" id="ghAcctHave">
+          <div class="acct-t" data-i18n="acctHave">I have an account</div>
+          <div class="acct-d" data-i18n="acctHaveD">Sign in &amp; authorize — about a minute</div>
+        </button>
+        <button type="button" class="acct-card" id="ghAcctNeed">
+          <div class="acct-t" data-i18n="acctNeed">No account yet</div>
+          <div class="acct-d" data-i18n="acctNeedD">Register first — about two minutes</div>
+        </button>
+      </div>
+      <div class="register-hint" id="ghRegister" style="display:none">
+        <div class="steps">
+          <div class="step"><span class="n">1</span><span><span data-i18n="regStep1">Open the sign-up page and create a free account</span> <a href="https://github.com/signup" target="_blank" rel="noopener" data-i18n="regOpen">Open sign-up →</a></span></div>
+          <div class="step"><span class="n">2</span><span data-i18n="regStep2">Verify your email, then come back here — this dialog will wait</span></div>
         </div>
-        <div class="fine" id="ghDeviceUnavailable" style="display:none;margin-top:8px" data-i18n="ghDeviceUnavailable">Device flow needs an OAuth App; paste a personal access token below.</div>
+        <div class="actions">
+          <button type="button" id="ghRegisteredBtn" data-i18n="regDone">I'm registered — continue</button>
+        </div>
       </div>
 
-      <div class="divider" data-i18n="orPat">or paste a token</div>
-      <label>GitHub Personal Access Token</label>
-      <input type="password" id="ghPat" placeholder="ghp_..." style="width:100%" />
-      <div class="actions">
-        <button type="button" id="ghPatBtn" data-i18n="save">Save &amp; apply</button>
+      <div id="ghAuth">
+        <div id="ghDevice">
+          <button type="button" id="ghDeviceBtn" style="width:100%" data-i18n="ghDeviceBtn">Connect GitHub (device authorization)</button>
+          <div class="device-code" id="ghCodeBox" style="display:none">
+            <div class="code" id="ghUserCode"></div>
+            <div class="hint" data-i18n="ghCodeHint">Enter this code on the authorization page</div>
+            <div style="margin-top:10px">
+              <a id="ghVerifyLink" href="#" target="_blank" rel="noopener" style="color:var(--accent);font-size:12.5px;font-weight:600" data-i18n="ghOpenAuth">Open authorization page →</a>
+            </div>
+            <div class="fine" style="margin-top:8px"><span class="spin"></span><span id="ghPollText" data-i18n="ghPolling">Waiting for authorization…</span></div>
+          </div>
+          <div class="fine" id="ghDeviceUnavailable" style="display:none;margin-top:8px" data-i18n="ghDeviceUnavailable">Device flow needs an OAuth App; paste a personal access token below.</div>
+        </div>
+
+        <div class="divider" data-i18n="orPat">or paste a token</div>
+        <div class="steps pat-guide">
+          <div class="step"><span class="n">1</span><span><span data-i18n="ghPatStep1">Open the token page (login required)</span> <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener">github.com/settings/tokens/new →</a></span></div>
+          <div class="step"><span class="n">2</span><span><span data-i18n="ghPatStep2">Give it a name and check the scope</span> <span class="scope-chip">repo</span></span></div>
+          <div class="step"><span class="n">3</span><span data-i18n="patStep3">Generate the token and paste it below</span></div>
+        </div>
+        <label>GitHub Personal Access Token</label>
+        <input type="password" id="ghPat" placeholder="ghp_..." style="width:100%" />
+        <div class="actions">
+          <button type="button" id="ghPatBtn" data-i18n="save">Save &amp; apply</button>
+        </div>
       </div>
     </div>
 
     <div class="pane" id="paneGitee">
-      <div class="fine" style="margin-bottom:8px" data-i18n="giteeNote">Gitee has no device flow — create a personal access token (repo + pull_requests scopes) and paste it.</div>
-      <label>Gitee Personal Access Token</label>
-      <input type="password" id="giteePat" placeholder="gitee token" style="width:100%" />
-      <div class="actions">
-        <button type="button" id="giteePatBtn" data-i18n="save">Save &amp; apply</button>
+      <div class="acct-row">
+        <button type="button" class="acct-card active" id="giAcctHave">
+          <div class="acct-t" data-i18n="acctHave">I have an account</div>
+          <div class="acct-d" data-i18n="acctHaveD">Sign in &amp; authorize — about a minute</div>
+        </button>
+        <button type="button" class="acct-card" id="giAcctNeed">
+          <div class="acct-t" data-i18n="acctNeed">No account yet</div>
+          <div class="acct-d" data-i18n="acctNeedD">Register first — about two minutes</div>
+        </button>
+      </div>
+      <div class="register-hint" id="giRegister" style="display:none">
+        <div class="steps">
+          <div class="step"><span class="n">1</span><span><span data-i18n="regStep1">Open the sign-up page and create a free account</span> <a href="https://gitee.com/signup" target="_blank" rel="noopener" data-i18n="regOpen">Open sign-up →</a></span></div>
+          <div class="step"><span class="n">2</span><span data-i18n="regStep2">Verify your email, then come back here — this dialog will wait</span></div>
+        </div>
+        <div class="actions">
+          <button type="button" id="giRegisteredBtn" data-i18n="regDone">I'm registered — continue</button>
+        </div>
+      </div>
+
+      <div id="giAuth">
+        <div class="steps pat-guide" style="margin-top:0">
+          <div class="step"><span class="n">1</span><span><span data-i18n="giPatStep1">Open the token page (login required)</span> <a href="https://gitee.com/profile/personal_access_tokens/new" target="_blank" rel="noopener">gitee.com/profile/personal_access_tokens/new →</a></span></div>
+          <div class="step"><span class="n">2</span><span><span data-i18n="giPatStep2">Give it a name and check the scopes</span> <span class="scope-chip">projects</span> <span class="scope-chip">pull_requests</span></span></div>
+          <div class="step"><span class="n">3</span><span data-i18n="patStep3">Generate the token and paste it below</span></div>
+        </div>
+        <label>Gitee Personal Access Token</label>
+        <input type="password" id="giteePat" placeholder="gitee token" style="width:100%" />
+        <div class="actions">
+          <button type="button" id="giteePatBtn" data-i18n="save">Save &amp; apply</button>
+        </div>
       </div>
     </div>
 
@@ -1451,6 +1550,21 @@ const I18N = {
                       zh: '贡献通道未配置，进化成果暂存本地。' },
   contribBannerOn:  { en: 'Contribution channel connected.', zh: '贡献通道已连接。' },
   contribBannerGo:  { en: 'Configure →', zh: '点击配置 →' },
+  contribWhy:       { en: 'Your token never leaves the cluster: it is written to a Secret held by the security gateway, and every platform call goes through it. This process stays credential-free.',
+                      zh: '令牌不出集群：只写入由安全网关代持的 Secret，所有平台调用都经网关出口，本进程零凭证。' },
+  acctHave:         { en: 'I have an account', zh: '我有账号' },
+  acctHaveD:        { en: 'Sign in & authorize — about a minute', zh: '登录并授权，约 1 分钟' },
+  acctNeed:         { en: 'No account yet', zh: '还没有账号' },
+  acctNeedD:        { en: 'Register first — about two minutes', zh: '先注册一个，约 2 分钟' },
+  regStep1:         { en: 'Open the sign-up page and create a free account', zh: '打开注册页，免费创建账号' },
+  regOpen:          { en: 'Open sign-up →', zh: '打开注册页 →' },
+  regStep2:         { en: 'Verify your email, then come back here — this dialog will wait', zh: '验证邮箱后回到这里——本窗口会等你' },
+  regDone:          { en: "I'm registered — continue", zh: '我注册好了，继续授权' },
+  ghPatStep1:       { en: 'Open the token page (login required)', zh: '打开令牌创建页（需先登录）' },
+  ghPatStep2:       { en: 'Give it a name and check the scope', zh: '起个名字，勾选权限' },
+  giPatStep1:       { en: 'Open the token page (login required)', zh: '打开令牌创建页（需先登录）' },
+  giPatStep2:       { en: 'Give it a name and check the scopes', zh: '起个名字，勾选权限' },
+  patStep3:         { en: 'Generate the token and paste it below', zh: '生成令牌，粘贴到下面' },
   ghDeviceBtn:      { en: 'Connect GitHub (device authorization)', zh: '连接 GitHub（设备授权）' },
   ghCodeHint:       { en: 'Enter this code on the authorization page', zh: '在授权页输入此代码（链接已预填）' },
   ghOpenAuth:       { en: 'Open authorization page →', zh: '打开授权页 →' },
@@ -1458,8 +1572,6 @@ const I18N = {
   ghDeviceUnavailable: { en: 'Device flow needs an OAuth App; paste a personal access token below.',
                          zh: '设备流需要 OAuth App；请在下方粘贴个人访问令牌。' },
   orPat:            { en: 'or paste a token', zh: '或粘贴令牌' },
-  giteeNote:        { en: 'Gitee has no device flow — create a personal access token (repo scope) and paste it.',
-                      zh: 'Gitee 无设备流——创建个人访问令牌（repo 权限）后粘贴。' },
   skipForNow:       { en: 'Skip for now', zh: '暂时跳过' },
   contribKeyNote:   { en: 'The token is written to the cluster Secret only, held by the security gateway, and never echoed back. An SSH key is generated and its public half uploaded.',
                       zh: '令牌只写入集群 Secret、由安全网关代持，不会回显。同时生成 SSH 密钥并自动上传公钥。' },
@@ -1630,6 +1742,28 @@ function switchProvider(which) {
 }
 $('segGithub').onclick = () => switchProvider('github');
 $('segGitee').onclick = () => switchProvider('gitee');
+
+// Account track per provider: "have an account" shows the auth surface,
+// "no account yet" swaps in the registration guide (which returns to the
+// auth surface once the user confirms they registered).
+function bindAcctTrack(prefix) {
+  const have = $(prefix + 'AcctHave');
+  const need = $(prefix + 'AcctNeed');
+  const register = $(prefix + 'Register');
+  const auth = $(prefix + 'Auth');
+  const show = (hasAccount) => {
+    have.classList.toggle('active', hasAccount);
+    need.classList.toggle('active', !hasAccount);
+    register.style.display = hasAccount ? 'none' : '';
+    auth.style.display = hasAccount ? '' : 'none';
+    contribErr('');
+  };
+  have.onclick = () => show(true);
+  need.onclick = () => show(false);
+  $(prefix + 'RegisteredBtn').onclick = () => show(true);
+}
+bindAcctTrack('gh');
+bindAcctTrack('gi');
 
 function openContrib() {
   contribErr('');

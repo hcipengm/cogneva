@@ -7,12 +7,19 @@ use tracing::{error, info, warn};
 /// evolution bridges.
 pub struct ReflectionPlugin {
     initialized: bool,
+    /// init 确认自进化管线真实启动且沙盒边界放行后为 true：start() 据此
+    /// 挂基线移植触发循环（跨插件消费 OrchestratorControl 只能在 start，
+    /// 见插件生命周期 init_all → start_all）。
+    porter_armed: bool,
 }
 
 impl ReflectionPlugin {
     /// Create a plugin that will build the reflection engine during `init`.
     pub fn new() -> Self {
-        Self { initialized: false }
+        Self {
+            initialized: false,
+            porter_armed: false,
+        }
     }
 }
 
@@ -542,6 +549,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 });
 
                 info!("Self-evolution auto-deploy pipeline started");
+
+                // 基线移植触发循环只在沙盒边界真实放行时挂载（dry-run 降级
+                // 环境不做任何 git 写操作）。start() 里消费 OrchestratorControl。
+                self.porter_armed =
+                    matches!(boundary, crate::sandbox::BoundaryDecision::Allowed(_));
             }
         }
 
@@ -549,7 +561,70 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         Ok(())
     }
 
-    async fn start(&self, _ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+    async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        if !self.porter_armed {
+            return Ok(());
+        }
+        let bp_config = crate::BaselinePortConfig::load()?;
+        if !bp_config.enabled {
+            info!("baseline port trigger disabled by config");
+            return Ok(());
+        }
+        let Ok(project_root) = std::env::current_dir() else {
+            warn!("no current dir; baseline port trigger disabled");
+            return Ok(());
+        };
+
+        // 无 orchestrator 也照常挂载：纯 cherry-pick 路径不依赖智能任务，
+        // 只是冲突解决与语义吸收确认退化（porter 内部已按此降级）。
+        let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
+        if orchestrator.is_none() {
+            info!("baseline port: no orchestrator; conflict resolution and semantic absorption checks degraded");
+        }
+
+        let instance_id = resolve_port_instance_id().await;
+        // 当前版本：部署注入的 COGNEVA_VERSION 优先（进化 Pod 种子即按它
+        // 对齐基线），退化为应用配置版本。
+        let current_version = std::env::var("COGNEVA_VERSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| ctx.config().app.version.clone())
+            .trim_start_matches('v')
+            .to_string();
+        let state_path = std::path::PathBuf::from(format!(
+            "{}/baseline-port-attempts.json",
+            ctx.config().app.data_dir
+        ));
+
+        let mut porter =
+            crate::BaselinePorter::new(&project_root).with_instance_id(instance_id.clone());
+        if let Some(orch) = orchestrator {
+            porter = porter.with_orchestrator(orch);
+        }
+        let porter = Arc::new(porter);
+
+        let shutdown = cog_core::ShutdownSignal::new();
+        if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+            let shutdown = shutdown.clone();
+            let mut rx = broadcast_tx.0.subscribe();
+            tokio::spawn(async move {
+                let _ = rx.recv().await;
+                shutdown.trigger();
+            });
+        }
+        info!(
+            instance = %instance_id,
+            version = %current_version,
+            repo = %project_root.display(),
+            "baseline port trigger enabled"
+        );
+        tokio::spawn(crate::run_baseline_port_loop(
+            porter,
+            current_version,
+            bp_config,
+            state_path,
+            shutdown,
+        ));
         Ok(())
     }
 
@@ -557,6 +632,32 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         info!("ReflectionPlugin shutdown");
         Ok(())
     }
+}
+
+/// 移植工作分支 `evol/<id>` 的实例 id 解析：显式 env 覆盖最优先，其次
+/// 读 cog-github 身份状态文件里的 branch_id（同一机器两个 crate 推导出的
+/// 分支名必须一致，否则 seed 对齐的 evol/* 与 porter 写出的 evol/<id>
+/// 会错开），最后退化 "local"。cog-reflection 不依赖 cog-github，直接读
+/// 其状态文件的 branch_id 字段。
+async fn resolve_port_instance_id() -> String {
+    if let Ok(v) = std::env::var("COGNEVA_INSTANCE_ID") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
+    let path = std::path::PathBuf::from(dir).join("identity.json");
+    if let Ok(text) = tokio::fs::read_to_string(&path).await {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(b) = v.get("branch_id").and_then(|x| x.as_str()) {
+                if !b.is_empty() {
+                    return b.to_string();
+                }
+            }
+        }
+    }
+    "local".into()
 }
 
 /// Persist + dispatch a notification when the sandbox boundary check

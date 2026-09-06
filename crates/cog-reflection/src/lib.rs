@@ -56,12 +56,12 @@ pub mod types;
 
 pub use auto_promoter::{AutoPromoter, PromotionChannel};
 pub use baseline_port::{
-    AbsorptionStatus, BaselinePorter, PortItemResult, PortOutcome, PortPlan, PortPlanItem,
-    PortReport, PortRoute, PromotedChange,
+    run_baseline_port_loop, AbsorptionStatus, BaselinePorter, PortItemResult, PortOutcome,
+    PortPlan, PortPlanItem, PortReport, PortRoute, PromotedChange,
 };
 pub use change_pipeline::{ApplyResult, ChangePipeline};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
-pub use config::{GitOpsConfig, PromotionGateConfig};
+pub use config::{BaselinePortConfig, GitOpsConfig, PromotionGateConfig};
 pub use detector::{DefaultLearningDetector, LearningDetector};
 pub use discovery::DiscoveryEngine;
 pub use effectiveness::SkillEffectivenessTracker;

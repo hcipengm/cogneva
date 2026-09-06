@@ -196,6 +196,18 @@ impl CodePlatformProvider for GiteeProvider {
         Ok(())
     }
 
+    async fn add_labels(&self, issue_number: u64, labels: &[String]) -> Result<()> {
+        // Gitee v5 给 PR 打标签走 pulls 端点，labels 为逗号分隔名单。
+        let joined = labels.join(",");
+        self.send(
+            self.http
+                .post(self.url(&format!("/pulls/{issue_number}/labels")))
+                .form(&[("labels", joined.as_str())]),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn list_issue_comments(&self, issue_number: u64) -> Result<Vec<PlatformComment>> {
         let number = self.issue_string_number(issue_number).await?;
         let v = self

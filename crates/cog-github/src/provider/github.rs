@@ -141,6 +141,15 @@ impl CodePlatformProvider for GitHubProvider {
         })
     }
 
+    async fn add_labels(&self, issue_number: u64, labels: &[String]) -> Result<()> {
+        self.client
+            .issues(&self.owner, &self.repo)
+            .add_labels(issue_number, labels)
+            .await
+            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+        Ok(())
+    }
+
     async fn list_open_pull_requests(&self) -> Result<Vec<PlatformPullRequest>> {
         let page = self
             .client

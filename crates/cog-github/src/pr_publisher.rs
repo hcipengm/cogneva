@@ -50,7 +50,7 @@ impl GitHubPrPublisher {
             issue_number,
             change_id,
             self.config.conversation.bot_signature,
-            metadata_block(identity, None, None)
+            metadata_block(identity, None, Some(&format!("#{issue_number}")))
         );
         self.publish(
             provider,
@@ -127,6 +127,23 @@ impl GitHubPrPublisher {
                 draft: false,
             })
             .await?;
+
+        // Cross-validation discovery filters on this label; without it no bot
+        // would ever pick the PR up. Best-effort: a provider without label
+        // support must not fail the publish itself.
+        if let Err(e) = provider
+            .add_labels(
+                pr.number,
+                &[crate::cross_validation::CROSS_VALIDATION_LABEL.to_string()],
+            )
+            .await
+        {
+            tracing::warn!(
+                pr = pr.number,
+                error = %e,
+                "failed to attach cross-validation label; PR will not be picked up by bot board"
+            );
+        }
 
         Ok(pr)
     }
@@ -372,10 +389,16 @@ impl cog_core::ChangeSink for GitHubChangeSink {
             .chars()
             .take(70)
             .collect::<String>();
-        let mut body = format!(
+        let mut body = String::new();
+        // Link back to the tracked issue so competing solutions for the same
+        // intent group together (bot board parses `Fixes #N`).
+        if let Some(issue_number) = change.issue_number {
+            body.push_str(&format!("Fixes #{issue_number}\n\n"));
+        }
+        body.push_str(&format!(
             "Change `{}` generated autonomously by Cogneva (PGE mode: {}).\n\n## Goal\n\n{}",
             change.change_id, change.pge_mode, change.goal
-        );
+        ));
         if let Some(ref rationale) = change.rationale {
             body.push_str(&format!("\n\n## Rationale\n\n{rationale}"));
         }
@@ -393,9 +416,10 @@ impl cog_core::ChangeSink for GitHubChangeSink {
         let eval_note = change
             .self_review_score
             .map(|score| format!("self-review={score:.2}"));
+        let related = change.issue_number.map(|n| format!("#{n}"));
         body.push_str(&format!(
             "\n\n{}",
-            metadata_block(identity, eval_note.as_deref(), None)
+            metadata_block(identity, eval_note.as_deref(), related.as_deref())
         ));
         let commit_message = format!(
             "chore(cogneva): autonomous change {}\n\n{}\n\n{}",

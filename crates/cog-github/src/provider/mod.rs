@@ -95,6 +95,17 @@ pub trait CodePlatformProvider: Send + Sync {
     /// outcome recording.
     async fn get_pull_request(&self, pr_number: u64) -> Result<PullRequestDetail>;
 
+    /// Attach labels to an issue or pull request (GitHub labels PRs through
+    /// the issues API; Gitee labels PRs via its pulls endpoint).
+    ///
+    /// Default: unsupported — providers without label access return an error
+    /// so callers can decide whether labeling is mandatory for their flow.
+    async fn add_labels(&self, _issue_number: u64, _labels: &[String]) -> Result<()> {
+        Err(crate::error::CogGitHubError::Provider(
+            "add_labels not supported by this provider".into(),
+        ))
+    }
+
     /// Fetch a single issue by number (webhook event handling).
     ///
     /// Default: scans `list_open_issues` — providers with a direct API should

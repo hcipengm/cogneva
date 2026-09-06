@@ -159,6 +159,8 @@ pub struct BaselinePorter {
     resolve_timeout_secs: u64,
     /// eval A/B 任务的等待上限（秒，含沙盒双构建）。
     eval_timeout_secs: u64,
+    /// 语义吸收确认任务的等待上限（秒）。
+    absorb_timeout_secs: u64,
     /// 轮询智能任务结果的间隔（秒）。
     poll_interval_secs: u64,
     /// 移植 commit 的提交者身份（agent 路径的新 commit 使用）。
@@ -175,6 +177,7 @@ impl BaselinePorter {
             quality_gate: true,
             resolve_timeout_secs: 1800,
             eval_timeout_secs: 3600,
+            absorb_timeout_secs: 600,
             poll_interval_secs: 5,
             committer_name: "Cogneva Evolution".into(),
             committer_email: "evolution@cogneva.local".into(),
@@ -209,6 +212,12 @@ impl BaselinePorter {
     /// 覆盖 eval A/B 任务的等待上限（秒）。
     pub fn with_eval_timeout(mut self, timeout_secs: u64) -> Self {
         self.eval_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// 覆盖语义吸收确认任务的等待上限（秒）。
+    pub fn with_absorb_timeout(mut self, timeout_secs: u64) -> Self {
+        self.absorb_timeout_secs = timeout_secs;
         self
     }
 
@@ -394,6 +403,122 @@ impl BaselinePorter {
         }
     }
 
+    /// 语义吸收确认：patch-id 未命中时，把[变更意图 + 原始 diff + 新基线
+    /// 相关现状]打包成 `baseline_port_absorb_check` 主流程任务，由 agent 读
+    /// 新基线代码判定意图是否已被覆盖。返回 true = 已吸收（跳过移植）。
+    ///
+    /// fail-closed：无编排器、任务失败/超时、回复无法解析为
+    /// `{"absorbed": bool}` 一律按未吸收处理——重复移植的成本远低于
+    /// 静默丢一条晋级变更。
+    async fn semantic_absorb_check(&self, change: &PromotedChange, new_tag: &str) -> bool {
+        let Some(orch) = &self.orchestrator else {
+            return false;
+        };
+
+        let patch = self.change_patch(&change.commit).await.unwrap_or_default();
+        let intent = self.change_intent(change).await;
+        let task_id = format!(
+            "port-absorb-{}-{}",
+            sanitize_ref(&change.change_id),
+            sanitize_ref(new_tag)
+        );
+        let goal = format!(
+            "Decide whether the new baseline {new_tag} already achieves the intent \
+             of the promoted change described below, even though its exact patch \
+             does not apply (different implementation, upstream fix, or refactor \
+             covering the same behavior).\n\n\
+             Change intent:\n{intent}\n\n\
+             Original diff:\n{}\n\n\
+             Inspect the current worktree (already at the new baseline) and answer \
+             ONLY with a JSON object: {{\"absorbed\": true}} if the baseline fully \
+             covers the intent, {{\"absorbed\": false}} if any part is still missing. \
+             When in doubt, answer false.",
+            tail(&patch, 12000)
+        );
+        let mut task = Task::new(
+            task_id.clone(),
+            TaskType::Custom("baseline_port_absorb_check".into()),
+            serde_json::json!({
+                "evolution_mode": "baseline_port",
+                "task_kind": "baseline_port_absorb_check",
+                "change_id": change.change_id,
+                "baseline_tag": new_tag,
+            }),
+        );
+        task.timeout_seconds = self.absorb_timeout_secs;
+        task.action_planner_meta = Some(Self::verified_meta(
+            "Baseline port semantic absorption check; read-only judgment",
+        ));
+
+        match self
+            .submit_and_wait(orch, task, goal, self.absorb_timeout_secs)
+            .await
+        {
+            Ok(Ok(completed)) => {
+                let absorbed = completed
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.get("absorbed"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                info!(
+                    change_id = %change.change_id,
+                    absorbed,
+                    "semantic absorption check completed"
+                );
+                absorbed
+            }
+            Ok(Err(reason)) => {
+                warn!(
+                    change_id = %change.change_id,
+                    %reason,
+                    "semantic absorption check failed; treating as pending"
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    change_id = %change.change_id,
+                    error = %e,
+                    "semantic absorption check error; treating as pending"
+                );
+                false
+            }
+        }
+    }
+
+    /// 该新基线是否已移植过：`evol/<id>` 分支存在且已包含 new_tag 即视为
+    /// 完成（移植产物分支从新基线切出，成功推送后 new_tag 必是其祖先）。
+    /// 远端探测失败按未移植处理——误判为重跑的代价是一次幂等移植，
+    /// 误判为已完成的代价是晋级历史静默丢失，必须偏保守。
+    pub async fn already_ported(&self, new_tag: &str) -> bool {
+        let instance = self.instance_id.clone().unwrap_or_else(|| "local".into());
+        let branch_ref = format!("refs/remotes/local/evol/{instance}");
+        if self
+            .git_opt(&["rev-parse", "--verify", "-q", &branch_ref])
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return false;
+        }
+        self.git(&["merge-base", "--is-ancestor", new_tag, &branch_ref])
+            .await
+            .is_ok()
+    }
+
+    /// 刷新上游/宿主 tag。两个远程各自尽力而为：宿主 bare（local）可能
+    /// 还没被 seed 播种，upstream 可能不可达——任一失败都不阻塞本轮判定
+    ///（判定基于本地已有 tag，最多晚一个轮询周期看到新基线）。
+    pub async fn fetch_tags(&self) {
+        for remote in ["local", "upstream"] {
+            if let Err(e) = self.git(&["fetch", "--tags", remote]).await {
+                debug!(remote, error = %e, "tag refresh failed; using local tags as-is");
+            }
+        }
+    }
+
     /// 产出移植计划。当前版本（如 `0.5.7`，不带 v 前缀）不低于最新 release
     /// tag、或仓库里没有 release tag 时返回 None（无新基线可移植）。
     pub async fn plan(&self, current_version: &str) -> SFResult<Option<PortPlan>> {
@@ -432,9 +557,18 @@ impl BaselinePorter {
 
         let mut items = Vec::with_capacity(changes.len());
         for change in changes {
-            let status = self
+            let mut status = self
                 .classify(&change, &new_tag, &absorbed, &pending)
                 .await?;
+            // patch-id 判定为待移植时，再做一次语义吸收确认：官方可能以
+            // 不同实现达成了同一意图（patch-id 不命中但语义已覆盖）。确认
+            // 是智能判定，走主流程任务；任何失败一律 fail-closed 回 Pending，
+            // 宁可重复移植也不静默丢弃晋级变更。
+            if status == AbsorptionStatus::Pending
+                && self.semantic_absorb_check(&change, &new_tag).await
+            {
+                status = AbsorptionStatus::Absorbed;
+            }
             info!(
                 change_id = %change.change_id,
                 tag = %change.tag,
@@ -1097,6 +1231,179 @@ impl BaselinePorter {
     }
 }
 
+// ============================================================================
+// 触发循环（规则3 接线）：轮询上游 release tag → 幂等判定 → plan → execute。
+//
+// 循环跑在沙盒进化 Pod 里，porter 的 repo_dir 即沙盒源码工作仓库。执行
+// 期间 porter 独占该工作树（checkout -B evol/<id>）——新基线出现是低频
+// 事件，移植完成后工作树即停在新基线移植产物上，与 seed 对齐逻辑同向。
+// ============================================================================
+
+/// 单个新基线的最近一次移植尝试记录。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct PortAttempt {
+    /// "done" | "failed"。
+    status: String,
+    /// RFC3339 时间。
+    at: String,
+}
+
+/// 尝试状态文件：tag → 最近一次尝试。done 永久跳过；failed 在冷却期
+/// 内跳过（崩溃重启不立刻重跑同一个失败基线，进程重启也不丢"已移植"
+/// 记忆）。文件损坏按空处理——最坏后果是一次幂等重跑，绝不反过来把
+/// 未移植的基线记成已移植。
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PortAttempts {
+    attempts: std::collections::HashMap<String, PortAttempt>,
+}
+
+async fn load_attempts(path: &std::path::Path) -> PortAttempts {
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            warn!(path = %path.display(), error = %e, "port attempts file corrupt; starting fresh");
+            PortAttempts::default()
+        }),
+        Err(_) => PortAttempts::default(),
+    }
+}
+
+async fn save_attempts(path: &std::path::Path, attempts: &PortAttempts) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            warn!(path = %path.display(), error = %e, "cannot create port attempts dir");
+            return;
+        }
+    }
+    match serde_json::to_string_pretty(attempts) {
+        Ok(json) => {
+            if let Err(e) = tokio::fs::write(path, json).await {
+                warn!(path = %path.display(), error = %e, "cannot persist port attempts");
+            }
+        }
+        Err(e) => warn!(error = %e, "cannot serialize port attempts"),
+    }
+}
+
+/// 该基线本轮是否应当尝试移植。bool 判定全部偏保守：任何不确定都
+/// 倾向"再试一次"而不是"跳过"。
+fn should_attempt(attempts: &PortAttempts, tag: &str, retry_cooldown_secs: u64) -> bool {
+    match attempts.attempts.get(tag) {
+        None => true,
+        Some(a) if a.status == "done" => false,
+        Some(a) => {
+            let elapsed = chrono::DateTime::parse_from_rfc3339(&a.at)
+                .map(|t| {
+                    chrono::Utc::now()
+                        .signed_duration_since(t.with_timezone(&chrono::Utc))
+                        .num_seconds()
+                        .max(0) as u64
+                })
+                // 时间戳不可解析：当作冷却已过，允许重试。
+                .unwrap_or(u64::MAX);
+            elapsed >= retry_cooldown_secs
+        }
+    }
+}
+
+/// 单轮触发：刷新 tag → 找新基线 → 幂等判定 → plan → execute → 记状态。
+async fn port_tick(
+    porter: &BaselinePorter,
+    current_version: &str,
+    config: &crate::BaselinePortConfig,
+    state_path: &std::path::Path,
+) -> SFResult<()> {
+    porter.fetch_tags().await;
+    let Some(latest) = porter.latest_release_tag().await? else {
+        return Ok(());
+    };
+    let mut attempts = load_attempts(state_path).await;
+
+    // 已成功移植过（含崩溃在 execute 之后、记状态之前的情形：远端分支
+    // 已含新基线即视为完成，顺手补记状态）。
+    if porter.already_ported(&latest).await {
+        if attempts.attempts.get(&latest).map(|a| a.status.as_str()) != Some("done") {
+            attempts.attempts.insert(
+                latest.clone(),
+                PortAttempt {
+                    status: "done".into(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+            save_attempts(state_path, &attempts).await;
+        }
+        return Ok(());
+    }
+    if !should_attempt(&attempts, &latest, config.retry_cooldown_secs) {
+        debug!(tag = %latest, "baseline port in retry cooldown; skipping");
+        return Ok(());
+    }
+
+    let Some(plan) = porter.plan(current_version).await? else {
+        return Ok(());
+    };
+    info!(
+        new_tag = %plan.new_tag,
+        pending = plan.pending().count(),
+        absorbed = plan.absorbed().count(),
+        "new upstream baseline detected; starting port"
+    );
+    let status = match porter.execute(&plan).await {
+        Ok(report) => {
+            info!(
+                new_tag = %report.new_tag,
+                clean_reset = report.clean_reset,
+                ported = report.ported().count(),
+                rework = report.needs_rework().count(),
+                "baseline port finished"
+            );
+            "done"
+        }
+        Err(e) => {
+            warn!(new_tag = %plan.new_tag, error = %e, "baseline port failed");
+            "failed"
+        }
+    };
+    attempts.attempts.insert(
+        plan.new_tag.clone(),
+        PortAttempt {
+            status: status.into(),
+            at: chrono::Utc::now().to_rfc3339(),
+        },
+    );
+    save_attempts(state_path, &attempts).await;
+    Ok(())
+}
+
+/// 基线移植触发循环。第一轮立即执行（启动即对齐新基线，不等一个
+/// 轮询周期），之后按 `poll_interval_secs` 周期运行直到 shutdown。
+pub async fn run_baseline_port_loop(
+    porter: Arc<BaselinePorter>,
+    current_version: String,
+    config: crate::BaselinePortConfig,
+    state_path: PathBuf,
+    shutdown: cog_core::ShutdownSignal,
+) {
+    let interval = Duration::from_secs(config.poll_interval_secs.max(60));
+    info!(
+        interval_secs = interval.as_secs(),
+        retry_cooldown_secs = config.retry_cooldown_secs,
+        version = %current_version,
+        "baseline port trigger loop started"
+    );
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.wait() => break,
+            _ = ticker.tick() => {
+                if let Err(e) = port_tick(&porter, &current_version, &config, &state_path).await {
+                    warn!(error = %e, "baseline port tick failed");
+                }
+            }
+        }
+    }
+}
+
 /// 输出尾部截断（编译/测试错误集中在尾部），按字符边界裁剪。
 fn tail(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -1437,6 +1744,121 @@ mod tests {
         assert_eq!(parse_release_version("not-a-tag"), None);
     }
 
+    #[test]
+    fn should_attempt_gate_by_status_and_cooldown() {
+        let mut attempts = PortAttempts::default();
+        // 无记录 → 尝试。
+        assert!(should_attempt(&attempts, "v0.5.8", 86_400));
+        // done → 永久跳过。
+        attempts.attempts.insert(
+            "v0.5.8".into(),
+            PortAttempt {
+                status: "done".into(),
+                at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        assert!(!should_attempt(&attempts, "v0.5.8", 86_400));
+        // failed 且在冷却期内 → 跳过；冷却已过 → 重试。
+        attempts.attempts.insert(
+            "v0.5.9".into(),
+            PortAttempt {
+                status: "failed".into(),
+                at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        assert!(!should_attempt(&attempts, "v0.5.9", 86_400));
+        assert!(should_attempt(&attempts, "v0.5.9", 0));
+        // 时间戳不可解析 → 按冷却已过处理（偏保守重试）。
+        attempts.attempts.insert(
+            "v0.6.0".into(),
+            PortAttempt {
+                status: "failed".into(),
+                at: "not-a-time".into(),
+            },
+        );
+        assert!(should_attempt(&attempts, "v0.6.0", 86_400));
+    }
+
+    #[tokio::test]
+    async fn semantic_absorption_confirmed_marks_change_absorbed() {
+        let dir = setup_repo().await;
+        make_promoted(dir.path(), "chg-sem", "feature.rs", "fn promoted() {}\n").await;
+        upstream_release(
+            dir.path(),
+            "v0.5.7",
+            "v0.5.8",
+            "other.rs",
+            "fn other() {}\n",
+        )
+        .await;
+
+        let orch = Arc::new(
+            MockOrchestrator::new(dir.path().to_path_buf())
+                .with_absorb_answer(serde_json::json!({"absorbed": true})),
+        );
+        let porter = porter_for(dir.path()).with_orchestrator(orch.clone());
+        let plan = porter.plan("0.5.7").await.unwrap().unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].status, AbsorptionStatus::Absorbed);
+        assert!(orch
+            .task_types()
+            .contains(&"baseline_port_absorb_check".to_string()));
+    }
+
+    #[tokio::test]
+    async fn semantic_absorb_unparseable_result_fails_closed_to_pending() {
+        let dir = setup_repo().await;
+        make_promoted(dir.path(), "chg-sem2", "feature.rs", "fn promoted() {}\n").await;
+        upstream_release(
+            dir.path(),
+            "v0.5.7",
+            "v0.5.8",
+            "other.rs",
+            "fn other() {}\n",
+        )
+        .await;
+
+        // 回复不是 {"absorbed": bool}：宁可重复移植也不静默丢弃。
+        let orch = Arc::new(
+            MockOrchestrator::new(dir.path().to_path_buf())
+                .with_absorb_answer(serde_json::json!({"answer": "yes"})),
+        );
+        let porter = porter_for(dir.path()).with_orchestrator(orch);
+        let plan = porter.plan("0.5.7").await.unwrap().unwrap();
+        assert_eq!(plan.items[0].status, AbsorptionStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn already_ported_detects_remote_branch_containing_tag() {
+        let dir = setup_repo().await;
+        make_promoted(dir.path(), "chg-ap", "feature.rs", "fn promoted() {}\n").await;
+        upstream_release(
+            dir.path(),
+            "v0.5.7",
+            "v0.5.8",
+            "other.rs",
+            "fn other() {}\n",
+        )
+        .await;
+
+        let porter = porter_for(dir.path()).with_instance_id("local");
+        // 移植前：无 evol 远端引用。
+        assert!(!porter.already_ported("v0.5.8").await);
+
+        let plan = porter.plan("0.5.7").await.unwrap().unwrap();
+        porter.execute(&plan).await.unwrap();
+        // 模拟推送后的远端跟踪引用（execute 无 local remote 时不推）。
+        let tip = git(dir.path(), &["rev-parse", "evol/local"]).await;
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/local/evol/local", &tip],
+        )
+        .await;
+        assert!(porter.already_ported("v0.5.8").await);
+        // 不存在的 tag：merge-base 失败 → 未移植（偏保守）。
+        assert!(!porter.already_ported("v9.9.9").await);
+    }
+
     // ========================================================================
     // 移植执行（execute）路径
     //
@@ -1461,6 +1883,8 @@ mod tests {
         task_types: std::sync::Mutex<Vec<String>>,
         rework: std::sync::Mutex<Vec<Task>>,
         resolve_script: std::sync::Mutex<std::collections::VecDeque<ResolveAction>>,
+        /// 语义吸收确认任务的固定回复（默认 {"absorbed": false}）。
+        absorb_answer: serde_json::Value,
     }
 
     impl MockOrchestrator {
@@ -1471,11 +1895,17 @@ mod tests {
                 task_types: std::sync::Mutex::new(Vec::new()),
                 rework: std::sync::Mutex::new(Vec::new()),
                 resolve_script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                absorb_answer: serde_json::json!({"absorbed": false}),
             }
         }
 
         fn script(self, actions: Vec<ResolveAction>) -> Self {
             *self.resolve_script.lock().unwrap() = actions.into();
+            self
+        }
+
+        fn with_absorb_answer(mut self, answer: serde_json::Value) -> Self {
+            self.absorb_answer = answer;
             self
         }
 
@@ -1526,6 +1956,9 @@ mod tests {
                 } else if type_name == "baseline_port_rework" {
                     task.status = TaskStatus::Completed;
                     self.rework.lock().unwrap().push(task.clone());
+                } else if type_name == "baseline_port_absorb_check" {
+                    task.status = TaskStatus::Completed;
+                    task.result = Some(self.absorb_answer.clone());
                 }
                 ids.push(task.id.clone());
                 self.tasks.lock().unwrap().insert(task.id.clone(), task);

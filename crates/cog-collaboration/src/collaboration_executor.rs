@@ -631,8 +631,12 @@ impl CollaborationExecutor {
                     "Self-evolution task succeeded but no ChangeSink is configured"
                 );
             } else {
-                let changes =
-                    Self::extract_changes(&result, &goal, &Self::pge_mode_str(&result.pge_mode));
+                let changes = Self::extract_changes(
+                    &result,
+                    &goal,
+                    &Self::pge_mode_str(&result.pge_mode),
+                    task.input.get("issue_number").and_then(|v| v.as_u64()),
+                );
                 for change in changes {
                     for sink in &self.change_sinks {
                         match sink.submit_change(change.clone()).await {
@@ -723,6 +727,7 @@ impl CollaborationExecutor {
         squad_result: &crate::squad::SquadResult,
         goal: &str,
         pge_mode: &str,
+        issue_number: Option<u64>,
     ) -> Vec<cog_core::GeneratedChange> {
         let mut changes = Vec::new();
         let Some(ref result_val) = squad_result.result else {
@@ -768,6 +773,7 @@ impl CollaborationExecutor {
                 rationale: None,
                 pge_mode: pge_mode.into(),
                 self_review_score: Self::extract_score(squad_result).map(|s| s as f32),
+                issue_number,
             });
         }
 

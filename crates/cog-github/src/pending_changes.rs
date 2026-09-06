@@ -145,6 +145,7 @@ mod tests {
             rationale: None,
             pge_mode: "squad".into(),
             self_review_score: None,
+            issue_number: None,
         }
     }
 

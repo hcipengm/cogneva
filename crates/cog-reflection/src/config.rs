@@ -106,7 +106,6 @@ impl PromotionGateConfig {
             .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
         Self::load_from(Path::new(&path))
     }
-
     pub fn load_from(path: &Path) -> SFResult<Self> {
         let mut cfg = match std::fs::read_to_string(path) {
             Ok(text) => {
@@ -222,6 +221,82 @@ impl PromotionGateConfig {
     }
 }
 
+/// 基线移植触发器配置（规则3：公版出新 release tag 后把历代晋级变更
+/// 自治移植到新基线）。porter 本体在沙盒进化 Pod 内运行，轮询上游 tag，
+/// 产出 `evol/<id>` 分支与 `gen-n` 代际 tag。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BaselinePortConfig {
+    /// 移植触发循环总开关。默认开启：外层已由 self_evolution.enabled 与
+    /// 沙盒边界双重把门，进了沙盒的实例应当自治跟上新基线。
+    pub enabled: bool,
+    /// 上游 release tag 轮询间隔（秒）。
+    pub poll_interval_secs: u64,
+    /// 同一新基线移植失败后的重试冷却（秒）；成功移植永久不再重跑。
+    pub retry_cooldown_secs: u64,
+}
+
+impl Default for BaselinePortConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_secs: 3600,
+            retry_cooldown_secs: 86_400,
+        }
+    }
+}
+
+impl BaselinePortConfig {
+    /// 从 cogneva.json 的 `self_evolution.baseline_port` 段加载，再叠加
+    /// env 覆盖。文件或段缺失时返回 Default；段存在但解析失败、或 env
+    /// 值非法时返回 Err——配置写错必须响亮失败。
+    pub fn load() -> SFResult<Self> {
+        let path = std::env::var("COGNEVA_CONFIG_PATH")
+            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        Self::load_from(Path::new(&path))
+    }
+
+    pub fn load_from(path: &Path) -> SFResult<Self> {
+        let mut cfg = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let root: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| SFError::Config(format!("{}: {e}", path.display())))?;
+                match root.pointer("/self_evolution/baseline_port") {
+                    Some(section) => serde_json::from_value(section.clone()).map_err(|e| {
+                        SFError::Config(format!(
+                            "{} self_evolution.baseline_port: {e}",
+                            path.display()
+                        ))
+                    })?,
+                    None => Self::default(),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
+        };
+        cfg.apply_env_with(|k| std::env::var(k).ok())?;
+        Ok(cfg)
+    }
+
+    /// env 覆盖。取值经 `get` 读取（测试可注入假 env）；非法值返回 Err。
+    fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) -> SFResult<()> {
+        fn parse<T: std::str::FromStr>(key: &str, raw: &str) -> SFResult<T> {
+            raw.parse::<T>()
+                .map_err(|_| SFError::Config(format!("{key} 值非法: {raw:?}")))
+        }
+        if let Some(v) = get("COGNEVA_BASELINE_PORT_ENABLED") {
+            self.enabled = parse("COGNEVA_BASELINE_PORT_ENABLED", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_BASELINE_PORT_POLL_INTERVAL_SECS") {
+            self.poll_interval_secs = parse("COGNEVA_BASELINE_PORT_POLL_INTERVAL_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_BASELINE_PORT_RETRY_COOLDOWN_SECS") {
+            self.retry_cooldown_secs = parse("COGNEVA_BASELINE_PORT_RETRY_COOLDOWN_SECS", &v)?;
+        }
+        Ok(())
+    }
+}
+
 /// GitOps 分发配置（路线 B：推送端只推中央仓库，拉取端各自自治，
 /// 沙盒全程不持有任何集群凭证）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +366,53 @@ impl Default for GitOpsConfig {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn baseline_port_defaults_and_section_load() {
+        let dir = std::env::temp_dir().join(format!("cog-reflection-bp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        // 段缺失：默认开启，默认节奏。
+        std::fs::write(&path, r#"{"self_evolution": {"enabled": true}}"#).unwrap();
+        let cfg = BaselinePortConfig::load_from(&path).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.poll_interval_secs, 3600);
+        assert_eq!(cfg.retry_cooldown_secs, 86_400);
+        // 段存在：按段取值，未写字段保持默认。
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"baseline_port": {"enabled": false, "poll_interval_secs": 120}}}"#,
+        )
+        .unwrap();
+        let cfg = BaselinePortConfig::load_from(&path).unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.poll_interval_secs, 120);
+        assert_eq!(cfg.retry_cooldown_secs, 86_400);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn baseline_port_env_overrides_and_invalid_is_loud() {
+        let env: HashMap<&str, &str> = [
+            ("COGNEVA_BASELINE_PORT_ENABLED", "false"),
+            ("COGNEVA_BASELINE_PORT_RETRY_COOLDOWN_SECS", "3600"),
+        ]
+        .into_iter()
+        .collect();
+        let mut cfg = BaselinePortConfig::default();
+        cfg.apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.retry_cooldown_secs, 3600);
+
+        let bad: HashMap<&str, &str> = [("COGNEVA_BASELINE_PORT_ENABLED", "maybe")]
+            .into_iter()
+            .collect();
+        let mut cfg = BaselinePortConfig::default();
+        assert!(cfg
+            .apply_env_with(|k| bad.get(k).map(|s| s.to_string()))
+            .is_err());
+    }
 
     #[test]
     fn default_is_safe_side() {
