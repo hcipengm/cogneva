@@ -1018,7 +1018,7 @@ impl Drop for Agent {
     fn drop(&mut self) {
         // Abort consumer and heartbeat tasks if present.
         if let Ok(inner) = self.inner.try_lock() {
-            if let Some(ref handle) = inner.consumer_handle {
+            if let Some(ref handle) = inner.task_handle {
                 handle.abort();
             }
             if let Some(ref handle) = inner.consumer_handle {
@@ -1032,16 +1032,9 @@ impl Drop for Agent {
         if let Some(ref lifecycle) = self.lifecycle {
             let agent_id = self.config.agent_id.clone();
             let lifecycle = lifecycle.clone();
-            // Best-effort async cleanup: spawn a blocking task to stop heartbeat.
-            // In a tokio runtime this will run; outside it silently does nothing.
-            let _ = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new();
-                if let Ok(rt) = rt {
-                    rt.block_on(async move {
-                        lifecycle.stop_heartbeat(&agent_id).await;
-                        let _ = lifecycle.transition(&agent_id, AgentState::Inactive).await;
-                    });
-                }
+            schedule_cleanup(async move {
+                lifecycle.stop_heartbeat(&agent_id).await;
+                let _ = lifecycle.transition(&agent_id, AgentState::Inactive).await;
             });
         }
 
@@ -1049,14 +1042,27 @@ impl Drop for Agent {
         if let Some(ref registry) = self.registry {
             let agent_id = self.config.agent_id.clone();
             let registry = registry.clone();
-            let _ = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new();
-                if let Ok(rt) = rt {
-                    rt.block_on(async move {
-                        let _ = registry.deregister(&agent_id).await;
-                    });
-                }
+            schedule_cleanup(async move {
+                let _ = registry.deregister(&agent_id).await;
             });
+        }
+    }
+}
+
+/// Run best-effort cleanup on the runtime that owns the agent.
+///
+/// `Drop` must not create a runtime or wait for I/O: either can deadlock during
+/// shutdown. If the agent is dropped outside Tokio, there is no runtime left to
+/// safely drive asynchronous cleanup, so the work is skipped.
+fn schedule_cleanup(task: impl std::future::Future<Output = ()> + Send + 'static) -> bool {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(task);
+            true
+        }
+        Err(_) => {
+            tracing::debug!("skipping agent cleanup outside a Tokio runtime");
+            false
         }
     }
 }
@@ -1143,5 +1149,38 @@ async fn run_agent_task(
                 let _ = result_tx.send(snap);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schedule_cleanup;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn cleanup_task_uses_the_current_runtime() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_by_task = ran.clone();
+
+        assert!(schedule_cleanup(async move {
+            ran_by_task.store(true, Ordering::SeqCst);
+        }));
+
+        tokio::task::yield_now().await;
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cleanup_task_is_skipped_without_a_runtime() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_by_task = ran.clone();
+
+        assert!(!schedule_cleanup(async move {
+            ran_by_task.store(true, Ordering::SeqCst);
+        }));
+        assert!(!ran.load(Ordering::SeqCst));
     }
 }
