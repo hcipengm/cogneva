@@ -49,8 +49,8 @@ fn main() {
 }
 
 fn collect_files(repo_root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let entries = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("读取资产目录 {} 失败: {e}", dir.display()));
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|e| panic!("读取资产目录 {} 失败: {e}", dir.display()));
     for entry in entries {
         let entry = entry.unwrap();
         let path = entry.path();

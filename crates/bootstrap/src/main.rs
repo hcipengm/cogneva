@@ -1273,11 +1273,7 @@ async fn ensure_source_tree() -> Result<PathBuf> {
     };
     let mut attempts: Vec<Vec<&str>> = Vec::new();
     if bare.join("HEAD").exists() {
-        attempts.push(vec![
-            "clone",
-            bare.to_str().unwrap(),
-            dir.to_str().unwrap(),
-        ]);
+        attempts.push(vec!["clone", bare.to_str().unwrap(), dir.to_str().unwrap()]);
     }
     for url in upstream {
         attempts.push(vec!["clone", "--depth", "1", url, dir.to_str().unwrap()]);
