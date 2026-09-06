@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cogneva · Gitee OAuth Callback</title>
+<style>
+  :root {
+    --bg: #0b0e11;
+    --panel: #12161b;
+    --border: #232a32;
+    --text: #d7dde3;
+    --dim: #7d8894;
+    --accent: #c71d23;
+    --ok: #3fb950;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "SFMono-Regular", ui-monospace, "JetBrains Mono", Consolas, "Courier New", monospace;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    width: 100%;
+    max-width: 620px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 40px 36px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--dim);
+    font-size: 13px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 28px;
+  }
+  .brand::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    background: var(--accent);
+    border-radius: 2px;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 12px; }
+  p.desc { color: var(--dim); font-size: 14px; line-height: 1.7; margin-bottom: 24px; }
+  .code-box {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px 18px;
+    font-size: 15px;
+    word-break: break-all;
+    color: var(--ok);
+    margin-bottom: 16px;
+    user-select: all;
+  }
+  .btn {
+    display: inline-block;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 10px 22px;
+    font-size: 14px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: filter .15s;
+  }
+  .btn:hover { filter: brightness(1.15); }
+  .status-ok h1 { color: var(--ok); }
+  .status-err h1 { color: var(--accent); }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 18px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">cogneva · gitee oauth</div>
+
+  <div id="sent" class="hidden status-ok">
+    <h1 data-zh="授权完成" data-en="Authorization complete">授权完成</h1>
+    <p class="desc" data-zh="授权码已自动送回 cogneva 向导页面，本窗口即将关闭。若没有关闭，手动关掉即可。"
+       data-en="The code has been handed back to the cogneva wizard. This window will close shortly; you may also close it manually.">授权码已自动送回 cogneva 向导页面，本窗口即将关闭。若没有关闭，手动关掉即可。</p>
+  </div>
+
+  <div id="manual" class="hidden">
+    <h1 data-zh="复制下方授权码" data-en="Copy the code below">复制下方授权码</h1>
+    <p class="desc" data-zh="自动递送不可用（未检测到打开本页的向导窗口）。回到 cogneva 向导第三步，把这段授权码粘贴进去即可。"
+       data-en="Automatic hand-off unavailable (no opener wizard window detected). Go back to step 3 of the cogneva wizard and paste this code.">自动递送不可用（未检测到打开本页的向导窗口）。回到 cogneva 向导第三步，把这段授权码粘贴进去即可。</p>
+    <div class="code-box" id="codeText"></div>
+    <button class="btn" id="copyBtn" data-zh="复制授权码" data-en="Copy code">复制授权码</button>
+    <div class="hint" data-zh="粘贴整段跳转网址也一样有效，向导会自动解析。"
+         data-en="Pasting the whole redirect URL works too — the wizard parses it.">粘贴整段跳转网址也一样有效，向导会自动解析。</div>
+  </div>
+
+  <div id="error" class="hidden status-err">
+    <h1 data-zh="地址里没有授权码" data-en="No code in this URL">地址里没有授权码</h1>
+    <p class="desc" data-zh="本页是 cogneva 的 Gitee 授权回调落地页，应由 Gitee 授权后自动跳转而来。请回到向导重新发起连接。"
+       data-en="This is the cogneva Gitee OAuth callback page, meant to be reached via Gitee's redirect after authorization. Please restart the connection from the wizard.">本页是 cogneva 的 Gitee 授权回调落地页，应由 Gitee 授权后自动跳转而来。请回到向导重新发起连接。</p>
+  </div>
+</div>
+
+<script>
+(function () {
+  var zh = (navigator.language || '').toLowerCase().indexOf('zh') === 0;
+  if (!zh) {
+    document.querySelectorAll('[data-en]').forEach(function (el) {
+      el.textContent = el.getAttribute('data-en');
+    });
+    document.documentElement.lang = 'en';
+  }
+
+  var params = new URLSearchParams(location.search);
+  var code = params.get('code');
+  var state = params.get('state');
+
+  function show(id) {
+    document.getElementById(id).classList.remove('hidden');
+  }
+
+  if (!code) {
+    show('error');
+    return;
+  }
+
+  var delivered = false;
+  if (window.opener && !window.opener.closed) {
+    try {
+      window.opener.postMessage({ type: 'cogneva-gitee-oauth', code: code, state: state }, '*');
+      delivered = true;
+    } catch (e) { delivered = false; }
+  }
+
+  if (delivered) {
+    show('sent');
+    setTimeout(function () { window.close(); }, 1500);
+    // 若 3 秒后窗口仍在（非脚本打开、浏览器拒绝关闭），给出手动兜底
+    setTimeout(function () {
+      if (!window.closed) {
+        document.getElementById('sent').classList.add('hidden');
+        document.getElementById('codeText').textContent = code;
+        show('manual');
+      }
+    }, 3200);
+  } else {
+    document.getElementById('codeText').textContent = code;
+    show('manual');
+  }
+
+  document.getElementById('copyBtn').addEventListener('click', function () {
+    var btn = this;
+    var done = function () {
+      btn.textContent = zh ? '已复制 ✓' : 'Copied ✓';
+      setTimeout(function () {
+        btn.textContent = zh ? btn.getAttribute('data-zh') : btn.getAttribute('data-en');
+      }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(code).then(done, done);
+    } else {
+      var ta = document.createElement('textarea');
+      ta.value = code;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (e) {}
+      document.body.removeChild(ta);
+      done();
+    }
+  });
+})();
+</script>
+</body>
+</html>
