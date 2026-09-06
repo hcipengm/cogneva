@@ -142,10 +142,16 @@ secrets:
   giteeWebhookToken: ""
 
 # 贡献通道（向导第二步）：GitHub OAuth 设备流的 client_id 是 OAuth App 的
-# 公开标识（非密钥），留空时设备流不可用、向导自动回退手动 PAT；真实 token
-# 由向导写入 cogneva-secrets，只进网关。
+# 公开标识（非密钥），留空时设备流不可用、向导自动回退手动 PAT；Gitee 走
+# OAuth 授权码流程，需要 client_id + client_secret 同时配置才开放（Gitee
+# 无设备流、token 24h 过期，网关后台用 refresh_token 自动续期）；
+# giteeOauthRedirectUri 留空时回调地址取向导页面所在源，适合 localhost 安装。
+# 真实 token 由向导写入 cogneva-secrets，只进网关。
 contribution:
   githubOauthClientId: ""
+  giteeOauthClientId: ""
+  giteeOauthClientSecret: ""
+  giteeOauthRedirectUri: ""
 
 # 主应用 GitOps 拉取端：poll 中央 bare 仓库的 evolution-release 分支，
 # L0 配置热更 / L1 金丝雀在本集群闭环（沙盒推送端只写 bare 仓库，零集群凭证）。

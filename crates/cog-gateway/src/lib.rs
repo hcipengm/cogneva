@@ -279,6 +279,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/evolution/stream", get(evolution::stream_handler))
         .route("/dashboard", get(dashboard::dashboard_handler))
         .route("/takeover", get(takeover::takeover_handler))
+        // Gitee OAuth 回调：浏览器重定向不带管理令牌，安全性靠一次性 state
+        // 参数（仅由已认证的管理请求签发）保证，因此挂在公开路由上。
+        .route(
+            "/api/v1/admin/contribution/gitee/oauth/callback",
+            get(contribution_admin::gitee_oauth_callback_handler),
+        )
         // WebUI 单页应用：根路径直接给 index.html，/assets 给构建产物，
         // 浏览器打开即用（一键拉起场景没有独立前端服务）
         .route("/", get(dashboard::dashboard_handler))
@@ -494,6 +500,14 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/admin/contribution/device/poll",
             post(contribution_admin::device_poll_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/gitee/oauth/start",
+            post(contribution_admin::gitee_oauth_start_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/gitee/oauth/exchange",
+            post(contribution_admin::gitee_oauth_exchange_handler),
         )
         .route(
             "/api/v1/admin/promotion-gate",

@@ -92,6 +92,18 @@ spec:
             - name: COGNEVA_GITHUB_OAUTH_CLIENT_ID
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.contribution.giteeOauthClientId }}
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.contribution.giteeOauthClientSecret }}
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.contribution.giteeOauthRedirectUri }}
+            - name: COGNEVA_GITEE_OAUTH_REDIRECT_URI
+              value: {{ . | quote }}
+            {{- end }}
 ---
 apiVersion: v1
 kind: Service

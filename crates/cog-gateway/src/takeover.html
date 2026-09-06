@@ -671,7 +671,7 @@
 <div class="modal-mask" id="contribMask">
   <div class="modal wide">
     <h3 data-i18n="contribTitle">Contribution channel</h3>
-    <div class="sub" data-i18n="contribSub">Connect a public code account so evolved changes open pull requests. Until then, changes are staged locally and submitted automatically once connected.</div>
+    <div class="sub" data-i18n="contribSub">Connect a public code account so the improvements this instance evolves flow back upstream as pull requests under your name — you get the credit, everyone gets the fix. Until then, changes are staged locally and submitted automatically once connected.</div>
 
     <div class="why-strip">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
@@ -754,6 +754,27 @@
       </div>
 
       <div id="giAuth">
+        <div id="giOauth">
+          <button type="button" id="giOauthBtn" style="width:100%" data-i18n="giOauthBtn">Connect Gitee (account authorization)</button>
+          <div id="giOauthBox" style="display:none">
+            <div class="steps" style="margin-top:10px">
+              <div class="step"><span class="n">1</span><span data-i18n="giOauthStep1">Finish sign-in (or registration) on the Gitee page that just opened, then approve the authorization</span></div>
+              <div class="step"><span class="n">2</span><span data-i18n="giOauthStep2">If the page jumps back here, you are done. If the browser shows an unreachable page, that is expected — copy the full URL from the address bar</span></div>
+              <div class="step"><span class="n">3</span><span data-i18n="giOauthStep3">Paste it below and finish the connection</span></div>
+            </div>
+            <div style="margin:10px 0">
+              <a id="giAuthLink" href="#" target="_blank" rel="noopener" style="color:var(--accent);font-size:12.5px;font-weight:600" data-i18n="giOpenAuth">Open Gitee authorization page →</a>
+            </div>
+            <div class="fine"><span class="spin"></span><span data-i18n="giWaiting">Waiting for authorization…</span></div>
+            <input type="text" id="giCode" data-i18n-ph="giPastePh" placeholder="Paste the full redirect URL from the address bar, or just the code" style="width:100%;margin-top:10px" autocomplete="off" />
+            <div class="actions">
+              <button type="button" id="giCodeBtn" data-i18n="giCodeBtn">Finish connection</button>
+            </div>
+          </div>
+          <div class="fine" id="giOauthUnavailable" style="display:none;margin-top:8px" data-i18n="giOauthUnavailable">Account authorization needs the project OAuth App configured; use a personal access token below for now.</div>
+        </div>
+
+        <div class="divider" data-i18n="orPat">or paste a token</div>
         <div class="steps pat-guide" style="margin-top:0">
           <div class="step"><span class="n">1</span><span><span data-i18n="giPatStep1">Open the token page (login required)</span> <a href="https://gitee.com/profile/personal_access_tokens/new" target="_blank" rel="noopener">gitee.com/profile/personal_access_tokens/new →</a></span></div>
           <div class="step"><span class="n">2</span><span><span data-i18n="giPatStep2">Give it a name and check the scopes</span> <span class="scope-chip">projects</span> <span class="scope-chip">pull_requests</span></span></div>
@@ -1544,8 +1565,8 @@ const I18N = {
   // Contribution channel (wizard step 2)
   contribBtn:       { en: 'Contribute', zh: '贡献通道' },
   contribTitle:     { en: 'Contribution channel', zh: '贡献通道' },
-  contribSub:       { en: 'Connect a public code account so evolved changes open pull requests. Until then, changes are staged locally and submitted automatically once connected.',
-                      zh: '连接公开代码账户后，进化产生的变更会自动提 PR。未连接前变更暂存本地，连接后自动批量提交。' },
+  contribSub:       { en: 'Connect a public code account so the improvements this instance evolves flow back upstream as pull requests under your name — you get the credit, everyone gets the fix. Until then, changes are staged locally and submitted automatically once connected.',
+                      zh: '连接公开代码账号后，本实例进化出的改进会以你的名义提 PR 回流公版仓库——署名归你，修复惠及所有人。未连接前变更暂存本地，连接后自动补提。' },
   contribBannerOff: { en: 'Contribution channel not configured — evolved changes are staged locally.',
                       zh: '贡献通道未配置，进化成果暂存本地。' },
   contribBannerOn:  { en: 'Contribution channel connected.', zh: '贡献通道已连接。' },
@@ -1572,6 +1593,20 @@ const I18N = {
   ghDeviceUnavailable: { en: 'Device flow needs an OAuth App; paste a personal access token below.',
                          zh: '设备流需要 OAuth App；请在下方粘贴个人访问令牌。' },
   orPat:            { en: 'or paste a token', zh: '或粘贴令牌' },
+  giOauthBtn:       { en: 'Connect Gitee (account authorization)', zh: '连接 Gitee（账号授权）' },
+  giOauthStep1:     { en: 'Finish sign-in (or registration) on the Gitee page that just opened, then approve the authorization',
+                      zh: '在刚打开的 Gitee 页面完成登录（或注册），然后点同意授权' },
+  giOauthStep2:     { en: 'If the page jumps back here, you are done. If the browser shows an unreachable page, that is expected — copy the full URL from the address bar',
+                      zh: '若页面自动跳回并完成，无需其他操作；若浏览器显示"无法访问"，属正常现象——复制地址栏里的完整网址' },
+  giOauthStep3:     { en: 'Paste it below and finish the connection', zh: '粘贴到下面，完成连接' },
+  giOpenAuth:       { en: 'Open Gitee authorization page →', zh: '打开 Gitee 授权页 →' },
+  giWaiting:        { en: 'Waiting for authorization…', zh: '等待授权中…' },
+  giPastePh:        { en: 'Paste the full redirect URL from the address bar, or just the code',
+                      zh: '粘贴地址栏的完整网址，或只粘贴其中的 code' },
+  giCodeBtn:        { en: 'Finish connection', zh: '完成连接' },
+  giNeedStart:      { en: 'Start the authorization with the button above first.', zh: '请先点上方按钮发起授权。' },
+  giOauthUnavailable: { en: 'Account authorization needs the project OAuth App configured; use a personal access token below for now.',
+                        zh: '账号授权需项目方配置 OAuth App；可先用下方个人令牌连接。' },
   skipForNow:       { en: 'Skip for now', zh: '暂时跳过' },
   contribKeyNote:   { en: 'The token is written to the cluster Secret only, held by the security gateway, and never echoed back. An SSH key is generated and its public half uploaded.',
                       zh: '令牌只写入集群 Secret、由安全网关代持，不会回显。同时生成 SSH 密钥并自动上传公钥。' },
@@ -1768,12 +1803,15 @@ bindAcctTrack('gi');
 function openContrib() {
   contribErr('');
   $('contribMask').classList.add('show');
-  // Device flow is only offered once an OAuth App client id is configured.
+  // OAuth paths are only offered once the project OAuth App is configured.
   api('/api/v1/admin/contribution-status')
     .then((s) => {
-      const available = !!s.device_flow_available;
-      $('ghDeviceBtn').style.display = available ? '' : 'none';
-      $('ghDeviceUnavailable').style.display = available ? 'none' : '';
+      const ghAvailable = !!s.device_flow_available;
+      $('ghDeviceBtn').style.display = ghAvailable ? '' : 'none';
+      $('ghDeviceUnavailable').style.display = ghAvailable ? 'none' : '';
+      const giAvailable = !!s.gitee_oauth_available;
+      $('giOauthBtn').style.display = giAvailable ? '' : 'none';
+      $('giOauthUnavailable').style.display = giAvailable ? 'none' : '';
     })
     .catch(() => {});
 }
@@ -1893,6 +1931,71 @@ function pollDevice(clientId, deviceCode, intervalSecs) {
   };
   contribPollTimer = setTimeout(tick, intervalSecs * 1000);
 }
+
+// ── Gitee authorization-code flow ──
+// Gitee has no device flow. The wizard opens the authorize page in a new tab;
+// on localhost installs Gitee redirects straight back to the gateway callback
+// (which completes the connection server-side), otherwise the user pastes the
+// redirect URL from the address bar. While the flow is open we poll the
+// status endpoint so a completed callback closes the wizard by itself.
+let giOAuthState = null;
+
+$('giOauthBtn').onclick = async () => {
+  $('giOauthBtn').disabled = true; contribErr('');
+  try {
+    const r = await api('/api/v1/admin/contribution/gitee/oauth/start', 'POST', {
+      redirect_origin: window.location.origin,
+    });
+    giOAuthState = r.state;
+    $('giAuthLink').href = r.authorize_url;
+    $('giCode').value = '';
+    $('giOauthBox').style.display = '';
+    window.open(r.authorize_url, '_blank', 'noopener');
+    pollGiteeOAuthStatus(Date.now() + 15 * 60 * 1000);
+  } catch (e) {
+    contribErr(e.message);
+  } finally {
+    $('giOauthBtn').disabled = false;
+  }
+};
+
+function pollGiteeOAuthStatus(deadline) {
+  stopContribPoll();
+  const tick = async () => {
+    try {
+      const s = await api('/api/v1/admin/contribution-status');
+      if (s.configured) {
+        stopContribPoll();
+        closeContrib();
+        toast(t('contribConnected'), 'ok');
+        checkContributionStatus();
+        return;
+      }
+    } catch { /* pod rolling after a completed callback */ }
+    if (Date.now() > deadline) { stopContribPoll(); return; }
+    contribPollTimer = setTimeout(tick, 5000);
+  };
+  contribPollTimer = setTimeout(tick, 5000);
+}
+
+$('giCodeBtn').onclick = async () => {
+  const pasted = $('giCode').value.trim();
+  if (!pasted) { contribErr(t('contribNeedPat')); return; }
+  if (!giOAuthState) { contribErr(t('giNeedStart')); return; }
+  $('giCodeBtn').disabled = true; contribErr('');
+  try {
+    await api('/api/v1/admin/contribution/gitee/oauth/exchange', 'POST', {
+      state: giOAuthState,
+      redirect_url: pasted,
+    });
+    stopContribPoll();
+    afterContribSaved();
+  } catch (e) {
+    contribErr(e.message);
+  } finally {
+    $('giCodeBtn').disabled = false;
+  }
+};
 
 setInterval(loadProcess, 10000);
 // Badge/switch state must track rolls triggered elsewhere (other tab, API,

@@ -4,9 +4,13 @@
 //! Gitee for users behind the GFW) without hand-editing tokens. On GitHub the
 //! default path is the OAuth device-authorization flow: the wizard opens the
 //! verification page with the user code pre-filled, the gateway polls for the
-//! token, then stores it. Gitee has no device flow, so a manually pasted PAT
-//! is the fallback (and the PAT fallback also covers GitHub before an OAuth
-//! App is registered).
+//! token, then stores it. Gitee has no device flow; its path is the OAuth
+//! authorization-code flow: the wizard opens the authorize page, Gitee
+//! redirects back to the gateway callback (or the user pastes the redirect
+//! URL), the gateway exchanges the code for a token pair and stores it.
+//! Gitee access tokens expire in 24h, so a background refresher rotates the
+//! pair via the refresh token well before expiry. A manually pasted PAT
+//! remains as the last-resort fallback on both platforms.
 //!
 //! Credentials follow the same rule as the LLM pool: the gateway is the only
 //! holder. A connected token is written to the `cogneva-secrets` Secret
@@ -16,16 +20,18 @@
 //! transport — the public key is uploaded to the account, the private key is
 //! stored in the same Secret (`git-ssh-private-key`).
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     Json,
 };
 use base64::Engine;
+use rand_core::RngCore;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -33,6 +39,7 @@ use crate::llm_admin::KubeClient;
 
 const SECRET_GITHUB_TOKEN: &str = "github-token";
 const SECRET_GITEE_TOKEN: &str = "gitee-token";
+const SECRET_GITEE_REFRESH: &str = "gitee-refresh-token";
 const SECRET_SSH_KEY: &str = "git-ssh-private-key";
 const SECRET_CONTRIB_CONFIG: &str = "contribution-config";
 
@@ -40,10 +47,20 @@ const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_API: &str = "https://api.github.com";
 const GITEE_API: &str = "https://gitee.com/api/v5";
+const GITEE_AUTHORIZE_URL: &str = "https://gitee.com/oauth/authorize";
+const GITEE_TOKEN_URL: &str = "https://gitee.com/oauth/token";
 
 /// OAuth scopes for the device-flow token: open PRs (`repo`) and upload the
 /// SSH public key (`write:public_key`).
 const GITHUB_DEVICE_SCOPE: &str = "repo write:public_key read:public_key";
+
+/// Gitee OAuth states are single-use and expire quickly: the user is mid-flow
+/// in another tab, anything older than this is abandoned.
+const OAUTH_STATE_TTL: Duration = Duration::from_secs(15 * 60);
+/// Gitee access tokens expire in 24h; refresh when less than this remains so
+/// a failed refresh still has hours of runway to retry on the next tick.
+const GITEE_REFRESH_THRESHOLD_SECS: u64 = 4 * 3600;
+const GITEE_REFRESH_INTERVAL_SECS: u64 = 3600;
 
 /// A generated Ed25519 keypair in OpenSSH formats.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +251,200 @@ fn oauth_client_id(explicit: Option<&str>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+fn gitee_oauth_client_id(explicit: Option<&str>) -> Option<String> {
+    explicit
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("COGNEVA_GITEE_OAUTH_CLIENT_ID").ok())
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn gitee_oauth_client_secret() -> Option<String> {
+    std::env::var("COGNEVA_GITEE_OAUTH_CLIENT_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Fixed callback override for the Gitee OAuth App. When unset the wizard
+/// passes its own origin so the redirect lands back on this gateway.
+fn gitee_oauth_redirect_override() -> Option<String> {
+    std::env::var("COGNEVA_GITEE_OAUTH_REDIRECT_URI")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn gitee_oauth_available() -> bool {
+    gitee_oauth_client_id(None).is_some() && gitee_oauth_client_secret().is_some()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// In-flight OAuth authorization states, keyed by the opaque state string.
+/// The value is the redirect_uri used at start — Gitee requires the same
+/// redirect_uri again when exchanging the code.
+fn oauth_states() -> &'static std::sync::Mutex<HashMap<String, (Instant, String)>> {
+    static STATES: OnceLock<std::sync::Mutex<HashMap<String, (Instant, String)>>> =
+        OnceLock::new();
+    STATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Create and remember a fresh single-use OAuth state for `redirect_uri`.
+pub fn new_oauth_state(redirect_uri: &str) -> String {
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    let state = hex::encode(bytes);
+    if let Ok(mut map) = oauth_states().lock() {
+        map.retain(|_, (created, _)| created.elapsed() < OAUTH_STATE_TTL);
+        map.insert(state.clone(), (Instant::now(), redirect_uri.to_string()));
+    }
+    state
+}
+
+/// Consume a state: returns the remembered redirect_uri iff the state exists
+/// and is fresh. A state can only be consumed once.
+fn take_oauth_state(state: &str) -> Option<String> {
+    let mut map = oauth_states().lock().ok()?;
+    match map.get(state) {
+        Some((created, _)) if created.elapsed() < OAUTH_STATE_TTL => {
+            map.remove(state).map(|(_, uri)| uri)
+        }
+        Some(_) => {
+            map.remove(state);
+            None
+        }
+        None => None,
+    }
+}
+
+/// A Gitee OAuth token pair with the metadata the refresher needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GiteeTokenSet {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: u64,
+    pub obtained_at: u64,
+}
+
+/// Parse a Gitee token-endpoint response. `now` is injected for tests.
+pub fn parse_gitee_token(json: &serde_json::Value, now: u64) -> Result<GiteeTokenSet, String> {
+    let access_token = json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            let desc = json
+                .get("error_description")
+                .or_else(|| json.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("响应缺少 access_token");
+            format!("Gitee 授权失败: {desc}")
+        })?;
+    Ok(GiteeTokenSet {
+        access_token: access_token.to_string(),
+        refresh_token: json
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        expires_in: json
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(86400),
+        obtained_at: now,
+    })
+}
+
+/// Build the Gitee authorize URL. Scopes are fixed at OAuth App registration
+/// (user_info / projects / pull_requests / keys); Gitee's authorize endpoint
+/// does not take a scope parameter.
+pub fn build_gitee_authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
+    format!(
+        "{GITEE_AUTHORIZE_URL}?client_id={client_id}&redirect_uri={}&response_type=code&state={state}",
+        urlencoding_encode(redirect_uri),
+    )
+}
+
+/// Minimal percent-encoding for query parameter values (redirect_uri).
+fn urlencoding_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Extract the authorization code from either a bare code or a full redirect
+/// URL the user pasted from the browser address bar.
+pub fn extract_gitee_code(code: Option<&str>, redirect_url: Option<&str>) -> Option<String> {
+    if let Some(c) = code.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(c.to_string());
+    }
+    let url = redirect_url?.trim().to_string();
+    let query = url.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "code" && !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Exchange an authorization code for a token pair. Gitee's token endpoint
+/// expects the parameters as a query string on a POST.
+async fn exchange_gitee_code(code: &str, redirect_uri: &str) -> Result<GiteeTokenSet, String> {
+    let client_id = gitee_oauth_client_id(None).ok_or("未配置 Gitee OAuth client_id")?;
+    let client_secret = gitee_oauth_client_secret().ok_or("未配置 Gitee OAuth client_secret")?;
+    let resp = http_client()
+        .post(GITEE_TOKEN_URL)
+        .query(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", redirect_uri),
+            ("client_secret", client_secret.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("无法连接 Gitee（{e}）"))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    parse_gitee_token(&body, unix_now())
+}
+
+/// Refresh a Gitee token pair. The refresh token rotates on every use.
+pub async fn refresh_gitee_token(refresh_token: &str) -> Result<GiteeTokenSet, String> {
+    let mut params = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    let client_id = gitee_oauth_client_id(None);
+    let client_secret = gitee_oauth_client_secret();
+    if let (Some(id), Some(secret)) = (client_id.as_deref(), client_secret.as_deref()) {
+        params.push(("client_id", id));
+        params.push(("client_secret", secret));
+    }
+    let resp = http_client()
+        .post(GITEE_TOKEN_URL)
+        .query(&params)
+        .send()
+        .await
+        .map_err(|e| format!("无法连接 Gitee（{e}）"))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    parse_gitee_token(&body, unix_now())
+}
+
 /// Verify a token and return the account login it authenticates as.
 async fn verify_token(provider: &str, token: &str) -> Result<String, String> {
     let client = http_client();
@@ -331,6 +542,7 @@ async fn persist_connected(
     provider: &str,
     token: &str,
     account: &str,
+    oauth: Option<&GiteeTokenSet>,
 ) -> Response {
     let keypair = generate_ssh_keypair("cogneva-contribution");
     let ssh_result = upload_public_key(provider, token, &keypair.public_line).await;
@@ -340,12 +552,24 @@ async fn persist_connected(
     } else {
         SECRET_GITHUB_TOKEN
     };
-    let config_json = serde_json::to_string(&json!({
+    let mut config_json_val = json!({
         "provider": provider,
-        "mode": "manual_or_device",
+        "mode": if oauth.is_some() { "oauth" } else { "manual_or_device" },
         "account": account,
-    }))
-    .unwrap_or_else(|_| "{}".to_string());
+    });
+    let mut string_data = json!({
+        token_key: token,
+        SECRET_SSH_KEY: keypair.private_pem,
+    });
+    if let Some(set) = oauth {
+        config_json_val["obtained_at"] = json!(set.obtained_at);
+        config_json_val["expires_in"] = json!(set.expires_in);
+        if let Some(refresh) = &set.refresh_token {
+            string_data[SECRET_GITEE_REFRESH] = json!(refresh);
+        }
+    }
+    string_data[SECRET_CONTRIB_CONFIG] =
+        json!(serde_json::to_string(&config_json_val).unwrap_or_else(|_| "{}".to_string()));
 
     if let Err(e) = kube
         .patch(
@@ -353,11 +577,7 @@ async fn persist_connected(
                 "/api/v1/namespaces/{}/secrets/cogneva-secrets",
                 kube.namespace()
             ),
-            json!({ "stringData": {
-                token_key: token,
-                SECRET_SSH_KEY: keypair.private_pem,
-                SECRET_CONTRIB_CONFIG: config_json,
-            }}),
+            json!({ "stringData": string_data }),
         )
         .await
     {
@@ -433,6 +653,7 @@ pub async fn contribution_status_handler(
                     "gitee": {"configured": gitee},
                     "ssh": {"key_present": ssh},
                     "device_flow_available": oauth_client_id(None).is_some(),
+                    "gitee_oauth_available": gitee_oauth_available(),
                 })),
             )
                 .into_response();
@@ -445,6 +666,7 @@ pub async fn contribution_status_handler(
             "provider": "none",
             "note": "not_in_cluster",
             "device_flow_available": oauth_client_id(None).is_some(),
+            "gitee_oauth_available": gitee_oauth_available(),
         })),
     )
         .into_response()
@@ -498,7 +720,7 @@ pub async fn contribution_config_handler(
                 .into_response();
         }
     };
-    persist_connected(&kube, provider, &token, &account).await
+    persist_connected(&kube, provider, &token, &account, None).await
 }
 
 /// POST /api/v1/admin/contribution/device/start — begin the GitHub device
@@ -627,7 +849,7 @@ pub async fn device_poll_handler(
                         .into_response();
                 }
             };
-            persist_connected(&kube, "github", &token, &account).await
+            persist_connected(&kube, "github", &token, &account, None).await
         }
         DevicePoll::Pending(interval) => (
             StatusCode::OK,
@@ -645,6 +867,288 @@ pub async fn device_poll_handler(
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GiteeOAuthStartRequest {
+    /// Optional OAuth App client id; falls back to the configured env one.
+    pub client_id: Option<String>,
+    /// The origin the wizard is served from (e.g. `http://localhost:8080`),
+    /// used to build the callback URL unless an override is configured.
+    pub redirect_origin: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GiteeOAuthExchangeRequest {
+    pub state: String,
+    /// Bare authorization code…
+    pub code: Option<String>,
+    /// …or the full redirect URL pasted from the browser address bar.
+    pub redirect_url: Option<String>,
+}
+
+/// Resolve the redirect_uri for a start request.
+fn resolve_redirect_uri(origin: Option<&str>) -> Result<String, String> {
+    if let Some(fixed) = gitee_oauth_redirect_override() {
+        return Ok(fixed);
+    }
+    let origin = origin
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少 redirect_origin，且未配置 COGNEVA_GITEE_OAUTH_REDIRECT_URI")?;
+    if !origin.starts_with("http://") && !origin.starts_with("https://") {
+        return Err("redirect_origin 必须是 http(s) 地址".to_string());
+    }
+    Ok(format!(
+        "{}/api/v1/admin/contribution/gitee/oauth/callback",
+        origin.trim_end_matches('/')
+    ))
+}
+
+/// POST /api/v1/admin/contribution/gitee/oauth/start — begin the Gitee
+/// authorization-code flow. Returns the authorize URL and state.
+pub async fn gitee_oauth_start_handler(
+    State(_state): State<Arc<crate::GatewayState>>,
+    Json(req): Json<GiteeOAuthStartRequest>,
+) -> Response {
+    let Some(client_id) = gitee_oauth_client_id(req.client_id.as_deref()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "no_oauth_app",
+                "message": "尚未配置 Gitee OAuth App client_id；请先用手动令牌通道连接，或由管理员设置 COGNEVA_GITEE_OAUTH_CLIENT_ID / COGNEVA_GITEE_OAUTH_CLIENT_SECRET"
+            })),
+        )
+            .into_response();
+    };
+    if gitee_oauth_client_secret().is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "no_oauth_app",
+                "message": "尚未配置 Gitee OAuth client_secret；请先用手动令牌通道连接，或由管理员设置 COGNEVA_GITEE_OAUTH_CLIENT_SECRET"
+            })),
+        )
+            .into_response();
+    }
+    let redirect_uri = match resolve_redirect_uri(req.redirect_origin.as_deref()) {
+        Ok(u) => u,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "bad_redirect", "message": message})),
+            )
+                .into_response();
+        }
+    };
+    let state = new_oauth_state(&redirect_uri);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "authorize_url": build_gitee_authorize_url(&client_id, &redirect_uri, &state),
+            "state": state,
+            "redirect_uri": redirect_uri,
+        })),
+    )
+        .into_response()
+}
+
+/// Shared tail of both Gitee OAuth entry points: consume the state, exchange
+/// the code, verify the token, and prepare the cluster client for persisting.
+type GiteeOAuthMaterial = (KubeClient, GiteeTokenSet, String);
+
+async fn complete_gitee_oauth(state: &str, code: &str) -> Result<GiteeOAuthMaterial, String> {
+    let redirect_uri =
+        take_oauth_state(state).ok_or("授权链接已过期或已使用，请回到接管台重新发起授权")?;
+    let set = exchange_gitee_code(code, &redirect_uri).await?;
+    let account = verify_token("gitee", &set.access_token).await?;
+    let kube = KubeClient::in_cluster()?;
+    Ok((kube, set, account))
+}
+
+/// POST /api/v1/admin/contribution/gitee/oauth/exchange — finish the flow
+/// from the wizard with a pasted code / redirect URL (admin-authenticated).
+pub async fn gitee_oauth_exchange_handler(
+    State(_state): State<Arc<crate::GatewayState>>,
+    Json(req): Json<GiteeOAuthExchangeRequest>,
+) -> Response {
+    let Some(code) = extract_gitee_code(req.code.as_deref(), req.redirect_url.as_deref()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing_code",
+                "message": "请粘贴授权码，或授权后浏览器地址栏里的完整网址"})),
+        )
+            .into_response();
+    };
+    match complete_gitee_oauth(&req.state, &code).await {
+        Ok((kube, set, account)) => {
+            persist_connected(&kube, "gitee", &set.access_token, &account, Some(&set)).await
+        }
+        Err(message) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "oauth_exchange_failed", "message": message})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GiteeOAuthCallbackQuery {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+    pub error_description: Option<String>,
+}
+
+fn oauth_result_page(title: &str, detail: &str, ok: bool) -> Html<String> {
+    let color = if ok { "#3fb950" } else { "#f85149" };
+    Html(format!(
+        "<!DOCTYPE html><html lang=\"zh\"><head><meta charset=\"utf-8\"><title>{title}</title>\
+         <style>body{{background:#0d1117;color:#e6edf3;font-family:ui-monospace,Menlo,Consolas,monospace;\
+         display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}\
+         .card{{max-width:420px;padding:28px;border:1px solid #30363d;border-radius:12px;background:#161b22}}\
+         h1{{font-size:18px;margin:0 0 10px;color:{color}}}p{{font-size:13px;color:#8b949e;line-height:1.7;margin:0}}</style></head>\
+         <body><div class=\"card\"><h1>{title}</h1><p>{detail}</p></div>\
+         <script>if (window.opener) {{ setTimeout(() => window.close(), 1500); }}</script></body></html>"
+    ))
+}
+
+/// GET /api/v1/admin/contribution/gitee/oauth/callback — the redirect target
+/// when Gitee can reach this gateway directly (e.g. localhost installs). This
+/// route is intentionally public: the browser redirect carries no admin
+/// token, and the single-use state parameter is the CSRF proof.
+pub async fn gitee_oauth_callback_handler(
+    Query(q): Query<GiteeOAuthCallbackQuery>,
+) -> Response {
+    if let Some(err) = q.error {
+        let detail = q.error_description.unwrap_or_default();
+        return oauth_result_page(
+            "授权未完成",
+            &format!("Gitee 返回错误：{err} {detail}。请回到接管台重试。"),
+            false,
+        )
+        .into_response();
+    }
+    let (Some(state), Some(code)) = (q.state, q.code) else {
+        return oauth_result_page("授权未完成", "回调缺少 code 或 state 参数。",false).into_response();
+    };
+    match complete_gitee_oauth(&state, &code).await {
+        Ok((kube, set, account)) => {
+            let resp =
+                persist_connected(&kube, "gitee", &set.access_token, &account, Some(&set)).await;
+            if resp.status().is_success() {
+                oauth_result_page(
+                    "授权成功",
+                    &format!("已连接 Gitee 账号 {account}，安全网关正在滚动重启（约一分钟）。本页可关闭，回到接管台即可看到状态更新。"),
+                    true,
+                )
+                .into_response()
+            } else {
+                oauth_result_page("保存失败", "令牌换取成功但写入集群 Secret 失败，请回到接管台重试。", false)
+                    .into_response()
+            }
+        }
+        Err(message) => {
+            oauth_result_page("授权未完成", &message, false).into_response()
+        }
+    }
+}
+
+/// Hourly refresher for Gitee OAuth tokens: the access token expires in 24h,
+/// so when less than GITEE_REFRESH_THRESHOLD_SECS remains the loop exchanges
+/// the refresh token for a new pair, patches the Secret and rolls the gateway
+/// so egress picks the fresh token up. PAT-mode installs have no refresh
+/// material and are skipped.
+pub fn spawn_gitee_token_refresher(
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !gitee_oauth_available() {
+            return;
+        }
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(GITEE_REFRESH_INTERVAL_SECS));
+        interval.tick().await; // first tick is immediate; skip it
+        loop {
+            tokio::select! {
+                _ = shutdown.recv() => break,
+                _ = interval.tick() => {
+                    if let Err(e) = gitee_refresh_tick().await {
+                        tracing::warn!(error = %e, "gitee token refresh tick failed");
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn gitee_refresh_tick() -> Result<(), String> {
+    let kube = KubeClient::in_cluster()?;
+    let secret = kube
+        .get_json(&format!(
+            "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+            kube.namespace()
+        ))
+        .await?;
+    let decode = |key: &str| -> Option<String> {
+        let b64 = secret.get("data")?.get(key)?.as_str()?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+        String::from_utf8(bytes).ok()
+    };
+    let config_raw = decode(SECRET_CONTRIB_CONFIG).unwrap_or_default();
+    let config: serde_json::Value =
+        serde_json::from_str(&config_raw).unwrap_or_else(|_| json!({}));
+    if config.get("provider").and_then(|v| v.as_str()) != Some("gitee")
+        || config.get("mode").and_then(|v| v.as_str()) != Some("oauth")
+    {
+        return Ok(());
+    }
+    let obtained_at = config
+        .get("obtained_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let expires_in = config
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(86400);
+    let remaining = (obtained_at + expires_in).saturating_sub(unix_now());
+    if remaining > GITEE_REFRESH_THRESHOLD_SECS {
+        return Ok(());
+    }
+    let refresh = decode(SECRET_GITEE_REFRESH)
+        .ok_or("contribution-config 声明 oauth 模式但缺少 gitee-refresh-token")?;
+    let set = refresh_gitee_token(&refresh).await?;
+    let account = config
+        .get("account")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gitee-user")
+        .to_string();
+    let new_config = serde_json::to_string(&json!({
+        "provider": "gitee",
+        "mode": "oauth",
+        "account": account,
+        "obtained_at": set.obtained_at,
+        "expires_in": set.expires_in,
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    let mut string_data = json!({
+        SECRET_GITEE_TOKEN: set.access_token,
+        SECRET_CONTRIB_CONFIG: new_config,
+    });
+    if let Some(new_refresh) = &set.refresh_token {
+        string_data[SECRET_GITEE_REFRESH] = json!(new_refresh);
+    }
+    kube.patch(
+        &format!(
+            "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+            kube.namespace()
+        ),
+        json!({ "stringData": string_data }),
+    )
+    .await?;
+    // The gateway reads the token from env at pod start; roll it so egress
+    // picks up the fresh pair. The new pod sees a young token and idles.
+    kube.restart_gateway().await
 }
 
 #[cfg(test)]
@@ -770,5 +1274,83 @@ mod tests {
         );
         assert_eq!(start.expires_in, 899);
         assert!(parse_device_start(&json!({"user_code": "x"})).is_err());
+    }
+
+    #[test]
+    fn gitee_token_parses_full_response() {
+        let set = parse_gitee_token(
+            &json!({
+                "access_token": "at-1",
+                "refresh_token": "rt-1",
+                "expires_in": 86400,
+                "token_type": "bearer",
+                "scope": "user_info projects"
+            }),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(set.access_token, "at-1");
+        assert_eq!(set.refresh_token.as_deref(), Some("rt-1"));
+        assert_eq!(set.expires_in, 86400);
+        assert_eq!(set.obtained_at, 1000);
+    }
+
+    #[test]
+    fn gitee_token_defaults_and_errors() {
+        // expires_in absent → 24h default; refresh_token absent → None.
+        let set = parse_gitee_token(&json!({"access_token": "at"}), 5).unwrap();
+        assert_eq!(set.expires_in, 86400);
+        assert!(set.refresh_token.is_none());
+        // Error payloads surface the provider's description.
+        let err = parse_gitee_token(
+            &json!({"error": "invalid_grant", "error_description": "code expired"}),
+            0,
+        )
+        .unwrap_err();
+        assert!(err.contains("code expired"));
+        assert!(parse_gitee_token(&json!({}), 0).is_err());
+    }
+
+    #[test]
+    fn gitee_authorize_url_encodes_redirect() {
+        let url = build_gitee_authorize_url(
+            "cid",
+            "http://localhost:8080/api/v1/admin/contribution/gitee/oauth/callback",
+            "st",
+        );
+        assert!(url.starts_with("https://gitee.com/oauth/authorize?client_id=cid"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fapi"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.ends_with("state=st"));
+    }
+
+    #[test]
+    fn extract_code_prefers_bare_then_url() {
+        assert_eq!(
+            extract_gitee_code(Some("abc"), Some("http://x/?code=zzz")),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            extract_gitee_code(None, Some("http://localhost:8080/cb?state=s&code=c123")),
+            Some("c123".to_string())
+        );
+        assert_eq!(
+            extract_gitee_code(Some("  "), Some("http://x/?code=q")),
+            Some("q".to_string())
+        );
+        assert_eq!(extract_gitee_code(None, Some("http://x/no-query")), None);
+        assert_eq!(extract_gitee_code(None, Some("http://x/?state=s")), None);
+        assert_eq!(extract_gitee_code(None, None), None);
+    }
+
+    #[test]
+    fn oauth_state_is_single_use() {
+        let state = new_oauth_state("http://localhost/cb");
+        assert_eq!(
+            take_oauth_state(&state),
+            Some("http://localhost/cb".to_string())
+        );
+        assert_eq!(take_oauth_state(&state), None);
+        assert_eq!(take_oauth_state("never-issued"), None);
     }
 }

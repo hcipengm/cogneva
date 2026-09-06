@@ -281,6 +281,11 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                 broadcast_tx.0.subscribe(),
                 ctx.config().system.timeout_checker_interval_secs,
             );
+            // Gitee OAuth token refresher: no-ops unless OAuth-mode material
+            // is present in the Secret.
+            let _gitee_refresh = crate::contribution_admin::spawn_gitee_token_refresher(
+                broadcast_tx.0.subscribe(),
+            );
         }
 
         Ok(())
