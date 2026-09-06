@@ -92,13 +92,3 @@ spec:
                   name: cogneva-secrets
                   key: webhook-internal
                   optional: true
-            # 贡献通道 GitHub OAuth 设备流 client_id（公开标识，非密钥）；
-            # 留空时向导设备流不可用、自动回退手动 PAT。
-            - name: COGNEVA_GITHUB_OAUTH_CLIENT_ID
-              value: "Ov23liz35yGbAC5vO0OP"
-            - name: COGNEVA_GITEE_OAUTH_CLIENT_ID
-              value: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
-            - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
-              value: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
-            - name: COGNEVA_GITEE_OAUTH_REDIRECT_URI
-              value: "https://hcipengm.github.io/cogneva/oauth-callback.html"

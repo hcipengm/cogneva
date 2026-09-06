@@ -83,6 +83,25 @@ spec:
                   name: cogneva-secrets
                   key: webhook-internal
                   optional: true
+            # 贡献通道 OAuth 应用身份（client_id/secret 随 chart 公开分发，是应用
+            # 标识而非用户凭证；用户 token 仍只进安全网关）。贡献通道管理端点与
+            # token 续期跑在本进程，env 必须挂在这里。
+            {{- with .Values.contribution.githubOauthClientId }}
+            - name: COGNEVA_GITHUB_OAUTH_CLIENT_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.contribution.giteeOauthClientId }}
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.contribution.giteeOauthClientSecret }}
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.contribution.giteeOauthRedirectUri }}
+            - name: COGNEVA_GITEE_OAUTH_REDIRECT_URI
+              value: {{ . | quote }}
+            {{- end }}
             # GitOps 拉取端：poll 中央 bare 仓库（挂入 /host-git）的 evolution-release
             # 分支，L0 配置热更 / L1 金丝雀在本集群闭环。kubectl 不可用时关闭，避免空转报错。
             - name: COGNEVA_GITOPS_ENABLED

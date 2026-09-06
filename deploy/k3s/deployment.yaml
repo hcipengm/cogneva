@@ -93,6 +93,18 @@ spec:
                   name: cogneva-secrets
                   key: webhook-internal
                   optional: true
+            # 贡献通道 OAuth 应用身份（随 chart 公开分发，是应用标识非用户凭证；
+            # 用户 token 只进安全网关）。贡献通道端点与 token 续期跑在本进程。
+            - name: COGNEVA_GITHUB_OAUTH_CLIENT_ID
+              value: "Ov23liz35yGbAC5vO0OP"
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_ID
+              value: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
+              value: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
+            # Gitee 严格校验 redirect_uri；默认落地页（静态回调页）用 postMessage
+            # 把 code 自动递回向导。
+            - name: COGNEVA_GITEE_OAUTH_REDIRECT_URI
+              value: "https://hcipengm.github.io/cogneva/oauth-callback.html"
             # GitOps 拉取端：poll 中央 bare 仓库（宿主 /var/lib/cogneva-data/
             # git-remote 挂入 /host-git）的 evolution-release 分支，L0 配置
             # 热更 / L1 金丝雀各自在本集群闭环。沙盒推送端只写该仓库。
