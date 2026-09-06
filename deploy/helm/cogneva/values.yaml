@@ -144,14 +144,17 @@ secrets:
 # 贡献通道（向导第二步）：GitHub OAuth 设备流的 client_id 是 OAuth App 的
 # 公开标识（非密钥），留空时设备流不可用、向导自动回退手动 PAT；Gitee 走
 # OAuth 授权码流程，需要 client_id + client_secret 同时配置才开放（Gitee
-# 无设备流、token 24h 过期，网关后台用 refresh_token 自动续期）；
-# giteeOauthRedirectUri 留空时回调地址取向导页面所在源，适合 localhost 安装。
+# 无设备流、token 24h 过期，网关后台用 refresh_token 自动续期）。
+# Gitee 对 redirect_uri 严格校验（已实证：非注册回调在授权页直接报错），
+# code 只回跳注册时固定的载体地址 https://github.com/hcipengm/cogneva，
+# 不存在 localhost 自动回跳；向导引导用户把跳转后地址栏完整网址粘贴回来。
+# 自注册自有 OAuth App 的部署方把 giteeOauthRedirectUri 改成自己的回调即可。
 # 真实 token 由向导写入 cogneva-secrets，只进网关。
 contribution:
   githubOauthClientId: "Ov23liz35yGbAC5vO0OP"
   giteeOauthClientId: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
   giteeOauthClientSecret: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
-  giteeOauthRedirectUri: ""
+  giteeOauthRedirectUri: "https://github.com/hcipengm/cogneva"
 
 # 主应用 GitOps 拉取端：poll 中央 bare 仓库的 evolution-release 分支，
 # L0 配置热更 / L1 金丝雀在本集群闭环（沙盒推送端只写 bare 仓库，零集群凭证）。

@@ -100,3 +100,5 @@ spec:
               value: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
             - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
               value: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
+            - name: COGNEVA_GITEE_OAUTH_REDIRECT_URI
+              value: "https://github.com/hcipengm/cogneva"
