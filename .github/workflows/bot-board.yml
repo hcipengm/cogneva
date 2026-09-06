@@ -1,0 +1,28 @@
+name: Bot contribution board
+
+# Aggregates open Cogneva bot PRs into a single tracking issue: per-PR
+# cross-validation tallies, a consensus ranking when several bots solve the
+# same issue (leading PR gets the `cogneva-recommended` label), and a per-bot
+# leaderboard. Pure read over PR data plus one maintained board issue.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  board:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render and publish bot board
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: python3 scripts/bot_board.py
