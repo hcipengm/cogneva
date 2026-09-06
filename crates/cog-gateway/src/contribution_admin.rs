@@ -289,8 +289,7 @@ fn unix_now() -> u64 {
 /// The value is the redirect_uri used at start — Gitee requires the same
 /// redirect_uri again when exchanging the code.
 fn oauth_states() -> &'static std::sync::Mutex<HashMap<String, (Instant, String)>> {
-    static STATES: OnceLock<std::sync::Mutex<HashMap<String, (Instant, String)>>> =
-        OnceLock::new();
+    static STATES: OnceLock<std::sync::Mutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
     STATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -1017,9 +1016,7 @@ fn oauth_result_page(title: &str, detail: &str, ok: bool) -> Html<String> {
 /// when Gitee can reach this gateway directly (e.g. localhost installs). This
 /// route is intentionally public: the browser redirect carries no admin
 /// token, and the single-use state parameter is the CSRF proof.
-pub async fn gitee_oauth_callback_handler(
-    Query(q): Query<GiteeOAuthCallbackQuery>,
-) -> Response {
+pub async fn gitee_oauth_callback_handler(Query(q): Query<GiteeOAuthCallbackQuery>) -> Response {
     if let Some(err) = q.error {
         let detail = q.error_description.unwrap_or_default();
         return oauth_result_page(
@@ -1030,7 +1027,8 @@ pub async fn gitee_oauth_callback_handler(
         .into_response();
     }
     let (Some(state), Some(code)) = (q.state, q.code) else {
-        return oauth_result_page("授权未完成", "回调缺少 code 或 state 参数。",false).into_response();
+        return oauth_result_page("授权未完成", "回调缺少 code 或 state 参数。", false)
+            .into_response();
     };
     match complete_gitee_oauth(&state, &code).await {
         Ok((kube, set, account)) => {
@@ -1044,13 +1042,15 @@ pub async fn gitee_oauth_callback_handler(
                 )
                 .into_response()
             } else {
-                oauth_result_page("保存失败", "令牌换取成功但写入集群 Secret 失败，请回到接管台重试。", false)
-                    .into_response()
+                oauth_result_page(
+                    "保存失败",
+                    "令牌换取成功但写入集群 Secret 失败，请回到接管台重试。",
+                    false,
+                )
+                .into_response()
             }
         }
-        Err(message) => {
-            oauth_result_page("授权未完成", &message, false).into_response()
-        }
+        Err(message) => oauth_result_page("授权未完成", &message, false).into_response(),
     }
 }
 
@@ -1066,8 +1066,7 @@ pub fn spawn_gitee_token_refresher(
         if !gitee_oauth_available() {
             return;
         }
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(GITEE_REFRESH_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(Duration::from_secs(GITEE_REFRESH_INTERVAL_SECS));
         interval.tick().await; // first tick is immediate; skip it
         loop {
             tokio::select! {
@@ -1096,8 +1095,7 @@ async fn gitee_refresh_tick() -> Result<(), String> {
         String::from_utf8(bytes).ok()
     };
     let config_raw = decode(SECRET_CONTRIB_CONFIG).unwrap_or_default();
-    let config: serde_json::Value =
-        serde_json::from_str(&config_raw).unwrap_or_else(|_| json!({}));
+    let config: serde_json::Value = serde_json::from_str(&config_raw).unwrap_or_else(|_| json!({}));
     if config.get("provider").and_then(|v| v.as_str()) != Some("gitee")
         || config.get("mode").and_then(|v| v.as_str()) != Some("oauth")
     {
