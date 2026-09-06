@@ -22,6 +22,146 @@ use crate::provider::{PlatformComment, PlatformPullRequest};
 /// Label marking PRs that are open to cross-validation by any instance.
 pub const CROSS_VALIDATION_LABEL: &str = "cogneva-bot";
 
+/// Machine-readable marker prefix carrying a validating instance's A/B eval
+/// metrics in a verdict comment. The board action parses these to rank
+/// competing solutions by measured improvement and statistical significance.
+pub const EVAL_MARKER_PREFIX: &str = "<!-- cogneva-eval:";
+
+/// Structured A/B eval metrics for one validated candidate. Field names are
+/// shortened for the inline comment marker; the same schema is what the
+/// validation task is asked to return.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalMetrics {
+    /// Whether an eval A/B applied to this change (false = tests-only verdict).
+    #[serde(default)]
+    pub applicable: bool,
+    /// Success rate before the change (baseline), 0.0–1.0.
+    #[serde(default, rename = "rb", skip_serializing_if = "Option::is_none")]
+    pub rate_before: Option<f64>,
+    /// Success rate after the change (treatment), 0.0–1.0.
+    #[serde(default, rename = "ra", skip_serializing_if = "Option::is_none")]
+    pub rate_after: Option<f64>,
+    /// Baseline sample size.
+    #[serde(default, rename = "nb", skip_serializing_if = "Option::is_none")]
+    pub n_before: Option<u64>,
+    /// Treatment sample size.
+    #[serde(default, rename = "na", skip_serializing_if = "Option::is_none")]
+    pub n_after: Option<u64>,
+    /// Two-proportion z statistic for the success-rate change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z: Option<f64>,
+    /// Whether the success-rate change is statistically significant (|z|>1.96).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub significant: bool,
+    /// Mean latency (ms) before the change.
+    #[serde(default, rename = "lb", skip_serializing_if = "Option::is_none")]
+    pub latency_before_ms: Option<u64>,
+    /// Mean latency (ms) after the change.
+    #[serde(default, rename = "la", skip_serializing_if = "Option::is_none")]
+    pub latency_after_ms: Option<u64>,
+}
+
+impl EvalMetrics {
+    /// Percentage-point improvement in success rate (after − before), if both
+    /// rates are present. Positive means the candidate is better.
+    pub fn improvement_pp(&self) -> Option<f64> {
+        match (self.rate_before, self.rate_after) {
+            (Some(b), Some(a)) => Some((a - b) * 100.0),
+            _ => None,
+        }
+    }
+}
+
+/// Render the inline comment marker for a metrics payload.
+pub fn eval_marker(m: &EvalMetrics) -> String {
+    let json = serde_json::to_string(m).unwrap_or_else(|_| "{}".into());
+    format!("{EVAL_MARKER_PREFIX} {json} -->")
+}
+
+/// Extract the metrics marker from a verdict comment body, if present.
+pub fn parse_eval_marker(body: &str) -> Option<EvalMetrics> {
+    let start = body.find(EVAL_MARKER_PREFIX)? + EVAL_MARKER_PREFIX.len();
+    let rest = &body[start..];
+    let end = rest.find("-->")?;
+    serde_json::from_str::<EvalMetrics>(rest[..end].trim()).ok()
+}
+
+/// Parse metrics from the validation task's `eval` JSON object. Returns None
+/// when eval did not apply or the payload carries no usable rates.
+fn metrics_from_object(obj: &serde_json::Value) -> Option<EvalMetrics> {
+    let mut m: EvalMetrics = serde_json::from_value(obj.clone()).ok()?;
+    // Accept both the short marker keys and the long prompt field names.
+    let get_f = |short: &str, long: &str| {
+        obj.get(short)
+            .or_else(|| obj.get(long))
+            .and_then(|v| v.as_f64())
+    };
+    let get_u = |short: &str, long: &str| {
+        obj.get(short)
+            .or_else(|| obj.get(long))
+            .and_then(|v| v.as_u64())
+    };
+    if m.rate_before.is_none() {
+        m.rate_before = get_f("rb", "rate_before");
+    }
+    if m.rate_after.is_none() {
+        m.rate_after = get_f("ra", "rate_after");
+    }
+    if m.n_before.is_none() {
+        m.n_before = get_u("nb", "n_before");
+    }
+    if m.n_after.is_none() {
+        m.n_after = get_u("na", "n_after");
+    }
+    if m.latency_before_ms.is_none() {
+        m.latency_before_ms = get_u("lb", "latency_before_ms");
+    }
+    if m.latency_after_ms.is_none() {
+        m.latency_after_ms = get_u("la", "latency_after_ms");
+    }
+    if !m.applicable {
+        return None;
+    }
+    // Require at least one measured rate; an empty/applicable-only payload is
+    // treated as "no quantitative data".
+    if m.rate_before.is_none() && m.rate_after.is_none() {
+        return None;
+    }
+    Some(m)
+}
+
+/// Human-readable one-line summary of metrics for the verdict comment.
+fn render_metrics_human(m: &EvalMetrics) -> String {
+    let mut parts = Vec::new();
+    if let (Some(b), Some(a)) = (m.rate_before, m.rate_after) {
+        let pp = (a - b) * 100.0;
+        let sig = if m.significant {
+            ", significant"
+        } else {
+            ", not significant"
+        };
+        let n = match (m.n_before, m.n_after) {
+            (Some(nb), Some(na)) => format!(", n={nb}/{na}"),
+            _ => String::new(),
+        };
+        let z = m.z.map(|z| format!(", z={z:.2}")).unwrap_or_default();
+        parts.push(format!(
+            "success rate {:.0}% → {:.0}% ({:+.1}pp{z}{n}{sig})",
+            b * 100.0,
+            a * 100.0,
+            pp
+        ));
+    }
+    if let (Some(lb), Some(la)) = (m.latency_before_ms, m.latency_after_ms) {
+        parts.push(format!("latency {lb}ms → {la}ms"));
+    }
+    if parts.is_empty() {
+        "eval ran but reported no quantitative metrics".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
 /// Orchestrator task kind for the sandbox validation run.
 pub const CROSS_VALIDATE_TASK_KIND: &str = "pr_cross_validate";
 
@@ -49,7 +189,7 @@ impl CvInflight {
 }
 
 /// The structured verdict returned by the validation task.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CrossValidationVerdict {
     /// `pass`, `fail` or `inconclusive`.
     pub verdict: String,
@@ -59,6 +199,9 @@ pub struct CrossValidationVerdict {
     pub tests: String,
     /// Eval A/B summary, or "not applicable".
     pub eval_note: String,
+    /// Structured A/B eval metrics when the task ran a quantitative eval;
+    /// None for tests-only verdicts or free-text eval reports.
+    pub metrics: Option<EvalMetrics>,
 }
 
 /// Persisted cross-validation record, keyed by PR number.
@@ -215,10 +358,17 @@ pub fn render_verdict_comment(
     } else {
         v.tests.trim().to_string()
     };
-    let eval = if v.eval_note.trim().is_empty() {
-        "not reported".to_string()
-    } else {
-        v.eval_note.trim().to_string()
+    // Prefer structured metrics for the human line when present; fall back to
+    // the free-text eval note, then "not reported".
+    let eval = match &v.metrics {
+        Some(m) => render_metrics_human(m),
+        None if !v.eval_note.trim().is_empty() => v.eval_note.trim().to_string(),
+        _ => "not reported".to_string(),
+    };
+    // Structured metrics ride along as a machine marker for the board action.
+    let eval_marker_line = match &v.metrics {
+        Some(m) => format!("\n\n{}", eval_marker(m)),
+        None => String::new(),
     };
     format!(
         "## Cogneva cross-validation\n\n\
@@ -227,7 +377,7 @@ pub fn render_verdict_comment(
          {summary}\n\n\
          - Tests: {tests}\n\
          - Eval: {eval}\n\n\
-         {marker}",
+         {marker}{eval_marker_line}",
         v.verdict.to_uppercase(),
         marker = verdict_comment_marker(pr, head_sha, handle),
     )
@@ -289,15 +439,38 @@ fn verdict_from_object(obj: &serde_json::Value) -> Option<CrossValidationVerdict
             .trim()
             .to_string()
     };
-    let mut eval_note = field("eval");
-    if eval_note.is_empty() {
-        eval_note = field("eval_note");
+    // `eval` is either a structured object (preferred: feeds the consensus
+    // ranking) or a free-text note (older/non-quantitative validations).
+    let mut metrics = None;
+    let mut eval_note = String::new();
+    match obj.get("eval") {
+        Some(serde_json::Value::Object(_)) => {
+            if let Some(m) = obj.get("eval").and_then(metrics_from_object) {
+                eval_note = render_metrics_human(&m);
+                metrics = Some(m);
+            } else {
+                // eval object present but not applicable / no rates.
+                eval_note = obj["eval"]
+                    .get("note")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("not applicable")
+                    .to_string();
+            }
+        }
+        Some(serde_json::Value::String(s)) => eval_note = s.trim().to_string(),
+        _ => {
+            let note = field("eval_note");
+            if !note.is_empty() {
+                eval_note = note;
+            }
+        }
     }
     Some(CrossValidationVerdict {
         verdict: verdict.to_string(),
         summary: field("summary"),
         tests: field("tests"),
         eval_note,
+        metrics,
     })
 }
 
@@ -460,6 +633,7 @@ mod tests {
                 summary: "ok".into(),
                 tests: "t".into(),
                 eval_note: "n/a".into(),
+                metrics: None,
             },
             42,
             "abcdef1234567890",
@@ -495,6 +669,81 @@ mod tests {
             "9988776655443322",
             handle
         ));
+    }
+
+    #[test]
+    fn structured_eval_metrics_round_trip_through_marker() {
+        let result = serde_json::json!({
+            "verdict": "pass",
+            "tests": "all green",
+            "summary": "works",
+            "eval": {
+                "applicable": true,
+                "rate_before": 0.70,
+                "rate_after": 0.88,
+                "n_before": 50,
+                "n_after": 50,
+                "z": 2.31,
+                "significant": true,
+                "latency_before_ms": 1200,
+                "latency_after_ms": 980
+            }
+        });
+        let v = extract_verdict(&result).expect("verdict parsed");
+        let m = v.metrics.as_ref().expect("structured metrics present");
+        assert_eq!(m.rate_after, Some(0.88));
+        assert!(m.significant);
+        assert!((m.improvement_pp().unwrap() - 18.0).abs() < 0.01);
+
+        // The verdict comment carries a machine marker that parses back.
+        let body = render_verdict_comment(&v, 12, "deadbeefcafef00d", "Carol#c1");
+        assert!(body.contains("success rate 70% → 88%"));
+        let parsed = parse_eval_marker(&body).expect("eval marker in comment");
+        assert_eq!(parsed.rate_before, Some(0.70));
+        assert_eq!(parsed.n_after, Some(50));
+        assert!(parsed.significant);
+    }
+
+    #[test]
+    fn long_field_names_are_accepted_for_eval_metrics() {
+        let result = serde_json::json!({
+            "verdict": "pass",
+            "eval": {
+                "applicable": true,
+                "rate_before": 0.5,
+                "rate_after": 0.75,
+                "n_before": 20,
+                "n_after": 20
+            }
+        });
+        let v = extract_verdict(&result).unwrap();
+        let m = v.metrics.unwrap();
+        assert_eq!(m.rate_after, Some(0.75));
+        assert_eq!(m.n_before, Some(20));
+    }
+
+    #[test]
+    fn free_text_eval_falls_back_without_metrics() {
+        let result = serde_json::json!({
+            "verdict": "inconclusive",
+            "eval": "eval harness not available in this sandbox"
+        });
+        let v = extract_verdict(&result).unwrap();
+        assert!(v.metrics.is_none());
+        assert!(v.eval_note.contains("harness not available"));
+        // No marker is emitted without structured metrics.
+        let body = render_verdict_comment(&v, 3, "abcd1234", "Dan#d9");
+        assert!(!body.contains(EVAL_MARKER_PREFIX));
+    }
+
+    #[test]
+    fn non_applicable_eval_yields_no_metrics() {
+        let result = serde_json::json!({
+            "verdict": "pass",
+            "eval": {"applicable": false}
+        });
+        let v = extract_verdict(&result).unwrap();
+        assert!(v.metrics.is_none());
     }
 
     #[test]

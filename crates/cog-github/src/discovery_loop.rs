@@ -1130,13 +1130,25 @@ impl GitHubDiscoveryLoop {
                  instance's own branch is intentional — that is the environment being validated).\n\
                  2. Run `cargo test --workspace` and capture the result.\n\
                  3. If the change touches eval-covered behavior, run the relevant eval A/B \
-                 (before/after) and report the comparison; otherwise say eval is not applicable.\n\
+                 (before/after) with the eval harness and report the comparison as the \
+                 structured `eval` object below: run the same eval task set on the unmodified \
+                 worktree (before) and on the diff-applied worktree (after), record success \
+                 counts and sample sizes for both, and compute the two-proportion z-test \
+                 (significant means |z| > 1.96). If no eval covers this change, return \
+                 {{\"applicable\": false}}.\n\
                  4. Revert the worktree afterwards (`git apply -R` or `git checkout -- .`). Do \
                  NOT commit, push, or open any pull request.\n\n\
                  Your final result must be ONE JSON object, no prose:\n\
                  {{\"verdict\": \"pass|fail|inconclusive\", \"tests\": \"cargo test summary\", \
-                 \"eval\": \"eval A/B summary, or not applicable\", \"summary\": \"one paragraph \
-                 with any failure details\"}}\n\
+                 \"eval\": {{\"applicable\": true, \"rate_before\": 0.0, \"rate_after\": 0.0, \
+                 \"n_before\": 0, \"n_after\": 0, \"z\": 0.0, \"significant\": false, \
+                 \"latency_before_ms\": 0, \"latency_after_ms\": 0}}, \"summary\": \"one \
+                 paragraph with any failure details\"}}\n\
+                 Rates are success fractions (0.0-1.0) over n_before/n_after eval runs; \
+                 latency fields are optional mean task latency in milliseconds and may be \
+                 omitted; set eval to {{\"applicable\": false}} when no eval applies. These \
+                 metrics feed the cross-instance consensus ranking, so report measured numbers \
+                 only — never guess or copy them.\n\
                  verdict=pass only when the diff applies cleanly and the full workspace test run \
                  passes (with no eval regression where eval applies).",
                 pr.number, pr.title, pr.url, pr.base_branch
@@ -1161,8 +1173,9 @@ impl GitHubDiscoveryLoop {
                 version: Some("1.0.0".into()),
                 note: Some(
                     "Cross-validation of an external bot PR: apply the diff in this instance's \
-                     worktree, run cargo test and applicable eval A/B, return a verdict JSON. \
-                     Do not commit, push, or open PRs."
+                     worktree, run cargo test and the applicable eval A/B, return a verdict JSON \
+                     with structured eval metrics (rates, sample sizes, z-test). Do not commit, \
+                     push, or open PRs."
                         .into(),
                 ),
                 source: Some(ActionPlannerSource::UserProvided),
