@@ -14,6 +14,7 @@ pub struct HttpState {
 pub struct AuthState {
     pub jwt_manager: Arc<dyn cog_core::AuthProvider>,
     pub user_store: Option<Arc<dyn cog_core::UserStore>>,
+    pub platform_identities: Option<Arc<dyn cog_core::PlatformIdentityStore>>,
     pub login_rate_limiter: Option<Arc<crate::auth::LoginRateLimiter>>,
     pub session_manager: Option<Arc<dyn cog_core::SessionManager>>,
 }

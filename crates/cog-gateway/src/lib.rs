@@ -107,6 +107,9 @@ pub struct GatewayState {
     pub connection_manager: Option<Arc<websocket_protocol::ConnectionManager>>,
     pub wiki_adapter: Option<Arc<dyn cog_core::WikiBackend>>,
     pub user_store: Option<Arc<dyn cog_core::UserStore>>,
+    /// Platform identity store (GitHub/Gitee account ↔ local user linkage).
+    /// Present whenever the PG user store is wired.
+    pub platform_identities: Option<Arc<dyn cog_core::PlatformIdentityStore>>,
     pub login_rate_limiter: Option<Arc<auth::LoginRateLimiter>>,
     pub session_manager: Option<Arc<dyn cog_core::SessionManager>>,
     /// In-memory store for [`cog_core::ActionPlan`] resources exposed via the
@@ -198,6 +201,7 @@ impl GatewayState {
         state::AuthState {
             jwt_manager: self.jwt_manager.clone(),
             user_store: self.user_store.clone(),
+            platform_identities: self.platform_identities.clone(),
             login_rate_limiter: self.login_rate_limiter.clone(),
             session_manager: self.session_manager.clone(),
         }
@@ -284,6 +288,24 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/admin/contribution/gitee/oauth/callback",
             get(contribution_admin::gitee_oauth_callback_handler),
+        )
+        // 平台账号登录（连接 GitHub/Gitee 即登录）：PAT 直登与 OAuth 授权码
+        // 流都不带本地凭据，安全性靠平台 token 校验与一次性 state 保证。
+        .route(
+            "/api/v1/auth/platform/login",
+            post(auth::platform::platform_login_handler),
+        )
+        .route(
+            "/api/v1/auth/platform/start",
+            post(auth::platform::oauth_start_handler),
+        )
+        .route(
+            "/api/v1/auth/platform/exchange",
+            post(auth::platform::oauth_exchange_handler),
+        )
+        .route(
+            "/api/v1/auth/platform/callback/{provider}",
+            get(auth::platform::oauth_callback_handler),
         )
         // WebUI 单页应用：根路径直接给 index.html，/assets 给构建产物，
         // 浏览器打开即用（一键拉起场景没有独立前端服务）

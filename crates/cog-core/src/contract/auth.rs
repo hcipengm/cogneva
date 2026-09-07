@@ -237,3 +237,48 @@ pub trait UserStore: Send + Sync {
     /// Update a user's profile.
     async fn update(&self, id: uuid::Uuid, updates: UserUpdate) -> crate::SFResult<Option<User>>;
 }
+
+/// A code-platform identity (GitHub/Gitee account) linked to a local user.
+/// Tokens themselves live only in the secure-gateway Secret; the store keeps
+/// references, never plaintext.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformIdentity {
+    pub user_id: Uuid,
+    pub provider: String,
+    pub provider_user_id: String,
+    pub login: String,
+    pub access_token_ref: Option<String>,
+    pub refresh_token_ref: Option<String>,
+}
+
+/// Storage contract for platform identities: connecting a GitHub/Gitee
+/// account is how a local user account comes into existence.
+#[async_trait::async_trait]
+pub trait PlatformIdentityStore: Send + Sync {
+    /// Find the local user linked to a platform identity.
+    async fn find_user_by_identity(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+    ) -> crate::SFResult<Option<User>>;
+
+    /// Link a platform identity to a local user, creating the user when the
+    /// identity is unknown. Returns the user and whether it was newly created.
+    /// The first user of an instance becomes [`UserType::Admin`] (the instance
+    /// owner); later users are [`UserType::Standard`].
+    #[allow(clippy::too_many_arguments)]
+    async fn find_or_create_by_identity(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+        login: &str,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+        access_token_ref: Option<String>,
+        refresh_token_ref: Option<String>,
+    ) -> crate::SFResult<(User, bool)>;
+
+    /// Unlink one platform identity (disconnect flow). Local users and their
+    /// data are not touched.
+    async fn unlink_identity(&self, provider: &str, provider_user_id: &str) -> crate::SFResult<()>;
+}

@@ -52,7 +52,7 @@ pub use mem::{
 pub use postgres::{
     HookArchiveRow, PostgresAuditRecorder, PostgresHookArchive, PostgresMetricsBackend,
     PostgresObservabilityGateway, PostgresRawLogIndexStore, PostgresSnapshotStore,
-    PostgresStateBackend,
+    PostgresStateBackend, PostgresUserStore,
 };
 
 #[cfg(feature = "redis")]

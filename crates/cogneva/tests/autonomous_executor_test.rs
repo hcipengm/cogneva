@@ -150,6 +150,7 @@ async fn build_test_state() -> AutonomousTestState {
         connection_manager: None,
         wiki_adapter: None,
         user_store: None,
+        platform_identities: None,
         login_rate_limiter: None,
         session_manager: None,
         heartbeat_history: None,

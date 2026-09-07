@@ -118,6 +118,13 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         let session_manager = ctx
             .consume_service::<dyn cog_core::SessionManager>()
             .expect("session manager");
+        // Account system: PG-backed user store + platform identity linkage,
+        // published by the storage plugin. Absent → bootstrap login paths
+        // (admin password / demo switch) stay in effect.
+        let user_store: Option<Arc<dyn cog_core::UserStore>> =
+            ctx.consume_service::<dyn cog_core::UserStore>();
+        let platform_identities: Option<Arc<dyn cog_core::PlatformIdentityStore>> =
+            ctx.consume_service::<dyn cog_core::PlatformIdentityStore>();
         // Login rate limiting shares the Redis the session manager uses;
         // without Redis the limiter stays off (login itself still works).
         let login_rate_limiter: Option<Arc<crate::auth::LoginRateLimiter>> =
@@ -214,6 +221,8 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &replay_engine,
             &session_manager,
             &login_rate_limiter,
+            &user_store,
+            &platform_identities,
             &sandbox_backend,
             &plugin_registry,
             &guardrail,
@@ -410,6 +419,14 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         cog_core::ConsumeSpec {
             type_name: "SessionManager",
             required: true,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "UserStore",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "PlatformIdentityStore",
+            required: false,
         },
         cog_core::ConsumeSpec {
             type_name: "SandboxBackend",

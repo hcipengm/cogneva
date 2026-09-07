@@ -19,6 +19,7 @@ use uuid::Uuid;
 pub mod error;
 pub mod middleware;
 mod password;
+pub mod platform;
 pub use self::{
     error::AuthError,
     password::{hash_password, verify_password},

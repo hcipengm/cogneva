@@ -344,6 +344,35 @@ impl cog_core::SystemPlugin for StoragePlugin {
         ctx.publish_service(state_backend.clone());
         info!("StoragePlugin state backend published");
 
+        // ── User store + platform identities (account system) ──
+        // PG-backed when the pool exists; absent PG the gateway keeps its
+        // no-store bootstrap paths (admin password / demo switch).
+        if let Some(ref pool) = config_pool {
+            let user_store = crate::PostgresUserStore::new(pool.clone());
+            match user_store.init_schema().await {
+                Ok(()) => {
+                    let store = Arc::new(user_store);
+                    let as_user_store: Arc<dyn cog_core::UserStore> = store.clone();
+                    ctx.publish_service(as_user_store);
+                    let as_identity_store: Arc<dyn cog_core::PlatformIdentityStore> = store;
+                    ctx.publish_service(as_identity_store);
+                    info!("StoragePlugin user store + platform identities published");
+                }
+                Err(e) => {
+                    if strict_persistence {
+                        return Err(cog_core::SFError::Config(format!(
+                            "PostgresUserStore init_schema failed (strict_persistence=true): {}",
+                            e
+                        )));
+                    }
+                    warn!(
+                        "PostgresUserStore init_schema failed: {}. Account system stays in bootstrap mode.",
+                        e
+                    );
+                }
+            }
+        }
+
         // ── Promotion ledger（晋级台账：配额/熔断/审计事实源，与 state
         //    backend 同一存储，避免双副本读到不同账本） ──
         let promotion_ledger: Arc<dyn cog_core::PromotionLedger> = if state_backend_pg {
@@ -680,6 +709,8 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         "ObservabilityGateway",
         "HookArchive",
         "MediaBackend",
+        "UserStore",
+        "PlatformIdentityStore",
     ],
     consumes: &[],
     factory: || Box::new(StoragePlugin::new()),

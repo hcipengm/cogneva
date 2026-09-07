@@ -45,8 +45,8 @@ const SECRET_CONTRIB_CONFIG: &str = "contribution-config";
 
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
-const GITHUB_API: &str = "https://api.github.com";
-const GITEE_API: &str = "https://gitee.com/api/v5";
+pub(crate) const GITHUB_API: &str = "https://api.github.com";
+pub(crate) const GITEE_API: &str = "https://gitee.com/api/v5";
 const GITEE_AUTHORIZE_URL: &str = "https://gitee.com/oauth/authorize";
 const GITEE_TOKEN_URL: &str = "https://gitee.com/oauth/token";
 
@@ -234,7 +234,7 @@ pub struct DevicePollRequest {
     pub device_code: String,
 }
 
-fn http_client() -> reqwest::Client {
+pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .user_agent("cogneva-contribution")
@@ -242,7 +242,7 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-fn oauth_client_id(explicit: Option<&str>) -> Option<String> {
+pub(crate) fn oauth_client_id(explicit: Option<&str>) -> Option<String> {
     explicit
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -251,7 +251,7 @@ fn oauth_client_id(explicit: Option<&str>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-fn gitee_oauth_client_id(explicit: Option<&str>) -> Option<String> {
+pub(crate) fn gitee_oauth_client_id(explicit: Option<&str>) -> Option<String> {
     explicit
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -260,7 +260,7 @@ fn gitee_oauth_client_id(explicit: Option<&str>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-fn gitee_oauth_client_secret() -> Option<String> {
+pub(crate) fn gitee_oauth_client_secret() -> Option<String> {
     std::env::var("COGNEVA_GITEE_OAUTH_CLIENT_SECRET")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -268,7 +268,7 @@ fn gitee_oauth_client_secret() -> Option<String> {
 
 /// Fixed callback override for the Gitee OAuth App. When unset the wizard
 /// passes its own origin so the redirect lands back on this gateway.
-fn gitee_oauth_redirect_override() -> Option<String> {
+pub(crate) fn gitee_oauth_redirect_override() -> Option<String> {
     std::env::var("COGNEVA_GITEE_OAUTH_REDIRECT_URI")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -307,7 +307,7 @@ pub fn new_oauth_state(redirect_uri: &str) -> String {
 
 /// Consume a state: returns the remembered redirect_uri iff the state exists
 /// and is fresh. A state can only be consumed once.
-fn take_oauth_state(state: &str) -> Option<String> {
+pub(crate) fn take_oauth_state(state: &str) -> Option<String> {
     let mut map = oauth_states().lock().ok()?;
     match map.get(state) {
         Some((created, _)) if created.elapsed() < OAUTH_STATE_TTL => {
@@ -403,7 +403,10 @@ pub fn extract_gitee_code(code: Option<&str>, redirect_url: Option<&str>) -> Opt
 
 /// Exchange an authorization code for a token pair. Gitee's token endpoint
 /// expects the parameters as a query string on a POST.
-async fn exchange_gitee_code(code: &str, redirect_uri: &str) -> Result<GiteeTokenSet, String> {
+pub(crate) async fn exchange_gitee_code(
+    code: &str,
+    redirect_uri: &str,
+) -> Result<GiteeTokenSet, String> {
     let client_id = gitee_oauth_client_id(None).ok_or("未配置 Gitee OAuth client_id")?;
     let client_secret = gitee_oauth_client_secret().ok_or("未配置 Gitee OAuth client_secret")?;
     let resp = http_client()
@@ -536,7 +539,7 @@ async fn upload_public_key(provider: &str, token: &str, public_line: &str) -> Re
 
 /// Persist a connected token (plus an Ed25519 SSH keypair) to the gateway
 /// Secret and roll the gateway so it picks the new credentials up.
-async fn persist_connected(
+pub(crate) async fn persist_connected(
     kube: &KubeClient,
     provider: &str,
     token: &str,
@@ -999,7 +1002,7 @@ pub struct GiteeOAuthCallbackQuery {
     pub error_description: Option<String>,
 }
 
-fn oauth_result_page(title: &str, detail: &str, ok: bool) -> Html<String> {
+pub(crate) fn oauth_result_page(title: &str, detail: &str, ok: bool) -> Html<String> {
     let color = if ok { "#3fb950" } else { "#f85149" };
     Html(format!(
         "<!DOCTYPE html><html lang=\"zh\"><head><meta charset=\"utf-8\"><title>{title}</title>\
