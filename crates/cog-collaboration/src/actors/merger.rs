@@ -124,6 +124,7 @@ pub fn parse_merge_result(value: &serde_json::Value) -> MergeResult {
                 summary: String::new(),
                 plan: serde_json::json!({}),
                 sub_tasks: Vec::new(),
+                acceptance_criteria: Vec::new(),
             },
             generation: GeneratorOutput {
                 content: serde_json::Value::Null,
@@ -153,6 +154,7 @@ pub fn fallback_best_branch(branches: &[PgeBranchResult]) -> MergeResult {
                 summary: String::new(),
                 plan: serde_json::json!({}),
                 sub_tasks: Vec::new(),
+                acceptance_criteria: Vec::new(),
             },
             generation: GeneratorOutput {
                 content: serde_json::Value::Null,

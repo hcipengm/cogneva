@@ -158,6 +158,10 @@ impl EvaluatorActor {
                  following context.plan. Score 80-100 for correct and complete results, \
                  60-79 for partially correct, below 60 for wrong or missing results. \
                  verdict: pass when score >= 80, partial when 60-79, fail otherwise. \
+                 When context.criteria lists acceptance criteria, you MUST judge every criterion \
+                 individually: emit one entry in criteria per acceptance criterion, using the criterion \
+                 text as name and setting score 100 only when the generation verifiably satisfies it. \
+                 In that case verdict may be pass ONLY if every acceptance criterion scores 100. \
                  Emit ONLY a single JSON object matching output_schema. No markdown, no code fences, no commentary."
             );
         }

@@ -149,13 +149,17 @@ impl PlannerActor {
                     "task_type": "string: a skill id from task.input.skills, or a generic executor type",
                     "input": {"query": "string: everything the executor needs to accomplish this task"},
                     "blocked_by": ["string: ids of tasks that must finish first, empty if none"]
-                }]
+                }],
+                "acceptance_criteria": ["string: one verifiable criterion per entry; each must be checkable as true/false against the final output"]
             });
             ctx["instructions"] = serde_json::json!(
                 "You are the Planner actor in a Plan-Generate-Evaluate pipeline. \
                  Read context.goal and decompose it into a small set of atomic, independently executable sub_tasks. \
                  Every sub-task must be self-contained: its input.query carries everything the executor needs. \
                  If the goal is trivially simple (e.g. a single question), return exactly ONE sub-task that directly addresses it. \
+                 Also produce acceptance_criteria: concrete, verifiable conditions the final output must satisfy \
+                 (e.g. 'the answer states the exact version number', 'the summary covers every sub-task'). \
+                 Each criterion must be checkable as true or false; do NOT write vague ones like 'implementation is complete'. \
                  Do NOT answer the goal yourself — your job is to produce the plan, the Generator executes it later. \
                  Emit ONLY a single JSON object matching output_schema. No markdown, no code fences, no commentary."
             );
@@ -210,6 +214,7 @@ impl PlannerActor {
                     summary: format!("Fallback plan for: {}", goal),
                     plan: serde_json::json!({}),
                     sub_tasks: Vec::new(),
+                    acceptance_criteria: Vec::new(),
                 }
             }
         };

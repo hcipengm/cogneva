@@ -20,6 +20,11 @@ pub struct PlannerOutput {
     pub plan: serde_json::Value,
     /// Atom tasks decomposed from the meta-task.
     pub sub_tasks: Vec<TaskSpec>,
+    /// Verifiable acceptance criteria the Evaluation stage must check one by one.
+    /// Empty means the plan imposes no explicit gate and the evaluator falls back
+    /// to its generic scoring rubric.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_criteria: Vec<String>,
 }
 
 /// A named artifact produced by the Generator.
@@ -138,6 +143,22 @@ pub struct EvaluationResult {
     pub details: Option<serde_json::Value>,
 }
 
+impl EvaluationResult {
+    /// Deterministic gate: when the plan declared acceptance criteria, a Pass
+    /// verdict is only credible if the evaluator actually reported a
+    /// per-criterion judgement. A Pass without any criterion evidence means
+    /// the declared gate was never checked — downgrade to Fail.
+    pub fn enforce_criteria_evidence(&mut self, criteria_were_supplied: bool) {
+        if criteria_were_supplied && self.verdict == Verdict::Pass && self.criteria.is_empty() {
+            self.verdict = Verdict::Fail;
+            self.feedback = format!(
+                "acceptance criteria were declared but the evaluator passed without judging them; original feedback: {}",
+                self.feedback
+            );
+        }
+    }
+}
+
 /// A single local repair cycle inside a pipeline attempt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocalRepairAttempt {
@@ -193,4 +214,68 @@ pub struct PgeRoundtableIteration {
     /// How the branches were merged, if parallel branches were used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_summary: Option<MergeSummary>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planner_output_without_criteria_deserializes_to_empty() {
+        let value = serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        });
+        let output: PlannerOutput = serde_json::from_value(value).unwrap();
+        assert!(output.acceptance_criteria.is_empty());
+    }
+
+    #[test]
+    fn planner_output_roundtrip_preserves_criteria() {
+        let output = PlannerOutput {
+            summary: "s".into(),
+            plan: serde_json::json!({}),
+            sub_tasks: Vec::new(),
+            acceptance_criteria: vec!["answer states the exact version".into()],
+        };
+        let value = serde_json::to_value(&output).unwrap();
+        let back: PlannerOutput = serde_json::from_value(value).unwrap();
+        assert_eq!(back.acceptance_criteria, output.acceptance_criteria);
+    }
+
+    fn pass_result(criteria: Vec<Criterion>) -> EvaluationResult {
+        EvaluationResult {
+            verdict: Verdict::Pass,
+            feedback: "looks good".into(),
+            score: Some(90),
+            criteria,
+            details: None,
+        }
+    }
+
+    #[test]
+    fn pass_without_criterion_evidence_is_downgraded_when_criteria_supplied() {
+        let mut result = pass_result(Vec::new());
+        result.enforce_criteria_evidence(true);
+        assert_eq!(result.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn pass_with_criterion_evidence_stays_pass() {
+        let mut result = pass_result(vec![Criterion {
+            name: "c1".into(),
+            score: 100,
+            comment: "met".into(),
+        }]);
+        result.enforce_criteria_evidence(true);
+        assert_eq!(result.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn no_declared_criteria_leaves_unevidenced_pass_alone() {
+        let mut result = pass_result(Vec::new());
+        result.enforce_criteria_evidence(false);
+        assert_eq!(result.verdict, Verdict::Pass);
+    }
 }

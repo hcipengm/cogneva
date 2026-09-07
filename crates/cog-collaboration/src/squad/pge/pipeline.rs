@@ -211,11 +211,21 @@ impl PgePipeline {
                     })
                 })
                 .collect();
-            let criteria: Vec<&str> = _context
+            // Acceptance criteria: the plan's own verifiable criteria gate the
+            // evaluation; caller-supplied context criteria are the fallback.
+            let context_criteria: Vec<&str> = _context
                 .get("criteria")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
+            let criteria: Vec<&str> = if plan.acceptance_criteria.is_empty() {
+                context_criteria
+            } else {
+                plan.acceptance_criteria
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect()
+            };
             let mut evaluation = evaluator
                 .evaluate(
                     task,
@@ -226,6 +236,7 @@ impl PgePipeline {
                     None,
                 )
                 .await;
+            evaluation.enforce_criteria_evidence(!criteria.is_empty());
 
             let mut local_repairs: Vec<LocalRepairAttempt> = Vec::new();
             let mut repair_stall = StallDetector::new(self.config.stall_threshold);
@@ -276,6 +287,7 @@ impl PgePipeline {
                         None,
                     )
                     .await;
+                evaluation.enforce_criteria_evidence(!criteria.is_empty());
 
                 local_repairs.push(LocalRepairAttempt {
                     repair_iteration,

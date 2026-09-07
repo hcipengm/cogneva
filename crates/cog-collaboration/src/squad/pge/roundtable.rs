@@ -355,6 +355,7 @@ impl PgeRoundtable {
                     summary: String::new(),
                     plan: serde_json::json!({}),
                     sub_tasks: Vec::new(),
+                    acceptance_criteria: Vec::new(),
                 },
                 generation: GeneratorOutput {
                     content: serde_json::Value::Null,
@@ -425,17 +426,23 @@ impl PgeRoundtable {
             .await;
 
         let generation_json = serde_json::to_value(&generation).unwrap_or_default();
-        let evaluation = self
+        let criteria: Vec<&str> = plan
+            .acceptance_criteria
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let mut evaluation = self
             .evaluator
             .evaluate(
                 task,
                 &plan_json,
                 &generation_json,
                 eval_history,
-                &[],
+                &criteria,
                 Some(board),
             )
             .await;
+        evaluation.enforce_criteria_evidence(!criteria.is_empty());
 
         (plan, generation, evaluation)
     }
@@ -513,16 +520,22 @@ impl PgeRoundtable {
                     .await;
 
                 let generation_json = serde_json::to_value(&generation).unwrap_or_default();
-                let evaluation = evaluator
+                let criteria: Vec<&str> = plan
+                    .acceptance_criteria
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                let mut evaluation = evaluator
                     .evaluate(
                         &task,
                         &plan_json,
                         &generation_json,
                         &eval_history,
-                        &[],
+                        &criteria,
                         Some(&board),
                     )
                     .await;
+                evaluation.enforce_criteria_evidence(!criteria.is_empty());
 
                 PgeBranchResult {
                     branch_id,
@@ -627,6 +640,7 @@ impl PgeRoundtable {
                     summary: String::new(),
                     plan: serde_json::json!({}),
                     sub_tasks: Vec::new(),
+                    acceptance_criteria: Vec::new(),
                 },
                 generation: GeneratorOutput {
                     content: serde_json::Value::Null,
@@ -743,6 +757,7 @@ pub fn parse_planner_output(value: &serde_json::Value, goal: &str) -> PlannerOut
         summary: format!("Plan for: {}", goal),
         plan: value.clone(),
         sub_tasks: Vec::new(),
+        acceptance_criteria: Vec::new(),
     })
 }
 
@@ -979,6 +994,7 @@ mod tests {
             summary: String::new(),
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
+            acceptance_criteria: Vec::new(),
         }
     }
 
