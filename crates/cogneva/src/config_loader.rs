@@ -112,6 +112,12 @@ fn default_env_mappings() -> HashMap<String, String> {
     m.insert("COGNEVA_HTTP_PORT".into(), "gateway.http_port".into());
     m.insert("COGNEVA_WS_PORT".into(), "gateway.ws_port".into());
     m.insert("COGNEVA_METRICS_PORT".into(), "gateway.metrics_port".into());
+    // Throwaway demo images flip the no-user-store demo login via env;
+    // production installs leave it unset (false).
+    m.insert(
+        "COGNEVA_DEMO_LOGIN_ENABLED".into(),
+        "gateway.demo_login_enabled".into(),
+    );
     // raw_logger
     m.insert(
         "COGNEVA_RAW_LOGGER_ENABLED".into(),
@@ -942,5 +948,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("VAULT_ADDR"));
+    }
+    #[test]
+    fn test_demo_login_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::set("COGNEVA_DEMO_LOGIN_ENABLED", "true");
+        let config = from_env();
+        assert!(config.gateway.demo_login_enabled);
     }
 }
