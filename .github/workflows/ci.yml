@@ -93,15 +93,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@cargo-tarpaulin
-      # 审计 1.4：--fail-under 基线阈值防退化（2026-07-23 基线 42.59%，
-      # 阈值 40 留弹性；随覆盖率提升逐步上调，只升不降）。
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      # 审计 1.4：--fail-under-lines 基线阈值防退化，只升不降。
+      # 2026-07-23 tarpaulin 基线 42.59%、阈值 40；2026-09-07 换 llvm-cov
+      # （编译器内生插桩，缓存友好，CI 墙钟砍半），计数口径不同需重标基线。
       - name: Generate coverage
-        run: cargo tarpaulin --workspace --out xml --fail-under 40
+        run: cargo llvm-cov --workspace --cobertura --output-path cobertura.xml --fail-under-lines 40
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
