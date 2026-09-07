@@ -108,6 +108,7 @@ impl CodePlatformProvider for GitHubProvider {
                 state: format!("{:?}", issue.state),
                 labels: issue.labels.into_iter().map(|l| l.name).collect(),
                 author: issue.user.login,
+                url: issue.html_url.to_string(),
                 created_at: issue.created_at,
                 updated_at: issue.updated_at,
             })

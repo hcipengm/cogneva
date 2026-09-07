@@ -27,6 +27,10 @@ pub struct LlmUpstream {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// 准入探测实证的原生 tool_calls 能力。`None` = 未知（老条目/env 配置，
+    /// 保持既有放行行为）；`Some(false)` = 探测证实不支持，携带 tools 的
+    /// 请求不再路由到该上游（快速失败，而不是让调用方烧钱空转）。
+    pub supports_tool_calls: Option<bool>,
 }
 
 impl std::fmt::Debug for LlmUpstream {
@@ -137,6 +141,7 @@ fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
                 base_url: get("base_url"),
                 model: get("model"),
                 api_key: get("api_key"),
+                supports_tool_calls: v.get("supports_tool_calls").and_then(|x| x.as_bool()),
             };
             if upstream.base_url.is_empty()
                 || upstream.model.is_empty()
@@ -480,22 +485,49 @@ async fn stream_forward(
             "网关未配置 LLM 上游".into(),
         ));
     }
+    let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+
+    // 携带 tools 的请求只路由到实证支持原生 tool_calls 的上游：
+    // 准入探测标记 Some(false) 的上游对工具类负载只会空转烧钱
+    // （工具调用被写成文本、工具零执行），直接跳过；全部不支持时
+    // 快速失败 422，调用方立刻拿到明确错误而不是烧完配额才发现。
+    // None（老条目/未探测）保持放行，不退化既有行为。
+    let wants_tools = parsed
+        .as_ref()
+        .and_then(|v| v.get("tools"))
+        .and_then(|t| t.as_array())
+        .is_some_and(|t| !t.is_empty());
     let candidates: Vec<&LlmUpstream> = state
         .config
         .llm_upstreams
         .iter()
         .filter(|u| u.api_style == style)
+        .filter(|u| !wants_tools || u.supports_tool_calls != Some(false))
         .collect();
     if candidates.is_empty() {
+        if wants_tools
+            && state
+                .config
+                .llm_upstreams
+                .iter()
+                .any(|u| u.api_style == style)
+        {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "请求携带 tools，但所有 {style} 上游经准入探测均不支持原生 \
+                     tool_calls；请在网关配置支持 function-calling 的上游"
+                ),
+            ));
+        }
         return Err((
             StatusCode::NOT_IMPLEMENTED,
             format!("passthrough has no {style}-style upstream configured"),
         ));
     }
-    let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
 
     let mut last_err = String::new();
     for upstream in candidates {
@@ -1436,6 +1468,21 @@ mod tests {
         assert!(parse_upstreams("not json").is_empty());
         assert!(parse_upstreams("").is_empty());
         assert!(parse_upstreams(r#"{"not": "an array"}"#).is_empty());
+    }
+
+    #[test]
+    fn upstreams_tool_calls_capability_parsed() {
+        let list = parse_upstreams(
+            r#"[
+                {"api_style": "openai", "base_url": "https://a.example.com", "model": "m1", "api_key": "k1", "supports_tool_calls": false},
+                {"api_style": "openai", "base_url": "https://b.example.com", "model": "m2", "api_key": "k2", "supports_tool_calls": true},
+                {"api_style": "openai", "base_url": "https://c.example.com", "model": "m3", "api_key": "k3"}
+            ]"#,
+        );
+        assert_eq!(list[0].supports_tool_calls, Some(false));
+        assert_eq!(list[1].supports_tool_calls, Some(true));
+        // 老条目没有该字段：能力未知，保持放行（不退化既有行为）。
+        assert_eq!(list[2].supports_tool_calls, None);
     }
 
     #[test]

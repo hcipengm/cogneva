@@ -118,6 +118,7 @@ fn parse_issue(v: &serde_json::Value) -> PlatformIssue {
         state: v["state"].as_str().unwrap_or_default().to_string(),
         labels,
         author: v["user"]["login"].as_str().unwrap_or_default().to_string(),
+        url: v["html_url"].as_str().unwrap_or_default().to_string(),
         created_at: parse_time(&v["created_at"]),
         updated_at: parse_time(&v["updated_at"]),
     }

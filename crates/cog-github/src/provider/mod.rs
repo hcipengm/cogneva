@@ -157,6 +157,8 @@ pub struct PlatformIssue {
     pub labels: Vec<String>,
     /// Author login/username.
     pub author: String,
+    /// Platform URL for the issue.
+    pub url: String,
     /// Creation timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Last update timestamp.

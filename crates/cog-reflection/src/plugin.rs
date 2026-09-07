@@ -562,6 +562,31 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // 自发现信号 watcher 不依赖沙盒边界门禁：它只读 orchestrator 任务
+        // 状态并提交内部意图，不碰 git 写操作。
+        let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
+        match (crate::SignalWatcherConfig::load(), orchestrator.clone()) {
+            (Ok(sw_config), Some(orch)) if sw_config.enabled => {
+                let shutdown = cog_core::ShutdownSignal::new();
+                if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                    let shutdown = shutdown.clone();
+                    let mut rx = broadcast_tx.0.subscribe();
+                    tokio::spawn(async move {
+                        let _ = rx.recv().await;
+                        shutdown.trigger();
+                    });
+                }
+                tokio::spawn(crate::run_signal_watcher_loop(orch, sw_config, shutdown));
+            }
+            (Ok(_), None) => {
+                info!("signal watcher: no orchestrator; self-discovery intents disabled");
+            }
+            (Ok(_), Some(_)) => {
+                info!("signal watcher disabled by config");
+            }
+            (Err(e), _) => return Err(e),
+        }
+
         if !self.porter_armed {
             return Ok(());
         }
@@ -577,7 +602,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
 
         // 无 orchestrator 也照常挂载：纯 cherry-pick 路径不依赖智能任务，
         // 只是冲突解决与语义吸收确认退化（porter 内部已按此降级）。
-        let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
         if orchestrator.is_none() {
             info!("baseline port: no orchestrator; conflict resolution and semantic absorption checks degraded");
         }

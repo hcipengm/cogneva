@@ -1,7 +1,7 @@
 //! GitHub discovery loop — the autonomous sensor loop from the design doc.
 //!
 //! Each round: scan issues → rebuild/refresh conversations → triage →
-//! either submit a `github_issue_fix` task to the orchestrator, post a
+//! either submit a `platform_issue_fix` task to the orchestrator, post a
 //! clarification question, escalate, or skip. Then poll tracked PRs and
 //! record outcomes into the reflection engine.
 
@@ -147,6 +147,7 @@ impl IntentContext<'_> {
             state: "open".to_string(),
             labels: self.labels.to_vec(),
             author: self.author.to_string(),
+            url: String::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -417,7 +418,7 @@ impl GitHubDiscoveryLoop {
     }
 
     /// 处理 CI 失败事件（webhook 驱动）：拉取失败 job 日志尾部并提交
-    /// `github_ci_fix` 修复任务。重复 run 或无法提交时返回 false。
+    /// `platform_ci_fix` 修复任务。重复 run 或无法提交时返回 false。
     pub async fn process_ci_failure(&mut self, event: CiFailureEvent) -> Result<bool> {
         if self.ci_submitted.contains(&event.run_id) {
             tracing::debug!(
@@ -430,7 +431,7 @@ impl GitHubDiscoveryLoop {
         let Some(ref orchestrator) = self.orchestrator else {
             tracing::warn!(
                 run_id = event.run_id,
-                "Orchestrator not available; cannot submit github_ci_fix task"
+                "Orchestrator not available; cannot submit platform_ci_fix task"
             );
             return Ok(false);
         };
@@ -494,8 +495,8 @@ impl GitHubDiscoveryLoop {
         );
 
         let task = Task::new(
-            format!("github-ci-run-{}", event.run_id),
-            TaskType::Custom("github_ci_fix".into()),
+            format!("{}-ci-run-{}", self.provider.platform_kind(), event.run_id),
+            TaskType::Custom("platform_ci_fix".into()),
             serde_json::json!({
                 "goal": goal,
                 "run_id": event.run_id,
@@ -523,7 +524,7 @@ impl GitHubDiscoveryLoop {
             run_id = event.run_id,
             workflow = %event.workflow_name,
             tasks = ?task_ids,
-            "Submitted github_ci_fix task to orchestrator"
+            "Submitted platform_ci_fix task to orchestrator"
         );
         self.ci_submitted.insert(event.run_id);
         Ok(true)
@@ -953,7 +954,7 @@ impl GitHubDiscoveryLoop {
         let Some(ref orchestrator) = self.orchestrator else {
             tracing::warn!(
                 issue = issue.number,
-                "Orchestrator not available; cannot submit github_issue_fix task"
+                "Orchestrator not available; cannot submit platform_issue_fix task"
             );
             return Ok(());
         };
@@ -974,20 +975,23 @@ impl GitHubDiscoveryLoop {
             .collect();
 
         let goal = format!(
-            "Fix GitHub issue #{}: {}\n\n{}",
-            issue.number, issue.title, issue.body
+            "Fix {} issue #{}: {}\n\n{}",
+            self.provider.platform_kind(),
+            issue.number,
+            issue.title,
+            issue.body
         );
 
         let task = Task::new(
-            format!("github-issue-{}", issue.number),
-            TaskType::Custom("github_issue_fix".into()),
+            format!("{}-issue-{}", self.provider.platform_kind(), issue.number),
+            TaskType::Custom("platform_issue_fix".into()),
             serde_json::json!({
                 "goal": goal,
                 "issue_number": issue.number,
                 "issue_title": issue.title,
                 "issue_body": issue.body,
                 "issue_labels": issue.labels,
-                "issue_url": format!("https://github.com/{}/issues/{}", self.config.repo, issue.number),
+                "issue_url": issue.url,
                 "conversation": history,
                 "evolution_mode": "generate_change",
             }),
@@ -1000,7 +1004,7 @@ impl GitHubDiscoveryLoop {
         tracing::info!(
             issue = issue.number,
             tasks = ?task_ids,
-            "Submitted github_issue_fix task to orchestrator"
+            "Submitted platform_issue_fix task to orchestrator"
         );
         Ok(())
     }
@@ -1077,7 +1081,7 @@ impl GitHubDiscoveryLoop {
         );
 
         let task = Task::new(
-            format!("platform-pr-{}", pr.number),
+            format!("{}-pr-{}", self.provider.platform_kind(), pr.number),
             TaskType::Custom("platform_pr_intent".into()),
             serde_json::json!({
                 "goal": goal,
@@ -1602,6 +1606,7 @@ mod tests {
             state: "open".into(),
             labels: vec![],
             author: "alice".into(),
+            url: String::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1639,15 +1644,15 @@ mod tests {
         let scanned = loop_.run_once().await.unwrap();
         assert_eq!(scanned, 1);
         // With an orchestrator the loop first submits the multimodal assess
-        // task; a `fix` verdict then submits the real github_issue_fix task.
+        // task; a `fix` verdict then submits the real platform_issue_fix task.
         let types = orchestrator.task_types.lock().unwrap();
         assert!(
             types.iter().any(|t| t == "platform_intent_assess"),
             "assess task should be submitted before acting; got {types:?}"
         );
         assert!(
-            types.iter().any(|t| t == "github_issue_fix"),
-            "a fix verdict should submit the github_issue_fix task; got {types:?}"
+            types.iter().any(|t| t == "platform_issue_fix"),
+            "a fix verdict should submit the platform_issue_fix task; got {types:?}"
         );
     }
 
@@ -1692,7 +1697,7 @@ mod tests {
         let types = orchestrator.task_types.lock().unwrap();
         assert!(types.iter().any(|t| t == "platform_intent_assess"));
         assert!(
-            !types.iter().any(|t| t == "github_issue_fix"),
+            !types.iter().any(|t| t == "platform_issue_fix"),
             "a clarify verdict must not submit a fix task; got {types:?}"
         );
     }
@@ -1726,7 +1731,7 @@ mod tests {
         let types = orchestrator.task_types.lock().unwrap();
         assert!(types.iter().any(|t| t == "platform_intent_assess"));
         assert!(
-            types.iter().any(|t| t == "github_issue_fix"),
+            types.iter().any(|t| t == "platform_issue_fix"),
             "heuristic fallback should still submit a fix for a clear issue; got {types:?}"
         );
     }

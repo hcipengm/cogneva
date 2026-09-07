@@ -698,7 +698,7 @@ impl CollaborationExecutor {
     fn is_self_evolution_task(task: &Task) -> bool {
         // Explicit self-evolution task type, or any task that opts into the
         // change-generation flow via the evolution_mode marker in its input
-        // (e.g. github_ci_fix / github_issue_fix from the GitHub integration).
+        // (e.g. platform_ci_fix / platform_issue_fix from the GitHub integration).
         matches!(
             &task.task_type,
             TaskType::Custom(s) if s == "self_evolution"
@@ -903,7 +903,7 @@ mod tests {
     fn evolution_mode_marker_routes_to_change_flow() {
         let task = Task::new(
             "t2",
-            TaskType::Custom("github_ci_fix".into()),
+            TaskType::Custom("platform_ci_fix".into()),
             serde_json::json!({"evolution_mode": "generate_change"}),
         );
         assert!(CollaborationExecutor::is_self_evolution_task(&task));
@@ -913,7 +913,7 @@ mod tests {
     fn plain_task_is_not_self_evolution() {
         let task = Task::new(
             "t3",
-            TaskType::Custom("github_ci_fix".into()),
+            TaskType::Custom("platform_ci_fix".into()),
             serde_json::json!({}),
         );
         assert!(!CollaborationExecutor::is_self_evolution_task(&task));

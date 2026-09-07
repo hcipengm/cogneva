@@ -107,6 +107,7 @@ mod tests {
             state: state.into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
             author: "someone".into(),
+            url: String::new(),
             created_at: updated_at,
             updated_at,
         }

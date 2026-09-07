@@ -174,6 +174,7 @@ mod tests {
             state: "open".into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
             author: "user".into(),
+            url: String::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

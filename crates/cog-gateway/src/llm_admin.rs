@@ -256,12 +256,85 @@ async fn resolve_upstream(
         }
     };
 
-    Ok(json!({
+    // function-calling 准入探测（仅 openai 协议面）：chat 能通不代表能干
+    // 工具活——有的上游把工具调用写成文本而非原生 tool_calls 字段，进化/
+    // 工具类负载在这种上游上空转烧钱。探测结果存进池条目，透传层据此
+    // 把携带 tools 的请求路由离开证实不支持的上游。探测失败（网络抖动
+    // 等）不写字段，保持未知放行。skip_verify 时跳过探测。
+    let mut entry = json!({
         "api_style": api_style,
         "base_url": base_url,
         "model": model,
         "api_key": api_key,
-    }))
+    });
+    if api_style == "openai" && !skip_verify {
+        match detect_tool_call_support(base_url, model, api_key).await {
+            Some(supported) => {
+                entry["supports_tool_calls"] = json!(supported);
+            }
+            None => {
+                tracing::warn!(
+                    base_url = %base_url,
+                    model = %model,
+                    "tool-calls capability probe inconclusive; capability left unknown"
+                );
+            }
+        }
+    }
+
+    Ok(entry)
+}
+
+/// function-calling 实证探测：发一个带 tools 的最小 chat 请求，强制模型
+/// 调工具；响应的 `message.tool_calls` 非空才算支持原生协议。返回 None
+/// 表示探测本身失败（网络/非 2xx），能力未知。文本协议变体（工具调用
+/// 写在 content 里）判定为不支持——那正是要挡在工具类负载门外的形态。
+async fn detect_tool_call_support(base_url: &str, model: &str, api_key: &str) -> Option<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+    let resp = client
+        .post(format!(
+            "{}/chat/completions",
+            base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": model,
+            "max_tokens": 128,
+            "messages": [{
+                "role": "user",
+                "content": "What is the weather in Paris right now? You must use the get_weather tool to answer."
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string", "description": "City name"}
+                        },
+                        "required": ["city"]
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        }))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let has_native_tool_calls = body
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|t| t.as_array())
+        .is_some_and(|t| !t.is_empty());
+    Some(has_native_tool_calls)
 }
 
 /// 保存前用用户手填的真 key 做实证协议探测（每种协议超时 8 秒）：

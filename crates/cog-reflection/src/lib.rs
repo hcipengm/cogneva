@@ -51,6 +51,7 @@ pub mod promotion_trend;
 pub mod recorder;
 pub mod reviewer;
 pub mod sandbox;
+pub mod signal_watcher;
 pub mod squad;
 pub mod types;
 
@@ -91,6 +92,7 @@ pub use promotion_trend::PromotionTrendReporter;
 pub use recorder::{InMemoryRecorder, LearningRecorder, MemoryBackendRecorder};
 pub use reviewer::PeriodicReviewer;
 pub use sandbox::{enforce_sandbox_boundary, BoundaryDecision, SandboxKind, SandboxSignals};
+pub use signal_watcher::{run_signal_watcher_loop, SignalWatcherConfig};
 pub use squad::DefaultSquadReflection;
 pub use types::*;
 
