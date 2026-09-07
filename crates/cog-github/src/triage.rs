@@ -18,7 +18,7 @@ use crate::config::GitHubIntegrationConfig;
 use crate::provider::PlatformIssue;
 
 /// Decision produced by [`IssueTriage`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TriageDecision {
     /// Not worth fixing or not enough information.
     Skip {

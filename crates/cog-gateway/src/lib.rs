@@ -378,6 +378,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/tasks/check-timeouts",
             post(tasks::check_timeouts_handler),
         )
+        .route("/api/v1/tasks/purge", post(tasks::purge_tasks_handler))
         .route("/api/v1/agents/register", post(agents::register_handler))
         .route(
             "/api/v1/agents/{id}",

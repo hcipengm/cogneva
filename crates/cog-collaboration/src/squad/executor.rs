@@ -617,13 +617,14 @@ impl SquadExecutor {
         let reflection = run_squad_reflection(squad_reflection, &verdict, &squad).await;
 
         let is_pipeline = matches!(squad.config.pge_mode, PgeMode::Pipeline);
-        // Deterministic environment/protocol failures cannot be fixed by a
-        // strategy upgrade — Roundtable would burn the same tokens to the
-        // same empty result.
+        // Deterministic environment/protocol failures and stall-detected
+        // degenerate loops cannot be fixed by a strategy upgrade — Roundtable
+        // would burn the same tokens to the same empty/flat result.
         let is_terminal = matches!(
             &verdict,
             RalphVerdict::Unrecoverable { reason, .. }
                 if reason.starts_with(crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX)
+                    || reason.starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX)
         );
         let can_upgrade = squad.config.max_retries > 0 && !is_terminal;
         let should_upgrade = can_upgrade

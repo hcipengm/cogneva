@@ -3,6 +3,7 @@
 pub mod context_board;
 pub mod pipeline;
 pub mod roundtable;
+pub mod stall;
 pub mod types;
 
 pub use context_board::{ContextBoard, InMemoryContextBoard, RedisContextBoard};
@@ -11,6 +12,7 @@ pub use roundtable::{
     parse_evaluation_result, parse_generator_output, parse_planner_output, PgeRoundtable,
     PgeRoundtableConfig, PgeRoundtableResult,
 };
+pub use stall::{ProgressSignals, StallDetector, StallVerdict, DEGENERATE_LOOP_PREFIX};
 pub use types::{
     Artifact, Criterion, EvaluationResult, GeneratorOutput, PgeRoundtableIteration, PlannerOutput,
     TaskSpec, Verdict,

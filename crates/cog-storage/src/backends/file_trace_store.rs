@@ -28,6 +28,37 @@ fn tier_subdir(tier: cog_core::StorageTier) -> &'static str {
     }
 }
 
+/// Filesystem-safe file stem for a trace id. Trace ids embed free-form agent
+/// ids that can be arbitrarily long or contain path separators; used directly
+/// as a file name they break writes (ENAMETOOLONG) or escape the tier
+/// directory. Short, safe ids pass through unchanged so existing files stay
+/// loadable; anything else becomes `prefix-<hash>`, keeping distinct long ids
+/// collision-free even when they share the retained prefix.
+fn file_stem(trace_id: &str) -> String {
+    const MAX_SAFE_LEN: usize = 180;
+    let is_safe = !trace_id.is_empty()
+        && trace_id.len() <= MAX_SAFE_LEN
+        && !trace_id.starts_with('.')
+        && trace_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if is_safe {
+        return trace_id.to_string();
+    }
+    let hash = blake3::hash(trace_id.as_bytes()).to_hex();
+    let prefix: String = trace_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(80)
+        .collect();
+    let prefix = prefix.trim_start_matches('.');
+    if prefix.is_empty() {
+        format!("trace-{}", &hash[..16])
+    } else {
+        format!("{}-{}", prefix, &hash[..16])
+    }
+}
+
 /// File-based trace store with tiered storage and compression support.
 pub struct FileTraceStore {
     base_dir: std::path::PathBuf,
@@ -48,17 +79,19 @@ impl FileTraceStore {
     /// Get the trace data file path for a given tier.
     fn trace_path(&self, tier: cog_core::StorageTier, trace_id: &str) -> std::path::PathBuf {
         let dir = self.tier_dir(tier);
+        let stem = file_stem(trace_id);
         match tier {
-            cog_core::StorageTier::Hot => dir.join(format!("{}.trace", trace_id)),
+            cog_core::StorageTier::Hot => dir.join(format!("{}.trace", stem)),
             cog_core::StorageTier::Warm | cog_core::StorageTier::Cold => {
-                dir.join(format!("{}.trace.zst", trace_id))
+                dir.join(format!("{}.trace.zst", stem))
             }
         }
     }
 
     /// Get the metadata file path for a given tier.
     fn meta_path(&self, tier: cog_core::StorageTier, trace_id: &str) -> std::path::PathBuf {
-        self.tier_dir(tier).join(format!("{}.meta.json", trace_id))
+        self.tier_dir(tier)
+            .join(format!("{}.meta.json", file_stem(trace_id)))
     }
 
     /// Search all tiers for a trace and return which tier contains it.
@@ -272,5 +305,63 @@ impl TraceStore for FileTraceStore {
         metas.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         metas.truncate(limit);
         Ok(metas)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_trace(trace_id: &str) -> AgentTrace {
+        AgentTrace {
+            trace_id: trace_id.to_string(),
+            session_id: None,
+            task_id: "t".into(),
+            agent_id: "a".into(),
+            created_at: chrono::Utc::now(),
+            event_count: 0,
+            byte_size: 0,
+            version: "test".into(),
+            tier: cog_core::StorageTier::Hot,
+            compression: 0,
+            checksum: String::new(),
+            events: Vec::new(),
+            llm_requests: Vec::new(),
+            llm_responses: Vec::new(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn short_safe_ids_pass_through_unchanged() {
+        assert_eq!(file_stem("agent-7f3c-abc123"), "agent-7f3c-abc123");
+    }
+
+    #[test]
+    fn long_ids_are_truncated_with_distinguishing_hash() {
+        let a = format!("{}-alpha", "x".repeat(300));
+        let b = format!("{}-bravo", "x".repeat(300));
+        let sa = file_stem(&a);
+        let sb = file_stem(&b);
+        assert!(sa.len() <= 100, "stem must fit NAME_MAX: {}", sa.len());
+        assert_ne!(sa, sb, "shared 80-char prefix must not collide");
+    }
+
+    #[test]
+    fn unsafe_characters_are_replaced_not_trusted() {
+        let stem = file_stem("../escape/attempt");
+        assert!(!stem.contains('/'));
+        assert!(!stem.starts_with('.'));
+    }
+
+    #[tokio::test]
+    async fn long_trace_id_roundtrips_through_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("fts-{}", uuid::Uuid::new_v4()));
+        let store = FileTraceStore::new(&dir);
+        let long_id = format!("agent-{}-{}", "x".repeat(300), uuid::Uuid::new_v4());
+        store.save(&test_trace(&long_id)).await.unwrap();
+        let loaded = store.load(&long_id).await.unwrap();
+        assert_eq!(loaded.unwrap().trace_id, long_id);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

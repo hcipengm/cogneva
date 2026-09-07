@@ -44,6 +44,11 @@ pub struct PgeRoundtableConfig {
     /// Optional merger agent used when [`branch_merge_strategy`] is
     /// [`BranchMergeStrategy::Custom`].
     pub merger: Option<MergerActor>,
+    /// Consecutive non-progress iterations that declare the debate a
+    /// degenerate loop (score/artifacts/error-class all flat) and stop it
+    /// early. The criterion is whether spend buys progress, never a flat
+    /// spend cap. 0 disables stall detection.
+    pub stall_threshold: u32,
 }
 
 impl std::fmt::Debug for PgeRoundtableConfig {
@@ -79,6 +84,7 @@ impl Default for PgeRoundtableConfig {
             agent_manager: None,
             llm_provider: None,
             merger: None,
+            stall_threshold: 2,
         }
     }
 }
@@ -172,6 +178,7 @@ impl PgeRoundtable {
     ) -> PgeRoundtableResult {
         let mut history: Vec<PgeRoundtableIteration> = Vec::new();
         let mut consensus_reached = false;
+        let mut stall = crate::squad::pge::stall::StallDetector::new(self.config.stall_threshold);
 
         let mut final_evaluation: Option<EvaluationResult> = None;
         let mut prev_verdict: Option<Verdict> = None;
@@ -262,6 +269,34 @@ impl PgeRoundtable {
                     iteration,
                     "Roundtable generation reported terminal environment failure; stopping debate"
                 );
+                break;
+            }
+
+            // Degenerate-loop guard: consecutive iterations buying no progress
+            // (score/artifacts/error-class flat) mean more rounds only rephrase
+            // the same failure. Mark the run and stop before spending more.
+            if !matches!(evaluation.verdict, Verdict::Pass)
+                && matches!(
+                    stall.observe(crate::squad::pge::stall::ProgressSignals::from_attempt(
+                        &generation,
+                        &evaluation,
+                    ),),
+                    crate::squad::pge::stall::StallVerdict::Stalled
+                )
+            {
+                tracing::warn!(
+                    iteration,
+                    "degenerate debate loop detected; stopping roundtable early"
+                );
+                if let Some(last) = history.last_mut() {
+                    last.evaluation.feedback = format!(
+                        "{}: {} consecutive iterations bought no progress \
+                         (score/artifacts/error-class flat); stopped early: {}",
+                        crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX,
+                        self.config.stall_threshold,
+                        last.evaluation.feedback
+                    );
+                }
                 break;
             }
 

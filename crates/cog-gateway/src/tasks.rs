@@ -408,6 +408,116 @@ pub async fn retry_task_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── Bulk backlog purge ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PurgeTasksRequest {
+    /// Eligible statuses; default `["pending", "scheduled"]`. Terminal
+    /// states are only touched when explicitly listed.
+    pub statuses: Option<Vec<String>>,
+    /// Optional task-type prefix filter, e.g. `"platform_issue_fix"` or
+    /// `"intent-assess"` (task ids embed the same words, so a prefix on
+    /// either the type or the id matches).
+    pub task_type_prefix: Option<String>,
+    /// Only tasks last updated more than this many seconds ago.
+    pub older_than_secs: Option<i64>,
+    /// Default true: report what would be cancelled without touching
+    /// anything. Pass false to actually cancel.
+    pub dry_run: Option<bool>,
+}
+
+fn parse_task_status(s: &str) -> Result<cog_core::TaskStatus, ApiError> {
+    match s.to_ascii_lowercase().as_str() {
+        "pending" => Ok(cog_core::TaskStatus::Pending),
+        "scheduled" => Ok(cog_core::TaskStatus::Scheduled),
+        "running" => Ok(cog_core::TaskStatus::Running),
+        "completed" => Ok(cog_core::TaskStatus::Completed),
+        "failed" => Ok(cog_core::TaskStatus::Failed),
+        "cancelled" => Ok(cog_core::TaskStatus::Cancelled),
+        other => Err(ApiError::bad_request(format!("unknown status: {other}"))),
+    }
+}
+
+/// Pure eligibility predicate for the purge: status set, optional type/id
+/// prefix, optional age cutoff. Extracted so the matching semantics are
+/// testable without a running orchestrator.
+fn purge_matches(
+    task: &Task,
+    statuses: &[cog_core::TaskStatus],
+    task_type_prefix: Option<&str>,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    statuses.contains(&task.status)
+        && task_type_prefix.is_none_or(|prefix| {
+            task_type_str(&task.task_type).starts_with(prefix) || task.id.starts_with(prefix)
+        })
+        && cutoff.is_none_or(|c| task.updated_at < c)
+}
+
+/// POST /api/v1/tasks/purge — interactive backlog cleanup. Backlog piles up
+/// silently (a stalled pipeline can queue thousands of stale intents); this
+/// endpoint is the operator's broom. Dry-run by default so an operator can
+/// inspect the match set before cancelling; the response is the audit
+/// record (what matched, what was cancelled, what resisted).
+pub async fn purge_tasks_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<PurgeTasksRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let dry_run = req.dry_run.unwrap_or(true);
+    let statuses = match &req.statuses {
+        Some(list) => list
+            .iter()
+            .map(|s| parse_task_status(s))
+            .collect::<Result<Vec<_>, _>>()?,
+        None => vec![
+            cog_core::TaskStatus::Pending,
+            cog_core::TaskStatus::Scheduled,
+        ],
+    };
+    let cutoff = req
+        .older_than_secs
+        .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s));
+
+    let matched: Vec<Task> = state
+        .orchestrator
+        .get_all_tasks()
+        .await
+        .into_iter()
+        .filter(|t| purge_matches(t, &statuses, req.task_type_prefix.as_deref(), cutoff))
+        .collect();
+
+    let mut cancelled: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    if !dry_run {
+        for task in &matched {
+            match state.orchestrator.cancel_task(&task.id).await {
+                Ok(_) => {
+                    broadcast_task_status(&state, &task.id, "Cancelled", None);
+                    cancelled.push(task.id.clone());
+                }
+                Err(_) => failed.push(task.id.clone()),
+            }
+        }
+        tracing::warn!(
+            matched = matched.len(),
+            cancelled = cancelled.len(),
+            resisted = failed.len(),
+            statuses = ?statuses,
+            task_type_prefix = req.task_type_prefix,
+            older_than_secs = req.older_than_secs,
+            "task backlog purge executed"
+        );
+    }
+
+    Ok(Json(serde_json::json!({
+        "dry_run": dry_run,
+        "matched": matched.len(),
+        "matched_ids": matched.iter().take(100).map(|t| t.id.clone()).collect::<Vec<_>>(),
+        "cancelled": cancelled.len(),
+        "resisted": failed,
+    })))
+}
+
 pub async fn task_summary_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<TaskSummary>, ApiError> {
@@ -535,4 +645,92 @@ pub async fn batch_complete_handler(
         }
     }
     Ok(Json(scheduled))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str, status: cog_core::TaskStatus, task_type: &str, age_secs: i64) -> Task {
+        let mut t = Task::new(
+            id.to_string(),
+            parse_task_type(task_type),
+            serde_json::json!({}),
+        );
+        t.status = status;
+        t.updated_at = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        t
+    }
+
+    #[test]
+    fn purge_matches_default_backlog_only() {
+        let backlog = cog_core::TaskStatus::Pending;
+        let running = cog_core::TaskStatus::Running;
+        let statuses = vec![
+            cog_core::TaskStatus::Pending,
+            cog_core::TaskStatus::Scheduled,
+        ];
+        let pending = task("a", backlog, "platform_issue_fix", 10);
+        let active = task("b", running, "platform_issue_fix", 10);
+        assert!(purge_matches(&pending, &statuses, None, None));
+        assert!(
+            !purge_matches(&active, &statuses, None, None),
+            "running tasks are never touched by the default backlog purge"
+        );
+    }
+
+    #[test]
+    fn purge_matches_prefix_on_type_or_id() {
+        let statuses = vec![cog_core::TaskStatus::Pending];
+        let by_type = task(
+            "x-1",
+            cog_core::TaskStatus::Pending,
+            "platform_issue_fix",
+            0,
+        );
+        let by_id = task(
+            "intent-assess-gitee-issue-7-abc",
+            cog_core::TaskStatus::Pending,
+            "custom_thing",
+            0,
+        );
+        let other = task("x-2", cog_core::TaskStatus::Pending, "self_audit", 0);
+        assert!(purge_matches(
+            &by_type,
+            &statuses,
+            Some("platform_issue"),
+            None
+        ));
+        assert!(purge_matches(
+            &by_id,
+            &statuses,
+            Some("intent-assess"),
+            None
+        ));
+        assert!(!purge_matches(
+            &other,
+            &statuses,
+            Some("platform_issue"),
+            None
+        ));
+    }
+
+    #[test]
+    fn purge_matches_age_cutoff() {
+        let statuses = vec![cog_core::TaskStatus::Pending];
+        let old = task("old", cog_core::TaskStatus::Pending, "t", 7200);
+        let fresh = task("fresh", cog_core::TaskStatus::Pending, "t", 60);
+        let cutoff = Some(chrono::Utc::now() - chrono::Duration::seconds(3600));
+        assert!(purge_matches(&old, &statuses, None, cutoff));
+        assert!(
+            !purge_matches(&fresh, &statuses, None, cutoff),
+            "fresh tasks survive an age-cutoff purge"
+        );
+    }
+
+    #[test]
+    fn parse_task_status_rejects_unknown() {
+        assert!(parse_task_status("pending").is_ok());
+        assert!(parse_task_status("nonsense").is_err());
+    }
 }

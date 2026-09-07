@@ -33,6 +33,11 @@ pub struct PgePipelineConfig {
     /// When the evaluator fails, the feedback is sent back to the generator
     /// while the plan remains unchanged. 0 disables local repair.
     pub local_repair_max: u32,
+    /// Consecutive non-progress attempts that declare the run a degenerate
+    /// loop (score/artifacts/error-class all flat) and stop it early. The
+    /// criterion is whether spend buys progress, never a flat spend cap.
+    /// 0 disables stall detection.
+    pub stall_threshold: u32,
 }
 
 impl Default for PgePipelineConfig {
@@ -41,6 +46,7 @@ impl Default for PgePipelineConfig {
             max_retries: 3,
             timeout_ms: 30_000,
             local_repair_max: 0,
+            stall_threshold: 2,
         }
     }
 }
@@ -141,6 +147,7 @@ impl PgePipeline {
         let mut last_evaluation: Option<EvaluationResult> = None;
         let mut last_generation: Option<GeneratorOutput> = None;
         let max_attempts = self.config.max_retries.max(1);
+        let mut stall = crate::squad::pge::stall::StallDetector::new(self.config.stall_threshold);
 
         for attempt in 1..=max_attempts {
             // Stage 1: Planner.
@@ -218,6 +225,8 @@ impl PgePipeline {
                 .await;
 
             let mut local_repairs: Vec<LocalRepairAttempt> = Vec::new();
+            let mut repair_stall =
+                crate::squad::pge::stall::StallDetector::new(self.config.stall_threshold);
 
             // Local repair loop: feed evaluator feedback back to generator.
             for repair_iteration in 1..=self.config.local_repair_max {
@@ -272,9 +281,64 @@ impl PgePipeline {
                     evaluation: evaluation.clone(),
                     feedback: repair_feedback,
                 });
+
+                // Repair-level stall guard: repairs that buy no progress stop
+                // early instead of burning the full local_repair_max budget.
+                if !matches!(evaluation.verdict, Verdict::Pass)
+                    && matches!(
+                        repair_stall.observe(
+                            crate::squad::pge::stall::ProgressSignals::from_attempt(
+                                &generation,
+                                &evaluation,
+                            ),
+                        ),
+                        crate::squad::pge::stall::StallVerdict::Stalled
+                    )
+                {
+                    tracing::warn!(
+                        attempt,
+                        repair_iteration,
+                        "degenerate repair loop detected; stopping local repairs early"
+                    );
+                    break;
+                }
             }
 
             let passed = matches!(evaluation.verdict, Verdict::Pass);
+
+            // Attempt-level stall guard: when consecutive full attempts buy no
+            // progress, mark the run degenerate and stop before spending more.
+            // The prefixed feedback lets outer loops classify the failure as
+            // non-retryable and route it to reflection as learning material.
+            if !passed {
+                let signals = crate::squad::pge::stall::ProgressSignals::from_attempt(
+                    &generation,
+                    &evaluation,
+                );
+                if matches!(
+                    stall.observe(signals),
+                    crate::squad::pge::stall::StallVerdict::Stalled
+                ) {
+                    let mut evaluation = evaluation;
+                    evaluation.feedback = format!(
+                        "{}: {} consecutive attempts bought no progress \
+                         (score/artifacts/error-class flat); stopped early: {}",
+                        crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX,
+                        self.config.stall_threshold,
+                        evaluation.feedback
+                    );
+                    tracing::warn!(attempt, "degenerate loop detected; stopping pipeline early");
+                    history.push(PgePipelineAttempt {
+                        attempt,
+                        plan,
+                        generation,
+                        evaluation,
+                        local_repairs,
+                    });
+                    break;
+                }
+            }
+
             history.push(PgePipelineAttempt {
                 attempt,
                 plan,
@@ -432,6 +496,7 @@ mod tests {
             max_retries: 1,
             timeout_ms: 5_000,
             local_repair_max: 0,
+            stall_threshold: 2,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
@@ -475,6 +540,7 @@ mod tests {
             max_retries: 2,
             timeout_ms: 5_000,
             local_repair_max: 0,
+            stall_threshold: 2,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -536,6 +602,7 @@ mod tests {
             max_retries: 0,
             timeout_ms: 5_000,
             local_repair_max: 0,
+            stall_threshold: 2,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -567,6 +634,7 @@ mod tests {
             max_retries: 3,
             timeout_ms: 5_000,
             local_repair_max: 0,
+            stall_threshold: 2,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -698,6 +766,7 @@ mod tests {
             max_retries: 1,
             timeout_ms: 5_000,
             local_repair_max: 2,
+            stall_threshold: 2,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
@@ -748,6 +817,7 @@ mod tests {
             max_retries: 2,
             timeout_ms: 5_000,
             local_repair_max: 1,
+            stall_threshold: 2,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -781,5 +851,95 @@ mod tests {
             1,
             "first attempt uses local_repair_max"
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_stops_degenerate_loop_early() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 5,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+        });
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
+        }));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"content": "", "artifacts": []}),
+        }));
+        // Evaluator fails identically every attempt: flat score, flat error
+        // class, no artifacts — the definition of a degenerate loop.
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"verdict": "fail", "score": 30, "feedback": "bad", "criteria": []}),
+        }));
+
+        let task = test_task("spinning");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        assert!(!result.passed);
+        assert_eq!(
+            result.attempts, 3,
+            "baseline + 2 flat attempts then stall stop, not 5 paid attempts"
+        );
+        assert!(
+            result
+                .final_evaluation
+                .feedback
+                .starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX),
+            "stall stop must be marked for outer loops: {}",
+            result.final_evaluation.feedback
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_progressing_attempts_are_not_stalled() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 4,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+        });
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
+        }));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"content": "", "artifacts": []}),
+        }));
+        // Score improves every attempt: spend is buying progress, so the
+        // pipeline must run to the retry ceiling even though it never passes.
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
+            responses: std::sync::Mutex::new(vec![
+                serde_json::json!({"verdict": "fail", "score": 30, "feedback": "bad", "criteria": []}),
+                serde_json::json!({"verdict": "fail", "score": 45, "feedback": "bad", "criteria": []}),
+                serde_json::json!({"verdict": "fail", "score": 60, "feedback": "bad", "criteria": []}),
+                serde_json::json!({"verdict": "fail", "score": 75, "feedback": "bad", "criteria": []}),
+            ]),
+        }));
+
+        let task = test_task("slow but progressing");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        assert!(!result.passed);
+        assert_eq!(result.attempts, 4, "progressing run must not stall-stop");
+        assert!(!result
+            .final_evaluation
+            .feedback
+            .starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX));
     }
 }

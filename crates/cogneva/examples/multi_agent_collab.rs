@@ -37,6 +37,7 @@ async fn main() -> cog_core::SFResult<()> {
         max_retries: 2,
         timeout_ms: 10_000,
         local_repair_max: 1,
+        stall_threshold: 2,
     });
     let result = pipeline
         .execute_task(

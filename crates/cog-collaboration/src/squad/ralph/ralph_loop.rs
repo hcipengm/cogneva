@@ -328,6 +328,15 @@ impl RalphLoop {
         evaluation: &EvaluationResult,
         history: &[RalphIteration],
     ) -> FailureAnalysis {
+        // Stall detection already determined this run is a degenerate loop:
+        // classified, non-retryable, no semantic analysis needed.
+        if evaluation
+            .feedback
+            .starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX)
+        {
+            return FailureAnalysis::Unrecoverable(evaluation.feedback.clone());
+        }
+
         // 检测重复相同失败（循环卡住）—— 纯控制流，无需语义理解
         let recent_same_feedback = history
             .iter()
@@ -672,6 +681,7 @@ mod tests {
             max_retries: 1,
             timeout_ms: 5_000,
             local_repair_max: 0,
+            stall_threshold: 2,
         });
         let planner = PlannerActor::new(Arc::new(pass_planner()));
         let generator = GeneratorActor::new(Arc::new(pass_generator()));

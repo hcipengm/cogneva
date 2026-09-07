@@ -79,6 +79,9 @@ pub struct GitHubDiscoveryLoop {
     /// Whether the persisted intent guards were already merged into the
     /// in-memory sets (first round only).
     guards_loaded: bool,
+    /// Restart-proof assess verdicts; see [`AssessVerdicts`]. Mutex because
+    /// the judge path runs under `&self`.
+    verdicts: tokio::sync::Mutex<AssessVerdicts>,
 }
 
 /// Persisted intent guards (`$COGNEVA_DATA_DIR/discovery-guards.json`):
@@ -98,6 +101,129 @@ struct DiscoveryGuardState {
 fn discovery_guard_state_path() -> std::path::PathBuf {
     let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
     std::path::PathBuf::from(dir).join("discovery-guards.json")
+}
+
+/// Persisted assess verdicts (`$COGNEVA_DATA_DIR/assess-verdicts.json`):
+/// deterministic assess task id → verdict + judgement time. The
+/// orchestrator's idempotent skip dedupes only while the task row lives in
+/// the DAG; this file keeps the "already judged" fact across pod restarts
+/// and DAG pruning so unchanged intents never re-pay an LLM judgement.
+/// Polling, webhook, and restart paths all share this one store.
+#[derive(Debug)]
+struct AssessVerdicts {
+    loaded: bool,
+    map: HashMap<String, StoredVerdict>,
+    path: std::path::PathBuf,
+}
+
+impl Default for AssessVerdicts {
+    fn default() -> Self {
+        Self {
+            loaded: false,
+            map: HashMap::new(),
+            path: default_verdicts_path(),
+        }
+    }
+}
+
+/// Production resolves the shared store from the data dir; unit tests get a
+/// unique temp file per loop instance instead — deterministic assess ids make
+/// a shared path leak verdicts across tests and across runs on this machine.
+#[cfg(not(test))]
+fn default_verdicts_path() -> std::path::PathBuf {
+    assess_verdicts_path()
+}
+
+#[cfg(test)]
+fn default_verdicts_path() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "assess-verdicts-test-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredVerdict {
+    decision: TriageDecision,
+    judged_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg_attr(test, allow(dead_code))] // test builds resolve per-instance temp paths instead
+fn assess_verdicts_path() -> std::path::PathBuf {
+    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
+    std::path::PathBuf::from(dir).join("assess-verdicts.json")
+}
+
+/// Identity prefix of an assess verdict key: `intent-assess-{platform}-
+/// {kind}-{number}-`, i.e. the key without its trailing 16-hex content hash.
+/// Keys outside this shape return None and are left untouched by both
+/// supersede eviction and closed-intent reaping.
+fn intent_verdict_prefix(task_id: &str) -> Option<String> {
+    let (head, hash) = task_id.rsplit_once('-')?;
+    if head.starts_with("intent-assess-")
+        && hash.len() == 16
+        && hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        Some(format!("{head}-"))
+    } else {
+        None
+    }
+}
+
+impl AssessVerdicts {
+    async fn ensure_loaded(&mut self) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+        let Ok(text) = tokio::fs::read_to_string(&self.path).await else {
+            return; // first boot — no verdicts yet
+        };
+        match serde_json::from_str::<HashMap<String, StoredVerdict>>(&text) {
+            Ok(map) => self.map = map,
+            Err(e) => tracing::warn!(error = %e, "assess verdicts file corrupt; starting fresh"),
+        }
+    }
+
+    async fn persist(&self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Ok(text) = serde_json::to_string(&self.map) {
+            let _ = tokio::fs::write(&self.path, text).await;
+        }
+    }
+
+    /// Insert a verdict, superseding older verdicts of the same intent (same
+    /// identity prefix, different content hash) — only the latest content
+    /// state of an intent matters, so each intent holds at most one entry.
+    fn upsert(&mut self, task_id: String, decision: TriageDecision) {
+        if let Some(prefix) = intent_verdict_prefix(&task_id) {
+            self.map
+                .retain(|k, _| k == &task_id || !k.starts_with(&prefix));
+        }
+        self.map.insert(
+            task_id,
+            StoredVerdict {
+                decision,
+                judged_at: chrono::Utc::now(),
+            },
+        );
+    }
+
+    /// Drop verdicts whose intent identity prefix is not in `open`. Keys
+    /// outside the assess id shape are not ours to reap. Returns how many
+    /// entries were dropped.
+    fn reap_closed(&mut self, open: &std::collections::HashSet<String>) -> usize {
+        let before = self.map.len();
+        self.map.retain(|k, _| match intent_verdict_prefix(k) {
+            Some(prefix) => open.contains(&prefix),
+            None => true,
+        });
+        before - self.map.len()
+    }
 }
 
 /// Which external-intent surface a conversation belongs to. Issues and PRs
@@ -181,6 +307,52 @@ impl GitHubDiscoveryLoop {
             cv_state: None,
             cv_inflight: HashMap::new(),
             guards_loaded: false,
+            verdicts: tokio::sync::Mutex::new(AssessVerdicts::default()),
+        }
+    }
+
+    /// Restart-proof verdict lookup: identical intent content (same
+    /// deterministic assess task id) reuses the stored judgement with zero
+    /// LLM spend, even after a pod restart or DAG pruning evicted the
+    /// original assess task.
+    async fn verdict_lookup(&self, task_id: &str) -> Option<TriageDecision> {
+        let mut verdicts = self.verdicts.lock().await;
+        verdicts.ensure_loaded().await;
+        let hit = verdicts.map.get(task_id).map(|v| v.decision.clone());
+        if hit.is_some() {
+            tracing::debug!(%task_id, "assess verdict reused from persistent store");
+        }
+        hit
+    }
+
+    /// Persist a fresh verdict. Best-effort: a write failure only means the
+    /// next restart may re-judge unchanged content once.
+    ///
+    /// No flat size cap: the store self-regulates. [`AssessVerdicts::upsert`]
+    /// bounds each intent to one entry, and [`Self::verdicts_reap_closed`]
+    /// drops verdicts of closed intents each poll round, so the store size
+    /// tracks the number of open intents.
+    async fn verdict_store(&self, task_id: String, decision: TriageDecision) {
+        let mut verdicts = self.verdicts.lock().await;
+        verdicts.ensure_loaded().await;
+        verdicts.upsert(task_id, decision);
+        verdicts.persist().await;
+    }
+
+    /// Drop verdicts whose intent is no longer open on the platform. Callers
+    /// must pass identity prefixes from a complete listing of both surfaces —
+    /// a partial view would drop verdicts of live intents.
+    async fn verdicts_reap_closed(&self, open_prefixes: &std::collections::HashSet<String>) {
+        let mut verdicts = self.verdicts.lock().await;
+        verdicts.ensure_loaded().await;
+        let dropped = verdicts.reap_closed(open_prefixes);
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                remaining = verdicts.map.len(),
+                "reaped assess verdicts of closed intents"
+            );
+            verdicts.persist().await;
         }
     }
 
@@ -273,6 +445,31 @@ impl GitHubDiscoveryLoop {
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to list open pull requests");
             }
+        }
+
+        // Reap verdicts of intents that have closed since their judgement, so
+        // the store size tracks live intents. The discovery scan above is
+        // watermark-filtered and cannot serve as the open set; both surfaces
+        // must list successfully or reaping is skipped this round — a partial
+        // view would drop verdicts of live intents.
+        match (
+            self.provider.list_open_issues().await,
+            self.provider.list_open_pull_requests().await,
+        ) {
+            (Ok(open_issues), Ok(open_prs)) => {
+                let platform = self.provider.platform_kind();
+                let open: std::collections::HashSet<String> = open_issues
+                    .iter()
+                    .map(|i| format!("intent-assess-{platform}-issue-{}-", i.number))
+                    .chain(
+                        open_prs
+                            .iter()
+                            .map(|p| format!("intent-assess-{platform}-pr-{}-", p.number)),
+                    )
+                    .collect();
+                self.verdicts_reap_closed(&open).await;
+            }
+            _ => tracing::debug!("skipping verdict reap: incomplete open-intent listing"),
         }
 
         // A2A 交叉验证：把公版上他人 bot PR 拉进本实例沙盒验证并回评。
@@ -747,6 +944,11 @@ impl GitHubDiscoveryLoop {
             number,
             &digest[..16]
         );
+        // Restart-proof reuse: identical content was already judged, the
+        // verdict survived in the persistent store — zero LLM spend.
+        if let Some(decision) = self.verdict_lookup(&task_id).await {
+            return Ok(decision);
+        }
         let goal = format!(
             "Assess actionability of {} #{}: {}",
             kind.as_str(),
@@ -790,7 +992,9 @@ impl GitHubDiscoveryLoop {
                 match t.status {
                     TaskStatus::Completed => {
                         let verdict = t.result.unwrap_or_default();
-                        return Ok(Self::verdict_to_decision(&verdict));
+                        let decision = Self::verdict_to_decision(&verdict);
+                        self.verdict_store(id.clone(), decision.clone()).await;
+                        return Ok(decision);
                     }
                     TaskStatus::Failed => {
                         return Err(crate::error::CogGitHubError::Provider(format!(
@@ -803,13 +1007,17 @@ impl GitHubDiscoveryLoop {
                         // same content would otherwise hit the cancelled task
                         // forever and fall back to the heuristic every round.
                         // Skip until the intent content changes (new hash).
+                        // Persisted like any verdict so the veto survives
+                        // restarts.
                         tracing::info!(
                             %id,
                             "assess task was cancelled; treating as skip until content changes"
                         );
-                        return Ok(TriageDecision::Skip {
+                        let decision = TriageDecision::Skip {
                             reason: "assess task cancelled".into(),
-                        });
+                        };
+                        self.verdict_store(id.clone(), decision.clone()).await;
+                        return Ok(decision);
                     }
                     _ => {}
                 }
@@ -2303,5 +2511,157 @@ mod tests {
         assert!(cv[0].1.contains("2 failures"));
 
         std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn assess_verdicts_roundtrip_through_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "verdicts-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("assess-verdicts.json");
+        let decision = TriageDecision::Fix {
+            priority: 2,
+            rationale: "clear bug report".into(),
+        };
+        {
+            let mut store = AssessVerdicts {
+                loaded: false,
+                map: HashMap::new(),
+                path: path.clone(),
+            };
+            store.ensure_loaded().await;
+            store.map.insert(
+                "intent-assess-github-issue-7-abc".to_string(),
+                StoredVerdict {
+                    decision: decision.clone(),
+                    judged_at: Utc::now(),
+                },
+            );
+            store.persist().await;
+        }
+        // "Restart": a fresh store over the same file must serve the verdict.
+        let mut reopened = AssessVerdicts {
+            loaded: false,
+            map: HashMap::new(),
+            path: path.clone(),
+        };
+        reopened.ensure_loaded().await;
+        assert_eq!(
+            reopened
+                .map
+                .get("intent-assess-github-issue-7-abc")
+                .map(|v| &v.decision),
+            Some(&decision)
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn assess_verdicts_corrupt_file_starts_fresh() {
+        let dir = std::env::temp_dir().join(format!(
+            "verdicts-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("assess-verdicts.json");
+        tokio::fs::write(&path, "{not json").await.unwrap();
+        let mut store = AssessVerdicts {
+            loaded: false,
+            map: HashMap::new(),
+            path: path.clone(),
+        };
+        store.ensure_loaded().await;
+        assert!(store.map.is_empty());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn verdict_prefix_parses_assess_id_shape() {
+        assert_eq!(
+            intent_verdict_prefix("intent-assess-github-issue-7-0123456789abcdef"),
+            Some("intent-assess-github-issue-7-".to_string())
+        );
+        assert_eq!(
+            intent_verdict_prefix("intent-assess-gitee-pr-42-deadbeefcafe1234"),
+            Some("intent-assess-gitee-pr-42-".to_string())
+        );
+        // Outside the assess id shape: untouched by supersede and reaping.
+        assert_eq!(intent_verdict_prefix("some-other-task-7"), None);
+        assert_eq!(
+            intent_verdict_prefix("intent-assess-github-issue-7-short"),
+            None
+        );
+        assert_eq!(intent_verdict_prefix("no-dash"), None);
+    }
+
+    #[test]
+    fn supersede_eviction_keeps_latest_content_state_per_intent() {
+        let mut store = AssessVerdicts::default();
+        let fix = || TriageDecision::Fix {
+            priority: 1,
+            rationale: "r".into(),
+        };
+        store.upsert(
+            "intent-assess-github-issue-7-aaaaaaaaaaaaaaaa".into(),
+            fix(),
+        );
+        store.upsert(
+            "intent-assess-github-issue-8-bbbbbbbbbbbbbbbb".into(),
+            fix(),
+        );
+        // Issue 7 content changed: the new hash supersedes the old entry.
+        store.upsert(
+            "intent-assess-github-issue-7-cccccccccccccccc".into(),
+            fix(),
+        );
+        assert_eq!(store.map.len(), 2);
+        assert!(!store
+            .map
+            .contains_key("intent-assess-github-issue-7-aaaaaaaaaaaaaaaa"));
+        assert!(store
+            .map
+            .contains_key("intent-assess-github-issue-7-cccccccccccccccc"));
+        assert!(store
+            .map
+            .contains_key("intent-assess-github-issue-8-bbbbbbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn reap_closed_drops_verdicts_of_closed_intents() {
+        let mut store = AssessVerdicts::default();
+        let skip = || TriageDecision::Skip { reason: "r".into() };
+        store.upsert(
+            "intent-assess-github-issue-7-aaaaaaaaaaaaaaaa".into(),
+            skip(),
+        );
+        store.upsert(
+            "intent-assess-github-issue-8-bbbbbbbbbbbbbbbb".into(),
+            skip(),
+        );
+        store.upsert("intent-assess-github-pr-3-cccccccccccccccc".into(), skip());
+        store.map.insert(
+            "unrelated-key".to_string(),
+            StoredVerdict {
+                decision: skip(),
+                judged_at: Utc::now(),
+            },
+        );
+        // Only issue 7 is still open.
+        let open: std::collections::HashSet<String> = ["intent-assess-github-issue-7-".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(store.reap_closed(&open), 2);
+        assert_eq!(store.map.len(), 2);
+        assert!(store
+            .map
+            .contains_key("intent-assess-github-issue-7-aaaaaaaaaaaaaaaa"));
+        assert!(store.map.contains_key("unrelated-key"));
     }
 }
