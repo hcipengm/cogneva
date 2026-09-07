@@ -15,6 +15,9 @@
 //!   (re-runs the Planner) up to [`PgePipelineConfig::max_retries`] times.
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
+use crate::squad::pge::stall::{
+    ProgressSignals, StallDetector, StallVerdict, DEGENERATE_LOOP_PREFIX,
+};
 use crate::squad::pge::types::{
     EvaluationResult, GeneratorOutput, LocalRepairAttempt, PlannerOutput, Verdict,
 };
@@ -147,7 +150,7 @@ impl PgePipeline {
         let mut last_evaluation: Option<EvaluationResult> = None;
         let mut last_generation: Option<GeneratorOutput> = None;
         let max_attempts = self.config.max_retries.max(1);
-        let mut stall = crate::squad::pge::stall::StallDetector::new(self.config.stall_threshold);
+        let mut stall = StallDetector::new(self.config.stall_threshold);
 
         for attempt in 1..=max_attempts {
             // Stage 1: Planner.
@@ -225,8 +228,7 @@ impl PgePipeline {
                 .await;
 
             let mut local_repairs: Vec<LocalRepairAttempt> = Vec::new();
-            let mut repair_stall =
-                crate::squad::pge::stall::StallDetector::new(self.config.stall_threshold);
+            let mut repair_stall = StallDetector::new(self.config.stall_threshold);
 
             // Local repair loop: feed evaluator feedback back to generator.
             for repair_iteration in 1..=self.config.local_repair_max {
@@ -286,13 +288,9 @@ impl PgePipeline {
                 // early instead of burning the full local_repair_max budget.
                 if !matches!(evaluation.verdict, Verdict::Pass)
                     && matches!(
-                        repair_stall.observe(
-                            crate::squad::pge::stall::ProgressSignals::from_attempt(
-                                &generation,
-                                &evaluation,
-                            ),
-                        ),
-                        crate::squad::pge::stall::StallVerdict::Stalled
+                        repair_stall
+                            .observe(ProgressSignals::from_attempt(&generation, &evaluation,),),
+                        StallVerdict::Stalled
                     )
                 {
                     tracing::warn!(
@@ -311,21 +309,13 @@ impl PgePipeline {
             // The prefixed feedback lets outer loops classify the failure as
             // non-retryable and route it to reflection as learning material.
             if !passed {
-                let signals = crate::squad::pge::stall::ProgressSignals::from_attempt(
-                    &generation,
-                    &evaluation,
-                );
-                if matches!(
-                    stall.observe(signals),
-                    crate::squad::pge::stall::StallVerdict::Stalled
-                ) {
+                let signals = ProgressSignals::from_attempt(&generation, &evaluation);
+                if matches!(stall.observe(signals), StallVerdict::Stalled) {
                     let mut evaluation = evaluation;
                     evaluation.feedback = format!(
                         "{}: {} consecutive attempts bought no progress \
                          (score/artifacts/error-class flat); stopped early: {}",
-                        crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX,
-                        self.config.stall_threshold,
-                        evaluation.feedback
+                        DEGENERATE_LOOP_PREFIX, self.config.stall_threshold, evaluation.feedback
                     );
                     tracing::warn!(attempt, "degenerate loop detected; stopping pipeline early");
                     history.push(PgePipelineAttempt {
@@ -893,7 +883,7 @@ mod tests {
             result
                 .final_evaluation
                 .feedback
-                .starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX),
+                .starts_with(DEGENERATE_LOOP_PREFIX),
             "stall stop must be marked for outer loops: {}",
             result.final_evaluation.feedback
         );
@@ -940,6 +930,6 @@ mod tests {
         assert!(!result
             .final_evaluation
             .feedback
-            .starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX));
+            .starts_with(DEGENERATE_LOOP_PREFIX));
     }
 }

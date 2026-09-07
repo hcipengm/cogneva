@@ -413,7 +413,8 @@ pub async fn retry_task_handler(
 #[derive(Debug, Deserialize)]
 pub struct PurgeTasksRequest {
     /// Eligible statuses; default `["pending", "scheduled"]`. Terminal
-    /// states are only touched when explicitly listed.
+    /// states are rejected: cancelling a finished task would rewrite its
+    /// recorded outcome.
     pub statuses: Option<Vec<String>>,
     /// Optional task-type prefix filter, e.g. `"platform_issue_fix"` or
     /// `"intent-assess"` (task ids embed the same words, so a prefix on
@@ -426,14 +427,17 @@ pub struct PurgeTasksRequest {
     pub dry_run: Option<bool>,
 }
 
+/// Statuses the purge may act on. Terminal states are excluded: cancelling a
+/// finished task would rewrite its recorded outcome, and a purge is a
+/// backlog broom, not a history editor.
 fn parse_task_status(s: &str) -> Result<cog_core::TaskStatus, ApiError> {
     match s.to_ascii_lowercase().as_str() {
         "pending" => Ok(cog_core::TaskStatus::Pending),
         "scheduled" => Ok(cog_core::TaskStatus::Scheduled),
         "running" => Ok(cog_core::TaskStatus::Running),
-        "completed" => Ok(cog_core::TaskStatus::Completed),
-        "failed" => Ok(cog_core::TaskStatus::Failed),
-        "cancelled" => Ok(cog_core::TaskStatus::Cancelled),
+        "completed" | "failed" | "cancelled" => Err(ApiError::bad_request(format!(
+            "status {s} is terminal; purge only acts on backlog (pending/scheduled/running)"
+        ))),
         other => Err(ApiError::bad_request(format!("unknown status: {other}"))),
     }
 }
@@ -732,5 +736,13 @@ mod tests {
     fn parse_task_status_rejects_unknown() {
         assert!(parse_task_status("pending").is_ok());
         assert!(parse_task_status("nonsense").is_err());
+    }
+
+    #[test]
+    fn parse_task_status_rejects_terminal() {
+        // Purging a finished task would rewrite its recorded outcome.
+        for s in ["completed", "failed", "cancelled"] {
+            assert!(parse_task_status(s).is_err(), "{s} must be rejected");
+        }
     }
 }

@@ -172,6 +172,16 @@ fn intent_verdict_prefix(task_id: &str) -> Option<String> {
     }
 }
 
+/// Page size the platform providers request when listing open intents. A
+/// listing that returns exactly this many entries may be truncated, so
+/// reaping requires a count below the cap on both surfaces to treat the open
+/// set as provably complete.
+const PROVIDER_LIST_PAGE_SIZE: usize = 100;
+
+fn listings_complete(issue_count: usize, pr_count: usize) -> bool {
+    issue_count < PROVIDER_LIST_PAGE_SIZE && pr_count < PROVIDER_LIST_PAGE_SIZE
+}
+
 impl AssessVerdicts {
     async fn ensure_loaded(&mut self) {
         if self.loaded {
@@ -449,14 +459,16 @@ impl GitHubDiscoveryLoop {
 
         // Reap verdicts of intents that have closed since their judgement, so
         // the store size tracks live intents. The discovery scan above is
-        // watermark-filtered and cannot serve as the open set; both surfaces
-        // must list successfully or reaping is skipped this round — a partial
-        // view would drop verdicts of live intents.
+        // watermark-filtered and cannot serve as the open set; reaping runs
+        // only when both listings are present AND provably complete — a
+        // partial view would drop verdicts of live intents.
         match (
             self.provider.list_open_issues().await,
             self.provider.list_open_pull_requests().await,
         ) {
-            (Ok(open_issues), Ok(open_prs)) => {
+            (Ok(open_issues), Ok(open_prs))
+                if listings_complete(open_issues.len(), open_prs.len()) =>
+            {
                 let platform = self.provider.platform_kind();
                 let open: std::collections::HashSet<String> = open_issues
                     .iter()
@@ -469,7 +481,9 @@ impl GitHubDiscoveryLoop {
                     .collect();
                 self.verdicts_reap_closed(&open).await;
             }
-            _ => tracing::debug!("skipping verdict reap: incomplete open-intent listing"),
+            _ => {
+                tracing::debug!("skipping verdict reap: incomplete open-intent listing")
+            }
         }
 
         // A2A 交叉验证：把公版上他人 bot PR 拉进本实例沙盒验证并回评。
@@ -2599,6 +2613,20 @@ mod tests {
             None
         );
         assert_eq!(intent_verdict_prefix("no-dash"), None);
+    }
+
+    #[test]
+    fn listings_at_page_cap_are_not_provably_complete() {
+        // A listing that filled the provider page may be truncated; the open
+        // set cannot be trusted, so reaping must be skipped this round.
+        assert!(!listings_complete(PROVIDER_LIST_PAGE_SIZE, 0));
+        assert!(!listings_complete(0, PROVIDER_LIST_PAGE_SIZE));
+        assert!(!listings_complete(
+            PROVIDER_LIST_PAGE_SIZE,
+            PROVIDER_LIST_PAGE_SIZE
+        ));
+        assert!(listings_complete(PROVIDER_LIST_PAGE_SIZE - 1, 3));
+        assert!(listings_complete(0, 0));
     }
 
     #[test]

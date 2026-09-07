@@ -2,6 +2,9 @@ use crate::actors::{
     EvaluatorActor, GeneratorActor, MergeResult, MergerActor, ModeratorActor, PlannerActor,
 };
 use crate::squad::pge::context_board::ContextBoard;
+use crate::squad::pge::stall::{
+    ProgressSignals, StallDetector, StallVerdict, DEGENERATE_LOOP_PREFIX,
+};
 use crate::squad::pge::types::{
     Artifact, BranchMergeStrategy, Criterion, EvaluationResult, GeneratorOutput, MergeSummary,
     PgeBranchResult, PgeRoundtableIteration, PlannerOutput, Verdict,
@@ -178,7 +181,7 @@ impl PgeRoundtable {
     ) -> PgeRoundtableResult {
         let mut history: Vec<PgeRoundtableIteration> = Vec::new();
         let mut consensus_reached = false;
-        let mut stall = crate::squad::pge::stall::StallDetector::new(self.config.stall_threshold);
+        let mut stall = StallDetector::new(self.config.stall_threshold);
 
         let mut final_evaluation: Option<EvaluationResult> = None;
         let mut prev_verdict: Option<Verdict> = None;
@@ -277,11 +280,8 @@ impl PgeRoundtable {
             // the same failure. Mark the run and stop before spending more.
             if !matches!(evaluation.verdict, Verdict::Pass)
                 && matches!(
-                    stall.observe(crate::squad::pge::stall::ProgressSignals::from_attempt(
-                        &generation,
-                        &evaluation,
-                    ),),
-                    crate::squad::pge::stall::StallVerdict::Stalled
+                    stall.observe(ProgressSignals::from_attempt(&generation, &evaluation,),),
+                    StallVerdict::Stalled
                 )
             {
                 tracing::warn!(
@@ -292,7 +292,7 @@ impl PgeRoundtable {
                     last.evaluation.feedback = format!(
                         "{}: {} consecutive iterations bought no progress \
                          (score/artifacts/error-class flat); stopped early: {}",
-                        crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX,
+                        DEGENERATE_LOOP_PREFIX,
                         self.config.stall_threshold,
                         last.evaluation.feedback
                     );
