@@ -120,8 +120,7 @@ fn default_state_dir() -> std::path::PathBuf {
 fn default_state_dir() -> std::path::PathBuf {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let d = std::env::temp_dir()
-            .join(format!("cogneva-test-state-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("cogneva-test-state-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
     })
