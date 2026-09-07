@@ -617,7 +617,15 @@ impl SquadExecutor {
         let reflection = run_squad_reflection(squad_reflection, &verdict, &squad).await;
 
         let is_pipeline = matches!(squad.config.pge_mode, PgeMode::Pipeline);
-        let can_upgrade = squad.config.max_retries > 0;
+        // Deterministic environment/protocol failures cannot be fixed by a
+        // strategy upgrade — Roundtable would burn the same tokens to the
+        // same empty result.
+        let is_terminal = matches!(
+            &verdict,
+            RalphVerdict::Unrecoverable { reason, .. }
+                if reason.starts_with(crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX)
+        );
+        let can_upgrade = squad.config.max_retries > 0 && !is_terminal;
         let should_upgrade = can_upgrade
             && if let Some(ref r) = reflection {
                 if r.upgrade_recommended && is_pipeline {

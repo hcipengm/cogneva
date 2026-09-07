@@ -14,6 +14,12 @@ use crate::error::Result;
 /// Generic code platform operations used by Cogneva's self-evolution loop.
 #[async_trait]
 pub trait CodePlatformProvider: Send + Sync {
+    /// Short platform identifier (`"github"` / `"gitee"`). Task ids are
+    /// namespaced by it because issue/PR numbers collide across platforms.
+    fn platform_kind(&self) -> &'static str {
+        "platform"
+    }
+
     /// List open issues from the configured repository.
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>>;
 
@@ -89,6 +95,19 @@ pub trait CodePlatformProvider: Send + Sync {
     /// Default: unsupported — providers return an empty list.
     async fn list_recent_ci_failures(&self, _max: usize) -> Result<Vec<CiFailureEvent>> {
         Ok(Vec::new())
+    }
+
+    /// Fetch the most recent CI run on a branch, in any state (a newer commit
+    /// whose CI is still running also counts as "the world moved on").
+    /// Self-healing uses it as a freshness check: when the latest run no
+    /// longer matches the failure event's head SHA (a newer commit landed) or
+    /// is green, the queued fix targets a world that no longer exists and
+    /// must be skipped.
+    ///
+    /// Default: unsupported — providers return `None`, and callers treat an
+    /// unknown state as fresh (submit the fix).
+    async fn latest_branch_ci_run(&self, _branch: &str) -> Result<Option<CiRunSummary>> {
+        Ok(None)
     }
 
     /// Fetch the current state of a pull request for merge decisions and
@@ -319,6 +338,17 @@ pub struct CiFailureEvent {
     pub head_branch: String,
     /// Platform URL for the run.
     pub html_url: String,
+}
+
+/// The most recent completed CI run on a branch, used for freshness checks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CiRunSummary {
+    /// Workflow run id.
+    pub run_id: u64,
+    /// Head commit SHA of the run.
+    pub head_sha: String,
+    /// Platform conclusion string (`"success"`, `"failure"`, ...).
+    pub conclusion: String,
 }
 
 /// Log tail of a failed CI job within a workflow run.

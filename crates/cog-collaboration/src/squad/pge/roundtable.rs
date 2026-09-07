@@ -255,6 +255,16 @@ impl PgeRoundtable {
                 merge_summary,
             });
 
+            // Deterministic environment/protocol failure: further debate
+            // rounds must fail identically — stop before paying for them.
+            if generation.is_terminal_env_failure() {
+                tracing::warn!(
+                    iteration,
+                    "Roundtable generation reported terminal environment failure; stopping debate"
+                );
+                break;
+            }
+
             // Consensus: require Verdict::Pass for at least 2 consecutive iterations.
             let verdict_stable = if let Some(ref prev) = prev_verdict {
                 matches!(evaluation.verdict, Verdict::Pass) && matches!(prev, Verdict::Pass)

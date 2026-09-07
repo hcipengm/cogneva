@@ -29,6 +29,113 @@ fn finalize_tool_call(block: &mut ContentBlock, buffer: &str) {
     }
 }
 
+/// Fallback for upstreams that emit tool calls as a text protocol
+/// (`{"action":"tool_calls","calls":[{"name":..., "arguments":...}]}`) inside
+/// the assistant content instead of native `tool_calls` deltas. Without this
+/// the payload is treated as final text, no tool ever executes, and agentic
+/// loops burn tokens retrying an empty generation. Returns the residual text
+/// surrounding the payload plus the parsed tool calls, or None when the text
+/// carries no such payload.
+fn extract_text_tool_calls(text: &str) -> Option<(String, Vec<ContentBlock>)> {
+    let trimmed = text.trim();
+    if !trimmed.contains("tool_calls") {
+        return None;
+    }
+    // Candidate JSON spans: the whole text, plus balanced `{...}` spans for
+    // prose-wrapped payloads. Cap candidates so pathological text stays cheap.
+    let mut spans: Vec<&str> = vec![trimmed];
+    let mut in_string = false;
+    let mut escape = false;
+    let mut depth = 0usize;
+    let mut span_start: Option<usize> = None;
+    for (i, ch) in trimmed.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    span_start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(start) = span_start.take() {
+                        let span = &trimmed[start..=i];
+                        if span != trimmed && spans.len() < 8 {
+                            spans.push(span);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for span in spans {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(span) else {
+            continue;
+        };
+        if v.get("action").and_then(|a| a.as_str()) != Some("tool_calls") {
+            continue;
+        }
+        let Some(calls) = v.get("calls").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        let mut blocks = Vec::new();
+        for (i, call) in calls.iter().enumerate() {
+            let Some(name) = call.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            // `arguments` arrives as an object on some upstreams and as a
+            // JSON-encoded string on others; normalize to a Value.
+            let arguments = match call.get("arguments") {
+                Some(serde_json::Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+                }
+                Some(other) => other.clone(),
+                None => serde_json::Value::Object(Default::default()),
+            };
+            blocks.push(ContentBlock::tool_call(
+                format!("textcall-{i}"),
+                name,
+                arguments,
+            ));
+        }
+        if blocks.is_empty() {
+            continue;
+        }
+        let residual = if span == trimmed {
+            String::new()
+        } else {
+            match (trimmed.find(span), span.len()) {
+                (Some(start), len) => {
+                    let before = trimmed[..start].trim();
+                    let after = trimmed[start + len..].trim();
+                    match (before.is_empty(), after.is_empty()) {
+                        (true, true) => String::new(),
+                        (false, true) => before.to_string(),
+                        (true, false) => after.to_string(),
+                        (false, false) => format!("{before}\n{after}"),
+                    }
+                }
+                _ => String::new(),
+            }
+        };
+        return Some((residual, blocks));
+    }
+    None
+}
+
 pub struct OpenAIProvider {
     client: Option<Arc<dyn cog_core::HttpClient>>,
     model: Model,
@@ -769,6 +876,42 @@ impl LLMProvider for OpenAIProvider {
                 finish_block(block, idx, &producer, &response.content).await;
             }
 
+            // Text-protocol tool-call fallback: some upstreams emit
+            // `{"action":"tool_calls","calls":[...]}` as assistant text instead
+            // of native tool_calls deltas. Convert it so the runtime executes
+            // the tools instead of treating the payload as final output.
+            if !matches!(
+                response.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            ) && !response.content.iter().any(|b| b.is_tool_call())
+            {
+                let combined: String = response
+                    .content
+                    .iter()
+                    .filter_map(|b| b.as_text())
+                    .collect();
+                if let Some((residual, calls)) = extract_text_tool_calls(&combined) {
+                    tracing::warn!(
+                        provider = "openai",
+                        model = %model.id,
+                        calls = calls.len(),
+                        "Converted text-protocol tool_calls payload into tool call blocks"
+                    );
+                    let mut rebuilt: Vec<ContentBlock> = response
+                        .content
+                        .iter()
+                        .filter(|b| !b.is_text())
+                        .cloned()
+                        .collect();
+                    if !residual.is_empty() {
+                        rebuilt.push(ContentBlock::text(residual));
+                    }
+                    rebuilt.extend(calls);
+                    response.content = rebuilt;
+                    response.stop_reason = StopReason::ToolUse;
+                }
+            }
+
             // Calculate cost from usage and model cost metadata
             if response.usage.total_tokens > 0
                 || response.usage.input > 0
@@ -1059,5 +1202,52 @@ mod tests {
         let body = provider.build_request_body(&messages, &ChatOptions::default());
         let msgs = body["messages"].as_array().unwrap();
         assert!(msgs[1].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn text_tool_calls_parsed_from_bare_payload() {
+        let text = r#"{"action":"tool_calls","calls":[{"name":"run_command","arguments":{"command":"cargo fmt"}}]}"#;
+        let (residual, calls) = extract_text_tool_calls(text).unwrap();
+        assert!(residual.is_empty());
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            ContentBlock::ToolCall {
+                name, arguments, ..
+            } => {
+                assert_eq!(name, "run_command");
+                assert_eq!(arguments["command"], "cargo fmt");
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_tool_calls_parsed_from_prose_wrapped_payload() {
+        let text = "我先检查一下代码。\n{\"action\":\"tool_calls\",\"calls\":[{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\"}\"},{\"name\":\"run_command\",\"arguments\":{\"command\":\"ls\"}}]}\n先读文件再列目录。";
+        let (residual, calls) = extract_text_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(residual.contains("我先检查一下代码。"));
+        assert!(residual.contains("先读文件再列目录。"));
+        match &calls[0] {
+            ContentBlock::ToolCall {
+                name, arguments, ..
+            } => {
+                assert_eq!(name, "read_file");
+                // arguments arrived as a JSON-encoded string and was normalized.
+                assert_eq!(arguments["path"], "src/main.rs");
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_tool_calls_ignores_plain_text_and_other_actions() {
+        assert!(extract_text_tool_calls("just a normal reply").is_none());
+        assert!(
+            extract_text_tool_calls("{\"action\":\"final_answer\",\"answer\":\"ok\"}").is_none()
+        );
+        assert!(extract_text_tool_calls("{\"action\":\"tool_calls\",\"calls\":[]}").is_none());
+        // Braces inside strings must not break span balancing.
+        assert!(extract_text_tool_calls("template literal: {\"x\": \"}\"} done").is_none());
     }
 }

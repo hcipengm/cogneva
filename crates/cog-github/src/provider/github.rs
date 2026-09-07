@@ -11,8 +11,8 @@ use crate::config::GitHubAccount;
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{
     gateway_attach_root, http_fetch_attachment, AttachmentData, CiFailureEvent, CiJobLog,
-    CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue, PlatformPullRequest,
-    PullRequestDetail,
+    CiRunSummary, CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue,
+    PlatformPullRequest, PullRequestDetail,
 };
 
 /// Max failed jobs whose logs are fetched per run.
@@ -79,6 +79,10 @@ impl GitHubProvider {
 
 #[async_trait]
 impl CodePlatformProvider for GitHubProvider {
+    fn platform_kind(&self) -> &'static str {
+        "github"
+    }
+
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {
         let page = self
             .client
@@ -93,6 +97,10 @@ impl CodePlatformProvider for GitHubProvider {
         Ok(page
             .items
             .into_iter()
+            // GitHub's issues API mixes pull requests into the list; PRs are
+            // served by the dedicated PR path, processing them here too would
+            // judge every PR twice.
+            .filter(|issue| issue.pull_request.is_none())
             .map(|issue| PlatformIssue {
                 number: issue.number,
                 title: issue.title,
@@ -337,6 +345,27 @@ impl CodePlatformProvider for GitHubProvider {
                 html_url: r.html_url.to_string(),
             })
             .collect())
+    }
+
+    async fn latest_branch_ci_run(&self, branch: &str) -> Result<Option<CiRunSummary>> {
+        // No status filter: a newer commit whose CI is still running must also
+        // count as "the world moved on", so the newest run of any state is the
+        // freshness reference.
+        let runs = self
+            .client
+            .workflows(&self.owner, &self.repo)
+            .list_all_runs()
+            .branch(branch)
+            .per_page(1)
+            .send()
+            .await
+            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+
+        Ok(runs.items.into_iter().next().map(|r| CiRunSummary {
+            run_id: r.id.into_inner(),
+            head_sha: r.head_sha,
+            conclusion: r.conclusion.unwrap_or_default(),
+        }))
     }
 
     async fn get_pull_request(&self, pr_number: u64) -> Result<PullRequestDetail> {

@@ -39,6 +39,32 @@ pub struct GeneratorOutput {
     pub artifacts: Vec<Artifact>,
 }
 
+/// Prefix marking a run whose failure cause is deterministic (environment or
+/// upstream protocol), so retry/upgrade loops can stop instead of re-paying
+/// for attempts that must fail again.
+pub const TERMINAL_ENV_FAILURE_PREFIX: &str = "terminal_env_failure";
+
+impl GeneratorOutput {
+    /// True when the generator produced nothing for a deterministic reason:
+    /// it reported an environment/protocol failure (tools never executed,
+    /// explicit `environment_error`), or it returned no artifacts and no
+    /// content at all. Retrying with the same environment cannot succeed, so
+    /// callers must treat the run as terminal rather than paying for more
+    /// attempts.
+    pub fn is_terminal_env_failure(&self) -> bool {
+        if !self.artifacts.is_empty() {
+            return false;
+        }
+        let text = match &self.content {
+            serde_json::Value::String(s) => s.as_str(),
+            serde_json::Value::Null => return true,
+            other => return other.to_string().is_empty(),
+        };
+        let t = text.to_ascii_lowercase();
+        t.contains("environment_error") || t.contains("tool_pipeline_broken")
+    }
+}
+
 /// A single evaluation criterion.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct Criterion {

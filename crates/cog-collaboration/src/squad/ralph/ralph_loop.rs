@@ -150,6 +150,13 @@ impl RalphLoop {
 
             let analysis = if passed {
                 FailureAnalysis::Recoverable(ResetStrategy::Identical)
+            } else if pge_result.final_generation.is_terminal_env_failure() {
+                // Deterministic environment/protocol failure: no reset
+                // strategy can fix it, stop before another paid iteration.
+                FailureAnalysis::Unrecoverable(format!(
+                    "{}: generator produced no artifacts (environment/protocol failure)",
+                    crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX
+                ))
             } else {
                 self.analyze_failure(&pge_result.final_evaluation, &self.history)
                     .await
@@ -247,6 +254,11 @@ impl RalphLoop {
 
             let analysis = if passed {
                 FailureAnalysis::Recoverable(ResetStrategy::Identical)
+            } else if rt_result.final_generation.is_terminal_env_failure() {
+                FailureAnalysis::Unrecoverable(format!(
+                    "{}: generator produced no artifacts (environment/protocol failure)",
+                    crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX
+                ))
             } else {
                 Self::analyze_roundtable_failure(&rt_result, &self.history)
             };

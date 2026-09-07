@@ -31,6 +31,11 @@ const ASSESS_TASK_TIMEOUT_SECS: u64 = 120;
 const ASSESS_WAIT_TIMEOUT_SECS: u64 = 100;
 /// Poll interval while waiting for the assess task to complete.
 const ASSESS_POLL_INTERVAL_MS: u64 = 500;
+/// Judgement-logic epoch mixed into the assess task id hash. Bump it when the
+/// judge prompt/logic changes, or after a bulk queue reset, to force one
+/// fresh judgement round; identical content under the same epoch reuses the
+/// existing task (and its verdict) instead of paying for a duplicate.
+const ASSESS_JUDGE_EPOCH: &str = "v2";
 /// Maximum cross-validation tasks running concurrently for this instance.
 const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
 /// DAG-side timeout for one cross-validation task (apply + workspace tests +
@@ -430,6 +435,37 @@ impl GitHubDiscoveryLoop {
             return Ok(false);
         };
 
+        // Freshness gate: the world may have moved on since the run failed —
+        // a newer commit on the branch (possibly the human's own fix) or a
+        // green latest run means the queued fix targets a stale failure.
+        // Fixing stale failures only burns tokens, so skip and mark handled.
+        // A check error also skips: CI failures recur and the next event
+        // re-evaluates, while an obsolete fix squad is pure waste.
+        match self.provider.latest_branch_ci_run(&event.head_branch).await {
+            Ok(Some(latest))
+                if latest.head_sha != event.head_sha || latest.conclusion == "success" =>
+            {
+                tracing::info!(
+                    run_id = event.run_id,
+                    branch = %event.head_branch,
+                    latest_run = latest.run_id,
+                    latest_conclusion = %latest.conclusion,
+                    "Skipping CI self-heal: branch has moved on or is green"
+                );
+                self.ci_submitted.insert(event.run_id);
+                return Ok(false);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    run_id = event.run_id,
+                    error = %e,
+                    "CI freshness check failed; skipping this failure event"
+                );
+                return Ok(false);
+            }
+        }
+
         let logs = self
             .provider
             .fetch_ci_failure_logs(event.run_id)
@@ -685,13 +721,30 @@ impl GitHubDiscoveryLoop {
     ) -> Result<TriageDecision> {
         let kind = intent.kind;
         let number = intent.number;
-        // Unique per submission so a re-judgement after a user reply does not
-        // collide with an already-completed task id.
+        // Deterministic id: platform + kind + number + content hash. Identical
+        // intent content maps to the same task id, so the orchestrator's
+        // idempotent insert dedupes repeat judgements and the poll below reads
+        // the existing verdict — no duplicate LLM spend. Content changes (new
+        // body/comment) produce a new hash and a fresh judgement. Issue/PR
+        // numbers collide across platforms, so the platform kind is part of
+        // the key.
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(ASSESS_JUDGE_EPOCH.as_bytes());
+        hasher.update(self.provider.platform_kind().as_bytes());
+        hasher.update(kind.as_str().as_bytes());
+        hasher.update(number.to_string().as_bytes());
+        hasher.update(intent.title.as_bytes());
+        hasher.update(intent.body.as_bytes());
+        hasher.update(reply_thread.as_bytes());
+        hasher.update(media.len().to_string().as_bytes());
+        let digest = hex::encode(hasher.finalize());
         let task_id = format!(
-            "intent-assess-{}-{}-{}",
+            "intent-assess-{}-{}-{}-{}",
+            self.provider.platform_kind(),
             kind.as_str(),
             number,
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            &digest[..16]
         );
         let goal = format!(
             "Assess actionability of {} #{}: {}",
@@ -745,9 +798,17 @@ impl GitHubDiscoveryLoop {
                         )));
                     }
                     TaskStatus::Cancelled => {
-                        return Err(crate::error::CogGitHubError::Provider(format!(
-                            "assess task {id} cancelled"
-                        )));
+                        // Cancellation is a veto: with deterministic ids the
+                        // same content would otherwise hit the cancelled task
+                        // forever and fall back to the heuristic every round.
+                        // Skip until the intent content changes (new hash).
+                        tracing::info!(
+                            %id,
+                            "assess task was cancelled; treating as skip until content changes"
+                        );
+                        return Ok(TriageDecision::Skip {
+                            reason: "assess task cancelled".into(),
+                        });
                     }
                     _ => {}
                 }

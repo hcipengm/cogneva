@@ -90,6 +90,43 @@ impl PgePipeline {
         Self { config }
     }
 
+    /// Build the failing result for a deterministic environment/protocol
+    /// failure: a synthesized zero-score evaluation marks the attempt, and
+    /// the feedback prefix lets outer loops (Ralph, squad escalation)
+    /// recognize the failure as terminal without re-parsing the generation.
+    fn terminal_result(
+        attempt: u32,
+        plan: PlannerOutput,
+        generation: GeneratorOutput,
+        mut history: Vec<PgePipelineAttempt>,
+    ) -> PgePipelineResult {
+        let evaluation = EvaluationResult {
+            verdict: Verdict::Fail,
+            feedback: format!(
+                "{}: generator produced no artifacts (environment/protocol failure)",
+                crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX
+            ),
+            score: Some(0),
+            criteria: Vec::new(),
+            details: None,
+        };
+        history.push(PgePipelineAttempt {
+            attempt,
+            plan: plan.clone(),
+            generation: generation.clone(),
+            evaluation: evaluation.clone(),
+            local_repairs: Vec::new(),
+        });
+        PgePipelineResult {
+            attempts: history.len() as u32,
+            passed: false,
+            final_plan: plan,
+            final_generation: generation,
+            final_evaluation: evaluation,
+            history,
+        }
+    }
+
     /// Run the pipeline with a structured [`Task`] instead of a plain `goal` string.
     /// This is the preferred entry point for new code.
     pub async fn execute_task(
@@ -139,6 +176,18 @@ impl PgePipeline {
                     None,
                 )
                 .await;
+
+            // Deterministic environment/protocol failure: the generator
+            // produced nothing because tools never ran or the upstream cannot
+            // honor the protocol. Skip the evaluator and all retries — every
+            // further attempt must fail identically and only burns tokens.
+            if generation.is_terminal_env_failure() {
+                tracing::warn!(
+                    attempt,
+                    "Generator reported terminal environment failure; aborting pipeline without evaluation"
+                );
+                return Self::terminal_result(attempt, plan, generation, history);
+            }
 
             // Stage 3: Evaluator.
             let eval_history: Vec<serde_json::Value> = history
@@ -193,6 +242,18 @@ impl PgePipeline {
                         None,
                     )
                     .await;
+
+                // Same terminal-failure guard as the initial generation: a
+                // repair that produced nothing for environment reasons must
+                // not be evaluated or retried.
+                if generation.is_terminal_env_failure() {
+                    tracing::warn!(
+                        attempt,
+                        repair_iteration,
+                        "Generator repair reported terminal environment failure; aborting pipeline"
+                    );
+                    return Self::terminal_result(attempt, plan.clone(), generation, history);
+                }
 
                 evaluation = evaluator
                     .evaluate(

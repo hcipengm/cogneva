@@ -134,6 +134,10 @@ fn parse_time(v: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
 
 #[async_trait]
 impl CodePlatformProvider for GiteeProvider {
+    fn platform_kind(&self) -> &'static str {
+        "gitee"
+    }
+
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {
         let v = self
             .send(self.get("/issues").query(&[
