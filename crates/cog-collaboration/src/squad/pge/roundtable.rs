@@ -52,6 +52,10 @@ pub struct PgeRoundtableConfig {
     /// early. The criterion is whether spend buys progress, never a flat
     /// spend cap. 0 disables stall detection.
     pub stall_threshold: u32,
+    /// When true, a consensus Pass is re-judged once in a fresh context
+    /// (no debate history) before the roundtable accepts it. On conflict the
+    /// reviewer wins; both verdicts are recorded in the final evaluation.
+    pub independent_review: bool,
 }
 
 impl std::fmt::Debug for PgeRoundtableConfig {
@@ -88,6 +92,7 @@ impl Default for PgeRoundtableConfig {
             llm_provider: None,
             merger: None,
             stall_threshold: 2,
+            independent_review: true,
         }
     }
 }
@@ -346,7 +351,7 @@ impl PgeRoundtable {
             final_evaluation = Some(evaluation);
         }
 
-        let last = history
+        let mut last = history
             .last()
             .cloned()
             .unwrap_or_else(|| PgeRoundtableIteration {
@@ -371,6 +376,50 @@ impl PgeRoundtable {
                 branches: Vec::new(),
                 merge_summary: None,
             });
+
+        // Independent review gate: every evaluator pass above saw the debate
+        // history, so consensus is self-assessment. Re-judge the final output
+        // in a fresh context (no history) before accepting; on conflict the
+        // reviewer wins. Both verdicts stay on the record.
+        if consensus_reached
+            && self.config.independent_review
+            && matches!(last.evaluation.verdict, Verdict::Pass)
+        {
+            let criteria: Vec<&str> = last
+                .plan
+                .acceptance_criteria
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let mut review = self
+                .evaluator
+                .evaluate(
+                    task,
+                    &serde_json::to_value(&last.plan).unwrap_or_default(),
+                    &serde_json::to_value(&last.generation).unwrap_or_default(),
+                    &[],
+                    &criteria,
+                    Some(&board),
+                )
+                .await;
+            review.enforce_criteria_evidence(!criteria.is_empty());
+            let review_json = serde_json::to_value(&review).unwrap_or_default();
+            if !matches!(review.verdict, Verdict::Pass) {
+                consensus_reached = false;
+                last.evaluation.verdict = Verdict::Fail;
+                last.evaluation.feedback = format!(
+                    "independent reviewer rejected the consensus: {}",
+                    review.feedback
+                );
+            }
+            let mut details = last
+                .evaluation
+                .details
+                .take()
+                .unwrap_or(serde_json::json!({}));
+            details["independent_review"] = review_json;
+            last.evaluation.details = Some(details);
+        }
 
         PgeRoundtableResult {
             iterations: history.len() as u32,
@@ -900,12 +949,42 @@ pub fn parse_evaluation_result(value: &serde_json::Value) -> EvaluationResult {
 mod tests {
     use super::*;
 
-    struct MockAgent;
+    struct MockAgent {
+        responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    }
+
+    impl MockAgent {
+        /// Single response repeated forever.
+        fn fixed(value: serde_json::Value) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([value])),
+            }
+        }
+
+        /// Responses consumed in order; the last one repeats once exhausted.
+        fn sequence(values: Vec<serde_json::Value>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(values.into()),
+            }
+        }
+
+        fn next_response(&self) -> serde_json::Value {
+            let mut responses = self.responses.lock().unwrap();
+            match responses.len() {
+                0 => serde_json::Value::Null,
+                1 => responses
+                    .front()
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                _ => responses.pop_front().unwrap_or(serde_json::Value::Null),
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl cog_core::Agent for MockAgent {
         async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
-            Ok(serde_json::Value::Null)
+            Ok(self.next_response())
         }
         async fn start(&self) {}
         async fn snapshot(
@@ -928,7 +1007,7 @@ mod tests {
             &self,
             _input: serde_json::Value,
         ) -> cog_core::SFResult<serde_json::Value> {
-            Ok(serde_json::Value::Null)
+            Ok(self.next_response())
         }
         async fn steer(&self, _instruction: String) -> cog_core::SFResult<()> {
             Ok(())
@@ -1042,9 +1121,15 @@ mod tests {
         };
         PgeRoundtable::new(
             config,
-            PlannerActor::new(std::sync::Arc::new(MockAgent)),
-            GeneratorActor::new(std::sync::Arc::new(MockAgent)),
-            EvaluatorActor::new(std::sync::Arc::new(MockAgent)),
+            PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(
+                serde_json::Value::Null,
+            ))),
+            GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+                serde_json::Value::Null,
+            ))),
+            EvaluatorActor::new(std::sync::Arc::new(MockAgent::fixed(
+                serde_json::Value::Null,
+            ))),
         )
     }
 
@@ -1084,5 +1169,97 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"a.rs"));
         assert!(names.contains(&"b.rs"));
+    }
+
+    #[tokio::test]
+    async fn independent_review_rejection_breaks_consensus() {
+        // Iteration 1 and 2 both pass (consensus), then the fresh-context
+        // reviewer rejects. The reviewer verdict must win.
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": {"code": "fn main() {}"}, "artifacts": []}),
+        )));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent::sequence(vec![
+            serde_json::json!({"verdict": "pass", "score": 90, "feedback": "ok", "criteria": []}),
+            serde_json::json!({"verdict": "pass", "score": 90, "feedback": "ok", "criteria": []}),
+            serde_json::json!({"verdict": "fail", "score": 10, "feedback": "reviewer: output ignores the goal", "criteria": []}),
+        ])));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 5,
+                consensus_threshold: 0.5,
+                stall_threshold: 0,
+                independent_review: true,
+                ..Default::default()
+            },
+            planner,
+            generator,
+            evaluator,
+        );
+        let task = cog_core::Task::new(
+            "t-review".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+        let result = rt.debate(&task, serde_json::json!({})).await;
+        assert!(
+            !result.consensus_reached,
+            "reviewer rejection must break consensus"
+        );
+        assert!(result
+            .final_evaluation
+            .feedback
+            .contains("independent reviewer rejected"));
+        let review = result
+            .final_evaluation
+            .details
+            .as_ref()
+            .and_then(|d| d.get("independent_review"))
+            .expect("reviewer verdict must be recorded");
+        assert_eq!(review["verdict"], "fail");
+    }
+
+    #[tokio::test]
+    async fn independent_review_agreement_keeps_consensus() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": {"code": "fn main() {}"}, "artifacts": []}),
+        )));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"verdict": "pass", "score": 90, "feedback": "ok", "criteria": []}),
+        )));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 5,
+                consensus_threshold: 0.5,
+                stall_threshold: 0,
+                independent_review: true,
+                ..Default::default()
+            },
+            planner,
+            generator,
+            evaluator,
+        );
+        let task = cog_core::Task::new(
+            "t-review-ok".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+        let result = rt.debate(&task, serde_json::json!({})).await;
+        assert!(result.consensus_reached);
+        assert!(result
+            .final_evaluation
+            .details
+            .as_ref()
+            .and_then(|d| d.get("independent_review"))
+            .is_some());
     }
 }

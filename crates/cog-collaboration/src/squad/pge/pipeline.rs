@@ -41,6 +41,11 @@ pub struct PgePipelineConfig {
     /// criterion is whether spend buys progress, never a flat spend cap.
     /// 0 disables stall detection.
     pub stall_threshold: u32,
+    /// When true, an evaluator Pass is re-judged once in a fresh context
+    /// (no attempt history, no prior feedback) before the pipeline accepts
+    /// it. Author and reviewer conclusions are both recorded in the final
+    /// evaluation; on conflict the reviewer wins.
+    pub independent_review: bool,
 }
 
 impl Default for PgePipelineConfig {
@@ -50,6 +55,7 @@ impl Default for PgePipelineConfig {
             timeout_ms: 30_000,
             local_repair_max: 0,
             stall_threshold: 2,
+            independent_review: true,
         }
     }
 }
@@ -314,6 +320,36 @@ impl PgePipeline {
                 }
             }
 
+            // Independent review gate: the evaluator above saw the attempt's
+            // own feedback loop, so its Pass is self-assessment. Re-judge in a
+            // fresh context (no history) before accepting; on conflict the
+            // reviewer wins. Both verdicts stay on the record.
+            if self.config.independent_review && matches!(evaluation.verdict, Verdict::Pass) {
+                let mut review = evaluator
+                    .evaluate(
+                        task,
+                        &plan_json,
+                        &serde_json::to_value(&generation).unwrap_or_default(),
+                        &[],
+                        &criteria,
+                        None,
+                    )
+                    .await;
+                review.enforce_criteria_evidence(!criteria.is_empty());
+                let review_json = serde_json::to_value(&review).unwrap_or_default();
+                if !matches!(review.verdict, Verdict::Pass) {
+                    evaluation.verdict = Verdict::Fail;
+                    evaluation.feedback = format!(
+                        "independent reviewer rejected the pass: {}",
+                        review.feedback
+                    );
+                }
+                let details = evaluation.details.take().unwrap_or(serde_json::json!({}));
+                let mut details = details;
+                details["independent_review"] = review_json;
+                evaluation.details = Some(details);
+            }
+
             let passed = matches!(evaluation.verdict, Verdict::Pass);
 
             // Attempt-level stall guard: when consecutive full attempts buy no
@@ -499,6 +535,7 @@ mod tests {
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
+            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
@@ -543,6 +580,7 @@ mod tests {
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
+            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -605,6 +643,7 @@ mod tests {
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
+            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -637,6 +676,7 @@ mod tests {
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
+            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -769,6 +809,7 @@ mod tests {
             timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,
+            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
@@ -820,6 +861,7 @@ mod tests {
             timeout_ms: 5_000,
             local_repair_max: 1,
             stall_threshold: 2,
+            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -862,6 +904,7 @@ mod tests {
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
+            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -908,6 +951,7 @@ mod tests {
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
+            independent_review: false,
         });
         let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
@@ -943,5 +987,106 @@ mod tests {
             .final_evaluation
             .feedback
             .starts_with(DEGENERATE_LOOP_PREFIX));
+    }
+
+    fn pass_planner() -> PlannerActor {
+        PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "summary": "test analysis",
+                "plan": {"specification": "test spec"},
+                "sub_tasks": [{"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": []}],
+            }),
+        }))
+    }
+
+    fn pass_generator() -> GeneratorActor {
+        GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "content": {"code": "fn main() {}"},
+                "artifacts": [],
+            }),
+        }))
+    }
+
+    #[tokio::test]
+    async fn independent_review_rejection_fails_the_attempt() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 0,
+            independent_review: true,
+        });
+        // First evaluation (author) passes; second evaluation (independent
+        // reviewer) rejects. The reviewer verdict must win.
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
+            responses: std::sync::Mutex::new(vec![
+                serde_json::json!({"verdict": "pass", "score": 92, "feedback": "looks fine", "criteria": []}),
+                serde_json::json!({"verdict": "fail", "score": 20, "feedback": "reviewer: output ignores the goal", "criteria": []}),
+            ]),
+        }));
+
+        let task = test_task("goal with hidden flaw");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &pass_planner(),
+                &pass_generator(),
+                &evaluator,
+            )
+            .await;
+
+        assert!(!result.passed, "reviewer rejection must fail the attempt");
+        assert!(result
+            .final_evaluation
+            .feedback
+            .contains("independent reviewer rejected"));
+        let review = result
+            .final_evaluation
+            .details
+            .as_ref()
+            .and_then(|d| d.get("independent_review"))
+            .expect("reviewer verdict must be recorded alongside the author verdict");
+        assert_eq!(review["verdict"], "fail");
+    }
+
+    #[tokio::test]
+    async fn independent_review_agreement_passes_and_records_review() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 0,
+            independent_review: true,
+        });
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
+            responses: std::sync::Mutex::new(vec![
+                serde_json::json!({"verdict": "pass", "score": 92, "feedback": "good", "criteria": []}),
+                serde_json::json!({"verdict": "pass", "score": 88, "feedback": "reviewer agrees", "criteria": []}),
+            ]),
+        }));
+
+        let task = test_task("solid goal");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &pass_planner(),
+                &pass_generator(),
+                &evaluator,
+            )
+            .await;
+
+        assert!(result.passed);
+        assert_eq!(
+            result
+                .final_evaluation
+                .details
+                .as_ref()
+                .and_then(|d| d.get("independent_review"))
+                .map(|r| r["feedback"].as_str().unwrap_or("")),
+            Some("reviewer agrees")
+        );
     }
 }
