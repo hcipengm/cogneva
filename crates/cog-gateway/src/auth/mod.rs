@@ -382,7 +382,8 @@ impl LoginRateLimiter {
 
     /// Record a generic attempt with a custom prefix.
     pub async fn record_attempt_prefix(&self, prefix: &str, identifier: &str) {
-        self.record_attempt(format!("{}:{}", prefix, identifier)).await;
+        self.record_attempt(format!("{}:{}", prefix, identifier))
+            .await;
     }
 
     async fn record_attempt(&self, key: String) {
