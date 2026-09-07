@@ -44,6 +44,7 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             let agent_manager = ctx.consume_service::<dyn cog_core::AgentManager>();
             let knowledge_backend = ctx.consume_service::<dyn cog_core::KnowledgeBackend>();
             let skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
+            let state_backend = ctx.consume_service::<dyn cog_core::StateBackend>();
 
             // self_review / pge / boundary 是 cog-collaboration 自有配置段，
             // 自读 cogneva.json（core config.rs 不聚合单 crate 配置）。
@@ -83,6 +84,9 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             }
             if let Some(ref registry) = skill_registry {
                 collab = collab.with_skill_registry(registry.clone());
+            }
+            if let Some(ref backend) = state_backend {
+                collab = collab.with_state_backend(backend.clone());
             }
 
             ctx.publish_service::<dyn cog_core::TaskExecutor>(Arc::new(collab));
@@ -150,6 +154,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "ExternalSkillRegistry",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "StateBackend",
             required: false,
         },
     ],

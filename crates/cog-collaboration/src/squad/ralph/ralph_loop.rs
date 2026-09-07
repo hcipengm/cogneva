@@ -28,7 +28,7 @@ pub enum RalphVerdict {
 }
 
 /// Ralph Loop 单次迭代记录。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RalphIteration {
     pub iteration: u32,
     pub reset_strategy: ResetStrategy,
@@ -38,7 +38,7 @@ pub struct RalphIteration {
 }
 
 /// 全局重置策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResetStrategy {
     /// 完全复用相同上下文重新执行。
     Identical,
@@ -86,6 +86,11 @@ impl Default for RalphLoopConfig {
     }
 }
 
+/// Board field under which the Ralph iteration history of a task is stored.
+/// Persisting it after every iteration lets a restarted task resume with its
+/// accumulated feedback instead of restarting blind.
+const RALPH_HISTORY_FIELD: &str = "ralph_history";
+
 /// Ralph Loop 外层质量控制循环。
 #[derive(Default)]
 pub struct RalphLoop {
@@ -93,6 +98,11 @@ pub struct RalphLoop {
     llm_provider: Option<Arc<dyn cog_core::LlmClient>>,
     /// 跨重试累积的迭代历史，支持 Ralph Loop 跨 Squad 重试复用历史。
     history: Vec<RalphIteration>,
+    /// History persistence: when set, the history is loaded from the task's
+    /// context board before the first iteration and written back after every
+    /// iteration, so a crashed pod's replacement resumes where it stopped.
+    history_task_id: Option<String>,
+    state_backend: Option<Arc<dyn cog_core::StateBackend>>,
 }
 
 impl RalphLoop {
@@ -112,6 +122,70 @@ impl RalphLoop {
         self
     }
 
+    /// Persist the iteration history on the owning task's context board.
+    /// `task_id` must be the DAG task id so a retried/transferred execution
+    /// of the same task finds the history.
+    pub fn with_history_store(
+        mut self,
+        task_id: String,
+        backend: Arc<dyn cog_core::StateBackend>,
+    ) -> Self {
+        self.history_task_id = Some(task_id);
+        self.state_backend = Some(backend);
+        self
+    }
+
+    /// Load a previously persisted history, replacing the in-memory one.
+    /// Best-effort: a missing or unreadable board starts from empty.
+    async fn load_history(&mut self) {
+        let (Some(task_id), Some(backend)) = (&self.history_task_id, &self.state_backend) else {
+            return;
+        };
+        match backend.get_board(task_id).await {
+            Ok(Some(board)) => {
+                if let Some(raw) = board.fields.get(RALPH_HISTORY_FIELD) {
+                    match serde_json::from_str::<Vec<RalphIteration>>(raw) {
+                        Ok(history) if !history.is_empty() => {
+                            tracing::info!(
+                                task_id,
+                                iterations = history.len(),
+                                "Ralph history restored from state backend"
+                            );
+                            self.history = history;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(task_id, "Ralph history parse failed: {}", e);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(task_id, "Ralph history load failed: {}", e);
+            }
+        }
+    }
+
+    /// Persist the current history. Best-effort: history loss degrades a
+    /// restart to a fresh run, it must never fail the loop itself.
+    async fn persist_history(&self) {
+        let (Some(task_id), Some(backend)) = (&self.history_task_id, &self.state_backend) else {
+            return;
+        };
+        match serde_json::to_string(&self.history) {
+            Ok(raw) => {
+                if let Err(e) = backend
+                    .set_board_field(task_id, RALPH_HISTORY_FIELD, &raw)
+                    .await
+                {
+                    tracing::warn!(task_id, "Ralph history persist failed: {}", e);
+                }
+            }
+            Err(e) => tracing::warn!(task_id, "Ralph history serialize failed: {}", e),
+        }
+    }
+
     /// 以 Pipeline 模式运行 Ralph Loop。
     pub async fn run_pipeline(
         &mut self,
@@ -122,6 +196,7 @@ impl RalphLoop {
         generator: &GeneratorActor,
         evaluator: &EvaluatorActor,
     ) -> RalphVerdict {
+        self.load_history().await;
         let start_iteration = self.history.len() as u32 + 1;
 
         for iteration in start_iteration..=self.config.safety_limit {
@@ -180,6 +255,7 @@ impl RalphLoop {
                 feedback: feedback.clone(),
                 snapshot,
             });
+            self.persist_history().await;
 
             if passed {
                 let total_iterations = self.history.len() as u32;
@@ -223,6 +299,7 @@ impl RalphLoop {
         mut context: serde_json::Value,
         roundtable: &PgeRoundtable,
     ) -> RalphVerdict {
+        self.load_history().await;
         let start_iteration = self.history.len() as u32 + 1;
 
         for iteration in start_iteration..=self.config.safety_limit {
@@ -277,6 +354,7 @@ impl RalphLoop {
                 feedback: feedback.clone(),
                 snapshot: snapshot.clone(),
             });
+            self.persist_history().await;
 
             if passed {
                 let total_iterations = self.history.len() as u32;
@@ -682,6 +760,7 @@ mod tests {
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 2,
+            independent_review: false,
         });
         let planner = PlannerActor::new(Arc::new(pass_planner()));
         let generator = GeneratorActor::new(Arc::new(pass_generator()));
@@ -1011,5 +1090,227 @@ mod tests {
             "Unknown strategy should fallback to Identical, got {:?}",
             analysis
         );
+    }
+
+    /// In-memory board-only StateBackend for history persistence tests.
+    struct BoardMockBackend {
+        fields: std::sync::Mutex<std::collections::HashMap<(String, String), String>>,
+    }
+
+    impl BoardMockBackend {
+        fn new() -> Self {
+            Self {
+                fields: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::StateBackend for BoardMockBackend {
+        async fn get_agent_state(
+            &self,
+            _agent_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::AgentState>> {
+            Ok(None)
+        }
+
+        async fn set_agent_state(
+            &self,
+            _agent_id: &str,
+            _state: &cog_core::AgentState,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn cas_agent_state(
+            &self,
+            _agent_id: &str,
+            _expected: &cog_core::AgentState,
+            _new: &cog_core::AgentState,
+        ) -> cog_core::SFResult<bool> {
+            Ok(false)
+        }
+
+        async fn get_checkpoint(
+            &self,
+            _task_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::TaskCheckpoint>> {
+            Ok(None)
+        }
+
+        async fn save_checkpoint(
+            &self,
+            _checkpoint: &cog_core::TaskCheckpoint,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _task_id: &str,
+            _event: &cog_core::Event,
+        ) -> cog_core::SFResult<u64> {
+            Ok(0)
+        }
+
+        async fn get_events(
+            &self,
+            _task_id: &str,
+            _offset: u64,
+            _limit: usize,
+        ) -> cog_core::SFResult<Vec<cog_core::Event>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_board(
+            &self,
+            task_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::ContextBoard>> {
+            let fields = self.fields.lock().unwrap();
+            let mut board = cog_core::ContextBoard {
+                task_id: task_id.to_string(),
+                ..Default::default()
+            };
+            for ((tid, field), value) in fields.iter() {
+                if tid == task_id {
+                    board.fields.insert(field.clone(), value.clone());
+                }
+            }
+            if board.fields.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(board))
+            }
+        }
+
+        async fn set_board_field(
+            &self,
+            task_id: &str,
+            field: &str,
+            value: &str,
+        ) -> cog_core::SFResult<()> {
+            self.fields
+                .lock()
+                .unwrap()
+                .insert((task_id.to_string(), field.to_string()), value.to_string());
+            Ok(())
+        }
+
+        async fn delete_checkpoint(&self, _task_id: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn delete_board(&self, task_id: &str) -> cog_core::SFResult<()> {
+            self.fields
+                .lock()
+                .unwrap()
+                .retain(|(tid, _), _| tid != task_id);
+            Ok(())
+        }
+
+        async fn remove_board_field(&self, task_id: &str, field: &str) -> cog_core::SFResult<()> {
+            self.fields
+                .lock()
+                .unwrap()
+                .remove(&(task_id.to_string(), field.to_string()));
+            Ok(())
+        }
+    }
+
+    fn fail_evaluator() -> MockAgent {
+        MockAgent {
+            response: serde_json::json!({"verdict": "fail", "score": 10, "feedback": "still bad", "criteria": []}),
+        }
+    }
+
+    #[tokio::test]
+    async fn ralph_history_persists_across_loop_instances() {
+        let backend = Arc::new(BoardMockBackend::new());
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(Arc::new(pass_planner()));
+        let generator = GeneratorActor::new(Arc::new(pass_generator()));
+
+        // First run: one failing iteration, history persisted on the board.
+        let mut first = RalphLoop::with_config(RalphLoopConfig { safety_limit: 1 })
+            .with_history_store("task-1".into(), backend.clone());
+        let verdict = first
+            .run_pipeline(
+                "goal",
+                serde_json::json!({}),
+                &pipeline,
+                &planner,
+                &generator,
+                &EvaluatorActor::new(Arc::new(fail_evaluator())),
+            )
+            .await;
+        let history = match verdict {
+            RalphVerdict::Unrecoverable { history, .. } => history,
+            other => panic!("expected Unrecoverable, got {:?}", other),
+        };
+        assert_eq!(history.len(), 1);
+
+        // Restart: a fresh loop on the same task resumes from persisted history.
+        let mut second = RalphLoop::with_config(RalphLoopConfig { safety_limit: 2 })
+            .with_history_store("task-1".into(), backend.clone());
+        let verdict = second
+            .run_pipeline(
+                "goal",
+                serde_json::json!({}),
+                &pipeline,
+                &planner,
+                &generator,
+                &EvaluatorActor::new(Arc::new(fail_evaluator())),
+            )
+            .await;
+        let history = match verdict {
+            RalphVerdict::Unrecoverable { history, .. } => history,
+            other => panic!("expected Unrecoverable, got {:?}", other),
+        };
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].iteration, 1);
+        assert_eq!(history[1].iteration, 2);
+
+        // The board itself holds the full resumed history.
+        let raw = backend
+            .fields
+            .lock()
+            .unwrap()
+            .get(&("task-1".to_string(), RALPH_HISTORY_FIELD.to_string()))
+            .cloned()
+            .expect("history field must be persisted");
+        let stored: Vec<RalphIteration> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(stored.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ralph_without_history_store_runs_in_memory_only() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig { safety_limit: 1 });
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let verdict = ralph
+            .run_pipeline(
+                "goal",
+                serde_json::json!({}),
+                &pipeline,
+                &PlannerActor::new(Arc::new(pass_planner())),
+                &GeneratorActor::new(Arc::new(pass_generator())),
+                &EvaluatorActor::new(Arc::new(fail_evaluator())),
+            )
+            .await;
+        match verdict {
+            RalphVerdict::Unrecoverable { history, .. } => assert_eq!(history.len(), 1),
+            other => panic!("expected Unrecoverable, got {:?}", other),
+        }
     }
 }

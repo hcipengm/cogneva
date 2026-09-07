@@ -113,6 +113,8 @@ pub struct SquadExecutor {
     pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Skill registry — 解析 SquadConfig 中 *_skill_id 指定的 prompt skill。
     skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
+    /// State backend — 持久化 RalphLoop 迭代历史（ContextBoard 载体），重启后可续跑。
+    state_backend: Option<Arc<dyn cog_core::StateBackend>>,
 }
 
 /// Optional service dependencies shared by squad execution stages.
@@ -127,6 +129,7 @@ pub(crate) struct SquadDeps {
     pub self_review: Option<cog_core::SelfReviewConfig>,
     pub pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
     pub skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
+    pub state_backend: Option<Arc<dyn cog_core::StateBackend>>,
 }
 
 impl SquadExecutor {
@@ -208,6 +211,13 @@ impl SquadExecutor {
         self
     }
 
+    /// Inject a state backend so RalphLoop can persist iteration history
+    /// across restarts (stored on the task's ContextBoard).
+    pub fn with_state_backend(mut self, backend: Arc<dyn cog_core::StateBackend>) -> Self {
+        self.state_backend = Some(backend);
+        self
+    }
+
     /// 直接执行一个 Squad，返回执行结果。
     pub async fn execute_squad(&self, task_id: String, config: SquadConfig) -> SquadResult {
         let squad_id = format!("squad:{}", task_id);
@@ -261,6 +271,7 @@ impl SquadExecutor {
             self_review: self.self_review.clone(),
             pge_schemas: self.pge_schemas.clone(),
             skill_registry: self.skill_registry.clone(),
+            state_backend: self.state_backend.clone(),
         };
         let result = Self::run_squad_with_retries(squad, deps).await;
         let squad_latency_ms = squad_start.elapsed().as_millis() as u64;
@@ -559,6 +570,9 @@ impl SquadExecutor {
         });
         if let Some(ref llm) = deps.llm_provider {
             ralph = ralph.with_llm_provider(llm.clone());
+        }
+        if let Some(ref backend) = deps.state_backend {
+            ralph = ralph.with_history_store(squad.task_id.clone(), backend.clone());
         }
 
         // 若 Squad 已携带快照，先从后端恢复

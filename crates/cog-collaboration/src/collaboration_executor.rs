@@ -25,6 +25,7 @@ pub struct CollaborationExecutor {
     self_review: Option<cog_core::SelfReviewConfig>,
     pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
     skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
+    state_backend: Option<Arc<dyn cog_core::StateBackend>>,
 }
 
 impl CollaborationExecutor {
@@ -44,6 +45,7 @@ impl CollaborationExecutor {
             self_review: None,
             pge_schemas: None,
             skill_registry: None,
+            state_backend: None,
         }
     }
 
@@ -134,6 +136,13 @@ impl CollaborationExecutor {
         registry: Arc<dyn cog_core::ExternalSkillRegistry>,
     ) -> Self {
         self.skill_registry = Some(registry);
+        self
+    }
+
+    /// Inject a state backend so squads can persist RalphLoop iteration
+    /// history across restarts.
+    pub fn with_state_backend(mut self, backend: Arc<dyn cog_core::StateBackend>) -> Self {
+        self.state_backend = Some(backend);
         self
     }
 }
@@ -437,6 +446,9 @@ impl CollaborationExecutor {
         if let Some(ref registry) = self.skill_registry {
             squad_executor = squad_executor.with_skill_registry(registry.clone());
         }
+        if let Some(ref backend) = self.state_backend {
+            squad_executor = squad_executor.with_state_backend(backend.clone());
+        }
 
         let result = squad_executor
             .execute_squad(
@@ -548,6 +560,9 @@ impl CollaborationExecutor {
         }
         if let Some(ref registry) = self.skill_registry {
             squad_executor = squad_executor.with_skill_registry(registry.clone());
+        }
+        if let Some(ref backend) = self.state_backend {
+            squad_executor = squad_executor.with_state_backend(backend.clone());
         }
 
         let mut context = task.input.clone();
