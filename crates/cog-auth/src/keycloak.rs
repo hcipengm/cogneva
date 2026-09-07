@@ -468,14 +468,58 @@ pub struct KeycloakUserInfo {
     pub resource_access: Option<HashMap<String, ClientAccess>>,
 }
 
-/// JWT claims decoded from a Keycloak access token (internal, minimal).
+/// JWT claims decoded from a Keycloak access token (internal). Captures the
+/// full standard claim set; `aud` stays opaque because Keycloak emits it as
+/// either a string or an array.
 #[derive(Debug, Clone, Deserialize)]
 struct KeycloakTokenClaims {
     pub sub: String,
     #[serde(default)]
+    pub preferred_username: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
     pub realm_access: RealmAccess,
     #[serde(default)]
     pub resource_access: HashMap<String, ClientAccess>,
+    #[serde(default)]
+    pub exp: i64,
+    #[serde(default)]
+    pub iat: i64,
+    #[serde(default)]
+    pub iss: String,
+    #[serde(default)]
+    pub aud: Option<serde_json::Value>,
+    #[serde(default)]
+    pub nbf: Option<i64>,
+}
+
+impl KeycloakTokenClaims {
+    /// Materialize the public claims view. `aud` reduces to its first entry
+    /// when Keycloak issued it as an array.
+    fn into_token_claims(self) -> TokenClaims {
+        let aud = match self.aud {
+            Some(serde_json::Value::String(s)) => s,
+            Some(serde_json::Value::Array(mut a)) if !a.is_empty() => match a.remove(0) {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            },
+            Some(other) => other.to_string(),
+            None => String::new(),
+        };
+        TokenClaims {
+            sub: self.sub,
+            preferred_username: self.preferred_username,
+            email: self.email,
+            realm_access: Some(self.realm_access),
+            resource_access: Some(self.resource_access),
+            exp: self.exp,
+            iat: self.iat,
+            iss: self.iss,
+            aud,
+            nbf: self.nbf,
+        }
+    }
 }
 
 /// Result of authenticating a user via Keycloak.
@@ -536,92 +580,19 @@ impl KeycloakAuthProvider {
     }
 
     /// Validate a JWT access token using cached JWKS and return a detailed result.
-    pub fn validate_token_with_result(&self, token: &str) -> TokenValidationResult {
-        let rt = tokio::runtime::Handle::try_current();
-        match rt {
-            Ok(handle) => {
-                let token = token.to_string();
-                let this = self;
-                match handle.block_on(async move { this.validate_token(&token).await }) {
-                    Ok(claims) => {
-                        let claims = TokenClaims {
-                            sub: claims.sub,
-                            preferred_username: None,
-                            email: None,
-                            realm_access: Some(claims.realm_access),
-                            resource_access: Some(claims.resource_access),
-                            exp: 0,
-                            iat: 0,
-                            iss: String::new(),
-                            aud: String::new(),
-                            nbf: None,
-                        };
-                        TokenValidationResult {
-                            valid: true,
-                            claims: Some(claims),
-                            error: None,
-                        }
-                    }
-                    Err(e) => TokenValidationResult {
-                        valid: false,
-                        claims: None,
-                        error: Some(e.to_string()),
-                    },
-                }
-            }
-            Err(_) => {
-                // No runtime available — perform synchronous validation
-                match self.validate_token_sync(token) {
-                    Ok(claims) => TokenValidationResult {
-                        valid: true,
-                        claims: Some(claims),
-                        error: None,
-                    },
-                    Err(e) => TokenValidationResult {
-                        valid: false,
-                        claims: None,
-                        error: Some(e.to_string()),
-                    },
-                }
-            }
+    pub async fn validate_token_with_result(&self, token: &str) -> TokenValidationResult {
+        match self.validate_token(token).await {
+            Ok(claims) => TokenValidationResult {
+                valid: true,
+                claims: Some(claims.into_token_claims()),
+                error: None,
+            },
+            Err(e) => TokenValidationResult {
+                valid: false,
+                claims: None,
+                error: Some(e.to_string()),
+            },
         }
-    }
-
-    /// Synchronous token validation (used when no Tokio runtime is available).
-    fn validate_token_sync(&self, token: &str) -> AuthResult<TokenClaims> {
-        let jwks = self.get_jwks_sync()?;
-
-        let header = decode_header(token)
-            .map_err(|e| AuthError::InvalidToken(format!("decode header failed: {e}")))?;
-
-        let kid = header
-            .kid
-            .ok_or_else(|| AuthError::InvalidToken("Token missing 'kid' header".into()))?;
-
-        let jwk = jwks
-            .find(&kid)
-            .ok_or_else(|| AuthError::InvalidToken(format!("No JWK found for kid: {kid}")))?;
-
-        let decoding_key = DecodingKey::from_jwk(jwk)
-            .map_err(|e| AuthError::InvalidToken(format!("invalid JWK: {e}")))?;
-
-        let mut validation = Validation::new(header.alg);
-        let expected_issuer = format!(
-            "{}/realms/{}",
-            self.client.config().base_url,
-            self.client.config().realm
-        );
-        validation.set_issuer(&[&expected_issuer]);
-        validation.set_audience(&[&self.client.config().client_id]);
-
-        let token_data = decode::<TokenClaims>(token, &decoding_key, &validation).map_err(|e| {
-            match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                _ => AuthError::InvalidToken(e.to_string()),
-            }
-        })?;
-
-        Ok(token_data.claims)
     }
 
     /// Validate a JWT access token using cached JWKS.
@@ -642,7 +613,34 @@ impl KeycloakAuthProvider {
         let decoding_key = DecodingKey::from_jwk(jwk)
             .map_err(|e| AuthError::InvalidToken(format!("invalid JWK: {e}")))?;
 
-        let mut validation = Validation::new(header.alg);
+        // Pin the verification algorithm to the JWK's declared `alg` instead
+        // of trusting the token header — otherwise a forged HS256 token turns
+        // the RSA public key into an HMAC secret (algorithm confusion).
+        // Keycloak's RS256 keys often omit `alg` in JWKS; default to RS256.
+        let alg = match jwk.common.key_algorithm {
+            Some(jsonwebtoken::jwk::KeyAlgorithm::RS256) => jsonwebtoken::Algorithm::RS256,
+            Some(jsonwebtoken::jwk::KeyAlgorithm::RS384) => jsonwebtoken::Algorithm::RS384,
+            Some(jsonwebtoken::jwk::KeyAlgorithm::RS512) => jsonwebtoken::Algorithm::RS512,
+            Some(jsonwebtoken::jwk::KeyAlgorithm::ES256) => jsonwebtoken::Algorithm::ES256,
+            Some(jsonwebtoken::jwk::KeyAlgorithm::ES384) => jsonwebtoken::Algorithm::ES384,
+            Some(jsonwebtoken::jwk::KeyAlgorithm::PS256) => jsonwebtoken::Algorithm::PS256,
+            Some(jsonwebtoken::jwk::KeyAlgorithm::PS384) => jsonwebtoken::Algorithm::PS384,
+            Some(jsonwebtoken::jwk::KeyAlgorithm::PS512) => jsonwebtoken::Algorithm::PS512,
+            Some(jsonwebtoken::jwk::KeyAlgorithm::EdDSA) => jsonwebtoken::Algorithm::EdDSA,
+            Some(other) => {
+                return Err(AuthError::InvalidToken(format!(
+                    "JWK algorithm {other} not allowed for bearer token validation"
+                )))
+            }
+            None => jsonwebtoken::Algorithm::RS256,
+        };
+        if header.alg != alg {
+            return Err(AuthError::InvalidToken(format!(
+                "token alg {:?} does not match JWK alg {:?}",
+                header.alg, alg
+            )));
+        }
+        let mut validation = Validation::new(alg);
         let expected_issuer = format!(
             "{}/realms/{}",
             self.client.config().base_url,
@@ -663,38 +661,8 @@ impl KeycloakAuthProvider {
 
     /// Get role mapping from a token string.
     pub async fn get_role_mapping(&self, token: &str) -> AuthResult<RoleMappingResult> {
-        let claims = self.validate_token(token).await?;
-        let claims = TokenClaims {
-            sub: claims.sub,
-            preferred_username: None,
-            email: None,
-            realm_access: Some(claims.realm_access),
-            resource_access: Some(claims.resource_access),
-            exp: 0,
-            iat: 0,
-            iss: String::new(),
-            aud: String::new(),
-            nbf: None,
-        };
+        let claims = self.validate_token(token).await?.into_token_claims();
         Ok(map_role_mapping(&claims))
-    }
-
-    /// Retrieve JWKS synchronously, using the in-memory cache when fresh.
-    fn get_jwks_sync(&self) -> AuthResult<JwkSet> {
-        {
-            let cache = self
-                .jwks_cache
-                .read()
-                .map_err(|_| AuthError::Internal("JWKS cache lock poisoned".into()))?;
-            if let Some(ref cached) = *cache {
-                if cached.fetched_at.elapsed() < JWKS_CACHE_TTL {
-                    return Ok(cached.jwks.clone());
-                }
-            }
-        }
-        Err(AuthError::Internal(
-            "JWKS cache miss — synchronous fetch not available without async runtime".into(),
-        ))
     }
 
     /// Retrieve JWKS, using the in-memory cache when fresh.

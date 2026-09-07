@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::GitHubIntegrationConfig;
 use cog_core::{
     ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, Task, TaskStatus, TaskType,
@@ -69,6 +71,28 @@ pub struct GitHubDiscoveryLoop {
     /// PR number → in-flight cross-validation task (submitted, not yet
     /// reaped). Keyed by PR number; at most one validation per PR at a time.
     cv_inflight: HashMap<u64, crate::cross_validation::CvInflight>,
+    /// Whether the persisted intent guards were already merged into the
+    /// in-memory sets (first round only).
+    guards_loaded: bool,
+}
+
+/// Persisted intent guards (`$COGNEVA_DATA_DIR/discovery-guards.json`):
+/// which intents already produced a task or a clarification question and
+/// which CI runs already produced a fix task. Without persistence a pod
+/// restart resubmits every open intent and reposts questions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DiscoveryGuardState {
+    #[serde(default)]
+    submitted: std::collections::HashSet<String>,
+    #[serde(default)]
+    awaiting_clarification: std::collections::HashSet<String>,
+    #[serde(default)]
+    ci_submitted: std::collections::HashSet<u64>,
+}
+
+fn discovery_guard_state_path() -> std::path::PathBuf {
+    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
+    std::path::PathBuf::from(dir).join("discovery-guards.json")
 }
 
 /// Which external-intent surface a conversation belongs to. Issues and PRs
@@ -150,6 +174,56 @@ impl GitHubDiscoveryLoop {
             ci_seen: None,
             cv_state: None,
             cv_inflight: HashMap::new(),
+            guards_loaded: false,
+        }
+    }
+
+    /// Merge persisted intent guards into the live sets (first round only).
+    async fn load_guards_once(&mut self) {
+        if self.guards_loaded {
+            return;
+        }
+        self.guards_loaded = true;
+        let Ok(text) = tokio::fs::read_to_string(discovery_guard_state_path()).await else {
+            return; // first boot — no state file yet
+        };
+        match serde_json::from_str::<DiscoveryGuardState>(&text) {
+            Ok(state) => {
+                self.submitted.extend(state.submitted);
+                self.awaiting_clarification
+                    .extend(state.awaiting_clarification);
+                self.ci_submitted.extend(state.ci_submitted);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "discovery guard state corrupt; starting fresh")
+            }
+        }
+    }
+
+    /// Best-effort persist of the intent guards. A write failure only means
+    /// the next restart may re-see handled intents; the platform-side comment
+    /// scan remains the backstop against double-posting.
+    async fn persist_guards(&self) {
+        let state = DiscoveryGuardState {
+            submitted: self.submitted.clone(),
+            awaiting_clarification: self.awaiting_clarification.clone(),
+            ci_submitted: self.ci_submitted.clone(),
+        };
+        let Ok(json) = serde_json::to_string_pretty(&state) else {
+            return;
+        };
+        let path = discovery_guard_state_path();
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if tokio::fs::create_dir_all(parent).await.is_ok() {
+            if let Err(e) = tokio::fs::write(&path, json).await {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "discovery guard state not writable; guards reset on restart"
+                );
+            }
         }
     }
 
@@ -160,6 +234,7 @@ impl GitHubDiscoveryLoop {
 
     /// Run one discovery round. Returns the number of issues scanned.
     pub async fn run_once(&mut self) -> Result<usize> {
+        self.load_guards_once().await;
         let issues = self
             .discovery
             .scan(self.provider.as_ref(), &self.config)
@@ -208,6 +283,8 @@ impl GitHubDiscoveryLoop {
         }
 
         self.poll_ci_failures().await;
+
+        self.persist_guards().await;
 
         Ok(scanned)
     }

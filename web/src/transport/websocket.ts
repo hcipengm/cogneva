@@ -31,6 +31,14 @@ export class EventStreamClient {
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private lastPongAt = 0;
+
+  private static readonly HEARTBEAT_INTERVAL_MS = 30000;
+  /** Half-open connections: no pong within this window → close + reconnect. */
+  private static readonly PONG_TIMEOUT_MS =
+    EventStreamClient.HEARTBEAT_INTERVAL_MS * 2 + 5000;
+  /** Slow steady-state retry cadence once fast attempts are exhausted. */
+  private static readonly SLOW_RECONNECT_MS = 30000;
 
   constructor(options: WebSocketOptions) {
     this.options = {
@@ -53,6 +61,7 @@ export class EventStreamClient {
 
     this.ws.onopen = () => {
       this.reconnectAttempts = 0;
+      this.lastPongAt = Date.now();
       this.setStatus('open');
       this.subscribe();
       this.startHeartbeat();
@@ -128,6 +137,11 @@ export class EventStreamClient {
       return;
     }
 
+    if (message.type === 'pong') {
+      this.lastPongAt = Date.now();
+      return;
+    }
+
     if (message.type === 'agent_event' && message.payload) {
       const event = normalizeAgentEvent(message.payload, message.event_id ?? message.payload.id as string);
       if (event) {
@@ -155,20 +169,32 @@ export class EventStreamClient {
   private scheduleReconnect(): void {
     const { reconnectIntervalMs, maxReconnectAttempts } = this.options;
     if (!reconnectIntervalMs || !maxReconnectAttempts) return;
-    if (this.reconnectAttempts >= maxReconnectAttempts) return;
 
     this.reconnectAttempts += 1;
+    // Fast exponential-ish backoff for the first maxReconnectAttempts tries,
+    // then keep retrying forever at a slow fixed cadence — a long server
+    // outage must not silently kill the live view.
+    const delay =
+      this.reconnectAttempts <= maxReconnectAttempts
+        ? reconnectIntervalMs * Math.min(this.reconnectAttempts, 5)
+        : EventStreamClient.SLOW_RECONNECT_MS;
     this.reconnectTimer = setTimeout(() => {
       this.connect();
-    }, reconnectIntervalMs * Math.min(this.reconnectAttempts, 5));
+    }, delay);
   }
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
     let seq = 0;
     this.pingTimer = setInterval(() => {
+      // A half-open socket never fires onclose; detect it via missing pongs
+      // and close so the reconnect path takes over.
+      if (Date.now() - this.lastPongAt > EventStreamClient.PONG_TIMEOUT_MS) {
+        this.ws?.close();
+        return;
+      }
       this.ping(seq++);
-    }, 30000);
+    }, EventStreamClient.HEARTBEAT_INTERVAL_MS);
   }
 
   private stopHeartbeat(): void {

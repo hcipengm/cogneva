@@ -63,6 +63,7 @@ echo "==> 内部实例密钥（自动随机生成，缺失才创建）"
 ensure_random pg-password
 ensure_random redis-password
 ensure_random webhook-internal
+ensure_random jwt-secret
 
 echo "==> 带外凭证占位（留空，由 WebUI 向导或 kubectl edit secret 写入）"
 ensure_blank llm-upstreams

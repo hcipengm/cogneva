@@ -304,7 +304,8 @@ impl OtlpHttpExporter {
         let client = self
             .client
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OtlpHttpExporter has no HttpClient configured"))?;
+            .ok_or_else(|| anyhow::anyhow!("OtlpHttpExporter has no HttpClient configured"))?
+            .clone();
         let resource = OtlpResource {
             attributes: vec![OtlpKeyValue {
                 key: "service.name".into(),
@@ -328,14 +329,21 @@ impl OtlpHttpExporter {
             }],
         };
 
-        let rt = tokio::runtime::Handle::try_current();
-        match rt {
-            Ok(handle) => handle.block_on(async {
-                let req = HttpRequest::post(&self.endpoint)
+        // Fire-and-forget: flush runs on the tracing hot path, where blocking
+        // the runtime panics. A failed export costs one batch.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("No Tokio runtime for OTLP flush — spans dropped");
+            return Ok(());
+        };
+        let endpoint = self.endpoint.clone();
+        let timeout_secs = self.timeout_secs;
+        handle.spawn(async move {
+            let result = async {
+                let req = HttpRequest::post(&endpoint)
                     .header("Content-Type", "application/json")
                     .json(&request)
                     .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
-                    .timeout(self.timeout_secs);
+                    .timeout(timeout_secs);
                 let resp = client
                     .execute(req)
                     .await
@@ -344,12 +352,13 @@ impl OtlpHttpExporter {
                     return Err(anyhow::anyhow!("OTLP returned {}", resp.status));
                 }
                 Ok(())
-            }),
-            Err(_) => {
-                tracing::debug!("No Tokio runtime for OTLP flush — spans dropped");
-                Ok(())
             }
-        }
+            .await;
+            if let Err(e) = result {
+                tracing::debug!("OTLP span export failed: {}", e);
+            }
+        });
+        Ok(())
     }
 }
 

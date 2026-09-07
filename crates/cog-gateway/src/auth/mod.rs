@@ -312,6 +312,23 @@ impl cog_core::UserStore for InMemoryUserStore {
 // Login rate limiter (Redis-backed)
 // ---------------------------------------------------------------------------
 
+/// Failed-login attempts allowed per identifier inside the window before
+/// the endpoint answers 429.
+pub const LOGIN_MAX_ATTEMPTS: u32 = 5;
+/// Sliding window (seconds) for failed-login counting.
+pub const LOGIN_WINDOW_SECONDS: u64 = 300;
+
+/// INCR with the TTL set atomically on first increment — a separate EXPIRE
+/// racing a crash would leave the counter key without TTL and lock the
+/// identifier forever.
+const INCR_WITH_TTL_SCRIPT: &str = r#"
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+"#;
+
 /// Rate-limits failed login attempts per identifier.
 #[derive(Debug, Clone)]
 pub struct LoginRateLimiter {
@@ -346,10 +363,7 @@ impl LoginRateLimiter {
 
     /// Record a failed login attempt.
     pub async fn record_failure(&self, identifier: &str) {
-        let mut conn = self.redis.lock().await;
-        let key = Self::key(identifier);
-        let _: Result<(), _> = conn.incr(&key, 1u32).await;
-        let _: Result<(), _> = conn.expire(&key, self.window_seconds as i64).await;
+        self.record_attempt(Self::key(identifier)).await;
     }
 
     /// Clear attempts on successful login.
@@ -368,16 +382,76 @@ impl LoginRateLimiter {
 
     /// Record a generic attempt with a custom prefix.
     pub async fn record_attempt_prefix(&self, prefix: &str, identifier: &str) {
+        self.record_attempt(format!("{}:{}", prefix, identifier)).await;
+    }
+
+    async fn record_attempt(&self, key: String) {
         let mut conn = self.redis.lock().await;
-        let key = format!("{}:{}", prefix, identifier);
-        let _: Result<(), _> = conn.incr(&key, 1u32).await;
-        let _: Result<(), _> = conn.expire(&key, self.window_seconds as i64).await;
+        let _: Result<u32, _> = redis::Script::new(INCR_WITH_TTL_SCRIPT)
+            .key(key)
+            .arg(self.window_seconds)
+            .invoke_async(&mut *conn)
+            .await;
     }
 }
 
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
+/// Permissions granted per user type. Mirrors the role mapping in cog-auth
+/// so the JWT claim set matches what the role implies; previously every real
+/// user was hardcoded to read-only while the demo path got everything.
+fn permissions_for_user_type(user_type: UserType) -> Vec<Permission> {
+    match user_type {
+        UserType::Admin => vec![
+            Permission::AgentRead,
+            Permission::AgentWrite,
+            Permission::QuotaRead,
+            Permission::QuotaAdmin,
+            Permission::UserAdmin,
+            Permission::WorkspaceManageMembers,
+            Permission::WorkspaceConfig,
+        ],
+        UserType::Standard => vec![
+            Permission::AgentRead,
+            Permission::AgentWrite,
+            Permission::QuotaRead,
+        ],
+        UserType::Guest => vec![Permission::AgentRead],
+    }
+}
+
+/// Access-token lifetime in seconds reported to clients — derived from the
+/// same gateway config the JWT manager signs with, so the advertised
+/// `expires_in` never drifts from the real token TTL.
+fn access_token_expires_in(state: &GatewayState) -> u64 {
+    state
+        .config
+        .read()
+        .map(|c| c.effective_access_token_ttl_minutes())
+        .unwrap_or(cog_core::DEFAULT_ACCESS_TOKEN_TTL_MINUTES)
+        .saturating_mul(60)
+}
+
+/// Best-effort client IP for the session audit record: first
+/// X-Forwarded-For hop, else X-Real-IP, else "unknown".
+fn client_ip(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
 
 pub async fn register_handler(
     State(state): State<Arc<GatewayState>>,
@@ -481,7 +555,11 @@ pub async fn register_handler(
 
     let token_pair = match state
         .jwt_manager
-        .generate_token(&user, vec!["default".into()], vec![Permission::AgentRead])
+        .generate_token(
+            &user,
+            vec!["default".into()],
+            permissions_for_user_type(user.user_type),
+        )
         .await
     {
         Ok(t) => t,
@@ -495,8 +573,83 @@ pub async fn register_handler(
             access_token: token_pair.access_token,
             refresh_token: token_pair.refresh_token,
             token_type: "Bearer".into(),
-            expires_in: 900,
+            expires_in: access_token_expires_in(&state),
             user: UserResponse::from(&user),
+            session_token: None,
+        }),
+    )
+        .into_response()
+}
+
+/// Login without a configured user store (single-node / demo deployments).
+/// Escape hatches in priority order: the bootstrap admin password
+/// (`COGNEVA_ADMIN_PASSWORD`, explicitly provisioned by the operator), then
+/// the demo switch (`gateway.demo_login_enabled`). Both issue an admin token;
+/// with neither configured the endpoint fails closed.
+async fn login_without_user_store(state: &GatewayState, payload: &LoginPayload) -> Response {
+    let admin_password = std::env::var("COGNEVA_ADMIN_PASSWORD").unwrap_or_default();
+    let demo_enabled = state
+        .config
+        .read()
+        .map(|c| c.demo_login_enabled)
+        .unwrap_or(false);
+
+    let authorized = if !admin_password.is_empty() {
+        payload.username == "admin" && payload.password == admin_password
+    } else if demo_enabled {
+        warn!(
+            "demo login enabled; granting admin token to '{}'",
+            payload.username
+        );
+        true
+    } else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "auth_unavailable",
+                "message": "No user store configured. Set COGNEVA_ADMIN_PASSWORD for the bootstrap admin login, or enable gateway.demo_login_enabled for throwaway demos."
+            })),
+        )
+            .into_response();
+    };
+    if !authorized {
+        warn!("bootstrap admin login rejected for '{}'", payload.username);
+        return AuthError::InvalidCredentials.into_response();
+    }
+
+    let admin_user = User {
+        id: Uuid::nil(),
+        phone: None,
+        email: None,
+        username: payload.username.clone(),
+        display_name: Some(payload.username.clone()),
+        avatar_url: None,
+        status: UserStatus::Active,
+        user_type: UserType::Admin,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let token_pair = match state
+        .jwt_manager
+        .generate_token(
+            &admin_user,
+            vec!["default".into()],
+            permissions_for_user_type(UserType::Admin),
+        )
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    info!("Bootstrap login (no user store): {}", payload.username);
+    (
+        StatusCode::OK,
+        Json(AuthResponse {
+            access_token: token_pair.access_token,
+            refresh_token: token_pair.refresh_token,
+            token_type: "Bearer".into(),
+            expires_in: access_token_expires_in(state),
+            user: UserResponse::from(&admin_user),
             session_token: None,
         }),
     )
@@ -505,64 +658,12 @@ pub async fn register_handler(
 
 pub async fn login_handler(
     State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<LoginPayload>,
 ) -> Response {
     let store = match state.user_store.as_ref() {
         Some(s) => s,
-        None => {
-            // 未配置用户库 = 单机/演示部署：登录必须开箱即用，否则一键拉起
-            // 的 WebUI 永远卡在认证墙（2026-08-04 用户明确要求）。直接授予
-            // 管理员 token；生产部署应配置用户库，届时本分支不会触发。
-            warn!(
-                "user store not configured; granting demo admin token to '{}'",
-                payload.username
-            );
-            let demo_user = User {
-                id: Uuid::nil(),
-                phone: None,
-                email: None,
-                username: payload.username.clone(),
-                display_name: Some(payload.username.clone()),
-                avatar_url: None,
-                status: UserStatus::Active,
-                user_type: UserType::Admin,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            };
-            let token_pair = match state
-                .jwt_manager
-                .generate_token(
-                    &demo_user,
-                    vec!["default".into()],
-                    vec![
-                        Permission::AgentRead,
-                        Permission::AgentWrite,
-                        Permission::QuotaRead,
-                        Permission::QuotaAdmin,
-                        Permission::UserAdmin,
-                        Permission::WorkspaceManageMembers,
-                        Permission::WorkspaceConfig,
-                    ],
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-            };
-            info!("Demo login (no user store): {}", payload.username);
-            return (
-                StatusCode::OK,
-                Json(AuthResponse {
-                    access_token: token_pair.access_token,
-                    refresh_token: token_pair.refresh_token,
-                    token_type: "Bearer".into(),
-                    expires_in: 900,
-                    user: UserResponse::from(&demo_user),
-                    session_token: None,
-                }),
-            )
-                .into_response();
-        }
+        None => return login_without_user_store(&state, &payload).await,
     };
 
     // Rate-limit check
@@ -633,7 +734,11 @@ pub async fn login_handler(
 
     let token_pair = match state
         .jwt_manager
-        .generate_token(&user, vec!["default".into()], vec![Permission::AgentRead])
+        .generate_token(
+            &user,
+            vec!["default".into()],
+            permissions_for_user_type(user.user_type),
+        )
         .await
     {
         Ok(t) => t,
@@ -646,7 +751,7 @@ pub async fn login_handler(
             user_id: user.id,
             workspace_id: None,
             login_method: "password".into(),
-            login_ip: "0.0.0.0".into(),
+            login_ip: client_ip(&headers),
             login_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
             device_info: None,
@@ -678,7 +783,7 @@ pub async fn login_handler(
             access_token: token_pair.access_token,
             refresh_token: token_pair.refresh_token,
             token_type: "Bearer".into(),
-            expires_in: 900,
+            expires_in: access_token_expires_in(&state),
             user: UserResponse::from(&user),
             session_token,
         }),
@@ -704,7 +809,7 @@ pub async fn refresh_handler(
         Json(json!({
             "access_token": new_access,
             "token_type": "Bearer",
-            "expires_in": 900
+            "expires_in": access_token_expires_in(&state)
         })),
     )
         .into_response()

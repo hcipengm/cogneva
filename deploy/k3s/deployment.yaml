@@ -93,6 +93,14 @@ spec:
                   name: cogneva-secrets
                   key: webhook-internal
                   optional: true
+            # JWT 签名密钥：安装时随机生成（init-secrets.sh）。缺失时进程生成
+            # 一次性随机密钥，重启即全员登出，不会被已知弱密钥伪造。
+            - name: COGNEVA_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: jwt-secret
+                  optional: true
             # 贡献通道 OAuth 应用身份（随 chart 公开分发，是应用标识非用户凭证；
             # 用户 token 只进安全网关）。贡献通道端点与 token 续期跑在本进程。
             - name: COGNEVA_GITHUB_OAUTH_CLIENT_ID

@@ -224,6 +224,11 @@ impl std::fmt::Debug for PlatformWebhookConfig {
     }
 }
 
+/// Built-in access-token TTL when the config leaves it at 0. Both the JWT
+/// manager (cog-auth) and the HTTP handlers (expires_in responses) derive
+/// from this so the two never drift apart.
+pub const DEFAULT_ACCESS_TOKEN_TTL_MINUTES: u64 = 15;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -232,6 +237,15 @@ pub struct GatewayConfig {
     pub ws_port: u16,
     pub metrics_port: u16,
     pub cors_origins: Vec<String>,
+    /// Access-token TTL in minutes. 0 = built-in default
+    /// ([`DEFAULT_ACCESS_TOKEN_TTL_MINUTES`]).
+    #[serde(default)]
+    pub access_token_ttl_minutes: u64,
+    /// Explicit opt-in for the no-user-store demo login (any credentials get
+    /// an admin token). Must stay false outside throwaway demo deployments;
+    /// production uses the bootstrap admin password or a real user store.
+    #[serde(default)]
+    pub demo_login_enabled: bool,
     #[serde(default = "default_websocket_timeout_secs")]
     pub websocket_timeout_secs: u64,
     #[serde(default = "default_websocket_inactivity_timeout_secs")]
@@ -256,6 +270,17 @@ pub struct GatewayConfig {
     /// WeChat Work (企业微信) robot webhook configuration.
     #[serde(default)]
     pub notification_wechat_work: Option<PlatformWebhookConfig>,
+}
+
+impl GatewayConfig {
+    /// Effective access-token TTL in minutes; never zero.
+    pub fn effective_access_token_ttl_minutes(&self) -> u64 {
+        if self.access_token_ttl_minutes == 0 {
+            DEFAULT_ACCESS_TOKEN_TTL_MINUTES
+        } else {
+            self.access_token_ttl_minutes
+        }
+    }
 }
 
 fn default_websocket_timeout_secs() -> u64 {

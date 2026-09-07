@@ -133,6 +133,7 @@ secrets:
   pgPassword: ""
   redisPassword: ""
   webhookInternal: ""
+  jwtSecret: ""
   llmApiKey: ""
   # 带外凭证（网关专用）：真实值带外写入，默认空（未配置时对应功能 fail-closed）。
   llmUpstreams: ""

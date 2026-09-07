@@ -1,7 +1,12 @@
 //! Auth plugin — implements [`cog_core::SystemPlugin`].
 
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Well-known placeholder from `JwtConfig::default()`. Refused at startup
+/// outside demo mode: HS256 with a public secret means anyone can forge an
+/// admin token offline.
+const KNOWN_WEAK_SECRET: &str = "change-me-in-production";
 
 /// Auth plugin that self-assembles and publishes JWT manager and session manager.
 pub struct AuthPlugin {
@@ -39,7 +44,7 @@ impl cog_core::SystemPlugin for AuthPlugin {
             .clone();
 
         let jwt_manager: Arc<dyn cog_core::AuthProvider> =
-            Arc::new(crate::JwtManager::new(crate::jwt::JwtConfig::default()));
+            Arc::new(crate::JwtManager::new(resolve_jwt_config(ctx.config())?));
         ctx.publish_service(jwt_manager);
         info!("AuthPlugin JWT manager published");
 
@@ -70,6 +75,43 @@ impl cog_core::SystemPlugin for AuthPlugin {
         info!("AuthPlugin shutdown");
         Ok(())
     }
+}
+
+/// Build the JWT config: TTL from the shared gateway config, HMAC secret from
+/// the `COGNEVA_JWT_SECRET` env (injected from the install-time generated
+/// cluster Secret). Unset env falls back to a per-boot random secret with a
+/// loud warning — safe against forgery, but every token dies on restart, so
+/// real deployments must inject the Secret. The known placeholder is refused
+/// unless demo login is explicitly enabled.
+fn resolve_jwt_config(config: &cog_core::Config) -> cog_core::SFResult<crate::jwt::JwtConfig> {
+    let mut cfg = crate::jwt::JwtConfig {
+        access_token_ttl_minutes: config.gateway.effective_access_token_ttl_minutes() as i64,
+        ..crate::jwt::JwtConfig::default()
+    };
+    match std::env::var("COGNEVA_JWT_SECRET") {
+        Ok(secret) if !secret.is_empty() => {
+            if secret == KNOWN_WEAK_SECRET && !config.gateway.demo_login_enabled {
+                return Err(cog_core::SFError::Config(format!(
+                    "COGNEVA_JWT_SECRET is the known placeholder '{KNOWN_WEAK_SECRET}'; \
+                     set a random secret (the installer generates one) or enable \
+                     gateway.demo_login_enabled for throwaway demos"
+                )));
+            }
+            cfg.secret = secret;
+        }
+        _ => {
+            cfg.secret = format!(
+                "ephemeral-{}-{}",
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4()
+            );
+            warn!(
+                "COGNEVA_JWT_SECRET not set; generated a per-boot random secret — \
+                 all issued tokens are invalidated on restart"
+            );
+        }
+    }
+    Ok(cfg)
 }
 
 /// Static descriptor for auto-discovery.

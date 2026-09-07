@@ -117,7 +117,8 @@ impl JaegerExporter {
         let client = self
             .client
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("JaegerExporter has no HttpClient configured"))?;
+            .ok_or_else(|| anyhow::anyhow!("JaegerExporter has no HttpClient configured"))?
+            .clone();
         let process = JaegerProcess {
             service_name: self.service_name.clone(),
             tags: vec![],
@@ -127,14 +128,20 @@ impl JaegerExporter {
             spans,
         };
         let url = format!("{}/api/v2/spans", self.endpoint.trim_end_matches('/'));
-        let rt = tokio::runtime::Handle::try_current();
-        match rt {
-            Ok(handle) => handle.block_on(async {
+        let timeout_secs = self.timeout_secs;
+        // Fire-and-forget: flush runs on the tracing hot path (span close),
+        // where blocking the runtime panics. A failed export costs one batch.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("No Tokio runtime available for Jaeger flush — spans dropped");
+            return Ok(());
+        };
+        handle.spawn(async move {
+            let result = async {
                 let req = HttpRequest::post(&url)
                     .header("Content-Type", "application/json")
                     .json(&batch)
                     .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
-                    .timeout(self.timeout_secs);
+                    .timeout(timeout_secs);
                 let resp = client
                     .execute(req)
                     .await
@@ -143,12 +150,13 @@ impl JaegerExporter {
                     return Err(anyhow::anyhow!("Jaeger returned {}", resp.status));
                 }
                 Ok(())
-            }),
-            Err(_) => {
-                tracing::debug!("No Tokio runtime available for Jaeger flush — spans dropped");
-                Ok(())
             }
-        }
+            .await;
+            if let Err(e) = result {
+                tracing::debug!("Jaeger span export failed: {}", e);
+            }
+        });
+        Ok(())
     }
 }
 
