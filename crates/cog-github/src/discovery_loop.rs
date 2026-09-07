@@ -99,8 +99,33 @@ struct DiscoveryGuardState {
 }
 
 fn discovery_guard_state_path() -> std::path::PathBuf {
-    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
-    std::path::PathBuf::from(dir).join("discovery-guards.json")
+    let dir = std::env::var("COGNEVA_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| default_state_dir());
+    dir.join("discovery-guards.json")
+}
+
+#[cfg(not(test))]
+fn default_state_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/cogneva-data")
+}
+
+// Test builds must never touch the production state dir: run_once loads and
+// persists the intent guards on every round, so a shared path lets deterministic
+// fixture keys (e.g. issue:7, ci run 5002) leak across tests and across runs on
+// a dev machine — a stale `awaiting_clarification`/`ci_submitted` then short-
+// circuits the behaviour under test. Mirror the per-process temp isolation the
+// assess-verdicts store already uses.
+#[cfg(test)]
+fn default_state_dir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir()
+            .join(format!("cogneva-test-state-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    })
+    .clone()
 }
 
 /// Persisted assess verdicts (`$COGNEVA_DATA_DIR/assess-verdicts.json`):
