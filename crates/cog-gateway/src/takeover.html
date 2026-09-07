@@ -648,6 +648,7 @@
 
 <div class="modal-mask" id="llmMask">
   <form class="modal" id="llmForm">
+    <div class="fine" data-i18n="step2of3" style="margin-bottom:6px;color:var(--accent);font-weight:600">Step 2 of 3</div>
     <h3 data-i18n="title">LLM Setup</h3>
     <div class="sub" id="llmSub"></div>
     <label data-i18n="preset">Provider preset</label>
@@ -797,19 +798,62 @@
 </div>
 
 <div class="modal-mask" id="loginMask">
-  <form class="modal" id="loginForm">
-    <h3 data-i18n="loginTitle">Sign in</h3>
-    <div class="sub" data-i18n="loginSub">This deployment has a user store configured — sign in with your admin account.</div>
-    <label data-i18n="loginUserLbl">Username</label>
-    <input type="text" id="loginUser" autocomplete="username" required />
-    <label data-i18n="loginPassLbl">Password</label>
-    <input type="password" id="loginPass" autocomplete="current-password" required />
-    <div class="err-box" id="loginErr"></div>
-    <div class="actions">
-      <button type="submit" id="loginSubmit" data-i18n="loginSubmit">Sign in</button>
-      <button type="button" class="ghost" id="loginClose" data-i18n="close">Close</button>
+  <div class="modal wide" id="loginCard">
+    <div class="fine" data-i18n="step1of3" style="margin-bottom:6px;color:var(--accent);font-weight:600">Step 1 of 3</div>
+    <h3 data-i18n="connectTitle">Connect your account — your Cogneva joins a community that evolves together</h3>
+    <div class="sub" data-i18n="connectBody">Your Cogneva gets smarter every day. Once connected, the skills it learns are shared with everyone — and the skills other Cognevas learn flow back into your system. One walks fast, many walk far. Your code and keys never leave your own machine; the only thing shared is what it has learned.</div>
+
+    <div class="acct-row">
+      <button type="button" class="acct-card" id="connectGitee">
+        <div class="acct-t">Gitee <span class="scope-chip" id="recGitee" style="display:none" data-i18n="recommended">recommended</span></div>
+        <div class="acct-d" data-i18n="oneClickAuth">One-click sign in &amp; authorize</div>
+      </button>
+      <button type="button" class="acct-card" id="connectGithub">
+        <div class="acct-t">GitHub <span class="scope-chip" id="recGithub" style="display:none" data-i18n="recommended">recommended</span></div>
+        <div class="acct-d" data-i18n="oneClickAuth">One-click sign in &amp; authorize</div>
+      </button>
     </div>
-  </form>
+    <div class="fine" data-i18n="noAccountHint" style="margin-bottom:10px">No account yet? Open one — it is free and takes two minutes.</div>
+
+    <div id="oauthPending" style="display:none">
+      <div class="steps" style="margin:8px 0">
+        <div class="step"><span class="n">1</span><span data-i18n="oauthWait1">Finish sign-in and approve the authorization on the platform page that just opened</span></div>
+        <div class="step"><span class="n">2</span><span data-i18n="oauthWait2">If the page jumps back here you are done. If the browser lands on an unreachable address, that is expected — copy the full URL from the address bar</span></div>
+      </div>
+      <input type="text" id="oauthPaste" data-i18n-ph="oauthPastePh" placeholder="Paste the full redirect URL or the code" style="width:100%" autocomplete="off" />
+      <div class="actions">
+        <button type="button" id="oauthFinish" data-i18n="finishLogin">Finish sign-in</button>
+      </div>
+    </div>
+
+    <div class="why-strip">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <span data-i18n="connectPromise">The access token is written only to the security gateway of your own cluster and never uploaded to any third party. You can disconnect with one click at any time.</span>
+    </div>
+
+    <div class="divider" data-i18n="otherWays">Other ways (token / password — offline)</div>
+    <div class="seg">
+      <button type="button" id="altGitee">Gitee</button>
+      <button type="button" id="altGithub">GitHub</button>
+    </div>
+    <input type="password" id="platPat" data-i18n-ph="patPh" placeholder="Paste a personal access token" style="width:100%" />
+    <div class="actions">
+      <button type="button" id="patLoginBtn" data-i18n="patLogin">Sign in with token</button>
+    </div>
+
+    <form id="loginForm" style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+      <div class="fine" data-i18n="localAdminHint" style="margin-bottom:8px">Local admin password (demo / offline installs)</div>
+      <label data-i18n="loginUserLbl">Username</label>
+      <input type="text" id="loginUser" autocomplete="username" required />
+      <label data-i18n="loginPassLbl">Password</label>
+      <input type="password" id="loginPass" autocomplete="current-password" required />
+      <div class="actions">
+        <button type="submit" id="loginSubmit" data-i18n="loginSubmit">Sign in</button>
+        <button type="button" class="ghost" id="loginClose" data-i18n="close">Close</button>
+      </div>
+    </form>
+    <div class="err-box" id="loginErr"></div>
+  </div>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -1406,6 +1450,30 @@ const I18N = {
   loginSubmit:    { en: 'Sign in', zh: '登录' },
   loginFailed:    { en: 'Sign-in failed: wrong username or password', zh: '登录失败：用户名或密码错误' },
   loginOk:        { en: 'Signed in', zh: '登录成功' },
+  step1of3:       { en: 'Step 1 of 3 — connect your code account', zh: '第 1 步 / 共 3 步：连接你的代码账号' },
+  step2of3:       { en: 'Step 2 of 3 — connect a model service', zh: '第 2 步 / 共 3 步：接入模型服务' },
+  connectTitle:   { en: 'Connect your account — your Cogneva joins a community that evolves together',
+                    zh: '连上账号，让你的 Cogneva 加入一个共同进化的社群' },
+  connectBody:    { en: 'Your Cogneva gets smarter every day. Once connected, the skills it learns are shared with everyone — and the skills other Cognevas learn flow back into your system. One walks fast, many walk far. Your code and keys never leave your own machine; the only thing shared is what it has learned.',
+                    zh: '你的 Cogneva 每天都在变聪明。连上账号后，它学会的新本领会分享给所有人；同样，全世界其他 Cogneva 学会的本领，也会流回你的系统。一个人走得快，一群人走得远。你的代码和密钥永远只存在你自己的机器里，分享的只有「学会的本领」。' },
+  oneClickAuth:   { en: 'One-click sign in & authorize', zh: '一键授权登录' },
+  recommended:    { en: 'recommended', zh: '推荐' },
+  noAccountHint:  { en: 'No account yet? Open one — it is free and takes about two minutes.',
+                    zh: '还没有账号？点进去顺手注册一个，免费。' },
+  oauthWait1:     { en: 'Finish sign-in and approve the authorization on the platform page that just opened',
+                    zh: '在刚打开的平台页面完成登录并同意授权' },
+  oauthWait2:     { en: 'If the page jumps back here you are done. If the browser lands on an unreachable address, that is expected — copy the full URL from the address bar',
+                    zh: '若页面自动跳回即已完成；若浏览器停在无法访问的地址，属正常，复制地址栏完整网址' },
+  oauthPastePh:   { en: 'Paste the full redirect URL or the code', zh: '粘贴授权后地址栏的完整网址或授权码' },
+  finishLogin:    { en: 'Finish sign-in', zh: '完成登录' },
+  connectPromise: { en: 'The access token is written only to the security gateway of your own cluster and never uploaded to any third party. You can disconnect with one click at any time.',
+                    zh: '授权令牌只写入你自己集群的安全网关，不会上传给任何第三方。你可随时一键断开。' },
+  otherWays:      { en: 'Other ways (token / password — offline)', zh: '其他方式（访问令牌 / 密码，离线场景）' },
+  patPh:          { en: 'Paste a personal access token', zh: '粘贴访问令牌（PAT）' },
+  patLogin:       { en: 'Sign in with token', zh: '用令牌登录' },
+  localAdminHint: { en: 'Local admin password (demo / offline installs)', zh: '本地管理员密码（演示 / 离线环境）' },
+  oauthUnavailable: { en: 'OAuth is not configured for this install — use a token below.',
+                    zh: '本实例未配置 OAuth 应用，请改用下方访问令牌登录。' },
   topoTitle:      { en: 'CLUSTER TOPOLOGY', zh: '集群拓扑' },
   pipeTitle:      { en: 'GOAL PIPELINE', zh: '目标流水线' },
   noActiveGoals:  { en: 'No active goals', zh: '暂无活动目标' },
@@ -2099,6 +2167,110 @@ async function reauth() {
 
 $('loginBtn').onclick = openLogin;
 $('loginClose').onclick = closeLogin;
+
+// ── Platform-account sign-in (step 1): connecting GitHub/Gitee IS the login ──
+// Region probe: mainland-China timezones/locales get Gitee recommended.
+function preferredPlatform() {
+  const tz = (Intl.DateTimeFormat().resolvedOptions().timeZone) || '';
+  const lang = (navigator.language || '').toLowerCase();
+  if (['Asia/Shanghai', 'Asia/Chongqing', 'Asia/Harbin', 'Asia/Urumqi'].includes(tz)) return 'gitee';
+  if (lang.startsWith('zh') && !tz.startsWith('America')) return 'gitee';
+  return 'github';
+}
+const recommendedPlatform = preferredPlatform();
+$('rec' + (recommendedPlatform === 'gitee' ? 'Gitee' : 'Github')).style.display = '';
+let altProvider = recommendedPlatform;
+$('alt' + (altProvider === 'gitee' ? 'Gitee' : 'Github')).classList.add('active');
+
+let oauthPending = null; // { provider, state }
+
+function adoptPlatformAuth(d) {
+  const token = d && d.auth && d.auth.access_token;
+  if (!token) return;
+  $('token').value = token;
+  localStorage.setItem(TOKEN_KEY, token);
+  closeLogin();
+  toast(t('loginOk'), 'ok');
+  afterLogin();
+}
+
+// The OAuth callback landing page posts the finished login back to the opener.
+window.addEventListener('message', (e) => {
+  if (e.origin !== location.origin) return;
+  const m = e.data || {};
+  if (m.type !== 'cogneva-login') return;
+  adoptPlatformAuth(m.data);
+});
+
+async function startPlatformOAuth(provider) {
+  $('loginErr').textContent = '';
+  try {
+    const r = await fetch('/api/v1/auth/platform/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, redirect_origin: location.origin }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      $('loginErr').textContent = d.message || t('oauthUnavailable');
+      return;
+    }
+    oauthPending = { provider, state: d.state };
+    window.open(d.authorize_url, '_blank', 'noopener');
+    $('oauthPending').style.display = '';
+    $('oauthPaste').focus();
+  } catch (err) {
+    $('loginErr').textContent = String(err);
+  }
+}
+
+$('connectGitee').onclick = () => startPlatformOAuth('gitee');
+$('connectGithub').onclick = () => startPlatformOAuth('github');
+
+$('altGitee').onclick = () => { altProvider = 'gitee'; $('altGitee').classList.add('active'); $('altGithub').classList.remove('active'); };
+$('altGithub').onclick = () => { altProvider = 'github'; $('altGithub').classList.add('active'); $('altGitee').classList.remove('active'); };
+
+$('oauthFinish').onclick = async () => {
+  if (!oauthPending) return;
+  const pasted = $('oauthPaste').value.trim();
+  if (!pasted) return;
+  $('loginErr').textContent = '';
+  try {
+    const r = await fetch('/api/v1/auth/platform/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: oauthPending.provider,
+        state: oauthPending.state,
+        redirect_url: pasted,
+      }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { $('loginErr').textContent = d.message || ('HTTP ' + r.status); return; }
+    adoptPlatformAuth(d);
+  } catch (err) {
+    $('loginErr').textContent = String(err);
+  }
+};
+
+$('patLoginBtn').onclick = async () => {
+  const token = $('platPat').value.trim();
+  if (!token) return;
+  $('loginErr').textContent = '';
+  try {
+    const r = await fetch('/api/v1/auth/platform/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: altProvider, access_token: token }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { $('loginErr').textContent = d.message || ('HTTP ' + r.status); return; }
+    adoptPlatformAuth(d);
+  } catch (err) {
+    $('loginErr').textContent = String(err);
+  }
+};
+
 $('loginForm').onsubmit = async (e) => {
   e.preventDefault();
   $('loginErr').textContent = '';

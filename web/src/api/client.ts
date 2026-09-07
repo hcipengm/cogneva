@@ -123,6 +123,70 @@ export async function login(
   return { token: res.access_token, user: res.user };
 }
 
+// ── Platform-account login (connect GitHub/Gitee = sign in) ──
+
+export type PlatformProvider = 'github' | 'gitee';
+
+export interface PlatformAuthPayload {
+  auth: {
+    access_token: string;
+    user: { id: string; username: string };
+  };
+  account_created: boolean;
+}
+
+function toLoginResponse(p: PlatformAuthPayload): LoginResponse {
+  return { token: p.auth.access_token, user: p.auth.user };
+}
+
+/** PAT / manual token login — also the offline escape hatch. */
+export async function platformLogin(
+  provider: PlatformProvider,
+  accessToken: string
+): Promise<LoginResponse> {
+  const p = await api.post<PlatformAuthPayload>('/api/v1/auth/platform/login', {
+    provider,
+    access_token: accessToken,
+  });
+  return toLoginResponse(p);
+}
+
+/** Begin the OAuth authorization-code flow. */
+export async function platformOAuthStart(
+  provider: PlatformProvider
+): Promise<{ authorize_url: string; state: string }> {
+  return api.post('/api/v1/auth/platform/start', {
+    provider,
+    redirect_origin: window.location.origin,
+  });
+}
+
+/** Finish OAuth with the pasted code or full redirect URL. */
+export async function platformOAuthExchange(
+  provider: PlatformProvider,
+  state: string,
+  code?: string,
+  redirectUrl?: string
+): Promise<LoginResponse> {
+  const p = await api.post<PlatformAuthPayload>('/api/v1/auth/platform/exchange', {
+    provider,
+    state,
+    code,
+    redirect_url: redirectUrl,
+  });
+  return toLoginResponse(p);
+}
+
+/** Region probe: mainland-China timezones/locales get Gitee recommended. */
+export function preferredPlatform(): PlatformProvider {
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? '';
+  const lang = navigator.language ?? '';
+  const cnTz = ['Asia/Shanghai', 'Asia/Chongqing', 'Asia/Harbin', 'Asia/Urumqi'];
+  if (cnTz.includes(tz)) return 'gitee';
+  if (lang.toLowerCase().startsWith('zh') && !tz.startsWith('America')) return 'gitee';
+  return 'github';
+}
+
 export async function getClusterOverview(): Promise<ClusterOverview> {
   return api.get<ClusterOverview>('/api/v1/cluster/overview');
 }

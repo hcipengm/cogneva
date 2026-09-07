@@ -10,7 +10,7 @@ import { useLlmStatus } from './hooks/useLlmStatus';
 const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true';
 
 export default function App() {
-  const { token, isAuthenticated, isLoading, error, signIn, signOut } =
+  const { token, isAuthenticated, isLoading, error, signIn, signInPlatformToken, signOut } =
     useAuth();
 
   const wsUrl = token
@@ -43,7 +43,12 @@ export default function App() {
       <InputOverlay clientRef={clientRef} />
 
       {!USE_MOCK && !isAuthenticated && (
-        <AuthOverlay onLogin={signIn} error={error} isLoading={isLoading} />
+        <AuthOverlay
+          onLogin={signIn}
+          onPlatformToken={signInPlatformToken}
+          error={error}
+          isLoading={isLoading}
+        />
       )}
 
       {!USE_MOCK && isAuthenticated && (showLlmWizard || settingsOpen) && (
