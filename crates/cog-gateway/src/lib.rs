@@ -110,6 +110,11 @@ pub struct GatewayState {
     /// Platform identity store (GitHub/Gitee account ↔ local user linkage).
     /// Present whenever the PG user store is wired.
     pub platform_identities: Option<Arc<dyn cog_core::PlatformIdentityStore>>,
+    /// Contribution channel owner control (policy gate + staged backlog),
+    /// published by the platform integration plugin. `None` when the
+    /// integration is absent — admin policy/pending/flush routes degrade to
+    /// explicit errors.
+    pub contribution_control: Option<Arc<dyn cog_core::ContributionControl>>,
     pub login_rate_limiter: Option<Arc<auth::LoginRateLimiter>>,
     pub session_manager: Option<Arc<dyn cog_core::SessionManager>>,
     /// In-memory store for [`cog_core::ActionPlan`] resources exposed via the
@@ -531,6 +536,22 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/admin/contribution/gitee/oauth/exchange",
             post(contribution_admin::gitee_oauth_exchange_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution-policy",
+            post(contribution_admin::contribution_policy_set_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/pending",
+            get(contribution_admin::contribution_pending_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/flush",
+            post(contribution_admin::contribution_flush_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/disconnect",
+            post(contribution_admin::contribution_disconnect_handler),
         )
         .route(
             "/api/v1/admin/promotion-gate",

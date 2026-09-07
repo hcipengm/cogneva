@@ -137,6 +137,7 @@ async fn spawn_app_full(
         wiki_adapter: None,
         user_store: None,
         platform_identities: None,
+        contribution_control: None,
         login_rate_limiter: None,
         session_manager: None,
         heartbeat_history: None,

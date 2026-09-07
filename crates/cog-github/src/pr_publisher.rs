@@ -339,6 +339,7 @@ pub async fn is_git_workdir(workdir: &Path) -> bool {
 pub struct GitHubChangeSink {
     publisher: GitHubPrPublisher,
     provider: Arc<dyn CodePlatformProvider>,
+    controller: Arc<crate::contribution::ContributionController>,
 }
 
 impl std::fmt::Debug for GitHubChangeSink {
@@ -349,11 +350,16 @@ impl std::fmt::Debug for GitHubChangeSink {
 
 impl GitHubChangeSink {
     /// Create a sink from a publisher and the platform provider used to open
-    /// pull requests.
-    pub fn new(publisher: GitHubPrPublisher, provider: Arc<dyn CodePlatformProvider>) -> Self {
+    /// pull requests. The controller carries the owner's contribution policy.
+    pub fn new(
+        publisher: GitHubPrPublisher,
+        provider: Arc<dyn CodePlatformProvider>,
+        controller: Arc<crate::contribution::ContributionController>,
+    ) -> Self {
         Self {
             publisher,
             provider,
+            controller,
         }
     }
 
@@ -362,11 +368,14 @@ impl GitHubChangeSink {
         let branch = format!("cogneva/auto-{}", sanitize(change_id));
         self.publisher.remote_branch_exists(&branch).await
     }
-}
 
-#[async_trait::async_trait]
-impl cog_core::ChangeSink for GitHubChangeSink {
-    async fn submit_change(&self, change: GeneratedChange) -> cog_core::SFResult<String> {
+    /// Publish a change regardless of the current policy: used when the owner
+    /// explicitly approves a staged change (the click IS the decision).
+    pub async fn publish_approved(&self, change: &GeneratedChange) -> cog_core::SFResult<String> {
+        self.publish_pr(change).await
+    }
+
+    async fn publish_pr(&self, change: &GeneratedChange) -> cog_core::SFResult<String> {
         let branch = format!("cogneva/auto-{}", sanitize(&change.change_id));
         // Idempotency for the staged-change flush: a change re-submitted after a
         // restart (crash between push and housekeeping) already has its branch on
@@ -421,6 +430,9 @@ impl cog_core::ChangeSink for GitHubChangeSink {
             "\n\n{}",
             metadata_block(identity, eval_note.as_deref(), related.as_deref())
         ));
+        body.push_str(
+            "\n\n---\nThis PR was generated autonomously by a Cogneva instance and is submitted under the instance owner's contribution policy.\n本 PR 由 Cogneva 实例自治演化产生，经属主授权策略自动提交。",
+        );
         let commit_message = format!(
             "chore(cogneva): autonomous change {}\n\n{}\n\n{}",
             change.change_id,
@@ -441,6 +453,25 @@ impl cog_core::ChangeSink for GitHubChangeSink {
             .await
             .map_err(|e| cog_core::SFError::Internal(e.to_string()))?;
         Ok(pr.url)
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::ChangeSink for GitHubChangeSink {
+    async fn submit_change(&self, change: GeneratedChange) -> cog_core::SFResult<String> {
+        // Owner policy gate: Ask/Local stage the change instead of opening a
+        // PR. Ask-mode entries surface in the UI and are flushed via
+        // `publish_approved` when the owner approves.
+        if self.controller.should_stage() {
+            let path = crate::pending_changes::stage_change(&change).await?;
+            tracing::info!(
+                change_id = %change.change_id,
+                policy = self.controller.policy().as_str(),
+                "change staged by contribution policy"
+            );
+            return Ok(format!("staged:{}", path.display()));
+        }
+        self.publish_pr(&change).await
     }
 }
 

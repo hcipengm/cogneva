@@ -285,6 +285,42 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Decode a base64 entry from a fetched Secret's `data` map.
+fn decode_secret_key(secret: &serde_json::Value, key: &str) -> Option<String> {
+    let b64 = secret.get("data")?.get(key)?.as_str()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Fetch and parse the `contribution-config` JSON document from the cluster
+/// Secret. Missing / unparsable yields an empty object (policy defaults to
+/// `auto` downstream).
+pub(crate) async fn read_contrib_config(kube: &KubeClient) -> serde_json::Value {
+    let secret = match kube
+        .get_json(&format!(
+            "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+            kube.namespace()
+        ))
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => return json!({}),
+    };
+    decode_secret_key(&secret, SECRET_CONTRIB_CONFIG)
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+/// The owner policy stored in the config document; absent → `Auto` (default
+/// 自动回流).
+pub(crate) fn policy_from_config(config: &serde_json::Value) -> cog_core::ContributionPolicy {
+    config
+        .get("policy")
+        .and_then(|v| v.as_str())
+        .and_then(cog_core::ContributionPolicy::parse)
+        .unwrap_or_default()
+}
+
 /// In-flight OAuth authorization states, keyed by the opaque state string.
 /// The value is the redirect_uri used at start — Gitee requires the same
 /// redirect_uri again when exchanging the code.
@@ -559,6 +595,15 @@ pub(crate) async fn persist_connected(
         "mode": if oauth.is_some() { "oauth" } else { "manual_or_device" },
         "account": account,
     });
+    // 重新连接不清空属主的回流策略：从既有配置继承 policy 字段。
+    let existing_policy = read_contrib_config(kube)
+        .await
+        .get("policy")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    if let Some(policy) = existing_policy {
+        config_json_val["policy"] = json!(policy);
+    }
     let mut string_data = json!({
         token_key: token,
         SECRET_SSH_KEY: keypair.private_pem,
@@ -616,10 +661,15 @@ pub(crate) async fn persist_connected(
 }
 
 /// GET /api/v1/admin/contribution-status — whether a contribution token is
-/// configured. Never returns token material.
+/// configured, plus the owner policy and the staged backlog size. Never
+/// returns token material.
 pub async fn contribution_status_handler(
-    State(_state): State<Arc<crate::GatewayState>>,
+    State(state): State<Arc<crate::GatewayState>>,
 ) -> Response {
+    let pending_count = match &state.contribution_control {
+        Some(control) => control.pending().await.map(|v| v.len()).unwrap_or(0),
+        None => 0,
+    };
     if let Ok(kube) = KubeClient::in_cluster() {
         if let Ok(secret) = kube
             .get_json(&format!(
@@ -646,6 +696,10 @@ pub async fn contribution_status_handler(
             } else {
                 "none"
             };
+            let config = decode_secret_key(&secret, SECRET_CONTRIB_CONFIG)
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .unwrap_or_else(|| json!({}));
+            let policy = policy_from_config(&config);
             return (
                 StatusCode::OK,
                 Json(json!({
@@ -654,6 +708,8 @@ pub async fn contribution_status_handler(
                     "github": {"configured": github},
                     "gitee": {"configured": gitee},
                     "ssh": {"key_present": ssh},
+                    "policy": policy.as_str(),
+                    "pending_count": pending_count,
                     "device_flow_available": oauth_client_id(None).is_some(),
                     "gitee_oauth_available": gitee_oauth_available(),
                 })),
@@ -667,6 +723,12 @@ pub async fn contribution_status_handler(
             "configured": false,
             "provider": "none",
             "note": "not_in_cluster",
+            "policy": state
+                .contribution_control
+                .as_ref()
+                .map(|c| c.policy().as_str())
+                .unwrap_or("auto"),
+            "pending_count": pending_count,
             "device_flow_available": oauth_client_id(None).is_some(),
             "gitee_oauth_available": gitee_oauth_available(),
         })),
@@ -1055,6 +1117,196 @@ pub async fn gitee_oauth_callback_handler(Query(q): Query<GiteeOAuthCallbackQuer
         }
         Err(message) => oauth_result_page("授权未完成", &message, false).into_response(),
     }
+}
+
+// ── 回流策略（属主三档）与断开 ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ContributionPolicyRequest {
+    /// `auto` | `ask` | `local`。
+    pub policy: String,
+}
+
+/// POST /api/v1/admin/contribution-policy — switch the owner policy. Takes
+/// effect immediately in-process (the platform plugin holds the live gate)
+/// and is persisted into the `contribution-config` document so the choice
+/// survives restarts. No gateway roll is needed: the token env is unchanged.
+pub async fn contribution_policy_set_handler(
+    State(state): State<Arc<crate::GatewayState>>,
+    Json(req): Json<ContributionPolicyRequest>,
+) -> Response {
+    let Some(policy) = cog_core::ContributionPolicy::parse(req.policy.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_policy",
+                "message": "policy 必须是 auto（自动回流）/ ask（每次问我）/ local（只在本地）"})),
+        )
+            .into_response();
+    };
+    if let Some(control) = &state.contribution_control {
+        control.set_policy(policy);
+    }
+    let persisted = match KubeClient::in_cluster() {
+        Ok(kube) => {
+            let mut config = read_contrib_config(&kube).await;
+            config["policy"] = json!(policy.as_str());
+            let raw = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+            kube.patch(
+                &format!(
+                    "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+                    kube.namespace()
+                ),
+                json!({ "stringData": { SECRET_CONTRIB_CONFIG: raw } }),
+            )
+            .await
+            .is_ok()
+        }
+        Err(_) => false,
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "policy": policy.as_str(),
+            "persisted": persisted,
+        })),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/admin/contribution/pending — staged changes awaiting a
+/// publish decision (oldest first). Content bodies are not returned.
+pub async fn contribution_pending_handler(
+    State(state): State<Arc<crate::GatewayState>>,
+) -> Response {
+    let Some(control) = &state.contribution_control else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "control_unavailable",
+                "message": "平台集成未启用，无法列出暂存变更"})),
+        )
+            .into_response();
+    };
+    match control.pending().await {
+        Ok(changes) => {
+            let items: Vec<serde_json::Value> = changes
+                .iter()
+                .map(|c| {
+                    json!({
+                        "change_id": c.change_id,
+                        "goal": c.goal,
+                        "affected_files": c.affected_files,
+                        "issue_number": c.issue_number,
+                        "pge_mode": c.pge_mode,
+                        "self_review_score": c.self_review_score,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "pending": items, "count": items.len()})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "pending_read_failed", "message": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContributionFlushRequest {
+    /// Submit only this staged change; omitted flushes the whole backlog.
+    pub change_id: Option<String>,
+}
+
+/// POST /api/v1/admin/contribution/flush — the owner's explicit approval:
+/// staged changes are submitted as PRs through the live channel, bypassing
+/// the policy gate. Errors when the channel is not connected.
+pub async fn contribution_flush_handler(
+    State(state): State<Arc<crate::GatewayState>>,
+    Json(req): Json<ContributionFlushRequest>,
+) -> Response {
+    let Some(control) = &state.contribution_control else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "control_unavailable",
+                "message": "平台集成未启用，无法提交暂存变更"})),
+        )
+            .into_response();
+    };
+    match control.flush_pending(req.change_id.as_deref()).await {
+        Ok(flushed) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "flushed": flushed})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "flush_failed", "message": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/admin/contribution/disconnect — revoke the channel: token
+/// material, the SSH deploy key and the config document are removed from the
+/// cluster Secret and the security gateway rolls so egress stops injecting
+/// credentials. Staged changes on disk are kept; reconnecting picks them up.
+pub async fn contribution_disconnect_handler(
+    State(_state): State<Arc<crate::GatewayState>>,
+) -> Response {
+    let kube = match KubeClient::in_cluster() {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "not_in_cluster", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    // Strategic merge patch: null values delete the keys from `data`.
+    if let Err(e) = kube
+        .patch(
+            &format!(
+                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+                kube.namespace()
+            ),
+            json!({ "data": {
+                SECRET_GITHUB_TOKEN: null,
+                SECRET_GITEE_TOKEN: null,
+                SECRET_GITEE_REFRESH: null,
+                SECRET_SSH_KEY: null,
+                SECRET_CONTRIB_CONFIG: null,
+            }}),
+        )
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "secret_patch_failed", "message": e})),
+        )
+            .into_response();
+    }
+    if let Err(e) = kube.restart_gateway().await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "gateway_restart_failed", "message": e})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "status": "disconnected",
+            "message": "贡献通道已断开，安全网关正在滚动重启；已暂存的变更保留在本机，重新连接后可继续提交",
+        })),
+    )
+        .into_response()
 }
 
 /// Hourly refresher for Gitee OAuth tokens: the access token expires in 24h,

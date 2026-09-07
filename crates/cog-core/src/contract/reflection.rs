@@ -102,6 +102,58 @@ pub trait ChangeSink: Send + Sync + std::fmt::Debug {
     async fn submit_change(&self, change: GeneratedChange) -> crate::SFResult<String>;
 }
 
+/// Owner policy for flowing evolved changes back upstream as PRs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContributionPolicy {
+    /// Changes that pass the quality gates are PR'd without asking (default —
+    /// the instance is genuinely autonomous).
+    #[default]
+    Auto,
+    /// Passing changes are staged and listed for the owner; each one is PR'd
+    /// only after explicit approval.
+    Ask,
+    /// Changes are staged locally and never submitted upstream.
+    Local,
+}
+
+impl ContributionPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ask => "ask",
+            Self::Local => "local",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "ask" => Some(Self::Ask),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+}
+
+/// Owner-facing control over the contribution channel: read/switch the
+/// policy, inspect the staged backlog, and flush it on demand.
+/// Implemented by the platform integration (which owns the staging dir and
+/// the live PR sink); consumed by the gateway admin API. Policy persistence
+/// is the gateway's job (it owns the cluster Secret); this handle keeps the
+/// in-process view.
+#[async_trait::async_trait]
+pub trait ContributionControl: Send + Sync {
+    fn policy(&self) -> ContributionPolicy;
+    fn set_policy(&self, policy: ContributionPolicy);
+    /// Staged changes awaiting a publish decision, oldest first.
+    async fn pending(&self) -> crate::SFResult<Vec<GeneratedChange>>;
+    /// Submit staged changes through the live sink, bypassing the policy gate
+    /// (the owner's click IS the approval). `change_id = None` flushes all.
+    /// Errors when the channel is not connected.
+    async fn flush_pending(&self, change_id: Option<&str>) -> crate::SFResult<usize>;
+}
+
 /// Parse a unified diff change and return the list of files it touches.
 ///
 /// Extracts paths from `+++ b/<path>` lines. New files appear as
@@ -456,4 +508,24 @@ pub trait MetaLearning: Send + Sync + std::fmt::Debug {
         decision: &str,
         outcome: DecisionOutcome,
     ) -> crate::SFResult<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contribution_policy_roundtrips_strings() {
+        for (p, s) in [
+            (ContributionPolicy::Auto, "auto"),
+            (ContributionPolicy::Ask, "ask"),
+            (ContributionPolicy::Local, "local"),
+        ] {
+            assert_eq!(p.as_str(), s);
+            assert_eq!(ContributionPolicy::parse(s), Some(p));
+            assert_eq!(serde_json::to_string(&p).unwrap(), format!("\"{s}\""));
+        }
+        assert_eq!(ContributionPolicy::parse("bogus"), None);
+        assert_eq!(ContributionPolicy::default(), ContributionPolicy::Auto);
+    }
 }

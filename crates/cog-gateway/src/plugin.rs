@@ -125,6 +125,10 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             ctx.consume_service::<dyn cog_core::UserStore>();
         let platform_identities: Option<Arc<dyn cog_core::PlatformIdentityStore>> =
             ctx.consume_service::<dyn cog_core::PlatformIdentityStore>();
+        // 贡献通道属主控制（策略门禁 + 暂存补发），由平台集成插件发布；
+        // 缺失时策略/暂存路由降级为显式错误。
+        let contribution_control: Option<Arc<dyn cog_core::ContributionControl>> =
+            ctx.consume_service::<dyn cog_core::ContributionControl>();
         // Login rate limiting shares the Redis the session manager uses;
         // without Redis the limiter stays off (login itself still works).
         let login_rate_limiter: Option<Arc<crate::auth::LoginRateLimiter>> =
@@ -223,6 +227,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &login_rate_limiter,
             &user_store,
             &platform_identities,
+            &contribution_control,
             &sandbox_backend,
             &plugin_registry,
             &guardrail,
@@ -261,6 +266,21 @@ impl cog_core::SystemPlugin for GatewayPlugin {
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         let state = self.state.clone().expect("gateway state not initialized");
+        // 进程重启后把 Secret 里持久化的回流策略灌回控制器（best-effort；
+        // 网关持有 Secret 访问权，平台插件进程内只留活档）。
+        if let Some(control) = state.contribution_control.clone() {
+            tokio::spawn(async move {
+                if let Ok(kube) = crate::llm_admin::KubeClient::in_cluster() {
+                    let config = crate::contribution_admin::read_contrib_config(&kube).await;
+                    let policy = crate::contribution_admin::policy_from_config(&config);
+                    control.set_policy(policy);
+                    info!(
+                        policy = policy.as_str(),
+                        "contribution policy restored from cluster secret"
+                    );
+                }
+            });
+        }
         let app = crate::create_router(state);
         let http_port = ctx.config().gateway.http_port;
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
@@ -357,6 +377,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         "protocol",
         "notification",
         "reflection",
+        "github",
     ],
     provides: &["GatewayState", "TaskExecutionCallback"],
     consumes: &[
@@ -538,6 +559,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "EvolutionAdmin",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "ContributionControl",
             required: false,
         },
     ],

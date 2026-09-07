@@ -789,6 +789,27 @@
       </div>
     </div>
 
+    <div id="contribConnected" style="display:none">
+      <div class="fine" id="contribAcctLine" style="margin-bottom:12px"></div>
+
+      <label data-i18n="policyLbl">Where do evolved changes go?</label>
+      <div class="seg" id="policySeg" style="margin-bottom:6px">
+        <button type="button" data-policy="auto" data-i18n="policyAuto">Share automatically</button>
+        <button type="button" data-policy="ask" data-i18n="policyAsk">Ask me each time</button>
+        <button type="button" data-policy="local" data-i18n="policyLocal">Keep local</button>
+      </div>
+      <div class="fine" id="policyHint" style="margin-bottom:14px"></div>
+
+      <div id="pendingBox" style="display:none">
+        <label data-i18n="pendingLbl">Changes waiting for your approval</label>
+        <div id="pendingList"></div>
+      </div>
+
+      <div class="actions" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
+        <button type="button" class="danger sm" id="disconnectBtn" data-i18n="disconnectBtn">Disconnect</button>
+      </div>
+    </div>
+
     <div class="err-box" id="contribErr"></div>
     <div class="fine" data-i18n="contribKeyNote" style="margin-top:10px">The token is written to the cluster Secret only, held by the security gateway, and never echoed back. An SSH key is generated and its public half uploaded.</div>
     <div class="actions">
@@ -1639,6 +1660,26 @@ const I18N = {
                       zh: '贡献通道未配置，进化成果暂存本地。' },
   contribBannerOn:  { en: 'Contribution channel connected.', zh: '贡献通道已连接。' },
   contribBannerGo:  { en: 'Configure →', zh: '点击配置 →' },
+  connectedAs:      { en: 'Connected account', zh: '已连接账号' },
+  policyLbl:        { en: 'Where do evolved changes go?', zh: '进化出的本领怎么分享？' },
+  policyAuto:       { en: 'Share automatically', zh: '自动回流' },
+  policyAsk:        { en: 'Ask me each time', zh: '每次问我' },
+  policyLocal:      { en: 'Keep local', zh: '只在本地' },
+  policyHintAuto:   { en: 'Changes that pass the quality gates are submitted as PRs right away, under your name.',
+                      zh: '通过质量闸的变更会自动以你的名义提交 PR 回流公版。' },
+  policyHintAsk:    { en: 'Passing changes are staged below; each one is submitted only after you click approve.',
+                      zh: '通过的变更先列在下方，逐条经你点头后才提交。' },
+  policyHintLocal:  { en: 'Changes stay on this machine and are never submitted upstream.',
+                      zh: '变更只留在你自己的机器上，永不提交上游。' },
+  policySaved:      { en: 'Policy updated', zh: '策略已更新' },
+  pendingLbl:       { en: 'Changes waiting for your approval', zh: '等待你确认的变更' },
+  pendingEmpty:     { en: 'Nothing staged right now.', zh: '当前没有暂存的变更。' },
+  submitPr:         { en: 'Submit PR', zh: '提交 PR' },
+  prSubmitted:      { en: 'Submitted as a pull request', zh: '已提交为 PR' },
+  disconnectBtn:    { en: 'Disconnect', zh: '断开连接' },
+  disconnectConfirm:{ en: 'Disconnect the contribution channel? Tokens are removed from the cluster and staged changes stay on this machine.',
+                      zh: '确定断开贡献通道？令牌会从集群中移除，已暂存的变更保留在本机。' },
+  disconnected:     { en: 'Channel disconnected — gateway is restarting', zh: '通道已断开，安全网关正在重启' },
   contribWhy:       { en: 'Your token never leaves the cluster: it is written to a Secret held by the security gateway, and every platform call goes through it. This process stays credential-free.',
                       zh: '令牌不出集群：只写入由安全网关代持的 Secret，所有平台调用都经网关出口，本进程零凭证。' },
   acctHave:         { en: 'I have an account', zh: '我有账号' },
@@ -1882,9 +1923,119 @@ function openContrib() {
       const giAvailable = !!s.gitee_oauth_available;
       $('giOauthBtn').style.display = giAvailable ? '' : 'none';
       $('giOauthUnavailable').style.display = giAvailable ? 'none' : '';
+      showContribConnected(s);
     })
     .catch(() => {});
 }
+
+// Connected state: swap the connect panes for the owner console (policy
+// three-way + staged backlog + disconnect).
+function showContribConnected(s) {
+  const connected = !!s.configured;
+  $('contribConnected').style.display = connected ? '' : 'none';
+  $('segGithub').parentElement.style.display = connected ? 'none' : '';
+  $('paneGithub').style.display = connected ? 'none' : '';
+  $('paneGitee').style.display = connected ? 'none' : '';
+  if (!connected) return;
+  $('contribAcctLine').textContent =
+    t('connectedAs') + '：' + (s.provider === 'gitee' ? 'Gitee' : 'GitHub');
+  setPolicyUi(s.policy || 'auto');
+  if (s.policy === 'ask' || (s.pending_count || 0) > 0) loadPending();
+  else $('pendingBox').style.display = 'none';
+}
+
+function setPolicyUi(policy) {
+  document.querySelectorAll('#policySeg button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.policy === policy);
+  });
+  const hintKey = { auto: 'policyHintAuto', ask: 'policyHintAsk', local: 'policyHintLocal' }[policy];
+  if (hintKey) $('policyHint').textContent = t(hintKey);
+  $('pendingBox').style.display = policy === 'ask' ? '' : $('pendingBox').style.display;
+}
+
+document.querySelectorAll('#policySeg button').forEach((b) => {
+  b.onclick = async () => {
+    contribErr('');
+    try {
+      await api('/api/v1/admin/contribution-policy', 'POST', { policy: b.dataset.policy });
+      setPolicyUi(b.dataset.policy);
+      if (b.dataset.policy === 'ask') loadPending();
+      toast(t('policySaved'), 'ok');
+    } catch (e) { contribErr(e.message); }
+  };
+});
+
+async function loadPending() {
+  $('pendingBox').style.display = '';
+  const list = $('pendingList');
+  try {
+    const r = await api('/api/v1/admin/contribution/pending');
+    const items = r.pending || [];
+    if (!items.length) {
+      list.innerHTML = '<div class="fine" style="padding:6px 0">' + t('pendingEmpty') + '</div>';
+      return;
+    }
+    list.innerHTML = '';
+    items.forEach((c) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)';
+      const text = document.createElement('div');
+      text.style.cssText = 'flex:1;min-width:0';
+      const goal = document.createElement('div');
+      goal.style.cssText = 'font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+      goal.textContent = c.goal || c.change_id;
+      const meta = document.createElement('div');
+      meta.className = 'fine';
+      const parts = [c.change_id];
+      if (c.issue_number) parts.push('#' + c.issue_number);
+      if (c.self_review_score != null) parts.push('score ' + c.self_review_score);
+      meta.textContent = parts.join(' · ');
+      text.appendChild(goal);
+      text.appendChild(meta);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'sm';
+      btn.textContent = t('submitPr');
+      btn.onclick = async () => {
+        btn.disabled = true; contribErr('');
+        try {
+          await api('/api/v1/admin/contribution/flush', 'POST', { change_id: c.change_id });
+          toast(t('prSubmitted'), 'ok');
+          loadPending();
+          checkContributionStatus();
+        } catch (e) { contribErr(e.message); btn.disabled = false; }
+      };
+      row.appendChild(text);
+      row.appendChild(btn);
+      list.appendChild(row);
+    });
+  } catch (e) {
+    list.innerHTML = '<div class="fine" style="padding:6px 0">' + (e.message || '') + '</div>';
+  }
+}
+
+$('disconnectBtn').onclick = async () => {
+  if (!window.confirm(t('disconnectConfirm'))) return;
+  $('disconnectBtn').disabled = true; contribErr('');
+  try {
+    await api('/api/v1/admin/contribution/disconnect', 'POST', {});
+    toast(t('disconnected'), 'ok');
+    // 网关滚动重启约一分钟；轮询到 configured=false 后收尾。
+    const deadline = Date.now() + 3 * 60 * 1000;
+    const timer = setInterval(async () => {
+      try {
+        const s = await api('/api/v1/admin/contribution-status');
+        if (!s.configured) {
+          clearInterval(timer);
+          closeContrib();
+          checkContributionStatus();
+        }
+      } catch { /* pod restarting */ }
+      if (Date.now() > deadline) { clearInterval(timer); closeContrib(); checkContributionStatus(); }
+    }, 5000);
+  } catch (e) { contribErr(e.message); }
+  finally { $('disconnectBtn').disabled = false; }
+};
 function closeContrib() {
   $('contribMask').classList.remove('show');
   stopContribPoll();
@@ -1926,7 +2077,9 @@ function afterContribSaved() {
       const s = await api('/api/v1/admin/contribution-status');
       if (s.configured) {
         clearInterval(timer);
-        closeContrib();
+        // 连接成功后留在弹窗里直接展示属主控制台（三档策略），
+        // 属主当下就能决定回流档位。
+        showContribConnected(s);
         toast(t('contribConnected'), 'ok');
         checkContributionStatus();
       }

@@ -15,6 +15,7 @@
 #![deny(missing_docs)]
 
 pub mod config;
+pub mod contribution;
 pub mod conversation;
 pub mod cross_validation;
 pub mod discovery;
@@ -33,6 +34,7 @@ pub mod webhook;
 pub use error::{CogGitHubError, Result};
 pub use webhook::{run_webhook_server, verify_signature, webhook_router, WebhookState};
 
+pub use contribution::ContributionController;
 pub use conversation::{ConversationState, ConversationTurn, IssueConversation};
 pub use discovery::IssueDiscovery;
 pub use discovery_loop::GitHubDiscoveryLoop;

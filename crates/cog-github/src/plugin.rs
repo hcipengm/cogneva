@@ -64,12 +64,18 @@ fn spawn_polling_loop(
 fn spawn_staged_drain(
     config: crate::config::GitHubIntegrationConfig,
     provider: Arc<dyn CodePlatformProvider>,
+    controller: Arc<crate::contribution::ContributionController>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         interval.tick().await; // 消费立即触发的首拍，让启动 drain 先跑
         loop {
             interval.tick().await;
+            // 策略门禁：ask 档等属主逐条确认（走 ContributionControl::flush_pending），
+            // local 档永不自动回流；两者都跳过自动补发。
+            if controller.should_stage() {
+                continue;
+            }
             if crate::pending_changes::load_pending().await.is_empty() {
                 continue;
             }
@@ -82,6 +88,7 @@ fn spawn_staged_drain(
                     let sink = crate::pr_publisher::GitHubChangeSink::new(
                         crate::pr_publisher::GitHubPrPublisher::new(workdir, config.clone()),
                         provider.clone(),
+                        controller.clone(),
                     );
                     let n = crate::pending_changes::drain_into(&sink).await;
                     if n > 0 {
@@ -121,6 +128,11 @@ impl cog_core::SystemPlugin for GitHubPlugin {
     }
 
     async fn init(&mut self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // 贡献策略控制器：网关 admin API 经它读写属主档位、列暂存、按确认补发；
+        // 无论通道是否已连接都发布，UI 才能在任何状态下读档/列暂存。
+        let controller = crate::contribution::ContributionController::new_shared();
+        ctx.publish_service::<dyn cog_core::ContributionControl>(controller.clone());
+
         // github/gitee_integration 是 cog-github 自有配置段，自读 cogneva.json。
         let mut config = crate::config::GitHubIntegrationConfig::load()?;
         let gitee_config = crate::config::GiteeIntegrationConfig::load()?;
@@ -162,14 +174,22 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                                         config.clone(),
                                     ),
                                     provider.clone(),
+                                    controller.clone(),
                                 ));
+                                // 属主在 UI 点"提交 PR"时经 ContributionControl::flush_pending
+                                // 调用同一 sink，绕过策略门禁（点击即批准）。
+                                controller.set_sink(sink.clone());
                                 // The channel is live: flush changes staged
                                 // before it was connected (best effort;
                                 // failures stay staged for the next start).
-                                let flushed =
-                                    crate::pending_changes::drain_into(sink.as_ref()).await;
-                                if flushed > 0 {
-                                    info!(count = flushed, "flushed staged changes to PRs");
+                                // ask/local 档不自动回流：ask 等属主逐条确认，
+                                // local 永不提交上游。
+                                if !controller.should_stage() {
+                                    let flushed =
+                                        crate::pending_changes::drain_into(sink.as_ref()).await;
+                                    if flushed > 0 {
+                                        info!(count = flushed, "flushed staged changes to PRs");
+                                    }
                                 }
                                 ctx.publish_service::<dyn cog_core::ChangeSink>(sink);
                                 pr_sink_published = true;
@@ -185,7 +205,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     // 网关，本进程并不重启）时，上面的启动 drain 不会重跑；
                     // 后台周期补发让暂存变更在通道接通后的下一个周期自动提交。
                     if !config.pr_workdir.is_empty() {
-                        spawn_staged_drain(config.clone(), provider.clone());
+                        spawn_staged_drain(config.clone(), provider.clone(), controller.clone());
                     }
 
                     self.provider = Some(provider);
@@ -415,7 +435,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "github",
     requires: &[],
     optional_requires: &[],
-    provides: &["CodePlatformProvider"],
+    provides: &["CodePlatformProvider", "ContributionControl"],
     consumes: &[],
     factory: || Box::new(GitHubPlugin::new()),
 };
