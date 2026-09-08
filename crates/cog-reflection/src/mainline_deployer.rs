@@ -835,7 +835,10 @@ impl MainlineDeployer {
                     "job",
                     name,
                     "-o",
-                    "jsonpath={.status.succeeded} {.status.failed} {.status.active}",
+                    // 分隔符必须显式占位：空格 + split_whitespace 会吞掉缺失
+                    // 字段，失败任务 succeeded 缺省时 failed 值顶到第一位，
+                    // 会被误判成 Complete。
+                    "jsonpath={.status.succeeded}|{.status.failed}|{.status.active}",
                 ],
                 30,
             )
@@ -847,7 +850,7 @@ impl MainlineDeployer {
             }
             Err(e) => return Err(e),
         };
-        let parts: Vec<&str> = out.split_whitespace().collect();
+        let parts: Vec<&str> = out.split('|').collect();
         let succeeded = parts
             .first()
             .and_then(|v| v.parse::<u32>().ok())
@@ -1047,19 +1050,31 @@ impl RolloutExecutor {
                         "deployment",
                         &t.deployment,
                         "-o",
-                        "jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas}",
+                        // 竖线显式占位：缺失字段（omitempty 的 updatedReplicas
+                        // 等）不能顶掉后续字段的位置。
+                        "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.updatedReplicas}|{.status.readyReplicas}|{.status.unavailableReplicas}",
                     ],
                     30,
                 )
                 .await?;
-            let parts: Vec<&str> = out.split_whitespace().collect();
+            let parts: Vec<&str> = out.split('|').collect();
             if parts.len() >= 5 {
                 let gen: u64 = parts[0].parse().unwrap_or(0);
                 let obs: u64 = parts[1].parse().unwrap_or(0);
                 let spec: u32 = parts[2].parse().unwrap_or(0);
                 let updated: u32 = parts[3].parse().unwrap_or(0);
                 let ready: u32 = parts[4].parse().unwrap_or(0);
-                if obs >= gen && gen > 0 && updated == spec && ready == spec && spec > 0 {
+                // unavailable 必须为 0：RollingUpdate 新旧副本并存时，旧副本
+                // 仍 ready 会让 ready==spec 提前成立，但新崩溃副本计入
+                // unavailable，不能判完成（等致命态/超时兜底）。
+                let unavailable: u32 = parts.get(5).and_then(|v| v.parse().ok()).unwrap_or(0);
+                if obs >= gen
+                    && gen > 0
+                    && updated == spec
+                    && ready == spec
+                    && unavailable == 0
+                    && spec > 0
+                {
                     return Ok(());
                 }
             }
@@ -1811,8 +1826,8 @@ done
 case "$*" in
   *generation*)
     case "$*" in
-      *cogneva-security-gateway*) echo "1 0 1 0 0" ;;
-      *) echo "1 1 1 1 1" ;;
+      *cogneva-security-gateway*) echo "1|0|1|0|0|" ;;
+      *) echo "1|1|1|1|1|" ;;
     esac ;;
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"get pods"*) echo "0 true " ;;
@@ -1872,8 +1887,8 @@ done
 case "$*" in
   *generation*)
     case "$*" in
-      *cogneva-security-gateway*) echo "1 0 1 0 0" ;;
-      *) echo "1 1 1 1 1" ;;
+      *cogneva-security-gateway*) echo "1|0|1|0|0|" ;;
+      *) echo "1|1|1|1|1|" ;;
     esac ;;
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"get pods"*)
@@ -1909,6 +1924,52 @@ exit 0
         assert!(
             calls.contains("set image deployment/cogneva-security-gateway security-gateway=localhost:30500/cogneva:main-old"),
             "fatal state must trigger rollback to snapshotted prev: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_status_distinguishes_failed_when_succeeded_field_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        // 真实 kubectl 对失败 Job 的输出形如 "|1|"：succeeded 缺省，
+        // 空格分隔解析会把 failed 顶到第一位误判 Complete。
+        let script = r#"#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in jsonpath=*) ;; *) echo "bad -o arg" >&2; exit 2 ;; esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *job-failed*) echo "|1|" ;;
+  *job-ok*) echo "1||" ;;
+  *job-running*) echo "||1" ;;
+  *) echo "not found" >&2; exit 1 ;;
+esac
+exit 0
+"#;
+        write_fake_bin(&bin_dir, "fake-kubectl", script);
+        let cfg = MainlineDeployerConfig {
+            kubectl_bin: bin_dir.join("fake-kubectl").to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let deployer = MainlineDeployer::new(cfg, bin_dir);
+        assert_eq!(
+            deployer.job_status("job-failed").await.unwrap(),
+            JobStatus::Failed
+        );
+        assert_eq!(
+            deployer.job_status("job-ok").await.unwrap(),
+            JobStatus::Complete
+        );
+        assert_eq!(
+            deployer.job_status("job-running").await.unwrap(),
+            JobStatus::Running
+        );
+        assert_eq!(
+            deployer.job_status("job-missing").await.unwrap(),
+            JobStatus::NotFound
         );
     }
 
