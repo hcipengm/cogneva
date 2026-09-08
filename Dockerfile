@@ -198,12 +198,19 @@ RUN if [ -n "$APT_MIRROR_HOST" ]; then \
 # libstdc++6：ONNX Runtime（fastembed/ort）动态链接依赖
 # buildah：自进化 publisher 打金丝雀 overlay 镜像并 push 到集群内 registry
 # （仅特权进化 Pod 用；主应用 Pod 非特权，装了也无法使用）
+# pkg-config + libssl-dev：沙盒内 cargo build 编译 openssl-sys 时 build script
+# 靠 pkg-config 找 OpenSSL 头文件与链接符号，只有 libssl3 运行库必挂。
+# protobuf-compiler：etcd-client 的 build.rs 用 tonic-build 编译 .proto，
+# 容器内必须有 protoc 可执行文件。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    libssl-dev \
     libstdc++6 \
     curl \
     build-essential \
+    pkg-config \
+    protobuf-compiler \
     git \
     openssh-client \
     python3 \

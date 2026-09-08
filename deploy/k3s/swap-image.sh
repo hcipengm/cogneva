@@ -188,6 +188,26 @@ if ! buildah run "$CTR" -- buildah --version >/dev/null 2>&1; then
     apt-get update && apt-get install -y --no-install-recommends buildah \
       && rm -rf /var/lib/apt/lists/*'
 fi
+# 原生构建依赖：沙盒内自进化/主线跟踪的 cargo build 要编译完整依赖树——
+# openssl-sys 的 build script 靠 pkg-config 找 libssl-dev 头文件与链接符号，
+# etcd-client 的 build.rs 用 tonic-build 编 .proto，容器内必须有 protoc；
+# 只装 libssl3 运行库时整个构建在 openssl-sys 处必挂。老基镜像（Dockerfile
+# runtime stage 补装前）缺这些，叠层流补装；全量构建由 Dockerfile 保证。
+# protobuf-compiler 在 universe 源，显式补齐 Components。
+if ! buildah run "$CTR" -- sh -c 'command -v pkg-config >/dev/null && pkg-config --exists openssl && command -v protoc >/dev/null' 2>/dev/null; then
+  echo "==> 基镜像缺原生构建依赖（pkg-config/libssl-dev/protobuf-compiler），叠层补装"
+  buildah run --user root -e "COGNEVA_CN_MIRROR=${COGNEVA_CN_MIRROR:-0}" "$CTR" -- sh -c '
+    if [ "${COGNEVA_CN_MIRROR:-0}" = "1" ]; then
+      sed -i -e "s|//archive.ubuntu.com|//mirrors.tuna.tsinghua.edu.cn|" \
+             -e "s|//security.ubuntu.com|//mirrors.tuna.tsinghua.edu.cn|" \
+             /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+    fi
+    sed -i "s/^Components: main.*/Components: main restricted universe multiverse/" \
+      /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+    apt-get update && apt-get install -y --no-install-recommends \
+      pkg-config libssl-dev protobuf-compiler \
+      && rm -rf /var/lib/apt/lists/*'
+fi
 # cargo sparse 镜像配置：沙盒内自进化/主线跟踪构建直接跑 cargo，
 # 缺 config 会直连 crates.io，受限网络下稀疏索引拉取慢到构建超时。
 # 叠层自愈（全量构建由 Dockerfile runtime stage 保证）。rsproxy 索引与
