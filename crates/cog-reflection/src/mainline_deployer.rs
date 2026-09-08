@@ -29,6 +29,10 @@ use crate::config::{MainlineDeployerConfig, RolloutTargetConfig};
 /// Pod 重启不丢。
 const BUILDAH_STORAGE: &str = "/opt/cogneva/sandbox/containers/storage";
 const BUILDAH_RUNROOT: &str = "/opt/cogneva/sandbox/containers/run";
+/// cargo registry 缓存同样落 PVC：镜像里的 /usr/local/cargo 是容器可写层，
+/// Pod 一重建（主线滚动最后一个目标就是 evolution 自己）索引与 crate 缓存
+/// 全丢，每次构建都要在家庭网络上重拉整个 crates.io 索引。
+const CARGO_HOME_PVC: &str = "/opt/cogneva/sandbox/cargo-home";
 
 // ---------------------------------------------------------------------------
 // 纯函数（无 IO，单测覆盖）
@@ -599,6 +603,7 @@ impl MainlineDeployer {
         cmd.args(["build", "--release", "--bin", "cogneva"])
             .current_dir(&self.src_dir)
             .env("CARGO_BUILD_JOBS", &jobs)
+            .env("CARGO_HOME", CARGO_HOME_PVC)
             // build.rs 回退只嵌 7 位短 sha，叠层后的 --version 校验匹配 12
             // 位前缀会必败；显式注入完整 rev（与 swap-image 双保险同源）。
             .env("COGNEVA_GIT_REVISION", rev)
