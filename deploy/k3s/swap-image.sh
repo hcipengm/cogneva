@@ -252,24 +252,50 @@ if [ "$DO_DEPLOY" = 1 ]; then
   want_id="$(k3s crictl inspecti "${IMAGE}:${NEW_TAG}" 2>/dev/null | python3 -c '
 import json,sys
 print(json.load(sys.stdin)["status"]["id"].rsplit(":",1)[-1])')"
-  got_id="$(running_pod_info | awk '{print $2}')"
-  if [ -n "$got_id" ] && [ "$want_id" != "$got_id" ]; then
+  # 四部署逐一核对 Ready Pod 的镜像 id。同版本号重跑时 tag 字符串没变，
+  # set image 不触发滚动；只核对单个 Pod 会漏掉其余部署——主应用还可能因
+  # 前面 kubectl apply 结构变更偶然重建而"假通过"，evolution 等却仍跑旧
+  # 镜像。四个 component 标签唯一，必须全查。stdout 输出仍停留在旧镜像的
+  # component 列表（空 = 全部已更新），诊断信息走 stderr。
+  stale_deploys() {
+    kubectl -n "$NS" get pods -o json 2>/dev/null | WANT="$want_id" python3 -c '
+import json, os, sys
+want = os.environ["WANT"]
+comps = ["gateway", "security-gateway", "evolution", "sandbox-executor"]
+data = json.load(sys.stdin)
+seen = {}
+for p in data.get("items", []):
+    comp = p.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+    if comp not in comps:
+        continue
+    for cs in p.get("status", {}).get("containerStatuses", []):
+        if cs.get("ready"):
+            seen.setdefault(comp, cs.get("imageID", "").rsplit(":", 1)[-1])
+stale = [c for c in comps if seen.get(c) != want]
+for c in comps:
+    print(f"    {c:18s} {seen.get(c, 'MISSING')[:12]}", file=sys.stderr)
+if stale:
+    print(" ".join(stale))
+'
+  }
+  stale="$(stale_deploys)"
+  if [ -n "$stale" ]; then
     # 同版本号重跑（tag 字符串没变）时 set image 不触发滚动，Pod 仍跑旧镜像
     # ID；强制重建让 :<tag> 解析到新 ID。
-    echo "==> 运行中仍是 ${got_id:0:12}（同版本重跑未触发滚动），强制重启四部署"
+    echo "==> 以下部署仍跑旧镜像（同版本重跑未触发滚动），强制重启：${stale}"
     kubectl -n "$NS" rollout restart deployment/cogneva deployment/cogneva-evolution \
       deployment/cogneva-security-gateway deployment/cogneva-sandbox-executor
     kubectl rollout status -n "$NS" deployment/cogneva --timeout=180s
     kubectl rollout status -n "$NS" deployment/cogneva-security-gateway --timeout=180s
     kubectl rollout status -n "$NS" deployment/cogneva-evolution --timeout=300s
     kubectl rollout status -n "$NS" deployment/cogneva-sandbox-executor --timeout=180s
-    got_id="$(running_pod_info | awk '{print $2}')"
+    stale="$(stale_deploys)"
   fi
-  if [ -z "$got_id" ] || [ "$want_id" != "$got_id" ]; then
-    echo "滚动后镜像不符：期望 ${want_id:0:12}，实际 ${got_id:0:12}" >&2
+  if [ -n "$stale" ]; then
+    echo "滚动后仍有部署镜像不符（期望 ${want_id:0:12}）：${stale}" >&2
     exit 1
   fi
-  echo "==> 新 Pod 运行 ${IMAGE}:${NEW_TAG}（${got_id:0:12}，rev ${GIT_REVISION}）"
+  echo "==> 四部署均运行 ${IMAGE}:${NEW_TAG}（${want_id:0:12}，rev ${GIT_REVISION}）"
 
   # 播种集群内 registry：金丝雀 overlay 的 FROM 源必须随版本前进。
   # 失败不致命（基座运行不依赖它），下次换版/bootstrap 会补播。
