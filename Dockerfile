@@ -202,6 +202,9 @@ RUN if [ -n "$APT_MIRROR_HOST" ]; then \
 # 靠 pkg-config 找 OpenSSL 头文件与链接符号，只有 libssl3 运行库必挂。
 # protobuf-compiler：etcd-client 的 build.rs 用 tonic-build 编译 .proto，
 # 容器内必须有 protoc 可执行文件。
+# crun：buildah run 在沙盒内执行叠层校验命令（如 --version）所需的 OCI
+# 运行时；--no-install-recommends 不会随 buildah 装它，build/copy/push
+# 不需要运行时所以缺它一直没暴露，到 buildah run 才报 "exec: no command"。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
@@ -211,6 +214,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
     protobuf-compiler \
+    crun \
     git \
     openssh-client \
     python3 \

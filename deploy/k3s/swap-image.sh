@@ -191,11 +191,13 @@ fi
 # 原生构建依赖：沙盒内自进化/主线跟踪的 cargo build 要编译完整依赖树——
 # openssl-sys 的 build script 靠 pkg-config 找 libssl-dev 头文件与链接符号，
 # etcd-client 的 build.rs 用 tonic-build 编 .proto，容器内必须有 protoc；
+# buildah run 在叠层内执行 --version 校验需要 OCI 运行时 crun（build/copy
+# /push 不需要，所以缺它到主线部署才暴露 "exec: no command"）。
 # 只装 libssl3 运行库时整个构建在 openssl-sys 处必挂。老基镜像（Dockerfile
 # runtime stage 补装前）缺这些，叠层流补装；全量构建由 Dockerfile 保证。
-# protobuf-compiler 在 universe 源，显式补齐 Components。
-if ! buildah run "$CTR" -- sh -c 'command -v pkg-config >/dev/null && pkg-config --exists openssl && command -v protoc >/dev/null' 2>/dev/null; then
-  echo "==> 基镜像缺原生构建依赖（pkg-config/libssl-dev/protobuf-compiler），叠层补装"
+# protobuf-compiler/crun 在 universe 源，显式补齐 Components。
+if ! buildah run "$CTR" -- sh -c 'command -v pkg-config >/dev/null && pkg-config --exists openssl && command -v protoc >/dev/null && command -v crun >/dev/null' 2>/dev/null; then
+  echo "==> 基镜像缺原生构建依赖（pkg-config/libssl-dev/protobuf-compiler/crun），叠层补装"
   buildah run --user root -e "COGNEVA_CN_MIRROR=${COGNEVA_CN_MIRROR:-0}" "$CTR" -- sh -c '
     if [ "${COGNEVA_CN_MIRROR:-0}" = "1" ]; then
       sed -i -e "s|//archive.ubuntu.com|//mirrors.tuna.tsinghua.edu.cn|" \
@@ -205,7 +207,7 @@ if ! buildah run "$CTR" -- sh -c 'command -v pkg-config >/dev/null && pkg-config
     sed -i "s/^Components: main.*/Components: main restricted universe multiverse/" \
       /etc/apt/sources.list.d/*.sources 2>/dev/null || true
     apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev protobuf-compiler \
+      pkg-config libssl-dev protobuf-compiler crun \
       && rm -rf /var/lib/apt/lists/*'
 fi
 # cargo sparse 镜像配置：沙盒内自进化/主线跟踪构建直接跑 cargo，
