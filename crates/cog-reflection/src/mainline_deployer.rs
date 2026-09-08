@@ -379,7 +379,7 @@ impl MainlineDeployer {
         let mut images = Vec::new();
         for t in &self.cfg.targets {
             let jsonpath = format!(
-                "{{.spec.template.spec.containers[?(@.name==\"{}\")].image}}",
+                "jsonpath={{.spec.template.spec.containers[?(@.name==\"{}\")].image}}",
                 t.container
             );
             let img = self
@@ -970,7 +970,7 @@ impl RolloutExecutor {
     /// 快照单个部署当前在跑的镜像（回滚目标）。
     async fn current_image(&self, t: &RolloutTarget) -> SFResult<String> {
         let jsonpath = format!(
-            "{{.spec.template.spec.containers[?(@.name==\"{}\")].image}}",
+            "jsonpath={{.spec.template.spec.containers[?(@.name==\"{}\")].image}}",
             t.container
         );
         let img = self
@@ -1469,12 +1469,24 @@ exit 0
 
     /// fake kubectl：deployment 镜像查询输出写死的 deployed_image（四部署同值），
     /// job 查询报 NotFound，apply 把 stdin 的 manifest 也落日志（job 名在
-    /// manifest 里，不在 argv），其余成功。
+    /// manifest 里，不在 argv），其余成功。`-o` 参数必须带 `jsonpath=` 前缀
+    /// （真 kubectl 对裸模板报 "unable to match a printer"，fake 同样拒绝，
+    /// 否则这类漏前缀单测抓不到）。
     fn fake_kubectl(dir: &Path, deployed_image: &str) -> String {
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
 case "$*" in
   *"get deployment"*) echo "{deployed_image}" ;;
   *"get job"*) echo "Error: jobs.batch \"x\" not found" >&2; exit 1 ;;
@@ -1492,11 +1504,22 @@ exit 0
     }
 
     /// fake kubectl：pods 查询输出从文件读（测试逐例改写文件模拟不同 Pod 态）。
+    /// `-o` 同样强制 jsonpath= 前缀（见 fake_kubectl 注释）。
     fn fake_kubectl_pods_from_file(dir: &Path, pods_file: &Path) -> String {
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
 case "$*" in
   *"get pods"*) cat '{pods_file}' ;;
   *) echo ok ;;
@@ -1688,6 +1711,16 @@ exit 0
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
 case "$*" in
   *generation*)
     case "$*" in

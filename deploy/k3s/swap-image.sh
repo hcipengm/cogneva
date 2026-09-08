@@ -273,7 +273,8 @@ for p in data.get("items", []):
             seen.setdefault(comp, cs.get("imageID", "").rsplit(":", 1)[-1])
 stale = [c for c in comps if seen.get(c) != want]
 for c in comps:
-    print(f"    {c:18s} {seen.get(c, 'MISSING')[:12]}", file=sys.stderr)
+    rid = seen.get(c, "MISSING")[:12]
+    print(f"    {c:18s} {rid}", file=sys.stderr)
 if stale:
     print(" ".join(stale))
 '

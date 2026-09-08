@@ -57,9 +57,15 @@ spec:
     # apply 滚动 Job）。in-cluster 经 kubernetes Service ClusterIP:443
     # （K3s Service CIDR 默认 10.43.0.0/16，标准 kubeadm 常用 10.96.0.0/12，
     # 由 networkPolicy.apiServerCidr values 覆盖）。
+    # 两条 ipBlock 缺一不可：部分 CNI 在 DNAT 前按 Service CIDR 匹配；另一
+    # 部分（含 K3s 内置策略控制器）在 DNAT 后匹配，此时目的地址是宿主网络
+    # 上的 apiserver 节点 IP:6443（hostNetwork，不是 Pod，podSelector 永远
+    # 匹配不到），用 0.0.0.0/0 兜底、端口钉死 443/6443 保持最小授权。
     - to:
         - ipBlock:
             cidr: "10.43.0.0/16"
+        - ipBlock:
+            cidr: "0.0.0.0/0"
       ports:
         - protocol: TCP
           port: 443
