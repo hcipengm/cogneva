@@ -599,6 +599,19 @@ impl MainlineDeployer {
     async fn build_binary(&self, rev: &str) -> SFResult<()> {
         let jobs = self.cfg.cargo_build_jobs.to_string();
         let cmdline = format!("cargo build --release --bin cogneva (jobs={jobs})");
+        // CARGO_HOME 换 PVC 后，镜像 /usr/local/cargo/config.toml 里的 sparse
+        // 镜像配置（受限网络构建注入）不会自动继承；缺失会直连 crates.io，
+        // 家庭网络上索引拉取极慢。一次性把镜像内配置带到 PVC。
+        let pvc_config = std::path::Path::new(CARGO_HOME_PVC).join("config.toml");
+        if tokio::fs::try_exists(&pvc_config).await.unwrap_or(false) == false {
+            let img_config = std::path::Path::new("/usr/local/cargo/config.toml");
+            if tokio::fs::try_exists(img_config).await.unwrap_or(false) {
+                if let Ok(body) = tokio::fs::read(img_config).await {
+                    let _ = tokio::fs::create_dir_all(CARGO_HOME_PVC).await;
+                    let _ = tokio::fs::write(&pvc_config, body).await;
+                }
+            }
+        }
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.args(["build", "--release", "--bin", "cogneva"])
             .current_dir(&self.src_dir)
