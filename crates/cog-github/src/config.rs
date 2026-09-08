@@ -361,6 +361,11 @@ pub struct BotIdentityConfig {
     pub persona: Option<String>,
     /// 实例机器指纹（SHA-256 hex）；身份的规范来源，缺失时首次使用自动生成。
     pub fingerprint: Option<String>,
+    /// GitHub App 的 slug（公开值，非凭证）：配置后 App installation token
+    /// 发出的评论/PR 由 GitHub 归因到 `<slug>[bot]` 登录名（如 `cogneva[bot]`），
+    /// 自身评论/自家 PR 识别把该登录名一并算作"自己"。未配置则只认 username。
+    #[serde(default)]
+    pub app_slug: Option<String>,
 }
 
 impl Default for BotIdentityConfig {
@@ -371,6 +376,7 @@ impl Default for BotIdentityConfig {
             email: "bot@cogneva.ai".into(),
             persona: None,
             fingerprint: None,
+            app_slug: None,
         }
     }
 }
@@ -397,12 +403,43 @@ impl BotIdentityConfig {
             .map(|i| i.git_email)
             .unwrap_or_else(|| self.email.clone())
     }
+
+    /// 平台登录名是否属于本实例 bot 自身。两类身份都要认：
+    /// 静态行动账号（`username`，如 PAT/OAuth 下的 `cogneva-bot`）与 GitHub
+    /// App 机器人登录名（`<app-slug>[bot]`，installation token 发出的评论/PR
+    /// 由平台自动归因到它）。漏判会把自己的评论当用户回复而重复追问/重复
+    /// 评论；只按 `[bot]` 后缀匹配则会误判 renovate/dependabot 等他人 bot，
+    /// 因此 slug 必须精确匹配。
+    pub fn is_own_login(&self, login: &str) -> bool {
+        if !self.username.is_empty() && login.eq_ignore_ascii_case(&self.username) {
+            return true;
+        }
+        if let Some(slug) = self.app_slug.as_deref().filter(|s| !s.is_empty()) {
+            if login.eq_ignore_ascii_case(&format!("{slug}[bot]")) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 自身评论识别要认的全部平台登录名（username + App bot 登录名）。
+    pub fn own_logins(&self) -> Vec<String> {
+        let mut logins = Vec::new();
+        if !self.username.is_empty() {
+            logins.push(self.username.clone());
+        }
+        if let Some(slug) = self.app_slug.as_deref().filter(|s| !s.is_empty()) {
+            logins.push(format!("{slug}[bot]"));
+        }
+        logins
+    }
 }
 
 const GITHUB_ENV: &[(&str, &str)] = &[
     ("COGNEVA_GITHUB_REPO", "repo"),
     ("COGNEVA_GITHUB_BASE_BRANCH", "base_branch"),
     ("COGNEVA_GITHUB_API_BASE", "api_base"),
+    ("COGNEVA_GITHUB_APP_SLUG", "bot_identity.app_slug"),
     (
         "COGNEVA_GITHUB_WEBHOOK_GATEWAY_VERIFIED",
         "webhook.gateway_verified",

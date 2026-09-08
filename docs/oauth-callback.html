@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>cogneva · Gitee OAuth Callback</title>
+<title>cogneva · OAuth Callback</title>
 <style>
   :root {
     --bg: #0b0e11;
@@ -84,7 +84,7 @@
 </head>
 <body>
 <div class="card">
-  <div class="brand">cogneva · gitee oauth</div>
+  <div class="brand">cogneva · oauth callback</div>
 
   <div id="sent" class="hidden status-ok">
     <h1 data-zh="授权完成" data-en="Authorization complete">授权完成</h1>
@@ -94,8 +94,8 @@
 
   <div id="manual" class="hidden">
     <h1 data-zh="复制下方授权码" data-en="Copy the code below">复制下方授权码</h1>
-    <p class="desc" data-zh="自动递送不可用（未检测到打开本页的向导窗口）。回到 cogneva 向导第三步，把这段授权码粘贴进去即可。"
-       data-en="Automatic hand-off unavailable (no opener wizard window detected). Go back to step 3 of the cogneva wizard and paste this code.">自动递送不可用（未检测到打开本页的向导窗口）。回到 cogneva 向导第三步，把这段授权码粘贴进去即可。</p>
+    <p class="desc" data-zh="自动递送不可用（未检测到打开本页的向导窗口）。回到 cogneva 向导，把这段授权码粘贴进去即可。"
+       data-en="Automatic hand-off unavailable (no opener wizard window detected). Go back to the cogneva wizard and paste this code.">自动递送不可用（未检测到打开本页的向导窗口）。回到 cogneva 向导，把这段授权码粘贴进去即可。</p>
     <div class="code-box" id="codeText"></div>
     <button class="btn" id="copyBtn" data-zh="复制授权码" data-en="Copy code">复制授权码</button>
     <div class="hint" data-zh="粘贴整段跳转网址也一样有效，向导会自动解析。"
@@ -104,8 +104,8 @@
 
   <div id="error" class="hidden status-err">
     <h1 data-zh="地址里没有授权码" data-en="No code in this URL">地址里没有授权码</h1>
-    <p class="desc" data-zh="本页是 cogneva 的 Gitee 授权回调落地页，应由 Gitee 授权后自动跳转而来。请回到向导重新发起连接。"
-       data-en="This is the cogneva Gitee OAuth callback page, meant to be reached via Gitee's redirect after authorization. Please restart the connection from the wizard.">本页是 cogneva 的 Gitee 授权回调落地页，应由 Gitee 授权后自动跳转而来。请回到向导重新发起连接。</p>
+    <p class="desc" data-zh="本页是 cogneva 的授权回调落地页，应由平台授权或 App 创建后自动跳转而来。请回到向导重新发起。"
+       data-en="This is the cogneva callback page, meant to be reached via the platform redirect after authorization or app creation. Please restart from the wizard.">本页是 cogneva 的授权回调落地页，应由平台授权或 App 创建后自动跳转而来。请回到向导重新发起。</p>
   </div>
 </div>
 
@@ -132,10 +132,16 @@
     return;
   }
 
+  // 同一落地页承接两种回跳：Gitee/OAuth 授权码与 GitHub App Manifest 创建
+  // 回调。URL 同形（?code&state），用向导发起时写入的 state 前缀区分消息类型。
+  var msgType = (state && state.indexOf('ghapp:') === 0)
+    ? 'cogneva-app-manifest'
+    : 'cogneva-gitee-oauth';
+
   var delivered = false;
   if (window.opener && !window.opener.closed) {
     try {
-      window.opener.postMessage({ type: 'cogneva-gitee-oauth', code: code, state: state }, '*');
+      window.opener.postMessage({ type: msgType, code: code, state: state }, '*');
       delivered = true;
     } catch (e) { delivered = false; }
   }

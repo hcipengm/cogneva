@@ -310,16 +310,21 @@ pub fn parse_meta_bot_handle(pr_body: &str) -> Option<String> {
 
 /// Whether a PR was produced by this instance. The metadata-block handle is
 /// authoritative (it survives shared bot accounts); a PR without a metadata
-/// block is treated as self when authored by the configured platform account,
-/// a conservative guard for pre-metadata self PRs.
-pub fn is_self_pr(pr: &PlatformPullRequest, own_handle: Option<&str>, own_username: &str) -> bool {
+/// block is treated as self when authored by one of the configured own logins
+/// (static bot account or the GitHub App bot login `<slug>[bot]`), a
+/// conservative guard for pre-metadata self PRs.
+pub fn is_self_pr(
+    pr: &PlatformPullRequest,
+    own_handle: Option<&str>,
+    own_logins: &[String],
+) -> bool {
     let meta_bot = parse_meta_bot_handle(&pr.body);
     if let (Some(own), Some(bot)) = (own_handle, meta_bot.as_deref()) {
         if own == bot {
             return true;
         }
     }
-    if meta_bot.is_none() && !own_username.is_empty() && pr.author == own_username {
+    if meta_bot.is_none() && own_logins.iter().any(|n| !n.is_empty() && pr.author == *n) {
         return true;
     }
     false
@@ -556,11 +561,12 @@ mod tests {
     #[test]
     fn self_pr_detection() {
         let own = "Alice#a3f9d2c1";
+        let own_logins = vec!["cogneva-bot".to_string(), "cogneva[bot]".to_string()];
         let body = format!("<!-- cogneva-bot-meta -->\nbot: {own}\nenv: prod\n");
         assert!(is_self_pr(
             &pr_with(&body, "shared-bot"),
             Some(own),
-            "cogneva-bot"
+            &own_logins
         ));
 
         let other = "<!-- cogneva-bot-meta -->\nbot: Bob#b81c0e9f\nenv: prod\n";
@@ -568,20 +574,32 @@ mod tests {
         assert!(!is_self_pr(
             &pr_with(other, "shared-bot"),
             Some(own),
-            "shared-bot"
+            &own_logins
         ));
 
         // No metadata block: same platform account => conservatively self.
         assert!(is_self_pr(
             &pr_with("old style PR", "cogneva-bot"),
             Some(own),
-            "cogneva-bot"
+            &own_logins
         ));
         // No metadata block, different account => another bot, validate it.
         assert!(!is_self_pr(
             &pr_with("old style PR", "someone-else"),
             Some(own),
-            "cogneva-bot"
+            &own_logins
+        ));
+        // App-attributed PRs carry the `<slug>[bot]` login; that is self.
+        assert!(is_self_pr(
+            &pr_with("old style PR", "cogneva[bot]"),
+            Some(own),
+            &own_logins
+        ));
+        // Other apps' bots (dependabot/renovate) must not be mistaken for self.
+        assert!(!is_self_pr(
+            &pr_with("old style PR", "renovate[bot]"),
+            Some(own),
+            &own_logins
         ));
     }
 

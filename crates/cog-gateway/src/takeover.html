@@ -335,6 +335,33 @@
   .divider { display: flex; align-items: center; gap: 8px; margin: 14px 0 10px; color: var(--text-2); font-size: 11px; }
   .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 
+  /* GitHub App 运营者高级区：默认折叠，普通用户无需展开 */
+  details.adv {
+    margin-top: 14px; border: 1px dashed var(--line); border-radius: 8px;
+    padding: 10px 14px; background: var(--bg-1);
+  }
+  details.adv summary {
+    cursor: pointer; font-size: 12px; color: var(--text-2); font-weight: 600;
+    list-style: none; user-select: none;
+  }
+  details.adv summary::before { content: "▸ "; color: var(--text-2); }
+  details.adv[open] summary::before { content: "▾ "; }
+  details.adv summary:hover { color: var(--text-1); }
+  details.adv textarea {
+    width: 100%; background: var(--bg-2); border: 1px solid var(--line); border-radius: 6px;
+    color: var(--text-0); font-family: var(--font-mono, monospace); font-size: 11px;
+    padding: 8px 10px; resize: vertical;
+  }
+  details.adv textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); outline: none; }
+  .app-status { display: flex; align-items: center; gap: 8px; font-size: 12.5px; margin: 10px 0 6px; }
+  .app-status .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .app-status.on .dot { background: var(--ok); }
+  .app-status.off .dot { background: var(--text-2); }
+  .app-link {
+    display: inline-block; margin: 6px 0; color: var(--accent);
+    font-size: 12.5px; font-weight: 600;
+  }
+
   /* Contribution wizard: account track cards + numbered step guides */
   .modal.wide { max-width: 520px; }
   .acct-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 14px; }
@@ -805,10 +832,49 @@
         <div id="pendingList"></div>
       </div>
 
+      <div id="ghAppInstallBox" style="display:none;margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+        <label data-i18n="ghAppInstallLbl">Enhance: install the official Cogneva app</label>
+        <div class="fine" style="margin:6px 0 8px" data-i18n="ghAppInstallHint">Optional. Lets the public Cogneva bot collaborate directly on your fork — for example pushing review fixes to your branch. The main contribution flow does not need it.</div>
+        <a class="app-link" id="ghAppInstallLink" href="https://github.com/apps/cogneva/installations/new" target="_blank" rel="noopener" data-i18n="ghAppInstallLink">Install the official Cogneva app on my repositories →</a>
+      </div>
+
       <div class="actions" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
         <button type="button" class="danger sm" id="disconnectBtn" data-i18n="disconnectBtn">Disconnect</button>
       </div>
     </div>
+
+    <details class="adv" id="ghAppAdv">
+      <summary data-i18n="ghAppAdvSummary">Operator: configure the public GitHub App (regular users skip this)</summary>
+
+      <div class="app-status off" id="ghAppStatusLine">
+        <span class="dot"></span><span id="ghAppStatusText"></span>
+      </div>
+
+      <button type="button" id="ghAppManifestBtn" style="width:100%" data-i18n="ghAppManifestBtn">Register GitHub App (one-click — the private key is returned automatically)</button>
+      <div id="ghAppManifestBox" style="display:none;margin-top:10px">
+        <div class="steps">
+          <div class="step"><span class="n">1</span><span data-i18n="ghAppStep1">On the GitHub page that just opened, confirm the pre-filled name and permissions, then click "Create GitHub App"</span></div>
+          <div class="step"><span class="n">2</span><span data-i18n="ghAppStep2">It jumps back and the private key is stored automatically. Then open the install page and add the app to a repository</span></div>
+          <div class="step"><span class="n">3</span><span data-i18n="ghAppStep3">Come back and click "Discover installation" to finish</span></div>
+        </div>
+        <a class="app-link" id="ghAppInstallLink2" href="https://github.com/apps/cogneva/installations/new" target="_blank" rel="noopener" data-i18n="ghAppInstallPage">Open the app install page →</a>
+        <div class="actions">
+          <button type="button" id="ghAppDiscoverBtn" data-i18n="ghAppDiscoverBtn">I've installed it — discover installation</button>
+        </div>
+      </div>
+
+      <div class="divider" data-i18n="ghAppManualDivider">or paste credentials manually (offline / no public callback)</div>
+      <label>App ID</label>
+      <input type="text" id="ghAppIdInput" style="width:100%" placeholder="123456" autocomplete="off" />
+      <label>Installation ID</label>
+      <input type="text" id="ghAppInstallIdInput" style="width:100%" placeholder="9876543" autocomplete="off" />
+      <label data-i18n="ghAppPemLbl">App private key (PEM)</label>
+      <textarea id="ghAppPemInput" rows="5" placeholder="-----BEGIN RSA PRIVATE KEY-----"></textarea>
+      <div class="actions">
+        <button type="button" id="ghAppSaveBtn" data-i18n="save">Save &amp; apply</button>
+        <button type="button" class="danger sm" id="ghAppClearBtn" data-i18n="ghAppClearBtn">Remove app config</button>
+      </div>
+    </details>
 
     <div class="err-box" id="contribErr"></div>
     <div class="fine" data-i18n="contribKeyNote" style="margin-top:10px">The token is written to the cluster Secret only, held by the security gateway, and never echoed back. An SSH key is generated and its public half uploaded.</div>
@@ -1724,6 +1790,29 @@ const I18N = {
   contribConnected: { en: 'Contribution channel connected', zh: '贡献通道已连接' },
   contribSaving:    { en: 'Connecting…', zh: '正在连接…' },
   contribNeedPat:   { en: 'Please paste a token first.', zh: '请先粘贴令牌。' },
+
+  // GitHub App（用户侧安装入口 + 运营者配置区）
+  ghAppInstallLbl:  { en: 'Enhance: install the official Cogneva app', zh: '增强：安装官方 Cogneva App' },
+  ghAppInstallHint: { en: 'Optional. Lets the public Cogneva bot collaborate directly on your fork — for example pushing review fixes to your branch. The main contribution flow does not need it.',
+                      zh: '可选。让公版 Cogneva 机器人直接在你的 fork 上协作（例如把评审修复推到你的分支）。主回流流程不依赖它。' },
+  ghAppInstallLink: { en: 'Install the official Cogneva app on my repositories →', zh: '把官方 Cogneva App 安装到我的仓库 →' },
+  ghAppAdvSummary:  { en: 'Operator: configure the public GitHub App (regular users skip this)', zh: '运营者：配置公版 GitHub App（普通用户无需展开）' },
+  ghAppStatusOn:    { en: 'GitHub App configured — egress signs as the app bot', zh: 'GitHub App 已配置——出口以 App 机器人身份发出' },
+  ghAppStatusOff:   { en: 'GitHub App not configured — egress uses the static token', zh: 'GitHub App 未配置——出口使用静态令牌' },
+  ghAppManifestBtn: { en: 'Register GitHub App (one-click — the private key is returned automatically)', zh: '一键注册 GitHub App（私钥自动回传，不经人手）' },
+  ghAppStep1:       { en: 'On the GitHub page that just opened, confirm the pre-filled name and permissions, then click "Create GitHub App"', zh: '在刚打开的 GitHub 页面确认预填的名称与权限，点「Create GitHub App」' },
+  ghAppStep2:       { en: 'It jumps back and the private key is stored automatically. Then open the install page and add the app to a repository', zh: '页面跳回后私钥自动存好。接着打开安装页，把 App 装到一个仓库' },
+  ghAppStep3:       { en: 'Come back and click "Discover installation" to finish', zh: '回到这里点「发现安装」完成配置' },
+  ghAppInstallPage: { en: 'Open the app install page →', zh: '打开 App 安装页 →' },
+  ghAppDiscoverBtn: { en: "I've installed it — discover installation", zh: '我已安装——发现安装' },
+  ghAppManualDivider: { en: 'or paste credentials manually (offline / no public callback)', zh: '或手动粘贴凭证（离线 / 无公网回调）' },
+  ghAppPemLbl:      { en: 'App private key (PEM)', zh: 'App 私钥（PEM）' },
+  ghAppClearBtn:    { en: 'Remove app config', zh: '移除 App 配置' },
+  ghAppCreated:     { en: 'GitHub App created and stored — now install it to a repository', zh: 'GitHub App 已创建并存好——请把它安装到仓库' },
+  ghAppDiscovered:  { en: 'Installation discovered and linked', zh: '已发现并关联安装' },
+  ghAppNeedAll:     { en: 'App ID, installation ID and the PEM private key are all required.', zh: 'App ID、安装 ID 与 PEM 私钥三项都要填。' },
+  ghAppSaved:       { en: 'GitHub App credentials saved; the gateway is rolling.', zh: 'GitHub App 凭证已保存，网关正在滚动重启。' },
+  ghAppRemoved:     { en: 'GitHub App config removed; egress falls back to the static token.', zh: 'GitHub App 配置已移除，出口回退静态令牌。' },
 };
 const t = (key) => I18N[key][LANG];
 
@@ -1923,9 +2012,20 @@ function openContrib() {
       const giAvailable = !!s.gitee_oauth_available;
       $('giOauthBtn').style.display = giAvailable ? '' : 'none';
       $('giOauthUnavailable').style.display = giAvailable ? 'none' : '';
+      renderGhAppStatus(!!s.github_app_configured);
       showContribConnected(s);
     })
     .catch(() => {});
+}
+
+// GitHub App 状态行（运营者高级区）：私钥从不回读，只显示布尔状态。
+function renderGhAppStatus(configured) {
+  const line = $('ghAppStatusLine');
+  line.classList.toggle('on', configured);
+  line.classList.toggle('off', !configured);
+  $('ghAppStatusText').textContent = configured
+    ? t('ghAppStatusOn')
+    : t('ghAppStatusOff');
 }
 
 // Connected state: swap the connect panes for the owner console (policy
@@ -1939,6 +2039,8 @@ function showContribConnected(s) {
   if (!connected) return;
   $('contribAcctLine').textContent =
     t('connectedAs') + '：' + (s.provider === 'gitee' ? 'Gitee' : 'GitHub');
+  // 「安装官方 App 到我的仓库」仅 GitHub 连接时有意义（Gitee 无 App 概念）。
+  $('ghAppInstallBox').style.display = s.provider === 'gitee' ? 'none' : '';
   setPolicyUi(s.policy || 'auto');
   if (s.policy === 'ask' || (s.pending_count || 0) > 0) loadPending();
   else $('pendingBox').style.display = 'none';
@@ -2248,6 +2350,114 @@ $('giCodeBtn').onclick = async () => {
   const pasted = $('giCode').value.trim();
   if (!pasted) { contribErr(t('contribNeedPat')); return; }
   finishGiteeOAuth(pasted);
+};
+
+// ── GitHub App（运营者配置公版 bot 身份；普通用户用「安装到我的仓库」入口）──
+const GH_APP_LANDING = 'https://hcipengm.github.io/cogneva/oauth-callback.html';
+let ghAppState = null;
+
+function setGhAppInstallLinks(htmlUrl) {
+  const base = (htmlUrl || 'https://github.com/apps/cogneva').replace(/\/$/, '');
+  const url = base + '/installations/new';
+  $('ghAppInstallLink').href = url;
+  $('ghAppInstallLink2').href = url;
+}
+
+$('ghAppManifestBtn').onclick = () => {
+  contribErr('');
+  // 一次性随机 state 即防伪凭证：落地页原样带回，匹配才兑换。
+  ghAppState = 'ghapp:' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const manifest = {
+    name: 'Cogneva',
+    url: 'https://github.com/hcipengm/cogneva',
+    public: true,
+    redirect_url: GH_APP_LANDING,
+    hook_active: false,
+    state: ghAppState,
+    default_permissions: {
+      metadata: 'read',
+      contents: 'write',
+      issues: 'write',
+      pull_requests: 'write',
+    },
+    default_events: ['issues', 'issue_comment', 'pull_request', 'pull_request_review'],
+  };
+  window.open(
+    'https://github.com/settings/apps/new?manifest=' + encodeURIComponent(JSON.stringify(manifest)),
+    'cognevaGhApp'
+  );
+  $('ghAppManifestBox').style.display = '';
+};
+
+// Manifest 回调落地页递回的 code：state 一次性随机值防伪（攻击者页面拿不到），
+// 因此不按 origin 过滤。匹配成功走服务端兑换，私钥由网关直写 Secret。
+window.addEventListener('message', (e) => {
+  const d = e && e.data;
+  if (!d || d.type !== 'cogneva-app-manifest' || !d.code) return;
+  if (!ghAppState || d.state !== ghAppState) return;
+  finishGhAppManifest(d.code);
+});
+
+async function finishGhAppManifest(code) {
+  $('ghAppManifestBtn').disabled = true;
+  try {
+    const r = await api('/api/v1/admin/contribution/github-app/manifest', 'POST', { code });
+    if (r.html_url) setGhAppInstallLinks(r.html_url);
+    toast(t('ghAppCreated'), 'ok');
+  } catch (e) {
+    contribErr(e.message);
+  } finally {
+    $('ghAppManifestBtn').disabled = false;
+  }
+}
+
+$('ghAppDiscoverBtn').onclick = async () => {
+  $('ghAppDiscoverBtn').disabled = true;
+  contribErr('');
+  try {
+    const r = await api('/api/v1/admin/contribution/github-app/discover', 'POST');
+    renderGhAppStatus(true);
+    toast(t('ghAppDiscovered') + (r.account ? '（' + r.account + '）' : ''), 'ok');
+  } catch (e) {
+    contribErr(e.message);
+  } finally {
+    $('ghAppDiscoverBtn').disabled = false;
+  }
+};
+
+$('ghAppSaveBtn').onclick = async () => {
+  const app_id = $('ghAppIdInput').value.trim();
+  const installation_id = $('ghAppInstallIdInput').value.trim();
+  const private_key = $('ghAppPemInput').value.trim();
+  if (!app_id || !installation_id || !private_key) { contribErr(t('ghAppNeedAll')); return; }
+  $('ghAppSaveBtn').disabled = true;
+  contribErr('');
+  try {
+    await api('/api/v1/admin/contribution/github-app', 'POST', { app_id, installation_id, private_key });
+    renderGhAppStatus(true);
+    $('ghAppIdInput').value = '';
+    $('ghAppInstallIdInput').value = '';
+    $('ghAppPemInput').value = '';
+    toast(t('ghAppSaved'), 'ok');
+  } catch (e) {
+    contribErr(e.message);
+  } finally {
+    $('ghAppSaveBtn').disabled = false;
+  }
+};
+
+$('ghAppClearBtn').onclick = async () => {
+  $('ghAppClearBtn').disabled = true;
+  contribErr('');
+  try {
+    await api('/api/v1/admin/contribution/github-app', 'DELETE');
+    renderGhAppStatus(false);
+    toast(t('ghAppRemoved'), 'ok');
+  } catch (e) {
+    contribErr(e.message);
+  } finally {
+    $('ghAppClearBtn').disabled = false;
+  }
 };
 
 setInterval(loadProcess, 10000);

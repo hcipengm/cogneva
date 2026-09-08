@@ -344,9 +344,12 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_prefers_explicit_config_fingerprint() {
-        let mut config = crate::config::BotIdentityConfig::default();
-        config.fingerprint =
-            Some("a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into());
+        let mut config = crate::config::BotIdentityConfig {
+            fingerprint: Some(
+                "a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into(),
+            ),
+            ..Default::default()
+        };
         let id = resolve(&mut config).await;
         assert_eq!(id.short, "a3f9d2c1");
     }
@@ -358,9 +361,12 @@ mod tests {
         assert_eq!(config.git_author_email(), "bot@cogneva.ai");
         assert!(config.instance().is_none());
 
-        let mut with_persona = crate::config::BotIdentityConfig::default();
-        with_persona.fingerprint =
-            Some("a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into());
+        let with_persona = crate::config::BotIdentityConfig {
+            fingerprint: Some(
+                "a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into(),
+            ),
+            ..Default::default()
+        };
         let instance = with_persona.instance().unwrap();
         assert_eq!(with_persona.git_author_name(), instance.git_name);
         assert!(with_persona.git_author_name().contains('#'));

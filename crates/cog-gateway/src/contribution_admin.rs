@@ -42,6 +42,9 @@ const SECRET_GITEE_TOKEN: &str = "gitee-token";
 const SECRET_GITEE_REFRESH: &str = "gitee-refresh-token";
 const SECRET_SSH_KEY: &str = "git-ssh-private-key";
 const SECRET_CONTRIB_CONFIG: &str = "contribution-config";
+const SECRET_GITHUB_APP_ID: &str = "github-app-id";
+const SECRET_GITHUB_APP_INSTALLATION_ID: &str = "github-app-installation-id";
+const SECRET_GITHUB_APP_KEY: &str = "github-app-private-key";
 
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -689,6 +692,10 @@ pub async fn contribution_status_handler(
             let github = has(SECRET_GITHUB_TOKEN);
             let gitee = has(SECRET_GITEE_TOKEN);
             let ssh = has(SECRET_SSH_KEY);
+            // App 三件套齐全才算配置好；只读布尔位，私钥绝不回传。
+            let github_app = has(SECRET_GITHUB_APP_ID)
+                && has(SECRET_GITHUB_APP_INSTALLATION_ID)
+                && has(SECRET_GITHUB_APP_KEY);
             let provider = if github {
                 "github"
             } else if gitee {
@@ -708,6 +715,7 @@ pub async fn contribution_status_handler(
                     "github": {"configured": github},
                     "gitee": {"configured": gitee},
                     "ssh": {"key_present": ssh},
+                    "github_app_configured": github_app,
                     "policy": policy.as_str(),
                     "pending_count": pending_count,
                     "device_flow_available": oauth_client_id(None).is_some(),
@@ -723,6 +731,7 @@ pub async fn contribution_status_handler(
             "configured": false,
             "provider": "none",
             "note": "not_in_cluster",
+            "github_app_configured": false,
             "policy": state
                 .contribution_control
                 .as_ref()
@@ -731,6 +740,422 @@ pub async fn contribution_status_handler(
             "pending_count": pending_count,
             "device_flow_available": oauth_client_id(None).is_some(),
             "gitee_oauth_available": gitee_oauth_available(),
+        })),
+    )
+        .into_response()
+}
+
+/// GitHub App 凭证配置请求（运营者通道：手动粘贴或 Manifest 流回填共用）。
+#[derive(Deserialize)]
+pub struct GitHubAppConfigRequest {
+    pub app_id: String,
+    pub installation_id: String,
+    pub private_key: String,
+}
+
+/// POST /api/v1/admin/contribution/github-app — 把 GitHub App 凭证
+/// （App ID、installation ID、私钥 PEM）写入网关 Secret 并滚动网关。
+/// 落盘前先做"数字 ID + 私钥可签名"校验（fail-closed）；私钥只进安全
+/// 网关，状态接口只回布尔位、绝不回读私钥。未配置 App 时网关出口回退
+/// 静态 token，属主主流程不依赖 App。
+pub async fn github_app_config_handler(
+    State(_state): State<Arc<crate::GatewayState>>,
+    Json(req): Json<GitHubAppConfigRequest>,
+) -> Response {
+    let app_id = req.app_id.trim();
+    let installation_id = req.installation_id.trim();
+    let private_key = req.private_key.trim();
+    if crate::github_app::GitHubAppCreds::parse(app_id, installation_id, private_key).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_app_credentials",
+                "message": "App 凭证校验失败：App ID 与安装 ID 须为数字，私钥须为可签名的 RSA PEM",
+            })),
+        )
+            .into_response();
+    }
+    let kube = match KubeClient::in_cluster() {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "not_in_cluster", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = kube
+        .patch(
+            &format!(
+                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+                kube.namespace()
+            ),
+            json!({ "stringData": {
+                SECRET_GITHUB_APP_ID: app_id,
+                SECRET_GITHUB_APP_INSTALLATION_ID: installation_id,
+                SECRET_GITHUB_APP_KEY: private_key,
+            }}),
+        )
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "secret_patch_failed", "message": e})),
+        )
+            .into_response();
+    }
+    if let Err(e) = kube.restart_gateway().await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "gateway_restart_failed", "message": e})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "status": "github_app_configured",
+            "message": "GitHub App 凭证已写入安全网关，滚动重启约一分钟后出口以 App bot 身份发出",
+        })),
+    )
+        .into_response()
+}
+
+/// DELETE /api/v1/admin/contribution/github-app — 移除 GitHub App 凭证，
+/// 网关出口回退静态 token（属主主流程不依赖 App，移除无功能损失）。
+pub async fn github_app_clear_handler(State(_state): State<Arc<crate::GatewayState>>) -> Response {
+    let kube = match KubeClient::in_cluster() {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "not_in_cluster", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    // Strategic merge patch: null values delete the keys from `data`.
+    if let Err(e) = kube
+        .patch(
+            &format!(
+                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+                kube.namespace()
+            ),
+            json!({ "data": {
+                SECRET_GITHUB_APP_ID: null,
+                SECRET_GITHUB_APP_INSTALLATION_ID: null,
+                SECRET_GITHUB_APP_KEY: null,
+            }}),
+        )
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "secret_patch_failed", "message": e})),
+        )
+            .into_response();
+    }
+    if let Err(e) = kube.restart_gateway().await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "gateway_restart_failed", "message": e})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "status": "github_app_cleared",
+            "message": "GitHub App 凭证已移除，安全网关出口回退静态令牌",
+        })),
+    )
+        .into_response()
+}
+
+/// Manifest 流回填请求：GitHub 创建 App 后回跳落地页带回的一次性 code。
+#[derive(Deserialize)]
+pub struct GitHubAppManifestRequest {
+    pub code: String,
+}
+
+/// POST /api/v1/admin/contribution/github-app/manifest — App Manifest 流的
+/// 服务端兑换：浏览器在 GitHub 创建 App 后回跳带回一次性 code，网关用 code
+/// 调 conversions 接口接回 app_id 与 PEM 私钥并直写 Secret。私钥从 GitHub
+/// 到网关不经浏览器/人手；conversions 无需预认证（code 一次性、几分钟有效）。
+/// 创建时 App 尚无安装，installation id 待安装后由 discover 接口补入。
+pub async fn github_app_manifest_handler(
+    State(_state): State<Arc<crate::GatewayState>>,
+    Json(req): Json<GitHubAppManifestRequest>,
+) -> Response {
+    let code = req.code.trim();
+    if code.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing_code", "message": "缺少 GitHub 创建 App 回跳的 code"})),
+        )
+            .into_response();
+    }
+    let url = format!("{GITHUB_API}/app-manifests/{code}/conversions");
+    let resp = match http_client()
+        .post(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "cogneva-security-gateway")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "manifest_exchange_failed", "message": format!("请求 GitHub 失败: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let body: String = body.chars().take(300).collect();
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "manifest_exchange_failed", "message": format!("GitHub 返回 {status}: {body}")})),
+        )
+            .into_response();
+    }
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "manifest_exchange_failed", "message": format!("解析 GitHub 响应失败: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let app_id = v.get("id").and_then(|x| x.as_u64()).map(|n| n.to_string());
+    let pem = v.get("pem").and_then(|x| x.as_str()).map(str::to_string);
+    let html_url = v
+        .get("html_url")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let (Some(app_id), Some(pem)) = (app_id, pem) else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "manifest_exchange_failed", "message": "GitHub 响应缺少 App ID 或私钥"})),
+        )
+            .into_response();
+    };
+    let kube = match KubeClient::in_cluster() {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "not_in_cluster", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    // 新 App 与旧 installation 不匹配：清掉旧 installation id，安装后再 discover。
+    if let Err(e) = kube
+        .patch(
+            &format!(
+                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+                kube.namespace()
+            ),
+            json!({
+                "stringData": {
+                    SECRET_GITHUB_APP_ID: app_id.clone(),
+                    SECRET_GITHUB_APP_KEY: pem,
+                },
+                "data": { SECRET_GITHUB_APP_INSTALLATION_ID: null },
+            }),
+        )
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "secret_patch_failed", "message": e})),
+        )
+            .into_response();
+    }
+    if let Err(e) = kube.restart_gateway().await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "gateway_restart_failed", "message": e})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "app_id": app_id,
+            "html_url": html_url,
+            "installed": false,
+            "message": "GitHub App 已创建，私钥已写入安全网关；请把 App 安装到仓库后点「发现安装」补全安装 ID",
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/admin/contribution/github-app/discover — App 安装后补全
+/// installation id：用已存的 App 私钥签 JWT 调 GitHub 列出本 App 的安装，
+/// 取首个安装写入 Secret。运营者在 GitHub 完成「安装到仓库」后点一次即可。
+pub async fn github_app_discover_handler(
+    State(_state): State<Arc<crate::GatewayState>>,
+) -> Response {
+    let kube = match KubeClient::in_cluster() {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "not_in_cluster", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    let secret = match kube
+        .get_json(&format!(
+            "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+            kube.namespace()
+        ))
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "secret_read_failed", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    let app_id_raw = decode_secret_key(&secret, SECRET_GITHUB_APP_ID);
+    let pem = decode_secret_key(&secret, SECRET_GITHUB_APP_KEY);
+    let (Some(app_id_raw), Some(pem)) = (app_id_raw, pem) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "app_not_created",
+                "message": "尚未创建/配置 GitHub App：请先一键注册或手动粘贴 App 凭证",
+            })),
+        )
+            .into_response();
+    };
+    let Ok(app_id_num) = app_id_raw.trim().parse::<u64>() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "app_id_invalid", "message": "Secret 中的 App ID 不是数字"})),
+        )
+            .into_response();
+    };
+    let jwt = match crate::github_app::mint_app_jwt(app_id_num, &pem) {
+        Ok(j) => j,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "jwt_failed", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    let resp = match http_client()
+        .get(format!("{GITHUB_API}/app/installations"))
+        .bearer_auth(jwt)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "cogneva-security-gateway")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "installations_lookup_failed", "message": format!("请求 GitHub 失败: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let body: String = body.chars().take(300).collect();
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "installations_lookup_failed", "message": format!("GitHub 返回 {status}: {body}")})),
+        )
+            .into_response();
+    }
+    let installs: Vec<serde_json::Value> = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "installations_lookup_failed", "message": format!("解析响应失败: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let Some(first) = installs.first() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "no_installation",
+                "message": "GitHub 上还没有任何安装：请先在 App 安装页把它装到仓库（可只选公版仓库），再回来点发现",
+            })),
+        )
+            .into_response();
+    };
+    let Some(installation_id) = first.get("id").and_then(|x| x.as_u64()) else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "installations_lookup_failed", "message": "安装记录缺少 id"})),
+        )
+            .into_response();
+    };
+    let account = first
+        .get("account")
+        .and_then(|a| a.get("login"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Err(e) = kube
+        .patch(
+            &format!(
+                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
+                kube.namespace()
+            ),
+            json!({ "stringData": {
+                SECRET_GITHUB_APP_INSTALLATION_ID: installation_id.to_string(),
+            }}),
+        )
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "secret_patch_failed", "message": e})),
+        )
+            .into_response();
+    }
+    if let Err(e) = kube.restart_gateway().await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "gateway_restart_failed", "message": e})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "installation_id": installation_id,
+            "account": account,
+            "installation_count": installs.len(),
+            "message": "已发现 GitHub App 安装，安全网关重启后出口以 App bot 身份发出",
         })),
     )
         .into_response()

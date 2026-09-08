@@ -10,6 +10,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::github_app::{self, AppTokenCache, GitHubAppCreds};
+
 use axum::{
     extract::State,
     http::StatusCode,
@@ -214,6 +216,26 @@ struct AppState {
     egress_stats: std::sync::Arc<LatencyStats>,
     llm_stats: std::sync::Arc<LatencyStats>,
     code_stats: std::sync::Arc<LatencyStats>,
+    /// 已配置的 GitHub App 凭证（仅网关持有私钥）；None = 用静态 token。
+    github_app: Option<GitHubAppCreds>,
+    /// installation token 缓存（mint 一次换一小时，复用到临过期前刷新）。
+    app_token_cache: std::sync::Arc<AppTokenCache>,
+}
+
+impl AppState {
+    /// 代码平台透传用的 GitHub 出口凭证：配置了 App 就用 installation token
+    /// （以 App bot 身份发出，署名归一），换取失败或未配置回退静态
+    /// OAuth/PAT token；两者皆无返回 None（调用方按未配置凭证处理）。
+    async fn github_bearer(&self) -> Option<String> {
+        github_app::resolve_github_bearer(
+            self.github_app.as_ref(),
+            &self.app_token_cache,
+            &self.stream_client,
+            "https://api.github.com",
+            self.config.github_token.as_deref(),
+        )
+        .await
+    }
 }
 
 /// 凭证泄露模式：命中即拦截并记日志。
@@ -783,11 +805,17 @@ async fn code_platform_forward(
     req: axum::extract::Request,
     platform: CodePlatform,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let (name, token) = match platform {
-        CodePlatform::GitHub => ("github", state.config.github_token.as_deref()),
-        CodePlatform::Gitee => ("gitee", state.config.gitee_token.as_deref()),
+    let name = match platform {
+        CodePlatform::GitHub => "github",
+        CodePlatform::Gitee => "gitee",
     };
-    let Some(token) = token else {
+    // GitHub 出口优先 App installation token（App bot 身份），回退静态 token；
+    // Gitee 无 App 概念，用静态 token 以 access_token 注入。
+    let token = match platform {
+        CodePlatform::GitHub => state.github_bearer().await,
+        CodePlatform::Gitee => state.config.gitee_token.clone(),
+    };
+    let Some(token) = token.as_deref() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             format!("网关未配置 {name} token"),
@@ -926,6 +954,12 @@ async fn attach_proxy(
         }
         CodePlatform::GitHub => {}
     }
+    // GitHub 附件出口凭证同样优先 App installation token，回退静态 token。
+    let gh_bearer = if matches!(platform, CodePlatform::GitHub) {
+        state.github_bearer().await
+    } else {
+        None
+    };
 
     // 逐跳重定向只允许白名单 https host，杜绝经平台开放重定向打到内网。
     let client = reqwest::Client::builder()
@@ -950,7 +984,7 @@ async fn attach_proxy(
     if matches!(platform, CodePlatform::GitHub)
         && matches!(host.as_str(), "github.com" | "api.github.com")
     {
-        if let Some(token) = state.config.github_token.as_deref() {
+        if let Some(token) = gh_bearer.as_deref() {
             builder = builder.bearer_auth(token);
         }
     }
@@ -1025,11 +1059,16 @@ async fn git_forward(
     req: axum::extract::Request,
     platform: CodePlatform,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let (name, token) = match platform {
-        CodePlatform::GitHub => ("github", state.config.github_token.as_deref()),
-        CodePlatform::Gitee => ("gitee", state.config.gitee_token.as_deref()),
+    let name = match platform {
+        CodePlatform::GitHub => "github",
+        CodePlatform::Gitee => "gitee",
     };
-    let Some(token) = token else {
+    // installation token 同样可作 git HTTPS 密码（x-access-token），App 与 PAT 双通道通用。
+    let token = match platform {
+        CodePlatform::GitHub => state.github_bearer().await,
+        CodePlatform::Gitee => state.config.gitee_token.clone(),
+    };
+    let Some(token) = token.as_deref() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             format!("网关未配置 {name} token"),
@@ -1328,8 +1367,13 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
         egress_stats: std::sync::Arc::new(LatencyStats::default()),
         llm_stats: std::sync::Arc::new(LatencyStats::default()),
         code_stats: std::sync::Arc::new(LatencyStats::default()),
+        github_app: GitHubAppCreds::from_env(),
+        app_token_cache: std::sync::Arc::new(AppTokenCache::default()),
         config: config.clone(),
     };
+    if state.github_app.is_some() {
+        tracing::info!("安全网关：检测到 GitHub App 凭证，代码平台出口将以 App bot 身份发出");
+    }
     let egress_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.egress_port));
     let llm_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.llm_port));
     let webhook_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.webhook_port));

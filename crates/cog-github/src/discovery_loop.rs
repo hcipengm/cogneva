@@ -647,8 +647,7 @@ impl GitHubDiscoveryLoop {
         let signed = !sig.is_empty() && body.trim_end().ends_with(sig.as_str());
         let actor = self.config.primary_account().ok().map(|a| a.username());
         let self_actor = actor.is_some_and(|u| !u.is_empty() && u == author)
-            || (!self.config.bot_identity.username.is_empty()
-                && self.config.bot_identity.username == author);
+            || self.config.bot_identity.is_own_login(&author);
         signed || self_actor
     }
 
@@ -818,10 +817,11 @@ impl GitHubDiscoveryLoop {
         }
         .unwrap_or_default();
         let key = kind.key(number);
+        let bot_logins = self.config.bot_identity.own_logins();
         let conversation = IssueConversation::from_comments(
             number,
             &comments,
-            &self.config.bot_identity.username,
+            &bot_logins,
             &self.config.conversation,
         );
 
@@ -1259,7 +1259,8 @@ impl GitHubDiscoveryLoop {
     /// 自循环防护——自家进化流水线产的 PR（`cogneva/` 分支前缀或机器人
     /// 署名）绝不能回流成新意图，否则无限自我增殖。
     async fn process_pr(&mut self, pr: &crate::provider::PlatformPullRequest) -> Result<()> {
-        if pr.head_branch.starts_with("cogneva/") || pr.author == self.config.bot_identity.username
+        if pr.head_branch.starts_with("cogneva/")
+            || self.config.bot_identity.is_own_login(&pr.author)
         {
             tracing::debug!(pr = pr.number, "Skipping self-produced PR");
             return Ok(());
@@ -1474,11 +1475,8 @@ impl GitHubDiscoveryLoop {
             {
                 continue;
             }
-            if crate::cross_validation::is_self_pr(
-                &pr,
-                Some(&handle),
-                &self.config.bot_identity.username,
-            ) {
+            let own_logins = self.config.bot_identity.own_logins();
+            if crate::cross_validation::is_self_pr(&pr, Some(&handle), &own_logins) {
                 continue;
             }
             let detail = match self.provider.get_pull_request(pr.number).await {
@@ -2367,21 +2365,21 @@ mod tests {
         );
 
         // Round 1: the external bot PR is submitted for validation; no comment
-        // until the sandbox task finishes.
+        // until the sandbox task finishes. Clone under the lock so no guard is
+        // held across the next await (std Mutex is not async-aware).
         loop_.run_once().await.unwrap();
-        let types = orchestrator.task_types.lock().unwrap();
+        let types = orchestrator.task_types.lock().unwrap().clone();
         assert!(
             types
                 .iter()
                 .any(|t| t == crate::cross_validation::CROSS_VALIDATE_TASK_KIND),
             "cross-validation task should be submitted; got {types:?}"
         );
-        drop(types);
         assert!(provider.comments.lock().unwrap().is_empty());
 
         // Round 2: the task reports a pass verdict → one verdict comment.
         loop_.run_once().await.unwrap();
-        let comments = provider.comments.lock().unwrap();
+        let comments = provider.comments.lock().unwrap().clone();
         let cv: Vec<&(u64, String)> = comments.iter().filter(|(n, _)| *n == 31).collect();
         assert_eq!(
             cv.len(),
@@ -2394,7 +2392,6 @@ mod tests {
         );
         assert!(cv[0].1.contains("Verdict: PASS"));
         assert!(cv[0].1.contains(&own_handle));
-        drop(comments);
 
         // Round 3: the validated head is skipped and the comment not duplicated.
         loop_.run_once().await.unwrap();

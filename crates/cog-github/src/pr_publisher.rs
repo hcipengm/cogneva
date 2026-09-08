@@ -654,9 +654,12 @@ mod tests {
 
     #[test]
     fn metadata_block_uses_instance_handle_when_present() {
-        let mut identity = BotIdentityConfig::default();
-        identity.fingerprint =
-            Some("a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into());
+        let identity = BotIdentityConfig {
+            fingerprint: Some(
+                "a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into(),
+            ),
+            ..Default::default()
+        };
         let block = metadata_block(&identity, Some("self-review=0.87"), Some("#42 (by Bob)"));
         assert!(block.starts_with("<!-- cogneva-bot-meta -->"));
         assert!(block.contains(&format!("bot: {}", identity.git_author_name())));

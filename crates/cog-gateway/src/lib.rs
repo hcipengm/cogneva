@@ -35,6 +35,7 @@ pub mod error;
 pub mod evolution;
 pub mod executor;
 pub mod files;
+pub mod github_app;
 pub mod heartbeat_history;
 pub mod hook_forwarder;
 pub mod hooks;
@@ -520,6 +521,19 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/admin/contribution-config",
             post(contribution_admin::contribution_config_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/github-app",
+            post(contribution_admin::github_app_config_handler)
+                .delete(contribution_admin::github_app_clear_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/github-app/manifest",
+            post(contribution_admin::github_app_manifest_handler),
+        )
+        .route(
+            "/api/v1/admin/contribution/github-app/discover",
+            post(contribution_admin::github_app_discover_handler),
         )
         .route(
             "/api/v1/admin/contribution/device/start",

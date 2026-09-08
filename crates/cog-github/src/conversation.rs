@@ -74,11 +74,12 @@ impl IssueConversation {
     }
 
     /// Rebuild the conversation from platform comments, classifying authors
-    /// as bot or user via `bot_username`.
+    /// as bot or user via `bot_logins` (the static bot account plus, when
+    /// configured, the GitHub App bot login `<slug>[bot]`).
     pub fn from_comments(
         issue_number: u64,
         comments: &[PlatformComment],
-        bot_username: &str,
+        bot_logins: &[String],
         config: &ConversationConfig,
     ) -> Self {
         let mut convo = Self::new(issue_number);
@@ -92,7 +93,8 @@ impl IssueConversation {
                     .body
                     .trim_end()
                     .ends_with(config.bot_signature.as_str());
-            let role = if comment.author == bot_username || signed_by_bot {
+            let author_is_bot = bot_logins.contains(&comment.author);
+            let role = if author_is_bot || signed_by_bot {
                 ConversationRole::Bot
             } else {
                 ConversationRole::User
@@ -438,7 +440,7 @@ mod tests {
         let convo = IssueConversation::from_comments(
             7,
             &comments,
-            "cogneva-bot",
+            &["cogneva-bot".to_string()],
             &ConversationConfig::default(),
         );
         assert_eq!(convo.state, ConversationState::AwaitingClarification);
@@ -455,7 +457,8 @@ mod tests {
             "Could you describe the problem?\n\n— Cogneva Bot",
             now_ts(),
         )];
-        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
+        let convo =
+            IssueConversation::from_comments(7, &comments, &["cogneva-bot".to_string()], &cfg);
         assert_eq!(convo.state, ConversationState::AwaitingClarification);
         assert_eq!(convo.rounds, 1);
     }
@@ -469,7 +472,7 @@ mod tests {
         let convo = IssueConversation::from_comments(
             7,
             &comments,
-            "cogneva-bot",
+            &["cogneva-bot".to_string()],
             &ConversationConfig::default(),
         );
         assert_eq!(convo.state, ConversationState::UserReplied);
@@ -483,7 +486,8 @@ mod tests {
         };
         let old = now_ts() - 3 * 3600;
         let comments = vec![comment("cogneva-bot", "please clarify", old)];
-        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
+        let convo =
+            IssueConversation::from_comments(7, &comments, &["cogneva-bot".to_string()], &cfg);
         assert_eq!(convo.state, ConversationState::Stale);
     }
 
@@ -526,7 +530,8 @@ mod tests {
                 now_ts(),
             ),
         ];
-        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
+        let convo =
+            IssueConversation::from_comments(7, &comments, &["cogneva-bot".to_string()], &cfg);
         assert_eq!(convo.state, ConversationState::UserReplied);
         assert_eq!(convo.rounds, 1);
     }
@@ -541,7 +546,7 @@ mod tests {
                 comment("cogneva-bot", "please clarify", now_ts() - 200),
                 comment("alice", body, now_ts()),
             ];
-            IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg).state
+            IssueConversation::from_comments(7, &comments, &["cogneva-bot".to_string()], &cfg).state
         };
         assert_eq!(mk("   "), ConversationState::AwaitingClarification);
         assert_eq!(
@@ -561,7 +566,8 @@ mod tests {
                 now_ts(),
             ),
         ];
-        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
+        let convo =
+            IssueConversation::from_comments(7, &comments, &["cogneva-bot".to_string()], &cfg);
         assert_eq!(convo.state, ConversationState::UserReplied);
     }
 
@@ -593,7 +599,8 @@ mod tests {
                 now_ts(),
             ),
         ];
-        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
+        let convo =
+            IssueConversation::from_comments(7, &comments, &["cogneva-bot".to_string()], &cfg);
         let urls = convo.media_urls();
         assert_eq!(urls.len(), 2, "{urls:?}");
         assert!(urls[0].contains("assets/1"));
@@ -606,7 +613,8 @@ mod tests {
             comment("cogneva-bot", "please clarify", now_ts() - 200),
             comment("alice", "复现：启动即崩溃 v0.2.0", now_ts()),
         ];
-        let convo = IssueConversation::from_comments(7, &comments, "cogneva-bot", &cfg);
+        let convo =
+            IssueConversation::from_comments(7, &comments, &["cogneva-bot".to_string()], &cfg);
         let ctx = convo.triage_context();
         assert!(ctx.contains("please clarify"));
         assert!(ctx.contains("复现：启动即崩溃 v0.2.0"));
