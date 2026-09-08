@@ -548,12 +548,30 @@ The **same command**. K3s needs a Linux kernel, so the script automatically inst
 
 ### 🪟 Windows
 
+Windows gets the **same one-liner experience**, with one extra layer behind the scenes: K3s cannot natively run on Windows, so `bootstrap.ps1` prepares WSL2 + Ubuntu as the Linux layer, then executes the exact same Linux one-liner inside it.
+
+**Environment requirements** — everything not listed here is auto-installed by the bootstrapper:
+
+- **Windows 10 2004+ (build 19041+) or Windows 11**, with virtualization (VT-x/AMD-V) enabled in BIOS/UEFI — WSL2 needs it;
+- **PowerShell running as Administrator** — Windows PowerShell 5.1 (built-in) or PowerShell 7+, launched via *Run as administrator*;
+- **Network access** to GitHub (restricted networks are handled automatically by switching to China mirrors);
+- **No manual WSL, Rust toolchain, Docker, or cluster setup**: the bootstrapper installs WSL2 + Ubuntu when missing and provisions/repairs every dependency (Rust, container runtime, K3s/buildah, …) inside WSL — zero host footprint.
+
+**Quick start**:
+
 ```powershell
 # Administrator PowerShell
 iwr -useb https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.ps1 | iex
 ```
 
-The script installs WSL2 + Ubuntu (prompts for a reboot if required — just re-run it afterwards, it is idempotent), then runs the same one-liner inside WSL. WSL2's default localhostForwarding exposes the WebUI at <http://localhost:8080>. Force China mirrors with `-CnMirror 1`: download the script first and pipe it, e.g. `& ([scriptblock]::Create((iwr -useb <url>).Content)) -CnMirror 1`.
+1. Open **Start**, type *PowerShell* (or *Terminal*), right-click it and choose **Run as administrator**;
+2. Paste the command above and press Enter — the script installs WSL2 + Ubuntu if needed, then hands over to the same unattended meta-bootstrap as Linux;
+3. If Windows asks for a **reboot** (WSL components need it), restart and re-run the *same* command afterwards — the script is idempotent and continues from where it stopped;
+4. Wait for the in-WSL bootstrap to finish: the first run downloads Ubuntu and all dependencies, so the time depends on your network;
+5. Done — WSL2's default localhostForwarding exposes the WebUI at <http://localhost:8080>; complete the mandatory LLM setup wizard on first visit;
+6. Day-to-day management: `wsl -d Ubuntu` to enter the Linux layer, `wsl --shutdown` to stop the VM.
+
+Force China mirrors with `-CnMirror 1`: download the script first and pipe it with the parameter, e.g. `& ([scriptblock]::Create((iwr -useb <url>).Content)) -CnMirror 1`.
 
 > The first URL is GitHub's official raw endpoint; if it is unreachable (e.g. restricted networks), the command automatically falls back to the Gitee mirror. The bootstrap script itself also falls back to the Gitee repo when fetching source code.
 
