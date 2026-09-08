@@ -73,6 +73,17 @@ pub fn job_name(rev: &str) -> String {
     format!("cogneva-mainline-{}", rev12(rev))
 }
 
+/// 命中即无自救可能的 Pod 等待态：拉不到镜像、镜像引用非法、挂载/配置
+/// 错误、容器反复崩溃退出。出现这些状态的新副本永远不会 ready，等再久
+/// 也只会烧 rollout 超时，必须立即判败触发回滚。
+const FATAL_WAITING_REASONS: &[&str] = &[
+    "ImagePullBackOff",
+    "ErrImagePull",
+    "InvalidImageName",
+    "CreateContainerConfigError",
+    "CrashLoopBackOff",
+];
+
 /// Pod 双标签选择器：主应用/网关/执行器的 name 标签都是 `cogneva`，
 /// 单标签会跨部署误判（gitops puller 旧代码只用 name= 的同源缺陷）。
 fn pod_selector(name: &str, component: &str) -> String {
@@ -1024,6 +1035,8 @@ impl RolloutExecutor {
 
     /// 轮询 deployment rollout 完成：observedGeneration 追上 generation 且
     /// updated/ready 副本数达期望（短查询，Job 在爆炸半径外不怕被杀）。
+    /// 轮询同时查 Pod 致命等待态：崩溃镜像永远不会 ready，干等 rollout 超时
+    /// （默认 300s）既拖慢回滚又让故障窗口白白拉长，命中即早退触发回滚。
     async fn wait_rollout_complete(&self, t: &RolloutTarget) -> SFResult<()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(self.rollout_timeout_secs);
         loop {
@@ -1050,6 +1063,9 @@ impl RolloutExecutor {
                     return Ok(());
                 }
             }
+            // 滚动中新旧 Pod 交替、containerStatuses 可能暂时缺失，空输出/查询
+            // 失败在这里不当致命（与 pods_healthy 不同），只认明确的致命等待态。
+            self.fatal_pod_state(t).await?;
             if std::time::Instant::now() >= deadline {
                 return Err(SFError::Agent(format!(
                     "rollout of deployment/{} did not complete within {}s (last: {out})",
@@ -1058,6 +1074,40 @@ impl RolloutExecutor {
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
+    }
+
+    /// 只查致命等待态（拉不到镜像、配置错误、CrashLoop）。滚动交替期
+    /// containerStatuses 缺失或查询临时失败均返回 Ok——由调用方的超时与
+    /// 后续 pods_healthy 兜底，这里只负责让"必死"的滚动快速失败。
+    async fn fatal_pod_state(&self, t: &RolloutTarget) -> SFResult<()> {
+        let selector = pod_selector(&t.name, &t.component);
+        let out = match self
+            .run_kubectl(
+                &[
+                    "get",
+                    "pods",
+                    "-l",
+                    &selector,
+                    "-o",
+                    "jsonpath={range .items[*]}{.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}",
+                ],
+                30,
+            )
+            .await
+        {
+            Ok(out) => out,
+            Err(_) => return Ok(()),
+        };
+        for line in out.lines() {
+            let reason = line.trim();
+            if FATAL_WAITING_REASONS.contains(&reason) {
+                return Err(SFError::Agent(format!(
+                    "pod of deployment/{} in fatal waiting state {reason}",
+                    t.deployment
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Pod 健康信号：双标签选择器，查 restartCount/ready/waiting reason。
@@ -1089,14 +1139,7 @@ impl RolloutExecutor {
             let restarts: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
             let ready = parts.next().unwrap_or("false");
             let waiting_reason = parts.next().unwrap_or("");
-            if matches!(
-                waiting_reason,
-                "ImagePullBackOff"
-                    | "ErrImagePull"
-                    | "InvalidImageName"
-                    | "CreateContainerConfigError"
-                    | "CrashLoopBackOff"
-            ) {
+            if FATAL_WAITING_REASONS.contains(&waiting_reason) {
                 return Err(SFError::Agent(format!(
                     "pod of deployment/{} in fatal waiting state {waiting_reason}: {line}",
                     t.deployment
@@ -1197,6 +1240,14 @@ impl RolloutExecutor {
 /// 内置默认四条（Job 不挂 configmap，与部署侧配置默认值同源）；回滚目标
 /// 由 Job 启动时快照各部署当前镜像得到，不通过参数传入。
 pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
+    // Job Pod 直接调这个子命令，不经 run_app；不初始化订阅者的话滚动/回滚
+    // 日志全部不落，Job 失败时 kubectl logs 是空的，无法诊断。
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let args: Vec<String> = std::env::args().skip(2).collect();
     let mut tag = String::new();
     let mut ns = "cogneva".to_string();
@@ -1795,6 +1846,69 @@ exit 0
         assert!(
             calls.contains("set image deployment/cogneva-security-gateway security-gateway=localhost:30500/cogneva:main-new"),
             "rollout should set failed target to new pull-endpoint tag: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crashloop_pod_fails_fast_without_waiting_for_rollout_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        // security-gateway rollout 永不完成且新 Pod CrashLoopBackOff：
+        // wait_rollout_complete 必须在首轮轮询即致命态早退，而不是等满超时。
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "bad -o arg" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *generation*)
+    case "$*" in
+      *cogneva-security-gateway*) echo "1 0 1 0 0" ;;
+      *) echo "1 1 1 1 1" ;;
+    esac ;;
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"get pods"*)
+    case "$*" in
+      *component=security-gateway*) echo "CrashLoopBackOff" ;;
+      *) echo "0 true " ;;
+    esac ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        // 超时给 300s：若致命态早退失效，测试会真的等 300s（暴露问题）。
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            300,
+        );
+        let cfg = MainlineDeployerConfig::default();
+        let plan = RolloutPlan::from_config(&cfg, "localhost:30500/cogneva:main-new".into());
+        let err = executor.run(&plan).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fatal waiting state CrashLoopBackOff"),
+            "{err}"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("set image deployment/cogneva-security-gateway security-gateway=localhost:30500/cogneva:main-old"),
+            "fatal state must trigger rollback to snapshotted prev: {calls}"
         );
     }
 
