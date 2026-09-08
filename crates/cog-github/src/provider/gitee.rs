@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{
     gateway_attach_root, http_fetch_attachment, AttachmentData, CiFailureEvent, CiJobLog,
-    CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue, PlatformPullRequest,
-    PullRequestDetail,
+    CodePlatformProvider, CreatePullRequest, ForkTarget, PlatformComment, PlatformIssue,
+    PlatformPullRequest, PullRequestDetail,
 };
 
 /// Gitee code platform provider (API v5).
@@ -77,6 +77,20 @@ impl GiteeProvider {
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
         self.http.get(self.url(path))
+    }
+
+    /// 拼装仓库作用域外的绝对 API URL（如 `/user`、`/repos/<fork>`）；
+    /// 直连模式同样附带 access_token。
+    fn abs_url(&self, path: &str) -> String {
+        let raw = format!("{}{}", self.base, path);
+        match &self.token {
+            Some(t) => {
+                let mut url = reqwest::Url::parse(&raw).expect("provider-built url is valid");
+                url.query_pairs_mut().append_pair("access_token", t);
+                url.into()
+            }
+            None => raw,
+        }
     }
 
     /// trait 的 issue_number 是 u64，承载 Gitee issue 的数值 `id`；而
@@ -337,6 +351,122 @@ impl CodePlatformProvider for GiteeProvider {
     async fn list_recent_ci_failures(&self, _max: usize) -> Result<Vec<CiFailureEvent>> {
         Ok(Vec::new())
     }
+
+    async fn ensure_push_target(&self) -> Result<Option<ForkTarget>> {
+        // 与 GitHub 同构：先查上游仓库写权限（任何 token 都能读仓库对象，
+        // 直推路径无需先解析登录名）→ 无写权限再查登录名、确保名下 fork
+        // 存在（先探后建，新建后轮询就绪）。网关模式本进程零 token。
+        // 仓库 404（token 不可见）视为无写权限，留给 fork 步骤报真错。
+        let target = match self.http.get(self.url("")).send().await {
+            Ok(resp) if resp.status().is_success() => Some(
+                resp.json::<serde_json::Value>()
+                    .await
+                    .map_err(CogGitHubError::Http)?,
+            ),
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => None,
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(CogGitHubError::Provider(format!(
+                    "gitee api returned HTTP {status}: {}",
+                    text.chars().take(200).collect::<String>()
+                )));
+            }
+            Err(e) => return Err(CogGitHubError::Http(e)),
+        };
+        if target
+            .as_ref()
+            .is_some_and(|t| matches!(t["permission"].as_str(), Some("admin") | Some("push")))
+        {
+            return Ok(None);
+        }
+
+        let user = self.send(self.http.get(self.abs_url("/user"))).await?;
+        let login = user["login"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CogGitHubError::Provider("GET /user returned no login".into()))?
+            .to_string();
+        // 权限字段缺失时，仓库 owner 即登录账号也可直推。
+        if target
+            .as_ref()
+            .is_some_and(|t| gitee_can_push(t, &login, &self.owner))
+        {
+            return Ok(None);
+        }
+
+        let fork_full = format!("{login}/{}", self.repo);
+        let probe = self
+            .http
+            .get(self.abs_url(&format!("/repos/{fork_full}")))
+            .send()
+            .await
+            .map_err(CogGitHubError::Http)?;
+        if probe.status() == reqwest::StatusCode::NOT_FOUND {
+            let resp = self
+                .http
+                .post(self.abs_url(&format!("/repos/{}/{}/forks", self.owner, self.repo)))
+                .send()
+                .await
+                .map_err(CogGitHubError::Http)?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(CogGitHubError::Provider(format!(
+                    "gitee fork creation returned HTTP {status}: {}",
+                    text.chars().take(200).collect::<String>()
+                )));
+            }
+            let mut ready = false;
+            for _ in 0..GITEE_FORK_READY_ATTEMPTS {
+                tokio::time::sleep(GITEE_FORK_READY_INTERVAL).await;
+                let r = self
+                    .http
+                    .get(self.abs_url(&format!("/repos/{fork_full}")))
+                    .send()
+                    .await
+                    .map_err(CogGitHubError::Http)?;
+                if r.status().is_success() {
+                    ready = true;
+                    break;
+                }
+            }
+            if !ready {
+                return Err(CogGitHubError::Provider(format!(
+                    "gitee fork {fork_full} did not become ready after creation"
+                )));
+            }
+            return Ok(Some(ForkTarget {
+                owner: login,
+                full_name: fork_full,
+                newly_created: true,
+            }));
+        } else if !probe.status().is_success() {
+            return Err(CogGitHubError::Provider(format!(
+                "gitee fork probe returned HTTP {}",
+                probe.status()
+            )));
+        }
+        Ok(Some(ForkTarget {
+            owner: login,
+            full_name: fork_full,
+            newly_created: false,
+        }))
+    }
+}
+
+/// Fork 就绪轮询预算（Gitee fork 同样异步传播到 git 后端）。
+const GITEE_FORK_READY_ATTEMPTS: u32 = 12;
+const GITEE_FORK_READY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Gitee 仓库对象的 `permission` 字段为 `"admin"`/`"push"` 时可直推；
+/// 字段缺失时退回"仓库 owner 即登录账号"判定。
+fn gitee_can_push(repo_json: &serde_json::Value, login: &str, owner: &str) -> bool {
+    match repo_json["permission"].as_str() {
+        Some("admin") | Some("push") => return true,
+        _ => {}
+    }
+    login.eq_ignore_ascii_case(owner)
 }
 
 /// 从创建 PR 响应构造平台无关表示。
@@ -383,6 +513,20 @@ fn parse_labels(v: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_permission_detection() {
+        for perm in ["admin", "push"] {
+            let v = serde_json::json!({ "permission": perm });
+            assert!(gitee_can_push(&v, "alice", "upstream"), "{perm} can push");
+        }
+        let v = serde_json::json!({ "permission": "pull" });
+        assert!(!gitee_can_push(&v, "alice", "upstream"));
+        // 字段缺失：owner 可推，他人不可。
+        let v = serde_json::json!({});
+        assert!(gitee_can_push(&v, "Upstream", "upstream"));
+        assert!(!gitee_can_push(&v, "alice", "upstream"));
+    }
 
     #[test]
     fn url_carries_token_only_in_direct_mode() {

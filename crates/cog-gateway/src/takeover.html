@@ -826,6 +826,7 @@
         <button type="button" data-policy="local" data-i18n="policyLocal">Keep local</button>
       </div>
       <div class="fine" id="policyHint" style="margin-bottom:14px"></div>
+      <div class="fine" data-i18n="contribForkNote" style="margin-bottom:14px">Automatic mode forks the public repo under your account when it cannot push upstream, then opens cross-fork pull requests from that fork. No manual fork is needed.</div>
 
       <div id="pendingBox" style="display:none">
         <label data-i18n="pendingLbl">Changes waiting for your approval</label>
@@ -1790,6 +1791,8 @@ const I18N = {
   contribConnected: { en: 'Contribution channel connected', zh: '贡献通道已连接' },
   contribSaving:    { en: 'Connecting…', zh: '正在连接…' },
   contribNeedPat:   { en: 'Please paste a token first.', zh: '请先粘贴令牌。' },
+  contribForkNote:  { en: 'Automatic mode forks the public repo under your account when it cannot push upstream, then opens cross-fork pull requests from that fork. No manual fork is needed.',
+                      zh: '自动回流模式下，若无权直接推送到上游仓库，会自动在你的账号下 fork 公开仓库，并从该 fork 发起跨仓 PR，无需手动 fork。' },
 
   // GitHub App（用户侧安装入口 + 运营者配置区）
   ghAppInstallLbl:  { en: 'Enhance: install the official Cogneva app', zh: '增强：安装官方 Cogneva App' },

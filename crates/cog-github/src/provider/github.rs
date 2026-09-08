@@ -11,8 +11,8 @@ use crate::config::GitHubAccount;
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{
     gateway_attach_root, http_fetch_attachment, AttachmentData, CiFailureEvent, CiJobLog,
-    CiRunSummary, CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue,
-    PlatformPullRequest, PullRequestDetail,
+    CiRunSummary, CodePlatformProvider, CreatePullRequest, ForkTarget, PlatformComment,
+    PlatformIssue, PlatformPullRequest, PullRequestDetail,
 };
 
 /// Max failed jobs whose logs are fetched per run.
@@ -429,6 +429,168 @@ impl CodePlatformProvider for GitHubProvider {
             created_at: pr.created_at.unwrap_or_else(chrono::Utc::now),
         })
     }
+
+    async fn ensure_push_target(&self) -> Result<Option<ForkTarget>> {
+        // 网关模式零 token（出口注入）；直连模式才解析。
+        let token = self.account.resolve_token().ok();
+        if token.is_none() && self.api_base.is_none() {
+            return Err(CogGitHubError::MissingToken(
+                "cannot ensure fork: no github token and no gateway api_base".into(),
+            ));
+        }
+        let base = self.api_base.as_deref().unwrap_or("https://api.github.com");
+        let http = reqwest::Client::new();
+        let auth_get = |url: String| {
+            let mut req = http.get(url);
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            req
+        };
+
+        // 1. Push access to the target repo? The `permissions.push` flag is
+        //    present on every authenticated response — including GitHub App
+        //    installation tokens, which cannot call GET /user. Decide the
+        //    same-repo branch from this flag first, so an app installed on
+        //    the upstream repo never depends on /user. A 404 (token cannot
+        //    see the repo) falls through to the fork attempt; other failures
+        //    are real errors.
+        let target = match auth_get(format!("{base}/repos/{}/{}", self.owner, self.repo))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => Some(
+                resp.json::<serde_json::Value>()
+                    .await
+                    .map_err(CogGitHubError::Http)?,
+            ),
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => None,
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(CogGitHubError::Provider(format!(
+                    "github api returned HTTP {status}: {}",
+                    text.chars().take(200).collect::<String>()
+                )));
+            }
+            Err(e) => return Err(CogGitHubError::Http(e)),
+        };
+        if target
+            .as_ref()
+            .is_some_and(|t| t["permissions"]["push"].as_bool() == Some(true))
+        {
+            return Ok(None);
+        }
+
+        // 2. No push access — resolve the login to fork under. GET /user
+        //    requires a user token (PAT / OAuth / device flow); an
+        //    installation token has no fork-able user identity and surfaces a
+        //    clear HTTP error here instead of forking under the wrong account.
+        let user = github_json(auth_get(format!("{base}/user")).send().await).await?;
+        let login = user["login"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CogGitHubError::Provider("GET /user returned no login".into()))?
+            .to_string();
+        // Owner fallback for responses lacking the permissions flag.
+        if target
+            .as_ref()
+            .is_some_and(|t| github_can_push(t, &login, &self.owner))
+        {
+            return Ok(None);
+        }
+
+        // 3. Fork under the authenticated account. GitHub's fork creation is
+        //    idempotent (existing fork → 200, new → 202), but probing the
+        //    fork coordinate first keeps the newly-created flag reliable for
+        //    push-readiness retries.
+        let fork_full = format!("{login}/{}", self.repo);
+        let probe = auth_get(format!("{base}/repos/{fork_full}"))
+            .send()
+            .await
+            .map_err(CogGitHubError::Http)?;
+        if probe.status() == reqwest::StatusCode::NOT_FOUND {
+            let mut post = http.post(format!("{base}/repos/{}/{}/forks", self.owner, self.repo));
+            if let Some(t) = &token {
+                post = post.bearer_auth(t);
+            }
+            let created = post.json(&serde_json::json!({})).send().await;
+            let resp = created.map_err(CogGitHubError::Http)?;
+            // 202 = fork accepted (async propagation); 200 = existed.
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(CogGitHubError::Provider(format!(
+                    "fork creation returned HTTP {status}: {}",
+                    text.chars().take(200).collect::<String>()
+                )));
+            }
+            // The fork object is returned immediately, but the git backend
+            // accepts pushes only after propagation; poll until ready.
+            let mut ready = false;
+            for _ in 0..FORK_READY_ATTEMPTS {
+                tokio::time::sleep(FORK_READY_INTERVAL).await;
+                let r = auth_get(format!("{base}/repos/{fork_full}"))
+                    .send()
+                    .await
+                    .map_err(CogGitHubError::Http)?;
+                if r.status().is_success() {
+                    ready = true;
+                    break;
+                }
+            }
+            if !ready {
+                return Err(CogGitHubError::Provider(format!(
+                    "fork {fork_full} did not become ready after creation"
+                )));
+            }
+            return Ok(Some(ForkTarget {
+                owner: login,
+                full_name: fork_full,
+                newly_created: true,
+            }));
+        } else if !probe.status().is_success() {
+            return Err(CogGitHubError::Provider(format!(
+                "fork probe returned HTTP {}",
+                probe.status()
+            )));
+        }
+        Ok(Some(ForkTarget {
+            owner: login,
+            full_name: fork_full,
+            newly_created: false,
+        }))
+    }
+}
+
+/// Poll budget for a freshly created fork's git backend to become writable.
+const FORK_READY_ATTEMPTS: u32 = 12;
+const FORK_READY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Parse a GitHub API JSON body, mapping non-2xx responses to a Provider
+/// error carrying the status and a response excerpt.
+async fn github_json(send: reqwest::Result<reqwest::Response>) -> Result<serde_json::Value> {
+    let resp = send.map_err(CogGitHubError::Http)?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(CogGitHubError::Http)?;
+    if !status.is_success() {
+        return Err(CogGitHubError::Provider(format!(
+            "github api returned HTTP {status}: {}",
+            text.chars().take(200).collect::<String>()
+        )));
+    }
+    serde_json::from_str(&text)
+        .map_err(|e| CogGitHubError::Provider(format!("github api returned non-JSON body: {e}")))
+}
+
+/// Decide whether the authenticated account can push to the target repo:
+/// the repo `permissions.push` flag (present on authenticated responses),
+/// or repo ownership as the fallback when the flag is absent.
+fn github_can_push(repo_json: &serde_json::Value, login: &str, owner: &str) -> bool {
+    if repo_json["permissions"]["push"].as_bool() == Some(true) {
+        return true;
+    }
+    login.eq_ignore_ascii_case(owner)
 }
 
 pub(crate) fn split_repo(repo: &str) -> Result<(String, String)> {
@@ -483,6 +645,19 @@ mod tests {
         // 网关模式：本进程零 token，凭证由透传端点出口注入。
         let p = GitHubProvider::new(&account, "o/r", Some("http://gw:8081/github/")).unwrap();
         assert_eq!(p.api_base.as_deref(), Some("http://gw:8081/github"));
+    }
+
+    #[test]
+    fn push_permission_detection() {
+        // permissions.push 是权威信号。
+        let v = serde_json::json!({ "permissions": { "push": true } });
+        assert!(github_can_push(&v, "alice", "upstream"));
+        let v = serde_json::json!({ "permissions": { "push": false } });
+        assert!(!github_can_push(&v, "alice", "upstream"));
+        // permissions 缺失时，仓库 owner 可推；他人不可。
+        let v = serde_json::json!({});
+        assert!(github_can_push(&v, "Upstream", "upstream"));
+        assert!(!github_can_push(&v, "alice", "upstream"));
     }
 
     #[test]

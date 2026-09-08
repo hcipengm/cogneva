@@ -15,7 +15,37 @@ use crate::config::{BotIdentityConfig, GitHubIntegrationConfig};
 use cog_core::{parse_diff_affected_files, GeneratedChange};
 
 use crate::error::{CogGitHubError, Result};
-use crate::provider::{CodePlatformProvider, CreatePullRequest, PlatformPullRequest};
+use crate::provider::{CodePlatformProvider, CreatePullRequest, ForkTarget, PlatformPullRequest};
+
+/// Where contribution branches are pushed for one publish round.
+#[derive(Debug, Clone)]
+enum PushTarget {
+    /// Direct push to the configured upstream repo (owner/collaborator
+    /// credential); the PR is same-repo with a bare branch head.
+    Upstream,
+    /// Push to the contributor's own fork; the PR is cross-fork with head
+    /// `<owner>:<branch>`.
+    Fork(ForkTarget),
+}
+
+impl PushTarget {
+    /// Git remote name in the working copy.
+    fn remote(&self) -> &'static str {
+        match self {
+            PushTarget::Upstream => "origin",
+            PushTarget::Fork(_) => "fork",
+        }
+    }
+
+    /// PR `head` value: bare branch for same-repo, `<fork-owner>:<branch>`
+    /// for cross-fork.
+    fn pr_head(&self, branch: &str) -> String {
+        match self {
+            PushTarget::Upstream => branch.to_string(),
+            PushTarget::Fork(f) => format!("{}:{}", f.owner, branch),
+        }
+    }
+}
 
 /// Publishes changes as pull requests.
 #[derive(Debug)]
@@ -69,6 +99,60 @@ impl GitHubPrPublisher {
         .await
     }
 
+    /// Resolve where this round's branch must be pushed: upstream when the
+    /// connected credential has push access, otherwise the contributor's
+    /// automatically ensured fork.
+    async fn resolve_target(&self, provider: &dyn CodePlatformProvider) -> Result<PushTarget> {
+        match provider.ensure_push_target().await? {
+            Some(fork) => {
+                tracing::info!(
+                    fork = %fork.full_name,
+                    new = fork.newly_created,
+                    "contribution account has no push access; using fork"
+                );
+                Ok(PushTarget::Fork(fork))
+            }
+            None => Ok(PushTarget::Upstream),
+        }
+    }
+
+    /// Make sure the git remote for `target` exists in the working copy and
+    /// points at the right URL. Base fetching always stays on `origin` (the
+    /// upstream); the fork remote is push-only.
+    async fn setup_remote(&self, target: &PushTarget) -> Result<()> {
+        let ForkTarget {
+            full_name,
+            newly_created,
+            ..
+        } = match target {
+            PushTarget::Upstream => return Ok(()),
+            PushTarget::Fork(f) => f,
+        };
+        let token = self
+            .config
+            .primary_account()
+            .ok()
+            .and_then(|a| a.resolve_token().ok());
+        let url = select_remote_url_for(
+            &self.config,
+            token.as_deref(),
+            git_proxy_base().as_deref(),
+            std::env::var_os("COGNEVA_GITHUB_USE_SSH").is_some(),
+            full_name,
+        );
+        // remove + add: idempotent across coordinate changes (renamed fork),
+        // and never touches origin.
+        let _ = self.git(&["remote", "remove", "fork"]).await;
+        self.git(&["remote", "add", "fork", &url]).await?;
+        if *newly_created {
+            // A just-created fork propagates to the git backend asynchronously;
+            // fetch it once the remote is wired so the push below has the
+            // repository reachable, and the push itself still retries.
+            let _ = self.git(&["fetch", "fork"]).await;
+        }
+        Ok(())
+    }
+
     /// Branch from the remote base, apply the change, commit, push, open PR.
     async fn publish(
         &self,
@@ -86,6 +170,10 @@ impl GitHubPrPublisher {
 
         let identity = &self.config.bot_identity;
         let base = self.config.base_branch.clone();
+        let target = self.resolve_target(provider).await?;
+        self.setup_remote(&target).await?;
+        let push_remote = target.remote();
+        let head_ref = target.pr_head(branch);
 
         // Branch straight from the remote base so a reused workdir never
         // builds on a stale local base.
@@ -115,14 +203,14 @@ impl GitHubPrPublisher {
             commit_message,
         ])
         .await?;
-        self.git(&["push", "-u", "origin", branch, "--force-with-lease"])
+        self.push_with_fork_retry(push_remote, branch, &target)
             .await?;
 
         let pr = provider
             .create_pull_request(CreatePullRequest {
                 title: pr_title.to_string(),
                 body: pr_body.to_string(),
-                head_branch: branch.to_string(),
+                head_branch: head_ref,
                 base_branch: base,
                 draft: false,
             })
@@ -146,6 +234,45 @@ impl GitHubPrPublisher {
         }
 
         Ok(pr)
+    }
+
+    /// Push the branch to the chosen remote. For a freshly created fork the
+    /// git backend may reject pushes for a few seconds while propagation
+    /// completes; retry briefly in that case. Upstream pushes are tried once
+    /// (a real permission error must surface loudly).
+    async fn push_with_fork_retry(
+        &self,
+        remote: &str,
+        branch: &str,
+        target: &PushTarget,
+    ) -> Result<()> {
+        let attempts = match target {
+            PushTarget::Fork(f) if f.newly_created => 4,
+            _ => 1,
+        };
+        let mut last_err = None;
+        for attempt in 0..attempts {
+            match self
+                .git(&["push", "-u", remote, branch, "--force-with-lease"])
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < attempts {
+                        tracing::info!(
+                            remote,
+                            branch,
+                            attempt,
+                            "fork not pushable yet; retrying after propagation delay"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| CogGitHubError::Provider("git push failed without an error".into())))
     }
 
     async fn apply_change(&self, change_content: &str) -> Result<()> {
@@ -183,13 +310,13 @@ impl GitHubPrPublisher {
         Ok(())
     }
 
-    /// Whether a branch already exists on the push remote (idempotency guard
+    /// Whether a branch already exists on the given remote (idempotency guard
     /// for the staged-change flush after the contribution channel comes up).
     /// Network errors are treated as "unknown → not published" so a transient
     /// failure still lets the normal publish path retry and fail loudly.
-    pub(crate) async fn remote_branch_exists(&self, branch: &str) -> bool {
+    pub(crate) async fn remote_branch_exists(&self, remote: &str, branch: &str) -> bool {
         let Ok(output) = tokio::process::Command::new("git")
-            .args(["ls-remote", "--heads", "origin", branch])
+            .args(["ls-remote", "--heads", remote, branch])
             .current_dir(&self.workdir)
             .output()
             .await
@@ -197,6 +324,19 @@ impl GitHubPrPublisher {
             return false;
         };
         output.status.success() && !output.stdout.trim_ascii().is_empty()
+    }
+
+    /// Resolve the push target (upstream or auto-fork) and wire its remote in
+    /// the working copy. Used by the idempotency check so it probes the same
+    /// remote the subsequent publish pushes to. Errors degrade to "not
+    /// published" so the normal publish path surfaces the real failure.
+    pub(crate) async fn prepare_push_remote(
+        &self,
+        provider: &dyn CodePlatformProvider,
+    ) -> Option<&'static str> {
+        let target = self.resolve_target(provider).await.ok()?;
+        self.setup_remote(&target).await.ok()?;
+        Some(target.remote())
     }
 }
 
@@ -363,10 +503,18 @@ impl GitHubChangeSink {
         }
     }
 
-    /// Whether `change_id` was already pushed as a `cogneva/auto-*` PR branch.
+    /// Whether `change_id` was already pushed as a `cogneva/auto-*` PR branch
+    /// on the resolved push remote (upstream or the contributor's fork).
     pub(crate) async fn already_published(&self, change_id: &str) -> bool {
         let branch = format!("cogneva/auto-{}", sanitize(change_id));
-        self.publisher.remote_branch_exists(&branch).await
+        match self
+            .publisher
+            .prepare_push_remote(self.provider.as_ref())
+            .await
+        {
+            Some(remote) => self.publisher.remote_branch_exists(remote, &branch).await,
+            None => false,
+        }
     }
 
     /// Publish a change regardless of the current policy: used when the owner
@@ -539,29 +687,35 @@ fn git_proxy_base() -> Option<String> {
 }
 
 fn remote_url(config: &GitHubIntegrationConfig, token: Option<&str>) -> String {
-    select_remote_url(
+    let repo = config.repo.clone();
+    select_remote_url_for(
         config,
         token,
         git_proxy_base().as_deref(),
         std::env::var_os("COGNEVA_GITHUB_USE_SSH").is_some(),
+        &repo,
     )
 }
 
-fn select_remote_url(
-    config: &GitHubIntegrationConfig,
+/// Build the git remote URL for `target_repo` (`owner/repo`). The fork remote
+/// uses the same channel selection as origin: gateway proxy (credential-free
+/// URL) first, then SSH, then token/anonymous HTTPS.
+fn select_remote_url_for(
+    _config: &GitHubIntegrationConfig,
     token: Option<&str>,
     proxy_base: Option<&str>,
     use_ssh: bool,
+    target_repo: &str,
 ) -> String {
     if let Some(base) = proxy_base {
-        return format!("{}/github/{}.git", base.trim_end_matches('/'), config.repo);
+        return format!("{}/github/{}.git", base.trim_end_matches('/'), target_repo);
     }
     if use_ssh {
-        return format!("ssh://git@github.com:22/{}.git", config.repo);
+        return format!("ssh://git@github.com:22/{target_repo}.git");
     }
     match token {
-        Some(t) => format!("https://x-access-token:{t}@github.com/{}.git", config.repo),
-        None => format!("https://github.com/{}.git", config.repo),
+        Some(t) => format!("https://x-access-token:{t}@github.com/{target_repo}.git"),
+        None => format!("https://github.com/{target_repo}.git"),
     }
 }
 
@@ -689,26 +843,63 @@ mod tests {
         };
         // 网关代理优先于一切，URL 不含任何凭证。
         assert_eq!(
-            select_remote_url(&config, Some("tok"), Some("http://gw:8081/git"), false),
+            select_remote_url_for(
+                &config,
+                Some("tok"),
+                Some("http://gw:8081/git"),
+                false,
+                "o/r"
+            ),
             "http://gw:8081/git/github/o/r.git"
         );
         // 尾斜杠归一。
         assert_eq!(
-            select_remote_url(&config, None, Some("http://gw:8081/git/"), true),
+            select_remote_url_for(&config, None, Some("http://gw:8081/git/"), true, "o/r"),
             "http://gw:8081/git/github/o/r.git"
         );
         // 无代理时 SSH 优先于 token HTTPS。
         assert_eq!(
-            select_remote_url(&config, Some("tok"), None, true),
+            select_remote_url_for(&config, Some("tok"), None, true, "o/r"),
             "ssh://git@github.com:22/o/r.git"
         );
         assert_eq!(
-            select_remote_url(&config, Some("tok"), None, false),
+            select_remote_url_for(&config, Some("tok"), None, false, "o/r"),
             "https://x-access-token:tok@github.com/o/r.git"
         );
         assert_eq!(
-            select_remote_url(&config, None, None, false),
+            select_remote_url_for(&config, None, None, false, "o/r"),
             "https://github.com/o/r.git"
         );
+        // fork 坐标走同一套通道选择，仅仓库段换成 fork。
+        assert_eq!(
+            select_remote_url_for(
+                &config,
+                Some("tok"),
+                Some("http://gw:8081/git"),
+                false,
+                "alice/r"
+            ),
+            "http://gw:8081/git/github/alice/r.git"
+        );
+        assert_eq!(
+            select_remote_url_for(&config, Some("tok"), None, false, "alice/r"),
+            "https://x-access-token:tok@github.com/alice/r.git"
+        );
+    }
+
+    #[test]
+    fn push_target_head_and_remote() {
+        assert_eq!(PushTarget::Upstream.remote(), "origin");
+        assert_eq!(
+            PushTarget::Upstream.pr_head("cogneva/auto-x"),
+            "cogneva/auto-x"
+        );
+        let fork = PushTarget::Fork(ForkTarget {
+            owner: "alice".into(),
+            full_name: "alice/r".into(),
+            newly_created: false,
+        });
+        assert_eq!(fork.remote(), "fork");
+        assert_eq!(fork.pr_head("cogneva/auto-x"), "alice:cogneva/auto-x");
     }
 }
