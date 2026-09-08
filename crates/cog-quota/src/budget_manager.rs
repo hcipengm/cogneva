@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 /// Manages context-window budget for a single agent.
-/// Corresponds to the runtime management of [`AgentWorkingMemory`].
+/// Corresponds to the runtime management of `AgentWorkingMemory`.
 #[async_trait]
 pub trait ContextBudgetManager: Send + Sync {
     /// Current context utilization ratio (0.0 ~ 1.0).

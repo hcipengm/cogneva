@@ -5,8 +5,8 @@
 //! - **Layer 1 — Schema**: 结构化事实（实体、关系、事件），存储于 PostgreSQL/TDSQL-PG
 //! - **Layer 2 — Summary**: 语义摘要 + embedding 向量，存储于 LanceDB/VectorDB
 //! ## 核心组件
-//! - [`MemoryBackend`] trait: 统一后端接口
-//! - [`MemoryExtractor`] trait: 从 Raw 提取 Schema 和 Summary
+//! - [`cog_core::MemoryBackend`] trait: 统一后端接口
+//! - [`cog_core::MemoryExtractor`] trait: 从 Raw 提取 Schema 和 Summary
 //! - [`MemoryIngestor`]: 后台服务，监听 AgentEvent 自动触发摄取
 //! - **CompositeMemoryBackend** — 组合后端
 //! - **MetricsInstrumentedMemoryBackend** — 指标装饰器

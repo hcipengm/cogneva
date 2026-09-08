@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tracing::info;
 
-/// Collaboration plugin that publishes [`CollaborationExecutor`] as a
+/// Collaboration plugin that publishes [`crate::CollaborationExecutor`] as a
 /// [`cog_core::TaskExecutor`] via pin-style.
 pub struct CollaborationPlugin;
 

@@ -91,7 +91,7 @@ pub trait WikiBackend: Send + Sync {
     }
 
     /// Search with explicit tier selection (Index / Vector / Skill / All).
-    /// Default delegates to [`search_typed`] for Index tier and returns an error for others.
+    /// Default delegates to [`Self::search`] for Index tier and returns an error for others.
     async fn search_with_tier(
         &self,
         query: &str,

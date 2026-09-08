@@ -2,12 +2,12 @@
 //! 与广播规则").
 //! ## Why a second engine?
 //! [`super::engine::HookEngine`] is a *publisher fan-out* engine: it matches a
-//! generic [`super::types::HookEvent`] against YAML-loaded
-//! [`super::types::HookDef`]s and dispatches static actions like webhooks,
+//! generic [`cog_core::HookEvent`] against YAML-loaded
+//! [`cog_core::HookDef`]s and dispatches static actions like webhooks,
 //! Redis Streams, or notifications.
 //! [`LifecycleHookEngine`] is a complementary *runtime event router*:
 //! 1. It owns an async input channel.  Producers (most importantly the
-//!    [`crate::control::AgentRuntime`]) `send` lifecycle events without caring who
+//!    [`crate::AgentRuntime`]) `send` lifecycle events without caring who
 //!    consumes them — the design's "zero-perception" property.
 //! 2. A spawned background task drains the channel.  For every event it
 //!    classifies the [`HookType`] (`TaskReceived`, `ToolBefore`, …), computes

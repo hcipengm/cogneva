@@ -17,7 +17,7 @@ pub fn init_backend_health_probe(
     }))
 }
 
-/// Assemble the [`GatewayState"] — the single source of truth for all
+/// Assemble the [`crate::GatewayState`] — the single source of truth for all
 /// runtime components accessible from HTTP/WebSocket handlers.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_gateway_state(

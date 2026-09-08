@@ -1,5 +1,5 @@
 //! D10 — 系统部署与运维指标计算。
-//! 测量约定：SystemEvalHarness 把测量值写入 agent_output[metric_name]，
+//! 测量约定：SystemEvalHarness 把测量值写入 `agent_output[metric_name]`，
 //! 本模块读取该值并与阈值比较；缺失时返回占位 (0.0, true)。
 
 use crate::dataset::EvalCase;

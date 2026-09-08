@@ -15,7 +15,7 @@ use cog_core::{SchemaEntry, SchemaSearchResult};
 /// In-memory schema backend with optional JSON persistence.
 /// Stores all entries in a `HashMap`.  When a persistence directory is set
 /// via [`MemorySchemaBackend::set_persist_dir`], the backend reads
-/// `<dir>/schema.json` on [`load`] and writes it back on every mutation.
+/// `<dir>/schema.json` on [`Self::load`] and writes it back on every mutation.
 #[derive(Default)]
 pub struct MemorySchemaBackend {
     store: RwLock<HashMap<String, SchemaEntry>>,

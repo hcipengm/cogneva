@@ -18,7 +18,7 @@ pub struct ConfigWatcher {
 
 impl ConfigWatcher {
     /// Start watching the given config paths.
-    /// On creation the current [`config_loader::load()`] result is sent as the initial
+    /// On creation the current [`crate::config_loader::load`] result is sent as the initial
     /// value.  Every time one of the watched files is modified the config is
     /// reloaded and subscribers receive the new value.
     /// The returned [`notify::RecommendedWatcher`] must be kept alive; dropping

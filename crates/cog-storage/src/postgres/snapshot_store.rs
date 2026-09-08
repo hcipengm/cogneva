@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use cog_core::{AgentCheckpoint, CheckpointStore, SFError, SFResult};
 
 /// PostgreSQL-backed snapshot store.
-/// Stores [`Snapshot`] objects as JSONB rows in a single table,
+/// Stores [`cog_core::AgentCheckpoint`] objects as JSONB rows in a single table,
 /// keyed by `snapshot_id`.
 pub struct PostgresSnapshotStore {
     pool: PgPool,

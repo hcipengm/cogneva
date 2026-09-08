@@ -112,14 +112,14 @@ impl ActionPlanOrchestrator {
 
     /// Override the maximum number of patterns retained in the DB. When the DB
     /// grows beyond this size, the lowest-scoring (and least-recently-used)
-    /// entries are evicted by [`Self::evict_expired_patterns`].
+    /// entries are evicted by `evict_expired_patterns`.
     pub fn with_max_pattern_db_size(mut self, size: usize) -> Self {
         self.max_pattern_db_size = size.max(1);
         self
     }
 
     /// Override the maximum age (in days) of pattern entries. Older entries are
-    /// dropped during [`Self::evict_expired_patterns`].
+    /// dropped during `evict_expired_patterns`.
     pub fn with_max_pattern_age_days(mut self, days: i64) -> Self {
         self.max_pattern_age_days = days.max(1);
         self
@@ -165,7 +165,7 @@ impl ActionPlanOrchestrator {
         self
     }
 
-    /// Attach a [`DagExecutor`] so that decomposed atomic tasks are
+    /// Attach a [`cog_core::DagExecutor`] so that decomposed atomic tasks are
     /// dynamically injected into the runtime DAG instead of returned as a
     /// static [`ActionPlan`].
     pub fn with_dag_executor(mut self, dag: Arc<dyn cog_core::DagExecutor>) -> Self {
@@ -532,7 +532,7 @@ impl ActionPlanOrchestrator {
 
     /// High-level entry point: process a goal with optional pre-existing tasks.
     /// 1. If all `tasks` have `action_planner_meta.verified == true`, inject them
-    ///    directly into the attached [`DagExecutor`] (skip decomposition).
+    ///    directly into the attached [`cog_core::DagExecutor`] (skip decomposition).
     /// 2. If `tasks` is empty, decompose the goal via collaboration (`TaskExecutor`).
     /// 3. If `tasks` exist but lack the verified marker, evaluate them and either
     ///    mark+inject or re-decompose.

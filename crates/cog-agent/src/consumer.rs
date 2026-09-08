@@ -128,7 +128,7 @@ impl AgentInboxConsumer {
     /// Claim messages that have been idle for at least `min_idle_ms` milliseconds.
     /// Useful for failover: when another consumer crashes, its pending
     /// messages can be claimed by a replacement consumer after a timeout.
-    /// Returns the claimed messages (same format as [`consume_batch`]).
+    /// Returns the claimed messages (same format as [`Self::consume_batch`]).
     pub async fn claim_stale(
         &mut self,
         min_idle_ms: usize,
@@ -191,7 +191,7 @@ impl AgentInboxConsumer {
     }
 }
 
-/// Generic agent consumer backed by any [`MessageBackend`] implementation.
+/// Generic agent consumer backed by any [`cog_core::MessageBackend`] implementation.
 /// This type was originally in `cog-core` but has been moved to `cog-agent`
 /// because it is a concrete implementation rather than a trait definition.
 pub struct AgentConsumer {

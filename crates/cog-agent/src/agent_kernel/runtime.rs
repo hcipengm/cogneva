@@ -397,8 +397,8 @@ impl AgentRuntime {
     }
 
     /// Capture a checkpoint of the current agent state.
-    /// Returns a [`Snapshot`] that can be persisted via a [`SnapshotStore`]
-    /// and later restored to resume execution.
+    /// Returns a [`cog_core::AgentCheckpoint`] that can be persisted via a
+    /// [`cog_core::CheckpointStore`] and later restored to resume execution.
     pub fn checkpoint(&self, task_id: impl Into<String>) -> SFResult<cog_core::AgentCheckpoint> {
         let snapshot_id = format!("snap-{}-{}", self.config.agent_id, uuid::Uuid::new_v4());
         tracing::info!(
@@ -421,7 +421,7 @@ impl AgentRuntime {
         })
     }
 
-    /// Restore agent state from a [`Snapshot`].
+    /// Restore agent state from a [`cog_core::AgentCheckpoint`].
     /// Reconstructs the context window and internal state so that
     /// [`run`](Self::run) can continue from where the snapshot was taken.
     /// Events after `snapshot.event_offset` can be replayed via

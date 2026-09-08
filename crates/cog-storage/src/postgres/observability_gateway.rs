@@ -89,7 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_cog_obs_squads_task_id ON cog_observability_squad
 /// PostgreSQL-backed observability gateway.
 /// Stores all observability data in PostgreSQL for durability across restarts.
 /// Real-time event subscription uses an in-memory broadcast channel (same
-/// mechanism as [`MemoryObservabilityGateway`]) so that consumers receive
+/// mechanism as [`crate::mem::MemoryObservabilityGateway`]) so that consumers receive
 /// low-latency push events. Historical events are replayed from the database
 /// before the live stream begins.
 pub struct PostgresObservabilityGateway {
@@ -124,8 +124,9 @@ impl PostgresObservabilityGateway {
 
     /// Publish an event to all active subscribers and persist it to PostgreSQL.
     /// This is a synchronous method (matching the surface of
-    /// [`MemoryObservabilityGateway::publish_event`]) so that it can be used
-    /// as a drop-in replacement in the [`EventGatewaySink`] path. The PG write
+    /// [`crate::mem::MemoryObservabilityGateway::publish_event`]) so that it
+    /// can be used as a drop-in replacement in the event-gateway-sink path.
+    /// The PG write
     /// is performed in a spawned task so the caller never blocks.
     pub fn publish_event(&self, event: AgentEvent) {
         let _ = self.event_tx.send(event.clone());

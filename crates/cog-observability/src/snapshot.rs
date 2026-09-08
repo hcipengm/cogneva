@@ -79,9 +79,9 @@ impl Default for TraceSerializer {
 // TraceCollector — trait-based collector (design doc compliant)
 // ==========================================================================
 
-/// TraceCollector: collects Agent execution traces via [`TraceStore`] trait.
+/// TraceCollector: collects Agent execution traces via [`cog_core::TraceStore`] trait.
 /// Does **not** perform file I/O directly.  All persistence is delegated to
-/// the injected [`TraceStore`] implementation (e.g. `RedisTraceStore`,
+/// the injected [`cog_core::TraceStore`] implementation (e.g. `RedisTraceStore`,
 /// `S3TraceStore`, `MemoryTraceStore`).
 pub struct TraceCollector {
     trace_store: std::sync::Arc<dyn cog_core::TraceStore>,
@@ -175,7 +175,7 @@ impl TraceCollector {
     /// Spawn a background task that subscribes to a broadcast [`AgentEvent`] stream
     /// and automatically collects per-agent execution traces.
     /// Traces are buffered in memory per `agent_id`. When an [`AgentEvent::AgentEnd`]
-    /// is observed the buffer is flushed to the configured [`TraceStore`].
+    /// is observed the buffer is flushed to the configured [`cog_core::TraceStore`].
     /// The task stops when the broadcast channel closes or `shutdown` fires.
     pub fn spawn_collection_task(
         self: Arc<Self>,
@@ -258,7 +258,7 @@ impl TraceCollector {
 // ==========================================================================
 
 /// Replay engine: deterministic re-execution from a persisted trace.
-/// Loads traces via [`TraceStore`] (no direct file I/O) and replays events
+/// Loads traces via [`cog_core::TraceStore`] (no direct file I/O) and replays events
 /// step-by-step for regression testing and bug reproduction.
 pub struct ReplayEngine {
     trace_store: Arc<dyn cog_core::TraceStore>,
@@ -479,7 +479,7 @@ pub struct MigrationStats {
 
 /// Trace tier migrator: scans persisted traces and updates their tier
 /// when they have aged out of the current tier.
-/// Operates entirely through [`TraceStore`] — no direct file I/O.
+/// Operates entirely through [`cog_core::TraceStore`] — no direct file I/O.
 pub struct TraceTierMigrator {
     trace_store: Arc<dyn cog_core::TraceStore>,
     hot_retention_days: u32,
@@ -502,7 +502,7 @@ impl TraceTierMigrator {
     /// Run a full migration scan.
     /// Lists all traces, checks each trace's age against the retention policy,
     /// and re-saves any trace whose tier has changed. The actual physical
-    /// move (e.g. Redis -> S3) is handled by the [`TraceStore`] backend
+    /// move (e.g. Redis -> S3) is handled by the [`cog_core::TraceStore`] backend
     /// or a downstream consumer that watches tier changes.
     pub async fn run_migration(&self) -> anyhow::Result<MigrationStats> {
         let mut stats = MigrationStats::default();

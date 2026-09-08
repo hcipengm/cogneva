@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 /// Forwards all HookEngine events to the WebSocket broadcast channel
-/// (and optionally to a downstream [`EventPublisher`] for cross-process consumers).
+/// (and optionally to a downstream [`cog_core::EventPublisher`] for cross-process consumers).
 /// Subscribes to the HookEngine's internal event broadcast and re-publishes
 /// each hook event as an `AgentEvent::TaskStatusChange` so WebSocket clients
 /// receive them.

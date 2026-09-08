@@ -2,7 +2,7 @@
 //!`cog-core` defines the [`HttpClient`] trait and request/response types so
 //!that business crates never depend on a specific HTTP implementation
 //!(reqwest, hyper, etc.).  The `cogneva` assembly layer injects the concrete
-//!backend — usually [`cog_net::ReqwestHttpClient`].
+//!backend — usually `cog_net::ReqwestHttpClient`.
 
 use crate::{SFError, SFResult};
 use bytes::Bytes;
@@ -15,7 +15,7 @@ use std::pin::Pin;
 pub type HttpBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, SFError>> + Send>>;
 
 /// An HTTP response with a streaming body.
-/// Callers should check [`status`] before consuming [`stream`].
+/// Callers should check [`Self::status`] before consuming [`Self::stream`].
 pub struct HttpStreamResponse {
     pub status: u16,
     pub headers: HashMap<String, String>,
@@ -183,7 +183,7 @@ pub trait HttpClient: Send + Sync + std::fmt::Debug {
     async fn execute(&self, req: HttpRequest) -> SFResult<HttpResponse>;
 
     /// Execute a request and return a streaming response.
-    /// The default implementation falls back to [`execute`] and yields the
+    /// The default implementation falls back to [`Self::execute`] and yields the
     /// full body as a single chunk.  Backends that support true streaming
     /// (e.g. `reqwest`) should override this.
     async fn execute_stream(&self, req: HttpRequest) -> SFResult<HttpStreamResponse> {
@@ -212,7 +212,7 @@ pub enum WsMessage {
 
 /// A single WebSocket connection.
 /// Callers receive this from [`WebSocketClient::connect`] and use it to
-/// send/receive messages until they call [`close`].
+/// send/receive messages until they call [`Self::close`].
 #[async_trait::async_trait]
 pub trait WebSocketConnection: Send + Sync {
     async fn send(&mut self, msg: WsMessage) -> SFResult<()>;

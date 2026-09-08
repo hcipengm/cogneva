@@ -463,7 +463,7 @@ pub trait SummaryBackend: Send + Sync {
     ) -> SFResult<Vec<SummarySearchResult>>;
 
     /// Hybrid search over summaries using both dense and sparse vectors.
-    /// Default implementation falls back to dense-only [`search_summary`].
+    /// Default implementation falls back to dense-only [`Self::search_summary`].
     async fn search_summary_hybrid(
         &self,
         namespace: &str,

@@ -123,7 +123,7 @@ impl BroadcastDispatcher {
     }
 
     /// Return a clone of the internal sender (useful when the sender needs to
-    /// be stored separately in [`GatewayState`]).
+    /// be stored separately in the gateway state).
     pub fn sender(&self) -> tokio::sync::broadcast::Sender<cog_core::Notification> {
         self.tx.clone()
     }

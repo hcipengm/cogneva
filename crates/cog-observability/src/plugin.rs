@@ -545,7 +545,7 @@ fn spawn_alert_manager_bridge(
     Some(manager)
 }
 
-/// Wrapper so [`LogFilterHandle`] can be stored in [`cog_core::PluginContext`].
+/// Wrapper so [`crate::LogFilterHandle`] can be stored in [`cog_core::PluginContext`].
 pub struct LogFilterHandleHolder(pub crate::LogFilterHandle);
 
 /// Static descriptor for auto-discovery.

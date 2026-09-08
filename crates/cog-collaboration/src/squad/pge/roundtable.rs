@@ -42,9 +42,10 @@ pub struct PgeRoundtableConfig {
     /// Optional agent manager used to create fresh agent instances for
     /// parallel branches.
     pub agent_manager: Option<Arc<dyn cog_core::AgentManager>>,
-    /// Optional LLM provider passed to [`AgentManager::create_agent`].
+    /// Optional LLM provider passed to
+    /// [`cog_core::AgentManager::create_agent`].
     pub llm_provider: Option<Arc<dyn cog_core::LlmClient>>,
-    /// Optional merger agent used when [`branch_merge_strategy`] is
+    /// Optional merger agent used when `branch_merge_strategy` is
     /// [`BranchMergeStrategy::Custom`].
     pub merger: Option<MergerActor>,
     /// Consecutive non-progress iterations that declare the debate a
@@ -112,7 +113,7 @@ pub struct PgeRoundtableResult {
 
 /// Multi-agent roundtable debate orchestrator.
 /// Directly holds [`PlannerActor`], [`GeneratorActor`], and [`EvaluatorActor`]
-/// — no internal wrapping of raw [`Agent`]s.
+/// — no internal wrapping of raw [`cog_core::Agent`]s.
 pub struct PgeRoundtable {
     config: PgeRoundtableConfig,
     planner: PlannerActor,
@@ -135,7 +136,7 @@ impl PgeRoundtable {
         }
     }
 
-    /// Run the roundtable with a structured [`Task`].
+    /// Run the roundtable with a structured [`cog_core::Task`].
     pub async fn debate(
         &self,
         task: &cog_core::Task,

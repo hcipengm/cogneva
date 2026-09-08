@@ -1,5 +1,5 @@
 //! D11 — 代码质量与架构指标计算（软工赛道 ASE/ICSE）。
-//! 测量约定与 D10 相同：静态分析 harness 把结果写入 agent_output[metric_name]。
+//! 测量约定与 D10 相同：静态分析 harness 把结果写入 `agent_output[metric_name]`。
 
 use crate::dataset::EvalCase;
 use crate::metric::{EvalMetric, EvalResult};

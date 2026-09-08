@@ -66,7 +66,7 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// High-level agent trait — abstracts the concrete [`cog_agent::Agent`] so
+/// High-level agent trait — abstracts the concrete `cog_agent::Agent` so
 /// that downstream crates (e.g. `cog-collaboration`) can create and drive
 /// agents without depending on `cog-agent`.
 #[async_trait]
@@ -129,7 +129,7 @@ pub trait Agent: Send + Sync {
     async fn receive_message(&self, msg: InboxMessage) -> crate::SFResult<()>;
 
     /// Review an output string via the agent's self-review capability.
-    /// Returns a [`SelfReviewResult`] indicating pass or need-revision.
+    /// Returns a [`crate::types::self_review::SelfReviewResult`] indicating pass or need-revision.
     /// Default: always pass.  Concrete implementations in `cog-agent` override
     /// this with the full SelfReviewLoop logic.
     async fn review_output(

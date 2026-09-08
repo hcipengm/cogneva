@@ -1,5 +1,5 @@
 //! Pluggable entry store for [`SummaryEntry`] typed data.
-//! The [`VectorSummaryBackend`] delegates structured-data persistence to a
+//! The [`crate::VectorSummaryBackend`] delegates structured-data persistence to a
 //! [`SummaryEntryStore`] so callers can choose between in-memory (testing)
 //! and PostgreSQL (production) without changing the vector-backend layer.
 

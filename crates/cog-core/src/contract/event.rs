@@ -224,7 +224,7 @@ impl<T, R> EventStreamProducer<T, R> {
 
 /// Abstract interface for publishing agent events to downstream consumers.
 /// Gateway and other edge crates consume this trait instead of directly
-/// depending on [`MessageBackend`], preserving the principle that:
+/// depending on [`crate::contract::stream::MessageBackend`], preserving the principle that:
 /// - **producers** (e.g. `cog-gateway`) only know a semantic interface
 /// - **implementors** (e.g. `cog-stream`) decide whether to use MQ, gRPC,
 ///   WebSocket, or an in-memory broadcast

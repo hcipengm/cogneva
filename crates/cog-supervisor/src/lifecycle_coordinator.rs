@@ -2,7 +2,7 @@
 //! transitions and checkpoint recovery.
 //! (Hook event emission for lifecycle state changes) of the design doc.
 //! The coordinator is a thin advisory layer: it receives health reports from
-//! the [`HealthChecker`], drives CAS state transitions via the [`StateBackend`],
+//! the [`crate::HealthChecker`], drives CAS state transitions via the [`StateBackend`],
 //! recovers checkpoints for dead-agent task handoff, and emits lifecycle
 //! hook events on the Supervisor broadcast channel.
 
@@ -43,7 +43,7 @@ pub struct RecoveredCheckpoint {
 /// The coordinator is **advisory** — it does not own the agent process.  It
 /// merely updates the canonical state in the [`StateBackend`] so that:
 /// 1. Other Supervisor components (Respawner, Rebalancer) see consistent state.
-/// 2. The agent's own [`LifecycleManager`] can detect external state changes
+/// 2. The agent's own `LifecycleManager` can detect external state changes
 ///    on its next heartbeat and react accordingly.
 /// 3. Checkpoints are recovered when an agent is declared Dead so tasks can
 ///    be resumed by a replacement agent.

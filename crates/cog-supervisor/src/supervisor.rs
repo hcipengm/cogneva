@@ -94,7 +94,7 @@ impl From<cog_core::SupervisorConfig> for SupervisorConfig {
 /// and event aggregation sub-systems.
 /// The Supervisor is constructed with shared `Arc` references to the
 /// orchestrator, state backend, observability gateway, quota manager,
-/// and scheduler gate.  It exposes a single [`run`] entry point that
+/// and scheduler gate.  It exposes a single [`Self::run`] entry point that
 /// drives all periodic tasks until a shutdown signal fires.
 pub struct Supervisor {
     pub config: std::sync::RwLock<SupervisorConfig>,
@@ -122,7 +122,7 @@ pub struct Supervisor {
 
 impl Supervisor {
     /// Build a Supervisor from production-grade dependencies.
-    /// Components like the [`QuotaManager`] are wrapped behind their
+    /// Components like the [`cog_core::QuotaManager`] are wrapped behind their
     /// trait equivalents so that test setups can substitute mocks.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -200,7 +200,7 @@ impl Supervisor {
     }
 
     /// Attach a [`watch::Receiver`] so the Supervisor can react to config
-    /// reloads at runtime.  Call this before [`run`].
+    /// reloads at runtime.  Call this before [`Self::run`].
     pub fn with_config_watch(mut self, rx: watch::Receiver<SupervisorConfig>) -> Self {
         self.config_rx = Some(rx);
         self
@@ -266,7 +266,7 @@ impl Supervisor {
     }
 
     /// Drive a single health-check pass and emit events for any
-    /// unhealthy agents.  Returns the underlying [`HealthReport`].
+    /// unhealthy agents.  Returns the underlying [`crate::HealthReport`].
     pub async fn run_health_pass(&self) -> SupervisorResult<crate::HealthReport> {
         let report = self.health.check().await?;
 

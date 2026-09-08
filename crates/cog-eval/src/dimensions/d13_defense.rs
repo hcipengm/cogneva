@@ -1,6 +1,6 @@
 //! D13 — 安全纵深防御指标计算（安全赛道 CCS/S&P）。
 //! 拦截率/削减率越高越好；逃逸成功率与代理延迟越低越好。
-//! 测量值由渗透测试 harness 写入 agent_output[metric_name]。
+//! 测量值由渗透测试 harness 写入 `agent_output[metric_name]`。
 
 use crate::dataset::EvalCase;
 use crate::metric::{EvalMetric, EvalResult};

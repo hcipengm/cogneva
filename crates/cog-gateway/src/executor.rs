@@ -88,7 +88,7 @@ pub fn spawn_collaboration_listener(
     })
 }
 
-/// Task runner backed by [`GatewayState`] — published as [`dyn TaskExecutionCallback`](cog_core::TaskExecutionCallback)
+/// Task runner backed by [`crate::GatewayState`] — published as [`dyn TaskExecutionCallback`](cog_core::TaskExecutionCallback)
 /// so that `cog-agent` can spawn pool workers without depending on `cog-gateway`.
 pub struct GatewayTaskRunner {
     state: Arc<crate::GatewayState>,

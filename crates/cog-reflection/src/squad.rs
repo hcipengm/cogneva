@@ -43,7 +43,7 @@ impl DefaultSquadReflection {
         }
     }
 
-    /// Attach an [`EmbeddingProvider`] for BGE-M3 semantic similarity.
+    /// Attach an [`cog_core::EmbeddingProvider`] for BGE-M3 semantic similarity.
     pub fn with_embedder(mut self, embedder: Arc<dyn cog_core::EmbeddingProvider>) -> Self {
         self.embedder = Some(embedder);
         self

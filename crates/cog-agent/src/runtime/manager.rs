@@ -79,7 +79,7 @@ impl GlobalAgentManager {
         self
     }
 
-    /// Set the default [`ToolRegistry`] shared by all spawned workers.
+    /// Set the default [`crate::ToolRegistry`] shared by all spawned workers.
     pub fn with_tools(mut self, tools: Arc<crate::ToolRegistry>) -> Self {
         self.default_tools = Some(tools);
         self

@@ -6,7 +6,7 @@ package sf.wal.v1;
 //
 // Each record is a self-contained unit that can be appended to a durable
 // log and replayed later for recovery.  The on-disk format is
-// length-delimited: <varint length><WalRecord bytes>...
+// length-delimited: `<varint length><WalRecord bytes>` repeated.
 //
 // Schema is additive-only; field numbers are stable.
 message WalRecord {

@@ -63,7 +63,7 @@ impl HeartbeatRecord {
     /// Map the heartbeat status onto an [`AgentState`] for mirroring
     /// into the durable backend.  `Healthy` heartbeats map to `Active`,
     /// `Degraded` to `Idle`, and `Unhealthy` to `Suspect` -- the
-    /// Supervisor's [`HealthChecker`] can still escalate to `Dead` once
+    /// Supervisor's [`crate::HealthChecker`] can still escalate to `Dead` once
     /// the heartbeat itself goes stale.
     pub fn to_agent_state(&self) -> AgentState {
         match self.status {

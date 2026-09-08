@@ -5,7 +5,8 @@ use super::ContentBlock;
 
 // ─── Broadcast Scope ───────────────────────────────────────────────────────
 
-/// The intended audience of a [`HierarchicalMessage`].
+/// The intended audience of a `HierarchicalMessage` (the wire format defined
+/// by the collaboration crate).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BroadcastScope {

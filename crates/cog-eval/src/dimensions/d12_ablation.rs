@@ -1,6 +1,6 @@
 //! D12 — 消融实验与进化指标计算。
 //! delta 类指标越高越好（正增量）；EvolutionConvergenceRate 越低越好（更快收敛）。
-//! 测量值由 AblationRunner / 进化跟踪器写入 agent_output[metric_name]。
+//! 测量值由 AblationRunner / 进化跟踪器写入 `agent_output[metric_name]`。
 
 use crate::dataset::EvalCase;
 use crate::metric::{EvalMetric, EvalResult};

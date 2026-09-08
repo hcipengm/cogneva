@@ -13,9 +13,9 @@ use tokio::io::AsyncWriteExt;
 /// When a `.wal.bin` file exists it takes precedence; otherwise the backend
 /// falls back to `.wal.jsonl`.  Writes always go to `.wal.bin`.
 /// On-disk format (protobuf):
-///   <varint length><WalRecord proto bytes><varint length><WalRecord proto bytes>...
+///   `<varint length><WalRecord proto bytes>` repeated end-to-end.
 /// Legacy format (JSONL):
-///   {json}\n{json}\n...
+///   `{json}\n{json}\n...`
 #[derive(Debug)]
 pub struct FileWalBackend {
     base_dir: PathBuf,

@@ -1094,7 +1094,7 @@ impl VectorBackend for MemoryVectorBackend {
 /// In-memory observability gateway for testing and local development.
 /// Stores all data in RAM.  Events are broadcast via a bounded
 /// [`tokio::sync::broadcast`] channel so that multiple consumers can
-/// [`subscribe_events`] simultaneously.
+/// [`cog_core::ObservabilityGateway::subscribe_events`] simultaneously.
 pub struct MemoryObservabilityGateway {
     state_backend: Arc<dyn cog_core::StateBackend>,
     logs: RwLock<HashMap<String, Vec<LogEntry>>>,

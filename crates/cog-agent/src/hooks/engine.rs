@@ -35,7 +35,7 @@ pub trait HookPublisher: Send + Sync {
     async fn notify_user(&self, user_id: &str, payload: &serde_json::Value) -> SFResult<()>;
 }
 
-/// Default publisher that uses an injected [`HttpClient`] for webhooks and an
+/// Default publisher that uses an injected [`cog_core::HttpClient`] for webhooks and an
 /// injected [`MessageBackend`](cog_core::MessageBackend) for Redis streams.
 pub struct DefaultHookPublisher {
     client: Option<Arc<dyn cog_core::HttpClient>>,

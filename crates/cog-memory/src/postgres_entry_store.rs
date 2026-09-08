@@ -2,7 +2,7 @@
 //! Stores the full typed [`SummaryEntry`] (including the embedding backup)
 //! in PostgreSQL, but **does not perform vector search itself**.
 //! Vector indexing and ANN retrieval are delegated to a separate
-//! [`cog_core::VectorBackend`] (e.g. Qdrant) via [`VectorSummaryBackend`].
+//! [`cog_core::VectorBackend`] (e.g. Qdrant) via [`crate::VectorSummaryBackend`].
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -34,7 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_summary_entries_ns_raw_uri ON summary_entries(nam
 "#;
 
 /// PostgreSQL-backed entry store for the Summary layer.
-/// Wraps a shared [`PgPool`].  Call [`init_table`] once at startup.
+/// Wraps a shared [`PgPool`].  Call [`Self::init_table`] once at startup.
 pub struct PostgresEntryStore {
     pool: PgPool,
 }

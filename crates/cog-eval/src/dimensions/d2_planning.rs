@@ -5,7 +5,7 @@ use crate::metric::{EvalMetric, EvalResult};
 
 /// 计算 D2 指标。
 /// 核心指标（PQ, PA, LC）需要 LLM-as-a-Judge 评估。此处提供基于启发式的近似计算，
-/// 精确评分需通过 [`crate::judge::PlanJudge`] / [`crate::judge::LogicJudge`] 完成。
+/// 精确评分需通过 [`crate::judge::plan_judge`] / [`crate::judge::logic_judge`] 完成。
 pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f64, bool) {
     match metric {
         EvalMetric::PlanQuality { threshold } => {

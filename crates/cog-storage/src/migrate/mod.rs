@@ -135,7 +135,7 @@ impl Migrator {
         }
     }
 
-    /// Same as [`run`] but only logs the SQL it *would* apply.
+    /// Same as [`Self::run`] but only logs the SQL it *would* apply.
     pub async fn run_dry(&self, database_url: &str) -> Result<()> {
         let driver = detect_driver(database_url)?;
         match driver {

@@ -33,9 +33,9 @@ pub struct RespawnAction {
 /// On a Dead Agent (provided by the [`crate::HealthChecker`]) the
 /// Respawner:
 /// 1. Looks up the Crew that owns the failed Agent.
-/// 2. Asks [`DagExecutor::crew_can_retry`] whether any tasks in
+/// 2. Asks [`cog_core::DagExecutor::crew_can_retry`] whether any tasks in
 ///    the crew still have retry budget.
-/// 3. If yes, calls [`DagExecutor::crew_retry_all`] to re-queue
+/// 3. If yes, calls [`cog_core::DagExecutor::crew_retry_all`] to re-queue
 ///    the tasks.  Otherwise it requests a Squad respawn.
 pub struct Respawner {
     registry: Arc<AgentRegistry>,

@@ -4,7 +4,7 @@
 //! clients can submit, retrieve, list and delete plans without going through
 //! the orchestrator's task-DAG flow.
 //! The store is a [`tokio::sync::Mutex<HashMap<String, StoredActionPlan>>`]
-//! attached to [`GatewayState`](crate::GatewayState). Replace with a Redis-
+//! attached to [`crate::GatewayState`]. Replace with a Redis-
 //! backed implementation when persistence across restarts is required.
 
 use axum::{

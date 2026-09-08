@@ -119,13 +119,14 @@ impl PluginContext {
         self.publish(Arc::new(Service(service)));
     }
 
-    /// Consume a trait object published via [`publish_service`].
+    /// Consume a trait object published via [`Self::publish_service`].
     /// Returns `Arc<T>` directly for ergonomic use.
     pub fn consume_service<T: ?Sized + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
         self.consume::<Service<T>>().map(|s| s.0.clone())
     }
 
-    /// Consume **all** trait objects of a given type published via [`publish_service`].
+    /// Consume **all** trait objects of a given type published via
+    /// [`Self::publish_service`].
     pub fn consume_all_services<T: ?Sized + Send + Sync + 'static>(&self) -> Vec<Arc<T>> {
         self.consume_all::<Service<T>>()
             .into_iter()

@@ -346,7 +346,7 @@ impl AutonomousCollaborator {
 
     /// Run a periodic decision pass (independent of events).
     /// Evaluates the pending-handoffs / ready-tasks ratio and emits a
-    /// scale-out event when the load exceeds [`LOAD_RATIO_THRESHOLD`].
+    /// scale-out event when the load exceeds `LOAD_RATIO_THRESHOLD`.
     pub async fn run_decision_pass(&self) {
         let pending = self.pending_count().await;
         let ready = self.orchestrator.get_ready_tasks().await.len();

@@ -2,12 +2,13 @@ use async_trait::async_trait;
 use cog_core::{OrchestratorControl, SFResult, Task};
 use std::sync::Arc;
 
-/// High-level orchestrator control that composes a [`DagExecutor`] and an
-/// [`ActionPlanner`] to provide the unified [`OrchestratorControl`] interface.
+/// High-level orchestrator control that composes a [`cog_core::DagExecutor`]
+/// and an [`cog_core::ActionPlanner`] to provide the unified
+/// [`OrchestratorControl`] interface.
 /// This struct lives in `cog-orchestrator` and delegates DAG state
-/// transitions to the internally-mutable [`DagExecutor`] implementation,
-/// while `submit_goal_auto` routes through [`ActionPlanner`] for
-/// goal decomposition when needed.
+/// transitions to the internally-mutable [`cog_core::DagExecutor`]
+/// implementation, while `submit_goal_auto` routes through
+/// [`cog_core::ActionPlanner`] for goal decomposition when needed.
 pub struct OrchestratorControlImpl {
     dag_executor: Arc<dyn cog_core::DagExecutor>,
     action_planner: Option<Arc<dyn cog_core::ActionPlanner>>,

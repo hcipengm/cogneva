@@ -72,7 +72,7 @@ pub struct PgePipelineAttempt {
     pub local_repairs: Vec<LocalRepairAttempt>,
 }
 
-/// Final result of a [`PgePipeline::execute`] run.
+/// Final result of a [`PgePipeline::execute_task`] run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PgePipelineResult {
     /// Total number of attempts executed.
@@ -142,7 +142,7 @@ impl PgePipeline {
         }
     }
 
-    /// Run the pipeline with a structured [`Task`] instead of a plain `goal` string.
+    /// Run the pipeline with a structured [`cog_core::Task`] instead of a plain `goal` string.
     /// This is the preferred entry point for new code.
     pub async fn execute_task(
         &self,

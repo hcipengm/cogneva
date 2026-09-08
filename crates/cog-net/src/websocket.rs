@@ -1,4 +1,4 @@
-//! WebSocket client implementation backed by [`tokio-tungstenite`].
+//! WebSocket client implementation backed by the `tokio-tungstenite` crate.
 //! Use [`TungsteniteWebSocketClient`] when you need to satisfy
 //! [`cog_core::WebSocketClient`] in tests or generic code.
 
@@ -7,7 +7,7 @@ use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use tokio_tungstenite::tungstenite::protocol::Message as TungsteniteMessage;
 
-/// A [`cog_core::WebSocketClient`] implementation backed by [`tokio-tungstenite`].
+/// A [`cog_core::WebSocketClient`] implementation backed by `tokio-tungstenite`.
 #[derive(Debug, Clone, Default)]
 pub struct TungsteniteWebSocketClient;
 

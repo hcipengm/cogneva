@@ -801,7 +801,7 @@ impl Agent {
     }
 
     /// Review an output string using the agent's self-review capability.
-    /// Delegates to [`SelfReviewLoop`] internally.
+    /// Delegates to [`crate::SelfReviewLoop`] internally.
     pub async fn review_output(
         &self,
         output: &str,
@@ -892,7 +892,7 @@ impl Agent {
         crate::consumer::AgentConsumer::send_message(to_agent_id, message, backend).await
     }
 
-    /// Read a field from the shared [`ContextBoard`] for the given task.
+    /// Read a field from the shared `ContextBoard` for the given task.
     pub async fn read_board(&self, task_id: &str, field: &str) -> SFResult<Option<String>> {
         let backend = self
             .state_backend
@@ -902,7 +902,7 @@ impl Agent {
         Ok(board.and_then(|b| b.fields.get(field).cloned()))
     }
 
-    /// Write a field to the shared [`ContextBoard`] for the given task.
+    /// Write a field to the shared `ContextBoard` for the given task.
     pub async fn write_board(&self, task_id: &str, field: &str, value: &str) -> SFResult<()> {
         let backend = self
             .state_backend

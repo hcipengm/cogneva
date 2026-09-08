@@ -50,6 +50,7 @@ impl Default for ShutdownSignal {
     }
 }
 
-/// Holder so `broadcast::Sender<()>` can be stored in [`PluginContext`].
+/// Holder so `broadcast::Sender<()>` can be stored in
+/// [`crate::contract::system_plugin::PluginContext`].
 #[derive(Clone)]
 pub struct ShutdownBroadcastTx(pub tokio::sync::broadcast::Sender<()>);

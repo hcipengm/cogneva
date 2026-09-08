@@ -32,11 +32,13 @@ pub struct ConfigPool(pub Option<sqlx::PgPool>);
 #[derive(Debug, Clone)]
 pub struct ExplainPool(pub Option<sqlx::PgPool>);
 
-/// Redis client wrapper so it can be stored in [`cog_core::PluginContext`].
+/// Redis client wrapper so it can be stored in
+/// [`crate::contract::system_plugin::PluginContext`].
 #[derive(Debug, Clone)]
 pub struct RedisClient(pub redis::Client);
 
-/// A single time-series sample returned by [`MetricsBackend::query_range`].
+/// A single time-series sample returned by
+/// [`MetricsBackend::query_gauge_range`].
 #[derive(Debug, Clone)]
 pub struct MetricSample {
     pub timestamp: DateTime<Utc>,

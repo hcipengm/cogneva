@@ -81,7 +81,7 @@ impl EvolutionEngine {
     }
 
     /// Inject a channel sink so that synthesized hooks can be auto-registered
-    /// by an external [`HookEngine`].
+    /// by an external hook engine.
     pub fn with_hook_sink(self, tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>) -> Self {
         if let Ok(mut guard) = self.hook_sink.lock() {
             *guard = Some(tx);
@@ -90,7 +90,7 @@ impl EvolutionEngine {
     }
 
     /// Inject a channel sink so that suggested tool variants can be
-    /// auto-registered by an external [`ToolRegistry`].
+    /// auto-registered by an external tool registry.
     pub fn with_tool_sink(self, tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>) -> Self {
         if let Ok(mut guard) = self.tool_sink.lock() {
             *guard = Some(tx);
@@ -277,9 +277,9 @@ impl EvolutionEngine {
     // L1 — Hook Synthesis
     // ========================================================================
 
-    /// Synthesize a [`HookDef`] from a recurring event pattern using the LLM.
+    /// Synthesize a [`cog_core::HookDef`] from a recurring event pattern using the LLM.
     /// The generated hook is written to `change_dir/hooks/{id}.json` and can be
-    /// loaded by the caller into a [`HookEngine`].
+    /// loaded by the caller into a hook engine.
     pub async fn synthesize_hook(
         &self,
         event_pattern: &str,
@@ -456,7 +456,7 @@ impl EvolutionEngine {
 
     /// Suggest an improved tool variant based on error patterns using the LLM.
     /// The generated tool schema is written to `change_dir/tools/{name}.json` and
-    /// can be registered by the caller into a [`ToolRegistry`].
+    /// can be registered by the caller into a tool registry.
     pub async fn suggest_tool_variant(
         &self,
         tool_name: &str,

@@ -98,7 +98,7 @@ pub trait WikiMaintainer: Send + Sync {
     /// Lint the wiki for health issues.
     async fn lint(&self) -> SFResult<LintReport>;
 
-    /// Update cross-references between pages (bidirectional [[links]]).
+    /// Update cross-references between pages (bidirectional `[[links]]`).
     async fn update_cross_references(&self) -> SFResult<()>;
 
     /// Archive an external answer as a Synthesis page.
