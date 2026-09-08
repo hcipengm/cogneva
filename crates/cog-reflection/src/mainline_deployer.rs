@@ -603,7 +603,7 @@ impl MainlineDeployer {
         // 镜像配置（受限网络构建注入）不会自动继承；缺失会直连 crates.io，
         // 家庭网络上索引拉取极慢。一次性把镜像内配置带到 PVC。
         let pvc_config = std::path::Path::new(CARGO_HOME_PVC).join("config.toml");
-        if tokio::fs::try_exists(&pvc_config).await.unwrap_or(false) == false {
+        if !tokio::fs::try_exists(&pvc_config).await.unwrap_or(false) {
             let img_config = std::path::Path::new("/usr/local/cargo/config.toml");
             if tokio::fs::try_exists(img_config).await.unwrap_or(false) {
                 if let Ok(body) = tokio::fs::read(img_config).await {
@@ -649,7 +649,12 @@ impl MainlineDeployer {
     /// buildah 叠层：FROM 当前在跑 tag → 换二进制 + migrations → --version
     /// 校验内嵌 rev → commit 不可变 tag → 同步 tag :local → 双推。
     async fn build_and_push(&self, rev: &str, base: &str, new_tag: &str) -> SFResult<()> {
-        let ctr = self.buildah(&["from", base], 1800).await?;
+        // 集群内 registry 是纯 HTTP，from 拉基镜像默认试 HTTPS 会报
+        // "http: server gave HTTP response to HTTPS client"，与 push 一样
+        // 必须显式关 TLS 校验。
+        let ctr = self
+            .buildah(&["from", "--tls-verify=false", base], 1800)
+            .await?;
         let ctr = ctr.trim().to_string();
         let result = self.buildah_steps(&ctr, rev, new_tag).await;
         if let Err(e) = self.buildah(&["rm", &ctr], 60).await {
@@ -1646,8 +1651,8 @@ exit 0
 
         let buildah_calls = std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap();
         assert!(
-            buildah_calls.contains("from reg.local:5000/cogneva:local"),
-            "base should be registry :local on first migration: {buildah_calls}"
+            buildah_calls.contains("from --tls-verify=false reg.local:5000/cogneva:local"),
+            "base pull from in-cluster http registry must skip TLS verify: {buildah_calls}"
         );
         // buildah commit/tag/push 走 Pod 内 push 端点（集群 DNS）。
         let push_tag = main_image("reg.local:5000", &rev_b);
