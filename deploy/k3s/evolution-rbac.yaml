@@ -35,11 +35,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  # Mainline rollout Jobs: build side applies (create) and queries status;
-  # the in-Job rollout reuses the same ServiceAccount.
+  # Mainline rollout Jobs: build side applies (create), queries status, and
+  # deletes a finished job before redispatch when deployments were reverted by
+  # an apply; the in-Job rollout reuses the same ServiceAccount.
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "list", "watch", "patch", "update"]
+    verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
   # Allow reading the cogneva ConfigMap if needed for configuration.
   - apiGroups: [""]
     resources: ["configmaps"]

@@ -71,10 +71,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  # 主线滚动 Job：构建侧 apply(create) 派发、状态查询；Job 内滚动复用同一 SA。
+  # 主线滚动 Job：构建侧 apply(create) 派发、状态查询、Job 已完成但部署被
+  # apply 打回时 delete 旧 Job 重新派发；Job 内滚动复用同一 SA。
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "list", "watch", "patch", "update"]
+    verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["cogneva-config"]

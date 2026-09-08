@@ -444,8 +444,33 @@ impl MainlineDeployer {
             if inflight.phase == Phase::Dispatched {
                 match self.job_status(&job_name(&inflight.rev)).await? {
                     JobStatus::Complete => {
-                        // Job 完成但部署尚未收敛（API 缓存/滚动尾巴）：下轮再判。
-                        info!(rev = %rev12(&inflight.rev), "rollout job complete; awaiting deployment convergence");
+                        // Job 成功退出意味着滚动要么收敛、要么已回滚（回滚是非零
+                        // 退出，记 Failed）。这里镜像仍不是目标 tag，只可能是
+                        // Job 跑完后被外部 apply/GitOps 打回：kubectl apply 同名
+                        // Job 是 no-op 不会重跑，必须删掉重新派发，否则永久卡
+                        // "等待收敛"。镜像已是目标 tag 则只是收敛尾巴，下轮再判。
+                        let target_tag = main_image(&self.pull_endpoint(), &inflight.rev);
+                        let all_on_target = self
+                            .deployed_images()
+                            .await?
+                            .iter()
+                            .all(|i| i == &target_tag);
+                        if all_on_target {
+                            info!(rev = %rev12(&inflight.rev), "rollout job complete; awaiting deployment convergence");
+                            return Ok(());
+                        }
+                        warn!(rev = %rev12(&inflight.rev), "rollout job complete but deployments not on target tag (reverted by an apply?); redispatching");
+                        self.kubectl(
+                            &[
+                                "delete",
+                                "job",
+                                &job_name(&inflight.rev),
+                                "--ignore-not-found",
+                            ],
+                            60,
+                        )
+                        .await?;
+                        self.dispatch_job(&inflight.rev, &target_tag).await?;
                         return Ok(());
                     }
                     JobStatus::Failed => {
@@ -1800,6 +1825,78 @@ exit 0
             !kubectl_calls.contains("apply"),
             "no job dispatch expected: {kubectl_calls}"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_job_with_reverted_images_is_redispatched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let log = bin_dir.join("kubectl.log");
+        // 四部署已被外部 apply 打回 :local（Legacy），而同 rev 的 Job 已完成。
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "bad -o arg" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *"get deployment"*) echo "localhost:30500/cogneva:local" ;;
+  *"get job"*) echo "1||" ;;
+  *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
+  *"delete"*) echo "job.batch \"x\" deleted" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        let kubectl = bin_dir.join("fake-kubectl");
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let buildah = fake_buildah(&bin_dir, "");
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl.to_string_lossy());
+        // 预置在飞状态：Job 已派发（Dispatched），避免触发构建流程。
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state = MainlineState {
+            in_flight: Some(InFlight {
+                rev: rev_b.clone(),
+                phase: Phase::Dispatched,
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let deployer = MainlineDeployer::new(cfg, &work);
+        deployer.poll_once().await.unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains(&format!("delete job {}", job_name(&rev_b))),
+            "completed job must be deleted before re-dispatch: {calls}"
+        );
+        assert!(
+            calls.matches("apply -f -").count() >= 1,
+            "rollout job must be re-dispatched: {calls}"
+        );
+        let state: MainlineState =
+            serde_json::from_str(&std::fs::read_to_string(state_dir.join("state.json")).unwrap())
+                .unwrap();
+        assert_eq!(state.in_flight.unwrap().phase, Phase::Dispatched);
     }
 
     #[tokio::test]
