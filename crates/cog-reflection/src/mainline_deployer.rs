@@ -502,9 +502,10 @@ impl MainlineDeployer {
         });
         self.save_state(&state)?;
 
-        // 1. 源码树对齐新 rev（脏树/有未发布 commit 时跳过本轮，绝不丢在途工作）。
+        // 1. 源码树对齐新 rev（脏树/有未发布 commit 时跳过本轮，绝不丢在途工作；
+        // 具体原因由 ensure_source_at 内按场景记日志）。
         if !self.ensure_source_at(&bare).await? {
-            info!("sandbox tree busy (in-flight change); mainline build skipped this round");
+            info!("mainline source alignment skipped this round");
             state.in_flight = None;
             self.save_state(&state)?;
             return Ok(());
@@ -555,6 +556,7 @@ impl MainlineDeployer {
             .map(|s| !s.is_empty())
             .unwrap_or(true);
         if dirty {
+            info!("mainline: sandbox tree dirty (in-flight change); skip this round");
             return Ok(false);
         }
         let head = self
@@ -573,6 +575,17 @@ impl MainlineDeployer {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !ancestor {
+            // 与"脏树（在途变更，下轮自愈）"不同：分叉/无共同祖先是永久性
+            // 卡死（典型：PVC 上残留 bare 重建前的旧克隆历史），每 10 分钟
+            // 静默跳过，必须告警并给出处置方法。
+            warn!(
+                head = %head.trim(),
+                target = %rev,
+                "mainline: sandbox HEAD is not an ancestor of upstream main; refusing \
+                 reset to protect unpublished commits. If the tree holds no in-flight \
+                 change (e.g. stale pre-reseed history), an operator can realign with \
+                 git -C <sandbox-src> reset --hard local/main"
+            );
             return Ok(false);
         }
         self.git_src(&["reset", "--hard", rev]).await?;
