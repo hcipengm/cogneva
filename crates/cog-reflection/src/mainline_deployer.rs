@@ -460,16 +460,6 @@ impl MainlineDeployer {
                             return Ok(());
                         }
                         warn!(rev = %rev12(&inflight.rev), "rollout job complete but deployments not on target tag (reverted by an apply?); redispatching");
-                        self.kubectl(
-                            &[
-                                "delete",
-                                "job",
-                                &job_name(&inflight.rev),
-                                "--ignore-not-found",
-                            ],
-                            60,
-                        )
-                        .await?;
                         self.dispatch_job(&inflight.rev, &target_tag).await?;
                         return Ok(());
                     }
@@ -757,10 +747,19 @@ impl MainlineDeployer {
         Ok(())
     }
 
-    /// 派滚动 Job。`kubectl apply -f -` 幂等：同 rev 重跑 Job 已存在时
-    /// 视为已派发（apply 是 upsert，不会重启已完成 Job）。new_tag 必须是
-    /// 节点 pull 端点引用（kubelet 经 NodePort 拉取）。
+    /// 派滚动 Job。同名 Job 已在跑时视为已派发（幂等）；同名 Job 已结束
+    /// （成功后镜像被 apply 打回、或失败冷却后重试）必须先删除再 apply——
+    /// `kubectl apply` 是 upsert，不会重新执行已完成的 Job。new_tag 必须
+    /// 是节点 pull 端点引用（kubelet 经 NodePort 拉取）。
     async fn dispatch_job(&self, rev: &str, new_tag: &str) -> SFResult<()> {
+        match self.job_status(&job_name(rev)).await? {
+            JobStatus::Running | JobStatus::NotFound => {}
+            JobStatus::Complete | JobStatus::Failed => {
+                info!(rev = %rev12(rev), "replacing finished rollout job before dispatch");
+                self.kubectl(&["delete", "job", &job_name(rev), "--ignore-not-found"], 60)
+                    .await?;
+            }
+        }
         let mut manifest = serde_json::json!({
             "apiVersion": "batch/v1",
             "kind": "Job",
