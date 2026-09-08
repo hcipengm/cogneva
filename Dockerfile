@@ -228,6 +228,15 @@ RUN if [ -n "$RUSTUP_DIST_SERVER" ]; then \
     fi && \
     /usr/local/cargo/bin/rustup component add rustfmt clippy
 
+# 受限网络：运行时镜像里的自进化/主线跟踪构建也要走 sparse 镜像。
+# builder 阶段写的 /usr/local/cargo/config.toml 不跨阶段，这里必须重写一份，
+# 否则沙盒内 cargo 直连 crates.io，家庭网络上索引拉取慢到构建超时。
+ARG CARGO_REGISTRY_SPARSE
+RUN if [ -n "$CARGO_REGISTRY_SPARSE" ]; then \
+    mkdir -p /usr/local/cargo && \
+    printf '[source.crates-io]\nreplace-with = "mirror"\n[source.mirror]\nregistry = "sparse+%s"\n\n[http]\nmultiplexing = false\n\n[net]\nretry = 10\n' "$CARGO_REGISTRY_SPARSE" > /usr/local/cargo/config.toml; \
+    fi
+
 # Create FHS directory structure
 RUN mkdir -p /opt/cogneva /var/lib/cogneva-data /etc/cogneva /run/cogneva
 

@@ -188,6 +188,16 @@ if ! buildah run "$CTR" -- buildah --version >/dev/null 2>&1; then
     apt-get update && apt-get install -y --no-install-recommends buildah \
       && rm -rf /var/lib/apt/lists/*'
 fi
+# cargo sparse 镜像配置：沙盒内自进化/主线跟踪构建直接跑 cargo，
+# 缺 config 会直连 crates.io，受限网络下稀疏索引拉取慢到构建超时。
+# 叠层自愈（全量构建由 Dockerfile runtime stage 保证）。rsproxy 索引与
+# crate 文件都自托管（TUNA 的 crate 文件回源 static.crates.io，国内必挂）。
+if [ "${COGNEVA_CN_MIRROR:-0}" = "1" ] && ! buildah run "$CTR" -- test -s /usr/local/cargo/config.toml 2>/dev/null; then
+  echo "==> 写入 cargo sparse 镜像配置（rsproxy）"
+  buildah run --user root "$CTR" -- sh -c '
+    mkdir -p /usr/local/cargo &&
+    printf "[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"sparse+https://rsproxy.cn/index/\"\n\n[http]\nmultiplexing = false\n\n[net]\nretry = 10\n" > /usr/local/cargo/config.toml'
+fi
 if [ -f web/dist/index.html ]; then
   # web/dist 是 git 忽略的构建产物——拷的是磁盘现状，要新鲜前端先加 --web
   buildah copy "$CTR" web/dist /opt/cogneva/web
