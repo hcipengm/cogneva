@@ -3,8 +3,10 @@
 //! 构建侧（进化 Pod 内，[`MainlineDeployer`] + [`run_mainline_loop`]）：
 //! 周期检测集群内 bare 仓库（/host-git）的 main 前进 → 沙盒源码树 reset 到
 //! 新 rev → cargo build（PVC target 增量缓存）→ buildah 基于"当前在跑的
-//! 不可变 tag"打最小 overlay → 推集群内 registry（`main-<rev12>` 不可变 tag
-//! + `:local` 浮动签）→ 派独立 Job 跑滚动。
+//! 不可变 tag"打最小 overlay → 推集群内 registry 的 `main-<rev12>` 不可变
+//! tag → 派独立 Job 跑滚动 → 滚动收敛后才把 registry 浮动签 `:local` 前移
+//! 到本 rev（`:local` 是静态清单/GitOps apply 的回退锚点，构建期就推会让
+//! 失败回滚的坏镜像成为浮动签权威）。
 //!
 //! 滚动侧（Job 内，[`RolloutExecutor`]，二进制子命令 `cogneva mainline-rollout`）：
 //! 按固定顺序 set image 四个 deployment（网关代理面先行、进化宿主最后），
@@ -430,6 +432,8 @@ impl MainlineDeployer {
             match &deployed {
                 DeployedState::Main(d) if rev12(d) == rev12(&inflight.rev) => {
                     info!(rev = %rev12(&inflight.rev), "mainline rollout converged");
+                    // 浮动签只在收敛后前移，失败回滚的坏镜像绝不进 :local。
+                    self.promote_local_tag(&inflight.rev).await?;
                     state.last_good_rev = Some(inflight.rev.clone());
                     state.last_good_tag = Some(main_image(&self.pull_endpoint(), &inflight.rev));
                     state.in_flight = None;
@@ -484,6 +488,18 @@ impl MainlineDeployer {
             }
             // phase < Dispatched：上轮在构建中途重启，落到下方构建流程
             // 幂等重跑（同 tag buildah/push 可重复）。
+        }
+
+        // 静态清单/GitOps apply 把四部署 pin 到 registry 浮动签 :local（见
+        // chart/k3s 清单）；:local 只在收敛后前移，所以 pin 命中 last_good 且
+        // bare 未再前进时就是"以浮动签形态收敛"，不重建重派。
+        let local_pin = local_image(&self.pull_endpoint());
+        if state.last_good_rev.as_deref() == Some(bare.as_str())
+            && !images.is_empty()
+            && images.iter().all(|i| i == &local_pin)
+        {
+            info!("deployments pinned to floating :local at current mainline; nothing to do");
+            return Ok(());
         }
 
         let attempts = if state.failed_rev.as_deref() == Some(bare.as_str()) {
@@ -549,7 +565,7 @@ impl MainlineDeployer {
         });
         self.save_state(&state)?;
 
-        // 3. buildah 叠层并推 registry（不可变 tag + :local 浮动签）。
+        // 3. buildah 叠层并推 registry（只推不可变 tag；:local 收敛后前移）。
         self.build_and_push(&bare, &base_tag, &push_tag).await?;
         state.in_flight = Some(InFlight {
             rev: bare.clone(),
@@ -673,7 +689,7 @@ impl MainlineDeployer {
     }
 
     /// buildah 叠层：FROM 当前在跑 tag → 换二进制 + migrations → --version
-    /// 校验内嵌 rev → commit 不可变 tag → 同步 tag :local → 双推。
+    /// 校验内嵌 rev → commit 不可变 tag → 只推不可变 tag（:local 收敛后推）。
     async fn build_and_push(&self, rev: &str, base: &str, new_tag: &str) -> SFResult<()> {
         // 集群内 registry 是纯 HTTP，from 拉基镜像默认试 HTTPS 会报
         // "http: server gave HTTP response to HTTPS client"，与 push 一样
@@ -735,15 +751,33 @@ impl MainlineDeployer {
         .await?;
         self.buildah(&["commit", ctr, new_tag], 600).await?;
 
-        // 浮动签权威同步落 registry：静态清单/GitOps apply pin 的是
-        // registry :local，主线每推一个不可变 tag 都把 :local 前移。
-        let local = local_image(&self.push_endpoint());
-        self.buildah(&["tag", new_tag, &local], 60).await?;
+        // 只推不可变 tag；浮动签 :local 在滚动收敛后由 promote_local_tag 前移，
+        // 防止构建失败/回滚的坏镜像成为静态清单 apply 的回退锚点。
         self.buildah(&["push", "--tls-verify=false", new_tag], 900)
             .await?;
+        info!(image = %new_tag, "mainline overlay image pushed to registry");
+        Ok(())
+    }
+
+    /// 滚动收敛后把 registry 浮动签 `:local` 前移到指定 rev。buildah 镜像库
+    /// 在 sandbox PVC 上，正常情况刚构建的不可变 tag 还在本地；Pod 重建后
+    /// 本地丢失则先从 registry 拉回（同 registry 秒回）再打签推送。
+    async fn promote_local_tag(&self, rev: &str) -> SFResult<()> {
+        let immutable = main_image(&self.push_endpoint(), rev);
+        let local = local_image(&self.push_endpoint());
+        let present = self
+            .buildah(&["images", "-q", &immutable], 30)
+            .await?
+            .trim()
+            .to_string();
+        if present.is_empty() {
+            self.buildah(&["pull", "--tls-verify=false", &immutable], 900)
+                .await?;
+        }
+        self.buildah(&["tag", &immutable, &local], 60).await?;
         self.buildah(&["push", "--tls-verify=false", &local], 900)
             .await?;
-        info!(image = %new_tag, "mainline overlay image pushed to registry");
+        info!(rev = %rev12(rev), tag = %local, "floating :local advanced to converged revision");
         Ok(())
     }
 
@@ -1755,9 +1789,17 @@ exit 0
             "{buildah_calls}"
         );
         assert!(buildah_calls.contains(&push_tag), "{buildah_calls}");
+
+        // 浮动签 :local 只在滚动收敛后前移：构建阶段允许 FROM registry :local
+        // （Legacy 基底），但绝不允许 tag/push 它，否则失败回滚的坏镜像会成为
+        // 静态清单 apply 的回退锚点。
+        let local_tag = local_image("reg.local:5000");
+        let moves_local = buildah_calls.lines().any(|l| {
+            (l.contains(" tag ") || l.contains(" push ")) && l.trim_end().ends_with(&local_tag)
+        });
         assert!(
-            buildah_calls.contains("reg.local:5000/cogneva:local"),
-            "floating :local tagged at push endpoint: {buildah_calls}"
+            !moves_local,
+            "floating :local must not be tagged/pushed before rollout converges: {buildah_calls}"
         );
 
         let kubectl_calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
@@ -1823,6 +1865,100 @@ exit 0
         assert!(
             !kubectl_calls.contains("apply"),
             "no job dispatch expected: {kubectl_calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn convergence_promotes_floating_local_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        // 四部署已经在目标 main tag 上：收敛分支优先于 Job 状态判定。
+        let deployed = main_image("localhost:30500", &rev_b);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, &work);
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state = MainlineState {
+            in_flight: Some(InFlight {
+                rev: rev_b.clone(),
+                phase: Phase::Dispatched,
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        deployer.poll_once().await.unwrap();
+
+        let buildah_calls = std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap();
+        let push_main = main_image("reg.local:5000", &rev_b);
+        let push_local = local_image("reg.local:5000");
+        assert!(
+            buildah_calls.contains(&format!("tag {push_main} {push_local}")),
+            "convergence must retag immutable tag to floating :local: {buildah_calls}"
+        );
+        assert!(
+            buildah_calls.contains(&format!("push --tls-verify=false {push_local}")),
+            "floating :local must be pushed on convergence: {buildah_calls}"
+        );
+
+        let state: MainlineState =
+            serde_json::from_str(&std::fs::read_to_string(state_dir.join("state.json")).unwrap())
+                .unwrap();
+        assert!(state.in_flight.is_none());
+        assert_eq!(state.last_good_rev.as_deref(), Some(rev_b.as_str()));
+        assert_eq!(
+            state.last_good_tag.as_deref(),
+            Some(main_image("localhost:30500", &rev_b).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn local_pin_at_last_good_is_noop_after_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        // 外部 apply 把四部署打回静态清单 pin：registry 浮动签 :local。
+        let kubectl = fake_kubectl(&bin_dir, "localhost:30500/cogneva:local");
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, &work);
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state = MainlineState {
+            last_good_rev: Some(rev_b.clone()),
+            last_good_tag: Some(main_image("localhost:30500", &rev_b)),
+            ..Default::default()
+        };
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        deployer.poll_once().await.unwrap();
+
+        assert!(
+            !bin_dir.join("buildah.log").exists(),
+            "apply pin to current :local must not trigger rebuild"
+        );
+        let kubectl_calls =
+            std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        assert!(
+            !kubectl_calls.contains("apply"),
+            "apply pin to current :local must not redispatch: {kubectl_calls}"
         );
     }
 

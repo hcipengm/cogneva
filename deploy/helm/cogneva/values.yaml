@@ -15,7 +15,12 @@ storage:
   retain: "cogneva-local-retain"
 
 image:
-  repository: localhost/cogneva
+  # 工作负载统一从集群内 registry 的 NodePort 拉取（每个节点的 kubelet 经
+  # localhost:<nodePort> 访问，containerd 对 localhost 默认 http 免 TLS）。
+  # 不直接 pin 节点本地镜像名：ctr tag/import 得到的引用名不保证被 kubelet
+  # 的镜像存在性判定采信，且静态清单/GitOps apply 后没有统一的浮动签权威。
+  # :local 浮动签只由 bootstrap 播种、swap-image/mainline 收敛后前移。
+  repository: localhost:30500/cogneva
   # 默认 tag = 应用版本（与 Cargo.toml workspace version 同源，发布脚本强制校验）。
   # 自举部署的 profile values 覆盖为 local（浮动签，随导入的 release 镜像走）。
   tag: "0.5.7"
@@ -69,7 +74,8 @@ sandboxExecutor:
       cpu: 1000m
       memory: 1Gi
 
-# 节点镜像构建（buildah DaemonSet）：每节点构建/导入 localhost/cogneva:* 镜像。
+# 节点镜像构建（buildah DaemonSet）：每节点提供 buildah 能力，产物导入节点
+# containerd 作暖缓存；工作负载运行时镜像权威走集群内 registry（见 image.repository）。
 # containerdSocket 是容器运行时 socket 在宿主的路径，随发行版不同：
 #   标准 containerd（kubeadm/EKS 等）= /run/containerd
 #   K3s  = /run/k3s/containerd

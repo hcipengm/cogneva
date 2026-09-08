@@ -2,8 +2,9 @@
 # publisher（进化 Pod）buildah push overlay 镜像到 Service:5000（集群 DNS，http）；
 # 节点 kubelet/containerd 经 NodePort 以 localhost:30500 pull——containerd 对
 # localhost 默认 http 免 TLS，每个节点的 NodePort 都由 kube-proxy 转发到本 Pod，
-# 单/多节点通吃，无需节点 registry 信任配置。bootstrap/swap-image 负责把
-# localhost/cogneva:local 基镜像播种进来（overlay 的 FROM）。
+# 单/多节点通吃，无需节点 registry 信任配置。四部署清单 pin 本仓库的
+# localhost:30500/cogneva:local 浮动签，bootstrap 首次播种、swap-image 换版与
+# mainline 收敛后负责前移；金丝雀/mainline overlay 的 FROM 也取这里的镜像。
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

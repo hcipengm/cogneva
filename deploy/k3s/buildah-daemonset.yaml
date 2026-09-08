@@ -1,6 +1,8 @@
 # 容器构建沙盒：在每个节点上提供 buildah 镜像构建能力（K3s 不带镜像构建）。
-# 构建产物通过 `buildah push ... docker-archive:` + `ctr images import` 进入 containerd，
-# 供 localhost/cogneva:* 镜像在本节点直接使用（imagePullPolicy: IfNotPresent）。
+# 构建产物通过 `buildah push ... docker-archive:` + `ctr images import` 进入节点
+# containerd 作本地暖缓存/离线回退；工作负载运行时镜像的权威来源是集群内
+# registry（清单 pin localhost:30500/cogneva:local），由 bootstrap/swap-image
+# 播种，不依赖节点本地引用名。
 # 使用 hostPath 挂载节点容器存储与 containerd socket，仅应在受控节点上运行。
 apiVersion: apps/v1
 kind: DaemonSet

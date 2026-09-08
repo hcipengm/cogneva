@@ -35,7 +35,7 @@ spec:
         fsGroup: 0
       initContainers:
         - name: seed-source
-          image: localhost/cogneva:local
+          image: localhost:30500/cogneva:local
           imagePullPolicy: IfNotPresent
           # 当前运行镜像版本（= chart appVersion，与 Cargo.toml 同源）；基线对齐锚到
           # 上游对应的 release tag v<版本>，保证进化改的是正在运行版本的代码。
@@ -119,7 +119,7 @@ spec:
               mountPath: /host-git
       containers:
         - name: cogneva
-          image: localhost/cogneva:local
+          image: localhost:30500/cogneva:local
           imagePullPolicy: IfNotPresent
           workingDir: /opt/cogneva/sandbox/src
           # 特权容器 = 文件系统沙盒边界（3.2 image-based 滚动更新后移除）

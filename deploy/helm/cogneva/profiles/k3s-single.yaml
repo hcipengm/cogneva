@@ -7,8 +7,9 @@
 # 渲染 apply 路径与 helm install 路径共用同一套 profile，能力完全一致。
 
 image:
-  # 元启动链路在节点内构建/导入 localhost/cogneva:local（buildah/分发器）；
-  # release 换版由 swap-image / 分发流程按版本重打 tag。
+  # 浮动签 :local（随 image.repository 解析为 localhost:30500/cogneva:local）：
+  # 元启动导入节点后播种进集群内 registry，release 换版由 swap-image 前移，
+  # 主线滚动收敛后由部署器自动前移。
   tag: local
 
 # apply 路径不携带 Secret：helm template 下 lookup 为空、randAlphaNum 每次

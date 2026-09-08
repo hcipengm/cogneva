@@ -34,7 +34,7 @@ spec:
         # This gives the Pod an isolated working tree while still allowing bidirectional
         # sync through the bare repo (host <-> bare repo <-> Pod).
         - name: seed-source
-          image: localhost/cogneva:local
+          image: localhost:30500/cogneva:local
           imagePullPolicy: IfNotPresent
           # 当前运行镜像版本（与镜像 tag 同源）；基线对齐锚到上游 release tag v<版本>。
           # 静态基线用占位符，实际装机的预渲染产物烘焙 chart appVersion。
@@ -119,7 +119,7 @@ spec:
               mountPath: /host-git
       containers:
         - name: cogneva
-          image: localhost/cogneva:local
+          image: localhost:30500/cogneva:local
           imagePullPolicy: IfNotPresent
           workingDir: /opt/cogneva/sandbox/src
           # Privileged container = filesystem sandbox boundary. All writes go

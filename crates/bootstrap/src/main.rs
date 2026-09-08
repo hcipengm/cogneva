@@ -10,7 +10,8 @@
 //! 4. 安装容器运行时 / buildah，并按供给装 K3s 或跑 kubespray（或复用现有集群）；
 //! 5. 供给运行时镜像：优先下载预构建 release 包（sha256 校验后导入集群），
 //!    不可用时回退从源码构建（K3s 单节点本地导入，K3s 多节点与标准 K8s 经
-//!    DaemonSet 逐节点分发；清单引用 localhost/cogneva:local）；
+//!    DaemonSet 逐节点分发），再把节点本地 localhost/cogneva:local 播种进集群
+//!    内 registry——清单统一 pin localhost:30500/cogneva:local；
 //! 6. kubectl apply 部署清单并等待关键 Pod Ready；
 //! 7. 打印 WebUI 地址并自动打开浏览器，退出（自毁）。
 //!
@@ -834,7 +835,9 @@ async fn ensure_buildah_mirror() -> Result<()> {
     Ok(())
 }
 
-/// 运行时镜像供给：清单引用 localhost/cogneva:local。
+/// 运行时镜像供给：镜像先进入节点 containerd（localhost/cogneva:local），随后由
+/// seed_cluster_registry 播种进集群内 registry——工作负载清单统一 pin
+/// localhost:30500/cogneva:local，不直接引用节点本地镜像名。
 /// 优先从 GitHub/Gitee release 下载预构建镜像（sha256 校验），失败回退源码构建
 /// （空白机全量 Rust release 构建需 1-3 小时，预构建下载仅需数分钟）。
 /// 仅 K3s 单节点走本机 `k3s ctr import` 快路径；K3s 多节点与 kubespray 标准
@@ -1143,13 +1146,14 @@ async fn render_distributor_manifest() -> Result<String> {
         .replace("__IMAGE_TAG__", env!("CARGO_PKG_VERSION")))
 }
 
-/// 把基镜像 localhost/cogneva:local 播种进集群内 registry：自进化金丝雀
-/// overlay 镜像 FROM 该基镜像，缺失则推送端构建必败。经宿主 containerd
-/// 客户端直推 NodePort（localhost http 免 TLS，多节点每节点都通）。
-/// 失败不致命——基座运行不依赖 registry，swap-image 换版时也会补播；
-/// 但首次金丝雀晋级前必须播种成功，故给足重试并明确告警。
+/// 把基镜像 localhost/cogneva:local 播种进集群内 registry：四部署清单统一
+/// pin localhost:30500/cogneva:local，自进化金丝雀/mainline overlay 也 FROM
+/// 该基镜像，缺失则工作负载只能 ImagePullBackOff。经宿主 containerd 客户端
+/// 直推 NodePort（localhost http 免 TLS，多节点每节点都通）。
+/// 失败是硬失败：清单 pin 已在 registry，播种不成功四部署拉不到镜像；
+/// 给足重试，仍失败则让引导器带着明确错误退出（可修复后重跑，幂等）。
 async fn seed_cluster_registry() -> Result<()> {
-    let waited = run(
+    run(
         "kubectl",
         &[
             "-n",
@@ -1160,14 +1164,8 @@ async fn seed_cluster_registry() -> Result<()> {
             "--timeout=300s",
         ],
     )
-    .await;
-    if let Err(e) = waited {
-        warn!(
-            "集群内 registry 未就绪，跳过基镜像播种（金丝雀晋级前需补播，\
-             见 swap-image.sh）: {e:#}"
-        );
-        return Ok(());
-    }
+    .await
+    .context("等待集群内 registry 就绪超时")?;
     // k3s 是多调用二进制（argv0=ctr），标准 containerd 直接用 ctr。
     let (program, ctr_prefix): (&str, &[&str]) = if command_exists("k3s").await {
         ("k3s", &["ctr"][..])
@@ -1197,13 +1195,78 @@ async fn seed_cluster_registry() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             }
             Err(e) => {
-                warn!(
-                    "registry 基镜像播种失败: {e:#}。金丝雀 overlay 推送会因此失败，\
-                     可在节点上手动执行 ctr -n k8s.io images push --plain-http {remote} {object}"
+                bail!(
+                    "registry 基镜像播种三次失败: {e:#}。四部署 pin {remote}，\
+                     可在节点上手动执行 ctr -n k8s.io images push --plain-http {remote} {object} \
+                     后重跑引导器"
                 );
-                return Ok(());
             }
         }
+    }
+    Ok(())
+}
+
+/// registry 播种发生在清单 apply 之后：四部署首轮拉取 :local 时镜像可能还没进
+/// registry，kubelet 已进入 ImagePullBackOff 退避（最长数分钟）。播种成功后
+/// 删除卡在镜像拉取失败状态的 Pod，让 ReplicaSet 立即重建并同步拉取，不等退避。
+async fn kick_image_pull_pending() -> Result<()> {
+    let output = Command::new("kubectl")
+        .args(["-n", "cogneva", "get", "pods", "-o", "json"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        warn!("查询 Pod 列表失败，跳过拉取失败 Pod 清理");
+        return Ok(());
+    }
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let pending: Vec<String> = body
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|p| {
+                    let name = p.pointer("/metadata/name")?.as_str()?;
+                    let stuck = p
+                        .pointer("/status/containerStatuses")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|statuses| {
+                            statuses.iter().any(|cs| {
+                                matches!(
+                                    cs.pointer("/state/waiting/reason").and_then(|r| r.as_str()),
+                                    Some("ImagePullBackOff" | "ErrImagePull" | "InvalidImageName")
+                                )
+                            })
+                        })
+                        || p.pointer("/status/initContainerStatuses")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|statuses| {
+                                statuses.iter().any(|cs| {
+                                    matches!(
+                                        cs.pointer("/state/waiting/reason")
+                                            .and_then(|r| r.as_str()),
+                                        Some(
+                                            "ImagePullBackOff"
+                                                | "ErrImagePull"
+                                                | "InvalidImageName"
+                                        )
+                                    )
+                                })
+                            });
+                    stuck.then_some(name.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for pod in &pending {
+        info!("registry 已播种，删除卡在镜像拉取的 Pod {pod} 触发立即重拉");
+        let _ = Command::new("kubectl")
+            .args(["-n", "cogneva", "delete", "pod", pod, "--ignore-not-found"])
+            .status()
+            .await;
     }
     Ok(())
 }
@@ -2042,8 +2105,9 @@ async fn main() -> Result<()> {
     }
     ensure_runtime_image(decision.distro, decision.multi).await?;
     deploy_manifests(cluster_existed).await?;
-    // 清单 apply 后 registry 才存在；基镜像播种失败不阻断安装（best-effort）
+    // 清单 apply 后 registry 才存在；四部署 pin registry :local，播种是硬依赖。
     seed_cluster_registry().await?;
+    kick_image_pull_pending().await?;
     wait_ready().await?;
 
     let webui =

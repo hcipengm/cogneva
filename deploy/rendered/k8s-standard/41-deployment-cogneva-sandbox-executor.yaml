@@ -41,7 +41,7 @@ spec:
         fsGroup: 1001
       containers:
         - name: sandbox-executor
-          image: localhost/cogneva:local
+          image: localhost:30500/cogneva:local
           imagePullPolicy: IfNotPresent
           command: ["/opt/cogneva/cogneva"]
           args: ["sandbox-executor"]

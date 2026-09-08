@@ -3,8 +3,9 @@
 # Change chart templates / values / profile, then re-run render-deploy.sh.
 # Source: cogneva/templates/sandbox.yaml
 # 容器构建沙盒：每个节点提供 buildah 镜像构建能力（K3s/最小化 K8s 不带镜像构建）。
-# 构建产物经 buildah push docker-archive + ctr images import 进入节点 containerd，
-# 供 localhost/cogneva:* 镜像本地使用（imagePullPolicy: IfNotPresent）。
+# 构建产物经 buildah push docker-archive + ctr images import 进入节点 containerd
+# 作本地暖缓存/离线回退；工作负载运行时镜像的权威来源是集群内 registry
+# （清单 pin localhost:30500/cogneva:local），不依赖节点本地引用名。
 # 挂载节点容器存储与 containerd socket，仅应在受控节点运行；未来迁移 MicroVM
 # 构建后可移除 privileged。
 apiVersion: apps/v1

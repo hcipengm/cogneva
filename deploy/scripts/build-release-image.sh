@@ -94,11 +94,11 @@ WORKDIR="$(mktemp -d /var/tmp/cogneva-release-XXXXXX)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 echo "==> 导出镜像（docker-archive）"
-# 归档内只带 :local 单标签（buildah docker-archive 不支持一次写多个引用）：
-# 消费面——预渲染清单与 profile values——都 pin :local；导入后由 bootstrap
-# （单节点快路径）或镜像分发器 DaemonSet（多节点）retag 出不可变版本 tag
-# localhost/cogneva:$VERSION 供追溯与按版本引用。版本溯源同时有镜像内
-# OCI LABEL（version/revision）与二进制 --version 兜底。
+# 归档内只带 localhost/cogneva:local 单标签（buildah docker-archive 不支持一次
+# 写多个引用）：导入节点后由 bootstrap 播种进集群内 registry 成为
+# localhost:30500/cogneva:local（预渲染清单与 profile values 的实际 pin）；
+# bootstrap/分发器另 retag 不可变版本 tag localhost/cogneva:$VERSION 仅供追溯。
+# 版本溯源同时有镜像内 OCI LABEL（version/revision）与二进制 --version 兜底。
 buildah push "$IMAGE" "docker-archive:$WORKDIR/image.tar:$IMAGE"
 
 echo "==> 压缩并计算 sha256"

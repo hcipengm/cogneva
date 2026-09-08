@@ -7,14 +7,16 @@
 #   版本号缺省取 Cargo.toml workspace version（镜像版本与代码版本单一同源）。
 #
 # 版本与标签不变式：
-#   - deploy yaml pin 的是浮动标签 localhost/cogneva:local；每次换版必须把
-#     :local 同步重打到新版本（宿主 buildah + 集群 containerd 两侧），否则
-#     任何人 kubectl apply 一下 yaml（或 GitOps 拉取端 apply）就会把线上
-#     静默打回 :local 指向的旧镜像（2026-08-06 透传 404 事故根因）。
+#   - deploy yaml pin 的是集群内 registry 浮动签 localhost:30500/cogneva:local；
+#     每次换版必须在 apply/滚动之前把新镜像（不可变版本 tag + :local）推进
+#     registry，否则任何人 kubectl apply 一下 yaml（或 GitOps 拉取端 apply）
+#     就会让线上拉回 registry 里 :local 指向的旧镜像（2026-08-06 透传 404
+#     事故根因；ctr tag 出的节点本地引用名 kubelet 不一定采信，故权威只放
+#     registry）。播种失败直接中止——此刻线上未动，安全失败。
 #   - 叠层基镜像永远取"线上 Ready Pod 实际运行镜像"对应的不可变版本 tag，
 #     绝不基于 :local 叠层——:local 一旦与运行版本脱节，叠层会把错误镜像
 #     当基底自我放大（2026-09-04 :local 指向一个多月前老镜像的事故根因）。
-#     脚本启动即校验 :local 与运行镜像一致，脱节则拒绝执行并给止血命令。
+#     脚本启动即校验节点 :local 与运行镜像一致，脱节则拒绝执行并给止血命令。
 #   - 镜像带 OCI LABEL（version/revision），二进制内嵌 git sha（--version），
 #     线上版本可直接追溯到 commit，不靠标签记忆。
 set -euo pipefail
@@ -109,6 +111,7 @@ except Exception:
     echo "此刻叠层会把旧镜像当基底；任何 apply/rollout 也会把线上打回旧版。" >&2
     echo "止血后重跑本脚本：" >&2
     echo "  k3s ctr -n k8s.io images tag --force ${IMAGE}:<运行版本tag> ${IMAGE}:local" >&2
+    echo "  k3s ctr -n k8s.io images push --plain-http localhost:30500/cogneva:local ${IMAGE}:local" >&2
     return 1
   fi
   echo "==> :local 与运行镜像一致（${local_id:0:12}）"
@@ -244,13 +247,23 @@ rm -f "$TAR"
 buildah push "${IMAGE}:${NEW_TAG}" "docker-archive:${TAR}:${IMAGE}:${NEW_TAG}"
 k3s ctr -n k8s.io images import "$TAR"
 rm -f "$TAR"
-# 集群内 :local 也要指向新版本（evolution initContainer 与 yaml pin 都用 :local）
+# 节点本地 :local 同步到新版本（暖缓存/离线回退；运行时权威是集群内 registry）
 k3s ctr -n k8s.io images tag --force "${IMAGE}:${NEW_TAG}" "${IMAGE}:local"
 
 if [ "$DO_DEPLOY" = 1 ]; then
+  # Registry 播种必须先于 apply：静态清单 pin 的是 localhost:30500/cogneva:local，
+  # 不先前移浮动签，apply 会让线上拉回 registry 里的旧镜像。版本 tag 一并推送
+  # （按版本引用/追溯）。任一失败立即中止——此时尚未 apply/滚动，线上不受影响。
+  echo "==> 播种集群内 registry（${NEW_TAG} + :local）"
+  kubectl -n "$NS" wait --for=condition=Available deployment/cogneva-registry --timeout=180s
+  buildah push --tls-verify=false "${IMAGE}:${NEW_TAG}" "localhost:30500/cogneva:${NEW_TAG}"
+  buildah push --tls-verify=false "${IMAGE}:local" "localhost:30500/cogneva:local"
+  echo "    registry 已更新（localhost:30500）"
+
   # 结构性变更随版本滚动（幂等 apply）：GitOps 拉取端 RBAC、进化配置、
   # 主部署（GitOps env/git-remote 挂载/prompts 挂载等）。apply 用的是
-  # 仓库 yaml 的 :local pin，此时 :local 已重打到新版本，不会打回旧版。
+  # 仓库 yaml 的 registry :local pin，该浮动签已在上方前移到新版本，
+  # 不会打回旧版。
   echo "==> 应用 GitOps RBAC / 进化 configmap / 主部署结构"
   kubectl apply -f deploy/k3s/gitops-puller-rbac.yaml
   kubectl apply -f deploy/k3s/evolution-configmap.yaml
@@ -329,17 +342,6 @@ if stale:
     exit 1
   fi
   echo "==> 四部署均运行 ${IMAGE}:${NEW_TAG}（${want_id:0:12}，rev ${GIT_REVISION}）"
-
-  # 播种集群内 registry：金丝雀 overlay 的 FROM 源必须随版本前进。
-  # 失败不致命（基座运行不依赖它），下次换版/bootstrap 会补播。
-  echo "==> 播种集群内 registry 基镜像"
-  if kubectl -n "$NS" wait --for=condition=Available deployment/cogneva-registry \
-       --timeout=180s >/dev/null 2>&1 \
-     && buildah push --tls-verify=false "${IMAGE}:local" "localhost:30500/cogneva:local" >/dev/null 2>&1; then
-    echo "    registry 已更新 :local（localhost:30500）"
-  else
-    echo "    警告: registry 播种失败（金丝雀推送前需手动补播 ctr images push）" >&2
-  fi
 fi
 
-echo "==> 完成：${IMAGE}:${NEW_TAG}（:local 已同步，rev ${GIT_REVISION}）"
+echo "==> 完成：${IMAGE}:${NEW_TAG}（节点与 registry 的 :local 均已同步，rev ${GIT_REVISION}）"
