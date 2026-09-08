@@ -14,11 +14,28 @@ metadata:
     app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: evolution
 rules:
-  # image-based 滚动更新：evolution worker patch 主 Deployment 镜像
+  # 主线跟踪部署器 / image 滚动：四个 cogneva deployment 的具名读与补丁
+  # （kubectl set image = PATCH 具名 deployment）。
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    resourceNames: ["cogneva"]
-    verbs: ["get", "patch"]
+    resourceNames:
+      - "cogneva"
+      - "cogneva-security-gateway"
+      - "cogneva-sandbox-executor"
+      - "cogneva-evolution"
+    verbs: ["get", "patch", "update"]
+  # list/watch 是集合级操作，RBAC 不能用 resourceNames 收窄，单独一条。
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["list", "watch"]
+  # Pod 健康检查（name+component 双标签选择器，集合 list）。
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # 主线滚动 Job：构建侧 apply(create) 派发、状态查询；Job 内滚动复用同一 SA。
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "patch", "update"]
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["cogneva-config"]

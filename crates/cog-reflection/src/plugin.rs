@@ -590,15 +590,45 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         if !self.porter_armed {
             return Ok(());
         }
+        let Ok(project_root) = std::env::current_dir() else {
+            warn!("no current dir; sandbox git loops disabled");
+            return Ok(());
+        };
+
+        // 主线跟踪自动部署器：检测集群内 bare 仓库公版 main 前进 → 沙盒
+        // 构建 → buildah 叠层推 registry → 派独立 Job 门禁滚动四部署。
+        // 默认关闭，配置 enabled 才起循环（依赖 RBAC/registry 就位）。
+        let ml_config = crate::MainlineDeployerConfig::load()?;
+        if ml_config.enabled {
+            let deployer = std::sync::Arc::new(crate::MainlineDeployer::new(
+                ml_config.clone(),
+                project_root.clone(),
+            ));
+            let shutdown = cog_core::ShutdownSignal::new();
+            if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                let shutdown = shutdown.clone();
+                let mut rx = broadcast_tx.0.subscribe();
+                tokio::spawn(async move {
+                    let _ = rx.recv().await;
+                    shutdown.trigger();
+                });
+            }
+            info!(
+                bare = %ml_config.bare_repo,
+                registry = %ml_config.registry,
+                interval_secs = ml_config.poll_interval_secs,
+                "mainline deployer enabled"
+            );
+            tokio::spawn(crate::run_mainline_loop(deployer, shutdown));
+        } else {
+            info!("mainline deployer disabled by config");
+        }
+
         let bp_config = crate::BaselinePortConfig::load()?;
         if !bp_config.enabled {
             info!("baseline port trigger disabled by config");
             return Ok(());
         }
-        let Ok(project_root) = std::env::current_dir() else {
-            warn!("no current dir; baseline port trigger disabled");
-            return Ok(());
-        };
 
         // 无 orchestrator 也照常挂载：纯 cherry-pick 路径不依赖智能任务，
         // 只是冲突解决与语义吸收确认退化（porter 内部已按此降级）。

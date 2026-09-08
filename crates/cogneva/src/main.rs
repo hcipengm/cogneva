@@ -32,5 +32,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(1).as_deref() == Some("validate-config") {
         return cogneva::validate_config::run().await;
     }
+    // 主线跟踪自动部署的滚动端：独立 Job Pod 内执行，四部署门禁滚动，
+    // 任一失败反向回滚 prev tag（进程本身跑在新镜像里，顺带 smoke test）。
+    if std::env::args().nth(1).as_deref() == Some("mainline-rollout") {
+        return cog_reflection::run_rollout_cli().await;
+    }
     cogneva::run_app().await
 }

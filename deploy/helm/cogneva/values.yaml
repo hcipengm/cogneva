@@ -184,3 +184,17 @@ ingress:
 
 networkPolicy:
   enabled: true
+  # kube-apiserver 的 Service CIDR：in-cluster kubectl 经 kubernetes Service
+  # ClusterIP:443 访问 apiserver。K3s 默认 10.43.0.0/16；标准 kubeadm 常用
+  # 10.96.0.0/12（k8s-standard profile 覆盖）。
+  apiServerCidr: 10.43.0.0/16
+
+# 主线跟踪自动部署器：进化 Pod 周期检测 bare 仓库公版 main 前进 → 沙盒构建 →
+# buildah 推集群内 registry → 派独立 Job 门禁滚动四部署，失败自动回滚。
+# 依赖 RBAC / NetworkPolicy(apiserver) / kubectl 二进制 / 集群内 registry 就位。
+mainlineDeployer:
+  enabled: true
+  pollIntervalSecs: 600
+  soakSecs: 120
+  failureCooldownSecs: 3600
+  cargoBuildJobs: 2

@@ -16,12 +16,30 @@ metadata:
     app.kubernetes.io/name: cogneva-evolution
     app.kubernetes.io/component: evolution
 rules:
-  # Allow the evolution worker to patch the main cogneva Deployment image
-  # when an image-based rollout is implemented.
+  # Mainline deployer / image rollout: named read+patch on the four cogneva
+  # Deployments (kubectl set image = PATCH on a named Deployment).
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    resourceNames: ["cogneva"]
-    verbs: ["get", "patch"]
+    resourceNames:
+      - "cogneva"
+      - "cogneva-security-gateway"
+      - "cogneva-sandbox-executor"
+      - "cogneva-evolution"
+    verbs: ["get", "patch", "update"]
+  # list/watch are collection-level verbs that RBAC cannot scope by
+  # resourceNames; keep them in a separate rule.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["list", "watch"]
+  # Pod health checks (name+component dual-label selector, collection list).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Mainline rollout Jobs: build side applies (create) and queries status;
+  # the in-Job rollout reuses the same ServiceAccount.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "patch", "update"]
   # Allow reading the cogneva ConfigMap if needed for configuration.
   - apiGroups: [""]
     resources: ["configmaps"]

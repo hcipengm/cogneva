@@ -41,6 +41,7 @@ pub mod flywheel;
 pub mod gitops_publisher;
 pub mod gitops_puller;
 pub mod image_rollout;
+pub mod mainline_deployer;
 pub mod matcher;
 pub mod meta_learning;
 pub mod policy_store;
@@ -62,7 +63,7 @@ pub use baseline_port::{
 };
 pub use change_pipeline::{ApplyResult, ChangePipeline};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
-pub use config::{BaselinePortConfig, GitOpsConfig, PromotionGateConfig};
+pub use config::{BaselinePortConfig, GitOpsConfig, MainlineDeployerConfig, PromotionGateConfig};
 pub use detector::{DefaultLearningDetector, LearningDetector};
 pub use discovery::DiscoveryEngine;
 pub use effectiveness::SkillEffectivenessTracker;
@@ -80,6 +81,10 @@ pub use flywheel::{JsonlFileSink, LearningSink, WarehouseRecorder};
 pub use gitops_publisher::GitOpsPublisher;
 pub use gitops_puller::{parse_tag_message, run_puller_loop, GitOpsPuller, PromotionCandidate};
 pub use image_rollout::ImageRollout;
+pub use mainline_deployer::{
+    run_mainline_loop, run_rollout_cli, MainlineDeployer, RolloutExecutor, RolloutPlan,
+    RolloutTarget,
+};
 pub use matcher::{DefaultLearningMatcher, LearningMatcher};
 pub use meta_learning::MetaLearningEngine;
 pub use policy_store::{

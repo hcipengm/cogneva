@@ -63,4 +63,21 @@ data:
   COGNEVA_MEMORY_ENABLED: "false"
   COGNEVA_VECTOR_BACKEND_REQUIRED: "false"
   COGNEVA_STRICT_PERSISTENCE: "false"
+  {{- if .Values.mainlineDeployer.enabled }}
+  # 主线跟踪自动部署器：检测 bare 仓库公版 main 前进后，沙盒构建 → buildah 推
+  # 集群内 registry（Pod 内走 Service DNS:5000）→ 派独立 Job 经节点 NodePort
+  # localhost:30500 滚动四部署。回滚目标由 Job 启动时快照，不在此配置。
+  COGNEVA_MAINLINE_DEPLOYER_ENABLED: "true"
+  COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS: {{ .Values.mainlineDeployer.pollIntervalSecs | quote }}
+  COGNEVA_MAINLINE_DEPLOYER_REGISTRY: "cogneva-registry.{{ include "cogneva.namespace" . }}.svc.cluster.local:5000"
+  COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY: "localhost:30500"
+  COGNEVA_MAINLINE_DEPLOYER_NAMESPACE: {{ include "cogneva.namespace" . | quote }}
+  COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: {{ .Values.mainlineDeployer.soakSecs | quote }}
+  COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: {{ .Values.mainlineDeployer.failureCooldownSecs | quote }}
+  COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: {{ .Values.mainlineDeployer.cargoBuildJobs | quote }}
+  {{- if .Values.gitops.kubectlBin.enabled }}
+  # 滚动 Job Pod 挂载宿主 k3s 二进制作为 kubectl（镜像不内置 kubectl）。
+  COGNEVA_MAINLINE_DEPLOYER_KUBECTL_HOST_PATH: {{ .Values.gitops.kubectlBin.hostPath | quote }}
+  {{- end }}
+  {{- end }}
 {{- end }}

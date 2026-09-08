@@ -1,0 +1,9 @@
+[Unit]
+Description=Cogneva upstream GitHub main pull (host repo -> k3s git-remote bare)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/omc_workspace/cogneva/deploy/k3s/pull-upstream-main.sh
+Nice=10

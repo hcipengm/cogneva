@@ -158,7 +158,7 @@ impl GitOpsPublisher {
         };
         let tag = format!("cogneva:promote-{}", sanitize(change_id));
         let image = format!("{endpoint}/{tag}");
-        let base = format!("{endpoint}/cogneva:local");
+        let base = self.resolve_base_image(&endpoint).await;
         let containerfile = self.binary_dir.join("Containerfile.promote");
         tokio::fs::write(
             &containerfile,
@@ -207,6 +207,89 @@ impl GitOpsPublisher {
         self.run(&self.config.builder_bin, &push_refs, 900).await?;
         info!(image = %image, "Promotion overlay image pushed to registry");
         Ok(())
+    }
+
+    /// 金丝雀 overlay 基底：优先取四个 cogneva deployment 当前在跑的
+    /// 不可变 `main-<rev>` tag。主线前进后浮动 :local 虽已同步前移，
+    /// 但构建机可能缓存着旧 :local 层，用不可变 tag 保证基底就是线上版本，
+    /// 避免金丝雀基于旧基线自我放大。查询失败/未迁移/混合态退回 :local。
+    async fn resolve_base_image(&self, endpoint: &str) -> String {
+        let fallback = format!("{endpoint}/cogneva:local");
+        let jsonpath = "{range .items[*]}{.metadata.name}{\"\\t\"}{range .spec.template.spec.containers[*]}{.name}={.image}{\",\"}{end}{\"\\n\"}{end}";
+        let out = match self
+            .run(
+                &self.config.kubectl_bin,
+                &[
+                    "-n",
+                    &self.config.namespace,
+                    "get",
+                    "deploy",
+                    "-o",
+                    jsonpath,
+                ],
+                30,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                info!(error = %e, "canary base: kubectl query failed; falling back to :local");
+                return fallback;
+            }
+        };
+        match deployed_main_rev(&out) {
+            Some(rev) => {
+                let base = format!("{endpoint}/cogneva:main-{rev}");
+                info!(base = %base, "canary overlay base resolved from deployed main tag");
+                base
+            }
+            None => fallback,
+        }
+    }
+}
+
+/// 解析 `kubectl get deploy` 的 tab 分隔输出：仅当四个 cogneva deployment
+/// 的所有容器都跑在同一个 `main-<rev>` tag 上时返回该 rev；Legacy（:local
+/// 时代）、混合态、空输出都返回 None。
+fn deployed_main_rev(jsonpath_out: &str) -> Option<String> {
+    const DEPLOYMENTS: [&str; 4] = [
+        "cogneva",
+        "cogneva-security-gateway",
+        "cogneva-sandbox-executor",
+        "cogneva-evolution",
+    ];
+    let mut revs = std::collections::BTreeSet::new();
+    let mut total = 0usize;
+    let mut on_main = 0usize;
+    for line in jsonpath_out.lines() {
+        let Some((name, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        if !DEPLOYMENTS.contains(&name) {
+            continue;
+        }
+        for pair in rest.split(',') {
+            let Some((_, image)) = pair.split_once('=') else {
+                continue;
+            };
+            if image.is_empty() {
+                continue;
+            }
+            total += 1;
+            if let Some(rev) = image
+                .rsplit(':')
+                .next()
+                .and_then(|tag| tag.strip_prefix("main-"))
+            {
+                revs.insert(rev.to_string());
+                on_main += 1;
+            }
+        }
+    }
+    if total > 0 && on_main == total && revs.len() == 1 {
+        revs.into_iter().next()
+    } else {
+        None
     }
 }
 
@@ -272,7 +355,8 @@ mod tests {
         path
     }
 
-    /// L1 发布者：staged 二进制 + 假构建器齐备。
+    /// L1 发布者：staged 二进制 + 假构建器齐备。kubectl 指向不存在的路径，
+    /// 金丝雀基底解析必然回退 :local（测试不碰真实集群）。
     fn l1_publisher(central: &std::path::Path, work: &std::path::Path) -> GitOpsPublisher {
         std::fs::write(work.join("cogneva"), b"staged-binary").unwrap();
         let builder = make_fake_builder(work);
@@ -280,6 +364,7 @@ mod tests {
             GitOpsConfig {
                 repo_url: central.to_string_lossy().into_owned(),
                 builder_bin: builder.to_string_lossy().into_owned(),
+                kubectl_bin: work.join("no-such-kubectl").to_string_lossy().into_owned(),
                 ..Default::default()
             },
             work,
@@ -387,6 +472,95 @@ mod tests {
         let publisher = GitOpsPublisher::new(GitOpsConfig::default(), work.path(), work.path());
         let err = publisher.publish(&change("p-1"), "l1_rollout").await;
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn deployed_main_rev_requires_unanimous_main_tag() {
+        let line =
+            |deploy: &str, container: &str, image: &str| format!("{deploy}\t{container}={image},");
+        let uniform = [
+            line("cogneva", "cogneva", "r:5000/cogneva:main-abcdef012345"),
+            line(
+                "cogneva-security-gateway",
+                "security-gateway",
+                "r:5000/cogneva:main-abcdef012345",
+            ),
+            line(
+                "cogneva-sandbox-executor",
+                "sandbox-executor",
+                "r:5000/cogneva:main-abcdef012345",
+            ),
+            line(
+                "cogneva-evolution",
+                "cogneva",
+                "r:5000/cogneva:main-abcdef012345",
+            ),
+        ]
+        .join("\n");
+        assert_eq!(deployed_main_rev(&uniform).as_deref(), Some("abcdef012345"));
+
+        // 迁移前（全 :local）→ None，回退 :local 基底。
+        let legacy = line("cogneva", "cogneva", "localhost/cogneva:local");
+        assert_eq!(deployed_main_rev(&legacy), None);
+
+        // 混合态（部分主线部分旧 tag）→ None。
+        let mixed = line("cogneva", "cogneva", "localhost/cogneva:local")
+            + "\n"
+            + &line(
+                "cogneva-security-gateway",
+                "security-gateway",
+                "r:5000/cogneva:main-abcdef012345",
+            );
+        assert_eq!(deployed_main_rev(&mixed), None);
+
+        // rev 不一致（滚动未收敛）→ None。
+        let diverged = line("cogneva", "cogneva", "r:5000/cogneva:main-aaaaaaaaaaaa")
+            + "\n"
+            + &line(
+                "cogneva-security-gateway",
+                "security-gateway",
+                "r:5000/cogneva:main-bbbbbbbbbbbb",
+            );
+        assert_eq!(deployed_main_rev(&diverged), None);
+
+        // 空输出 → None。
+        assert_eq!(deployed_main_rev(""), None);
+    }
+
+    #[tokio::test]
+    async fn canary_overlay_uses_deployed_main_tag_as_base() {
+        let (central, work) = setup_repo().await;
+        // fake kubectl：四部署统一在 main-abcdef012345 上（tab 分隔输出）。
+        let kubectl = work.path().join("fake-kubectl");
+        let script = "#!/bin/sh\ncat <<'EOF'\ncogneva\tcogneva=reg.test:5000/cogneva:main-abcdef012345,\ncogneva-security-gateway\tsecurity-gateway=reg.test:5000/cogneva:main-abcdef012345,\ncogneva-sandbox-executor\tsandbox-executor=reg.test:5000/cogneva:main-abcdef012345,\ncogneva-evolution\tcogneva=reg.test:5000/cogneva:main-abcdef012345,\nEOF\n";
+        std::fs::write(&kubectl, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::fs::write(work.path().join("cogneva"), b"staged-binary").unwrap();
+        let builder = make_fake_builder(work.path());
+        let publisher = GitOpsPublisher::new(
+            GitOpsConfig {
+                repo_url: central.path().to_string_lossy().into_owned(),
+                builder_bin: builder.to_string_lossy().into_owned(),
+                kubectl_bin: kubectl.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            work.path(),
+            work.path(),
+        );
+        publisher
+            .publish(&change("p-9"), "l1_rollout")
+            .await
+            .unwrap();
+
+        let cf = std::fs::read_to_string(work.path().join("Containerfile.promote")).unwrap();
+        assert!(
+            cf.contains(
+                "FROM cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:main-abcdef012345"
+            ),
+            "canary base must follow deployed main tag: {cf}"
+        );
     }
 
     #[tokio::test]

@@ -182,6 +182,11 @@ spec:
               # ConfigMap 挂成同名目录，进程读文件失败静默回退默认配置
               mountPath: /etc/cogneva
               readOnly: true
+            # 主线部署器构建侧在本 Pod 内调 kubectl（查四部署镜像、apply 滚动
+            # Job）。K3s 多调用二进制 argv[0]=kubectl 即 kubectl，版本与集群一致。
+            - name: kubectl-bin
+              mountPath: /usr/local/bin/kubectl
+              readOnly: true
           resources:
             limits:
               cpu: 4000m
@@ -203,3 +208,7 @@ spec:
         - name: cogneva-json
           configMap:
             name: cogneva-json
+        - name: kubectl-bin
+          hostPath:
+            path: /usr/local/bin/k3s
+            type: File

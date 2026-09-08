@@ -192,6 +192,11 @@ spec:
               # 报"No LLM backends configured"（2026-08-04 实测定位）
               mountPath: /etc/cogneva
               readOnly: true
+            # 主线部署器构建侧在本 Pod 内调 kubectl（查四部署镜像、apply 滚动
+            # Job）。k3s 多调用二进制 argv[0]=kubectl 即 kubectl，版本与集群一致。
+            - name: kubectl-bin
+              mountPath: /usr/local/bin/kubectl
+              readOnly: true
             # Mount the Docker socket only if you plan to build container images
             # from inside the evolution Pod. Remove for pure self_exec mode.
             # - name: docker-sock
@@ -230,6 +235,12 @@ spec:
           # 与主部署一致走 ConfigMap；hostPath 指开发机路径在空白机上必挂失败
           configMap:
             name: cogneva-json
+        - name: kubectl-bin
+          # 宿主 k3s 二进制挂载为 Pod 内 kubectl（argv[0]=kubectl 的多调用二进制，
+          # 版本与集群天然一致）；bootstrap 先装 k3s 再部署，文件必然存在。
+          hostPath:
+            path: /usr/local/bin/k3s
+            type: File
         # - name: docker-sock
         #   hostPath:
         #     path: /var/run/docker.sock

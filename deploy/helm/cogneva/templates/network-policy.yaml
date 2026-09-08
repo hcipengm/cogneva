@@ -44,9 +44,60 @@ spec:
         # （run_command/read_file/write_file），该 Pod 不持有任何 Secret。
         - protocol: TCP
           port: 9090
-        # 集群内镜像仓库（5000）：publisher push 金丝雀 overlay 镜像
+        # 集群内镜像仓库（5000）：publisher push 金丝雀 overlay / 主线 overlay 镜像
         - protocol: TCP
           port: 5000
+    # kube-apiserver：主线部署器构建侧在 Pod 内调 kubectl（查四部署镜像、
+    # apply 滚动 Job）。in-cluster 经 kubernetes Service ClusterIP:443
+    # （K3s Service CIDR 默认 10.43.0.0/16，标准 kubeadm 常用 10.96.0.0/12，
+    # 由 networkPolicy.apiServerCidr values 覆盖）。
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.apiServerCidr | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# 主线滚动 Job Pod（新镜像 smoke test + 门禁滚动四部署）：网络面最小化，
+# 只准访问 kube-apiserver（kubectl set image / 查 rollout 与 pod 健康）与
+# DNS，不需要数据面、网关、registry（构建与 push 都在进化 Pod 完成）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cogneva-mainline-rollout-egress
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mainline-rollout
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: mainline-rollout
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.apiServerCidr | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
     - to:
         - namespaceSelector:
             matchLabels:

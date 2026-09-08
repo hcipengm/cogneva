@@ -50,9 +50,21 @@ spec:
         # （run_command/read_file/write_file），该 Pod 不持有任何 Secret。
         - protocol: TCP
           port: 9090
-        # 集群内镜像仓库（5000）：publisher push 金丝雀 overlay 镜像
+        # 集群内镜像仓库（5000）：publisher push 金丝雀 overlay / 主线 overlay 镜像
         - protocol: TCP
           port: 5000
+    # kube-apiserver：主线部署器构建侧在 Pod 内调 kubectl（查四部署镜像、
+    # apply 滚动 Job）。in-cluster 经 kubernetes Service ClusterIP:443
+    # （K3s Service CIDR 默认 10.43.0.0/16，标准 kubeadm 常用 10.96.0.0/12，
+    # 由 networkPolicy.apiServerCidr values 覆盖）。
+    - to:
+        - ipBlock:
+            cidr: "10.43.0.0/16"
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
     - to:
         - namespaceSelector:
             matchLabels:
