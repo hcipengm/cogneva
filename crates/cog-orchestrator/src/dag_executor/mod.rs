@@ -143,147 +143,172 @@ impl DagExecutorRuntime {
             }
         }
 
-        let mut stream = self.backend.subscribe(&result_stream, &group_name).await?;
-
-        loop {
-            let next = tokio::select! {
-                biased;
-                _ = shutdown.wait() => break,
-                msg = stream.next() => msg,
-            };
-
-            let (msg_id, bytes) = match next {
-                Some(Ok(v)) => v,
-                Some(Err(e)) => return Err(e),
-                None => break,
-            };
-
-            let msg: DagMessage = match serde_json::from_slice(&bytes) {
-                Ok(m) => m,
+        // Resubscribe on stream failure/end: exiting the task would freeze the
+        // consumer group until the next pod restart (a single transient error
+        // historically stalled groups for days).
+        'subscribe: loop {
+            let mut stream = match self.backend.subscribe(&result_stream, &group_name).await {
+                Ok(s) => s,
                 Err(e) => {
-                    // Poison message: no future bytes can parse better, so ack
-                    // it out instead of letting the sweeper redeliver forever.
-                    tracing::warn!(msg_id = %msg_id, "Failed to deserialize DagMessage: {e}");
-                    if let Err(e) = self
-                        .backend
-                        .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                        .await
-                    {
-                        tracing::warn!(msg_id = %msg_id, "Failed to ack poison result message: {e}");
+                    tracing::warn!("result stream subscribe failed, retrying: {e}");
+                    tokio::select! {
+                        _ = shutdown.wait() => break 'subscribe,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
                     }
-                    continue;
                 }
             };
 
-            match msg {
-                DagMessage::TaskComplete {
-                    task_id, result, ..
-                } => {
-                    match self
-                        .orchestrator
-                        .complete_task(&task_id, result.clone())
-                        .await
-                    {
-                        Ok(scheduled) => {
-                            tracing::info!(
-                                task_id = %task_id,
-                                scheduled = scheduled.len(),
-                                "Task completed via message queue"
-                            );
-                        }
-                        Err(e @ cog_core::SFError::TaskFailed { .. }) => {
-                            // Duplicate/stale result for an already-terminal or
-                            // unknown task: reprocessing can never succeed, so
-                            // ack and drop instead of spinning on redelivery.
-                            tracing::warn!(
-                                task_id = %task_id, msg_id = %msg_id,
-                                "result message rejected by DAG ({e}); dropping"
-                            );
-                            if let Err(e) = self
-                                .backend
-                                .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                                .await
-                            {
-                                tracing::warn!(
-                                    task_id = %task_id, msg_id = %msg_id,
-                                    "Failed to ack stale result message: {e}"
-                                );
-                            }
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(task_id = %task_id, "complete_task failed: {e}");
-                            continue;
-                        }
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break 'subscribe,
+                    msg = stream.next() => msg,
+                };
+
+                let (msg_id, bytes) = match next {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => {
+                        tracing::warn!("result stream error, resubscribing: {e}");
+                        break;
                     }
-                    if let Err(e) = self.publish_ready_tasks().await {
-                        // Keep the message pending: redelivery hits the
-                        // terminal-task reject above but retries scheduling.
-                        tracing::warn!("publish_ready_tasks after complete failed: {e}");
+                    None => {
+                        tracing::warn!("result stream ended, resubscribing");
+                        break;
+                    }
+                };
+
+                let msg: DagMessage = match serde_json::from_slice(&bytes) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // Poison message: no future bytes can parse better, so ack
+                        // it out instead of letting the sweeper redeliver forever.
+                        tracing::warn!(msg_id = %msg_id, "Failed to deserialize DagMessage: {e}");
+                        if let Err(e) = self
+                            .backend
+                            .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                            .await
+                        {
+                            tracing::warn!(msg_id = %msg_id, "Failed to ack poison result message: {e}");
+                        }
                         continue;
                     }
-                    if let Err(e) = self
-                        .backend
-                        .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                        .await
-                    {
-                        tracing::warn!(task_id = %task_id, msg_id = %msg_id, "Failed to ack result message: {e}");
-                    }
-                }
-                DagMessage::TaskFailed { task_id, error, .. } => {
-                    match self.orchestrator.fail_task(&task_id, error.clone()).await {
-                        Ok((retried, cancelled, _dlq_pushed)) => {
-                            tracing::warn!(
-                                task_id = %task_id,
-                                retried,
-                                cancelled = cancelled.len(),
-                                "Task failed via message queue"
-                            );
-                        }
-                        Err(e @ cog_core::SFError::TaskFailed { .. }) => {
-                            tracing::warn!(
-                                task_id = %task_id, msg_id = %msg_id,
-                                "failure result rejected by DAG ({e}); dropping"
-                            );
-                            if let Err(e) = self
-                                .backend
-                                .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                                .await
-                            {
-                                tracing::warn!(
-                                    task_id = %task_id, msg_id = %msg_id,
-                                    "Failed to ack stale failure message: {e}"
+                };
+
+                match msg {
+                    DagMessage::TaskComplete {
+                        task_id, result, ..
+                    } => {
+                        match self
+                            .orchestrator
+                            .complete_task(&task_id, result.clone())
+                            .await
+                        {
+                            Ok(scheduled) => {
+                                tracing::info!(
+                                    task_id = %task_id,
+                                    scheduled = scheduled.len(),
+                                    "Task completed via message queue"
                                 );
                             }
+                            Err(e @ cog_core::SFError::TaskFailed { .. }) => {
+                                // Duplicate/stale result for an already-terminal or
+                                // unknown task: reprocessing can never succeed, so
+                                // ack and drop instead of spinning on redelivery.
+                                tracing::warn!(
+                                    task_id = %task_id, msg_id = %msg_id,
+                                    "result message rejected by DAG ({e}); dropping"
+                                );
+                                if let Err(e) = self
+                                    .backend
+                                    .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        task_id = %task_id, msg_id = %msg_id,
+                                        "Failed to ack stale result message: {e}"
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(task_id = %task_id, "complete_task failed: {e}");
+                                continue;
+                            }
+                        }
+                        if let Err(e) = self.publish_ready_tasks().await {
+                            // Keep the message pending: redelivery hits the
+                            // terminal-task reject above but retries scheduling.
+                            tracing::warn!("publish_ready_tasks after complete failed: {e}");
                             continue;
                         }
-                        Err(e) => {
-                            tracing::warn!(task_id = %task_id, "fail_task failed: {e}");
-                            continue;
+                        if let Err(e) = self
+                            .backend
+                            .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                            .await
+                        {
+                            tracing::warn!(task_id = %task_id, msg_id = %msg_id, "Failed to ack result message: {e}");
                         }
                     }
-                    if let Err(e) = self.publish_ready_tasks().await {
-                        tracing::warn!("publish_ready_tasks after fail failed: {e}");
-                        continue;
+                    DagMessage::TaskFailed { task_id, error, .. } => {
+                        match self.orchestrator.fail_task(&task_id, error.clone()).await {
+                            Ok((retried, cancelled, _dlq_pushed)) => {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    retried,
+                                    cancelled = cancelled.len(),
+                                    "Task failed via message queue"
+                                );
+                            }
+                            Err(e @ cog_core::SFError::TaskFailed { .. }) => {
+                                tracing::warn!(
+                                    task_id = %task_id, msg_id = %msg_id,
+                                    "failure result rejected by DAG ({e}); dropping"
+                                );
+                                if let Err(e) = self
+                                    .backend
+                                    .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        task_id = %task_id, msg_id = %msg_id,
+                                        "Failed to ack stale failure message: {e}"
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(task_id = %task_id, "fail_task failed: {e}");
+                                continue;
+                            }
+                        }
+                        if let Err(e) = self.publish_ready_tasks().await {
+                            tracing::warn!("publish_ready_tasks after fail failed: {e}");
+                            continue;
+                        }
+                        if let Err(e) = self
+                            .backend
+                            .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                            .await
+                        {
+                            tracing::warn!(task_id = %task_id, msg_id = %msg_id, "Failed to ack failure message: {e}");
+                        }
                     }
-                    if let Err(e) = self
-                        .backend
-                        .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                        .await
-                    {
-                        tracing::warn!(task_id = %task_id, msg_id = %msg_id, "Failed to ack failure message: {e}");
+                    _ => {
+                        tracing::debug!(msg_id = %msg_id, "Ignoring non-result DagMessage variant");
+                        if let Err(e) = self
+                            .backend
+                            .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                            .await
+                        {
+                            tracing::warn!(msg_id = %msg_id, "Failed to ack unhandled result message: {e}");
+                        }
                     }
                 }
-                _ => {
-                    tracing::debug!(msg_id = %msg_id, "Ignoring non-result DagMessage variant");
-                    if let Err(e) = self
-                        .backend
-                        .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                        .await
-                    {
-                        tracing::warn!(msg_id = %msg_id, "Failed to ack unhandled result message: {e}");
-                    }
-                }
+            }
+
+            tokio::select! {
+                _ = shutdown.wait() => break 'subscribe,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
             }
         }
 
@@ -308,89 +333,111 @@ impl DagExecutorRuntime {
                 return Err(e);
             }
         }
-        let mut stream = self.backend.subscribe(&goal_stream, &group).await?;
-
-        loop {
-            let next = tokio::select! {
-                biased;
-                _ = shutdown.wait() => break,
-                msg = stream.next() => msg,
-            };
-
-            let (msg_id, bytes) = match next {
-                Some(Ok(v)) => v,
-                Some(Err(e)) => return Err(e),
-                None => break,
-            };
-
-            let goal: cog_core::GoalMessage = match serde_json::from_slice(&bytes) {
-                Ok(g) => g,
+        'subscribe: loop {
+            let mut stream = match self.backend.subscribe(&goal_stream, &group).await {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(msg_id = %msg_id, "Failed to deserialize GoalMessage: {e}");
-                    if let Err(e) = self
-                        .backend
-                        .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
-                        .await
-                    {
-                        tracing::warn!(msg_id = %msg_id, "Failed to ack poison goal message: {e}");
+                    tracing::warn!("goal stream subscribe failed, retrying: {e}");
+                    tokio::select! {
+                        _ = shutdown.wait() => break 'subscribe,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
                     }
-                    continue;
                 }
             };
 
-            tracing::info!(
-                goal_id = %goal.message_id,
-                workspace = %goal.workspace_id,
-                task_count = goal.tasks.len(),
-                "Goal received from message queue"
-            );
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break 'subscribe,
+                    msg = stream.next() => msg,
+                };
 
-            // Unified path: always route through ActionPlanner.
-            // ActionPlanner checks markers and decides:
-            //   - verified tasks  → inject directly into DagExecutor
-            //   - empty / unverified → decompose via collaboration
-            if let (Some(ref planner), Some(ref skill_registry)) =
-                (&self.action_planner, &self.skill_registry)
-            {
-                let registry = skill_registry.read().await;
-                let tasks = goal.tasks;
-                match planner.process_goal(&goal.goal, tasks, &registry).await {
-                    Ok(ids) => {
-                        tracing::info!(
-                            goal_id = %goal.message_id,
-                            task_count = %ids.len(),
-                            "Goal processed via ActionPlanner"
-                        );
+                let (msg_id, bytes) = match next {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => {
+                        tracing::warn!("goal stream error, resubscribing: {e}");
+                        break;
                     }
-                    // Planner failure can be transient (LLM/collaboration):
-                    // leave pending so redelivery retries; dedup by message_id
-                    // prevents double submission.
+                    None => {
+                        tracing::warn!("goal stream ended, resubscribing");
+                        break;
+                    }
+                };
+
+                let goal: cog_core::GoalMessage = match serde_json::from_slice(&bytes) {
+                    Ok(g) => g,
                     Err(e) => {
-                        tracing::warn!(
-                            goal_id = %goal.message_id,
-                            "ActionPlanner processing failed: {e}"
-                        );
+                        tracing::warn!(msg_id = %msg_id, "Failed to deserialize GoalMessage: {e}");
+                        if let Err(e) = self
+                            .backend
+                            .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
+                            .await
+                        {
+                            tracing::warn!(msg_id = %msg_id, "Failed to ack poison goal message: {e}");
+                        }
+                        continue;
+                    }
+                };
+
+                tracing::info!(
+                    goal_id = %goal.message_id,
+                    workspace = %goal.workspace_id,
+                    task_count = goal.tasks.len(),
+                    "Goal received from message queue"
+                );
+
+                // Unified path: always route through ActionPlanner.
+                // ActionPlanner checks markers and decides:
+                //   - verified tasks  → inject directly into DagExecutor
+                //   - empty / unverified → decompose via collaboration
+                if let (Some(ref planner), Some(ref skill_registry)) =
+                    (&self.action_planner, &self.skill_registry)
+                {
+                    let registry = skill_registry.read().await;
+                    let tasks = goal.tasks;
+                    match planner.process_goal(&goal.goal, tasks, &registry).await {
+                        Ok(ids) => {
+                            tracing::info!(
+                                goal_id = %goal.message_id,
+                                task_count = %ids.len(),
+                                "Goal processed via ActionPlanner"
+                            );
+                        }
+                        // Planner failure can be transient (LLM/collaboration):
+                        // leave pending so redelivery retries; dedup by message_id
+                        // prevents double submission.
+                        Err(e) => {
+                            tracing::warn!(
+                                goal_id = %goal.message_id,
+                                "ActionPlanner processing failed: {e}"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    // Fallback: direct DagExecutor submission when ActionPlanner unavailable.
+                    if let Err(e) = self.submit_goal(&goal.goal, goal.tasks).await {
+                        tracing::warn!(goal_id = %goal.message_id, "submit_goal failed: {e}");
                         continue;
                     }
                 }
-            } else {
-                // Fallback: direct DagExecutor submission when ActionPlanner unavailable.
-                if let Err(e) = self.submit_goal(&goal.goal, goal.tasks).await {
-                    tracing::warn!(goal_id = %goal.message_id, "submit_goal failed: {e}");
+
+                if let Err(e) = self.publish_ready_tasks().await {
+                    tracing::warn!(goal_id = %goal.message_id, "publish_ready_tasks after goal failed: {e}");
                     continue;
+                }
+                if let Err(e) = self
+                    .backend
+                    .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
+                    .await
+                {
+                    tracing::warn!(goal_id = %goal.message_id, msg_id = %msg_id, "Failed to ack goal message: {e}");
                 }
             }
 
-            if let Err(e) = self.publish_ready_tasks().await {
-                tracing::warn!(goal_id = %goal.message_id, "publish_ready_tasks after goal failed: {e}");
-                continue;
-            }
-            if let Err(e) = self
-                .backend
-                .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
-                .await
-            {
-                tracing::warn!(goal_id = %goal.message_id, msg_id = %msg_id, "Failed to ack goal message: {e}");
+            tokio::select! {
+                _ = shutdown.wait() => break 'subscribe,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
             }
         }
 

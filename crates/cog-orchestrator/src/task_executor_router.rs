@@ -136,7 +136,6 @@ impl TaskExecutorRouter {
             });
         }
 
-        let mut stream = task_backend.subscribe(&ready_stream, &group).await?;
         let pipe = ReadyPipeline {
             task_backend: &task_backend,
             result_backend: &result_backend,
@@ -145,17 +144,44 @@ impl TaskExecutorRouter {
             workspace_id,
         };
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.wait() => break,
-                msg = stream.next() => match msg {
-                    Some(Ok((msg_id, bytes))) => {
-                        self.process_ready_message(&pipe, msg_id, &bytes).await;
+        // Resubscribe on stream failure/end instead of exiting the spawned
+        // task: a single transient read error historically ended the loop and
+        // froze the ready group for days until the next pod restart.
+        'subscribe: loop {
+            let mut stream = match task_backend.subscribe(&ready_stream, &group).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("ready stream subscribe failed, retrying: {e}");
+                    tokio::select! {
+                        _ = shutdown.wait() => break 'subscribe,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
                     }
-                    Some(Err(e)) => tracing::warn!("task stream error: {e}"),
-                    None => break,
                 }
+            };
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break 'subscribe,
+                    msg = stream.next() => match msg {
+                        Some(Ok((msg_id, bytes))) => {
+                            self.process_ready_message(&pipe, msg_id, &bytes).await;
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("task stream error, resubscribing: {e}");
+                            break;
+                        }
+                        None => {
+                            tracing::warn!("ready stream ended, resubscribing");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = shutdown.wait() => break 'subscribe,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
             }
         }
 

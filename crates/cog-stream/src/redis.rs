@@ -1,7 +1,6 @@
 //! Redis Streams-backed [`MessageBackend`] implementation.
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, RedisError};
 
@@ -9,6 +8,7 @@ use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
 
 /// Redis Streams-backed [`MessageBackend`].
 pub struct RedisMessageBackend {
+    client: redis::Client,
     connection: MultiplexedConnection,
 }
 
@@ -19,7 +19,19 @@ impl RedisMessageBackend {
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| SFError::Redis(e.to_string()))?;
-        Ok(Self { connection })
+        Ok(Self { client, connection })
+    }
+
+    /// Open a dedicated connection for one long-lived subscription.
+    /// Blocking XREADGROUP commands serialize on a multiplexed connection:
+    /// sharing one connection across N consumers makes every consumer poll at
+    /// most once per N x block-time (observed: dozens of system + agent
+    /// consumers slowed backlog drain to ~1 message/minute).
+    async fn subscribe_connection(&self) -> SFResult<MultiplexedConnection> {
+        self.client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| SFError::Redis(e.to_string()))
     }
 }
 
@@ -56,7 +68,7 @@ impl MessageBackend for RedisMessageBackend {
     }
 
     async fn subscribe(&self, subject: &str, group: &str) -> SFResult<MessageStream> {
-        let mut conn = self.connection.clone();
+        let conn = self.subscribe_connection().await?;
         let subject = subject.to_string();
         let group = group.to_string();
 
@@ -70,46 +82,30 @@ impl MessageBackend for RedisMessageBackend {
             );
         }
 
-        let opts = redis::streams::StreamReadOptions::default()
-            .group(&group, "consumer-1")
-            .count(1)
-            .block(1000);
-
-        let result: redis::RedisResult<redis::streams::StreamReadReply> =
-            conn.xread_options(&[&subject], &[">"], &opts).await;
-
-        let initial = match result {
-            Ok(reply) => extract_messages(reply),
-            Err(e) => return Err(SFError::Redis(e.to_string())),
-        };
-
-        let stream = futures::stream::iter(initial.into_iter().map(Ok)).chain(
-            futures::stream::try_unfold(conn, move |mut conn| {
-                let subject = subject.clone();
-                let group = group.clone();
-                async move {
-                    loop {
-                        let opts = redis::streams::StreamReadOptions::default()
-                            .group(&group, "consumer-1")
-                            .count(1)
-                            .block(5000);
-
-                        let result: redis::RedisResult<redis::streams::StreamReadReply> =
-                            conn.xread_options(&[&subject], &[">"], &opts).await;
-
-                        match result {
-                            Ok(reply) => {
-                                let msgs = extract_messages(reply);
-                                if let Some((id, bytes)) = msgs.into_iter().next() {
-                                    return Ok(Some(((id, bytes), conn)));
-                                }
-                            }
-                            Err(e) => return Err(SFError::Redis(e.to_string())),
+        // The read loop retries inside the stream instead of yielding Err:
+        // try_unfold terminates permanently on Err, and consumer loops treat
+        // the following None as a clean exit — one transient Redis error then
+        // stalls the consumer group silently until the pod restarts (observed:
+        // groups frozen for days while lag piled up).
+        let stream = futures::stream::try_unfold((conn, 0u64), move |(mut conn, mut backoff)| {
+            let subject = subject.clone();
+            let group = group.clone();
+            async move {
+                loop {
+                    match group_read(&mut conn, &subject, &group, ">", 5000).await {
+                        Ok(Some(item)) => return Ok(Some((item, (conn, 0)))),
+                        Ok(None) => backoff = 0,
+                        Err(e) => {
+                            tracing::warn!(
+                                stream = %subject,
+                                "XREADGROUP failed, retrying with backoff: {e}"
+                            );
+                            backoff = sleep_backoff(backoff).await;
                         }
                     }
                 }
-            }),
-        );
+            }
+        });
 
         Ok(Box::pin(stream))
     }
@@ -120,50 +116,41 @@ impl MessageBackend for RedisMessageBackend {
         group: &str,
         start_id: &str,
     ) -> SFResult<MessageStream> {
-        let mut conn = self.connection.clone();
+        let conn = self.subscribe_connection().await?;
         let subject = subject.to_string();
         let group = group.to_string();
         let start_id = start_id.to_string();
 
-        let opts = redis::streams::StreamReadOptions::default()
-            .group(&group, "consumer-1")
-            .count(1)
-            .block(1000);
-
-        let result: redis::RedisResult<redis::streams::StreamReadReply> =
-            conn.xread_options(&[&subject], &[&start_id], &opts).await;
-
-        let initial = match result {
-            Ok(reply) => extract_messages(reply),
-            Err(e) => return Err(SFError::Redis(e.to_string())),
-        };
-
-        let stream = futures::stream::iter(initial.into_iter().map(Ok)).chain(
-            futures::stream::try_unfold(conn, move |mut conn| {
+        // State carries the one-shot start id; the blocking tail reads ">".
+        // Errors retry in place for the same reason as `subscribe` above.
+        let stream = futures::stream::try_unfold(
+            (conn, Some(start_id), 0u64),
+            move |(mut conn, mut first_id, mut backoff)| {
                 let subject = subject.clone();
                 let group = group.clone();
                 async move {
                     loop {
-                        let opts = redis::streams::StreamReadOptions::default()
-                            .group(&group, "consumer-1")
-                            .count(1)
-                            .block(5000);
-
-                        let result: redis::RedisResult<redis::streams::StreamReadReply> =
-                            conn.xread_options(&[&subject], &[">"], &opts).await;
-
-                        match result {
-                            Ok(reply) => {
-                                let msgs = extract_messages(reply);
-                                if let Some((id, bytes)) = msgs.into_iter().next() {
-                                    return Ok(Some(((id, bytes), conn)));
-                                }
+                        let id = first_id.as_deref().unwrap_or(">");
+                        let block_ms = if first_id.is_some() { 1000 } else { 5000 };
+                        match group_read(&mut conn, &subject, &group, id, block_ms).await {
+                            Ok(Some(item)) => {
+                                return Ok(Some((item, (conn, None, 0))));
                             }
-                            Err(e) => return Err(SFError::Redis(e.to_string())),
+                            Ok(None) => {
+                                first_id = None;
+                                backoff = 0;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    stream = %subject,
+                                    "XREADGROUP failed, retrying with backoff: {e}"
+                                );
+                                backoff = sleep_backoff(backoff).await;
+                            }
                         }
                     }
                 }
-            }),
+            },
         );
 
         Ok(Box::pin(stream))
@@ -251,6 +238,28 @@ impl MessageBackend for RedisMessageBackend {
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         Ok(())
     }
+}
+
+async fn group_read(
+    conn: &mut MultiplexedConnection,
+    subject: &str,
+    group: &str,
+    id: &str,
+    block_ms: usize,
+) -> redis::RedisResult<Option<(String, Vec<u8>)>> {
+    let opts = redis::streams::StreamReadOptions::default()
+        .group(group, "consumer-1")
+        .count(1)
+        .block(block_ms);
+    let reply = conn.xread_options(&[subject], &[id], &opts).await?;
+    Ok(extract_messages(reply).into_iter().next())
+}
+
+/// Sleep an exponential backoff (1s→30s cap) and return the next delay.
+async fn sleep_backoff(backoff_secs: u64) -> u64 {
+    let delay = if backoff_secs == 0 { 1 } else { backoff_secs };
+    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+    delay.saturating_mul(2).min(30)
 }
 
 fn extract_messages(reply: redis::streams::StreamReadReply) -> Vec<(String, Vec<u8>)> {
@@ -375,5 +384,71 @@ mod tests {
             .query_async(&mut raw)
             .await
             .expect("del");
+    }
+
+    #[tokio::test]
+    async fn test_blocked_subscription_does_not_head_of_line_block_others() {
+        // Regression: subscriptions shared one multiplexed connection, and a
+        // blocked XREADGROUP on an empty stream stalled every other consumer
+        // on the same connection until its block expired.
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let idle_stream = format!("cog-test:hol-idle-{suffix}");
+        let busy_stream = format!("cog-test:hol-busy-{suffix}");
+        let idle_group = format!("hol-idle-{suffix}");
+        let busy_group = format!("hol-busy-{suffix}");
+        for k in [&idle_stream, &busy_stream] {
+            let _: i64 = redis::cmd("DEL").arg(k).query_async(&mut raw).await.unwrap();
+        }
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+        backend
+            .create_consumer_group(&idle_stream, &idle_group)
+            .await
+            .unwrap();
+        backend
+            .create_consumer_group(&busy_stream, &busy_group)
+            .await
+            .unwrap();
+
+        // Long-lived blocked read on the empty stream.
+        let idle_backend = backend.clone();
+        let idle_stream_task = idle_stream.clone();
+        let idle_group_task = idle_group.clone();
+        let idle_handle = tokio::spawn(async move {
+            let mut sub = idle_backend
+                .subscribe(&idle_stream_task, &idle_group_task)
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(8), sub.next()).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // A message on the other stream must arrive immediately, not wait for
+        // the idle reader's 5s block to expire.
+        backend.publish(&busy_stream, b"b").await.unwrap();
+        let mut busy_sub = backend.subscribe(&busy_stream, &busy_group).await.unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(3), busy_sub.next()).await {
+            Ok(Some(Ok((_, bytes)))) => assert_eq!(bytes, b"b"),
+            other => panic!("blocked subscription head-of-line blocked peer: {other:?}"),
+        }
+
+        idle_handle.abort();
+        for k in [&idle_stream, &busy_stream] {
+            let _: i64 = redis::cmd("DEL").arg(k).query_async(&mut raw).await.unwrap();
+        }
     }
 }
