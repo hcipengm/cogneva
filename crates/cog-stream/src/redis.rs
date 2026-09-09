@@ -21,17 +21,6 @@ impl RedisMessageBackend {
             .map_err(|e| SFError::Redis(e.to_string()))?;
         Ok(Self { connection })
     }
-
-    /// Acknowledge one or more message IDs in a consumer group.
-    pub async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()> {
-        let _: () = self
-            .connection
-            .clone()
-            .xack(stream, group, ids)
-            .await
-            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -201,6 +190,19 @@ impl MessageBackend for RedisMessageBackend {
         }
     }
 
+    async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let _: i64 = self
+            .connection
+            .clone()
+            .xack(stream, group, ids)
+            .await
+            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        Ok(())
+    }
+
     async fn claim_pending(
         &self,
         stream: &str,
@@ -272,6 +274,23 @@ fn extract_messages(reply: redis::streams::StreamReadReply) -> Vec<(String, Vec<
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::sync::Arc;
+
+    async fn pending_count(raw: &mut MultiplexedConnection, stream: &str, group: &str) -> i64 {
+        let v: redis::Value = redis::cmd("XPENDING")
+            .arg(stream)
+            .arg(group)
+            .query_async(raw)
+            .await
+            .expect("XPENDING");
+        match v {
+            redis::Value::Array(a) => match a.first() {
+                Some(redis::Value::Int(n)) => *n,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
 
     #[tokio::test]
     async fn test_redis_publish_and_subscribe() {
@@ -306,5 +325,55 @@ mod tests {
             Ok(Some(Ok((_, bytes)))) => assert_eq!(bytes, b"hello"),
             _ => eprintln!("SKIP: Redis stream read timed out or failed"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_ack_through_dyn_trait_clears_pending() {
+        // Regression: ack was an inherent method while the trait supplied a
+        // no-op default, so calls through `dyn MessageBackend` compiled fine
+        // but never issued XACK — pending messages were redelivered forever.
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let stream = "cog-test:dyn-ack";
+        let group = "dyn-ack-group";
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+
+        backend.publish(stream, b"one").await.unwrap();
+        backend.create_consumer_group(stream, group).await.unwrap();
+        let mut sub = backend.subscribe(stream, group).await.unwrap();
+        let (id, bytes) =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
+                Ok(Some(Ok(msg))) => msg,
+                _ => {
+                    eprintln!("SKIP: Redis stream read timed out or failed");
+                    return;
+                }
+            };
+        assert_eq!(bytes, b"one");
+        assert_eq!(pending_count(&mut raw, stream, group).await, 1);
+
+        backend.ack(stream, group, &[id]).await.unwrap();
+        assert_eq!(pending_count(&mut raw, stream, group).await, 0);
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
     }
 }

@@ -51,10 +51,11 @@ pub trait MessageBackend: Send + Sync {
     async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()>;
 
     /// Acknowledge one or more message IDs in a consumer group.
-    /// Default no-op for backends that do not require explicit acks.
-    async fn ack(&self, _stream: &str, _group: &str, _ids: &[String]) -> SFResult<()> {
-        Ok(())
-    }
+    /// Backends without explicit acks (in-memory) must implement this as a
+    /// deliberate no-op; it is required rather than defaulted so a backend
+    /// that needs acks can never silently inherit a no-op through a trait
+    /// object call.
+    async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()>;
 
     /// Claim pending messages that have been idle longer than `min_idle_ms`
     /// (delivered to a consumer that never acked — e.g. the pod died

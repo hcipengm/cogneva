@@ -544,6 +544,10 @@ mod tests {
         async fn create_consumer_group(&self, _stream: &str, _group: &str) -> SFResult<()> {
             Ok(())
         }
+
+        async fn ack(&self, _stream: &str, _group: &str, _ids: &[String]) -> SFResult<()> {
+            Ok(())
+        }
     }
 
     // --- identifier helpers --------------------------------------------------
