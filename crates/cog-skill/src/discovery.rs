@@ -8,7 +8,7 @@ pub async fn discover_skills(dir: &Path) -> SFResult<Vec<PathBuf>> {
     let mut skills = Vec::new();
 
     if !dir.exists() {
-        tracing::warn!("Skills directory does not exist: {}", dir.display());
+        tracing::debug!("Skills directory does not exist: {}", dir.display());
         return Ok(skills);
     }
 
