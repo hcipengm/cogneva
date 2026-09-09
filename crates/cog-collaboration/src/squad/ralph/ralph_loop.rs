@@ -496,7 +496,10 @@ Respond with **only** a JSON object matching this schema:\n\
         let options = cog_core::ChatOptions {
             model: None,
             temperature: Some(0.2),
-            max_tokens: Some(512),
+            // Four verbose JSON fields routinely fill ~1.5k chars; 512 tokens
+            // truncated the answer mid-string ("EOF while parsing a string")
+            // and every failure classification silently fell back to Identical.
+            max_tokens: Some(1024),
             tools: None,
             // Use Text mode instead of Json: some OpenAI-compatible providers
             // (e.g. Kimi /coding endpoint) reject response_format=json_object
