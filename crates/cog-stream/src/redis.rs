@@ -410,7 +410,11 @@ mod tests {
         let idle_group = format!("hol-idle-{suffix}");
         let busy_group = format!("hol-busy-{suffix}");
         for k in [&idle_stream, &busy_stream] {
-            let _: i64 = redis::cmd("DEL").arg(k).query_async(&mut raw).await.unwrap();
+            let _: i64 = redis::cmd("DEL")
+                .arg(k)
+                .query_async(&mut raw)
+                .await
+                .unwrap();
         }
 
         let backend: Arc<dyn MessageBackend> =
@@ -448,7 +452,11 @@ mod tests {
 
         idle_handle.abort();
         for k in [&idle_stream, &busy_stream] {
-            let _: i64 = redis::cmd("DEL").arg(k).query_async(&mut raw).await.unwrap();
+            let _: i64 = redis::cmd("DEL")
+                .arg(k)
+                .query_async(&mut raw)
+                .await
+                .unwrap();
         }
     }
 }
