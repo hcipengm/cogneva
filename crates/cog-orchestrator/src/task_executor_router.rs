@@ -3,8 +3,10 @@ use cog_core::{
     DagMessage, MessageBackend, OrchestratorControl, SFError, SFResult, ShutdownSignal, Task,
     TaskExecutor, TaskResult, TaskType,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Dispatcher that routes ready tasks to the first [`TaskExecutor`] whose
 /// [`TaskExecutor::supports`] returns `true`.
@@ -87,62 +89,95 @@ impl TaskExecutorRouter {
         // 阈值必须大于最长任务执行时长，否则正在执行的长任务会被误判死亡
         // 而并发重投（at-least-once：下游 complete_task 需容忍重复）。
         const PENDING_IDLE_MS: u64 = 10 * 60 * 1000;
-        const CLAIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        const CLAIM_INTERVAL: Duration = Duration::from_secs(60);
         const CLAIM_BATCH: usize = 16;
+        // 认领消息的执行并发上限。tick 只负责认领和派发，不能在某条认领
+        // 消息的执行上 await：agent 任务可能跑几十分钟，串行处理会让整个
+        // pending 恢复循环停摆（实测一条任务执行 90+ 分钟，期间零
+        // XAUTOCLAIM，恢复网形同虚设）。
+        const CLAIM_CONCURRENCY: usize = 4;
+
+        let pipe = Arc::new(ReadyPipeline {
+            task_backend: task_backend.clone(),
+            result_backend: result_backend.clone(),
+            ready_stream: ready_stream.clone(),
+            group: group.clone(),
+            workspace_id: workspace_id.to_string(),
+        });
+
         {
             let sweeper = self.clone();
             let sweep_task_backend = task_backend.clone();
-            let sweep_result_backend = result_backend.clone();
-            let sweep_stream = ready_stream.clone();
-            let sweep_group = group.clone();
             let sweep_shutdown = shutdown.clone();
-            let sweep_workspace = workspace_id.to_string();
+            let sweep_pipe = pipe.clone();
+            let claim_slots = Arc::new(tokio::sync::Semaphore::new(CLAIM_CONCURRENCY));
             tokio::spawn(async move {
-                let pipe = ReadyPipeline {
-                    task_backend: &sweep_task_backend,
-                    result_backend: &sweep_result_backend,
-                    ready_stream: &sweep_stream,
-                    group: &sweep_group,
-                    workspace_id: &sweep_workspace,
-                };
                 let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
                 loop {
                     tokio::select! {
                         biased;
                         _ = sweep_shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            match sweep_task_backend
-                                .claim_pending(&sweep_stream, &sweep_group, PENDING_IDLE_MS, CLAIM_BATCH)
+                            let claimed = match sweep_task_backend
+                                .claim_pending(
+                                    &sweep_pipe.ready_stream,
+                                    &sweep_pipe.group,
+                                    PENDING_IDLE_MS,
+                                    CLAIM_BATCH,
+                                )
                                 .await
                             {
-                                Ok(claimed) if !claimed.is_empty() => {
-                                    tracing::warn!(
-                                        stream = %sweep_stream,
-                                        count = claimed.len(),
-                                        "Claimed idle pending ready messages for re-execution"
-                                    );
-                                    for (msg_id, bytes) in claimed {
-                                        sweeper.process_ready_message(&pipe, msg_id, &bytes).await;
-                                    }
-                                }
-                                Ok(_) => {}
+                                Ok(claimed) => claimed,
                                 Err(e) => {
-                                    tracing::warn!(stream = %sweep_stream, "Pending claim sweep failed: {e}")
+                                    tracing::warn!(
+                                        stream = %sweep_pipe.ready_stream,
+                                        "Pending claim sweep failed: {e}"
+                                    );
+                                    continue;
                                 }
+                            };
+                            if claimed.is_empty() {
+                                continue;
+                            }
+                            tracing::warn!(
+                                stream = %sweep_pipe.ready_stream,
+                                count = claimed.len(),
+                                "Claimed idle pending ready messages for re-execution"
+                            );
+                            for (msg_id, bytes) in claimed {
+                                // 先拿许可再派发：限制重执行并发，shutdown
+                                // 时也不再起新执行；许可在处理任务内持有到
+                                // 执行结束。
+                                let permit = tokio::select! {
+                                    _ = sweep_shutdown.wait() => break,
+                                    acquired = claim_slots.clone().acquire_owned() => match acquired {
+                                        Ok(permit) => permit,
+                                        Err(_) => break,
+                                    },
+                                };
+                                let sweeper = sweeper.clone();
+                                let pipe = sweep_pipe.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    // 处理 panic 不得杀死清扫循环：记录后
+                                    // 消息仍在 PEL，超过 idle 阈值会被下一
+                                    // 轮重新认领，恢复路径自愈。
+                                    let guarded = AssertUnwindSafe(
+                                        sweeper.process_ready_message(&pipe, msg_id, &bytes),
+                                    );
+                                    if let Err(payload) = guarded.catch_unwind().await {
+                                        tracing::warn!(
+                                            "claimed ready message processing panicked: {}",
+                                            panic_message(&payload)
+                                        );
+                                    }
+                                });
                             }
                         }
                     }
                 }
             });
         }
-
-        let pipe = ReadyPipeline {
-            task_backend: &task_backend,
-            result_backend: &result_backend,
-            ready_stream: &ready_stream,
-            group: &group,
-            workspace_id,
-        };
 
         // Resubscribe on stream failure/end instead of exiting the spawned
         // task: a single transient read error historically ended the loop and
@@ -190,11 +225,24 @@ impl TaskExecutorRouter {
 
     /// 执行一条 ready 消息的全管线：反序列化 → start_task → execute →
     /// 发布结果 → ack。主订阅循环与 pending 恢复清扫器共用。
-    async fn process_ready_message(&self, pipe: &ReadyPipeline<'_>, msg_id: String, bytes: &[u8]) {
+    async fn process_ready_message(&self, pipe: &ReadyPipeline, msg_id: String, bytes: &[u8]) {
         let task: Task = match serde_json::from_slice(bytes) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("Failed to deserialize task from ready stream: {e}");
+                // 毒消息永远不会反序列化成功，不 ack 会被清扫器每 10 分钟
+                // 重投一次、空转到流被删为止；ack 丢弃让队列过得去。
+                tracing::warn!(msg_id = %msg_id, "Failed to deserialize task from ready stream: {e}; dropping");
+                if let Err(e) = pipe
+                    .task_backend
+                    .ack(
+                        &pipe.ready_stream,
+                        &pipe.group,
+                        std::slice::from_ref(&msg_id),
+                    )
+                    .await
+                {
+                    tracing::warn!(msg_id = %msg_id, "Failed to ack poison ready message: {e}");
+                }
                 return;
             }
         };
@@ -211,7 +259,11 @@ impl TaskExecutorRouter {
                     tracing::warn!(task_id = %task.id, msg_id = %msg_id, "ready message rejected by DAG ({e}); dropping");
                     if let Err(e) = pipe
                         .task_backend
-                        .ack(pipe.ready_stream, pipe.group, std::slice::from_ref(&msg_id))
+                        .ack(
+                            &pipe.ready_stream,
+                            &pipe.group,
+                            std::slice::from_ref(&msg_id),
+                        )
                         .await
                     {
                         tracing::warn!(task_id = %task.id, msg_id = %msg_id, "Failed to ack stale ready message: {e}");
@@ -222,7 +274,19 @@ impl TaskExecutorRouter {
             }
         }
 
-        let result = self.execute(&task).await;
+        // timeout_seconds 是任务自带的执行契约。编排侧的超时检查器只会把
+        // Running 任务标记失败/重试，并不取消这里的执行 future；不在此兑
+        // 现，失控的 agent 任务会无限期占住串行消费位置（实测 90+ 分钟不
+        // 返回，后续 ready 消息全部队头阻塞）。超时按执行失败处理，结果
+        // 走既有发布路径，重试/DLQ 由 DAG 侧决定。
+        let timeout = Duration::from_secs(task.timeout_seconds.max(1));
+        let result = match tokio::time::timeout(timeout, self.execute(&task)).await {
+            Ok(result) => result,
+            Err(_) => Err(SFError::Agent(format!(
+                "Task execution timed out after {} seconds",
+                task.timeout_seconds
+            ))),
+        };
 
         let payload = match result {
             Ok(r) => {
@@ -269,7 +333,11 @@ impl TaskExecutorRouter {
         }
         if let Err(e) = pipe
             .task_backend
-            .ack(pipe.ready_stream, pipe.group, std::slice::from_ref(&msg_id))
+            .ack(
+                &pipe.ready_stream,
+                &pipe.group,
+                std::slice::from_ref(&msg_id),
+            )
             .await
         {
             tracing::warn!(task_id = %task.id, msg_id = %msg_id, "Failed to ack ready message: {e}");
@@ -277,13 +345,24 @@ impl TaskExecutorRouter {
     }
 }
 
-/// process_ready_message 的共享上下文，避免参数列表过长。
-struct ReadyPipeline<'a> {
-    task_backend: &'a Arc<dyn MessageBackend>,
-    result_backend: &'a Arc<dyn MessageBackend>,
-    ready_stream: &'a str,
-    group: &'a str,
-    workspace_id: &'a str,
+/// process_ready_message 的共享上下文，主订阅循环与 pending 清扫器共用，
+/// 持有所有权以便清扫器把处理派发到独立任务。
+struct ReadyPipeline {
+    task_backend: Arc<dyn MessageBackend>,
+    result_backend: Arc<dyn MessageBackend>,
+    ready_stream: String,
+    group: String,
+    workspace_id: String,
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 #[async_trait]
@@ -304,5 +383,236 @@ impl TaskExecutor for TaskExecutorRouter {
 impl Default for TaskExecutorRouter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod ready_pipeline_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use cog_core::{MessageStream, TaskResultMetadata};
+
+    #[derive(Default)]
+    struct ScriptedBackend {
+        published: tokio::sync::Mutex<Vec<(String, Vec<u8>)>>,
+        acks: tokio::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+    }
+
+    #[async_trait]
+    impl MessageBackend for ScriptedBackend {
+        async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
+            self.published
+                .lock()
+                .await
+                .push((subject.to_string(), payload.to_vec()));
+            Ok(())
+        }
+        async fn subscribe(&self, _subject: &str, _group: &str) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn subscribe_from(
+            &self,
+            _subject: &str,
+            _group: &str,
+            _start_id: &str,
+        ) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn create_consumer_group(&self, _stream: &str, _group: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()> {
+            self.acks
+                .lock()
+                .await
+                .push((stream.to_string(), group.to_string(), ids.to_vec()));
+            Ok(())
+        }
+        async fn claim_pending(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _min_idle_ms: u64,
+            _count: usize,
+        ) -> SFResult<Vec<(String, Vec<u8>)>> {
+            Ok(Vec::new())
+        }
+        async fn dlq(&self, _stream: &str, _msg_id: &str, _reason: &str) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    struct SlowExecutor {
+        sleep_secs: u64,
+        panic_instead: bool,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for SlowExecutor {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+        async fn execute(&self, _task: &Task) -> SFResult<TaskResult> {
+            if self.panic_instead {
+                panic!("executor boom");
+            }
+            tokio::time::sleep(Duration::from_secs(self.sleep_secs)).await;
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({"done": true}),
+                metadata: TaskResultMetadata::new("slow"),
+            })
+        }
+    }
+
+    fn test_task(timeout_seconds: u64) -> Task {
+        let now = chrono::Utc::now();
+        // task_type custom 变体即可，SlowExecutor supports 全部类型。
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": "t-timeout",
+            "task_type": {"custom": "slow"},
+            "status": "pending",
+            "input": {},
+            "blocked_by": [],
+            "blocks": [],
+            "priority": 1,
+            "created_at": now,
+            "updated_at": now,
+            "retry_count": 0,
+            "max_retries": 3,
+            "timeout_seconds": timeout_seconds,
+            "is_executable": true
+        }))
+        .unwrap();
+        task
+    }
+
+    fn test_pipe(backend: Arc<ScriptedBackend>) -> Arc<ReadyPipeline> {
+        Arc::new(ReadyPipeline {
+            task_backend: backend.clone(),
+            result_backend: backend,
+            ready_stream: "ready".into(),
+            group: "grp".into(),
+            workspace_id: "ws".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn execution_is_cancelled_at_task_timeout() {
+        // 回归：execute future 不受 timeout_seconds 约束，失控 agent 任务能
+        // 占住串行消费位置 90+ 分钟，后续消息全部队头阻塞。
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(SlowExecutor {
+                sleep_secs: 10,
+                panic_instead: false,
+            }))
+            .await;
+
+        let started = std::time::Instant::now();
+        router
+            .process_ready_message(
+                &pipe,
+                "m1".into(),
+                &serde_json::to_vec(&test_task(1)).unwrap(),
+            )
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "execution was not cancelled at the declared timeout: {:?}",
+            started.elapsed()
+        );
+
+        let published = backend.published.lock().await;
+        assert_eq!(published.len(), 1, "timeout must still publish a result");
+        let msg: DagMessage = serde_json::from_slice(&published[0].1).unwrap();
+        match msg {
+            DagMessage::TaskFailed { error, .. } => {
+                assert!(error.contains("timed out after 1 seconds"), "{error}");
+            }
+            other => panic!("expected TaskFailed on timeout, got {other:?}"),
+        }
+        let acks = backend.acks.lock().await;
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].2, vec!["m1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn poison_ready_message_is_acked() {
+        // 回归：反序列化失败直接 return 不 ack，毒消息被清扫器每 10 分钟
+        // 重投一次，永远过不去。
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(SlowExecutor {
+                sleep_secs: 0,
+                panic_instead: false,
+            }))
+            .await;
+
+        router
+            .process_ready_message(&pipe, "m-poison".into(), b"not-json")
+            .await;
+
+        assert!(backend.published.lock().await.is_empty());
+        let acks = backend.acks.lock().await;
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].2, vec!["m-poison".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn successful_ready_message_publishes_and_acks() {
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(SlowExecutor {
+                sleep_secs: 0,
+                panic_instead: false,
+            }))
+            .await;
+
+        router
+            .process_ready_message(
+                &pipe,
+                "m-ok".into(),
+                &serde_json::to_vec(&test_task(60)).unwrap(),
+            )
+            .await;
+
+        let published = backend.published.lock().await;
+        assert_eq!(published.len(), 1);
+        let msg: DagMessage = serde_json::from_slice(&published[0].1).unwrap();
+        assert!(matches!(msg, DagMessage::TaskComplete { .. }));
+        let acks = backend.acks.lock().await;
+        assert_eq!(acks[0].2, vec!["m-ok".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn claimed_processing_panic_is_contained_and_not_acked() {
+        // 回归：清扫 tick 内直接 await 处理，一条消息 panic 会永久杀死
+        // spawn 的清扫任务；现在处理被 catch_unwind 兜住，消息不 ack、留
+        // 在 PEL 等下一轮重新认领。
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(SlowExecutor {
+                sleep_secs: 0,
+                panic_instead: true,
+            }))
+            .await;
+
+        let outcome = AssertUnwindSafe(router.process_ready_message(
+            &pipe,
+            "m-boom".into(),
+            &serde_json::to_vec(&test_task(5)).unwrap(),
+        ))
+        .catch_unwind()
+        .await;
+        assert!(outcome.is_err(), "panic must be caught by catch_unwind");
+        assert!(
+            backend.acks.lock().await.is_empty(),
+            "panicked message must stay unacked for redelivery"
+        );
     }
 }
