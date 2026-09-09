@@ -94,7 +94,12 @@ async fn build_test_state() -> AutonomousTestState {
     let orchestrator = Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag_executor));
 
     let jwt_manager: Arc<dyn cog_core::AuthProvider> = Arc::new(cog_auth::JwtManager::new(
-        cog_auth::jwt::JwtConfig::default(),
+        cog_auth::jwt::JwtConfig {
+            // `JwtConfig::default()` carries the public placeholder and is
+            // rejected by `JwtManager::new`; tests use a strong fixed secret.
+            secret: "test-hmac-secret-0123456789abcdef0123456789abcdef".into(),
+            ..Default::default()
+        },
     ));
 
     // Build a minimal quota manager backed by in-memory Redis fallback.
