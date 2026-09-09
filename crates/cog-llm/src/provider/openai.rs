@@ -15,16 +15,97 @@ use crate::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
+/// Per-index accumulator for a streaming tool call. OpenAI-compatible SSE
+/// deltas carry an explicit `index` because one turn can contain several
+/// parallel tool calls; chunks for distinct calls must never share a buffer.
+struct ToolCallAcc {
+    id: String,
+    name: String,
+    args: String,
+    content_pos: usize,
+}
+
+/// Parse streamed tool-call arguments into a JSON object. Upstreams
+/// occasionally emit recoverable-but-invalid shapes: a JSON-encoded string
+/// wrapping the object, or several objects concatenated together. A bare
+/// `Value::String` must never reach the wire — strict providers reject the
+/// next turn with 400 InvalidParameter when a historical tool_call carries
+/// non-object arguments.
+fn parse_tool_arguments(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return serde_json::json!({});
+    }
+    let mut candidates: Vec<String> = vec![trimmed.to_string()];
+    if let Ok(serde_json::Value::String(inner)) = serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        candidates.push(inner);
+    }
+    for candidate in &candidates {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+            if v.is_object() {
+                return v;
+            }
+        }
+        if let Some(v) = first_balanced_json_object(candidate) {
+            return v;
+        }
+    }
+    serde_json::json!({})
+}
+
+/// Extract the first balanced `{...}` object from a string that may contain
+/// trailing junk (e.g. two concatenated objects).
+fn first_balanced_json_object(text: &str) -> Option<serde_json::Value> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, ch) in text[start..].char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let span = &text[start..start + i + ch.len_utf8()];
+                    return serde_json::from_str(span).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Normalize an already-parsed tool-call argument value into a JSON object so
+/// historical assistant tool_calls are always wire-valid.
+fn sanitize_tool_arguments(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(_) => value.clone(),
+        serde_json::Value::String(s) => parse_tool_arguments(s),
+        _ => serde_json::json!({}),
+    }
+}
+
 /// Finalize a tool call block by parsing accumulated JSON arguments.
-/// If parse fails, keeps the raw string as `Value::String`.
 fn finalize_tool_call(block: &mut ContentBlock, buffer: &str) {
     if let ContentBlock::ToolCall {
         ref mut arguments, ..
     } = block
     {
         if !buffer.is_empty() {
-            *arguments = serde_json::from_str(buffer)
-                .unwrap_or_else(|_| serde_json::Value::String(buffer.to_string()));
+            *arguments = parse_tool_arguments(buffer);
         }
     }
 }
@@ -99,11 +180,9 @@ fn extract_text_tool_calls(text: &str) -> Option<(String, Vec<ContentBlock>)> {
             // `arguments` arrives as an object on some upstreams and as a
             // JSON-encoded string on others; normalize to a Value.
             let arguments = match call.get("arguments") {
-                Some(serde_json::Value::String(s)) => {
-                    serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
-                }
-                Some(other) => other.clone(),
-                None => serde_json::Value::Object(Default::default()),
+                Some(serde_json::Value::String(s)) => parse_tool_arguments(s),
+                Some(other) => sanitize_tool_arguments(other),
+                None => serde_json::json!({}),
             };
             blocks.push(ContentBlock::tool_call(
                 format!("textcall-{i}"),
@@ -221,7 +300,7 @@ impl OpenAIProvider {
                                     "type": "function",
                                     "function": {
                                         "name": c.name,
-                                        "arguments": c.arguments.to_string(),
+                                        "arguments": sanitize_tool_arguments(&c.arguments).to_string(),
                                     }
                                 })
                             })
@@ -503,7 +582,9 @@ impl LLMProvider for OpenAIProvider {
             futures::pin_mut!(lines);
 
             let mut current_block: Option<ContentBlock> = None;
-            let mut current_tool_args_buffer: Option<String> = None;
+            let mut tool_accs: std::collections::BTreeMap<u64, ToolCallAcc> =
+                std::collections::BTreeMap::new();
+            let mut active_tool_index: Option<u64> = None;
 
             // Some providers (e.g. kimi-k2.6 under high load) open the SSE stream
             // but then stall without sending data. A per-event timeout lets us fail
@@ -652,18 +733,24 @@ impl LLMProvider for OpenAIProvider {
                                     // Finish previous block if exists
                                     if let Some(ref mut block) = current_block {
                                         if block.is_tool_call() {
-                                            if let Some(ref buf) = current_tool_args_buffer {
-                                                finalize_tool_call(block, buf);
-                                                if let Some(last) = response.content.last_mut() {
-                                                    *last = block.clone();
+                                            if let Some(active) = active_tool_index {
+                                                if let Some(acc) = tool_accs.get(&active) {
+                                                    if let Some(b) =
+                                                        response.content.get_mut(acc.content_pos)
+                                                    {
+                                                        finalize_tool_call(b, &acc.args);
+                                                    }
+                                                    block.clone_from(
+                                                        &response.content[acc.content_pos],
+                                                    );
                                                 }
                                             }
+                                            active_tool_index = None;
                                         }
                                         let prev_idx = idx.saturating_sub(1);
                                         finish_block(block, prev_idx, &producer, &response.content)
                                             .await;
                                     }
-                                    current_tool_args_buffer = None;
                                     current_block = Some(ContentBlock::text(content));
                                     response.content.push(current_block.clone().unwrap());
                                     if producer
@@ -707,13 +794,20 @@ impl LLMProvider for OpenAIProvider {
                                     if current_block.as_ref().is_none_or(|b| !b.is_thinking()) {
                                         if let Some(ref mut block) = current_block {
                                             if block.is_tool_call() {
-                                                if let Some(ref buf) = current_tool_args_buffer {
-                                                    finalize_tool_call(block, buf);
-                                                    if let Some(last) = response.content.last_mut()
-                                                    {
-                                                        *last = block.clone();
+                                                if let Some(active) = active_tool_index {
+                                                    if let Some(acc) = tool_accs.get(&active) {
+                                                        if let Some(b) = response
+                                                            .content
+                                                            .get_mut(acc.content_pos)
+                                                        {
+                                                            finalize_tool_call(b, &acc.args);
+                                                        }
+                                                        block.clone_from(
+                                                            &response.content[acc.content_pos],
+                                                        );
                                                     }
                                                 }
+                                                active_tool_index = None;
                                             }
                                             let prev_idx = idx.saturating_sub(1);
                                             finish_block(
@@ -724,7 +818,6 @@ impl LLMProvider for OpenAIProvider {
                                             )
                                             .await;
                                         }
-                                        current_tool_args_buffer = None;
                                         current_block = Some(ContentBlock::thinking(reasoning));
                                         response.content.push(current_block.clone().unwrap());
                                         if producer
@@ -767,6 +860,8 @@ impl LLMProvider for OpenAIProvider {
                         if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array())
                         {
                             for tool_call in tool_calls {
+                                let tc_index =
+                                    tool_call.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let id = tool_call
                                     .get("id")
                                     .and_then(|v| v.as_str())
@@ -784,61 +879,94 @@ impl LLMProvider for OpenAIProvider {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
 
-                                let idx = response.content.len();
-                                if current_block.as_ref().is_none_or(|b| !b.is_tool_call()) {
-                                    if let Some(ref mut block) = current_block {
-                                        if block.is_tool_call() {
-                                            if let Some(ref buf) = current_tool_args_buffer {
-                                                finalize_tool_call(block, buf);
-                                                if let Some(last) = response.content.last_mut() {
-                                                    *last = block.clone();
-                                                }
+                                if active_tool_index != Some(tc_index) {
+                                    // Switching to another parallel tool call: finalize
+                                    // the previous call, finish any open text/thinking
+                                    // block, and open the new call.
+                                    if let Some(prev) = active_tool_index {
+                                        if let Some(acc) = tool_accs.get(&prev) {
+                                            if let Some(b) =
+                                                response.content.get_mut(acc.content_pos)
+                                            {
+                                                finalize_tool_call(b, &acc.args);
                                             }
+                                            let block = response.content[acc.content_pos].clone();
+                                            finish_block(
+                                                &block,
+                                                acc.content_pos,
+                                                &producer,
+                                                &response.content,
+                                            )
+                                            .await;
                                         }
+                                    } else if let Some(block) = current_block.take() {
+                                        let prev_idx = response.content.len().saturating_sub(1);
                                         finish_block(
-                                            block,
-                                            idx.saturating_sub(1),
+                                            &block,
+                                            prev_idx,
                                             &producer,
                                             &response.content,
                                         )
                                         .await;
                                     }
-                                    let mut buffer = String::new();
-                                    buffer.push_str(args_chunk);
-                                    current_block = Some(ContentBlock::tool_call(
-                                        if id.is_empty() {
-                                            "pending".to_string()
-                                        } else {
-                                            id.clone()
-                                        },
-                                        if name.is_empty() {
-                                            "pending".to_string()
-                                        } else {
-                                            name.clone()
-                                        },
-                                        serde_json::Value::Object(Default::default()),
-                                    ));
-                                    current_tool_args_buffer = Some(buffer);
-                                    response.content.push(current_block.clone().unwrap());
-                                    if producer
-                                        .push(AssistantMessageEvent::ToolCallStart {
-                                            content_index: idx,
-                                            partial: Message::assistant(response.content.clone()),
-                                            timestamp: chrono::Utc::now(),
-                                        })
-                                        .await
-                                        .is_err()
+                                    active_tool_index = Some(tc_index);
+                                    current_block = None;
+                                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                                        tool_accs.entry(tc_index)
                                     {
-                                        break 'stream;
+                                        let content_pos = response.content.len();
+                                        let init_id = if id.is_empty() {
+                                            "pending".to_string()
+                                        } else {
+                                            id.to_string()
+                                        };
+                                        let init_name = if name.is_empty() {
+                                            "pending".to_string()
+                                        } else {
+                                            name.to_string()
+                                        };
+                                        let block = ContentBlock::tool_call(
+                                            init_id.clone(),
+                                            init_name.clone(),
+                                            serde_json::Value::Object(Default::default()),
+                                        );
+                                        entry.insert(ToolCallAcc {
+                                            id: init_id,
+                                            name: init_name,
+                                            args: String::new(),
+                                            content_pos,
+                                        });
+                                        response.content.push(block);
+                                        if producer
+                                            .push(AssistantMessageEvent::ToolCallStart {
+                                                content_index: content_pos,
+                                                partial: Message::assistant(
+                                                    response.content.clone(),
+                                                ),
+                                                timestamp: chrono::Utc::now(),
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break 'stream;
+                                        }
                                     }
-                                } else if let Some(ref mut buffer) = current_tool_args_buffer {
-                                    buffer.push_str(args_chunk);
-                                    // Do NOT update ContentBlock::ToolCall.arguments during deltas.
-                                    // arguments remains an empty object placeholder until the block is finalized.
                                 }
+                                let acc = tool_accs.get_mut(&tc_index).expect("inserted above");
+                                if !id.is_empty() {
+                                    acc.id = id;
+                                }
+                                if !name.is_empty() {
+                                    acc.name = name;
+                                }
+                                if !args_chunk.is_empty() {
+                                    acc.args.push_str(args_chunk);
+                                }
+                                let content_pos = acc.content_pos;
+                                current_block = Some(response.content[content_pos].clone());
                                 if producer
                                     .push(AssistantMessageEvent::ToolCallDelta {
-                                        content_index: idx,
+                                        content_index: content_pos,
                                         delta: args_chunk.to_string(),
                                         partial: Message::assistant(response.content.clone()),
                                         timestamp: chrono::Utc::now(),
@@ -862,18 +990,35 @@ impl LLMProvider for OpenAIProvider {
                 }
             }
 
-            // Finish any remaining block
-            if let Some(ref mut block) = current_block {
-                if block.is_tool_call() {
-                    if let Some(ref buf) = current_tool_args_buffer {
-                        finalize_tool_call(block, buf);
+            // Materialize every streamed tool call into its placeholder block.
+            for acc in tool_accs.values() {
+                if let Some(b) = response.content.get_mut(acc.content_pos) {
+                    finalize_tool_call(b, &acc.args);
+                    if let ContentBlock::ToolCall {
+                        ref mut id,
+                        ref mut name,
+                        ..
+                    } = b
+                    {
+                        *id = acc.id.clone();
+                        *name = acc.name.clone();
                     }
                 }
+            }
+            // Finish the still-open block: the active tool call, or the last
+            // text/thinking block. Earlier parallel calls already emitted
+            // ToolCallEnd when the stream switched index away from them.
+            if let Some(active) = active_tool_index {
+                if let Some(acc) = tool_accs.get(&active) {
+                    let block = response.content[acc.content_pos].clone();
+                    finish_block(&block, acc.content_pos, &producer, &response.content).await;
+                }
+            } else if let Some(block) = current_block.take() {
                 if let Some(last) = response.content.last_mut() {
                     *last = block.clone();
                 }
                 let idx = response.content.len().saturating_sub(1);
-                finish_block(block, idx, &producer, &response.content).await;
+                finish_block(&block, idx, &producer, &response.content).await;
             }
 
             // Text-protocol tool-call fallback: some upstreams emit
@@ -1249,5 +1394,126 @@ mod tests {
         assert!(extract_text_tool_calls("{\"action\":\"tool_calls\",\"calls\":[]}").is_none());
         // Braces inside strings must not break span balancing.
         assert!(extract_text_tool_calls("template literal: {\"x\": \"}\"} done").is_none());
+    }
+
+    #[test]
+    fn streamed_tool_arguments_normalize_invalid_shapes_to_objects() {
+        assert_eq!(
+            parse_tool_arguments("{\"command\":\"ls\"}"),
+            json!({"command": "ls"})
+        );
+        // JSON-encoded string wrapping the object.
+        assert_eq!(
+            parse_tool_arguments("\"{\\\"command\\\":\\\"ls\\\"}\""),
+            json!({"command": "ls"})
+        );
+        // Two concatenated objects: salvage the first one.
+        assert_eq!(
+            parse_tool_arguments("{\"command\":\"ls\"}{\"command\":\"pwd\"}"),
+            json!({"command": "ls"})
+        );
+        // Double-encoded concatenated shape seen from ark parallel tool calls.
+        assert_eq!(
+            parse_tool_arguments(
+                "\"{\\\"command\\\": \\\"ls; pwd\\\"}{\\\"command\\\": \\\"find /\\\"}\""
+            ),
+            json!({"command": "ls; pwd"})
+        );
+        assert_eq!(parse_tool_arguments(""), json!({}));
+        assert_eq!(parse_tool_arguments("not json"), json!({}));
+
+        // Wire serialization must always emit an object, never a bare string.
+        let bad = Message::assistant(vec![ContentBlock::tool_call(
+            "c1",
+            "run_command",
+            serde_json::Value::String("{\"a\":1}{\"b\":2}".into()),
+        )]);
+        let provider = OpenAIProvider::new(test_model(), "key");
+        let body = provider.build_request_body(&[bad], &ChatOptions::default());
+        let args = &body["messages"][0]["tool_calls"][0]["function"]["arguments"];
+        let parsed: serde_json::Value = serde_json::from_str(args.as_str().unwrap()).unwrap();
+        assert_eq!(parsed, json!({"a": 1}));
+    }
+
+    #[derive(Debug)]
+    struct SseClient {
+        body: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for SseClient {
+        async fn execute(&self, _req: cog_core::HttpRequest) -> SFResult<cog_core::HttpResponse> {
+            unreachable!("stream path only")
+        }
+        async fn execute_stream(
+            &self,
+            _req: cog_core::HttpRequest,
+        ) -> SFResult<cog_core::HttpStreamResponse> {
+            let chunk: Result<bytes::Bytes, SFError> = Ok(bytes::Bytes::from(self.body.clone()));
+            let stream: cog_core::HttpBodyStream = Box::pin(futures::stream::iter(vec![chunk]));
+            Ok(cog_core::HttpStreamResponse {
+                status: 200,
+                headers: std::collections::HashMap::new(),
+                stream,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_stream_tool_calls_keep_distinct_indices() {
+        let mut sse = String::new();
+        let mut evt = |obj: &str| sse.push_str(&format!("data: {obj}\n\n"));
+        evt(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"run_command","arguments":""}}]}}]}"#,
+        );
+        evt(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"com"}}]}}]}"#,
+        );
+        evt(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"mand\":\"ls\"}"}}]}}]}"#,
+        );
+        evt(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","type":"function","function":{"name":"run_command","arguments":""}}]}}]}"#,
+        );
+        evt(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"command\":\"pwd\"}"}}]}}]}"#,
+        );
+        evt(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#);
+        evt("[DONE]");
+
+        let provider =
+            OpenAIProvider::new(test_model(), "key").with_client(std::sync::Arc::new(SseClient {
+                body: sse.into_bytes(),
+            }));
+        let mut stream = provider
+            .chat_stream(&[Message::user("do things")], &ChatOptions::default())
+            .await
+            .expect("stream starts");
+        while stream.next().await.is_some() {}
+        let response = stream.result().await;
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
+        let calls: Vec<_> = response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    ..
+                } => Some((id.as_str(), name.as_str(), arguments.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            2,
+            "two parallel calls must not merge: {calls:?}"
+        );
+        assert_eq!(calls[0].0, "call_0");
+        assert_eq!(calls[0].1, "run_command");
+        assert_eq!(calls[0].2, json!({"command": "ls"}));
+        assert_eq!(calls[1].0, "call_1");
+        assert_eq!(calls[1].2, json!({"command": "pwd"}));
     }
 }

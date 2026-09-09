@@ -61,18 +61,60 @@ impl ContextWindow {
 
     fn trim_if_needed(&mut self) {
         while self.current_tokens > self.max_tokens && self.messages.len() > 2 {
-            // 保留 system message，从 oldest non-system 开始删除
-            let remove_idx = self
-                .messages
-                .iter()
-                .position(|m| !matches!(m, Message::System { .. }));
+            // 保留 system message 与首条 user（任务输入）：丢掉首条 user 后，
+            // 后续轮次会变成 assistant/tool 起头的无目标对话，模型答非所问。
+            // 也不拆掉 assistant(tool_calls) 与其紧随的 tool result 配对。
+            let mut first_user_seen = false;
+            let remove_idx = self.messages.iter().position(|m| match m {
+                Message::System { .. } => false,
+                Message::User { .. } => {
+                    if first_user_seen {
+                        true
+                    } else {
+                        first_user_seen = true;
+                        false
+                    }
+                }
+                _ => true,
+            });
 
-            if let Some(idx) = remove_idx {
-                let removed = self.messages.remove(idx);
-                self.current_tokens -= estimate_tokens(&removed.content());
-            } else {
-                break;
+            let Some(mut idx) = remove_idx else { break };
+            if let Message::Assistant { .. } = self.messages[idx] {
+                if self
+                    .messages
+                    .get(idx + 1)
+                    .is_some_and(|m| matches!(m, Message::ToolResult { .. }))
+                {
+                    // 改删它后面的 tool result；扫描下一个可删位置
+                    let mut candidate = idx + 1;
+                    loop {
+                        let removable = self.messages.get(candidate).is_some_and(|m| {
+                            !matches!(m, Message::System { .. }) && {
+                                let is_first_user = matches!(m, Message::User { .. })
+                                    && self.messages[..candidate]
+                                        .iter()
+                                        .all(|x| !matches!(x, Message::User { .. }));
+                                !is_first_user
+                            }
+                        });
+                        if removable {
+                            idx = candidate;
+                            break;
+                        }
+                        if self.messages.get(candidate).is_none() {
+                            break;
+                        }
+                        candidate += 1;
+                    }
+                    if self.messages.get(idx).is_none() {
+                        break;
+                    }
+                }
             }
+            let removed = self.messages.remove(idx);
+            self.current_tokens = self
+                .current_tokens
+                .saturating_sub(estimate_tokens(&removed.content()));
         }
         // 裁剪可能把 assistant 删掉却留下它的 tool result；严格校验的供应商
         // （Kimi/OpenAI）会拒绝找不到对应 tool_calls 声明的 tool 消息。
@@ -151,5 +193,58 @@ mod tests {
                 "oldest non-system message must never be an orphaned tool result"
             );
         }
+    }
+
+    #[test]
+    fn trim_never_evicts_first_user_message() {
+        let mut ctx = ContextWindow::new(60);
+        let big = "任务 ".repeat(60);
+        ctx.add_message(Message::user(big.clone()));
+        ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+            "call_1",
+            "run_command",
+            serde_json::json!({"command": "ls"}),
+        )]));
+        ctx.add_message(Message::tool_result_text("call_1", "run_command", "done"));
+
+        assert!(
+            ctx.messages().iter().any(|m| m.content() == big),
+            "the original task input must survive trimming"
+        );
+        assert!(
+            !matches!(
+                ctx.messages().first(),
+                Some(Message::Assistant { .. }) | Some(Message::ToolResult { .. })
+            ),
+            "window must not start with an assistant/tool message after trimming"
+        );
+    }
+
+    #[test]
+    fn trim_does_not_split_tool_call_from_its_result() {
+        let mut ctx = ContextWindow::new(30);
+        ctx.add_message(Message::user("task input task input task input"));
+        ctx.add_message(Message::user("filler filler filler filler filler filler"));
+        ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+            "call_9",
+            "run_command",
+            serde_json::json!({"command": "ls"}),
+        )]));
+        ctx.add_message(Message::tool_result_text("call_9", "run_command", "ok"));
+
+        let msgs = ctx.messages();
+        if let Some(pos) = msgs
+            .iter()
+            .position(|m| m.tool_calls().iter().any(|c| c.id == "call_9"))
+        {
+            assert!(
+                matches!(msgs.get(pos + 1), Some(Message::ToolResult { tool_call_id, .. }) if tool_call_id == "call_9"),
+                "assistant tool_call must stay paired with its result"
+            );
+        }
+        assert!(
+            !matches!(msgs.first(), Some(Message::ToolResult { .. })),
+            "head must never be an orphaned tool result"
+        );
     }
 }
