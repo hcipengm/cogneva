@@ -864,16 +864,37 @@ impl Agent {
                 }
             };
 
+            let inbox_stream = consumer.inbox_stream().to_string();
             while let Some(result) = stream.next().await {
                 match result {
-                    Ok((_msg_id, bytes)) => match serde_json::from_slice::<InboxMessage>(&bytes) {
-                        Ok(msg) => {
-                            if let Err(e) = handler(msg).await {
-                                tracing::warn!("Inbox handler error: {}", e);
+                    Ok((msg_id, bytes)) => {
+                        match serde_json::from_slice::<InboxMessage>(&bytes) {
+                            Ok(msg) => {
+                                if let Err(e) = handler(msg).await {
+                                    // Leave pending: redelivery retries the handler.
+                                    tracing::warn!(
+                                        msg_id = %msg_id,
+                                        "Inbox handler error, message kept pending: {}",
+                                        e
+                                    );
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    msg_id = %msg_id,
+                                    "Failed to deserialize InboxMessage: {}",
+                                    e
+                                );
                             }
                         }
-                        Err(e) => tracing::warn!("Failed to deserialize InboxMessage: {}", e),
-                    },
+                        if let Err(e) = backend
+                            .ack(&inbox_stream, &group_name, std::slice::from_ref(&msg_id))
+                            .await
+                        {
+                            tracing::warn!(msg_id = %msg_id, "Failed to ack inbox message: {}", e);
+                        }
+                    }
                     Err(e) => tracing::warn!("Stream error: {}", e),
                 }
             }

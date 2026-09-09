@@ -244,10 +244,43 @@ impl AgentConsumer {
             .await?;
 
         while let Some(result) = stream.next().await {
-            let (_msg_id, bytes) = result?;
-            let message: cog_core::InboxMessage =
-                serde_json::from_slice(&bytes).map_err(cog_core::SFError::Serialization)?;
+            let (msg_id, bytes) = result?;
+            let message: cog_core::InboxMessage = match serde_json::from_slice(&bytes)
+                .map_err(cog_core::SFError::Serialization)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    // Poison message: ack it out, otherwise every redelivery
+                    // fails the same parse and the consumer can never advance.
+                    tracing::warn!(msg_id = %msg_id, "Failed to deserialize InboxMessage: {e}");
+                    if let Err(e) = self
+                        .backend
+                        .ack(
+                            &self.inbox_stream,
+                            &group_name,
+                            std::slice::from_ref(&msg_id),
+                        )
+                        .await
+                    {
+                        tracing::warn!(msg_id = %msg_id, "Failed to ack poison inbox message: {e}");
+                    }
+                    continue;
+                }
+            };
+            // Handler error propagates: the message stays pending for
+            // redelivery instead of being acked as processed.
             handler(message).await?;
+            if let Err(e) = self
+                .backend
+                .ack(
+                    &self.inbox_stream,
+                    &group_name,
+                    std::slice::from_ref(&msg_id),
+                )
+                .await
+            {
+                tracing::warn!(msg_id = %msg_id, "Failed to ack inbox message: {e}");
+            }
         }
 
         Ok(())

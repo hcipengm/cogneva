@@ -152,7 +152,7 @@ impl DagExecutorRuntime {
                 msg = stream.next() => msg,
             };
 
-            let (_msg_id, bytes) = match next {
+            let (msg_id, bytes) = match next {
                 Some(Ok(v)) => v,
                 Some(Err(e)) => return Err(e),
                 None => break,
@@ -161,7 +161,16 @@ impl DagExecutorRuntime {
             let msg: DagMessage = match serde_json::from_slice(&bytes) {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!("Failed to deserialize DagMessage: {e}");
+                    // Poison message: no future bytes can parse better, so ack
+                    // it out instead of letting the sweeper redeliver forever.
+                    tracing::warn!(msg_id = %msg_id, "Failed to deserialize DagMessage: {e}");
+                    if let Err(e) = self
+                        .backend
+                        .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                        .await
+                    {
+                        tracing::warn!(msg_id = %msg_id, "Failed to ack poison result message: {e}");
+                    }
                     continue;
                 }
             };
@@ -182,12 +191,43 @@ impl DagExecutorRuntime {
                                 "Task completed via message queue"
                             );
                         }
+                        Err(e @ cog_core::SFError::TaskFailed { .. }) => {
+                            // Duplicate/stale result for an already-terminal or
+                            // unknown task: reprocessing can never succeed, so
+                            // ack and drop instead of spinning on redelivery.
+                            tracing::warn!(
+                                task_id = %task_id, msg_id = %msg_id,
+                                "result message rejected by DAG ({e}); dropping"
+                            );
+                            if let Err(e) = self
+                                .backend
+                                .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                                .await
+                            {
+                                tracing::warn!(
+                                    task_id = %task_id, msg_id = %msg_id,
+                                    "Failed to ack stale result message: {e}"
+                                );
+                            }
+                            continue;
+                        }
                         Err(e) => {
                             tracing::warn!(task_id = %task_id, "complete_task failed: {e}");
+                            continue;
                         }
                     }
                     if let Err(e) = self.publish_ready_tasks().await {
+                        // Keep the message pending: redelivery hits the
+                        // terminal-task reject above but retries scheduling.
                         tracing::warn!("publish_ready_tasks after complete failed: {e}");
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .backend
+                        .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                        .await
+                    {
+                        tracing::warn!(task_id = %task_id, msg_id = %msg_id, "Failed to ack result message: {e}");
                     }
                 }
                 DagMessage::TaskFailed { task_id, error, .. } => {
@@ -200,16 +240,49 @@ impl DagExecutorRuntime {
                                 "Task failed via message queue"
                             );
                         }
+                        Err(e @ cog_core::SFError::TaskFailed { .. }) => {
+                            tracing::warn!(
+                                task_id = %task_id, msg_id = %msg_id,
+                                "failure result rejected by DAG ({e}); dropping"
+                            );
+                            if let Err(e) = self
+                                .backend
+                                .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                                .await
+                            {
+                                tracing::warn!(
+                                    task_id = %task_id, msg_id = %msg_id,
+                                    "Failed to ack stale failure message: {e}"
+                                );
+                            }
+                            continue;
+                        }
                         Err(e) => {
                             tracing::warn!(task_id = %task_id, "fail_task failed: {e}");
+                            continue;
                         }
                     }
                     if let Err(e) = self.publish_ready_tasks().await {
                         tracing::warn!("publish_ready_tasks after fail failed: {e}");
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .backend
+                        .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                        .await
+                    {
+                        tracing::warn!(task_id = %task_id, msg_id = %msg_id, "Failed to ack failure message: {e}");
                     }
                 }
                 _ => {
-                    tracing::debug!("Ignoring non-result DagMessage variant");
+                    tracing::debug!(msg_id = %msg_id, "Ignoring non-result DagMessage variant");
+                    if let Err(e) = self
+                        .backend
+                        .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
+                        .await
+                    {
+                        tracing::warn!(msg_id = %msg_id, "Failed to ack unhandled result message: {e}");
+                    }
                 }
             }
         }
@@ -244,7 +317,7 @@ impl DagExecutorRuntime {
                 msg = stream.next() => msg,
             };
 
-            let (_msg_id, bytes) = match next {
+            let (msg_id, bytes) = match next {
                 Some(Ok(v)) => v,
                 Some(Err(e)) => return Err(e),
                 None => break,
@@ -253,7 +326,14 @@ impl DagExecutorRuntime {
             let goal: cog_core::GoalMessage = match serde_json::from_slice(&bytes) {
                 Ok(g) => g,
                 Err(e) => {
-                    tracing::warn!("Failed to deserialize GoalMessage: {e}");
+                    tracing::warn!(msg_id = %msg_id, "Failed to deserialize GoalMessage: {e}");
+                    if let Err(e) = self
+                        .backend
+                        .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
+                        .await
+                    {
+                        tracing::warn!(msg_id = %msg_id, "Failed to ack poison goal message: {e}");
+                    }
                     continue;
                 }
             };
@@ -282,6 +362,9 @@ impl DagExecutorRuntime {
                             "Goal processed via ActionPlanner"
                         );
                     }
+                    // Planner failure can be transient (LLM/collaboration):
+                    // leave pending so redelivery retries; dedup by message_id
+                    // prevents double submission.
                     Err(e) => {
                         tracing::warn!(
                             goal_id = %goal.message_id,
@@ -300,9 +383,189 @@ impl DagExecutorRuntime {
 
             if let Err(e) = self.publish_ready_tasks().await {
                 tracing::warn!(goal_id = %goal.message_id, "publish_ready_tasks after goal failed: {e}");
+                continue;
+            }
+            if let Err(e) = self
+                .backend
+                .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
+                .await
+            {
+                tracing::warn!(goal_id = %goal.message_id, msg_id = %msg_id, "Failed to ack goal message: {e}");
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod consumer_ack_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use cog_core::MessageStream;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type Queue = HashMap<String, Vec<(String, Vec<u8>)>>;
+    type AckLog = Vec<(String, String, Vec<String>)>;
+
+    /// Scripted backend: subscribe replays a fixed queue per subject then
+    /// blocks forever; ack calls are recorded for assertions.
+    #[derive(Clone, Default)]
+    struct ScriptedBackend {
+        queues: Arc<Mutex<Queue>>,
+        acks: Arc<Mutex<AckLog>>,
+    }
+
+    impl ScriptedBackend {
+        fn enqueue(&self, subject: &str, msg_id: &str, bytes: Vec<u8>) {
+            self.queues
+                .lock()
+                .unwrap()
+                .entry(subject.to_string())
+                .or_default()
+                .push((msg_id.to_string(), bytes));
+        }
+
+        fn acked_ids(&self) -> Vec<String> {
+            self.acks
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|(_, _, ids)| ids.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl MessageBackend for ScriptedBackend {
+        async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
+            Ok(())
+        }
+        async fn subscribe(&self, subject: &str, _group: &str) -> SFResult<MessageStream> {
+            let queue = self
+                .queues
+                .lock()
+                .unwrap()
+                .remove(subject)
+                .unwrap_or_default();
+            let stream =
+                futures::stream::iter(queue.into_iter().map(Ok)).chain(futures::stream::pending());
+            Ok(Box::pin(stream))
+        }
+        async fn subscribe_from(
+            &self,
+            _subject: &str,
+            _group: &str,
+            _start_id: &str,
+        ) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn create_consumer_group(&self, _stream: &str, _group: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()> {
+            self.acks
+                .lock()
+                .unwrap()
+                .push((stream.to_string(), group.to_string(), ids.to_vec()));
+            Ok(())
+        }
+    }
+
+    fn test_runtime(backend: ScriptedBackend) -> DagExecutorRuntime {
+        DagExecutorRuntime::new_with_backend(
+            DagExecutorConfig {
+                redis_url: "memory".into(),
+                workspace_id: "ws-ack-test".into(),
+                consumer_group: "grp-ack-test".into(),
+                max_retries: 1,
+            },
+            backend,
+        )
+    }
+
+    async fn wait_for_acks(backend: &ScriptedBackend, n: usize) -> Vec<String> {
+        for _ in 0..50 {
+            if backend.acks.lock().unwrap().len() >= n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        backend.acked_ids()
+    }
+
+    #[tokio::test]
+    async fn stale_result_for_unknown_task_is_acked() {
+        // Regression: run_consumer discarded msg_id and never acked, so stale
+        // results sat in the PEL and were redelivered on every restart/sweep.
+        let backend = ScriptedBackend::default();
+        let msg = DagMessage::TaskComplete {
+            message_id: "m1".into(),
+            timestamp: chrono::Utc::now(),
+            task_id: "task-does-not-exist".into(),
+            result: serde_json::json!({"ok": true}),
+            sender: "exec".into(),
+            recipient: "dag".into(),
+        };
+        let bytes = serde_json::to_vec(&msg).unwrap();
+        backend.enqueue("orchestrator:results:ws-ack-test", "rid-1", bytes);
+
+        let runtime = test_runtime(backend.clone());
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
+        let acks = wait_for_acks(&backend, 1).await;
+        shutdown.trigger();
+        let _ = handle.await.unwrap();
+
+        assert_eq!(acks, vec!["rid-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn poison_result_message_is_acked() {
+        let backend = ScriptedBackend::default();
+        backend.enqueue(
+            "orchestrator:results:ws-ack-test",
+            "rid-poison",
+            b"not-json".to_vec(),
+        );
+
+        let runtime = test_runtime(backend.clone());
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
+        let acks = wait_for_acks(&backend, 1).await;
+        shutdown.trigger();
+        let _ = handle.await.unwrap();
+
+        assert_eq!(acks, vec!["rid-poison".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn processed_goal_is_acked() {
+        let backend = ScriptedBackend::default();
+        let goal = cog_core::GoalMessage {
+            message_id: "g1".into(),
+            timestamp: chrono::Utc::now(),
+            workspace_id: "ws-ack-test".into(),
+            goal_id: "goal-1".into(),
+            goal: "noop goal".into(),
+            tasks: vec![],
+            priority: 0,
+            source: cog_core::GoalSource::Internal,
+        };
+        let bytes = serde_json::to_vec(&goal).unwrap();
+        backend.enqueue("goals:ws-ack-test", "gid-1", bytes);
+
+        let runtime = test_runtime(backend.clone());
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move { runtime.run_goal_consumer(shutdown_clone).await });
+        let acks = wait_for_acks(&backend, 1).await;
+        shutdown.trigger();
+        let _ = handle.await.unwrap();
+
+        assert_eq!(acks, vec!["gid-1".to_string()]);
     }
 }
