@@ -105,12 +105,16 @@ impl TaskExecutorRouter {
             workspace_id: workspace_id.to_string(),
         });
 
+        // 主订阅循环与清扫器共用的执行许可：新鲜投递与 idle 认领合计最多
+        // CLAIM_CONCURRENCY 条在途执行。
+        let claim_slots = Arc::new(tokio::sync::Semaphore::new(CLAIM_CONCURRENCY));
+
         {
             let sweeper = self.clone();
             let sweep_task_backend = task_backend.clone();
             let sweep_shutdown = shutdown.clone();
             let sweep_pipe = pipe.clone();
-            let claim_slots = Arc::new(tokio::sync::Semaphore::new(CLAIM_CONCURRENCY));
+            let sweep_slots = claim_slots.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
                 loop {
@@ -150,28 +154,17 @@ impl TaskExecutorRouter {
                                 // 执行结束。
                                 let permit = tokio::select! {
                                     _ = sweep_shutdown.wait() => break,
-                                    acquired = claim_slots.clone().acquire_owned() => match acquired {
+                                    acquired = sweep_slots.clone().acquire_owned() => match acquired {
                                         Ok(permit) => permit,
                                         Err(_) => break,
                                     },
                                 };
-                                let sweeper = sweeper.clone();
-                                let pipe = sweep_pipe.clone();
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    // 处理 panic 不得杀死清扫循环：记录后
-                                    // 消息仍在 PEL，超过 idle 阈值会被下一
-                                    // 轮重新认领，恢复路径自愈。
-                                    let guarded = AssertUnwindSafe(
-                                        sweeper.process_ready_message(&pipe, msg_id, &bytes),
-                                    );
-                                    if let Err(payload) = guarded.catch_unwind().await {
-                                        tracing::warn!(
-                                            "claimed ready message processing panicked: {}",
-                                            panic_message(&payload)
-                                        );
-                                    }
-                                });
+                                sweeper.spawn_ready_processing(
+                                    sweep_pipe.clone(),
+                                    msg_id,
+                                    bytes,
+                                    permit,
+                                );
                             }
                         }
                     }
@@ -199,8 +192,26 @@ impl TaskExecutorRouter {
                     biased;
                     _ = shutdown.wait() => break 'subscribe,
                     msg = stream.next() => match msg {
+                        // 读取与执行解耦：订阅循环只负责投递，处理在独立
+                        // 任务里跑。串行 await 执行会让一条长任务（timeout
+                        // 最长 30 分钟）期间完全不发 XREADGROUP，积压消息
+                        // 全部队头阻塞（实测重启后 lag 被占住 ~30 分钟）。
+                        // 许可在读取侧获取：在途执行打满时订阅自然背压，
+                        // 不会无限派发。
                         Some(Ok((msg_id, bytes))) => {
-                            self.process_ready_message(&pipe, msg_id, &bytes).await;
+                            let permit = tokio::select! {
+                                _ = shutdown.wait() => break 'subscribe,
+                                acquired = claim_slots.clone().acquire_owned() => match acquired {
+                                    Ok(permit) => permit,
+                                    Err(_) => break 'subscribe,
+                                },
+                            };
+                            self.spawn_ready_processing(
+                                pipe.clone(),
+                                msg_id,
+                                bytes,
+                                permit,
+                            );
                         }
                         Some(Err(e)) => {
                             tracing::warn!("task stream error, resubscribing: {e}");
@@ -221,6 +232,30 @@ impl TaskExecutorRouter {
         }
 
         Ok(())
+    }
+
+    /// 把一条已拿到执行许可的 ready 消息派发到独立任务。主订阅循环与
+    /// pending 清扫器共用：调用方负责先取得许可（执行打满时在读取侧背
+    /// 压），处理任务持有许可到执行结束。panic 只杀单条处理任务并记录，
+    /// 消息不 ack 留在 PEL，超过 idle 阈值后由清扫器重新认领。
+    fn spawn_ready_processing(
+        &self,
+        pipe: Arc<ReadyPipeline>,
+        msg_id: String,
+        bytes: Vec<u8>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let guarded = AssertUnwindSafe(this.process_ready_message(&pipe, msg_id, &bytes));
+            if let Err(payload) = guarded.catch_unwind().await {
+                tracing::warn!(
+                    "ready message processing panicked: {}",
+                    panic_message(&payload)
+                );
+            }
+        });
     }
 
     /// 执行一条 ready 消息的全管线：反序列化 → start_task → execute →
@@ -586,6 +621,172 @@ mod ready_pipeline_tests {
         assert!(matches!(msg, DagMessage::TaskComplete { .. }));
         let acks = backend.acks.lock().await;
         assert_eq!(acks[0].2, vec!["m-ok".to_string()]);
+    }
+
+    struct QueueBackend {
+        published: tokio::sync::Mutex<Vec<(String, Vec<u8>)>>,
+        acks: tokio::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+        queue: tokio::sync::Mutex<std::collections::VecDeque<(String, Vec<u8>)>>,
+    }
+
+    impl QueueBackend {
+        fn new(queue: Vec<(String, Vec<u8>)>) -> Self {
+            Self {
+                published: tokio::sync::Mutex::new(Vec::new()),
+                acks: tokio::sync::Mutex::new(Vec::new()),
+                queue: tokio::sync::Mutex::new(queue.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MessageBackend for QueueBackend {
+        async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
+            self.published
+                .lock()
+                .await
+                .push((subject.to_string(), payload.to_vec()));
+            Ok(())
+        }
+        async fn subscribe(&self, _subject: &str, _group: &str) -> SFResult<MessageStream> {
+            // 吐出预置消息后永久 pending，模拟空流长轮询。
+            let items: Vec<(String, Vec<u8>)> = self.queue.lock().await.drain(..).collect();
+            Ok(Box::pin(
+                futures::stream::iter(items.into_iter().map(Ok)).chain(futures::stream::pending()),
+            ))
+        }
+        async fn subscribe_from(
+            &self,
+            _subject: &str,
+            _group: &str,
+            _start_id: &str,
+        ) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn create_consumer_group(&self, _stream: &str, _group: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()> {
+            self.acks
+                .lock()
+                .await
+                .push((stream.to_string(), group.to_string(), ids.to_vec()));
+            Ok(())
+        }
+        async fn claim_pending(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _min_idle_ms: u64,
+            _count: usize,
+        ) -> SFResult<Vec<(String, Vec<u8>)>> {
+            Ok(Vec::new())
+        }
+        async fn dlq(&self, _stream: &str, _msg_id: &str, _reason: &str) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    struct ActiveGuard {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct ConcurrencyExecutor {
+        sleep_secs: u64,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for ConcurrencyExecutor {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+        async fn execute(&self, _task: &Task) -> SFResult<TaskResult> {
+            use std::sync::atomic::Ordering;
+            let _guard = ActiveGuard {
+                active: self.active.clone(),
+            };
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(self.sleep_secs)).await;
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({"done": true}),
+                metadata: TaskResultMetadata::new("concurrency"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_task_does_not_block_ready_stream() {
+        // 回归：主订阅循环串行 await 处理，一条长任务执行期间不发
+        // XREADGROUP，后续消息全部队头阻塞（实测 timeout 1800s 的任务把
+        // 读取位占住约 30 分钟，lag 无法消化）。派发改为 spawn 后，第二条
+        // 消息必须与第一条并发执行，两者都在各自 1s timeout 后完成。
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mk_task = |id: &str| {
+            let mut task = test_task(1);
+            task.id = id.into();
+            serde_json::to_vec(&task).unwrap()
+        };
+        let backend = Arc::new(QueueBackend::new(vec![
+            ("m1".into(), mk_task("t-a")),
+            ("m2".into(), mk_task("t-b")),
+        ]));
+        let router = Arc::new(
+            TaskExecutorRouter::new()
+                .with_executor(Arc::new(ConcurrencyExecutor {
+                    sleep_secs: 10,
+                    active: active.clone(),
+                    max_active: max_active.clone(),
+                }))
+                .await,
+        );
+
+        let shutdown = ShutdownSignal::new();
+        let runner = {
+            let router = router.clone();
+            let backend = backend.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                router
+                    .run_consumer(backend.clone(), backend, "ws", shutdown)
+                    .await
+            })
+        };
+
+        let started = std::time::Instant::now();
+        loop {
+            if backend.acks.lock().await.len() == 2 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "both messages were not processed"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "stream stayed blocked during the slow task: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            max_active.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "messages were not processed concurrently"
+        );
+
+        shutdown.trigger();
+        runner.await.unwrap().unwrap();
     }
 
     #[tokio::test]
