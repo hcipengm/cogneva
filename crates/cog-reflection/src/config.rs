@@ -420,6 +420,11 @@ pub struct MainlineDeployerConfig {
     pub max_attempts_per_rev: u32,
     /// 单个 deployment 滚动等待超时（秒）。
     pub rollout_timeout_secs: u64,
+    /// 空闲心跳日志的最小间隔（秒）。SameRev 收敛路径静默返回（无推进即
+    /// 无日志），单凭日志无法证明部署器存活；心跳按该间隔打一条 INFO
+    /// 状态摘要（bare HEAD / last_good / in_flight / 失败计数）。0 表示
+    /// 每轮轮询都打。
+    pub heartbeat_log_secs: u64,
     /// 滚动目标，顺序即滚动顺序。默认：网关代理面先行，进化宿主最后。
     pub targets: Vec<RolloutTargetConfig>,
 }
@@ -445,6 +450,7 @@ impl Default for MainlineDeployerConfig {
             failure_cooldown_secs: 3600,
             max_attempts_per_rev: 2,
             rollout_timeout_secs: 300,
+            heartbeat_log_secs: 3600,
             targets: vec![
                 RolloutTargetConfig {
                     deployment: "cogneva-security-gateway".into(),
@@ -559,6 +565,9 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_TIMEOUT_SECS") {
             self.rollout_timeout_secs =
                 parse("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_TIMEOUT_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS") {
+            self.heartbeat_log_secs = parse("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS", &v)?;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BUILDER_BIN") {
             self.builder_bin = v;
@@ -778,16 +787,19 @@ mod tests {
             ("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", "30"),
             ("COGNEVA_MAINLINE_DEPLOYER_REGISTRY", "reg.local:5000"),
             ("COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS", "1"),
+            ("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS", "120"),
         ]
         .into_iter()
         .collect();
         let mut cfg = MainlineDeployerConfig::default();
+        assert_eq!(cfg.heartbeat_log_secs, 3600);
         cfg.apply_env_with(|k| env.get(k).map(|s| s.to_string()))
             .unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.poll_interval_secs, 30);
         assert_eq!(cfg.registry, "reg.local:5000");
         assert_eq!(cfg.cargo_build_jobs, 1);
+        assert_eq!(cfg.heartbeat_log_secs, 120);
 
         let bad: HashMap<&str, &str> = [("COGNEVA_MAINLINE_DEPLOYER_ENABLED", "nope")]
             .into_iter()

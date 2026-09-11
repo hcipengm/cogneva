@@ -242,6 +242,17 @@ impl MainlineDeployer {
         }
     }
 
+    /// 打一条 INFO 心跳：bare HEAD + 持久化状态摘要。bare 读取失败只降级
+    /// 成占位文本，不影响主循环——心跳本身绝不能成为故障源。
+    async fn log_heartbeat(&self) {
+        let bare = self
+            .bare_main_rev()
+            .await
+            .unwrap_or_else(|e| format!("unreadable({e})"));
+        let summary = heartbeat_message(&self.load_state(), &bare, chrono::Utc::now().timestamp());
+        info!(heartbeat = %summary, "mainline deployer heartbeat");
+    }
+
     fn save_state(&self, state: &MainlineState) -> SFResult<()> {
         std::fs::create_dir_all(&self.cfg.state_dir)
             .map_err(|e| SFError::IO(format!("create state dir {}: {e}", self.cfg.state_dir)))?;
@@ -946,6 +957,25 @@ impl Drop for BuildLock {
     }
 }
 
+/// 心跳摘要（纯函数便于测试）：一行覆盖空闲态全部关键状态。SameRev 收敛
+/// 路径静默返回，没有这条摘要时部署器存活无法从日志证明。
+fn heartbeat_message(state: &MainlineState, bare_rev: &str, now_unix: i64) -> String {
+    let in_flight = state
+        .in_flight
+        .as_ref()
+        .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
+        .unwrap_or_else(|| "none".into());
+    format!(
+        "bare={} last_good={} in_flight={} failed_rev={} failed_attempts={} cooldown_remaining_secs={}",
+        rev12(bare_rev),
+        state.last_good_rev.as_deref().map(rev12).unwrap_or("none"),
+        in_flight,
+        state.failed_rev.as_deref().map(rev12).unwrap_or("none"),
+        state.failed_attempts,
+        (state.failed_cooldown_until - now_unix).max(0),
+    )
+}
+
 /// 构建侧后台循环入口（插件 spawn）。
 pub async fn run_mainline_loop(
     deployer: std::sync::Arc<MainlineDeployer>,
@@ -968,6 +998,9 @@ pub async fn run_mainline_loop(
         "Mainline deployer loop started"
     );
     let mut ticker = tokio::time::interval(interval);
+    // 空闲心跳：SameRev 路径静默返回，靠周期性 INFO 摘要证明部署器存活。
+    let heartbeat_every = Duration::from_secs(deployer.cfg.heartbeat_log_secs);
+    let mut last_heartbeat: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             biased;
@@ -975,6 +1008,13 @@ pub async fn run_mainline_loop(
             _ = ticker.tick() => {
                 if let Err(e) = deployer.poll_once().await {
                     warn!(error = %e, "mainline deployer poll failed");
+                }
+                let due = last_heartbeat
+                    .map(|t| t.elapsed() >= heartbeat_every)
+                    .unwrap_or(true);
+                if due {
+                    deployer.log_heartbeat().await;
+                    last_heartbeat = Some(tokio::time::Instant::now());
                 }
             }
         }
@@ -1388,6 +1428,53 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_message_summarizes_idle_state() {
+        let state = MainlineState {
+            last_good_tag: Some("cogneva:main-4dfd51ff1209".into()),
+            last_good_rev: Some("4dfd51ff1209abcdef".into()),
+            in_flight: None,
+            failed_rev: None,
+            failed_cooldown_until: 0,
+            failed_attempts: 0,
+        };
+        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", 100);
+        assert!(msg.contains("bare=4dfd51ff1209"), "{msg}");
+        assert!(msg.contains("last_good=4dfd51ff1209"), "{msg}");
+        assert!(msg.contains("in_flight=none"), "{msg}");
+        assert!(msg.contains("failed_rev=none"), "{msg}");
+        assert!(msg.contains("failed_attempts=0"), "{msg}");
+        assert!(msg.contains("cooldown_remaining_secs=0"), "{msg}");
+    }
+
+    #[test]
+    fn heartbeat_message_shows_inflight_and_cooldown() {
+        let state = MainlineState {
+            last_good_tag: None,
+            last_good_rev: None,
+            in_flight: Some(InFlight {
+                rev: "aabbccddeeff0011".into(),
+                phase: Phase::Pushed,
+            }),
+            failed_rev: Some("112233445566aabb".into()),
+            failed_cooldown_until: 1500,
+            failed_attempts: 2,
+        };
+        let msg = heartbeat_message(&state, "aabbccddeeff0011", 1000);
+        assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
+        assert!(msg.contains("failed_rev=112233445566"), "{msg}");
+        assert!(msg.contains("failed_attempts=2"), "{msg}");
+        assert!(msg.contains("cooldown_remaining_secs=500"), "{msg}");
+    }
+
+    #[test]
+    fn heartbeat_message_survives_unreadable_bare_rev() {
+        // 心跳本身绝不能成为故障源：bare 读取失败时降级为占位文本。
+        let msg = heartbeat_message(&MainlineState::default(), "unreadable(git failed)", 0);
+        assert!(msg.contains("bare=unreadable("), "{msg}");
+        assert!(msg.contains("last_good=none"), "{msg}");
+    }
+
+    #[test]
     fn image_refs_and_rev_parsing() {
         let img = main_image("cogneva-registry.cogneva.svc:5000", "abcdef0123456789");
         assert_eq!(
@@ -1718,6 +1805,7 @@ exit 0
             failure_cooldown_secs: 60,
             max_attempts_per_rev: 2,
             rollout_timeout_secs: 60,
+            heartbeat_log_secs: 3600,
             targets: MainlineDeployerConfig::default().targets,
         }
     }
