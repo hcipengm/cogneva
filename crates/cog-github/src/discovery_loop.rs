@@ -568,11 +568,55 @@ impl GitHubDiscoveryLoop {
     /// Run one discovery round. Returns the number of issues scanned.
     pub async fn run_once(&mut self) -> Result<usize> {
         self.load_guards_once().await;
-        let issues = self
+        let mut issues = self
             .discovery
             .scan(self.provider.as_ref(), &self.config)
             .await?;
         let scanned = issues.len();
+
+        // The scan watermark advances past every issue it has seen, so an
+        // intent whose terminal-failure backoff window expires later would
+        // never resurface through scan — silently turning "back off and
+        // retry" into "give up forever". Fetch the due ones explicitly.
+        // PRs need no such path: they are listed in full every round.
+        let scanned_numbers: std::collections::HashSet<u64> =
+            issues.iter().map(|i| i.number).collect();
+        let now = std::time::Instant::now();
+        let due: Vec<u64> = self
+            .terminal_backoff
+            .iter()
+            .filter(|(key, b)| {
+                key.starts_with("issue:")
+                    && now >= b.skip_until
+                    && key["issue:".len()..]
+                        .parse::<u64>()
+                        .map(|n| !scanned_numbers.contains(&n))
+                        .unwrap_or(false)
+            })
+            .filter_map(|(key, _)| key["issue:".len()..].parse::<u64>().ok())
+            .collect();
+        for number in due {
+            match self.provider.get_issue(number).await {
+                Ok(issue)
+                    if self
+                        .config
+                        .allowed_issue_states
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&issue.state)) =>
+                {
+                    tracing::info!(number, "terminal-backoff window expired; retrying issue");
+                    issues.push(issue);
+                }
+                Ok(_) => {
+                    // Closed since the failure — nothing to retry; drop the
+                    // entry so it stops being re-fetched every round.
+                    self.terminal_backoff.remove(&format!("issue:{number}"));
+                }
+                Err(e) => {
+                    tracing::warn!(number, error = %e, "Failed to fetch backoff-due issue for retry");
+                }
+            }
+        }
 
         for issue in issues {
             let key = format!("issue:{}", issue.number);
@@ -2147,6 +2191,60 @@ mod tests {
         assert!(
             !types.iter().any(|t| t == "platform_issue_fix"),
             "a clarify verdict must not submit a fix task; got {types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_due_issue_is_refetched_past_watermark() {
+        // Terminal backoff promises a retry once its window expires, but the
+        // scan watermark has already advanced past the issue's updated_at, so
+        // a plain scan round can never surface it again. The loop must fetch
+        // due intents explicitly, otherwise a backoff silently degrades into
+        // a permanent give-up (observed in production: a generator timeout
+        // parked a security fix forever).
+        let provider = Arc::new(MockProvider {
+            issues: vec![issue(
+                77,
+                "WebSocket chat bypasses the permission check; repro: open ws without a token and send a task",
+            )],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        // Watermark set ahead of the issue's updated_at: scan cannot see #77.
+        loop_.discovery = IssueDiscovery::with_watermark(Utc::now() + chrono::Duration::seconds(1));
+        // Expired terminal-failure backoff entry left by an earlier failed round.
+        loop_.terminal_backoff.insert(
+            "issue:77".into(),
+            TerminalBackoff {
+                consecutive: 1,
+                skip_until: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            },
+        );
+
+        let scanned = loop_.run_once().await.unwrap();
+        assert_eq!(scanned, 0, "watermark-filtered scan sees nothing");
+
+        let types = orchestrator.task_types.lock().unwrap();
+        assert!(
+            types.iter().any(|t| t == "platform_intent_assess"),
+            "due backoff issue should be re-fetched and judged again; got {types:?}"
+        );
+        drop(types);
+        assert!(
+            !loop_.terminal_backoff.contains_key("issue:77"),
+            "successful retry should clear the backoff entry"
         );
     }
 
