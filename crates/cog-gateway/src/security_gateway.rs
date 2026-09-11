@@ -61,9 +61,14 @@ pub struct SecurityGatewayConfig {
     /// 域名白名单；空 = 不限制（仅黑名单生效）。
     pub domain_allowlist: Vec<String>,
     pub domain_denylist: Vec<String>,
-    /// LLM 上游池：按声明顺序故障转移（429 限流 / 402 额度耗尽 / 连接失败
-    /// 切下一个）。空 = 未配置，LLM 通道一律 503。
+    /// LLM 上游池：健康优先故障转移——任何首字节前的失败（连接失败或
+    /// 任意非 2xx，配额/限流/鉴权的状态码形态因厂商而异）都切下一个，
+    /// 失败上游进嫌疑窗（指数退避），后台探测器在窗口到期时最小请求复测。
+    /// 空 = 未配置，LLM 通道一律 503。
     pub llm_upstreams: Vec<LlmUpstream>,
+    /// 嫌疑上游的主动探测间隔秒数（COGNEVA_LLM_HEALTH_PROBE_SECS，默认 300），
+    /// 同时是嫌疑窗指数退避的基数。
+    pub llm_health_probe_secs: u64,
     /// GitHub API 透传出口注入的 token（COGNEVA_GITHUB_TOKEN）。未配置时
     /// `/github/*` 一律 503。
     pub github_token: Option<String>,
@@ -103,6 +108,7 @@ impl SecurityGatewayConfig {
             domain_allowlist: list("COGNEVA_SG_DOMAIN_ALLOWLIST"),
             domain_denylist: list("COGNEVA_SG_DOMAIN_DENYLIST"),
             llm_upstreams: upstreams_from_env(),
+            llm_health_probe_secs: env_u64("COGNEVA_LLM_HEALTH_PROBE_SECS", 300),
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
             webhook_port: env_u16("COGNEVA_SG_WEBHOOK_PORT", 8082),
@@ -165,16 +171,126 @@ fn normalize_style(raw: &str) -> String {
     }
 }
 
-/// 429（限流）/ 402（额度耗尽）判定为可转移：池内还有上游就切下一个。
-fn retryable_status(status: u16) -> bool {
-    status == 429 || status == 402
-}
-
 fn env_u16(key: &str, default: u16) -> u16 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// 日志/合成错误串里的上游错误体摘录：截头防大错误页刷爆日志。
+/// 截断长度保证常见厂商错误 JSON 的 type 字段（如 access_terminated_error）
+/// 不被切掉——调用方的终止性失败分类依赖这些标记。
+fn error_excerpt(text: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let t = text.trim();
+    if t.chars().count() <= MAX_CHARS {
+        t.to_string()
+    } else {
+        t.chars().take(MAX_CHARS).collect::<String>() + "…"
+    }
+}
+
+// ─── LLM 上游池健康表（进程内热切换依据）─────────────────────
+
+/// 嫌疑窗指数退避封顶：与调用侧终止退避同形，配额类终止的上游
+/// 每窗口最多烧一次最小探测调用，恢复延迟最多一个窗口。
+const SUSPECT_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
+
+/// 嫌疑窗时长：探测间隔 × 2^(n-1)，封顶 6h。n 为连续失败次数。
+fn suspect_backoff_secs(consecutive_failures: u32, probe_interval_secs: u64) -> u64 {
+    let base = probe_interval_secs.max(30);
+    let exp = consecutive_failures.saturating_sub(1).min(20);
+    base.saturating_mul(1u64 << exp)
+        .min(SUSPECT_BACKOFF_CAP_SECS)
+}
+
+/// 单个上游的健康态。
+#[derive(Debug)]
+struct UpstreamHealth {
+    consecutive_failures: u32,
+    /// None = 健康；Some(t) = 嫌疑至 t。窗口未到期时请求路由降级为
+    /// 兜底、探测器不重复测；到期后自然放行一次（真实请求或探测器
+    /// 谁先碰到谁实证），成功即恢复健康，失败则指数加窗。
+    suspect_until: Option<std::time::Instant>,
+}
+
+/// 池健康表：key = base_url|model（上游在池内的身份）。纯进程内状态，
+/// 重启即清零——代价只是每个坏上游多试一次，换来的是无持久化依赖。
+#[derive(Default)]
+struct LlmHealthTable {
+    states: Mutex<std::collections::HashMap<String, UpstreamHealth>>,
+}
+
+impl LlmHealthTable {
+    fn key(u: &LlmUpstream) -> String {
+        format!("{}|{}", u.base_url, u.model)
+    }
+
+    fn is_suspect(&self, u: &LlmUpstream) -> bool {
+        let now = std::time::Instant::now();
+        let states = self.states.lock().unwrap();
+        states
+            .get(&Self::key(u))
+            .and_then(|h| h.suspect_until)
+            .is_some_and(|t| now < t)
+    }
+
+    /// 记录一次失败：仅在"未嫌疑或窗口已到期"时计数并开/加窗——
+    /// 窗口内的并发失败突发不重复计（避免一次事故把指数打飞）。
+    /// 返回 Some((连续失败数, 窗口秒)) 表示开了新窗，调用方据此打 WARN。
+    fn note_failure(&self, u: &LlmUpstream, probe_interval_secs: u64) -> Option<(u32, u64)> {
+        let now = std::time::Instant::now();
+        let mut states = self.states.lock().unwrap();
+        let entry = states.entry(Self::key(u)).or_insert(UpstreamHealth {
+            consecutive_failures: 0,
+            suspect_until: None,
+        });
+        if entry.suspect_until.is_some_and(|t| now < t) {
+            return None;
+        }
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        let secs = suspect_backoff_secs(entry.consecutive_failures, probe_interval_secs);
+        entry.suspect_until = Some(now + std::time::Duration::from_secs(secs));
+        Some((entry.consecutive_failures, secs))
+    }
+
+    /// 记录一次成功：嫌疑态清除。返回此前是否处于嫌疑（调用方打恢复日志）。
+    fn note_success(&self, u: &LlmUpstream) -> bool {
+        let mut states = self.states.lock().unwrap();
+        match states.remove(&Self::key(u)) {
+            Some(h) => h.suspect_until.is_some(),
+            None => false,
+        }
+    }
+
+    /// 嫌疑上游的复测窗口是否到期：只有这些需要主动探测，
+    /// 健康上游不探（每次探测都烧真实配额，由真实请求实证即可）。
+    fn due_for_probe(&self, u: &LlmUpstream) -> bool {
+        let now = std::time::Instant::now();
+        let states = self.states.lock().unwrap();
+        states
+            .get(&Self::key(u))
+            .and_then(|h| h.suspect_until)
+            .is_some_and(|t| now >= t)
+    }
+}
+
+/// 候选排序：健康在前、嫌疑降级为兜底，两组内保持配置顺序（stable sort）。
+/// 嫌疑上游不硬排除——健康态可能过期，且全部嫌疑时仍要有人被试。
+fn order_by_health<'a>(
+    mut candidates: Vec<&'a LlmUpstream>,
+    health: &LlmHealthTable,
+) -> Vec<&'a LlmUpstream> {
+    candidates.sort_by_key(|u| health.is_suspect(u) as u8);
+    candidates
 }
 
 /// 简单延迟直方图（feed D10 GatewayLatency 指标）。
@@ -220,6 +336,9 @@ struct AppState {
     github_app: Option<GitHubAppCreds>,
     /// installation token 缓存（mint 一次换一小时，复用到临过期前刷新）。
     app_token_cache: std::sync::Arc<AppTokenCache>,
+    /// LLM 上游池健康表：请求路径失败/成功实时写入，探测器周期复测，
+    /// 候选排序据此热切换（进程内状态，零重启）。
+    llm_health: std::sync::Arc<LlmHealthTable>,
 }
 
 impl AppState {
@@ -494,8 +613,13 @@ async fn anthropic_messages_passthrough(
 /// 零上游知识，真实模型名只有网关知道（WebUI 向导或管理 API 写入），
 /// 调用方配置里的 model 只是占位。
 /// 多上游故障转移：只在"还没开始回流的阶段"切换——连接失败或上游在
-/// 首字节前返回 429/402 时切下一个同协议面上游；一旦开始流式回传就不再
-/// 切换（字节已发给调用方，无法换人）。
+/// 首字节前返回任意非 2xx 时切下一个同协议面上游（配额/限流/鉴权错误
+/// 的状态码形态因厂商而异，按码表判定必然漏；凭证与模型池内互相独立，
+/// 单点失败永远值得试下一个）；一旦开始流式回传就不再切换（字节已发给
+/// 调用方，无法换人）。失败上游进嫌疑窗，候选排序健康优先（热切换）。
+/// 池耗尽时把最后一个真实上游错误透传给调用方——厂商错误标记
+/// （如 access_terminated_error）是调用侧终止性失败分类的依据，
+/// 不能被合成文本吃掉。
 async fn stream_forward(
     state: AppState,
     req: axum::extract::Request,
@@ -551,7 +675,13 @@ async fn stream_forward(
         ));
     }
 
+    // 热切换：健康上游优先，嫌疑上游降级为兜底（不硬排除）。
+    let candidates = order_by_health(candidates, &state.llm_health);
+
     let mut last_err = String::new();
+    // 最后一个真实上游错误响应（状态码、content-type、原始 body）：
+    // 池耗尽时优先透传它，而不是合成 502 文本。
+    let mut last_failure: Option<(reqwest::StatusCode, String, String)> = None;
     for upstream in candidates {
         let base = upstream.base_url.trim_end_matches('/');
         let url = match style {
@@ -598,17 +728,40 @@ async fn stream_forward(
             Ok(resp) => resp,
             Err(e) => {
                 last_err = format!("连接上游 {base} 失败: {e}");
+                tracing::warn!(upstream = %base, error = %e, "LLM 上游连接失败，切换池内下一个");
+                mark_upstream_failure(&state, upstream, base);
                 continue;
             }
         };
-        if retryable_status(resp.status().as_u16()) {
-            last_err = format!("上游 {base} 返回 HTTP {}", resp.status());
+        let status = resp.status();
+        if !status.is_success() {
+            // 首字节前的任何非 2xx 都转移：配额/限流/鉴权的状态码形态
+            // 因厂商而异（429/402/403/451…），按码表判定必然漏；池内
+            // 凭证与模型互相独立，单点失败永远值得试下一个。
+            let ctype = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                upstream = %base,
+                status = %status,
+                body = %error_excerpt(&text),
+                "LLM 上游首字节前返回非 2xx，切换池内下一个"
+            );
+            mark_upstream_failure(&state, upstream, base);
+            last_err = format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text));
+            last_failure = Some((status, ctype, text));
             continue;
+        }
+        if state.llm_health.note_success(upstream) {
+            tracing::info!(upstream = %base, "LLM 上游恢复健康（真实请求实证）");
         }
         state.llm_stats.record(start.elapsed().as_millis() as u64);
 
-        let status =
-            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -622,17 +775,118 @@ async fn stream_forward(
             .body(axum::body::Body::from_stream(stream))
             .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
     }
+    // 池耗尽：有真实上游错误响应就透传状态码与原始 body（保留厂商
+    // 错误标记，调用侧终止性退避据此分类），连真实响应都没有才合成 502。
+    if let Some((status, ctype, body)) = last_failure {
+        let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Ok(axum::response::Response::builder()
+            .status(status)
+            .header("content-type", ctype)
+            .body(axum::body::Body::from(body))
+            .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
+    }
     Err((
         StatusCode::BAD_GATEWAY,
         format!("全部 {style} 协议面上游均不可用，最后错误：{last_err}"),
     ))
 }
 
-/// 单上游调用失败的归类：可转移（429/402/连接失败，切下一个上游）与
-/// 终态（鉴权失败、参数错误等，换上游也大概率一样错，直接返回）。
-enum UpstreamFail {
-    Retryable(String),
-    Fatal(String),
+/// 请求路径上的上游失败记账：进/加嫌疑窗，开新窗时打一条 WARN
+/// （窗口内的并发失败突发不重复计数也不刷日志）。
+fn mark_upstream_failure(state: &AppState, upstream: &LlmUpstream, base: &str) {
+    if let Some((consecutive, secs)) = state
+        .llm_health
+        .note_failure(upstream, state.config.llm_health_probe_secs)
+    {
+        tracing::warn!(
+            upstream = %base,
+            consecutive_failures = consecutive,
+            suspect_window_secs = secs,
+            "LLM 上游标记嫌疑，探测窗口到期后复测"
+        );
+    }
+}
+
+/// 主动健康探测循环：周期扫描嫌疑窗到期的上游，发最小请求复测。
+/// 只探嫌疑上游——健康上游由真实请求持续实证，不额外烧配额；嫌疑上游
+/// 每退避窗口最多烧一次 max_tokens=1 的探测，配额消耗有界。
+/// 探测成功即热恢复（进程内清嫌疑，零重启），失败则指数加窗。
+async fn run_llm_health_prober(state: AppState) {
+    let period = std::time::Duration::from_secs(state.config.llm_health_probe_secs.max(30));
+    let mut ticker = tokio::time::interval(period);
+    loop {
+        ticker.tick().await;
+        probe_suspect_upstreams(&state).await;
+    }
+}
+
+/// 单轮探测：对所有"嫌疑窗已到期"的上游各发一次最小复测请求。
+async fn probe_suspect_upstreams(state: &AppState) {
+    let due: Vec<LlmUpstream> = state
+        .config
+        .llm_upstreams
+        .iter()
+        .filter(|u| state.llm_health.due_for_probe(u))
+        .cloned()
+        .collect();
+    for upstream in due {
+        let base = upstream.base_url.trim_end_matches('/');
+        match probe_upstream(state, &upstream).await {
+            Ok(()) => {
+                if state.llm_health.note_success(&upstream) {
+                    tracing::info!(upstream = %base, "LLM 上游探测复通，热恢复进池");
+                }
+            }
+            Err(msg) => {
+                if let Some((consecutive, secs)) = state
+                    .llm_health
+                    .note_failure(&upstream, state.config.llm_health_probe_secs)
+                {
+                    tracing::warn!(
+                        upstream = %base,
+                        consecutive_failures = consecutive,
+                        suspect_window_secs = secs,
+                        error = %msg,
+                        "LLM 上游探测仍失败，指数加窗"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 最小连通性探测：max_tokens=1 的单轮 ping，只认 HTTP 状态码。
+/// 不带 tools（探测目标是"这家还能不能用"，能力准入另有探测）。
+async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), String> {
+    let base = upstream.base_url.trim_end_matches('/');
+    let url = match upstream.api_style.as_str() {
+        "anthropic" => format!("{base}/v1/messages"),
+        _ => format!("{base}/chat/completions"),
+    };
+    let payload = serde_json::json!({
+        "model": upstream.model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
+    });
+    let builder = state
+        .stream_client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&payload);
+    let builder = match upstream.api_style.as_str() {
+        "anthropic" => builder
+            .header("x-api-key", &upstream.api_key)
+            .header("anthropic-version", "2023-06-01"),
+        _ => builder.bearer_auth(&upstream.api_key),
+    };
+    let resp = builder.send().await.map_err(|e| format!("连接失败: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(format!("HTTP {status}: {}", error_excerpt(&text)))
+    }
 }
 
 async fn call_llm(
@@ -645,12 +899,26 @@ async fn call_llm(
             "网关未配置 LLM 上游".into(),
         ));
     }
+    // 与透传路径同一套热切换语义：健康优先，任何单上游失败（含鉴权类——
+    // 池内各家凭证互相独立，A 家 key 坏不代表 B 家坏）都切下一个。
+    let candidates = order_by_health(
+        state.config.llm_upstreams.iter().collect(),
+        &state.llm_health,
+    );
     let mut last_err = String::new();
-    for upstream in &state.config.llm_upstreams {
+    for upstream in candidates {
         match call_one_upstream(state, upstream, &messages).await {
-            Ok(resp) => return Ok(resp),
-            Err(UpstreamFail::Retryable(msg)) => last_err = msg,
-            Err(UpstreamFail::Fatal(msg)) => return Err((StatusCode::BAD_GATEWAY, msg)),
+            Ok(resp) => {
+                if state.llm_health.note_success(upstream) {
+                    tracing::info!(upstream = %upstream.base_url, "LLM 上游恢复健康（真实请求实证）");
+                }
+                return Ok(resp);
+            }
+            Err(msg) => {
+                tracing::warn!(upstream = %upstream.base_url, error = %msg, "LLM 上游调用失败，切换池内下一个");
+                mark_upstream_failure(state, upstream, upstream.base_url.trim_end_matches('/'));
+                last_err = msg;
+            }
         }
     }
     Err((
@@ -663,7 +931,7 @@ async fn call_one_upstream(
     state: &AppState,
     upstream: &LlmUpstream,
     messages: &[ChatMessage],
-) -> Result<Json<LlmResponse>, UpstreamFail> {
+) -> Result<Json<LlmResponse>, String> {
     let base = upstream.base_url.trim_end_matches('/');
     if upstream.api_style == "anthropic" {
         let (system, msgs): (String, Vec<&ChatMessage>) = {
@@ -691,20 +959,19 @@ async fn call_one_upstream(
             }))
             .send()
             .await
-            .map_err(|e| UpstreamFail::Retryable(format!("连接上游 {base} 失败: {e}")))?;
+            .map_err(|e| format!("连接上游 {base} 失败: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
-            let msg = format!("上游 {base} 返回 HTTP {status}");
-            return Err(if retryable_status(status.as_u16()) {
-                UpstreamFail::Retryable(msg)
-            } else {
-                UpstreamFail::Fatal(msg)
-            });
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "上游 {base} 返回 HTTP {status}: {}",
+                error_excerpt(&text)
+            ));
         }
         let v: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| UpstreamFail::Fatal(e.to_string()))?;
+            .map_err(|e| format!("上游 {base} 响应解析失败: {e}"))?;
         let content = v["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -725,20 +992,19 @@ async fn call_one_upstream(
         }))
         .send()
         .await
-        .map_err(|e| UpstreamFail::Retryable(format!("连接上游 {base} 失败: {e}")))?;
+        .map_err(|e| format!("连接上游 {base} 失败: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let msg = format!("上游 {base} 返回 HTTP {status}");
-        return Err(if retryable_status(status.as_u16()) {
-            UpstreamFail::Retryable(msg)
-        } else {
-            UpstreamFail::Fatal(msg)
-        });
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "上游 {base} 返回 HTTP {status}: {}",
+            error_excerpt(&text)
+        ));
     }
     let v: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| UpstreamFail::Fatal(e.to_string()))?;
+        .map_err(|e| format!("上游 {base} 响应解析失败: {e}"))?;
     let content = v["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default()
@@ -1369,11 +1635,13 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
         code_stats: std::sync::Arc::new(LatencyStats::default()),
         github_app: GitHubAppCreds::from_env(),
         app_token_cache: std::sync::Arc::new(AppTokenCache::default()),
+        llm_health: std::sync::Arc::new(LlmHealthTable::default()),
         config: config.clone(),
     };
     if state.github_app.is_some() {
         tracing::info!("安全网关：检测到 GitHub App 凭证，代码平台出口将以 App bot 身份发出");
     }
+    tokio::spawn(run_llm_health_prober(state.clone()));
     let egress_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.egress_port));
     let llm_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.llm_port));
     let webhook_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.webhook_port));
@@ -1417,6 +1685,7 @@ mod tests {
             domain_allowlist: allow.iter().map(|s| s.to_string()).collect(),
             domain_denylist: deny.iter().map(|s| s.to_string()).collect(),
             llm_upstreams: Vec::new(),
+            llm_health_probe_secs: 300,
             github_token: None,
             gitee_token: None,
             webhook_port: 8082,
@@ -1530,11 +1799,259 @@ mod tests {
     }
 
     #[test]
-    fn retryable_status_only_429_402() {
-        assert!(retryable_status(429));
-        assert!(retryable_status(402));
-        assert!(!retryable_status(401));
-        assert!(!retryable_status(500));
+    fn suspect_backoff_exponential_and_capped() {
+        // 窗口 = 探测间隔 × 2^(n-1)，封顶 6h；间隔有 30s 下限防呆。
+        assert_eq!(suspect_backoff_secs(1, 300), 300);
+        assert_eq!(suspect_backoff_secs(2, 300), 600);
+        assert_eq!(suspect_backoff_secs(3, 300), 1200);
+        assert_eq!(suspect_backoff_secs(10, 300), SUSPECT_BACKOFF_CAP_SECS);
+        assert_eq!(suspect_backoff_secs(0, 5), 30);
+    }
+
+    #[test]
+    fn health_table_window_semantics() {
+        let table = LlmHealthTable::default();
+        let u = LlmUpstream {
+            api_style: "openai".into(),
+            base_url: "https://a.example.com".into(),
+            model: "m1".into(),
+            api_key: "k".into(),
+            supports_tool_calls: None,
+        };
+        assert!(!table.is_suspect(&u));
+        // 首次失败开新窗：返回计数供调用方打 WARN。
+        assert_eq!(table.note_failure(&u, 300), Some((1, 300)));
+        assert!(table.is_suspect(&u));
+        assert!(!table.due_for_probe(&u));
+        // 窗口内的后续失败静默（不重复计数、不刷日志）。
+        assert_eq!(table.note_failure(&u, 300), None);
+        // 成功即恢复健康；note_success 报告此前确实处于嫌疑。
+        assert!(table.note_success(&u));
+        assert!(!table.is_suspect(&u));
+        assert!(!table.note_success(&u));
+    }
+
+    #[test]
+    fn order_by_health_demotes_suspect_keeps_config_order() {
+        let table = LlmHealthTable::default();
+        let mk = |base: &str| LlmUpstream {
+            api_style: "openai".into(),
+            base_url: base.into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            supports_tool_calls: None,
+        };
+        let a = mk("https://a");
+        let b = mk("https://b");
+        let c = mk("https://c");
+        table.note_failure(&b, 300);
+        let ordered = order_by_health(vec![&a, &b, &c], &table);
+        assert_eq!(ordered[0].base_url, "https://a");
+        assert_eq!(ordered[1].base_url, "https://c");
+        assert_eq!(ordered[2].base_url, "https://b");
+    }
+
+    #[tokio::test]
+    async fn stream_forward_fails_over_403_quota_and_passes_through_last_error() {
+        // 实证场景回归：Kimi 周配额终止返回 403（非 429/402），旧逻辑
+        // 直接透传短路全池，健康的后续上游永远不被尝试。新语义：首字节前
+        // 任何非 2xx 都切下一个；全部失败时透传最后一个真实上游错误
+        //（保留 access_terminated_error 等厂商标记给调用侧终止退避分类）。
+        let quota_body = r#"{"error":{"message":"You've reached your weekly (7-day) usage limit.","type":"access_terminated_error"}}"#;
+        let dead = spawn_stub_upstream(403, quota_body).await;
+        let dead2 = spawn_stub_upstream(429, r#"{"error":{"type":"rate_limit_exceeded"}}"#).await;
+
+        let state = test_state(vec![
+            stub_upstream(&dead, "m1"),
+            stub_upstream(&dead2, "m2"),
+        ]);
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = chat_completions_passthrough(State(state.clone()), req)
+            .await
+            .unwrap();
+        // 池耗尽：透传最后一个真实上游状态码与 body。
+        assert_eq!(resp.status(), 429);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("rate_limit_exceeded"));
+        // 两个失败上游都进了嫌疑窗。
+        assert!(state.llm_health.is_suspect(&stub_upstream(&dead, "m1")));
+        assert!(state.llm_health.is_suspect(&stub_upstream(&dead2, "m2")));
+    }
+
+    #[tokio::test]
+    async fn stream_forward_falls_through_to_healthy_upstream() {
+        // 池内第一个上游配额终止（403），第二个健康：调用方应拿到第二个
+        // 上游的 200 回流，且失败者进嫌疑窗、健康者被实证恢复语义覆盖。
+        let dead =
+            spawn_stub_upstream(403, r#"{"error":{"type":"access_terminated_error"}}"#).await;
+        let healthy_body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+        let healthy = spawn_stub_upstream(200, healthy_body).await;
+
+        let state = test_state(vec![
+            stub_upstream(&dead, "m1"),
+            stub_upstream(&healthy, "m2"),
+        ]);
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = chat_completions_passthrough(State(state.clone()), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], healthy_body.as_bytes());
+        assert!(state.llm_health.is_suspect(&stub_upstream(&dead, "m1")));
+        assert!(!state.llm_health.is_suspect(&stub_upstream(&healthy, "m2")));
+    }
+
+    #[tokio::test]
+    async fn health_order_routes_around_suspect_upstream() {
+        // 热切换核心：嫌疑上游降级为兜底——即便它排在配置顺序第一位，
+        // 请求也应命中健康的第二个上游（第一个此刻其实是活的桩，
+        // 用来证明"没被选中"而不是"选中了但失败"）。
+        let first_body = r#"{"choices":[{"message":{"role":"assistant","content":"first"}}"]}"#;
+        let second_body = r#"{"choices":[{"message":{"role":"assistant","content":"second"}}"]}"#;
+        let first = spawn_stub_upstream(200, first_body).await;
+        let second = spawn_stub_upstream(200, second_body).await;
+
+        let state = test_state(vec![
+            stub_upstream(&first, "m1"),
+            stub_upstream(&second, "m2"),
+        ]);
+        // 手工把第一个上游标记为嫌疑（模拟上一轮失败开窗）。
+        state
+            .llm_health
+            .note_failure(&stub_upstream(&first, "m1"), 300);
+
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = chat_completions_passthrough(State(state.clone()), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], second_body.as_bytes());
+        // 嫌疑上游没有被真实请求触碰（note_success 会清窗，窗应仍在）。
+        assert!(state.llm_health.is_suspect(&stub_upstream(&first, "m1")));
+    }
+
+    #[tokio::test]
+    async fn prober_recovers_suspect_upstream_when_window_due() {
+        // 探测器语义：窗口到期的嫌疑上游被最小请求复测，成功即热恢复。
+        let alive = spawn_stub_upstream(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#,
+        )
+        .await;
+        let state = test_state(vec![stub_upstream(&alive, "m1")]);
+        let u = stub_upstream(&alive, "m1");
+        state.llm_health.note_failure(&u, 300);
+        assert!(state.llm_health.is_suspect(&u));
+        assert!(!state.llm_health.due_for_probe(&u));
+
+        // 模拟窗口到期（直接改表内时刻，测试不真睡 300s）。
+        {
+            let mut states = state.llm_health.states.lock().unwrap();
+            let entry = states
+                .get_mut(&LlmHealthTable::key(&u))
+                .expect("suspect entry exists");
+            entry.suspect_until =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        }
+        assert!(state.llm_health.due_for_probe(&u));
+
+        // 探测一轮：成功 → 清嫌疑。
+        probe_suspect_upstreams(&state).await;
+        assert!(!state.llm_health.is_suspect(&u));
+    }
+
+    #[tokio::test]
+    async fn prober_extends_window_on_repeated_failure() {
+        // 探测器语义：复测仍失败 → 指数加窗（不刷屏、不烧配额）。
+        let dead =
+            spawn_stub_upstream(403, r#"{"error":{"type":"access_terminated_error"}}"#).await;
+        let state = test_state(vec![stub_upstream(&dead, "m1")]);
+        let u = stub_upstream(&dead, "m1");
+        state.llm_health.note_failure(&u, 300);
+        {
+            let mut states = state.llm_health.states.lock().unwrap();
+            let entry = states
+                .get_mut(&LlmHealthTable::key(&u))
+                .expect("suspect entry exists");
+            entry.suspect_until =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        }
+        probe_suspect_upstreams(&state).await;
+        assert!(state.llm_health.is_suspect(&u));
+        let states = state.llm_health.states.lock().unwrap();
+        let entry = states.get(&LlmHealthTable::key(&u)).unwrap();
+        assert_eq!(entry.consecutive_failures, 2);
+    }
+
+    fn stub_upstream(base: &str, model: &str) -> LlmUpstream {
+        LlmUpstream {
+            api_style: "openai".into(),
+            base_url: base.to_string(),
+            model: model.to_string(),
+            api_key: "stub-key".into(),
+            supports_tool_calls: None,
+        }
+    }
+
+    fn test_state(upstreams: Vec<LlmUpstream>) -> AppState {
+        AppState {
+            client: reqwest::Client::new(),
+            stream_client: reqwest::Client::new(),
+            egress_stats: std::sync::Arc::new(LatencyStats::default()),
+            llm_stats: std::sync::Arc::new(LatencyStats::default()),
+            code_stats: std::sync::Arc::new(LatencyStats::default()),
+            github_app: None,
+            app_token_cache: std::sync::Arc::new(AppTokenCache::default()),
+            llm_health: std::sync::Arc::new(LlmHealthTable::default()),
+            config: SecurityGatewayConfig {
+                llm_upstreams: upstreams,
+                ..cfg(&[], &[])
+            },
+        }
+    }
+
+    /// 本地桩上游：固定状态码 + 固定 body 的 /chat/completions。
+    async fn spawn_stub_upstream(status: u16, body: &'static str) -> String {
+        use axum::http::header;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
     }
 
     #[test]
