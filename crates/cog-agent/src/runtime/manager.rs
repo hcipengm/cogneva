@@ -51,6 +51,7 @@ impl GlobalAgentManager {
                 max_iterations: 10,
                 context_window_size: 4000,
                 skill_cache_ttl_secs: 30,
+                think_stall_timeout_secs: 240,
                 skill_config: None,
                 crew_id: None,
                 squad_id: None,

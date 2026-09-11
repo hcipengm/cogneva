@@ -311,6 +311,7 @@ async fn test_agent_loop_runs_correctly() {
         crew_id: None,
         squad_id: None,
         skill_cache_ttl_secs: 30,
+        think_stall_timeout_secs: 240,
     };
 
     let mut agent_loop = AgentRuntime::new(config, event_tx);

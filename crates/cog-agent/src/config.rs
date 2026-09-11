@@ -48,6 +48,10 @@ const AGENT_LOOP_ENV: &[(&str, &str)] = &[
         "COGNEVA_AGENT_LOOP_SKILL_CACHE_TTL_SECS",
         "skill_cache_ttl_secs",
     ),
+    (
+        "COGNEVA_AGENT_LOOP_THINK_STALL_TIMEOUT_SECS",
+        "think_stall_timeout_secs",
+    ),
 ];
 
 const AGENT_POOL_ENV: &[(&str, &str)] = &[
@@ -66,6 +70,9 @@ pub struct AgentLoopConfig {
     pub context_window_size: usize,
     /// TTL for the available_skills cache in AgentRuntime (seconds).
     pub skill_cache_ttl_secs: u64,
+    /// Abort a streaming think turn only after no stream event arrives for
+    /// this many consecutive seconds (stall detection, not a wall-clock cap).
+    pub think_stall_timeout_secs: u64,
 }
 
 impl Default for AgentLoopConfig {
@@ -76,6 +83,7 @@ impl Default for AgentLoopConfig {
             max_iterations: 10,
             context_window_size: 4000,
             skill_cache_ttl_secs: 30,
+            think_stall_timeout_secs: 240,
         }
     }
 }
@@ -98,6 +106,7 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
             max_iterations: c.max_iterations,
             context_window_size: c.context_window_size,
             skill_cache_ttl_secs: c.skill_cache_ttl_secs,
+            think_stall_timeout_secs: c.think_stall_timeout_secs,
             skill_config: None,
             crew_id: None,
             squad_id: None,

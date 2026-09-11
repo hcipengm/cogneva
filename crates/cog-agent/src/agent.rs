@@ -1134,6 +1134,7 @@ async fn run_agent_task(
                         max_iterations: cfg.max_iterations,
                         context_window_size: cfg.context_window_size,
                         skill_cache_ttl_secs: cfg.skill_cache_ttl_secs,
+                        think_stall_timeout_secs: cfg.think_stall_timeout_secs,
                         skill_config: cfg.skill_config.clone(),
                         crew_id: cfg.crew_id.clone(),
                         squad_id: cfg.squad_id.clone(),

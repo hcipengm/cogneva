@@ -614,25 +614,16 @@ impl AgentRuntime {
             })
             .await?;
 
-            // Step 1: Thinking (streaming)
+            // Step 1: Thinking (streaming).
+            //
+            // No whole-turn wall-clock cap here: slow models legitimately spend
+            // many minutes emitting large generations, and killing a live
+            // stream mid-flight wastes the tokens already produced and gets
+            // misclassified as an environment failure. Hang protection lives
+            // inside think_stream as a per-event stall timeout instead.
             self.state = RuntimeState::Thinking;
             tracing::info!(agent_id = %self.config.agent_id, "AgentRuntime::run calling think_stream");
-            let think_timeout = Duration::from_secs(240);
-            let assistant_msg = match tokio::time::timeout(think_timeout, self.think_stream(llm))
-                .await
-            {
-                Ok(Ok(msg)) => msg,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    let err = SFError::Agent(format!(
-                        "AgentRuntime::think_stream timed out after {}s for agent {}",
-                        think_timeout.as_secs(),
-                        self.config.agent_id
-                    ));
-                    tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream timeout");
-                    return Err(err);
-                }
-            };
+            let assistant_msg = self.think_stream(llm).await?;
 
             let thought_text: String = assistant_msg
                 .content_blocks()
@@ -1022,8 +1013,34 @@ impl AgentRuntime {
             ..Default::default()
         };
 
+        // Stall-based hang protection: the clock resets on every stream event,
+        // so a slow-but-alive generation is never aborted — only a connection
+        // that stops making progress for the full window is treated as dead.
+        let stall_timeout = Duration::from_secs(self.config.think_stall_timeout_secs.max(1));
+        let stall_err = |phase: &str| {
+            SFError::Agent(format!(
+                "AgentRuntime::think_stream timed out: no LLM stream progress for {}s while {} for agent {}",
+                stall_timeout.as_secs(),
+                phase,
+                self.config.agent_id
+            ))
+        };
+
         tracing::info!(agent_id = %self.config.agent_id, message_count = messages.len(), "AgentRuntime::think_stream calling LLM chat_stream");
-        let stream = llm.chat_stream(&messages, &options).await?;
+        let mut stream = match tokio::time::timeout(
+            stall_timeout,
+            llm.chat_stream(&messages, &options),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                let err = stall_err("establishing the stream");
+                tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream stall timeout");
+                return Err(err);
+            }
+        };
         tracing::info!(agent_id = %self.config.agent_id, "AgentRuntime::think_stream LLM chat_stream returned");
 
         // Emit MessageStart
@@ -1036,9 +1053,19 @@ impl AgentRuntime {
 
         let mut final_message = Message::assistant(Vec::new());
 
-        // Iterate over the streaming events
-        let mut stream = stream;
-        while let Some(event) = stream.next().await {
+        // Iterate over the streaming events. Each await is stall-guarded: an
+        // event arriving resets the clock, so long generations survive while a
+        // hung stream is aborted after one quiet window.
+        loop {
+            let event = match tokio::time::timeout(stall_timeout, stream.next()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => {
+                    let err = stall_err("streaming events");
+                    tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream stall timeout");
+                    return Err(err);
+                }
+            };
             match &event {
                 AssistantMessageEvent::TextStart { partial, .. }
                 | AssistantMessageEvent::TextDelta { partial, .. }
@@ -1069,8 +1096,17 @@ impl AgentRuntime {
             .await?;
         }
 
-        // Get the final response
-        let response = stream.result().await;
+        // Get the final response. The stream has already ended, so this
+        // normally resolves instantly; the stall guard only covers a producer
+        // that closed the event channel without ever completing the result.
+        let response = match tokio::time::timeout(stall_timeout, stream.result()).await {
+            Ok(response) => response,
+            Err(_) => {
+                let err = stall_err("awaiting the final response");
+                tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream stall timeout");
+                return Err(err);
+            }
+        };
 
         // Build the final message from response content
         let content = if !response.content.is_empty() {
@@ -1570,6 +1606,176 @@ mod tests {
         assert!(
             matches!(replayed_events[1], AgentEvent::TurnStart { .. }),
             "second replayed event should be TurnStart"
+        );
+    }
+
+    // ─── Timing-controlled mock LLM for stall detection tests ───
+
+    struct Chunk {
+        delay: Duration,
+        text: &'static str,
+    }
+
+    /// Streams `chunks` with per-chunk delays. With `hang_after_chunks` the
+    /// producer holds the stream open forever after the last chunk: the
+    /// connection neither progresses nor terminates, exactly like a hung
+    /// upstream.
+    struct TimedStreamLlm {
+        chunks: Vec<Chunk>,
+        hang_after_chunks: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for TimedStreamLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, producer) = cog_core::EventStream::with_capacity(16);
+            let chunks: Vec<(Duration, String)> = self
+                .chunks
+                .iter()
+                .map(|c| (c.delay, c.text.to_string()))
+                .collect();
+            let hang = self.hang_after_chunks;
+            tokio::spawn(async move {
+                let mut producer = producer;
+                let mut text = String::new();
+                for (delay, delta) in chunks {
+                    tokio::time::sleep(delay).await;
+                    text.push_str(&delta);
+                    let _ = producer
+                        .push(AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta,
+                            partial: Message::assistant_text(text.clone()),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                }
+                if hang {
+                    // Hold the producer (and thus the stream) open forever.
+                    std::future::pending::<()>().await;
+                }
+                producer.end(cog_core::ChatResponse {
+                    content: vec![ContentBlock::Text {
+                        text,
+                        text_signature: None,
+                    }],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            Ok(cog_core::ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: r#"{"result":"reformatted"}"#.into(),
+                    text_signature: None,
+                }],
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                response_id: None,
+                usage: cog_core::Usage::default(),
+                stop_reason: cog_core::StopReason::Stop,
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn stall_test_runtime(agent_id: &str) -> AgentRuntime {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: agent_id.into(),
+            max_iterations: 1,
+            think_stall_timeout_secs: 1,
+            ..Default::default()
+        };
+        AgentRuntime::new(config, tx)
+    }
+
+    #[tokio::test]
+    async fn think_stream_stall_timeout_aborts_hung_stream() {
+        let llm = TimedStreamLlm {
+            chunks: vec![Chunk {
+                delay: Duration::from_millis(50),
+                text: "partial",
+            }],
+            hang_after_chunks: true,
+        };
+        let mut runtime = stall_test_runtime("stall-hang");
+        let started = std::time::Instant::now();
+        let err = runtime
+            .run(serde_json::json!({"task": "hang"}), &llm)
+            .await
+            .expect_err("hung stream must abort with a stall timeout");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timed out") && msg.contains("no LLM stream progress"),
+            "error should describe the stall timeout, got: {msg}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "stall window should fire promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn think_stream_slow_but_live_stream_is_not_aborted() {
+        // Every chunk arrives well within the 1s stall window, but the total
+        // turn (6 × 400ms ≈ 2.4s) far exceeds it. A whole-turn wall-clock cap
+        // would kill this stream mid-generation; stall detection must not.
+        // The fragments assemble into a valid JSON object so run() completes
+        // without the reformat fallback.
+        let llm = TimedStreamLlm {
+            chunks: [r#"{""#, r#""resu"#, r#"lt":""#, r#""o"#, r#"k""#, "}"]
+                .iter()
+                .map(|text| Chunk {
+                    delay: Duration::from_millis(400),
+                    text,
+                })
+                .collect(),
+            hang_after_chunks: false,
+        };
+        let mut runtime = stall_test_runtime("stall-slow-alive");
+        let started = std::time::Instant::now();
+        runtime
+            .run(serde_json::json!({"task": "slow"}), &llm)
+            .await
+            .expect("live stream slower than the stall window must still complete");
+        assert!(
+            started.elapsed() >= Duration::from_millis(2000),
+            "test should actually outlast the stall window, took {:?}",
+            started.elapsed()
         );
     }
 }

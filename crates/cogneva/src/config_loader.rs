@@ -851,6 +851,7 @@ mod tests {
             max_iterations: 7,
             context_window_size: 8192,
             skill_cache_ttl_secs: 30,
+            think_stall_timeout_secs: 240,
         };
         let business: cog_core::RuntimeConfig = cfg.into();
         assert_eq!(business.agent_id, "agent-42");

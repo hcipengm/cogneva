@@ -41,6 +41,14 @@ pub struct RuntimeConfig {
     pub context_window_size: usize,
     /// TTL for the available_skills cache in seconds.
     pub skill_cache_ttl_secs: u64,
+    /// Stall timeout for a single streaming think turn, in seconds.
+    ///
+    /// This is NOT a whole-turn wall-clock cap: a stream that keeps producing
+    /// events may run arbitrarily long (slow models legitimately spend many
+    /// minutes emitting large generations). The turn is only aborted when no
+    /// stream event arrives for this many consecutive seconds, which indicates
+    /// a hung connection rather than a slow one.
+    pub think_stall_timeout_secs: u64,
     /// Optional dynamic skill configuration that overrides role defaults.
     pub skill_config: Option<crate::SkillConfig>,
     /// Optional Crew identifier — attached to lifecycle events so the hook
@@ -59,6 +67,7 @@ impl Default for RuntimeConfig {
             max_iterations: 10,
             context_window_size: 4000,
             skill_cache_ttl_secs: 30,
+            think_stall_timeout_secs: 240,
             skill_config: None,
             crew_id: None,
             squad_id: None,
