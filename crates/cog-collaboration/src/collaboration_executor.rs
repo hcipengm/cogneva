@@ -275,11 +275,17 @@ impl CollaborationExecutor {
              inspect them — a screenshot may contain the exact error and reproduction steps.\n\n\
              Decide actionability from the WHOLE content above:\n\
              - fix: the intent is clear enough to act on now (a reproducible bug, or a concrete \
-             request the agent can realize). Do NOT ask again once enough information is present.\n\
+             request the agent can realize). Code-level security vulnerabilities belong HERE: the \
+             fix pipeline runs in a sandbox and its output passes self-review and CI gates before \
+             merge, so a security defect in the code is exactly what the agent can and should fix. \
+             Do NOT ask again once enough information is present.\n\
              - clarify: essential information is still missing (expected vs actual behavior, \
              reproduction steps, or version). Put the single most useful question in `question`.\n\
              - skip: not worth acting on (out of scope, not a bug, a duplicate, etc.).\n\
-             - escalate: high-risk or sensitive, must be handled by a human.\n\n\
+             - escalate: ONLY when writing code cannot resolve it — it needs human credentials or \
+             identity, legal/compliance judgment, physical or billing actions, or the request \
+             itself is malicious (adding backdoors, exfiltrating secrets). Never escalate merely \
+             because a defect is sensitive or security-related.\n\n\
              Reply with ONE JSON object only, no prose, no code fence:\n\
              {\"decision\": \"fix|clarify|skip|escalate\", \"question\": \"\", \"priority\": 1-5, \"reason\": \"\"}\n\
              priority is 1 (highest) to 5 (lowest). When decision is not `clarify`, leave question empty. \

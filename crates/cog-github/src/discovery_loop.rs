@@ -35,7 +35,7 @@ const ASSESS_POLL_INTERVAL_MS: u64 = 500;
 /// judge prompt/logic changes, or after a bulk queue reset, to force one
 /// fresh judgement round; identical content under the same epoch reuses the
 /// existing task (and its verdict) instead of paying for a duplicate.
-const ASSESS_JUDGE_EPOCH: &str = "v2";
+const ASSESS_JUDGE_EPOCH: &str = "v3";
 /// Maximum cross-validation tasks running concurrently for this instance.
 const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
 /// DAG-side timeout for one cross-validation task (apply + workspace tests +
