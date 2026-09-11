@@ -41,6 +41,61 @@ const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
 /// DAG-side timeout for one cross-validation task (apply + workspace tests +
 /// optional eval A/B in the sandbox).
 const CROSS_VALIDATE_TASK_TIMEOUT_SECS: u64 = 3600;
+/// Upper bound of the per-intent exponential backoff after terminal
+/// (deterministic) upstream failures. Quota/billing windows reset on a
+/// day scale; probing more often than this cap only adds failed attempts
+/// without speeding recovery. Six hours bounds the post-reset recovery
+/// lag while keeping probe cost at one failed call per intent per window.
+const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
+
+/// Markers of deterministic (terminal) upstream failures: retrying the same
+/// intent next tick cannot succeed until an external window resets
+/// (quota/billing) or credentials/config change (auth/protocol). Rate-limit
+/// errors are deliberately NOT included — those are transient per-minute
+/// signals and must keep the normal next-tick retry.
+fn is_terminal_upstream_failure(err: &str) -> bool {
+    const MARKERS: [&str; 11] = [
+        // PGE/generator classified environment-protocol failure (wire marker).
+        "terminal_env_failure",
+        // Provider quota/billing terminations observed in production.
+        "access_terminated_error",
+        "usage limit",
+        "insufficient_balance",
+        "insufficient balance",
+        "quota exceeded",
+        // Credential failures: retrying cannot fix them.
+        "invalid_api_key",
+        "invalid api key",
+        "incorrect api key",
+        "authentication_error",
+        "authentication error",
+    ];
+    let t = err.to_ascii_lowercase();
+    MARKERS.iter().any(|m| t.contains(m))
+}
+
+/// Exponential backoff for consecutive terminal failures: first failure
+/// backs off one poll interval, then doubles, capped at
+/// [`TERMINAL_BACKOFF_CAP_SECS`]. Self-adjusting — the schedule derives from
+/// the configured poll interval and the observed failure streak, not from a
+/// flat per-intent quota.
+fn terminal_backoff_delay(consecutive: u32, base_secs: u64) -> std::time::Duration {
+    let base = base_secs.max(30);
+    let exp = consecutive.saturating_sub(1).min(20);
+    let secs = base
+        .saturating_mul(1u64 << exp)
+        .min(TERMINAL_BACKOFF_CAP_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Per-intent backoff state after terminal upstream failures. In-memory
+/// only: a pod restart costs at most one fresh failed probe per intent
+/// before the window re-establishes.
+#[derive(Debug)]
+struct TerminalBackoff {
+    consecutive: u32,
+    skip_until: std::time::Instant,
+}
 
 /// The autonomous GitHub sensor loop.
 pub struct GitHubDiscoveryLoop {
@@ -82,6 +137,13 @@ pub struct GitHubDiscoveryLoop {
     /// Restart-proof assess verdicts; see [`AssessVerdicts`]. Mutex because
     /// the judge path runs under `&self`.
     verdicts: tokio::sync::Mutex<AssessVerdicts>,
+    /// Per-intent exponential backoff after terminal (deterministic)
+    /// upstream failures — quota exhaustion, auth rejection, broken
+    /// protocol. These cannot succeed by retrying next tick, so the intent
+    /// sleeps for `poll_interval * 2^n` (capped) instead of paying a doomed
+    /// LLM attempt chain every round. Keyed by `"<kind>:<number>"`, the same
+    /// convention as [`Self::conversations`].
+    terminal_backoff: HashMap<String, TerminalBackoff>,
 }
 
 /// Persisted intent guards (`$COGNEVA_DATA_DIR/discovery-guards.json`):
@@ -342,6 +404,7 @@ impl GitHubDiscoveryLoop {
             cv_inflight: HashMap::new(),
             guards_loaded: false,
             verdicts: tokio::sync::Mutex::new(AssessVerdicts::default()),
+            terminal_backoff: HashMap::new(),
         }
     }
 
@@ -444,6 +507,64 @@ impl GitHubDiscoveryLoop {
         self.recorder.track(pr_number, change_id);
     }
 
+    /// Whether this intent is still inside its terminal-failure backoff
+    /// window and must be skipped this round. Skips log at debug — the WARN
+    /// was already emitted once when the window was set, so a quota outage
+    /// produces one WARN per intent per window instead of one per tick.
+    fn in_terminal_backoff(&self, key: &str) -> bool {
+        match self.terminal_backoff.get(key) {
+            Some(b) if std::time::Instant::now() < b.skip_until => {
+                tracing::debug!(
+                    %key,
+                    remaining_secs = (b.skip_until - std::time::Instant::now()).as_secs(),
+                    "intent in terminal-failure backoff; skipping this round"
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record a failed processing attempt. Terminal (deterministic) failures
+    /// grow the per-intent exponential backoff window; anything else keeps
+    /// the historical per-round WARN and next-tick retry.
+    fn note_processing_failure(
+        &mut self,
+        key: &str,
+        label: &str,
+        number: u64,
+        err: &dyn std::fmt::Display,
+    ) {
+        let text = err.to_string();
+        if !is_terminal_upstream_failure(&text) {
+            tracing::warn!(
+                label,
+                number,
+                error = %text,
+                "Failed to process discovered item"
+            );
+            return;
+        }
+        let entry = self
+            .terminal_backoff
+            .entry(key.to_string())
+            .or_insert_with(|| TerminalBackoff {
+                consecutive: 0,
+                skip_until: std::time::Instant::now(),
+            });
+        entry.consecutive += 1;
+        let delay = terminal_backoff_delay(entry.consecutive, self.config.poll_interval_secs);
+        entry.skip_until = std::time::Instant::now() + delay;
+        tracing::warn!(
+            label,
+            number,
+            consecutive_failures = entry.consecutive,
+            backoff_secs = delay.as_secs(),
+            error = %text,
+            "terminal upstream failure (quota/auth/protocol); backing off this intent instead of retrying every round"
+        );
+    }
+
     /// Run one discovery round. Returns the number of issues scanned.
     pub async fn run_once(&mut self) -> Result<usize> {
         self.load_guards_once().await;
@@ -454,12 +575,15 @@ impl GitHubDiscoveryLoop {
         let scanned = issues.len();
 
         for issue in issues {
-            if let Err(e) = self.process_issue(&issue).await {
-                tracing::warn!(
-                    issue = issue.number,
-                    error = %e,
-                    "Failed to process discovered issue"
-                );
+            let key = format!("issue:{}", issue.number);
+            if self.in_terminal_backoff(&key) {
+                continue;
+            }
+            match self.process_issue(&issue).await {
+                Ok(()) => {
+                    self.terminal_backoff.remove(&key);
+                }
+                Err(e) => self.note_processing_failure(&key, "issue", issue.number, &e),
             }
         }
 
@@ -467,12 +591,15 @@ impl GitHubDiscoveryLoop {
         match self.provider.list_open_pull_requests().await {
             Ok(prs) => {
                 for pr in prs {
-                    if let Err(e) = self.process_pr(&pr).await {
-                        tracing::warn!(
-                            pr = pr.number,
-                            error = %e,
-                            "Failed to process discovered pull request"
-                        );
+                    let key = format!("pr:{}", pr.number);
+                    if self.in_terminal_backoff(&key) {
+                        continue;
+                    }
+                    match self.process_pr(&pr).await {
+                        Ok(()) => {
+                            self.terminal_backoff.remove(&key);
+                        }
+                        Err(e) => self.note_processing_failure(&key, "pull request", pr.number, &e),
                     }
                 }
             }
@@ -1597,6 +1724,83 @@ mod tests {
     };
     use chrono::Utc;
     use std::sync::Mutex;
+
+    #[test]
+    fn terminal_failure_markers_match_production_payloads() {
+        // Real provider quota payload observed in production.
+        let quota = r#"Agent execution error: LLM stream error: API error: {"error":{"message":"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends.","type":"access_terminated_error"}}"#;
+        assert!(is_terminal_upstream_failure(quota));
+        // Wrapped decompose failure as surfaced to the discovery loop.
+        let env = "provider error: Agent execution error: Decomposition failed: \
+                   terminal_env_failure: generator produced no artifacts \
+                   (environment/protocol failure) — LLM connection required";
+        assert!(is_terminal_upstream_failure(env));
+        assert!(is_terminal_upstream_failure("HTTP 429: quota exceeded"));
+        assert!(is_terminal_upstream_failure(
+            "invalid_api_key: check credentials"
+        ));
+        assert!(is_terminal_upstream_failure("Error: insufficient balance"));
+    }
+
+    #[test]
+    fn transient_failures_are_not_terminal() {
+        // Rate limits are per-minute transient signals: must keep next-tick retry.
+        assert!(!is_terminal_upstream_failure(
+            "rate_limit_exceeded: retry later"
+        ));
+        assert!(!is_terminal_upstream_failure("connection reset by peer"));
+        assert!(!is_terminal_upstream_failure("task timed out after 120s"));
+        assert!(!is_terminal_upstream_failure(""));
+    }
+
+    #[test]
+    fn terminal_backoff_grows_exponentially_and_caps() {
+        let d = |n: u32| terminal_backoff_delay(n, 300).as_secs();
+        assert_eq!(d(1), 300);
+        assert_eq!(d(2), 600);
+        assert_eq!(d(3), 1200);
+        assert_eq!(d(10), TERMINAL_BACKOFF_CAP_SECS);
+        assert_eq!(d(u32::MAX), TERMINAL_BACKOFF_CAP_SECS);
+        // Tiny poll intervals still back off at least 30s per step.
+        assert_eq!(terminal_backoff_delay(1, 5).as_secs(), 30);
+    }
+
+    #[test]
+    fn terminal_failure_opens_window_transient_does_not() {
+        let provider: Arc<dyn CodePlatformProvider> = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let mut loop_ =
+            GitHubDiscoveryLoop::new(provider, IssueTriage::rules_only(), config(), None, None);
+
+        // Terminal failure opens the backoff window for that intent only.
+        loop_.note_processing_failure(
+            "pr:54",
+            "pull request",
+            54,
+            &"Decomposition failed: terminal_env_failure: generator produced no artifacts",
+        );
+        assert!(loop_.in_terminal_backoff("pr:54"));
+        assert!(!loop_.in_terminal_backoff("pr:55"));
+        assert_eq!(loop_.terminal_backoff["pr:54"].consecutive, 1);
+
+        // A second terminal failure grows the streak (window doubled).
+        loop_.note_processing_failure("pr:54", "pull request", 54, &"access_terminated_error");
+        assert_eq!(loop_.terminal_backoff["pr:54"].consecutive, 2);
+
+        // Success clears the window — recovery needs no manual reset.
+        loop_.terminal_backoff.remove("pr:54");
+        assert!(!loop_.in_terminal_backoff("pr:54"));
+
+        // Transient failures keep the historical retry-every-round behavior.
+        loop_.note_processing_failure("issue:7", "issue", 7, &"connection reset by peer");
+        assert!(!loop_.in_terminal_backoff("issue:7"));
+    }
 
     struct MockProvider {
         issues: Vec<PlatformIssue>,
