@@ -694,6 +694,32 @@ impl Default for MicroVmConfig {
     }
 }
 
+/// 工作区动态分配配置。取消共用固定树后，部署器与每个进化任务各自从裸仓库
+/// 检出 `git worktree`；本段决定这些检出去哪里、编译产物缓存在哪。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelfEvolutionWorkspaceConfig {
+    /// 工作树根目录（每棵检出是它的一个子目录）。
+    pub root: String,
+    /// 共享 `CARGO_TARGET_DIR`。故意放在工作树之外，工作树才能被整棵重建而
+    /// 不丢增量编译缓存。
+    pub target_dir: String,
+    /// 临时工作树的存活上限（秒）。属主 pid 是 Pod 进程号，进程内永远"活着"，
+    /// 所以存活时长是唯一能揪出"进程还在但任务已崩"的兜底，取值要容得下
+    /// 一整轮演进。
+    pub ephemeral_ttl_secs: u64,
+}
+
+impl Default for SelfEvolutionWorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            root: "/opt/cogneva/sandbox/workspaces".into(),
+            target_dir: "/opt/cogneva/sandbox/src/target".into(),
+            ephemeral_ttl_secs: 21600,
+        }
+    }
+}
+
 /// Configuration for the self-evolution auto-deploy pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -731,6 +757,8 @@ pub struct SelfEvolutionConfig {
     pub image_rollout: ImageRolloutConfig,
     /// Firecracker 微虚拟机沙盒；enabled=false 时忽略整块配置。
     pub microvm: MicroVmConfig,
+    /// 工作树动态分配；默认值即生产路径，通常无需显式配置。
+    pub workspaces: SelfEvolutionWorkspaceConfig,
 }
 
 impl Default for SelfEvolutionConfig {
@@ -756,6 +784,7 @@ impl Default for SelfEvolutionConfig {
             notify_on_failure: true,
             image_rollout: ImageRolloutConfig::default(),
             microvm: MicroVmConfig::default(),
+            workspaces: SelfEvolutionWorkspaceConfig::default(),
         }
     }
 }

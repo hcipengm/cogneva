@@ -40,6 +40,8 @@ pub struct ReflectionPlugin {
     porter_armed: bool,
     /// 见 [`PoolGate`]；init 阶段 spawn 的循环据此跳过 LLM 依赖轮次。
     pool_gate: Arc<PoolGate>,
+    /// 全插件唯一的分配器：部署器、各进化消费者都从这里取工作树。
+    workspaces: Option<Arc<crate::workspace::WorkspaceManager>>,
 }
 
 impl ReflectionPlugin {
@@ -49,6 +51,7 @@ impl ReflectionPlugin {
             initialized: false,
             porter_armed: false,
             pool_gate: Arc::new(PoolGate::default()),
+            workspaces: None,
         }
     }
 }
@@ -89,6 +92,47 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         let project_root = std::env::current_dir().ok();
         let change_dir = ctx.config().self_evolution.change_dir.clone();
 
+        // 工作区分配器：全插件唯一实例，部署器与各进化消费者共用。裸仓库取自
+        // 部署器配置（默认 /host-git，与 GitOps 推送端同源）。
+        let bare_repo = crate::MainlineDeployerConfig::load()?.bare_repo;
+        let ws_cfg = &ctx.config().self_evolution.workspaces;
+        let workspaces = Arc::new(
+            crate::workspace::WorkspaceManager::new(&bare_repo, &ws_cfg.root, &ws_cfg.target_dir)
+                .with_ephemeral_ttl(std::time::Duration::from_secs(ws_cfg.ephemeral_ttl_secs)),
+        );
+        info!(
+            bare = %bare_repo,
+            root = %ws_cfg.root,
+            target_dir = %ws_cfg.target_dir,
+            ttl_secs = ws_cfg.ephemeral_ttl_secs,
+            "workspace allocator configured"
+        );
+        self.workspaces = Some(workspaces);
+
+        // 引擎只把 project_root 用于变更路径校验，给它一棵稳定只读的基线
+        // 工作树即可；工作树随沙盒生命周期存在，不再是那棵被大家共用的树。
+        let instance_id = resolve_port_instance_id().await;
+        let version = current_version(ctx);
+        let mut engine_root = project_root.clone();
+        if ctx.config().self_evolution.enabled {
+            if let Some(ws) = self.workspaces.as_ref() {
+                let base = ws.resolve_base(&instance_id, &version).await;
+                let spec = crate::workspace::WorkspaceSpec::persistent(
+                    "engine-baseline",
+                    crate::workspace::WorkspaceKind::EngineBaseline,
+                    base,
+                );
+                match ws.ensure_persistent(spec).await {
+                    Ok(w) => engine_root = Some(w.path),
+                    Err(e) => warn!(
+                        error = %e,
+                        "engine baseline workspace unavailable; change path validation falls \
+                         back to the process working directory"
+                    ),
+                }
+            }
+        }
+
         // Build the evolution engine up-front. It is required both as a
         // ChangeSink for collaboration-generated changes and for the
         // self-evolution auto-deploy pipeline. It does not depend on a
@@ -102,7 +146,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     Some(prompt_manager.clone()),
                 )
                 .with_change_dir(change_dir.clone());
-                if let Some(ref root) = project_root {
+                if let Some(ref root) = engine_root {
                     evolution = evolution.with_project_root(root.clone());
                 }
                 Some(Arc::new(evolution))
@@ -120,7 +164,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 Some(prompt_manager.clone()),
                 Some(hook_tx),
                 Some(tool_tx),
-                project_root,
+                engine_root.clone(),
                 change_dir.clone(),
             )
         } else {
@@ -369,8 +413,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     return Ok(());
                 };
 
-                if let Err(e) =
-                    ensure_self_evolution_environment(&project_root, &self_evolution).await
+                // 进程工作目录不再是源码树，环境校验改以基线工作树为准；
+                // 基线不可用时退回工作目录（校验会显式报错，不静默降级）。
+                let env_root = engine_root.clone().unwrap_or_else(|| project_root.clone());
+                if let Err(e) = ensure_self_evolution_environment(&env_root, &self_evolution).await
                 {
                     error!(error = %e, "Self-evolution environment validation failed");
                     return Err(e);
@@ -385,14 +431,16 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     self_evolution.auto_apply && !self_evolution.manual_approve,
                 )
                 .with_test_timeout(self_evolution.test_timeout_secs)
-                .with_promotion_policy(promotion.clone());
+                .with_promotion_policy(promotion.clone())
+                .with_target_dir(&self_evolution.workspaces.target_dir);
 
                 let deployer = crate::EvolutionDeployer::new(
                     &project_root,
                     &self_evolution.binary_dir,
                     &self_evolution.backup_dir,
                 )
-                .with_build_timeout(self_evolution.build_timeout_secs);
+                .with_build_timeout(self_evolution.build_timeout_secs)
+                .with_target_dir(&self_evolution.workspaces.target_dir);
 
                 let binary_switcher = ctx.consume_service::<dyn cog_core::BinarySwitcher>();
                 let audit_stream = ctx.consume_service::<dyn cog_core::AuditStream>();
@@ -425,6 +473,9 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     admin = admin.with_audit_stream(stream.clone());
                 }
                 admin = admin.with_artifact_evolution(artifact_evolution.clone());
+                if let Some(ws) = self.workspaces.clone() {
+                    admin = admin.with_workspaces(ws);
+                }
                 if let Some(ref ledger) = promotion_ledger {
                     admin = admin.with_promotion_state(
                         promotion_switch.clone(),
@@ -474,9 +525,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             branch = %promotion.gitops.branch,
                             "GitOps promotion publisher enabled"
                         );
+                        // 推送端只要求「能解析待发布提交的 git 目录」：指向裸仓库，
+                        // 变更提交来自用完即弃的临时工作树也不影响推送。
                         Some(Arc::new(crate::GitOpsPublisher::new(
                             promotion.gitops.clone(),
-                            &project_root,
+                            &bare_repo,
                             &self_evolution.binary_dir,
                         )))
                     } else {
@@ -563,6 +616,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let poll_interval =
                     std::time::Duration::from_secs(self_evolution.poll_interval_secs);
 
+                let Some(cycle_workspaces) = self.workspaces.clone() else {
+                    warn!("workspace allocator unavailable; self-evolution cycle disabled");
+                    self.initialized = true;
+                    return Ok(());
+                };
+                let cycle_instance = instance_id.clone();
+                let cycle_version = version.clone();
+
                 let pool_gate = self.pool_gate.clone();
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(poll_interval);
@@ -574,16 +635,18 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             info!("LLM upstream pool unavailable; skipping self-evolution cycle");
                             continue;
                         }
-                        if let Err(e) = run_evolution_cycle(
-                            &pipeline,
-                            &deployer,
-                            binary_switcher.as_ref(),
-                            &engine,
-                            &self_evolution,
-                            evolution_metrics.as_ref(),
-                            promoter.as_ref(),
-                        )
-                        .await
+                        let deps = CycleDeps {
+                            pipeline: &pipeline,
+                            deployer: &deployer,
+                            binary_switcher: binary_switcher.as_ref(),
+                            engine: &engine,
+                            config: &self_evolution,
+                            evolution_metrics: evolution_metrics.as_ref(),
+                            promoter: promoter.as_ref(),
+                            workspaces: &cycle_workspaces,
+                        };
+                        if let Err(e) =
+                            run_evolution_cycle(deps, &cycle_instance, &cycle_version).await
                         {
                             warn!(error = %e, "Self-evolution cycle failed");
                         }
@@ -649,10 +712,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // 默认关闭，配置 enabled 才起循环（依赖 RBAC/registry 就位）。
         let ml_config = crate::MainlineDeployerConfig::load()?;
         if ml_config.enabled {
-            let deployer = std::sync::Arc::new(crate::MainlineDeployer::new(
-                ml_config.clone(),
-                project_root.clone(),
-            ));
+            let Some(workspaces) = self.workspaces.clone() else {
+                warn!("mainline deployer enabled but workspace allocator missing; skipping");
+                return Ok(());
+            };
+            let deployer =
+                std::sync::Arc::new(crate::MainlineDeployer::new(ml_config.clone(), workspaces));
             let shutdown = cog_core::ShutdownSignal::new();
             if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
                 let shutdown = shutdown.clone();
@@ -686,21 +751,31 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         }
 
         let instance_id = resolve_port_instance_id().await;
-        // 当前版本：部署注入的 COGNEVA_VERSION 优先（进化 Pod 种子即按它
-        // 对齐基线），退化为应用配置版本。
-        let current_version = std::env::var("COGNEVA_VERSION")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| ctx.config().app.version.clone())
-            .trim_start_matches('v')
-            .to_string();
+        let current_version = current_version(ctx);
         let state_path = std::path::PathBuf::from(format!(
             "{}/baseline-port-attempts.json",
             ctx.config().app.data_dir
         ));
 
-        let mut porter =
-            crate::BaselinePorter::new(&project_root).with_instance_id(instance_id.clone());
+        // 移植器按实例常驻一棵工作树：与部署器、引擎基线、各轮演进任务的工作
+        // 树互不干涉，移植期间独占它做 checkout -B。
+        let mut porter = if let Some(ws) = self.workspaces.clone() {
+            let base = ws.resolve_base(&instance_id, &current_version).await;
+            let spec = crate::workspace::WorkspaceSpec::persistent(
+                format!("porter-{instance_id}"),
+                crate::workspace::WorkspaceKind::Porter,
+                base,
+            );
+            crate::BaselinePorter::new(ws.porter_workspace(&instance_id))
+                .with_instance_id(instance_id.clone())
+                .with_workspace(ws.clone(), spec)
+                .with_target_dir(ws.target_dir().to_path_buf())
+        } else {
+            warn!(
+                "no workspace allocator; baseline port falls back to the process working directory"
+            );
+            crate::BaselinePorter::new(&project_root).with_instance_id(instance_id.clone())
+        };
         if let Some(orch) = orchestrator {
             porter = porter.with_orchestrator(orch);
         }
@@ -739,6 +814,17 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         info!("ReflectionPlugin shutdown");
         Ok(())
     }
+}
+
+/// 当前运行版本号：部署注入的 COGNEVA_VERSION 优先（进化 Pod 种子即按它
+/// 对齐基线），退化为应用配置版本；统一去掉 `v` 前缀。
+fn current_version(ctx: &cog_core::PluginContext) -> String {
+    std::env::var("COGNEVA_VERSION")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| ctx.config().app.version.clone())
+        .trim_start_matches('v')
+        .to_string()
 }
 
 /// 移植工作分支 `evol/<id>` 的实例 id 解析：显式 env 覆盖最优先，其次
@@ -1177,23 +1263,60 @@ async fn ensure_binary_in_place(
     Ok(())
 }
 
+/// 一轮演进所需的共享依赖，逐轮不变。打包成一个结构体而不是摊成参数列表，
+/// 免得每加一个消费者都要改所有调用点。
+struct CycleDeps<'a> {
+    pipeline: &'a crate::ChangePipeline,
+    deployer: &'a crate::EvolutionDeployer,
+    binary_switcher: Option<&'a Arc<dyn cog_core::BinarySwitcher>>,
+    engine: &'a Arc<crate::ReflectionEngine>,
+    config: &'a cog_core::SelfEvolutionConfig,
+    evolution_metrics: Option<&'a Arc<dyn cog_core::EvolutionMetrics>>,
+    promoter: Option<&'a Arc<crate::AutoPromoter>>,
+    workspaces: &'a Arc<crate::workspace::WorkspaceManager>,
+}
+
 /// Run one pass of the self-evolution auto-deploy pipeline.
+///
+/// 每轮演进独占一棵临时工作树（轮内多个变更串行复用），轮末归还：任何检出
+/// 停在哪里都不影响部署器与别的轮次。
 async fn run_evolution_cycle(
-    pipeline: &crate::ChangePipeline,
-    deployer: &crate::EvolutionDeployer,
-    binary_switcher: Option<&Arc<dyn cog_core::BinarySwitcher>>,
-    engine: &Arc<crate::ReflectionEngine>,
-    config: &cog_core::SelfEvolutionConfig,
-    evolution_metrics: Option<&Arc<dyn cog_core::EvolutionMetrics>>,
-    promoter: Option<&Arc<crate::AutoPromoter>>,
+    deps: CycleDeps<'_>,
+    instance: &str,
+    version: &str,
 ) -> cog_core::SFResult<()> {
+    let base = deps.workspaces.resolve_base(instance, version).await;
+    let workspace = deps.workspaces.acquire_ephemeral("cycle", base).await?;
+    info!(path = %workspace.path.display(), "evolution cycle workspace acquired");
+    let mgr = deps.workspaces;
+    let outcome = run_evolution_cycle_in(deps, &workspace.path).await;
+    if let Err(e) = mgr.release(&workspace).await {
+        warn!(error = %e, "evolution cycle workspace release failed");
+    }
+    outcome
+}
+
+async fn run_evolution_cycle_in(
+    deps: CycleDeps<'_>,
+    workdir: &std::path::Path,
+) -> cog_core::SFResult<()> {
+    let CycleDeps {
+        pipeline,
+        deployer,
+        binary_switcher,
+        engine,
+        config,
+        evolution_metrics,
+        promoter,
+        workspaces,
+    } = deps;
     let Some(evo_engine) = engine.evolution.as_ref() else {
         return Ok(());
     };
 
     // 先对齐上游主线再处理 change：沙盒树陈旧会让 GitOps 拉取端应用晋级
     // 产物时连带回退无关文件。同步失败不阻塞本轮（用当前树继续）。
-    if let Err(e) = pipeline.sync_with_upstream().await {
+    if let Err(e) = pipeline.sync_with_upstream_in(workdir).await {
         warn!(error = %e, "Sandbox source sync failed; continuing with current tree");
     }
 
@@ -1209,7 +1332,7 @@ async fn run_evolution_cycle(
     for change in changes {
         let mut change_failed = false;
 
-        let result = match pipeline.apply_and_test(&change).await {
+        let result = match pipeline.apply_and_test_in(&change, workdir).await {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "Change apply/test failed");
@@ -1241,7 +1364,10 @@ async fn run_evolution_cycle(
         } else if !config.auto_apply || config.manual_approve {
             info!(change_id = %result.change_id, "Change awaiting manual approval");
         } else {
-            let artifact = match deployer.commit_and_build(&result.change_id).await {
+            let artifact = match deployer
+                .commit_and_build_in(&result.change_id, workdir)
+                .await
+            {
                 Ok(a) => a,
                 Err(e) => {
                     warn!(change_id = %result.change_id, error = %e, "Change commit/build failed");
@@ -1334,11 +1460,17 @@ async fn run_evolution_cycle(
                     m.record_event(false).await;
                 }
                 // 沙盒部署成功 → 交晋级触发器（soak → 分级 → GitOps/审批台）。
+                // 显式带上待发布提交：本轮工作树是临时的，晋级经 soak 后才跑，
+                // 那时它可能已经归还，推送端只按裸仓库里的提交发布。
                 if let Some(p) = promoter {
                     let p = p.clone();
+                    let source = crate::PromotionSource {
+                        repo: workspaces.bare_repo().to_path_buf(),
+                        rev: artifact.commit_hash.clone(),
+                    };
                     let promoted_change = change.clone();
                     tokio::spawn(async move {
-                        p.on_sandbox_deployed(promoted_change).await;
+                        p.on_sandbox_deployed(promoted_change, Some(source)).await;
                     });
                 }
                 continue;

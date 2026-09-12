@@ -35,6 +35,9 @@ pub struct ChangePipeline {
     auto_apply: bool,
     test_timeout_secs: u64,
     promotion_policy: Option<crate::PromotionGateConfig>,
+    /// 共享 CARGO_TARGET_DIR：把编译产物留在工作树之外，临时工作树用完即弃
+    /// 也不会丢增量缓存。
+    target_dir: Option<PathBuf>,
 }
 
 impl ChangePipeline {
@@ -49,7 +52,19 @@ impl ChangePipeline {
             auto_apply,
             test_timeout_secs: 600,
             promotion_policy: None,
+            target_dir: None,
         }
+    }
+
+    pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.target_dir = Some(dir.into());
+        self
+    }
+
+    /// 构造时给定的默认工作目录。未接分配器的调用方据此退回进程工作目录，
+    /// 接了分配器的调用方一律改用分配出来的工作树。
+    pub fn project_root(&self) -> &std::path::Path {
+        &self.project_root
     }
 
     pub fn with_test_timeout(mut self, secs: u64) -> Self {
@@ -151,6 +166,16 @@ impl ChangePipeline {
     ///
     /// On test failure the working tree is always rolled back.
     pub async fn apply_and_test(&self, change: &EvolutionResult) -> SFResult<ApplyResult> {
+        self.apply_and_test_in(change, &self.project_root).await
+    }
+
+    /// 在指定工作树里应用并测试变更。每轮演进取一棵临时工作树，处理后归还，
+    /// 因而这里不能沿用构造时的固定目录。
+    pub async fn apply_and_test_in(
+        &self,
+        change: &EvolutionResult,
+        workdir: &Path,
+    ) -> SFResult<ApplyResult> {
         info!(change_id = %change.artifact_id, "Applying evolution change");
 
         let files_changed = Self::parse_diff(&change.content)?;
@@ -177,10 +202,10 @@ impl ChangePipeline {
             }
         }
 
-        Self::validate_change_files(&files_changed, &self.project_root)?;
-        self.ensure_clean_workspace().await?;
+        Self::validate_change_files(&files_changed, workdir)?;
+        self.ensure_clean_workspace(workdir).await?;
 
-        if let Err(e) = self.git_apply_check(&change.content).await {
+        if let Err(e) = self.git_apply_check(workdir, &change.content).await {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
@@ -190,7 +215,7 @@ impl ChangePipeline {
             });
         }
 
-        if let Err(e) = self.git_apply(&change.content).await {
+        if let Err(e) = self.git_apply(workdir, &change.content).await {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
@@ -200,11 +225,11 @@ impl ChangePipeline {
             });
         }
 
-        let (test_passed, test_output) = match self.run_cargo_test().await {
+        let (test_passed, test_output) = match self.run_cargo_test(workdir).await {
             Ok(result) => result,
             Err(e) => {
                 warn!(change_id = %change.artifact_id, error = %e, "cargo test execution failed");
-                let _ = self.git_reset_hard().await;
+                let _ = self.git_reset_hard(workdir).await;
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -221,12 +246,12 @@ impl ChangePipeline {
                 EvolutionStatus::Active
             } else {
                 info!(change_id = %change.artifact_id, "Change tests passed; rolling back for manual review");
-                let _ = self.git_reset_hard().await;
+                let _ = self.git_reset_hard(workdir).await;
                 EvolutionStatus::AwaitingReview
             }
         } else {
             warn!(change_id = %change.artifact_id, "Change tests failed; rolling back");
-            let _ = self.git_reset_hard().await;
+            let _ = self.git_reset_hard(workdir).await;
             EvolutionStatus::ValidationFailed
         };
 
@@ -337,10 +362,10 @@ impl ChangePipeline {
     }
 
     /// Refuse to apply if the git working tree already has uncommitted changes.
-    async fn ensure_clean_workspace(&self) -> SFResult<()> {
+    async fn ensure_clean_workspace(&self, workdir: &Path) -> SFResult<()> {
         let output = tokio::process::Command::new("git")
             .args(["status", "--porcelain"])
-            .current_dir(&self.project_root)
+            .current_dir(workdir)
             .output()
             .await
             .map_err(|e| SFError::IO(format!("Failed to check git status: {}", e)))?;
@@ -356,19 +381,24 @@ impl ChangePipeline {
     }
 
     /// Run `git apply --check` on change content without modifying the tree.
-    async fn git_apply_check(&self, change_content: &str) -> SFResult<()> {
-        self.run_git_apply(change_content, true).await
+    async fn git_apply_check(&self, workdir: &Path, change_content: &str) -> SFResult<()> {
+        self.run_git_apply(workdir, change_content, true).await
     }
 
     /// Apply change content to the working tree with `git apply`.
-    async fn git_apply(&self, change_content: &str) -> SFResult<()> {
-        self.run_git_apply(change_content, false).await
+    async fn git_apply(&self, workdir: &Path, change_content: &str) -> SFResult<()> {
+        self.run_git_apply(workdir, change_content, false).await
     }
 
     /// Shared implementation for `git apply [--check]`.
-    async fn run_git_apply(&self, change_content: &str, check_only: bool) -> SFResult<()> {
+    async fn run_git_apply(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+        check_only: bool,
+    ) -> SFResult<()> {
         let mut cmd = tokio::process::Command::new("git");
-        cmd.arg("apply").arg("-v").current_dir(&self.project_root);
+        cmd.arg("apply").arg("-v").current_dir(workdir);
         if check_only {
             cmd.arg("--check");
         }
@@ -408,10 +438,10 @@ impl ChangePipeline {
     }
 
     /// Restore the working tree to HEAD.
-    async fn git_reset_hard(&self) -> SFResult<()> {
+    async fn git_reset_hard(&self, workdir: &Path) -> SFResult<()> {
         let output = tokio::process::Command::new("git")
             .args(["reset", "--hard", "HEAD"])
-            .current_dir(&self.project_root)
+            .current_dir(workdir)
             .output()
             .await
             .map_err(|e| SFError::IO(format!("Failed to run git reset: {}", e)))?;
@@ -424,10 +454,10 @@ impl ChangePipeline {
     }
 
     /// Run a git command; Some(stdout) on success, None otherwise.
-    async fn git_try(&self, args: &[&str]) -> Option<String> {
+    async fn git_try(&self, workdir: &Path, args: &[&str]) -> Option<String> {
         let output = tokio::process::Command::new("git")
             .args(args)
-            .current_dir(&self.project_root)
+            .current_dir(workdir)
             .output()
             .await
             .ok()?;
@@ -451,25 +481,35 @@ impl ChangePipeline {
     /// - 否则（有未发布的本地 change commit，如 soak 期/推送失败熔断中）
     ///   → 跳过，等发布成功或人工处置后再同步
     pub async fn sync_with_upstream(&self) -> SFResult<()> {
+        self.sync_with_upstream_in(&self.project_root).await
+    }
+
+    /// 在指定工作树里同步上游主线。工作树里 `local` 远程指向裸仓库，既有
+    /// `fetch local` / `reset --hard local/main` 语义不变。
+    pub async fn sync_with_upstream_in(&self, workdir: &Path) -> SFResult<()> {
         if self
-            .git_try(&["remote", "get-url", "local"])
+            .git_try(workdir, &["remote", "get-url", "local"])
             .await
             .is_none()
         {
             return Ok(());
         }
-        if self.git_try(&["fetch", "local", "main"]).await.is_none() {
+        if self
+            .git_try(workdir, &["fetch", "local", "main"])
+            .await
+            .is_none()
+        {
             warn!("sync_with_upstream: fetch local main failed; keeping current tree");
             return Ok(());
         }
         // 晋级分支首轮可能还不存在，失败不阻塞 main 同步。
         let has_release = self
-            .git_try(&["fetch", "local", "evolution-release"])
+            .git_try(workdir, &["fetch", "local", "evolution-release"])
             .await
             .is_some();
 
         let dirty = self
-            .git_try(&["status", "--porcelain"])
+            .git_try(workdir, &["status", "--porcelain"])
             .await
             .map(|s| !s.is_empty())
             .unwrap_or(true);
@@ -479,11 +519,11 @@ impl ChangePipeline {
         }
 
         let head = self
-            .git_try(&["rev-parse", "HEAD"])
+            .git_try(workdir, &["rev-parse", "HEAD"])
             .await
             .unwrap_or_default();
         let upstream = self
-            .git_try(&["rev-parse", "local/main"])
+            .git_try(workdir, &["rev-parse", "local/main"])
             .await
             .unwrap_or_default();
         if head.is_empty() || upstream.is_empty() {
@@ -494,17 +534,23 @@ impl ChangePipeline {
         }
 
         let on_mainline = self
-            .git_try(&["merge-base", "--is-ancestor", "HEAD", "local/main"])
+            .git_try(
+                workdir,
+                &["merge-base", "--is-ancestor", "HEAD", "local/main"],
+            )
             .await
             .is_some();
         let published = has_release
             && self
-                .git_try(&[
-                    "merge-base",
-                    "--is-ancestor",
-                    "HEAD",
-                    "local/evolution-release",
-                ])
+                .git_try(
+                    workdir,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        "HEAD",
+                        "local/evolution-release",
+                    ],
+                )
                 .await
                 .is_some();
 
@@ -518,7 +564,7 @@ impl ChangePipeline {
 
         let output = tokio::process::Command::new("git")
             .args(["reset", "--hard", "local/main"])
-            .current_dir(&self.project_root)
+            .current_dir(workdir)
             .output()
             .await
             .map_err(|e| SFError::IO(format!("Failed to run git reset: {}", e)))?;
@@ -538,12 +584,16 @@ impl ChangePipeline {
     }
 
     /// Run `cargo test --workspace` and return (success, combined_output).
-    async fn run_cargo_test(&self) -> SFResult<(bool, String)> {
+    async fn run_cargo_test(&self, workdir: &Path) -> SFResult<(bool, String)> {
         info!("Running cargo test --workspace");
-        let output = tokio::process::Command::new("cargo")
-            .args(["test", "--workspace"])
-            .current_dir(&self.project_root)
-            .kill_on_drop(true)
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.args(["test", "--workspace"])
+            .current_dir(workdir)
+            .kill_on_drop(true);
+        if let Some(target) = &self.target_dir {
+            cmd.env("CARGO_TARGET_DIR", target);
+        }
+        let output = cmd
             .output()
             .await
             .map_err(|e| SFError::IO(format!("Failed to run cargo test: {}", e)))?;
@@ -644,9 +694,9 @@ index 1111111..2222222 100644
 +fn new() {}
 "#;
 
-        let pipeline = ChangePipeline::new(root, root.join("changes"), true);
-        pipeline.git_apply_check(change).await.unwrap();
-        pipeline.git_apply(change).await.unwrap();
+        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
+        pipeline.git_apply_check(root, change).await.unwrap();
+        pipeline.git_apply(root, change).await.unwrap();
 
         let content = tokio::fs::read_to_string(&src_path).await.unwrap();
         assert!(content.contains("fn new()"));
@@ -816,6 +866,57 @@ index 1111111..2222222 100644
         assert!(!result.test_passed);
         assert_eq!(result.new_status, crate::types::EvolutionStatus::Rejected);
         assert!(result.test_output.contains("Promotion gate rejected"));
+    }
+
+    /// 变更必须落在传入的工作树里，兄弟工作树与构造时的固定目录都不受影响
+    /// ——这是「按任务动态分配工作树」的核心隔离性质。
+    #[tokio::test]
+    async fn apply_lands_in_given_worktree_not_siblings() {
+        let (upstream, _work) = scaffold_upstream().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = crate::workspace::WorkspaceManager::new(
+            upstream.path(),
+            tmp.path().join("workspaces"),
+            tmp.path().join("target"),
+        );
+        let mine = mgr
+            .acquire_ephemeral("cycle", crate::workspace::BaseRef::Branch("main".into()))
+            .await
+            .unwrap();
+        let sibling = mgr
+            .acquire_ephemeral("cycle", crate::workspace::BaseRef::Branch("main".into()))
+            .await
+            .unwrap();
+
+        // project_root 指到一个无关目录，确保走的是传入的 workdir 而不是构造值。
+        let decoy = tmp.path().join("decoy");
+        let pipeline = ChangePipeline::new(&decoy, decoy.join("changes"), true);
+        let diff = r#"diff --git a/a.txt b/a.txt
+index 1111111..2222222 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1,2 @@
+ a
++b
+"#;
+        pipeline.ensure_clean_workspace(&mine.path).await.unwrap();
+        pipeline.git_apply_check(&mine.path, diff).await.unwrap();
+        pipeline.git_apply(&mine.path, diff).await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(mine.path.join("a.txt"))
+                .await
+                .unwrap(),
+            "a\nb\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(sibling.path.join("a.txt"))
+                .await
+                .unwrap(),
+            "a\n",
+            "兄弟工作树必须保持基线"
+        );
+        assert!(!decoy.exists(), "构造时的固定目录不应被写入");
     }
 
     #[tokio::test]

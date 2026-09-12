@@ -30,6 +30,16 @@ use crate::promotion_gate::{classify, count_diff_lines, GateVerdict};
 use crate::types::{EvolutionResult, EvolutionStatus};
 use crate::ReflectionEngine;
 
+/// 待晋级提交的来源。沙盒变更提交在临时工作树里（detached HEAD，用完即弃），
+/// 推送端不能假设自己的检出就是待发布内容，必须显式拿到提交。
+#[derive(Debug, Clone)]
+pub struct PromotionSource {
+    /// 提交所在的 git 目录（工作树或裸仓库），只要对象库里有该提交即可。
+    pub repo: std::path::PathBuf,
+    /// 提交（完整或短 hash）。
+    pub rev: String,
+}
+
 /// 晋级出口（GitOps 推送端实现，见 `gitops_publisher`）。
 /// 返回发布引用（commit hash / tag）。
 #[async_trait]
@@ -38,6 +48,23 @@ pub trait PromotionChannel: Send + Sync {
     async fn publish_config(&self, change: &EvolutionResult) -> SFResult<String>;
     /// L1：代码变化，发布到 release 分支供各集群拉取端金丝雀。
     async fn publish_rollout(&self, change: &EvolutionResult) -> SFResult<String>;
+    /// 从显式来源发布（L0）。缺省实现忽略来源，沿用推送端自己的检出——
+    /// 老实现与测试据此零改动，只有真正支持指定提交的推送端才覆盖。
+    async fn publish_config_from(
+        &self,
+        _source: &PromotionSource,
+        change: &EvolutionResult,
+    ) -> SFResult<String> {
+        self.publish_config(change).await
+    }
+    /// 从显式来源发布（L1）。
+    async fn publish_rollout_from(
+        &self,
+        _source: &PromotionSource,
+        change: &EvolutionResult,
+    ) -> SFResult<String> {
+        self.publish_rollout(change).await
+    }
 }
 
 /// 晋级触发器。无状态时序：配额与熔断全部从台账推导，进程重启不丢。
@@ -82,7 +109,11 @@ impl AutoPromoter {
 
     /// 沙盒部署成功回调：等待 soak 后走完整晋级判定。
     /// 设计为在后台任务里调用（调用方 tokio::spawn）。
-    pub async fn on_sandbox_deployed(&self, change: EvolutionResult) {
+    pub async fn on_sandbox_deployed(
+        &self,
+        change: EvolutionResult,
+        source: Option<PromotionSource>,
+    ) {
         let change_id = change.artifact_id.clone();
         if self.policy.soak_secs > 0 {
             info!(
@@ -92,13 +123,22 @@ impl AutoPromoter {
             );
             tokio::time::sleep(std::time::Duration::from_secs(self.policy.soak_secs)).await;
         }
-        if let Err(e) = self.decide_and_promote(&change).await {
+        if let Err(e) = self.decide_and_promote_with(&change, source.as_ref()).await {
             warn!(change_id = %change_id, error = %e, "Promotion decision failed");
         }
     }
 
-    /// 完整晋级判定（测试可直接调用，跳过 soak）。
+    /// 完整晋级判定（测试可直接调用，跳过 soak），按推送端自己的检出发布。
     pub async fn decide_and_promote(&self, change: &EvolutionResult) -> SFResult<()> {
+        self.decide_and_promote_with(change, None).await
+    }
+
+    /// 完整晋级判定，可指定待发布提交来源。
+    pub async fn decide_and_promote_with(
+        &self,
+        change: &EvolutionResult,
+        source: Option<&PromotionSource>,
+    ) -> SFResult<()> {
         let change_id = change.artifact_id.clone();
 
         // eval 门：评估明确否决的 change 不晋级。
@@ -196,10 +236,11 @@ impl AutoPromoter {
             .await?;
 
         let channel = self.channel.as_ref().expect("checked above");
-        let publish = if level == "l0_config" {
-            channel.publish_config(change).await
-        } else {
-            channel.publish_rollout(change).await
+        let publish = match (level, source) {
+            ("l0_config", Some(src)) => channel.publish_config_from(src, change).await,
+            ("l0_config", None) => channel.publish_config(change).await,
+            (_, Some(src)) => channel.publish_rollout_from(src, change).await,
+            (_, None) => channel.publish_rollout(change).await,
         };
 
         match publish {
@@ -230,6 +271,15 @@ impl AutoPromoter {
     /// 人工审批通过后的晋级入口（审批台/admin API 调用）。
     /// 跳过配额（人本身就是配额），但仍走出口发布。
     pub async fn promote_approved(&self, change: &EvolutionResult) -> SFResult<String> {
+        self.promote_approved_with(change, None).await
+    }
+
+    /// 人工审批通过后的晋级入口，可指定待发布提交来源。
+    pub async fn promote_approved_with(
+        &self,
+        change: &EvolutionResult,
+        source: Option<&PromotionSource>,
+    ) -> SFResult<String> {
         let change_id = change.artifact_id.clone();
         let Some(channel) = self.channel.as_ref() else {
             return Err(cog_core::SFError::Config(
@@ -259,10 +309,11 @@ impl AutoPromoter {
                 change.eval_summary.as_deref(),
             )
             .await?;
-        let publish = if level == "l0_config" {
-            channel.publish_config(change).await
-        } else {
-            channel.publish_rollout(change).await
+        let publish = match (level, source) {
+            ("l0_config", Some(src)) => channel.publish_config_from(src, change).await,
+            ("l0_config", None) => channel.publish_config(change).await,
+            (_, Some(src)) => channel.publish_rollout_from(src, change).await,
+            (_, None) => channel.publish_rollout(change).await,
         };
         match publish {
             Ok(reference) => {

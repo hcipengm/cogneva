@@ -6,7 +6,7 @@
 //! - If the build fails, roll back the git commit.
 //! - Stage the new binary for the supervisor's binary switcher.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use cog_core::{SFError, SFResult};
@@ -31,6 +31,8 @@ pub struct EvolutionDeployer {
     build_timeout_secs: u64,
     git_name: String,
     git_email: String,
+    /// 共享 CARGO_TARGET_DIR：产物不进临时工作树，工作树用完即弃不丢缓存。
+    target_dir: Option<PathBuf>,
 }
 
 impl EvolutionDeployer {
@@ -47,7 +49,20 @@ impl EvolutionDeployer {
             build_timeout_secs: 1800,
             git_name: "Cogneva Self-Evolution".to_string(),
             git_email: "self-evolution@cogneva.ai".to_string(),
+            target_dir: None,
         }
+    }
+
+    pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.target_dir = Some(dir.into());
+        self
+    }
+
+    /// 构建产物目录：显式配置的共享 target，否则退回工作树内的 target。
+    fn resolved_target_dir(&self, workdir: &Path) -> PathBuf {
+        self.target_dir
+            .clone()
+            .unwrap_or_else(|| workdir.join("target"))
     }
 
     pub fn with_binary_name(mut self, name: impl Into<String>) -> Self {
@@ -71,19 +86,30 @@ impl EvolutionDeployer {
     ///
     /// On build failure the git commit is rolled back with `git reset --hard HEAD~1`.
     pub async fn commit_and_build(&self, change_id: &str) -> SFResult<BuildArtifact> {
+        self.commit_and_build_in(change_id, &self.project_root)
+            .await
+    }
+
+    /// 在指定工作树里提交并构建。每轮演进用自己的临时工作树，构建产物仍落
+    /// 共享 target 目录。
+    pub async fn commit_and_build_in(
+        &self,
+        change_id: &str,
+        workdir: &Path,
+    ) -> SFResult<BuildArtifact> {
         info!(change_id = %change_id, "Committing evolution changes");
-        self.git_add_all().await?;
-        let commit_hash = self.git_commit(change_id).await?;
+        self.git_add_all(workdir).await?;
+        let commit_hash = self.git_commit(workdir, change_id).await?;
 
         info!(change_id = %change_id, "Building release binary");
         let start = Instant::now();
-        let build_result = self.run_cargo_build().await;
+        let build_result = self.run_cargo_build(workdir).await;
         let duration = start.elapsed();
 
         match build_result {
             Ok(()) => {
                 info!(change_id = %change_id, "Release binary built successfully");
-                let new_binary_path = self.stage_new_binary().await?;
+                let new_binary_path = self.stage_new_binary(workdir).await?;
                 Ok(BuildArtifact {
                     change_id: change_id.to_string(),
                     commit_hash,
@@ -97,7 +123,7 @@ impl EvolutionDeployer {
                     error = %e,
                     "Release build failed; rolling back commit"
                 );
-                self.git_reset_hard_parent().await?;
+                self.git_reset_hard_parent(workdir).await?;
                 Err(SFError::Agent(format!(
                     "Build failed and commit rolled back: {}",
                     e
@@ -106,10 +132,10 @@ impl EvolutionDeployer {
         }
     }
 
-    async fn git_add_all(&self) -> SFResult<()> {
+    async fn git_add_all(&self, workdir: &Path) -> SFResult<()> {
         let output = tokio::process::Command::new("git")
             .args(["add", "-A"])
-            .current_dir(&self.project_root)
+            .current_dir(workdir)
             .output()
             .await
             .map_err(|e| SFError::IO(format!("Failed to run git add: {}", e)))?;
@@ -121,7 +147,7 @@ impl EvolutionDeployer {
         Ok(())
     }
 
-    async fn git_commit(&self, change_id: &str) -> SFResult<String> {
+    async fn git_commit(&self, workdir: &Path, change_id: &str) -> SFResult<String> {
         let message = format!(
             "feat(evolution): apply self-generated change {}\n\nCo-Authored-By: {} <{}>",
             change_id, self.git_name, self.git_email
@@ -137,7 +163,7 @@ impl EvolutionDeployer {
                 "-m",
                 &message,
             ])
-            .current_dir(&self.project_root)
+            .current_dir(workdir)
             .output()
             .await
             .map_err(|e| SFError::IO(format!("Failed to run git commit: {}", e)))?;
@@ -150,7 +176,7 @@ impl EvolutionDeployer {
         // Return the short commit hash.
         let hash_output = tokio::process::Command::new("git")
             .args(["rev-parse", "--short", "HEAD"])
-            .current_dir(&self.project_root)
+            .current_dir(workdir)
             .output()
             .await
             .map_err(|e| SFError::IO(format!("Failed to read commit hash: {}", e)))?;
@@ -160,10 +186,10 @@ impl EvolutionDeployer {
             .to_string())
     }
 
-    async fn git_reset_hard_parent(&self) -> SFResult<()> {
+    async fn git_reset_hard_parent(&self, workdir: &Path) -> SFResult<()> {
         let output = tokio::process::Command::new("git")
             .args(["reset", "--hard", "HEAD~1"])
-            .current_dir(&self.project_root)
+            .current_dir(workdir)
             .output()
             .await
             .map_err(|e| SFError::IO(format!("Failed to roll back commit: {}", e)))?;
@@ -175,11 +201,15 @@ impl EvolutionDeployer {
         Ok(())
     }
 
-    async fn run_cargo_build(&self) -> SFResult<()> {
-        let output = tokio::process::Command::new("cargo")
-            .args(["build", "--release", "--bin", &self.binary_name])
-            .current_dir(&self.project_root)
-            .kill_on_drop(true)
+    async fn run_cargo_build(&self, workdir: &Path) -> SFResult<()> {
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.args(["build", "--release", "--bin", &self.binary_name])
+            .current_dir(workdir)
+            .kill_on_drop(true);
+        if let Some(target) = &self.target_dir {
+            cmd.env("CARGO_TARGET_DIR", target);
+        }
+        let output = cmd
             .output()
             .await
             .map_err(|e| SFError::IO(format!("Failed to run cargo build: {}", e)))?;
@@ -195,7 +225,7 @@ impl EvolutionDeployer {
         Ok(())
     }
 
-    async fn stage_new_binary(&self) -> SFResult<PathBuf> {
+    async fn stage_new_binary(&self, workdir: &Path) -> SFResult<PathBuf> {
         tokio::fs::create_dir_all(&self.binary_dir)
             .await
             .map_err(|e| {
@@ -217,8 +247,7 @@ impl EvolutionDeployer {
             })?;
 
         let source = self
-            .project_root
-            .join("target")
+            .resolved_target_dir(workdir)
             .join("release")
             .join(&self.binary_name);
         let staged = self.binary_dir.join(format!("{}.new", self.binary_name));

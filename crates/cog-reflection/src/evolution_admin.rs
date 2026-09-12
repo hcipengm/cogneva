@@ -34,6 +34,9 @@ pub struct EvolutionAdminService {
     promotion_config_enabled: bool,
     /// 最新晋级周报（周期报表器写入，admin 端点读取）。
     trend_latest: Option<Arc<tokio::sync::RwLock<Option<cog_core::PromotionTrendReport>>>>,
+    /// 工作区分配器：admin 触发的应用/构建各取一棵临时工作树，与自动流水线
+    /// 和各轮演进互不干涉。未接线时退回进程工作目录（单测场景）。
+    workspaces: Option<Arc<crate::workspace::WorkspaceManager>>,
 }
 
 /// 从 unified diff 文本提取一行摘要（"3 files, +42 -17"）；非 diff 内容返回 None。
@@ -88,7 +91,14 @@ impl EvolutionAdminService {
             promotion_ledger: None,
             promotion_config_enabled: false,
             trend_latest: None,
+            workspaces: None,
         }
+    }
+
+    /// 接入工作区分配器：admin 操作在临时工作树里跑。
+    pub fn with_workspaces(mut self, workspaces: Arc<crate::workspace::WorkspaceManager>) -> Self {
+        self.workspaces = Some(workspaces);
+        self
     }
 
     /// 接入变更行状态广播通道（接管台 SSE 推送）。
@@ -269,10 +279,49 @@ impl EvolutionAdminService {
         }
     }
 
+    /// 取一棵 admin 临时工作树；未接分配器时返回 None（调用方用进程工作目录）。
+    /// 操作结束必须 [`EvolutionAdminService::release_admin_workspace`] 归还。
+    async fn acquire_admin_workspace(&self) -> SFResult<Option<crate::workspace::Workspace>> {
+        let Some(mgr) = self.workspaces.as_ref() else {
+            return Ok(None);
+        };
+        let base = crate::workspace::BaseRef::Branch("main".into());
+        Ok(Some(mgr.acquire_ephemeral("admin", base).await?))
+    }
+
+    fn admin_workdir(&self, ws: Option<&crate::workspace::Workspace>) -> std::path::PathBuf {
+        match ws {
+            Some(ws) => ws.path.clone(),
+            None => self.pipeline.project_root().to_path_buf(),
+        }
+    }
+
+    async fn release_admin_workspace(&self, ws: Option<&crate::workspace::Workspace>) {
+        if let (Some(mgr), Some(ws)) = (self.workspaces.as_ref(), ws) {
+            if let Err(e) = mgr.release(ws).await {
+                warn!(error = %e, "admin workspace release failed");
+            }
+        }
+    }
+
     /// Shared commit/build/switch flow used by both `deploy_change` and
     /// `approve_change`. Ensures the change is applied and tests pass first.
     async fn deploy_inner(&self, change_id: &str) -> SFResult<EvolutionDeployResponse> {
-        let apply_result = self.apply_change(change_id).await?;
+        // 应用与提交必须落在同一棵树：apply 把变更留在工作区里，deployer 紧接着
+        // 提交它，中途换树就提交不到任何东西。
+        let ws = self.acquire_admin_workspace().await?;
+        let workdir = self.admin_workdir(ws.as_ref());
+        let outcome = self.deploy_in_workdir(change_id, &workdir).await;
+        self.release_admin_workspace(ws.as_ref()).await;
+        outcome
+    }
+
+    async fn deploy_in_workdir(
+        &self,
+        change_id: &str,
+        workdir: &std::path::Path,
+    ) -> SFResult<EvolutionDeployResponse> {
+        let apply_result = self.apply_in(change_id, workdir).await?;
         if !apply_result.test_passed {
             return Err(SFError::Validation(format!(
                 "change {} did not pass tests; cannot deploy",
@@ -280,7 +329,10 @@ impl EvolutionAdminService {
             )));
         }
 
-        let artifact = self.deployer.commit_and_build(change_id).await?;
+        let artifact = self
+            .deployer
+            .commit_and_build_in(change_id, workdir)
+            .await?;
         info!(
             change_id = %artifact.change_id,
             commit = %artifact.commit_hash,
@@ -338,6 +390,49 @@ impl EvolutionAdminService {
             commit_hash: artifact.commit_hash,
             staged_binary_path: artifact.new_binary_path.to_string_lossy().to_string(),
             switched,
+        })
+    }
+
+    /// 应用并测试变更的公共体（`apply_change` 与 `deploy_in_workdir` 共用）。
+    async fn apply_in(
+        &self,
+        change_id: &str,
+        workdir: &std::path::Path,
+    ) -> SFResult<EvolutionApplyResponse> {
+        let change = self.find_pending_change(change_id).await?;
+        let result = self.pipeline.apply_and_test_in(&change, workdir).await?;
+
+        if let Some(ref evo) = self.engine.evolution {
+            evo.update_status(change_id, result.new_status).await;
+        }
+
+        let failed = !result.test_passed;
+        if failed {
+            self.record_event(true).await;
+            self.record_change_failed().await;
+        } else {
+            self.record_event(false).await;
+        }
+        self.audit(
+            change_id,
+            "change.apply",
+            serde_json::json!({
+                "test_passed": result.test_passed,
+                "new_status": format!("{:?}", result.new_status).to_lowercase(),
+            }),
+        )
+        .await;
+
+        Ok(EvolutionApplyResponse {
+            change_id: result.change_id,
+            test_passed: result.test_passed,
+            test_output: result.test_output,
+            new_status: format!("{:?}", result.new_status).to_lowercase(),
+            files_changed: result
+                .files_changed
+                .into_iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
         })
     }
 }
@@ -429,41 +524,11 @@ impl EvolutionAdmin for EvolutionAdminService {
     }
 
     async fn apply_change(&self, change_id: &str) -> SFResult<EvolutionApplyResponse> {
-        let change = self.find_pending_change(change_id).await?;
-        let result = self.pipeline.apply_and_test(&change).await?;
-
-        if let Some(ref evo) = self.engine.evolution {
-            evo.update_status(change_id, result.new_status).await;
-        }
-
-        let failed = !result.test_passed;
-        if failed {
-            self.record_event(true).await;
-            self.record_change_failed().await;
-        } else {
-            self.record_event(false).await;
-        }
-        self.audit(
-            change_id,
-            "change.apply",
-            serde_json::json!({
-                "test_passed": result.test_passed,
-                "new_status": format!("{:?}", result.new_status).to_lowercase(),
-            }),
-        )
-        .await;
-
-        Ok(EvolutionApplyResponse {
-            change_id: result.change_id,
-            test_passed: result.test_passed,
-            test_output: result.test_output,
-            new_status: format!("{:?}", result.new_status).to_lowercase(),
-            files_changed: result
-                .files_changed
-                .into_iter()
-                .map(|p| p.to_string_lossy().to_string())
-                .collect(),
-        })
+        let ws = self.acquire_admin_workspace().await?;
+        let workdir = self.admin_workdir(ws.as_ref());
+        let outcome = self.apply_in(change_id, &workdir).await;
+        self.release_admin_workspace(ws.as_ref()).await;
+        outcome
     }
 
     async fn deploy_change(&self, change_id: &str) -> SFResult<EvolutionDeployResponse> {

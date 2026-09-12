@@ -212,16 +212,27 @@ struct MainlineState {
 
 pub struct MainlineDeployer {
     cfg: MainlineDeployerConfig,
-    /// 沙盒源码树（进化 Pod workingDir，/opt/cogneva/sandbox/src）。
-    src_dir: PathBuf,
+    /// 部署器独占一棵稳定路径的工作树。与进化任务的工作树互不干涉：这里是
+    /// 唯一能自由 `reset --hard` 的检出，任何第三方检出停在哪里都不影响它。
+    workspaces: std::sync::Arc<crate::workspace::WorkspaceManager>,
 }
 
 impl MainlineDeployer {
-    pub fn new(cfg: MainlineDeployerConfig, src_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            cfg,
-            src_dir: src_dir.into(),
-        }
+    pub fn new(
+        cfg: MainlineDeployerConfig,
+        workspaces: std::sync::Arc<crate::workspace::WorkspaceManager>,
+    ) -> Self {
+        Self { cfg, workspaces }
+    }
+
+    /// 部署器工作树路径（稳定）。
+    pub fn workdir(&self) -> PathBuf {
+        self.workspaces.deployer_workspace()
+    }
+
+    /// 外部共享的 CARGO_TARGET_DIR：工作树可整棵重建而不丢增量编译缓存。
+    pub fn target_dir(&self) -> PathBuf {
+        self.workspaces.target_dir().to_path_buf()
     }
 
     fn state_path(&self) -> PathBuf {
@@ -342,7 +353,8 @@ impl MainlineDeployer {
     }
 
     async fn git_src(&self, args: &[&str]) -> SFResult<String> {
-        self.run_cmd("git", args, Some(&self.src_dir), 120).await
+        let workdir = self.workdir();
+        self.run_cmd("git", args, Some(&workdir), 120).await
     }
 
     /// bare 仓库指定分支的完整 rev。
@@ -559,14 +571,8 @@ impl MainlineDeployer {
         });
         self.save_state(&state)?;
 
-        // 1. 源码树对齐新 rev（脏树/有未发布 commit 时跳过本轮，绝不丢在途工作；
-        // 具体原因由 ensure_source_at 内按场景记日志）。
-        if !self.ensure_source_at(&bare).await? {
-            info!("mainline source alignment skipped this round");
-            state.in_flight = None;
-            self.save_state(&state)?;
-            return Ok(());
-        }
+        // 1. 把独占工作树对齐到新 rev。树是部署器自己的，可无条件 reset。
+        self.ensure_source_at(&bare).await?;
 
         // 2. cargo build --release（target/ 在 source PVC 上增量缓存）。
         self.build_binary(&bare).await?;
@@ -596,57 +602,19 @@ impl MainlineDeployer {
         Ok(())
     }
 
-    /// 源码树 reset 到目标 rev。返回 false = 沙盒忙（脏树/未发布 commit），
-    /// 本轮跳过。安全规则与 change_pipeline::sync_with_upstream 同源。
-    async fn ensure_source_at(&self, rev: &str) -> SFResult<bool> {
-        if self
-            .git_src(&["fetch", "local", &self.cfg.branch])
-            .await
-            .is_err()
-        {
-            warn!("mainline: fetch local main failed; keeping current tree");
-            return Ok(false);
-        }
-        let dirty = self
-            .git_src(&["status", "--porcelain"])
-            .await
-            .map(|s| !s.is_empty())
-            .unwrap_or(true);
-        if dirty {
-            info!("mainline: sandbox tree dirty (in-flight change); skip this round");
-            return Ok(false);
-        }
-        let head = self
-            .git_src(&["rev-parse", "HEAD"])
-            .await
-            .unwrap_or_default();
-        if rev12(head.trim()) == rev12(rev) {
-            return Ok(true);
-        }
-        // HEAD 必须是目标 rev 的祖先（无未发布本地 commit）。
-        let ancestor = tokio::process::Command::new("git")
-            .args(["merge-base", "--is-ancestor", "HEAD", rev])
-            .current_dir(&self.src_dir)
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !ancestor {
-            // 与"脏树（在途变更，下轮自愈）"不同：分叉/无共同祖先是永久性
-            // 卡死（典型：PVC 上残留 bare 重建前的旧克隆历史），每 10 分钟
-            // 静默跳过，必须告警并给出处置方法。
-            warn!(
-                head = %head.trim(),
-                target = %rev,
-                "mainline: sandbox HEAD is not an ancestor of upstream main; refusing \
-                 reset to protect unpublished commits. If the tree holds no in-flight \
-                 change (e.g. stale pre-reseed history), an operator can realign with \
-                 git -C <sandbox-src> reset --hard local/main"
-            );
-            return Ok(false);
-        }
+    /// 把部署器独占的工作树对齐到目标 rev。这里没有守卫也没有"忙则跳过"：
+    /// 树是自己的，不存在需要保护的在途工作，损坏就重建。
+    async fn ensure_source_at(&self, rev: &str) -> SFResult<()> {
+        let spec = crate::workspace::WorkspaceSpec::persistent(
+            "mainline",
+            crate::workspace::WorkspaceKind::Deployer,
+            crate::workspace::BaseRef::Commit(rev.to_string()),
+        );
+        self.workspaces.ensure_persistent(spec).await?;
         self.git_src(&["reset", "--hard", rev]).await?;
-        Ok(true)
+        // target 目录在工作树之外，clean 只清源码，不丢增量编译缓存。
+        self.git_src(&["clean", "-ffdx"]).await?;
+        Ok(())
     }
 
     async fn build_binary(&self, rev: &str) -> SFResult<()> {
@@ -667,9 +635,11 @@ impl MainlineDeployer {
         }
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.args(["build", "--release", "--bin", "cogneva"])
-            .current_dir(&self.src_dir)
+            .current_dir(self.workdir())
             .env("CARGO_BUILD_JOBS", &jobs)
             .env("CARGO_HOME", CARGO_HOME_PVC)
+            // 工作树只放源码；产物落在共享 target，工作树重建也不用冷编译。
+            .env("CARGO_TARGET_DIR", self.target_dir())
             // build.rs 回退只嵌 7 位短 sha，叠层后的 --version 校验匹配 12
             // 位前缀会必败；显式注入完整 rev（与 swap-image 双保险同源）。
             .env("COGNEVA_GIT_REVISION", rev)
@@ -692,7 +662,7 @@ impl MainlineDeployer {
             )));
         }
         // strip 失败不致命（二进制可跑，只是体积大）。
-        let bin = self.src_dir.join("target/release/cogneva");
+        let bin = self.target_dir().join("release/cogneva");
         let _ = self
             .run_cmd("strip", &[bin.to_str().unwrap_or("")], None, 60)
             .await;
@@ -718,8 +688,8 @@ impl MainlineDeployer {
     }
 
     async fn buildah_steps(&self, ctr: &str, rev: &str, new_tag: &str) -> SFResult<()> {
-        let bin = self.src_dir.join("target/release/cogneva");
-        let migrations = self.src_dir.join("crates/cog-storage/migrations");
+        let bin = self.target_dir().join("release/cogneva");
+        let migrations = self.workdir().join("crates/cog-storage/migrations");
         self.buildah(
             &["copy", ctr, bin.to_str().unwrap(), "/opt/cogneva/cogneva"],
             300,
@@ -981,14 +951,32 @@ pub async fn run_mainline_loop(
     deployer: std::sync::Arc<MainlineDeployer>,
     shutdown: ShutdownSignal,
 ) {
-    // 宿主 bare 仓库（/host-git）与沙盒树属主/挂载场景会撞 git
+    // 宿主 bare 仓库（/host-git）与工作树属主/挂载场景会撞 git
     // dubious-ownership；safe.directory 只有 global 配置被采信（与
-    // gitops puller 同源处理），启动时幂等写入。
-    for dir in [deployer.cfg.bare_repo.as_str(), "/opt/cogneva/sandbox/src"] {
+    // gitops puller 同源处理），启动时幂等写入。临时工作树路径启动时还
+    // 不存在，由分配器在创建时按需注册。
+    let workdir = deployer.workdir();
+    for dir in [
+        deployer.cfg.bare_repo.as_str(),
+        deployer.workspaces.root().to_str().unwrap_or(""),
+        workdir.to_str().unwrap_or(""),
+    ] {
         let _ = tokio::process::Command::new("git")
             .args(["config", "--global", "--add", "safe.directory", dir])
             .output()
             .await;
+    }
+    // 崩溃残留的临时工作树与裸仓库里的孤儿登记在循环启动时清一次。
+    let _ = deployer.workspaces.prune().await;
+    match deployer.workspaces.gc_stale().await {
+        Ok(reclaimed) if !reclaimed.is_empty() => {
+            info!(
+                count = reclaimed.len(),
+                "reclaimed leaked mainline workspaces"
+            )
+        }
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "workspace gc failed"),
     }
     let interval = Duration::from_secs(deployer.cfg.poll_interval_secs.max(30));
     info!(
@@ -1689,8 +1677,9 @@ mod tests {
     }
 
     /// 命令层测试会改进程级 PATH（cargo/strip 靠 PATH 查找），用静态锁串行化，
-    /// 避免并行测试互相串改环境。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// 避免并行测试互相串改环境。用异步锁是因为持有期必须覆盖被测命令的 await，
+    /// 同步锁守卫跨 await 持锁会触发 clippy::await_holding_lock。
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// fake buildah：记录调用，from 输出容器名，run --version 输出带目标 rev
     /// 的版本串（rev 直接写进脚本，不走进程 env，避免并行竞态）。
@@ -1810,22 +1799,34 @@ exit 0
         }
     }
 
+    /// 部署器工作树的分配器；工作树与 target 都落在测试临时目录内。
+    fn test_workspaces(
+        root: &Path,
+        bare: &Path,
+    ) -> std::sync::Arc<crate::workspace::WorkspaceManager> {
+        std::sync::Arc::new(crate::workspace::WorkspaceManager::new(
+            bare,
+            root.join("workspaces"),
+            root.join("target"),
+        ))
+    }
+
     /// fake cargo：build_binary 靠 PATH 查找 "cargo"，假二进制必须叫这个名。
-    /// 产出一个假二进制占位（migrations 由真实 git 仓库提供）；接收的
+    /// 产物写进外置的共享 target 目录（工作树里不再有 target/）；接收的
     /// COGNEVA_GIT_REVISION 落盘（构建侧必须显式注入完整 rev）。
-    fn fake_cargo(dir: &Path, work: &Path) {
+    fn fake_cargo(dir: &Path, target_dir: &Path) {
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
 echo "$COGNEVA_GIT_REVISION" >> '{envlog}'
-mkdir -p '{work}/target/release'
-echo 'fake-binary' > '{work}/target/release/cogneva'
-chmod +x '{work}/target/release/cogneva'
+mkdir -p '{target}/release'
+echo 'fake-binary' > '{target}/release/cogneva'
+chmod +x '{target}/release/cogneva'
 exit 0
 "#,
             log = dir.join("cargo.log").display(),
             envlog = dir.join("cargo-env.log").display(),
-            work = work.display()
+            target = target_dir.display()
         );
         write_fake_bin(dir, "cargo", &script);
     }
@@ -1835,23 +1836,23 @@ exit 0
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     // ENV_LOCK 是进程级 PATH 串行锁：PATH 是进程全局状态，必须跨 await 持有
-    // 直到被测命令跑完，用同步 Mutex 即可（测试内不跨任务死锁）。
+    // 直到被测命令跑完。
     async fn poll_once_builds_pushes_and_dispatches_on_new_main() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
         let kubectl = fake_kubectl(&bin_dir, "reg.local:5000/cogneva:local");
-        fake_cargo(&bin_dir, &work);
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
         fake_strip(&bin_dir);
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        let deployer = MainlineDeployer::new(cfg, &work);
+        let deployer = MainlineDeployer::new(cfg, ws);
 
         // cargo/strip 靠 PATH 查找，bin_dir 前置；ENV_LOCK 保证无并行测试串改。
         let old_path = std::env::var("PATH").unwrap_or_default();
@@ -1926,14 +1927,90 @@ exit 0
         assert_eq!(state.in_flight.unwrap().phase, Phase::Dispatched);
     }
 
+    /// 本次死结的回归：第三方工作树停在无关提交（一条与 main 无共同祖先的
+    /// 独立历史）时，部署器照常推进。旧设计里被占用的那棵树就是部署器唯一的
+    /// 共享工作树，祖先守卫会把部署永久卡在"每轮静默跳过"。
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
-    async fn poll_once_noop_when_already_at_main() {
-        let _env = ENV_LOCK.lock().unwrap();
+    async fn deployer_not_wedged_by_foreign_worktree() {
+        let _env = ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let ws = test_workspaces(root, &bare);
+
+        // 与 main 无共同祖先的旁支历史，推给裸仓库。
+        real_git(&work, &["checkout", "--orphan", "side"]).await;
+        std::fs::write(work.join("side.txt"), "side\n").unwrap();
+        real_git(&work, &["add", "."]).await;
+        real_git(&work, &["commit", "-m", "side"]).await;
+        real_git(&work, &["push", "origin", "side"]).await;
+
+        // 模拟智能体占树：另一棵工作树停在无关分支上。
+        let foreign = ws
+            .acquire_ephemeral(
+                "agent-task",
+                crate::workspace::BaseRef::Branch("side".into()),
+            )
+            .await
+            .unwrap();
+        assert!(foreign.path.exists());
+        // 前提校验：这棵树确实停在 main 的非祖先上——正是旧守卫拒绝搬动的条件。
+        let is_ancestor = tokio::process::Command::new("git")
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "merge-base",
+                "--is-ancestor",
+                "side",
+                "main",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            !is_ancestor.status.success(),
+            "setup must reproduce the wedge condition: side is not an ancestor of main"
+        );
+
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        let kubectl = fake_kubectl(&bin_dir, "reg.local:5000/cogneva:local");
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, ws.clone());
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        let buildah_calls = std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap();
+        assert!(
+            buildah_calls.contains(&main_image("reg.local:5000", &rev_b)),
+            "deployer must keep advancing despite a foreign worktree: {buildah_calls}"
+        );
+        // 第三方工作树原样保留，部署器不碰它。
+        assert!(foreign.path.exists(), "foreign worktree must be left alone");
+        assert_eq!(
+            real_git_stdout(&foreign.path, &["rev-parse", "HEAD"]).await,
+            real_git_stdout(
+                &bare,
+                &["--git-dir", bare.to_str().unwrap(), "rev-parse", "side"]
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
+    async fn poll_once_noop_when_already_at_main() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let buildah = fake_buildah(&bin_dir, "");
@@ -1941,7 +2018,7 @@ exit 0
         let kubectl = fake_kubectl(&bin_dir, &deployed);
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        let deployer = MainlineDeployer::new(cfg, &work);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
         deployer.poll_once().await.unwrap();
 
         assert!(
@@ -1960,7 +2037,7 @@ exit 0
     async fn convergence_promotes_floating_local_tag() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let buildah = fake_buildah(&bin_dir, "");
@@ -1969,7 +2046,7 @@ exit 0
         let kubectl = fake_kubectl(&bin_dir, &deployed);
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        let deployer = MainlineDeployer::new(cfg, &work);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let state = MainlineState {
@@ -2014,7 +2091,7 @@ exit 0
     async fn local_pin_at_last_good_is_noop_after_apply() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let buildah = fake_buildah(&bin_dir, "");
@@ -2022,7 +2099,7 @@ exit 0
         let kubectl = fake_kubectl(&bin_dir, "localhost:30500/cogneva:local");
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        let deployer = MainlineDeployer::new(cfg, &work);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let state = MainlineState {
@@ -2054,7 +2131,7 @@ exit 0
     async fn completed_job_with_reverted_images_is_redispatched() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let log = bin_dir.join("kubectl.log");
@@ -2104,7 +2181,7 @@ exit 0
         )
         .unwrap();
 
-        let deployer = MainlineDeployer::new(cfg, &work);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
         deployer.poll_once().await.unwrap();
 
         let calls = std::fs::read_to_string(&log).unwrap();
@@ -2274,7 +2351,7 @@ exit 0
             kubectl_bin: bin_dir.join("fake-kubectl").to_string_lossy().to_string(),
             ..Default::default()
         };
-        let deployer = MainlineDeployer::new(cfg, bin_dir);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(&bin_dir, &bin_dir));
         assert_eq!(
             deployer.job_status("job-failed").await.unwrap(),
             JobStatus::Failed

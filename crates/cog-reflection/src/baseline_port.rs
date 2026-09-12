@@ -170,6 +170,13 @@ pub struct BaselinePorter {
     /// 必然失败且会空转重试，据此退化为纯 git 路径——与 orchestrator 缺失
     /// 同语义——机械 cherry-pick 照常继续。gate 由插件 start 阶段注入。
     llm_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
+    /// 工作区分配器 + 常驻工作树规格；接了之后仓库由分配器保证存在。
+    workspace: Option<(
+        Arc<crate::workspace::WorkspaceManager>,
+        crate::workspace::WorkspaceSpec,
+    )>,
+    /// 共享编译产物目录（质量门的 cargo 走这里，工作树只放源码）。
+    target_dir: Option<PathBuf>,
 }
 
 impl BaselinePorter {
@@ -186,6 +193,8 @@ impl BaselinePorter {
             committer_name: "Cogneva Evolution".into(),
             committer_email: "evolution@cogneva.local".into(),
             llm_gate: None,
+            workspace: None,
+            target_dir: None,
         }
     }
 
@@ -222,6 +231,37 @@ impl BaselinePorter {
     pub fn with_instance_id(mut self, id: impl Into<String>) -> Self {
         self.instance_id = Some(id.into());
         self
+    }
+
+    /// 移植工作树路径。
+    pub fn repo_dir(&self) -> &std::path::Path {
+        &self.repo_dir
+    }
+
+    /// 注入工作区分配器与常驻工作树规格：移植工作树被外部清掉时按需重建，
+    /// 而不是整条移植链就此失效。
+    pub fn with_workspace(
+        mut self,
+        workspaces: Arc<crate::workspace::WorkspaceManager>,
+        spec: crate::workspace::WorkspaceSpec,
+    ) -> Self {
+        self.workspace = Some((workspaces, spec));
+        self
+    }
+
+    /// 覆盖共享编译产物目录（外置后工作树重建不丢增量缓存）。
+    pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.target_dir = Some(dir.into());
+        self
+    }
+
+    /// 确保移植工作树存在可用。未接分配器时是 no-op（调用方自备仓库）。
+    pub async fn ensure_repo(&self) -> SFResult<()> {
+        let Some((mgr, spec)) = &self.workspace else {
+            return Ok(());
+        };
+        mgr.ensure_persistent(spec.clone()).await?;
+        Ok(())
     }
 
     /// 关闭 cargo 质量门（仅单元测试用：临时仓库无 Rust workspace）。
@@ -1152,11 +1192,14 @@ impl BaselinePorter {
 
     async fn run_cargo(&self, args: &[&str], timeout_secs: u64) -> SFResult<(bool, String)> {
         let cmdline = format!("cargo {}", args.join(" "));
-        let fut = tokio::process::Command::new("cargo")
-            .args(args)
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.args(args)
             .current_dir(&self.repo_dir)
-            .kill_on_drop(true)
-            .output();
+            .kill_on_drop(true);
+        if let Some(dir) = &self.target_dir {
+            cmd.env("CARGO_TARGET_DIR", dir);
+        }
+        let fut = cmd.output();
         let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
             .await
             .map_err(|_| SFError::IO(format!("{cmdline} timed out after {timeout_secs}s")))?
@@ -1262,9 +1305,10 @@ impl BaselinePorter {
 // ============================================================================
 // 触发循环（规则3 接线）：轮询上游 release tag → 幂等判定 → plan → execute。
 //
-// 循环跑在沙盒进化 Pod 里，porter 的 repo_dir 即沙盒源码工作仓库。执行
-// 期间 porter 独占该工作树（checkout -B evol/<id>）——新基线出现是低频
-// 事件，移植完成后工作树即停在新基线移植产物上，与 seed 对齐逻辑同向。
+// 循环跑在沙盒进化 Pod 里，porter 的 repo_dir 是按实例分配的常驻工作树
+// （porter-<instance>），与部署器和各进化任务的工作树互不干涉。执行期间
+// porter 独占该工作树（checkout -B evol/<id>）——新基线出现是低频事件，
+// 移植完成后工作树即停在新基线移植产物上。
 // ============================================================================
 
 /// 单个新基线的最近一次移植尝试记录。
@@ -1340,6 +1384,7 @@ async fn port_tick(
     config: &crate::BaselinePortConfig,
     state_path: &std::path::Path,
 ) -> SFResult<()> {
+    porter.ensure_repo().await?;
     porter.fetch_tags().await;
     let Some(latest) = porter.latest_release_tag().await? else {
         return Ok(());

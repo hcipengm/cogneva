@@ -55,8 +55,9 @@ pub mod sandbox;
 pub mod signal_watcher;
 pub mod squad;
 pub mod types;
+pub mod workspace;
 
-pub use auto_promoter::{AutoPromoter, PromotionChannel};
+pub use auto_promoter::{AutoPromoter, PromotionChannel, PromotionSource};
 pub use baseline_port::{
     run_baseline_port_loop, AbsorptionStatus, BaselinePorter, PortItemResult, PortOutcome,
     PortPlan, PortPlanItem, PortReport, PortRoute, PromotedChange,

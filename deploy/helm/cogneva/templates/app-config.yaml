@@ -51,6 +51,11 @@ data:
   COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS: "300"
   COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS: "600"
   COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS: "1800"
+  # 工作树动态分配：部署器独占一棵稳定路径的检出，进化任务各取临时检出，
+  # 互不影响；共享 CARGO_TARGET_DIR 在工作树之外，重建工作树不丢增量缓存。
+  COGNEVA_SELF_EVOLUTION_WORKSPACES_ROOT: {{ .Values.evolution.workspaces.root | quote }}
+  COGNEVA_SELF_EVOLUTION_WORKSPACES_TARGET_DIR: {{ .Values.evolution.workspaces.targetDir | quote }}
+  COGNEVA_SELF_EVOLUTION_WORKSPACES_EPHEMERAL_TTL_SECS: {{ .Values.evolution.workspaces.ephemeralTtlSecs | quote }}
   # 晋级门（推送端）：沙盒验证全过的变更（change）经分级策略判定后，L0/L1 自动晋级
   # 走 GitOps 发布（annotated tag + evolution-release 分支推中央 bare 仓库），
   # L2 留审批台。推送只写挂载的 bare 仓库 /host-git，不持任何集群凭证。

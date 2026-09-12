@@ -68,6 +68,14 @@ evolution:
     storage: 5Gi
   sandboxStorage: 20Gi
   sourceStorage: 10Gi
+  # 工作树动态分配：部署器与每个进化任务各自从裸仓库检出 git worktree，
+  # 任一方把检出停在哪里都不再影响另一方。共享 CARGO_TARGET_DIR 故意留在
+  # 工作树之外（source PVC 的克隆根内），工作树可整棵重建而不丢增量编译缓存。
+  workspaces:
+    root: /opt/cogneva/sandbox/workspaces
+    targetDir: /opt/cogneva/sandbox/src/target
+    # 临时工作树存活上限；要容得下一整轮演进，进程号不足以判断任务是否还活着。
+    ephemeralTtlSecs: 21600
   resources:
     requests:
       cpu: 500m

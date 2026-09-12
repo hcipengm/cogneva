@@ -221,6 +221,18 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS".into(),
         "self_evolution.build_timeout_secs".into(),
     );
+    m.insert(
+        "COGNEVA_SELF_EVOLUTION_WORKSPACES_ROOT".into(),
+        "self_evolution.workspaces.root".into(),
+    );
+    m.insert(
+        "COGNEVA_SELF_EVOLUTION_WORKSPACES_TARGET_DIR".into(),
+        "self_evolution.workspaces.target_dir".into(),
+    );
+    m.insert(
+        "COGNEVA_SELF_EVOLUTION_WORKSPACES_EPHEMERAL_TTL_SECS".into(),
+        "self_evolution.workspaces.ephemeral_ttl_secs".into(),
+    );
     // system
     m.insert(
         "COGNEVA_SKILL_HOT_RELOAD_INTERVAL_SECS".into(),

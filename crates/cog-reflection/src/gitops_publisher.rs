@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use cog_core::{SFError, SFResult};
 use tracing::info;
 
-use crate::auto_promoter::PromotionChannel;
+use crate::auto_promoter::{PromotionChannel, PromotionSource};
 use crate::types::EvolutionResult;
 
 /// change_id 只保留 [A-Za-z0-9-_]，其余替换为 '-'（git ref / 镜像 tag
@@ -41,7 +41,10 @@ fn sanitize(change_id: &str) -> String {
 
 pub struct GitOpsPublisher {
     config: GitOpsConfig,
-    project_root: PathBuf,
+    /// 执行 git 的目录（裸仓库或任一工作树，同一对象库即可）。刻意不绑
+    /// 具体工作树：待晋级的提交可能来自用完即弃的临时工作树，推送端只
+    /// 需要能在对象库里解析它。
+    repo_dir: PathBuf,
     /// 沙盒编译产物所在目录（registry 模式打镜像用）。
     binary_dir: PathBuf,
 }
@@ -49,21 +52,27 @@ pub struct GitOpsPublisher {
 impl GitOpsPublisher {
     pub fn new(
         config: GitOpsConfig,
-        project_root: impl Into<PathBuf>,
+        repo_dir: impl Into<PathBuf>,
         binary_dir: impl Into<PathBuf>,
     ) -> Self {
         Self {
             config,
-            project_root: project_root.into(),
+            repo_dir: repo_dir.into(),
             binary_dir: binary_dir.into(),
         }
     }
 
-    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+    async fn run_in(
+        &self,
+        program: &str,
+        dir: &std::path::Path,
+        args: &[&str],
+        timeout_secs: u64,
+    ) -> SFResult<String> {
         let cmdline = format!("{} {}", program, args.join(" "));
         let fut = tokio::process::Command::new(program)
             .args(args)
-            .current_dir(&self.project_root)
+            .current_dir(dir)
             .kill_on_drop(true)
             .output();
         let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
@@ -77,19 +86,49 @@ impl GitOpsPublisher {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    async fn git(&self, args: &[&str]) -> SFResult<String> {
-        self.run("git", args, 120).await
+    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+        self.run_in(program, &self.repo_dir, args, timeout_secs)
+            .await
     }
 
-    /// 推送当前 HEAD 到 release 分支 + 打 promote tag。
-    /// 返回 HEAD commit hash。
-    async fn publish(&self, change: &EvolutionResult, level: &str) -> SFResult<String> {
+    async fn git_in(&self, dir: &std::path::Path, args: &[&str]) -> SFResult<String> {
+        self.run_in("git", dir, args, 120).await
+    }
+
+    async fn git(&self, args: &[&str]) -> SFResult<String> {
+        self.git_in(&self.repo_dir, args).await
+    }
+
+    /// 推送待晋级提交到 release 分支 + 打 promote tag，返回提交 hash。
+    ///
+    /// `source` 显式给出待发布提交所在的 git 目录与 rev：沙盒变更提交在临时
+    /// 工作树里（detached HEAD），推送端不能假设自己的检出就是待发布内容。
+    /// 为 `None` 时按既有的「当前检出 HEAD」语义处理。
+    async fn publish(
+        &self,
+        change: &EvolutionResult,
+        level: &str,
+        source: Option<&PromotionSource>,
+    ) -> SFResult<String> {
         if self.config.repo_url.is_empty() {
             return Err(SFError::Config(
                 "gitops.repo_url 未配置，无法推送晋级产物".into(),
             ));
         }
-        let head = self.git(&["rev-parse", "HEAD"]).await?;
+        let (dir, head) = match source {
+            Some(src) => (
+                src.repo.clone(),
+                self.git_in(
+                    &src.repo,
+                    &["rev-parse", &format!("{}^{{commit}}", src.rev)],
+                )
+                .await?,
+            ),
+            None => (
+                self.repo_dir.clone(),
+                self.git(&["rev-parse", "HEAD"]).await?,
+            ),
+        };
         let tag = format!("promote/{}", sanitize(&change.artifact_id));
         let msg = format!(
             "change_id={}\nlevel={}\neval={}",
@@ -98,23 +137,33 @@ impl GitOpsPublisher {
             change.eval_summary.as_deref().unwrap_or("none")
         );
 
-        // promote tag 是指针性质，重推同 change 允许 -f 覆盖。
-        self.git(&["tag", "-a", "-f", "-m", &msg, &tag, &head])
+        // promote tag 是指针性质，重推同 change 允许 -f 覆盖；打上 tag 同时
+        // 让这个提交从任何分支之外变得可达，后续 gc 不会把它清掉。
+        self.git_in(&dir, &["tag", "-a", "-f", "-m", &msg, &tag, &head])
             .await?;
 
         // 非 force 推分支：历史必须 fast-forward。远端出现非本管线
         // 提交时 push 失败 → 台账 Failed → 熔断兜底，绝不强推覆盖。
-        self.git(&[
-            "push",
-            &self.config.repo_url,
-            &format!("HEAD:{}", self.config.branch),
-        ])
+        // 目标写成完整 refname：refspec 的 src 是提交对象时 git 不再猜
+        // destination，只给短分支名会被拒。
+        let target_branch = self.config.branch.trim_start_matches("refs/heads/");
+        self.git_in(
+            &dir,
+            &[
+                "push",
+                &self.config.repo_url,
+                &format!("{head}:refs/heads/{target_branch}"),
+            ],
+        )
         .await?;
-        self.git(&[
-            "push",
-            &self.config.repo_url,
-            &format!("refs/tags/{tag}:refs/tags/{tag}"),
-        ])
+        self.git_in(
+            &dir,
+            &[
+                "push",
+                &self.config.repo_url,
+                &format!("refs/tags/{tag}:refs/tags/{tag}"),
+            ],
+        )
         .await?;
 
         info!(
@@ -296,11 +345,27 @@ fn deployed_main_rev(jsonpath_out: &str) -> Option<String> {
 #[async_trait]
 impl PromotionChannel for GitOpsPublisher {
     async fn publish_config(&self, change: &EvolutionResult) -> SFResult<String> {
-        self.publish(change, "l0_config").await
+        self.publish(change, "l0_config", None).await
     }
 
     async fn publish_rollout(&self, change: &EvolutionResult) -> SFResult<String> {
-        self.publish(change, "l1_rollout").await
+        self.publish(change, "l1_rollout", None).await
+    }
+
+    async fn publish_config_from(
+        &self,
+        source: &PromotionSource,
+        change: &EvolutionResult,
+    ) -> SFResult<String> {
+        self.publish(change, "l0_config", Some(source)).await
+    }
+
+    async fn publish_rollout_from(
+        &self,
+        source: &PromotionSource,
+        change: &EvolutionResult,
+    ) -> SFResult<String> {
+        self.publish(change, "l1_rollout", Some(source)).await
     }
 }
 
@@ -390,7 +455,7 @@ mod tests {
         let publisher = l1_publisher(central.path(), work.path());
 
         let head = publisher
-            .publish(&change("p-1"), "l1_rollout")
+            .publish(&change("p-1"), "l1_rollout", None)
             .await
             .unwrap();
 
@@ -436,7 +501,7 @@ mod tests {
             work.path(),
         );
         publisher
-            .publish(&change("p/1; rm -rf"), "l0_config")
+            .publish(&change("p/1; rm -rf"), "l0_config", None)
             .await
             .unwrap();
         let tags = git(central.path(), &["tag", "-l"]).await;
@@ -448,7 +513,7 @@ mod tests {
         let (central, work) = setup_repo().await;
         let publisher = l1_publisher(central.path(), work.path());
         publisher
-            .publish(&change("p-1"), "l1_rollout")
+            .publish(&change("p-1"), "l1_rollout", None)
             .await
             .unwrap();
 
@@ -459,7 +524,7 @@ mod tests {
         git(work.path(), &["commit", "-m", "second"]).await;
 
         publisher
-            .publish(&change("p-2"), "l1_rollout")
+            .publish(&change("p-2"), "l1_rollout", None)
             .await
             .unwrap();
         let log = git(central.path(), &["log", "--format=%s", "evolution-release"]).await;
@@ -470,7 +535,7 @@ mod tests {
     async fn empty_repo_url_rejected() {
         let (_central, work) = setup_repo().await;
         let publisher = GitOpsPublisher::new(GitOpsConfig::default(), work.path(), work.path());
-        let err = publisher.publish(&change("p-1"), "l1_rollout").await;
+        let err = publisher.publish(&change("p-1"), "l1_rollout", None).await;
         assert!(err.is_err());
     }
 
@@ -550,7 +615,7 @@ mod tests {
             work.path(),
         );
         publisher
-            .publish(&change("p-9"), "l1_rollout")
+            .publish(&change("p-9"), "l1_rollout", None)
             .await
             .unwrap();
 
