@@ -563,11 +563,24 @@ struct AppState {
     pool_obs: Arc<PoolObservability>,
     /// 跨进程池状态信号连接（调度侧读同一个键决定是否暂停 LLM 依赖型任务）。
     redis: Option<redis::aio::MultiplexedConnection>,
-    /// 上一轮池可用性（边沿去重：只在进入/离开"全灭"时发事件与告警）。
+    /// 池不可用判定（证据锁存）。任何一次"全上游都承接不了"的观测置位；
+    /// 只有某个上游实证成功才清除。健康表为空表示**没有证据**，不等于证据表明
+    /// 可用——进程刚起来、或流量停了一阵，表就是空的。若把空表当可用，判定会
+    /// 在每次网关重启时凭空翻回"恢复"，让告警、暂停信号与调度侧一起误判。
     pool_down: Arc<AtomicBool>,
+    /// 自上次池判定以来是否出现过上游实证成功（清除 `pool_down` 的唯一凭据）。
+    pool_recovered: Arc<AtomicBool>,
 }
 
 impl AppState {
+    /// 记一次上游实证成功：清该上游的嫌疑态，并留下"池可恢复"的凭据供
+    /// 下一拍池判定解除锁存。任何"上游真的应答了"的路径都必须经此记录，
+    /// 否则池判定只能靠窗口到期推断恢复——而那只是"可以再试"，不是恢复。
+    fn note_upstream_success(&self, u: &LlmUpstream) -> bool {
+        self.pool_recovered.store(true, Ordering::SeqCst);
+        self.llm_health.note_success(u)
+    }
+
     /// 代码平台透传用的 GitHub 出口凭证：配置了 App 就用 installation token
     /// （以 App bot 身份发出，署名归一），换取失败或未配置回退静态
     /// OAuth/PAT token；两者皆无返回 None（调用方按未配置凭证处理）。
@@ -799,7 +812,18 @@ async fn refresh_pool_state(state: &AppState) {
     if upstreams.is_empty() {
         return;
     }
-    let down = state.llm_health.all_suspect(upstreams);
+    let all_out = state.llm_health.all_suspect(upstreams);
+    let recovered = state.pool_recovered.swap(false, Ordering::SeqCst);
+    // 池判定按证据走：观测到"全上游都承接不了"即置位；只有上游实证成功才清除。
+    // 窗口到期只说明"可以再试一次"，不是恢复的证据，所以不解除锁存——否则告警会
+    // 随退避窗到期反复 resolve→firing，而池其实一直不可用。
+    let down = if all_out {
+        true
+    } else if recovered {
+        false
+    } else {
+        state.pool_down.load(Ordering::SeqCst)
+    };
     let earliest = state.llm_health.earliest_recovery(upstreams);
 
     for (key, healthy, _failures, _reset) in state.llm_health.snapshot(upstreams) {
@@ -1299,7 +1323,7 @@ async fn stream_forward(
             last_failure = Some((status, ctype, text));
             continue;
         }
-        if state.llm_health.note_success(upstream) {
+        if state.note_upstream_success(upstream) {
             tracing::info!(upstream = %base, "LLM 上游恢复健康（真实请求实证）");
             record_upstream_state(&state, upstream, true, 0, None);
         }
@@ -1383,19 +1407,25 @@ async fn run_llm_health_prober(state: AppState) {
 }
 
 /// 单轮探测：对所有"嫌疑窗已到期"的上游各发一次最小复测请求。
+///
+/// 池判定锁存为不可用时，探测覆盖池内全部上游，而不只看窗口到期的那几个：
+/// 那种状态下 LLM 依赖型任务已被暂停，没有真实请求来实证恢复；若探测也因为
+/// "表里没有这条记录"而不发，就没人能发现恢复——这正是要避免的"任务停了→
+/// 没人探活→永不恢复"死锁。
 async fn probe_suspect_upstreams(state: &AppState) {
+    let latched_down = state.pool_down.load(Ordering::SeqCst);
     let due: Vec<LlmUpstream> = state
         .config
         .llm_upstreams
         .iter()
-        .filter(|u| state.llm_health.due_for_probe(u))
+        .filter(|u| latched_down || state.llm_health.due_for_probe(u))
         .cloned()
         .collect();
     for upstream in due {
         let base = upstream.base_url.trim_end_matches('/');
         match probe_upstream(state, &upstream).await {
             Ok(()) => {
-                if state.llm_health.note_success(&upstream) {
+                if state.note_upstream_success(&upstream) {
                     tracing::info!(upstream = %base, "LLM 上游探测复通，热恢复进池");
                     record_upstream_state(state, &upstream, true, 0, None);
                 }
@@ -1499,7 +1529,7 @@ async fn call_llm(
         let start = std::time::Instant::now();
         match call_one_upstream(state, upstream, &messages).await {
             Ok(resp) => {
-                if state.llm_health.note_success(upstream) {
+                if state.note_upstream_success(upstream) {
                     tracing::info!(upstream = %upstream.base_url, "LLM 上游恢复健康（真实请求实证）");
                     record_upstream_state(state, upstream, true, 0, None);
                 }
@@ -2393,6 +2423,14 @@ async fn build_pool_observability(
     )
 }
 
+/// 重启后的池判定初值：进程内的健康表重启即清零，若只凭空表推导，每次重启都会
+/// 凭空把池判回"可用"。而上一条真实证据（Redis 里那条跨进程池状态）恰好说明池
+/// 不可用——所以启动时以它为期初值，之后再等探测或真实请求的成功实证解除。
+fn seed_pool_down(raw: Option<&str>) -> bool {
+    raw.and_then(|s| serde_json::from_str::<cog_core::LlmPoolStatus>(s).ok())
+        .is_some_and(|s| s.unavailable)
+}
+
 /// 启动安全网关（三个通道各自监听）。
 pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
     let http_client: Arc<dyn cog_core::HttpClient> =
@@ -2400,6 +2438,24 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
     init_gateway_logging(&config.observability, &http_client);
 
     let (pool_obs, redis) = build_pool_observability(&config, &http_client).await;
+    let pool_down = match redis.as_ref() {
+        Some(conn) => {
+            let mut conn = conn.clone();
+            let raw: Option<String> = redis::cmd("GET")
+                .arg(cog_core::LLM_POOL_STATUS_KEY)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(None);
+            let seeded = seed_pool_down(raw.as_deref());
+            if seeded {
+                tracing::warn!(
+                    "池不可用判定沿用上次跨进程信号（重启不凭空清零），待上游实证成功解除"
+                );
+            }
+            seeded
+        }
+        None => false,
+    };
     let state = AppState {
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -2415,7 +2471,8 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
         llm_health: std::sync::Arc::new(LlmHealthTable::default()),
         pool_obs,
         redis,
-        pool_down: Arc::new(AtomicBool::new(false)),
+        pool_down: Arc::new(AtomicBool::new(pool_down)),
+        pool_recovered: Arc::new(AtomicBool::new(false)),
         config: config.clone(),
     };
     if state.github_app.is_some() {
@@ -2792,10 +2849,53 @@ mod tests {
             "应暴露最早恢复时刻: {text}"
         );
 
-        // 恢复：边沿复位。
-        state.llm_health.note_success(&u);
+        // 恢复要凭据：上游实证成功才解除锁存。
+        state.note_upstream_success(&u);
         refresh_pool_state(&state).await;
         assert!(!state.pool_down.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn pool_verdict_holds_without_recovery_evidence() {
+        let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let u = stub_upstream("https://a.example.com", "m1");
+        let far = Utc::now().timestamp() + 600;
+
+        state.llm_health.note_failure(&u, 300, Some(far));
+        refresh_pool_state(&state).await;
+        assert!(state.pool_down.load(Ordering::SeqCst), "全上游不可用即置位");
+
+        // 窗口到期、也无恢复证据：判定保持不可用。空表是"没有证据"，不是
+        // "证据表明可用"——否则网关每次重启都会凭空把池判回可用。
+        state.llm_health.note_success(&u);
+        assert!(
+            state.llm_health.states.lock().unwrap().is_empty(),
+            "窗口已清，接下来的推导只依据证据"
+        );
+        refresh_pool_state(&state).await;
+        assert!(
+            state.pool_down.load(Ordering::SeqCst),
+            "没有实证成功就不解除锁存"
+        );
+    }
+
+    #[test]
+    fn restart_seeds_pool_verdict_from_cross_process_signal() {
+        let down = cog_core::LlmPoolStatus {
+            unavailable: true,
+            earliest_recovery_unix: Utc::now().timestamp() + 600,
+            unavailable_upstreams: vec!["https://a.example.com|m1".into()],
+        };
+        let raw = serde_json::to_string(&down).unwrap();
+        assert!(seed_pool_down(Some(&raw)), "上次判不可用则重启沿用");
+
+        let up = cog_core::LlmPoolStatus {
+            unavailable: false,
+            ..down
+        };
+        assert!(!seed_pool_down(Some(&serde_json::to_string(&up).unwrap())));
+        assert!(!seed_pool_down(None), "无信号时按乐观起手");
+        assert!(!seed_pool_down(Some("{not json")), "坏载荷不误判为不可用");
     }
 
     #[test]
@@ -3010,6 +3110,7 @@ mod tests {
             }),
             redis: None,
             pool_down: Arc::new(AtomicBool::new(false)),
+            pool_recovered: Arc::new(AtomicBool::new(false)),
             config: SecurityGatewayConfig {
                 llm_upstreams: upstreams,
                 ..cfg(&[], &[])
