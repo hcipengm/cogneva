@@ -33,6 +33,10 @@ const GIT_TIMEOUT_SECS: u64 = 120;
 /// 同一进程内永远"活着"，存活时长才是唯一的兜底判据。
 pub const DEFAULT_EPHEMERAL_TTL: Duration = Duration::from_secs(21600);
 
+/// 回收"实例身份已轮换"遗留工作树的最小存活时长。滚动更新期间新旧 Pod 会短暂
+/// 共存、共享同一工作树根，旧 Pod 正在用的树必须活过这个窗口。
+pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(3600);
+
 /// 工作树用途。除 `Ephemeral` 外都是常驻：不参与回收，跨轮次保留。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -338,6 +342,56 @@ impl WorkspaceManager {
                 self.remove_meta(id);
                 reclaimed.push(entry.path.clone());
             }
+        }
+        Ok(reclaimed)
+    }
+
+    /// 回收"实例身份已轮换"遗留的常驻工作树。
+    ///
+    /// 一个进程只有一个当前实例，按实例命名的 `cycle-*` / `porter-*` 树在实例
+    /// 轮换后就是没人再用的残留；单例的 `mainline` / `engine-baseline` 不在此列。
+    /// 加最小存活时长是因为滚动更新期间新旧 Pod 会短暂共存、共享同一个工作树根，
+    /// 旧 Pod 正在使用的工作树必须活过这个窗口。
+    pub async fn gc_orphan_instances(
+        &self,
+        instance: &str,
+        min_age: Duration,
+    ) -> SFResult<Vec<PathBuf>> {
+        let keep = [
+            sanitize_id(&format!("cycle-{instance}")),
+            sanitize_id(&format!("porter-{instance}")),
+        ];
+        let mut reclaimed = Vec::new();
+        let now = chrono::Utc::now().timestamp();
+        for entry in self.list().await.unwrap_or_default() {
+            if !entry.path.starts_with(&self.root) {
+                continue;
+            }
+            let Some(id) = entry.path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if keep.iter().any(|k| k == id) {
+                continue;
+            }
+            let Some(meta) = self.read_meta(id) else {
+                continue;
+            };
+            if !matches!(meta.kind, WorkspaceKind::Cycle | WorkspaceKind::Porter) {
+                continue;
+            }
+            let age = (now - meta.created_at_unix).max(0) as u64;
+            if age < min_age.as_secs() {
+                continue;
+            }
+            info!(
+                id = %id,
+                kind = meta.kind.as_str(),
+                age_secs = age,
+                "reclaiming workspace of a rotated instance identity"
+            );
+            self.force_remove_path(&entry.path).await;
+            self.remove_meta(id);
+            reclaimed.push(entry.path.clone());
         }
         Ok(reclaimed)
     }
@@ -825,6 +879,78 @@ mod tests {
         assert_eq!(mgr.list().await.unwrap().len(), 2);
         // 常驻类型不参与回收，GC 不许动它们。
         assert!(mgr.gc_stale().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_reclaims_rotated_instance_trees_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare);
+        async fn persistent(
+            mgr: &WorkspaceManager,
+            id: &str,
+            kind: WorkspaceKind,
+            rev: &str,
+        ) -> Workspace {
+            mgr.ensure_persistent(WorkspaceSpec::persistent(
+                id,
+                kind,
+                BaseRef::Commit(rev.to_string()),
+            ))
+            .await
+            .unwrap()
+        }
+
+        // 单例：不随实例轮换，任何情况都不许回收。
+        let mainline = persistent(&mgr, "mainline", WorkspaceKind::Deployer, &rev_b).await;
+        let baseline = persistent(
+            &mgr,
+            "engine-baseline",
+            WorkspaceKind::EngineBaseline,
+            &rev_b,
+        )
+        .await;
+        // 当前实例：正在用。
+        let cycle_now = persistent(&mgr, "cycle-quinn", WorkspaceKind::Cycle, &rev_b).await;
+        let porter_now = persistent(&mgr, "porter-quinn", WorkspaceKind::Porter, &rev_b).await;
+        // 已轮换实例的残留：按实例命名，没人再用。
+        let cycle_old = persistent(&mgr, "cycle-ada", WorkspaceKind::Cycle, &rev_b).await;
+        let porter_old = persistent(&mgr, "porter-ada", WorkspaceKind::Porter, &rev_b).await;
+        // 同样已轮换、但刚建出来：处在滚动更新共存窗口内，这一轮不回收。
+        let cycle_fresh = persistent(&mgr, "cycle-max", WorkspaceKind::Cycle, &rev_b).await;
+
+        // 把三棵"旧"树的边车时间戳推早，模拟身份轮换后的既存残留。
+        let old = chrono::Utc::now().timestamp() - ORPHAN_MIN_AGE.as_secs() as i64 - 60;
+        for ws in [&cycle_old, &porter_old] {
+            let kind = mgr.read_meta(&ws.id).unwrap().kind;
+            mgr.write_meta(&WorkspaceMeta {
+                id: ws.id.clone(),
+                kind,
+                pid: std::process::id(),
+                created_at_unix: old,
+                base: rev_b.clone(),
+                task_id: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let reclaimed = mgr
+            .gc_orphan_instances("quinn", ORPHAN_MIN_AGE)
+            .await
+            .unwrap();
+        let mut got: Vec<String> = reclaimed
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["cycle-ada", "porter-ada"]);
+        assert!(!cycle_old.path.exists(), "轮换实例的树要删掉");
+        assert!(!porter_old.path.exists(), "轮换实例的树要删掉");
+        for kept in [&mainline, &baseline, &cycle_now, &porter_now, &cycle_fresh] {
+            assert!(kept.path.exists(), "{} 不能被动", kept.id);
+        }
+        assert_eq!(mgr.list().await.unwrap().len(), 5);
     }
 
     #[tokio::test]

@@ -130,6 +130,32 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                          back to the process working directory"
                     ),
                 }
+                // 实例身份每次 Pod 重启都会重新生成（身份文件不在持久卷上），按实例
+                // 命名的常驻工作树因此会被永久遗弃。启动时收一次：先清理登记残留，
+                // 再回收泄漏的临时树，最后回收已轮换实例的常驻树。
+                if let Err(e) = ws.prune().await {
+                    warn!(error = %e, "workspace prune failed");
+                }
+                match ws.gc_stale().await {
+                    Ok(reclaimed) if !reclaimed.is_empty() => {
+                        info!(count = reclaimed.len(), "reclaimed leaked workspaces")
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "workspace gc failed"),
+                }
+                match ws
+                    .gc_orphan_instances(&instance_id, crate::workspace::ORPHAN_MIN_AGE)
+                    .await
+                {
+                    Ok(reclaimed) if !reclaimed.is_empty() => {
+                        info!(
+                            count = reclaimed.len(),
+                            "reclaimed rotated-instance workspaces"
+                        )
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "workspace orphan gc failed"),
+                }
             }
         }
 
