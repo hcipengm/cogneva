@@ -34,7 +34,7 @@ spec:
       containers:
         - name: buildah
           image: quay.io/buildah/stable:latest
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           command: ["sleep", "infinity"]
           securityContext:
             privileged: true

@@ -114,7 +114,7 @@ spec:
       containers:
         - name: buildah
           image: {{ .Values.buildah.image }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.buildah.pullPolicy }}
           command: ["sleep", "infinity"]
           securityContext:
             privileged: true

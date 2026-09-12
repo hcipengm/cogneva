@@ -131,6 +131,10 @@ sandboxExecutor:
 buildah:
   enabled: true
   image: quay.io/buildah/stable:latest
+  # 与业务镜像分策略：这是外部第三方镜像，不是集群内 registry 的浮动签。
+  # 不跟 image.pullPolicy 的 Always——外网不可达时 Always 会让容器起不来，
+  # 直接废掉构建能力；这份 :latest 只在节点首次需要时拉一次。
+  pullPolicy: IfNotPresent
   containerdSocket: /run/containerd
   storageHostPath: /var/lib/cogneva-buildah
   resources:
