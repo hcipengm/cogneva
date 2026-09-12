@@ -1,12 +1,20 @@
 //! 沙盒工作区动态分配。
 //!
-//! 以集群内裸仓库为唯一源，按任务分配 `git worktree` 检出：部署器独占一棵稳定
-//! 路径的工作树，每个智能体任务拿到自己的临时工作树。任何一方把检出停在哪里都
-//! 不会改变另一方的仓库状态，共用一棵可变树导致的互相卡死从结构上消失。
+//! 以集群内裸仓库为唯一源，按用途分配 `git worktree` 检出：部署器、每轮演进、
+//! 移植器各占一棵，谁把检出停在哪里都不改变别人的仓库状态，共用一棵可变树导致的
+//! 互相卡死从结构上消失。
 //!
 //! 编译产物目录（cargo target）外置并共享：工作树里只有源码，因此工作树可以被
 //! 清理或整棵重建而不丢增量缓存；cargo 自身对 target 目录加文件锁，多个构建天然
 //! 串行，无需另造构建锁。
+//!
+//! 周期性构建路径必须**稳定复用**，不能每轮换新路径。cargo 对本地 path crate 的
+//! 新鲜度按源码 mtime 判定（路径不进指纹）：`worktree add` 把整棵树写成当前时间，
+//! 于是新路径的工作树会让全部本地 crate 重编一次，只有外部依赖命中缓存；同一路径
+//! 上 `reset --hard` 只重写有差异的文件，未变 crate 才保持新鲜。所以部署器、每轮
+//! 演进、移植器、引擎基线都取常驻工作树就地从基线刷新。只有一次性的临时任务
+//! （如运维手工触发的 admin 部署）才用带 uuid 的 [`WorkspaceManager::acquire_ephemeral`]，
+//! 以路径唯一换取并发安全，代价是那一次冷编。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,6 +38,7 @@ pub const DEFAULT_EPHEMERAL_TTL: Duration = Duration::from_secs(21600);
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceKind {
     Deployer,
+    Cycle,
     Porter,
     EngineBaseline,
     Ephemeral,
@@ -43,6 +52,7 @@ impl WorkspaceKind {
     fn as_str(self) -> &'static str {
         match self {
             WorkspaceKind::Deployer => "deployer",
+            WorkspaceKind::Cycle => "cycle",
             WorkspaceKind::Porter => "porter",
             WorkspaceKind::EngineBaseline => "engine-baseline",
             WorkspaceKind::Ephemeral => "ephemeral",
@@ -187,6 +197,12 @@ impl WorkspaceManager {
     /// 引擎只读基线工作树（稳定路径，就地刷新）。
     pub fn engine_baseline_workspace(&self) -> PathBuf {
         self.path_for("engine-baseline")
+    }
+
+    /// 某实例每轮演进独占的工作树（稳定路径，就地刷新）。同一实例的轮次串行，
+    /// 故复用同一棵；跨实例各有一棵，互不干扰。
+    pub fn cycle_workspace(&self, instance: &str) -> PathBuf {
+        self.path_for(&format!("cycle-{instance}"))
     }
 
     /// 移植器按实例常驻的工作树路径。
@@ -750,6 +766,65 @@ mod tests {
             "回到 rev_a 后 b.txt 应消失"
         );
         assert!(mgr.target_dir().join("marker").exists(), "编译缓存要保住");
+    }
+
+    #[tokio::test]
+    async fn cycle_workspace_is_reused_across_rounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, rev_a, rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare);
+        let spec =
+            |base: BaseRef| WorkspaceSpec::persistent("cycle-quinn", WorkspaceKind::Cycle, base);
+
+        let first = mgr
+            .ensure_persistent(spec(BaseRef::Commit(rev_a.clone())))
+            .await
+            .unwrap();
+        assert_eq!(first.path, mgr.cycle_workspace("quinn"));
+        // 轮末把变更留在树里：下一轮必须回到基线，而不是新建一棵。
+        std::fs::write(first.path.join("leftover.txt"), "dirty").unwrap();
+
+        let second = mgr
+            .ensure_persistent(spec(BaseRef::Commit(rev_b.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.path, first.path,
+            "同一实例必须复用同一路径，换路径会丢编译缓存"
+        );
+        assert_eq!(mgr.list().await.unwrap().len(), 1);
+        mgr.refresh(&second, BaseRef::Commit(rev_b.clone()))
+            .await
+            .unwrap();
+        assert!(!second.path.join("leftover.txt").exists());
+        assert_eq!(git_out(&second.path, &["rev-parse", "HEAD"]), rev_b);
+    }
+
+    #[tokio::test]
+    async fn cycle_workspaces_are_isolated_per_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare);
+        let a = mgr
+            .ensure_persistent(WorkspaceSpec::persistent(
+                "cycle-quinn",
+                WorkspaceKind::Cycle,
+                BaseRef::Commit(rev_b.clone()),
+            ))
+            .await
+            .unwrap();
+        let b = mgr
+            .ensure_persistent(WorkspaceSpec::persistent(
+                "cycle-other",
+                WorkspaceKind::Cycle,
+                BaseRef::Commit(rev_b.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(a.path, b.path);
+        assert_eq!(mgr.list().await.unwrap().len(), 2);
+        // 常驻类型不参与回收，GC 不许动它们。
+        assert!(mgr.gc_stale().await.unwrap().is_empty());
     }
 
     #[tokio::test]

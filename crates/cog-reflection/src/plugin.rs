@@ -1278,22 +1278,26 @@ struct CycleDeps<'a> {
 
 /// Run one pass of the self-evolution auto-deploy pipeline.
 ///
-/// 每轮演进独占一棵临时工作树（轮内多个变更串行复用），轮末归还：任何检出
-/// 停在哪里都不影响部署器与别的轮次。
+/// 每轮演进独占一棵工作树（轮内多个变更串行复用），轮首刷新回基线：任何检出
+/// 停在哪里都不影响部署器与别的轮次。工作树按实例常驻而非每轮新建，路径稳定才
+/// 能让共享 target 目录命中增量缓存——换新路径会让全部本地 crate 重编一次。
 async fn run_evolution_cycle(
     deps: CycleDeps<'_>,
     instance: &str,
     version: &str,
 ) -> cog_core::SFResult<()> {
     let base = deps.workspaces.resolve_base(instance, version).await;
-    let workspace = deps.workspaces.acquire_ephemeral("cycle", base).await?;
-    info!(path = %workspace.path.display(), "evolution cycle workspace acquired");
-    let mgr = deps.workspaces;
-    let outcome = run_evolution_cycle_in(deps, &workspace.path).await;
-    if let Err(e) = mgr.release(&workspace).await {
-        warn!(error = %e, "evolution cycle workspace release failed");
-    }
-    outcome
+    let workspace = deps
+        .workspaces
+        .ensure_persistent(crate::workspace::WorkspaceSpec::persistent(
+            format!("cycle-{instance}"),
+            crate::workspace::WorkspaceKind::Cycle,
+            base.clone(),
+        ))
+        .await?;
+    deps.workspaces.refresh(&workspace, base).await?;
+    info!(path = %workspace.path.display(), "evolution cycle workspace ready");
+    run_evolution_cycle_in(deps, &workspace.path).await
 }
 
 async fn run_evolution_cycle_in(
