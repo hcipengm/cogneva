@@ -440,22 +440,6 @@ impl LlmHealthTable {
         !upstreams.is_empty() && upstreams.iter().all(|u| self.is_suspect(u))
     }
 
-    /// 确定性配额耗尽：池内每个上游都在嫌疑窗内且都给出了恢复时刻。
-    /// 与"全在嫌疑窗"的区别在于——配额在 reset 前不会恢复，遍历重试纯属
-    /// 烧请求；而瞬时故障的嫌疑上游仍值得一试（既有兜底语义不退化）。
-    fn all_quota_exhausted(&self, upstreams: &[LlmUpstream]) -> bool {
-        if upstreams.is_empty() {
-            return false;
-        }
-        let states = self.states.lock().unwrap();
-        let now = std::time::Instant::now();
-        upstreams.iter().all(|u| {
-            states.get(&Self::key(u)).is_some_and(|h| {
-                h.suspect_until.is_some_and(|t| now < t) && h.quota_reset_unix.is_some()
-            })
-        })
-    }
-
     /// 池内最早可能恢复的 unix 秒：取嫌疑上游里最近的一个上界
     /// （有配额恢复时刻用时刻，否则用窗口到期时间）；无嫌疑上游返回 0。
     fn earliest_recovery(&self, upstreams: &[LlmUpstream]) -> i64 {
@@ -598,12 +582,20 @@ impl AppState {
         .await
     }
 
-    /// 池级熔断判定：给定协议面候选，若全是确定性配额耗尽，返回
-    /// `Retry-After` 秒数（到最早恢复时刻，至少 60s），否则 None。
-    /// 调用方据此在入口快速失败，不再逐个上游重试。
-    fn quota_circuit_break(&self, candidates: &[&LlmUpstream]) -> Option<u64> {
+    /// 池级熔断判定：给定协议面候选，只要没有一个上游当下能承接请求
+    /// （全在嫌疑窗内），就返回 `Retry-After` 秒数（到最早恢复时刻，至少 60s），
+    /// 否则 None。调用方据此在入口快速失败，不再逐个上游重试。
+    ///
+    /// 判据必须与"池不可用"的其它观测面同源（告警、调度侧暂停、Redis 信号都取
+    /// `all_suspect`），否则会出现"调度侧已暂停、请求路径仍在遍历全池"的分裂：
+    /// 池里只要有一个上游的失败不带可解析的配额恢复时刻（例如配额耗尽以 403
+    /// 形式给出、正文里没有时间戳），任何"仅当全部配额确定耗尽才熔断"的更窄
+    /// 判据都会失效，于是每次调用照样把整个池打一遍。窗口到期即离开全灭态，
+    /// 真实请求仍会立刻试一次，所以按全灭熔断不损失机会性恢复；窗口内的遍历
+    /// 才是纯烧请求。
+    fn pool_circuit_break(&self, candidates: &[&LlmUpstream]) -> Option<u64> {
         let owned: Vec<LlmUpstream> = candidates.iter().map(|u| (*u).clone()).collect();
-        if !self.llm_health.all_quota_exhausted(&owned) {
+        if !self.llm_health.all_suspect(&owned) {
             return None;
         }
         let earliest = self.llm_health.earliest_recovery(&owned);
@@ -1184,13 +1176,12 @@ async fn stream_forward(
         ));
     }
 
-    // 池级熔断：同协议面上游全是确定性配额耗尽时，遍历重试只烧请求——
-    // 配额在 reset 前不会恢复。直接 503 + Retry-After 让调用方立刻知道
-    // 何时可再来。瞬时故障的嫌疑上游不走这条路（仍值得一试）。
-    if let Some(retry_after) = state.quota_circuit_break(&candidates) {
+    // 池级熔断：同协议面没有一个上游当下能承接请求时，遍历重试只烧请求。
+    // 直接 503 + Retry-After 让调用方立刻知道何时可再来。
+    if let Some(retry_after) = state.pool_circuit_break(&candidates) {
         tracing::warn!(
             retry_after_secs = retry_after,
-            "LLM 上游池配额耗尽，快速失败 503"
+            "LLM 上游池当前无可用上游，快速失败 503"
         );
         return Ok(axum::response::Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -1198,7 +1189,7 @@ async fn stream_forward(
             .header("content-type", "application/json")
             .body(axum::body::Body::from(
                 serde_json::json!({
-                    "error": "所有 LLM 上游配额已耗尽",
+                    "error": "所有 LLM 上游当前不可用",
                     "retry_after_seconds": retry_after,
                 })
                 .to_string(),
@@ -1492,14 +1483,14 @@ async fn call_llm(
     // 与透传路径同一套热切换语义：健康优先，任何单上游失败（含鉴权类——
     // 池内各家凭证互相独立，A 家 key 坏不代表 B 家坏）都切下一个。
     let next_candidates: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
-    if let Some(retry_after) = state.quota_circuit_break(&next_candidates) {
+    if let Some(retry_after) = state.pool_circuit_break(&next_candidates) {
         tracing::warn!(
             retry_after_secs = retry_after,
-            "LLM 上游池配额耗尽，快速失败 503"
+            "LLM 上游池当前无可用上游，快速失败 503"
         );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("所有 LLM 上游配额已耗尽，{retry_after} 秒后重试"),
+            format!("所有 LLM 上游当前不可用，{retry_after} 秒后重试"),
         ));
     }
     let candidates = order_by_health(next_candidates, &state.llm_health);
@@ -2678,21 +2669,17 @@ mod tests {
         let far = Utc::now().timestamp() + 7_200;
 
         assert!(!table.all_suspect(&pool));
-        assert!(!table.all_quota_exhausted(&pool));
         assert_eq!(table.earliest_recovery(&pool), 0);
 
         // 配额窗：窗口被拉到恢复时刻，且给出恢复时间上界。
         table.note_failure(&a, 300, Some(far));
         assert!(table.is_suspect(&a));
         assert!(!table.all_suspect(&pool), "还有健康上游时池未全灭");
-        // 单上游配额耗尽即确定性不可用。
-        assert!(table.all_quota_exhausted(&pool[..1]));
         assert_eq!(table.earliest_recovery(&pool), far);
 
-        // 第二个上游只是瞬时失败（无 reset）→ 池全灭但不是配额耗尽。
+        // 第二个上游只是瞬时失败（无 reset）→ 同样计入"全灭"：它当下也承接不了。
         table.note_failure(&b, 300, None);
         assert!(table.all_suspect(&pool));
-        assert!(!table.all_quota_exhausted(&pool));
         // b 的退避窗只有 300s，比 a 的配额恢复上界近，故池的最早恢复取 b 的窗口。
         let earliest = table.earliest_recovery(&pool);
         assert!(earliest < far, "取最早的那个上界：b 的退避窗更近");
@@ -2704,7 +2691,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn circuit_breaks_only_on_deterministic_quota_exhaustion() {
+    async fn circuit_breaks_whenever_no_upstream_can_serve() {
         let far = Utc::now().timestamp() + 3_600;
         let state = test_state(vec![
             stub_upstream("https://a.example.com", "m1"),
@@ -2714,26 +2701,40 @@ mod tests {
         let b = stub_upstream("https://b.example.com", "m2");
         let all: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
 
+        assert_eq!(state.pool_circuit_break(&all), None, "池健康时不熔断");
+
         state.llm_health.note_failure(&a, 300, Some(far));
-        assert_eq!(state.quota_circuit_break(&all), None, "池内仍有健康上游");
+        assert_eq!(state.pool_circuit_break(&all), None, "池内仍有健康上游");
 
         state.llm_health.note_failure(&b, 300, Some(far));
-        let wait = state.quota_circuit_break(&all).expect("配额全灭即熔断");
+        let wait = state.pool_circuit_break(&all).expect("全在嫌疑窗内即熔断");
         assert!((3_500..=3_600).contains(&wait), "Retry-After 指向最早恢复");
 
-        // 瞬时全灭（无 reset）不熔断：仍值得逐个试。
-        let state = test_state(vec![stub_upstream("https://c.example.com", "m3")]);
+        // 异构全灭：一家配额以 429 + reset 给出，另一家配额以 403 给出且不带
+        // 恢复时刻。必须照样熔断——否则每次调用仍会把整个池遍历一遍，烧掉
+        // 本可在窗口内省下的请求。
+        let state = test_state(vec![
+            stub_upstream("https://c.example.com", "m3"),
+            stub_upstream("https://d.example.com", "m4"),
+        ]);
         let c = stub_upstream("https://c.example.com", "m3");
-        state.llm_health.note_failure(&c, 300, None);
-        assert_eq!(
-            state.quota_circuit_break(&state.config.llm_upstreams.iter().collect::<Vec<_>>()),
-            None
+        let d = stub_upstream("https://d.example.com", "m4");
+        state.llm_health.note_failure(&c, 300, Some(far));
+        state.llm_health.note_failure(&d, 300, None);
+        let all: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
+        assert!(
+            state.pool_circuit_break(&all).is_some(),
+            "无恢复时刻的上游不解除熔断"
         );
+
+        // 任一上游恢复即解除熔断，真实请求立刻有机会试它。
+        state.llm_health.note_success(&c);
+        assert_eq!(state.pool_circuit_break(&all), None, "有上游可用即放行");
     }
 
     #[tokio::test]
-    async fn quota_exhausted_passthrough_fails_fast_with_retry_after() {
-        // 上游全灭且配额已知：透传端点直接 503 + Retry-After，不再逐个打上游。
+    async fn pool_down_passthrough_fails_fast_with_retry_after() {
+        // 上游全灭：透传端点直接 503 + Retry-After，不再逐个打上游。
         let far = Utc::now().timestamp() + 1_200;
         let state = test_state(vec![stub_upstream("https://dead.example.com", "m1")]);
         let u = stub_upstream("https://dead.example.com", "m1");
