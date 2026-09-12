@@ -33,9 +33,14 @@ const GIT_TIMEOUT_SECS: u64 = 120;
 /// 同一进程内永远"活着"，存活时长才是唯一的兜底判据。
 pub const DEFAULT_EPHEMERAL_TTL: Duration = Duration::from_secs(21600);
 
-/// 回收"实例身份已轮换"遗留工作树的最小存活时长。滚动更新期间新旧 Pod 会短暂
-/// 共存、共享同一工作树根，旧 Pod 正在用的树必须活过这个窗口。
-pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(3600);
+/// 回收"实例身份已轮换"遗留工作树的最小存活时长。滚动更新期间新旧 Pod 可能
+/// 短暂共存、共享同一工作树根，旧 Pod 正在用的树必须活过这个窗口。
+///
+/// 取值依据：沙盒 PVC 是 ReadWriteOnce、工作负载策略是 Recreate，新 Pod 起来时
+/// 旧 Pod 必须已经释放卷，实际重叠窗口接近零；这个值只防御将来换成 RWX 或
+/// RollingUpdate 的情形，取默认终止宽限期的若干倍即可，不能取大——取值越大，
+/// 重启越频繁时遗留树越可能永远躲过回收。
+pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(900);
 
 /// 工作树用途。除 `Ephemeral` 外都是常驻：不参与回收，跨轮次保留。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
