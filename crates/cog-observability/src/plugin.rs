@@ -335,6 +335,50 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
 
 /// Convert a [`SupervisorEvent`] into [`AlertEvent`]s for Alertmanager webhook dispatch.
 fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<AlertEvent> {
+    // LLM 上游池全灭是"无人可用"级别的故障：不补可联通的上游，整条 LLM
+    // 依赖链停摆，所以路由到通知出口（Critical），恢复时自动 resolve。
+    match event {
+        cog_core::SupervisorEvent::LlmUpstreamPoolDown {
+            earliest_recovery_unix,
+            unavailable,
+            timestamp,
+        } => {
+            let mut labels = HashMap::new();
+            labels.insert("alert_type".into(), "llm_upstream_pool_down".into());
+            labels.insert("unavailable_count".into(), unavailable.len().to_string());
+            labels.insert(
+                "earliest_recovery_unix".into(),
+                earliest_recovery_unix.to_string(),
+            );
+            labels.insert("unavailable".into(), unavailable.join(","));
+            let inst = AlertInstance {
+                rule_name: "llm_upstream_pool_down".into(),
+                labels,
+                state: AlertState::Firing,
+                severity: AlertSeverity::Critical,
+                value: unavailable.len() as f64,
+                starts_at: *timestamp,
+                ends_at: None,
+                updated_at: Utc::now(),
+            };
+            return vec![AlertEvent::Firing(inst)];
+        }
+        cog_core::SupervisorEvent::LlmUpstreamPoolRecovered { timestamp } => {
+            let inst = AlertInstance {
+                rule_name: "llm_upstream_pool_down".into(),
+                labels: HashMap::new(),
+                state: AlertState::Resolved,
+                severity: AlertSeverity::Info,
+                value: 0.0,
+                starts_at: *timestamp,
+                ends_at: Some(Utc::now()),
+                updated_at: Utc::now(),
+            };
+            return vec![AlertEvent::Resolved(inst)];
+        }
+        _ => {}
+    }
+
     let now = Utc::now();
     match event {
         cog_core::SupervisorEvent::AgentUnhealthy {

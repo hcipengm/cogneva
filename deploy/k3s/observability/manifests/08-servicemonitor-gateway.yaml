@@ -1,0 +1,26 @@
+# ServiceMonitor — 让 Prometheus 抓安全网关的上游池指标。
+# 网关是上游池健康的唯一掌握者：llm_upstream_healthy / llm_pool_available /
+# llm_pool_earliest_recovery_seconds 只在这里产生，主应用 Service 抓不到。
+# /metrics 走 egress 通道（8080），与主应用共用的 04-servicemonitor 分开一份，
+# 避免给不含该端口的 Service 挂错端点。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cogneva-gateway-metrics
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - cogneva
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cogneva
+      app.kubernetes.io/component: security-gateway
+  endpoints:
+    - port: egress-proxy
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true

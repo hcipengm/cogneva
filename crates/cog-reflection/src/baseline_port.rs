@@ -166,6 +166,10 @@ pub struct BaselinePorter {
     /// 移植 commit 的提交者身份（agent 路径的新 commit 使用）。
     committer_name: String,
     committer_email: String,
+    /// LLM 上游池暂停句柄。池全灭时智能步骤（冲突解决、语义吸收、eval A/B）
+    /// 必然失败且会空转重试，据此退化为纯 git 路径——与 orchestrator 缺失
+    /// 同语义——机械 cherry-pick 照常继续。gate 由插件 start 阶段注入。
+    llm_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 }
 
 impl BaselinePorter {
@@ -181,6 +185,7 @@ impl BaselinePorter {
             poll_interval_secs: 5,
             committer_name: "Cogneva Evolution".into(),
             committer_email: "evolution@cogneva.local".into(),
+            llm_gate: None,
         }
     }
 
@@ -188,6 +193,29 @@ impl BaselinePorter {
     pub fn with_orchestrator(mut self, orch: Arc<dyn OrchestratorControl>) -> Self {
         self.orchestrator = Some(orch);
         self
+    }
+
+    /// 注入 LLM 上游池暂停句柄（池全灭时智能步骤退化，机械路径继续）。
+    pub fn with_llm_gate(mut self, gate: Arc<dyn cog_core::SchedulerGate>) -> Self {
+        self.llm_gate = Some(gate);
+        self
+    }
+
+    /// LLM 上游池当前是否暂停了 LLM 依赖型工作。
+    fn llm_paused(&self) -> bool {
+        self.llm_gate
+            .as_ref()
+            .is_some_and(|g| g.is_paused_kind(cog_core::TaskClass::LlmDependent))
+    }
+
+    /// 供智能步骤使用的编排器句柄：池暂停时返回 `None`，让调用方走既有的
+    /// 「无编排器 → 纯 git / 回流」降级分支，而不是提交注定失败的任务。
+    fn llm_orchestrator(&self) -> Option<&Arc<dyn OrchestratorControl>> {
+        if self.llm_paused() {
+            None
+        } else {
+            self.orchestrator.as_ref()
+        }
     }
 
     /// 注入实例身份 id（决定 `evol/<id>` 分支名）。
@@ -411,7 +439,7 @@ impl BaselinePorter {
     /// `{"absorbed": bool}` 一律按未吸收处理——重复移植的成本远低于
     /// 静默丢一条晋级变更。
     async fn semantic_absorb_check(&self, change: &PromotedChange, new_tag: &str) -> bool {
-        let Some(orch) = &self.orchestrator else {
+        let Some(orch) = self.llm_orchestrator() else {
             return false;
         };
 
@@ -714,11 +742,11 @@ impl BaselinePorter {
                         self.commit_ported(change, new_tag, round).await?;
                     }
                     Err(task_error) => {
-                        if self.orchestrator.is_none() {
+                        if self.llm_orchestrator().is_none() {
                             // 无主流程可提交智能任务：纯 git 路径已走到头。
                             warn!(
                                 change_id = %change.change_id,
-                                "orchestrator unavailable; cannot resolve port failure"
+                                "orchestrator unavailable (or LLM pool down); cannot resolve port failure"
                             );
                             feedback = task_error;
                             break;
@@ -821,7 +849,7 @@ impl BaselinePorter {
         round: u32,
         feedback: &str,
     ) -> SFResult<Result<(), String>> {
-        let Some(orch) = &self.orchestrator else {
+        let Some(orch) = self.llm_orchestrator() else {
             return Ok(Err("orchestrator not configured".into()));
         };
 
@@ -939,7 +967,7 @@ impl BaselinePorter {
             change.change_id
         );
 
-        let Some(orch) = &self.orchestrator else {
+        let Some(orch) = self.llm_orchestrator() else {
             self.fs_rework_dump(change, new_tag, reason, &goal).await;
             return;
         };
@@ -1065,9 +1093,9 @@ impl BaselinePorter {
         new_tag: &str,
         round: u32,
     ) -> SFResult<Result<(), String>> {
-        let Some(orch) = &self.orchestrator else {
+        let Some(orch) = self.llm_orchestrator() else {
             debug!(
-                "no orchestrator; eval A/B gate skipped for {}",
+                "no orchestrator (or LLM pool down); eval A/B gate skipped for {}",
                 change.change_id
             );
             return Ok(Ok(()));

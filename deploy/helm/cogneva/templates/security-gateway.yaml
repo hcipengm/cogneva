@@ -107,6 +107,47 @@ spec:
                   name: cogneva-secrets
                   key: webhook-internal
                   optional: true
+            # ── 上游池可观测与自愈落盘 ──
+            # 告警状态机落 PG（重启可查历史），池状态跨进程信号走 Redis。
+            # 复用集群内既有实例，凭证来自 cogneva-secrets（安装时随机生成）。
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: pg-password
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: redis-password
+            - name: COGNEVA_DATABASE_URL
+              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+            - name: COGNEVA_REDIS_URL
+              value: "redis://:$(REDIS_PASSWORD)@redis-0.redis.{{ include "cogneva.namespace" . }}.svc.cluster.local:6379"
+            # 日志→Loki、时序明细→ClickHouse、告警→Alertmanager；端点随观测栈，
+            # 未启用时对应导出静默降级（池自愈主链不受影响）。
+            - name: COGNEVA_LOKI_ENABLED
+              value: {{ .Values.securityGateway.observability.loki.enabled | quote }}
+            - name: COGNEVA_LOKI_ENDPOINT
+              value: {{ .Values.securityGateway.observability.loki.endpoint | quote }}
+            - name: COGNEVA_CLICKHOUSE_ENABLED
+              value: {{ .Values.securityGateway.observability.clickhouse.enabled | quote }}
+            - name: COGNEVA_CLICKHOUSE_BASE_URL
+              value: {{ .Values.securityGateway.observability.clickhouse.baseUrl | quote }}
+            - name: COGNEVA_CLICKHOUSE_DATABASE
+              value: {{ .Values.securityGateway.observability.clickhouse.database | quote }}
+            - name: COGNEVA_CLICKHOUSE_TABLE
+              value: {{ .Values.securityGateway.observability.clickhouse.table | quote }}
+            - name: COGNEVA_CLICKHOUSE_USERNAME
+              value: {{ .Values.securityGateway.observability.clickhouse.username | quote }}
+            # 密码由可观测栈安装时镜像写入（monitoring/clickhouse-credentials →
+            # cogneva-secrets/clickhouse-password）；未部署时 optional 缺省即降级。
+            - name: COGNEVA_CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: clickhouse-password
+                  optional: true
 ---
 apiVersion: v1
 kind: Service

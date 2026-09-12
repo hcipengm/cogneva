@@ -1,3 +1,4 @@
+pub mod alert_store;
 pub mod alerts;
 pub mod analytics;
 pub mod config;

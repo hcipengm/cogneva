@@ -121,7 +121,29 @@ pub trait BinarySwitcher: Send + Sync {
 
 // ─── Scheduler Gate ────────────────────────────────────────────────────────
 
+/// Cooperative task classification for pause gating.
+///
+/// An unavailable LLM upstream pool stops only the work that genuinely needs
+/// an LLM; mechanical work (builds, image publishing, CI/mainline deployment,
+/// metric collection, health checks, baseline rebase/merge) must keep running.
+/// Pausing everything would stall deployment and collection that can make
+/// progress without an LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClass {
+    /// Requires a reachable LLM upstream: agent planner/generator/evaluator,
+    /// goal decomposition, intent assessment, reflection generation, chat.
+    LlmDependent,
+    /// Makes progress without any LLM call.
+    Mechanical,
+}
+
 /// Pause signal for the autonomous scheduler.
+///
+/// The global [`pause`](SchedulerGate::pause) / [`resume`](SchedulerGate::resume)
+/// pair is the coarse operator switch; the per-class
+/// [`pause_kind`](SchedulerGate::pause_kind) family lets one task class pause
+/// without stopping the others (used when the LLM upstream pool goes down).
 pub trait SchedulerGate: Send + Sync {
     /// Returns `true` while the scheduler is paused.
     fn is_paused(&self) -> bool;
@@ -131,6 +153,33 @@ pub trait SchedulerGate: Send + Sync {
 
     /// Resume the scheduler. Returns the previous state.
     fn resume(&self) -> bool;
+
+    /// Returns `true` while the given task class is paused.
+    fn is_paused_kind(&self, class: TaskClass) -> bool;
+
+    /// Pause one task class. Returns the previous state.
+    fn pause_kind(&self, class: TaskClass) -> bool;
+
+    /// Resume one task class. Returns the previous state.
+    fn resume_kind(&self, class: TaskClass) -> bool;
+}
+
+/// Redis key carrying the LLM upstream pool status between the security
+/// gateway (which owns upstream health) and the scheduler side (which decides
+/// whether LLM-dependent work may run). The gateway writes it with a TTL
+/// bounded by the earliest known recovery, so a crashed gateway cannot wedge
+/// the scheduler open or closed forever.
+pub const LLM_POOL_STATUS_KEY: &str = "llm:pool:status";
+
+/// Cross-process snapshot of LLM upstream pool health.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmPoolStatus {
+    /// `true` when no configured upstream can currently serve a request.
+    pub unavailable: bool,
+    /// Earliest known upstream recovery as unix seconds; `0` when unknown.
+    pub earliest_recovery_unix: i64,
+    /// Identity (`base_url|model`) of the unusable upstreams.
+    pub unavailable_upstreams: Vec<String>,
 }
 
 /// Health issue identified for an Agent / Crew / Squad.
@@ -247,6 +296,21 @@ pub enum SupervisorEvent {
         timestamp: DateTime<Utc>,
     },
 
+    /// Every configured LLM upstream is unavailable (quota exhausted, auth
+    /// rejected, unreachable). LLM-dependent work is paused until recovery;
+    /// mechanical work keeps running.
+    LlmUpstreamPoolDown {
+        /// Earliest known upstream recovery time as unix seconds; `0` when no
+        /// upstream reported a reset time, so the alert can say "unknown".
+        earliest_recovery_unix: i64,
+        /// Identity of the unusable upstreams (`base_url|model`).
+        unavailable: Vec<String>,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// At least one LLM upstream is usable again; LLM-dependent work resumes.
+    LlmUpstreamPoolRecovered { timestamp: DateTime<Utc> },
+
     /// Imbalanced workload detected and a rebalance plan was emitted.
     Rebalance {
         ready_tasks: usize,
@@ -338,6 +402,8 @@ impl SupervisorEvent {
             SupervisorEvent::SquadRespawnExecuted { .. } => "squad_respawn_executed",
             SupervisorEvent::QuotaThresholdBreached { .. } => "quota_threshold_breached",
             SupervisorEvent::QuotaRecovered { .. } => "quota_recovered",
+            SupervisorEvent::LlmUpstreamPoolDown { .. } => "llm_upstream_pool_down",
+            SupervisorEvent::LlmUpstreamPoolRecovered { .. } => "llm_upstream_pool_recovered",
             SupervisorEvent::Rebalance { .. } => "rebalance",
             SupervisorEvent::AgentRuntimeDetected { .. } => "agent_loop_detected",
             SupervisorEvent::TaskHandOff { .. } => "task_hand_off",

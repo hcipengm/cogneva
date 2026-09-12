@@ -145,6 +145,43 @@ impl AlertStore {
                     resolved: false,
                 })
             }
+            SupervisorEvent::LlmUpstreamPoolDown { earliest_recovery_unix, unavailable, timestamp } => {
+                let eta = if *earliest_recovery_unix > 0 {
+                    DateTime::<Utc>::from_timestamp(*earliest_recovery_unix, 0)
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| "unknown".into())
+                } else {
+                    "unknown".into()
+                };
+                Some(Alert {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    severity: AlertSeverity::Critical,
+                    event_type: "llm_upstream_pool_down".to_string(),
+                    message: format!(
+                        "All {} LLM upstreams unavailable (earliest recovery: {eta}); \
+                         LLM-dependent tasks paused, supply a reachable upstream",
+                        unavailable.len()
+                    ),
+                    agent_id: None,
+                    task_id: None,
+                    crew_id: None,
+                    timestamp: *timestamp,
+                    resolved: false,
+                })
+            }
+            SupervisorEvent::LlmUpstreamPoolRecovered { timestamp } => {
+                Some(Alert {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    severity: AlertSeverity::Info,
+                    event_type: "llm_upstream_pool_down".to_string(),
+                    message: "LLM upstream pool recovered; LLM-dependent tasks resumed".to_string(),
+                    agent_id: None,
+                    task_id: None,
+                    crew_id: None,
+                    timestamp: *timestamp,
+                    resolved: true,
+                })
+            }
             _ => None,
         }
     }
@@ -188,5 +225,47 @@ impl cog_core::AlertStore for AlertStore {
                 resolved: a.resolved,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_down_maps_to_critical_unresolved_alert() {
+        let event = SupervisorEvent::LlmUpstreamPoolDown {
+            earliest_recovery_unix: 1_789_315_200,
+            unavailable: vec!["https://a.example|model-a".into()],
+            timestamp: Utc::now(),
+        };
+        let alert = AlertStore::event_to_alert(&event).expect("池全灭必须产生告警");
+        assert_eq!(alert.event_type, "llm_upstream_pool_down");
+        assert_eq!(alert.severity, AlertSeverity::Critical);
+        assert!(!alert.resolved);
+        assert!(alert.message.contains("2026-09-13"), "含最早恢复时间: {}", alert.message);
+    }
+
+    #[test]
+    fn pool_down_with_unknown_recovery_still_alerts() {
+        let event = SupervisorEvent::LlmUpstreamPoolDown {
+            earliest_recovery_unix: 0,
+            unavailable: vec!["https://a.example|model-a".into()],
+            timestamp: Utc::now(),
+        };
+        let alert = AlertStore::event_to_alert(&event).expect("未知恢复时间也要告警");
+        assert!(alert.message.contains("unknown"), "{}", alert.message);
+    }
+
+    #[test]
+    fn pool_recovered_maps_to_resolved_info_alert() {
+        let event = SupervisorEvent::LlmUpstreamPoolRecovered {
+            timestamp: Utc::now(),
+        };
+        let alert = AlertStore::event_to_alert(&event).expect("恢复必须产生告警");
+        // 与 Down 同 event_type：满足告警状态机的同键 resolve 语义。
+        assert_eq!(alert.event_type, "llm_upstream_pool_down");
+        assert_eq!(alert.severity, AlertSeverity::Info);
+        assert!(alert.resolved);
     }
 }

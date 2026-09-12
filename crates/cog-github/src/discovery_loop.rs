@@ -144,6 +144,11 @@ pub struct GitHubDiscoveryLoop {
     /// LLM attempt chain every round. Keyed by `"<kind>:<number>"`, the same
     /// convention as [`Self::conversations`].
     terminal_backoff: HashMap<String, TerminalBackoff>,
+    /// Optional scheduler gate. When the LLM upstream pool is down the
+    /// supervisor pauses the [`TaskClass::LlmDependent`] class; every round
+    /// that would call an LLM (triage assessment, fix submission) is skipped
+    /// until it resumes. Mechanical rounds keep the existing behaviour.
+    gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 }
 
 /// Persisted intent guards (`$COGNEVA_DATA_DIR/discovery-guards.json`):
@@ -405,7 +410,22 @@ impl GitHubDiscoveryLoop {
             guards_loaded: false,
             verdicts: tokio::sync::Mutex::new(AssessVerdicts::default()),
             terminal_backoff: HashMap::new(),
+            gate: None,
         }
+    }
+
+    /// Attach the scheduler gate so the loop can skip rounds while the LLM
+    /// upstream pool is down. Without a gate the loop runs unconditionally.
+    pub fn with_gate(mut self, gate: Arc<dyn cog_core::SchedulerGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Whether LLM-dependent work is currently paused by the pool guard.
+    fn llm_paused(&self) -> bool {
+        self.gate
+            .as_ref()
+            .is_some_and(|g| g.is_paused_kind(cog_core::TaskClass::LlmDependent))
     }
 
     /// Restart-proof verdict lookup: identical intent content (same
@@ -567,6 +587,17 @@ impl GitHubDiscoveryLoop {
 
     /// Run one discovery round. Returns the number of issues scanned.
     pub async fn run_once(&mut self) -> Result<usize> {
+        // Pool down: every interesting path below is LLM-dependent (triage
+        // assessment, cross-validation, fix submission). Skip the round
+        // instead of paying a doomed attempt chain; the guard clears itself
+        // when the gateway probes an upstream back to health.
+        if self.llm_paused() {
+            tracing::info!(
+                platform = %self.provider.platform_kind(),
+                "LLM upstream pool unavailable; skipping discovery round"
+            );
+            return Ok(0);
+        }
         self.load_guards_once().await;
         let mut issues = self
             .discovery

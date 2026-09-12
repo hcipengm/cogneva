@@ -259,6 +259,12 @@ impl cog_core::SystemPlugin for GitHubPlugin {
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
         let reflection = ctx.consume_service::<dyn cog_core::ReflectionEngine>();
+        // 池全灭时 supervisor 只暂停 LLM 依赖型任务；发现循环每轮入口据此跳过，
+        // 不再发注定失败的 LLM 请求。gate 由 supervisor 插件发布，可选。
+        let gate = ctx.consume_service::<dyn cog_core::SchedulerGate>();
+        if gate.is_none() {
+            info!("GitHubPlugin: no scheduler gate; discovery rounds run unconditionally");
+        }
         // 本 crate 是传感器/执行器，绝不直连 LLM。语义可行动性判定以
         // platform_intent_assess 任务经 orchestrator 派给 cog-collaboration 的
         // 单 agent 多模态分支；无 orchestrator 时 triage 退回本地规则启发式。
@@ -275,15 +281,17 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                        provider: &Arc<dyn CodePlatformProvider>|
          -> SharedLoop {
             let triage = crate::triage::IssueTriage::rules_only();
-            Arc::new(tokio::sync::Mutex::new(
-                crate::discovery_loop::GitHubDiscoveryLoop::new(
-                    provider.clone(),
-                    triage,
-                    config.clone(),
-                    orchestrator.clone(),
-                    reflection.clone(),
-                ),
-            ))
+            let mut loop_ = crate::discovery_loop::GitHubDiscoveryLoop::new(
+                provider.clone(),
+                triage,
+                config.clone(),
+                orchestrator.clone(),
+                reflection.clone(),
+            );
+            if let Some(gate) = gate.clone() {
+                loop_ = loop_.with_gate(gate);
+            }
+            Arc::new(tokio::sync::Mutex::new(loop_))
         };
         let github_shared = match (&self.config, &self.provider) {
             (Some(c), Some(p)) => Some(mk_loop(c, p)),
@@ -434,8 +442,12 @@ impl cog_core::SystemPlugin for GitHubPlugin {
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "github",
     requires: &[],
-    optional_requires: &[],
+    // 池全灭时按 SchedulerGate 跳过 LLM 依赖轮次；supervisor 缺席也能跑。
+    optional_requires: &["supervisor"],
     provides: &["CodePlatformProvider", "ContributionControl"],
-    consumes: &[],
+    consumes: &[cog_core::ConsumeSpec {
+        type_name: "SchedulerGate",
+        required: false,
+    }],
     factory: || Box::new(GitHubPlugin::new()),
 };

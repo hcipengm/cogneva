@@ -12,6 +12,7 @@ pub struct SupervisorConfigTxHolder(pub tokio::sync::watch::Sender<crate::Superv
 pub struct SupervisorPlugin {
     initialized: bool,
     supervisor: Option<Arc<crate::Supervisor>>,
+    scheduler_gate: Option<Arc<crate::SchedulerGate>>,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -22,6 +23,7 @@ impl SupervisorPlugin {
         Self {
             initialized: false,
             supervisor: None,
+            scheduler_gate: None,
             shutdown_tx: Mutex::new(None),
             task_handle: Mutex::new(None),
         }
@@ -31,6 +33,48 @@ impl SupervisorPlugin {
 impl Default for SupervisorPlugin {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SupervisorPlugin {
+    /// Start the LLM upstream pool awareness loop. Needs both the scheduler
+    /// gate and a Redis URL (the gateway publishes the pool snapshot there);
+    /// without Redis this is a single-process deployment, so the loop is not
+    /// started and the gate stays under operator control only.
+    async fn spawn_llm_pool_guard(&self, ctx: &cog_core::PluginContext) {
+        let Some(gate) = self.scheduler_gate.clone() else {
+            return;
+        };
+        let redis_url = ctx.config().dag_executor.redis_url.clone();
+        if redis_url.is_empty() {
+            info!("LLM pool guard disabled: no redis_url configured");
+            return;
+        }
+        let source =
+            match crate::llm_pool_guard::RedisLlmPoolStatusSource::connect(&redis_url).await {
+                Ok(source) => Arc::new(source),
+                Err(e) => {
+                    warn!("LLM pool guard disabled: redis connect failed: {e}");
+                    return;
+                }
+            };
+        let Some(event_tx) =
+            ctx.consume::<tokio::sync::broadcast::Sender<cog_core::SupervisorEvent>>()
+        else {
+            warn!("LLM pool guard disabled: no SupervisorEvent sender published");
+            return;
+        };
+        let interval_secs = std::env::var("COGNEVA_LLM_POOL_CHECK_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(5);
+        let guard = Arc::new(crate::llm_pool_guard::LlmPoolGuard::new(source, gate));
+        guard.spawn(
+            (*event_tx).clone(),
+            std::time::Duration::from_secs(interval_secs),
+        );
+        info!(interval_secs, "LLM pool guard started");
     }
 }
 
@@ -159,6 +203,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         }
 
         self.supervisor = Some(supervisor);
+        self.scheduler_gate = Some(scheduler_gate);
         self.initialized = true;
         Ok(())
     }
@@ -178,6 +223,11 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
 
         *self.shutdown_tx.lock().await = Some(shutdown_tx);
         *self.task_handle.lock().await = Some(handle);
+
+        // ── LLM upstream pool awareness ──
+        // Pool health is owned by the security gateway; this loop reads its
+        // cross-process snapshot and pauses only the LLM-dependent class.
+        self.spawn_llm_pool_guard(ctx).await;
 
         // ── Multi-backend consumer ──
         let config = ctx.config();

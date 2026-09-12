@@ -7,8 +7,9 @@
 //!
 //! 凭证只从环境变量读取（K8s Secret 仅注入本服务），永不转发给沙盒。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::github_app::{self, AppTokenCache, GitHubAppCreds};
 
@@ -19,6 +20,15 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use chrono::{DateTime, Datelike, Utc};
+use cog_core::MetricsBackend;
+use cog_observability::alert_store::{AlertTransition, NewAlert, PostgresAlertStore};
+use cog_observability::analytics::{
+    AnalyticsEvent, ClickHouseAnalyticsBackend, ClickHouseEventBuffer,
+};
+use cog_observability::config::ObservabilityExportersConfig;
+use cog_observability::logs::{init_subscriber_with_pusher, LokiBackgroundPusher, LokiPushClient};
+use cog_observability::metrics::PrometheusMetricsBackend;
 use serde::{Deserialize, Serialize};
 
 /// 单个 LLM 上游：凭证只从环境变量读取（K8s Secret 仅注入本服务），永不转发给沙盒。
@@ -89,6 +99,18 @@ pub struct SecurityGatewayConfig {
     pub webhook_internal_secret: Option<String>,
     /// 验签通过后的转发基址（COGNEVA_WEBHOOK_FORWARD_URL）。
     pub webhook_forward_url: String,
+    /// 池状态发布/判定间隔秒数（COGNEVA_LLM_POOL_CHECK_SECS，默认 30，下限 5）：
+    /// 指标刷新、Redis 共享键续期、告警状态机推进的统一节拍。
+    pub pool_check_secs: u64,
+    /// PostgreSQL 连接串（COGNEVA_DATABASE_URL）：告警状态机落盘。缺省则
+    /// 只在日志/指标里可见，不写库（不破坏无 PG 的部署）。
+    pub database_url: Option<String>,
+    /// Redis 连接串（COGNEVA_REDIS_URL）：跨进程池状态信号。缺省则调度侧
+    /// 看不到池状态，只剩网关自身的熔断与日志。
+    pub redis_url: Option<String>,
+    /// 观测导出目标（Loki / ClickHouse / Alertmanager），走 `observability`
+    /// 段 + `COGNEVA_LOKI_*` 等 env 覆盖；缺省全部关闭。
+    pub observability: ObservabilityExportersConfig,
 }
 
 impl SecurityGatewayConfig {
@@ -117,6 +139,14 @@ impl SecurityGatewayConfig {
             webhook_internal_secret: token("COGNEVA_WEBHOOK_INTERNAL_SECRET"),
             webhook_forward_url: std::env::var("COGNEVA_WEBHOOK_FORWARD_URL")
                 .unwrap_or_else(|_| "http://cogneva:9091".into()),
+            pool_check_secs: env_u64("COGNEVA_LLM_POOL_CHECK_SECS", 30).max(5),
+            database_url: token("COGNEVA_DATABASE_URL"),
+            redis_url: token("COGNEVA_REDIS_URL"),
+            // 配置文件缺失即默认全关，env 覆盖在 load() 内完成。
+            observability: ObservabilityExportersConfig::load().unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "观测导出配置解析失败，按全部关闭处理");
+                ObservabilityExportersConfig::default()
+            }),
         }
     }
 }
@@ -212,6 +242,112 @@ fn suspect_backoff_secs(consecutive_failures: u32, probe_interval_secs: u64) -> 
         .min(SUSPECT_BACKOFF_CAP_SECS)
 }
 
+/// 从上游错误体/响应头解析出的恢复时刻（unix 秒）。
+///
+/// 上游在配额类错误里通常直接给出窗口重置时间（各厂商格式不同），能解析
+/// 出来就把嫌疑窗精确设到那一刻——窗口内不再发探测请求，也就不会用
+/// `max_tokens=1` 的探测去撞一堵已知要到某时刻才开的门。
+/// `Retry-After` 优先（协议标准，语义明确），其次错误体里的 `reset at ...`。
+fn parse_quota_reset(body: &str, retry_after: Option<&str>) -> Option<i64> {
+    if let Some(secs) = retry_after.and_then(parse_retry_after_secs) {
+        return Some(Utc::now().timestamp().saturating_add(secs));
+    }
+    parse_reset_at(body)
+}
+
+/// `Retry-After`：秒数或 HTTP-date 两种合法形态。
+fn parse_retry_after_secs(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<i64>() {
+        return Some(secs.max(0));
+    }
+    DateTime::parse_from_rfc2822(raw)
+        .ok()
+        .map(|t| (t.timestamp() - Utc::now().timestamp()).max(0))
+}
+
+/// 错误体里的 `reset at <时间>`：取该短语后的时间戳，按几种已知形态解析。
+fn parse_reset_at(body: &str) -> Option<i64> {
+    let lowered = body.to_ascii_lowercase();
+    let idx = lowered.find("reset at")?;
+    let rest = body[idx + "reset at".len()..].trim_start();
+    // 时间戳到句号/引号/逗号/换行止；后面常跟厂商建议文案，不能吞进来。
+    let stamp: String = rest
+        .chars()
+        .take_while(|c| !matches!(c, '.' | '"' | '\\' | '\n' | '\r' | ',' | ';'))
+        .collect();
+    parse_stamp(stamp.trim())
+}
+
+/// 时间戳形态：`2026-09-14 00:00:00 +0800 CST`、`09-18 15:39:00 UTC`、
+/// RFC3339 等。两个已知难点：时区缩写（UTC/GMT/CST…）chrono 不认，统一当
+/// UTC 解释，至多差几小时而窗长以小时计；无年份的日期 chrono 拒收，借一个
+/// 闰年补全位再按当前年份校正（`fix_year`）。
+fn parse_stamp(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.timestamp());
+    }
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let (Some(date), Some(time)) = (tokens.first(), tokens.get(1)) else {
+        return None;
+    };
+    // 第三段可能是数字偏移（能直接解析），也可能只是时区缩写（丢弃）。
+    let offset = tokens.get(2).copied().filter(|t| looks_like_offset(t));
+
+    for fmt in ["%Y-%m-%d", "%Y/%m/%d"] {
+        let stamp = format!("{date} {time}");
+        if let Some(off) = offset {
+            if let Ok(dt) =
+                DateTime::parse_from_str(&format!("{stamp} {off}"), &format!("{fmt} %H:%M:%S %z"))
+            {
+                return Some(dt.timestamp());
+            }
+        } else if let Ok(naive) =
+            chrono::NaiveDateTime::parse_from_str(&stamp, &format!("{fmt} %H:%M:%S"))
+        {
+            return Some(naive.and_utc().timestamp());
+        }
+    }
+    // 无年份：借 2024（闰年，容得下 02-29）补全，再由 fix_year 校正到正确年份。
+    for (fmt, stamp) in [
+        ("%Y-%m-%d %H:%M:%S", format!("2024-{date} {time}")),
+        ("%Y/%m/%d %H:%M:%S", format!("2024/{date} {time}")),
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&stamp, fmt) {
+            return Some(fix_year(naive));
+        }
+    }
+    None
+}
+
+/// `+0800` / `-05:00` 形态的数值时区偏移（区别于 `UTC`/`CST` 这类缩写）。
+fn looks_like_offset(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    matches!(bytes.first(), Some(b'+') | Some(b'-'))
+        && matches!(token.len(), 5 | 6)
+        && token[1..].chars().all(|c| c.is_ascii_digit() || c == ':')
+}
+
+/// 补年份（无年份格式）：落在过去一天以上说明跨年了，加一年。
+fn fix_year(naive: chrono::NaiveDateTime) -> i64 {
+    let now = Utc::now();
+    let this_year = naive
+        .with_year(now.year())
+        .unwrap_or(naive)
+        .and_utc()
+        .timestamp();
+    if this_year < now.timestamp() - 86_400 {
+        naive
+            .with_year(now.year() + 1)
+            .unwrap_or(naive)
+            .and_utc()
+            .timestamp()
+    } else {
+        this_year
+    }
+}
+
 /// 单个上游的健康态。
 #[derive(Debug)]
 struct UpstreamHealth {
@@ -220,6 +356,9 @@ struct UpstreamHealth {
     /// 兜底、探测器不重复测；到期后自然放行一次（真实请求或探测器
     /// 谁先碰到谁实证），成功即恢复健康，失败则指数加窗。
     suspect_until: Option<std::time::Instant>,
+    /// 上游给出的配额恢复时刻（unix 秒），仅配额类失败有。它把"嫌疑"升级为
+    /// "确定性不可用"：此刻之前不可能恢复，池级熔断据此判定。
+    quota_reset_unix: Option<i64>,
 }
 
 /// 池健康表：key = base_url|model（上游在池内的身份）。纯进程内状态，
@@ -245,19 +384,37 @@ impl LlmHealthTable {
 
     /// 记录一次失败：仅在"未嫌疑或窗口已到期"时计数并开/加窗——
     /// 窗口内的并发失败突发不重复计（避免一次事故把指数打飞）。
+    /// 配额类失败（`quota_reset_unix` 有值）把窗口下限提到恢复时刻，
+    /// 但两者都封顶 6h：宁可多探一次，也不把窗口设到永远。
     /// 返回 Some((连续失败数, 窗口秒)) 表示开了新窗，调用方据此打 WARN。
-    fn note_failure(&self, u: &LlmUpstream, probe_interval_secs: u64) -> Option<(u32, u64)> {
+    fn note_failure(
+        &self,
+        u: &LlmUpstream,
+        probe_interval_secs: u64,
+        quota_reset_unix: Option<i64>,
+    ) -> Option<(u32, u64)> {
         let now = std::time::Instant::now();
         let mut states = self.states.lock().unwrap();
         let entry = states.entry(Self::key(u)).or_insert(UpstreamHealth {
             consecutive_failures: 0,
             suspect_until: None,
+            quota_reset_unix: None,
         });
         if entry.suspect_until.is_some_and(|t| now < t) {
+            // 窗口内的重复失败不重开窗，但一旦上游给了恢复时刻就吸收它：
+            // 首字节前的并发失败里，只有部分响应体带配额信息。
+            if quota_reset_unix.is_some() {
+                entry.quota_reset_unix = quota_reset_unix;
+            }
             return None;
         }
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-        let secs = suspect_backoff_secs(entry.consecutive_failures, probe_interval_secs);
+        let mut secs = suspect_backoff_secs(entry.consecutive_failures, probe_interval_secs);
+        if let Some(reset_at) = quota_reset_unix {
+            let until_reset = reset_at.saturating_sub(Utc::now().timestamp()).max(0) as u64;
+            secs = secs.max(until_reset).min(SUSPECT_BACKOFF_CAP_SECS);
+        }
+        entry.quota_reset_unix = quota_reset_unix;
         entry.suspect_until = Some(now + std::time::Duration::from_secs(secs));
         Some((entry.consecutive_failures, secs))
     }
@@ -269,6 +426,71 @@ impl LlmHealthTable {
             Some(h) => h.suspect_until.is_some(),
             None => false,
         }
+    }
+
+    /// 池全灭：池内每一个上游都处在未到期的嫌疑窗内。
+    /// 此时没有任何上游能承接请求，是"池不可用"的观测事实。
+    fn all_suspect(&self, upstreams: &[LlmUpstream]) -> bool {
+        !upstreams.is_empty() && upstreams.iter().all(|u| self.is_suspect(u))
+    }
+
+    /// 确定性配额耗尽：池内每个上游都在嫌疑窗内且都给出了恢复时刻。
+    /// 与"全在嫌疑窗"的区别在于——配额在 reset 前不会恢复，遍历重试纯属
+    /// 烧请求；而瞬时故障的嫌疑上游仍值得一试（既有兜底语义不退化）。
+    fn all_quota_exhausted(&self, upstreams: &[LlmUpstream]) -> bool {
+        if upstreams.is_empty() {
+            return false;
+        }
+        let states = self.states.lock().unwrap();
+        let now = std::time::Instant::now();
+        upstreams.iter().all(|u| {
+            states.get(&Self::key(u)).is_some_and(|h| {
+                h.suspect_until.is_some_and(|t| now < t) && h.quota_reset_unix.is_some()
+            })
+        })
+    }
+
+    /// 池内最早可能恢复的 unix 秒：取嫌疑上游里最近的一个上界
+    /// （有配额恢复时刻用时刻，否则用窗口到期时间）；无嫌疑上游返回 0。
+    fn earliest_recovery(&self, upstreams: &[LlmUpstream]) -> i64 {
+        let now_instant = std::time::Instant::now();
+        let now_unix = Utc::now().timestamp();
+        let states = self.states.lock().unwrap();
+        upstreams
+            .iter()
+            .filter_map(|u| {
+                let h = states.get(&Self::key(u))?;
+                let until = h.suspect_until?;
+                if now_instant >= until {
+                    return None;
+                }
+                Some(match h.quota_reset_unix {
+                    Some(reset) => reset,
+                    None => now_unix + until.duration_since(now_instant).as_secs() as i64,
+                })
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// 逐上游健康快照：`(身份, 是否健康, 连续失败数, 配额恢复时刻)`。
+    /// 供指标与时序事件使用。
+    fn snapshot(&self, upstreams: &[LlmUpstream]) -> Vec<(String, bool, u32, Option<i64>)> {
+        let now = std::time::Instant::now();
+        let states = self.states.lock().unwrap();
+        upstreams
+            .iter()
+            .map(|u| {
+                let key = Self::key(u);
+                match states.get(&key) {
+                    Some(h) => {
+                        let suspect = h.suspect_until.is_some_and(|t| now < t);
+                        (key, !suspect, h.consecutive_failures, h.quota_reset_unix)
+                    }
+                    None => (key, true, 0, None),
+                }
+            })
+            .collect()
     }
 
     /// 嫌疑上游的复测窗口是否到期：只有这些需要主动探测，
@@ -322,6 +544,14 @@ impl LatencyStats {
     }
 }
 
+/// 池健康的三类落盘出口。指标是纯进程内 Prometheus 注册表（无外部依赖，
+/// 始终可用）；时序与告警需要外部后端，未配置时为 None（静默跳过）。
+struct PoolObservability {
+    metrics: Arc<PrometheusMetricsBackend>,
+    analytics: Option<Arc<ClickHouseEventBuffer>>,
+    alerts: Option<Arc<PostgresAlertStore>>,
+}
+
 #[derive(Clone)]
 struct AppState {
     config: SecurityGatewayConfig,
@@ -339,6 +569,12 @@ struct AppState {
     /// LLM 上游池健康表：请求路径失败/成功实时写入，探测器周期复测，
     /// 候选排序据此热切换（进程内状态，零重启）。
     llm_health: std::sync::Arc<LlmHealthTable>,
+    /// 池健康的落盘出口（指标/时序/告警）。
+    pool_obs: Arc<PoolObservability>,
+    /// 跨进程池状态信号连接（调度侧读同一个键决定是否暂停 LLM 依赖型任务）。
+    redis: Option<redis::aio::MultiplexedConnection>,
+    /// 上一轮池可用性（边沿去重：只在进入/离开"全灭"时发事件与告警）。
+    pool_down: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -354,6 +590,268 @@ impl AppState {
             self.config.github_token.as_deref(),
         )
         .await
+    }
+
+    /// 池级熔断判定：给定协议面候选，若全是确定性配额耗尽，返回
+    /// `Retry-After` 秒数（到最早恢复时刻，至少 60s），否则 None。
+    /// 调用方据此在入口快速失败，不再逐个上游重试。
+    fn quota_circuit_break(&self, candidates: &[&LlmUpstream]) -> Option<u64> {
+        let owned: Vec<LlmUpstream> = candidates.iter().map(|u| (*u).clone()).collect();
+        if !self.llm_health.all_quota_exhausted(&owned) {
+            return None;
+        }
+        let earliest = self.llm_health.earliest_recovery(&owned);
+        let wait = earliest.saturating_sub(Utc::now().timestamp()).max(60) as u64;
+        Some(wait)
+    }
+}
+
+/// 池状态快照发往 Redis 的 TTL 秒数：下界给探测节拍留出续期余量，
+/// 上界防止网关崩溃后调度侧被永久钉在暂停态。
+fn pool_status_ttl_secs(state: &AppState, earliest_recovery_unix: i64) -> u64 {
+    let now = Utc::now().timestamp();
+    let until = earliest_recovery_unix.saturating_sub(now).max(0) as u64;
+    until
+        .max(state.config.pool_check_secs.saturating_mul(3))
+        .clamp(30, 7 * 24 * 3600)
+}
+
+// ─── 池健康的四类落盘 ────────────────────────────────────────
+
+/// 记一次 gauge。指标注册表是进程内的，写失败只可能是标签类型冲突，降级为
+/// debug 日志，绝不影响请求路径。
+async fn record_gauge(state: &AppState, name: &str, value: f64, labels: &[(&str, &str)]) {
+    let map: HashMap<String, String> = labels
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    if let Err(e) = state.pool_obs.metrics.record_gauge(name, value, map).await {
+        tracing::debug!(error = %e, metric = name, "指标写入失败");
+    }
+}
+
+/// 记一次 counter（+1）。
+async fn record_counter(state: &AppState, name: &str, labels: &[(&str, &str)]) {
+    let map: HashMap<String, String> = labels
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    if let Err(e) = state.pool_obs.metrics.record_counter(name, 1.0, map).await {
+        tracing::debug!(error = %e, metric = name, "指标写入失败");
+    }
+}
+
+/// 发一条时序明细到 ClickHouse。高吞吐、append-only，正是这类数据的去处；
+/// 未配置后端时静默跳过。
+fn record_event(state: &AppState, event: AnalyticsEvent) {
+    if let Some(analytics) = &state.pool_obs.analytics {
+        analytics.send(event);
+    }
+}
+
+/// 一次上游调用的落点：指标 counter + 时序明细（上游、结果、延迟）。
+async fn record_llm_call(state: &AppState, upstream: &LlmUpstream, result: &str, latency_ms: u64) {
+    let key = LlmHealthTable::key(upstream);
+    record_counter(
+        state,
+        "llm_calls_total",
+        &[("upstream", &key), ("result", result)],
+    )
+    .await;
+    record_event(
+        state,
+        AnalyticsEvent::new("llm_call")
+            .property("upstream", serde_json::json!(key))
+            .property("result", serde_json::json!(result))
+            .property("latency_ms", serde_json::json!(latency_ms)),
+    );
+}
+
+/// 上游健康状态变化的落点：时序明细（状态、连续失败数、配额恢复时刻），
+/// 由失败/成功/探测三处调用，天然只在边沿发生（窗口内重复失败不重开窗）。
+fn record_upstream_state(
+    state: &AppState,
+    upstream: &LlmUpstream,
+    healthy: bool,
+    failures: u32,
+    quota_reset_unix: Option<i64>,
+) {
+    let key = LlmHealthTable::key(upstream);
+    let reset = quota_reset_unix.unwrap_or(0);
+    record_event(
+        state,
+        AnalyticsEvent::new("llm_upstream_state")
+            .property("upstream", serde_json::json!(key))
+            .property(
+                "state",
+                serde_json::json!(if healthy { "healthy" } else { "suspect" }),
+            )
+            .property("consecutive_failures", serde_json::json!(failures))
+            .property("quota_reset_unix", serde_json::json!(reset)),
+    );
+}
+
+/// 把池状态写入/清除跨进程 Redis 信号。网关崩了也不会把调度侧永久钉在
+/// 暂停态：键带 TTL，节拍内持续续期，恢复即刻删除。
+async fn publish_pool_signal(state: &AppState, down: bool, earliest_recovery_unix: i64) {
+    let Some(conn) = &state.redis else {
+        return;
+    };
+    let mut conn = conn.clone();
+    if down {
+        let unavailable: Vec<String> = state
+            .config
+            .llm_upstreams
+            .iter()
+            .filter(|u| state.llm_health.is_suspect(u))
+            .map(LlmHealthTable::key)
+            .collect();
+        let status = cog_core::LlmPoolStatus {
+            unavailable: true,
+            earliest_recovery_unix,
+            unavailable_upstreams: unavailable,
+        };
+        let payload = match serde_json::to_string(&status) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "池状态序列化失败，跳过 Redis 发布");
+                return;
+            }
+        };
+        let ttl = pool_status_ttl_secs(state, earliest_recovery_unix);
+        let res: redis::RedisResult<()> = redis::cmd("SET")
+            .arg(cog_core::LLM_POOL_STATUS_KEY)
+            .arg(payload)
+            .arg("EX")
+            .arg(ttl)
+            .query_async(&mut conn)
+            .await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "池状态写入 Redis 失败");
+        }
+    } else {
+        let res: redis::RedisResult<()> = redis::cmd("DEL")
+            .arg(cog_core::LLM_POOL_STATUS_KEY)
+            .query_async(&mut conn)
+            .await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "池状态清除 Redis 失败");
+        }
+    }
+}
+
+/// 推进 PG 告警状态机（幂等）。只在意外的边沿调用，Fired/Resolved 各打一条
+/// 日志——告警历史落在 PG，重启后仍可查。
+async fn sync_pool_alert(state: &AppState, down: bool) {
+    let Some(alerts) = &state.pool_obs.alerts else {
+        return;
+    };
+    let earliest = state
+        .llm_health
+        .earliest_recovery(&state.config.llm_upstreams);
+    let eta = if earliest > 0 {
+        DateTime::from_timestamp(earliest, 0)
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "unknown".into())
+    } else {
+        "unknown".into()
+    };
+    let unavailable: Vec<String> = state
+        .config
+        .llm_upstreams
+        .iter()
+        .filter(|u| state.llm_health.is_suspect(u))
+        .map(LlmHealthTable::key)
+        .collect();
+    let alert = NewAlert {
+        rule: "llm_upstream_pool_down".into(),
+        dedup_key: "llm_upstream_pool_down".into(),
+        severity: "critical".into(),
+        message: if down {
+            format!(
+                "所有 {} 个 LLM 上游不可用（最早恢复 {}）；LLM 依赖型任务已暂停，请补充可联通的上游",
+                unavailable.len(),
+                eta
+            )
+        } else {
+            "LLM 上游池已恢复，LLM 依赖型任务自动继续".into()
+        },
+        labels: serde_json::json!({
+            "unavailable": unavailable,
+            "earliest_recovery_unix": earliest,
+        }),
+    };
+    match alerts.set_alert(down, &alert).await {
+        Ok(AlertTransition::Fired) => {
+            tracing::error!(earliest_recovery = %eta, "池全灭告警已落 PG（firing）");
+        }
+        Ok(AlertTransition::Resolved) => {
+            tracing::info!("池全灭告警已落 PG（resolved）");
+        }
+        Ok(AlertTransition::NoChange) => {}
+        Err(e) => tracing::warn!(error = %e, "池告警落 PG 失败"),
+    }
+}
+
+/// 池状态节拍：刷新指标 → 续期跨进程信号 → 边沿处告警与日志。
+/// 只在进入/离开"池全灭"时发告警与 ERROR 日志；指标每拍都刷新，
+/// 保证 Prometheus 抓到的永远是当前值。
+async fn refresh_pool_state(state: &AppState) {
+    let upstreams = &state.config.llm_upstreams;
+    if upstreams.is_empty() {
+        return;
+    }
+    let down = state.llm_health.all_suspect(upstreams);
+    let earliest = state.llm_health.earliest_recovery(upstreams);
+
+    for (key, healthy, _failures, _reset) in state.llm_health.snapshot(upstreams) {
+        record_gauge(
+            state,
+            "llm_upstream_healthy",
+            if healthy { 1.0 } else { 0.0 },
+            &[("upstream", &key)],
+        )
+        .await;
+    }
+    record_gauge(
+        state,
+        "llm_pool_available",
+        if down { 0.0 } else { 1.0 },
+        &[],
+    )
+    .await;
+    record_gauge(
+        state,
+        "llm_pool_earliest_recovery_seconds",
+        earliest as f64,
+        &[],
+    )
+    .await;
+
+    publish_pool_signal(state, down, earliest).await;
+
+    let was_down = state.pool_down.swap(down, Ordering::SeqCst);
+    if down != was_down {
+        if down {
+            tracing::error!(
+                earliest_recovery_unix = earliest,
+                upstreams = ?upstreams.iter().map(LlmHealthTable::key).collect::<Vec<_>>(),
+                "LLM 上游池全灭，进入熔断；LLM 依赖型任务应暂停，需补充可联通的上游"
+            );
+        } else {
+            tracing::info!("LLM 上游池恢复，熔断解除；LLM 依赖型任务自动继续");
+        }
+        sync_pool_alert(state, down).await;
+    }
+}
+
+/// 池状态发布循环：把进程内的池健康周期性落成指标/时序/告警/跨进程信号。
+async fn run_pool_state_publisher(state: AppState) {
+    let period = std::time::Duration::from_secs(state.config.pool_check_secs.max(5));
+    let mut ticker = tokio::time::interval(period);
+    loop {
+        ticker.tick().await;
+        refresh_pool_state(&state).await;
     }
 }
 
@@ -675,6 +1173,28 @@ async fn stream_forward(
         ));
     }
 
+    // 池级熔断：同协议面上游全是确定性配额耗尽时，遍历重试只烧请求——
+    // 配额在 reset 前不会恢复。直接 503 + Retry-After 让调用方立刻知道
+    // 何时可再来。瞬时故障的嫌疑上游不走这条路（仍值得一试）。
+    if let Some(retry_after) = state.quota_circuit_break(&candidates) {
+        tracing::warn!(
+            retry_after_secs = retry_after,
+            "LLM 上游池配额耗尽，快速失败 503"
+        );
+        return Ok(axum::response::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", retry_after.to_string())
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "error": "所有 LLM 上游配额已耗尽",
+                    "retry_after_seconds": retry_after,
+                })
+                .to_string(),
+            ))
+            .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
+    }
+
     // 热切换：健康上游优先，嫌疑上游降级为兜底（不硬排除）。
     let candidates = order_by_health(candidates, &state.llm_health);
 
@@ -729,7 +1249,14 @@ async fn stream_forward(
             Err(e) => {
                 last_err = format!("连接上游 {base} 失败: {e}");
                 tracing::warn!(upstream = %base, error = %e, "LLM 上游连接失败，切换池内下一个");
-                mark_upstream_failure(&state, upstream, base);
+                record_llm_call(
+                    &state,
+                    upstream,
+                    "error",
+                    start.elapsed().as_millis() as u64,
+                )
+                .await;
+                mark_upstream_failure(&state, upstream, base, None).await;
                 continue;
             }
         };
@@ -744,22 +1271,39 @@ async fn stream_forward(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
+            let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
             tracing::warn!(
                 upstream = %base,
                 status = %status,
+                quota_reset_unix = quota_reset.unwrap_or(0),
                 body = %error_excerpt(&text),
                 "LLM 上游首字节前返回非 2xx，切换池内下一个"
             );
-            mark_upstream_failure(&state, upstream, base);
+            record_llm_call(
+                &state,
+                upstream,
+                "error",
+                start.elapsed().as_millis() as u64,
+            )
+            .await;
+            mark_upstream_failure(&state, upstream, base, quota_reset).await;
             last_err = format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text));
             last_failure = Some((status, ctype, text));
             continue;
         }
         if state.llm_health.note_success(upstream) {
             tracing::info!(upstream = %base, "LLM 上游恢复健康（真实请求实证）");
+            record_upstream_state(&state, upstream, true, 0, None);
         }
-        state.llm_stats.record(start.elapsed().as_millis() as u64);
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        state.llm_stats.record(elapsed_ms);
+        record_llm_call(&state, upstream, "ok", elapsed_ms).await;
 
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let content_type = resp
@@ -792,18 +1336,34 @@ async fn stream_forward(
 }
 
 /// 请求路径上的上游失败记账：进/加嫌疑窗，开新窗时打一条 WARN
-/// （窗口内的并发失败突发不重复计数也不刷日志）。
-fn mark_upstream_failure(state: &AppState, upstream: &LlmUpstream, base: &str) {
-    if let Some((consecutive, secs)) = state
-        .llm_health
-        .note_failure(upstream, state.config.llm_health_probe_secs)
-    {
+/// （窗口内的并发失败突发不重复计数也不刷日志），并落指标与时序明细。
+/// `quota_reset_unix` 是上游给出的配额恢复时刻（解析得到才有），
+/// 它让嫌疑窗精确覆盖到恢复时刻，窗口内不再浪费探测请求。
+async fn mark_upstream_failure(
+    state: &AppState,
+    upstream: &LlmUpstream,
+    base: &str,
+    quota_reset_unix: Option<i64>,
+) {
+    record_counter(
+        state,
+        "llm_upstream_failures_total",
+        &[("upstream", &LlmHealthTable::key(upstream))],
+    )
+    .await;
+    if let Some((consecutive, secs)) = state.llm_health.note_failure(
+        upstream,
+        state.config.llm_health_probe_secs,
+        quota_reset_unix,
+    ) {
         tracing::warn!(
             upstream = %base,
             consecutive_failures = consecutive,
             suspect_window_secs = secs,
+            quota_reset_unix = quota_reset_unix.unwrap_or(0),
             "LLM 上游标记嫌疑，探测窗口到期后复测"
         );
+        record_upstream_state(state, upstream, false, consecutive, quota_reset_unix);
     }
 }
 
@@ -835,20 +1395,24 @@ async fn probe_suspect_upstreams(state: &AppState) {
             Ok(()) => {
                 if state.llm_health.note_success(&upstream) {
                     tracing::info!(upstream = %base, "LLM 上游探测复通，热恢复进池");
+                    record_upstream_state(state, &upstream, true, 0, None);
                 }
             }
-            Err(msg) => {
-                if let Some((consecutive, secs)) = state
-                    .llm_health
-                    .note_failure(&upstream, state.config.llm_health_probe_secs)
-                {
+            Err((msg, quota_reset)) => {
+                if let Some((consecutive, secs)) = state.llm_health.note_failure(
+                    &upstream,
+                    state.config.llm_health_probe_secs,
+                    quota_reset,
+                ) {
                     tracing::warn!(
                         upstream = %base,
                         consecutive_failures = consecutive,
                         suspect_window_secs = secs,
+                        quota_reset_unix = quota_reset.unwrap_or(0),
                         error = %msg,
                         "LLM 上游探测仍失败，指数加窗"
                     );
+                    record_upstream_state(state, &upstream, false, consecutive, quota_reset);
                 }
             }
         }
@@ -857,7 +1421,10 @@ async fn probe_suspect_upstreams(state: &AppState) {
 
 /// 最小连通性探测：max_tokens=1 的单轮 ping，只认 HTTP 状态码。
 /// 不带 tools（探测目标是"这家还能不能用"，能力准入另有探测）。
-async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), String> {
+async fn probe_upstream(
+    state: &AppState,
+    upstream: &LlmUpstream,
+) -> Result<(), (String, Option<i64>)> {
     let base = upstream.base_url.trim_end_matches('/');
     let url = match upstream.api_style.as_str() {
         "anthropic" => format!("{base}/v1/messages"),
@@ -879,13 +1446,25 @@ async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), 
             .header("anthropic-version", "2023-06-01"),
         _ => builder.bearer_auth(&upstream.api_key),
     };
-    let resp = builder.send().await.map_err(|e| format!("连接失败: {e}"))?;
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| (format!("连接失败: {e}"), None))?;
     let status = resp.status();
     if status.is_success() {
         Ok(())
     } else {
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let text = resp.text().await.unwrap_or_default();
-        Err(format!("HTTP {status}: {}", error_excerpt(&text)))
+        let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
+        Err((
+            format!("HTTP {status}: {}", error_excerpt(&text)),
+            quota_reset,
+        ))
     }
 }
 
@@ -901,22 +1480,40 @@ async fn call_llm(
     }
     // 与透传路径同一套热切换语义：健康优先，任何单上游失败（含鉴权类——
     // 池内各家凭证互相独立，A 家 key 坏不代表 B 家坏）都切下一个。
-    let candidates = order_by_health(
-        state.config.llm_upstreams.iter().collect(),
-        &state.llm_health,
-    );
+    let next_candidates: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
+    if let Some(retry_after) = state.quota_circuit_break(&next_candidates) {
+        tracing::warn!(
+            retry_after_secs = retry_after,
+            "LLM 上游池配额耗尽，快速失败 503"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("所有 LLM 上游配额已耗尽，{retry_after} 秒后重试"),
+        ));
+    }
+    let candidates = order_by_health(next_candidates, &state.llm_health);
     let mut last_err = String::new();
     for upstream in candidates {
+        let start = std::time::Instant::now();
         match call_one_upstream(state, upstream, &messages).await {
             Ok(resp) => {
                 if state.llm_health.note_success(upstream) {
                     tracing::info!(upstream = %upstream.base_url, "LLM 上游恢复健康（真实请求实证）");
+                    record_upstream_state(state, upstream, true, 0, None);
                 }
+                record_llm_call(state, upstream, "ok", start.elapsed().as_millis() as u64).await;
                 return Ok(resp);
             }
-            Err(msg) => {
+            Err((msg, quota_reset)) => {
                 tracing::warn!(upstream = %upstream.base_url, error = %msg, "LLM 上游调用失败，切换池内下一个");
-                mark_upstream_failure(state, upstream, upstream.base_url.trim_end_matches('/'));
+                record_llm_call(state, upstream, "error", start.elapsed().as_millis() as u64).await;
+                mark_upstream_failure(
+                    state,
+                    upstream,
+                    upstream.base_url.trim_end_matches('/'),
+                    quota_reset,
+                )
+                .await;
                 last_err = msg;
             }
         }
@@ -931,7 +1528,7 @@ async fn call_one_upstream(
     state: &AppState,
     upstream: &LlmUpstream,
     messages: &[ChatMessage],
-) -> Result<Json<LlmResponse>, String> {
+) -> Result<Json<LlmResponse>, (String, Option<i64>)> {
     let base = upstream.base_url.trim_end_matches('/');
     if upstream.api_style == "anthropic" {
         let (system, msgs): (String, Vec<&ChatMessage>) = {
@@ -959,19 +1556,25 @@ async fn call_one_upstream(
             }))
             .send()
             .await
-            .map_err(|e| format!("连接上游 {base} 失败: {e}"))?;
+            .map_err(|e| (format!("连接上游 {base} 失败: {e}"), None))?;
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "上游 {base} 返回 HTTP {status}: {}",
-                error_excerpt(&text)
+            let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
+            return Err((
+                format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
+                quota_reset,
             ));
         }
         let v: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| format!("上游 {base} 响应解析失败: {e}"))?;
+            .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None))?;
         let content = v["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -992,19 +1595,25 @@ async fn call_one_upstream(
         }))
         .send()
         .await
-        .map_err(|e| format!("连接上游 {base} 失败: {e}"))?;
+        .map_err(|e| (format!("连接上游 {base} 失败: {e}"), None))?;
     let status = resp.status();
     if !status.is_success() {
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "上游 {base} 返回 HTTP {status}: {}",
-            error_excerpt(&text)
+        let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
+        return Err((
+            format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
+            quota_reset,
         ));
     }
     let v: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("上游 {base} 响应解析失败: {e}"))?;
+        .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None))?;
     let content = v["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default()
@@ -1563,7 +2172,29 @@ async fn health_ready(State(state): State<AppState>) -> &'static str {
     "ok"
 }
 
-async fn metrics_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+/// `/metrics`：标准 Prometheus 文本，供抓取端消费。
+/// 网关自有的请求/延迟统计保留在 `/metrics/json`（旧调用方零影响）。
+async fn metrics_handler(State(state): State<AppState>) -> axum::response::Response {
+    match state.pool_obs.metrics.encode() {
+        Ok(bytes) => axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+            .body(axum::body::Body::from(bytes))
+            .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())),
+        Err(e) => {
+            tracing::warn!(error = %e, "指标编码失败");
+            axum::response::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::from(format!(
+                    "metrics encode failed: {e}"
+                )))
+                .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
+        }
+    }
+}
+
+/// 旧的 JSON 形态（网关自有的 egress/llm/code 统计），保持向后兼容。
+async fn metrics_json_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "egress": {
             "requests": state.egress_stats.requests.load(Ordering::Relaxed),
@@ -1589,7 +2220,8 @@ fn router(state: AppState, llm_channel: bool) -> Router {
     let r = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/metrics", get(metrics_handler));
+        .route("/metrics", get(metrics_handler))
+        .route("/metrics/json", get(metrics_json_handler));
     let r = if llm_channel {
         r.route("/v1/intent", post(intent_handler))
             .route("/v1/chat", post(chat_handler))
@@ -1621,8 +2253,141 @@ fn webhook_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 装日志订阅者：级别 `COGNEVA_LOG_LEVEL` → `RUST_LOG` → info，格式
+/// `COGNEVA_LOG_FORMAT=json|pretty`。Loki 开启时同一批事件镜像一份到 Loki，
+/// 网关的 stdout 与 Loki 内容一致（此前网关从不装订阅者，tracing 全被丢弃，
+/// `kubectl logs` 一片空白）。
+fn init_gateway_logging(
+    obs: &ObservabilityExportersConfig,
+    http_client: &Arc<dyn cog_core::HttpClient>,
+) {
+    let level = std::env::var("COGNEVA_LOG_LEVEL")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info".into());
+    let format = if std::env::var("COGNEVA_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+    {
+        cog_observability::LogFormat::Json
+    } else {
+        cog_observability::LogFormat::Pretty
+    };
+    let pusher = if obs.loki.enabled {
+        let client = Arc::new(
+            LokiPushClient::new(&obs.loki.endpoint)
+                .with_max_retries(obs.loki.max_retries.max(1))
+                .with_timeout(obs.loki.timeout_secs)
+                .with_label("service", "cogneva-security-gateway")
+                .with_client(http_client.clone()),
+        );
+        let pusher = Arc::new(LokiBackgroundPusher::new(
+            client,
+            std::time::Duration::from_secs(obs.loki.flush_interval_sec.max(1)),
+            obs.loki.max_batch_size.max(1),
+        ));
+        tokio::spawn({
+            let pusher = pusher.clone();
+            async move { pusher.run_loop().await }
+        });
+        Some(pusher)
+    } else {
+        None
+    };
+    init_subscriber_with_pusher(&level, format, pusher, "cogneva-security-gateway");
+}
+
+/// 构建池健康的三类落盘出口，外加跨进程 Redis 信号连接。
+/// 任一外部后端不可用都只降级（None + WARN），不阻止网关启动——
+/// 网关的核心职责是代理与凭证代持，观测是附加能力。
+async fn build_pool_observability(
+    config: &SecurityGatewayConfig,
+    http_client: &Arc<dyn cog_core::HttpClient>,
+) -> (
+    Arc<PoolObservability>,
+    Option<redis::aio::MultiplexedConnection>,
+) {
+    let obs = &config.observability;
+    let metrics = Arc::new(PrometheusMetricsBackend::new(""));
+
+    let analytics = if obs.clickhouse.enabled {
+        let backend = Arc::new(
+            ClickHouseAnalyticsBackend::new(&obs.clickhouse.base_url, &obs.clickhouse.database)
+                .with_table(&obs.clickhouse.table)
+                .with_auth(&obs.clickhouse.username, &obs.clickhouse.password)
+                .with_client(http_client.clone()),
+        );
+        if let Err(e) = backend.init_table().await {
+            tracing::warn!(error = %e, "ClickHouse 建表失败，时序明细降级为关闭");
+            None
+        } else {
+            tracing::info!(table = %obs.clickhouse.table, "ClickHouse 时序明细已接入");
+            Some(Arc::new(ClickHouseEventBuffer::new(
+                backend,
+                std::time::Duration::from_secs(obs.clickhouse.flush_interval_sec.max(1)),
+                obs.clickhouse.max_batch_size.max(1),
+            )))
+        }
+    } else {
+        None
+    };
+
+    let alerts = match config.database_url.as_deref() {
+        Some(url) => match PostgresAlertStore::connect(url).await {
+            Ok(store) => match store.init_schema().await {
+                Ok(()) => {
+                    tracing::info!("告警状态机已落 PostgreSQL");
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "alerts 建表失败，告警落库降级为关闭");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "PostgreSQL 连接失败，告警落库降级为关闭");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let redis = match config.redis_url.as_deref() {
+        Some(url) => match redis::Client::open(url) {
+            Ok(client) => match client.get_multiplexed_async_connection().await {
+                Ok(conn) => {
+                    tracing::info!("池状态跨进程信号已接 Redis");
+                    Some(conn)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Redis 连接失败，跨进程池状态降级为关闭");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "Redis 连接串非法，跨进程池状态降级为关闭");
+                None
+            }
+        },
+        None => None,
+    };
+
+    (
+        Arc::new(PoolObservability {
+            metrics,
+            analytics,
+            alerts,
+        }),
+        redis,
+    )
+}
+
 /// 启动安全网关（三个通道各自监听）。
 pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let http_client: Arc<dyn cog_core::HttpClient> =
+        Arc::new(cog_net::ReqwestHttpClient::new(reqwest::Client::new()));
+    init_gateway_logging(&config.observability, &http_client);
+
+    let (pool_obs, redis) = build_pool_observability(&config, &http_client).await;
     let state = AppState {
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -1636,12 +2401,16 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
         github_app: GitHubAppCreds::from_env(),
         app_token_cache: std::sync::Arc::new(AppTokenCache::default()),
         llm_health: std::sync::Arc::new(LlmHealthTable::default()),
+        pool_obs,
+        redis,
+        pool_down: Arc::new(AtomicBool::new(false)),
         config: config.clone(),
     };
     if state.github_app.is_some() {
         tracing::info!("安全网关：检测到 GitHub App 凭证，代码平台出口将以 App bot 身份发出");
     }
     tokio::spawn(run_llm_health_prober(state.clone()));
+    tokio::spawn(run_pool_state_publisher(state.clone()));
     let egress_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.egress_port));
     let llm_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.llm_port));
     let webhook_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.webhook_port));
@@ -1693,6 +2462,10 @@ mod tests {
             gitee_webhook_token: None,
             webhook_internal_secret: None,
             webhook_forward_url: "http://cogneva:9091".into(),
+            pool_check_secs: 30,
+            database_url: None,
+            redis_url: None,
+            observability: ObservabilityExportersConfig::default(),
         }
     }
 
@@ -1820,15 +2593,190 @@ mod tests {
         };
         assert!(!table.is_suspect(&u));
         // 首次失败开新窗：返回计数供调用方打 WARN。
-        assert_eq!(table.note_failure(&u, 300), Some((1, 300)));
+        assert_eq!(table.note_failure(&u, 300, None), Some((1, 300)));
         assert!(table.is_suspect(&u));
         assert!(!table.due_for_probe(&u));
         // 窗口内的后续失败静默（不重复计数、不刷日志）。
-        assert_eq!(table.note_failure(&u, 300), None);
+        assert_eq!(table.note_failure(&u, 300, None), None);
         // 成功即恢复健康；note_success 报告此前确实处于嫌疑。
         assert!(table.note_success(&u));
         assert!(!table.is_suspect(&u));
         assert!(!table.note_success(&u));
+    }
+
+    #[test]
+    fn quota_reset_parsed_from_vendor_bodies() {
+        // 实证抓到的两种厂商格式：带年份+数字偏移（ark），无年份+时区缩写（kimi）。
+        let ark = parse_reset_at("quota exhausted, reset at 2026-09-14 00:00:00 +0800 CST");
+        assert!(ark.is_some(), "带偏移的 reset at 必须能解析");
+        // +0800 的 2026-09-14 00:00 等于 UTC 2026-09-13 16:00。
+        let expected = DateTime::parse_from_rfc3339("2026-09-13T16:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(ark.unwrap(), expected);
+
+        let kimi = parse_reset_at("Your quota will reset at 09-18 15:39:00 UTC.");
+        assert!(kimi.is_some(), "无年份 + 时区缩写必须能解析");
+        assert!(kimi.unwrap() > Utc::now().timestamp(), "解析结果应在未来");
+
+        assert!(parse_reset_at("no reset time here").is_none());
+        assert!(parse_reset_at("").is_none());
+    }
+
+    #[test]
+    fn quota_reset_prefers_retry_after_header() {
+        let now = Utc::now().timestamp();
+        let parsed = parse_quota_reset("reset at 09-18 15:39:00 UTC.", Some("120"));
+        let secs = parsed.unwrap() - now;
+        assert!((115..=125).contains(&secs), "Retry-After 优先且按秒解释");
+
+        // 非法 Retry-After 回退到错误体解析。
+        assert!(parse_quota_reset("reset at 09-18 15:39:00 UTC.", Some("soon")).is_some());
+    }
+
+    #[test]
+    fn health_table_quota_window_and_pool_verdicts() {
+        let table = LlmHealthTable::default();
+        let mk = |base: &str| LlmUpstream {
+            api_style: "openai".into(),
+            base_url: base.into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            supports_tool_calls: None,
+        };
+        let a = mk("https://a");
+        let b = mk("https://b");
+        let pool = vec![a.clone(), b.clone()];
+        let far = Utc::now().timestamp() + 7_200;
+
+        assert!(!table.all_suspect(&pool));
+        assert!(!table.all_quota_exhausted(&pool));
+        assert_eq!(table.earliest_recovery(&pool), 0);
+
+        // 配额窗：窗口被拉到恢复时刻，且给出恢复时间上界。
+        table.note_failure(&a, 300, Some(far));
+        assert!(table.is_suspect(&a));
+        assert!(!table.all_suspect(&pool), "还有健康上游时池未全灭");
+        // 单上游配额耗尽即确定性不可用。
+        assert!(table.all_quota_exhausted(&pool[..1]));
+        assert_eq!(table.earliest_recovery(&pool), far);
+
+        // 第二个上游只是瞬时失败（无 reset）→ 池全灭但不是配额耗尽。
+        table.note_failure(&b, 300, None);
+        assert!(table.all_suspect(&pool));
+        assert!(!table.all_quota_exhausted(&pool));
+        // b 的退避窗只有 300s，比 a 的配额恢复上界近，故池的最早恢复取 b 的窗口。
+        let earliest = table.earliest_recovery(&pool);
+        assert!(earliest < far, "取最早的那个上界：b 的退避窗更近");
+        assert!(earliest > Utc::now().timestamp());
+
+        // 恢复一个即离开"全灭"。
+        table.note_success(&a);
+        assert!(!table.all_suspect(&pool));
+    }
+
+    #[tokio::test]
+    async fn circuit_breaks_only_on_deterministic_quota_exhaustion() {
+        let far = Utc::now().timestamp() + 3_600;
+        let state = test_state(vec![
+            stub_upstream("https://a.example.com", "m1"),
+            stub_upstream("https://b.example.com", "m2"),
+        ]);
+        let a = stub_upstream("https://a.example.com", "m1");
+        let b = stub_upstream("https://b.example.com", "m2");
+        let all: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
+
+        state.llm_health.note_failure(&a, 300, Some(far));
+        assert_eq!(state.quota_circuit_break(&all), None, "池内仍有健康上游");
+
+        state.llm_health.note_failure(&b, 300, Some(far));
+        let wait = state.quota_circuit_break(&all).expect("配额全灭即熔断");
+        assert!((3_500..=3_600).contains(&wait), "Retry-After 指向最早恢复");
+
+        // 瞬时全灭（无 reset）不熔断：仍值得逐个试。
+        let state = test_state(vec![stub_upstream("https://c.example.com", "m3")]);
+        let c = stub_upstream("https://c.example.com", "m3");
+        state.llm_health.note_failure(&c, 300, None);
+        assert_eq!(
+            state.quota_circuit_break(&state.config.llm_upstreams.iter().collect::<Vec<_>>()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_exhausted_passthrough_fails_fast_with_retry_after() {
+        // 上游全灭且配额已知：透传端点直接 503 + Retry-After，不再逐个打上游。
+        let far = Utc::now().timestamp() + 1_200;
+        let state = test_state(vec![stub_upstream("https://dead.example.com", "m1")]);
+        let u = stub_upstream("https://dead.example.com", "m1");
+        state.llm_health.note_failure(&u, 300, Some(far));
+
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = chat_completions_passthrough(State(state.clone()), req)
+            .await
+            .expect("熔断返回 Response 而非 Err");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after: u64 = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("必须带 Retry-After");
+        assert!((1_100..=1_200).contains(&retry_after));
+    }
+
+    #[tokio::test]
+    async fn pool_state_refresh_publishes_metrics_and_edges() {
+        let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let u = stub_upstream("https://a.example.com", "m1");
+
+        // 健康：池可用 1，未进入熔断态。
+        refresh_pool_state(&state).await;
+        assert!(!state.pool_down.load(Ordering::SeqCst));
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains("llm_pool_available 1"),
+            "指标应反映池可用: {text}"
+        );
+
+        // 配额全灭：池不可用，边沿置位。
+        let far = Utc::now().timestamp() + 600;
+        state.llm_health.note_failure(&u, 300, Some(far));
+        refresh_pool_state(&state).await;
+        assert!(state.pool_down.load(Ordering::SeqCst));
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains("llm_pool_available 0"),
+            "指标应反映池不可用: {text}"
+        );
+        assert!(
+            text.contains("llm_upstream_healthy"),
+            "应有逐上游健康 gauge"
+        );
+        assert!(
+            text.contains(&format!("llm_pool_earliest_recovery_seconds {far}")),
+            "应暴露最早恢复时刻: {text}"
+        );
+
+        // 恢复：边沿复位。
+        state.llm_health.note_success(&u);
+        refresh_pool_state(&state).await;
+        assert!(!state.pool_down.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pool_status_ttl_bounded() {
+        let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        // 恢复时刻已知：TTL 覆盖到那时（+余量），不过上限。
+        let ttl = pool_status_ttl_secs(&state, Utc::now().timestamp() + 3_600);
+        assert!((3_600..=3_700).contains(&ttl));
+        // 未知恢复：TTL 至少给节拍留续期余量。
+        assert!(pool_status_ttl_secs(&state, 0) >= 30);
     }
 
     #[test]
@@ -1844,7 +2792,7 @@ mod tests {
         let a = mk("https://a");
         let b = mk("https://b");
         let c = mk("https://c");
-        table.note_failure(&b, 300);
+        table.note_failure(&b, 300, None);
         let ordered = order_by_health(vec![&a, &b, &c], &table);
         assert_eq!(ordered[0].base_url, "https://a");
         assert_eq!(ordered[1].base_url, "https://c");
@@ -1933,7 +2881,7 @@ mod tests {
         // 手工把第一个上游标记为嫌疑（模拟上一轮失败开窗）。
         state
             .llm_health
-            .note_failure(&stub_upstream(&first, "m1"), 300);
+            .note_failure(&stub_upstream(&first, "m1"), 300, None);
 
         let req = axum::extract::Request::builder()
             .method("POST")
@@ -1963,7 +2911,7 @@ mod tests {
         .await;
         let state = test_state(vec![stub_upstream(&alive, "m1")]);
         let u = stub_upstream(&alive, "m1");
-        state.llm_health.note_failure(&u, 300);
+        state.llm_health.note_failure(&u, 300, None);
         assert!(state.llm_health.is_suspect(&u));
         assert!(!state.llm_health.due_for_probe(&u));
 
@@ -1990,7 +2938,7 @@ mod tests {
             spawn_stub_upstream(403, r#"{"error":{"type":"access_terminated_error"}}"#).await;
         let state = test_state(vec![stub_upstream(&dead, "m1")]);
         let u = stub_upstream(&dead, "m1");
-        state.llm_health.note_failure(&u, 300);
+        state.llm_health.note_failure(&u, 300, None);
         {
             let mut states = state.llm_health.states.lock().unwrap();
             let entry = states
@@ -2026,6 +2974,13 @@ mod tests {
             github_app: None,
             app_token_cache: std::sync::Arc::new(AppTokenCache::default()),
             llm_health: std::sync::Arc::new(LlmHealthTable::default()),
+            pool_obs: std::sync::Arc::new(PoolObservability {
+                metrics: std::sync::Arc::new(PrometheusMetricsBackend::new("")),
+                analytics: None,
+                alerts: None,
+            }),
+            redis: None,
+            pool_down: Arc::new(AtomicBool::new(false)),
             config: SecurityGatewayConfig {
                 llm_upstreams: upstreams,
                 ..cfg(&[], &[])

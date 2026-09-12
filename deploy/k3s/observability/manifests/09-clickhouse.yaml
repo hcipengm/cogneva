@@ -1,0 +1,110 @@
+# ClickHouse — 时序明细后端（上游状态变化 / LLM 调用结果 / 可用率曲线）。
+# 网关把每次上游状态变化与调用结果批量写这里，列存 + MergeTree 支持高吞吐写入
+# 与时间桶聚合；告警状态机（需行级 UPDATE）走 PostgreSQL，日志走 Loki，
+# 指标走 Prometheus——四类体裁各落各的后端，不是互为备选。
+#
+# 凭证：clickhouse-credentials 由 install.sh 首次生成强随机密码（仓库零可用密钥），
+# 并镜像写入 cogneva 命名空间的 cogneva-secrets/clickhouse-password，供安全网关连接
+# （跨命名空间不能在 env 里直接引用 Secret，故安装时同步一份）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+    app.kubernetes.io/component: clickhouse
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: http
+      protocol: TCP
+    - name: native
+      port: 9000
+      targetPort: native
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+    app.kubernetes.io/component: clickhouse
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: clickhouse
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clickhouse
+        app.kubernetes.io/part-of: cog-observability
+    spec:
+      securityContext:
+        fsGroup: 101
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24.8
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8123
+              protocol: TCP
+            - name: native
+              containerPort: 9000
+              protocol: TCP
+          env:
+            - name: CLICKHOUSE_DB
+              value: "cogneva"
+            - name: CLICKHOUSE_USER
+              value: "cogneva"
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-credentials
+                  key: password
+            # 允许 CLICKHOUSE_USER 自己建表（网关启动时 init_table 建 llm_events）。
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 3Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        # 不绑定厂商 StorageClass：跟随集群默认 SC（local-path / longhorn 均可）。
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi

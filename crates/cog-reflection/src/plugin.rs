@@ -3,6 +3,33 @@
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+/// 延迟持有的 LLM 上游池暂停句柄。`SchedulerGate` 由 supervisor 插件在
+/// init 阶段发布，而 reflection 的 init 早于 supervisor（supervisor 可选依赖
+/// reflection）；自进化循环在 init 阶段就已 spawn，因此用这个句柄跨越
+/// init→start 的时间窗：init 建句柄、start 填充、循环只读取。gate 未就绪时
+/// 视为不暂停（保持既有行为，不因 supervisor 缺席而停摆）。
+#[derive(Default)]
+struct PoolGate(std::sync::Mutex<Option<Arc<dyn cog_core::SchedulerGate>>>);
+
+impl PoolGate {
+    fn set(&self, gate: Arc<dyn cog_core::SchedulerGate>) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(gate);
+        }
+    }
+
+    fn llm_paused(&self) -> bool {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref()
+                    .map(|g| g.is_paused_kind(cog_core::TaskClass::LlmDependent))
+            })
+            .unwrap_or(false)
+    }
+}
+
 /// Reflection plugin that self-assembles the reflection engine and spawns
 /// evolution bridges.
 pub struct ReflectionPlugin {
@@ -11,6 +38,8 @@ pub struct ReflectionPlugin {
     /// 挂基线移植触发循环（跨插件消费 OrchestratorControl 只能在 start，
     /// 见插件生命周期 init_all → start_all）。
     porter_armed: bool,
+    /// 见 [`PoolGate`]；init 阶段 spawn 的循环据此跳过 LLM 依赖轮次。
+    pool_gate: Arc<PoolGate>,
 }
 
 impl ReflectionPlugin {
@@ -19,6 +48,7 @@ impl ReflectionPlugin {
         Self {
             initialized: false,
             porter_armed: false,
+            pool_gate: Arc::new(PoolGate::default()),
         }
     }
 }
@@ -296,10 +326,15 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     );
                     let metrics = evolution_metrics.clone();
                     let poll = std::time::Duration::from_secs(self_evolution.poll_interval_secs);
+                    let pool_gate = self.pool_gate.clone();
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(poll);
                         loop {
                             interval.tick().await;
+                            if pool_gate.llm_paused() {
+                                info!("LLM upstream pool unavailable; skipping microvm evolution cycle");
+                                continue;
+                            }
                             match microvm.run_evolution().await {
                                 Ok(outcome) => {
                                     if let Some(m) = metrics.as_ref() {
@@ -528,10 +563,17 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let poll_interval =
                     std::time::Duration::from_secs(self_evolution.poll_interval_secs);
 
+                let pool_gate = self.pool_gate.clone();
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(poll_interval);
                     loop {
                         interval.tick().await;
+                        // 变更生成整条链都依赖 LLM：池全灭时空转只会烧配额、
+                        // 刷日志，跳过本轮；池恢复后自动继续。
+                        if pool_gate.llm_paused() {
+                            info!("LLM upstream pool unavailable; skipping self-evolution cycle");
+                            continue;
+                        }
                         if let Err(e) = run_evolution_cycle(
                             &pipeline,
                             &deployer,
@@ -562,6 +604,13 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // 池暂停句柄在此填充（supervisor 已在 init 阶段发布 SchedulerGate）。
+        let llm_gate = ctx.consume_service::<dyn cog_core::SchedulerGate>();
+        if let Some(gate) = &llm_gate {
+            self.pool_gate.set(gate.clone());
+        } else {
+            info!("no scheduler gate; LLM-dependent loops run unconditionally");
+        }
         // 自发现信号 watcher 不依赖沙盒边界门禁：它只读 orchestrator 任务
         // 状态并提交内部意图，不碰 git 写操作。
         let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
@@ -654,6 +703,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             crate::BaselinePorter::new(&project_root).with_instance_id(instance_id.clone());
         if let Some(orch) = orchestrator {
             porter = porter.with_orchestrator(orch);
+        }
+        // 池全灭时智能段（冲突解决/语义吸收/eval）退化，机械 cherry-pick 继续。
+        if let Some(gate) = llm_gate {
+            porter = porter.with_llm_gate(gate);
         }
         let porter = Arc::new(porter);
 
@@ -1320,7 +1373,9 @@ async fn run_evolution_cycle(
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "reflection",
     requires: &["skill", "prompt", "agent"],
-    optional_requires: &["llm", "memory"],
+    // supervisor 可选：其 SchedulerGate 用于池全灭时暂停 LLM 依赖型循环；
+    // 不能写成 requires（supervisor 反向可选依赖 reflection，会成环）。
+    optional_requires: &["llm", "memory", "supervisor"],
     provides: &[
         "ReflectionEngine",
         "SquadReflection",
@@ -1359,6 +1414,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "EvolutionMetrics",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "SchedulerGate",
             required: false,
         },
     ],

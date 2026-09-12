@@ -57,20 +57,48 @@ add_helm_repos() {
     log_info "Helm 仓库更新完成 ✓"
 }
 
+# ─── ClickHouse 凭证（只能在清单之前）───────────────────────────
+# 仓库零可用密钥：首次安装生成强随机密码存 monitoring/clickhouse-credentials，
+# 再镜像一份到 cogneva/clickhouse-password 供安全网关连接（跨命名空间不能在
+# Pod env 里直接引用 Secret，只能各存一份，值同源）。已存在则保留不动。
+ensure_clickhouse_credentials() {
+    log_info "准备 ClickHouse 凭证..."
+
+    if ! kubectl -n "${NAMESPACE}" get secret clickhouse-credentials >/dev/null 2>&1; then
+        local pw
+        pw="$(openssl rand -hex 24)"
+        kubectl -n "${NAMESPACE}" create secret generic clickhouse-credentials \
+            --from-literal=password="${pw}" >/dev/null
+        log_info "clickhouse-credentials 已生成随机密码"
+    else
+        log_info "clickhouse-credentials 已存在，保留不动"
+    fi
+}
+
 # ─── 部署基础 Manifests ───────────────────────────────────────────
 deploy_manifests() {
     log_info "部署 K8s 基础资源 (Namespace / Secrets / ServiceMonitor / Dashboard)..."
 
-    # 不应用的两个文件及原因：
+    # 不应用的文件及原因：
     #   02-networkpolicy — 首条策略对 monitoring 全体 Pod 做 ingress 默认拒绝，
     #     但放行来源按 Pod 标签匹配 ingress controller；hostNetwork 模式的
     #     ingress-nginx 源地址是节点 IP，匹配不上，会把反代流量全拦下。
     #     生产形态（controller 非 hostNetwork）再启用。
     #   05-podmonitor — 与 04-servicemonitor 二选一的替代方案，避免双份抓取。
+    #   09-clickhouse — 只在 full 档部署（时序明细后端，见 deploy_clickhouse）。
     for f in "${MANIFESTS_DIR}"/*.yaml; do
         case "$(basename "$f")" in
             02-networkpolicy.yaml|05-podmonitor-cogneva.yaml)
                 log_warn "跳过: $(basename "$f")"
+                continue ;;
+            09-clickhouse.yaml)
+                if [ "${PROFILE}" = "full" ]; then
+                    ensure_clickhouse_credentials
+                    log_info "应用: $(basename "$f")"
+                    kubectl apply -f "$f"
+                else
+                    log_warn "跳过: $(basename "$f")（缩配档不部署时序明细后端）"
+                fi
                 continue ;;
         esac
         log_info "应用: $(basename "$f")"
@@ -78,6 +106,21 @@ deploy_manifests() {
     done
 
     log_info "基础资源部署完成 ✓"
+}
+
+# ─── 把 ClickHouse 密码镜像给安全网关命名空间 ─────────────────────
+# 网关从 cogneva-secrets/clickhouse-password 读，值必须与 ClickHouse 服务端一致。
+mirror_clickhouse_password() {
+    kubectl -n cogneva get ns >/dev/null 2>&1 || { log_warn "cogneva 命名空间不存在，跳过密码镜像"; return; }
+    local pw_b64
+    pw_b64="$(kubectl -n "${NAMESPACE}" get secret clickhouse-credentials -o jsonpath='{.data.password}')"
+    kubectl -n cogneva get secret cogneva-secrets >/dev/null 2>&1 \
+        || kubectl -n cogneva create secret generic cogneva-secrets
+    kubectl -n cogneva patch secret cogneva-secrets --type=json \
+        -p="[{\"op\":\"add\",\"path\":\"/data/clickhouse-password\",\"value\":\"${pw_b64}\"}]" >/dev/null 2>&1 \
+        || kubectl -n cogneva patch secret cogneva-secrets --type=merge \
+            -p="{\"data\":{\"clickhouse-password\":\"${pw_b64}\"}}" >/dev/null
+    log_info "ClickHouse 密码已镜像到 cogneva-secrets"
 }
 
 # ─── 部署 kube-prometheus-stack ───────────────────────────────────
@@ -164,8 +207,11 @@ main() {
     if [ "${PROFILE}" = "full" ]; then
         deploy_loki
         deploy_jaeger
+        # ClickHouse 清单已在 deploy_manifests 应用；这里把密码同步给网关命名空间，
+        # 网关据此连 ClickHouse 写时序明细（securityGateway.observability.clickhouse）。
+        mirror_clickhouse_password
     else
-        log_info "缩配档跳过 Loki / Jaeger（日志与链路追踪生产档再上）"
+        log_info "缩配档跳过 Loki / ClickHouse / Jaeger（日志、时序明细与链路追踪生产档再上）"
     fi
     verify_deployment
 

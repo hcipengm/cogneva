@@ -165,6 +165,9 @@ const OBS_ENV: &[(&str, &str)] = &[
     ("COGNEVA_CLICKHOUSE_ENABLED", "clickhouse.enabled"),
     ("COGNEVA_CLICKHOUSE_BASE_URL", "clickhouse.base_url"),
     ("COGNEVA_CLICKHOUSE_DATABASE", "clickhouse.database"),
+    ("COGNEVA_CLICKHOUSE_TABLE", "clickhouse.table"),
+    ("COGNEVA_CLICKHOUSE_USERNAME", "clickhouse.username"),
+    ("COGNEVA_CLICKHOUSE_PASSWORD", "clickhouse.password"),
     ("COGNEVA_ALERTMANAGER_ENABLED", "alertmanager.enabled"),
     (
         "COGNEVA_ALERTMANAGER_WEBHOOK_URL",

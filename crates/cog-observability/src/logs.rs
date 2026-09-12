@@ -24,8 +24,20 @@ pub type LogFilterHandle =
 /// Returns a [`LogFilterHandle`] so callers can hot-reload the `EnvFilter`
 /// without restarting the process.
 pub fn init_subscriber(log_level: &str, format: crate::LogFormat) -> LogFilterHandle {
+    init_subscriber_with_pusher(log_level, format, None, "cogneva")
+}
+
+/// Same as [`init_subscriber`] but additionally mirrors every event into Loki
+/// through `pusher`. Pass `None` to skip the mirror (console-only logging).
+pub fn init_subscriber_with_pusher(
+    log_level: &str,
+    format: crate::LogFormat,
+    pusher: Option<Arc<LokiBackgroundPusher>>,
+    service: &str,
+) -> LogFilterHandle {
     let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
     let (reloadable_filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    let loki_layer = pusher.map(|p| LokiLayer::new(p, service));
 
     match format {
         crate::LogFormat::Json => {
@@ -43,6 +55,7 @@ pub fn init_subscriber(log_level: &str, format: crate::LogFormat) -> LogFilterHa
                 .with(reloadable_filter)
                 .with(json_layer)
                 .with(SfContextLayer)
+                .with(loki_layer)
                 .try_init();
         }
         crate::LogFormat::Pretty => {
@@ -58,11 +71,116 @@ pub fn init_subscriber(log_level: &str, format: crate::LogFormat) -> LogFilterHa
                 .with(reloadable_filter)
                 .with(pretty_layer)
                 .with(SfContextLayer)
+                .with(loki_layer)
                 .try_init();
         }
     }
 
     handle
+}
+
+/// `tracing` layer that mirrors events to a [`LokiBackgroundPusher`].
+///
+/// Without this the Loki client has nothing feeding it — the structured logs
+/// land in Loki only if something converts tracing events into [`LogEntry`].
+pub struct LokiLayer {
+    pusher: Arc<LokiBackgroundPusher>,
+    service: String,
+}
+
+impl LokiLayer {
+    pub fn new(pusher: Arc<LokiBackgroundPusher>, service: impl Into<String>) -> Self {
+        Self {
+            pusher,
+            service: service.into(),
+        }
+    }
+}
+
+/// Collects an event's fields into a [`LogEntry`] shape.
+#[derive(Default)]
+struct LokiFieldVisitor {
+    message: String,
+    event: Option<String>,
+    fields: HashMap<String, serde_json::Value>,
+}
+
+impl LokiFieldVisitor {
+    fn record(&mut self, name: &str, value: serde_json::Value) {
+        match name {
+            "message" => {
+                if let serde_json::Value::String(s) = &value {
+                    self.message = s.clone();
+                } else {
+                    self.message = value.to_string();
+                }
+            }
+            "event" => {
+                self.event = Some(match value {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                });
+            }
+            other => {
+                self.fields.insert(other.to_string(), value);
+            }
+        }
+    }
+}
+
+impl tracing::field::Visit for LokiFieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let name = field.name();
+        // The fmt macros render `%x` through record_debug as a quoted string;
+        // LogEntry carries plain text, so unwrap the debug quoting for strings.
+        let text = format!("{value:?}");
+        let plain = text
+            .strip_prefix('"')
+            .and_then(|t| t.strip_suffix('"'))
+            .map(|t| t.to_string())
+            .unwrap_or(text);
+        self.record(name, serde_json::Value::String(plain));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.record(field.name(), serde_json::Value::String(value.to_string()));
+    }
+}
+
+impl<S> Layer<S> for LokiLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let mut visitor = LokiFieldVisitor::default();
+        event.record(&mut visitor);
+        let meta = event.metadata();
+        visitor.fields.insert(
+            "service".into(),
+            serde_json::Value::String(self.service.clone()),
+        );
+        visitor.fields.insert(
+            "target".into(),
+            serde_json::Value::String(meta.target().to_string()),
+        );
+
+        let message = if visitor.message.is_empty() {
+            meta.target().to_string()
+        } else {
+            visitor.message
+        };
+        self.pusher.enqueue(LogEntry {
+            timestamp: chrono::Utc::now(),
+            level: meta.level().to_string().to_lowercase(),
+            event: visitor.event.unwrap_or_else(|| meta.target().to_string()),
+            trace_id: None,
+            span_id: None,
+            task_id: None,
+            agent_id: None,
+            message,
+            context: visitor.fields,
+        });
+    }
 }
 
 /// Custom tracing layer that injects Cogneva standardized context fields.
