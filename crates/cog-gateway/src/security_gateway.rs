@@ -746,8 +746,8 @@ async fn publish_pool_signal(state: &AppState, down: bool, earliest_recovery_uni
     }
 }
 
-/// 推进 PG 告警状态机（幂等）。只在意外的边沿调用，Fired/Resolved 各打一条
-/// 日志——告警历史落在 PG，重启后仍可查。
+/// 推进 PG 告警状态机（幂等）。每拍调用，让 PG 里的告警状态始终是池状态的投影；
+/// Fired/Resolved 各打一条日志——告警历史落在 PG，重启后仍可查。
 async fn sync_pool_alert(state: &AppState, down: bool) {
     let Some(alerts) = &state.pool_obs.alerts else {
         return;
@@ -847,8 +847,13 @@ async fn refresh_pool_state(state: &AppState) {
         } else {
             tracing::info!("LLM 上游池恢复，熔断解除；LLM 依赖型任务自动继续");
         }
-        sync_pool_alert(state, down).await;
     }
+    // 告警状态的对账每拍都做，不只在进程内边沿上做：告警的真值在 PG，进程内的
+    // 边沿只用来打日志。若进程在"发火"与"恢复"之间重启（滚动、崩溃、换机），
+    // 新进程起来时池已是好的、看不到任何边沿，只靠边沿触发就会让那条 firing
+    // 永久留在 PG 里，恢复事实再也写不回去。set_alert 幂等（先读 PG 现态再决定
+    // 是否迁移），所以每拍调用只是让它成为池状态的投影。
+    sync_pool_alert(state, down).await;
 }
 
 /// 池状态发布循环：把进程内的池健康周期性落成指标/时序/告警/跨进程信号。
