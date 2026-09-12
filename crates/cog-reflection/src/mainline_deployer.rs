@@ -166,15 +166,16 @@ fn pod_selector(name: &str, component: &str) -> String {
 }
 
 /// 四部署当前镜像的归类。
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DeployedState {
     /// 四部署统一跑在 `main-<rev>` 上。
     Main(String),
     /// 全都不是主线 tag（迁移前的 localhost/cogneva:local 时代）：允许首轮
     /// 以 registry :local 为基底前进。
     Legacy,
-    /// 混合态（部分主线、部分旧 tag，或主线 rev 不一致）：上一轮滚动未
-    /// 收敛，绝不触发新一轮。
+    /// 混合态（部分主线、部分旧 tag，或主线 rev 不一致）。有在飞滚动时表示
+    /// 上一轮滚动未收敛，绝不触发新一轮；无在飞滚动时是外部写入造成的非一致，
+    /// 由 [`normalize_deployed`] 归一后放行。
     Mixed,
 }
 
@@ -198,6 +199,22 @@ fn classify_deployed(images: &[String]) -> DeployedState {
         DeployedState::Main(first)
     } else {
         DeployedState::Mixed
+    }
+}
+
+/// 归一混合态与"在飞滚动"的关系。
+///
+/// 混合态的原义是"上一轮的滚动还没收敛"——那只在自己真有滚动在飞时成立。
+/// 没有在飞滚动却出现混合态，只可能是外部写入造成的（清单被重下发、部分 apply、
+/// GitOps 金丝雀、手工 `set image`），此时按 Mixed 一直拒会让部署器**永久静默停摆**
+/// （只有一行 INFO，没有任何自愈路径）。这种混合态按 Legacy 放行，本轮滚动把四部署
+/// 重新 pin 回同一个 rev 即自愈。
+///
+/// 有在飞滚动时保持 Mixed 原义：绝不叠加新一轮。
+fn normalize_deployed(deployed: &DeployedState, has_in_flight: bool) -> DeployedState {
+    match deployed {
+        DeployedState::Mixed if !has_in_flight => DeployedState::Legacy,
+        other => other.clone(),
     }
 }
 
@@ -723,6 +740,15 @@ impl MainlineDeployer {
             // 落到下方构建流程：reset 到 bare、复用已有不可变镜像或重建，
             // 再派 Job 把四部署 pin 回 `main-<rev>`。
         }
+
+        let normalized = normalize_deployed(&deployed, state.in_flight.is_some());
+        if normalized != deployed {
+            warn!(
+                images = ?images,
+                "deployments sit on mixed images with no rollout in flight (an external partial apply?); converging them onto one revision"
+            );
+        }
+        let deployed = normalized;
 
         let attempts = if state.failed_rev.as_deref() == Some(bare.as_str()) {
             state.failed_attempts
@@ -1830,6 +1856,32 @@ mod tests {
         );
     }
 
+    /// 混合态只在真有滚动在飞时才算"上一轮未收敛"；无在飞滚动时是外部写入造成的
+    /// 非一致，必须归一放行，否则部署器永久停摆。
+    #[test]
+    fn mixed_state_only_blocks_while_a_rollout_is_in_flight() {
+        let mixed = DeployedState::Mixed;
+        assert_eq!(
+            normalize_deployed(&mixed, true),
+            DeployedState::Mixed,
+            "有在飞滚动：保持原义，绝不叠加新一轮"
+        );
+        assert_eq!(
+            normalize_deployed(&mixed, false),
+            DeployedState::Legacy,
+            "无在飞滚动：外部写入的非一致，放行让本轮把它收敛回单一 rev"
+        );
+        // 归一不动其它态：正常主线不会被降级成 Legacy。
+        assert_eq!(
+            normalize_deployed(&DeployedState::Main("aa1111111111".into()), false),
+            DeployedState::Main("aa1111111111".into())
+        );
+        assert_eq!(
+            normalize_deployed(&DeployedState::Legacy, true),
+            DeployedState::Legacy
+        );
+    }
+
     #[test]
     fn advance_decisions() {
         let bare = "bb2222222222";
@@ -2039,6 +2091,43 @@ exit 0
 "#,
             log = log.display(),
             deployed_image = deployed_image
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// fake kubectl：按 deployment 名字分别返回镜像，用来构造"四部署镜像不一致"
+    /// 的现场（清单被部分重下发 / 手工 set image）。名字后的空格是必要边界：
+    /// `cogneva ` 不会匹配上 `cogneva-evolution `。
+    fn fake_kubectl_per_deployment(dir: &Path, first: &str, second: &str) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *"get deployment cogneva-security-gateway "*) echo '{first}' ;;
+  *"get deployment cogneva "*) echo '{first}' ;;
+  *"get deployment "*" jsonpath="*) echo '{second}' ;;
+  *"get job"*) echo "Error: jobs.batch \"x\" not found" >&2; exit 1 ;;
+  *"get pods"*) echo "0 true " ;;
+  *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            first = first,
+            second = second
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         dir.join("fake-kubectl").to_string_lossy().to_string()
@@ -2306,6 +2395,55 @@ exit 0
                 &["--git-dir", bare.to_str().unwrap(), "rev-parse", "side"]
             )
             .await
+        );
+    }
+
+    /// 回归：四部署镜像被外部写入弄成不一致（清单部分重下发、手工 set image），
+    /// 且本地没有在飞滚动。旧逻辑按"上一轮未收敛"永久跳过——只有一行 INFO，
+    /// 没有任何自愈路径，部署器就此静默停摆。修正后应照常构建并派发滚动 Job，
+    /// 由这一轮把四部署重新 pin 回同一个 rev。
+    #[tokio::test]
+    // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
+    async fn poll_once_converges_mixed_deployments_with_no_rollout_in_flight() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        // 网关与主应用停在浮动签，执行器与进化停在旧主线 tag。
+        let kubectl = fake_kubectl_per_deployment(
+            &bin_dir,
+            "localhost:30500/cogneva:local",
+            "localhost:30500/cogneva:main-000000000000",
+        );
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, ws);
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        let kubectl_calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            kubectl_calls.contains("apply -f -"),
+            "mixed deployments must not wedge the deployer; a rollout job should be dispatched: {kubectl_calls}"
+        );
+        assert!(
+            kubectl_calls.contains(&job_name(&rev_b)),
+            "rollout job must target the bare main rev: {kubectl_calls}"
+        );
+        // 基底退回浮动签：混合态里没有唯一可信的主线 rev 可作 from。
+        let buildah_calls = std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap();
+        assert!(
+            buildah_calls.contains("from --tls-verify=false reg.local:5000/cogneva:local"),
+            "{buildah_calls}"
         );
     }
 
