@@ -109,6 +109,14 @@ spec:
               value: "http://cogneva-security-gateway:8081/gitee"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
+            # 实例身份指纹：身份的规范来源，安装期生成、升级复用。身份决定
+            # `evol/<id>` 分支名与按实例命名的常驻工作树，必须跨重启与重装稳定。
+            - name: COGNEVA_INSTANCE_FINGERPRINT
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: instance-fingerprint
+                  optional: true
           lifecycle:
             postStart:
               exec:

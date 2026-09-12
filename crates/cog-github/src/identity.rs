@@ -105,17 +105,95 @@ pub fn identity_state_path() -> PathBuf {
     PathBuf::from(dir).join("identity.json")
 }
 
+/// 装入期指纹的环境变量名。集群里由 `cogneva-secrets` 的
+/// `instance-fingerprint` 注入，安装时生成一次、之后幂等保留。
+///
+/// 为什么需要它：容器里采集不到 machine-id，指纹素材只剩 Pod 主机名与
+/// veth MAC，两者都随 Pod 生命周期变化——身份于是只能靠"把结果写到持久卷"
+/// 粘住，重装集群或换机器就换名。把指纹变成安装期提供的外部输入之后，身份
+/// 不再依赖任何易失素材，可以随 Secret 备份、迁移，运维也能显式钉住。
+pub const ENV_FINGERPRINT: &str = "COGNEVA_INSTANCE_FINGERPRINT";
+
+/// 读取装入期指纹；未设置或全空白视为未提供。
+pub fn fingerprint_from_env() -> Option<String> {
+    std::env::var(ENV_FINGERPRINT)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// 把身份写进状态文件，供其他 crate（如按 `evol/<id>` 命名的沙盒侧）读取。
+/// 写失败只告警：身份本身仍然有效，只是跨进程共享的那份副本缺失。
+async fn persist_state_file(identity: &InstanceIdentity) {
+    let path = identity_state_path();
+    let Ok(json) = serde_json::to_string_pretty(identity) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            warn!(path = %path.display(), error = %e, "identity state dir not writable");
+            return;
+        }
+    }
+    if let Err(e) = tokio::fs::write(&path, json).await {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "identity state file not writable; identity stays process-local"
+        );
+    }
+}
+
+/// 进程启动早期把装入期指纹落地为身份状态文件。
+///
+/// 必须在插件初始化之前调用：`evol/<id>` 分支名与实例工作树名由 cog-reflection
+/// 直接读状态文件得出，而身份解析发生在 cog-github 插件里，两者启动顺序并无
+/// 保证——冷启动时先读的一方会读到空文件，把分支名退化成 `local`。启动早期
+/// 统一落一次盘，所有消费者看到的永远是同一份身份。
+///
+/// 未提供装入期指纹时返回 `None`，交由 [`resolve`] 走既有的状态文件/机器指纹
+/// 路径（未接入 Secret 的单机场景行为不变）。
+pub async fn seed_from_env() -> Option<InstanceIdentity> {
+    let fingerprint = fingerprint_from_env()?;
+    let identity = InstanceIdentity::from_fingerprint(&fingerprint);
+
+    // 与既有状态文件不一致意味着这次启动会给实例换名：按实例命名的分支与
+    // 工作树会变成孤儿。是运维显式提供新指纹的结果，但必须留下声音。
+    if let Ok(text) = tokio::fs::read_to_string(identity_state_path()).await {
+        if let Ok(previous) = serde_json::from_str::<InstanceIdentity>(&text) {
+            if previous.fingerprint != identity.fingerprint {
+                warn!(
+                    previous = %previous.handle,
+                    current = %identity.handle,
+                    "provisioned fingerprint differs from the persisted identity; \
+                     this instance is being renamed"
+                );
+            }
+        }
+    }
+
+    persist_state_file(&identity).await;
+    Some(identity)
+}
+
 /// 实例身份解析的统一入口（首次进化时自动生成）。
 ///
-/// 优先级：内存配置指纹 → 状态文件 → 现场采集机器指纹生成（并尽力回写状态
-/// 文件与回填配置）。指纹由机器标识确定性推导：即便状态文件/配置都不可用，
-/// 同一台机器每次推导出的身份仍然一致。机器标识全部缺失的极端环境退化为
-/// 进程内临时身份（重启可能换名，仅保底不阻塞启动）。
+/// 优先级：内存配置指纹 → 装入期指纹（Secret 注入）→ 状态文件 → 现场采集
+/// 机器指纹生成（并尽力回写状态文件与回填配置）。装入期指纹优先于状态文件：
+/// 它是安装期提供的外部输入，重装带同一个 Secret、换机器带同一个 Secret 都能
+/// 得到同一个身份，这正是"身份可迁移"的前提。机器标识全部缺失的极端环境退化
+/// 为进程内临时身份（重启可能换名，仅保底不阻塞启动）。
 pub async fn resolve(config: &mut crate::config::BotIdentityConfig) -> InstanceIdentity {
     if let Some(fp) = config.fingerprint.as_ref() {
         if !fp.is_empty() {
             return InstanceIdentity::from_fingerprint(fp);
         }
+    }
+    if let Some(fingerprint) = fingerprint_from_env() {
+        let identity = InstanceIdentity::from_fingerprint(&fingerprint);
+        identity.persist_to(config);
+        persist_state_file(&identity).await;
+        return identity;
     }
     let path = identity_state_path();
     if let Ok(text) = tokio::fs::read_to_string(&path).await {
@@ -127,19 +205,7 @@ pub async fn resolve(config: &mut crate::config::BotIdentityConfig) -> InstanceI
     match InstanceIdentity::generate().await {
         Ok(identity) => {
             identity.persist_to(config);
-            if let Ok(json) = serde_json::to_string_pretty(&identity) {
-                if let Some(parent) = path.parent() {
-                    if tokio::fs::create_dir_all(parent).await.is_ok()
-                        && tokio::fs::write(&path, json).await.is_err()
-                    {
-                        warn!(
-                            path = %path.display(),
-                            "identity state file not writable; identity stays process-local \
-                             (still stable across restarts on this machine)"
-                        );
-                    }
-                }
-            }
+            persist_state_file(&identity).await;
             identity
         }
         Err(e) => {
@@ -352,6 +418,67 @@ mod tests {
         };
         let id = resolve(&mut config).await;
         assert_eq!(id.short, "a3f9d2c1");
+    }
+
+    /// 装入期指纹是身份的规范来源：没有状态文件时，它必须先于机器指纹生效，
+    /// 并把结果落盘给别的 crate 读。
+    #[tokio::test]
+    async fn resolve_prefers_provisioned_env_fingerprint() {
+        let _guard = ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let provisioned = "b81c0e9fb81c0e9fb81c0e9fb81c0e9fb81c0e9fb81c0e9fb81c0e9fb81c0e9f";
+        std::env::set_var(ENV_FINGERPRINT, provisioned);
+
+        let mut config = crate::config::BotIdentityConfig::default();
+        let id = resolve(&mut config).await;
+
+        assert_eq!(id.fingerprint, provisioned);
+        assert_eq!(id.short, "b81c0e9f");
+        assert_eq!(config.fingerprint.as_deref(), Some(provisioned));
+        let persisted: InstanceIdentity =
+            serde_json::from_str(&std::fs::read_to_string(identity_state_path()).unwrap()).unwrap();
+        assert_eq!(persisted, id);
+
+        std::env::remove_var(ENV_FINGERPRINT);
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 启动早期播种：这是插件初始化之前唯一一次落盘，目的是让读状态文件的
+    /// cog-reflection 与解析身份的 cog-github 看到同一份身份。
+    #[tokio::test]
+    async fn seed_from_env_writes_state_file() {
+        let _guard = ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+
+        std::env::remove_var(ENV_FINGERPRINT);
+        assert!(
+            seed_from_env().await.is_none(),
+            "未提供装入期指纹时不得凭空造身份"
+        );
+        assert!(!identity_state_path().exists());
+
+        let provisioned = "deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe";
+        std::env::set_var(ENV_FINGERPRINT, provisioned);
+        let seeded = seed_from_env().await.expect("应当播种身份");
+        assert_eq!(seeded.fingerprint, provisioned);
+
+        let written: InstanceIdentity =
+            serde_json::from_str(&std::fs::read_to_string(identity_state_path()).unwrap()).unwrap();
+        assert_eq!(written, seeded);
+
+        // 换一个指纹再播种：状态文件必须被改写（装入期指纹优先于陈旧文件）。
+        let rotated = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::env::set_var(ENV_FINGERPRINT, rotated);
+        let reseeded = seed_from_env().await.expect("应当播种身份");
+        assert_ne!(reseeded.handle, seeded.handle);
+        let written: InstanceIdentity =
+            serde_json::from_str(&std::fs::read_to_string(identity_state_path()).unwrap()).unwrap();
+        assert_eq!(written.fingerprint, rotated);
+
+        std::env::remove_var(ENV_FINGERPRINT);
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[test]

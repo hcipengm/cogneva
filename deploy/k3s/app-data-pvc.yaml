@@ -5,6 +5,7 @@
 # 主应用与进化 Pod 各一个卷：两者以不同 UID 运行，共享同一 RWO 卷时 kubelet
 # 的 fsGroup 会互相改属主。
 # 不写 storageClassName，跟随集群默认 SC（与 pg/redis/qdrant 同策略）。
+# 卷与密钥一样带卸载保护：重装要接着用同一份状态，卸载删掉就等于丢实例。
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -13,6 +14,8 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: gateway-data
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce
@@ -28,6 +31,8 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva-evolution
     app.kubernetes.io/component: evolution-data
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce

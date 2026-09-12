@@ -233,6 +233,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_SELF_EVOLUTION_WORKSPACES_EPHEMERAL_TTL_SECS".into(),
         "self_evolution.workspaces.ephemeral_ttl_secs".into(),
     );
+    m.insert(
+        "COGNEVA_SELF_EVOLUTION_WORKSPACES_ORPHAN_BRANCH_TTL_SECS".into(),
+        "self_evolution.workspaces.orphan_branch_ttl_secs".into(),
+    );
     // system
     m.insert(
         "COGNEVA_SKILL_HOT_RELOAD_INTERVAL_SECS".into(),

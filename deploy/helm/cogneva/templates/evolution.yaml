@@ -7,6 +7,10 @@ metadata:
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: evolution
+  annotations:
+    # 卸载不销毁数据卷：重装要接着用同一份状态（工作树、原始日志、数仓、记忆、
+    # 裸仓库），删掉就等于丢实例。
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce
@@ -25,6 +29,9 @@ metadata:
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: evolution-source
+  annotations:
+    # 卸载不销毁数据卷：共享 CARGO_TARGET_DIR 在这里，删掉就得从零冷编译。
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce
@@ -43,6 +50,9 @@ metadata:
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: evolution-data
+  annotations:
+    # 卸载不销毁数据卷：实例身份的落盘状态文件在这里，删掉实例就会改名。
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce
@@ -220,6 +230,14 @@ spec:
               value: "http://cogneva-security-gateway:8081/gitee"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
+            # 实例身份指纹：身份的规范来源，安装期生成、升级复用。身份决定
+            # `evol/<id>` 分支名与按实例命名的常驻工作树，必须跨重启与重装稳定。
+            - name: COGNEVA_INSTANCE_FINGERPRINT
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: instance-fingerprint
+                  optional: true
           lifecycle:
             postStart:
               exec:
@@ -298,6 +316,9 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: evolution
+  annotations:
+    # 卸载不销毁数据卷：裸仓库是全部进化分支与晋级产物的规范来源。
+    helm.sh/resource-policy: keep
 spec:
   accessModes: ["ReadWriteOnce"]
   {{- with .Values.storage.retain }}

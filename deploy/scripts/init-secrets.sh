@@ -48,6 +48,28 @@ ensure_random() {
   echo "  ${key}: 已生成随机强密钥"
 }
 
+# 实例身份指纹：必须随 Secret 存活，是实例身份的规范来源。容器里采集不到
+# machine-id，指纹素材只剩 Pod 主机名与 veth MAC（每轮重启都变），所以身份
+# 不能靠容器内推导——这里生成一次并永久保留，重装/换机器带上同一个 Secret
+# 就是同一个实例。64 位十六进制，与机器指纹同形。
+ensure_fingerprint() {
+  local key=instance-fingerprint cur val b64
+  cur="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null || true)"
+  if [ -n "$cur" ]; then
+    echo "  ${key}: 已存在，保留不动"
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    val="$(openssl rand -hex 32)"
+  else
+    val="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  fi
+  b64="$(printf '%s' "$val" | base64 | tr -d '\n')"
+  kubectl -n "$NS" patch secret "$SECRET" --type=json \
+    -p="[{\"op\":\"add\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]" >/dev/null
+  echo "  ${key}: 已生成随机指纹"
+}
+
 # 带外凭证：仅确保键存在（空占位），真值由向导/运维写入，脚本不生成。
 ensure_blank() {
   local key="$1"
@@ -64,6 +86,9 @@ ensure_random pg-password
 ensure_random redis-password
 ensure_random webhook-internal
 ensure_random jwt-secret
+
+echo "==> 实例身份指纹（64 位十六进制，缺失才创建）"
+ensure_fingerprint
 
 echo "==> 带外凭证占位（留空，由 WebUI 向导或 kubectl edit secret 写入）"
 ensure_blank llm-upstreams

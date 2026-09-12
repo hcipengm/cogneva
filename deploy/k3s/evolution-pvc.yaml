@@ -6,6 +6,9 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva-evolution
     app.kubernetes.io/component: evolution
+  # 卷与密钥一样带卸载保护：重装要接着用同一份状态。
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce
@@ -23,6 +26,8 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva-evolution
     app.kubernetes.io/component: evolution-source
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce

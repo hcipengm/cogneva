@@ -74,6 +74,9 @@ metadata:
   labels:
     app.kubernetes.io/name: nats
     app.kubernetes.io/component: event-bus
+  # 卷与密钥一样带卸载保护：重装要接着用同一份状态（事件流积压）。
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce

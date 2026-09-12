@@ -10,6 +10,9 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: evolution
+  annotations:
+    # 卸载不销毁数据卷：裸仓库是全部进化分支与晋级产物的规范来源。
+    helm.sh/resource-policy: keep
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: cogneva-local-retain

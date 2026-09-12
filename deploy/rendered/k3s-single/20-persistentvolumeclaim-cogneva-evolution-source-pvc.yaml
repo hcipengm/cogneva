@@ -13,6 +13,9 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: evolution-source
+  annotations:
+    # 卸载不销毁数据卷：共享 CARGO_TARGET_DIR 在这里，删掉就得从零冷编译。
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce

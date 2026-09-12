@@ -708,6 +708,11 @@ pub struct SelfEvolutionWorkspaceConfig {
     /// 所以存活时长是唯一能揪出"进程还在但任务已崩"的兜底，取值要容得下
     /// 一整轮演进。
     pub ephemeral_ttl_secs: u64,
+    /// 身份轮换后遗留的 `evol/<旧id>` 分支的回收判据（秒）：已并入 main 的
+    /// 分支立即回收，未并入的要等超过这个时长才回收。取值要明显大于两次移植
+    /// 之间的间隔——存活实例的分支每次移植都会被强推刷新，长期不动的分支说明
+    /// 其所属实例已经不在了。
+    pub orphan_branch_ttl_secs: u64,
 }
 
 impl Default for SelfEvolutionWorkspaceConfig {
@@ -716,6 +721,7 @@ impl Default for SelfEvolutionWorkspaceConfig {
             root: "/opt/cogneva/sandbox/workspaces".into(),
             target_dir: "/opt/cogneva/sandbox/src/target".into(),
             ephemeral_ttl_secs: 21600,
+            orphan_branch_ttl_secs: 2592000,
         }
     }
 }

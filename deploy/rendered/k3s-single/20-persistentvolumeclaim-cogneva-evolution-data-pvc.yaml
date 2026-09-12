@@ -13,6 +13,9 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: evolution-data
+  annotations:
+    # 卸载不销毁数据卷：实例身份的落盘状态文件在这里，删掉实例就会改名。
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce

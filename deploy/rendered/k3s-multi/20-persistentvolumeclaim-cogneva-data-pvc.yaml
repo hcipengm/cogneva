@@ -13,6 +13,10 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: gateway-data
+  annotations:
+    # 卸载不销毁数据卷：主应用的数据目录（身份、记忆、数仓、原始日志）在这里，
+    # 删掉就等于丢实例。
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce

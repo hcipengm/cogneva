@@ -156,6 +156,24 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "workspace orphan gc failed"),
                 }
+                // 裸仓库里的 `evol/<id>` 分支只有推入、没有删除，身份每轮换一次就
+                // 永久多一条。启动时收一次：只动非本实例、且已并入 main 或超期的。
+                match ws
+                    .gc_orphan_evol_branches(
+                        &instance_id,
+                        std::time::Duration::from_secs(ws_cfg.orphan_branch_ttl_secs),
+                    )
+                    .await
+                {
+                    Ok(reclaimed) if !reclaimed.is_empty() => {
+                        info!(
+                            count = reclaimed.len(),
+                            "reclaimed orphan evolution branches"
+                        )
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "orphan evolution branch gc failed"),
+                }
             }
         }
 

@@ -26,6 +26,7 @@ data:
   COGNEVA_SELF_EVOLUTION_WORKSPACES_ROOT: "/opt/cogneva/sandbox/workspaces"
   COGNEVA_SELF_EVOLUTION_WORKSPACES_TARGET_DIR: "/opt/cogneva/sandbox/src/target"
   COGNEVA_SELF_EVOLUTION_WORKSPACES_EPHEMERAL_TTL_SECS: "21600"
+  COGNEVA_SELF_EVOLUTION_WORKSPACES_ORPHAN_BRANCH_TTL_SECS: "2592000"
   # 晋级门（推送端）：沙盒验证全过的变更（change） 经分级策略判定后，L0/L1 自动
   # 晋级走 GitOps 发布（annotated tag + evolution-release 分支推到中央
   # 仓库），L2 留审批台。中央仓库即本 Pod 挂载的宿主 bare 仓库 /host-git

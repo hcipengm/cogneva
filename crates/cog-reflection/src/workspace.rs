@@ -401,6 +401,73 @@ impl WorkspaceManager {
         Ok(reclaimed)
     }
 
+    /// 回收"实例身份已轮换"遗留的 `evol/<旧id>` 分支。
+    ///
+    /// 移植工作分支以实例身份命名，身份一换名就再没有任何代码读它，但 ref
+    /// 会连同其可达提交永久留在裸仓库里——每轮换一次身份就多一条。回收判据
+    /// 二选一，缺一不删：
+    ///
+    /// - 已完全并入 main：活干完了，删掉不丢任何提交；
+    /// - 末次提交已超过 ttl：所属实例长期不活动（存活实例的分支每次移植都会被
+    ///   强推刷新），留着只占 ref 与可达对象。
+    ///
+    /// 当前实例自己的分支永不删；正被工作树占用的分支由 git 自身拒绝删除，
+    /// 记录后跳过。`main` / `master` 之类不带 `evol/` 前缀的 ref 一律不在此列。
+    pub async fn gc_orphan_evol_branches(
+        &self,
+        current_instance: &str,
+        ttl: Duration,
+    ) -> SFResult<Vec<String>> {
+        let keep = format!("evol/{current_instance}");
+        let out = self
+            .git_bare(&[
+                "for-each-ref",
+                "--format=%(refname:short) %(objectname) %(committerdate:unix)",
+                "refs/heads/evol/",
+            ])
+            .await?;
+        let now = chrono::Utc::now().timestamp();
+        let mut reclaimed = Vec::new();
+        for line in out.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(name), Some(rev), Some(ts)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if name == keep {
+                continue;
+            }
+            let merged = self
+                .git_bare(&["merge-base", "--is-ancestor", rev, "main"])
+                .await
+                .is_ok();
+            let age = (now - ts.parse::<i64>().unwrap_or(now)).max(0) as u64;
+            if !merged && age < ttl.as_secs() {
+                continue;
+            }
+            match self.git_bare(&["branch", "-D", name]).await {
+                Ok(_) => {
+                    info!(
+                        branch = %name,
+                        rev = %&rev[..rev.len().min(12)],
+                        age_secs = age,
+                        reason = if merged { "merged-into-main" } else { "stale" },
+                        "reclaimed orphan evolution branch"
+                    );
+                    reclaimed.push(name.to_string());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        branch = %name,
+                        error = %e,
+                        "orphan evolution branch could not be deleted; leaving it in place"
+                    );
+                }
+            }
+        }
+        Ok(reclaimed)
+    }
+
     // -- 内部 ---------------------------------------------------------------
 
     fn workspace_of(&self, spec: &WorkspaceSpec, path: &Path) -> Workspace {
@@ -956,6 +1023,67 @@ mod tests {
             assert!(kept.path.exists(), "{} 不能被动", kept.id);
         }
         assert_eq!(mgr.list().await.unwrap().len(), 5);
+    }
+
+    /// 在裸仓库里执行并断言成功，返回 stdout。
+    fn bare(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// 把 name 指向 parent 之上的一个新提交——不并入 main 的分支。
+    fn branch_with_wip_commit(bare_dir: &Path, name: &str, parent: &str) {
+        let tree = bare(bare_dir, &["rev-parse", &format!("{parent}^{{tree}}")]);
+        let new = bare(bare_dir, &["commit-tree", &tree, "-p", parent, "-m", "wip"]);
+        bare(bare_dir, &["branch", "-f", name, &new]);
+    }
+
+    #[tokio::test]
+    async fn orphan_evol_branches_reclaimed_only_when_merged_or_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare_repo, rev_a, _rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare_repo);
+
+        // 当前实例：即使落后于 main 也不许动，下一轮移植还要强推它。
+        bare(&bare_repo, &["branch", "evol/quinn", &rev_a]);
+        // 旧实例，活干完了：已完全并入 main。
+        bare(&bare_repo, &["branch", "evol/ada", &rev_a]);
+        // 旧实例，未并入但刚提交：处在活跃窗口内，这一轮保留。
+        branch_with_wip_commit(&bare_repo, "evol/max", &rev_a);
+
+        let reclaimed = mgr
+            .gc_orphan_evol_branches("quinn", Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, vec!["evol/ada"]);
+        assert!(git_out(&bare_repo, &["branch", "--list", "evol/ada"]).is_empty());
+        assert!(!git_out(&bare_repo, &["branch", "--list", "evol/quinn"]).is_empty());
+        assert!(!git_out(&bare_repo, &["branch", "--list", "evol/max"]).is_empty());
+
+        // ttl 归零：未并入的旧分支随即按超期回收。
+        let reclaimed = mgr
+            .gc_orphan_evol_branches("quinn", Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, vec!["evol/max"]);
+        assert!(git_out(&bare_repo, &["branch", "--list", "evol/max"]).is_empty());
+        assert!(!git_out(&bare_repo, &["branch", "--list", "evol/quinn"]).is_empty());
+        // 非 `evol/` 前缀的 ref 不在扫描范围内。
+        assert!(!git_out(&bare_repo, &["branch", "--list", "main"]).is_empty());
     }
 
     #[tokio::test]

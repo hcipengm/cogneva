@@ -13,6 +13,9 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: cluster-registry
+  # 卷与密钥一样带卸载保护：重装要接着用同一份状态（已分发的镜像层）。
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce

@@ -7,6 +7,10 @@ metadata:
   labels:
     app.kubernetes.io/name: qdrant
     app.kubernetes.io/component: vector-db
+  annotations:
+    # 卸载不销毁数据卷：重装要接着用同一份状态（向量库、身份、记忆、数仓、
+    # 裸仓库），删掉就等于丢实例。
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce

@@ -93,6 +93,10 @@ evolution:
     targetDir: /opt/cogneva/sandbox/src/target
     # 临时工作树存活上限；要容得下一整轮演进，进程号不足以判断任务是否还活着。
     ephemeralTtlSecs: 21600
+    # 身份轮换后遗留的 `evol/<旧id>` 分支回收判据：已并入 main 的立即回收，
+    # 未并入的等超过这个时长（默认 30 天）才回收。存活实例的分支每次移植都会
+    # 被强推刷新，长期不动即说明所属实例已不在。
+    orphanBranchTtlSecs: 2592000
   resources:
     requests:
       cpu: 500m
@@ -179,6 +183,10 @@ secrets:
   redisPassword: ""
   webhookInternal: ""
   jwtSecret: ""
+  # 实例身份指纹（64 位十六进制）：安装时生成一次、之后幂等保留。身份不再由
+  # 容器内的机器标识推导（容器里只有 Pod 主机名与 veth MAC，两者每轮重启都变），
+  # 因此重装带同一个 Secret、换机器带同一个 Secret 都是同一个实例，也可显式钉住。
+  instanceFingerprint: ""
   llmApiKey: ""
   # 带外凭证（网关专用）：真实值带外写入，默认空（未配置时对应功能 fail-closed）。
   llmUpstreams: ""

@@ -40,6 +40,17 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // 解析 secret://env|file|vault 引用（审计 3.3）。
     config_loader::resolve_secret_refs(&mut config).await?;
 
+    // 身份状态文件必须在任何插件初始化之前落地：分支名 `evol/<id>` 与实例
+    // 工作树名由 cog-reflection 直接读状态文件得出，而身份解析发生在
+    // cog-github 插件里，冷启动时谁先读谁就决定了名字。
+    if let Some(identity) = cog_github::identity::seed_from_env().await {
+        tracing::info!(
+            handle = %identity.handle,
+            branch = %identity.branch_id,
+            "instance identity seeded from the provisioned fingerprint"
+        );
+    }
+
     let ctx = cog_core::PluginContext::new(config.core.clone());
     ctx.publish(Arc::new(config.core.clone()));
 

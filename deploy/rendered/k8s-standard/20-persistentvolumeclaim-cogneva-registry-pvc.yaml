@@ -20,6 +20,10 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.5.7"
     app.kubernetes.io/component: cluster-registry
+  annotations:
+    # 卸载不销毁数据卷：重装要接着用同一份状态（已分发的镜像层、身份、记忆、
+    # 数仓、裸仓库），删掉就等于丢实例。
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce
