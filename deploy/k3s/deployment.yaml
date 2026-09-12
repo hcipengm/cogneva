@@ -111,14 +111,14 @@ spec:
                   name: cogneva-secrets
                   key: instance-fingerprint
                   optional: true
-            # 贡献通道 OAuth 应用身份（随 chart 公开分发，是应用标识非用户凭证；
-            # 用户 token 只进安全网关）。贡献通道端点与 token 续期跑在本进程。
+            # 贡献通道：GitHub 设备流只用公开的 client_id（本流程无 client_secret）。
+            # Gitee 授权码流程的应用凭证由安全网关代持，本进程经
+            # COGNEVA_OAUTH_GATEWAY_URL 借用（授权 URL 与授权码兑换都在网关侧），
+            # 本 Pod 零持有 client_secret。
             - name: COGNEVA_GITHUB_OAUTH_CLIENT_ID
               value: "Ov23liz35yGbAC5vO0OP"
-            - name: COGNEVA_GITEE_OAUTH_CLIENT_ID
-              value: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
-            - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
-              value: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
+            - name: COGNEVA_OAUTH_GATEWAY_URL
+              value: "http://cogneva-security-gateway:8081"
             # Gitee 严格校验 redirect_uri；默认落地页（静态回调页）用 postMessage
             # 把 code 自动递回向导。
             - name: COGNEVA_GITEE_OAUTH_REDIRECT_URI

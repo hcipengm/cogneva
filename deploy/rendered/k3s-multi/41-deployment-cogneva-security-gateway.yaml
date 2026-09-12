@@ -98,6 +98,14 @@ spec:
                   name: cogneva-secrets
                   key: gitee-token
                   optional: true
+            # 贡献通道 Gitee OAuth 应用凭证：授权码兑换与 token 续期的唯一起点，
+            # 只注入本进程，业务 Pod 零持有；缺失即授权码通道 fail-closed
+            # （手动令牌/PAT 通道不受影响）。值是项目方 OAuth App 的公开应用
+            # 标识，随 chart values 原样恢复，重装/换机不受影响。
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_ID
+              value: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
+            - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
+              value: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
             - name: COGNEVA_GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:

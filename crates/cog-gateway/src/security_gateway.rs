@@ -85,6 +85,11 @@ pub struct SecurityGatewayConfig {
     /// Gitee API 透传出口注入的 token（COGNEVA_GITEE_TOKEN），以
     /// `access_token` query 参数注入（Gitee API v5 官方认证方式）。
     pub gitee_token: Option<String>,
+    /// Gitee OAuth App 凭证（COGNEVA_GITEE_OAUTH_CLIENT_ID / _SECRET）：贡献
+    /// 通道授权码兑换的唯一起点。业务 Pod 零持有，主应用只经 `/v1/oauth/gitee/*`
+    /// 借用；两者缺一即 fail-closed，授权码通道不可用（手动令牌通道不受影响）。
+    pub gitee_oauth_client_id: Option<String>,
+    pub gitee_oauth_client_secret: Option<String>,
     /// Webhook 入口通道监听端口（第三通道，面向集群外平台回调）。
     pub webhook_port: u16,
     /// 观测通道监听端口（第四通道，只挂 /health/* 与 /metrics）。
@@ -119,6 +124,17 @@ pub struct SecurityGatewayConfig {
 }
 
 impl SecurityGatewayConfig {
+    /// 贡献通道 Gitee OAuth 应用凭证；两者缺一视为未配置（fail-closed）。
+    /// 本进程是唯一持有者，只有 `/v1/oauth/gitee/*` 会读它。
+    fn gitee_oauth_creds(&self) -> Option<(&str, &str)> {
+        let id = self.gitee_oauth_client_id.as_deref()?;
+        let secret = self.gitee_oauth_client_secret.as_deref()?;
+        if id.is_empty() || secret.is_empty() {
+            return None;
+        }
+        Some((id, secret))
+    }
+
     pub fn from_env() -> Self {
         let list = |key: &str| {
             std::env::var(key)
@@ -138,6 +154,8 @@ impl SecurityGatewayConfig {
             llm_health_probe_secs: env_u64("COGNEVA_LLM_HEALTH_PROBE_SECS", 300),
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
+            gitee_oauth_client_id: token("COGNEVA_GITEE_OAUTH_CLIENT_ID"),
+            gitee_oauth_client_secret: token("COGNEVA_GITEE_OAUTH_CLIENT_SECRET"),
             webhook_port: env_u16("COGNEVA_SG_WEBHOOK_PORT", 8082),
             metrics_port: env_u16("COGNEVA_SG_METRICS_PORT", 9090),
             github_webhook_secret: token("COGNEVA_GITHUB_WEBHOOK_SECRET"),
@@ -1679,6 +1697,103 @@ async fn gitee_passthrough(
     code_platform_forward(state, req, CodePlatform::Gitee).await
 }
 
+/// token 端点响应体。主应用侧用既有的 `parse_gitee_token` 解析同一形状
+/// （access_token / refresh_token / expires_in），两端语义不漂移。
+fn gitee_token_body(set: &crate::contribution_admin::GiteeTokenSet) -> serde_json::Value {
+    serde_json::json!({
+        "access_token": set.access_token,
+        "refresh_token": set.refresh_token,
+        "expires_in": set.expires_in,
+    })
+}
+
+/// GET /v1/oauth/gitee/app — 借出 OAuth App 的公开标识（client_id）并表明凭证
+/// 是否齐备。主应用据此拼授权 URL、判定可用性；client_secret 永不出本进程。
+async fn gitee_oauth_app_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.config.gitee_oauth_creds() {
+        Some((id, _)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"available": true, "client_id": id})),
+        ),
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({"available": false})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct GiteeOAuthExchangeBody {
+    code: String,
+    #[serde(default)]
+    redirect_uri: String,
+}
+
+/// POST /v1/oauth/gitee/exchange — 用网关凭证兑换授权码。主应用只送
+/// code/redirect_uri，应用凭证不进业务进程。
+async fn gitee_oauth_exchange_handler(
+    State(state): State<AppState>,
+    Json(body): Json<GiteeOAuthExchangeBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some((id, secret)) = state.config.gitee_oauth_creds() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error_description": "安全网关未配置 Gitee OAuth 应用凭证"
+            })),
+        );
+    };
+    match crate::contribution_admin::exchange_gitee_code_with(
+        id,
+        secret,
+        &body.code,
+        &body.redirect_uri,
+    )
+    .await
+    {
+        Ok(set) => (StatusCode::OK, Json(gitee_token_body(&set))),
+        Err(message) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error_description": message})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct GiteeOAuthRefreshBody {
+    refresh_token: String,
+}
+
+/// POST /v1/oauth/gitee/refresh — 同上，用网关凭证把 refresh token 换成新对。
+async fn gitee_oauth_refresh_handler(
+    State(state): State<AppState>,
+    Json(body): Json<GiteeOAuthRefreshBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some((id, secret)) = state.config.gitee_oauth_creds() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error_description": "安全网关未配置 Gitee OAuth 应用凭证"
+            })),
+        );
+    };
+    match crate::contribution_admin::refresh_gitee_token_with(
+        Some(id),
+        Some(secret),
+        &body.refresh_token,
+    )
+    .await
+    {
+        Ok(set) => (StatusCode::OK, Json(gitee_token_body(&set))),
+        Err(message) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error_description": message})),
+        ),
+    }
+}
+
 /// 构造平台上游 URL：剥离 `/github`/`/gitee` 前缀后拼到平台基址，
 /// 保留原 query；Gitee 额外把 token 以 access_token query 参数注入。
 fn code_platform_url(
@@ -2261,6 +2376,12 @@ fn router(state: AppState, llm_channel: bool) -> Router {
             .route("/v1/messages", post(anthropic_messages_passthrough))
             .route("/github/{*path}", axum::routing::any(github_passthrough))
             .route("/gitee/{*path}", axum::routing::any(gitee_passthrough))
+            .route("/v1/oauth/gitee/app", get(gitee_oauth_app_handler))
+            .route(
+                "/v1/oauth/gitee/exchange",
+                post(gitee_oauth_exchange_handler),
+            )
+            .route("/v1/oauth/gitee/refresh", post(gitee_oauth_refresh_handler))
             .route(
                 "/git/github/{*path}",
                 axum::routing::any(git_github_passthrough),
@@ -2532,6 +2653,8 @@ mod tests {
             llm_health_probe_secs: 300,
             github_token: None,
             gitee_token: None,
+            gitee_oauth_client_id: None,
+            gitee_oauth_client_secret: None,
             webhook_port: 8082,
             metrics_port: 9090,
             github_webhook_secret: None,
@@ -2543,6 +2666,26 @@ mod tests {
             redis_url: None,
             observability: ObservabilityExportersConfig::default(),
         }
+    }
+
+    /// Gitee OAuth 应用凭证必须成对才可用：只有 client_id 而无 client_secret 时
+    /// 授权码通道必须 fail-closed，不能"看起来可用"却在兑换时失败。
+    #[test]
+    fn gitee_oauth_creds_requires_both_fields() {
+        let mut cfg = cfg(&[], &[]);
+        assert!(cfg.gitee_oauth_creds().is_none());
+
+        cfg.gitee_oauth_client_id = Some("app-id".into());
+        assert!(cfg.gitee_oauth_creds().is_none());
+
+        cfg.gitee_oauth_client_secret = Some("".into());
+        assert!(cfg.gitee_oauth_creds().is_none(), "空 secret 视为未配置");
+
+        cfg.gitee_oauth_client_secret = Some("app-secret".into());
+        assert_eq!(cfg.gitee_oauth_creds(), Some(("app-id", "app-secret")));
+
+        cfg.gitee_oauth_client_id = Some("".into());
+        assert!(cfg.gitee_oauth_creds().is_none(), "空 client_id 视为未配置");
     }
 
     #[test]

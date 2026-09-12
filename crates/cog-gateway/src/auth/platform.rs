@@ -314,11 +314,11 @@ pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response
     let state = contrib::new_oauth_state(&redirect_uri);
     let url = match provider.as_str() {
         "gitee" => {
-            let Some(client_id) = contrib::gitee_oauth_client_id(None) else {
+            let Some(client_id) = contrib::gitee_oauth_client_id().await else {
                 return json_err(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "oauth_not_configured",
-                    "尚未配置 Gitee OAuth client_id；请改用访问令牌（PAT）登录",
+                    "尚未配置 Gitee OAuth 应用；请改用访问令牌（PAT）登录",
                 );
             };
             let redirect = contrib::gitee_oauth_redirect_override().unwrap_or(redirect_uri);

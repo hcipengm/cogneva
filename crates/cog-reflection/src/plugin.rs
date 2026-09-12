@@ -130,9 +130,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                          back to the process working directory"
                     ),
                 }
-                // 实例身份每次 Pod 重启都会重新生成（身份文件不在持久卷上），按实例
-                // 命名的常驻工作树因此会被永久遗弃。启动时收一次：先清理登记残留，
-                // 再回收泄漏的临时树，最后回收已轮换实例的常驻树。
+                // 实例身份来自装入期指纹并落盘在持久数据目录，重启与换机都不变；
+                // 只有运维显式轮换指纹、或新装机没带上原 Secret 时，按实例命名的
+                // 常驻工作树才会被遗弃。启动时收一次：先清理登记残留，再回收泄漏
+                // 的临时树，最后回收已轮换实例的常驻树。
                 if let Err(e) = ws.prune().await {
                     warn!(error = %e, "workspace prune failed");
                 }

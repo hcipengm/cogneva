@@ -254,19 +254,62 @@ pub(crate) fn oauth_client_id(explicit: Option<&str>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-pub(crate) fn gitee_oauth_client_id(explicit: Option<&str>) -> Option<String> {
-    explicit
-        .map(str::trim)
+/// 安全网关内部端点基址（同命名空间 Service）。Gitee OAuth 应用凭证与授权码
+/// 兑换都发生在网关进程内，主应用只经此地址借用，本进程零持有 client_secret。
+pub(crate) fn oauth_gateway_base() -> String {
+    std::env::var("COGNEVA_OAUTH_GATEWAY_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| std::env::var("COGNEVA_GITEE_OAUTH_CLIENT_ID").ok())
-        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http://cogneva-security-gateway:8081".to_string())
 }
 
-pub(crate) fn gitee_oauth_client_secret() -> Option<String> {
-    std::env::var("COGNEVA_GITEE_OAUTH_CLIENT_SECRET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+/// 向网关借 Gitee OAuth App 的 client_id（公开标识）。未配置或网关不可达返回
+/// None，调用方据此走"未配置 OAuth App"的引导。判据只有网关这一个来源，
+/// 主应用不另立近似判据。
+pub(crate) async fn gitee_oauth_client_id() -> Option<String> {
+    let url = format!("{}/v1/oauth/gitee/app", oauth_gateway_base());
+    let body: serde_json::Value = http_client()
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    body.get("client_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+pub(crate) async fn gitee_oauth_available() -> bool {
+    gitee_oauth_client_id().await.is_some()
+}
+
+/// 调用网关的 OAuth 端点：成功返回 token 端点响应体，失败返回可展示的错误。
+async fn oauth_gateway_call(
+    path: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}{path}", oauth_gateway_base());
+    let resp = http_client()
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("无法连接安全网关（{e}）"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let msg = body
+            .get("error_description")
+            .or_else(|| body.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("安全网关拒绝了授权请求");
+        return Err(msg.to_string());
+    }
+    Ok(body)
 }
 
 /// Fixed callback override for the Gitee OAuth App. When unset the wizard
@@ -275,10 +318,6 @@ pub(crate) fn gitee_oauth_redirect_override() -> Option<String> {
     std::env::var("COGNEVA_GITEE_OAUTH_REDIRECT_URI")
         .ok()
         .filter(|s| !s.trim().is_empty())
-}
-
-fn gitee_oauth_available() -> bool {
-    gitee_oauth_client_id(None).is_some() && gitee_oauth_client_secret().is_some()
 }
 
 fn unix_now() -> u64 {
@@ -440,22 +479,22 @@ pub fn extract_gitee_code(code: Option<&str>, redirect_url: Option<&str>) -> Opt
     None
 }
 
-/// Exchange an authorization code for a token pair. Gitee's token endpoint
-/// expects the parameters as a query string on a POST.
-pub(crate) async fn exchange_gitee_code(
+/// Gitee 授权码兑换：client_id/secret 由调用方给出，只有安全网关进程持有。
+/// Gitee 的 token 端点要求参数走 query string 的 POST。
+pub(crate) async fn exchange_gitee_code_with(
+    client_id: &str,
+    client_secret: &str,
     code: &str,
     redirect_uri: &str,
 ) -> Result<GiteeTokenSet, String> {
-    let client_id = gitee_oauth_client_id(None).ok_or("未配置 Gitee OAuth client_id")?;
-    let client_secret = gitee_oauth_client_secret().ok_or("未配置 Gitee OAuth client_secret")?;
     let resp = http_client()
         .post(GITEE_TOKEN_URL)
         .query(&[
             ("grant_type", "authorization_code"),
             ("code", code),
-            ("client_id", client_id.as_str()),
+            ("client_id", client_id),
             ("redirect_uri", redirect_uri),
-            ("client_secret", client_secret.as_str()),
+            ("client_secret", client_secret),
         ])
         .send()
         .await
@@ -464,15 +503,18 @@ pub(crate) async fn exchange_gitee_code(
     parse_gitee_token(&body, unix_now())
 }
 
-/// Refresh a Gitee token pair. The refresh token rotates on every use.
-pub async fn refresh_gitee_token(refresh_token: &str) -> Result<GiteeTokenSet, String> {
+/// Gitee refresh token 换新：凭证由调用方给出，只有安全网关进程持有。
+/// refresh token 每次使用都会轮换。
+pub(crate) async fn refresh_gitee_token_with(
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+    refresh_token: &str,
+) -> Result<GiteeTokenSet, String> {
     let mut params = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
     ];
-    let client_id = gitee_oauth_client_id(None);
-    let client_secret = gitee_oauth_client_secret();
-    if let (Some(id), Some(secret)) = (client_id.as_deref(), client_secret.as_deref()) {
+    if let (Some(id), Some(secret)) = (client_id, client_secret) {
         params.push(("client_id", id));
         params.push(("client_secret", secret));
     }
@@ -483,6 +525,30 @@ pub async fn refresh_gitee_token(refresh_token: &str) -> Result<GiteeTokenSet, S
         .await
         .map_err(|e| format!("无法连接 Gitee（{e}）"))?;
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    parse_gitee_token(&body, unix_now())
+}
+
+/// 授权码兑换：经安全网关执行，本进程不接触应用凭证。
+pub(crate) async fn exchange_gitee_code(
+    code: &str,
+    redirect_uri: &str,
+) -> Result<GiteeTokenSet, String> {
+    let body = oauth_gateway_call(
+        "/v1/oauth/gitee/exchange",
+        json!({"code": code, "redirect_uri": redirect_uri}),
+    )
+    .await?;
+    parse_gitee_token(&body, unix_now())
+}
+
+/// Refresh a Gitee token pair through the gateway. The refresh token rotates on
+/// every use.
+pub async fn refresh_gitee_token(refresh_token: &str) -> Result<GiteeTokenSet, String> {
+    let body = oauth_gateway_call(
+        "/v1/oauth/gitee/refresh",
+        json!({"refresh_token": refresh_token}),
+    )
+    .await?;
     parse_gitee_token(&body, unix_now())
 }
 
@@ -719,7 +785,7 @@ pub async fn contribution_status_handler(
                     "policy": policy.as_str(),
                     "pending_count": pending_count,
                     "device_flow_available": oauth_client_id(None).is_some(),
-                    "gitee_oauth_available": gitee_oauth_available(),
+                    "gitee_oauth_available": gitee_oauth_available().await,
                 })),
             )
                 .into_response();
@@ -739,7 +805,7 @@ pub async fn contribution_status_handler(
                 .unwrap_or("auto"),
             "pending_count": pending_count,
             "device_flow_available": oauth_client_id(None).is_some(),
-            "gitee_oauth_available": gitee_oauth_available(),
+            "gitee_oauth_available": gitee_oauth_available().await,
         })),
     )
         .into_response()
@@ -1360,8 +1426,6 @@ pub async fn device_poll_handler(
 
 #[derive(Debug, Deserialize)]
 pub struct GiteeOAuthStartRequest {
-    /// Optional OAuth App client id; falls back to the configured env one.
-    pub client_id: Option<String>,
     /// The origin the wizard is served from (e.g. `http://localhost:8080`),
     /// used to build the callback URL unless an override is configured.
     pub redirect_origin: Option<String>,
@@ -1400,26 +1464,16 @@ pub async fn gitee_oauth_start_handler(
     State(_state): State<Arc<crate::GatewayState>>,
     Json(req): Json<GiteeOAuthStartRequest>,
 ) -> Response {
-    let Some(client_id) = gitee_oauth_client_id(req.client_id.as_deref()) else {
+    let Some(client_id) = gitee_oauth_client_id().await else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "no_oauth_app",
-                "message": "尚未配置 Gitee OAuth App client_id；请先用手动令牌通道连接，或由管理员设置 COGNEVA_GITEE_OAUTH_CLIENT_ID / COGNEVA_GITEE_OAUTH_CLIENT_SECRET"
+                "message": "尚未配置 Gitee OAuth App；请先用手动令牌通道连接，或由管理员为安全网关配置应用凭证"
             })),
         )
             .into_response();
     };
-    if gitee_oauth_client_secret().is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "no_oauth_app",
-                "message": "尚未配置 Gitee OAuth client_secret；请先用手动令牌通道连接，或由管理员设置 COGNEVA_GITEE_OAUTH_CLIENT_SECRET"
-            })),
-        )
-            .into_response();
-    }
     let redirect_uri = match resolve_redirect_uri(req.redirect_origin.as_deref()) {
         Ok(u) => u,
         Err(message) => {
@@ -1743,7 +1797,7 @@ pub fn spawn_gitee_token_refresher(
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if !gitee_oauth_available() {
+        if !gitee_oauth_available().await {
             return;
         }
         let mut interval = tokio::time::interval(Duration::from_secs(GITEE_REFRESH_INTERVAL_SECS));
