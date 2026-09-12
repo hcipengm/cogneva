@@ -1312,17 +1312,44 @@ async fn run_evolution_cycle(
     instance: &str,
     version: &str,
 ) -> cog_core::SFResult<()> {
+    use crate::workspace::{WorkspaceKind, WorkspaceSpec};
+
     let base = deps.workspaces.resolve_base(instance, version).await;
     let workspace = deps
         .workspaces
-        .ensure_persistent(crate::workspace::WorkspaceSpec::persistent(
+        .ensure_persistent(WorkspaceSpec::persistent(
             format!("cycle-{instance}"),
-            crate::workspace::WorkspaceKind::Cycle,
+            WorkspaceKind::Cycle,
             base.clone(),
         ))
         .await?;
-    deps.workspaces.refresh(&workspace, base).await?;
+    deps.workspaces.refresh(&workspace, base.clone()).await?;
     info!(path = %workspace.path.display(), "evolution cycle workspace ready");
+
+    // 引擎用基线树做 diff 可应用性校验，它必须与被校验的变更处在同一基线：
+    // 基线树停在旧提交时，新基线带进来的改动会让本来合法的变更在 --check
+    // 阶段被误判为打不上，变更被丢弃却看不出原因。基线与本轮工作树同源，
+    // 就地移动 HEAD 即可。
+    match deps
+        .workspaces
+        .ensure_persistent(WorkspaceSpec::persistent(
+            "engine-baseline",
+            WorkspaceKind::EngineBaseline,
+            base.clone(),
+        ))
+        .await
+    {
+        Ok(baseline) => {
+            if let Err(e) = deps.workspaces.refresh(&baseline, base).await {
+                warn!(
+                    error = %e,
+                    "engine baseline refresh failed; change validation keeps the previous baseline"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "engine baseline workspace unavailable"),
+    }
+
     run_evolution_cycle_in(deps, &workspace.path).await
 }
 
