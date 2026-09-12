@@ -1,0 +1,36 @@
+# 应用数据目录卷：identity.json（实例身份）、warehouse（学习数仓）、policies
+# （进化策略）、memory、raw-logs、对象存储后端都落在这里，必须跨 Pod 重启存活。
+# 身份文件一旦丢失，实例名就会随每次重启的机器指纹重算，按实例命名的资源
+# （沙盒工作树、evol/ 分支）随之逐次遗留，数仓与策略也一并清零。
+# 主应用与进化 Pod 各一个卷：两者以不同 UID 运行，共享同一 RWO 卷时 kubelet
+# 的 fsGroup 会互相改属主。
+# 不写 storageClassName，跟随集群默认 SC（与 pg/redis/qdrant 同策略）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-data-pvc
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: gateway-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-evolution-data-pvc
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva-evolution
+    app.kubernetes.io/component: evolution-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

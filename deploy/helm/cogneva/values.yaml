@@ -14,6 +14,17 @@ storage:
   evolution: "local-path"
   retain: "cogneva-local-retain"
 
+# 应用数据目录根（/var/lib/cogneva-data）：实例身份 identity.json、学习数仓
+# warehouse、进化策略 policies、记忆 memory、原始日志 raw-logs、对象存储后端都
+# 落在这里。必须跨 Pod 重启存活——身份文件一旦丢失，实例名就会随每次重启的机器
+# 指纹重算，按实例命名的资源（沙盒工作树、evol/ 分支）随之逐次遗留，数仓与策略
+# 也一并清零。主应用与进化 Pod 各挂一个卷：两者以不同 UID 运行，共享同一 RWO 卷
+# 时 kubelet 的 fsGroup 会互相改属主。
+appData:
+  storage: 5Gi
+  # 空 = 跟随集群默认 SC（与 pg/redis/qdrant 同策略，不绑厂商）。
+  storageClass: ""
+
 image:
   # 工作负载统一从集群内 registry 的 NodePort 拉取（每个节点的 kubelet 经
   # localhost:<nodePort> 访问，containerd 对 localhost 默认 http 免 TLS）。

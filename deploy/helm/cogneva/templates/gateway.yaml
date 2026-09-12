@@ -141,6 +141,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/sf-data
+            # 应用数据落持久卷：identity.json 决定实例名，丢了就会随机器指纹重算，
+            # 按实例命名的资源逐次遗留；数仓 / 策略 / 记忆 / 原始日志同在此目录。
+            - name: app-data
+              mountPath: /var/lib/cogneva-data
             - name: cogneva-json
               mountPath: /etc/cogneva
               readOnly: true
@@ -162,6 +166,9 @@ spec:
       volumes:
         - name: data
           emptyDir: {}
+        - name: app-data
+          persistentVolumeClaim:
+            claimName: cogneva-data-pvc
         - name: cogneva-json
           configMap:
             name: cogneva-json
@@ -191,6 +198,24 @@ spec:
         runAsNonRoot: true
         runAsUser: 1001
         fsGroup: 1001
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-data-pvc
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.appData.storage }}
+  {{- with .Values.appData.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: Service

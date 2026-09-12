@@ -9,6 +9,7 @@ resources:
   - cogneva-json-configmap.yaml
   - prompts-configmap.yaml
   - deployment.yaml
+  - app-data-pvc.yaml
   - llm-admin-rbac.yaml
   - gitops-puller-rbac.yaml
   - service.yaml

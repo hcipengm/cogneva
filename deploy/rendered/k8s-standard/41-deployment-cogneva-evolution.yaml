@@ -127,6 +127,10 @@ spec:
               mountPath: /opt/cogneva/sandbox
             - name: source
               mountPath: /opt/cogneva/sandbox/src
+            # 应用数据落持久卷：identity.json 决定实例名，丢了就会随机器指纹重算，
+            # 按实例命名的资源逐次遗留；数仓 / 策略 / 记忆 / 原始日志同在此目录。
+            - name: app-data
+              mountPath: /var/lib/cogneva-data
             - name: git-remote
               mountPath: /host-git
               readOnly: false
@@ -149,6 +153,9 @@ spec:
         - name: source
           persistentVolumeClaim:
             claimName: cogneva-evolution-source-pvc
+        - name: app-data
+          persistentVolumeClaim:
+            claimName: cogneva-evolution-data-pvc
         - name: git-remote
           # 多节点/生产：hostPath 只存在于单个节点，必须走集群卷
           persistentVolumeClaim:
