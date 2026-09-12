@@ -64,14 +64,16 @@ securityGateway:
     - monitoring
   # 上游池可观测导出端点。四种体裁各落各的后端：日志→Loki、时序明细
   # →ClickHouse、告警状态机→PostgreSQL（复用 cogneva 自身 PG，无需配置）、
-  # 指标→Prometheus（ServiceMonitor 已抓取）。全部默认关闭：端点不通时网关
-  # 只 WARN 降级，池自愈主链（Redis 跨进程信号 + PG 告警）不依赖它们。
+  # 指标→Prometheus（ServiceMonitor 已抓取）。默认开启：观测栈的安装脚本
+  # 默认就带上这两个后端（BACKENDS=1）；端点不通时网关只降级告警，池自愈
+  # 主链（Redis 跨进程信号 + PG 告警）不依赖它们。只要指标栈时设 BACKENDS=0
+  # 并把这两项置 false。
   observability:
     loki:
-      enabled: false
+      enabled: true
       endpoint: "http://loki.monitoring.svc.cluster.local:3100"
     clickhouse:
-      enabled: false
+      enabled: true
       baseUrl: "http://clickhouse.monitoring.svc.cluster.local:8123"
       database: "cogneva"
       table: "llm_events"

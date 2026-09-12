@@ -190,9 +190,13 @@ impl ClickHouseAnalyticsBackend {
         })
     }
 
-    /// Initialize the analytics table if it does not exist.
-    pub async fn init_table(&self) -> anyhow::Result<()> {
-        let ddl = format!(
+    /// DDL for the analytics table.
+    ///
+    /// TTL 的表达式必须求值为 `Date` 或 `DateTime`：列是 `DateTime64(3)`，直接
+    /// 拿它当 TTL 表达式会被拒（`Code: 450 BAD_TTL_EXPRESSION`），故显式转成
+    /// `DateTime` 再算过期时刻。毫秒精度仍保留在列里，只是过期判定按秒。
+    fn create_table_ddl(&self) -> String {
+        format!(
             r#"
             CREATE TABLE IF NOT EXISTS {}.{} (
                 event_id String,
@@ -206,11 +210,16 @@ impl ClickHouseAnalyticsBackend {
             ) ENGINE = MergeTree()
             ORDER BY (event_type, timestamp)
             PARTITION BY toYYYYMM(timestamp)
-            TTL timestamp + INTERVAL 1 YEAR
+            TTL toDateTime(timestamp) + INTERVAL 1 YEAR
             SETTINGS index_granularity = 8192
             "#,
             self.database, self.table
-        );
+        )
+    }
+
+    /// Initialize the analytics table if it does not exist.
+    pub async fn init_table(&self) -> anyhow::Result<()> {
+        let ddl = self.create_table_ddl();
 
         let mut req = HttpRequest::post(&self.base_url).body(ddl.into_bytes());
         if let Some((k, v)) = self.auth_header() {
@@ -742,5 +751,30 @@ impl ClickHouseEventBuffer {
 
     pub fn send(&self, event: AnalyticsEvent) {
         let _ = self.tx.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `DateTime64(3)` 不能直接当 TTL 表达式（ClickHouse 报 450
+    /// `BAD_TTL_EXPRESSION`），必须转成 `DateTime`；列类型仍是毫秒精度。
+    #[test]
+    fn clickhouse_ddl_ttl_casts_datetime64() {
+        let backend = ClickHouseAnalyticsBackend::new("http://clickhouse:8123", "cogneva")
+            .with_table("llm_events");
+        let ddl = backend.create_table_ddl();
+
+        assert!(ddl.contains("timestamp DateTime64(3)"), "{ddl}");
+        assert!(
+            ddl.contains("TTL toDateTime(timestamp) + INTERVAL 1 YEAR"),
+            "TTL 必须对 DateTime64 列做转换，否则建表 450：{ddl}"
+        );
+        assert!(
+            !ddl.contains("TTL timestamp + INTERVAL"),
+            "裸 DateTime64 列作 TTL 表达式会被 ClickHouse 拒收：{ddl}"
+        );
+        assert!(ddl.contains("cogneva.llm_events"), "{ddl}");
     }
 }

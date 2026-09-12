@@ -153,11 +153,11 @@ spec:
             # 日志→Loki、时序明细→ClickHouse、告警→Alertmanager；端点随观测栈，
             # 未启用时对应导出静默降级（池自愈主链不受影响）。
             - name: COGNEVA_LOKI_ENABLED
-              value: "false"
+              value: "true"
             - name: COGNEVA_LOKI_ENDPOINT
               value: "http://loki.monitoring.svc.cluster.local:3100"
             - name: COGNEVA_CLICKHOUSE_ENABLED
-              value: "false"
+              value: "true"
             - name: COGNEVA_CLICKHOUSE_BASE_URL
               value: "http://clickhouse.monitoring.svc.cluster.local:8123"
             - name: COGNEVA_CLICKHOUSE_DATABASE

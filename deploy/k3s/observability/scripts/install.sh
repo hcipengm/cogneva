@@ -2,13 +2,18 @@
 # Cogneva 可观测性栈一键安装脚本
 #
 # 用法:
-#   ./install.sh            # 默认 small 档：prometheus+grafana+node-exporter+kube-state-metrics，
-#                           # 适配 4C/7.5G 单节点（本机）
-#   PROFILE=full ./install.sh   # 全量档：加 alertmanager+loki+jaeger，面向多节点生产
+#   ./install.sh                  # 默认：small 档指标栈 + Loki/ClickHouse 两个日志与
+#                                 #        时序明细后端（适配 4C/7.5G 单节点，本机）
+#   PROFILE=full ./install.sh     # 指标栈换成全量档（alertmanager 等），面向多节点生产
+#   BACKENDS=0 ./install.sh       # 不装 Loki / ClickHouse，只要指标栈
+#
+# PROFILE 只决定指标栈（kube-prometheus-stack）用缩配还是全量 values；
+# 日志与时序明细后端是否安装由 BACKENDS 独立控制，两者互不牵连。
 
 set -euo pipefail
 
 PROFILE="${PROFILE:-small}"
+BACKENDS="${BACKENDS:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELM_DIR="${SCRIPT_DIR}/../helm"
@@ -51,7 +56,6 @@ check_prerequisites() {
 add_helm_repos() {
     log_info "添加 Helm 仓库..."
     helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
-    helm repo add grafana https://grafana.github.io/helm-charts 2>/dev/null || true
     helm repo add jaegertracing https://jaegertracing.github.io/helm-charts 2>/dev/null || true
     helm repo update
     log_info "Helm 仓库更新完成 ✓"
@@ -85,19 +89,22 @@ deploy_manifests() {
     #     ingress-nginx 源地址是节点 IP，匹配不上，会把反代流量全拦下。
     #     生产形态（controller 非 hostNetwork）再启用。
     #   05-podmonitor — 与 04-servicemonitor 二选一的替代方案，避免双份抓取。
-    #   09-clickhouse — 只在 full 档部署（时序明细后端，见 deploy_clickhouse）。
+    #   09-clickhouse / 10-loki — 日志与时序明细后端，由 BACKENDS 开关控制。
     for f in "${MANIFESTS_DIR}"/*.yaml; do
         case "$(basename "$f")" in
             02-networkpolicy.yaml|05-podmonitor-cogneva.yaml)
                 log_warn "跳过: $(basename "$f")"
                 continue ;;
-            09-clickhouse.yaml)
-                if [ "${PROFILE}" = "full" ]; then
-                    ensure_clickhouse_credentials
+            09-clickhouse.yaml|10-loki.yaml)
+                if [ "${BACKENDS}" = "1" ]; then
+                    # 凭证只能在清单之前备好：ClickHouse 从 secretKeyRef 读密码。
+                    if [ "$(basename "$f")" = "09-clickhouse.yaml" ]; then
+                        ensure_clickhouse_credentials
+                    fi
                     log_info "应用: $(basename "$f")"
                     kubectl apply -f "$f"
                 else
-                    log_warn "跳过: $(basename "$f")（缩配档不部署时序明细后端）"
+                    log_warn "跳过: $(basename "$f")（BACKENDS=0）"
                 fi
                 continue ;;
         esac
@@ -141,19 +148,6 @@ deploy_prometheus_stack() {
         --timeout 600s
 
     log_info "kube-prometheus-stack 部署完成 ✓"
-}
-
-# ─── 部署 Loki ────────────────────────────────────────────────────
-deploy_loki() {
-    log_info "部署 Loki + Promtail (日志聚合)..."
-
-    helm upgrade --install loki grafana/loki-stack \
-        --namespace "${NAMESPACE}" \
-        --values "${HELM_DIR}/loki-values.yaml" \
-        --wait \
-        --timeout 300s
-
-    log_info "Loki 部署完成 ✓"
 }
 
 # ─── 部署 Jaeger ──────────────────────────────────────────────────
@@ -204,14 +198,16 @@ main() {
     add_helm_repos
     deploy_manifests
     deploy_prometheus_stack
-    if [ "${PROFILE}" = "full" ]; then
-        deploy_loki
-        deploy_jaeger
-        # ClickHouse 清单已在 deploy_manifests 应用；这里把密码同步给网关命名空间，
-        # 网关据此连 ClickHouse 写时序明细（securityGateway.observability.clickhouse）。
+    # Loki / ClickHouse 清单已在 deploy_manifests 应用；这里把 ClickHouse 密码同步给
+    # 网关命名空间，网关据此连 ClickHouse 写时序明细
+    # （securityGateway.observability.clickhouse）。
+    if [ "${BACKENDS}" = "1" ]; then
         mirror_clickhouse_password
     else
-        log_info "缩配档跳过 Loki / ClickHouse / Jaeger（日志、时序明细与链路追踪生产档再上）"
+        log_info "BACKENDS=0：跳过日志与时序明细后端（Loki / ClickHouse）"
+    fi
+    if [ "${PROFILE}" = "full" ]; then
+        deploy_jaeger
     fi
     verify_deployment
 

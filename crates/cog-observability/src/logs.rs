@@ -391,15 +391,29 @@ impl LokiPushClient {
     }
 
     fn build_payload(&self, entries: Vec<LogEntry>) -> serde_json::Value {
-        let mut streams: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        // 流标签必须是对象（`{"job":"…"}`），不能是标签集字面量字符串：Loki 的
+        // loghttp 解码器对字符串形式一律 400（`Value looks like object`），
+        // 只有对象形式收得下。按标签集分组，键用 BTreeMap 保证流顺序确定。
+        let mut streams: BTreeMap<BTreeMap<String, String>, Vec<(String, String)>> =
+            BTreeMap::new();
         for entry in entries {
             let level = entry.level.clone();
-            let stream_key = format!(
-                "{{job=\"{}\",service=\"{}\",level=\"{}\"}}",
-                self.base_labels.get("job").unwrap_or(&"cogneva".into()),
-                self.base_labels.get("service").unwrap_or(&"cogneva".into()),
-                level
+            let mut labels: BTreeMap<String, String> = BTreeMap::new();
+            labels.insert(
+                "job".into(),
+                self.base_labels
+                    .get("job")
+                    .cloned()
+                    .unwrap_or_else(|| "cogneva".to_string()),
             );
+            labels.insert(
+                "service".into(),
+                self.base_labels
+                    .get("service")
+                    .cloned()
+                    .unwrap_or_else(|| "cogneva".to_string()),
+            );
+            labels.insert("level".into(), level.clone());
             let timestamp_ns = format!("{}", entry.timestamp.timestamp_nanos_opt().unwrap_or(0));
             let line = format!(
                 "[{}] {} {}",
@@ -408,7 +422,7 @@ impl LokiPushClient {
                 entry.message
             );
             streams
-                .entry(stream_key)
+                .entry(labels)
                 .or_default()
                 .push((timestamp_ns, line));
         }
@@ -481,5 +495,69 @@ impl LokiBackgroundPusher {
                 tracing::warn!("Loki background push failed: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(level: &str, message: &str) -> LogEntry {
+        LogEntry {
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            level: level.into(),
+            event: "probe".into(),
+            trace_id: None,
+            span_id: None,
+            task_id: None,
+            agent_id: None,
+            message: message.into(),
+            context: HashMap::new(),
+        }
+    }
+
+    /// 流标签必须是对象：Loki 的 loghttp 解码器拒收标签集字面量字符串
+    /// （`map[level:…]` 形式的 `"stream"` 会 400 `Value looks like object`）。
+    #[test]
+    fn payload_stream_is_object_not_label_literal() {
+        let client = LokiPushClient::new("http://loki:3100").with_label("service", "probe");
+        let payload = client.build_payload(vec![entry("info", "hello")]);
+
+        let streams = payload
+            .get("streams")
+            .and_then(|v| v.as_array())
+            .expect("streams array");
+        assert_eq!(streams.len(), 1);
+        let stream = streams[0].get("stream").expect("stream field");
+        assert!(
+            stream.is_object(),
+            "stream must be a JSON object, got {stream}"
+        );
+        assert_eq!(
+            stream.get("service").and_then(|v| v.as_str()),
+            Some("probe")
+        );
+        assert_eq!(stream.get("level").and_then(|v| v.as_str()), Some("info"));
+        assert_eq!(stream.get("job").and_then(|v| v.as_str()), Some("cogneva"));
+
+        let values = streams[0]
+            .get("values")
+            .and_then(|v| v.as_array())
+            .expect("values array");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].as_array().expect("entry pair").len(), 2);
+    }
+
+    /// 同一标签集合并成一条流，级别不同则分属不同流。
+    #[test]
+    fn payload_groups_entries_by_label_set() {
+        let client = LokiPushClient::new("http://loki:3100").with_label("service", "probe");
+        let payload = client.build_payload(vec![
+            entry("info", "a"),
+            entry("info", "b"),
+            entry("warn", "c"),
+        ]);
+        let streams = payload.get("streams").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(streams.len(), 2, "info 两条合一，warn 单独一条");
     }
 }

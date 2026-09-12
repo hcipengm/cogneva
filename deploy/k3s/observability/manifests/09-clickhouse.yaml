@@ -91,13 +91,16 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 20
             failureThreshold: 5
+          # 请求压到最小：单节点可支配内存本就紧（节点请求量已近 allocatable），
+          # 本后端是旁路导出面，写入量小，给调度器一个低成本占位即可；
+          # 上限留 1Gi 兜住突发批量。装到多节点生产可上调。
           resources:
             requests:
-              cpu: 500m
-              memory: 1Gi
+              cpu: 100m
+              memory: 128Mi
             limits:
-              cpu: 2000m
-              memory: 3Gi
+              cpu: 1000m
+              memory: 1Gi
   volumeClaimTemplates:
     - metadata:
         name: data
