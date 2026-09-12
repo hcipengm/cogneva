@@ -243,7 +243,11 @@ mod tests {
         assert_eq!(alert.event_type, "llm_upstream_pool_down");
         assert_eq!(alert.severity, AlertSeverity::Critical);
         assert!(!alert.resolved);
-        assert!(alert.message.contains("2026-09-13"), "含最早恢复时间: {}", alert.message);
+        assert!(
+            alert.message.contains("2026-09-13"),
+            "含最早恢复时间: {}",
+            alert.message
+        );
     }
 
     #[test]
