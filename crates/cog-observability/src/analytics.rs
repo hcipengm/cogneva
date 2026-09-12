@@ -174,6 +174,17 @@ impl ClickHouseAnalyticsBackend {
         format!("{}/?database={}", self.base_url, self.database)
     }
 
+    /// 批量插入的 URL。必须显式拼出唯一的 `?`：`url()` 已经带了查询串，
+    /// 再往上接一个 `/?query=…` 会把第二个 `?` 之后的内容整体塞进 `database`
+    /// 参数的值里，服务端于是报 `Database 'cogneva/?query=INSERT …' does not
+    /// exist`。
+    fn insert_url(&self) -> String {
+        format!(
+            "{}/?database={}&query=INSERT+INTO+{}+FORMAT+JSONEachRow",
+            self.base_url, self.database, self.table
+        )
+    }
+
     fn auth_header(&self) -> Option<(String, String)> {
         if self.password.is_empty() {
             None
@@ -271,12 +282,7 @@ impl AnalyticsBackend for ClickHouseAnalyticsBackend {
             .collect::<Result<Vec<_>, _>>()?
             .join("\n");
 
-        let url = format!(
-            "{}/?query=INSERT+INTO+{}+FORMAT+JSONEachRow",
-            self.url(),
-            self.table
-        );
-        let mut req = HttpRequest::post(&url).body(body.into_bytes());
+        let mut req = HttpRequest::post(self.insert_url()).body(body.into_bytes());
         if let Some((k, v)) = self.auth_header() {
             req = req.header(k, v);
         }
@@ -776,5 +782,25 @@ mod tests {
             "裸 DateTime64 列作 TTL 表达式会被 ClickHouse 拒收：{ddl}"
         );
         assert!(ddl.contains("cogneva.llm_events"), "{ddl}");
+    }
+
+    /// 插入 URL 只能有一个 `?`：第二个 `?` 会把 query 参数整段并进 `database`
+    /// 的值，服务端报 `Database 'cogneva/?query=INSERT …' does not exist`。
+    #[test]
+    fn clickhouse_insert_url_has_a_single_query_separator() {
+        let backend = ClickHouseAnalyticsBackend::new("http://clickhouse:8123", "cogneva")
+            .with_table("llm_events");
+        let url = backend.insert_url();
+
+        assert_eq!(
+            url.matches('?').count(),
+            1,
+            "only the first query separator may be a '?': {url}"
+        );
+        assert!(url.contains("database=cogneva&query=INSERT"), "{url}");
+        assert!(
+            url.contains("INSERT+INTO+llm_events+FORMAT+JSONEachRow"),
+            "{url}"
+        );
     }
 }
