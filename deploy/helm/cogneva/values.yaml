@@ -35,7 +35,11 @@ image:
   # 默认 tag = 应用版本（与 Cargo.toml workspace version 同源，发布脚本强制校验）。
   # 自举部署的 profile values 覆盖为 local（浮动签，随导入的 release 镜像走）。
   tag: "0.5.7"
-  pullPolicy: IfNotPresent
+  # 必须 Always：静态清单把四部署指回浮动签 :local，内容可被 bootstrap/swap-image
+  # 重新播种。IfNotPresent 下节点缓存里那份旧内容会被无限期复用——tag 字符串没变、
+  # registry 上 :local 也是新的，唯独节点跑的是旧二进制，任何基于清单/registry 的
+  # 校验都看不出这条降级。Always 让浮动签的"拉取时解析"语义成立。
+  pullPolicy: Always
 
 gateway:
   # 单副本：单节点集群双副本无可用性收益，只放大内存与凭证副本；多节点后调回 2

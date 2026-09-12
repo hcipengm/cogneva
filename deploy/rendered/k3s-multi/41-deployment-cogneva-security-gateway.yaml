@@ -35,7 +35,7 @@ spec:
       containers:
         - name: security-gateway
           image: localhost:30500/cogneva:local
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/opt/cogneva/cogneva"]
           args: ["security-gateway"]
           ports:

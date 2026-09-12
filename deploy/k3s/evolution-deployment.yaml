@@ -35,7 +35,9 @@ spec:
         # this init step only prepares the shared object store and layout.
         - name: seed-source
           image: localhost:30500/cogneva:local
-          imagePullPolicy: IfNotPresent
+          # 必须 Always：静态清单把部署指回浮动签 :local，内容可被 bootstrap/
+          # swap-image 重新播种；IfNotPresent 会无限期复用节点缓存里的旧内容。
+          imagePullPolicy: Always
           command:
             - sh
             - -c
@@ -73,7 +75,9 @@ spec:
       containers:
         - name: cogneva
           image: localhost:30500/cogneva:local
-          imagePullPolicy: IfNotPresent
+          # 必须 Always：静态清单把部署指回浮动签 :local，内容可被 bootstrap/
+          # swap-image 重新播种；IfNotPresent 会无限期复用节点缓存里的旧内容。
+          imagePullPolicy: Always
           workingDir: /opt/cogneva/sandbox/workspaces
           # Privileged container = filesystem sandbox boundary. All writes go
           # into the mounted PVCs; the node itself is only exposed through the

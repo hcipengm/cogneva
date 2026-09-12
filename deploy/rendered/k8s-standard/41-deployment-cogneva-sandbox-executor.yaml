@@ -42,7 +42,7 @@ spec:
       containers:
         - name: sandbox-executor
           image: localhost:30500/cogneva:local
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/opt/cogneva/cogneva"]
           args: ["sandbox-executor"]
           ports:

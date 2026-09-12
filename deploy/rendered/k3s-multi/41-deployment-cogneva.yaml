@@ -47,7 +47,7 @@ spec:
       containers:
         - name: cogneva
           image: localhost:30500/cogneva:local
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8080

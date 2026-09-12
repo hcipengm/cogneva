@@ -36,7 +36,7 @@ spec:
       initContainers:
         - name: seed-source
           image: localhost:30500/cogneva:local
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command:
             - sh
             - -c
@@ -73,7 +73,7 @@ spec:
       containers:
         - name: cogneva
           image: localhost:30500/cogneva:local
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           workingDir: /opt/cogneva/sandbox/workspaces
           # 特权容器 = 文件系统沙盒边界（3.2 image-based 滚动更新后移除）
           securityContext:

@@ -43,7 +43,9 @@ spec:
       containers:
         - name: cogneva
           image: localhost:30500/cogneva:local
-          imagePullPolicy: IfNotPresent
+          # 必须 Always：静态清单把部署指回浮动签 :local，内容可被 bootstrap/
+          # swap-image 重新播种；IfNotPresent 会无限期复用节点缓存里的旧内容。
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8080
