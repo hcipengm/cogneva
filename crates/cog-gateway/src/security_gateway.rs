@@ -87,6 +87,11 @@ pub struct SecurityGatewayConfig {
     pub gitee_token: Option<String>,
     /// Webhook 入口通道监听端口（第三通道，面向集群外平台回调）。
     pub webhook_port: u16,
+    /// 观测通道监听端口（第四通道，只挂 /health/* 与 /metrics）。
+    /// 单列一条的原因：egress 与 LLM 通道会注入真实上游凭证，跨命名空间
+    /// 放行等于把凭证代持能力交给监控侧；观测通道不含任何代理路由，
+    /// 可以只对它放行监控命名空间。
+    pub metrics_port: u16,
     /// GitHub webhook HMAC-SHA256 验签 secret（COGNEVA_GITHUB_WEBHOOK_SECRET）。
     /// 未配置时 /webhooks/github 一律 503（fail-closed）。
     pub github_webhook_secret: Option<String>,
@@ -134,6 +139,7 @@ impl SecurityGatewayConfig {
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
             webhook_port: env_u16("COGNEVA_SG_WEBHOOK_PORT", 8082),
+            metrics_port: env_u16("COGNEVA_SG_METRICS_PORT", 9090),
             github_webhook_secret: token("COGNEVA_GITHUB_WEBHOOK_SECRET"),
             gitee_webhook_token: token("COGNEVA_GITEE_WEBHOOK_TOKEN"),
             webhook_internal_secret: token("COGNEVA_WEBHOOK_INTERNAL_SECRET"),
@@ -2253,6 +2259,16 @@ fn webhook_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 观测通道路由：只暴露健康检查与指标，不含代理、不含 webhook 转发。
+fn metrics_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
+        .route("/metrics", get(metrics_handler))
+        .route("/metrics/json", get(metrics_json_handler))
+        .with_state(state)
+}
+
 /// 装日志订阅者：级别 `COGNEVA_LOG_LEVEL` → `RUST_LOG` → info，格式
 /// `COGNEVA_LOG_FORMAT=json|pretty`。Loki 开启时同一批事件镜像一份到 Loki，
 /// 网关的 stdout 与 Loki 内容一致（此前网关从不装订阅者，tracing 全被丢弃，
@@ -2414,10 +2430,12 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
     let egress_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.egress_port));
     let llm_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.llm_port));
     let webhook_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.webhook_port));
+    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.metrics_port));
     tracing::info!(
         egress = %egress_addr,
         llm = %llm_addr,
         webhook = %webhook_addr,
+        metrics = %metrics_addr,
         allowlist = ?config.domain_allowlist,
         denylist = ?config.domain_denylist,
         "安全网关启动（凭证仅存在本进程内存）"
@@ -2432,9 +2450,13 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
     );
     let webhook = axum::serve(
         tokio::net::TcpListener::bind(webhook_addr).await?,
-        webhook_router(state),
+        webhook_router(state.clone()),
     );
-    tokio::try_join!(egress, llm, webhook)?;
+    let metrics = axum::serve(
+        tokio::net::TcpListener::bind(metrics_addr).await?,
+        metrics_router(state),
+    );
+    tokio::try_join!(egress, llm, webhook, metrics)?;
     Ok(())
 }
 
@@ -2458,6 +2480,7 @@ mod tests {
             github_token: None,
             gitee_token: None,
             webhook_port: 8082,
+            metrics_port: 9090,
             github_webhook_secret: None,
             gitee_webhook_token: None,
             webhook_internal_secret: None,
@@ -3085,5 +3108,42 @@ mod tests {
         assert!(!is_media_content_type("text/html"));
         assert!(!is_media_content_type("application/json"));
         assert!(!is_media_content_type("application/octet-stream"));
+    }
+
+    /// 观测通道必须能出指标，且**必须不含任何代理路由**——监控侧能被放行
+    /// 到这条通道，前提就是它拿不到凭证代持能力。
+    #[tokio::test]
+    async fn metrics_channel_serves_metrics_and_no_proxy_routes() {
+        use tower::ServiceExt;
+        let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let app = metrics_router(state);
+
+        let get = |uri: &'static str| {
+            axum::extract::Request::builder()
+                .uri(uri)
+                .method("GET")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for uri in ["/metrics", "/metrics/json", "/health/live", "/health/ready"] {
+            let resp = app.clone().oneshot(get(uri)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} 应可用");
+        }
+
+        let post = |uri: &'static str| {
+            axum::extract::Request::builder()
+                .uri(uri)
+                .method("POST")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for uri in ["/proxy", "/v1/chat/completions", "/webhooks/github"] {
+            let resp = app.clone().oneshot(post(uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} 不应出现在观测通道上"
+            );
+        }
     }
 }

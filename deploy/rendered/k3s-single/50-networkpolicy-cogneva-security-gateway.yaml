@@ -34,5 +34,18 @@ spec:
     - ports:
         - protocol: TCP
           port: 8082
+    # 观测通道：只向监控命名空间放行，且只放这一个端口。该通道不挂任何代理
+    # 路由，监控侧即使被放行也拿不到凭证代持能力（8080/8081 会注入真上游凭证，
+    # 因此那两条仍只对同命名空间开放）。
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  - "monitoring"
+      ports:
+        - protocol: TCP
+          port: 9090
   egress:
     - {}

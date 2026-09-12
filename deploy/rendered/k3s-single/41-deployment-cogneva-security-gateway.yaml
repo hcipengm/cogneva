@@ -48,6 +48,9 @@ spec:
             - name: webhook
               containerPort: 8082
               protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: cogneva-config
@@ -154,3 +157,6 @@ spec:
                   name: cogneva-secrets
                   key: clickhouse-password
                   optional: true
+            # 观测通道监听端口；与容器端口同源 values，避免两处漂移。
+            - name: COGNEVA_SG_METRICS_PORT
+              value: "9090"

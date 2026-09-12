@@ -42,6 +42,9 @@ spec:
             - name: webhook
               containerPort: 8082
               protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.securityGateway.metricsPort }}
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: cogneva-config
@@ -148,6 +151,9 @@ spec:
                   name: cogneva-secrets
                   key: clickhouse-password
                   optional: true
+            # 观测通道监听端口；与容器端口同源 values，避免两处漂移。
+            - name: COGNEVA_SG_METRICS_PORT
+              value: {{ .Values.securityGateway.metricsPort | quote }}
 ---
 apiVersion: v1
 kind: Service
@@ -170,5 +176,9 @@ spec:
     - name: llm-proxy
       port: 8081
       targetPort: llm-proxy
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.securityGateway.metricsPort }}
+      targetPort: metrics
       protocol: TCP
 {{- end }}

@@ -52,6 +52,12 @@ gateway:
 securityGateway:
   enabled: true
   replicas: 1
+  # 观测通道端口：只挂 /health/* 与 /metrics，不含任何代理路由。与 8080/8081
+  # 分列的原因是那两条通道会注入真实上游凭证，跨命名空间放行等于把凭证代持
+  # 能力交给监控侧；观测通道没有代理面，可以只对它放行监控命名空间。
+  metricsPort: 9090
+  metricsAllowedNamespaces:
+    - monitoring
   # 上游池可观测导出端点。四种体裁各落各的后端：日志→Loki、时序明细
   # →ClickHouse、告警状态机→PostgreSQL（复用 cogneva 自身 PG，无需配置）、
   # 指标→Prometheus（ServiceMonitor 已抓取）。全部默认关闭：端点不通时网关
