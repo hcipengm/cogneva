@@ -75,6 +75,76 @@ pub fn job_name(rev: &str) -> String {
     format!("cogneva-mainline-{}", rev12(rev))
 }
 
+/// `host:port` 端点拆成 (host, port)。buildah 强制 registry 端点带端口，
+/// 集群内 registry 因此永远可解析。
+fn endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
+    let (host, port) = endpoint.trim_end_matches('/').rsplit_once(':')?;
+    Some((host, port.parse().ok()?))
+}
+
+/// 单平台 manifest 的 config blob digest（多平台 index 没有这一层）。
+fn config_digest_of(manifest: &serde_json::Value) -> Option<String> {
+    manifest
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|d| d.as_str())
+        .map(|d| d.to_string())
+}
+
+/// 多平台 index 里第一个子 manifest 的 digest（各平台镜像由同一次构建产出，
+/// rev 标签一致，取哪个都行）。
+fn first_manifest_digest(index: &serde_json::Value) -> Option<String> {
+    index
+        .get("manifests")
+        .and_then(|m| m.as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| m.get("digest"))
+        .and_then(|d| d.as_str())
+        .map(|d| d.to_string())
+}
+
+/// 从 image config blob 里取构建期写入的 rev 标签。
+fn revision_of_config_blob(blob: &serde_json::Value) -> Option<String> {
+    blob.get("config")?
+        .get("Labels")?
+        .get("org.opencontainers.image.revision")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// 从裸 HTTP 响应里切出状态码与 body（按 `Content-Length` 截断；缺失则取
+/// 剩余全部）。registry 的 JSON 响应永远带 Content-Length。
+fn parse_http_response(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&raw[..split]).ok()?;
+    let mut lines = head.lines();
+    let status = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let len = lines
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse::<usize>().ok());
+    let body = &raw[split + 4..];
+    let body = match len {
+        Some(n) if n <= body.len() => &body[..n],
+        _ => body,
+    };
+    Some((status, body.to_vec()))
+}
+
+/// 这些 tag 的镜像内容与 rev 一一对应（不可变），其余（浮动签）不能由
+/// tag 反推 rev——必须问 registry 当前内容是什么版本。
+fn tag_is_immutable_for_rev(tag: &str) -> bool {
+    tag.starts_with("main-")
+}
+
+/// 浮动签是否就是目标 rev：仅当 registry 上该 tag 的镜像当前确实构建自
+/// `bare_rev` 时才成立。只看清单里的 tag 字符串会把"标签还在、内容已被
+/// 重新播种成旧二进制"当成已收敛，浮动签随即前移，旧二进制被固化成
+/// 静态清单 apply 的回退锚点。
+fn floating_pin_is_converged(declared_rev: Option<&str>, bare_rev: &str) -> bool {
+    matches!(declared_rev, Some(r) if rev12(r) == rev12(bare_rev))
+}
+
 /// 命中即无自救可能的 Pod 等待态：拉不到镜像、镜像引用非法、挂载/配置
 /// 错误、容器反复崩溃退出。出现这些状态的新副本永远不会 ready，等再久
 /// 也只会烧 rollout 超时，必须立即判败触发回滚。
@@ -430,6 +500,123 @@ impl MainlineDeployer {
         Ok(images)
     }
 
+    /// 集群内 registry 的最小只读客户端：明文 HTTP、同命名空间 DNS、
+    /// 无凭证（insecure registry，buildah 走的就是这条通道）。
+    async fn registry_get(&self, path: &str, accept: &[&str]) -> SFResult<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let endpoint = self.push_endpoint();
+        let (host, port) = endpoint_host_port(&endpoint).ok_or_else(|| {
+            SFError::Agent(format!("registry endpoint {endpoint:?} is not host:port"))
+        })?;
+        let accepted = if accept.is_empty() {
+            String::new()
+        } else {
+            format!("Accept: {}\r\n", accept.join(", "))
+        };
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{accepted}Connection: close\r\n\r\n");
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::net::TcpStream::connect((host, port)),
+        )
+        .await
+        .map_err(|_| SFError::IO(format!("registry {endpoint} connect timed out")))?
+        .map_err(|e| SFError::IO(format!("registry {endpoint} connect failed: {e}")))?;
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .map_err(|e| SFError::IO(format!("registry request write failed: {e}")))?;
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut raw))
+            .await
+            .map_err(|_| SFError::IO("registry read timed out".into()))?
+            .map_err(|e| SFError::IO(format!("registry read failed: {e}")))?;
+        let (status, body) = parse_http_response(&raw)
+            .ok_or_else(|| SFError::IO("registry returned a malformed HTTP response".into()))?;
+        if status != 200 {
+            return Err(SFError::IO(format!("registry GET {path} -> {status}")));
+        }
+        Ok(body)
+    }
+
+    /// registry 上某 tag 当前内容构建自哪个 rev：manifest → config blob →
+    /// `org.opencontainers.image.revision` 标签。多平台 index 多一跳，先下
+    /// 第一个子 manifest 取它的 config digest（各平台同 rev，标签一致）。
+    async fn registry_tag_revision(&self, tag: &str) -> SFResult<Option<String>> {
+        const MANIFEST_ACCEPT: &[&str] = &[
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        ];
+        let manifest = self.registry_manifest(tag, MANIFEST_ACCEPT).await?;
+        let config_digest = match config_digest_of(&manifest) {
+            Some(d) => d,
+            None => {
+                let Some(child) = first_manifest_digest(&manifest) else {
+                    return Ok(None);
+                };
+                let child_manifest = self.registry_manifest(&child, MANIFEST_ACCEPT).await?;
+                let Some(d) = config_digest_of(&child_manifest) else {
+                    return Ok(None);
+                };
+                d
+            }
+        };
+        let blob: serde_json::Value = serde_json::from_slice(
+            &self
+                .registry_get(&format!("/v2/cogneva/blobs/{config_digest}"), &[])
+                .await?,
+        )
+        .map_err(|e| {
+            SFError::IO(format!(
+                "registry config blob {config_digest} is not JSON: {e}"
+            ))
+        })?;
+        Ok(revision_of_config_blob(&blob))
+    }
+
+    /// 取一个 manifest（tag 或 digest 引用皆可）。
+    async fn registry_manifest(
+        &self,
+        reference: &str,
+        accept: &[&str],
+    ) -> SFResult<serde_json::Value> {
+        serde_json::from_slice(
+            &self
+                .registry_get(&format!("/v2/cogneva/manifests/{reference}"), accept)
+                .await?,
+        )
+        .map_err(|e| SFError::IO(format!("registry manifest {reference} is not JSON: {e}")))
+    }
+
+    /// registry 上某 tag 是否存在（manifest 可取）。用于"不重建也能修"的
+    /// 快路：不可变 tag 内容与 rev 一一对应，存在即可直接滚动。
+    async fn registry_tag_exists(&self, tag: &str) -> bool {
+        self.registry_get(
+            &format!("/v2/cogneva/manifests/{tag}"),
+            &["application/vnd.docker.distribution.manifest.v2+json"],
+        )
+        .await
+        .is_ok()
+    }
+
+    /// 四部署当前声明的镜像对应哪个 rev。不可变 `main-<rev>` 由 tag 直接
+    /// 给出（tag 与内容一一对应）；浮动签必须问 registry 当前内容构建自
+    /// 哪个 rev——tag 字符串本身不含 rev，而内容随时可能被重新播种。四部署
+    /// 不一致或查不到一律 None（未知绝不当作已收敛）。
+    async fn declared_image_rev(&self, images: &[String]) -> Option<String> {
+        let first = images.first()?;
+        if !images.iter().all(|i| i == first) {
+            return None;
+        }
+        let tag = first.rsplit(':').next()?;
+        if tag_is_immutable_for_rev(tag) {
+            return parse_main_rev(first).map(|s| s.to_string());
+        }
+        self.registry_tag_revision(tag).await.ok().flatten()
+    }
+
     /// 叠层基底（buildah from，Pod 内走 push 端点）：已在主线 tag 上则用
     /// 不可变 main-<prev>；迁移首轮（Legacy）用 registry :local
     /// （swap-image/bootstrap 已播种）。绝不基于节点 localhost/cogneva:local
@@ -517,12 +704,24 @@ impl MainlineDeployer {
         // chart/k3s 清单）；:local 只在收敛后前移，所以 pin 命中 last_good 且
         // bare 未再前进时就是"以浮动签形态收敛"，不重建重派。
         let local_pin = local_image(&self.pull_endpoint());
-        if state.last_good_rev.as_deref() == Some(bare.as_str())
-            && !images.is_empty()
-            && images.iter().all(|i| i == &local_pin)
-        {
-            info!("deployments pinned to floating :local at current mainline; nothing to do");
-            return Ok(());
+        let on_local_pin = !images.is_empty() && images.iter().all(|i| i == &local_pin);
+        if state.last_good_rev.as_deref() == Some(bare.as_str()) && on_local_pin {
+            // 声明态只是"清单里写的是 :local"。浮动签的内容可以被重新播种
+            // （bootstrap/swap-image 从本机镜像重推），此时节点会随清单滚动
+            // 落到旧二进制，而 tag 字符串一个字都没变——只看清单就会把"退回
+            // 旧版"判成"无事可做"。必须问 registry 当前内容构建自哪个 rev。
+            let running_rev = self.declared_image_rev(&images).await;
+            if floating_pin_is_converged(running_rev.as_deref(), &bare) {
+                info!(rev = %rev12(&bare), "deployments pinned to floating :local carrying the current mainline; nothing to do");
+                return Ok(());
+            }
+            warn!(
+                rev = %rev12(&bare),
+                running_rev = ?running_rev,
+                "floating :local no longer carries the current mainline (re-seeded?); re-pinning"
+            );
+            // 落到下方构建流程：reset 到 bare、复用已有不可变镜像或重建，
+            // 再派 Job 把四部署 pin 回 `main-<rev>`。
         }
 
         let attempts = if state.failed_rev.as_deref() == Some(bare.as_str()) {
@@ -563,6 +762,30 @@ impl MainlineDeployer {
         let push_tag = main_image(&self.push_endpoint(), &bare);
         let pull_tag = main_image(&self.pull_endpoint(), &bare);
         let base_tag = self.resolve_base(&deployed);
+
+        // 不可变 tag 与 rev 一一对应：registry 上已有 `main-<rev>` 就说明
+        // 该 rev 早已构建过（清单被重下发打回浮动签后，四部署只是需要重新
+        // pin 回去），直接派 Job 滚动即可，4C 机器上省掉一次全程构建。
+        // 该 rev 此前失败过就老老实实重建——半推成功留下的坏 tag 不能靠
+        // 复用来"修复"，否则会在同一处反复失败。
+        if state.failed_rev.as_deref() != Some(bare.as_str())
+            && self.registry_tag_exists(&push_tag).await
+        {
+            info!(rev = %rev12(&bare), tag = %push_tag, "immutable image already in registry; re-pinning without a rebuild");
+            state.in_flight = Some(InFlight {
+                rev: bare.clone(),
+                phase: Phase::Pushed,
+            });
+            self.save_state(&state)?;
+            self.dispatch_job(&bare, &pull_tag).await?;
+            state.in_flight = Some(InFlight {
+                rev: bare.clone(),
+                phase: Phase::Dispatched,
+            });
+            self.save_state(&state)?;
+            return Ok(());
+        }
+
         info!(rev = %rev12(&bare), base = %base_tag, "mainline advance: building");
 
         state.in_flight = Some(InFlight {
@@ -1416,6 +1639,88 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_host_port_splits_registry_endpoint() {
+        assert_eq!(
+            endpoint_host_port("cogneva-registry.cogneva.svc.cluster.local:5000"),
+            Some(("cogneva-registry.cogneva.svc.cluster.local", 5000))
+        );
+        assert_eq!(
+            endpoint_host_port("reg.local:5000/"),
+            Some(("reg.local", 5000))
+        );
+        assert_eq!(endpoint_host_port("no-port"), None);
+        assert_eq!(endpoint_host_port("host:notaport"), None);
+    }
+
+    #[test]
+    fn manifest_helpers_split_single_manifest_from_index() {
+        let single: serde_json::Value = serde_json::json!({"config": {"digest": "sha256:cfg1"}});
+        assert_eq!(config_digest_of(&single).as_deref(), Some("sha256:cfg1"));
+        assert_eq!(first_manifest_digest(&single), None);
+
+        let index: serde_json::Value = serde_json::json!({
+            "manifests": [{"digest": "sha256:plat"}, {"digest": "sha256:plat2"}]
+        });
+        assert_eq!(config_digest_of(&index), None);
+        assert_eq!(
+            first_manifest_digest(&index).as_deref(),
+            Some("sha256:plat")
+        );
+
+        assert_eq!(config_digest_of(&serde_json::json!({"layers": []})), None);
+    }
+
+    #[test]
+    fn revision_label_read_from_config_blob() {
+        let blob = serde_json::json!({
+            "config": {"Labels": {"org.opencontainers.image.revision": "deadbeefcafe"}}
+        });
+        assert_eq!(
+            revision_of_config_blob(&blob).as_deref(),
+            Some("deadbeefcafe")
+        );
+        assert_eq!(
+            revision_of_config_blob(&serde_json::json!({"config": {"Labels": {}}})),
+            None
+        );
+        assert_eq!(revision_of_config_blob(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn http_response_body_cut_at_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":1}trailing";
+        let (status, body) = parse_http_response(raw).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"{\"a\":1}");
+
+        // 无 Content-Length（或短于实际）时取剩余全部——registry 的响应
+        // 一律带长度，这条只是不让解析在异常响应上 panic。
+        let raw = b"HTTP/1.1 404 Not Found\r\n\r\nnope";
+        let (status, body) = parse_http_response(raw).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(body, b"nope");
+    }
+
+    #[test]
+    fn floating_pin_convergence_compares_content_not_the_tag_string() {
+        let bare = "4dfd51ff1209abcdef";
+        assert!(floating_pin_is_converged(Some("4dfd51ff1209abcdef"), bare));
+        // registry 上的内容标签是短 id 也能对上。
+        assert!(floating_pin_is_converged(Some("4dfd51ff1209"), bare));
+        // 浮动签被重新播种成别的 rev：清单里 tag 一个字没变，但没收敛。
+        assert!(!floating_pin_is_converged(Some("000000000000abcd"), bare));
+        // 读不到内容版本一律不当作已收敛。
+        assert!(!floating_pin_is_converged(None, bare));
+    }
+
+    #[test]
+    fn only_main_prefixed_tags_imply_a_rev() {
+        assert!(tag_is_immutable_for_rev("main-4dfd51ff1209"));
+        assert!(!tag_is_immutable_for_rev("local"));
+        assert!(!tag_is_immutable_for_rev("promote-p-1"));
+    }
+
+    #[test]
     fn heartbeat_message_summarizes_idle_state() {
         let state = MainlineState {
             last_good_tag: Some("cogneva:main-4dfd51ff1209".into()),
@@ -2033,6 +2338,240 @@ exit 0
         );
     }
 
+    /// 极简假 registry：按序应答预置响应，每连接一次。返回 (endpoint, 收到的请求)。
+    async fn fake_registry(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut reqs = Vec::new();
+            for resp in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                reqs.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+            reqs
+        });
+        (format!("127.0.0.1:{port}"), handle)
+    }
+
+    fn http_200(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+
+    #[tokio::test]
+    async fn registry_tag_revision_reads_label_from_manifest_and_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"schemaVersion":2,"config":{"digest":"sha256:cfg1"}}"#),
+            http_200(
+                r#"{"config":{"Labels":{"org.opencontainers.image.revision":"deadbeefcafe"}}}"#,
+            ),
+        ])
+        .await;
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        cfg.registry = endpoint;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let rev = deployer.registry_tag_revision("local").await.unwrap();
+        assert_eq!(rev.as_deref(), Some("deadbeefcafe"));
+
+        let reqs = handle.await.unwrap();
+        assert!(
+            reqs[0].contains("/v2/cogneva/manifests/local"),
+            "{:?}",
+            reqs[0]
+        );
+        assert!(
+            reqs[1].contains("/v2/cogneva/blobs/sha256:cfg1"),
+            "{:?}",
+            reqs[1]
+        );
+        // 明文 HTTP：Pod 与集群内 registry 之间不做 TLS。
+        assert!(reqs[0].starts_with("GET /v2/"), "{:?}", reqs[0]);
+    }
+
+    #[tokio::test]
+    async fn registry_tag_revision_follows_a_multi_platform_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"schemaVersion":2,"manifests":[{"digest":"sha256:plat"}]}"#),
+            http_200(r#"{"config":{"digest":"sha256:cfg2"}}"#),
+            http_200(
+                r#"{"config":{"Labels":{"org.opencontainers.image.revision":"cafebabe0011"}}}"#,
+            ),
+        ])
+        .await;
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        cfg.registry = endpoint;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let rev = deployer.registry_tag_revision("local").await.unwrap();
+        assert_eq!(rev.as_deref(), Some("cafebabe0011"));
+        let reqs = handle.await.unwrap();
+        assert!(
+            reqs[1].contains("/v2/cogneva/manifests/sha256:plat"),
+            "{:?}",
+            reqs[1]
+        );
+        assert!(
+            reqs[2].contains("/v2/cogneva/blobs/sha256:cfg2"),
+            "{:?}",
+            reqs[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_image_rev_derives_immutable_tags_without_the_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        // 指向不可达端口：不可变 tag 必须不依赖 registry 就能读出 rev。
+        cfg.registry = "127.0.0.1:1".into();
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let imgs = vec![main_image("localhost:30500", "abcdef0123456789"); 4];
+        assert_eq!(
+            deployer.declared_image_rev(&imgs).await.as_deref(),
+            Some("abcdef012345")
+        );
+        // 四部署不一致：未知，绝不当成已收敛。
+        let mixed = vec![
+            main_image("localhost:30500", "abcdef0123456789"),
+            local_image("localhost:30500"),
+        ];
+        assert_eq!(deployer.declared_image_rev(&mixed).await, None);
+    }
+
+    /// 浮动签被重新播种成别的 rev：清单里的 tag 字符串一个字没变，但节点
+    /// 已经随清单滚到旧二进制。必须识别出没收敛并重新 pin 回 `main-<rev>`。
+    #[tokio::test]
+    async fn floating_pin_drift_is_detected_and_repaired() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        let kubectl = fake_kubectl(&bin_dir, "localhost:30500/cogneva:local");
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        // 三次 registry 命中：读 :local 的 manifest、读其 config blob（rev 是
+        // 别的值）、查 main-<rev> 是否存在（不存在 → 必须真重建）。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"schemaVersion":2,"config":{"digest":"sha256:cfg2"}}"#),
+            http_200(
+                r#"{"config":{"Labels":{"org.opencontainers.image.revision":"000000000000abcd"}}}"#,
+            ),
+            HTTP_404.to_string(),
+        ])
+        .await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.registry = endpoint;
+        let deployer = MainlineDeployer::new(cfg, ws);
+
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state = MainlineState {
+            last_good_rev: Some(rev_b.clone()),
+            ..Default::default()
+        };
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        handle.await.unwrap();
+        let buildah_calls = std::fs::read_to_string(bin_dir.join("buildah.log"))
+            .expect("drift must not take the no-op shortcut");
+        assert!(
+            buildah_calls.contains("push --tls-verify=false"),
+            "{buildah_calls}"
+        );
+        let kubectl_calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(kubectl_calls.contains("apply -f -"), "{kubectl_calls}");
+    }
+
+    /// 不可变 tag 已在 registry 里：清单重下发把四部署打回浮动签后，只需
+    /// 重新 pin 回去，4C 机器上不必再跑一次全程构建。
+    #[tokio::test]
+    async fn existing_immutable_image_is_repinned_without_a_rebuild() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        let kubectl = fake_kubectl(&bin_dir, "localhost:30500/cogneva:local");
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"schemaVersion":2,"config":{"digest":"sha256:cfg3"}}"#),
+            http_200(
+                r#"{"config":{"Labels":{"org.opencontainers.image.revision":"000000000000abcd"}}}"#,
+            ),
+            // main-<rev> 已存在：直接复用。
+            http_200("{}"),
+        ])
+        .await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.registry = endpoint;
+        let deployer = MainlineDeployer::new(cfg, ws);
+
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state = MainlineState {
+            last_good_rev: Some(rev_b.clone()),
+            ..Default::default()
+        };
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        handle.await.unwrap();
+        assert!(
+            !bin_dir.join("buildah.log").exists(),
+            "an image already in the registry must be reused, not rebuilt"
+        );
+        let kubectl_calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(kubectl_calls.contains("apply -f -"), "{kubectl_calls}");
+        assert!(
+            kubectl_calls.contains(&main_image("localhost:30500", &rev_b)),
+            "job must pin the deployments back to the immutable tag: {kubectl_calls}"
+        );
+    }
+
     #[tokio::test]
     async fn convergence_promotes_floating_local_tag() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2097,8 +2636,17 @@ exit 0
         let buildah = fake_buildah(&bin_dir, "");
         // 外部 apply 把四部署打回静态清单 pin：registry 浮动签 :local。
         let kubectl = fake_kubectl(&bin_dir, "localhost:30500/cogneva:local");
+        // registry 上 :local 的内容确实构建自当前 mainline rev：这才叫收敛。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"schemaVersion":2,"config":{"digest":"sha256:cfg1"}}"#),
+            http_200(&format!(
+                r#"{{"config":{{"Labels":{{"org.opencontainers.image.revision":"{rev_b}"}}}}}}"#
+            )),
+        ])
+        .await;
 
-        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.registry = endpoint;
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -2114,6 +2662,7 @@ exit 0
         .unwrap();
 
         deployer.poll_once().await.unwrap();
+        handle.await.unwrap();
 
         assert!(
             !bin_dir.join("buildah.log").exists(),
