@@ -395,6 +395,46 @@ fn parse_list_keys(xml: &str) -> Vec<String> {
     keys
 }
 
+/// Encode a query-string value the way AWS SigV4 canonicalization requires:
+/// every character except the unreserved set is percent-encoded — including
+/// `/`, which the path encoder deliberately leaves alone. A continuation token
+/// is base64 and routinely contains `/`, `+` and `=`, so reusing the path
+/// encoder here would sign a canonical query the server never reproduces.
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{:02X}", byte));
+            }
+        }
+    }
+    out
+}
+
+/// Extract the text of the first `<tag>...</tag>` in an XML document.
+fn xml_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)?;
+    Some(xml[start..start + end].to_string())
+}
+
+/// Whether a ListObjectsV2 response reports more keys beyond this page.
+fn parse_is_truncated(xml: &str) -> bool {
+    matches!(xml_text(xml, "IsTruncated").as_deref(), Some("true"))
+}
+
+/// The opaque cursor for the next page, undecoded as returned by the server.
+fn parse_next_token(xml: &str) -> Option<String> {
+    xml_text(xml, "NextContinuationToken")
+}
+
 #[async_trait]
 impl ObjectBackend for S3ObjectBackend {
     async fn put(&self, key: &str, data: &[u8]) -> SFResult<String> {
@@ -527,43 +567,190 @@ impl ObjectBackend for S3ObjectBackend {
         self.with_retry(|| async {
             let empty_hash = S3ObjectBackend::sha256_hex(b"");
             let canonical_uri = format!("/{}/", self.bucket);
-
-            // Build query string for ListObjectsV2
-            let mut query_parts = vec!["list-type=2".to_string(), "max-keys=1000".to_string()];
-            if let Some(p) = prefix {
-                query_parts.push(format!("prefix={}", percent_encode(p)));
-            }
-            query_parts.sort();
-            let canonical_query = query_parts.join("&");
-
-            let signed_headers =
-                self.sign_request("GET", &canonical_uri, &canonical_query, &empty_hash, &[]);
-
             let ep = self.endpoint.trim_end_matches('/');
-            let url = format!("{}/{}?{}", ep, self.bucket, canonical_query);
-            let mut req = HttpRequest::get(&url);
-            for (k, v) in signed_headers {
-                req = req.header(k, v);
-            }
 
-            let resp = self.with_timeout(self.client()?.execute(req)).await?;
-            if resp.is_success() {
+            let mut all_keys = Vec::new();
+            let mut continuation: Option<String> = None;
+            // A bucket listing is unbounded; cap the walk so a server that keeps
+            // reporting truncation without advancing the cursor cannot spin forever.
+            const MAX_PAGES: usize = 10_000;
+
+            for _ in 0..MAX_PAGES {
+                // Query parts are sorted before signing; SigV4 canonicalization
+                // requires the same ordering the URL carries.
+                let mut query_parts = vec!["list-type=2".to_string(), "max-keys=1000".to_string()];
+                if let Some(p) = prefix {
+                    query_parts.push(format!("prefix={}", percent_encode_query(p)));
+                }
+                if let Some(token) = &continuation {
+                    query_parts.push(format!(
+                        "continuation-token={}",
+                        percent_encode_query(token)
+                    ));
+                }
+                query_parts.sort();
+                let canonical_query = query_parts.join("&");
+
+                let signed_headers =
+                    self.sign_request("GET", &canonical_uri, &canonical_query, &empty_hash, &[]);
+
+                let url = format!("{}/{}?{}", ep, self.bucket, canonical_query);
+                let mut req = HttpRequest::get(&url);
+                for (k, v) in signed_headers {
+                    req = req.header(k, v);
+                }
+
+                let resp = self.with_timeout(self.client()?.execute(req)).await?;
+                if !resp.is_success() {
+                    let status = resp.status;
+                    let body = resp
+                        .text()
+                        .unwrap_or_else(|_| "<unable to read body>".to_string());
+                    return Err(SFError::Adapter {
+                        provider: "s3".to_string(),
+                        message: format!("LIST failed: {} - {}", status, body),
+                    });
+                }
                 let body = resp.text().map_err(|e| SFError::Adapter {
                     provider: "s3".to_string(),
                     message: format!("read list body failed: {}", e),
                 })?;
-                Ok(parse_list_keys(&body))
-            } else {
-                let status = resp.status;
-                let body = resp
-                    .text()
-                    .unwrap_or_else(|_| "<unable to read body>".to_string());
-                Err(SFError::Adapter {
-                    provider: "s3".to_string(),
-                    message: format!("LIST failed: {} - {}", status, body),
-                })
+
+                all_keys.extend(parse_list_keys(&body));
+
+                if !parse_is_truncated(&body) {
+                    return Ok(all_keys);
+                }
+                continuation = parse_next_token(&body);
+                if continuation.is_none() {
+                    // Truncated but no cursor: the rest is unreachable. Returning
+                    // what we have is wrong silently, so fail loudly.
+                    return Err(SFError::Adapter {
+                        provider: "s3".to_string(),
+                        message: "LIST response truncated without NextContinuationToken"
+                            .to_string(),
+                    });
+                }
             }
+
+            Err(SFError::Adapter {
+                provider: "s3".to_string(),
+                message: format!(
+                    "LIST exceeded {} pages; refusing to loop further",
+                    MAX_PAGES
+                ),
+            })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serves a scripted sequence of ListObjectsV2 pages and records the URL of
+    /// every request so a test can assert the continuation cursor was forwarded.
+    #[derive(Debug)]
+    struct PagingHttp {
+        pages: Vec<String>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for PagingHttp {
+        async fn execute(&self, req: cog_core::HttpRequest) -> SFResult<cog_core::HttpResponse> {
+            let index = {
+                let mut seen = self.seen.lock().unwrap();
+                let index = seen.len();
+                seen.push(req.url.clone());
+                index
+            };
+            let body = self
+                .pages
+                .get(index)
+                .cloned()
+                .ok_or_else(|| SFError::Adapter {
+                    provider: "s3".to_string(),
+                    message: format!("unexpected extra LIST request #{}", index + 1),
+                })?;
+            Ok(cog_core::HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: body.into_bytes(),
+            })
+        }
+    }
+
+    fn page(keys: &[&str], truncated: bool, token: Option<&str>) -> String {
+        let contents: String = keys
+            .iter()
+            .map(|k| format!("<Contents><Key>{}</Key></Contents>", k))
+            .collect();
+        let next = token
+            .map(|t| format!("<NextContinuationToken>{}</NextContinuationToken>", t))
+            .unwrap_or_default();
+        format!(
+            "<ListBucketResult>{}{}<IsTruncated>{}</IsTruncated>{}</ListBucketResult>",
+            contents, next, truncated, ""
+        )
+    }
+
+    fn backend(pages: Vec<String>) -> (S3ObjectBackend, Arc<PagingHttp>) {
+        let http = Arc::new(PagingHttp {
+            pages,
+            seen: Mutex::new(Vec::new()),
+        });
+        let backend =
+            S3ObjectBackend::new("http://seaweed-s3:8333", "us-east-1", "cogneva", "ak", "sk")
+                .with_client(http.clone());
+        (backend, http)
+    }
+
+    #[tokio::test]
+    async fn list_walks_every_page_via_continuation_token() {
+        let (backend, http) = backend(vec![
+            page(&["a/1", "a/2"], true, Some("tok en/+1=")),
+            page(&["a/3"], false, None),
+        ]);
+
+        let keys = backend.list(Some("a/")).await.unwrap();
+
+        assert_eq!(keys, vec!["a/1", "a/2", "a/3"]);
+        let seen = http.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "expected exactly two LIST requests");
+        assert!(seen[0].contains("prefix=a%2F"), "got: {}", seen[0]);
+        assert!(
+            seen[1].contains("continuation-token=tok%20en%2F%2B1%3D"),
+            "second page must carry the encoded cursor, got: {}",
+            seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_stops_after_a_single_untruncated_page() {
+        let (backend, http) = backend(vec![page(&["only"], false, None)]);
+
+        let keys = backend.list(None).await.unwrap();
+
+        assert_eq!(keys, vec!["only"]);
+        assert_eq!(http.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_fails_loudly_when_truncated_without_a_cursor() {
+        // The retry wrapper re-runs the whole listing, so the scripted server
+        // must answer each attempt the same way.
+        let truncated = page(&["a/1"], true, None);
+        let (backend, _) = backend(vec![truncated.clone(), truncated.clone(), truncated]);
+
+        let err = backend.list(None).await.unwrap_err().to_string();
+
+        assert!(
+            err.contains("truncated without NextContinuationToken"),
+            "got: {}",
+            err
+        );
     }
 }

@@ -187,6 +187,13 @@ backends:
     enabled: true
     image: getmeili/meilisearch:v1.10.3
     storage: 5Gi
+  # S3 兼容对象存储，承载永久记忆的 Raw 层与冷层。默认在集群内跑 SeaweedFS
+  # 单进程（master + volume + filer + S3 网关），禁用即把 providers.storage
+  # 指向外部 S3 兼容端点（MinIO / 云对象存储，代码路径相同）。
+  seaweedfs:
+    enabled: true
+    image: chrislusf/seaweedfs:3.71
+    storage: 10Gi
 
 # 明文默认值仅用于开发；生产请用 --set-file 或外部 Secret（然后 secrets.create=false）
 secrets:
@@ -203,6 +210,9 @@ secrets:
   instanceFingerprint: ""
   # Meilisearch 主密钥：安装时随机生成，重装复用同一 Secret 中的值。
   meiliMasterKey: ""
+  # 对象存储（SeaweedFS S3 网关）凭证：同上，留空则安装时随机生成。
+  s3AccessKey: ""
+  s3SecretKey: ""
   llmApiKey: ""
   # 带外凭证（网关专用）：真实值带外写入，默认空（未配置时对应功能 fail-closed）。
   llmUpstreams: ""

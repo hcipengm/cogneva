@@ -32,6 +32,7 @@ resources:
   - nats-deployment.yaml
   - nats-service.yaml
   - meilisearch.yaml
+  - seaweedfs.yaml
   - cluster-registry.yaml
   - network-policy.yaml
   - ingress.yaml

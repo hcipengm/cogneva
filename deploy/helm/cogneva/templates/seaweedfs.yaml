@@ -1,0 +1,136 @@
+{{- if .Values.backends.seaweedfs.enabled }}
+{{- /*
+SeaweedFS 对象存储：master + volume + filer + S3 网关跑在同一个 `weed server`
+进程里（单节点部署，组件间走进程内调用，省掉四份清单与它们之间的服务发现）。
+对外只暴露 S3 网关的 8333，主应用经 SigV4 存取；filer 元数据与 volume 数据
+都落在同一块持久卷上，Pod 重建不丢对象。
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-pvc
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: objectstore
+  annotations:
+    # 卸载不销毁数据卷：这是永久记忆 Raw 层的权威副本，删掉等于清空记忆。
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.backends.seaweedfs.storage }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: objectstore
+spec:
+  replicas: 1
+  strategy:
+    # RWO 卷不能两个 Pod 同时挂，滚动更新必须先退旧再起新。
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: seaweedfs
+      app.kubernetes.io/component: objectstore
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seaweedfs
+        app.kubernetes.io/component: objectstore
+    spec:
+      containers:
+        - name: seaweedfs
+          image: {{ .Values.backends.seaweedfs.image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - server
+            - -dir=/data
+            - -master.port=9333
+            - -volume.port=8080
+            - -filer
+            - -filer.port=8888
+            - -s3
+            - -s3.port=8333
+            # 身份文件由 cogneva-secrets 提供：网关按它校验 SigV4，主应用按
+            # 同一份凭证签名。缺省无此文件时网关放开匿名访问，等于对象存储
+            # 无鉴权，故这里是必需挂载。
+            - -s3.config=/etc/seaweedfs/s3.json
+          ports:
+            - name: s3
+              containerPort: 8333
+              protocol: TCP
+            - name: master
+              containerPort: 9333
+              protocol: TCP
+            - name: filer
+              containerPort: 8888
+              protocol: TCP
+          # 主进程含四个角色，探针分开测：存活看 master 的 HTTP 接口（未鉴权、
+          # 恒 200），就绪额外确认 S3 网关真的在应答——端口被 bind 不等于网关
+          # 已经接上 filer，提早放流量会让首次写入失败。
+          livenessProbe:
+            httpGet:
+              path: /cluster/status
+              port: master
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - wget -qS -O /dev/null http://127.0.0.1:8333/ 2>&1 | grep -q 'HTTP/1.1'
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: s3-config
+              mountPath: /etc/seaweedfs
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: seaweedfs-pvc
+        - name: s3-config
+          secret:
+            secretName: cogneva-secrets
+            optional: true
+            items:
+              - key: seaweedfs-s3.json
+                path: s3.json
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: objectstore
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: objectstore
+  ports:
+    - name: s3
+      port: 8333
+      targetPort: s3
+      protocol: TCP
+{{- end }}

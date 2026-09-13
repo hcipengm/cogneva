@@ -70,6 +70,47 @@ ensure_fingerprint() {
   echo "  ${key}: 已生成随机指纹"
 }
 
+# 读 Secret 中某个键的明文值（空则输出空）。
+secret_value() {
+  local key="$1"
+  kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null \
+    | base64 -d 2>/dev/null || true
+}
+
+# SeaweedFS S3 网关的身份文件：同时携带 accessKey 与 secretKey，是唯一能被
+# 网关直接读入的形态。两个键先生成，再由它们拼出 JSON；JSON 已存在则保留，
+# 避免与已生效的凭证错位。
+ensure_s3_identity() {
+  local key=seaweedfs-s3.json cur access secret json b64
+  cur="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null || true)"
+  if [ -n "$cur" ]; then
+    echo "  ${key}: 已存在，保留不动"
+    return
+  fi
+  ensure_random s3-access-key
+  ensure_random s3-secret-key
+  access="$(secret_value s3-access-key)"
+  secret="$(secret_value s3-secret-key)"
+  json="$(cat <<JSON
+{
+  "identities": [
+    {
+      "name": "cogneva",
+      "credentials": [
+        { "accessKey": "${access}", "secretKey": "${secret}" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
+JSON
+)"
+  b64="$(printf '%s' "$json" | base64 | tr -d '\n')"
+  kubectl -n "$NS" patch secret "$SECRET" --type=json \
+    -p="[{\"op\":\"add\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]" >/dev/null
+  echo "  ${key}: 已生成（凭证取自 s3-access-key / s3-secret-key）"
+}
+
 # 带外凭证：仅确保键存在（空占位），真值由向导/运维写入，脚本不生成。
 ensure_blank() {
   local key="$1"
@@ -90,6 +131,9 @@ ensure_random meili-master-key
 
 echo "==> 实例身份指纹（64 位十六进制，缺失才创建）"
 ensure_fingerprint
+
+echo "==> 对象存储 S3 凭证（缺失才创建）"
+ensure_s3_identity
 
 echo "==> 带外凭证占位（留空，由 WebUI 向导或 kubectl edit secret 写入）"
 ensure_blank llm-upstreams

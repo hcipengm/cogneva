@@ -3,6 +3,8 @@
 # 默认值并夹紧单容器上下限。数值按单节点 K3s（≥4C8G 空白机）设定，已计入
 # 常设镜像分发器开销（image-server 100m/64Mi + 每节点 importer 200m/1Gi）；
 # 多节点每增一个节点多 200m/1Gi，生产 K8s 分支请按集群规模上调。
+# 存储额度含对象存储（SeaweedFS 10Gi，承载永久记忆 Raw 层）：内存类后端
+# 各 10Gi、对象存储 10Gi，合计已接近上限，因此比最初设定的 100Gi 上调 10Gi。
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -18,7 +20,7 @@ spec:
     limits.cpu: "17"
     limits.memory: "34Gi"
     pods: "40"
-    requests.storage: 100Gi
+    requests.storage: 110Gi
 ---
 apiVersion: v1
 kind: LimitRange

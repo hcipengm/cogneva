@@ -124,6 +124,19 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: meili-master-key
+            # 对象存储凭证：cogneva.json 的 providers.storage.options 经
+            # ${S3_ACCESS_KEY} / ${S3_SECRET_KEY} 插值。两个 Pod 共用同一对
+            # 密钥，也就共用同一个对象命名空间——这正是记忆共享的前提。
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: s3-access-key
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: s3-secret-key
           lifecycle:
             postStart:
               exec:

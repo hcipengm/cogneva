@@ -54,6 +54,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             raw_logger_config,
             _tier_migrator_enabled,
             data_dir,
+            storage_provider_config,
         ) = {
             let config = ctx.config();
             let db_url = std::env::var("COGNEVA_DATABASE_URL")
@@ -87,6 +88,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 config.raw_logger.clone(),
                 config.tier_migrator.enabled,
                 config.app.data_dir.clone(),
+                config.providers.storage.clone(),
             )
         };
 
@@ -689,11 +691,14 @@ impl cog_core::SystemPlugin for StoragePlugin {
         info!("StoragePlugin raw log index store published");
 
         // ── ObjectBackend (singleton for all modules) ──
-        let object_backend: Arc<dyn cog_core::ObjectBackend> = Arc::new(
-            crate::FileObjectBackend::new(std::path::Path::new(&data_dir)),
+        let http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
+        let object_backend =
+            build_object_backend(&storage_provider_config, &data_dir, http_client)?;
+        info!(
+            "StoragePlugin object backend published (provider={})",
+            storage_provider_config.provider
         );
         ctx.publish_service(object_backend);
-        info!("StoragePlugin object backend published");
 
         self.initialized = true;
         Ok(())
@@ -703,32 +708,45 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // ── Tier migrator (raw-log cold-tier migration) ──
         if ctx.config().tier_migrator.enabled {
             if let Some(store) = ctx.consume_service::<dyn cog_core::RawLogIndexStore>() {
-                let cold_dir = format!("{}/cold", ctx.config().raw_logger.base_dir);
+                // Reuse the published singleton. Building a second local-fs
+                // backend here put cold objects on the pod's own disk, so a
+                // reader on another replica could not find what this wrote.
+                let object_backend = ctx.consume_service::<dyn cog_core::ObjectBackend>();
                 let base_dir = ctx.config().raw_logger.base_dir.clone();
+                let cold_dir = format!("{}/cold", base_dir);
                 let tier_config = ctx.config().tier_migrator.clone();
                 let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
                 let shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
                     .map(|s| (*s).clone())
                     .unwrap_or_default();
-                tokio::spawn(async move {
-                    if let Err(e) = tokio::fs::create_dir_all(&cold_dir).await {
-                        warn!("Failed to create cold-tier dir {}: {}", cold_dir, e);
+                match object_backend {
+                    Some(object_backend) => {
+                        tokio::spawn(async move {
+                            let mut migrator = crate::TierMigrator::new(
+                                base_dir,
+                                crate::tier_policy_from_config(&tier_config),
+                                object_backend,
+                                store,
+                            );
+                            if let Some(mb) = metrics {
+                                migrator = migrator.with_metrics(mb);
+                            }
+                            let _handle = Arc::new(migrator).spawn(shutdown);
+                            info!("TierMigrator started");
+                        });
                     }
-                    let object_backend: Arc<dyn cog_core::ObjectBackend> =
-                        Arc::new(crate::FileObjectBackend::new(&cold_dir));
-                    let mut migrator = crate::TierMigrator::new(
-                        base_dir,
-                        crate::tier_policy_from_config(&tier_config),
-                        object_backend,
-                        store,
-                    );
-                    if let Some(mb) = metrics {
-                        migrator = migrator.with_metrics(mb);
+                    None => {
+                        warn!(
+                            "TierMigrator enabled but no ObjectBackend published; cold tier will not migrate"
+                        );
                     }
-                    let _handle = Arc::new(migrator).spawn(shutdown);
-                    info!("TierMigrator started");
-                });
+                }
+                // The local cold dir only exists for readers that resolve a
+                // `file://` cold path without the object backend's help.
+                if let Err(e) = tokio::fs::create_dir_all(&cold_dir).await {
+                    warn!("Failed to create cold-tier dir {}: {}", cold_dir, e);
+                }
             }
         } else {
             info!("TierMigrator disabled");
@@ -762,10 +780,77 @@ impl cog_core::SystemPlugin for StoragePlugin {
     }
 }
 
+/// Build the object backend named by `providers.storage.provider`.
+///
+/// The provider string has always been this config's switch, but the code
+/// ignored it and always built a local file backend — so an S3-compatible
+/// deployment stored objects on the pod's own disk, where a second replica
+/// could not see them and a restart on another node lost them. An unknown
+/// provider is a hard error rather than a silent fallback, for the same
+/// reason: falling back is how the misconfiguration stayed invisible.
+fn build_object_backend(
+    storage: &cog_core::ProviderConfig,
+    data_dir: &str,
+    http_client: Option<Arc<dyn cog_core::HttpClient>>,
+) -> cog_core::SFResult<Arc<dyn cog_core::ObjectBackend>> {
+    let opt = |key: &str| {
+        storage
+            .options
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let required = |key: &str| {
+        opt(key).ok_or_else(|| {
+            cog_core::SFError::Config(format!(
+                "providers.storage.options.{} is required for provider '{}'",
+                key, storage.provider
+            ))
+        })
+    };
+
+    match storage.provider.as_str() {
+        "local-fs" => {
+            let base = opt("base_path").unwrap_or_else(|| data_dir.to_string());
+            Ok(Arc::new(crate::FileObjectBackend::new(
+                std::path::Path::new(&base),
+            )))
+        }
+        // MinIO and SeaweedFS both speak the S3 REST API; only the endpoint
+        // differs, so they share one code path.
+        "s3" | "minio" | "seaweedfs" => {
+            let endpoint = required("endpoint")?;
+            let bucket = required("bucket")?;
+            let region = opt("region").unwrap_or_else(|| "us-east-1".to_string());
+            let access_key = required("access_key")?;
+            let secret_key = required("secret_key")?;
+            // Every S3 call fails without a client, so refuse to publish a
+            // backend that can never work instead of failing later per call.
+            let client = http_client.ok_or_else(|| {
+                cog_core::SFError::Config(format!(
+                    "providers.storage.provider='{}' needs an HttpClient, but none was published",
+                    storage.provider
+                ))
+            })?;
+            Ok(Arc::new(
+                crate::S3ObjectBackend::new(endpoint, region, bucket, access_key, secret_key)
+                    .with_client(client),
+            ))
+        }
+        other => Err(cog_core::SFError::Config(format!(
+            "Unknown providers.storage.provider '{}'; expected one of: local-fs, s3, minio, seaweedfs",
+            other
+        ))),
+    }
+}
+
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "storage",
-    requires: &[],
+    // The S3 object backend needs an HttpClient during init, and plugins in
+    // the same layer init in parallel. Declaring the edge puts storage in a
+    // later layer than net so the client is published before it is consumed.
+    requires: &["net"],
     optional_requires: &[],
     provides: &[
         "RawLogger",
@@ -785,6 +870,9 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         "UserStore",
         "PlatformIdentityStore",
     ],
-    consumes: &[],
+    consumes: &[cog_core::ConsumeSpec {
+        type_name: "HttpClient",
+        required: false,
+    }],
     factory: || Box::new(StoragePlugin::new()),
 };

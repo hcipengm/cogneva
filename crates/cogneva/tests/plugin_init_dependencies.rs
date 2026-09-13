@@ -23,26 +23,45 @@ const STORAGE_PROVIDED: &[&str] = &[
     "PlatformIdentityStore",
 ];
 
-/// Services each plugin consumes during `init`, read off its `plugin.rs`.
-const INIT_CONSUMES: &[(&str, &[&str])] = &[
-    ("memory", &["ExplainPool", "VectorBackend", "ObjectBackend"]),
-    ("wiki", &["ObjectBackend"]),
+/// Services the net plugin publishes, in time for consumers.
+const NET_PROVIDED: &[&str] = &["HttpClient"];
+
+/// (consumer plugin, producer plugin, services consumed during init), read off
+/// each consumer's `plugin.rs`.
+const INIT_CONSUMES: &[(&str, &str, &[&str])] = &[
+    (
+        "memory",
+        "storage",
+        &["ExplainPool", "VectorBackend", "ObjectBackend"],
+    ),
+    ("wiki", "storage", &["ObjectBackend"]),
+    // The object backend is chosen from `providers.storage.provider` at init;
+    // the S3 path needs an HttpClient then, not on first request.
+    ("storage", "net", &["HttpClient"]),
 ];
 
+fn provided_by(producer: &str) -> &'static [&'static str] {
+    match producer {
+        "storage" => STORAGE_PROVIDED,
+        "net" => NET_PROVIDED,
+        other => panic!("{other} has no provided-service list in this test"),
+    }
+}
+
 fn assert_declared(plugin: &str, requires: &[&str]) {
-    let (_, consumed) = INIT_CONSUMES
+    let (_, producer, consumed) = INIT_CONSUMES
         .iter()
-        .find(|(name, _)| *name == plugin)
+        .find(|(name, _, _)| *name == plugin)
         .unwrap_or_else(|| panic!("{plugin} is missing from INIT_CONSUMES"));
 
     for service in *consumed {
         assert!(
-            STORAGE_PROVIDED.contains(service),
-            "{service} is not listed as storage-provided; this test is stale"
+            provided_by(producer).contains(service),
+            "{service} is not listed as provided by {producer}; this test is stale"
         );
         assert!(
-            requires.contains(&"storage"),
-            "{plugin} consumes {service} during init but does not require storage; \
+            requires.contains(producer),
+            "{plugin} consumes {service} during init but does not require {producer}; \
              same-layer plugins init in parallel, so this is a race"
         );
     }
@@ -56,4 +75,9 @@ fn memory_plugin_declares_storage_dependency() {
 #[test]
 fn wiki_plugin_declares_storage_dependency() {
     assert_declared("wiki", cog_wiki::plugin::DESCRIPTOR.requires);
+}
+
+#[test]
+fn storage_plugin_declares_net_dependency() {
+    assert_declared("storage", cog_storage::plugin::DESCRIPTOR.requires);
 }

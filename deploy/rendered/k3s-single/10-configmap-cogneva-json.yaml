@@ -207,9 +207,14 @@ data:
           "options": {}
         },
         "storage": {
-          "provider": "local-fs",
+          "provider": "seaweedfs",
           "enabled": true,
           "options": {
+            "endpoint": "http://seaweedfs.cogneva.svc.cluster.local:8333",
+            "bucket": "cogneva",
+            "region": "us-east-1",
+            "access_key": "${S3_ACCESS_KEY}",
+            "secret_key": "${S3_SECRET_KEY}",
             "base_path": "/var/lib/cogneva-data/storage"
           }
         },
