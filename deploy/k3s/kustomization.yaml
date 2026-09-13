@@ -31,6 +31,7 @@ resources:
   - qdrant-service.yaml
   - nats-deployment.yaml
   - nats-service.yaml
+  - meilisearch.yaml
   - cluster-registry.yaml
   - network-policy.yaml
   - ingress.yaml

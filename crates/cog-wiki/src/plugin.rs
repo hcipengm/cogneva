@@ -33,7 +33,7 @@ impl cog_core::SystemPlugin for WikiPlugin {
         }
 
         let config = ctx.config();
-        let wiki_adapter = build_wiki_adapter(config, ctx).await;
+        let wiki_adapter = build_wiki_adapter(config, ctx).await?;
 
         if let Some(ref backend) = wiki_adapter {
             ctx.publish_service(backend.clone());
@@ -72,7 +72,9 @@ impl cog_core::SystemPlugin for WikiPlugin {
 async fn build_wiki_adapter(
     config: &cog_core::Config,
     ctx: &cog_core::PluginContext,
-) -> Option<Arc<dyn cog_core::WikiBackend>> {
+) -> cog_core::SFResult<Option<Arc<dyn cog_core::WikiBackend>>> {
+    let strict = config.system.strict_persistence;
+
     if let Some(ref wiki_cfg) = config.providers.wiki {
         if wiki_cfg.enabled && wiki_cfg.provider == "meilisearch" {
             let host = wiki_cfg
@@ -87,25 +89,47 @@ async fn build_wiki_adapter(
                 .and_then(|v| v.as_str())
                 .unwrap_or("wiki");
             let adapter = crate::meilisearch::MeilisearchWikiBackend::new(host, api_key, index);
-            tracing::info!(
-                "WikiBackend initialized: provider=meilisearch host={} index={}",
-                host,
-                index
+            if cog_core::WikiBackend::health_check(&adapter).await {
+                tracing::info!(
+                    "WikiBackend initialized: provider=meilisearch host={} index={}",
+                    host,
+                    index
+                );
+                return Ok(Some(Arc::new(adapter)));
+            }
+            if strict {
+                return Err(cog_core::SFError::Config(format!(
+                    "Meilisearch wiki backend unreachable at {}; the configured provider would silently fall back to the local wiki (strict_persistence=true)",
+                    host
+                )));
+            }
+            tracing::warn!(
+                "Meilisearch wiki backend unreachable at {}; falling back to local wiki",
+                host
             );
-            return Some(Arc::new(adapter));
         }
     }
 
-    let object_backend = ctx.consume_service::<dyn cog_core::ObjectBackend>()?;
+    let Some(object_backend) = ctx.consume_service::<dyn cog_core::ObjectBackend>() else {
+        if strict {
+            return Err(cog_core::SFError::Config(
+                "No ObjectBackend available for the wiki backend (strict_persistence=true)".into(),
+            ));
+        }
+        return Ok(None);
+    };
     let adapter = crate::WikiManager::new(object_backend);
     tracing::info!("WikiBackend initialized: provider=local-wiki prefix=wiki");
-    Some(Arc::new(adapter))
+    Ok(Some(Arc::new(adapter)))
 }
 
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "wiki",
-    requires: &[],
+    // Same reasoning as cog-memory: the ObjectBackend is consumed during init,
+    // and same-layer plugins init in parallel, so the edge must be declared or
+    // the consume races with storage's init.
+    requires: &["storage"],
     optional_requires: &[],
     provides: &["WikiBackend", "KnowledgeBackend"],
     consumes: &[

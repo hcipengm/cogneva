@@ -270,24 +270,40 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // ── CheckpointStore (must happen before explain_pool is moved into ExplainPool) ──
         let snapshot_store: Arc<dyn cog_core::CheckpointStore> = {
             let snapshot_dir = format!("{}/snapshots", raw_logger_config.base_dir);
-            let _ = tokio::fs::create_dir_all(&snapshot_dir).await;
-            if let Some(ref pool) = explain_pool {
-                let store = crate::PostgresSnapshotStore::new(pool.clone());
-                match store.init_schema().await {
-                    Ok(()) => {
-                        info!("PostgresSnapshotStore initialized");
-                        Arc::new(store)
-                    }
-                    Err(e) => {
-                        warn!(
-                            "PostgresSnapshotStore init_schema failed: {}. Falling back to file.",
-                            e
-                        );
-                        Arc::new(crate::FileSnapshotStore::new(&snapshot_dir))
+            match explain_pool {
+                Some(ref pool) => {
+                    let store = crate::PostgresSnapshotStore::new(pool.clone());
+                    match store.init_schema().await {
+                        Ok(()) => {
+                            info!("PostgresSnapshotStore initialized");
+                            Arc::new(store)
+                        }
+                        Err(e) => {
+                            if strict_persistence {
+                                return Err(cog_core::SFError::Config(format!(
+                                    "PostgresSnapshotStore init_schema failed (strict_persistence=true): {}",
+                                    e
+                                )));
+                            }
+                            warn!(
+                                "PostgresSnapshotStore init_schema failed: {}. Falling back to file.",
+                                e
+                            );
+                            let _ = tokio::fs::create_dir_all(&snapshot_dir).await;
+                            Arc::new(crate::FileSnapshotStore::new(&snapshot_dir))
+                        }
                     }
                 }
-            } else {
-                Arc::new(crate::FileSnapshotStore::new(&snapshot_dir))
+                None => {
+                    if strict_persistence {
+                        return Err(cog_core::SFError::Config(
+                            "PostgreSQL pool not available for CheckpointStore (strict_persistence=true)"
+                                .into(),
+                        ));
+                    }
+                    let _ = tokio::fs::create_dir_all(&snapshot_dir).await;
+                    Arc::new(crate::FileSnapshotStore::new(&snapshot_dir))
+                }
             }
         };
         ctx.publish_service(snapshot_store);
@@ -386,29 +402,42 @@ impl cog_core::SystemPlugin for StoragePlugin {
         info!("StoragePlugin promotion ledger published");
 
         // ── ObservabilityGateway (must happen before explain_pool is moved into ExplainPool) ──
-        let observability_gateway: Arc<dyn cog_core::ObservabilityGateway> = if let Some(ref pool) =
-            explain_pool
-        {
-            let gateway = crate::PostgresObservabilityGateway::new(pool.clone())
-                .with_event_channel_capacity(
-                    ctx.config().system.observability_event_channel_capacity,
-                );
-            match gateway.init_schema().await {
-                Ok(()) => {
-                    info!("PostgresObservabilityGateway initialized");
-                    Arc::new(gateway)
-                }
-                Err(e) => {
-                    warn!("PostgresObservabilityGateway init_schema failed: {}. Falling back to memory.", e);
-                    Arc::new(crate::MemoryObservabilityGateway::new(
-                        state_backend.clone(),
-                    ))
+        let observability_gateway: Arc<dyn cog_core::ObservabilityGateway> = match explain_pool {
+            Some(ref pool) => {
+                let gateway = crate::PostgresObservabilityGateway::new(pool.clone())
+                    .with_event_channel_capacity(
+                        ctx.config().system.observability_event_channel_capacity,
+                    );
+                match gateway.init_schema().await {
+                    Ok(()) => {
+                        info!("PostgresObservabilityGateway initialized");
+                        Arc::new(gateway)
+                    }
+                    Err(e) => {
+                        if strict_persistence {
+                            return Err(cog_core::SFError::Config(format!(
+                                "PostgresObservabilityGateway init_schema failed (strict_persistence=true): {}",
+                                e
+                            )));
+                        }
+                        warn!("PostgresObservabilityGateway init_schema failed: {}. Falling back to memory.", e);
+                        Arc::new(crate::MemoryObservabilityGateway::new(
+                            state_backend.clone(),
+                        ))
+                    }
                 }
             }
-        } else {
-            Arc::new(crate::MemoryObservabilityGateway::new(
-                state_backend.clone(),
-            ))
+            None => {
+                if strict_persistence {
+                    return Err(cog_core::SFError::Config(
+                        "PostgreSQL pool not available for ObservabilityGateway (strict_persistence=true)"
+                            .into(),
+                    ));
+                }
+                Arc::new(crate::MemoryObservabilityGateway::new(
+                    state_backend.clone(),
+                ))
+            }
         };
         ctx.publish_service(observability_gateway);
         info!("StoragePlugin observability gateway published");

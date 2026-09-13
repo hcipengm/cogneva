@@ -77,6 +77,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             redis_url,
             consumer_group,
             max_retries,
+            strict_persistence,
         ) = {
             let config = ctx.config();
             (
@@ -93,6 +94,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 config.dag_executor.redis_url.clone(),
                 config.dag_executor.consumer_group.clone(),
                 config.dag_executor.max_retries,
+                config.system.strict_persistence,
             )
         };
 
@@ -154,6 +156,11 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             info!("VectorBackend connected for pattern-db hybrid retrieval");
             action_plan_orchestrator = action_plan_orchestrator.with_vector_backend(vb);
         } else {
+            if strict_persistence {
+                return Err(cog_core::SFError::Config(
+                    "No VectorBackend published; pattern-db would fall back to in-memory retrieval (strict_persistence=true)".into(),
+                ));
+            }
             warn!("No VectorBackend published. Pattern-db will use in-memory retrieval.");
         }
 

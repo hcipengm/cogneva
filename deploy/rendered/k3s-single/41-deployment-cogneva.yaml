@@ -106,6 +106,15 @@ spec:
                   name: cogneva-secrets
                   key: instance-fingerprint
                   optional: true
+            # wiki 检索后端（Meilisearch）主密钥：cogneva.json 的
+            # providers.wiki.options.api_key 经 ${MEILI_MASTER_KEY} 插值。必填——
+            # /health 不鉴权，密钥错误只会在真正读写索引时才暴露，留空会把问题
+            # 推迟到运行期，不如让 Pod 起不来。
+            - name: MEILI_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: meili-master-key
             # 贡献通道：GitHub 设备流只用公开的 client_id（本流程无 client_secret）。
             # Gitee 授权码流程的应用凭证由安全网关代持，本进程经
             # COGNEVA_OAUTH_GATEWAY_URL 借用（授权 URL 与授权码兑换都在网关侧），

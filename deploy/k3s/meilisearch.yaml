@@ -1,0 +1,110 @@
+# Meilisearch 全文检索后端（wiki 的存储协议）。cogneva.json 的
+# providers.wiki 指向 meilisearch.cogneva.svc.cluster.local:7700，api_key 经
+# ${MEILI_MASTER_KEY} 插值，主密钥安装时生成（init-secrets.sh）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: meilisearch-pvc
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: meilisearch
+    app.kubernetes.io/component: search
+  # 卷与密钥一样带卸载保护：重装要接着用同一份索引，删掉就得重新灌。
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meilisearch
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: meilisearch
+    app.kubernetes.io/component: search
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: meilisearch
+      app.kubernetes.io/component: search
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: meilisearch
+        app.kubernetes.io/component: search
+    spec:
+      containers:
+        - name: meilisearch
+          image: getmeili/meilisearch:v1.10.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 7700
+              protocol: TCP
+          env:
+            # production 模式强制要求主密钥；监听地址必须显式放开到 0.0.0.0，
+            # 否则 development 默认只听 127.0.0.1，集群内 Service 打不进来。
+            - name: MEILI_ENV
+              value: production
+            - name: MEILI_HTTP_ADDR
+              value: 0.0.0.0:7700
+            - name: MEILI_NO_ANALYTICS
+              value: "true"
+            - name: MEILI_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: meili-master-key
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /meili_data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: meilisearch-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meilisearch
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: meilisearch
+    app.kubernetes.io/component: search
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: meilisearch
+    app.kubernetes.io/component: search
+  ports:
+    - name: http
+      port: 7700
+      targetPort: http
+      protocol: TCP

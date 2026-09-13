@@ -208,7 +208,7 @@ data:
           "enabled": true,
           "options": {
             "host": "http://meilisearch.cogneva.svc.cluster.local:7700",
-            "api_key": null,
+            "api_key": "${MEILI_MASTER_KEY}",
             "index": "wiki"
           }
         }

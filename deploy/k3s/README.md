@@ -25,7 +25,7 @@ profile values 表达：`deploy/helm/cogneva/profiles/k3s-single.yaml`、
 bash deploy/scripts/check-deploy-parity.sh
 # 对比 kubectl kustomize deploy/k3s 与 chart k3s profile 渲染结果：
 # 资源集合 + 每个工作负载的 env/卷/挂载/端口/ServiceAccount 必须全对齐
-# （38 个资源基线），差异即失败。
+# （47 个资源基线），差异即失败。
 ```
 
 **改动拓扑的正确顺序**：改 chart templates / values.yaml → 跑

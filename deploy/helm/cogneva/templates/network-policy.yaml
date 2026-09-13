@@ -40,6 +40,9 @@ spec:
           port: 4222
         - protocol: TCP
           port: 6333
+        # Meilisearch（7700）：wiki 检索后端，进化 Pod 启动即健康检查该地址。
+        - protocol: TCP
+          port: 7700
         # 沙箱执行器（9090）：主应用与进化共用的零凭证工具执行面
         # （run_command/read_file/write_file），该 Pod 不持有任何 Secret。
         - protocol: TCP

@@ -68,12 +68,7 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             });
 
         // ── Vector backend ──
-        let vector_backend = ctx
-            .consume_service::<dyn cog_core::VectorBackend>()
-            .unwrap_or_else(|| {
-                warn!("No VectorBackend published by StoragePlugin; using no-op fallback");
-                Arc::new(crate::NoopVectorBackend::new())
-            });
+        let vector_backend = ctx.consume_service::<dyn cog_core::VectorBackend>();
 
         // ── Memory backend ──
         if !memory_enabled {
@@ -81,6 +76,20 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             self.initialized = true;
             return Ok(());
         }
+
+        let vector_backend: Arc<dyn cog_core::VectorBackend> = match vector_backend {
+            Some(b) => b,
+            None => {
+                if strict_persistence {
+                    return Err(cog_core::SFError::Config(
+                        "No VectorBackend published by StoragePlugin (strict_persistence=true)"
+                            .into(),
+                    ));
+                }
+                warn!("No VectorBackend published by StoragePlugin; using no-op fallback");
+                Arc::new(crate::NoopVectorBackend::new())
+            }
+        };
 
         let memory_backend: Option<Arc<dyn cog_core::MemoryBackend>> = {
             let backend: Arc<dyn cog_core::MemoryBackend> = match memory_backend_type.as_str() {
@@ -110,22 +119,32 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                         memory_embedding_dimension,
                     );
                     composite = composite.with_summary_backend(Arc::new(summary_backend));
-                    if let Some(ref pool) = pg_pool_explain {
-                        let schema_backend =
-                            Arc::new(crate::PostgresSchemaBackend::from_pool(pool.clone()));
-                        match schema_backend.init_table().await {
-                            Ok(()) => {
-                                info!("PostgresSchemaBackend initialized for schema layer");
-                                composite = composite.with_schema_backend(schema_backend);
-                            }
-                            Err(e) => {
-                                if strict_persistence {
-                                    return Err(cog_core::SFError::Config(
-                                        format!("PostgresSchemaBackend init_table failed (strict_persistence=true): {}", e)
-                                    ));
+                    match pg_pool_explain {
+                        Some(ref pool) => {
+                            let schema_backend =
+                                Arc::new(crate::PostgresSchemaBackend::from_pool(pool.clone()));
+                            match schema_backend.init_table().await {
+                                Ok(()) => {
+                                    info!("PostgresSchemaBackend initialized for schema layer");
+                                    composite = composite.with_schema_backend(schema_backend);
                                 }
-                                warn!("PostgresSchemaBackend init_table failed: {}. Schema layer will use memory fallback.", e);
+                                Err(e) => {
+                                    if strict_persistence {
+                                        return Err(cog_core::SFError::Config(
+                                            format!("PostgresSchemaBackend init_table failed (strict_persistence=true): {}", e)
+                                        ));
+                                    }
+                                    warn!("PostgresSchemaBackend init_table failed: {}. Schema layer will use memory fallback.", e);
+                                }
                             }
+                        }
+                        None => {
+                            if strict_persistence {
+                                return Err(cog_core::SFError::Config(
+                                    "No ExplainPool published by StoragePlugin; the schema layer of composite memory has no persistent store (strict_persistence=true)".into(),
+                                ));
+                            }
+                            warn!("No ExplainPool published by StoragePlugin; schema layer will use memory fallback");
                         }
                     }
                     info!("CompositeMemoryBackend enabled");
@@ -134,6 +153,10 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                         metrics_backend.clone(),
                     ))
                 }
+                // Gated by the deployment config, not by strict_persistence: the
+                // shipped config still selects this in-memory backend, and the
+                // composite path it would fall back to is not yet durable. The
+                // hard failure belongs with that switch, not before it.
                 _ => {
                     info!("MemoryMemoryBackend enabled");
                     Arc::new(crate::MetricsInstrumentedMemoryBackend::new(
@@ -153,6 +176,10 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                     Some(Arc::new(p))
                 }
                 Err(e) => {
+                    // Not gated yet: the model is fetched from the network at
+                    // startup, so a hard failure here would take the process down
+                    // on any cluster without egress. The gate goes in together
+                    // with baking the model into the image.
                     warn!("Failed to load BGE-M3 embedding model: {}", e);
                     None
                 }
@@ -249,7 +276,11 @@ pub struct RerankerProviderHolder(pub Arc<dyn crate::RerankerProvider>);
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "memory",
-    requires: &[],
+    // Layers initialise in parallel, so consuming storage's ExplainPool /
+    // VectorBackend / ObjectBackend without declaring the dependency is a
+    // race with storage's own init. Storage defines no dependencies, so this
+    // edge cannot form a cycle.
+    requires: &["storage"],
     optional_requires: &[],
     provides: &[
         "MemoryBackend",

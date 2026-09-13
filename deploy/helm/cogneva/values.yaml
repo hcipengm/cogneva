@@ -183,6 +183,10 @@ backends:
     enabled: true
     image: nats:2.10-alpine
     storage: 10Gi
+  meilisearch:
+    enabled: true
+    image: getmeili/meilisearch:v1.10.3
+    storage: 5Gi
 
 # 明文默认值仅用于开发；生产请用 --set-file 或外部 Secret（然后 secrets.create=false）
 secrets:
@@ -197,6 +201,8 @@ secrets:
   # 容器内的机器标识推导（容器里只有 Pod 主机名与 veth MAC，两者每轮重启都变），
   # 因此重装带同一个 Secret、换机器带同一个 Secret 都是同一个实例，也可显式钉住。
   instanceFingerprint: ""
+  # Meilisearch 主密钥：安装时随机生成，重装复用同一 Secret 中的值。
+  meiliMasterKey: ""
   llmApiKey: ""
   # 带外凭证（网关专用）：真实值带外写入，默认空（未配置时对应功能 fail-closed）。
   llmUpstreams: ""

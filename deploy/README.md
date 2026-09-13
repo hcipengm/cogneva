@@ -31,7 +31,7 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 | 脚本 | 功能 |
 |---|---|
 | `render-deploy.sh` | 用 `helm template -f profiles/<p>.yaml` 把 chart 渲染进 `rendered/<profile>/`；`--check` 做 CI 新鲜度门禁（重渲染有 diff 即红） |
-| `check-deploy-parity.sh` | chart k3s profile 渲染 vs `k3s/` 静态清单的**字段级 parity** 门禁（38 资源基线，env/卷/挂载/端口/SA 全比对），CI 强制 |
+| `check-deploy-parity.sh` | chart k3s profile 渲染 vs `k3s/` 静态清单的**字段级 parity** 门禁（47 资源基线，env/卷/挂载/端口/SA 全比对），CI 强制 |
 | `init-secrets.sh` | 安装时**随机生成**内部密钥（pg/redis/内部签名）并创建 Secret；幂等不覆盖已有值；元启动 apply 前自动跑 |
 | `distribute-image.sh` | 多节点镜像增量升级：把镜像 tar 分发到全部节点并滚动重启 |
 | `build-release-image.sh` | release 预构建运行时镜像的**本机单源**构建（产物 tar.gz + sha256） |
@@ -79,14 +79,14 @@ containerd socket `/run/containerd`、不挂宿主 kubectl；前置：集群须�
 StorageClass，如 Longhorn）。渲染检查：`helm template cogneva deploy/helm/cogneva
 -f deploy/helm/cogneva/profiles/<profile>.yaml`。
 
-关键 values：`backends.{postgres,redis,qdrant,nats}.enabled` 控制是否随 chart 部署后端（禁用即使用外部服务）；`evolution.enabled` 控制自进化 worker，`evolution.gitRemote.mode`（`hostPath` 单节点 / `pvc` 多节点）控制中央 bare 仓库供给；`sandboxExecutor.enabled` / `buildah.enabled` 控制沙盒执行器与节点镜像构建 DaemonSet；`buildah.containerdSocket` 适配发行版（K3s 为 `/run/k3s/containerd`，标准 containerd 为 `/run/containerd`）；`storage.localRetainClass.create`（K3s 专有 Retain StorageClass，标准 K8s 置 false）与 `storage.evolution`/`storage.retain` 控制各卷存储类（留空跟随集群默认 SC）；`gitops.kubectlBin.enabled`+`gitops.kubectlBin.hostPath` 控制主应用 GitOps 拉取端的 Pod 内 kubectl（K3s 挂宿主 k3s 二进制，节点无可用二进制时置 false）；`webhook.nodePort` 为平台 webhook 入口；`ingress.className`（`nginx` 默认 / `traefik` 自动附带 WebSocket Middleware）；`networkPolicy.enabled` 控制沙盒出站隔离。内部密钥留空即安装时自动随机生成；预渲染清单路径用 `secrets.create=false`，密钥改由 init-secrets.sh 生成（bootstrap 自动调用）。
+关键 values：`backends.{postgres,redis,qdrant,nats,meilisearch}.enabled` 控制是否随 chart 部署后端（禁用即使用外部服务）；`evolution.enabled` 控制自进化 worker，`evolution.gitRemote.mode`（`hostPath` 单节点 / `pvc` 多节点）控制中央 bare 仓库供给；`sandboxExecutor.enabled` / `buildah.enabled` 控制沙盒执行器与节点镜像构建 DaemonSet；`buildah.containerdSocket` 适配发行版（K3s 为 `/run/k3s/containerd`，标准 containerd 为 `/run/containerd`）；`storage.localRetainClass.create`（K3s 专有 Retain StorageClass，标准 K8s 置 false）与 `storage.evolution`/`storage.retain` 控制各卷存储类（留空跟随集群默认 SC）；`gitops.kubectlBin.enabled`+`gitops.kubectlBin.hostPath` 控制主应用 GitOps 拉取端的 Pod 内 kubectl（K3s 挂宿主 k3s 二进制，节点无可用二进制时置 false）；`webhook.nodePort` 为平台 webhook 入口；`ingress.className`（`nginx` 默认 / `traefik` 自动附带 WebSocket Middleware）；`networkPolicy.enabled` 控制沙盒出站隔离。内部密钥留空即安装时自动随机生成；预渲染清单路径用 `secrets.create=false`，密钥改由 init-secrets.sh 生成（bootstrap 自动调用）。
 
 > **维护者注意**：应用拓扑唯一权威源是 Helm chart（`deploy/helm/cogneva/`）。
 > `deploy/rendered/<profile>/` 是 chart 的 CI 渲染产物（`bash
 > deploy/scripts/render-deploy.sh` 重新生成，CI 新鲜度门禁防漂移）；
 > `deploy/k3s/` 静态清单是 parity 基线兼集群内 GitOps 拉取端的运行时消费物，
 > 必须与 chart k3s profile 字段级对齐，由 CI 与 `deploy/scripts/check-deploy-parity.sh`
-> 强制（38 资源基线）。改拓扑的顺序见 `deploy/k3s/README.md`。
+> 强制（47 资源基线）。改拓扑的顺序见 `deploy/k3s/README.md`。
 
 ---
 

@@ -199,6 +199,15 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 None
             };
 
+        // A missing memory backend means learned state would be dropped on
+        // restart, which is what strict_persistence forbids. A missing LLM
+        // only lowers reflection quality, so it is not gated.
+        if strict_persistence && memory_backend.is_none() {
+            return Err(cog_core::SFError::Config(
+                "ReflectionEngine has no MemoryBackend; in-memory mode would drop persistent learning (strict_persistence=true)".into(),
+            ));
+        }
+
         let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
             crate::ReflectionEngine::new_self_evolution(
@@ -213,9 +222,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 change_dir.clone(),
             )
         } else {
-            if strict_persistence {
-                warn!("ReflectionEngine falling back to in-memory mode (memory_backend or llm_provider unavailable)");
-            }
+            warn!("ReflectionEngine falling back to in-memory mode (memory_backend or llm_provider unavailable)");
             info!("ReflectionEngine initialized in in-memory mode");
             let mut engine = crate::ReflectionEngine::new_in_memory(skill_registry.clone());
             if let Some(ref evo) = evolution_engine {

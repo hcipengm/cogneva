@@ -86,6 +86,7 @@ ensure_random pg-password
 ensure_random redis-password
 ensure_random webhook-internal
 ensure_random jwt-secret
+ensure_random meili-master-key
 
 echo "==> 实例身份指纹（64 位十六进制，缺失才创建）"
 ensure_fingerprint
