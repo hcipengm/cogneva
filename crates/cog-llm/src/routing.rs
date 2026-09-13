@@ -250,6 +250,20 @@ impl LLMProvider for RoutingProvider {
                 }
             };
 
+            // Drain the bounded event stream to completion before awaiting the
+            // result. The producer task pushes events with backpressure and only
+            // calls `end()` — which resolves `result()` — after its last push
+            // succeeds. Once the channel fills, `push().await` blocks, so a
+            // consumer that awaits `result()` without ever reading events
+            // deadlocks both itself and the producer: the producer stalls on a
+            // full channel and never reaches `end()`, and `result()` waits on a
+            // oneshot that is never sent. A large reply (e.g. a structured JSON
+            // extraction emitting more deltas than the stream capacity) hangs the
+            // caller forever with no error and no timeout. Reading every event
+            // lets the producer finish. This mirrors the drain each backend
+            // provider already does in its own `chat()`.
+            while stream.next().await.is_some() {}
+
             let response = stream.result().await;
             let latency_ms = start.elapsed().as_millis() as u64;
 
@@ -616,5 +630,107 @@ mod tests {
             response.error_message.as_deref(),
             Some("API error: 429 rate limit exceeded")
         );
+    }
+
+    /// A backend whose `chat_stream` emits far more events than the stream
+    /// capacity from a spawned producer task, exactly like the real OpenAI
+    /// provider streaming a large reply. The producer can only reach `end()`
+    /// (which resolves `result()`) if the consumer keeps reading; once the
+    /// bounded channel fills, `push().await` blocks.
+    struct HighVolumeProvider {
+        events: usize,
+        capacity: usize,
+    }
+
+    #[async_trait]
+    impl LLMProvider for HighVolumeProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            options: &ChatOptions,
+        ) -> SFResult<ChatResponse> {
+            let mut stream = self.chat_stream(messages, options).await?;
+            while stream.next().await.is_some() {}
+            Ok(stream.result().await)
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<AssistantMessageEventStream> {
+            let (stream, mut producer) = AssistantMessageEventStream::with_capacity(self.capacity);
+            let events = self.events;
+            tokio::spawn(async move {
+                let content = vec![ContentBlock::text("done")];
+                for i in 0..events {
+                    // Blocks on backpressure once the channel is full and no
+                    // consumer is draining — the deadlock trigger.
+                    if producer
+                        .push(AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: format!("chunk{i}"),
+                            partial: Message::assistant(content.clone()),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let response = ChatResponse {
+                    content,
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: crate::Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                };
+                producer.end(response);
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &CompleteOptions,
+        ) -> SFResult<AssistantMessageEventStream> {
+            self.chat_stream(&[], &ChatOptions::default()).await
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// `RoutingProvider::chat()` must drain the event stream before awaiting
+    /// `result()`. Without the drain, a reply emitting more events than the
+    /// stream capacity deadlocks: the producer blocks on a full channel and
+    /// never calls `end()`, so `result()` waits forever with no error and no
+    /// timeout. This hung every non-streaming `chat()` caller routed through
+    /// `RoutingProvider` (notably the memory ingestor's structured extraction).
+    /// The timeout turns a would-be hang into a test failure.
+    #[tokio::test]
+    async fn test_chat_drains_high_volume_stream_without_deadlock() {
+        let backend = Arc::new(HighVolumeProvider {
+            events: 500,
+            capacity: 8,
+        });
+        let router = RoutingProvider::new(vec![backend], 1, true, true);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            router.chat(&[Message::user("hi")], &ChatOptions::default()),
+        )
+        .await
+        .expect("RoutingProvider::chat() deadlocked: it must drain the event stream before awaiting result()")
+        .unwrap();
+
+        assert_eq!(response.stop_reason, StopReason::Stop);
     }
 }
