@@ -1495,34 +1495,14 @@ fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Val
     Ok(docs)
 }
 
-/// 把单文档 Deployment 清单里指定容器的 image 改写为本次滚动引用。
-/// kind / metadata.name / 容器名全部显式校验，且必须恰好命中一个容器——
-/// 错改比不改危险，宁可整个发布失败。
-fn patch_deployment_image(
-    yaml_text: &str,
+/// 改写单个 Deployment 文档里指定容器的 image。容器名显式校验且必须恰好
+/// 命中一个——错改比不改危险，宁可整个发布失败。
+fn patch_container_image(
+    v: &mut serde_yaml::Value,
     origin: &str,
-    expect_deployment: &str,
     container: &str,
     image: &str,
-) -> SFResult<String> {
-    let mut v: serde_yaml::Value = serde_yaml::from_str(yaml_text)
-        .map_err(|e| SFError::Config(format!("{origin}: invalid YAML: {e}")))?;
-    let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-    if kind != "Deployment" {
-        return Err(SFError::Config(format!(
-            "{origin}: expected Deployment, found {kind}"
-        )));
-    }
-    let name = v
-        .get("metadata")
-        .and_then(|m| m.get("name"))
-        .and_then(|n| n.as_str())
-        .unwrap_or("");
-    if name != expect_deployment {
-        return Err(SFError::Config(format!(
-            "{origin}: deployment name {name} does not match rollout target {expect_deployment}"
-        )));
-    }
+) -> SFResult<()> {
     // serde_yaml::Value 没有 JSON Pointer 辅助，逐层 get_mut 下钻；任一层
     // 结构缺失都报硬错误（发布集里的 deployment 清单结构异常不该静默放行）。
     let containers = v
@@ -1553,8 +1533,76 @@ fn patch_deployment_image(
             "{origin}: expected exactly one container named {container}, found {patched}"
         )));
     }
-    serde_yaml::to_string(&v)
-        .map_err(|e| SFError::Config(format!("{origin}: serialize patched manifest: {e}")))
+    Ok(())
+}
+
+/// 把目标清单里指定容器的 image 改写为本次滚动引用。
+///
+/// 目标清单允许多文档（如 Deployment + 配套 Service 同文件）：目标
+/// Deployment 必须恰好出现一个且名字精确匹配，其余命名空间级文档原样
+/// 随目标下发；与支撑包同一套红线——Secret 硬报错、集群级 kind 与
+/// RBAC kind 跳过。单文档 `from_str` 会在多文档文件上报错并卡死整条
+/// 发布链路（旧版二进制的实机事故形态），故按文档流解析。
+fn patch_deployment_image(
+    yaml_text: &str,
+    origin: &str,
+    expect_deployment: &str,
+    container: &str,
+    image: &str,
+) -> SFResult<String> {
+    let mut out_docs: Vec<serde_yaml::Value> = Vec::new();
+    let mut deployments = 0usize;
+    for doc in serde_yaml::Deserializer::from_str(yaml_text) {
+        let mut v = serde_yaml::Value::deserialize(doc)
+            .map_err(|e| SFError::Config(format!("{origin}: invalid YAML document: {e}")))?;
+        if v.is_null() {
+            continue;
+        }
+        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        if kind == "Secret" {
+            return Err(SFError::Config(format!(
+                "{origin}: Secret in manifest bundle is forbidden; secrets never travel through manifests"
+            )));
+        }
+        if is_cluster_scoped_kind(kind) {
+            info!(origin = %origin, kind = %kind, "manifest bundle: skipping cluster-scoped kind");
+            continue;
+        }
+        if RBAC_KINDS.contains(&kind) {
+            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping RBAC kind; permission changes must be applied out-of-band");
+            continue;
+        }
+        if kind == "Deployment" {
+            let name = v
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if name != expect_deployment {
+                return Err(SFError::Config(format!(
+                    "{origin}: deployment name {name} does not match rollout target {expect_deployment}"
+                )));
+            }
+            patch_container_image(&mut v, origin, container, image)?;
+            deployments += 1;
+        }
+        out_docs.push(v);
+    }
+    if deployments != 1 {
+        return Err(SFError::Config(format!(
+            "{origin}: expected exactly one Deployment named {expect_deployment}, found {deployments}"
+        )));
+    }
+    let mut out = String::new();
+    for d in &out_docs {
+        out.push_str("---\n");
+        out.push_str(
+            &serde_yaml::to_string(d).map_err(|e| {
+                SFError::Config(format!("{origin}: serialize patched manifest: {e}"))
+            })?,
+        );
+    }
+    Ok(out)
 }
 
 /// 从发布集文件内容（kustomization resources 里的相对路径 → 文件文本）
@@ -3758,6 +3806,95 @@ exit 0
         let err =
             build_rollout_bundle(&files, kustomization, &bundle_targets(), "img").unwrap_err();
         assert!(err.to_string().contains("forbidden"), "{err}");
+    }
+
+    /// 目标清单是多文档文件（Deployment + 配套 Service 同文件）时组包必须
+    /// 成功：Deployment 改写 image、Service 原样随目标下发。单文档解析会在
+    /// 这里报 "more than one document" 并卡死整条发布链路——实机事故回归。
+    #[test]
+    fn build_rollout_bundle_handles_multidoc_target_manifest() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "evolution-deployment.yaml".to_string(),
+            format!(
+                "{}---\nkind: Service\nmetadata:\n  name: cogneva-evolution\nspec:\n  ports:\n    - port: 8080\n",
+                deployment_yaml("cogneva-evolution", "cogneva")
+            ),
+        );
+        let kustomization = "resources:\n  - deployment.yaml\n  - evolution-deployment.yaml\n";
+        let bundle =
+            build_rollout_bundle(&files, kustomization, &bundle_targets(), "reg/img:main-x")
+                .unwrap();
+        let target = bundle
+            .targets
+            .iter()
+            .find(|t| t.deployment == "cogneva-evolution")
+            .expect("evolution target present");
+        assert!(
+            target.yaml.contains("image: reg/img:main-x"),
+            "{target_yaml}",
+            target_yaml = target.yaml
+        );
+        assert!(
+            target.yaml.contains("kind: Service"),
+            "companion Service must ride along the target manifest: {}",
+            target.yaml
+        );
+    }
+
+    /// 目标清单里的红线与支持包一致：Secret 硬报错；名字不匹配的 Deployment
+    /// 硬报错（错滚比不滚危险）；没有目标 Deployment 也硬报错。
+    #[test]
+    fn multidoc_target_manifest_guards() {
+        // Secret 混进目标文件：forbidden。
+        let with_secret = format!(
+            "{}---\nkind: Secret\nmetadata:\n  name: s\n",
+            deployment_yaml("cogneva-evolution", "cogneva")
+        );
+        let err = patch_deployment_image(
+            &with_secret,
+            "evolution-deployment.yaml",
+            "cogneva-evolution",
+            "cogneva",
+            "img",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("forbidden"), "{err}");
+
+        // 名字不匹配的 Deployment：硬错误。
+        let wrong_name = format!(
+            "{}---\n{}",
+            deployment_yaml("cogneva-evolution", "cogneva"),
+            deployment_yaml("other-deployment", "cogneva")
+        );
+        let err = patch_deployment_image(
+            &wrong_name,
+            "evolution-deployment.yaml",
+            "cogneva-evolution",
+            "cogneva",
+            "img",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match rollout target"),
+            "{err}"
+        );
+
+        // 只有 Service 没有 Deployment：恰好一个 Deployment 的约束报错。
+        let no_deploy = "kind: Service\nmetadata:\n  name: s\nspec:\n  ports:\n    - port: 1\n";
+        let err = patch_deployment_image(
+            no_deploy,
+            "evolution-deployment.yaml",
+            "cogneva-evolution",
+            "cogneva",
+            "img",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("found 0"), "{err}");
     }
 
     #[tokio::test]

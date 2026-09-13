@@ -274,6 +274,7 @@ if [ "$DO_DEPLOY" = 1 ]; then
   # 沙箱执行器（第 5 Pod）：deployment+service 幂等 apply，主应用经
   # system.sandbox_executor_url 路由 run_command/read_file/write_file 到此。
   kubectl apply -f deploy/k3s/sandbox-executor-deployment.yaml
+  kubectl apply -f deploy/k3s/sandbox-executor-service.yaml
   # 集群内镜像仓库（金丝雀 overlay 秒级分发通道），随换版幂等落地存量集群
   kubectl apply -f deploy/k3s/cluster-registry.yaml
 

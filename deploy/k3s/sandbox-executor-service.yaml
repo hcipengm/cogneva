@@ -1,0 +1,22 @@
+# 沙箱执行器的集群内 Service：主应用经 system.sandbox_executor_url 路由
+# run_command/read_file/write_file 到执行器 Pod。
+# 与 Deployment 分文件：主线部署器的目标清单按单文档解析改写 image，
+# Service 走支撑包通道下发（与 gateway-deployment/gateway-service 同构）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-sandbox-executor
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: sandbox-executor
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: sandbox-executor
+  ports:
+    - name: executor
+      port: 9090
+      targetPort: executor
+      protocol: TCP
