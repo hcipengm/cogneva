@@ -94,7 +94,10 @@ pub struct ProviderConfigs {
 pub struct ProviderConfig {
     pub provider: String, // mysql, tdsql, postgres, lancedb, local-sfu...
     pub enabled: bool,
-    #[serde(flatten)]
+    /// Backend-specific settings, written in the config file as an `"options"`
+    /// object beside `provider` and `enabled`. Flattening this map would lift
+    /// those keys one level up, leaving the only key present the literal string
+    /// `"options"` and every `options.get(...)` lookup in the consumers empty.
     pub options: HashMap<String, serde_json::Value>,
 }
 

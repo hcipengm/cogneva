@@ -48,9 +48,6 @@ data:
   COGNEVA_RAW_LOGGER_BASE_DIR: "/var/lib/cogneva-data/raw-logs"
   COGNEVA_RAW_LOGGER_BUFFER_SIZE: "1000"
 
-  # Memory
-  COGNEVA_MEMORY_ENABLED: "false"
-  COGNEVA_MEMORY_BACKEND_TYPE: "memory"
-  COGNEVA_MEMORY_BASE_DIR: "/var/lib/cogneva-data/memory"
-  COGNEVA_MEMORY_EMBEDDING_DIMENSION: "128"
-  COGNEVA_MEMORY_AUTO_INGEST: "false"
+  # memory 段不在这里覆盖：cog-memory 自读 cogneva.json 的 memory 段，
+  # 这里再写一份就会与文件打架（曾经写死 enabled=false 把文件里的 true 顶掉，
+  # 记忆不发布，反射插件的严格门随即拒绝启动）。要改记忆配置改文件。

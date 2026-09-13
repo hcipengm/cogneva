@@ -281,11 +281,14 @@ data:
       },
       "memory": {
         "_comment": "Memory backend — enabled by default for self-evolution persistence.",
+        "_comment_models": "load_*_model gates the ONNX weights loaded at startup. They stay off on the shipped profile: BGE-M3 and the reranker are ~2.1GiB resident each, the gateway pod allows 2Gi, and a cache miss fetches from HuggingFace with no client timeout, which stalls plugin init forever on a cluster without that egress. Turn them on on a host that has the RAM and the weights.",
         "enabled": true,
         "backend_type": "memory",
         "base_dir": "/var/lib/cogneva-data/memory",
         "embedding_dimension": 128,
-        "auto_ingest": true
+        "auto_ingest": true,
+        "load_embedding_model": false,
+        "load_reranker_model": false
       },
       "tier_migrator": {
         "enabled": false,

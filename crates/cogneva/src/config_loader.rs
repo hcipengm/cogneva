@@ -706,6 +706,48 @@ mod tests {
         assert_eq!(config.supervisor.health_interval_secs, 10);
     }
 
+    /// Provider settings live in a nested `"options"` object, and consumers read
+    /// them with `options.get(...)`. Round-tripping through the merge pipeline
+    /// must not lift those keys out of the object, or an endpoint such as the
+    /// wiki host silently falls back to a default nobody configured.
+    #[test]
+    fn test_provider_options_survive_the_load_pipeline() {
+        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+        let json = r#"{
+            "providers": {
+                "pg": { "provider": "postgres", "enabled": true,
+                        "options": { "connection": "postgres://db/cogneva" } },
+                "wiki": { "provider": "meilisearch", "enabled": true,
+                          "options": { "host": "http://meili:7700", "index": "wiki" } }
+            }
+        }"#;
+        tmpfile.write_all(json.as_bytes()).unwrap();
+
+        let config = from_json_file(tmpfile.path()).unwrap();
+        assert_eq!(
+            config
+                .providers
+                .pg
+                .options
+                .get("connection")
+                .and_then(|v| v.as_str()),
+            Some("postgres://db/cogneva")
+        );
+        let wiki = config
+            .providers
+            .wiki
+            .as_ref()
+            .expect("wiki provider present");
+        assert_eq!(
+            wiki.options.get("host").and_then(|v| v.as_str()),
+            Some("http://meili:7700")
+        );
+        assert_eq!(
+            wiki.options.get("index").and_then(|v| v.as_str()),
+            Some("wiki")
+        );
+    }
+
     #[test]
     fn test_from_json_file() {
         let mut tmpfile = tempfile::NamedTempFile::new().unwrap();

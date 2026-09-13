@@ -41,6 +41,8 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             memory_base_dir,
             memory_embedding_dimension,
             strict_persistence,
+            load_embedding_model,
+            load_reranker_model,
         ) = {
             let config = ctx.config();
             // memory 是 cog-memory 自有配置段，自读 cogneva.json。
@@ -51,6 +53,8 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                 memory.base_dir.clone(),
                 memory.embedding_dimension,
                 config.system.strict_persistence,
+                memory.load_embedding_model,
+                memory.load_reranker_model,
             )
         };
 
@@ -169,24 +173,30 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         };
 
         // ── Embedding provider ──
-        let embed_provider: Option<Arc<dyn cog_core::EmbeddingProvider>> =
+        let embed_provider: Option<Arc<dyn cog_core::EmbeddingProvider>> = if load_embedding_model {
             match crate::FastEmbedProvider::try_new() {
                 Ok(p) => {
                     info!("FastEmbed BGE-M3 loaded: {} dim", p.dimension());
                     Some(Arc::new(p))
                 }
                 Err(e) => {
-                    // Not gated yet: the model is fetched from the network at
-                    // startup, so a hard failure here would take the process down
-                    // on any cluster without egress. The gate goes in together
-                    // with baking the model into the image.
                     warn!("Failed to load BGE-M3 embedding model: {}", e);
                     None
                 }
-            };
+            }
+        } else {
+            // 关掉是因为这台机器/这个集群吃不下：权重约 2.1GiB 常驻，且本地无缓存
+            // 时会向 HuggingFace 发一次没有超时的拉取，离线集群里会把 init 挂死。
+            // 换到内存/磁盘够用、或已把模型预热进镜像的环境，把它打开即可恢复向量能力。
+            info!(
+                "Embedding model loading disabled (memory.load_embedding_model=false); \
+                 published vectors stay unavailable"
+            );
+            None
+        };
 
         // ── Reranker provider ──
-        let reranker_provider: Option<Arc<dyn crate::RerankerProvider>> =
+        let reranker_provider: Option<Arc<dyn crate::RerankerProvider>> = if load_reranker_model {
             match crate::FastEmbedRerankerProvider::try_new() {
                 Ok(p) => {
                     info!("FastEmbed BGE-Reranker-V2-M3 loaded");
@@ -196,7 +206,14 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                     warn!("Failed to load BGE-Reranker-V2-M3: {}", e);
                     None
                 }
-            };
+            }
+        } else {
+            info!(
+                "Reranker model loading disabled (memory.load_reranker_model=false); \
+                 no reranker published"
+            );
+            None
+        };
 
         // Publish all services.
         if let Some(ref b) = memory_backend {
