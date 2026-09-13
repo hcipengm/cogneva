@@ -33,7 +33,7 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         }
 
         let redis_client = ctx
-            .consume::<cog_core::storage::RedisClient>()
+            .consume::<cog_storage::RedisClient>()
             .expect("redis client")
             .0
             .clone();

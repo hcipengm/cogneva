@@ -3,9 +3,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// User account status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[sqlx(rename_all = "snake_case")]
 pub enum UserStatus {
     Active,
     Inactive,
@@ -13,14 +12,55 @@ pub enum UserStatus {
     Locked,
 }
 
+impl UserStatus {
+    /// Canonical storage representation (matches the `users.status` column).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Inactive => "inactive",
+            Self::Disabled => "disabled",
+            Self::Locked => "locked",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]. Unknown values fall back to [`Self::Active`].
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "inactive" => Self::Inactive,
+            "disabled" => Self::Disabled,
+            "locked" => Self::Locked,
+            _ => Self::Active,
+        }
+    }
+}
+
 /// User type / tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[sqlx(rename_all = "snake_case")]
 pub enum UserType {
     Admin,
     Standard,
     Guest,
+}
+
+impl UserType {
+    /// Canonical storage representation (matches the `users.user_type` column).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Standard => "standard",
+            Self::Guest => "guest",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]. Unknown values fall back to [`Self::Standard`].
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "admin" => Self::Admin,
+            "guest" => Self::Guest,
+            _ => Self::Standard,
+        }
+    }
 }
 
 /// Core user entity.
@@ -134,15 +174,38 @@ pub struct SessionInfo {
 }
 
 /// Authentication method type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[sqlx(rename_all = "snake_case")]
 pub enum AuthType {
     Phone,
     Wechat,
     EnterpriseWechat,
     Ldap,
     Email,
+}
+
+impl AuthType {
+    /// Canonical storage representation (matches `user_auth_methods.auth_type`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Phone => "phone",
+            Self::Wechat => "wechat",
+            Self::EnterpriseWechat => "enterprise_wechat",
+            Self::Ldap => "ldap",
+            Self::Email => "email",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]. Unknown values fall back to [`Self::Phone`].
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "wechat" => Self::Wechat,
+            "enterprise_wechat" => Self::EnterpriseWechat,
+            "ldap" => Self::Ldap,
+            "email" => Self::Email,
+            _ => Self::Phone,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

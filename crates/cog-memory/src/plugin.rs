@@ -56,7 +56,7 @@ impl cog_core::SystemPlugin for MemoryPlugin {
 
         // Consume PostgreSQL explain pool (published by StoragePlugin).
         let pg_pool_explain = ctx
-            .consume::<cog_core::storage::ExplainPool>()
+            .consume::<cog_storage::ExplainPool>()
             .and_then(|p| p.0.clone());
 
         // ── Metrics backend ──

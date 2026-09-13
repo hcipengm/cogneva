@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use cog_core::storage::{ConfigPool, ExplainPool, MessagesPool, RedisClient, UsersPool};
+use crate::pools::{ConfigPool, ExplainPool, MessagesPool, RedisClient, UsersPool};
 
 /// Storage plugin that creates and publishes PostgreSQL pools and Redis client.
 pub struct StoragePlugin {

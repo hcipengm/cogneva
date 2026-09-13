@@ -77,7 +77,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         let hook_engine: Option<Arc<dyn cog_core::HookEngine>> =
             ctx.consume_service::<dyn cog_core::HookEngine>();
         let pg_pool_explain = ctx
-            .consume::<cog_core::ExplainPool>()
+            .consume::<cog_storage::ExplainPool>()
             .and_then(|p| p.0.clone());
         let hook_archive = ctx.consume_service::<dyn cog_core::HookArchive>();
         let media_backend = ctx.consume_service::<dyn cog_core::MediaBackend>();
@@ -132,7 +132,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // Login rate limiting shares the Redis the session manager uses;
         // without Redis the limiter stays off (login itself still works).
         let login_rate_limiter: Option<Arc<crate::auth::LoginRateLimiter>> =
-            match ctx.consume::<cog_core::storage::RedisClient>() {
+            match ctx.consume::<cog_storage::RedisClient>() {
                 Some(client) => match client.0.get_multiplexed_async_connection().await {
                     Ok(conn) => Some(Arc::new(crate::auth::LoginRateLimiter::new(
                         conn,

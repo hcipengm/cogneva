@@ -18,25 +18,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// PostgreSQL pool wrappers published by the storage plugin so that
-/// downstream crates can consume them without depending on `cog-storage`.
-#[derive(Debug, Clone)]
-pub struct UsersPool(pub Option<sqlx::PgPool>);
-
-#[derive(Debug, Clone)]
-pub struct MessagesPool(pub Option<sqlx::PgPool>);
-
-#[derive(Debug, Clone)]
-pub struct ConfigPool(pub Option<sqlx::PgPool>);
-
-#[derive(Debug, Clone)]
-pub struct ExplainPool(pub Option<sqlx::PgPool>);
-
-/// Redis client wrapper so it can be stored in
-/// [`crate::contract::system_plugin::PluginContext`].
-#[derive(Debug, Clone)]
-pub struct RedisClient(pub redis::Client);
-
 /// A single time-series sample returned by
 /// [`MetricsBackend::query_gauge_range`].
 #[derive(Debug, Clone)]

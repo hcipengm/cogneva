@@ -32,23 +32,6 @@ type UserRow = (
     DateTime<Utc>,
 );
 
-fn parse_status(s: &str) -> UserStatus {
-    match s {
-        "inactive" => UserStatus::Inactive,
-        "disabled" => UserStatus::Disabled,
-        "locked" => UserStatus::Locked,
-        _ => UserStatus::Active,
-    }
-}
-
-fn parse_user_type(s: &str) -> UserType {
-    match s {
-        "admin" => UserType::Admin,
-        "guest" => UserType::Guest,
-        _ => UserType::Standard,
-    }
-}
-
 fn user_from_row(r: UserRow) -> User {
     User {
         id: r.0,
@@ -57,8 +40,8 @@ fn user_from_row(r: UserRow) -> User {
         username: r.3,
         display_name: r.4,
         avatar_url: r.5,
-        status: parse_status(&r.6),
-        user_type: parse_user_type(&r.7),
+        status: UserStatus::from_str_lossy(&r.6),
+        user_type: UserType::from_str_lossy(&r.7),
         created_at: r.8,
         updated_at: r.9,
     }

@@ -26,6 +26,7 @@ pub mod backends;
 pub mod dlq;
 pub mod etcd;
 pub mod event_filter;
+pub mod pools;
 pub mod raw;
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -60,6 +61,10 @@ pub use redis::{MemoryAgentRegistry, RedisAgentRegistry, RedisBackend, RedisTrac
 
 pub use agent_id::generate_agent_id;
 pub use etcd::registry::EtcdAgentRegistry;
+
+#[cfg(feature = "redis")]
+pub use pools::RedisClient;
+pub use pools::{ConfigPool, ExplainPool, MessagesPool, UsersPool};
 
 pub use raw::{FileRawLogger, MemoryRawLogger, NoopRawLogger};
 

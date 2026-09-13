@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
+cog-storage = { workspace = true }
 
 async-trait = "0.1"
 axum = { workspace = true }

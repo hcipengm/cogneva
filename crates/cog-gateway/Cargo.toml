@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
+cog-storage = { workspace = true }
 # 横切关注点：网关是上游池健康的唯一掌握者，指标/日志/时序/告警四类
 # 落盘复用 cog-observability 既有设施（无环：observability 只依赖 core）。
 cog-observability = { workspace = true }

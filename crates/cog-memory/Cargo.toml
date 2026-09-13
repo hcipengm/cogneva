@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
+cog-storage = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

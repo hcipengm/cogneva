@@ -72,7 +72,7 @@ impl UserRepository<MySql> {
             WHERE m.auth_type = ? AND m.auth_id = ?
             "#,
         )
-        .bind(auth_type)
+        .bind(auth_type.as_str())
         .bind(auth_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -102,7 +102,7 @@ impl UserRepository<MySql> {
         .bind(email)
         .bind(username)
         .bind(display_name)
-        .bind(user_type)
+        .bind(user_type.as_str())
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -125,7 +125,7 @@ impl UserRepository<MySql> {
     pub async fn update_status(&self, id: Uuid, status: UserStatus) -> AuthResult<()> {
         let now = Utc::now();
         sqlx::query("UPDATE users SET status = ?, updated_at = ? WHERE id = ?")
-            .bind(status)
+            .bind(status.as_str())
             .bind(now)
             .bind(id)
             .execute(&self.pool)
@@ -183,7 +183,7 @@ impl UserRepository<Postgres> {
             WHERE m.auth_type = $1 AND m.auth_id = $2
             "#,
         )
-        .bind(auth_type)
+        .bind(auth_type.as_str())
         .bind(auth_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -213,7 +213,7 @@ impl UserRepository<Postgres> {
         .bind(email)
         .bind(username)
         .bind(display_name)
-        .bind(user_type)
+        .bind(user_type.as_str())
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -236,7 +236,7 @@ impl UserRepository<Postgres> {
     pub async fn update_status(&self, id: Uuid, status: UserStatus) -> AuthResult<()> {
         let now = Utc::now();
         sqlx::query("UPDATE users SET status = $1, updated_at = $2 WHERE id = $3")
-            .bind(status)
+            .bind(status.as_str())
             .bind(now)
             .bind(id)
             .execute(&self.pool)
@@ -257,8 +257,8 @@ fn map_mysql_row_to_user(row: sqlx::mysql::MySqlRow) -> Result<User, sqlx::Error
         username: row.try_get("username")?,
         display_name: row.try_get("display_name")?,
         avatar_url: row.try_get("avatar_url")?,
-        status: row.try_get("status")?,
-        user_type: row.try_get("user_type")?,
+        status: UserStatus::from_str_lossy(&row.try_get::<String, _>("status")?),
+        user_type: UserType::from_str_lossy(&row.try_get::<String, _>("user_type")?),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -272,8 +272,8 @@ fn map_pg_row_to_user(row: sqlx::postgres::PgRow) -> Result<User, sqlx::Error> {
         username: row.try_get("username")?,
         display_name: row.try_get("display_name")?,
         avatar_url: row.try_get("avatar_url")?,
-        status: row.try_get("status")?,
-        user_type: row.try_get("user_type")?,
+        status: UserStatus::from_str_lossy(&row.try_get::<String, _>("status")?),
+        user_type: UserType::from_str_lossy(&row.try_get::<String, _>("user_type")?),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

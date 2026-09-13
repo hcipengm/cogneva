@@ -20,8 +20,6 @@ futures = { workspace = true }
 bytes = { workspace = true }
 schemars = { workspace = true }
 jsonschema = { workspace = true }
-sqlx = { workspace = true }
-redis = { workspace = true }
 blake3 = { workspace = true }
 zstd = { workspace = true }
 regex = "1.11"
