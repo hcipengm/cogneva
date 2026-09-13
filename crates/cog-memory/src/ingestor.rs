@@ -2,10 +2,38 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use cog_core::MemoryExtractor;
 use cog_core::{AgentEvent, SFResult};
 use cog_core::{MemoryBackend, RawSource};
+
+/// 归档 id 里来源 slug 的长度上限。与时间戳/随机段合计仍远低于文件系统
+/// NAME_MAX(255 字节)，同时保留足够前缀让人能从对象键认出来源。
+const RAW_ID_SLUG_MAX: usize = 64;
+
+/// 把任意来源 id 收敛成对象键安全的有界形式。自进化系统里 agent_id 可以是
+/// 整段 issue 标题（数百字节 CJK，含 `:`、`#`、空格甚至 `/`）：直接拼进
+/// 对象键会让 local-fs 后端把整键当超长单段路径写（ENAMETOOLONG），每次
+/// 归档都失败；同一 agent 的多次会话还会互相覆盖同一个对象。规则：只保留
+/// ASCII 字母数字与 `.`/`-`，其余折成 `_`；截到 [`RAW_ID_SLUG_MAX`]；附
+/// 毫秒时间戳与 8 位随机段，保证每次归档唯一。原始 id 由调用方放进 tags
+/// 保留可追溯性。
+fn bounded_raw_id(prefix: &str, source: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    let slug: String = source
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(RAW_ID_SLUG_MAX)
+        .collect();
+    let random = &Uuid::new_v4().simple().to_string()[..8];
+    format!("{prefix}-{slug}-{}-{random}", now.timestamp_millis())
+}
 
 /// Configuration for [`MemoryIngestor`] retry and dead-letter behaviour.
 #[derive(Debug, Clone)]
@@ -104,12 +132,18 @@ impl MemoryIngestor {
 
                 // Serialize messages as raw source payload
                 let payload = serde_json::to_vec(messages).unwrap_or_else(|_| b"[]".to_vec());
+                // The agent_id becomes an object-key path component, and in a
+                // self-evolving system it can be a whole issue title (hundreds
+                // of CJK bytes, `:`/`#`/spaces). Bound it to a path-safe form
+                // so the local-fs object backend never trips NAME_MAX, and keep
+                // the verbatim agent_id as a tag for traceability.
                 let raw = RawSource::new(
-                    format!("agent-{}", agent_id),
+                    bounded_raw_id("agent", agent_id, chrono::Utc::now()),
                     "default",
                     "conversation/transcript",
                     payload,
-                );
+                )
+                .with_tags(vec![format!("agent_id:{}", agent_id)]);
 
                 // Archive raw source
                 let uri = self.backend.archive_raw(&raw).await?;
@@ -204,9 +238,16 @@ impl MemoryIngestor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MemoryMemoryBackend, RuleBasedExtractor};
+    use crate::{
+        CompositeMemoryBackend, MemoryMemoryBackend, NoopVectorBackend, RuleBasedExtractor,
+    };
     use chrono::Utc;
     use cog_core::Message;
+
+    /// The agent_id shape that motivated [`bounded_raw_id`]: a self-evolving
+    /// system routes whole issue titles through as agent ids — hundreds of
+    /// CJK bytes plus `:`, `#`, spaces.
+    const LIVE_LONG_AGENT_ID: &str = "squad:decompose-Fix gitee issue #34295240: 刷新接口未区分访问令牌和刷新令牌，访问令牌可换取新令牌";
 
     fn agent_end(agent_id: &str) -> AgentEvent {
         AgentEvent::AgentEnd {
@@ -297,5 +338,73 @@ mod tests {
             }
         }
         assert!(exited, "task must exit after an explicit stop signal");
+    }
+
+    /// Contract pin for [`bounded_raw_id`]: a whole-issue-title agent_id must
+    /// collapse to a path-safe, NAME_MAX-bounded object key that stays unique
+    /// per archive even within the same millisecond.
+    #[test]
+    fn bounded_raw_id_bounds_pathological_agent_id() {
+        let now = Utc::now();
+        let id = bounded_raw_id("agent", LIVE_LONG_AGENT_ID, now);
+
+        // Worst case: prefix(5+1) + slug(64) + '-' + 13-digit millis + '-' +
+        // 8 hex — comfortably below the 255-byte NAME_MAX per path component.
+        assert!(id.len() < 128, "id not bounded: {} bytes", id.len());
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')),
+            "id contains path-unsafe characters: {id}"
+        );
+        // Same input at the same instant must still produce distinct ids,
+        // otherwise one agent's sessions overwrite each other's archives.
+        let id2 = bounded_raw_id("agent", LIVE_LONG_AGENT_ID, now);
+        assert_ne!(id, id2, "ids must stay unique per archive");
+    }
+
+    /// Regression for the ENAMETOOLONG archive failure: with the raw layer on
+    /// a real filesystem object store (the production wiring), a full issue
+    /// title as agent_id must still archive, and the verbatim agent_id must
+    /// survive as a tag for traceability.
+    #[tokio::test]
+    async fn long_agent_id_archives_on_filesystem_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let composite = CompositeMemoryBackend::new(
+            Arc::new(cog_storage::FileObjectBackend::new(dir.path())),
+            Arc::new(NoopVectorBackend::new()),
+            8,
+        );
+        let backend: Arc<dyn MemoryBackend> = Arc::new(composite);
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
+        let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(16);
+        let _handle = ingestor.spawn(event_tx.subscribe());
+
+        event_tx.send(agent_end(LIVE_LONG_AGENT_ID)).unwrap();
+
+        let mut archived_id = None;
+        for _ in 0..100 {
+            if let Ok(list) = backend.list_raw("default", None).await {
+                if let Some(id) = list.into_iter().next() {
+                    archived_id = Some(id);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let id = archived_id.expect("long agent_id must archive on the filesystem backend");
+        assert!(id.len() < 128, "archived id not bounded: {id}");
+
+        let raw = backend
+            .get_raw("default", &id)
+            .await
+            .expect("raw readable")
+            .expect("raw present");
+        assert!(
+            raw.tags
+                .iter()
+                .any(|t| t == &format!("agent_id:{LIVE_LONG_AGENT_ID}")),
+            "verbatim agent_id must be retained in tags, got {:?}",
+            raw.tags
+        );
     }
 }
