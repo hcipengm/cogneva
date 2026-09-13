@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::collections::HashMap;
+use base64::Engine;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,10 +24,13 @@ use cog_core::{SchemaBackend, SummaryBackend};
 /// [`with_summary_backend`](Self::with_summary_backend).
 pub struct CompositeMemoryBackend {
     raw: Arc<dyn ObjectBackend>,
-    raw_ids: std::sync::RwLock<HashMap<String, Vec<String>>>,
     schema: Arc<dyn SchemaBackend>,
     summary: Arc<dyn SummaryBackend>,
     metrics: std::sync::RwLock<MemoryMetrics>,
+    embedding_dim: usize,
+    /// Dense embedder used when a caller stores an explicit memory. Without
+    /// one the entry gets a zero vector, which is honest but unsearchable.
+    embedder: Option<Arc<dyn cog_core::EmbeddingProvider>>,
     /// Concrete handle to the default schema backend, retained while the
     /// caller has not replaced it.  Used by [`set_persist_dir`](Self::set_persist_dir)
     /// and [`load`](Self::load) so the legacy persistence helpers keep working.
@@ -48,13 +51,21 @@ impl CompositeMemoryBackend {
         let summary = Arc::new(VectorSummaryBackend::new(vector, embedding_dim));
         Self {
             raw,
-            raw_ids: std::sync::RwLock::new(HashMap::new()),
             schema: schema.clone(),
             summary: summary.clone(),
             metrics: std::sync::RwLock::new(MemoryMetrics::default()),
+            embedding_dim,
+            embedder: None,
             default_schema: Some(schema),
             default_summary: Some(summary),
         }
+    }
+
+    /// Attach a dense embedder. Explicit ingests then store a real embedding
+    /// instead of a zero vector.
+    pub fn with_embedder(mut self, embedder: Arc<dyn cog_core::EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// Replace the schema-layer backend with a custom implementation
@@ -105,21 +116,67 @@ impl CompositeMemoryBackend {
     fn raw_key(namespace: &str, id: &str) -> String {
         format!("memory/raw/{}/{}", namespace, id)
     }
+
+    fn raw_prefix(namespace: &str) -> String {
+        format!("memory/raw/{}/", namespace)
+    }
+
+    /// Serialize a raw source into the object the Raw layer stores.
+    ///
+    /// The payload goes in as base64 rather than a JSON number array: a text
+    /// payload stored that way costs several bytes per input byte, and these
+    /// objects are written on every archived memory.
+    fn encode_raw(source: &RawSource) -> SFResult<Vec<u8>> {
+        let envelope = RawEnvelope {
+            id: source.id.clone(),
+            namespace: source.namespace.clone(),
+            content_type: source.content_type.clone(),
+            tags: source.tags.clone(),
+            created_at: source.created_at,
+            archived_at: source.archived_at,
+            payload: base64::engine::general_purpose::STANDARD.encode(&source.payload),
+        };
+        serde_json::to_vec(&envelope)
+            .map_err(|e| SFError::Agent(format!("encode raw source failed: {}", e)))
+    }
+
+    fn decode_raw(bytes: &[u8]) -> SFResult<RawSource> {
+        let envelope: RawEnvelope = serde_json::from_slice(bytes)
+            .map_err(|e| SFError::Agent(format!("decode raw source failed: {}", e)))?;
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(&envelope.payload)
+            .map_err(|e| SFError::Agent(format!("decode raw payload failed: {}", e)))?;
+        Ok(RawSource {
+            id: envelope.id,
+            namespace: envelope.namespace,
+            content_type: envelope.content_type,
+            payload,
+            tags: envelope.tags,
+            created_at: envelope.created_at,
+            archived_at: envelope.archived_at,
+        })
+    }
+}
+
+/// On-object form of a [`RawSource`]. Storing the metadata alongside the
+/// payload keeps a raw source self-describing: the content type survives a
+/// round trip instead of being guessed back as `application/octet-stream`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RawEnvelope {
+    id: String,
+    namespace: String,
+    content_type: String,
+    tags: Vec<String>,
+    created_at: DateTime<Utc>,
+    archived_at: DateTime<Utc>,
+    payload: String,
 }
 
 #[async_trait]
 impl MemoryBackend for CompositeMemoryBackend {
     async fn archive_raw(&self, source: &RawSource) -> SFResult<String> {
         let key = Self::raw_key(&source.namespace, &source.id);
-        let uri = self.raw.put(&key, &source.payload).await?;
-        let mut ids = self
-            .raw_ids
-            .write()
-            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        let ns_ids = ids.entry(source.namespace.clone()).or_default();
-        if !ns_ids.contains(&source.id) {
-            ns_ids.push(source.id.clone());
-        }
+        let uri = self.raw.put(&key, &Self::encode_raw(source)?).await?;
         let mut metrics = self
             .metrics
             .write()
@@ -131,39 +188,55 @@ impl MemoryBackend for CompositeMemoryBackend {
     async fn get_raw(&self, namespace: &str, id: &str) -> SFResult<Option<RawSource>> {
         let key = Self::raw_key(namespace, id);
         match self.raw.get(&key).await? {
-            Some(data) => {
-                // Reconstruct a minimal RawSource from the payload.
-                // In production the full metadata would be stored alongside.
-                Ok(Some(RawSource::new(
-                    id,
-                    namespace,
-                    "application/octet-stream",
-                    data,
-                )))
-            }
+            Some(data) => Ok(Some(Self::decode_raw(&data)?)),
             None => Ok(None),
         }
     }
 
-    async fn list_raw(&self, namespace: &str, _prefix: Option<&str>) -> SFResult<Vec<String>> {
-        let ids = self
-            .raw_ids
-            .read()
-            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        Ok(ids.get(namespace).cloned().unwrap_or_default())
+    async fn list_raw(
+        &self,
+        namespace: &str,
+        content_type_prefix: Option<&str>,
+    ) -> SFResult<Vec<String>> {
+        // The object store is the index: an in-process map is empty after a
+        // restart and diverges between replicas, which is exactly the failure
+        // this layer exists to avoid.
+        let prefix = Self::raw_prefix(namespace);
+        let mut ids: Vec<String> = self
+            .raw
+            .list(Some(&prefix))
+            .await?
+            .into_iter()
+            .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+            .filter(|id| !id.is_empty())
+            .collect();
+
+        if let Some(content_type) = content_type_prefix {
+            // A listing carries keys only, and the content type lives inside
+            // the stored envelope, so a type-filtered query reads its
+            // candidates back. Unfiltered listings stay a single call.
+            let mut matched = Vec::with_capacity(ids.len());
+            for id in ids {
+                let key = Self::raw_key(namespace, &id);
+                if let Some(bytes) = self.raw.get(&key).await? {
+                    if Self::decode_raw(&bytes)?
+                        .content_type
+                        .starts_with(content_type)
+                    {
+                        matched.push(id);
+                    }
+                }
+            }
+            ids = matched;
+        }
+
+        ids.sort();
+        Ok(ids)
     }
 
     async fn delete_raw(&self, namespace: &str, id: &str) -> SFResult<()> {
         let key = Self::raw_key(namespace, id);
-        self.raw.delete(&key).await?;
-        let mut ids = self
-            .raw_ids
-            .write()
-            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        if let Some(ns_ids) = ids.get_mut(namespace) {
-            ns_ids.retain(|x| x != id);
-        }
-        Ok(())
+        self.raw.delete(&key).await
     }
 
     async fn store_schema(&self, namespace: &str, entry: &SchemaEntry) -> SFResult<()> {
@@ -368,18 +441,7 @@ impl MemoryBackend for CompositeMemoryBackend {
             .with_tags(tags);
 
         let key = Self::raw_key(namespace, &id);
-        self.raw.put(&key, &raw.payload).await?;
-
-        {
-            let mut ids = self
-                .raw_ids
-                .write()
-                .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-            let ns_ids = ids.entry(namespace.to_string()).or_default();
-            if !ns_ids.contains(&id) {
-                ns_ids.push(id.clone());
-            }
-        }
+        self.raw.put(&key, &Self::encode_raw(&raw)?).await?;
 
         {
             let mut metrics = self
@@ -389,11 +451,24 @@ impl MemoryBackend for CompositeMemoryBackend {
             metrics.raw_archived += 1;
         }
 
+        // A zero vector is unsearchable, so embed the text when an embedder is
+        // available. Falling back to the configured dimension keeps the vector
+        // shape consistent with the collection either way.
+        let embedding = match self.embedder.as_ref() {
+            Some(embedder) => embedder
+                .embed(vec![text.to_string()])
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| SFError::Agent("embedder returned no vector".into()))?,
+            None => vec![0.0f32; self.embedding_dim],
+        };
+
         let summary = SummaryEntry::new(
             &id,
             namespace,
             text,
-            vec![0.0f32; 128],
+            embedding,
             "explicit",
             cog_core::SourceRef::new(format!("memory://{}", id), "explicit/v1"),
         )
@@ -415,16 +490,6 @@ impl MemoryBackend for CompositeMemoryBackend {
     async fn forget(&self, namespace: &str, id: &str) -> SFResult<()> {
         let key = Self::raw_key(namespace, id);
         self.raw.delete(&key).await?;
-
-        {
-            let mut ids = self
-                .raw_ids
-                .write()
-                .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-            if let Some(ns_ids) = ids.get_mut(namespace) {
-                ns_ids.retain(|x| x != id);
-            }
-        }
 
         let schemas = self.schema.schema_for_raw(namespace, id).await?;
         for s in schemas {

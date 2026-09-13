@@ -38,7 +38,6 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         let (
             memory_enabled,
             memory_backend_type,
-            memory_base_dir,
             memory_embedding_dimension,
             strict_persistence,
             load_embedding_model,
@@ -50,7 +49,6 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             (
                 memory.enabled,
                 memory.backend_type.clone(),
-                memory.base_dir.clone(),
                 memory.embedding_dimension,
                 config.system.strict_persistence,
                 memory.load_embedding_model,
@@ -95,6 +93,32 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             }
         };
 
+        // ── Embedding provider ──
+        // Built before the memory backend so an explicit ingest can embed with
+        // the real model instead of storing a zero vector.
+        let embed_provider: Option<Arc<dyn cog_core::EmbeddingProvider>> = if load_embedding_model {
+            match crate::FastEmbedProvider::try_new() {
+                Ok(p) => {
+                    info!("FastEmbed BGE-M3 loaded: {} dim", p.dimension());
+                    Some(Arc::new(p))
+                }
+                Err(e) => {
+                    warn!("Failed to load BGE-M3 embedding model: {}", e);
+                    None
+                }
+            }
+        } else {
+            // 关掉是因为这台机器吃不下：权重约 2.1GiB 常驻（dense 与 sparse 各开一个
+            // session，等于同一份权重占两遍），且本地无缓存时会向 HuggingFace 发一次
+            // 没有超时的拉取，离线集群里会把 init 挂死。权重不进镜像，由部署侧以
+            // 只读卷/共享目录提供；确认权重就位且内存足够再打开即恢复向量能力。
+            info!(
+                "Embedding model loading disabled (memory.load_embedding_model=false); \
+                 published vectors stay unavailable"
+            );
+            None
+        };
+
         let memory_backend: Option<Arc<dyn cog_core::MemoryBackend>> = {
             let backend: Arc<dyn cog_core::MemoryBackend> = match memory_backend_type.as_str() {
                 "composite" => {
@@ -112,17 +136,61 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                         vector_backend.clone(),
                         memory_embedding_dimension,
                     );
-                    composite.set_persist_dir(&memory_base_dir);
-                    if let Err(e) = composite.load().await {
-                        warn!("Failed to load persisted memory data: {}", e);
-                    } else {
-                        info!("CompositeMemoryBackend loaded persisted data");
+                    if let Some(ref embedder) = embed_provider {
+                        composite = composite.with_embedder(embedder.clone());
                     }
-                    let summary_backend = crate::VectorSummaryBackend::new(
+
+                    // Each layer's own backend loads its own state. The composite's
+                    // `set_persist_dir`/`load` helpers only drive the default
+                    // in-memory backends, and both are replaced right here, so
+                    // calling them would do nothing but look like recovery.
+                    let mut summary_backend = crate::VectorSummaryBackend::new(
                         vector_backend.clone(),
                         memory_embedding_dimension,
                     );
+                    match pg_pool_explain {
+                        Some(ref pool) => {
+                            let entry_store = crate::PostgresEntryStore::from_pool(pool.clone());
+                            match entry_store.init_table().await {
+                                Ok(()) => {
+                                    info!("PostgresEntryStore initialized for summary layer");
+                                    summary_backend =
+                                        summary_backend.with_store(Arc::new(entry_store));
+                                }
+                                Err(e) => {
+                                    if strict_persistence {
+                                        return Err(cog_core::SFError::Config(format!(
+                                            "PostgresEntryStore init_table failed (strict_persistence=true): {}",
+                                            e
+                                        )));
+                                    }
+                                    warn!(
+                                        "PostgresEntryStore init_table failed: {}. Summary layer will use memory fallback.",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            if strict_persistence {
+                                return Err(cog_core::SFError::Config(
+                                    "No ExplainPool published by StoragePlugin; the summary layer of composite memory has no persistent entry store (strict_persistence=true)".into(),
+                                ));
+                            }
+                            warn!("No ExplainPool published by StoragePlugin; summary layer will use memory fallback");
+                        }
+                    }
+                    if let Err(e) = summary_backend.load().await {
+                        if strict_persistence {
+                            return Err(cog_core::SFError::Config(format!(
+                                "Summary layer failed to load persisted entries (strict_persistence=true): {}",
+                                e
+                            )));
+                        }
+                        warn!("Summary layer failed to load persisted entries: {}", e);
+                    }
                     composite = composite.with_summary_backend(Arc::new(summary_backend));
+
                     match pg_pool_explain {
                         Some(ref pool) => {
                             let schema_backend =
@@ -157,42 +225,24 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                         metrics_backend.clone(),
                     ))
                 }
-                // Gated by the deployment config, not by strict_persistence: the
-                // shipped config still selects this in-memory backend, and the
-                // composite path it would fall back to is not yet durable. The
-                // hard failure belongs with that switch, not before it.
-                _ => {
-                    info!("MemoryMemoryBackend enabled");
+                // Non-durable by construction. Gated by the deployment config
+                // rather than by strict_persistence: choosing this backend is a
+                // deliberate "lose it on restart" decision, not a degradation
+                // the strict flag is meant to catch.
+                "memory" => {
+                    info!("MemoryMemoryBackend enabled (in-process, not durable)");
                     Arc::new(crate::MetricsInstrumentedMemoryBackend::new(
                         Arc::new(crate::MemoryMemoryBackend::new()),
                         metrics_backend.clone(),
                     ))
                 }
+                other => {
+                    return Err(cog_core::SFError::Config(format!(
+                        "unknown memory.backend_type {other:?}; expected \"composite\" or \"memory\""
+                    )));
+                }
             };
             Some(backend)
-        };
-
-        // ── Embedding provider ──
-        let embed_provider: Option<Arc<dyn cog_core::EmbeddingProvider>> = if load_embedding_model {
-            match crate::FastEmbedProvider::try_new() {
-                Ok(p) => {
-                    info!("FastEmbed BGE-M3 loaded: {} dim", p.dimension());
-                    Some(Arc::new(p))
-                }
-                Err(e) => {
-                    warn!("Failed to load BGE-M3 embedding model: {}", e);
-                    None
-                }
-            }
-        } else {
-            // 关掉是因为这台机器/这个集群吃不下：权重约 2.1GiB 常驻，且本地无缓存
-            // 时会向 HuggingFace 发一次没有超时的拉取，离线集群里会把 init 挂死。
-            // 换到内存/磁盘够用、或已把模型预热进镜像的环境，把它打开即可恢复向量能力。
-            info!(
-                "Embedding model loading disabled (memory.load_embedding_model=false); \
-                 published vectors stay unavailable"
-            );
-            None
         };
 
         // ── Reranker provider ──

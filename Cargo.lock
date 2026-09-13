@@ -1634,6 +1634,7 @@ version = "0.5.7"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "cog-core",
  "cog-storage",
@@ -1643,6 +1644,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

@@ -870,3 +870,156 @@ async fn test_composite_memory_query_relations_filtered() {
         .unwrap();
     assert_eq!(results.len(), 2);
 }
+
+/// Dense-only embedder: every text maps to the same non-zero vector, which is
+/// enough to distinguish "embedded" from the all-zero fallback.
+struct StubEmbedder {
+    dim: usize,
+}
+
+#[async_trait::async_trait]
+impl cog_core::EmbeddingProvider for StubEmbedder {
+    async fn embed(&self, texts: Vec<String>) -> cog_core::SFResult<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![0.25f32; self.dim]).collect())
+    }
+
+    async fn embed_sparse(
+        &self,
+        texts: Vec<String>,
+    ) -> cog_core::SFResult<Vec<cog_core::SparseEmbedding>> {
+        Ok(texts
+            .iter()
+            .map(|_| cog_core::SparseEmbedding::new(vec![1], vec![1.0]))
+            .collect())
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
+
+/// The Raw layer reads its index from the object store rather than an
+/// in-process map, so a fresh backend over the same store still lists what an
+/// earlier one archived. A restart is modelled by building the backend twice.
+#[tokio::test]
+async fn test_list_raw_survives_backend_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+
+    let first = CompositeMemoryBackend::new(
+        object.clone(),
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        1024,
+    );
+    first.archive_raw(&make_raw("r1", "one")).await.unwrap();
+    first.archive_raw(&make_raw("r2", "two")).await.unwrap();
+
+    let second = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        1024,
+    );
+    let ids = second.list_raw("default", None).await.unwrap();
+    assert_eq!(ids, vec!["r1".to_string(), "r2".to_string()]);
+}
+
+/// Archived raw sources stay self-describing: content type and tags come back
+/// as stored instead of being guessed back as application/octet-stream.
+#[tokio::test]
+async fn test_raw_roundtrip_preserves_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        1024,
+    );
+
+    let source = make_raw("m1", "payload").with_tags(vec!["alpha".into(), "beta".into()]);
+    backend.archive_raw(&source).await.unwrap();
+
+    let back = backend.get_raw("default", "m1").await.unwrap().unwrap();
+    assert_eq!(back.content_type, "conversation/transcript");
+    assert_eq!(back.tags, vec!["alpha".to_string(), "beta".to_string()]);
+    assert_eq!(String::from_utf8_lossy(&back.payload), "payload");
+}
+
+#[tokio::test]
+async fn test_list_raw_filters_by_content_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        1024,
+    );
+
+    backend.archive_raw(&make_raw("a", "A")).await.unwrap();
+    backend
+        .archive_raw(&RawSource::new(
+            "b",
+            "default",
+            "memory/explicit",
+            b"B".to_vec(),
+        ))
+        .await
+        .unwrap();
+
+    let all = backend.list_raw("default", None).await.unwrap();
+    assert_eq!(all.len(), 2);
+
+    let only_conversation = backend
+        .list_raw("default", Some("conversation/"))
+        .await
+        .unwrap();
+    assert_eq!(only_conversation, vec!["a".to_string()]);
+}
+
+/// An explicit ingest embeds with the injected provider; a zero vector would
+/// be unsearchable, which is the state this guards against.
+#[tokio::test]
+async fn test_ingest_explicit_embeds_with_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        1024,
+    )
+    .with_embedder(Arc::new(StubEmbedder { dim: 1024 }));
+
+    backend
+        .ingest_explicit("default", "remember this", 0.9, Vec::new())
+        .await
+        .unwrap();
+
+    let entries = backend.list_summary("default").await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].embedding.len(), 1024);
+    assert!(
+        entries[0].embedding.iter().any(|v| *v != 0.0),
+        "explicit ingest must not store a zero vector when an embedder is available"
+    );
+}
+
+/// Without an embedder the vector is zero, but it still has to match the
+/// configured dimension so the collection shape stays consistent.
+#[tokio::test]
+async fn test_ingest_explicit_without_embedder_uses_configured_dimension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        1024,
+    );
+
+    backend
+        .ingest_explicit("default", "no embedder here", 0.5, Vec::new())
+        .await
+        .unwrap();
+
+    let entries = backend.list_summary("default").await.unwrap();
+    assert_eq!(entries[0].embedding.len(), 1024);
+    assert!(entries[0].embedding.iter().all(|v| *v == 0.0));
+}
