@@ -14,11 +14,14 @@ metadata:
     app.kubernetes.io/version: "0.5.7"
 spec:
   replicas: 1
+  # No surge: every profile runs a single replica on a single node, so a surging
+  # pod has nowhere to be scheduled and the rollout times out. Terminating the
+  # old pod first frees its request, at the cost of a brief restart window.
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: cogneva
