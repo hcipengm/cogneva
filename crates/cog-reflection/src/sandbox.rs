@@ -380,4 +380,43 @@ mod tests {
         assert!(!effective.auto_apply);
         assert!(matches!(decision, BoundaryDecision::Allowed(_)));
     }
+
+    /// `executor_enabled` is orthogonal to the sandbox boundary: the boundary
+    /// only decides whether real apply/deploy is allowed, while executor_enabled
+    /// decides whether this process runs the change loops at all. The plugin
+    /// rebinds its config to this function's output before reading the gate, so
+    /// both the Allowed and the Downgraded path must carry executor_enabled
+    /// through — otherwise a main app configured with executor_enabled=false
+    /// would silently regain the default (true) and start a competing evolution
+    /// cycle again.
+    #[test]
+    fn preserves_executor_enabled_across_boundary() {
+        let allowed_cfg = SelfEvolutionConfig {
+            executor_enabled: false,
+            ..Default::default()
+        };
+        let allowed_signals = SandboxSignals {
+            kubernetes_service_host: Some("10.96.0.1".into()),
+            ..Default::default()
+        };
+        let (effective, decision) = enforce_sandbox_boundary(&allowed_cfg, &allowed_signals);
+        assert!(matches!(decision, BoundaryDecision::Allowed(_)));
+        assert!(
+            !effective.executor_enabled,
+            "Allowed path must preserve executor_enabled=false"
+        );
+
+        let downgraded_cfg = SelfEvolutionConfig {
+            auto_apply: true,
+            auto_deploy: true,
+            executor_enabled: false,
+            ..Default::default()
+        };
+        let (effective, decision) = enforce_sandbox_boundary(&downgraded_cfg, &bare_signals());
+        assert!(matches!(decision, BoundaryDecision::Downgraded(_)));
+        assert!(
+            !effective.executor_enabled,
+            "Downgraded path must preserve executor_enabled=false"
+        );
+    }
 }

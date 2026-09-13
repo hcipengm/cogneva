@@ -41,6 +41,9 @@ metadata:
     app.kubernetes.io/component: evolution
 data:
   COGNEVA_SELF_EVOLUTION_ENABLED: "true"
+  # 本 Pod 是专用变更执行器：跑进化循环 / 基线移植 / 主线部署器。主应用 Pod 置
+  # false 只留控制面（admin + GitOps 拉取端），两端不抢同一实例的工作树。
+  COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED: "true"
   COGNEVA_SELF_EVOLUTION_AUTO_APPLY: "true"
   COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY: "true"
   COGNEVA_SELF_EVOLUTION_SANDBOX_MODE: "true"

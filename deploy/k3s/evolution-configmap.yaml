@@ -11,6 +11,11 @@ metadata:
 # and point all directories into the mounted PVC.
 data:
   COGNEVA_SELF_EVOLUTION_ENABLED: "true"
+  # This pod is the dedicated change executor: it runs the evolution cycle,
+  # baseline porter, and mainline deployer. The main app pod sets this false so
+  # it stays a control plane (admin API + cluster-side GitOps puller) and the
+  # two never race over the same instance's worktrees.
+  COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED: "true"
   COGNEVA_SELF_EVOLUTION_AUTO_APPLY: "true"
   COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY: "true"
   COGNEVA_SELF_EVOLUTION_SANDBOX_MODE: "true"

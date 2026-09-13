@@ -148,6 +148,13 @@ spec:
               value: {{ .Values.gitops.clusterName | quote }}
             - name: COGNEVA_GITOPS_METRICS_URL
               value: "http://localhost:8080/metrics"
+            # 主应用是控制面，不是变更执行器：基础 cogneva.json 对全部 Pod 打开
+            # self_evolution.enabled，若不在这里关掉执行器，本 Pod 会每轮跑进化
+            # 循环 / 基线移植，与专用进化 worker 抢同一实例指纹、裸仓库与工作树
+            # 根目录（"missing but already registered worktree" 永久失败）。置
+            # false 后本 Pod 仍发布 admin 服务、仍跑上面这条集群侧 GitOps 拉取端。
+            - name: COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED
+              value: "false"
           livenessProbe:
             httpGet:
               path: /health/live

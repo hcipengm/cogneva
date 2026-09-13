@@ -737,6 +737,18 @@ impl Default for SelfEvolutionWorkspaceConfig {
 #[serde(default)]
 pub struct SelfEvolutionConfig {
     pub enabled: bool,
+    /// Whether this process runs the change-execution loops (evolution cycle,
+    /// baseline porter, mainline deployer, microVM executor). Symmetric with
+    /// the GitOps `puller_enabled`: a deployment splits the executor role from
+    /// the control-plane role so exactly one process generates and lands
+    /// changes. Default true so a single-binary / non-K8s host keeps evolving
+    /// with no extra wiring. In a multi-pod cluster the dedicated evolution
+    /// worker leaves it true while the main application sets it false — the
+    /// main app then still serves the admin API and runs the cluster-side
+    /// GitOps puller, but never spawns a second executor that would race the
+    /// evolution worker over the shared instance fingerprint, bare repo, and
+    /// workspace worktrees.
+    pub executor_enabled: bool,
     pub auto_apply: bool,
     pub auto_deploy: bool,
     pub sandbox_mode: bool,
@@ -777,6 +789,7 @@ impl Default for SelfEvolutionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            executor_enabled: true,
             auto_apply: true,
             auto_deploy: true,
             sandbox_mode: false,

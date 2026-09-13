@@ -410,7 +410,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // MicroVM（挂载 PV → 执行进化 → 阅后即焚）。preflight 失败
                 // 视为配置错误：显式报错并禁用 pipeline，绝不静默落到无沙盒
                 // 的本地执行。
-                if self_evolution.microvm.enabled {
+                // microVM 编排同样是执行器职责，且本分支会提前 return 跳过
+                // 控制面（admin 服务 / GitOps 拉取端）。只有本进程承担变更执行
+                // （executor_enabled）时才进入，否则主应用会被这条早退路径剥夺
+                // 控制面。microvm 关闭时本就不进此分支，门禁只为防御「基础配置
+                // 对全部 Pod 打开 microvm」的误配。
+                if self_evolution.microvm.enabled && self_evolution.executor_enabled {
                     let microvm = crate::FirecrackerSandbox::new(self_evolution.microvm.clone());
                     if let Err(e) = microvm.preflight() {
                         error!(error = %e, "microvm preflight failed; self-evolution pipeline disabled");
@@ -665,52 +670,68 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     }
                 }
 
-                let poll_interval =
-                    std::time::Duration::from_secs(self_evolution.poll_interval_secs);
+                // 本进程是否承担变更执行器职责。主应用（executor_enabled=false）
+                // 只保留控制面（admin 服务 / GitOps 拉取端），不派生进化循环，
+                // 也就不与共用同一实例指纹 / 裸仓库 / 工作树根目录的专用进化
+                // worker 抢工作树。先取出来：下面的 spawn 会把 self_evolution
+                // 整体 move 进闭包，事后再读它会触发 use-after-move。
+                let executor_enabled = self_evolution.executor_enabled;
+                if executor_enabled {
+                    let poll_interval =
+                        std::time::Duration::from_secs(self_evolution.poll_interval_secs);
 
-                let Some(cycle_workspaces) = self.workspaces.clone() else {
-                    warn!("workspace allocator unavailable; self-evolution cycle disabled");
-                    self.initialized = true;
-                    return Ok(());
-                };
-                let cycle_instance = instance_id.clone();
-                let cycle_version = version.clone();
+                    let Some(cycle_workspaces) = self.workspaces.clone() else {
+                        warn!("workspace allocator unavailable; self-evolution cycle disabled");
+                        self.initialized = true;
+                        return Ok(());
+                    };
+                    let cycle_instance = instance_id.clone();
+                    let cycle_version = version.clone();
 
-                let pool_gate = self.pool_gate.clone();
-                tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(poll_interval);
-                    loop {
-                        interval.tick().await;
-                        // 变更生成整条链都依赖 LLM：池全灭时空转只会烧配额、
-                        // 刷日志，跳过本轮；池恢复后自动继续。
-                        if pool_gate.llm_paused() {
-                            info!("LLM upstream pool unavailable; skipping self-evolution cycle");
-                            continue;
+                    let pool_gate = self.pool_gate.clone();
+                    tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(poll_interval);
+                        loop {
+                            interval.tick().await;
+                            // 变更生成整条链都依赖 LLM：池全灭时空转只会烧配额、
+                            // 刷日志，跳过本轮；池恢复后自动继续。
+                            if pool_gate.llm_paused() {
+                                info!(
+                                    "LLM upstream pool unavailable; skipping self-evolution cycle"
+                                );
+                                continue;
+                            }
+                            let deps = CycleDeps {
+                                pipeline: &pipeline,
+                                deployer: &deployer,
+                                binary_switcher: binary_switcher.as_ref(),
+                                engine: &engine,
+                                config: &self_evolution,
+                                evolution_metrics: evolution_metrics.as_ref(),
+                                promoter: promoter.as_ref(),
+                                workspaces: &cycle_workspaces,
+                            };
+                            if let Err(e) =
+                                run_evolution_cycle(deps, &cycle_instance, &cycle_version).await
+                            {
+                                warn!(error = %e, "Self-evolution cycle failed");
+                            }
                         }
-                        let deps = CycleDeps {
-                            pipeline: &pipeline,
-                            deployer: &deployer,
-                            binary_switcher: binary_switcher.as_ref(),
-                            engine: &engine,
-                            config: &self_evolution,
-                            evolution_metrics: evolution_metrics.as_ref(),
-                            promoter: promoter.as_ref(),
-                            workspaces: &cycle_workspaces,
-                        };
-                        if let Err(e) =
-                            run_evolution_cycle(deps, &cycle_instance, &cycle_version).await
-                        {
-                            warn!(error = %e, "Self-evolution cycle failed");
-                        }
-                    }
-                });
+                    });
 
-                info!("Self-evolution auto-deploy pipeline started");
+                    info!("Self-evolution auto-deploy pipeline started");
+                } else {
+                    info!(
+                        "self-evolution executor disabled here; running control plane only \
+                         (admin API + GitOps puller), no change-execution cycle spawned"
+                    );
+                }
 
-                // 基线移植触发循环只在沙盒边界真实放行时挂载（dry-run 降级
-                // 环境不做任何 git 写操作）。start() 里消费 OrchestratorControl。
-                self.porter_armed =
-                    matches!(boundary, crate::sandbox::BoundaryDecision::Allowed(_));
+                // 基线移植触发循环（连同 start() 里的主线部署器）只在本进程承担
+                // 执行器职责、且沙盒边界真实放行时挂载（dry-run 降级环境不做任何
+                // git 写操作）。start() 里消费 OrchestratorControl。
+                self.porter_armed = executor_enabled
+                    && matches!(boundary, crate::sandbox::BoundaryDecision::Allowed(_));
             }
         }
 

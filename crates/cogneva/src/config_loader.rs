@@ -174,6 +174,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "self_evolution.enabled".into(),
     );
     m.insert(
+        "COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED".into(),
+        "self_evolution.executor_enabled".into(),
+    );
+    m.insert(
         "COGNEVA_SELF_EVOLUTION_AUTO_APPLY".into(),
         "self_evolution.auto_apply".into(),
     );
@@ -1018,5 +1022,39 @@ mod tests {
         let _guard = EnvGuard::set("COGNEVA_DEMO_LOGIN_ENABLED", "true");
         let config = from_env();
         assert!(config.gateway.demo_login_enabled);
+    }
+
+    /// The main app pod runs as a control plane: it keeps
+    /// `self_evolution.enabled` true (so it still publishes the admin API and
+    /// runs the cluster-side GitOps puller) but sets EXECUTOR_ENABLED=false to
+    /// stop spawning change-execution loops. That override must survive the env
+    /// layer — otherwise the main app keeps running an evolution cycle every
+    /// poll and races the dedicated evolution worker over the shared instance
+    /// fingerprint, bare repo, and workspace worktrees (the "missing but
+    /// already registered worktree" failure that never lands a change).
+    #[test]
+    fn test_self_evolution_executor_enabled_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g_enabled = EnvGuard::set("COGNEVA_SELF_EVOLUTION_ENABLED", "true");
+        let _g_exec = EnvGuard::set("COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED", "false");
+        let config = from_env();
+        assert!(
+            config.self_evolution.enabled,
+            "control plane stays mounted: enabled must remain true"
+        );
+        assert!(
+            !config.self_evolution.executor_enabled,
+            "EXECUTOR_ENABLED=false must reach self_evolution.executor_enabled"
+        );
+    }
+
+    /// With no env override the executor stays on, so a single-binary / non-K8s
+    /// host keeps evolving with zero extra wiring.
+    #[test]
+    fn test_self_evolution_executor_enabled_defaults_true() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::remove("COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED");
+        let config = from_env();
+        assert!(config.self_evolution.executor_enabled);
     }
 }
