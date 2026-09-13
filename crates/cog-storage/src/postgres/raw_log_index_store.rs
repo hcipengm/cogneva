@@ -1,8 +1,13 @@
 //! PostgreSQL-backed implementation of [`RawLogIndexStore`].
+//!
+//! The table is owned by the migrations, which declare it partitioned by
+//! `log_date`. The store therefore never creates it: a store-local
+//! `CREATE TABLE IF NOT EXISTS` would be a second definition of the same table
+//! and the two would drift.
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 use cog_core::{RawLogIndexEntry, RawLogIndexStore, RawLogQuery, SFError, SFResult, StorageTier};
 
@@ -15,42 +20,6 @@ impl PostgresRawLogIndexStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-
-    /// Auto-create the required table and indexes if they do not exist.
-    pub async fn init_schema(&self) -> SFResult<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS raw_log_index (
-                id            BIGSERIAL,
-                stream_name   VARCHAR(32)  NOT NULL,
-                log_date      DATE         NOT NULL,
-                file_path     TEXT         NOT NULL,
-                tier          VARCHAR(8)   NOT NULL DEFAULT 'hot',
-                size_bytes    BIGINT       NOT NULL DEFAULT 0,
-                checksum      VARCHAR(128) NOT NULL,
-                start_time    TIMESTAMPTZ  NOT NULL,
-                end_time      TIMESTAMPTZ  NOT NULL,
-                created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (stream_name, log_date)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS raw_log_index_stream_time_idx
-                ON raw_log_index (stream_name, start_time, end_time)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -59,28 +28,32 @@ impl RawLogIndexStore for PostgresRawLogIndexStore {
         sqlx::query(
             r#"
             INSERT INTO raw_log_index (
-                stream_name, log_date, file_path, tier, size_bytes,
-                checksum, start_time, end_time, created_at
+                stream_name, log_date, hour, storage_path, size_bytes,
+                event_count, checksum, first_at, last_at, tier, created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (stream_name, log_date) DO UPDATE SET
-                file_path    = EXCLUDED.file_path,
-                tier         = EXCLUDED.tier,
+                hour         = EXCLUDED.hour,
+                storage_path = EXCLUDED.storage_path,
                 size_bytes   = EXCLUDED.size_bytes,
+                event_count  = EXCLUDED.event_count,
                 checksum     = EXCLUDED.checksum,
-                start_time   = EXCLUDED.start_time,
-                end_time     = EXCLUDED.end_time,
+                first_at     = EXCLUDED.first_at,
+                last_at      = EXCLUDED.last_at,
+                tier         = EXCLUDED.tier,
                 created_at   = EXCLUDED.created_at
             "#,
         )
         .bind(&entry.stream_name)
         .bind(entry.log_date)
+        .bind(entry.hour as i16)
         .bind(&entry.file_path)
-        .bind(entry.tier.as_str())
         .bind(entry.size_bytes as i64)
+        .bind(entry.event_count as i64)
         .bind(&entry.checksum)
         .bind(entry.start_time)
         .bind(entry.end_time)
+        .bind(entry.tier.as_str())
         .bind(entry.created_at)
         .execute(&self.pool)
         .await
@@ -90,85 +63,74 @@ impl RawLogIndexStore for PostgresRawLogIndexStore {
     }
 
     async fn query(&self, q: &RawLogQuery) -> SFResult<Vec<RawLogIndexEntry>> {
-        let mut sql = String::from(
-            "SELECT stream_name, log_date, file_path, tier, size_bytes, \
-             checksum, start_time, end_time, created_at FROM raw_log_index WHERE 1=1",
-        );
+        // Every filter is optional, so each one is written as "an absent
+        // parameter matches everything" rather than assembled from string
+        // fragments: placeholder numbering cannot drift out of step with the
+        // bindings.
+        let rows = sqlx::query(
+            r#"
+            SELECT stream_name, log_date, hour, storage_path, size_bytes,
+                   event_count, checksum, first_at, last_at, tier, created_at
+            FROM raw_log_index
+            WHERE ($1::text IS NULL OR stream_name = $1)
+              AND ($2::text IS NULL OR tier = $2)
+              AND ($3::timestamptz IS NULL OR last_at >= $3)
+              AND ($4::timestamptz IS NULL OR first_at <= $4)
+              AND ($5::smallint IS NULL OR hour = $5)
+            ORDER BY first_at ASC
+            LIMIT $6
+            "#,
+        )
+        .bind(q.stream.as_deref())
+        .bind(q.tier.map(|t| t.as_str()))
+        .bind(q.start)
+        .bind(q.end)
+        .bind(q.hour.map(|h| h as i16))
+        .bind(q.limit.map(|l| l as i64).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
 
-        if q.stream.is_some() {
-            sql.push_str(" AND stream_name = $1");
-        }
-        if q.tier.is_some() {
-            sql.push_str(" AND tier = $2");
-        }
-        if q.start.is_some() {
-            sql.push_str(" AND end_time >= $3");
-        }
-        if q.end.is_some() {
-            sql.push_str(" AND start_time <= $4");
-        }
-
-        sql.push_str(" ORDER BY start_time ASC");
-
-        if q.limit.is_some() {
-            sql.push_str(" LIMIT $5");
-        }
-
-        let mut query = sqlx::query_as::<_, RawLogIndexRow>(&sql);
-
-        if let Some(ref stream) = q.stream {
-            query = query.bind(stream);
-        }
-        if let Some(tier) = q.tier {
-            query = query.bind(tier.as_str());
-        }
-        if let Some(start) = q.start {
-            query = query.bind(start);
-        }
-        if let Some(end) = q.end {
-            query = query.bind(end);
-        }
-        if let Some(limit) = q.limit {
-            query = query.bind(limit as i64);
-        }
-
-        let rows: Vec<RawLogIndexRow> = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
-
-        Ok(rows.into_iter().map(|r| r.into_entry()).collect())
+        rows.iter().map(row_to_entry).collect()
     }
 }
 
-/// Internal row type for sqlx mapping.
-#[derive(sqlx::FromRow)]
-struct RawLogIndexRow {
-    stream_name: String,
-    log_date: NaiveDate,
-    file_path: String,
-    tier: String,
-    size_bytes: i64,
-    checksum: String,
-    start_time: DateTime<Utc>,
-    end_time: DateTime<Utc>,
-    created_at: DateTime<Utc>,
-}
+/// A malformed tier is reported rather than defaulted, so a schema mismatch
+/// cannot masquerade as a tier decision.
+fn row_to_entry(row: &sqlx::postgres::PgRow) -> SFResult<RawLogIndexEntry> {
+    let column = |name: &str| SFError::Database(format!("raw_log_index.{name} unreadable"));
+    let tier: String = row.try_get("tier").map_err(|_| column("tier"))?;
+    let tier = tier
+        .parse::<StorageTier>()
+        .map_err(|_| SFError::Database(format!("unknown storage tier in raw_log_index: {tier}")))?;
 
-impl RawLogIndexRow {
-    fn into_entry(self) -> RawLogIndexEntry {
-        RawLogIndexEntry {
-            hour: 0,
-            stream_name: self.stream_name,
-            log_date: self.log_date,
-            file_path: self.file_path,
-            tier: self.tier.parse().unwrap_or(StorageTier::Hot),
-            size_bytes: self.size_bytes as u64,
-            event_count: 0,
-            checksum: self.checksum,
-            start_time: self.start_time,
-            end_time: self.end_time,
-            created_at: self.created_at,
-        }
-    }
+    Ok(RawLogIndexEntry {
+        hour: row.try_get::<i16, _>("hour").map_err(|_| column("hour"))? as u8,
+        stream_name: row
+            .try_get("stream_name")
+            .map_err(|_| column("stream_name"))?,
+        log_date: row
+            .try_get::<NaiveDate, _>("log_date")
+            .map_err(|_| column("log_date"))?,
+        file_path: row
+            .try_get("storage_path")
+            .map_err(|_| column("storage_path"))?,
+        tier,
+        size_bytes: row
+            .try_get::<i64, _>("size_bytes")
+            .map_err(|_| column("size_bytes"))? as u64,
+        event_count: row
+            .try_get::<i64, _>("event_count")
+            .map_err(|_| column("event_count"))? as u64,
+        checksum: row.try_get("checksum").map_err(|_| column("checksum"))?,
+        start_time: row
+            .try_get::<DateTime<Utc>, _>("first_at")
+            .map_err(|_| column("first_at"))?,
+        end_time: row
+            .try_get::<DateTime<Utc>, _>("last_at")
+            .map_err(|_| column("last_at"))?,
+        created_at: row
+            .try_get::<DateTime<Utc>, _>("created_at")
+            .map_err(|_| column("created_at"))?,
+    })
 }

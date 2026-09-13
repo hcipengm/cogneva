@@ -860,29 +860,9 @@ pub struct RawLogQuery {
 }
 
 /// Persistence abstraction for `raw_log_index`. Implementations: in-memory
-/// (testing), PostgreSQL (production — to be added when sqlx wiring lands).
+/// (tests) and PostgreSQL.
 #[async_trait]
 pub trait RawLogIndexStore: Send + Sync {
     async fn upsert(&self, entry: RawLogIndexEntry) -> SFResult<()>;
     async fn query(&self, q: &RawLogQuery) -> SFResult<Vec<RawLogIndexEntry>>;
 }
-
-/// doc, the runtime, and the database stay in lock-step.
-pub const RAW_LOG_INDEX_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS raw_log_index (
-    id            BIGSERIAL,
-    stream_name   VARCHAR(32)  NOT NULL,
-    log_date      DATE         NOT NULL,
-    file_path     TEXT         NOT NULL,
-    tier          VARCHAR(8)   NOT NULL DEFAULT 'hot',
-    size_bytes    BIGINT       NOT NULL DEFAULT 0,
-    checksum      VARCHAR(128) NOT NULL,
-    start_time    TIMESTAMPTZ  NOT NULL,
-    end_time      TIMESTAMPTZ  NOT NULL,
-    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (stream_name, log_date)
-) PARTITION BY RANGE (log_date);
-
-CREATE INDEX IF NOT EXISTS raw_log_index_stream_time_idx
-    ON raw_log_index (stream_name, start_time, end_time);
-"#;

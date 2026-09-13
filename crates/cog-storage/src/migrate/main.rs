@@ -17,7 +17,7 @@ struct Args {
     driver: Option<String>,
 
     /// Migrations root directory.
-    #[arg(long, default_value = "crates/cog-db/migrations")]
+    #[arg(long, default_value = "crates/cog-storage/migrations")]
     migrations_dir: PathBuf,
 
     /// Print what would be applied without touching the database.

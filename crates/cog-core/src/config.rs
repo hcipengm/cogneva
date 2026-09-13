@@ -505,6 +505,8 @@ pub struct SystemConfig {
     pub stale_task_detector_poll_secs: u64,
     /// Trace tier migrator run interval (seconds).
     pub trace_migrator_interval_secs: u64,
+    /// Interval between monthly-partition maintenance rounds (seconds).
+    pub partition_maintenance_interval_secs: u64,
     /// WASM tool execution timeout (seconds).
     pub tool_timeout_secs: u64,
     /// URL of the remote sandbox executor (e.g.
@@ -564,6 +566,7 @@ impl Default for SystemConfig {
             timeout_checker_interval_secs: 30,
             stale_task_detector_poll_secs: 15,
             trace_migrator_interval_secs: 3600,
+            partition_maintenance_interval_secs: 3600,
             tool_timeout_secs: 30,
             sandbox_executor_url: None,
             grpc_reconnect_interval_secs: 5,

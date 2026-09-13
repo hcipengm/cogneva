@@ -8,12 +8,19 @@ use crate::pools::{ConfigPool, ExplainPool, MessagesPool, RedisClient, UsersPool
 /// Storage plugin that creates and publishes PostgreSQL pools and Redis client.
 pub struct StoragePlugin {
     initialized: bool,
+    /// Kept from `init` so `start` can spawn background tasks that need the
+    /// database. The published pool handle is consumed by whoever needs it
+    /// first, so a task started later cannot recover it from the context.
+    pg_pool: Option<sqlx::PgPool>,
 }
 
 impl StoragePlugin {
     /// Create the storage plugin.
     pub fn new() -> Self {
-        Self { initialized: false }
+        Self {
+            initialized: false,
+            pg_pool: None,
+        }
     }
 }
 
@@ -208,6 +215,8 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("PostgreSQL DSN not configured. Persistence backends will use memory fallback.");
             (None, None, None, None)
         };
+
+        self.pg_pool = explain_pool.clone();
 
         // ── GuardAuditRecorder (PostgreSQL) ──
         if let Some(ref pool) = explain_pool.clone() {
@@ -658,8 +667,24 @@ impl cog_core::SystemPlugin for StoragePlugin {
         info!("StoragePlugin trace store published");
 
         // ── RawLogIndexStore ──
-        let raw_log_index_store: Arc<dyn cog_core::RawLogIndexStore> =
-            Arc::new(crate::MemoryRawLogIndexStore::new());
+        // The index locates raw files for replay; losing it on restart means
+        // the files are still there but nothing can find them, so the
+        // in-memory store is only acceptable when persistence is not required.
+        let raw_log_index_store: Arc<dyn cog_core::RawLogIndexStore> = match self.pg_pool.clone() {
+            Some(pool) => {
+                info!("PostgresRawLogIndexStore initialized");
+                Arc::new(crate::PostgresRawLogIndexStore::new(pool))
+            }
+            None => {
+                if strict_persistence {
+                    return Err(cog_core::SFError::Config(
+                        "No PostgreSQL pool for RawLogIndexStore (strict_persistence=true)".into(),
+                    ));
+                }
+                warn!("No PostgreSQL pool; raw log index will not survive a restart");
+                Arc::new(crate::MemoryRawLogIndexStore::new())
+            }
+        };
         ctx.publish_service(raw_log_index_store);
         info!("StoragePlugin raw log index store published");
 
@@ -707,6 +732,25 @@ impl cog_core::SystemPlugin for StoragePlugin {
             }
         } else {
             info!("TierMigrator disabled");
+        }
+
+        // ── Partition maintenance ──
+        // Without a live window the time-series tables reject writes: their key
+        // has no partition to route to. Keep it open and alert on backlog.
+        if let Some(pool) = self.pg_pool.clone() {
+            let interval_secs = ctx.config().system.partition_maintenance_interval_secs;
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            let maintainer = crate::PartitionMaintainer::new(
+                pool,
+                crate::partition_maintainer::time_series_tables(),
+            );
+            tokio::spawn(async move { maintainer.run(interval_secs, shutdown).await });
+            info!("PartitionMaintainer started");
+        } else {
+            info!("PartitionMaintainer disabled (no PostgreSQL pool)");
         }
 
         Ok(())

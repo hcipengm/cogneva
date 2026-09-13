@@ -40,6 +40,7 @@ pub mod meilisearch;
 #[cfg(feature = "mem")]
 pub mod mem;
 pub mod migrate;
+pub mod partition_maintainer;
 
 // ─── Crate-level re-exports (backward-compatible with old `cog-db` usage) ───
 
@@ -86,6 +87,7 @@ pub use migrate::{
 };
 
 pub use dlq::MemoryDeadLetterQueue;
+pub use partition_maintainer::PartitionMaintainer;
 
 pub mod plugin;
 #[cfg(feature = "redis")]
