@@ -374,6 +374,11 @@ pub struct RolloutTargetConfig {
     /// Pod 标签 app.kubernetes.io/name（健康检查选择器用）。主应用/网关/
     /// 执行器的 name 都是 `cogneva`，必须 name+component 双标签才能区分。
     pub name: String,
+    /// 该 Deployment 在清单目录内的文件名。滚版时 Job 以 apply 这份清单
+    /// （镜像改写为目标不可变 tag）交付完整 Pod spec——env/卷/挂载的变更
+    /// 因此随镜像一起到达集群；None 时该目标退回 set image 旧路径。
+    #[serde(default)]
+    pub manifest: Option<String>,
 }
 
 /// 主线跟踪自动部署器配置：进化 Pod 内常驻循环，检测集群内 bare 仓库
@@ -425,6 +430,14 @@ pub struct MainlineDeployerConfig {
     /// 状态摘要（bare HEAD / last_good / in_flight / 失败计数）。0 表示
     /// 每轮轮询都打。
     pub heartbeat_log_secs: u64,
+    /// 清单目录（仓库内相对路径）。目录里的 `kustomization.yaml` resources
+    /// 列表是发布资源集的权威清单：滚动 Job 按它 apply 支撑资源（configmap/
+    /// service/RBAC/基础设施负载），集群级资源（Namespace/StorageClass 等）
+    /// 属安装期产物、自动跳过，Secret 按设计不入清单、出现即拒绝。
+    pub manifest_dir: String,
+    /// 是否让滚动 Job 以 apply 仓库清单交付完整 spec。false 时退回纯
+    /// set image 旧路径（清单变更不随镜像下发）。
+    pub deliver_manifests: bool,
     /// 滚动目标，顺序即滚动顺序。默认：网关代理面先行，进化宿主最后。
     pub targets: Vec<RolloutTargetConfig>,
 }
@@ -451,30 +464,36 @@ impl Default for MainlineDeployerConfig {
             max_attempts_per_rev: 2,
             rollout_timeout_secs: 300,
             heartbeat_log_secs: 3600,
+            manifest_dir: "deploy/k3s".into(),
+            deliver_manifests: true,
             targets: vec![
                 RolloutTargetConfig {
                     deployment: "cogneva-security-gateway".into(),
                     container: "security-gateway".into(),
                     component: "security-gateway".into(),
                     name: "cogneva".into(),
+                    manifest: Some("gateway-deployment.yaml".into()),
                 },
                 RolloutTargetConfig {
                     deployment: "cogneva-sandbox-executor".into(),
                     container: "sandbox-executor".into(),
                     component: "sandbox-executor".into(),
                     name: "cogneva".into(),
+                    manifest: Some("sandbox-executor-deployment.yaml".into()),
                 },
                 RolloutTargetConfig {
                     deployment: "cogneva".into(),
                     container: "cogneva".into(),
                     component: "gateway".into(),
                     name: "cogneva".into(),
+                    manifest: Some("deployment.yaml".into()),
                 },
                 RolloutTargetConfig {
                     deployment: "cogneva-evolution".into(),
                     container: "cogneva".into(),
                     component: "evolution".into(),
                     name: "cogneva-evolution".into(),
+                    manifest: Some("evolution-deployment.yaml".into()),
                 },
             ],
         }
@@ -568,6 +587,12 @@ impl MainlineDeployerConfig {
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS") {
             self.heartbeat_log_secs = parse("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_MANIFEST_DIR") {
+            self.manifest_dir = v;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_DELIVER_MANIFESTS") {
+            self.deliver_manifests = parse("COGNEVA_MAINLINE_DEPLOYER_DELIVER_MANIFESTS", &v)?;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BUILDER_BIN") {
             self.builder_bin = v;

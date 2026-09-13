@@ -4,20 +4,33 @@
 //! 周期检测集群内 bare 仓库（/host-git）的 main 前进 → 沙盒源码树 reset 到
 //! 新 rev → cargo build（PVC target 增量缓存）→ buildah 基于"当前在跑的
 //! 不可变 tag"打最小 overlay → 推集群内 registry 的 `main-<rev12>` 不可变
-//! tag → 派独立 Job 跑滚动 → 滚动收敛后才把 registry 浮动签 `:local` 前移
+//! tag → 组装该 rev 的清单包（发布集里除四个 deployment 外的支撑资源 +
+//! 镜像已改写为本次目标的 deployment 清单）发布成 per-rev ConfigMap →
+//! 派独立 Job 跑滚动 → 滚动收敛后才把 registry 浮动签 `:local` 前移
 //! 到本 rev（`:local` 是静态清单/GitOps apply 的回退锚点，构建期就推会让
 //! 失败回滚的坏镜像成为浮动签权威）。
 //!
 //! 滚动侧（Job 内，[`RolloutExecutor`]，二进制子命令 `cogneva mainline-rollout`）：
-//! 按固定顺序 set image 四个 deployment（网关代理面先行、进化宿主最后），
-//! 每个部署过 rollout 完成 + Pod 健康双门禁，全部滚完后 soak 观察窗复查；
-//! 任一失败把已滚部署反向 set image 回 prev tag。
+//! 挂载了清单目录时先 apply 支撑资源（新镜像启动所需的 RBAC/ConfigMap/
+//! Service 等先就位），再按固定顺序滚动四个 deployment（网关代理面先行、
+//! 进化宿主最后）——目标有随镜像下发的清单则 apply 整份清单，否则回落
+//! set image；每个部署过 rollout 完成 + Pod 健康双门禁，全部滚完后 soak
+//! 观察窗复查；任一失败把已滚部署反向 set image 回 prev tag。
+//!
+//! 清单随镜像走解决的是拓扑滞后：只 set image 时，chart 里与工作负载一起
+//! 演进的 ConfigMap/Service/PVC 变更永远到不了集群（没人 apply 新清单），
+//! 新二进制配旧拓扑跑。清单包只含命名空间级的非权限面资源：Secret 硬性
+//! 拒绝（零带外凭证红线）；集群级 kind 与 Role/RoleBinding 跳过——K8s
+//! 反提权规定 apply 一个 Role 要求发起者已持有其中全部权限，部署面永远
+//! 不该持有发布集里管理类 Role 的权限，给自己发 bind/escalate 又等于
+//! 自治系统自我提权，所以权限边界变更必须走安装面/人工核准。
 //!
 //! 滚动必须放 Job 而不是进化 Pod 自身：cogneva-evolution 是 Recreate 单副本，
 //! 部署器就跑在里面，对自己 set image 会立刻杀掉门禁/回滚逻辑，新镜像
 //! crashloop 时无人 undo，进化面永久宕。Job 用新镜像跑还顺带 smoke test：
 //! 新二进制起不来则一次 set image 都不会发生。
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1024,6 +1037,52 @@ impl MainlineDeployer {
                     .await?;
             }
         }
+        let mut args: Vec<String> = vec![
+            "mainline-rollout".into(),
+            "--tag".into(),
+            new_tag.to_string(),
+            "--ns".into(),
+            self.cfg.namespace.clone(),
+            "--soak-secs".into(),
+            self.cfg.soak_secs.to_string(),
+            "--restart-threshold".into(),
+            self.cfg.restart_threshold.to_string(),
+            "--timeout".into(),
+            self.cfg.rollout_timeout_secs.to_string(),
+        ];
+        let mut volumes: Vec<serde_json::Value> = Vec::new();
+        let mut mounts: Vec<serde_json::Value> = Vec::new();
+        if self.cfg.deliver_manifests {
+            // 组包失败直接报错：不派 Job，in_flight 停在 Pushed，下轮 poll
+            // 重试——发布集坏（清单缺失/Secret 混入）时宁可不上线也不能
+            // 静默回落纯 set image，那会让拓扑滞后悄悄回来。
+            let bundle = self.build_bundle_at(rev, new_tag).await?;
+            self.publish_manifests_configmap(rev, &bundle).await?;
+            args.push("--manifests-dir".into());
+            args.push("/manifests".into());
+            volumes.push(serde_json::json!({
+                "name": "manifests",
+                "configMap": { "name": manifests_configmap_name(rev) }
+            }));
+            mounts.push(serde_json::json!({
+                "name": "manifests",
+                "mountPath": "/manifests",
+                "readOnly": true
+            }));
+        }
+        // Job Pod 也需要 kubectl：镜像不内置，挂载宿主 k3s 多调用二进制
+        // （argv[0]=kubectl 即 kubectl）。配置为空（镜像自带/标准 K8s）时不挂。
+        if !self.cfg.kubectl_host_path.is_empty() {
+            volumes.push(serde_json::json!({
+                "name": "kubectl-bin",
+                "hostPath": { "path": &self.cfg.kubectl_host_path, "type": "File" }
+            }));
+            mounts.push(serde_json::json!({
+                "name": "kubectl-bin",
+                "mountPath": "/usr/local/bin/kubectl",
+                "readOnly": true
+            }));
+        }
         let mut manifest = serde_json::json!({
             "apiVersion": "batch/v1",
             "kind": "Job",
@@ -1054,37 +1113,25 @@ impl MainlineDeployer {
                             "image": new_tag,
                             "imagePullPolicy": "IfNotPresent",
                             "command": ["/opt/cogneva/cogneva"],
-                            "args": [
-                                "mainline-rollout",
-                                "--tag", new_tag,
-                                "--ns", &self.cfg.namespace,
-                                "--soak-secs", &self.cfg.soak_secs.to_string(),
-                                "--restart-threshold", &self.cfg.restart_threshold.to_string(),
-                                "--timeout", &self.cfg.rollout_timeout_secs.to_string(),
-                            ],
+                            "args": args,
                         }],
                     },
                 },
             },
         });
-        // Job Pod 也需要 kubectl：镜像不内置，挂载宿主 k3s 多调用二进制
-        // （argv[0]=kubectl 即 kubectl）。配置为空（镜像自带/标准 K8s）时不挂。
-        if !self.cfg.kubectl_host_path.is_empty() {
-            manifest["spec"]["template"]["spec"]["volumes"] = serde_json::json!([
-                {
-                    "name": "kubectl-bin",
-                    "hostPath": { "path": &self.cfg.kubectl_host_path, "type": "File" }
-                }
-            ]);
-            manifest["spec"]["template"]["spec"]["containers"][0]["volumeMounts"] = serde_json::json!([
-                {
-                    "name": "kubectl-bin",
-                    "mountPath": "/usr/local/bin/kubectl",
-                    "readOnly": true
-                }
-            ]);
+        if !volumes.is_empty() {
+            manifest["spec"]["template"]["spec"]["volumes"] = serde_json::Value::Array(volumes);
+        }
+        if !mounts.is_empty() {
+            manifest["spec"]["template"]["spec"]["containers"][0]["volumeMounts"] =
+                serde_json::Value::Array(mounts);
         }
         let body = serde_json::to_vec_pretty(&manifest)?;
+        self.apply_stdin(&body, "rollout job").await
+    }
+
+    /// `kubectl apply -f -`，清单经 stdin 传入（Job 与清单包 ConfigMap 共用）。
+    async fn apply_stdin(&self, body: &[u8], what: &str) -> SFResult<()> {
         let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
             .args(["-n", &self.cfg.namespace, "apply", "-f", "-"])
             .stdin(std::process::Stdio::piped())
@@ -1099,7 +1146,7 @@ impl MainlineDeployer {
                 .stdin
                 .take()
                 .ok_or_else(|| SFError::IO("kubectl stdin unavailable".into()))?;
-            stdin.write_all(&body).await?;
+            stdin.write_all(body).await?;
             stdin.shutdown().await?;
         }
         let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
@@ -1108,10 +1155,92 @@ impl MainlineDeployer {
             .map_err(|e| SFError::IO(format!("kubectl apply: {e}")))?;
         if !output.status.success() {
             return Err(SFError::IO(format!(
-                "kubectl apply job failed: {}",
+                "kubectl apply {what} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             )));
         }
+        Ok(())
+    }
+
+    /// 从 bare 仓库读指定 rev 下的文件内容（不触碰沙盒工作树，构建与
+    /// 组包互不干扰）。
+    async fn git_show(&self, rev: &str, path: &str) -> SFResult<String> {
+        let spec = format!("{rev}:{path}");
+        self.run_cmd(
+            "git",
+            &["--git-dir", &self.cfg.bare_repo, "show", &spec],
+            None,
+            30,
+        )
+        .await
+    }
+
+    /// 读 rev 处的发布清单并组装清单包。image 必须是节点 pull 端点引用
+    /// （kubelet 经 NodePort 拉取），与 set image 路径同一约束。
+    async fn build_bundle_at(&self, rev: &str, image: &str) -> SFResult<RolloutBundle> {
+        let dir = self.cfg.manifest_dir.trim_end_matches('/');
+        let kustomization = self
+            .git_show(rev, &format!("{dir}/kustomization.yaml"))
+            .await?;
+        let resources = parse_kustomization_resources(&kustomization)?;
+        let mut files = BTreeMap::new();
+        for res in &resources {
+            let content = self.git_show(rev, &format!("{dir}/{res}")).await?;
+            files.insert(res.clone(), content);
+        }
+        let bundle = build_rollout_bundle(&files, &kustomization, &self.cfg.targets, image)?;
+        info!(
+            rev = %rev12(rev),
+            support_bytes = bundle.support_yaml.len(),
+            target_manifests = bundle.targets.len(),
+            "manifest bundle assembled"
+        );
+        Ok(bundle)
+    }
+
+    /// 清单包发布成 per-rev ConfigMap（Job 挂载消费）。先按 label 清理
+    /// 旧包——名字含 rev 猜不得，label 是稳定选择器；清理失败只 warn
+    /// （新包 apply 不受影响，残留由下次发布再清）。
+    async fn publish_manifests_configmap(&self, rev: &str, bundle: &RolloutBundle) -> SFResult<()> {
+        if let Err(e) = self
+            .kubectl(
+                &[
+                    "delete",
+                    "configmap",
+                    "-l",
+                    "app.kubernetes.io/component=mainline-manifests",
+                    "--ignore-not-found",
+                ],
+                60,
+            )
+            .await
+        {
+            warn!(error = %e, "stale manifest configmap cleanup failed (best effort)");
+        }
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "support.yaml".into(),
+            serde_json::Value::String(bundle.support_yaml.clone()),
+        );
+        for t in &bundle.targets {
+            data.insert(t.key.clone(), serde_json::Value::String(t.yaml.clone()));
+        }
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": manifests_configmap_name(rev),
+                "namespace": self.cfg.namespace,
+                "labels": {
+                    "app.kubernetes.io/name": "cogneva",
+                    "app.kubernetes.io/component": "mainline-manifests",
+                },
+            },
+            "data": serde_json::Value::Object(data),
+        });
+        let body = serde_json::to_vec_pretty(&cm)?;
+        self.apply_stdin(&body, "manifests configmap").await?;
+        info!(rev = %rev12(rev), name = %manifests_configmap_name(rev), "manifest bundle published");
         Ok(())
     }
 
@@ -1259,6 +1388,260 @@ pub async fn run_mainline_loop(
 }
 
 // ---------------------------------------------------------------------------
+// 清单包组装（纯函数，单测覆盖）
+// ---------------------------------------------------------------------------
+
+/// 一次滚动携带的发布清单全集：support 是四个 deployment 之外的支撑资源
+/// （命名空间级），targets 是镜像已改写为本次滚动引用的 deployment 清单。
+/// 滚动侧先 apply support，再按 targets 顺序逐个 apply。
+#[derive(Debug)]
+pub struct RolloutBundle {
+    pub support_yaml: String,
+    pub targets: Vec<TargetManifest>,
+}
+
+#[derive(Debug)]
+pub struct TargetManifest {
+    pub deployment: String,
+    /// ConfigMap data / 挂载目录里的文件名。
+    pub key: String,
+    pub yaml: String,
+}
+
+/// 目标 deployment 清单在包内的固定文件名（滚动侧按此约定找文件）。
+fn target_manifest_key(deployment: &str) -> String {
+    format!("deploy-{deployment}.yaml")
+}
+
+/// 清单包 ConfigMap 名（per-rev，不可变；旧包在下次发布前按 label 清理）。
+fn manifests_configmap_name(rev: &str) -> String {
+    format!("mainline-manifests-{}", rev12(rev))
+}
+
+/// 集群级 kind：进化 SA 只有命名空间级 Role，apply 这些必然被拒；它们由
+/// 安装面（bootstrap/管理员 kubeconfig）管理，不进部署链路。
+const CLUSTER_SCOPED_KINDS: &[&str] = &[
+    "Namespace",
+    "StorageClass",
+    "PersistentVolume",
+    "ClusterRole",
+    "ClusterRoleBinding",
+    "CustomResourceDefinition",
+    "PriorityClass",
+    "IngressClass",
+    "RuntimeClass",
+    "APIService",
+    "ValidatingWebhookConfiguration",
+    "MutatingWebhookConfiguration",
+];
+
+fn is_cluster_scoped_kind(kind: &str) -> bool {
+    CLUSTER_SCOPED_KINDS.contains(&kind)
+}
+
+/// 解析 kustomization.yaml 的 resources 列表——发布集的权威定义。
+fn parse_kustomization_resources(text: &str) -> SFResult<Vec<String>> {
+    let v: serde_yaml::Value = serde_yaml::from_str(text)
+        .map_err(|e| SFError::Config(format!("parse kustomization.yaml: {e}")))?;
+    let resources = v
+        .get("resources")
+        .and_then(|r| r.as_sequence())
+        .ok_or_else(|| SFError::Config("kustomization.yaml has no resources list".into()))?;
+    resources
+        .iter()
+        .map(|r| {
+            r.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| SFError::Config("kustomization resources entry not a string".into()))
+        })
+        .collect()
+}
+
+/// 权限面 kind：与集群级 kind 一样不经部署面下发。K8s 反提权规定 apply
+/// 一个 Role 要求发起者已持有其中全部权限——发布集里存在部署器 SA 永远
+/// 不该持有的权限（如读 Secret 的管理 Role），apply 必被拒；给部署器发
+/// bind/escalate 或那些权限本身则等于让自治系统给自己提权。权限边界的
+/// 变更必须走安装面/人工核准（bootstrap 以管理员身份 apply 全量清单）。
+const RBAC_KINDS: &[&str] = &["Role", "RoleBinding"];
+
+/// 拆分多文档 YAML 并过滤进支撑包：Secret 硬报错（零带外凭证红线，密钥
+/// 永不进清单链路）；集群级 kind 与权限面 kind（Role/RoleBinding）跳过
+/// 并记日志（前者由安装面管理，后者见 [`RBAC_KINDS`] 的反提权理由）；
+/// 空文档（`---` 分隔产生）跳过。
+fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Value>> {
+    let mut docs = Vec::new();
+    for doc in serde_yaml::Deserializer::from_str(yaml_text) {
+        let v = serde_yaml::Value::deserialize(doc)
+            .map_err(|e| SFError::Config(format!("{origin}: invalid YAML document: {e}")))?;
+        if v.is_null() {
+            continue;
+        }
+        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        if kind == "Secret" {
+            return Err(SFError::Config(format!(
+                "{origin}: Secret in manifest bundle is forbidden; secrets never travel through manifests"
+            )));
+        }
+        if is_cluster_scoped_kind(kind) {
+            info!(origin = %origin, kind = %kind, "manifest bundle: skipping cluster-scoped kind");
+            continue;
+        }
+        if RBAC_KINDS.contains(&kind) {
+            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping RBAC kind; permission changes must be applied out-of-band");
+            continue;
+        }
+        docs.push(v);
+    }
+    Ok(docs)
+}
+
+/// 把单文档 Deployment 清单里指定容器的 image 改写为本次滚动引用。
+/// kind / metadata.name / 容器名全部显式校验，且必须恰好命中一个容器——
+/// 错改比不改危险，宁可整个发布失败。
+fn patch_deployment_image(
+    yaml_text: &str,
+    origin: &str,
+    expect_deployment: &str,
+    container: &str,
+    image: &str,
+) -> SFResult<String> {
+    let mut v: serde_yaml::Value = serde_yaml::from_str(yaml_text)
+        .map_err(|e| SFError::Config(format!("{origin}: invalid YAML: {e}")))?;
+    let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if kind != "Deployment" {
+        return Err(SFError::Config(format!(
+            "{origin}: expected Deployment, found {kind}"
+        )));
+    }
+    let name = v
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    if name != expect_deployment {
+        return Err(SFError::Config(format!(
+            "{origin}: deployment name {name} does not match rollout target {expect_deployment}"
+        )));
+    }
+    // serde_yaml::Value 没有 JSON Pointer 辅助，逐层 get_mut 下钻；任一层
+    // 结构缺失都报硬错误（发布集里的 deployment 清单结构异常不该静默放行）。
+    let containers = v
+        .get_mut("spec")
+        .and_then(|s| s.get_mut("template"))
+        .and_then(|t| t.get_mut("spec"))
+        .and_then(|s| s.get_mut("containers"))
+        .and_then(|c| c.as_sequence_mut())
+        .ok_or_else(|| {
+            SFError::Config(format!(
+                "{origin}: no containers list under spec.template.spec"
+            ))
+        })?;
+    let mut patched = 0usize;
+    for c in containers.iter_mut() {
+        if c.get("name").and_then(|n| n.as_str()) == Some(container) {
+            if let Some(map) = c.as_mapping_mut() {
+                map.insert(
+                    serde_yaml::Value::String("image".into()),
+                    serde_yaml::Value::String(image.to_string()),
+                );
+                patched += 1;
+            }
+        }
+    }
+    if patched != 1 {
+        return Err(SFError::Config(format!(
+            "{origin}: expected exactly one container named {container}, found {patched}"
+        )));
+    }
+    serde_yaml::to_string(&v)
+        .map_err(|e| SFError::Config(format!("{origin}: serialize patched manifest: {e}")))
+}
+
+/// 从发布集文件内容（kustomization resources 里的相对路径 → 文件文本）
+/// 组装清单包。目标 deployment 的清单必须在发布集里，缺文件 / 名字对不上
+/// 都是硬错误——静默回落 set image 会掩盖发布集漂移，让拓扑滞后悄悄回来。
+/// targets 输出保持调用方给的滚动顺序（与 kustomization 里的文件顺序无关）。
+pub fn build_rollout_bundle(
+    files: &BTreeMap<String, String>,
+    kustomization: &str,
+    targets: &[RolloutTargetConfig],
+    image: &str,
+) -> SFResult<RolloutBundle> {
+    let resources = parse_kustomization_resources(kustomization)?;
+    if let Some(dup) = duplicate_resources(&resources) {
+        return Err(SFError::Config(format!(
+            "duplicate resource {dup} in kustomization resources"
+        )));
+    }
+    let mut patched: BTreeMap<String, String> = BTreeMap::new();
+    let mut support_docs: Vec<serde_yaml::Value> = Vec::new();
+    for res in &resources {
+        let content = files.get(res).ok_or_else(|| {
+            SFError::Config(format!(
+                "kustomization resource {res} missing from bundle files"
+            ))
+        })?;
+        if let Some(t) = targets
+            .iter()
+            .find(|t| t.manifest.as_deref() == Some(res.as_str()))
+        {
+            let yaml = patch_deployment_image(content, res, &t.deployment, &t.container, image)?;
+            patched.insert(res.clone(), yaml);
+        } else {
+            support_docs.extend(namespace_docs(content, res)?);
+        }
+    }
+    let mut target_manifests = Vec::new();
+    for t in targets {
+        let Some(m) = t.manifest.as_deref() else {
+            // 未声明清单的目标由滚动侧回落 set image（版本偏差兼容路径）。
+            continue;
+        };
+        if !resources.iter().any(|r| r == m) {
+            return Err(SFError::Config(format!(
+                "manifest {m} of rollout target {} is not in kustomization resources",
+                t.deployment
+            )));
+        }
+        let yaml = patched.remove(m).ok_or_else(|| {
+            SFError::Config(format!(
+                "manifest {m} of target {} was not patched",
+                t.deployment
+            ))
+        })?;
+        target_manifests.push(TargetManifest {
+            deployment: t.deployment.clone(),
+            key: target_manifest_key(&t.deployment),
+            yaml,
+        });
+    }
+    // 声明了清单的目标之间不允许共用同一文件：patched 里同名条目会被
+    // remove 吃掉，第二个目标报"was not patched"硬错误，不会静默错配。
+    let mut support_yaml = String::new();
+    for d in &support_docs {
+        support_yaml.push_str("---\n");
+        support_yaml.push_str(
+            &serde_yaml::to_string(d)
+                .map_err(|e| SFError::Config(format!("serialize support doc: {e}")))?,
+        );
+    }
+    Ok(RolloutBundle {
+        support_yaml,
+        targets: target_manifests,
+    })
+}
+
+/// 发布集去重校验：kustomization resources 不允许重复条目（重复会让
+/// patch/support 双路都处理同一文件，support 里出现两份相同资源）。
+fn duplicate_resources(resources: &[String]) -> Option<&str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    resources
+        .iter()
+        .map(|s| s.as_str())
+        .find(|s| !seen.insert(s))
+}
+
+// ---------------------------------------------------------------------------
 // 滚动侧（Job 内执行）
 // ---------------------------------------------------------------------------
 
@@ -1273,6 +1656,11 @@ pub struct RolloutPlan {
     /// 新镜像引用（节点 pull 端点，kubelet 经 NodePort 拉取）。
     pub tag: String,
     pub targets: Vec<RolloutTarget>,
+    /// 随镜像下发的发布清单目录（Job 挂载点，可选）。目录在时：先 apply
+    /// support.yaml，目标存在 `deploy-<deployment>.yaml` 则 apply 整份清单
+    /// （镜像已改写为 tag），否则回落 set image。缺省走纯 set image 旧路
+    /// ——派发侧是旧版二进制（版本偏差）时 Job 也能滚。
+    pub manifests_dir: Option<String>,
 }
 
 impl RolloutPlan {
@@ -1287,7 +1675,11 @@ impl RolloutPlan {
                 name: t.name.clone(),
             })
             .collect();
-        Self { tag, targets }
+        Self {
+            tag,
+            targets,
+            manifests_dir: None,
+        }
     }
 }
 
@@ -1350,6 +1742,25 @@ impl RolloutExecutor {
         )
         .await?;
         Ok(())
+    }
+
+    /// 把单个目标滚到新镜像：优先 apply 随镜像下发的整份 deployment 清单
+    /// （携带拓扑/配置漂移修正），清单缺失才回落 set image（只动 image 字段）。
+    /// 两条路径都只负责"提交变更"，收敛判定与回滚仍由调用方统一处理。
+    async fn apply_target(&self, plan: &RolloutPlan, t: &RolloutTarget) -> SFResult<()> {
+        if let Some(dir) = &plan.manifests_dir {
+            let path = Path::new(dir).join(target_manifest_key(&t.deployment));
+            if path.is_file() {
+                let path_arg = path.to_string_lossy().to_string();
+                info!(deployment = %t.deployment, manifest = %path_arg, "mainline rollout: apply target manifest");
+                return self
+                    .run_kubectl(&["apply", "-f", &path_arg], 60)
+                    .await
+                    .map(|_| ());
+            }
+            warn!(deployment = %t.deployment, "no target manifest in bundle; falling back to set image");
+        }
+        self.set_image(t, &plan.tag).await
     }
 
     /// 快照单个部署当前在跑的镜像（回滚目标）。
@@ -1511,13 +1922,28 @@ impl RolloutExecutor {
         Ok(())
     }
 
-    /// 按计划顺序滚动四部署，逐部署双门禁，全滚完后 soak 复查；任一失败
-    /// 把已滚目标反向 set image 回 prev tag（不用 rollout undo——多目标
-    /// 无事务性，undo 还会连带回退其他字段）。
+    /// 先落地支撑清单（如随镜像下发），再按计划顺序滚动四部署，逐部署
+    /// 双门禁，全滚完后 soak 复查；任一失败把已滚目标反向 set image 回
+    /// prev tag（不用 rollout undo——多目标无事务性，undo 还会连带回退
+    /// 其他字段）。回滚只回退 image：支撑资源不反向删改（apply 是幂等
+    /// upsert，旧镜像配新支撑资源可运行；删改支撑资源反而可能把在跑
+    /// 集群打坏）。
     pub async fn run(&self, plan: &RolloutPlan) -> SFResult<()> {
-        // 任何 set image 之前先快照各部署当前镜像作为回滚目标：per-target、
+        // 支撑资源先于任何镜像变更就位：新二进制启动依赖的 RBAC/ConfigMap/
+        // Service 若晚于滚动落地，新 Pod 会因缺依赖 crashloop 触发无谓回滚。
+        // 失败直接中止，此时一个镜像都没动（线上原样）。
+        if let Some(dir) = &plan.manifests_dir {
+            let support = Path::new(dir).join("support.yaml");
+            if support.is_file() && support.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                let support_arg = support.to_string_lossy().to_string();
+                info!(manifest = %support_arg, "mainline rollout: applying support manifests");
+                self.run_kubectl(&["apply", "-f", &support_arg], 120)
+                    .await?;
+            }
+        }
+        // 任何镜像变更之前先快照各部署当前镜像作为回滚目标：per-target、
         // 端点零歧义，Legacy 首轮（节点 localhost/cogneva:local）也能精确回退。
-        // 快照失败则一次 set image 都不发生（线上原样）。
+        // 快照失败则一次变更都不发生（线上原样）。
         let mut prevs: Vec<(String, String)> = Vec::new();
         for t in &plan.targets {
             let img = self.current_image(t).await?;
@@ -1526,8 +1952,7 @@ impl RolloutExecutor {
         }
         let mut done: Vec<&RolloutTarget> = Vec::new();
         for target in &plan.targets {
-            info!(deployment = %target.deployment, tag = %plan.tag, "mainline rollout: set image");
-            if let Err(e) = self.set_image(target, &plan.tag).await {
+            if let Err(e) = self.apply_target(plan, target).await {
                 self.rollback(&done, &prevs).await;
                 return Err(e);
             }
@@ -1605,6 +2030,7 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
     let mut restart_threshold = 1u32;
     let mut timeout = 300u64;
     let mut kubectl = "kubectl".to_string();
+    let mut manifests_dir: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let value = |i: usize| -> Result<String, Box<dyn std::error::Error>> {
@@ -1637,6 +2063,10 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
                 kubectl = value(i)?;
                 i += 2;
             }
+            "--manifests-dir" => {
+                manifests_dir = Some(value(i)?);
+                i += 2;
+            }
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
@@ -1644,7 +2074,8 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--tag is required".into());
     }
     let cfg = MainlineDeployerConfig::default();
-    let plan = RolloutPlan::from_config(&cfg, tag);
+    let mut plan = RolloutPlan::from_config(&cfg, tag);
+    plan.manifests_dir = manifests_dir;
     let executor = RolloutExecutor::new(kubectl, ns, soak_secs, restart_threshold, timeout);
     executor.run(&plan).await?;
     Ok(())
@@ -2189,6 +2620,9 @@ exit 0
             max_attempts_per_rev: 2,
             rollout_timeout_secs: 60,
             heartbeat_log_secs: 3600,
+            manifest_dir: "deploy/k3s".into(),
+            // 测试夹具仓库没有 deploy/k3s 清单树；这些用例走 set image 旧路径。
+            deliver_manifests: false,
             targets: MainlineDeployerConfig::default().targets,
         }
     }
@@ -3086,5 +3520,394 @@ exit 0
         // 健康。
         std::fs::write(&pods_file, "0 true ").unwrap();
         assert!(executor.pods_healthy(&target, false).await.is_ok());
+    }
+
+    #[test]
+    fn manifest_bundle_naming_is_stable() {
+        assert_eq!(target_manifest_key("cogneva"), "deploy-cogneva.yaml");
+        assert_eq!(
+            manifests_configmap_name("0123456789abcdef"),
+            "mainline-manifests-0123456789ab"
+        );
+    }
+
+    #[test]
+    fn kustomization_resources_parsed_and_validated() {
+        let ok =
+            parse_kustomization_resources("resources:\n  - namespace.yaml\n  - deployment.yaml\n")
+                .unwrap();
+        assert_eq!(ok, vec!["namespace.yaml", "deployment.yaml"]);
+        // 缺 resources 列表硬报错（发布集定义缺失不该静默当空集）。
+        assert!(parse_kustomization_resources("kind: Kustomization\n").is_err());
+        // 条目非字符串硬报错。
+        assert!(parse_kustomization_resources("resources:\n  - a: b\n").is_err());
+    }
+
+    #[test]
+    fn duplicate_resources_detected() {
+        let dup = vec![
+            "a.yaml".to_string(),
+            "b.yaml".to_string(),
+            "a.yaml".to_string(),
+        ];
+        assert_eq!(duplicate_resources(&dup), Some("a.yaml"));
+        let uniq = vec!["a.yaml".to_string(), "b.yaml".to_string()];
+        assert_eq!(duplicate_resources(&uniq), None);
+    }
+
+    #[test]
+    fn cluster_scoped_kind_classification() {
+        for k in [
+            "Namespace",
+            "StorageClass",
+            "ClusterRole",
+            "ClusterRoleBinding",
+            "CustomResourceDefinition",
+            "ValidatingWebhookConfiguration",
+        ] {
+            assert!(is_cluster_scoped_kind(k), "{k} should be cluster-scoped");
+        }
+        for k in [
+            "Deployment",
+            "ConfigMap",
+            "Service",
+            "Role",
+            "RoleBinding",
+            "Secret",
+        ] {
+            assert!(!is_cluster_scoped_kind(k), "{k} should be namespace-scoped");
+        }
+    }
+
+    #[test]
+    fn namespace_docs_skips_cluster_scoped_and_rbac_and_rejects_secret() {
+        // 多文档：Namespace（集群级）与 Role（权限面）跳过，ConfigMap/Service 保留，空文档跳过。
+        let yaml = "---\nkind: Namespace\nmetadata:\n  name: x\n---\nkind: ConfigMap\nmetadata:\n  name: c\n---\nkind: Role\nmetadata:\n  name: r\nrules: []\n---\nkind: RoleBinding\nmetadata:\n  name: rb\n---\nkind: Service\nmetadata:\n  name: svc\n---\n";
+        let docs = namespace_docs(yaml, "mixed.yaml").unwrap();
+        let kinds: Vec<&str> = docs
+            .iter()
+            .filter_map(|d| d.get("kind").and_then(|k| k.as_str()))
+            .collect();
+        assert_eq!(kinds, vec!["ConfigMap", "Service"]);
+        // Secret 混入是硬错误（零带外凭证红线）。
+        let secret = "kind: Secret\nmetadata:\n  name: s\n";
+        let err = namespace_docs(secret, "secret.yaml").unwrap_err();
+        assert!(err.to_string().contains("forbidden"), "{err}");
+    }
+
+    #[test]
+    fn patch_deployment_image_rewrites_named_container() {
+        let yaml = "kind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  template:\n    spec:\n      containers:\n        - name: sidecar\n          image: old-side\n        - name: cogneva\n          image: old\n";
+        let out = patch_deployment_image(yaml, "d.yaml", "cogneva", "cogneva", "new").unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        let containers = v
+            .get("spec")
+            .unwrap()
+            .get("template")
+            .unwrap()
+            .get("spec")
+            .unwrap()
+            .get("containers")
+            .unwrap()
+            .as_sequence()
+            .unwrap();
+        // sidecar 不动，cogneva 改写。
+        assert_eq!(
+            containers[0].get("image").unwrap().as_str(),
+            Some("old-side")
+        );
+        assert_eq!(containers[1].get("image").unwrap().as_str(), Some("new"));
+    }
+
+    #[test]
+    fn patch_deployment_image_guards() {
+        // kind 非 Deployment。
+        assert!(patch_deployment_image(
+            "kind: Service\nmetadata:\n  name: cogneva\n",
+            "s",
+            "cogneva",
+            "cogneva",
+            "i"
+        )
+        .is_err());
+        // 名字对不上。
+        let d = "kind: Deployment\nmetadata:\n  name: other\nspec:\n  template:\n    spec:\n      containers:\n        - name: cogneva\n          image: old\n";
+        assert!(patch_deployment_image(d, "d", "cogneva", "cogneva", "i").is_err());
+        // 容器名不存在（命中 0 个）。
+        let no_container = "kind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  template:\n    spec:\n      containers:\n        - name: zzz\n          image: old\n";
+        assert!(patch_deployment_image(no_container, "d", "cogneva", "cogneva", "i").is_err());
+        // 同名容器两个（命中 2 个，歧义拒绝）。
+        let dup = "kind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  template:\n    spec:\n      containers:\n        - name: cogneva\n          image: a\n        - name: cogneva\n          image: b\n";
+        assert!(patch_deployment_image(dup, "d", "cogneva", "cogneva", "i").is_err());
+        // containers 结构缺失。
+        let no_spec = "kind: Deployment\nmetadata:\n  name: cogneva\nspec: {}\n";
+        assert!(patch_deployment_image(no_spec, "d", "cogneva", "cogneva", "i").is_err());
+    }
+
+    fn bundle_targets() -> Vec<RolloutTargetConfig> {
+        vec![
+            RolloutTargetConfig {
+                deployment: "cogneva".into(),
+                container: "cogneva".into(),
+                component: "gateway".into(),
+                name: "cogneva".into(),
+                manifest: Some("deployment.yaml".into()),
+            },
+            RolloutTargetConfig {
+                deployment: "cogneva-evolution".into(),
+                container: "cogneva".into(),
+                component: "evolution".into(),
+                name: "cogneva".into(),
+                manifest: Some("evolution-deployment.yaml".into()),
+            },
+        ]
+    }
+
+    fn deployment_yaml(name: &str, container: &str) -> String {
+        format!(
+            "kind: Deployment\nmetadata:\n  name: {name}\nspec:\n  template:\n    spec:\n      containers:\n        - name: {container}\n          image: placeholder\n"
+        )
+    }
+
+    #[test]
+    fn build_rollout_bundle_splits_support_and_targets() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "namespace.yaml".to_string(),
+            "kind: Namespace\nmetadata:\n  name: cogneva\n".to_string(),
+        );
+        files.insert(
+            "configmap.yaml".to_string(),
+            "kind: ConfigMap\nmetadata:\n  name: c\ndata:\n  k: v\n".to_string(),
+        );
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "evolution-deployment.yaml".to_string(),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        );
+        // kustomization resources 顺序与 targets 顺序不同，输出按 targets 序。
+        let kustomization =
+            "resources:\n  - namespace.yaml\n  - evolution-deployment.yaml\n  - configmap.yaml\n  - deployment.yaml\n";
+        let bundle = build_rollout_bundle(
+            &files,
+            kustomization,
+            &bundle_targets(),
+            "reg/cogneva:main-x",
+        )
+        .unwrap();
+        // support 只含 ConfigMap（Namespace 集群级被跳过）。
+        assert!(bundle.support_yaml.contains("kind: ConfigMap"));
+        assert!(!bundle.support_yaml.contains("kind: Namespace"));
+        // targets 按声明序：cogneva 先，evolution 后；镜像已改写。
+        assert_eq!(bundle.targets.len(), 2);
+        assert_eq!(bundle.targets[0].deployment, "cogneva");
+        assert_eq!(bundle.targets[0].key, "deploy-cogneva.yaml");
+        assert!(bundle.targets[0].yaml.contains("reg/cogneva:main-x"));
+        assert_eq!(bundle.targets[1].deployment, "cogneva-evolution");
+    }
+
+    #[test]
+    fn build_rollout_bundle_guards() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "evolution-deployment.yaml".to_string(),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        );
+        // kustomization 缺 evolution-deployment.yaml：目标声明了清单却不在发布集，硬错误。
+        let partial = "resources:\n  - deployment.yaml\n";
+        let err = build_rollout_bundle(&files, partial, &bundle_targets(), "img").unwrap_err();
+        assert!(
+            err.to_string().contains("not in kustomization resources"),
+            "{err}"
+        );
+        // kustomization 引用了 files 里不存在的资源：硬错误。
+        let kustomization =
+            "resources:\n  - deployment.yaml\n  - evolution-deployment.yaml\n  - missing.yaml\n";
+        let err =
+            build_rollout_bundle(&files, kustomization, &bundle_targets(), "img").unwrap_err();
+        assert!(
+            err.to_string().contains("missing from bundle files"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_rollout_bundle_rejects_secret_in_support() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "evolution-deployment.yaml".to_string(),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        );
+        files.insert(
+            "secret.yaml".to_string(),
+            "kind: Secret\nmetadata:\n  name: s\n".to_string(),
+        );
+        let kustomization =
+            "resources:\n  - deployment.yaml\n  - evolution-deployment.yaml\n  - secret.yaml\n";
+        let err =
+            build_rollout_bundle(&files, kustomization, &bundle_targets(), "img").unwrap_err();
+        assert!(err.to_string().contains("forbidden"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_manifests_publishes_bundle_and_mounts_it() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+
+        // 发布清单树推进 bare/main：组包经 git show 从 bare 读，与工作树无关。
+        // setup_repos 把工作树停在 rev_a（bare 在 rev_b），必须先对齐再提交，
+        // 否则 push 非快进被拒。
+        real_git(&work, &["reset", "--hard", &rev_b]).await;
+        let k3s = work.join("deploy/k3s");
+        std::fs::create_dir_all(&k3s).unwrap();
+        std::fs::write(
+            k3s.join("kustomization.yaml"),
+            "resources:\n  - namespace.yaml\n  - configmap.yaml\n  - gateway-deployment.yaml\n  - sandbox-executor-deployment.yaml\n  - deployment.yaml\n  - evolution-deployment.yaml\n",
+        )
+        .unwrap();
+        std::fs::write(
+            k3s.join("namespace.yaml"),
+            "kind: Namespace\nmetadata:\n  name: cogneva\n",
+        )
+        .unwrap();
+        std::fs::write(
+            k3s.join("configmap.yaml"),
+            "kind: ConfigMap\nmetadata:\n  name: cogneva-config\ndata:\n  k: v\n",
+        )
+        .unwrap();
+        std::fs::write(
+            k3s.join("gateway-deployment.yaml"),
+            deployment_yaml("cogneva-security-gateway", "security-gateway"),
+        )
+        .unwrap();
+        std::fs::write(
+            k3s.join("sandbox-executor-deployment.yaml"),
+            deployment_yaml("cogneva-sandbox-executor", "sandbox-executor"),
+        )
+        .unwrap();
+        std::fs::write(
+            k3s.join("deployment.yaml"),
+            deployment_yaml("cogneva", "cogneva"),
+        )
+        .unwrap();
+        std::fs::write(
+            k3s.join("evolution-deployment.yaml"),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        )
+        .unwrap();
+        real_git(&work, &["add", "."]).await;
+        real_git(&work, &["commit", "-m", "manifest tree"]).await;
+        real_git(&work, &["push", "origin", "main"]).await;
+        let rev_c = real_git_stdout(
+            &bare,
+            &["--git-dir", bare.to_str().unwrap(), "rev-parse", "main"],
+        )
+        .await;
+
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_c));
+        let kubectl = fake_kubectl(&bin_dir, "reg.local:5000/cogneva:local");
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.deliver_manifests = true;
+        let deployer = MainlineDeployer::new(cfg, ws);
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        let log = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        let pull_tag = main_image("localhost:30500", &rev_c);
+        // 清单包 ConfigMap 先于 Job 发布，且被 Job 以只读卷挂载。
+        assert!(
+            log.contains(&manifests_configmap_name(&rev_c)),
+            "manifests configmap missing: {log}"
+        );
+        assert!(log.contains("--manifests-dir"), "job args missing: {log}");
+        assert!(log.contains("\"mountPath\": \"/manifests\""), "{log}");
+        // support.yaml 只带命名空间级资源（Namespace 集群级被跳过），
+        // 四个 deployment 清单镜像全部改写为节点 pull 端点引用。
+        assert!(log.contains("kind: ConfigMap"), "{log}");
+        assert!(!log.contains("kind: Namespace"), "{log}");
+        assert!(
+            log.contains(&format!("image: {pull_tag}")),
+            "target manifests must carry the pull-endpoint image: {log}"
+        );
+        // placeholder 镜像不能漏进包里（漏了说明有 deployment 没被改写）。
+        assert!(!log.contains("image: placeholder"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn manifest_bundle_failure_blocks_dispatch() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 夹具仓库没有 deploy/k3s 清单树：组包必须硬失败，Job 一个都不派。
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        let kubectl = fake_kubectl(&bin_dir, "reg.local:5000/cogneva:local");
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.deliver_manifests = true;
+        let deployer = MainlineDeployer::new(cfg, ws);
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        let err = deployer.poll_once().await.unwrap_err();
+        std::env::set_var("PATH", old_path);
+
+        assert!(
+            err.to_string().contains("kustomization.yaml"),
+            "bundle failure must name the missing release set: {err}"
+        );
+        let log = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            !log.contains("apply -f -"),
+            "no job may be dispatched: {log}"
+        );
+        // in_flight 停在 Pushed：下轮 poll 走复用路径重试派发，不重建镜像。
+        let state = deployer.load_state();
+        let inflight = state.in_flight.expect("in_flight must stay for retry");
+        assert_eq!(inflight.rev, rev_b);
+        assert_eq!(inflight.phase, Phase::Pushed);
+    }
+
+    #[test]
+    fn build_rollout_bundle_target_without_manifest_is_skipped() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        // 第二个目标 manifest=None：不进包，滚动侧对它回落 set image。
+        let mut targets = bundle_targets();
+        targets[1].manifest = None;
+        let kustomization = "resources:\n  - deployment.yaml\n";
+        let bundle = build_rollout_bundle(&files, kustomization, &targets, "img").unwrap();
+        assert_eq!(bundle.targets.len(), 1);
+        assert_eq!(bundle.targets[0].deployment, "cogneva");
     }
 }

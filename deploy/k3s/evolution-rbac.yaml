@@ -16,21 +16,28 @@ metadata:
     app.kubernetes.io/name: cogneva-evolution
     app.kubernetes.io/component: evolution
 rules:
-  # Mainline deployer / image rollout: named read+patch on the four cogneva
-  # Deployments (kubectl set image = PATCH on a named Deployment).
+  # Mainline deployer delivers a manifest bundle with the image: the rollout
+  # Job applies the release set's support resources and deployment manifests
+  # (so topology changes reach the cluster with each version). apply can create
+  # new resources, so resourceNames cannot scope it; the grants are
+  # collection-level but the Role itself is namespace-bounded. The permission
+  # plane (Role/RoleBinding) and Secrets never travel through the deploy path:
+  # the bundle builder filters them out and no verbs are granted here, so the
+  # autonomous system cannot escalate its own privileges.
   - apiGroups: ["apps"]
-    resources: ["deployments"]
-    resourceNames:
-      - "cogneva"
-      - "cogneva-security-gateway"
-      - "cogneva-sandbox-executor"
-      - "cogneva-evolution"
-    verbs: ["get", "patch", "update"]
-  # list/watch are collection-level verbs that RBAC cannot scope by
-  # resourceNames; keep them in a separate rule.
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["list", "watch"]
+    resources: ["deployments", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services", "serviceaccounts", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # Stale manifest-bundle ConfigMap cleanup (label-selected delete; names carry
+  # a rev and cannot be enumerated by resourceNames).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies", "ingresses"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   # Pod health checks (name+component dual-label selector, collection list).
   - apiGroups: [""]
     resources: ["pods"]
@@ -41,11 +48,6 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
-  # Allow reading the cogneva ConfigMap if needed for configuration.
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    resourceNames: ["cogneva-config"]
-    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

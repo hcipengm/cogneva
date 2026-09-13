@@ -81,20 +81,24 @@ metadata:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: evolution
 rules:
-  # 主线跟踪部署器 / image 滚动：四个 cogneva deployment 的具名读与补丁
-  # （kubectl set image = PATCH 具名 deployment）。
+  # 主线跟踪部署器随镜像下发清单包：滚动 Job 以 apply 交付发布集里的支撑
+  # 资源与 deployment 清单（拓扑变更因此随版本到达集群）。apply 可能创建
+  # 新资源，无法用 resourceNames 白名单，授权是集合级——但 Role 本身限定
+  # 在本命名空间。权限面（Role/RoleBinding）与 Secret 不经部署面：组包侧
+  # 硬性过滤，这里也不授权，防止自治系统为自己提权。
   - apiGroups: ["apps"]
-    resources: ["deployments"]
-    resourceNames:
-      - "cogneva"
-      - "cogneva-security-gateway"
-      - "cogneva-sandbox-executor"
-      - "cogneva-evolution"
-    verbs: ["get", "patch", "update"]
-  # list/watch 是集合级操作，RBAC 不能用 resourceNames 收窄，单独一条。
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["list", "watch"]
+    resources: ["deployments", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services", "serviceaccounts", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # 旧清单包 ConfigMap 清理（按 label 选择删除，名字含 rev 不可枚举）。
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies", "ingresses"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   # Pod 健康检查（name+component 双标签选择器，集合 list）。
   - apiGroups: [""]
     resources: ["pods"]
@@ -104,10 +108,6 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    resourceNames: ["cogneva-config"]
-    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
