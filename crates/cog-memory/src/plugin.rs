@@ -8,12 +8,20 @@ use tracing::{info, warn};
 /// metrics backend, embedding provider, and reranker provider.
 pub struct MemoryPlugin {
     initialized: bool,
+    /// Stop handle for the auto-ingest background task. Must be held for the
+    /// whole plugin lifetime: the ingestor stops on an explicit signal or
+    /// when the event broadcast closes, and `shutdown` uses this handle to
+    /// stop it cleanly.
+    ingestor_stop: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
 }
 
 impl MemoryPlugin {
     /// Create a plugin that will build all memory services during `init`.
     pub fn new() -> Self {
-        Self { initialized: false }
+        Self {
+            initialized: false,
+            ingestor_stop: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -324,7 +332,16 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             let ingestor = crate::MemoryIngestor::new(backend, extractor);
             info!("Memory auto-ingest enabled");
             if let Some(tx) = event_tx {
-                let _ = ingestor.spawn(tx.subscribe());
+                // The ingestor task exits as soon as the returned stop handle
+                // is dropped, so it must be kept alive for the plugin's whole
+                // lifetime; `shutdown` later signals it through this handle.
+                let stop_handle = ingestor.spawn(tx.subscribe());
+                match self.ingestor_stop.lock() {
+                    Ok(mut slot) => *slot = Some(stop_handle),
+                    Err(poisoned) => {
+                        *poisoned.into_inner() = Some(stop_handle);
+                    }
+                }
             }
         }
 
@@ -332,6 +349,15 @@ impl cog_core::SystemPlugin for MemoryPlugin {
     }
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
+        let stop_handle = match self.ingestor_stop.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(handle) = stop_handle {
+            // Signal the ingestor task to exit; dropping the handle would
+            // also stop it, but an explicit signal keeps the intent clear.
+            let _ = handle.send(()).await;
+        }
         info!("MemoryPlugin shutdown");
         Ok(())
     }

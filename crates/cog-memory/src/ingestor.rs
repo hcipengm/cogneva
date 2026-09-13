@@ -68,9 +68,20 @@ impl MemoryIngestor {
             info!("MemoryIngestor started");
             loop {
                 tokio::select! {
-                    Ok(event) = event_rx.recv() => {
-                        if let Err(e) = self.handle_event(&event).await {
-                            warn!("Memory ingestion failed: {}", e);
+                    result = event_rx.recv() => {
+                        match result {
+                            Ok(event) => {
+                                if let Err(e) = self.handle_event(&event).await {
+                                    warn!("Memory ingestion failed: {}", e);
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("MemoryIngestor lagged, skipped {} events", n);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                info!("AgentEvent broadcast closed; MemoryIngestor stopping");
+                                break;
+                            }
                         }
                     }
                     _ = stop_rx.recv() => {
@@ -187,5 +198,104 @@ impl MemoryIngestor {
         let uri = self.backend.archive_raw(&dlq_raw).await?;
         info!("Wrote failed ingestion to DLQ: {}", uri);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MemoryMemoryBackend, RuleBasedExtractor};
+    use chrono::Utc;
+    use cog_core::Message;
+
+    fn agent_end(agent_id: &str) -> AgentEvent {
+        AgentEvent::AgentEnd {
+            agent_id: agent_id.into(),
+            messages: vec![Message::user(
+                "the deploy key lives in the security gateway",
+            )],
+            crew_id: None,
+            squad_id: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    async fn archived_count(backend: &MemoryMemoryBackend) -> usize {
+        backend
+            .list_raw("default", None)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    async fn wait_for_archives(backend: &MemoryMemoryBackend, expect: usize) -> bool {
+        for _ in 0..100 {
+            if archived_count(backend).await >= expect {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// Regression: the stop handle is the ingestor's lifetime anchor. A caller
+    /// that discards it (`let _ = spawn(...)`) silently kills auto-ingest
+    /// within milliseconds — the plugin used to do exactly that. While the
+    /// handle is held, the task must keep consuming events across many rounds.
+    #[tokio::test]
+    async fn keeps_consuming_while_handle_is_held() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
+        let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(16);
+        let _handle = ingestor.spawn(event_tx.subscribe());
+
+        for round in 0..3 {
+            event_tx.send(agent_end(&format!("a-{round}"))).unwrap();
+            assert!(
+                wait_for_archives(&backend, round + 1).await,
+                "event {round} must be archived while the handle is held"
+            );
+        }
+    }
+
+    /// Contract pin: dropping the handle stops the background task.
+    #[tokio::test]
+    async fn dropping_handle_stops_task() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
+        let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(16);
+        let handle = ingestor.spawn(event_tx.subscribe());
+        drop(handle);
+
+        let mut exited = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Once the task exits, its broadcast receiver is gone and send fails.
+            if event_tx.send(agent_end("a-x")).is_err() {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "task must exit after its stop handle is dropped");
+    }
+
+    /// Contract pin: an explicit stop signal through the handle ends the task.
+    #[tokio::test]
+    async fn explicit_stop_signal_stops_task() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
+        let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(16);
+        let handle = ingestor.spawn(event_tx.subscribe());
+
+        handle.send(()).await.unwrap();
+        let mut exited = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if event_tx.send(agent_end("a-x")).is_err() {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "task must exit after an explicit stop signal");
     }
 }
