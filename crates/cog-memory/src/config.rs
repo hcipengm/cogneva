@@ -45,6 +45,47 @@ pub struct MemoryConfig {
     /// 关闭原因同 [`Self::load_embedding_model`]；其拉取路径写死
     /// `https://huggingface.co`、不吃 `HF_ENDPOINT`，离线集群只能靠本地就位。
     pub load_reranker_model: bool,
+    /// 自动摄取（AgentEnd → 记忆三层）的运行参数。
+    pub ingest: IngestConfig,
+}
+
+/// 自动摄取管线的运行参数。代码侧 [`Default`] 只是兜底，集群上调参改
+/// cogneva.json 的 `memory.ingest` 段。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IngestConfig {
+    /// 单条消息的最大重试次数（指数退避 1s、2s、4s…）。
+    pub max_retries: u32,
+    /// 重试退避基数（毫秒）。
+    pub retry_base_delay_ms: u64,
+    /// 最终失败的消息是否写死信命名空间。
+    pub enable_dlq: bool,
+    /// 死信命名空间。
+    pub dlq_namespace: String,
+    /// 抽取并发上限。抽取是 LLM 时延主导的 I/O 任务，这个值决定事件洪峰
+    /// 后积压的排空速率。
+    pub extraction_concurrency: usize,
+    /// 启动时是否对账扫描"已归档未抽取"的 raw 并补驱动（覆盖崩溃窗口）。
+    pub startup_reconcile: bool,
+    /// 对账只回看最近这么多个小时的 raw。
+    pub reconcile_lookback_hours: u64,
+    /// 积压深度告警起点（达到后每翻倍打一条 WARN）。
+    pub backlog_warn_at: usize,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            retry_base_delay_ms: 1000,
+            enable_dlq: true,
+            dlq_namespace: "dlq".into(),
+            extraction_concurrency: 4,
+            startup_reconcile: true,
+            reconcile_lookback_hours: 24,
+            backlog_warn_at: 64,
+        }
+    }
 }
 
 impl MemoryConfig {

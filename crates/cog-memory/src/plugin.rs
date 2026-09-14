@@ -329,7 +329,8 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             } else {
                 Arc::new(crate::RuleBasedExtractor::new())
             };
-            let ingestor = crate::MemoryIngestor::new(backend, extractor);
+            let ingestor =
+                crate::MemoryIngestor::new(backend, extractor).with_config((&memory.ingest).into());
             info!("Memory auto-ingest enabled");
             if let Some(tx) = event_tx {
                 // The ingestor task exits as soon as the returned stop handle

@@ -46,4 +46,4 @@ pub use schema_backend::MemorySchemaBackend;
 pub use vector_summary_backend::{VectorSummaryBackend, DEFAULT_SUMMARY_COLLECTION};
 pub mod plugin;
 
-pub use config::MemoryConfig;
+pub use config::{IngestConfig, MemoryConfig};
