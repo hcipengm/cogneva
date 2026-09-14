@@ -1638,6 +1638,7 @@ dependencies = [
  "chrono",
  "cog-core",
  "cog-storage",
+ "cog-stream",
  "fastembed",
  "futures",
  "schemars",

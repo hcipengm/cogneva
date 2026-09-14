@@ -107,7 +107,6 @@ pub struct ProviderConfig {
 /// into `urls: [nats_url]` at load time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct NatsConfig {
     /// List of NATS server URLs.  For clusters provide at least 3.
     /// Example: `["nats://n1:4222", "nats://n2:4222", "nats://n3:4222"]`
@@ -116,6 +115,29 @@ pub struct NatsConfig {
     pub auth: NatsAuthConfig,
     /// TLS settings.
     pub tls: NatsTlsConfig,
+    /// 消费者 ack 等待时长（秒）：超过未 ack 服务端自动重投。必须大于最坏
+    /// 单条处理时延——记忆摄取一条含归档+两次 LLM 调用+重试，分钟级；小于
+    /// 它会在处理途中重投造成重复消费。默认 900s 覆盖该最坏情况。
+    pub consumer_ack_wait_secs: u64,
+    /// 单条消息的最大投递次数。消费方按投递次数判定毒药消息：写 DLQ 后
+    /// ack 终止，不让它在流里无限重投。
+    pub consumer_max_deliver: i64,
+    /// 服务端允许的在途未 ack 消息上限，超出即停止投递。消费端的背压闸门：
+    /// 积压在流里（持久），不堆在消费者进程内存里。
+    pub consumer_max_ack_pending: usize,
+}
+
+impl Default for NatsConfig {
+    fn default() -> Self {
+        Self {
+            urls: Vec::new(),
+            auth: NatsAuthConfig::default(),
+            tls: NatsTlsConfig::default(),
+            consumer_ack_wait_secs: 900,
+            consumer_max_deliver: 5,
+            consumer_max_ack_pending: 1024,
+        }
+    }
 }
 
 /// NATS authentication configuration.
@@ -602,6 +624,21 @@ pub struct MultiBackendConsumerConfig {
     pub channel: String,
     pub group: String,
     pub retry_interval_secs: u64,
+    /// AgentEnd 事件面走持久总线（true）还是只走进程内 broadcast（false）。
+    /// 打开后：agent 在事件产生处把 AgentEnd 写入总线（有界异步缓冲兜底
+    /// 总线故障窗），broadcast 由 MultiBackendEventConsumer 回灌一次；
+    /// 记忆摄取器改以自己的消费组从总线消费，ack 在归档+抽取完成后。
+    /// 必须两侧同开同关——只开一侧会造成重复摄取或事件丢失。
+    pub events_on_bus: bool,
+    /// 事件面专用 NATS 地址列表。非空时事件面用独立的 NATS JetStream 连接，
+    /// 与全局 MessageBackend（任务队列，可能仍在 Redis）解耦；为空时事件面
+    /// 复用全局 MessageBackend。
+    pub nats_urls: Vec<String>,
+    /// 发布端异步缓冲容量。总线故障期间事件在缓冲里排队；排满后新事件
+    /// 打 ERROR 并丢弃（事件仍在 WAL/日志链路可查），缓冲绝不无界增长。
+    pub publish_buffer_capacity: usize,
+    /// 发布失败的重试退避基数（毫秒），指数退避。
+    pub publish_retry_base_delay_ms: u64,
 }
 
 impl Default for MultiBackendConsumerConfig {
@@ -611,6 +648,10 @@ impl Default for MultiBackendConsumerConfig {
             channel: "cogneva-events".into(),
             group: "cogneva-consumer".into(),
             retry_interval_secs: 5,
+            events_on_bus: false,
+            nats_urls: Vec::new(),
+            publish_buffer_capacity: 256,
+            publish_retry_base_delay_ms: 1000,
         }
     }
 }

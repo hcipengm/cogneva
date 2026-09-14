@@ -106,6 +106,48 @@ impl cog_core::SystemPlugin for StreamPlugin {
             info!("StreamPlugin no message backend configured");
         }
 
+        // ── Event plane backend ──
+        // 事件面（AgentEnd 等需要持久投递的事件）可以走独立的 NATS JetStream
+        // 连接，与全局 MessageBackend（任务队列）解耦；未配置专用地址时复用
+        // 全局后端。消费方（agent 发布、supervisor 回灌、memory 摄取）统一
+        // 从 EventPlaneBackend 取，不各自判断来源。
+        {
+            let mbc = ctx.config().multi_backend_consumer.clone();
+            let plane: Option<Arc<dyn cog_core::MessageBackend>> = if !mbc.nats_urls.is_empty() {
+                // 继承全局 NATS 配置的 auth/tls/消费者 tuning，只覆盖地址——
+                // 事件面与任务队列的 NATS 参数同一份配置面，不另起炉灶。
+                let mut plane_config = ctx.config().dag_executor.nats.clone();
+                plane_config.urls = mbc.nats_urls.clone();
+                match crate::NatsMessageBackend::new(&plane_config).await {
+                    Ok(b) => {
+                        info!(
+                            "Event plane on dedicated NATS JetStream: {:?}",
+                            mbc.nats_urls
+                        );
+                        Some(Arc::new(b))
+                    }
+                    Err(e) => {
+                        if strict_persistence {
+                            return Err(cog_core::SFError::Config(format!(
+                                "Event plane NATS connect failed (strict_persistence=true): {e}"
+                            )));
+                        }
+                        warn!("Event plane NATS connect failed: {e}. Using global message backend");
+                        backend.clone()
+                    }
+                }
+            } else {
+                backend.clone()
+            };
+            if let Some(plane_backend) = plane {
+                ctx.publish(Arc::new(cog_core::EventPlaneBackend(plane_backend.clone())));
+                let plane_publisher: Arc<dyn cog_core::EventPublisher> =
+                    Arc::new(crate::MqEventPublisher::new(plane_backend, mbc.channel));
+                ctx.publish(Arc::new(cog_core::EventPlanePublisher(plane_publisher)));
+                info!("StreamPlugin event plane published");
+            }
+        }
+
         // ── Event broadcast channel ──
         let (event_tx, _event_rx) =
             tokio::sync::broadcast::channel::<cog_core::AgentEvent>(event_channel_capacity);
@@ -134,6 +176,8 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     provides: &[
         "MessageBackend",
         "EventPublisher",
+        "EventPlaneBackend",
+        "EventPlanePublisher",
         "Sender<AgentEvent>",
         "Sender<TaskEvent>",
     ],

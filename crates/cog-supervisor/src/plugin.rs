@@ -230,19 +230,33 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         self.spawn_llm_pool_guard(ctx).await;
 
         // ── Multi-backend consumer ──
-        let config = ctx.config();
-        if config.multi_backend_consumer.enabled {
-            if let Some(backend) = ctx.consume_service::<dyn cog_core::MessageBackend>() {
+        let mbc = ctx.config().multi_backend_consumer.clone();
+        if mbc.enabled {
+            // 回灌来源随事件面开关切换：events_on_bus 开启后 AgentEnd 只发
+            // 事件面（JetStream），回灌必须从事件面读，否则 broadcast 上的
+            // AgentEnd 彻底断流；关闭时维持全局后端（零回归）。
+            let plane_backend = if mbc.events_on_bus {
+                ctx.consume::<cog_core::EventPlaneBackend>()
+                    .map(|h| h.0.clone())
+            } else {
+                None
+            };
+            let global_backend = ctx.consume_service::<dyn cog_core::MessageBackend>();
+            let primary = plane_backend.or(global_backend);
+            if let Some(backend) = primary {
                 if let Some(event_tx) =
                     ctx.consume::<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>()
                 {
                     let consumer = crate::MultiBackendEventConsumer::new(
                         backend.clone(),
                         (*event_tx).clone(),
-                        &config.multi_backend_consumer.channel,
+                        &mbc.channel,
                     )
-                    .with_retry_interval(config.multi_backend_consumer.retry_interval_secs);
-                    info!("MultiBackendEventConsumer started (primary: NATS/Redis)");
+                    .with_retry_interval(mbc.retry_interval_secs);
+                    info!(
+                        events_on_bus = mbc.events_on_bus,
+                        "MultiBackendEventConsumer started"
+                    );
                     consumer.spawn();
                 }
             } else {
@@ -320,6 +334,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "MessageBackend",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "EventPlaneBackend",
             required: false,
         },
     ],

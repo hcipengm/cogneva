@@ -94,3 +94,14 @@ pub trait MessageBackend: Send + Sync {
         Ok(())
     }
 }
+
+/// 事件面专用消息后端的插件间传递 holder。StreamPlugin 发布：
+/// `multi_backend_consumer.nats_urls` 非空时是独立的 NATS JetStream 连接
+/// （事件面与任务队列的全局 MessageBackend 解耦），否则复用全局后端。
+/// 消费方：cog-agent（发布 AgentEnd）、cog-supervisor（回灌 broadcast）、
+/// cog-memory（摄取消费）。
+pub struct EventPlaneBackend(pub std::sync::Arc<dyn MessageBackend>);
+
+/// 事件面发布器——绑定了事件 channel 的 [`crate::EventPublisher`]，
+/// 由 StreamPlugin 随 [`EventPlaneBackend`] 一起发布。
+pub struct EventPlanePublisher(pub std::sync::Arc<dyn crate::EventPublisher>);

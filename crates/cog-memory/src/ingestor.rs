@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use cog_core::MemoryExtractor;
 use cog_core::{AgentEvent, SFResult};
-use cog_core::{MemoryBackend, RawSource};
+use cog_core::{MemoryBackend, MessageBackend, RawSource};
 
 use crate::IngestConfig;
 
@@ -14,15 +14,13 @@ use crate::IngestConfig;
 /// NAME_MAX(255 字节)，同时保留足够前缀让人能从对象键认出来源。
 const RAW_ID_SLUG_MAX: usize = 64;
 
-/// 把任意来源 id 收敛成对象键安全的有界形式。自进化系统里 agent_id 可以是
-/// 整段 issue 标题（数百字节 CJK，含 `:`、`#`、空格甚至 `/`）：直接拼进
-/// 对象键会让 local-fs 后端把整键当超长单段路径写（ENAMETOOLONG），每次
-/// 归档都失败；同一 agent 的多次会话还会互相覆盖同一个对象。规则：只保留
-/// ASCII 字母数字与 `.`/`-`，其余折成 `_`；截到 [`RAW_ID_SLUG_MAX`]；附
-/// 毫秒时间戳与 8 位随机段，保证每次归档唯一。原始 id 由调用方放进 tags
-/// 保留可追溯性。
-fn bounded_raw_id(prefix: &str, source: &str, now: chrono::DateTime<chrono::Utc>) -> String {
-    let slug: String = source
+/// 把任意来源收敛成对象键安全的 slug：只保留 ASCII 字母数字与 `.`/`-`，
+/// 其余折成 `_`，截到 [`RAW_ID_SLUG_MAX`]。自进化系统里 agent_id 可以是
+/// 整段 issue 标题（数百字节 CJK，含 `:`、`#`、空格甚至 `/`），直接拼进
+/// 对象键会让 local-fs 后端 ENAMETOOLONG。原始 id 由调用方放进 tags 保留
+/// 可追溯性。
+fn slugify(source: &str) -> String {
+    source
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
@@ -32,9 +30,26 @@ fn bounded_raw_id(prefix: &str, source: &str, now: chrono::DateTime<chrono::Utc>
             }
         })
         .take(RAW_ID_SLUG_MAX)
-        .collect();
+        .collect()
+}
+
+/// 每次归档唯一的 id：slug + 毫秒时间戳 + 8 位随机段。同一 agent 的多次
+/// 会话不会互相覆盖同一个对象。
+fn bounded_raw_id(prefix: &str, source: &str, now: chrono::DateTime<chrono::Utc>) -> String {
     let random = &Uuid::new_v4().simple().to_string()[..8];
-    format!("{prefix}-{slug}-{}-{random}", now.timestamp_millis())
+    format!(
+        "{prefix}-{}-{}-{random}",
+        slugify(source),
+        now.timestamp_millis()
+    )
+}
+
+/// 确定性 id：同一事件（同一时间戳的同一来源）反复投递产生同一个对象键。
+/// 总线红投/去重的根基——归档按键幂等覆盖，层检查跳过已存在层，重放不会
+/// 派生第二份档案。尾部 `-evt` 占位保持与随机段相同的 `-{millis}-{seg}`
+/// 结构，[`raw_id_timestamp`] 从右数第二段取时间戳的解析对两种 id 同构。
+fn deterministic_raw_id(prefix: &str, source: &str, ts: chrono::DateTime<chrono::Utc>) -> String {
+    format!("{prefix}-{}-{}-evt", slugify(source), ts.timestamp_millis())
 }
 
 /// 从 [`bounded_raw_id`] 生成的 id 尾部取回毫秒时间戳（`-{millis}-{rand8}`
@@ -69,6 +84,17 @@ pub struct MemoryIngestorConfig {
     /// 积压深度告警起点：深度首次达到该值及之后每翻倍一次打一条 WARN，
     /// 让吞不下的事件洪峰在日志里可见而不是静默排队。
     pub backlog_warn_at: usize,
+    /// 总线消费组名（durable consumer / consumer group）。同组多副本共同
+    /// 分担事件，组名即断点续传的身份。
+    pub bus_group: String,
+    /// pending 认领清扫间隔（秒）。只对支持认领的后端（Redis Streams）
+    /// 有意义；JetStream 由 ack_wait 自动红投，清扫恒返回空。
+    pub bus_claim_interval_secs: u64,
+    /// 认领门槛：pending 消息空闲超过这么多毫秒才被本消费者接走——必须
+    /// 大于单条最坏处理时长，否则把别人正在处理的活抢过来重复抽。
+    pub bus_claim_min_idle_ms: u64,
+    /// 每轮认领的批大小上限。
+    pub bus_claim_batch: usize,
 }
 
 impl Default for MemoryIngestorConfig {
@@ -82,6 +108,10 @@ impl Default for MemoryIngestorConfig {
             startup_reconcile: true,
             reconcile_lookback_hours: 24,
             backlog_warn_at: 64,
+            bus_group: "memory-ingestor".into(),
+            bus_claim_interval_secs: 30,
+            bus_claim_min_idle_ms: 900_000,
+            bus_claim_batch: 32,
         }
     }
 }
@@ -97,14 +127,51 @@ impl From<&IngestConfig> for MemoryIngestorConfig {
             startup_reconcile: c.startup_reconcile,
             reconcile_lookback_hours: c.reconcile_lookback_hours,
             backlog_warn_at: c.backlog_warn_at,
+            bus_group: c.bus_group.clone(),
+            bus_claim_interval_secs: c.bus_claim_interval_secs,
+            bus_claim_min_idle_ms: c.bus_claim_min_idle_ms,
+            bus_claim_batch: c.bus_claim_batch,
         }
     }
 }
 
 /// 排队等待处理的 raw。`archived` 标记是否已落对象存储：worker 先补归档
-/// （幂等重放）再做抽取，重启后由对账扫描兜底。
+/// （幂等重放）再做抽取，重启后由对账扫描兜底。`ack` 只在总线消费模式下
+/// 有值：处理完成后回执给总线，消息才算真正消费掉。
 struct QueuedRaw {
     raw: RawSource,
+    ack: Option<BusAck>,
+}
+
+/// 总线消息的兑现凭证。处理成功后才 ack；ack 本身失败时消息会被总线红投，
+/// 由确定性 id + 层存在性检查保证重放幂等。
+struct BusAck {
+    backend: Arc<dyn MessageBackend>,
+    channel: String,
+    group: String,
+    message_id: String,
+}
+
+impl BusAck {
+    async fn ack(self) {
+        if let Err(e) = self
+            .backend
+            .ack(
+                &self.channel,
+                &self.group,
+                std::slice::from_ref(&self.message_id),
+            )
+            .await
+        {
+            // ack 失败 = 总线稍后红投；摄取侧幂等，代价只是一次重复处理。
+            warn!("Memory ingest bus ack failed for {}: {e}", self.message_id);
+        }
+    }
+
+    /// 同步上下文里的丢弃式 ack（非目标事件/毒消息）。
+    fn ack_fire_and_forget(self) {
+        tokio::spawn(self.ack());
+    }
 }
 
 /// Background service that listens to the AgentEvent broadcast stream and
@@ -144,31 +211,7 @@ impl MemoryIngestor {
         let backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let inner = Arc::new(self);
 
-        // 派发循环：认领一个任务就拿一个信号量许可 spawn 出去，绝不在循环
-        // 位置 await 整条处理；许可数即并发上限。
-        {
-            let inner = inner.clone();
-            let backlog = backlog.clone();
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(
-                inner.config.extraction_concurrency,
-            ));
-            tokio::spawn(async move {
-                let mut job_rx = job_rx;
-                while let Some(job) = job_rx.recv().await {
-                    let permit = match semaphore.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => break, // 信号量关闭只发生在派发任务自身消亡时
-                    };
-                    let inner = inner.clone();
-                    let backlog = backlog.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        inner.process(job).await;
-                        backlog.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    });
-                }
-            });
-        }
+        inner.start_dispatcher(job_rx, backlog.clone());
 
         tokio::spawn(async move {
             info!("MemoryIngestor started");
@@ -181,7 +224,7 @@ impl MemoryIngestor {
                         match result {
                             Ok(AgentEvent::AgentEnd { agent_id, messages, .. }) => {
                                 let raw = build_raw(&agent_id, &messages);
-                                enqueue(&job_tx, &backlog, QueuedRaw { raw }, inner.config.backlog_warn_at);
+                                enqueue(&job_tx, &backlog, QueuedRaw { raw, ack: None }, inner.config.backlog_warn_at);
                             }
                             Ok(_) => {}
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -209,10 +252,216 @@ impl MemoryIngestor {
         stop_tx
     }
 
+    /// 总线消费模式：AgentEnd 从持久事件面（JetStream / Redis Streams）按
+    /// 消费组拉取，归档+抽取完成后才 ack。进程崩溃时未 ack 的消息由总线
+    /// 红投（JetStream ack_wait / Redis 由 pending 清扫认领），不再依赖
+    /// "已入队未归档"那一小段内存状态；确定性 raw id 让红投重放幂等。
+    /// 广播模式有的对账扫描、并发上限、积压告警这里原样保留。
+    pub fn spawn_bus(
+        self,
+        bus: Arc<dyn MessageBackend>,
+        channel: impl Into<String>,
+    ) -> mpsc::Sender<()> {
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<QueuedRaw>();
+        let backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inner = Arc::new(self);
+        let channel = channel.into();
+        let group = inner.config.bus_group.clone();
+
+        inner.start_dispatcher(job_rx, backlog.clone());
+
+        // pending 清扫：把"投递给了已死消费者、始终没 ack"的消息认领回来。
+        // JetStream 靠 ack_wait 自动红投，claim_pending 默认返回空；Redis
+        // Streams 必须靠这个清扫兜底。
+        {
+            let bus = bus.clone();
+            let channel = channel.clone();
+            let group = group.clone();
+            let job_tx = job_tx.clone();
+            let backlog = backlog.clone();
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(
+                    inner.config.bus_claim_interval_secs,
+                ));
+                interval.tick().await; // 跳过立即触发的那一拍
+                loop {
+                    interval.tick().await;
+                    if job_tx.is_closed() {
+                        break;
+                    }
+                    match bus
+                        .claim_pending(
+                            &channel,
+                            &group,
+                            inner.config.bus_claim_min_idle_ms,
+                            inner.config.bus_claim_batch,
+                        )
+                        .await
+                    {
+                        Ok(claimed) => {
+                            if !claimed.is_empty() {
+                                info!(
+                                    "Memory ingest claimed {} pending bus messages",
+                                    claimed.len()
+                                );
+                            }
+                            for (id, payload) in claimed {
+                                inner.enqueue_bus_payload(
+                                    &job_tx, &backlog, &bus, &channel, id, &payload,
+                                );
+                            }
+                        }
+                        Err(e) => warn!("Memory ingest claim_pending failed: {e}"),
+                    }
+                }
+            });
+        }
+
+        tokio::spawn(async move {
+            info!("MemoryIngestor bus consumer started (channel={channel}, group={group})");
+            if inner.config.startup_reconcile {
+                inner.reconcile(&job_tx, &backlog).await;
+            }
+            // durable 消费组：已存在时创建是幂等 no-op，失败也不挡订阅——
+            // 订阅失败下面的重订阅循环会接着退避重试。
+            if let Err(e) = bus.create_consumer_group(&channel, &group).await {
+                warn!("Memory ingest create_consumer_group failed (continuing): {e}");
+            }
+            let mut stopped = false;
+            while !stopped {
+                // 消费循环必须自愈：订阅失败/流中断就地退避重订阅，瞬时错误
+                // 绝不终结整个摄取服务。
+                let mut stream = match bus.subscribe(&channel, &group).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Memory ingest bus subscribe failed: {e}; retrying in 5s");
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                            _ = stop_rx.recv() => { break; }
+                        }
+                        continue;
+                    }
+                };
+                loop {
+                    tokio::select! {
+                        _ = stop_rx.recv() => {
+                            info!("MemoryIngestor stopping");
+                            stopped = true;
+                            break;
+                        }
+                        item = futures::StreamExt::next(&mut stream) => {
+                            match item {
+                                Some(Ok((id, payload))) => {
+                                    inner.enqueue_bus_payload(&job_tx, &backlog, &bus, &channel, id, &payload);
+                                }
+                                Some(Err(e)) => {
+                                    warn!("Memory ingest bus stream error: {e}; resubscribing");
+                                    break;
+                                }
+                                None => {
+                                    warn!("Memory ingest bus stream closed; resubscribing");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // 关掉入口：派发循环收完残余任务后自然退出，在途抽取跑完。
+            drop(job_tx);
+        });
+
+        stop_tx
+    }
+
+    /// 一条总线消息的入队：解出 AgentEnd 才入队（ack 随任务走）；其他事件
+    /// 类型与毒消息直接 ack 丢弃——毒消息不 ack 会在 ack_wait 后无限红投。
+    fn enqueue_bus_payload(
+        &self,
+        job_tx: &mpsc::UnboundedSender<QueuedRaw>,
+        backlog: &std::sync::atomic::AtomicUsize,
+        bus: &Arc<dyn MessageBackend>,
+        channel: &str,
+        id: String,
+        payload: &[u8],
+    ) {
+        let ack = || BusAck {
+            backend: bus.clone(),
+            channel: channel.to_string(),
+            group: self.config.bus_group.clone(),
+            message_id: id.clone(),
+        };
+        match serde_json::from_slice::<AgentEvent>(payload) {
+            Ok(AgentEvent::AgentEnd {
+                agent_id,
+                messages,
+                timestamp,
+                ..
+            }) => {
+                let raw = build_raw_at(&agent_id, &messages, timestamp);
+                enqueue(
+                    job_tx,
+                    backlog,
+                    QueuedRaw {
+                        raw,
+                        ack: Some(ack()),
+                    },
+                    self.config.backlog_warn_at,
+                );
+            }
+            Ok(_) => {
+                // 事件面契约上只承载 AgentEnd；其他类型出现说明发布侧越界，
+                // 与本摄取器无关，ack 丢弃。
+                ack().ack_fire_and_forget();
+            }
+            Err(e) => {
+                error!("Memory ingest dropping undecodable bus message {id}: {e}");
+                ack().ack_fire_and_forget();
+            }
+        }
+    }
+
+    /// 派发循环：认领一个任务就拿一个信号量许可 spawn 出去，绝不在循环
+    /// 位置 await 整条处理；许可数即并发上限。
+    fn start_dispatcher(
+        self: &Arc<Self>,
+        job_rx: mpsc::UnboundedReceiver<QueuedRaw>,
+        backlog: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let inner = self.clone();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            inner.config.extraction_concurrency,
+        ));
+        tokio::spawn(async move {
+            let mut job_rx = job_rx;
+            while let Some(job) = job_rx.recv().await {
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break, // 信号量关闭只发生在派发任务自身消亡时
+                };
+                let inner = inner.clone();
+                let backlog = backlog.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let done = inner.process(job.raw).await;
+                    backlog.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    if done {
+                        if let Some(ack) = job.ack {
+                            ack.ack().await;
+                        }
+                    }
+                    // 处理失败不 ack：总线在 ack_wait 后红投，摄取幂等。
+                });
+            }
+        });
+    }
+
     /// 单条 raw 的完整处理：先确保归档（幂等），再补齐缺失的层。层检查让
-    /// 崩溃重放不会重复写已存在的 schema/summary。
-    async fn process(&self, job: QueuedRaw) {
-        let raw = job.raw;
+    /// 崩溃重放不会重复写已存在的 schema/summary。返回是否处理完成——总线
+    /// 模式下只有完成才 ack，未完成留给红投。
+    async fn process(&self, raw: RawSource) -> bool {
         let label = format!("archive {}", raw.id);
         if let Err(e) = self
             .retry_with_backoff(&label, || async {
@@ -223,7 +472,7 @@ impl MemoryIngestor {
             // 归档都失败时 DLQ（本身也是一次归档）大概率同样写不进，只能
             // 响亮报错；事件体仍在广播上游的日志链路里可查。
             error!("Memory archive failed for {} after retries: {}", raw.id, e);
-            return;
+            return false;
         }
         debug!("Archived raw source: {}", raw.id);
 
@@ -239,9 +488,15 @@ impl MemoryIngestor {
             if self.config.enable_dlq {
                 if let Err(dlq_err) = self.write_dlq(&raw, &e.to_string()).await {
                     warn!("Failed to write DLQ entry: {}", dlq_err);
+                    // DLQ 都写不进：不 ack 留给总线红投，比静默终结响亮。
+                    return false;
                 }
             }
+            // 抽取失败但已落 DLQ：事件有了终结记录，ack 掉不再红投——
+            // 否则同一条坏消息会按 max_deliver 反复抽同样的错。
+            return self.config.enable_dlq;
         }
+        true
     }
 
     /// 补齐 raw 缺失的层：schema 或 summary 已存在就跳过对应抽取。对账重放
@@ -294,7 +549,7 @@ impl MemoryIngestor {
                     enqueue(
                         job_tx,
                         backlog,
-                        QueuedRaw { raw },
+                        QueuedRaw { raw, ack: None },
                         self.config.backlog_warn_at,
                     );
                 }
@@ -391,6 +646,23 @@ fn build_raw(agent_id: &str, messages: &[cog_core::Message]) -> RawSource {
     let payload = serde_json::to_vec(messages).unwrap_or_else(|_| b"[]".to_vec());
     RawSource::new(
         bounded_raw_id("agent", agent_id, chrono::Utc::now()),
+        "default",
+        "conversation/transcript",
+        payload,
+    )
+    .with_tags(vec![format!("agent_id:{}", agent_id)])
+}
+
+/// 总线路径的事件 → 持久层记录：id 由事件自身时间戳决定，同一事件红投
+/// 多少次都落到同一个对象键上，重放天然幂等。
+fn build_raw_at(
+    agent_id: &str,
+    messages: &[cog_core::Message],
+    ts: chrono::DateTime<chrono::Utc>,
+) -> RawSource {
+    let payload = serde_json::to_vec(messages).unwrap_or_else(|_| b"[]".to_vec());
+    RawSource::new(
+        deterministic_raw_id("agent", agent_id, ts),
         "default",
         "conversation/transcript",
         payload,
@@ -752,5 +1024,148 @@ mod tests {
             schema_before,
             "existing schema entries must not be duplicated by the re-drive"
         );
+    }
+
+    fn agent_end_at(agent_id: &str, ts: chrono::DateTime<Utc>) -> AgentEvent {
+        AgentEvent::AgentEnd {
+            agent_id: agent_id.into(),
+            messages: vec![Message::user(
+                "the deploy key lives in the security gateway",
+            )],
+            crew_id: None,
+            squad_id: None,
+            timestamp: ts,
+        }
+    }
+
+    /// 确定性 id 契约：同一事件（同来源同时间戳）永远得到同一对象键——
+    /// 总线红投去重的根基；不同时间戳必须不同键；时间戳解析与随机段 id 同构。
+    #[test]
+    fn deterministic_raw_id_is_stable_per_event() {
+        let ts = Utc::now();
+        let a = deterministic_raw_id("agent", "src", ts);
+        let b = deterministic_raw_id("agent", "src", ts);
+        assert_eq!(a, b, "same event must map to the same id");
+        assert!(a.ends_with("-evt"));
+        let parsed = raw_id_timestamp(&a).expect("timestamp must parse back");
+        assert_eq!(parsed.timestamp_millis(), ts.timestamp_millis());
+        let later = deterministic_raw_id("agent", "src", ts + chrono::Duration::milliseconds(1));
+        assert_ne!(a, later, "distinct events must not collide");
+        // 病态 agent_id 走同一个 slug 收敛，键仍然安全有界。
+        let pathological = deterministic_raw_id("agent", LIVE_LONG_AGENT_ID, ts);
+        assert!(pathological.len() < 128, "id not bounded: {pathological}");
+    }
+
+    /// 总线模式端到端（内存后端）：发布 → 消费组订阅 → 归档+抽取 → ack。
+    /// 对应生产形态：AgentEnd 只上事件面，摄取器从总线消费组拉取。
+    #[tokio::test]
+    async fn bus_events_are_archived_and_extracted() {
+        const EVENTS: usize = 4;
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let bus = Arc::new(cog_stream::MemoryMessageBackend::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
+        let _handle = ingestor.spawn_bus(bus.clone(), "cogneva-events");
+        // 等订阅建立再发布，排除"发布早于订阅"的竞态（真实后端靠持久流
+        // 天然覆盖这个窗口，内存后端的 buffer 也覆盖，但等一拍更直白）。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for i in 0..EVENTS {
+            let ev = agent_end_at(&format!("bus-{i}"), Utc::now());
+            bus.publish("cogneva-events", &serde_json::to_vec(&ev).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let backend2 = backend.clone();
+        assert!(
+            wait_for(move || {
+                let backend = backend2.clone();
+                Box::pin(async move { summary_count(&backend).await >= EVENTS })
+            })
+            .await,
+            "all {EVENTS} bus events must be extracted"
+        );
+        assert_eq!(
+            archived_count(&backend).await,
+            EVENTS,
+            "all {EVENTS} bus events must be archived"
+        );
+    }
+
+    /// 总线红投幂等：同一事件（同字节 = 同时间戳同来源）被重复投递时，
+    /// 归档与 summary 都必须只有一份。红投是 JetStream ack_wait/崩溃恢复
+    /// 的正常形态，不是异常。
+    #[tokio::test]
+    async fn bus_redelivery_is_idempotent() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let bus = Arc::new(cog_stream::MemoryMessageBackend::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
+        let _handle = ingestor.spawn_bus(bus.clone(), "cogneva-events");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let bytes = serde_json::to_vec(&agent_end_at("redelivered", Utc::now())).unwrap();
+        bus.publish("cogneva-events", &bytes).await.unwrap();
+
+        // 第一遍处理完再投第二遍：复刻 ack 失败后的红投时序（ack_wait
+        // 远大于处理时长，红投到达时原处理早已完成）。
+        let backend2 = backend.clone();
+        assert!(
+            wait_for(move || {
+                let backend = backend2.clone();
+                Box::pin(async move { summary_count(&backend).await >= 1 })
+            })
+            .await,
+            "first delivery must be extracted"
+        );
+        bus.publish("cogneva-events", &bytes).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            archived_count(&backend).await,
+            1,
+            "redelivery must not create a second archive"
+        );
+        assert_eq!(
+            summary_count(&backend).await,
+            1,
+            "redelivery must not create a second summary"
+        );
+    }
+
+    /// 毒消息与越界事件类型：无法解码的载荷、非 AgentEnd 事件都必须被
+    /// 消费掉（ack 丢弃）而不是卡住后续消息——消费组是队头阻塞语义。
+    #[tokio::test]
+    async fn bus_poison_and_foreign_events_do_not_block() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let bus = Arc::new(cog_stream::MemoryMessageBackend::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
+        let _handle = ingestor.spawn_bus(bus.clone(), "cogneva-events");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        bus.publish("cogneva-events", b"not-json-poison")
+            .await
+            .unwrap();
+        let foreign = AgentEvent::Heartbeat {
+            agent_id: "h".into(),
+            timestamp: Utc::now(),
+        };
+        bus.publish("cogneva-events", &serde_json::to_vec(&foreign).unwrap())
+            .await
+            .unwrap();
+        let good = agent_end_at("after-poison", Utc::now());
+        bus.publish("cogneva-events", &serde_json::to_vec(&good).unwrap())
+            .await
+            .unwrap();
+
+        let backend2 = backend.clone();
+        assert!(
+            wait_for(move || {
+                let backend = backend2.clone();
+                Box::pin(async move { summary_count(&backend).await >= 1 })
+            })
+            .await,
+            "the good event behind poison must still be processed"
+        );
+        assert_eq!(archived_count(&backend).await, 1);
     }
 }

@@ -332,7 +332,43 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             let ingestor =
                 crate::MemoryIngestor::new(backend, extractor).with_config((&memory.ingest).into());
             info!("Memory auto-ingest enabled");
-            if let Some(tx) = event_tx {
+            // 事件面开关与发布侧同开同关：开启后 AgentEnd 只上持久总线，
+            // 摄取器必须从总线消费（ack 后完成），广播上不再有活体 AgentEnd。
+            let mbc = ctx.config().multi_backend_consumer.clone();
+            if mbc.enabled && mbc.events_on_bus {
+                match ctx.consume::<cog_core::EventPlaneBackend>() {
+                    Some(plane) => {
+                        let stop_handle = ingestor.spawn_bus(plane.0.clone(), mbc.channel.clone());
+                        match self.ingestor_stop.lock() {
+                            Ok(mut slot) => *slot = Some(stop_handle),
+                            Err(poisoned) => {
+                                *poisoned.into_inner() = Some(stop_handle);
+                            }
+                        }
+                        info!("Memory auto-ingest consuming from event plane bus");
+                    }
+                    None => {
+                        if ctx.config().system.strict_persistence {
+                            return Err(cog_core::SFError::Config(
+                                "events_on_bus=true but EventPlaneBackend unavailable (strict_persistence=true)"
+                                    .into(),
+                            ));
+                        }
+                        warn!(
+                            "events_on_bus=true but EventPlaneBackend unavailable; falling back to broadcast ingest"
+                        );
+                        if let Some(tx) = event_tx {
+                            let stop_handle = ingestor.spawn(tx.subscribe());
+                            match self.ingestor_stop.lock() {
+                                Ok(mut slot) => *slot = Some(stop_handle),
+                                Err(poisoned) => {
+                                    *poisoned.into_inner() = Some(stop_handle);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(tx) = event_tx {
                 // The ingestor task exits as soon as the returned stop handle
                 // is dropped, so it must be kept alive for the plugin's whole
                 // lifetime; `shutdown` later signals it through this handle.
@@ -398,6 +434,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "ObjectBackend",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "EventPlaneBackend",
             required: false,
         },
     ],

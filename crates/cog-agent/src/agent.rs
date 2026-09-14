@@ -86,6 +86,9 @@ pub struct Agent {
     guardrail: Option<Arc<dyn cog_core::Guardrail>>,
     /// Broadcast channel capacity for agent events.
     event_channel_capacity: usize,
+    /// 持久事件总线投递口。装上之后 AgentEnd 只写总线（broadcast 由
+    /// MultiBackendEventConsumer 回灌一次），其余变体仍只走 broadcast。
+    event_bus_sink: Option<crate::EventBusSink>,
     /// mpsc channel capacity for agent commands.
     cmd_channel_capacity: usize,
     /// mpsc channel capacity for loop-internal events.
@@ -146,6 +149,7 @@ impl Agent {
             external_skill_registry: None,
             guardrail: None,
             event_channel_capacity,
+            event_bus_sink: None,
             cmd_channel_capacity,
             loop_event_channel_capacity,
             heartbeat_interval_secs: 10,
@@ -171,6 +175,15 @@ impl Agent {
     /// silently stop receiving events afterwards.
     pub fn with_event_bus(mut self, tx: broadcast::Sender<AgentEvent>) -> Self {
         self.event_tx = tx;
+        self
+    }
+
+    /// Attach the durable event bus sink. With it, `AgentEnd` events go to the
+    /// bus only (broadcast receives them once via the multi-backend consumer
+    /// re-injection); every other variant stays broadcast-only.
+    /// Must be called before `start`, like [`Self::with_event_bus`].
+    pub fn with_event_bus_sink(mut self, sink: crate::EventBusSink) -> Self {
+        self.event_bus_sink = Some(sink);
         self
     }
 
@@ -320,6 +333,7 @@ impl Agent {
         let sandbox_backend = self.sandbox_backend.clone();
         let plugin_registry = self.plugin_registry.clone();
         let external_skill_registry = self.external_skill_registry.clone();
+        let event_bus_sink = self.event_bus_sink.clone();
 
         let loop_event_cap = self.loop_event_channel_capacity;
         let handle = tokio::spawn(async move {
@@ -352,9 +366,10 @@ impl Agent {
 
             // Forward events from AgentRuntime mpsc to Agent broadcast
             let forward_event_tx = event_tx.clone();
+            let forward_sink = event_bus_sink.clone();
             let forward_handle = tokio::spawn(async move {
                 while let Some(event) = loop_event_rx.recv().await {
-                    let _ = forward_event_tx.send(event);
+                    forward_event(event, &forward_event_tx, forward_sink.as_ref());
                 }
             });
 
@@ -690,6 +705,7 @@ impl Agent {
         let checkpoint_store = self.checkpoint_store.clone();
         let sandbox_backend = self.sandbox_backend.clone();
         let plugin_registry = self.plugin_registry.clone();
+        let event_bus_sink = self.event_bus_sink.clone();
 
         let loop_event_cap = self.loop_event_channel_capacity;
         let handle = tokio::spawn(async move {
@@ -722,18 +738,25 @@ impl Agent {
                 tracing::error!("Failed to restore snapshot: {}", e);
             }
 
-            // Replay events after snapshot offset if WAL is available
+            // Replay events after snapshot offset if WAL is available.
+            // 重放直发 broadcast 做本地状态重建，不过运行时 mpsc——mpsc 下游
+            // 的总线投递只认活体流量，重放事件再进总线会被摄取侧当成新事件
+            // 重复建档。
             if snapshot.event_offset > 0 {
-                if let Err(e) = agent_loop.replay_events(snapshot.event_offset).await {
+                if let Err(e) = agent_loop
+                    .replay_events(snapshot.event_offset, &event_tx)
+                    .await
+                {
                     tracing::warn!("Event replay failed: {}", e);
                 }
             }
 
             // Forward events from AgentRuntime mpsc to Agent broadcast
             let forward_event_tx = event_tx.clone();
+            let forward_sink = event_bus_sink.clone();
             let forward_handle = tokio::spawn(async move {
                 while let Some(event) = loop_event_rx.recv().await {
-                    let _ = forward_event_tx.send(event);
+                    forward_event(event, &forward_event_tx, forward_sink.as_ref());
                 }
             });
 
@@ -1082,6 +1105,23 @@ impl Drop for Agent {
     }
 }
 
+/// forward 循环的分发规则：装上总线投递口时 `AgentEnd` 只写总线——broadcast
+/// 由 MultiBackendEventConsumer 从总线回灌恰好一次，本地实时消费者经回灌看到；
+/// 直发+回灌会让 broadcast 订阅者看到两次。其余变体只写 broadcast。
+fn forward_event(
+    event: AgentEvent,
+    broadcast_tx: &broadcast::Sender<AgentEvent>,
+    sink: Option<&crate::EventBusSink>,
+) {
+    if let Some(s) = sink {
+        if matches!(event, AgentEvent::AgentEnd { .. }) {
+            s.send(event);
+            return;
+        }
+    }
+    let _ = broadcast_tx.send(event);
+}
+
 async fn run_agent_task(
     agent_loop: &mut AgentRuntime,
     mut cmd_rx: mpsc::Receiver<AgentCommand>,
@@ -1165,5 +1205,108 @@ async fn run_agent_task(
                 let _ = result_tx.send(snap);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod forward_event_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 记录投递的事件；EventBusSink 的排空任务是异步的，测试里轮询等待。
+    #[derive(Default)]
+    struct SpyPublisher {
+        published: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::EventPublisher for SpyPublisher {
+        async fn publish(&self, event: &AgentEvent) -> cog_core::SFResult<()> {
+            let agent_id = match event {
+                AgentEvent::AgentEnd { agent_id, .. } => agent_id.clone(),
+                _ => "other".into(),
+            };
+            self.published.lock().unwrap().push(agent_id);
+            Ok(())
+        }
+    }
+
+    fn agent_end(agent_id: &str) -> AgentEvent {
+        AgentEvent::AgentEnd {
+            agent_id: agent_id.into(),
+            messages: vec![],
+            crew_id: None,
+            squad_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    async fn wait_published(spy: &SpyPublisher, n: usize) -> bool {
+        for _ in 0..100 {
+            if spy.published.lock().unwrap().len() >= n {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// 总线模式的核心不变式：装了投递口后 AgentEnd 只上总线，绝不直发
+    /// broadcast——broadcast 的那一份由回灌消费者补，直发+回灌=重复。
+    #[tokio::test]
+    async fn agent_end_goes_to_sink_not_broadcast_when_sink_set() {
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<AgentEvent>(8);
+        let spy = Arc::new(SpyPublisher::default());
+        let sink = crate::EventBusSink::spawn(spy.clone(), 8, 1);
+
+        forward_event(agent_end("a-bus"), &broadcast_tx, Some(&sink));
+
+        assert!(
+            broadcast_rx.try_recv().is_err(),
+            "AgentEnd must not be sent to broadcast directly when a sink is set"
+        );
+        assert!(
+            wait_published(&spy, 1).await,
+            "AgentEnd must reach the bus publisher"
+        );
+    }
+
+    /// 其余事件变体不受总线开关影响：只写 broadcast，不进总线——总线契约
+    /// 上只承载 AgentEnd，高频事件上总线会打爆持久层。
+    #[tokio::test]
+    async fn non_agent_end_stays_on_broadcast_even_with_sink() {
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<AgentEvent>(8);
+        let spy = Arc::new(SpyPublisher::default());
+        let sink = crate::EventBusSink::spawn(spy.clone(), 8, 1);
+
+        forward_event(
+            AgentEvent::Heartbeat {
+                agent_id: "a-live".into(),
+                timestamp: chrono::Utc::now(),
+            },
+            &broadcast_tx,
+            Some(&sink),
+        );
+
+        assert!(
+            broadcast_rx.try_recv().is_ok(),
+            "non-AgentEnd events must stay on broadcast"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            spy.published.lock().unwrap().is_empty(),
+            "non-AgentEnd events must never reach the bus"
+        );
+    }
+
+    /// 无投递口（events_on_bus 关闭）时维持旧行为：AgentEnd 直发 broadcast。
+    #[tokio::test]
+    async fn agent_end_goes_to_broadcast_when_no_sink() {
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<AgentEvent>(8);
+        forward_event(agent_end("a-local"), &broadcast_tx, None);
+        assert!(
+            matches!(broadcast_rx.try_recv(), Ok(AgentEvent::AgentEnd { .. })),
+            "without a sink AgentEnd must stay on broadcast"
+        );
     }
 }

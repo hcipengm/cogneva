@@ -46,7 +46,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         }
 
         // Snapshot config values to drop immutable borrow before publishing.
-        let (data_dir, tool_timeout_secs, nats_config, hook_engine_config, _agent_config) = {
+        let (data_dir, tool_timeout_secs, nats_config, hook_engine_config, _agent_config, mbc) = {
             let config = ctx.config();
             (
                 config.app.data_dir.clone(),
@@ -54,6 +54,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 config.dag_executor.nats.clone(),
                 config.hook_engine.clone(),
                 config.agent.clone(),
+                config.multi_backend_consumer.clone(),
             )
         };
 
@@ -237,6 +238,33 @@ impl cog_core::SystemPlugin for AgentPlugin {
         {
             pool_builder = pool_builder.with_event_bus((*event_tx).clone());
             info!("AgentPlugin workers attached to shared event bus");
+        }
+        // AgentEnd 持久总线投递：开关打开时 worker 的 AgentEnd 改走事件面
+        // （JetStream），经有界内存缓冲+退避重试发布；broadcast 侧的 AgentEnd
+        // 由回灌消费者再注入，恰好一次。开关关闭时维持纯 broadcast 行为。
+        if mbc.enabled && mbc.events_on_bus {
+            match ctx.consume::<cog_core::EventPlanePublisher>() {
+                Some(plane_pub) => {
+                    let sink = crate::EventBusSink::spawn(
+                        plane_pub.0.clone(),
+                        mbc.publish_buffer_capacity,
+                        mbc.publish_retry_base_delay_ms,
+                    );
+                    pool_builder = pool_builder.with_event_bus_sink(sink);
+                    info!("AgentPlugin AgentEnd event bus sink attached");
+                }
+                None => {
+                    if ctx.config().system.strict_persistence {
+                        return Err(cog_core::SFError::Config(
+                            "events_on_bus=true but EventPlanePublisher unavailable (strict_persistence=true)"
+                                .into(),
+                        ));
+                    }
+                    warn!(
+                        "events_on_bus=true but EventPlanePublisher unavailable; AgentEnd stays on broadcast only"
+                    );
+                }
+            }
         }
         if let Some(ref esr) = external_skill_registry {
             pool_builder = pool_builder.with_external_skill_registry(esr.clone());
@@ -514,6 +542,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "Sender<AgentEvent>",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "EventPlanePublisher",
             required: false,
         },
     ],

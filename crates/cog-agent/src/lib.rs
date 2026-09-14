@@ -3,6 +3,7 @@ pub mod agent_kernel;
 pub mod config;
 pub mod consumer;
 pub mod context;
+pub mod event_bus_sink;
 pub mod hooks;
 pub mod lifecycle;
 pub mod observable;
@@ -16,6 +17,7 @@ pub use config::{AgentLoopConfig, AgentManagerConfig};
 
 pub use agent::Agent;
 pub use consumer::{AgentInboxConsumer, InboxMessage};
+pub use event_bus_sink::EventBusSink;
 
 // Re-export the canonical AgentState from cog-core so consumers see a single type.
 pub use agent_kernel::{AgentHooks, AgentRuntime, ReActLoop, ReActStep, RuntimeState, RuntimeStep};

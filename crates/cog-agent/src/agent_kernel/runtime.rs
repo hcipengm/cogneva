@@ -513,11 +513,16 @@ impl AgentRuntime {
     }
 
     /// Replay WAL events from the given offset onward.
-    /// Re-emits each event through the loop's event channel so that
-    /// downstream consumers (broadcast, metrics, etc.) see the full
-    /// history after a snapshot restore.
+    /// Re-emits each event directly through the broadcast sink so that
+    /// downstream consumers (metrics, etc.) see the full history after a
+    /// snapshot restore. Replay bypasses the runtime mpsc: the bus delivery
+    /// path downstream of it only accepts live traffic.
     /// Returns the number of events replayed.
-    pub async fn replay_events(&self, from_offset: u64) -> SFResult<usize> {
+    pub async fn replay_events(
+        &self,
+        from_offset: u64,
+        sink: &tokio::sync::broadcast::Sender<AgentEvent>,
+    ) -> SFResult<usize> {
         let Some(ref wal) = self.wal else {
             return Ok(0);
         };
@@ -531,9 +536,10 @@ impl AgentRuntime {
         for record in records {
             // Reconstruct AgentEvent from WalRecord payload
             if let Ok(event) = wal_record_to_agent_event(&record) {
-                if self.event_tx.send(event).await.is_err() {
-                    return Err(SFError::Backpressure);
-                }
+                // 重放事件直发 broadcast（本地状态重建），不进运行时 mpsc：
+                // mpsc 下游的总线投递只认活体流量，重放再进总线会被摄取侧
+                // 当成新事件重复建档。无订阅者时 send 报错属正常，不算失败。
+                let _ = sink.send(event);
                 count += 1;
             }
         }
@@ -1566,7 +1572,7 @@ mod tests {
         );
 
         // 5. Simulate restart: new runtime + restore checkpoint + replay WAL
-        let (new_event_tx, mut new_event_rx) = mpsc::channel::<AgentEvent>(100);
+        let (new_event_tx, _new_event_rx) = mpsc::channel::<AgentEvent>(100);
         let new_config = RuntimeConfig {
             agent_id: agent_id.into(),
             ..Default::default()
@@ -1580,16 +1586,17 @@ mod tests {
         new_runtime
             .restore(&checkpoint)
             .expect("restore checkpoint");
+        let (replay_tx, mut replay_rx) = tokio::sync::broadcast::channel::<AgentEvent>(100);
         let replayed = new_runtime
-            .replay_events(checkpoint.event_offset)
+            .replay_events(checkpoint.event_offset, &replay_tx)
             .await
             .expect("replay events");
         assert_eq!(replayed, 2, "should replay 2 post-checkpoint events");
 
-        // 6. Collect replayed events from the new receiver
+        // 6. Collect replayed events from the broadcast receiver
         let mut replayed_events = Vec::new();
-        while let Ok(Some(ev)) =
-            tokio::time::timeout(std::time::Duration::from_millis(50), new_event_rx.recv()).await
+        while let Ok(Ok(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), replay_rx.recv()).await
         {
             replayed_events.push(ev);
         }

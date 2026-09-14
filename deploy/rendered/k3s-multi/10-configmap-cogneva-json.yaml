@@ -291,7 +291,14 @@ data:
         "embedding_dimension": 1024,
         "auto_ingest": true,
         "load_embedding_model": false,
-        "load_reranker_model": false
+        "load_reranker_model": false,
+        "ingest": {
+          "_comment": "Bus-mode consumer knobs (active when multi_backend_consumer.events_on_bus=true). bus_claim_min_idle_ms must exceed the worst-case single-event processing time so a live worker's job is never claimed away; JetStream redelivery is governed by ack_wait, the claim sweeper covers Redis-class backends.",
+          "bus_group": "memory-ingestor",
+          "bus_claim_interval_secs": 30,
+          "bus_claim_min_idle_ms": 900000,
+          "bus_claim_batch": 32
+        }
       },
       "tier_migrator": {
         "enabled": false,
@@ -414,10 +421,15 @@ data:
         "notify_on_failure": true
       },
       "multi_backend_consumer": {
+        "_comment": "events_on_bus=true: AgentEnd is published only to the persistent event plane (dedicated NATS JetStream at nats_urls, decoupled from the task-queue backend); the supervisor re-injects it into the broadcast exactly once and memory-ingestor consumes from the bus with ack-after-processing. Publish-side knobs bound the in-memory buffer that covers NATS outage windows.",
         "enabled": true,
         "channel": "cogneva-events",
         "group": "cogneva-consumer",
-        "retry_interval_secs": 5
+        "retry_interval_secs": 5,
+        "events_on_bus": true,
+        "nats_urls": ["nats-service:4222"],
+        "publish_buffer_capacity": 256,
+        "publish_retry_base_delay_ms": 1000
       },
       "github_integration": {
         "_comment": "GitHub integration for self-evolution. Tokens are resolved from environment variables and never enter the sandbox. discovery_mode=both: polling is the periodic fallback, webhook events (via the security gateway, gateway_verified) give second-level response.",

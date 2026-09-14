@@ -20,6 +20,15 @@ use cog_core::{MessageBackend, MessageStream, NatsConfig, SFError, SFResult};
 pub struct NatsMessageBackend {
     jetstream: jetstream::Context,
     pending_acks: Arc<RwLock<HashMap<String, async_nats::jetstream::Message>>>,
+    consumer_tuning: ConsumerTuning,
+}
+
+/// JetStream pull-consumer tuning carried from [`NatsConfig`].
+#[derive(Clone, Copy)]
+struct ConsumerTuning {
+    ack_wait: std::time::Duration,
+    max_deliver: i64,
+    max_ack_pending: usize,
 }
 
 impl NatsMessageBackend {
@@ -67,7 +76,28 @@ impl NatsMessageBackend {
         Ok(Self {
             jetstream,
             pending_acks: Arc::new(RwLock::new(HashMap::new())),
+            consumer_tuning: ConsumerTuning {
+                ack_wait: std::time::Duration::from_secs(config.consumer_ack_wait_secs),
+                max_deliver: config.consumer_max_deliver,
+                max_ack_pending: config.consumer_max_ack_pending,
+            },
         })
+    }
+
+    /// Build the pull consumer config with the deployment's tuning applied.
+    /// `ack_wait` must exceed the worst-case per-message processing latency
+    /// (memory ingest: archive + two LLM calls + retries, minutes), otherwise
+    /// in-flight messages get redelivered and processed twice.
+    fn consumer_config(&self, group: &str, deliver_policy: DeliverPolicy) -> pull::Config {
+        pull::Config {
+            durable_name: Some(group.to_string()),
+            deliver_policy,
+            ack_policy: AckPolicy::Explicit,
+            ack_wait: self.consumer_tuning.ack_wait,
+            max_deliver: self.consumer_tuning.max_deliver,
+            max_ack_pending: self.consumer_tuning.max_ack_pending as i64,
+            ..Default::default()
+        }
     }
 
     /// Ensure a JetStream stream exists for the given subject.
@@ -123,15 +153,7 @@ impl MessageBackend for NatsMessageBackend {
     async fn subscribe(&self, subject: &str, group: &str) -> SFResult<MessageStream> {
         let stream = self.ensure_stream(subject).await?;
         let consumer: jetstream::consumer::Consumer<pull::Config> = stream
-            .get_or_create_consumer(
-                group,
-                pull::Config {
-                    durable_name: Some(group.to_string()),
-                    deliver_policy: DeliverPolicy::New,
-                    ack_policy: AckPolicy::Explicit,
-                    ..Default::default()
-                },
-            )
+            .get_or_create_consumer(group, self.consumer_config(group, DeliverPolicy::New))
             .await
             .map_err(|e| SFError::DagExecutor(format!("JetStream consumer create failed: {e}")))?;
 
@@ -184,15 +206,7 @@ impl MessageBackend for NatsMessageBackend {
         };
 
         let consumer: jetstream::consumer::Consumer<pull::Config> = stream
-            .get_or_create_consumer(
-                group,
-                pull::Config {
-                    durable_name: Some(group.to_string()),
-                    deliver_policy,
-                    ack_policy: AckPolicy::Explicit,
-                    ..Default::default()
-                },
-            )
+            .get_or_create_consumer(group, self.consumer_config(group, deliver_policy))
             .await
             .map_err(|e| SFError::DagExecutor(format!("JetStream consumer create failed: {e}")))?;
 
@@ -228,15 +242,7 @@ impl MessageBackend for NatsMessageBackend {
     async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()> {
         let js_stream = self.ensure_stream(stream).await?;
         let _: jetstream::consumer::Consumer<pull::Config> = js_stream
-            .get_or_create_consumer(
-                group,
-                pull::Config {
-                    durable_name: Some(group.to_string()),
-                    deliver_policy: DeliverPolicy::New,
-                    ack_policy: AckPolicy::Explicit,
-                    ..Default::default()
-                },
-            )
+            .get_or_create_consumer(group, self.consumer_config(group, DeliverPolicy::New))
             .await
             .map_err(|e| SFError::DagExecutor(format!("JetStream consumer create failed: {e}")))?;
         Ok(())
@@ -288,6 +294,7 @@ impl Clone for NatsMessageBackend {
         Self {
             jetstream: self.jetstream.clone(),
             pending_acks: Arc::clone(&self.pending_acks),
+            consumer_tuning: self.consumer_tuning,
         }
     }
 }

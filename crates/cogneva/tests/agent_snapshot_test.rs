@@ -1,5 +1,5 @@
 use cog_agent::{Agent, AgentRuntime, RuntimeState};
-use cog_core::RuntimeConfig;
+use cog_core::{AgentEvent, RuntimeConfig};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -247,7 +247,7 @@ async fn test_snapshot_event_replay_with_wal() {
     let agent_wal2 = AgentWal::new(wal_backend, "session-replay")
         .await
         .expect("wal2 init failed");
-    let (event_tx2, mut event_rx2) = mpsc::channel(128);
+    let (event_tx2, _event_rx2) = mpsc::channel(128);
     let mut restored_loop = AgentRuntime::new(
         RuntimeConfig {
             agent_id: "replay-agent".into(),
@@ -266,9 +266,10 @@ async fn test_snapshot_event_replay_with_wal() {
 
     restored_loop.restore(&snap).unwrap();
 
-    // Replay events from the snapshot offset
+    // Replay events from the snapshot offset (replay goes to broadcast)
+    let (replay_tx, mut replay_rx) = tokio::sync::broadcast::channel::<AgentEvent>(128);
     let replayed = restored_loop
-        .replay_events(offset_before)
+        .replay_events(offset_before, &replay_tx)
         .await
         .expect("replay failed");
 
@@ -277,7 +278,7 @@ async fn test_snapshot_event_replay_with_wal() {
 
     // Collect replayed events
     let mut replayed_events = Vec::new();
-    while let Ok(event) = event_rx2.try_recv() {
+    while let Ok(event) = replay_rx.try_recv() {
         replayed_events.push(event);
     }
     assert!(

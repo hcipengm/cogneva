@@ -31,6 +31,7 @@ pub struct GlobalAgentManager {
     default_tools: Option<Arc<crate::ToolRegistry>>,
     external_skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     event_bus: Option<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>,
+    event_bus_sink: Option<crate::EventBusSink>,
 }
 
 impl GlobalAgentManager {
@@ -59,7 +60,17 @@ impl GlobalAgentManager {
             default_tools: None,
             external_skill_registry: None,
             event_bus: None,
+            event_bus_sink: None,
         }
+    }
+
+    /// Route AgentEnd events from every spawned worker onto the persistent
+    /// event bus (JetStream event plane when enabled). Live events still go
+    /// to the broadcast bus unless a sink is set, in which case AgentEnd
+    /// reaches broadcast consumers via bus re-injection exactly once.
+    pub fn with_event_bus_sink(mut self, sink: crate::EventBusSink) -> Self {
+        self.event_bus_sink = Some(sink);
+        self
     }
 
     /// Publish every spawned worker onto the shared cluster-wide event bus so
@@ -135,6 +146,9 @@ impl GlobalAgentManager {
             }
             if let Some(ref bus) = self.event_bus {
                 a = a.with_event_bus(bus.clone());
+            }
+            if let Some(ref sink) = self.event_bus_sink {
+                a = a.with_event_bus_sink(sink.clone());
             }
             a
         };
@@ -238,6 +252,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
             }
             if let Some(ref bus) = self.event_bus {
                 a = a.with_event_bus(bus.clone());
+            }
+            if let Some(ref sink) = self.event_bus_sink {
+                a = a.with_event_bus_sink(sink.clone());
             }
             a
         };

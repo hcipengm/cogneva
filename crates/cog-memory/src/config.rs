@@ -71,6 +71,14 @@ pub struct IngestConfig {
     pub reconcile_lookback_hours: u64,
     /// 积压深度告警起点（达到后每翻倍打一条 WARN）。
     pub backlog_warn_at: usize,
+    /// 总线消费组名（durable consumer / consumer group）。
+    pub bus_group: String,
+    /// pending 认领清扫间隔（秒；Redis Streams 用，JetStream 靠 ack_wait 自动红投）。
+    pub bus_claim_interval_secs: u64,
+    /// 认领门槛：pending 空闲超过这么多毫秒才被接走（须大于单条最坏处理时长）。
+    pub bus_claim_min_idle_ms: u64,
+    /// 每轮认领批大小上限。
+    pub bus_claim_batch: usize,
 }
 
 impl Default for IngestConfig {
@@ -84,6 +92,10 @@ impl Default for IngestConfig {
             startup_reconcile: true,
             reconcile_lookback_hours: 24,
             backlog_warn_at: 64,
+            bus_group: "memory-ingestor".into(),
+            bus_claim_interval_secs: 30,
+            bus_claim_min_idle_ms: 900_000,
+            bus_claim_batch: 32,
         }
     }
 }
