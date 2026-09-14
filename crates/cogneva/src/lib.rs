@@ -26,6 +26,15 @@ use tracing::warn;
 
 /// Pure wiring logic: initialize components and connect them together.
 pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
+    // 正式日志栈由 observability 插件安装，而它排在 net/storage 之后——在那
+    // 之前的一切 tracing 事件（配置加载、版本行、身份播种、先初始化的插件）
+    // 会落进 tracing 的 no-op 默认订阅者被静默丢弃，而那正是启动失败最常发生
+    // 的窗口。这里先装一个最小 stdout 订阅者兜底；插件初始化时不二次安装
+    // （全局订阅者只能装一次），而是把配置好的输出栈热替换进来并重载过滤器。
+    // 只能放在 run_app()：子命令二进制（mainline-rollout、command-server、
+    // security-gateway）各自用会 panic 的 .init() 装订阅者，不走这条路径。
+    cog_observability::install_early_subscriber();
+
     let mut config = assembly::infra::load_and_normalize_config();
     let app_version = if config.core.app.version.is_empty() {
         env!("CARGO_PKG_VERSION")

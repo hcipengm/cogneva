@@ -16,29 +16,111 @@ use cog_core::{HttpClient, HttpRequest};
 use std::sync::Arc;
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 pub type LogFilterHandle =
     tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
-/// Initialize the global subscriber with the configured format and level.
-/// Returns a [`LogFilterHandle`] so callers can hot-reload the `EnvFilter`
-/// without restarting the process.
-pub fn init_subscriber(log_level: &str, format: crate::LogFormat) -> LogFilterHandle {
-    init_subscriber_with_pusher(log_level, format, None, "cogneva")
+/// An owned, type-erased output layer stack that can sit on subscriber `S`.
+pub(crate) type BoxedLayer<S> = Box<dyn Layer<S> + Send + Sync + 'static>;
+
+/// The subscriber stack installed by [`install_early_subscriber`]: a
+/// reloadable `EnvFilter` directly on the registry (so the returned
+/// [`LogFilterHandle`] keeps its canonical type) with a swappable output
+/// stack on top.
+pub(crate) type EarlyRegistry = tracing_subscriber::layer::Layered<
+    tracing_subscriber::reload::Layer<EnvFilter, tracing_subscriber::Registry>,
+    tracing_subscriber::Registry,
+>;
+
+/// Handles captured by the early subscriber so the observability plugin can
+/// upgrade the output stack in place instead of installing a second global
+/// subscriber (which would silently fail and drop the configured format).
+pub(crate) struct EarlyHandles {
+    pub(crate) filter: LogFilterHandle,
+    pub(crate) output: tracing_subscriber::reload::Handle<BoxedLayer<EarlyRegistry>, EarlyRegistry>,
 }
 
-/// Same as [`init_subscriber`] but additionally mirrors every event into Loki
-/// through `pusher`. Pass `None` to skip the mirror (console-only logging).
-pub fn init_subscriber_with_pusher(
-    log_level: &str,
+static EARLY: OnceLock<EarlyHandles> = OnceLock::new();
+
+/// Install a minimal global subscriber as the very first step of process
+/// startup, before config loading and plugin initialization.
+///
+/// The full log stack (JSON/pretty format, Loki mirror, context fields) is
+/// installed by the observability plugin, which initialises only after its
+/// dependencies (net, storage). Without an early subscriber every `tracing`
+/// event emitted before that point — config load, identity seeding, all
+/// layer-0 plugin init logs — falls into tracing's no-op default subscriber
+/// and is silently lost, which is exactly the window where startup failures
+/// happen. The early subscriber prints to stdout at `RUST_LOG` (default
+/// `info`); when [`init_subscriber_with_pusher`] or the Jaeger initializer
+/// runs later it hot-swaps the output stack and reloads the filter, so no
+/// event is dropped on either side of the swap.
+///
+/// Idempotent in effect: if a global subscriber already exists the install
+/// fails, a note goes to stderr, and later initializers fall back to their
+/// direct-install path.
+pub fn install_early_subscriber() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let (reloadable_filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
+    let early_output = tracing_subscriber::fmt::layer()
+        .compact()
+        .with_target(true)
+        .with_line_number(true)
+        .with_writer(std::io::stdout);
+    let (reloadable_output, output_handle) =
+        tracing_subscriber::reload::Layer::new(Box::new(early_output) as BoxedLayer<EarlyRegistry>);
+    match tracing_subscriber::registry()
+        .with(reloadable_filter)
+        .with(reloadable_output)
+        .try_init()
+    {
+        Ok(()) => {
+            let _ = EARLY.set(EarlyHandles {
+                filter: filter_handle,
+                output: output_handle,
+            });
+        }
+        Err(e) => eprintln!(
+            "early log subscriber not installed ({e}); \
+             the observability plugin will install the full stack directly"
+        ),
+    }
+}
+
+pub(crate) fn early_handles() -> Option<&'static EarlyHandles> {
+    EARLY.get()
+}
+
+/// Replace the early subscriber's output stack and filter level in place.
+/// Events keep flowing across the swap; failures are reported on stderr
+/// because by this point stderr is the only guaranteed log sink.
+pub(crate) fn upgrade_early(
+    handles: &EarlyHandles,
+    output: BoxedLayer<EarlyRegistry>,
+    filter: EnvFilter,
+) {
+    if let Err(e) = handles.output.modify(|slot| *slot = output) {
+        eprintln!("failed to swap early log output stack: {e}");
+    }
+    if let Err(e) = handles.filter.reload(filter) {
+        eprintln!("failed to reload early log filter: {e}");
+    }
+}
+
+/// Build the configured console/mirror output stack: format layer +
+/// standardized context fields + optional Loki mirror. Generic over the
+/// subscriber it will sit on (plain registry for direct installs, the early
+/// registry stack for in-place upgrades).
+fn output_stack<S>(
     format: crate::LogFormat,
     pusher: Option<Arc<LokiBackgroundPusher>>,
     service: &str,
-) -> LogFilterHandle {
-    let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
-    let (reloadable_filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+) -> BoxedLayer<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a> + 'static,
+{
     let loki_layer = pusher.map(|p| LokiLayer::new(p, service));
-
     match format {
         crate::LogFormat::Json => {
             let json_layer = tracing_subscriber::fmt::layer()
@@ -50,13 +132,7 @@ pub fn init_subscriber_with_pusher(
                 .with_line_number(true)
                 .with_file(true)
                 .flatten_event(true);
-
-            let _ = tracing_subscriber::registry()
-                .with(reloadable_filter)
-                .with(json_layer)
-                .with(SfContextLayer)
-                .with(loki_layer)
-                .try_init();
+            Box::new(json_layer.and_then(SfContextLayer).and_then(loki_layer))
         }
         crate::LogFormat::Pretty => {
             let pretty_layer = tracing_subscriber::fmt::layer()
@@ -66,14 +142,45 @@ pub fn init_subscriber_with_pusher(
                 .with_thread_ids(true)
                 .with_line_number(true)
                 .with_file(true);
-
-            let _ = tracing_subscriber::registry()
-                .with(reloadable_filter)
-                .with(pretty_layer)
-                .with(SfContextLayer)
-                .with(loki_layer)
-                .try_init();
+            Box::new(pretty_layer.and_then(SfContextLayer).and_then(loki_layer))
         }
+    }
+}
+
+/// Initialize the global subscriber with the configured format and level.
+/// Returns a [`LogFilterHandle`] so callers can hot-reload the `EnvFilter`
+/// without restarting the process.
+pub fn init_subscriber(log_level: &str, format: crate::LogFormat) -> LogFilterHandle {
+    init_subscriber_with_pusher(log_level, format, None, "cogneva")
+}
+
+/// Same as [`init_subscriber`] but additionally mirrors every event into Loki
+/// through `pusher`. Pass `None` to skip the mirror (console-only logging).
+///
+/// When [`install_early_subscriber`] ran earlier in this process the full
+/// stack is swapped into the existing global subscriber (the only way to
+/// keep both the boot logs and the configured format — a global subscriber
+/// can be installed just once); otherwise it is installed directly.
+pub fn init_subscriber_with_pusher(
+    log_level: &str,
+    format: crate::LogFormat,
+    pusher: Option<Arc<LokiBackgroundPusher>>,
+    service: &str,
+) -> LogFilterHandle {
+    let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if let Some(handles) = early_handles() {
+        upgrade_early(handles, output_stack(format, pusher, service), filter);
+        return handles.filter.clone();
+    }
+
+    let (reloadable_filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    if let Err(e) = tracing_subscriber::registry()
+        .with(reloadable_filter)
+        .with(output_stack(format, pusher, service))
+        .try_init()
+    {
+        eprintln!("log subscriber not installed: {e}");
     }
 
     handle
@@ -559,5 +666,68 @@ mod tests {
         ]);
         let streams = payload.get("streams").and_then(|v| v.as_array()).unwrap();
         assert_eq!(streams.len(), 2, "info 两条合一，warn 单独一条");
+    }
+
+    /// 数事件的假输出层：模拟早期兜底栈与升级后的正式栈。
+    #[derive(Clone)]
+    struct Capture(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Capture {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        }
+
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, _event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 早期订阅者的热替换契约：升级前的事件不丢（这正是 init 日志丢失的
+    /// 修复点）、升级后旧输出栈彻底让位、过滤器可就地重载生效。
+    /// 用 with_default 走线程本地分发，不碰进程级 EARLY OnceLock。
+    #[test]
+    fn early_subscriber_captures_then_hot_swaps_output_and_filter() {
+        let early = Capture::new();
+        let late = Capture::new();
+
+        let (reloadable_filter, filter_handle) =
+            tracing_subscriber::reload::Layer::new(EnvFilter::new("info"));
+        let (reloadable_output, output_handle) = tracing_subscriber::reload::Layer::new(Box::new(
+            early.clone(),
+        )
+            as BoxedLayer<EarlyRegistry>);
+        let subscriber = tracing_subscriber::registry()
+            .with(reloadable_filter)
+            .with(reloadable_output);
+        let handles = EarlyHandles {
+            filter: filter_handle,
+            output: output_handle,
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            // 升级前：兜底栈收得到事件（修复前这些全部落进 no-op 订阅者）。
+            tracing::info!(target: "early-subscriber-test", "boot event before upgrade");
+            assert_eq!(early.count(), 1, "early stack must capture boot events");
+            assert_eq!(late.count(), 0);
+
+            // 热替换输出栈：旧栈让位，新栈接管，事件流不中断。
+            upgrade_early(&handles, Box::new(late.clone()), EnvFilter::new("info"));
+            tracing::info!(target: "early-subscriber-test", "event after upgrade");
+            assert_eq!(early.count(), 1, "swapped-out stack must stop receiving");
+            assert_eq!(late.count(), 1, "upgraded stack must receive events");
+
+            // 过滤器就地重载到 warn：info 被挡、warn 通过。
+            upgrade_early(&handles, Box::new(late.clone()), EnvFilter::new("warn"));
+            tracing::info!(target: "early-subscriber-test", "should be filtered out");
+            assert_eq!(late.count(), 1, "reloaded filter must block info");
+            tracing::warn!(target: "early-subscriber-test", "should pass");
+            assert_eq!(late.count(), 2, "reloaded filter must pass warn");
+        });
     }
 }

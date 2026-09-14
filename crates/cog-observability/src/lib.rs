@@ -15,7 +15,7 @@ pub mod search_index;
 pub mod snapshot;
 pub mod traces;
 
-pub use logs::{init_subscriber, LogFilterHandle};
+pub use logs::{init_subscriber, install_early_subscriber, LogFilterHandle};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -166,8 +166,9 @@ pub use observable::ObservabilityObservable;
 /// - Human: Prometheus metrics, structured logs, Jaeger traces
 /// - Agent/Developer: Snapshot manager
 /// - Machine: Raw stream writer
-///   **Important**: This function installs a global `tracing_subscriber`.
-///   It must be called *before* any `tracing` macros are used.
+///   **Important**: This function installs (or, when
+///   [`install_early_subscriber`] already claimed the global slot, hot-swaps
+///   into) the global `tracing_subscriber`.
 pub fn init(config: &ObservabilityConfig) -> ObservabilityInitResult {
     let mut result = ObservabilityInitResult::default();
 

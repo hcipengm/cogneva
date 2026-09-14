@@ -289,29 +289,18 @@ impl<'a> tracing::field::Visit for FieldVisitor<'a> {
     }
 }
 
-/// Initialize the global subscriber with a Jaeger export layer.
-/// Returns the exporter handle so callers can call `flush_all()` on shutdown.
-/// This installs a new `tracing_subscriber::Registry` with both the
-/// configured log format layer *and* the Jaeger layer.
-pub fn init_jaeger_subscriber(
-    endpoint: &str,
-    service_name: &str,
-    log_level: &str,
+/// Build the Jaeger output stack: format layer + standardized context
+/// fields + span exporter. Generic over the subscriber it will sit on
+/// (plain registry for direct installs, the early registry stack for
+/// in-place upgrades).
+fn jaeger_output<S>(
     log_format: crate::LogFormat,
-    http_client: Option<Arc<dyn HttpClient>>,
-) -> std::sync::Arc<JaegerExporter> {
+    jaeger_layer: JaegerLayer,
+) -> crate::logs::BoxedLayer<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a> + 'static,
+{
     use tracing_subscriber::fmt::format::FmtSpan;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::EnvFilter;
-
-    let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
-    let mut exporter = JaegerExporter::new(endpoint, service_name);
-    if let Some(client) = http_client {
-        exporter = exporter.with_client(client);
-    }
-    let exporter = std::sync::Arc::new(exporter);
-    let jaeger_layer = JaegerLayer::new(exporter.clone());
 
     match log_format {
         crate::LogFormat::Json => {
@@ -325,12 +314,11 @@ pub fn init_jaeger_subscriber(
                 .with_file(true)
                 .flatten_event(true);
 
-            let _ = tracing_subscriber::registry()
-                .with(filter)
-                .with(json_layer)
-                .with(crate::logs::SfContextLayer)
-                .with(jaeger_layer)
-                .try_init();
+            Box::new(
+                json_layer
+                    .and_then(crate::logs::SfContextLayer)
+                    .and_then(jaeger_layer),
+            )
         }
         crate::LogFormat::Pretty => {
             let pretty_layer = tracing_subscriber::fmt::layer()
@@ -341,13 +329,57 @@ pub fn init_jaeger_subscriber(
                 .with_line_number(true)
                 .with_file(true);
 
-            let _ = tracing_subscriber::registry()
-                .with(filter)
-                .with(pretty_layer)
-                .with(crate::logs::SfContextLayer)
-                .with(jaeger_layer)
-                .try_init();
+            Box::new(
+                pretty_layer
+                    .and_then(crate::logs::SfContextLayer)
+                    .and_then(jaeger_layer),
+            )
         }
+    }
+}
+
+/// Initialize the global subscriber with a Jaeger export layer.
+/// Returns the exporter handle so callers can call `flush_all()` on shutdown.
+///
+/// When [`crate::install_early_subscriber`] ran earlier in this process the
+/// stack is swapped into the existing global subscriber (a global subscriber
+/// can only be installed once — a second `try_init` silently fails and the
+/// boot logs would keep the early format forever); otherwise it is installed
+/// directly on a fresh registry.
+pub fn init_jaeger_subscriber(
+    endpoint: &str,
+    service_name: &str,
+    log_level: &str,
+    log_format: crate::LogFormat,
+    http_client: Option<Arc<dyn HttpClient>>,
+) -> std::sync::Arc<JaegerExporter> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+    let mut exporter = JaegerExporter::new(endpoint, service_name);
+    if let Some(client) = http_client {
+        exporter = exporter.with_client(client);
+    }
+    let exporter = std::sync::Arc::new(exporter);
+    let jaeger_layer = JaegerLayer::new(exporter.clone());
+
+    if let Some(handles) = crate::logs::early_handles() {
+        crate::logs::upgrade_early(
+            handles,
+            jaeger_output::<crate::logs::EarlyRegistry>(log_format, jaeger_layer),
+            filter,
+        );
+        return exporter;
+    }
+
+    if let Err(e) = tracing_subscriber::registry()
+        .with(filter)
+        .with(jaeger_output(log_format, jaeger_layer))
+        .try_init()
+    {
+        eprintln!("jaeger log subscriber not installed: {e}");
     }
 
     exporter
