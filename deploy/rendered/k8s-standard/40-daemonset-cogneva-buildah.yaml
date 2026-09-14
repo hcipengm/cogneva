@@ -44,7 +44,7 @@ spec:
               memory: 4Gi
             requests:
               cpu: 250m
-              memory: 512Mi
+              memory: 64Mi
           volumeMounts:
             - name: containers-storage
               mountPath: /var/lib/containers

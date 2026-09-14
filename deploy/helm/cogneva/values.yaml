@@ -153,9 +153,12 @@ buildah:
   containerdSocket: /run/containerd
   storageHostPath: /var/lib/cogneva-buildah
   resources:
+    # 常态是纯守护进程（实测常驻 ~1Mi），构建尖峰由 limit + 节点实际余量
+    # 承接；request 按常驻实耗定，不为偶发构建常年锁住半 G 调度额度
+    # （小节点上这会挤得短作业排不进来）。
     requests:
       cpu: 250m
-      memory: 512Mi
+      memory: 64Mi
     limits:
       cpu: 2000m
       memory: 4Gi
