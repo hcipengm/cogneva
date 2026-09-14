@@ -370,6 +370,23 @@ impl ActionPlanOrchestrator {
         Ok(count)
     }
 
+    /// 分解任务的稳定 id。
+    ///
+    /// 这个 id 是一条意图链全部下游状态的索引键（squad board、ralph 迭代
+    /// 历史、事件主题），必须对同一意图稳定——goal 文本里嵌的易变内容
+    /// （实时积压计数、run id、空白/大小写差异）一旦进 id，同一意图每轮
+    /// 都会裂变成新链。身份优先级：有提示任务时取调用方已稳定的任务 id
+    /// （平台 `{platform}-issue-{n}`、自信号键），否则取空白归一化后的
+    /// goal 文本 hash。goal 原文只留在任务 input 里给 LLM，不进身份。
+    fn decompose_task_id(goal: &str, hints: Option<&[Task]>) -> String {
+        let identity = hints
+            .and_then(|h| h.first())
+            .map(|t| t.id.clone())
+            .unwrap_or_else(|| goal.split_whitespace().collect::<Vec<_>>().join(" "));
+        let digest = blake3::hash(identity.as_bytes()).to_hex();
+        format!("decompose-{}", &digest[..16])
+    }
+
     /// Main entry point: decompose a goal into an ActionPlan.
     pub async fn decompose_goal(
         &self,
@@ -427,7 +444,11 @@ impl ActionPlanOrchestrator {
                     }))
                     .collect::<Vec<_>>());
             }
-            let mut task = Task::new(format!("decompose-{}", goal), TaskType::Planner, task_input);
+            let mut task = Task::new(
+                Self::decompose_task_id(goal, hints),
+                TaskType::Planner,
+                task_input,
+            );
             // CollaborationExecutor dispatches on is_executable: false routes to
             // the decomposition path (output carries atomic_tasks); true would
             // take the atomic-execution path and never produce a task list.
@@ -1191,6 +1212,40 @@ impl cog_core::ActionPlanner for ActionPlanOrchestrator {
 mod tests {
     use super::*;
     use cog_core::{TaskResult, TaskResultMetadata};
+
+    fn hint_task(id: &str) -> Task {
+        Task::new(id, TaskType::Custom("fix".into()), serde_json::json!({}))
+    }
+
+    #[test]
+    fn decompose_id_prefers_caller_identity_over_goal_text() {
+        let hints = vec![hint_task("github-issue-56")];
+        let a = ActionPlanOrchestrator::decompose_task_id(
+            "Investigate backlog: 33 tasks pending",
+            Some(&hints),
+        );
+        let b = ActionPlanOrchestrator::decompose_task_id(
+            "Investigate backlog: 41 tasks pending",
+            Some(&hints),
+        );
+        assert_eq!(a, b);
+        assert!(a.starts_with("decompose-"));
+        assert_eq!(a.len(), "decompose-".len() + 16);
+    }
+
+    #[test]
+    fn decompose_id_normalizes_whitespace_when_no_hints() {
+        let a = ActionPlanOrchestrator::decompose_task_id("Audit this\nrepo  for defects", None);
+        let b = ActionPlanOrchestrator::decompose_task_id("Audit this repo for defects", None);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn decompose_id_differs_for_different_goals() {
+        let a = ActionPlanOrchestrator::decompose_task_id("Fix issue 56", None);
+        let b = ActionPlanOrchestrator::decompose_task_id("Fix issue 57", None);
+        assert_ne!(a, b);
+    }
 
     /// Mock [`TaskExecutor`] that returns a fixed list of [`AtomicTask`]s.
     struct MockTaskExecutor {
