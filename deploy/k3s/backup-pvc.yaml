@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-backup-pvc
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: backup
+  # 与数据卷同级待遇：卸载不销毁，重装后备份还在原地可恢复。
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

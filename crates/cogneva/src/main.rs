@@ -37,5 +37,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(1).as_deref() == Some("mainline-rollout") {
         return cog_reflection::run_rollout_cli().await;
     }
+    // 数据面备份与恢复：CronJob 每日打包，换机/重装由一次性恢复 Job 消费。
+    if std::env::args().nth(1).as_deref() == Some("backup") {
+        return cogneva::backup::run_backup_from_env().await;
+    }
+    if std::env::args().nth(1).as_deref() == Some("restore") {
+        return cogneva::backup::run_restore_from_env().await;
+    }
     cogneva::run_app().await
 }

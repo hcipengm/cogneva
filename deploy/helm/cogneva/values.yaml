@@ -25,6 +25,19 @@ appData:
   # 空 = 跟随集群默认 SC（与 pg/redis/qdrant 同策略，不绑厂商）。
   storageClass: ""
 
+# 数据面备份：权威数据（PG 逻辑导出 + Qdrant 一致性快照 + 对象 raw 层 +
+# 实例身份 Secret）打成 tar.zst 落 cogneva-backup-pvc。重启档由 PVC keep
+# 策略覆盖，本备份覆盖重装/换机档（restore-from-package.sh 消费）。
+backup:
+  enabled: true
+  # 每日 03:17：错峰，避开整点/半点的集群任务共振。
+  schedule: "17 3 * * *"
+  # 保留最新 N 份，更老的落盘即删。
+  keepCount: 7
+  storage: 10Gi
+  # 空 = 跟随集群默认 SC（与 pg/redis/qdrant 同策略，不绑厂商）。
+  storageClass: ""
+
 image:
   # 工作负载统一从集群内 registry 的 NodePort 拉取（每个节点的 kubelet 经
   # localhost:<nodePort> 访问，containerd 对 localhost 默认 http 免 TLS）。

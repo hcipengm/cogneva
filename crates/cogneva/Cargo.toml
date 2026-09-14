@@ -63,12 +63,15 @@ thiserror = { workspace = true }
 tonic = { workspace = true }
 base64 = "0.22"
 rustls = { workspace = true }
+# 备份恢复子命令：包格式 tar.zst、Qdrant 快照走 REST multipart。
+reqwest = { workspace = true, features = ["multipart"] }
+tar = "0.4"
+zstd = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
 
 [dev-dependencies]
-reqwest = { workspace = true }
 tempfile = "3"
 filetime = "0.2"
 async-trait = "0.1"

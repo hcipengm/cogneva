@@ -35,5 +35,7 @@ resources:
   - meilisearch.yaml
   - seaweedfs.yaml
   - cluster-registry.yaml
+  - backup-pvc.yaml
+  - backup-cronjob.yaml
   - network-policy.yaml
   - ingress.yaml

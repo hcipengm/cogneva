@@ -3,6 +3,7 @@
 //! All modules are declared here so tests can access them via `cogneva::`.
 
 pub mod assembly;
+pub mod backup;
 pub mod bootstrap;
 pub mod config_loader;
 pub mod config_watcher;

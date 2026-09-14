@@ -1,0 +1,103 @@
+{{- if .Values.backup.enabled }}
+# 数据面备份：权威数据（PG 逻辑导出 + Qdrant 一致性快照 + 对象 raw 层 +
+# 实例身份 Secret）每日打成 tar.zst 落专用备份卷。重启档由 PVC keep 策略
+# 覆盖，本备份覆盖重装/换机档（restore-from-package.sh 消费）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-backup-pvc
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: backup
+  annotations:
+    # 与数据卷同级待遇：卸载不销毁，重装后备份还在原地可恢复。
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.backup.storage }}
+  {{- with .Values.backup.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cogneva-backup
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # 备份失败不重试成串：下一个周期自然再来，连续失败由 history 留证。
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: cogneva
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: backup
+              image: {{ include "cogneva.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args: ["backup"]
+              env:
+                - name: PG_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: cogneva-secrets
+                      key: pg-password
+                - name: COGNEVA_DATABASE_URL
+                  value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+                # 快照 API 只在 Qdrant REST 端口（6333），gRPC（6334）没有。
+                - name: COGNEVA_QDRANT_HTTP_URL
+                  value: "http://qdrant.{{ include "cogneva.namespace" . }}.svc.cluster.local:6333"
+                - name: COGNEVA_BACKUP_KEEP
+                  value: {{ .Values.backup.keepCount | quote }}
+                - name: COGNEVA_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 1000m
+                  memory: 1Gi
+              volumeMounts:
+                # 对象 raw 层来源（只读：备份绝不写数据卷）。
+                - name: data
+                  mountPath: /var/lib/cogneva-data
+                  readOnly: true
+                # 身份导出：Secret 以只读卷进 Pod，打成 apply-able manifest，
+                # 不为备份单独扩 RBAC。
+                - name: secrets
+                  mountPath: /secrets
+                  readOnly: true
+                - name: backup
+                  mountPath: /backups
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: cogneva-data-pvc
+            - name: secrets
+              secret:
+                secretName: cogneva-secrets
+            - name: backup
+              persistentVolumeClaim:
+                claimName: cogneva-backup-pvc
+{{- end }}
