@@ -247,13 +247,23 @@ pub async fn restore_postgres(
         .execute(&mut *tx)
         .await?;
         for table in &tables {
-            let data = std::fs::read(pkg_pg_dir.join(format!("public.{table}.csv")))?;
+            // 分块流式灌入：整表读进内存会在大表上把容器打 OOM
+            // （metrics 类表 CSV 可达数百 MB 并随时间增长）。
+            let mut file = std::fs::File::open(pkg_pg_dir.join(format!("public.{table}.csv")))?;
             let mut copy_in = tx
                 .copy_in_raw(&format!(
                     "COPY \"{table}\" FROM STDIN WITH (FORMAT csv, HEADER true)"
                 ))
                 .await?;
-            copy_in.send(data).await?;
+            use std::io::Read;
+            let mut buf = vec![0u8; 1024 * 1024];
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                copy_in.send(buf[..n].to_vec()).await?;
+            }
             copy_in.finish().await?;
         }
         tx.commit().await?;
