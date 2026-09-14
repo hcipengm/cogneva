@@ -29,6 +29,7 @@ use cog_observability::analytics::{
 use cog_observability::config::ObservabilityExportersConfig;
 use cog_observability::logs::{init_subscriber_with_pusher, LokiBackgroundPusher, LokiPushClient};
 use cog_observability::metrics::PrometheusMetricsBackend;
+use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore};
 use serde::{Deserialize, Serialize};
 
 /// 单个 LLM 上游：凭证只从环境变量读取（K8s Secret 仅注入本服务），永不转发给沙盒。
@@ -558,6 +559,8 @@ struct PoolObservability {
     metrics: Arc<PrometheusMetricsBackend>,
     analytics: Option<Arc<ClickHouseEventBuffer>>,
     alerts: Option<Arc<PostgresAlertStore>>,
+    /// 逐调用 token 计量明细（PG）。未配置数据库时 None，计量退化为指标+时序。
+    usage: Option<Arc<LlmUsageStore>>,
 }
 
 #[derive(Clone)]
@@ -661,11 +664,21 @@ async fn record_gauge(state: &AppState, name: &str, value: f64, labels: &[(&str,
 
 /// 记一次 counter（+1）。
 async fn record_counter(state: &AppState, name: &str, labels: &[(&str, &str)]) {
+    record_counter_add(state, name, 1.0, labels).await;
+}
+
+/// 记一次 counter 增量。token 计量这类非一维计数走这里。
+async fn record_counter_add(state: &AppState, name: &str, amount: f64, labels: &[(&str, &str)]) {
     let map: HashMap<String, String> = labels
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect();
-    if let Err(e) = state.pool_obs.metrics.record_counter(name, 1.0, map).await {
+    if let Err(e) = state
+        .pool_obs
+        .metrics
+        .record_counter(name, amount, map)
+        .await
+    {
         tracing::debug!(error = %e, metric = name, "指标写入失败");
     }
 }
@@ -694,6 +707,190 @@ async fn record_llm_call(state: &AppState, upstream: &LlmUpstream, result: &str,
             .property("result", serde_json::json!(result))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
+}
+
+/// 一次调用的 token 计量落点（三处同写）：Prometheus counter、ClickHouse 明细、
+/// PG 台账。只在拿到真实 usage 或确知为零时调用；任何落点失败只降级为
+/// warn/debug，绝不影响请求路径——计量是观测，不是业务。
+async fn record_llm_tokens(
+    state: &AppState,
+    upstream: &LlmUpstream,
+    result: &str,
+    tokens_input: u64,
+    tokens_output: u64,
+    latency_ms: u64,
+) {
+    let key = LlmHealthTable::key(upstream);
+    if tokens_input > 0 {
+        record_counter_add(
+            state,
+            "llm_tokens_total",
+            tokens_input as f64,
+            &[("upstream", &key), ("kind", "input")],
+        )
+        .await;
+    }
+    if tokens_output > 0 {
+        record_counter_add(
+            state,
+            "llm_tokens_total",
+            tokens_output as f64,
+            &[("upstream", &key), ("kind", "output")],
+        )
+        .await;
+    }
+    record_event(
+        state,
+        AnalyticsEvent::new("llm_usage")
+            .property("upstream", serde_json::json!(key))
+            .property("model", serde_json::json!(upstream.model))
+            .property("result", serde_json::json!(result))
+            .property("tokens_in", serde_json::json!(tokens_input))
+            .property("tokens_out", serde_json::json!(tokens_output))
+            .property("latency_ms", serde_json::json!(latency_ms)),
+    );
+    if let Some(store) = &state.pool_obs.usage {
+        let record = LlmUsageRecord {
+            upstream: key,
+            api_style: upstream.api_style.clone(),
+            model: upstream.model.clone(),
+            result: result.to_string(),
+            tokens_input,
+            tokens_output,
+            latency_ms,
+        };
+        let store = store.clone();
+        // 台账写入异步化：流结束的调用方不该等一次 PG insert。
+        tokio::spawn(async move {
+            if let Err(e) = store.record(&record).await {
+                tracing::warn!(error = %e, "LLM 计量明细落库失败");
+            }
+        });
+    }
+}
+
+/// 从一条 SSE `data:` 负载或非流式 JSON body 里提取 token usage。
+/// 兼容两个协议面：OpenAI 尾帧的 `usage{prompt_tokens,completion_tokens}`；
+/// Anthropic 的 `message_start`（input_tokens）与 `message_delta`
+/// （output_tokens，累计值，最后一帧为准）。认不出就 None，调用方按零记。
+fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    let as_u64 = |v: &serde_json::Value| v.as_u64().filter(|n| *n > 0);
+    match json.get("type").and_then(|t| t.as_str()) {
+        Some("message_start") => {
+            let input = json.pointer("/message/usage/input_tokens").and_then(as_u64);
+            (input, None)
+        }
+        Some("message_delta") => {
+            let output = json.pointer("/usage/output_tokens").and_then(as_u64);
+            (None, output)
+        }
+        _ => {
+            let usage = json.get("usage");
+            (
+                usage.and_then(|u| u.get("prompt_tokens")).and_then(as_u64),
+                usage
+                    .and_then(|u| u.get("completion_tokens"))
+                    .and_then(as_u64),
+            )
+        }
+    }
+}
+
+/// 透传响应流的旁路扫描器：逐字节转发不变，只从 SSE `data:` 行里抠 usage。
+/// 非 SSE 响应（application/json 整体 body）在行解析失败后由 `finish`
+/// 兜底解析。扫描永不报错——认不出 usage 就是零，不是故障。
+#[derive(Default)]
+struct UsageScanner {
+    line_buf: Vec<u8>,
+    raw: Vec<u8>,
+    tokens_input: u64,
+    tokens_output: u64,
+}
+
+impl UsageScanner {
+    fn feed(&mut self, chunk: &[u8]) {
+        self.line_buf.extend_from_slice(chunk);
+        // 非 SSE body 的兜底解析需要原文；上限 1MiB 防内存被异常响应顶爆。
+        if self.raw.len() < 1024 * 1024 {
+            self.raw.extend_from_slice(chunk);
+        }
+        while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&line);
+            let Some(data) = text.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                let (input, output) = extract_usage(&json);
+                if let Some(n) = input {
+                    self.tokens_input = n;
+                }
+                if let Some(n) = output {
+                    self.tokens_output = n;
+                }
+            }
+        }
+    }
+
+    /// 流结束时兜底：SSE 行扫描一无所获时按整体 JSON 解析一次
+    /// （非流式透传响应的 body 就是一整块 JSON）。
+    fn finish(&mut self) {
+        if self.tokens_input > 0 || self.tokens_output > 0 {
+            return;
+        }
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&self.raw) {
+            let (input, output) = extract_usage(&json);
+            if let Some(n) = input {
+                self.tokens_input = n;
+            }
+            if let Some(n) = output {
+                self.tokens_output = n;
+            }
+        }
+    }
+}
+
+/// 把上游响应流包一层旁路扫描：字节原样转发，流结束后把扫到的 usage 记账。
+/// 调用方提前断连时收尾闭包不执行——那种情况下游也多半没收到尾帧，
+/// 没记到的是真实没产生的 output，符合事实。
+fn wrap_usage_scan(
+    state: AppState,
+    upstream: LlmUpstream,
+    stream: impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + 'static,
+    start: std::time::Instant,
+) -> impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send {
+    use futures::StreamExt;
+    let scanner = Arc::new(Mutex::new(UsageScanner::default()));
+    let scan = scanner.clone();
+    let scanned = stream.map(move |item| {
+        if let Ok(bytes) = &item {
+            let mut s = scan.lock().unwrap();
+            s.feed(bytes);
+        }
+        item
+    });
+    let finalize = futures::stream::once(async move {
+        let (input, output) = {
+            let mut s = scanner.lock().unwrap();
+            s.finish();
+            (s.tokens_input, s.tokens_output)
+        };
+        record_llm_tokens(
+            &state,
+            &upstream,
+            "ok",
+            input,
+            output,
+            start.elapsed().as_millis() as u64,
+        )
+        .await;
+        Ok(axum::body::Bytes::new())
+    });
+    scanned.chain(finalize)
 }
 
 /// 上游健康状态变化的落点：时序明细（状态、连续失败数、配额恢复时刻），
@@ -1356,7 +1553,7 @@ async fn stream_forward(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
-        let stream = resp.bytes_stream();
+        let stream = wrap_usage_scan(state.clone(), upstream.clone(), resp.bytes_stream(), start);
         return Ok(axum::response::Response::builder()
             .status(status)
             .header("content-type", content_type)
@@ -1579,6 +1776,7 @@ async fn call_one_upstream(
     upstream: &LlmUpstream,
     messages: &[ChatMessage],
 ) -> Result<Json<LlmResponse>, (String, Option<i64>)> {
+    let start = std::time::Instant::now();
     let base = upstream.base_url.trim_end_matches('/');
     if upstream.api_style == "anthropic" {
         let (system, msgs): (String, Vec<&ChatMessage>) = {
@@ -1625,6 +1823,16 @@ async fn call_one_upstream(
             .json()
             .await
             .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None))?;
+        let (usage_in, usage_out) = extract_usage(&v);
+        record_llm_tokens(
+            state,
+            upstream,
+            "ok",
+            usage_in.unwrap_or(0),
+            usage_out.unwrap_or(0),
+            start.elapsed().as_millis() as u64,
+        )
+        .await;
         let content = v["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -1664,6 +1872,16 @@ async fn call_one_upstream(
         .json()
         .await
         .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None))?;
+    let (usage_in, usage_out) = extract_usage(&v);
+    record_llm_tokens(
+        state,
+        upstream,
+        "ok",
+        usage_in.unwrap_or(0),
+        usage_out.unwrap_or(0),
+        start.elapsed().as_millis() as u64,
+    )
+    .await;
     let content = v["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default()
@@ -2534,11 +2752,32 @@ async fn build_pool_observability(
         None => None,
     };
 
+    let usage = match config.database_url.as_deref() {
+        Some(url) => match LlmUsageStore::connect(url).await {
+            Ok(store) => match store.init_schema().await {
+                Ok(()) => {
+                    tracing::info!("LLM token 计量明细已落 PostgreSQL");
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "gateway_llm_usage 建表失败，计量明细降级为关闭");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "PostgreSQL 连接失败，计量明细降级为关闭");
+                None
+            }
+        },
+        None => None,
+    };
+
     (
         Arc::new(PoolObservability {
             metrics,
             analytics,
             alerts,
+            usage,
         }),
         redis,
     )
@@ -2642,6 +2881,78 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_extract_openai_final_chunk() {
+        let json = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 123, "completion_tokens": 45}
+        });
+        assert_eq!(extract_usage(&json), (Some(123), Some(45)));
+    }
+
+    #[test]
+    fn usage_extract_anthropic_frames() {
+        let start = serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 77, "output_tokens": 1}}
+        });
+        assert_eq!(extract_usage(&start), (Some(77), None));
+        let delta = serde_json::json!({
+            "type": "message_delta",
+            "usage": {"output_tokens": 210}
+        });
+        assert_eq!(extract_usage(&delta), (None, Some(210)));
+    }
+
+    #[test]
+    fn usage_extract_unrelated_json_is_none() {
+        let json = serde_json::json!({"choices": [{"delta": {"content": "hi"}}]});
+        assert_eq!(extract_usage(&json), (None, None));
+    }
+
+    #[test]
+    fn scanner_reads_openai_sse_tail() {
+        let mut s = UsageScanner::default();
+        s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n");
+        s.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n",
+        );
+        s.feed(b"data: [DONE]\n\n");
+        s.finish();
+        assert_eq!(s.tokens_input, 10);
+        assert_eq!(s.tokens_output, 2);
+    }
+
+    #[test]
+    fn scanner_handles_split_lines() {
+        let mut s = UsageScanner::default();
+        s.feed(b"data: {\"usage\":{\"prompt_");
+        s.feed(b"tokens\":5,\"completion_tokens\":6}}\n");
+        s.finish();
+        assert_eq!(s.tokens_input, 5);
+        assert_eq!(s.tokens_output, 6);
+    }
+
+    #[test]
+    fn scanner_anthropic_accumulates_across_frames() {
+        let mut s = UsageScanner::default();
+        s.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":33,\"output_tokens\":1}}}\n\n");
+        s.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":8}}\n\n");
+        s.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n");
+        s.finish();
+        assert_eq!(s.tokens_input, 33);
+        assert_eq!(s.tokens_output, 40);
+    }
+
+    #[test]
+    fn scanner_falls_back_to_whole_body_json() {
+        let mut s = UsageScanner::default();
+        s.feed(br#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":9,"completion_tokens":3}}"#);
+        s.finish();
+        assert_eq!(s.tokens_input, 9);
+        assert_eq!(s.tokens_output, 3);
+    }
 
     fn cfg(allow: &[&str], deny: &[&str]) -> SecurityGatewayConfig {
         SecurityGatewayConfig {
@@ -3250,6 +3561,7 @@ mod tests {
                 metrics: std::sync::Arc::new(PrometheusMetricsBackend::new("")),
                 analytics: None,
                 alerts: None,
+                usage: None,
             }),
             redis: None,
             pool_down: Arc::new(AtomicBool::new(false)),

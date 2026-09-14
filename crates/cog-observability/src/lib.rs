@@ -14,6 +14,7 @@ pub mod raw_stream;
 pub mod search_index;
 pub mod snapshot;
 pub mod traces;
+pub mod usage_store;
 
 pub use logs::{init_subscriber, install_early_subscriber, LogFilterHandle};
 
