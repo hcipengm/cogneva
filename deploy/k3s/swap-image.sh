@@ -49,7 +49,7 @@ echo "==> 新版本 ${IMAGE}:${NEW_TAG}（workspace version ${WORKSPACE_VERSION}
 # git revision 注入二进制（build.rs 也会自查 git，显式传双保险）
 GIT_REVISION="$(git rev-parse --short HEAD)$(git status --porcelain | grep -q . && echo -dirty || true)"
 
-# 输出线上 Ready 主 Pod 的 <name> <imageID>，没有则空
+# 输出线上 Ready 主 Pod 的 <name> <imageID>（完整 repo@sha256:manifest 引用），没有则空
 running_pod_info() {
   kubectl -n "$NS" get pods -l app.kubernetes.io/name=cogneva -o json | python3 -c '
 import json,sys
@@ -57,12 +57,13 @@ d=json.load(sys.stdin)
 for p in d.get("items",[]):
     for cs in p.get("status",{}).get("containerStatuses",[]):
         if cs.get("name")=="cogneva" and cs.get("ready"):
-            print(p["metadata"]["name"], cs.get("imageID","").rsplit(":",1)[-1])
+            print(p["metadata"]["name"], cs.get("imageID",""))
             sys.exit(0)
 '
 }
 
-# 线上 Ready Pod 实际运行镜像对应的不可变版本 tag（非 local）
+# 线上 Ready Pod 实际运行镜像对应的不可变版本 tag（非 local）。
+# imageID 是 repo@sha256:manifest 引用：crictl 不认裸 digest，完整引用才能查。
 resolve_running_tag() {
   local info pod image_id inspect tag
   info="$(running_pod_info)"
@@ -71,16 +72,17 @@ resolve_running_tag() {
     return 1; }
   pod="${info%% *}"; image_id="${info##* }"
   inspect="$(k3s crictl inspecti "$image_id" 2>/dev/null)" || {
-    echo "集群 containerd 查不到 Pod $pod 的运行镜像 ${image_id:0:12}" >&2; return 1; }
+    echo "集群 containerd 查不到 Pod $pod 的运行镜像 ${image_id}" >&2; return 1; }
   tag="$(printf '%s' "$inspect" | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
 for t in d.get("status",{}).get("repoTags") or []:
-    p="localhost/cogneva:"
-    if t.startswith(p):
-        v=t[len(p):]
-        if v != "local":
-            print(v); break
+    p=("localhost/cogneva:", "localhost:30500/cogneva:")
+    for pre in p:
+        if t.startswith(pre):
+            v=t[len(pre):]
+            if v != "local":
+                print(v); sys.exit(0)
 ')"
   [ -n "$tag" ] || {
     echo "Pod $pod 运行镜像只有 :local 标签、无不可变版本 tag；请显式 --prev" >&2
