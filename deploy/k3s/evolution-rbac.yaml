@@ -45,8 +45,10 @@ rules:
   # Mainline rollout Jobs: build side applies (create), queries status, and
   # deletes a finished job before redispatch when deployments were reverted by
   # an apply; the in-Job rollout reuses the same ServiceAccount.
+  # cronjobs ride the same rule: the rollout pod kubectl-applies the rendered
+  # manifests (which include the backup CronJob) and apply needs to get it.
   - apiGroups: ["batch"]
-    resources: ["jobs"]
+    resources: ["jobs", "cronjobs"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

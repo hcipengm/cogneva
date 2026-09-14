@@ -105,8 +105,10 @@ rules:
     verbs: ["get", "list", "watch"]
   # 主线滚动 Job：构建侧 apply(create) 派发、状态查询、Job 已完成但部署被
   # apply 打回时 delete 旧 Job 重新派发；Job 内滚动复用同一 SA。
+  # cronjobs 同规则：滚动端 kubectl apply 渲染清单含备份 CronJob，apply 的
+  # 存在性检查要 get 该资源。
   - apiGroups: ["batch"]
-    resources: ["jobs"]
+    resources: ["jobs", "cronjobs"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
