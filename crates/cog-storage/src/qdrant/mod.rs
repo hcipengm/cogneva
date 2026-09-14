@@ -13,7 +13,25 @@ use qdrant_client::qdrant::{
     VectorParams, VectorParamsMap, Vectors, VectorsConfig,
 };
 use serde_json::Value;
+use sha2::Digest;
 use std::collections::HashMap;
+
+/// Qdrant point ids only accept a UUID or an unsigned integer, while callers
+/// hand us arbitrary strings (e.g. `summary-<bounded agent id>`). Derive a
+/// stable UUID from the caller id so re-inserts upsert instead of erroring,
+/// and deletes resolve to the same point. The caller id itself stays in
+/// `metadata_json.id`, which is what the read path correlates on.
+fn point_id_for(caller_id: &str) -> String {
+    if uuid::Uuid::parse_str(caller_id).is_ok() || caller_id.parse::<u64>().is_ok() {
+        return caller_id.to_string();
+    }
+    let digest = sha2::Sha256::digest(caller_id.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4 layout
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
 
 /// Qdrant-backed [`VectorBackend`].
 /// Talks to a Qdrant cluster over gRPC/HTTP.  Collections are created on
@@ -133,7 +151,7 @@ impl VectorBackend for QdrantVectorBackend {
             let vectors_map = HashMap::from([("dense".to_string(), Vector::new_dense(vec))]);
 
             let point = PointStruct {
-                id: Some(id.into()),
+                id: Some(point_id_for(&id).into()),
                 payload,
                 vectors: Some(Vectors::from(vectors_map)),
             };
@@ -210,7 +228,7 @@ impl VectorBackend for QdrantVectorBackend {
 
     async fn delete(&self, collection: &str, ids: &[String]) -> SFResult<()> {
         let id_values: Vec<qdrant_client::qdrant::PointId> =
-            ids.iter().map(|id| id.clone().into()).collect();
+            ids.iter().map(|id| point_id_for(id).into()).collect();
 
         let delete = DeletePoints {
             collection_name: collection.to_string(),
@@ -264,7 +282,7 @@ impl VectorBackend for QdrantVectorBackend {
             )]);
 
             let point = PointStruct {
-                id: Some(id.into()),
+                id: Some(point_id_for(&id).into()),
                 payload,
                 vectors: Some(Vectors::from(vectors_map)),
             };
@@ -351,5 +369,38 @@ impl VectorBackend for QdrantVectorBackend {
             .await
             .map_err(|e| SFError::Validation(format!("qdrant collection check failed: {e}")))?;
         Ok(exists)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::point_id_for;
+
+    /// 生产里真实撞墙的 id 形状：摄取器把整条 issue 标题绑进 agent id，
+    /// summary id 是 `summary-` 前缀加绑定的超长字符串，Qdrant 只认
+    /// UUID/u64，直接拒绝 upsert，summary 通路整体写不进去。
+    const LIVE_SUMMARY_ID: &str = "summary-agent-squad_decompose-Fix_gitee_issue__\
+        34295240_______________________________________-1789347585888-ba4e032b";
+
+    #[test]
+    fn arbitrary_caller_id_maps_to_stable_valid_uuid() {
+        let first = point_id_for(LIVE_SUMMARY_ID);
+        assert!(
+            uuid::Uuid::parse_str(&first).is_ok(),
+            "派生结果必须是 Qdrant 接受的 UUID：{first}"
+        );
+        assert_eq!(first, point_id_for(LIVE_SUMMARY_ID), "同一 id 必须幂等");
+        assert_ne!(
+            first,
+            point_id_for("summary-agent-other"),
+            "不同 id 不许撞同一个 point"
+        );
+    }
+
+    #[test]
+    fn already_valid_point_ids_pass_through() {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        assert_eq!(point_id_for(&uuid), uuid, "UUID 原样透传");
+        assert_eq!(point_id_for("42"), "42", "u64 原样透传");
     }
 }
