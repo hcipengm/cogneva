@@ -114,7 +114,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         let instance_id = resolve_port_instance_id().await;
         let version = current_version(ctx);
         let mut engine_root = project_root.clone();
-        if ctx.config().self_evolution.enabled {
+        // 引擎基线树与启动期工作树清理都要写裸仓库；控制面进程的 /host-git
+        // 是只读挂载（executor_enabled=false，不派生进化循环），建不出也清
+        // 不动，硬试只会每轮启动刷一串降级告警。基线树跟着执行器职责走。
+        let self_evolution_cfg = &ctx.config().self_evolution;
+        if self_evolution_cfg.enabled && self_evolution_cfg.executor_enabled {
             if let Some(ws) = self.workspaces.as_ref() {
                 let base = ws.resolve_base(&instance_id, &version).await;
                 let spec = crate::workspace::WorkspaceSpec::persistent(

@@ -21,13 +21,49 @@ use std::time::Duration;
 
 use cog_core::{SFError, SFResult};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 /// 工作树默认根目录（沙盒 PVC 内，与 bin/backups/changes/mainline 同级）。
 pub const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
 
 /// git 子命令超时：worktree add 要检出全树，给足余量。
 const GIT_TIMEOUT_SECS: u64 = 120;
+
+/// 陈旧 git 锁的最小判定年龄。本进程的 git 子命令全部带 120s 超时且超时即杀
+/// （kill_on_drop），活着的命令不可能持锁超过该值；超龄锁只可能是被杀进程
+/// （OOM、节点重启、竞态互踩）留下的尸体，清掉并重试是唯一自愈路径——否则
+/// 工作树的所有写操作永久失败，进化循环每轮空转。
+pub(crate) const STALE_GIT_LOCK_AGE: Duration = Duration::from_secs(600);
+
+/// 从 git 失败输出里提取锁文件路径。git 的固定措辞：
+/// `fatal: Unable to create '<path>/index.lock': File exists.`
+/// 只认 `.lock` 结尾的路径，防止把别的引号串误当锁删除。
+pub(crate) fn stale_lock_candidate(error_text: &str) -> Option<PathBuf> {
+    const PREFIX: &str = "Unable to create '";
+    const SUFFIX: &str = "': File exists";
+    let start = error_text.find(PREFIX)? + PREFIX.len();
+    let end = error_text[start..].find(SUFFIX)? + start;
+    let path = PathBuf::from(&error_text[start..end]);
+    if path.extension().and_then(|s| s.to_str()) == Some("lock") {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// 锁文件年龄达到 `max_age` 才删除（防止误删并发活锁）。返回是否删掉。
+pub(crate) async fn clear_stale_git_lock(lock: &Path, max_age: Duration) -> bool {
+    let Ok(meta) = tokio::fs::metadata(lock).await else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    if mtime.elapsed().unwrap_or(Duration::ZERO) < max_age {
+        return false;
+    }
+    tokio::fs::remove_file(lock).await.is_ok()
+}
 
 /// 临时工作树默认存活上限。要容得下一整轮演进：属主 pid 是 Pod 进程号，
 /// 同一进程内永远"活着"，存活时长才是唯一的兜底判据。
@@ -152,6 +188,7 @@ pub struct WorkspaceManager {
     target_dir: PathBuf,
     meta_dir: PathBuf,
     ephemeral_ttl: Duration,
+    stale_lock_age: Duration,
 }
 
 impl WorkspaceManager {
@@ -168,12 +205,19 @@ impl WorkspaceManager {
             target_dir: target_dir.into(),
             meta_dir,
             ephemeral_ttl: DEFAULT_EPHEMERAL_TTL,
+            stale_lock_age: STALE_GIT_LOCK_AGE,
         }
     }
 
     /// 覆盖临时工作树存活上限（回收策略随分配器走，各子系统用同一个值）。
     pub fn with_ephemeral_ttl(mut self, ttl: Duration) -> Self {
         self.ephemeral_ttl = ttl;
+        self
+    }
+
+    /// 覆盖陈旧 git 锁的判定年龄（测试用短值触发自愈路径）。
+    pub fn with_stale_lock_age(mut self, age: Duration) -> Self {
+        self.stale_lock_age = age;
         self
     }
 
@@ -600,6 +644,34 @@ impl WorkspaceManager {
     }
 
     async fn run_git(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {
+        match self.run_git_once(args, workdir).await {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                // 被杀进程留下的锁会让该工作树的所有写操作永久失败；锁龄超过
+                // 判定值即清除并重试一次（活锁受超时+kill_on_drop 保护，等不到
+                // 这个年龄）。
+                let cleared = match stale_lock_candidate(&e.to_string()) {
+                    Some(lock) => {
+                        let gone = clear_stale_git_lock(&lock, self.stale_lock_age).await;
+                        if gone {
+                            warn!(
+                                lock = %lock.display(),
+                                "removed stale git lock left by a killed process; retrying"
+                            );
+                        }
+                        gone
+                    }
+                    None => false,
+                };
+                if cleared {
+                    return self.run_git_once(args, workdir).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn run_git_once(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args).kill_on_drop(true);
         if let Some(dir) = workdir {
@@ -1175,5 +1247,58 @@ mod tests {
         assert_eq!(sanitize_id("evol/quinn-33b30bf1"), "evol-quinn-33b30bf1");
         assert_eq!(sanitize_id("porter::local"), "porter--local");
         assert_eq!(sanitize_id("///"), "ws");
+    }
+
+    /// 锁路径只从 git 的固定报错措辞里提取，且必须真是 .lock 文件——
+    /// 别的引号串不能误当锁删掉。
+    #[test]
+    fn stale_lock_candidate_parses_git_wording() {
+        let err =
+            "git reset failed: fatal: Unable to create '/repo/.git/index.lock': File exists.\n";
+        assert_eq!(
+            stale_lock_candidate(err),
+            Some(PathBuf::from("/repo/.git/index.lock"))
+        );
+        assert!(
+            stale_lock_candidate("fatal: Unable to create '/repo/.git/HEAD': File exists.")
+                .is_none(),
+            "非 .lock 结尾的路径不许碰"
+        );
+        assert!(stale_lock_candidate("some other error").is_none());
+    }
+
+    /// 被杀进程留下的陈旧锁：清掉并重试后写操作恢复；锁龄不足的新锁
+    /// 可能是并发活锁，不许动，错误原样抛出。
+    #[tokio::test]
+    async fn stale_git_lock_is_cleared_and_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, rev_a, rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare).with_stale_lock_age(Duration::ZERO);
+        let ws = mgr
+            .acquire_ephemeral("cycle", BaseRef::Commit(rev_b.clone()))
+            .await
+            .unwrap();
+
+        // 工作树的 GIT_DIR 在裸仓库的 worktrees/ 下，锁要种在那里。
+        let gitdir = PathBuf::from(git_out(&ws.path, &["rev-parse", "--absolute-git-dir"]));
+        let lock = gitdir.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        // 判定龄为零：任何锁都按尸体处理，清掉重试后 refresh 必须成功。
+        mgr.refresh(&ws, BaseRef::Commit(rev_a.clone()))
+            .await
+            .unwrap();
+        assert!(!lock.exists(), "陈旧锁要被清掉");
+        assert_eq!(git_out(&ws.path, &["rev-parse", "HEAD"]), rev_a);
+
+        // 默认 600s 判定龄下刚种的锁是新锁：不许删，操作必须失败。
+        let mgr = manager(tmp.path(), &bare);
+        std::fs::write(&lock, "").unwrap();
+        let err = mgr
+            .refresh(&ws, BaseRef::Commit(rev_b.clone()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("index.lock"));
+        assert!(lock.exists(), "可能是活锁的新锁不能删");
     }
 }
