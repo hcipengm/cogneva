@@ -419,7 +419,8 @@ data:
         "events_on_bus": true,
         "nats_urls": ["nats-service:4222"],
         "publish_buffer_capacity": 256,
-        "publish_retry_base_delay_ms": 1000
+        "publish_retry_base_delay_ms": 1000,
+        "events_stream_retention": "limits"
       },
       "github_integration": {
         "_comment": "GitHub integration for self-evolution. Tokens are resolved from environment variables and never enter the sandbox. discovery_mode=both: polling is the periodic fallback, webhook events (via the security gateway, gateway_verified) give second-level response.",

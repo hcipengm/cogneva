@@ -125,6 +125,13 @@ pub struct NatsConfig {
     /// 服务端允许的在途未 ack 消息上限，超出即停止投递。消费端的背压闸门：
     /// 积压在流里（持久），不堆在消费者进程内存里。
     pub consumer_max_ack_pending: usize,
+    /// 自动建流的保留策略："workqueue"（消息被任一消费组 ack 后即删，适合
+    /// 任务分发）/"limits"（按容量上限保留，适合多消费组各自全量消费的事件
+    /// 面）/"interest"。默认 workqueue 保持任务队列既有语义；事件面等多
+    /// 订阅方场景必须 limits，否则先 ack 的消费组会把消息从其他组嘴里删掉。
+    /// 注意：NATS 不允许在既有流上把 retention 改入/改出 workqueue，策略
+    /// 变更只能靠删流重建。
+    pub stream_retention: String,
 }
 
 impl Default for NatsConfig {
@@ -136,6 +143,7 @@ impl Default for NatsConfig {
             consumer_ack_wait_secs: 900,
             consumer_max_deliver: 5,
             consumer_max_ack_pending: 1024,
+            stream_retention: "workqueue".into(),
         }
     }
 }
@@ -639,6 +647,11 @@ pub struct MultiBackendConsumerConfig {
     pub publish_buffer_capacity: usize,
     /// 发布失败的重试退避基数（毫秒），指数退避。
     pub publish_retry_base_delay_ms: u64,
+    /// 事件面流的保留策略（写入事件面 NatsConfig.stream_retention）。事件面
+    /// 有 supervisor 回灌与记忆摄取两个独立消费组、各自要全量事件，必须
+    /// "limits"（或 "interest"）；默认即 limits。workqueue 会让先 ack 的
+    /// 消费组把事件从其他组删掉，且其消费组只接受 deliver-all。
+    pub events_stream_retention: String,
 }
 
 impl Default for MultiBackendConsumerConfig {
@@ -652,6 +665,7 @@ impl Default for MultiBackendConsumerConfig {
             nats_urls: Vec::new(),
             publish_buffer_capacity: 256,
             publish_retry_base_delay_ms: 1000,
+            events_stream_retention: "limits".into(),
         }
     }
 }

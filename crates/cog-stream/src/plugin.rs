@@ -114,10 +114,13 @@ impl cog_core::SystemPlugin for StreamPlugin {
         {
             let mbc = ctx.config().multi_backend_consumer.clone();
             let plane: Option<Arc<dyn cog_core::MessageBackend>> = if !mbc.nats_urls.is_empty() {
-                // 继承全局 NATS 配置的 auth/tls/消费者 tuning，只覆盖地址——
-                // 事件面与任务队列的 NATS 参数同一份配置面，不另起炉灶。
+                // 继承全局 NATS 配置的 auth/tls/消费者 tuning，只覆盖地址与
+                // 流保留策略——事件面与任务队列的 NATS 参数同一份配置面，不另起
+                // 炉灶。事件面是多消费组扇出，默认 limits 而非任务队列的
+                // workqueue（后者先 ack 的组会把事件从其他组删掉）。
                 let mut plane_config = ctx.config().dag_executor.nats.clone();
                 plane_config.urls = mbc.nats_urls.clone();
+                plane_config.stream_retention = mbc.events_stream_retention.clone();
                 match crate::NatsMessageBackend::new(&plane_config).await {
                     Ok(b) => {
                         info!(

@@ -88,10 +88,43 @@ for t in d.get("status",{}).get("repoTags") or []:
   printf '%s' "$tag"
 }
 
+# Pod imageID 是 registry 拉取侧的 manifest digest（repo@sha256:...），而
+# containerd CRI 的 image id 是 config digest——两种 digest 直接比永远不相等。
+# 统一折算到 config digest 再比：manifest 经 registry API 解出 config。
+resolve_config_digest() {
+  local iid="$1"
+  case "$iid" in
+    *@sha256:*)
+      local host name manifest
+      host="${iid%%/*}"
+      name="${iid#*/}"; name="${name%@sha256:*}"
+      manifest="${iid##*@}"
+      curl -sf -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+        "http://${host}/v2/${name}/manifests/${manifest}" | python3 -c '
+import json,sys
+print(json.load(sys.stdin)["config"]["digest"].rsplit(":",1)[-1])
+'
+      ;;
+    sha256:*) printf '%s' "${iid#sha256:}" ;;
+    *) printf '%s' "$iid" ;;
+  esac
+}
+
 # 校验浮动 :local 与线上运行镜像一致；脱节直接拒绝（叠层会把错误自我放大）
 verify_local_matches_running() {
-  local running_id local_id
-  running_id="$(running_pod_info | awk '{print $2}')"
+  local running_ref running_id local_id
+  running_ref="$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=cogneva -o json | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for p in d.get("items",[]):
+    for cs in p.get("status",{}).get("containerStatuses",[]):
+        if cs.get("name")=="cogneva" and cs.get("ready"):
+            print(cs.get("imageID",""))
+            sys.exit(0)
+')"
+  [ -n "$running_ref" ] || { echo "线上没有 Ready 的 cogneva Pod" >&2; return 1; }
+  running_id="$(resolve_config_digest "$running_ref")"
+  [ -n "$running_id" ] || { echo "运行镜像 $running_ref 折算 config digest 失败" >&2; return 1; }
   local_id="$(k3s crictl inspecti "${IMAGE}:local" 2>/dev/null | python3 -c '
 import json,sys
 try:
@@ -99,7 +132,6 @@ try:
 except Exception:
     pass
 ' || true)"
-  [ -n "$running_id" ] || { echo "线上没有 Ready 的 cogneva Pod" >&2; return 1; }
   if [ -z "$local_id" ]; then
     echo "集群 containerd 没有 ${IMAGE}:local 标签（首次部署？）" >&2
     return 1
@@ -284,46 +316,57 @@ if [ "$DO_DEPLOY" = 1 ]; then
   kubectl create configmap cogneva-prompts -n "$NS" \
     --from-file=prompts/ --dry-run=client -o yaml | kubectl apply -f -
 
-  echo "==> 四部署滚动到 ${NEW_TAG}"
-  kubectl set image -n "$NS" deployment/cogneva "cogneva=${IMAGE}:${NEW_TAG}"
-  kubectl set image -n "$NS" deployment/cogneva-evolution "cogneva=${IMAGE}:${NEW_TAG}"
-  kubectl set image -n "$NS" deployment/cogneva-security-gateway "security-gateway=${IMAGE}:${NEW_TAG}"
-  kubectl set image -n "$NS" deployment/cogneva-sandbox-executor "sandbox-executor=${IMAGE}:${NEW_TAG}"
+  # 四部署按拓扑约定 pin 集群内 registry 引用（localhost:30500），且
+  # imagePullPolicy: Always——必须用 registry 引用滚动，写节点本地
+  # localhost/cogneva:<tag> 会让 kubelet 去 https://localhost 拉取直接失败。
+  echo "==> 四部署滚动到 localhost:30500/cogneva:${NEW_TAG}"
+  kubectl set image -n "$NS" deployment/cogneva "cogneva=localhost:30500/cogneva:${NEW_TAG}"
+  kubectl set image -n "$NS" deployment/cogneva-evolution "cogneva=localhost:30500/cogneva:${NEW_TAG}"
+  kubectl set image -n "$NS" deployment/cogneva-security-gateway "security-gateway=localhost:30500/cogneva:${NEW_TAG}"
+  kubectl set image -n "$NS" deployment/cogneva-sandbox-executor "sandbox-executor=localhost:30500/cogneva:${NEW_TAG}"
   kubectl rollout status -n "$NS" deployment/cogneva --timeout=180s
   kubectl rollout status -n "$NS" deployment/cogneva-security-gateway --timeout=180s
   kubectl rollout status -n "$NS" deployment/cogneva-evolution --timeout=300s
   kubectl rollout status -n "$NS" deployment/cogneva-sandbox-executor --timeout=180s
 
   echo "==> 校验新 Pod 实际运行镜像"
-  want_id="$(k3s crictl inspecti "${IMAGE}:${NEW_TAG}" 2>/dev/null | python3 -c '
+  # want 侧从 registry 取 NEW_TAG 的 manifest 折算 config digest；Pod imageID
+  # 是 manifest digest，两侧统一经 resolve_config_digest 折算再比（同
+  # verify_local_matches_running 的 digest 种类对齐）。
+  want_id="$(curl -sf \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "http://localhost:30500/v2/cogneva/manifests/${NEW_TAG}" | python3 -c '
 import json,sys
-print(json.load(sys.stdin)["status"]["id"].rsplit(":",1)[-1])')"
+print(json.load(sys.stdin)["config"]["digest"].rsplit(":",1)[-1])
+')"
+  [ -n "$want_id" ] || { echo "registry 查询 localhost:30500/cogneva:${NEW_TAG} manifest 失败" >&2; exit 1; }
   # 四部署逐一核对 Ready Pod 的镜像 id。同版本号重跑时 tag 字符串没变，
   # set image 不触发滚动；只核对单个 Pod 会漏掉其余部署——主应用还可能因
   # 前面 kubectl apply 结构变更偶然重建而"假通过"，evolution 等却仍跑旧
   # 镜像。四个 component 标签唯一，必须全查。stdout 输出仍停留在旧镜像的
   # component 列表（空 = 全部已更新），诊断信息走 stderr。
   stale_deploys() {
-    kubectl -n "$NS" get pods -o json 2>/dev/null | WANT="$want_id" python3 -c '
-import json, os, sys
-want = os.environ["WANT"]
-comps = ["gateway", "security-gateway", "evolution", "sandbox-executor"]
-data = json.load(sys.stdin)
-seen = {}
-for p in data.get("items", []):
-    comp = p.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
-    if comp not in comps:
-        continue
-    for cs in p.get("status", {}).get("containerStatuses", []):
+    local comp iid rid stale=""
+    for comp in gateway security-gateway evolution sandbox-executor; do
+      iid="$(kubectl -n "$NS" get pods -l "app.kubernetes.io/component=${comp}" -o json 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for p in d.get("items",[]):
+    for cs in p.get("status",{}).get("containerStatuses",[]):
         if cs.get("ready"):
-            seen.setdefault(comp, cs.get("imageID", "").rsplit(":", 1)[-1])
-stale = [c for c in comps if seen.get(c) != want]
-for c in comps:
-    rid = seen.get(c, "MISSING")[:12]
-    print(f"    {c:18s} {rid}", file=sys.stderr)
-if stale:
-    print(" ".join(stale))
-'
+            print(cs.get("imageID",""))
+            sys.exit(0)
+')"
+      if [ -z "$iid" ]; then
+        rid="MISSING"
+      else
+        rid="$(resolve_config_digest "$iid")"
+        [ -n "$rid" ] || rid="UNRESOLVED"
+      fi
+      printf '    %-18s %s\n' "$comp" "${rid:0:12}" >&2
+      [ "$rid" = "$want_id" ] || stale="${stale:+$stale }$comp"
+    done
+    printf '%s' "$stale"
   }
   stale="$(stale_deploys)"
   if [ -n "$stale" ]; then
@@ -342,7 +385,7 @@ if stale:
     echo "滚动后仍有部署镜像不符（期望 ${want_id:0:12}）：${stale}" >&2
     exit 1
   fi
-  echo "==> 四部署均运行 ${IMAGE}:${NEW_TAG}（${want_id:0:12}，rev ${GIT_REVISION}）"
+  echo "==> 四部署均运行 localhost:30500/cogneva:${NEW_TAG}（${want_id:0:12}，rev ${GIT_REVISION}）"
 fi
 
 echo "==> 完成：${IMAGE}:${NEW_TAG}（节点与 registry 的 :local 均已同步，rev ${GIT_REVISION}）"

@@ -13,7 +13,8 @@ use std::sync::{Arc, RwLock};
 use cog_core::{MessageBackend, MessageStream, NatsConfig, SFError, SFResult};
 
 /// NATS JetStream-backed [`MessageBackend`].
-/// Streams are auto-created from the subject name with `WorkQueue` retention.
+/// Streams are auto-created from the subject name with the retention policy
+/// from [`NatsConfig::stream_retention`] (default `WorkQueue`).
 /// Consumer groups are mapped to durable JetStream pull consumers.
 /// Received messages are held in an internal map so that [`Self::ack`] can
 /// reference them by sequence number.
@@ -21,6 +22,19 @@ pub struct NatsMessageBackend {
     jetstream: jetstream::Context,
     pending_acks: Arc<RwLock<HashMap<String, async_nats::jetstream::Message>>>,
     consumer_tuning: ConsumerTuning,
+    stream_retention: RetentionPolicy,
+}
+
+/// Parse [`NatsConfig::stream_retention`] into a JetStream retention policy.
+fn parse_retention(raw: &str) -> SFResult<RetentionPolicy> {
+    match raw {
+        "workqueue" => Ok(RetentionPolicy::WorkQueue),
+        "limits" => Ok(RetentionPolicy::Limits),
+        "interest" => Ok(RetentionPolicy::Interest),
+        other => Err(SFError::Validation(format!(
+            "invalid NATS stream_retention: {other} (want workqueue|limits|interest)"
+        ))),
+    }
 }
 
 /// JetStream pull-consumer tuning carried from [`NatsConfig`].
@@ -81,6 +95,7 @@ impl NatsMessageBackend {
                 max_deliver: config.consumer_max_deliver,
                 max_ack_pending: config.consumer_max_ack_pending,
             },
+            stream_retention: parse_retention(&config.stream_retention)?,
         })
     }
 
@@ -101,17 +116,37 @@ impl NatsMessageBackend {
     }
 
     /// Ensure a JetStream stream exists for the given subject.
+    /// An existing stream whose retention differs from the configured policy
+    /// is a hard error, not a silent reuse: NATS forbids changing retention
+    /// to/from workqueue on a live stream, and running on the wrong policy
+    /// (e.g. workqueue under a multi-consumer event plane) silently starves
+    /// consumer groups. Recreate the stream deliberately instead.
     async fn ensure_stream(&self, subject: &str) -> SFResult<jetstream::stream::Stream> {
         let stream_name = subject_to_stream_name(subject);
-        self.jetstream
+        let stream = self
+            .jetstream
             .get_or_create_stream(jetstream::stream::Config {
                 name: stream_name.clone(),
                 subjects: vec![subject.to_string()],
-                retention: RetentionPolicy::WorkQueue,
+                retention: self.stream_retention,
                 ..Default::default()
             })
             .await
-            .map_err(|e| SFError::DagExecutor(format!("JetStream stream create failed: {e}")))
+            .map_err(|e| SFError::DagExecutor(format!("JetStream stream create failed: {e}")))?;
+        let mut stream = stream;
+        let actual = stream
+            .info()
+            .await
+            .map_err(|e| SFError::DagExecutor(format!("JetStream stream info failed: {e}")))?
+            .config
+            .retention;
+        if actual != self.stream_retention {
+            return Err(SFError::DagExecutor(format!(
+                "JetStream stream {stream_name} retention mismatch: running {actual:?}, configured {:?}; delete and recreate the stream to change policy",
+                self.stream_retention
+            )));
+        }
+        Ok(stream)
     }
 }
 
@@ -295,6 +330,7 @@ impl Clone for NatsMessageBackend {
             jetstream: self.jetstream.clone(),
             pending_acks: Arc::clone(&self.pending_acks),
             consumer_tuning: self.consumer_tuning,
+            stream_retention: self.stream_retention,
         }
     }
 }
