@@ -262,7 +262,10 @@ fn evaluate_advance(
             if !is_ancestor {
                 return AdvanceDecision::NotAncestor;
             }
-            if now_ts < cooldown_until {
+            // 冷却只挡"重试同一失败 rev"（attempts>0 意味着 bare 就是失败 rev，
+            // 见调用处的 keyed 计数）。冷却若连新 rev 一起挡，fix-forward 提交
+            // （修的正是上次失败原因）会被无谓延迟一个冷却窗。
+            if attempts > 0 && now_ts < cooldown_until {
                 return AdvanceDecision::InCooldown;
             }
             if attempts >= max_attempts {
@@ -2376,10 +2379,15 @@ mod tests {
             evaluate_advance(bare, &main("aa1111111111"), false, now, 0, 0, 2),
             AdvanceDecision::NotAncestor
         );
-        // 冷却中
+        // 冷却中且目标是失败 rev 本身（attempts>0）才挡
+        assert_eq!(
+            evaluate_advance(bare, &main("aa1111111111"), true, now, 2000, 1, 2),
+            AdvanceDecision::InCooldown
+        );
+        // 冷却窗内推进到新 rev（fix-forward）不挡：新提交可能正是修复
         assert_eq!(
             evaluate_advance(bare, &main("aa1111111111"), true, now, 2000, 0, 2),
-            AdvanceDecision::InCooldown
+            AdvanceDecision::Advance
         );
         // 超次数
         assert_eq!(
