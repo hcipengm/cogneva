@@ -279,8 +279,10 @@ pub fn build_secret_manifest(
     for entry in std::fs::read_dir(secrets_dir)? {
         let entry = entry?;
         let path = entry.path();
-        // 挂载点下还有 ..data / ..2024_xxx 这类符号链接，只收普通文件。
-        if !path.is_file() || path.is_symlink() {
+        // K8s Secret 卷的每个 key 都是指向 ..data/<key> 的符号链接，is_file
+        // 跟随链接为真；要排除的是 ..data / ..2024_xxx 这类点开头的内部条目，
+        // 不是链接本身。
+        if !path.is_file() {
             continue;
         }
         let key = entry.file_name().to_string_lossy().into_owned();
@@ -749,13 +751,19 @@ mod tests {
 
     #[test]
     fn secret_manifest_is_applyable_sorted_and_base64() {
+        // 复刻 K8s Secret 卷的真实形态：每个 key 是指向 ..data/<key> 的符号
+        // 链接，另有 ..2024_01_01_00_00_00.000000000 时间戳目录。
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("pg-password"), b"s3cret\n").unwrap();
-        std::fs::write(dir.path().join("jwt-secret"), b"abc").unwrap();
-        // 挂载 Secret 卷里的内部符号链接命名，不许进包。
-        std::fs::write(dir.path().join("..data"), b"garbage").unwrap();
+        let root = dir.path();
+        let data_dir = root.join("..2024_01_01_00_00_00.000000000");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("pg-password"), b"s3cret\n").unwrap();
+        std::fs::write(data_dir.join("jwt-secret"), b"abc").unwrap();
+        std::os::unix::fs::symlink(&data_dir, root.join("..data")).unwrap();
+        std::os::unix::fs::symlink("..data/pg-password", root.join("pg-password")).unwrap();
+        std::os::unix::fs::symlink("..data/jwt-secret", root.join("jwt-secret")).unwrap();
 
-        let (yaml, keys) = build_secret_manifest(dir.path(), "cogneva").unwrap();
+        let (yaml, keys) = build_secret_manifest(root, "cogneva").unwrap();
 
         assert_eq!(keys, vec!["jwt-secret", "pg-password"], "key 必须排序");
         assert!(yaml.starts_with("apiVersion: v1\nkind: Secret\n"));

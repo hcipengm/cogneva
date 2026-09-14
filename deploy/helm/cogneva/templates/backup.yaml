@@ -72,9 +72,11 @@ spec:
                     fieldRef:
                       fieldPath: metadata.namespace
               resources:
+                # 请求按流式作业实耗定（COPY→文件、tar.zst 流式压缩，常驻内存
+                # 极小）；定高了在资源紧张的小节点上会调度不出来。
                 requests:
                   cpu: 100m
-                  memory: 256Mi
+                  memory: 64Mi
                 limits:
                   cpu: 1000m
                   memory: 1Gi
