@@ -21,8 +21,6 @@ use cog_core::{RawLogIndexEntry, RawLogIndexStore, RawLogQuery, StorageTier};
 use cog_storage::partition_maintainer::{PartitionMaintainer, PartitionedTable};
 use cog_storage::PostgresRawLogIndexStore;
 
-const TABLE: &str = "partition_maintainer_probe";
-
 fn database_url() -> String {
     std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
         "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
@@ -31,30 +29,38 @@ fn database_url() -> String {
 }
 
 /// The probe is partitioned by `ts` and named so that its partition prefix
-/// differs from its own name, exercising the prefix field.
-fn probe_table() -> PartitionedTable {
-    PartitionedTable::new(TABLE, "ts", "probe_part")
+/// differs from its own name, exercising the prefix field. Each test gets its
+/// own table *and* prefix: the tests share one database and run in parallel,
+/// and partitions are plain relations — two parents cannot both own a
+/// `probe_part_default`.
+fn probe_table(table: &str) -> PartitionedTable {
+    PartitionedTable::new(table, "ts", &format!("{table}_part"))
+}
+
+/// Partition relation names for a probe table, mirroring `probe_table`.
+fn probe_names(table: &str) -> (String, String) {
+    (format!("{table}_part_default"), format!("{table}_part_y"))
 }
 
 fn month_start(year: i32, month: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, 1).unwrap()
 }
 
-async fn fresh_probe(pool: &PgPool) {
-    sqlx::query(&format!("DROP TABLE IF EXISTS {TABLE} CASCADE"))
+async fn fresh_probe(pool: &PgPool, table: &str) {
+    sqlx::query(&format!("DROP TABLE IF EXISTS {table} CASCADE"))
         .execute(pool)
         .await
         .unwrap();
     sqlx::query(&format!(
-        "CREATE TABLE {TABLE} (id BIGSERIAL, ts TIMESTAMPTZ NOT NULL, note TEXT) PARTITION BY RANGE (ts)"
+        "CREATE TABLE {table} (id BIGSERIAL, ts TIMESTAMPTZ NOT NULL, note TEXT) PARTITION BY RANGE (ts)"
     ))
     .execute(pool)
     .await
     .unwrap();
 }
 
-async fn drop_probe(pool: &PgPool) {
-    sqlx::query(&format!("DROP TABLE IF EXISTS {TABLE} CASCADE"))
+async fn drop_probe(pool: &PgPool, table: &str) {
+    sqlx::query(&format!("DROP TABLE IF EXISTS {table} CASCADE"))
         .execute(pool)
         .await
         .unwrap();
@@ -67,30 +73,32 @@ async fn count_in(pool: &PgPool, relation: &str) -> i64 {
         .unwrap()
 }
 
-async fn insert_at(pool: &PgPool, ts: &str) {
+async fn insert_at(pool: &PgPool, table: &str, ts: &str) {
     sqlx::query(&format!(
-        "INSERT INTO {TABLE} (ts, note) VALUES ('{ts}'::timestamptz, 'probe')"
+        "INSERT INTO {table} (ts, note) VALUES ('{ts}'::timestamptz, 'probe')"
     ))
     .execute(pool)
     .await
     .unwrap();
 }
 
-fn maintainer(pool: PgPool) -> PartitionMaintainer {
-    PartitionMaintainer::new(pool, vec![probe_table()])
+fn maintainer(pool: PgPool, table: &str) -> PartitionMaintainer {
+    PartitionMaintainer::new(pool, vec![probe_table(table)])
 }
 
 #[tokio::test]
 #[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
 async fn opens_the_current_month_and_a_default_partition() {
+    const TABLE: &str = "partition_maintainer_probe_open";
     let pool = PgPool::connect(&database_url()).await.unwrap();
-    fresh_probe(&pool).await;
+    fresh_probe(&pool, TABLE).await;
 
-    let maintainer = maintainer(pool.clone());
+    let maintainer = maintainer(pool.clone(), TABLE);
     maintainer.maintain().await.unwrap();
 
+    let (default, yprefix) = probe_names(TABLE);
     let today = Utc::now().date_naive();
-    let current = format!("probe_part_y{}m{:02}", today.year(), today.month());
+    let current = format!("{yprefix}{}m{:02}", today.year(), today.month());
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1)")
             .bind(&current)
@@ -98,65 +106,73 @@ async fn opens_the_current_month_and_a_default_partition() {
             .await
             .unwrap();
     assert!(exists, "{current} should have been created");
-    assert_eq!(count_in(&pool, "probe_part_default").await, 0);
+    assert_eq!(count_in(&pool, &default).await, 0);
 
     // A row for the current month routes into the month, not into DEFAULT.
-    insert_at(&pool, &format!("{today} 12:00:00+00")).await;
+    insert_at(&pool, TABLE, &format!("{today} 12:00:00+00")).await;
     assert_eq!(count_in(&pool, &current).await, 1);
-    assert_eq!(count_in(&pool, "probe_part_default").await, 0);
+    assert_eq!(count_in(&pool, &default).await, 0);
 
     // Running again changes nothing.
     maintainer.maintain().await.unwrap();
     assert_eq!(count_in(&pool, &current).await, 1);
-    assert_eq!(count_in(&pool, "probe_part_default").await, 0);
+    assert_eq!(count_in(&pool, &default).await, 0);
 
-    drop_probe(&pool).await;
+    drop_probe(&pool, TABLE).await;
 }
 
 #[tokio::test]
 #[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
 async fn rows_parked_in_default_are_moved_when_their_partition_appears() {
+    const TABLE: &str = "partition_maintainer_probe_relocate";
     let pool = PgPool::connect(&database_url()).await.unwrap();
-    fresh_probe(&pool).await;
+    fresh_probe(&pool, TABLE).await;
 
-    let maintainer = maintainer(pool.clone());
+    let maintainer = maintainer(pool.clone(), TABLE);
     maintainer.maintain().await.unwrap();
 
     // Pick a month inside the maintained window, then remove its partition so
     // the next insert has only DEFAULT to fall into.
+    let (default, yprefix) = probe_names(TABLE);
     let target = Utc::now().date_naive() + chrono::Months::new(1);
-    let name = format!("probe_part_y{}m{:02}", target.year(), target.month());
+    let name = format!("{yprefix}{}m{:02}", target.year(), target.month());
     sqlx::query(&format!("DROP TABLE {name}"))
         .execute(&pool)
         .await
         .unwrap();
 
     let start = month_start(target.year(), target.month());
-    insert_at(&pool, &format!("{start} 12:00:00+00")).await;
-    assert_eq!(count_in(&pool, "probe_part_default").await, 1);
+    insert_at(&pool, TABLE, &format!("{start} 12:00:00+00")).await;
+    assert_eq!(count_in(&pool, &default).await, 1);
 
     // Maintenance recreates the partition and relocates the row.
     maintainer.maintain().await.unwrap();
     assert_eq!(count_in(&pool, &name).await, 1);
-    assert_eq!(count_in(&pool, "probe_part_default").await, 0);
+    assert_eq!(count_in(&pool, &default).await, 0);
 
     // And it stays put on the next round.
     maintainer.maintain().await.unwrap();
     assert_eq!(count_in(&pool, &name).await, 1);
-    assert_eq!(count_in(&pool, "probe_part_default").await, 0);
+    assert_eq!(count_in(&pool, &default).await, 0);
 
-    drop_probe(&pool).await;
+    drop_probe(&pool, TABLE).await;
 }
 
 /// The index store reads and writes the real `raw_log_index`, whose layout is
 /// owned by the migrations. A column renamed in one place and not the other
-/// fails only at runtime, so the round trip is checked here. Rows use
+/// fails only at runtime, so the round trip is checked here. The throwaway
+/// database starts empty, so the migrations are applied first. Rows use
 /// far-future dates so they land in the DEFAULT partition, and are deleted
 /// again. `(stream_name, log_date)` is the key, so each row needs its own date.
 #[tokio::test]
 #[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
 async fn raw_log_index_round_trips_every_tier() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
+    let url = database_url();
+    cog_storage::migrate::Migrator::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+        .run(&url)
+        .await
+        .unwrap();
+    let pool = PgPool::connect(&url).await.unwrap();
     let store = PostgresRawLogIndexStore::new(pool.clone());
     let created_at = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
     let rows = [
