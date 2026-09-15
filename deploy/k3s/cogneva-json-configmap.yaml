@@ -425,7 +425,7 @@ data:
       },
       "self_review": {
         "_comment": "PGE actor self-review quality gate. enabled=true 时 Planner/Generator/Evaluator/Moderator/Merger 的输出会经过 SelfReviewLoop 审查并用修订结果替换原始输出。",
-        "enabled": false,
+        "enabled": true,
         "max_iterations": 2,
         "quality_threshold": 0.8,
         "spec": null,
