@@ -65,7 +65,10 @@ impl Default for RuntimeConfig {
             agent_id: "agent".into(),
             role: "planner".into(),
             max_iterations: 10,
-            context_window_size: 4000,
+            // 32k fallback: 4k windows amputate tool-call history so badly that
+            // CJK task prompts alone trigger trimming, leaving the model with
+            // only the task text each iteration (amnesia → repeated work).
+            context_window_size: 32000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             skill_config: None,

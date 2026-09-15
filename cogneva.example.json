@@ -324,7 +324,7 @@
     "agent_id": "agent-001",
     "role": "planner",
     "max_iterations": 10,
-    "context_window_size": 4000,
+    "context_window_size": 64000,
     "skill_cache_ttl_secs": 30
   },
   "self_review": {

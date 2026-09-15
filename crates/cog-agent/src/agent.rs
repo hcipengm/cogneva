@@ -42,7 +42,7 @@ pub enum AgentCommand {
 ///         agent_id: "my-agent".into(),
 ///         role: AgentRole::Planner,
 ///         max_iterations: 10,
-///         context_window_size: 4000,
+///         context_window_size: 32000,
 ///     },
 ///     Arc::new(my_llm_provider),
 /// );

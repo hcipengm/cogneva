@@ -190,7 +190,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             agent_id: "eval-agent".into(),
             role: "evaluator".into(),
             max_iterations: 5,
-            context_window_size: 4000,
+            context_window_size: 32000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             skill_config: None,

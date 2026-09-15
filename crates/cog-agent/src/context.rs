@@ -116,7 +116,9 @@ impl ContextWindow {
 }
 
 /// 简化的 token 估算。
-/// CJK 字符每个算 2 token，英文单词算 4 token。
+/// CJK 字符每个算 2 token（保守）；其余按字符数 /4 粗估（英文约 4 字符
+/// 1 token）。CJK 必须按字符计而非字节：UTF-8 一个汉字 3 字节，按字节
+/// 会把中文上下文高估 3 倍，窗口提前触发裁剪。
 pub fn estimate_tokens(text: &str) -> usize {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -126,14 +128,15 @@ pub fn estimate_tokens(text: &str) -> usize {
     let mut tokens = 0;
     for part in trimmed.split_whitespace() {
         // CJK 字符检测
-        let has_cjk = part.chars().any(|c| {
-            ('\u{4e00}'..='\u{9fff}').contains(&c)
-                || ('\u{3000}'..='\u{303f}').contains(&c)
-                || ('\u{ff00}'..='\u{ffef}').contains(&c)
-        });
-
-        if has_cjk {
-            tokens += part.len() * 2; // 每个字节约 2 token（保守估计）
+        let is_cjk = |c: &char| {
+            ('\u{4e00}'..='\u{9fff}').contains(c)
+                || ('\u{3000}'..='\u{303f}').contains(c)
+                || ('\u{ff00}'..='\u{ffef}').contains(c)
+        };
+        let cjk_chars = part.chars().filter(is_cjk).count();
+        let other_chars = part.chars().count() - cjk_chars;
+        if cjk_chars > 0 {
+            tokens += cjk_chars * 2 + other_chars.div_ceil(4);
         } else {
             tokens += 4; // 英文单词约 4 token
         }
