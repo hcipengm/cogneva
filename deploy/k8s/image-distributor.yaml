@@ -3,49 +3,64 @@
 # containerd 都预导入 localhost/cogneva:local 作暖缓存（工作负载实际 pin
 # localhost:30500/cogneva:local 从集群内 registry 拉取，元启动节点负责把同镜像
 # 播种进 registry；节点已有 blob 时拉取零流量）。
-# 流程：镜像服务 Pod 承载 tar.gz → DaemonSet 每节点下载并用宿主 ctr 导入
+# 流程：镜像服务 Deployment 承载 tar.gz → DaemonSet 每节点下载并用宿主 ctr 导入
 # 宿主 containerd → readiness 探针上报完成。
 # 增量升级：kubectl cp 新 tar 覆盖 → kubectl -n cogneva rollout restart
 # daemonset/cogneva-image-distributor（emptyDir 重建，重新下载导入新 tag）。
 # deploy/scripts/distribute-image.sh 封装了上述升级流程。
 # __BUSYBOX_IMAGE__ 由 bootstrap 按网络模式替换（CN 走 daocloud 镜像）。
+# 镜像服务必须是 Deployment 而非裸 Pod：裸 Pod 被驱逐（如节点磁盘压力）后
+# 无控制器重建，分发器会随之永久 CrashLoop（2026-09-14 实证）。
 ---
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: cogneva-image-server
   namespace: cogneva
   labels:
     app: cogneva-image-server
 spec:
-  containers:
-    - name: httpd
-      image: __BUSYBOX_IMAGE__
-      command: ["sh", "-c", "httpd -f -p 8080 -h /share"]
-      ports:
-        - containerPort: 8080
-      volumeMounts:
+  replicas: 1
+  # emptyDir 不跨 Pod 共享，滚动无意义
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cogneva-image-server
+  template:
+    metadata:
+      name: cogneva-image-server
+      labels:
+        app: cogneva-image-server
+    spec:
+      containers:
+        - name: httpd
+          image: __BUSYBOX_IMAGE__
+          command: ["sh", "-c", "httpd -f -p 8080 -h /share"]
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: share
+              mountPath: /share
+          readinessProbe:
+            # 不能用 httpGet：/share 为空时 busybox httpd 对 / 返回 404，
+            # 而镜像包要等 Ready 后才 cp 进来——会死锁。端口通即代表 httpd 已起
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          resources:
+            # 显式声明极小资源：不声明会吃 LimitRange 默认值（500m/512Mi），
+            # 命名空间 ResourceQuota 按业务负载+分发器开销总量设计，不能浪费
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
         - name: share
-          mountPath: /share
-      readinessProbe:
-        # 不能用 httpGet：/share 为空时 busybox httpd 对 / 返回 404，
-        # 而镜像包要等 Ready 后才 cp 进来——会死锁。端口通即代表 httpd 已起
-        tcpSocket:
-          port: 8080
-        initialDelaySeconds: 1
-        periodSeconds: 2
-      resources:
-        # 显式声明极小资源：不声明会吃 LimitRange 默认值（500m/512Mi），
-        # 命名空间 ResourceQuota 按业务负载+分发器开销总量设计，不能浪费
-        requests:
-          cpu: 10m
-          memory: 16Mi
-        limits:
-          cpu: 100m
-          memory: 64Mi
-  volumes:
-    - name: share
-      emptyDir: {}
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -90,7 +105,13 @@ spec:
             - |
               set -e
               echo "[distributor] 下载镜像包..."
-              wget -q -O /workspace/image.tar.gz http://cogneva-image-server.cogneva.svc:8080/image.tar.gz
+              # 镜像服务可能暂未就位（被驱逐重建中、tar 未注入）：常设设施
+              # 不允许 CrashLoop 刷噪音，原地等而不是退出重进
+              until wget -q -O /workspace/image.tar.gz http://cogneva-image-server.cogneva.svc:8080/image.tar.gz; do
+                echo "[distributor] 镜像服务暂不可用，60s 后重试..."
+                rm -f /workspace/image.tar.gz
+                sleep 60
+              done
               CTR=""
               # 优先独立的 ctr 符号链接（多调用二进制按 argv[0] 分发，直接调
               # ctr 最可靠；部分 k3s 构建不认 'k3s ctr' 子命令形式）

@@ -1056,7 +1056,7 @@ async fn distribute_image_to_nodes(image: &str) -> Result<()> {
     Ok(())
 }
 
-/// 起临时镜像服务 Pod → kubectl cp 注入 tar → DaemonSet 逐节点导入 → 清理。
+/// 起镜像服务 Deployment → kubectl cp 注入 tar → DaemonSet 逐节点导入 → 清理。
 async fn distribute_via_daemonset(tar: &str) -> Result<()> {
     let manifest = render_distributor_manifest().await?;
     let mdir = make_workdir("distributor")?;
@@ -1076,27 +1076,24 @@ async fn distribute_via_daemonset(tar: &str) -> Result<()> {
         .await?;
         run("kubectl", &["apply", "-f", &mstr]).await?;
         info!("注入镜像包到分发服务 Pod...");
-        // 等服务 Pod Ready 才能 cp。超时给足 10 分钟：空白机首拉 busybox
-        // 镜像（经镜像站）可能远超 2 分钟，超时不等于失败
+        // 镜像服务是 Deployment（裸 Pod 被驱逐后无控制器重建，2026-09-14 实证
+        // 导致分发器永久 CrashLoop）；等 Available 后按 label 解析当前 Pod 名
+        // 再 cp。超时给足 10 分钟：空白机首拉 busybox 镜像（经镜像站）可能
+        // 远超 2 分钟，超时不等于失败
         run(
             "kubectl",
             &[
-                "-n", "cogneva", "wait", "--for=condition=Ready", "pod/cogneva-image-server",
-                "--timeout=600s",
+                "-n", "cogneva", "wait", "--for=condition=Available",
+                "deployment/cogneva-image-server", "--timeout=600s",
             ],
         )
         .await?;
-        run(
-            "kubectl",
-            &[
-                "-n",
-                "cogneva",
-                "cp",
-                tar,
-                "cogneva-image-server:/share/image.tar.gz",
-            ],
-        )
-        .await?;
+        let cp_cmd = format!(
+            "POD=$(kubectl -n cogneva get pod -l app=cogneva-image-server \
+             -o jsonpath='{{.items[0].metadata.name}}') && \
+             kubectl -n cogneva cp '{tar}' \"$POD\":/share/image.tar.gz"
+        );
+        run("sh", &["-c", &cp_cmd]).await?;
         info!("触发/重发分发（rollout restart 保证重跑时重新导入）...");
         run(
             "kubectl",
