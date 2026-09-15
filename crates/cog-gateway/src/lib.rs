@@ -1107,6 +1107,16 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
         }
     }
 
+    // Pull D8 collaboration metrics (ralph terminations, squad outcomes) from
+    // registered observables so they reach Prometheus alongside backend counters.
+    let d8_metrics = cog_core::collect_all_metrics(&state.observables, "D8").await;
+    if !d8_metrics.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&prometheus_render::render_raw_metrics(&d8_metrics));
+    }
+
     if body.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, "metrics backend disabled").into_response();
     }
