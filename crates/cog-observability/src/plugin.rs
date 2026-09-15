@@ -14,6 +14,10 @@ pub struct ObservabilityPlugin {
     initialized: bool,
     trace_collector: Option<Arc<crate::snapshot::TraceCollector>>,
     trace_tier_migrator: Option<Arc<crate::snapshot::TraceTierMigrator>>,
+    /// Persistent alert state machine, created in `init` so the read-side
+    /// service is published before any plugin `start` runs (init_all
+    /// completes before start_all; publishing in start would race consumers).
+    alert_store: Option<Arc<PostgresAlertStore>>,
 }
 
 impl ObservabilityPlugin {
@@ -23,6 +27,7 @@ impl ObservabilityPlugin {
             initialized: false,
             trace_collector: None,
             trace_tier_migrator: None,
+            alert_store: None,
         }
     }
 }
@@ -251,6 +256,36 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         ctx.publish_service(evolution_metrics);
         info!("ObservabilityPlugin evolution metrics published");
 
+        // ── Persistent alert state machine ──
+        // Created here (not in start) so the read-side ActiveAlertSource is
+        // published before any plugin's start runs — init_all completes
+        // before start_all, and self-discovery consumes it in start.
+        self.alert_store = match std::env::var("COGNEVA_DATABASE_URL") {
+            Ok(url) if !url.trim().is_empty() => match PostgresAlertStore::connect(&url).await {
+                Ok(store) => match store.init_schema().await {
+                    Ok(()) => {
+                        info!("alert state machine persisted to PostgreSQL");
+                        let store = Arc::new(store);
+                        let source: Arc<dyn cog_core::ActiveAlertSource> = store.clone();
+                        ctx.publish_service(source);
+                        Some(store)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "alert table init failed; alerts stay notification-only");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(error = %e, "alert store connect failed; alerts stay notification-only");
+                    None
+                }
+            },
+            _ => {
+                info!("COGNEVA_DATABASE_URL unset; alert state machine not persisted");
+                None
+            }
+        };
+
         self.initialized = true;
         Ok(())
     }
@@ -296,28 +331,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
 
         // ── Alert bridge: notification outlet + persistent state machine ──
         let obs_cfg = crate::ObservabilityExportersConfig::load()?;
-        let alert_store = match std::env::var("COGNEVA_DATABASE_URL") {
-            Ok(url) if !url.trim().is_empty() => match PostgresAlertStore::connect(&url).await {
-                Ok(store) => match store.init_schema().await {
-                    Ok(()) => {
-                        info!("alert state machine persisted to PostgreSQL");
-                        Some(Arc::new(store))
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "alert table init failed; alerts stay notification-only");
-                        None
-                    }
-                },
-                Err(e) => {
-                    warn!(error = %e, "alert store connect failed; alerts stay notification-only");
-                    None
-                }
-            },
-            _ => {
-                info!("COGNEVA_DATABASE_URL unset; alert state machine not persisted");
-                None
-            }
-        };
+        let alert_store = self.alert_store.clone();
         let webhook =
             if obs_cfg.alertmanager.enabled && !obs_cfg.alertmanager.webhook_url.is_empty() {
                 Some((
@@ -336,7 +350,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                         info!("webhook configured but no HttpClient; alerts persist only");
                     }
                     let bridged =
-                        spawn_alert_bridge(webhook, http_client, alert_store, &supervisor);
+                        spawn_alert_bridge(webhook.clone(), http_client, alert_store, &supervisor);
                     if bridged.is_some() {
                         info!("Alertmanager webhook bridge started");
                     }
@@ -345,6 +359,59 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             }
         } else {
             info!("alert bridge disabled: no webhook and no PostgreSQL store");
+        }
+
+        // ── Infra alert watcher: PromQL rules → persisted alerts ──
+        // Infrastructure faults (node disk pressure, crash loops) happen
+        // below the supervisor's view; without this they never become
+        // persisted alerts and self-discovery stays blind to them.
+        let infra = obs_cfg.infra_watch.clone();
+        if infra.enabled && !infra.prometheus_url.is_empty() && !infra.rules.is_empty() {
+            match ctx.consume_service::<dyn cog_core::HttpClient>() {
+                Some(http) => {
+                    let notifier = webhook.as_ref().map(|(url, timeout_secs)| {
+                        // Convert infra rules into AlertRule entries so
+                        // webhook payloads resolve rule summaries.
+                        let rules = infra
+                            .rules
+                            .iter()
+                            .map(|r| {
+                                cog_core::alerts::AlertRuleBuilder::new(
+                                    r.name.clone(),
+                                    r.promql.clone(),
+                                )
+                                .condition(r.condition)
+                                .severity(r.severity)
+                                .summary(r.summary.clone())
+                                .build()
+                            })
+                            .collect();
+                        Arc::new(
+                            crate::alerts::AlertManager::new(
+                                rules,
+                                vec![AlertChannel::Webhook {
+                                    url: url.clone(),
+                                    headers: HashMap::new(),
+                                }],
+                            )
+                            .with_timeout(*timeout_secs)
+                            .with_client(http.clone()),
+                        )
+                    });
+                    let shutdown = ctx
+                        .consume::<cog_core::ShutdownSignal>()
+                        .map(|s| (*s).clone())
+                        .unwrap_or_default();
+                    let outlets = crate::infra_watch::InfraWatchOutlets {
+                        store: self.alert_store.clone(),
+                        notifier,
+                    };
+                    tokio::spawn(crate::infra_watch::run_infra_watch_loop(
+                        infra, outlets, http, shutdown,
+                    ));
+                }
+                None => warn!("infra watch configured but no HttpClient; disabled"),
+            }
         }
 
         Ok(())

@@ -4,6 +4,7 @@ pub mod analytics;
 pub mod config;
 pub mod explainability;
 pub mod explainability_pg;
+pub mod infra_watch;
 pub mod jaeger;
 pub mod logs;
 pub mod metrics;
@@ -324,6 +325,7 @@ impl ObservabilityHandle {
 // JaegerConfig 与本文件既有追踪配置类型同名，不重复导出；需要时用
 // crate::config::JaegerConfig 全路径。
 pub use config::{
-    AlertmanagerConfig, ClickHouseConfig, ElasticsearchConfig, LokiConfig,
-    ObservabilityExportersConfig,
+    AlertmanagerConfig, ClickHouseConfig, ElasticsearchConfig, InfraRule, InfraWatchConfig,
+    LokiConfig, ObservabilityExportersConfig,
 };
+pub use infra_watch::{run_infra_watch_loop, InfraWatchOutlets};

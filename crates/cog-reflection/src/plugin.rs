@@ -765,7 +765,18 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         shutdown.trigger();
                     });
                 }
-                tokio::spawn(crate::run_signal_watcher_loop(orch, sw_config, shutdown));
+                // Persisted-alert channel: published by the observability
+                // plugin in init, so it is guaranteed visible here.
+                let alert_source = ctx.consume_service::<dyn cog_core::ActiveAlertSource>();
+                if alert_source.is_none() {
+                    info!("signal watcher: no ActiveAlertSource; persisted-alert channel off");
+                }
+                tokio::spawn(crate::run_signal_watcher_loop(
+                    orch,
+                    sw_config,
+                    shutdown,
+                    alert_source,
+                ));
             }
             (Ok(_), None) => {
                 info!("signal watcher: no orchestrator; self-discovery intents disabled");

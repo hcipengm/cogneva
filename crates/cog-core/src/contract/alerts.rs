@@ -277,3 +277,29 @@ pub trait AlertStore: Send + Sync {
     /// List active (unresolved) alerts, newest first, up to `limit`.
     fn list_active(&self, limit: usize) -> Vec<Alert>;
 }
+
+/// Storage-agnostic view of one persisted alert row. Produced by the
+/// observability plugin's PostgreSQL-backed store and consumed by
+/// self-discovery (cog-reflection), which must react to firing alerts
+/// without depending on the storage crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedAlert {
+    pub rule: String,
+    /// Stable identity of the alert instance; re-raising the same condition
+    /// reuses the same key, so consumers can dedup on it across restarts.
+    pub dedup_key: String,
+    pub severity: String,
+    /// `firing` or `resolved`.
+    pub state: String,
+    pub message: String,
+    pub labels: serde_json::Value,
+    pub fired_at: DateTime<Utc>,
+}
+
+/// Read-side handle over persisted alerts. Published by whichever plugin owns
+/// alert persistence so other crates can turn firing alerts into work.
+#[async_trait::async_trait]
+pub trait ActiveAlertSource: Send + Sync {
+    /// Alerts currently in the `firing` state, newest first.
+    async fn list_active_alerts(&self, limit: i64) -> Vec<PersistedAlert>;
+}

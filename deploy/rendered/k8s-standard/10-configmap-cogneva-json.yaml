@@ -364,6 +364,51 @@ data:
         "context_window_size": 64000,
         "skill_cache_ttl_secs": 30
       },
+      "observability": {
+        "infra_watch": {
+          "_comment": "基础设施告警→持久化→自发现。规则即部署策略：阈值改这里不用重建镜像。series 消失或条件不再成立会自动 resolve；规则查询失败不会误 resolve。",
+          "enabled": true,
+          "prometheus_url": "http://cog-observability-prometheus.monitoring:9090",
+          "poll_interval_secs": 60,
+          "rules": [
+            {
+              "name": "node_disk_usage_high",
+              "promql": "100 - 100 * node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}",
+              "condition": {"greater_than": 75.0},
+              "severity": "warning",
+              "summary": "node root filesystem usage above 75% (current {value}%)"
+            },
+            {
+              "name": "node_disk_usage_critical",
+              "promql": "100 - 100 * node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}",
+              "condition": {"greater_than": 85.0},
+              "severity": "critical",
+              "summary": "node root filesystem usage above 85% (current {value}%); kubelet eviction starts soon"
+            },
+            {
+              "name": "node_disk_pressure",
+              "promql": "kube_node_status_condition{condition=\"DiskPressure\", status=\"true\"}",
+              "condition": {"greater_than": 0.0},
+              "severity": "critical",
+              "summary": "kubelet reports DiskPressure; pods are being evicted"
+            },
+            {
+              "name": "node_memory_pressure",
+              "promql": "kube_node_status_condition{condition=\"MemoryPressure\", status=\"true\"}",
+              "condition": {"greater_than": 0.0},
+              "severity": "warning",
+              "summary": "kubelet reports MemoryPressure"
+            },
+            {
+              "name": "pod_restarting_fast",
+              "promql": "increase(kube_pod_container_status_restarts_total{namespace=\"cogneva\"}[15m])",
+              "condition": {"greater_than": 5.0},
+              "severity": "warning",
+              "summary": "cogneva pod restarting more than 5 times in 15m ({value})"
+            }
+          ]
+        }
+      },
       "self_review": {
         "_comment": "PGE actor self-review quality gate. enabled=true 时 Planner/Generator/Evaluator/Moderator/Merger 的输出会经过 SelfReviewLoop 审查并用修订结果替换原始输出。",
         "enabled": false,

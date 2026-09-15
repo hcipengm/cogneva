@@ -16,6 +16,45 @@ pub struct ObservabilityExportersConfig {
     pub clickhouse: ClickHouseConfig,
     pub alertmanager: AlertmanagerConfig,
     pub elasticsearch: ElasticsearchConfig,
+    pub infra_watch: InfraWatchConfig,
+}
+
+/// Infrastructure alert watcher: evaluates PromQL rules against a
+/// Prometheus-compatible endpoint and drives results into the persistent
+/// alert state machine, so infrastructure faults (node disk pressure, pod
+/// crash loops) become persisted alerts that self-discovery can consume.
+///
+/// Rules come from configuration, not code: thresholds and even the set of
+/// watched signals are deployment policy, and hardcoding them would force a
+/// rebuild for every tuning change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InfraWatchConfig {
+    pub enabled: bool,
+    /// Prometheus-compatible base URL; empty disables the watcher.
+    pub prometheus_url: String,
+    pub poll_interval_secs: u64,
+    pub rules: Vec<InfraRule>,
+}
+
+/// One PromQL-backed alert rule. Every series the query returns is evaluated
+/// against `condition`; each matching series is one alert instance keyed by
+/// rule name plus its identity labels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraRule {
+    pub name: String,
+    pub promql: String,
+    pub condition: cog_core::AlertCondition,
+    pub severity: cog_core::AlertSeverity,
+    /// Human-readable summary; `{value}` is substituted with the last
+    /// observed sample value.
+    pub summary: String,
+}
+
+impl InfraWatchConfig {
+    /// Minimum poll cadence: faster polling only burns Prometheus CPU without
+    /// improving detection, since scrape intervals dominate freshness.
+    pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +211,12 @@ const OBS_ENV: &[(&str, &str)] = &[
     (
         "COGNEVA_ALERTMANAGER_WEBHOOK_URL",
         "alertmanager.webhook_url",
+    ),
+    ("COGNEVA_INFRA_WATCH_ENABLED", "infra_watch.enabled"),
+    ("COGNEVA_INFRA_WATCH_URL", "infra_watch.prometheus_url"),
+    (
+        "COGNEVA_INFRA_WATCH_POLL_SECS",
+        "infra_watch.poll_interval_secs",
     ),
 ];
 

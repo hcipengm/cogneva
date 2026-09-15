@@ -12,6 +12,9 @@
 //! 3. **Periodic self-audit**: a cadence-gated intent asking a squad to audit
 //!    the own repository (hardcoded secrets, weak defaults, injection
 //!    surface) — runtime reflection cannot see static code properties.
+//! 4. **Persisted alerts**: firing rows in the alert state machine (infra
+//!    watcher, supervisor bridge) are faults something already judged
+//!    alert-worthy; each becomes an intent keyed by its dedup key.
 //!
 //! Every intent uses a deterministic id so the orchestrator's idempotent
 //! skip dedupes across ticks and pod restarts; a local state file adds
@@ -48,6 +51,12 @@ pub struct SignalWatcherConfig {
     pub report_cooldown_secs: i64,
     /// Self-audit cadence (seconds); 0 disables the audit channel.
     pub self_audit_interval_secs: i64,
+    /// Channel 4: turn persisted firing alerts into intents. Persisted
+    /// alerts are how infrastructure and gateway faults surface to
+    /// self-discovery — without this channel they page nobody.
+    pub alert_channel_enabled: bool,
+    /// Max alerts converted to intents per tick (flood guard).
+    pub alert_channel_max_per_tick: usize,
 }
 
 impl Default for SignalWatcherConfig {
@@ -60,6 +69,8 @@ impl Default for SignalWatcherConfig {
             backlog_threshold: 100,
             report_cooldown_secs: 86_400,
             self_audit_interval_secs: 7 * 86_400,
+            alert_channel_enabled: true,
+            alert_channel_max_per_tick: 5,
         }
     }
 }
@@ -216,7 +227,11 @@ async fn submit_intent(
 }
 
 /// One watcher tick: scan task state, emit intents for active signals.
-async fn tick(orch: &Arc<dyn OrchestratorControl>, config: &SignalWatcherConfig) {
+async fn tick(
+    orch: &Arc<dyn OrchestratorControl>,
+    config: &SignalWatcherConfig,
+    alert_source: Option<&Arc<dyn cog_core::ActiveAlertSource>>,
+) {
     let now = Utc::now();
     let tasks = orch.get_all_tasks().await;
     let mut state = load_state().await;
@@ -337,6 +352,50 @@ async fn tick(orch: &Arc<dyn OrchestratorControl>, config: &SignalWatcherConfig)
         }
     }
 
+    // 4. Persisted firing alerts → intents. Alerts are how faults below the
+    // task layer (node disk pressure, crash loops, pool outages) surface;
+    // each firing alert becomes an evolution intent keyed by its dedup key,
+    // so the fix work is tracked and cooled down like any other signal.
+    if config.alert_channel_enabled {
+        if let Some(source) = alert_source {
+            let alerts = source.list_active_alerts(100).await;
+            for alert in alerts.into_iter().take(config.alert_channel_max_per_tick) {
+                let key = format!("alert:{}", alert.dedup_key);
+                if !may_report(&mut state, &key, config.report_cooldown_secs, now) {
+                    continue;
+                }
+                dirty = true;
+                let hash = short_hash(&key);
+                let goal = format!(
+                    "Investigate and fix the root cause of firing alert \"{}\" \
+                     (severity: {}): {}. Alert labels: {}. The alert fired at {} \
+                     and is still active. Identify the underlying defect or \
+                     resource condition, implement a durable fix, and explain \
+                     how recurrence is prevented.",
+                    alert.rule,
+                    alert.severity,
+                    alert.message,
+                    alert.labels,
+                    alert.fired_at.to_rfc3339(),
+                );
+                submit_intent(
+                    orch,
+                    format!("self-signal-alert-{hash}"),
+                    "self_signal",
+                    goal,
+                    serde_json::json!({
+                        "kind": "persisted_alert",
+                        "rule": alert.rule,
+                        "dedup_key": alert.dedup_key,
+                        "severity": alert.severity,
+                        "labels": alert.labels,
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
     if dirty {
         save_state(&state).await;
     }
@@ -348,6 +407,7 @@ pub async fn run_signal_watcher_loop(
     orchestrator: Arc<dyn OrchestratorControl>,
     config: SignalWatcherConfig,
     shutdown: cog_core::ShutdownSignal,
+    alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
 ) {
     let interval = Duration::from_secs(config.poll_interval_secs.max(60));
     info!(
@@ -355,6 +415,7 @@ pub async fn run_signal_watcher_loop(
         failure_recurrence_threshold = config.failure_recurrence_threshold,
         backlog_threshold = config.backlog_threshold,
         self_audit_interval_secs = config.self_audit_interval_secs,
+        alert_channel = alert_source.is_some() && config.alert_channel_enabled,
         "self-discovery signal watcher started"
     );
     let mut ticker = tokio::time::interval(interval);
@@ -363,7 +424,7 @@ pub async fn run_signal_watcher_loop(
             biased;
             _ = shutdown.wait() => break,
             _ = ticker.tick() => {
-                tick(&orchestrator, &config).await;
+                tick(&orchestrator, &config, alert_source.as_ref()).await;
             }
         }
     }

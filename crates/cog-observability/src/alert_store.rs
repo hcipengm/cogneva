@@ -197,6 +197,34 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> AlertRecord {
     }
 }
 
+/// Self-discovery consumes firing alerts through this core-contract view,
+/// keeping cog-reflection free of any storage-crate dependency. Read errors
+/// degrade to an empty list: a watcher tick must never panic on a transient
+/// database hiccup, and the next tick retries.
+#[async_trait::async_trait]
+impl cog_core::ActiveAlertSource for PostgresAlertStore {
+    async fn list_active_alerts(&self, limit: i64) -> Vec<cog_core::PersistedAlert> {
+        match self.list_active(limit).await {
+            Ok(records) => records
+                .into_iter()
+                .map(|r| cog_core::PersistedAlert {
+                    rule: r.rule,
+                    dedup_key: r.dedup_key,
+                    severity: r.severity,
+                    state: r.state,
+                    message: r.message,
+                    labels: r.labels,
+                    fired_at: r.fired_at,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "listing active alerts failed");
+                Vec::new()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
