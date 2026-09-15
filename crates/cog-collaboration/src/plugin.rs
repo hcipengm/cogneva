@@ -61,6 +61,8 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
                 collab = collab.with_pge_schemas(pge.schemas.clone());
             }
 
+            collab = collab.with_ralph_config(crate::RalphSettings::load()?.to_loop_config());
+
             if let Some(ref hook) = hook_engine {
                 collab = collab.with_hook_engine(hook.clone());
             }

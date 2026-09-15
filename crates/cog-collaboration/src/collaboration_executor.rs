@@ -26,6 +26,8 @@ pub struct CollaborationExecutor {
     pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
     skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// Ralph Loop 预算与停滞窗口（配置面 `ralph` 段；None = 默认）。
+    ralph: Option<crate::squad::ralph::RalphLoopConfig>,
 }
 
 impl CollaborationExecutor {
@@ -46,6 +48,7 @@ impl CollaborationExecutor {
             pge_schemas: None,
             skill_registry: None,
             state_backend: None,
+            ralph: None,
         }
     }
 
@@ -143,6 +146,13 @@ impl CollaborationExecutor {
     /// history across restarts.
     pub fn with_state_backend(mut self, backend: Arc<dyn cog_core::StateBackend>) -> Self {
         self.state_backend = Some(backend);
+        self
+    }
+
+    /// Override Ralph Loop budget/stagnation knobs for all squads
+    /// (from the `ralph` config section).
+    pub fn with_ralph_config(mut self, config: crate::squad::ralph::RalphLoopConfig) -> Self {
+        self.ralph = Some(config);
         self
     }
 }
@@ -455,6 +465,9 @@ impl CollaborationExecutor {
         if let Some(ref backend) = self.state_backend {
             squad_executor = squad_executor.with_state_backend(backend.clone());
         }
+        if let Some(ralph) = self.ralph {
+            squad_executor = squad_executor.with_ralph_config(ralph);
+        }
 
         let result = squad_executor
             .execute_squad(
@@ -569,6 +582,9 @@ impl CollaborationExecutor {
         }
         if let Some(ref backend) = self.state_backend {
             squad_executor = squad_executor.with_state_backend(backend.clone());
+        }
+        if let Some(ralph) = self.ralph {
+            squad_executor = squad_executor.with_ralph_config(ralph);
         }
 
         let mut context = task.input.clone();

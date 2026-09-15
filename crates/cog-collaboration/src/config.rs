@@ -111,6 +111,45 @@ impl PgeSettings {
     }
 }
 
+/// Ralph Loop 预算与停滞窗口配置。不收敛的链必须在预算内终止——
+/// 无人值守场景没有操作者盯流调 prompt，"视为无限"等于无限烧 token。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RalphSettings {
+    /// 单链迭代预算硬上限。
+    pub max_iterations: u32,
+    /// 停滞窗口：最近这么多轮全部失败、重置策略全部 Identical、且
+    /// 归一化反馈逐字相同即终止。0 = 关闭停滞检测。
+    pub stagnation_window: u32,
+}
+
+impl Default for RalphSettings {
+    fn default() -> Self {
+        Self {
+            max_iterations: 50,
+            stagnation_window: 5,
+        }
+    }
+}
+
+impl RalphSettings {
+    pub fn load() -> SFResult<Self> {
+        load_section("/ralph")
+    }
+
+    pub fn load_from(path: &Path) -> SFResult<Self> {
+        load_section_from(path, "/ralph")
+    }
+
+    /// Convert to the loop-level config struct.
+    pub fn to_loop_config(&self) -> crate::squad::ralph::RalphLoopConfig {
+        crate::squad::ralph::RalphLoopConfig {
+            max_iterations: self.max_iterations,
+            stagnation_window: self.stagnation_window,
+        }
+    }
+}
+
 /// Boundary rule configuration（cog-collaboration 注入 Evaluator 做动态
 /// 边界维度评估）。规则元素类型 [`cog_core::BoundaryRule`] 是跨 crate
 /// 数据契约，留在 core。
@@ -145,6 +184,14 @@ mod tests {
         assert!(!SelfReviewSettings::load_from(p).unwrap().enabled);
         assert!(PgeSettings::load_from(p).unwrap().schemas.is_empty());
         assert!(BoundaryConfig::load_from(p).unwrap().rules.is_empty());
+    }
+
+    #[test]
+    fn ralph_settings_defaults_bound_the_loop() {
+        let p = Path::new("/nonexistent/cogneva.json");
+        let r = RalphSettings::load_from(p).unwrap();
+        assert_eq!(r.max_iterations, 50);
+        assert_eq!(r.stagnation_window, 5);
     }
 
     #[test]

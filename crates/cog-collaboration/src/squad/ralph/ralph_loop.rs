@@ -1,7 +1,8 @@
 //! Loop 1 — Ralph Loop（Squad 外层质量控制循环）。
-//! - 无 max_rounds 硬限制，只有两个停止条件：PGE Pass 或 判定"不可修复"。
+//! - 停止条件：PGE Pass、判定"不可修复"、停滞检测、或迭代预算耗尽。
 //! - 全局重置策略（非局部修补）：Identical / Modified / Escalated。
-//! - safety_limit 仅为防止失控的运行时保险，设计语义上视为无限。
+//! - 迭代预算（max_iterations）是有界止损：无人值守场景没有操作者盯流
+//!   调 prompt，不收敛的链必须在预算内终止，不能"视为无限"地烧。
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::squad::pge::pipeline::PgePipeline;
@@ -73,15 +74,19 @@ pub struct SemanticFailureAnalysis {
 /// Ralph Loop 配置。
 #[derive(Debug, Clone, Copy)]
 pub struct RalphLoopConfig {
-    /// 运行时安全上限。设计语义无限制，但生产环境需防止资源耗尽。
-    /// 默认 1_000（足够大，视为"无限"）。
-    pub safety_limit: u32,
+    /// 迭代预算硬上限。达到即终止并归档结论——不收敛的链继续迭代只是
+    /// 燃烧 token（实证：曾有不收敛链跑到 600+ 迭代零通过）。
+    pub max_iterations: u32,
+    /// 停滞窗口：最近这么多轮全部失败、重置策略全部 Identical、且
+    /// 归一化反馈逐字相同，判定为停滞并终止。0 = 关闭停滞检测。
+    pub stagnation_window: u32,
 }
 
 impl Default for RalphLoopConfig {
     fn default() -> Self {
         Self {
-            safety_limit: 1_000,
+            max_iterations: 50,
+            stagnation_window: 5,
         }
     }
 }
@@ -186,6 +191,73 @@ impl RalphLoop {
         }
     }
 
+    /// 停滞判定：最近 stagnation_window 轮全部失败、重置策略全部
+    /// Identical、且归一化反馈逐字相同——循环在原地空转，继续迭代
+    /// 只是燃烧 token。纯确定性判据，不引入额外 LLM 调用。
+    fn is_stagnated(&self) -> bool {
+        let window = self.config.stagnation_window as usize;
+        if window == 0 || self.history.len() < window {
+            return false;
+        }
+        let tail = &self.history[self.history.len() - window..];
+        if tail.iter().any(|it| it.pge_passed) {
+            return false;
+        }
+        if tail
+            .iter()
+            .any(|it| it.reset_strategy != ResetStrategy::Identical)
+        {
+            return false;
+        }
+        let normalize = |s: &str| {
+            s.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        };
+        let first = normalize(&tail[0].feedback);
+        tail.iter().all(|it| normalize(&it.feedback) == first)
+    }
+
+    /// 停滞终止的统一形态：Warn 日志 + 指标 + Unrecoverable 判定，
+    /// 历史与结论随 verdict 归档，不是无声消失。
+    fn stagnated_verdict(&self) -> RalphVerdict {
+        let total_iterations = self.history.len() as u32;
+        tracing::warn!(
+            iterations = total_iterations,
+            window = self.config.stagnation_window,
+            "Ralph Loop stagnated: identical failure repeated across the window; terminating"
+        );
+        crate::observable::global_observable().record_ralph_termination("stagnated");
+        RalphVerdict::Unrecoverable {
+            reason: format!(
+                "Ralph Loop stagnated: no progress signal across the last {} iterations",
+                self.config.stagnation_window
+            ),
+            iterations: total_iterations,
+            history: self.history.clone(),
+        }
+    }
+
+    /// 预算耗尽的统一形态（与停滞同构，便于下游按 reason 前缀分类）。
+    fn budget_exhausted_verdict(&self) -> RalphVerdict {
+        let total_iterations = self.history.len() as u32;
+        tracing::warn!(
+            iterations = total_iterations,
+            max_iterations = self.config.max_iterations,
+            "Ralph Loop exhausted its iteration budget; terminating"
+        );
+        crate::observable::global_observable().record_ralph_termination("budget_exhausted");
+        RalphVerdict::Unrecoverable {
+            reason: format!(
+                "Ralph Loop exhausted iteration budget of {}",
+                self.config.max_iterations
+            ),
+            iterations: total_iterations,
+            history: self.history.clone(),
+        }
+    }
+
     /// 以 Pipeline 模式运行 Ralph Loop。
     pub async fn run_pipeline(
         &mut self,
@@ -199,7 +271,7 @@ impl RalphLoop {
         self.load_history().await;
         let start_iteration = self.history.len() as u32 + 1;
 
-        for iteration in start_iteration..=self.config.safety_limit {
+        for iteration in start_iteration..=self.config.max_iterations {
             crate::observable::global_observable().record_round();
             if iteration > 1 {
                 context["ralph_iteration"] = serde_json::json!(iteration);
@@ -266,6 +338,10 @@ impl RalphLoop {
                 };
             }
 
+            if self.is_stagnated() {
+                return self.stagnated_verdict();
+            }
+
             match analysis {
                 FailureAnalysis::Recoverable(strategy) => {
                     context["reset_strategy"] = serde_json::json!(format!("{:?}", strategy));
@@ -281,15 +357,7 @@ impl RalphLoop {
             }
         }
 
-        let total_iterations = self.history.len() as u32;
-        RalphVerdict::Unrecoverable {
-            reason: format!(
-                "Ralph Loop reached safety limit of {} iterations",
-                self.config.safety_limit
-            ),
-            iterations: total_iterations,
-            history: self.history.clone(),
-        }
+        self.budget_exhausted_verdict()
     }
 
     /// 以 Roundtable 模式运行 Ralph Loop。
@@ -302,7 +370,7 @@ impl RalphLoop {
         self.load_history().await;
         let start_iteration = self.history.len() as u32 + 1;
 
-        for iteration in start_iteration..=self.config.safety_limit {
+        for iteration in start_iteration..=self.config.max_iterations {
             crate::observable::global_observable().record_round();
             if iteration > 1 {
                 context["ralph_iteration"] = serde_json::json!(iteration);
@@ -365,6 +433,10 @@ impl RalphLoop {
                 };
             }
 
+            if self.is_stagnated() {
+                return self.stagnated_verdict();
+            }
+
             match analysis {
                 FailureAnalysis::Recoverable(strategy) => {
                     context["reset_strategy"] = serde_json::json!(format!("{:?}", strategy));
@@ -380,15 +452,7 @@ impl RalphLoop {
             }
         }
 
-        let total_iterations = self.history.len() as u32;
-        RalphVerdict::Unrecoverable {
-            reason: format!(
-                "Ralph Loop reached safety limit of {} iterations",
-                self.config.safety_limit
-            ),
-            iterations: total_iterations,
-            history: self.history.clone(),
-        }
+        self.budget_exhausted_verdict()
     }
 
     /// 分析 Pipeline 失败原因。
@@ -757,7 +821,10 @@ mod tests {
 
     #[tokio::test]
     async fn ralph_pipeline_passes_on_first_attempt() {
-        let mut ralph = RalphLoop::with_config(RalphLoopConfig { safety_limit: 10 });
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 10,
+            ..Default::default()
+        });
         let pipeline = PgePipeline::new(PgePipelineConfig {
             max_retries: 1,
             timeout_ms: 5_000,
@@ -849,7 +916,10 @@ mod tests {
 
     #[tokio::test]
     async fn ralph_roundtable_with_low_threshold_passes() {
-        let mut ralph = RalphLoop::with_config(RalphLoopConfig { safety_limit: 10 });
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 10,
+            ..Default::default()
+        });
         let config = PgeRoundtableConfig {
             max_iterations: 3,
             consensus_threshold: 0.3,
@@ -879,10 +949,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ralph_safety_limit_triggers_unrecoverable() {
-        let mut ralph = RalphLoop::with_config(RalphLoopConfig { safety_limit: 2 });
+    async fn ralph_budget_exhaustion_triggers_unrecoverable() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 2,
+            ..Default::default()
+        });
         // consensus_threshold=1.0 要求 score=100，mock evaluator 返回 92 分 → 无法 consensus。
-        // Ralph 两轮后触发 safety_limit。
+        // Ralph 两轮后耗尽迭代预算。
         let config = PgeRoundtableConfig {
             max_iterations: 1,
             consensus_threshold: 1.0,
@@ -907,6 +980,119 @@ mod tests {
             }
             other => panic!("Expected Unrecoverable at safety limit, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------
+
+    fn failed_iteration(iteration: u32, strategy: ResetStrategy, feedback: &str) -> RalphIteration {
+        RalphIteration {
+            iteration,
+            reset_strategy: strategy,
+            pge_passed: false,
+            feedback: feedback.to_string(),
+            snapshot: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn stagnation_detected_on_identical_repeated_failures() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 3,
+        });
+        for i in 1..=3 {
+            ralph.history.push(failed_iteration(
+                i,
+                ResetStrategy::Identical,
+                "Evaluator rejected: missing tests",
+            ));
+        }
+        assert!(ralph.is_stagnated());
+    }
+
+    #[test]
+    fn stagnation_ignores_whitespace_and_case_drift() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 2,
+        });
+        ralph.history.push(failed_iteration(
+            1,
+            ResetStrategy::Identical,
+            "Missing  Tests",
+        ));
+        ralph.history.push(failed_iteration(
+            2,
+            ResetStrategy::Identical,
+            "missing tests",
+        ));
+        assert!(ralph.is_stagnated());
+    }
+
+    #[test]
+    fn no_stagnation_when_feedback_varies() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 2,
+        });
+        ralph.history.push(failed_iteration(
+            1,
+            ResetStrategy::Identical,
+            "missing tests",
+        ));
+        ralph.history.push(failed_iteration(
+            2,
+            ResetStrategy::Identical,
+            "wrong return type",
+        ));
+        assert!(!ralph.is_stagnated());
+    }
+
+    #[test]
+    fn no_stagnation_when_strategy_changes() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 2,
+        });
+        ralph.history.push(failed_iteration(
+            1,
+            ResetStrategy::Identical,
+            "missing tests",
+        ));
+        ralph.history.push(failed_iteration(
+            2,
+            ResetStrategy::Modified,
+            "missing tests",
+        ));
+        assert!(!ralph.is_stagnated());
+    }
+
+    #[test]
+    fn stagnation_window_zero_disables_detection() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 0,
+        });
+        for i in 1..=5 {
+            ralph
+                .history
+                .push(failed_iteration(i, ResetStrategy::Identical, "same"));
+        }
+        assert!(!ralph.is_stagnated());
+    }
+
+    #[test]
+    fn stagnation_needs_full_window() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 5,
+        });
+        for i in 1..=4 {
+            ralph
+                .history
+                .push(failed_iteration(i, ResetStrategy::Identical, "same"));
+        }
+        assert!(!ralph.is_stagnated());
     }
 
     // -----------------------------------------------------------------
@@ -1240,8 +1426,11 @@ mod tests {
         let generator = GeneratorActor::new(Arc::new(pass_generator()));
 
         // First run: one failing iteration, history persisted on the board.
-        let mut first = RalphLoop::with_config(RalphLoopConfig { safety_limit: 1 })
-            .with_history_store("task-1".into(), backend.clone());
+        let mut first = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 1,
+            ..Default::default()
+        })
+        .with_history_store("task-1".into(), backend.clone());
         let verdict = first
             .run_pipeline(
                 "goal",
@@ -1259,8 +1448,11 @@ mod tests {
         assert_eq!(history.len(), 1);
 
         // Restart: a fresh loop on the same task resumes from persisted history.
-        let mut second = RalphLoop::with_config(RalphLoopConfig { safety_limit: 2 })
-            .with_history_store("task-1".into(), backend.clone());
+        let mut second = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 2,
+            ..Default::default()
+        })
+        .with_history_store("task-1".into(), backend.clone());
         let verdict = second
             .run_pipeline(
                 "goal",
@@ -1293,7 +1485,10 @@ mod tests {
 
     #[tokio::test]
     async fn ralph_without_history_store_runs_in_memory_only() {
-        let mut ralph = RalphLoop::with_config(RalphLoopConfig { safety_limit: 1 });
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 1,
+            ..Default::default()
+        });
         let pipeline = PgePipeline::new(PgePipelineConfig {
             max_retries: 1,
             timeout_ms: 5_000,

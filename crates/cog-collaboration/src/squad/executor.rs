@@ -115,6 +115,8 @@ pub struct SquadExecutor {
     skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     /// State backend — 持久化 RalphLoop 迭代历史（ContextBoard 载体），重启后可续跑。
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// Ralph Loop 预算与停滞窗口（来自配置面 `ralph` 段，默认见 RalphLoopConfig）。
+    ralph: RalphLoopConfig,
 }
 
 /// Optional service dependencies shared by squad execution stages.
@@ -130,6 +132,7 @@ pub(crate) struct SquadDeps {
     pub pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
     pub skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     pub state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    pub ralph: RalphLoopConfig,
 }
 
 impl SquadExecutor {
@@ -218,6 +221,13 @@ impl SquadExecutor {
         self
     }
 
+    /// Override Ralph Loop budget/stagnation knobs (from the `ralph` config
+    /// section). Unset = `RalphLoopConfig::default()`.
+    pub fn with_ralph_config(mut self, config: RalphLoopConfig) -> Self {
+        self.ralph = config;
+        self
+    }
+
     /// 直接执行一个 Squad，返回执行结果。
     pub async fn execute_squad(&self, task_id: String, config: SquadConfig) -> SquadResult {
         let squad_id = format!("squad:{}", task_id);
@@ -272,6 +282,7 @@ impl SquadExecutor {
             pge_schemas: self.pge_schemas.clone(),
             skill_registry: self.skill_registry.clone(),
             state_backend: self.state_backend.clone(),
+            ralph: self.ralph,
         };
         let result = Self::run_squad_with_retries(squad, deps).await;
         let squad_latency_ms = squad_start.elapsed().as_millis() as u64;
@@ -555,18 +566,20 @@ impl SquadExecutor {
     }
 
     /// 运行单个 Squad。
-    /// Ralph Loop 内部已有 safety_limit: 1000 次迭代，Squad 层不再做无意义重试。
+    /// Ralph Loop 由配置面的迭代预算与停滞窗口止损（默认 50 轮/5 轮停滞窗），
+    /// Squad 层不再做无意义重试。
     /// 只做一次策略升级：Pipeline 失败后自动切换到 Roundtable，再试一次。
     async fn run_squad_with_retries(mut squad: Squad, deps: SquadDeps) -> SquadResult {
         let hook_engine = &deps.hook_engine;
         let object_backend = &deps.object_backend;
         let squad_reflection = &deps.squad_reflection;
         let mut ralph = RalphLoop::with_config(RalphLoopConfig {
-            safety_limit: if squad.config.is_self_evolution {
+            max_iterations: if squad.config.is_self_evolution {
                 2
             } else {
-                1_000
+                deps.ralph.max_iterations
             },
+            stagnation_window: deps.ralph.stagnation_window,
         });
         if let Some(ref llm) = deps.llm_provider {
             ralph = ralph.with_llm_provider(llm.clone());

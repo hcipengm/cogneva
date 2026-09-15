@@ -24,6 +24,9 @@ pub struct CollaborationObservable {
     agent_message_count: AtomicU64,
     agent_turnaround_ms: Arc<Mutex<HashMap<String, Vec<u64>>>>,
     round_count: AtomicU64,
+    /// Ralph Loop 终止计数，按终止原因分类（stagnated / budget_exhausted）。
+    /// 不收敛链被有界止损是核心健康信号，必须可观测。
+    ralph_terminations: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -46,6 +49,12 @@ impl CollaborationObservable {
 
     pub fn record_round(&self) {
         self.round_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_ralph_termination(&self, reason: &str) {
+        if let Ok(mut map) = self.ralph_terminations.try_lock() {
+            *map.entry(reason.to_string()).or_insert(0) += 1;
+        }
     }
 }
 
@@ -71,6 +80,13 @@ impl Observable for CollaborationObservable {
                             .with_label("agent_id", agent_id),
                     );
                 }
+            }
+            let terminations = self.ralph_terminations.lock().await;
+            for (reason, count) in terminations.iter() {
+                metrics.push(
+                    RawMetric::new("ralph_terminations_total", *count as f64)
+                        .with_label("reason", reason),
+                );
             }
         }
         Ok(metrics)
