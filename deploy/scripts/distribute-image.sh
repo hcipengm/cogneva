@@ -12,15 +12,18 @@ TAR="${1:?用法: distribute-image.sh <image.tar.gz>}"
 NS=cogneva
 
 echo "==> 注入新镜像包到分发服务 Pod"
-# 镜像服务是裸 Pod（无控制器），被删后不会自动重建，这里先检查并给出恢复路径
-kubectl -n "$NS" get pod cogneva-image-server >/dev/null 2>&1 || {
-    echo "错误: 镜像服务 Pod cogneva-image-server 不存在。"
-    echo "恢复: 重跑 bootstrap，或从 deploy/k8s/image-distributor.yaml 提取镜像服务段、"
-    echo "      把 __BUSYBOX_IMAGE__ 替换为可用 busybox 镜像后 kubectl apply。"
+# 镜像服务是 Deployment（裸 Pod 被驱逐后无控制器重建，2026-09-14 实证导致
+# 分发器永久 CrashLoop）；按 label 解析当前 Pod 名再 cp
+kubectl -n "$NS" get deployment cogneva-image-server >/dev/null 2>&1 || {
+    echo "错误: 镜像服务 Deployment cogneva-image-server 不存在。"
+    echo "恢复: 重跑 bootstrap，或把 deploy/k8s/image-distributor.yaml 里的"
+    echo "      __BUSYBOX_IMAGE__ 替换为可用 busybox 镜像后 kubectl apply。"
     exit 1
 }
-kubectl -n "$NS" wait --for=condition=Ready pod/cogneva-image-server --timeout=600s
-kubectl -n "$NS" cp "$TAR" cogneva-image-server:/share/image.tar.gz
+kubectl -n "$NS" wait --for=condition=Available deployment/cogneva-image-server --timeout=600s
+SERVER_POD=$(kubectl -n "$NS" get pod -l app=cogneva-image-server -o jsonpath='{.items[0].metadata.name}')
+[ -n "$SERVER_POD" ] || { echo "错误: 找不到镜像服务 Pod"; exit 1; }
+kubectl -n "$NS" cp "$TAR" "$SERVER_POD":/share/image.tar.gz
 
 echo "==> 触发全节点重新导入"
 kubectl -n "$NS" rollout restart daemonset/cogneva-image-distributor
