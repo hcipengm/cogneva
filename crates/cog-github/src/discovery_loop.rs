@@ -1808,7 +1808,7 @@ mod tests {
         // Wrapped decompose failure as surfaced to the discovery loop.
         let env = "provider error: Agent execution error: Decomposition failed: \
                    terminal_env_failure: generator produced no artifacts \
-                   (environment/protocol failure) — LLM connection required";
+                   (environment/protocol failure)";
         assert!(is_terminal_upstream_failure(env));
         assert!(is_terminal_upstream_failure("HTTP 429: quota exceeded"));
         assert!(is_terminal_upstream_failure(

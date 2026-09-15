@@ -484,10 +484,7 @@ impl ActionPlanOrchestrator {
                 }
                 Err(e) => {
                     tracing::warn!("TaskExecutor decomposition failed: {}", e);
-                    return Err(SFError::Agent(format!(
-                        "Decomposition failed: {} — LLM connection required",
-                        e
-                    )));
+                    return Err(SFError::Agent(format!("Decomposition failed: {}", e)));
                 }
             }
         } else {
