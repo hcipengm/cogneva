@@ -277,3 +277,125 @@ where
         UserContentRepr::Text(text) => Ok(vec![ContentBlock::text(text)]),
     }
 }
+
+/// Counters describing what [`enforce_tool_chain_validity`] repaired.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChainRepair {
+    /// Assistant messages that had at least one unanswered tool call stripped.
+    pub stripped_assistants: usize,
+    /// Tool result messages dropped because no assistant declared the call.
+    pub dropped_tool_results: usize,
+}
+
+impl ChainRepair {
+    pub fn is_clean(&self) -> bool {
+        self.stripped_assistants == 0 && self.dropped_tool_results == 0
+    }
+}
+
+/// Drop tool result messages whose declaring assistant is no longer in the
+/// list. Unlike [`enforce_tool_chain_validity`] this never touches assistant
+/// messages: a tool call whose result has not arrived *yet* is normal for a
+/// live conversation (the result is appended on the next turn), so only
+/// results that can never be answered — their declaring assistant is gone,
+/// e.g. removed by context trimming — are dropped.
+pub fn drop_orphan_tool_results(messages: &[Message]) -> (Vec<Message>, usize) {
+    use std::collections::HashSet;
+
+    let declared: HashSet<String> = messages
+        .iter()
+        .flat_map(|m| m.tool_calls())
+        .map(|c| c.id)
+        .collect();
+    let mut dropped = 0usize;
+    let out = messages
+        .iter()
+        .filter(|m| match m {
+            Message::ToolResult { tool_call_id, .. } if !declared.contains(tool_call_id) => {
+                dropped += 1;
+                false
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    (out, dropped)
+}
+
+/// Enforce the tool-call chain invariant that strict providers (Kimi, OpenAI,
+/// ark) reject with a 400: every assistant tool call must be answered by a
+/// following tool result, and every tool result must reference a tool call a
+/// prior assistant declared.
+///
+/// Context trimming and snapshot restore can both break this invariant; any
+/// code path that hands a message list to a strict provider must run it
+/// through this function first. Unanswered tool calls are stripped from the
+/// assistant (a placeholder text block keeps the message non-empty), orphan
+/// tool results are dropped.
+pub fn enforce_tool_chain_validity(messages: &[Message]) -> (Vec<Message>, ChainRepair) {
+    use std::collections::HashSet;
+
+    let declared: HashSet<String> = messages
+        .iter()
+        .flat_map(|m| m.tool_calls())
+        .map(|c| c.id)
+        .collect();
+    let answered: HashSet<String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut repair = ChainRepair::default();
+    let mut out = Vec::with_capacity(messages.len());
+    for msg in messages {
+        match msg {
+            Message::ToolResult { tool_call_id, .. } if !declared.contains(tool_call_id) => {
+                repair.dropped_tool_results += 1;
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+                usage,
+                timestamp,
+            } => {
+                let kept: Vec<ContentBlock> = content
+                    .iter()
+                    .filter(|b| match b {
+                        ContentBlock::ToolCall { id, .. } => answered.contains(id),
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect();
+                if kept.len() == content.len() {
+                    out.push(msg.clone());
+                    continue;
+                }
+                repair.stripped_assistants += 1;
+                let mut kept = kept;
+                if kept.is_empty() {
+                    kept.push(ContentBlock::text(
+                        "(tool calls elided: results unavailable)",
+                    ));
+                }
+                let kept_legacy = tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .filter(|c| answered.contains(&c.id))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+                out.push(Message::Assistant {
+                    content: kept,
+                    tool_calls: kept_legacy,
+                    usage: usage.clone(),
+                    timestamp: *timestamp,
+                });
+            }
+            _ => out.push(msg.clone()),
+        }
+    }
+    (out, repair)
+}

@@ -1519,10 +1519,18 @@ async fn stream_forward(
                 .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
             let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
+            // 请求形态错误（400/404/422：坏消息链、不支持的参数、端点不存在）
+            // 是调用侧问题，不是上游健康问题：同一条请求换到任何兼容上游都会
+            // 被拒，把它记进嫌疑窗会让一条坏请求依次毒化全池（2026-09-15
+            // 实证：planner 孤儿 tool_calls 链把 kimi 与 ark 先后打进嫌疑窗，
+            // 池全灭 503）。仍故障转移（上游间能力确有差异，如多模态支持），
+            // 但只记独立计数指标，不动健康表。
+            let request_shape_error = matches!(status.as_u16(), 400 | 404 | 422);
             tracing::warn!(
                 upstream = %base,
                 status = %status,
                 quota_reset_unix = quota_reset.unwrap_or(0),
+                request_shape_error,
                 body = %error_excerpt(&text),
                 "LLM 上游首字节前返回非 2xx，切换池内下一个"
             );
@@ -1533,7 +1541,16 @@ async fn stream_forward(
                 start.elapsed().as_millis() as u64,
             )
             .await;
-            mark_upstream_failure(&state, upstream, base, quota_reset).await;
+            if request_shape_error {
+                record_counter(
+                    &state,
+                    "llm_upstream_client_errors_total",
+                    &[("upstream", &LlmHealthTable::key(upstream))],
+                )
+                .await;
+            } else {
+                mark_upstream_failure(&state, upstream, base, quota_reset).await;
+            }
             last_err = format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text));
             last_failure = Some((status, ctype, text));
             continue;

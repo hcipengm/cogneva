@@ -244,11 +244,23 @@ impl OpenAIProvider {
 
     fn build_request_body(&self, messages: &[Message], options: &ChatOptions) -> serde_json::Value {
         let compat = compat_from_options(options, &self.model.base_url);
+        // Wire-validity guard at the protocol edge: context trimming or
+        // snapshot restore can leave orphan tool calls/results that strict
+        // providers reject with a 400; repair here and warn so the producing
+        // bug stays visible in logs.
+        let (messages, repair) = cog_core::enforce_tool_chain_validity(messages);
+        if !repair.is_clean() {
+            tracing::warn!(
+                stripped_assistants = repair.stripped_assistants,
+                dropped_tool_results = repair.dropped_tool_results,
+                "outgoing LLM request had orphan tool calls/results; repaired at protocol edge"
+            );
+        }
 
         let mut msgs: Vec<serde_json::Value> = Vec::new();
         let mut prev_was_tool_result = false;
 
-        for msg in messages {
+        for msg in &messages {
             // If previous message was a tool result and this is a user/system message,
             // some providers require an assistant message in between.
             if compat.requires_assistant_after_tool_result
@@ -1423,13 +1435,15 @@ mod tests {
         assert_eq!(parse_tool_arguments("not json"), json!({}));
 
         // Wire serialization must always emit an object, never a bare string.
+        // The tool result keeps the chain valid so the edge guard retains c1.
         let bad = Message::assistant(vec![ContentBlock::tool_call(
             "c1",
             "run_command",
             serde_json::Value::String("{\"a\":1}{\"b\":2}".into()),
         )]);
+        let ok = Message::tool_result_text("c1", "run_command", "done");
         let provider = OpenAIProvider::new(test_model(), "key");
-        let body = provider.build_request_body(&[bad], &ChatOptions::default());
+        let body = provider.build_request_body(&[bad, ok], &ChatOptions::default());
         let args = &body["messages"][0]["tool_calls"][0]["function"]["arguments"];
         let parsed: serde_json::Value = serde_json::from_str(args.as_str().unwrap()).unwrap();
         assert_eq!(parsed, json!({"a": 1}));
@@ -1515,5 +1529,65 @@ mod tests {
         assert_eq!(calls[0].2, json!({"command": "ls"}));
         assert_eq!(calls[1].0, "call_1");
         assert_eq!(calls[1].2, json!({"command": "pwd"}));
+    }
+
+    #[test]
+    fn chain_validity_strips_unanswered_tool_calls() {
+        let messages = vec![
+            Message::user("do it"),
+            Message::assistant(vec![
+                ContentBlock::text("checking"),
+                ContentBlock::tool_call("run_command:0", "run_command", json!({"command": "ls"})),
+                ContentBlock::tool_call("run_command:1", "run_command", json!({"command": "pwd"})),
+            ]),
+        ];
+        let (out, repair) = cog_core::enforce_tool_chain_validity(&messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(repair.stripped_assistants, 1);
+        assert!(
+            out[1].tool_calls().is_empty(),
+            "unanswered tool_calls must be stripped before sending"
+        );
+        assert!(out[1].content().contains("checking"));
+    }
+
+    #[test]
+    fn chain_validity_drops_orphan_tool_results() {
+        let messages = vec![
+            Message::user("do it"),
+            Message::tool_result_text("ghost:0", "run_command", "ok"),
+            Message::assistant(vec![ContentBlock::tool_call(
+                "run_command:0",
+                "run_command",
+                json!({"command": "ls"}),
+            )]),
+            Message::tool_result_text("run_command:0", "run_command", "done"),
+        ];
+        let (out, repair) = cog_core::enforce_tool_chain_validity(&messages);
+        assert_eq!(repair.dropped_tool_results, 1);
+        assert_eq!(
+            out.len(),
+            3,
+            "orphan result dropped, valid pair kept: {out:?}"
+        );
+        assert!(matches!(out[2], Message::ToolResult { .. }));
+    }
+
+    #[test]
+    fn chain_validity_keeps_valid_chain_untouched() {
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("do it"),
+            Message::assistant(vec![ContentBlock::tool_call(
+                "a:0",
+                "run_command",
+                json!({"command": "ls"}),
+            )]),
+            Message::tool_result_text("a:0", "run_command", "ok"),
+            Message::assistant_text("final answer"),
+        ];
+        let (out, repair) = cog_core::enforce_tool_chain_validity(&messages);
+        assert!(repair.is_clean());
+        assert_eq!(out, messages);
     }
 }

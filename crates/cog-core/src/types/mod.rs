@@ -19,7 +19,10 @@ pub use event::{
     AgentEvent, AssistantMessageEvent, ErrorSeverity, StopReason, StreamEvent, TaskEvent,
 };
 pub use inbox::InboxMessage;
-pub use message::{BroadcastScope, Cost, Message, TokenUsage, ToolCall, ToolDefinition};
+pub use message::{
+    drop_orphan_tool_results, enforce_tool_chain_validity, BroadcastScope, ChainRepair, Cost,
+    Message, TokenUsage, ToolCall, ToolDefinition,
+};
 pub use self_review::{SelfReviewConfig, SelfReviewRecord, SelfReviewResult};
 pub use task::{
     ActionPlannerMeta, ActionPlannerSource, DagMessage, GoalMessage, GoalSource, Task, TaskDAG,

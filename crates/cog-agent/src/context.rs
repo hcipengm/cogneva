@@ -63,7 +63,10 @@ impl ContextWindow {
         while self.current_tokens > self.max_tokens && self.messages.len() > 2 {
             // 保留 system message 与首条 user（任务输入）：丢掉首条 user 后，
             // 后续轮次会变成 assistant/tool 起头的无目标对话，模型答非所问。
-            // 也不拆掉 assistant(tool_calls) 与其紧随的 tool result 配对。
+            // 删除单位是「轮次组」：assistant(tool_calls) 与其紧随的 tool result
+            // 必须同进同出——只删 result 会留下声明了 tool_calls 却无响应的
+            // assistant，严格校验的供应商（Kimi/OpenAI）直接 400 拒绝整条请求，
+            // 网关侧还会把这条 400 误记成上游故障。
             let mut first_user_seen = false;
             let remove_idx = self.messages.iter().position(|m| match m {
                 Message::System { .. } => false,
@@ -78,65 +81,36 @@ impl ContextWindow {
                 _ => true,
             });
 
-            let Some(mut idx) = remove_idx else { break };
-            if let Message::Assistant { .. } = self.messages[idx] {
-                if self
+            let Some(idx) = remove_idx else { break };
+            let mut end = idx + 1;
+            if matches!(self.messages[idx], Message::Assistant { .. }) {
+                while self
                     .messages
-                    .get(idx + 1)
+                    .get(end)
                     .is_some_and(|m| matches!(m, Message::ToolResult { .. }))
                 {
-                    // 改删它后面的 tool result；扫描下一个可删位置
-                    let mut candidate = idx + 1;
-                    loop {
-                        let removable = self.messages.get(candidate).is_some_and(|m| {
-                            !matches!(m, Message::System { .. }) && {
-                                let is_first_user = matches!(m, Message::User { .. })
-                                    && self.messages[..candidate]
-                                        .iter()
-                                        .all(|x| !matches!(x, Message::User { .. }));
-                                !is_first_user
-                            }
-                        });
-                        if removable {
-                            idx = candidate;
-                            break;
-                        }
-                        if self.messages.get(candidate).is_none() {
-                            break;
-                        }
-                        candidate += 1;
-                    }
-                    if self.messages.get(idx).is_none() {
-                        break;
-                    }
+                    end += 1;
                 }
             }
-            let removed = self.messages.remove(idx);
-            self.current_tokens = self
-                .current_tokens
-                .saturating_sub(estimate_tokens(&removed.content()));
+            let mut freed = 0usize;
+            for m in self.messages.drain(idx..end) {
+                freed += estimate_tokens(&m.content());
+            }
+            self.current_tokens = self.current_tokens.saturating_sub(freed);
         }
         // 裁剪可能把 assistant 删掉却留下它的 tool result；严格校验的供应商
-        // （Kimi/OpenAI）会拒绝找不到对应 tool_calls 声明的 tool 消息。
-        // 把失去上下文的头部 tool result 一并摘掉。
-        while self.messages.len() > 1 {
-            let orphan = self
-                .messages
-                .iter()
-                .position(|m| !matches!(m, Message::System { .. }))
-                .is_some_and(|idx| matches!(self.messages[idx], Message::ToolResult { .. }));
-            if !orphan {
-                break;
-            }
-            let idx = self
-                .messages
-                .iter()
-                .position(|m| !matches!(m, Message::System { .. }))
-                .unwrap();
-            let removed = self.messages.remove(idx);
+        // （Kimi/OpenAI）会拒绝找不到对应 tool_calls 声明的 tool 消息。孤儿
+        // 可能出现在头部之外（预算在 len<=2 时停止裁剪），所以扫整条链。
+        // 反过来不剥「尚未应答」的 tool_call：结果是下一轮才追加的，这里剥离
+        // 会把正常进行中的调用也删掉——那一步只在协议边缘做。
+        let (repaired, dropped) = cog_core::drop_orphan_tool_results(&self.messages);
+        if dropped > 0 {
+            self.messages = repaired;
             self.current_tokens = self
-                .current_tokens
-                .saturating_sub(estimate_tokens(&removed.content()));
+                .messages
+                .iter()
+                .map(|m| estimate_tokens(&m.content()))
+                .sum();
         }
     }
 }
@@ -246,5 +220,68 @@ mod tests {
             !matches!(msgs.first(), Some(Message::ToolResult { .. })),
             "head must never be an orphaned tool result"
         );
+    }
+
+    /// 生产事故回归（2026-09-15）：planner 的 run_command 输出顶爆预算时，
+    /// 旧裁剪只删 tool result、留下声明了 tool_calls 的 assistant，Kimi/ark
+    /// 对这条孤儿链直接 400，网关再把 400 误记为上游故障导致全池熔断。
+    /// 裁剪必须以「assistant + 其全部 tool result」为最小删除单位。
+    #[test]
+    fn trim_over_budget_never_leaves_assistant_tool_calls_unanswered() {
+        let mut ctx = ContextWindow::new(120);
+        ctx.add_message(Message::user("原始任务输入 原始任务输入 原始任务输入"));
+        ctx.add_message(Message::assistant(vec![
+            cog_core::ContentBlock::tool_call(
+                "run_command:0",
+                "run_command",
+                serde_json::json!({"command": "cargo build"}),
+            ),
+            cog_core::ContentBlock::tool_call(
+                "run_command:1",
+                "run_command",
+                serde_json::json!({"command": "cargo test"}),
+            ),
+        ]));
+        // 两条大输出，逐条 add 时各自触发 trim
+        let big_a = "构建日志 输出很多 ".repeat(40);
+        let big_b = "测试日志 输出很多 ".repeat(40);
+        ctx.add_message(Message::tool_result_text(
+            "run_command:0",
+            "run_command",
+            &big_a,
+        ));
+        ctx.add_message(Message::tool_result_text(
+            "run_command:1",
+            "run_command",
+            &big_b,
+        ));
+
+        let msgs = ctx.messages();
+        for (i, m) in msgs.iter().enumerate() {
+            // 每个被保留的 assistant tool_call 都必须在紧随其后的
+            // ToolResult 里有响应
+            for call in m.tool_calls() {
+                let answered = msgs[i + 1..]
+                    .iter()
+                    .take_while(|n| matches!(n, Message::ToolResult { .. }))
+                    .any(|n| matches!(n, Message::ToolResult { tool_call_id, .. } if *tool_call_id == call.id));
+                assert!(
+                    answered,
+                    "assistant tool_call {} survived trim without its result: {:?}",
+                    call.id,
+                    msgs.iter().map(|m| m.role()).collect::<Vec<_>>()
+                );
+            }
+            // 每个被保留的 ToolResult 都必须有在前 assistant 声明过
+            if let Message::ToolResult { tool_call_id, .. } = m {
+                let declared = msgs[..i]
+                    .iter()
+                    .any(|p| p.tool_calls().iter().any(|c| &c.id == tool_call_id));
+                assert!(
+                    declared,
+                    "tool result {tool_call_id} has no declaring assistant"
+                );
+            }
+        }
     }
 }
