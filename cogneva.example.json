@@ -378,8 +378,21 @@
           },
           "severity": "warning",
           "summary": "cogneva pod restarting more than 5 times in 15m ({value})"
+        },
+        {
+          "name": "pod_oom_killed",
+          "promql": "kube_pod_container_status_last_terminated_reason{namespace=\"cogneva\", reason=\"OOMKilled\"}",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "critical",
+          "summary": "cogneva workload container last exit was OOMKilled; memory footprint exceeds its limit"
         }
       ]
+    },
+    "trace_collector": {
+      "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。",
+      "buffer_max_bytes": 16777216
     }
   },
   "self_review": {

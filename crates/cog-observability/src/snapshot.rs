@@ -174,16 +174,40 @@ impl TraceCollector {
 
     /// Spawn a background task that subscribes to a broadcast [`AgentEvent`] stream
     /// and automatically collects per-agent execution traces.
-    /// Traces are buffered in memory per `agent_id`. When an [`AgentEvent::AgentEnd`]
-    /// is observed the buffer is flushed to the configured [`cog_core::TraceStore`].
+    ///
+    /// Events buffer in memory per `agent_id` and flush on [`AgentEvent::AgentEnd`].
+    /// Squad agents can run for hours across dozens of iterations, so the buffer
+    /// is bounded by `buffer_max_bytes`: on overflow the buffered events flush as
+    /// a partial trace chunk (`{agent_id}-{run_id}-part{n}`) and buffering resumes.
+    /// Without the bound a single long run accumulates an unbounded in-memory
+    /// trace (observed 80 MiB for one planner) and OOM-kills the host process.
+    /// `buffer_max_bytes == 0` disables chunking.
     /// The task stops when the broadcast channel closes or `shutdown` fires.
     pub fn spawn_collection_task(
         self: Arc<Self>,
         mut event_rx: tokio::sync::broadcast::Receiver<AgentEvent>,
         shutdown: cog_core::ShutdownSignal,
+        buffer_max_bytes: usize,
     ) -> tokio::task::JoinHandle<()> {
+        struct AgentBuffer {
+            events: Vec<AgentEvent>,
+            bytes: usize,
+            /// Stable per run so all chunks of one run share the id prefix.
+            run_id: String,
+            /// How many partial chunks have been flushed for this run.
+            flushed: u32,
+        }
+
+        fn event_size(event: &AgentEvent) -> usize {
+            // Serialized length is the honest size measure: the same bytes are
+            // what would sit in the buffer. Events arrive at LLM-call pace, so
+            // the extra serialization is negligible against the flush-time
+            // serialization that happens anyway.
+            serde_json::to_vec(event).map(|v| v.len()).unwrap_or(0)
+        }
+
         tokio::spawn(async move {
-            let mut buffers: HashMap<String, Vec<AgentEvent>> = HashMap::new();
+            let mut buffers: HashMap<String, AgentBuffer> = HashMap::new();
             loop {
                 tokio::select! {
                     result = event_rx.recv() => {
@@ -191,13 +215,45 @@ impl TraceCollector {
                             Ok(event) => {
                                 let agent_id = match &event {
                                     AgentEvent::AgentStart { agent_id, .. } => {
-                                        buffers.insert(agent_id.clone(), vec![event.clone()]);
+                                        let bytes = event_size(&event);
+                                        buffers.insert(
+                                            agent_id.clone(),
+                                            AgentBuffer {
+                                                events: vec![event.clone()],
+                                                bytes,
+                                                run_id: uuid::Uuid::new_v4().to_string(),
+                                                flushed: 0,
+                                            },
+                                        );
                                         continue;
                                     }
                                     AgentEvent::AgentEnd { agent_id, .. } => {
-                                        let mut events = buffers.remove(agent_id).unwrap_or_default();
-                                        events.push(event.clone());
-                                        let trace_id = format!("{}-{}", agent_id, uuid::Uuid::new_v4());
+                                        let entry = buffers.remove(agent_id);
+                                        let (events, trace_id) = match entry {
+                                            Some(mut entry) => {
+                                                entry.events.push(event.clone());
+                                                let trace_id = if entry.flushed == 0 {
+                                                    format!("{}-{}", agent_id, entry.run_id)
+                                                } else {
+                                                    format!(
+                                                        "{}-{}-part{}",
+                                                        agent_id, entry.run_id, entry.flushed
+                                                    )
+                                                };
+                                                (entry.events, trace_id)
+                                            }
+                                            // AgentEnd without a seen AgentStart (collector
+                                            // joined mid-run): still persist the terminal
+                                            // event, as before chunking existed.
+                                            None => (
+                                                vec![event.clone()],
+                                                format!(
+                                                    "{}-{}",
+                                                    agent_id,
+                                                    uuid::Uuid::new_v4()
+                                                ),
+                                            ),
+                                        };
                                         if let Err(e) = self.collect(
                                             &trace_id,
                                             None,
@@ -233,8 +289,37 @@ impl TraceCollector {
                                     AgentEvent::ResourceAlert { agent_id, .. } => agent_id.clone(),
                                     AgentEvent::Heartbeat { agent_id, .. } => agent_id.clone(),
                                 };
-                                if let Some(buf) = buffers.get_mut(&agent_id) {
-                                    buf.push(event);
+                                if let Some(entry) = buffers.get_mut(&agent_id) {
+                                    let size = event_size(&event);
+                                    if buffer_max_bytes > 0
+                                        && entry.bytes + size > buffer_max_bytes
+                                        && !entry.events.is_empty()
+                                    {
+                                        let chunk = std::mem::take(&mut entry.events);
+                                        let trace_id = format!(
+                                            "{}-{}-part{}",
+                                            agent_id, entry.run_id, entry.flushed
+                                        );
+                                        entry.flushed += 1;
+                                        entry.bytes = 0;
+                                        tracing::info!(
+                                            agent_id = %agent_id,
+                                            part = entry.flushed,
+                                            buffer_max_bytes,
+                                            "trace buffer budget reached; flushed partial trace chunk"
+                                        );
+                                        if let Err(e) = self.collect(
+                                            &trace_id,
+                                            None,
+                                            None,
+                                            Some(agent_id.clone()),
+                                            chunk,
+                                        ).await {
+                                            tracing::warn!("Trace chunk collection failed: {}", e);
+                                        }
+                                    }
+                                    entry.bytes += size;
+                                    entry.events.push(event);
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -572,5 +657,156 @@ impl TraceTierMigrator {
         );
 
         Ok(stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemTraceStore {
+        saved: Mutex<Vec<cog_core::AgentTrace>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::TraceStore for MemTraceStore {
+        async fn save(&self, trace: &cog_core::AgentTrace) -> cog_core::SFResult<String> {
+            self.saved.lock().unwrap().push(trace.clone());
+            Ok(trace.trace_id.clone())
+        }
+        async fn load(&self, trace_id: &str) -> cog_core::SFResult<Option<cog_core::AgentTrace>> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.trace_id == trace_id)
+                .cloned())
+        }
+        async fn delete(&self, trace_id: &str) -> cog_core::SFResult<()> {
+            self.saved
+                .lock()
+                .unwrap()
+                .retain(|t| t.trace_id != trace_id);
+            Ok(())
+        }
+        async fn list(&self, limit: usize) -> cog_core::SFResult<Vec<cog_core::AgentTrace>> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        async fn list_meta(&self, limit: usize) -> cog_core::SFResult<Vec<cog_core::TraceMeta>> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .take(limit)
+                .map(cog_core::TraceMeta::from_trace)
+                .collect())
+        }
+    }
+
+    fn heartbeat(agent_id: &str) -> AgentEvent {
+        AgentEvent::Heartbeat {
+            agent_id: agent_id.to_string(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn agent_start(agent_id: &str) -> AgentEvent {
+        AgentEvent::AgentStart {
+            agent_id: agent_id.to_string(),
+            crew_id: None,
+            squad_id: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn agent_end(agent_id: &str) -> AgentEvent {
+        AgentEvent::AgentEnd {
+            agent_id: agent_id.to_string(),
+            messages: Vec::new(),
+            crew_id: None,
+            squad_id: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// A run whose events exceed the byte budget must flush bounded partial
+    /// chunks instead of accumulating one unbounded in-memory trace, and the
+    /// final chunk on AgentEnd carries the part suffix so all pieces share
+    /// the run id prefix.
+    #[tokio::test]
+    async fn buffer_budget_overflow_flushes_partial_chunks() {
+        let store = Arc::new(MemTraceStore::default());
+        let collector = Arc::new(TraceCollector {
+            trace_store: store.clone(),
+        });
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        let shutdown = cog_core::ShutdownSignal::new();
+        let handle = collector
+            .clone()
+            .spawn_collection_task(rx, shutdown.clone(), 2048);
+
+        let agent = "agent-x";
+        tx.send(agent_start(agent)).unwrap();
+        for _ in 0..60 {
+            tx.send(heartbeat(agent)).unwrap();
+        }
+        tx.send(agent_end(agent)).unwrap();
+
+        // Let the collector drain the channel before shutdown.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        shutdown.trigger();
+        let _ = handle.await;
+
+        let saved = store.saved.lock().unwrap();
+        assert!(
+            saved.len() > 1,
+            "expected multiple chunks, got {}",
+            saved.len()
+        );
+        let prefix = format!("{agent}-");
+        assert!(saved.iter().all(|t| t.trace_id.starts_with(&prefix)));
+        assert!(saved.iter().any(|t| t.trace_id.contains("-part")));
+        let total_events: u64 = saved.iter().map(|t| t.event_count).sum();
+        assert_eq!(total_events, 62, "no event may be lost across chunks");
+    }
+
+    /// A run within budget keeps the legacy single-trace id shape (no part
+    /// suffix), so existing trace consumers see no change.
+    #[tokio::test]
+    async fn run_within_budget_keeps_single_trace_id() {
+        let store = Arc::new(MemTraceStore::default());
+        let collector = Arc::new(TraceCollector {
+            trace_store: store.clone(),
+        });
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        let shutdown = cog_core::ShutdownSignal::new();
+        let handle = collector
+            .clone()
+            .spawn_collection_task(rx, shutdown.clone(), 1 << 20);
+
+        let agent = "agent-y";
+        tx.send(agent_start(agent)).unwrap();
+        tx.send(heartbeat(agent)).unwrap();
+        tx.send(agent_end(agent)).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        shutdown.trigger();
+        let _ = handle.await;
+
+        let saved = store.saved.lock().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(!saved[0].trace_id.contains("-part"));
+        assert_eq!(saved[0].event_count, 3);
     }
 }

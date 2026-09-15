@@ -18,6 +18,9 @@ pub struct ObservabilityPlugin {
     /// service is published before any plugin `start` runs (init_all
     /// completes before start_all; publishing in start would race consumers).
     alert_store: Option<Arc<PostgresAlertStore>>,
+    /// Per-agent trace buffer budget, read in `init` from config and applied
+    /// to the collection task in `start`.
+    trace_buffer_max_bytes: usize,
 }
 
 impl ObservabilityPlugin {
@@ -28,6 +31,7 @@ impl ObservabilityPlugin {
             trace_collector: None,
             trace_tier_migrator: None,
             alert_store: None,
+            trace_buffer_max_bytes: crate::config::TraceCollectorConfig::default().buffer_max_bytes,
         }
     }
 }
@@ -77,6 +81,8 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             .consume_service::<dyn cog_core::HttpClient>()
             .expect("http client")
             .clone();
+
+        self.trace_buffer_max_bytes = observability.trace_collector.buffer_max_bytes;
 
         // ── Subscriber (global) ──
         let log_level = std::env::var("RUST_LOG").unwrap_or(log_level);
@@ -301,6 +307,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     ctx.consume::<cog_core::ShutdownSignal>()
                         .map(|s| (*s).clone())
                         .unwrap_or_default(),
+                    self.trace_buffer_max_bytes,
                 );
             }
         }

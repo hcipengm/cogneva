@@ -374,39 +374,62 @@ data:
             {
               "name": "node_disk_usage_high",
               "promql": "100 - 100 * node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}",
-              "condition": {"greater_than": 75.0},
+              "condition": {
+                "greater_than": 75.0
+              },
               "severity": "warning",
               "summary": "node root filesystem usage above 75% (current {value}%)"
             },
             {
               "name": "node_disk_usage_critical",
               "promql": "100 - 100 * node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}",
-              "condition": {"greater_than": 85.0},
+              "condition": {
+                "greater_than": 85.0
+              },
               "severity": "critical",
               "summary": "node root filesystem usage above 85% (current {value}%); kubelet eviction starts soon"
             },
             {
               "name": "node_disk_pressure",
               "promql": "kube_node_status_condition{condition=\"DiskPressure\", status=\"true\"}",
-              "condition": {"greater_than": 0.0},
+              "condition": {
+                "greater_than": 0.0
+              },
               "severity": "critical",
               "summary": "kubelet reports DiskPressure; pods are being evicted"
             },
             {
               "name": "node_memory_pressure",
               "promql": "kube_node_status_condition{condition=\"MemoryPressure\", status=\"true\"}",
-              "condition": {"greater_than": 0.0},
+              "condition": {
+                "greater_than": 0.0
+              },
               "severity": "warning",
               "summary": "kubelet reports MemoryPressure"
             },
             {
               "name": "pod_restarting_fast",
               "promql": "increase(kube_pod_container_status_restarts_total{namespace=\"cogneva\"}[15m])",
-              "condition": {"greater_than": 5.0},
+              "condition": {
+                "greater_than": 5.0
+              },
               "severity": "warning",
               "summary": "cogneva pod restarting more than 5 times in 15m ({value})"
+            },
+            {
+              "name": "pod_oom_killed",
+              "promql": "kube_pod_container_status_last_terminated_reason{namespace=\"cogneva\", reason=\"OOMKilled\"}",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "critical",
+              "summary": "cogneva workload container last exit was OOMKilled; memory footprint exceeds its limit"
             }
           ]
+        },
+        "trace_collector": {
+          "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。",
+          "buffer_max_bytes": 16777216
         }
       },
       "self_review": {
@@ -472,7 +495,9 @@ data:
         "group": "cogneva-consumer",
         "retry_interval_secs": 5,
         "events_on_bus": true,
-        "nats_urls": ["nats-service:4222"],
+        "nats_urls": [
+          "nats-service:4222"
+        ],
         "publish_buffer_capacity": 256,
         "publish_retry_base_delay_ms": 1000,
         "events_stream_retention": "limits"

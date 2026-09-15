@@ -17,6 +17,30 @@ pub struct ObservabilityExportersConfig {
     pub alertmanager: AlertmanagerConfig,
     pub elasticsearch: ElasticsearchConfig,
     pub infra_watch: InfraWatchConfig,
+    pub trace_collector: TraceCollectorConfig,
+}
+
+/// Trace collector in-memory buffering policy. Squad agents can run for
+/// hours; without a byte budget the per-agent event buffer grows without
+/// bound and OOM-kills the host process (observed: one planner trace
+/// reached 80 MiB before persistence). The budget is deployment policy,
+/// not a code constant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceCollectorConfig {
+    /// Per-agent in-memory event buffer budget in bytes. On overflow the
+    /// buffered events are flushed as a partial trace chunk and buffering
+    /// resumes, so a long run yields several bounded chunks instead of one
+    /// unbounded trace. 0 disables chunking (not recommended).
+    pub buffer_max_bytes: usize,
+}
+
+impl Default for TraceCollectorConfig {
+    fn default() -> Self {
+        Self {
+            buffer_max_bytes: 16 * 1024 * 1024,
+        }
+    }
 }
 
 /// Infrastructure alert watcher: evaluates PromQL rules against a
@@ -217,6 +241,10 @@ const OBS_ENV: &[(&str, &str)] = &[
     (
         "COGNEVA_INFRA_WATCH_POLL_SECS",
         "infra_watch.poll_interval_secs",
+    ),
+    (
+        "COGNEVA_TRACE_BUFFER_MAX_BYTES",
+        "trace_collector.buffer_max_bytes",
     ),
 ];
 
