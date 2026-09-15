@@ -60,7 +60,7 @@ impl cog_core::SystemPlugin for GuardrailPlugin {
         info!("GuardrailPlugin guardrail published");
 
         // Observable publish (pin-style)
-        ctx.publish_service(crate::observable::global_observable());
+        ctx.publish_observable(crate::observable::global_observable());
         info!("GuardrailPlugin observable published");
 
         self.initialized = true;

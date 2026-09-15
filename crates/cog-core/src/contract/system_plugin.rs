@@ -119,6 +119,16 @@ impl PluginContext {
         self.publish(Arc::new(Service(service)));
     }
 
+    /// Publish an [`crate::Observable`] for metrics collection.
+    ///
+    /// The registry is keyed by static `TypeId`, so publishing a concrete
+    /// `Arc<MyObservable>` via [`Self::publish_service`] is invisible to
+    /// `consume_all_services::<dyn Observable>()`; always publish observables
+    /// through this method so the coercion happens at the call site.
+    pub fn publish_observable(&self, observable: Arc<dyn crate::Observable>) {
+        self.publish_service::<dyn crate::Observable>(observable);
+    }
+
     /// Consume a trait object published via [`Self::publish_service`].
     /// Returns `Arc<T>` directly for ergonomic use.
     pub fn consume_service<T: ?Sized + Send + Sync + 'static>(&self) -> Option<Arc<T>> {

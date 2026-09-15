@@ -295,7 +295,7 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         }
 
         // Observable publish (pin-style)
-        ctx.publish_service(crate::observable::global_observable());
+        ctx.publish_observable(crate::observable::global_observable());
         info!("MemoryPlugin observable published");
 
         self.initialized = true;

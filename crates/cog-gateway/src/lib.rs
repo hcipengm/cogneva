@@ -1117,6 +1117,20 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
         body.push_str(&prometheus_render::render_raw_metrics(&d8_metrics));
     }
 
+    // Self-observation: registry 按静态 TypeId 登记服务，某个 observable 若
+    // 以具体类型注册就对这里不可见，指标静默消失。暴露注册数量让告警面
+    // 能发现"指标缺席"本身，而不是等人工察觉。
+    if !body.is_empty() {
+        body.push_str(
+            "\n# HELP cogneva_observables_registered Observable services visible to the metrics endpoint\n\
+             # TYPE cogneva_observables_registered gauge\n",
+        );
+        body.push_str(&format!(
+            "cogneva_observables_registered {}\n",
+            state.observables.len()
+        ));
+    }
+
     if body.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, "metrics backend disabled").into_response();
     }

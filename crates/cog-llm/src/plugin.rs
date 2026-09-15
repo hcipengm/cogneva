@@ -55,7 +55,7 @@ impl cog_core::SystemPlugin for LlmPlugin {
         ctx.publish_service::<dyn cog_core::LlmClient>(hot_swap.clone());
 
         // Observable publish (pin-style)
-        ctx.publish_service(crate::observable::global_observable());
+        ctx.publish_observable(crate::observable::global_observable());
         info!("LlmPlugin observable published");
 
         self.initialized = true;

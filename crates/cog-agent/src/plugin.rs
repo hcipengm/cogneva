@@ -276,7 +276,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         info!("AgentPlugin agent pool published");
 
         // ── Observable publish (pin-style) ──
-        ctx.publish_service(crate::observable::global_observable());
+        ctx.publish_observable(crate::observable::global_observable());
         info!("AgentPlugin observable published");
 
         self.initialized = true;

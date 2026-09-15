@@ -242,12 +242,8 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         self.trace_tier_migrator = Some(trace_tier_migrator);
 
         // Observable publish (pin-style)
-        // 必须显式协变为 dyn Observable：publish_service 按静态类型 TypeId 注册，
-        // 直接传具体类型会让网关 consume_all_services::<dyn Observable>() 拿不到，
-        // D5 指标（接管台/events）永远为 0。
         let observable = crate::observable::global_observable();
-        let as_observable: Arc<dyn cog_core::Observable> = observable.clone();
-        ctx.publish_service(as_observable);
+        ctx.publish_observable(observable.clone());
         info!("ObservabilityPlugin observable published");
 
         // Evolution metrics service for self-evolution pipeline.

@@ -162,6 +162,10 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             ctx.consume_service::<dyn cog_core::EvalService>();
         let observables: Vec<Arc<dyn cog_core::Observable>> =
             ctx.consume_all_services::<dyn cog_core::Observable>();
+        info!(
+            count = observables.len(),
+            "Gateway consumed Observable services"
+        );
         let mcp_client: Option<Arc<dyn cog_core::McpClient>> =
             ctx.consume_service::<dyn cog_core::McpClient>();
         let external_skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
