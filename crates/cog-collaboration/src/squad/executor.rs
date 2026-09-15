@@ -811,17 +811,44 @@ impl SquadExecutor {
 }
 
 /// 从 RalphVerdict 构造 AgentSquadContribution 列表，供 SquadReflection 使用。
+///
+/// 评估结论必须回流为结构化 learnings/errors：只带 result 快照时，
+/// 反思层第一步（收集个体学习）恒为空，squad 永远产出 0 learnings。
+/// 判定非 Pass 时把评估反馈与评分细则转成 generator 的 Correction 学习；
+/// 整个 loop 被判不可修复时记一条 ErrorEntry，供复发匹配与模式检测消费。
 fn build_contributions_from_verdict(
     verdict: &RalphVerdict,
     squad_id: &str,
 ) -> Vec<cog_core::AgentSquadContribution> {
-    let snapshot = match verdict {
-        RalphVerdict::Passed { result, .. } => result.clone(),
-        RalphVerdict::Unrecoverable { history, .. } => history
-            .last()
-            .map(|h| h.snapshot.clone())
-            .unwrap_or(serde_json::Value::Null),
+    let (snapshot, unrecoverable_reason) = match verdict {
+        RalphVerdict::Passed { result, .. } => (result.clone(), None),
+        RalphVerdict::Unrecoverable {
+            reason, history, ..
+        } => (
+            history
+                .last()
+                .map(|h| h.snapshot.clone())
+                .unwrap_or(serde_json::Value::Null),
+            Some(reason.clone()),
+        ),
     };
+
+    let evaluation = extract_evaluation(&snapshot);
+    let learnings = evaluation
+        .as_ref()
+        .map(learnings_from_evaluation)
+        .unwrap_or_default();
+    let errors = unrecoverable_reason
+        .map(|reason| {
+            vec![cog_core::ErrorEntry::new(
+                cog_core::Priority::High,
+                "ralph loop judged the goal unrecoverable",
+                reason,
+                format!("squad:{squad_id}"),
+                "escalate to a human or reframe the goal",
+            )]
+        })
+        .unwrap_or_default();
 
     // Pipeline 快照在顶层包含 plan / generation / evaluation
     let has_pipeline_shape = snapshot.get("plan").is_some() || snapshot.get("final_plan").is_some();
@@ -832,7 +859,7 @@ fn build_contributions_from_verdict(
             .get("final_generation")
             .or(snapshot.get("generation"))
             .cloned();
-        let evaluation = snapshot
+        let evaluation_value = snapshot
             .get("final_evaluation")
             .or(snapshot.get("evaluation"))
             .cloned();
@@ -848,8 +875,8 @@ fn build_contributions_from_verdict(
             cog_core::AgentSquadContribution {
                 agent_id: format!("{}:generator", squad_id),
                 role: "generator".into(),
-                learnings: Vec::new(),
-                errors: Vec::new(),
+                learnings,
+                errors,
                 result: generation,
             },
             cog_core::AgentSquadContribution {
@@ -857,7 +884,7 @@ fn build_contributions_from_verdict(
                 role: "evaluator".into(),
                 learnings: Vec::new(),
                 errors: Vec::new(),
-                result: evaluation,
+                result: evaluation_value,
             },
         ]
     } else {
@@ -874,8 +901,8 @@ fn build_contributions_from_verdict(
             cog_core::AgentSquadContribution {
                 agent_id: format!("{}:generator", squad_id),
                 role: "generator".into(),
-                learnings: Vec::new(),
-                errors: Vec::new(),
+                learnings,
+                errors,
                 result: rt.clone(),
             },
             cog_core::AgentSquadContribution {
@@ -887,6 +914,58 @@ fn build_contributions_from_verdict(
             },
         ]
     }
+}
+
+/// 迭代快照与通过结果对评估结果的落点不同（`evaluation` / `final_evaluation`），
+/// 两个键都试。解析失败按无评估处理，不让反思因快照形状变化而 panic。
+fn extract_evaluation(
+    snapshot: &serde_json::Value,
+) -> Option<crate::squad::pge::types::EvaluationResult> {
+    let raw = snapshot
+        .get("final_evaluation")
+        .or_else(|| snapshot.get("evaluation"))?;
+    serde_json::from_value(raw.clone()).ok()
+}
+
+/// 非 Pass 判定 → 一条 Correction 学习：摘要取反馈，细节带全部评分细则，
+/// 让复发匹配能按内容聚合同类失败。Pass 没有需要纠正的东西，不产出学习。
+fn learnings_from_evaluation(
+    evaluation: &crate::squad::pge::types::EvaluationResult,
+) -> Vec<cog_core::Learning> {
+    use crate::squad::pge::types::Verdict;
+
+    if matches!(evaluation.verdict, Verdict::Pass) {
+        return Vec::new();
+    }
+    let priority = match evaluation.verdict {
+        Verdict::Fail => cog_core::Priority::High,
+        _ => cog_core::Priority::Medium,
+    };
+    let criteria_detail = if evaluation.criteria.is_empty() {
+        String::new()
+    } else {
+        let lines = evaluation
+            .criteria
+            .iter()
+            .map(|c| format!("- {}: {}/100 — {}", c.name, c.score, c.comment))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\ncriteria:\n{lines}")
+    };
+    let mut learning = cog_core::Learning::new(
+        cog_core::LearningCategory::Correction,
+        priority,
+        cog_core::Area::Backend,
+        evaluation.feedback.chars().take(200).collect::<String>(),
+        format!(
+            "{:?}:{}{}",
+            evaluation.verdict, evaluation.feedback, criteria_detail
+        ),
+        &evaluation.feedback,
+        cog_core::LearningSource::SelfReview,
+    );
+    learning.tags.push("squad-reflection".into());
+    vec![learning]
 }
 
 /// 运行 Squad 级反思（若配置了 reflection 引擎）。
@@ -906,5 +985,141 @@ async fn run_squad_reflection(
             tracing::warn!("Squad reflection failed for {}: {}", squad.id, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::squad::pge::types::{Criterion, EvaluationResult};
+    use crate::squad::ralph::ralph_loop::{RalphIteration, ResetStrategy};
+
+    fn evaluation_json(verdict: &str, feedback: &str) -> serde_json::Value {
+        serde_json::to_value(EvaluationResult {
+            verdict: serde_json::from_value(serde_json::json!(verdict)).unwrap(),
+            feedback: feedback.into(),
+            score: Some(40),
+            criteria: vec![Criterion {
+                name: "tests pass".into(),
+                score: 0,
+                comment: "no test artifacts produced".into(),
+            }],
+            details: None,
+        })
+        .unwrap()
+    }
+
+    fn pipeline_snapshot(verdict: &str, feedback: &str) -> serde_json::Value {
+        serde_json::json!({
+            "plan": {"steps": []},
+            "generation": {"content": "diff"},
+            "evaluation": evaluation_json(verdict, feedback),
+        })
+    }
+
+    #[test]
+    fn failed_evaluation_becomes_generator_correction_learning() {
+        let verdict = RalphVerdict::Unrecoverable {
+            reason: "stagnation".into(),
+            iterations: 3,
+            history: vec![RalphIteration {
+                iteration: 3,
+                reset_strategy: ResetStrategy::Identical,
+                pge_passed: false,
+                feedback: "evaluator: criteria unmet".into(),
+                snapshot: pipeline_snapshot("fail", "evaluator: criteria unmet"),
+            }],
+        };
+        let contributions = build_contributions_from_verdict(&verdict, "squad-x");
+        let generator = contributions
+            .iter()
+            .find(|c| c.role == "generator")
+            .expect("generator contribution");
+        assert_eq!(
+            generator.learnings.len(),
+            1,
+            "failed verdict must yield a learning"
+        );
+        let learning = &generator.learnings[0];
+        assert!(matches!(
+            learning.category,
+            cog_core::LearningCategory::Correction
+        ));
+        assert!(matches!(learning.priority, cog_core::Priority::High));
+        assert!(learning.details.contains("tests pass"));
+        assert_eq!(
+            generator.errors.len(),
+            1,
+            "unrecoverable verdict must yield an error entry"
+        );
+        assert_eq!(generator.errors[0].error_message, "stagnation");
+    }
+
+    #[test]
+    fn passed_verdict_yields_no_learnings_or_errors() {
+        let verdict = RalphVerdict::Passed {
+            result: serde_json::json!({
+                "final_plan": {"steps": []},
+                "final_generation": {"content": "ok"},
+                "final_evaluation": evaluation_json("pass", "looks good"),
+            }),
+            iterations: 1,
+            history: vec![],
+        };
+        let contributions = build_contributions_from_verdict(&verdict, "squad-y");
+        for c in &contributions {
+            assert!(c.learnings.is_empty(), "pass must not invent learnings");
+            assert!(c.errors.is_empty(), "pass must not invent errors");
+        }
+    }
+
+    #[test]
+    fn roundtable_snapshot_also_feeds_learnings() {
+        let verdict = RalphVerdict::Unrecoverable {
+            reason: "max iterations".into(),
+            iterations: 50,
+            history: vec![RalphIteration {
+                iteration: 50,
+                reset_strategy: ResetStrategy::Identical,
+                pge_passed: false,
+                feedback: "roundtable rejected".into(),
+                snapshot: serde_json::json!({
+                    "roundtable": {"transcript": []},
+                    "evaluation": evaluation_json("partial", "roundtable rejected"),
+                }),
+            }],
+        };
+        let contributions = build_contributions_from_verdict(&verdict, "squad-z");
+        let generator = contributions
+            .iter()
+            .find(|c| c.role == "generator")
+            .expect("generator contribution");
+        assert_eq!(generator.learnings.len(), 1);
+        assert!(matches!(
+            generator.learnings[0].priority,
+            cog_core::Priority::Medium
+        ));
+    }
+
+    #[test]
+    fn malformed_evaluation_snapshot_does_not_panic() {
+        let verdict = RalphVerdict::Unrecoverable {
+            reason: "broken".into(),
+            iterations: 1,
+            history: vec![RalphIteration {
+                iteration: 1,
+                reset_strategy: ResetStrategy::Identical,
+                pge_passed: false,
+                feedback: String::new(),
+                snapshot: serde_json::json!({"plan": {}, "evaluation": "not-an-object"}),
+            }],
+        };
+        let contributions = build_contributions_from_verdict(&verdict, "squad-w");
+        let generator = contributions
+            .iter()
+            .find(|c| c.role == "generator")
+            .expect("generator contribution");
+        assert!(generator.learnings.is_empty());
+        assert_eq!(generator.errors.len(), 1);
     }
 }
