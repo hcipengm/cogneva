@@ -51,14 +51,32 @@ impl Default for TraceCollectorConfig {
 /// Rules come from configuration, not code: thresholds and even the set of
 /// watched signals are deployment policy, and hardcoding them would force a
 /// rebuild for every tuning change.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InfraWatchConfig {
     pub enabled: bool,
     /// Prometheus-compatible base URL; empty disables the watcher.
     pub prometheus_url: String,
     pub poll_interval_secs: u64,
+    /// Consecutive evaluation failures of one rule before the watcher raises
+    /// its own alert about the rule being broken. A failed query only logs
+    /// otherwise, so a dead Prometheus or a blocked network path would leave
+    /// the whole self-discovery channel dark without anyone noticing. 0
+    /// disables this self-alert.
+    pub eval_failure_alert_after: u32,
     pub rules: Vec<InfraRule>,
+}
+
+impl Default for InfraWatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prometheus_url: String::new(),
+            poll_interval_secs: 0,
+            eval_failure_alert_after: 3,
+            rules: Vec::new(),
+        }
+    }
 }
 
 /// One PromQL-backed alert rule. Every series the query returns is evaluated

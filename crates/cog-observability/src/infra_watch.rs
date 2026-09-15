@@ -45,6 +45,13 @@ const NON_IDENTITY_LABELS: &[&str] = &[
     "prometheus",
 ];
 
+/// Rule name for the watcher's self-alert: a rule whose query keeps failing
+/// is itself an incident (dead Prometheus, blocked network path), raised
+/// through the same persistent state machine as infrastructure alerts so
+/// self-discovery sees the observation gap. Kept distinct from configured
+/// rule names so the series-resolution pass never touches these rows.
+pub const EVAL_FAILURE_RULE: &str = "infra_watch_eval_failure";
+
 /// Outlets the watcher drives. Both are optional: with no store the watcher
 /// still notifies, with no notifier it still persists, with neither it does
 /// not run at all (the plugin decides).
@@ -74,8 +81,12 @@ pub async fn run_infra_watch_loop(
 
     // dedup keys currently believed firing; adopted from the store on the
     // first tick so a restart resolves rows it can no longer observe instead
-    // of stranding them.
+    // of stranding them. Eval-failure self-alerts live in their own set:
+    // they are keyed by rule name, not series identity, and must survive the
+    // series-resolution pass untouched.
     let mut known_firing: HashSet<String> = HashSet::new();
+    let mut eval_failure_firing: HashSet<String> = HashSet::new();
+    let mut failure_streaks: HashMap<String, u32> = HashMap::new();
     let mut adopted = false;
 
     let mut ticker = tokio::time::interval(interval);
@@ -87,10 +98,10 @@ pub async fn run_infra_watch_loop(
                 if !adopted {
                     adopted = true;
                     if let Some(store) = &outlets.store {
-                        adopt_active_alerts(store, &config, &mut known_firing).await;
+                        adopt_active_alerts(store, &config, &mut known_firing, &mut eval_failure_firing).await;
                     }
                 }
-                tick(&config, &outlets, &http, &mut known_firing).await;
+                tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks).await;
             }
         }
     }
@@ -98,17 +109,21 @@ pub async fn run_infra_watch_loop(
 
 /// Seed `known_firing` with rows this watcher's rules raised before a
 /// restart. Rows raised by other producers (different rule names) are left
-/// alone.
+/// alone. Eval-failure self-alert rows are adopted separately: they stay
+/// firing until the affected rule queries successfully again.
 async fn adopt_active_alerts(
     store: &PostgresAlertStore,
     config: &InfraWatchConfig,
     known_firing: &mut HashSet<String>,
+    eval_failure_firing: &mut HashSet<String>,
 ) {
     match store.list_active(1000).await {
         Ok(records) => {
             let rule_names: HashSet<&str> = config.rules.iter().map(|r| r.name.as_str()).collect();
             for record in records {
-                if rule_names.contains(record.rule.as_str()) {
+                if record.rule == EVAL_FAILURE_RULE {
+                    eval_failure_firing.insert(record.dedup_key);
+                } else if rule_names.contains(record.rule.as_str()) {
                     known_firing.insert(record.dedup_key);
                 }
             }
@@ -123,6 +138,8 @@ async fn tick(
     outlets: &InfraWatchOutlets,
     http: &Arc<dyn cog_core::HttpClient>,
     known_firing: &mut HashSet<String>,
+    eval_failure_firing: &mut HashSet<String>,
+    failure_streaks: &mut HashMap<String, u32>,
 ) {
     let mut true_keys: HashSet<String> = HashSet::new();
     let mut queried_prefixes: HashSet<String> = HashSet::new();
@@ -135,9 +152,26 @@ async fn tick(
                 // no prefix to `queried_prefixes`, so its previously-firing
                 // rows survive this tick untouched.
                 warn!(rule = %rule.name, error = %e, "infra watch: rule query failed");
+                let streak = failure_streaks.entry(rule.name.clone()).or_insert(0);
+                *streak = streak.saturating_add(1);
+                if config.eval_failure_alert_after > 0 && *streak >= config.eval_failure_alert_after
+                {
+                    let key = format!("{EVAL_FAILURE_RULE}:{}", rule.name);
+                    if eval_failure_firing.insert(key.clone()) {
+                        fire_eval_failure(&rule.name, *streak, &e, &key, outlets).await;
+                    }
+                }
                 continue;
             }
         };
+        // The rule queried successfully: any eval-failure self-alert for it
+        // resolves (including rows adopted after a restart, for which no
+        // in-process streak exists), and the streak resets.
+        failure_streaks.remove(&rule.name);
+        let eval_key = format!("{EVAL_FAILURE_RULE}:{}", rule.name);
+        if eval_failure_firing.remove(&eval_key) {
+            resolve(&eval_key, outlets).await;
+        }
         queried_prefixes.insert(format!("{}:", rule.name));
         for sample in &series {
             if !rule.condition.evaluate(sample.value) {
@@ -307,6 +341,55 @@ async fn fire(
     }
 }
 
+/// Raise the watcher's self-alert for a rule whose query keeps failing.
+/// Goes through the same persistent state machine as infrastructure alerts
+/// so the observation gap becomes a signal self-discovery can consume.
+async fn fire_eval_failure(
+    rule_name: &str,
+    streak: u32,
+    error: &str,
+    key: &str,
+    outlets: &InfraWatchOutlets,
+) {
+    let message =
+        format!("infra watch rule \"{rule_name}\" query failed {streak} times in a row: {error}");
+    let labels = HashMap::from([
+        ("watched_rule".to_string(), rule_name.to_string()),
+        ("message".to_string(), message.clone()),
+        ("source".to_string(), "infra_watch".to_string()),
+    ]);
+    if let Some(store) = &outlets.store {
+        let alert = NewAlert {
+            rule: EVAL_FAILURE_RULE.to_string(),
+            dedup_key: key.to_string(),
+            severity: cog_core::AlertSeverity::Warning.as_str().to_string(),
+            message: message.clone(),
+            labels: serde_json::to_value(&labels).unwrap_or_else(|_| serde_json::json!({})),
+        };
+        match store.set_alert(true, &alert).await {
+            Ok(AlertTransition::Fired) => {
+                warn!(rule = %rule_name, streak, "infra watch eval-failure alert firing");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(rule = %rule_name, error = %e, "eval-failure alert persist failed"),
+        }
+    }
+    if let Some(notifier) = &outlets.notifier {
+        let now = Utc::now();
+        let inst = AlertInstance {
+            rule_name: EVAL_FAILURE_RULE.to_string(),
+            labels,
+            state: AlertState::Firing,
+            severity: cog_core::AlertSeverity::Warning,
+            value: streak as f64,
+            starts_at: now,
+            ends_at: None,
+            updated_at: now,
+        };
+        notifier.notify(&[AlertEvent::Firing(inst)]).await;
+    }
+}
+
 /// Close one alert row and notify the resolution.
 async fn resolve(key: &str, outlets: &InfraWatchOutlets) {
     if let Some(store) = &outlets.store {
@@ -422,5 +505,147 @@ mod tests {
             urlencoding("up{job=\"x\"} > 0"),
             "up%7Bjob%3D%22x%22%7D%20%3E%200"
         );
+    }
+
+    /// HTTP client stub: fails every request until flipped to succeed.
+    #[derive(Debug)]
+    struct FlakyHttp {
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl Default for FlakyHttp {
+        fn default() -> Self {
+            Self {
+                fail: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl FlakyHttp {
+        fn succeeding() -> Self {
+            Self {
+                fail: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for FlakyHttp {
+        async fn execute(
+            &self,
+            _req: cog_core::HttpRequest,
+        ) -> cog_core::SFResult<cog_core::HttpResponse> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(cog_core::SFError::IO("connection refused".into()));
+            }
+            Ok(cog_core::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "status": "success",
+                    "data": {"resultType": "vector", "result": []}
+                }))
+                .unwrap(),
+            })
+        }
+    }
+
+    fn test_rule(name: &str) -> crate::config::InfraRule {
+        crate::config::InfraRule {
+            name: name.to_string(),
+            promql: "up".to_string(),
+            condition: cog_core::AlertCondition::GreaterThan(0.0),
+            severity: cog_core::AlertSeverity::Warning,
+            summary: "s".to_string(),
+        }
+    }
+
+    fn test_config(threshold: u32) -> InfraWatchConfig {
+        InfraWatchConfig {
+            enabled: true,
+            prometheus_url: "http://prom:9090".to_string(),
+            poll_interval_secs: 60,
+            eval_failure_alert_after: threshold,
+            rules: vec![test_rule("rule_a")],
+        }
+    }
+
+    #[tokio::test]
+    async fn eval_failures_raise_self_alert_after_threshold_and_resolve_on_success() {
+        let config = test_config(2);
+        let outlets = InfraWatchOutlets {
+            store: None,
+            notifier: None,
+        };
+        let http: Arc<dyn cog_core::HttpClient> = Arc::new(FlakyHttp::default());
+        let mut known_firing = HashSet::new();
+        let mut eval_firing = HashSet::new();
+        let mut streaks = HashMap::new();
+        let key = format!("{EVAL_FAILURE_RULE}:rule_a");
+
+        // First failure: below threshold, no self-alert.
+        tick(
+            &config,
+            &outlets,
+            &http,
+            &mut known_firing,
+            &mut eval_firing,
+            &mut streaks,
+        )
+        .await;
+        assert!(eval_firing.is_empty());
+
+        // Second failure: threshold reached, self-alert key latches.
+        tick(
+            &config,
+            &outlets,
+            &http,
+            &mut known_firing,
+            &mut eval_firing,
+            &mut streaks,
+        )
+        .await;
+        assert!(eval_firing.contains(&key));
+
+        // Recovery: successful query clears the self-alert and the streak.
+        let http = Arc::new(FlakyHttp::succeeding());
+        let http: Arc<dyn cog_core::HttpClient> = http;
+        tick(
+            &config,
+            &outlets,
+            &http,
+            &mut known_firing,
+            &mut eval_firing,
+            &mut streaks,
+        )
+        .await;
+        assert!(eval_firing.is_empty());
+        assert!(streaks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn eval_failure_threshold_zero_disables_self_alert() {
+        let config = test_config(0);
+        let outlets = InfraWatchOutlets {
+            store: None,
+            notifier: None,
+        };
+        let http: Arc<dyn cog_core::HttpClient> = Arc::new(FlakyHttp::default());
+        let mut known_firing = HashSet::new();
+        let mut eval_firing = HashSet::new();
+        let mut streaks = HashMap::new();
+        for _ in 0..5 {
+            tick(
+                &config,
+                &outlets,
+                &http,
+                &mut known_firing,
+                &mut eval_firing,
+                &mut streaks,
+            )
+            .await;
+        }
+        assert!(eval_firing.is_empty());
+        assert_eq!(streaks.get("rule_a"), Some(&5));
     }
 }

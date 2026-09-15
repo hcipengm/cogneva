@@ -370,6 +370,7 @@ data:
           "enabled": true,
           "prometheus_url": "http://cog-observability-prometheus.monitoring:9090",
           "poll_interval_secs": 60,
+          "eval_failure_alert_after": 3,
           "rules": [
             {
               "name": "node_disk_usage_high",
