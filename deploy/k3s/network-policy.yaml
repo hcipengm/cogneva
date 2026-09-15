@@ -52,6 +52,16 @@ spec:
         # 集群内镜像仓库（5000）：publisher push 金丝雀 / 主线 overlay 镜像
         - protocol: TCP
           port: 5000
+    # 监控栈（9090）：infra_watch 按 PromQL 探测节点磁盘 / Pod OOM 等基础设施
+    # 信号，查询跨命名空间落到 monitoring 命名空间的 Prometheus。
+    # podSelector:{} 只匹配本命名空间，必须显式 namespaceSelector。
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
     # kube-apiserver：主线部署器构建侧在 Pod 内调 kubectl（查四部署镜像、
     # apply 滚动 Job）。in-cluster 经 kubernetes Service ClusterIP:443
     # （K3s Service CIDR 10.43.0.0/16；标准 kubeadm 多为 10.96.0.0/12）。

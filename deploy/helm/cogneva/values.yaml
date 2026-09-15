@@ -285,6 +285,9 @@ networkPolicy:
   # ClusterIP:443 访问 apiserver。K3s 默认 10.43.0.0/16；标准 kubeadm 常用
   # 10.96.0.0/12（k8s-standard profile 覆盖）。
   apiServerCidr: 10.43.0.0/16
+  # 监控栈所在命名空间：evolution 的 infra_watch 要按 PromQL 探测基础设施
+  # 信号（节点磁盘、Pod OOM 等），需放行到该命名空间的 9090（Prometheus）。
+  monitoringNamespace: monitoring
 
 # 主线跟踪自动部署器：进化 Pod 周期检测 bare 仓库公版 main 前进 → 沙盒构建 →
 # buildah 推集群内 registry → 派独立 Job 门禁滚动四部署，失败自动回滚。
