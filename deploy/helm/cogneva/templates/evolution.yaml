@@ -335,6 +335,29 @@ spec:
             path: {{ .Values.gitops.kubectlBin.hostPath }}
             type: File
         {{- end }}
+---
+# 进化 Pod 的指标端点。ServiceMonitor 按 Service 标签发现端点，进化负载此前
+# 没有 Service，于是它产生的指标（Ralph 循环终止等）在观测面上完全缺席——
+# 监控里只有主应用那一半，恰好漏掉承担大部分 decompose 的那一半。
+# 沿用 cogneva 名字标签，与主应用共用同一条 ServiceMonitor，不新增抓取配置。
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-evolution
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: evolution
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cogneva-evolution
+    app.kubernetes.io/component: evolution
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
 {{- if eq .Values.evolution.gitRemote.mode "pvc" }}
 ---
 apiVersion: v1

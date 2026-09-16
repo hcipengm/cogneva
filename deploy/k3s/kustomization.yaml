@@ -21,6 +21,7 @@ resources:
   - sandbox-executor-service.yaml
   - evolution-configmap.yaml
   - evolution-deployment.yaml
+  - evolution-service.yaml
   - evolution-pvc.yaml
   - evolution-rbac.yaml
   - buildah-daemonset.yaml
