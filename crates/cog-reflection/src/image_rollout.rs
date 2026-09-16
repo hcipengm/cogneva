@@ -175,13 +175,7 @@ impl ImageRollout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn write_fake_bin(dir: &std::path::Path, name: &str, script: &str) {
-        let path = dir.join(name);
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    use crate::test_support::write_executable as write_fake_bin;
 
     fn artifact(dir: &std::path::Path) -> crate::evolution_deployer::BuildArtifact {
         let binary = dir.join("cogneva");

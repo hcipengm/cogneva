@@ -57,6 +57,9 @@ pub mod squad;
 pub mod types;
 pub mod workspace;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use auto_promoter::{AutoPromoter, PromotionChannel, PromotionSource};
 pub use baseline_port::{
     run_baseline_port_loop, AbsorptionStatus, BaselinePorter, PortItemResult, PortOutcome,

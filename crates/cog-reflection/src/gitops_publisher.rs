@@ -408,16 +408,12 @@ mod tests {
     /// 假镜像构建器：L1 晋级会调 buildah 打 overlay 镜像，测试里记录参数后成功。
     /// 日志路径直接写进脚本（测试线程共享进程 env，不能用 env 传日志路径）。
     fn make_fake_builder(dir: &std::path::Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("fake-buildah");
         let log = dir.join("builder.log");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+        crate::test_support::write_executable(
+            dir,
+            "fake-buildah",
+            &format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
         )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
     }
 
     /// L1 发布者：staged 二进制 + 假构建器齐备。kubectl 指向不存在的路径，
@@ -596,11 +592,8 @@ mod tests {
     async fn canary_overlay_uses_deployed_main_tag_as_base() {
         let (central, work) = setup_repo().await;
         // fake kubectl：四部署统一在 main-abcdef012345 上（tab 分隔输出）。
-        let kubectl = work.path().join("fake-kubectl");
         let script = "#!/bin/sh\ncat <<'EOF'\ncogneva\tcogneva=reg.test:5000/cogneva:main-abcdef012345,\ncogneva-security-gateway\tsecurity-gateway=reg.test:5000/cogneva:main-abcdef012345,\ncogneva-sandbox-executor\tsandbox-executor=reg.test:5000/cogneva:main-abcdef012345,\ncogneva-evolution\tcogneva=reg.test:5000/cogneva:main-abcdef012345,\nEOF\n";
-        std::fs::write(&kubectl, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let kubectl = crate::test_support::write_executable(work.path(), "fake-kubectl", script);
 
         std::fs::write(work.path().join("cogneva"), b"staged-binary").unwrap();
         let builder = make_fake_builder(work.path());

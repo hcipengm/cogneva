@@ -1334,7 +1334,12 @@ async fn ensure_binary_in_place(
             expected = %expected_binary.display(),
             "Current executable path does not match configured binary_dir/cogneva; copying binary in sandbox mode"
         );
-        tokio::fs::copy(&current_exe, &expected_binary).await.map_err(|e| {
+        // Stage then rename: another process may be executing the destination
+        // (a previous instance or a dispatched Job), and truncating a binary
+        // someone is running fails with ETXTBSY while exposing a half-written
+        // executable to the exec that follows. The rename swaps whole files.
+        let staged = binary_dir.join("cogneva.staging");
+        tokio::fs::copy(&current_exe, &staged).await.map_err(|e| {
             cog_core::SFError::IO(format!(
                 "Failed to copy current executable {} to {}: {}. Self-exec switch mode needs the binary at the configured binary_dir.",
                 current_exe.display(),
@@ -1345,9 +1350,16 @@ async fn ensure_binary_in_place(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&expected_binary, std::fs::Permissions::from_mode(0o755))
-                .await?;
+            tokio::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).await?;
         }
+        tokio::fs::rename(&staged, &expected_binary)
+            .await
+            .map_err(|e| {
+                cog_core::SFError::IO(format!(
+                    "Failed to install current executable at {}: {e}. Self-exec switch mode needs the binary at the configured binary_dir.",
+                    expected_binary.display()
+                ))
+            })?;
         info!(path = %expected_binary.display(), "Copied current executable to configured binary path in sandbox mode");
         return Ok(());
     }

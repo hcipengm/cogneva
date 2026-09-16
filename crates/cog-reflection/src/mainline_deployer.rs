@@ -2449,13 +2449,7 @@ mod tests {
 
     // --- 命令层测试：真实 git 仓库 + fake buildah/kubectl/cargo/strip ---
 
-    use std::os::unix::fs::PermissionsExt;
-
-    fn write_fake_bin(dir: &Path, name: &str, script: &str) {
-        let path = dir.join(name);
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    use crate::test_support::write_executable as write_fake_bin;
 
     async fn real_git(dir: &Path, args: &[&str]) {
         let out = tokio::process::Command::new("git")
