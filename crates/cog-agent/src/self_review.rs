@@ -158,7 +158,7 @@ impl SelfReviewLoop {
             "spec": spec,
         });
         let user_msg = Message::user(user_payload.to_string());
-        let options = ChatOptions::default();
+        let options = ChatOptions::default().with_actor("self_review");
 
         let output = execute_structured::<CritiqueOutput>(llm, &[user_msg], &options).await?;
         let raw = serde_json::to_string(&output).unwrap_or_default();
@@ -184,7 +184,7 @@ impl SelfReviewLoop {
             "best_practices": best_practices,
         });
         let user_msg = Message::user(user_payload.to_string());
-        let options = ChatOptions::default();
+        let options = ChatOptions::default().with_actor("self_review");
 
         let output = execute_structured::<ComparisonOutput>(llm, &[user_msg], &options).await?;
         let raw = serde_json::to_string(&output).unwrap_or_default();
@@ -244,7 +244,8 @@ impl SelfReviewLoop {
         let options = ChatOptions {
             response_format: ResponseFormat::Text,
             ..Default::default()
-        };
+        }
+        .with_actor("self_review");
 
         let response = llm.chat(&[user_msg], &options).await?;
         let revised = extract_text(&response);

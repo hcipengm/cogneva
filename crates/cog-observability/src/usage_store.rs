@@ -20,6 +20,9 @@ pub struct LlmUsageRecord {
     pub model: String,
     /// `ok` or `error` — errors carry zero tokens but keep the attempt visible.
     pub result: String,
+    /// Calling component as normalized by the gateway (`self_review`,
+    /// `agent:<role>`, `unknown`); lets per-actor token spend be audited.
+    pub actor: String,
     pub tokens_input: u64,
     pub tokens_output: u64,
     /// Wall time of the call; for streams this is first-byte to last-byte.
@@ -56,6 +59,13 @@ impl LlmUsageStore {
         )
         .execute(&self.pool)
         .await?;
+        // Additive migration for the per-actor dimension; old rows stay
+        // attributable as "unknown" without a table rewrite.
+        sqlx::query(
+            "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS actor TEXT NOT NULL DEFAULT 'unknown'",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts)",
         )
@@ -68,9 +78,9 @@ impl LlmUsageStore {
         sqlx::query(
             r#"
             INSERT INTO gateway_llm_usage
-                (id, upstream, api_style, model, result,
+                (id, upstream, api_style, model, result, actor,
                  tokens_input, tokens_output, latency_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -78,6 +88,7 @@ impl LlmUsageStore {
         .bind(&r.api_style)
         .bind(&r.model)
         .bind(&r.result)
+        .bind(&r.actor)
         .bind(r.tokens_input as i64)
         .bind(r.tokens_output as i64)
         .bind(r.latency_ms as i64)

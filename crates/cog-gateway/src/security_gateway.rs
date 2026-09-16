@@ -691,13 +691,38 @@ fn record_event(state: &AppState, event: AnalyticsEvent) {
     }
 }
 
-/// 一次上游调用的落点：指标 counter + 时序明细（上游、结果、延迟）。
-async fn record_llm_call(state: &AppState, upstream: &LlmUpstream, result: &str, latency_ms: u64) {
+/// Actor label fallthrough when the caller did not identify itself or sent a
+/// malformed value. Keep the metric vocabulary bounded at this edge: accept
+/// only short lowercase tokens so arbitrary request input cannot explode
+/// Prometheus label cardinality.
+fn normalize_actor(raw: Option<&str>) -> String {
+    match raw {
+        Some(v)
+            if !v.is_empty()
+                && v.len() <= 32
+                && v.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b':' | b'_' | b'-')
+                }) =>
+        {
+            v.to_string()
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+/// 一次上游调用的落点：指标 counter + 时序明细（上游、结果、调用来源、延迟）。
+async fn record_llm_call(
+    state: &AppState,
+    upstream: &LlmUpstream,
+    result: &str,
+    latency_ms: u64,
+    actor: &str,
+) {
     let key = LlmHealthTable::key(upstream);
     record_counter(
         state,
         "llm_calls_total",
-        &[("upstream", &key), ("result", result)],
+        &[("upstream", &key), ("result", result), ("actor", actor)],
     )
     .await;
     record_event(
@@ -705,6 +730,7 @@ async fn record_llm_call(state: &AppState, upstream: &LlmUpstream, result: &str,
         AnalyticsEvent::new("llm_call")
             .property("upstream", serde_json::json!(key))
             .property("result", serde_json::json!(result))
+            .property("actor", serde_json::json!(actor))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
 }
@@ -719,6 +745,7 @@ async fn record_llm_tokens(
     tokens_input: u64,
     tokens_output: u64,
     latency_ms: u64,
+    actor: &str,
 ) {
     let key = LlmHealthTable::key(upstream);
     if tokens_input > 0 {
@@ -726,7 +753,7 @@ async fn record_llm_tokens(
             state,
             "llm_tokens_total",
             tokens_input as f64,
-            &[("upstream", &key), ("kind", "input")],
+            &[("upstream", &key), ("kind", "input"), ("actor", actor)],
         )
         .await;
     }
@@ -735,7 +762,7 @@ async fn record_llm_tokens(
             state,
             "llm_tokens_total",
             tokens_output as f64,
-            &[("upstream", &key), ("kind", "output")],
+            &[("upstream", &key), ("kind", "output"), ("actor", actor)],
         )
         .await;
     }
@@ -745,6 +772,7 @@ async fn record_llm_tokens(
             .property("upstream", serde_json::json!(key))
             .property("model", serde_json::json!(upstream.model))
             .property("result", serde_json::json!(result))
+            .property("actor", serde_json::json!(actor))
             .property("tokens_in", serde_json::json!(tokens_input))
             .property("tokens_out", serde_json::json!(tokens_output))
             .property("latency_ms", serde_json::json!(latency_ms)),
@@ -755,6 +783,7 @@ async fn record_llm_tokens(
             api_style: upstream.api_style.clone(),
             model: upstream.model.clone(),
             result: result.to_string(),
+            actor: actor.to_string(),
             tokens_input,
             tokens_output,
             latency_ms,
@@ -862,6 +891,7 @@ fn wrap_usage_scan(
     upstream: LlmUpstream,
     stream: impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + 'static,
     start: std::time::Instant,
+    actor: String,
 ) -> impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send {
     use futures::StreamExt;
     let scanner = Arc::new(Mutex::new(UsageScanner::default()));
@@ -886,6 +916,7 @@ fn wrap_usage_scan(
             input,
             output,
             start.elapsed().as_millis() as u64,
+            &actor,
         )
         .await;
         Ok(axum::body::Bytes::new())
@@ -1371,6 +1402,11 @@ async fn stream_forward(
             "网关未配置 LLM 上游".into(),
         ));
     }
+    let actor = normalize_actor(
+        req.headers()
+            .get(cog_core::LLM_ACTOR_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    );
     let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -1495,6 +1531,7 @@ async fn stream_forward(
                     upstream,
                     "error",
                     start.elapsed().as_millis() as u64,
+                    &actor,
                 )
                 .await;
                 mark_upstream_failure(&state, upstream, base, None).await;
@@ -1539,6 +1576,7 @@ async fn stream_forward(
                 upstream,
                 "error",
                 start.elapsed().as_millis() as u64,
+                &actor,
             )
             .await;
             if request_shape_error {
@@ -1561,7 +1599,7 @@ async fn stream_forward(
         }
         let elapsed_ms = start.elapsed().as_millis() as u64;
         state.llm_stats.record(elapsed_ms);
-        record_llm_call(&state, upstream, "ok", elapsed_ms).await;
+        record_llm_call(&state, upstream, "ok", elapsed_ms, &actor).await;
 
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let content_type = resp
@@ -1570,7 +1608,13 @@ async fn stream_forward(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
-        let stream = wrap_usage_scan(state.clone(), upstream.clone(), resp.bytes_stream(), start);
+        let stream = wrap_usage_scan(
+            state.clone(),
+            upstream.clone(),
+            resp.bytes_stream(),
+            start,
+            actor.clone(),
+        );
         return Ok(axum::response::Response::builder()
             .status(status)
             .header("content-type", content_type)
@@ -1757,20 +1801,37 @@ async fn call_llm(
     }
     let candidates = order_by_health(next_candidates, &state.llm_health);
     let mut last_err = String::new();
+    // This endpoint is the gateway's own intent classifier, not a proxied
+    // business call, so its actor dimension is fixed rather than headered.
+    let actor = "intent_gateway";
     for upstream in candidates {
         let start = std::time::Instant::now();
-        match call_one_upstream(state, upstream, &messages).await {
+        match call_one_upstream(state, upstream, &messages, actor).await {
             Ok(resp) => {
                 if state.note_upstream_success(upstream) {
                     tracing::info!(upstream = %upstream.base_url, "LLM 上游恢复健康（真实请求实证）");
                     record_upstream_state(state, upstream, true, 0, None);
                 }
-                record_llm_call(state, upstream, "ok", start.elapsed().as_millis() as u64).await;
+                record_llm_call(
+                    state,
+                    upstream,
+                    "ok",
+                    start.elapsed().as_millis() as u64,
+                    actor,
+                )
+                .await;
                 return Ok(resp);
             }
             Err((msg, quota_reset)) => {
                 tracing::warn!(upstream = %upstream.base_url, error = %msg, "LLM 上游调用失败，切换池内下一个");
-                record_llm_call(state, upstream, "error", start.elapsed().as_millis() as u64).await;
+                record_llm_call(
+                    state,
+                    upstream,
+                    "error",
+                    start.elapsed().as_millis() as u64,
+                    actor,
+                )
+                .await;
                 mark_upstream_failure(
                     state,
                     upstream,
@@ -1792,6 +1853,7 @@ async fn call_one_upstream(
     state: &AppState,
     upstream: &LlmUpstream,
     messages: &[ChatMessage],
+    actor: &str,
 ) -> Result<Json<LlmResponse>, (String, Option<i64>)> {
     let start = std::time::Instant::now();
     let base = upstream.base_url.trim_end_matches('/');
@@ -1848,6 +1910,7 @@ async fn call_one_upstream(
             usage_in.unwrap_or(0),
             usage_out.unwrap_or(0),
             start.elapsed().as_millis() as u64,
+            actor,
         )
         .await;
         let content = v["content"][0]["text"]
@@ -1897,6 +1960,7 @@ async fn call_one_upstream(
         usage_in.unwrap_or(0),
         usage_out.unwrap_or(0),
         start.elapsed().as_millis() as u64,
+        actor,
     )
     .await;
     let content = v["choices"][0]["message"]["content"]
@@ -2898,6 +2962,20 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_header_normalized_to_bounded_labels() {
+        assert_eq!(normalize_actor(Some("self_review")), "self_review");
+        assert_eq!(normalize_actor(Some("agent:generator")), "agent:generator");
+        // Missing header, empty value, uppercase, illegal characters, and an
+        // over-long value all collapse to the single bounded fallthrough label.
+        assert_eq!(normalize_actor(None), "unknown");
+        assert_eq!(normalize_actor(Some("")), "unknown");
+        assert_eq!(normalize_actor(Some("Agent")), "unknown");
+        assert_eq!(normalize_actor(Some("bad/actor")), "unknown");
+        assert_eq!(normalize_actor(Some(&"a".repeat(33))), "unknown");
+        assert_eq!(normalize_actor(Some(&"a".repeat(32))), "a".repeat(32));
+    }
 
     #[test]
     fn usage_extract_openai_final_chunk() {

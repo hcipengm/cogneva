@@ -582,7 +582,8 @@ impl AgentRuntime {
         let options = cog_core::ChatOptions {
             tools: tool_defs,
             ..Default::default()
-        };
+        }
+        .with_actor(&format!("agent:{}", self.config.role));
 
         llm.chat_stream(&messages, &options).await
     }
@@ -1035,7 +1036,8 @@ impl AgentRuntime {
         let options = cog_core::ChatOptions {
             tools: tool_defs,
             ..Default::default()
-        };
+        }
+        .with_actor(&format!("agent:{}", self.config.role));
 
         // Stall-based hang protection: the clock resets on every stream event,
         // so a slow-but-alive generation is never aborted — only a connection
@@ -1206,7 +1208,8 @@ impl AgentRuntime {
             max_tokens: Some(1024),
             temperature: Some(0.1),
             ..Default::default()
-        };
+        }
+        .with_actor(&format!("agent:{}", self.config.role));
 
         let reformat_timeout = Duration::from_secs(30);
         match tokio::time::timeout(reformat_timeout, llm.chat(&[user_msg], &options)).await {

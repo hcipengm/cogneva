@@ -12,6 +12,11 @@ use std::sync::Arc;
 pub type AssistantMessageEventStream = EventStream<AssistantMessageEvent, ChatResponse>;
 pub type AssistantMessageEventProducer = EventStreamProducer<AssistantMessageEvent, ChatResponse>;
 
+/// Inbound header carrying the calling component identity through the LLM
+/// proxy. The gateway turns it into the bounded `actor` dimension on token
+/// metrics so per-actor consumption (e.g. self-review) is observable.
+pub const LLM_ACTOR_HEADER: &str = "x-cogneva-actor";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
@@ -90,6 +95,16 @@ impl std::fmt::Debug for ChatOptions {
             .field("abort_signal", &self.abort_signal)
             .field("raw_logger", &self.raw_logger.as_ref().map(|_| "[logger]"))
             .finish()
+    }
+}
+
+impl ChatOptions {
+    /// Tag every outbound HTTP request of this call with the calling component
+    /// identity (e.g. "self_review", "agent:generator") for token attribution.
+    pub fn with_actor(mut self, actor: &str) -> Self {
+        self.headers
+            .insert(LLM_ACTOR_HEADER.to_string(), actor.to_string());
+        self
     }
 }
 
