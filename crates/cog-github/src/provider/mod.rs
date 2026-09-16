@@ -110,6 +110,28 @@ pub trait CodePlatformProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Combined CI verdict for one commit on the base branch: `Some(true)`
+    /// when every reported run completed green, `Some(false)` when at least
+    /// one did not, `None` while runs are pending or nothing has reported yet.
+    ///
+    /// `None` means "no evidence", never "probably fine" — the landing loop
+    /// waits rather than guessing. Used to watch a commit that was pushed
+    /// straight to the base branch, which has no pull request to read.
+    ///
+    /// Default: unsupported — providers return `None`.
+    async fn ci_verdict_for_sha(&self, _sha: &str) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Log tails of the failed CI jobs for one commit on the base branch.
+    ///
+    /// Default: unsupported — providers return an empty string, so a red
+    /// verdict still reverts and still records the outcome, just without the
+    /// failure detail.
+    async fn ci_failure_log_for_sha(&self, _sha: &str) -> Result<String> {
+        Ok(String::new())
+    }
+
     /// Fetch the current state of a pull request for merge decisions and
     /// outcome recording.
     async fn get_pull_request(&self, pr_number: u64) -> Result<PullRequestDetail>;
@@ -140,40 +162,6 @@ pub trait CodePlatformProvider: Send + Sync {
                 ))
             })
     }
-
-    /// Resolve where contribution branches must be pushed for the
-    /// authenticated credential.
-    ///
-    /// Pull requests live on the base repository, but their head branch must
-    /// sit in a repository the author can push to. When the connected account
-    /// has push access to the configured repo (owner/collaborator), branches
-    /// go there directly and the PR is same-repo — returns `None`. Otherwise
-    /// the provider ensures a fork under the authenticated account exists
-    /// (creating it once, idempotently) and returns its coordinate; the
-    /// publisher then pushes to the fork and opens a cross-fork PR with
-    /// head `<fork-owner>:<branch>`.
-    ///
-    /// Default: `None` (direct push), preserving behavior for providers
-    /// without fork support.
-    async fn ensure_push_target(&self) -> Result<Option<ForkTarget>> {
-        Ok(None)
-    }
-}
-
-/// Coordinate of a contributor's fork, returned by
-/// [`CodePlatformProvider::ensure_push_target`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForkTarget {
-    /// Login of the fork owner (the authenticated account); used as the
-    /// cross-fork PR head prefix (`<owner>:<branch>`).
-    pub owner: String,
-    /// Full repository coordinate `owner/repo` of the fork; used to build
-    /// the git push remote URL.
-    pub full_name: String,
-    /// Whether the fork was created by this call (drives push readiness
-    /// retries: a freshly created fork propagates to the git backend
-    /// asynchronously on both platforms).
-    pub newly_created: bool,
 }
 
 /// A platform-agnostic issue representation.

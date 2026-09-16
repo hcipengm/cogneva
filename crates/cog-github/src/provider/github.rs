@@ -11,8 +11,8 @@ use crate::config::GitHubAccount;
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{
     gateway_attach_root, http_fetch_attachment, AttachmentData, CiFailureEvent, CiJobLog,
-    CiRunSummary, CodePlatformProvider, CreatePullRequest, ForkTarget, PlatformComment,
-    PlatformIssue, PlatformPullRequest, PullRequestDetail,
+    CiRunSummary, CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue,
+    PlatformPullRequest, PullRequestDetail,
 };
 
 /// Max failed jobs whose logs are fetched per run.
@@ -29,6 +29,8 @@ pub struct GitHubProvider {
     owner: String,
     repo: String,
     account: GitHubAccount,
+    /// Base branch changes land on and whose CI is watched (e.g. `main`).
+    base_branch: String,
     /// API 基址覆盖（安全网关透传端点）。None = 直连 api.github.com。
     api_base: Option<String>,
 }
@@ -42,7 +44,12 @@ impl GitHubProvider {
     /// resolved from the environment or the inline config field at this moment
     /// and is held in memory only; it is not written to disk or passed to the
     /// sandbox.
-    pub fn new(account: &GitHubAccount, repo: &str, api_base: Option<&str>) -> Result<Self> {
+    pub fn new(
+        account: &GitHubAccount,
+        repo: &str,
+        base_branch: &str,
+        api_base: Option<&str>,
+    ) -> Result<Self> {
         let client = match api_base {
             Some(base) => Octocrab::builder()
                 .base_uri(base)
@@ -67,6 +74,7 @@ impl GitHubProvider {
             owner,
             repo: repo_name,
             account: account.clone(),
+            base_branch: base_branch.to_string(),
             api_base: api_base.map(|s| s.trim_end_matches('/').to_string()),
         })
     }
@@ -74,6 +82,11 @@ impl GitHubProvider {
     /// The account this provider is acting as.
     pub fn account(&self) -> &GitHubAccount {
         &self.account
+    }
+
+    /// Base branch this provider lands changes on and watches CI for.
+    pub fn base_branch(&self) -> &str {
+        &self.base_branch
     }
 
     /// CI verdict for a PR head, from check runs first and legacy commit
@@ -107,46 +120,73 @@ impl GitHubProvider {
         let mut pending = false;
         let mut saw_signal = false;
         for (owner, repo) in &targets {
-            let runs = self
-                .client
-                .checks(owner, repo)
-                .list_check_runs_for_git_ref(octocrab::params::repos::Commitish(sha.clone()))
-                .send()
-                .await;
-            // An API error is not evidence either way; fall through to the
-            // status path and ultimately to None.
-            if let Ok(list) = runs {
-                for run in list.check_runs {
-                    saw_signal = true;
-                    match run.conclusion {
-                        Some(conclusion) => conclusions.push(conclusion),
-                        None => pending = true,
-                    }
-                }
-            }
+            let (saw, is_pending, mut found) = self.check_run_signals(owner, repo, &sha).await;
+            saw_signal |= saw;
+            pending |= is_pending;
+            conclusions.append(&mut found);
         }
         if let Some(verdict) = fold_ci_signals(saw_signal, pending, &conclusions) {
             return Some(verdict);
         }
 
         for (owner, repo) in &targets {
-            let route = format!("/repos/{owner}/{repo}/commits/{sha}/status");
-            let status = self
-                .client
-                .get::<octocrab::models::CombinedStatus, _, _>(route, None::<&()>)
-                .await;
-            if let Ok(status) = status {
-                if status.total_count > 0 {
-                    return match status.state {
-                        octocrab::models::StatusState::Success => Some(true),
-                        octocrab::models::StatusState::Failure
-                        | octocrab::models::StatusState::Error => Some(false),
-                        _ => None,
-                    };
-                }
+            if let Some(verdict) = self.combined_status_verdict(owner, repo, &sha).await {
+                return Some(verdict);
             }
         }
         None
+    }
+
+    /// Conclusions of every check run reported for `sha` on one repository:
+    /// whether any signal exists at all, whether some run is still running,
+    /// and the completed conclusions. An API error yields no signal — never
+    /// evidence either way.
+    async fn check_run_signals(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> (bool, bool, Vec<String>) {
+        let mut saw_signal = false;
+        let mut pending = false;
+        let mut conclusions = Vec::new();
+        let runs = self
+            .client
+            .checks(owner, repo)
+            .list_check_runs_for_git_ref(octocrab::params::repos::Commitish(sha.to_string()))
+            .send()
+            .await;
+        if let Ok(list) = runs {
+            for run in list.check_runs {
+                saw_signal = true;
+                match run.conclusion {
+                    Some(conclusion) => conclusions.push(conclusion),
+                    None => pending = true,
+                }
+            }
+        }
+        (saw_signal, pending, conclusions)
+    }
+
+    /// Commit-status fallback for repositories that report CI through statuses
+    /// rather than check runs. `None` when nothing was reported.
+    async fn combined_status_verdict(&self, owner: &str, repo: &str, sha: &str) -> Option<bool> {
+        let route = format!("/repos/{owner}/{repo}/commits/{sha}/status");
+        let status = self
+            .client
+            .get::<octocrab::models::CombinedStatus, _, _>(route, None::<&()>)
+            .await
+            .ok()?;
+        if status.total_count == 0 {
+            return None;
+        }
+        match status.state {
+            octocrab::models::StatusState::Success => Some(true),
+            octocrab::models::StatusState::Failure | octocrab::models::StatusState::Error => {
+                Some(false)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -442,6 +482,46 @@ impl CodePlatformProvider for GitHubProvider {
         }))
     }
 
+    async fn ci_verdict_for_sha(&self, sha: &str) -> Result<Option<bool>> {
+        let (saw_signal, pending, conclusions) =
+            self.check_run_signals(&self.owner, &self.repo, sha).await;
+        if let Some(verdict) = fold_ci_signals(saw_signal, pending, &conclusions) {
+            return Ok(Some(verdict));
+        }
+        Ok(self
+            .combined_status_verdict(&self.owner, &self.repo, sha)
+            .await)
+    }
+
+    async fn ci_failure_log_for_sha(&self, sha: &str) -> Result<String> {
+        // The workflow-run list has no head-SHA filter, so narrow by branch
+        // (a landed commit is on the base branch) and match client-side.
+        let runs = self
+            .client
+            .workflows(&self.owner, &self.repo)
+            .list_all_runs()
+            .branch(&self.base_branch)
+            .per_page(50)
+            .send()
+            .await
+            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+
+        let Some(run) = runs
+            .items
+            .into_iter()
+            .find(|r| r.head_sha == sha && r.conclusion.as_deref() == Some("failure"))
+        else {
+            return Ok(String::new());
+        };
+
+        let logs = self.fetch_ci_failure_logs(run.id.into_inner()).await?;
+        Ok(logs
+            .into_iter()
+            .map(|l| format!("## {} (job {})\n{}", l.job_name, l.job_id, l.log_tail))
+            .collect::<Vec<_>>()
+            .join("\n\n"))
+    }
+
     async fn get_pull_request(&self, pr_number: u64) -> Result<PullRequestDetail> {
         let pr = self
             .client
@@ -489,168 +569,6 @@ impl CodePlatformProvider for GitHubProvider {
             created_at: pr.created_at.unwrap_or_else(chrono::Utc::now),
         })
     }
-
-    async fn ensure_push_target(&self) -> Result<Option<ForkTarget>> {
-        // 网关模式零 token（出口注入）；直连模式才解析。
-        let token = self.account.resolve_token().ok();
-        if token.is_none() && self.api_base.is_none() {
-            return Err(CogGitHubError::MissingToken(
-                "cannot ensure fork: no github token and no gateway api_base".into(),
-            ));
-        }
-        let base = self.api_base.as_deref().unwrap_or("https://api.github.com");
-        let http = reqwest::Client::new();
-        let auth_get = |url: String| {
-            let mut req = http.get(url);
-            if let Some(t) = &token {
-                req = req.bearer_auth(t);
-            }
-            req
-        };
-
-        // 1. Push access to the target repo? The `permissions.push` flag is
-        //    present on every authenticated response — including GitHub App
-        //    installation tokens, which cannot call GET /user. Decide the
-        //    same-repo branch from this flag first, so an app installed on
-        //    the upstream repo never depends on /user. A 404 (token cannot
-        //    see the repo) falls through to the fork attempt; other failures
-        //    are real errors.
-        let target = match auth_get(format!("{base}/repos/{}/{}", self.owner, self.repo))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => Some(
-                resp.json::<serde_json::Value>()
-                    .await
-                    .map_err(CogGitHubError::Http)?,
-            ),
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => None,
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(CogGitHubError::Provider(format!(
-                    "github api returned HTTP {status}: {}",
-                    text.chars().take(200).collect::<String>()
-                )));
-            }
-            Err(e) => return Err(CogGitHubError::Http(e)),
-        };
-        if target
-            .as_ref()
-            .is_some_and(|t| t["permissions"]["push"].as_bool() == Some(true))
-        {
-            return Ok(None);
-        }
-
-        // 2. No push access — resolve the login to fork under. GET /user
-        //    requires a user token (PAT / OAuth / device flow); an
-        //    installation token has no fork-able user identity and surfaces a
-        //    clear HTTP error here instead of forking under the wrong account.
-        let user = github_json(auth_get(format!("{base}/user")).send().await).await?;
-        let login = user["login"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| CogGitHubError::Provider("GET /user returned no login".into()))?
-            .to_string();
-        // Owner fallback for responses lacking the permissions flag.
-        if target
-            .as_ref()
-            .is_some_and(|t| github_can_push(t, &login, &self.owner))
-        {
-            return Ok(None);
-        }
-
-        // 3. Fork under the authenticated account. GitHub's fork creation is
-        //    idempotent (existing fork → 200, new → 202), but probing the
-        //    fork coordinate first keeps the newly-created flag reliable for
-        //    push-readiness retries.
-        let fork_full = format!("{login}/{}", self.repo);
-        let probe = auth_get(format!("{base}/repos/{fork_full}"))
-            .send()
-            .await
-            .map_err(CogGitHubError::Http)?;
-        if probe.status() == reqwest::StatusCode::NOT_FOUND {
-            let mut post = http.post(format!("{base}/repos/{}/{}/forks", self.owner, self.repo));
-            if let Some(t) = &token {
-                post = post.bearer_auth(t);
-            }
-            let created = post.json(&serde_json::json!({})).send().await;
-            let resp = created.map_err(CogGitHubError::Http)?;
-            // 202 = fork accepted (async propagation); 200 = existed.
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(CogGitHubError::Provider(format!(
-                    "fork creation returned HTTP {status}: {}",
-                    text.chars().take(200).collect::<String>()
-                )));
-            }
-            // The fork object is returned immediately, but the git backend
-            // accepts pushes only after propagation; poll until ready.
-            let mut ready = false;
-            for _ in 0..FORK_READY_ATTEMPTS {
-                tokio::time::sleep(FORK_READY_INTERVAL).await;
-                let r = auth_get(format!("{base}/repos/{fork_full}"))
-                    .send()
-                    .await
-                    .map_err(CogGitHubError::Http)?;
-                if r.status().is_success() {
-                    ready = true;
-                    break;
-                }
-            }
-            if !ready {
-                return Err(CogGitHubError::Provider(format!(
-                    "fork {fork_full} did not become ready after creation"
-                )));
-            }
-            return Ok(Some(ForkTarget {
-                owner: login,
-                full_name: fork_full,
-                newly_created: true,
-            }));
-        } else if !probe.status().is_success() {
-            return Err(CogGitHubError::Provider(format!(
-                "fork probe returned HTTP {}",
-                probe.status()
-            )));
-        }
-        Ok(Some(ForkTarget {
-            owner: login,
-            full_name: fork_full,
-            newly_created: false,
-        }))
-    }
-}
-
-/// Poll budget for a freshly created fork's git backend to become writable.
-const FORK_READY_ATTEMPTS: u32 = 12;
-const FORK_READY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Parse a GitHub API JSON body, mapping non-2xx responses to a Provider
-/// error carrying the status and a response excerpt.
-async fn github_json(send: reqwest::Result<reqwest::Response>) -> Result<serde_json::Value> {
-    let resp = send.map_err(CogGitHubError::Http)?;
-    let status = resp.status();
-    let text = resp.text().await.map_err(CogGitHubError::Http)?;
-    if !status.is_success() {
-        return Err(CogGitHubError::Provider(format!(
-            "github api returned HTTP {status}: {}",
-            text.chars().take(200).collect::<String>()
-        )));
-    }
-    serde_json::from_str(&text)
-        .map_err(|e| CogGitHubError::Provider(format!("github api returned non-JSON body: {e}")))
-}
-
-/// Decide whether the authenticated account can push to the target repo:
-/// the repo `permissions.push` flag (present on authenticated responses),
-/// or repo ownership as the fallback when the flag is absent.
-fn github_can_push(repo_json: &serde_json::Value, login: &str, owner: &str) -> bool {
-    if repo_json["permissions"]["push"].as_bool() == Some(true) {
-        return true;
-    }
-    login.eq_ignore_ascii_case(owner)
 }
 
 pub(crate) fn split_repo(repo: &str) -> Result<(String, String)> {
@@ -724,23 +642,12 @@ mod tests {
             ..Default::default()
         });
         // 直连模式：无 token 拒绝构建（凭证缺失响亮报错）。
-        assert!(GitHubProvider::new(&account, "o/r", None).is_err());
+        assert!(GitHubProvider::new(&account, "o/r", "main", None).is_err());
         // 网关模式：本进程零 token，凭证由透传端点出口注入。
-        let p = GitHubProvider::new(&account, "o/r", Some("http://gw:8081/github/")).unwrap();
+        let p =
+            GitHubProvider::new(&account, "o/r", "main", Some("http://gw:8081/github/")).unwrap();
         assert_eq!(p.api_base.as_deref(), Some("http://gw:8081/github"));
-    }
-
-    #[test]
-    fn push_permission_detection() {
-        // permissions.push 是权威信号。
-        let v = serde_json::json!({ "permissions": { "push": true } });
-        assert!(github_can_push(&v, "alice", "upstream"));
-        let v = serde_json::json!({ "permissions": { "push": false } });
-        assert!(!github_can_push(&v, "alice", "upstream"));
-        // permissions 缺失时，仓库 owner 可推；他人不可。
-        let v = serde_json::json!({});
-        assert!(github_can_push(&v, "Upstream", "upstream"));
-        assert!(!github_can_push(&v, "alice", "upstream"));
+        assert_eq!(p.base_branch(), "main");
     }
 
     #[test]

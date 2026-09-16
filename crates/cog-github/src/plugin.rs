@@ -23,6 +23,8 @@ struct LoopState {
 pub struct GitHubPlugin {
     config: Option<crate::config::GitHubIntegrationConfig>,
     provider: Option<Arc<dyn CodePlatformProvider>>,
+    /// 落地通道：init 建好、start 用它拉起 CI 监视循环。
+    channel: Option<Arc<crate::landing::MainChannel>>,
     /// Gitee 侧：循环配置（策略继承 github_integration）+ 平台 provider。
     gitee: Option<(
         crate::config::GitHubIntegrationConfig,
@@ -60,10 +62,9 @@ fn spawn_polling_loop(
 /// 后台周期补发暂存变更。初始化时的 drain 只覆盖"启动时通道已就绪"；向导在
 /// 进程运行期间补配 token 时只有网关滚动重启、本进程不重启，暂存变更会靠这个
 /// 周期任务在下一轮自动提交。补发幂等：成功的变更由 drain 删除暂存文件，
-/// 已推送的分支有 `already_published` 守卫，失败留到下一轮。
+/// 失败留到下一轮。
 fn spawn_staged_drain(
-    config: crate::config::GitHubIntegrationConfig,
-    provider: Arc<dyn CodePlatformProvider>,
+    channel: Arc<crate::landing::MainChannel>,
     controller: Arc<crate::contribution::ContributionController>,
 ) {
     tokio::spawn(async move {
@@ -79,28 +80,44 @@ fn spawn_staged_drain(
             if crate::pending_changes::load_pending().await.is_empty() {
                 continue;
             }
-            let token = config
-                .primary_account()
-                .ok()
-                .and_then(|a| a.resolve_token().ok());
-            match crate::pr_publisher::ensure_workdir(&config, token.as_deref()).await {
-                Ok(workdir) => {
-                    let sink = crate::pr_publisher::GitHubChangeSink::new(
-                        crate::pr_publisher::GitHubPrPublisher::new(workdir, config.clone()),
-                        provider.clone(),
-                        controller.clone(),
-                    );
-                    let n = crate::pending_changes::drain_into(&sink).await;
-                    if n > 0 {
-                        info!(count = n, "staged changes flushed by background drain");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "background staged-change drain skipped (channel not ready)");
-                }
+            let n = crate::pending_changes::drain_into(channel.as_ref()).await;
+            if n > 0 {
+                info!(count = n, "staged changes flushed by background drain");
             }
         }
     });
+}
+
+/// 落地提交的 CI 监视循环：绿了收尾，红了撤销 + 重驱一次 + 记 reflection。
+///
+/// 循环读的是落盘记录而不是进程内状态：自进化主线在装上新二进制后会替换自身
+/// 进程，落盘之前的推送与之后的监视必然分属两个进程，只有落盘的状态能跨过去。
+fn spawn_landing_watch(
+    channel: Arc<crate::landing::MainChannel>,
+    reflection: Option<Arc<dyn cog_core::ReflectionEngine>>,
+    orchestrator: Option<Arc<dyn cog_core::OrchestratorControl>>,
+    interval_secs: u64,
+    mut rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let interval = std::time::Duration::from_secs(interval_secs.max(30));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            tokio::select! {
+                _ = rx.changed() => {
+                    info!("landing CI watch shutting down");
+                    return;
+                }
+                _ = ticker.tick() => {}
+            }
+            crate::landing::watch_landed(
+                channel.as_ref(),
+                reflection.as_deref(),
+                orchestrator.as_deref(),
+            )
+            .await;
+        }
+    })
 }
 
 impl GitHubPlugin {
@@ -109,6 +126,7 @@ impl GitHubPlugin {
         Self {
             config: None,
             provider: None,
+            channel: None,
             gitee: None,
             loop_state: Mutex::new(None),
         }
@@ -152,58 +170,60 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         }
 
         if config.enabled {
-            let mut pr_sink_published = false;
+            let mut channel_published = false;
             match crate::default_provider(&config) {
                 Ok(provider) => {
                     let provider: Arc<dyn CodePlatformProvider> = Arc::from(provider);
                     ctx.publish_service::<dyn CodePlatformProvider>(provider.clone());
                     info!(repo = %config.repo, "GitHubPlugin initialized");
 
-                    // Change-to-PR publishing (ChangeSink) for autonomous fixes.
-                    // 工作目录未配置时从数据目录派生，通道默认就是通的；真正的
-                    // 发布开关是贡献策略（auto/ask/local），不是路径是否填了值。
+                    // 变更落地通道：把沙盒验完的变更直接提交到主分支，并在之后
+                    // 盯这次提交的 CI。工作目录未配置时从数据目录派生，通道默认
+                    // 就是通的；真正的开关是贡献策略（auto/ask/local），不是路径
+                    // 是否填了值。
                     let token = config
                         .primary_account()
                         .ok()
                         .and_then(|a| a.resolve_token().ok());
-                    match crate::pr_publisher::ensure_workdir(&config, token.as_deref()).await {
+                    match crate::landing::ensure_workdir(&config, token.as_deref()).await {
                         Ok(workdir) => {
-                            let sink = Arc::new(crate::pr_publisher::GitHubChangeSink::new(
-                                crate::pr_publisher::GitHubPrPublisher::new(
-                                    workdir.clone(),
-                                    config.clone(),
-                                ),
+                            let channel = Arc::new(crate::landing::MainChannel::new(
+                                workdir.clone(),
+                                config.clone(),
                                 provider.clone(),
                                 controller.clone(),
                             ));
-                            // 属主在 UI 点"提交 PR"时经 ContributionControl::flush_pending
-                            // 调用同一 sink，绕过策略门禁（点击即批准）。
-                            controller.set_sink(sink.clone());
-                            // The channel is live: flush changes staged
-                            // before it was connected (best effort;
-                            // failures stay staged for the next start).
-                            // ask/local 档不自动回流：ask 等属主逐条确认，
-                            // local 永不提交上游。
+                            // 属主在 UI 点"提交"时经 ContributionControl::flush_pending
+                            // 调用同一通道，跳过策略门禁（点击即批准）。
+                            controller.set_sink(channel.clone());
+                            // The channel is live: take over changes staged
+                            // before it was connected (best effort; failures
+                            // stay staged for the next attempt). ask/local 档
+                            // 不自动回流：ask 等属主逐条确认，local 永不提交上游。
                             if !controller.should_stage() {
                                 let flushed =
-                                    crate::pending_changes::drain_into(sink.as_ref()).await;
+                                    crate::pending_changes::drain_into(channel.as_ref()).await;
                                 if flushed > 0 {
-                                    info!(count = flushed, "flushed staged changes to PRs");
+                                    info!(count = flushed, "took over staged changes");
                                 }
                             }
-                            ctx.publish_service::<dyn cog_core::ChangeSink>(sink);
-                            pr_sink_published = true;
-                            info!(workdir = %workdir.display(), "GitHub ChangeSink published");
+                            ctx.publish_service::<dyn cog_core::ChangeSink>(channel.clone());
+                            ctx.publish_service::<dyn cog_core::ChangeLanding>(channel.clone());
+                            self.channel = Some(channel.clone());
+                            channel_published = true;
+                            info!(workdir = %workdir.display(), "GitHub landing channel published");
                         }
                         Err(e) => {
-                            warn!(error = %e, "GitHub PR workdir unavailable; ChangeSink not published");
+                            warn!(error = %e, "GitHub landing workdir unavailable; channel not published");
                         }
                     }
 
                     // 向导在进程运行期间补配 token（写入网关 Secret 后滚动重启
                     // 网关，本进程并不重启）时，上面的启动 drain 不会重跑；
-                    // 后台周期补发让暂存变更在通道接通后的下一个周期自动提交。
-                    spawn_staged_drain(config.clone(), provider.clone(), controller.clone());
+                    // 后台周期补发让暂存变更在通道接通后的下一个周期被接管。
+                    if let Some(channel) = self.channel.clone() {
+                        spawn_staged_drain(channel, controller.clone());
+                    }
 
                     self.provider = Some(provider);
                     self.config = Some(config.clone());
@@ -214,10 +234,10 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     warn!(error = %e, "GitHubPlugin provider unavailable; integration inactive");
                 }
             }
-            // No PR path yet (channel unconfigured, no workdir, or no
+            // No landing path yet (channel unconfigured, no workdir, or no
             // provider): stage generated changes locally so they survive until
             // the contribution channel is connected and drained.
-            if !pr_sink_published {
+            if !channel_published {
                 ctx.publish_service::<dyn cog_core::ChangeSink>(Arc::new(
                     crate::pending_changes::PendingChangeSink,
                 ));
@@ -271,6 +291,20 @@ impl cog_core::SystemPlugin for GitHubPlugin {
 
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        // 落地提交的 CI 监视与发现循环彼此独立：发现循环可能因 discovery_mode
+        // 不启动（纯事件入口且未配 secret 等），但已经落到主分支上的提交依然
+        // 必须有人盯 CI，否则红了没人撤销。
+        if let Some(channel) = self.channel.clone() {
+            handles.push(spawn_landing_watch(
+                channel.clone(),
+                reflection.clone(),
+                orchestrator.clone(),
+                channel.ci_poll_interval_secs(),
+                rx.clone(),
+            ));
+            info!("landing CI watch started");
+        }
 
         // GitHub / Gitee 两个平台的 discovery loop 集中创建，轮询与事件
         // 入口共享同一实例（事件驱动与周期兜底互补）。

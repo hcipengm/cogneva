@@ -18,7 +18,7 @@ pub fn pending_dir() -> PathBuf {
 }
 
 /// Filesystem-safe form of a change id.
-fn slug(id: &str) -> String {
+pub(crate) fn slug(id: &str) -> String {
     id.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {

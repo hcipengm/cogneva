@@ -10,13 +10,13 @@ use std::sync::{Arc, RwLock};
 
 use cog_core::{ContributionControl, ContributionPolicy, GeneratedChange, SFError, SFResult};
 
+use crate::landing::MainChannel;
 use crate::pending_changes;
-use crate::pr_publisher::GitHubChangeSink;
 
 /// In-process owner policy + live sink for the contribution channel.
 pub struct ContributionController {
     policy: RwLock<ContributionPolicy>,
-    sink: RwLock<Option<Arc<GitHubChangeSink>>>,
+    sink: RwLock<Option<Arc<MainChannel>>>,
 }
 
 impl ContributionController {
@@ -25,8 +25,8 @@ impl ContributionController {
         Arc::new(Self::default())
     }
 
-    /// Publish (or replace) the live PR sink once the channel is connected.
-    pub fn set_sink(&self, sink: Arc<GitHubChangeSink>) {
+    /// Publish (or replace) the live landing channel once it is connected.
+    pub fn set_sink(&self, sink: Arc<MainChannel>) {
         *self.sink.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
     }
 
@@ -38,6 +38,19 @@ impl ContributionController {
     /// True when generated changes must be staged instead of published.
     pub fn should_stage(&self) -> bool {
         self.policy() != ContributionPolicy::Auto
+    }
+
+    /// Changes awaiting a decision: staged by policy, plus generated ones no
+    /// sandbox has verified yet (which are recorded on landing so they are
+    /// visible instead of silently dropped).
+    async fn pending_changes(&self) -> Vec<GeneratedChange> {
+        let mut changes = pending_changes::load_pending().await;
+        for record in crate::landing::load_records().await {
+            if record.state == crate::landing::LandingState::Unverified {
+                changes.push(record.change);
+            }
+        }
+        changes
     }
 }
 
@@ -61,7 +74,7 @@ impl ContributionControl for ContributionController {
     }
 
     async fn pending(&self) -> SFResult<Vec<GeneratedChange>> {
-        Ok(pending_changes::load_pending().await)
+        Ok(self.pending_changes().await)
     }
 
     async fn flush_pending(&self, change_id: Option<&str>) -> SFResult<usize> {
@@ -74,16 +87,17 @@ impl ContributionControl for ContributionController {
                 SFError::Config("贡献通道未连接：先连接平台账号，再提交暂存变更".to_string())
             })?;
         let mut flushed = 0;
-        for change in pending_changes::load_pending().await {
+        for change in self.pending_changes().await {
             if let Some(id) = change_id {
                 if change.change_id != id {
                     continue;
                 }
             }
-            // Owner approval bypasses the policy gate — the click IS the decision.
-            match sink.publish_approved(&change).await {
+            // Owner approval bypasses the policy gate — the click IS the
+            // decision. Landing clears the staged file and replaces the
+            // unverified record with a landed one in the same step.
+            match sink.land_approved(&change).await {
                 Ok(_) => {
-                    pending_changes::remove_staged(&change.change_id).await;
                     flushed += 1;
                 }
                 Err(e) => {

@@ -211,8 +211,9 @@ pub struct GitHubIntegrationConfig {
     pub poll_interval_secs: u64,
     /// Maximum number of issues to scan per polling round.
     pub max_issues_per_scan: usize,
-    /// Whether to automatically create PRs when a change is generated.
-    pub auto_create_pr: bool,
+    /// Whether an actionable issue is turned into a fix task automatically.
+    /// Off means the intent is only recorded, never acted on.
+    pub auto_submit_fixes: bool,
     /// Policy governing whether a generated change may land on the base
     /// branch, and what happens when the CI run for a landed commit fails.
     pub landing_policy: LandingPolicy,
@@ -228,10 +229,11 @@ pub struct GitHubIntegrationConfig {
     pub conversation: ConversationConfig,
     /// Webhook 事件入口（discovery_mode=events/both 时生效）。
     pub webhook: WebhookConfig,
-    /// Local git working copy used by the PR publisher. Leave empty to derive
-    /// one from the data dir (see [`GitHubIntegrationConfig::pr_workdir_path`]);
-    /// set it to place the clone somewhere specific.
-    pub pr_workdir: String,
+    /// Local git working copy used to diff incoming pull requests and to land
+    /// changes on the base branch. Leave empty to derive one from the data dir
+    /// (see [`GitHubIntegrationConfig::git_workdir_path`]); set it to place the
+    /// clone somewhere specific.
+    pub git_workdir: String,
     /// GitHub API 基址覆盖：指向安全网关透传端点（如
     /// `http://cogneva-security-gateway:8081/github`）。设置后本进程不再
     /// 解析平台 token，凭证由网关出口注入；不设置则直连 api.github.com
@@ -252,7 +254,7 @@ impl Default for GitHubIntegrationConfig {
             ],
             poll_interval_secs: 300,
             max_issues_per_scan: 50,
-            auto_create_pr: true,
+            auto_submit_fixes: true,
             landing_policy: LandingPolicy::default(),
             human_required_labels: vec!["security".into(), "breaking-change".into()],
             forbidden_labels: vec!["wontfix".into(), "manual-only".into()],
@@ -260,7 +262,7 @@ impl Default for GitHubIntegrationConfig {
             bot_identity: BotIdentityConfig::default(),
             conversation: ConversationConfig::default(),
             webhook: WebhookConfig::default(),
-            pr_workdir: String::new(),
+            git_workdir: String::new(),
             api_base: None,
         }
     }
@@ -276,23 +278,23 @@ impl GitHubIntegrationConfig {
             .ok_or_else(|| SFError::Validation("no GitHub account configured".into()))
     }
 
-    /// The git working copy the PR publisher clones into.
+    /// The git working copy the channel clones into.
     ///
-    /// An empty `pr_workdir` means "not configured", not "publishing off": a
-    /// derived default under the data dir keeps the change-to-PR channel live
-    /// without a hand-edited path in the deployment config. Whether changes
-    /// are actually published is the contribution policy's decision
-    /// (`ContributionPolicy::Local` never sends them upstream), and turning
-    /// the whole integration off is `enabled`.
-    pub fn pr_workdir_path(&self) -> std::path::PathBuf {
-        if !self.pr_workdir.trim().is_empty() {
-            return std::path::PathBuf::from(self.pr_workdir.trim());
+    /// An empty `git_workdir` means "not configured", not "channel off": a
+    /// derived default under the data dir keeps the channel live without a
+    /// hand-edited path in the deployment config. Whether changes actually go
+    /// upstream is the contribution policy's decision
+    /// (`ContributionPolicy::Local` never sends them), and turning the whole
+    /// integration off is `enabled`.
+    pub fn git_workdir_path(&self) -> std::path::PathBuf {
+        if !self.git_workdir.trim().is_empty() {
+            return std::path::PathBuf::from(self.git_workdir.trim());
         }
         let dir = std::env::var("COGNEVA_DATA_DIR")
             .ok()
             .filter(|d| !d.trim().is_empty())
             .unwrap_or_else(|| "/var/lib/cogneva-data".into());
-        std::path::Path::new(dir.trim()).join("pr-workdir")
+        std::path::Path::new(dir.trim()).join("git-workdir")
     }
 }
 
@@ -326,6 +328,12 @@ pub struct LandingPolicy {
     /// How long to watch a landed commit's CI before giving up on that
     /// revision (seconds).
     pub ci_watch_timeout_secs: u64,
+    /// How often the landing loop re-reads the base branch's CI state (seconds).
+    pub ci_poll_interval_secs: u64,
+    /// How many times a landing is retried when the push loses a race against
+    /// a newer base tip. Each retry re-fetches and re-applies the change onto
+    /// the new tip.
+    pub max_land_attempts: u32,
 }
 
 impl Default for LandingPolicy {
@@ -343,6 +351,8 @@ impl Default for LandingPolicy {
             revert_on_ci_failure: true,
             redrive_on_ci_failure: true,
             ci_watch_timeout_secs: 1800,
+            ci_poll_interval_secs: 60,
+            max_land_attempts: 3,
         }
     }
 }

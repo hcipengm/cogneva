@@ -21,10 +21,10 @@ pub mod discovery;
 pub mod discovery_loop;
 pub mod error;
 pub mod identity;
+pub mod landing;
 pub mod outcome_recorder;
 pub mod pending_changes;
 pub mod plugin;
-pub mod pr_publisher;
 pub mod provider;
 pub mod triage;
 pub mod webhook;
@@ -37,8 +37,8 @@ pub use conversation::{ConversationState, ConversationTurn, IssueConversation};
 pub use discovery::IssueDiscovery;
 pub use discovery_loop::GitHubDiscoveryLoop;
 pub use identity::{machine_fingerprint, InstanceIdentity, NAME_POOL};
+pub use landing::{LandingRecord, LandingState, MainChannel};
 pub use outcome_recorder::OutcomeRecorder;
-pub use pr_publisher::{GitHubChangeSink, GitHubPrPublisher};
 pub use provider::gitee::GiteeProvider;
 pub use provider::github::GitHubProvider;
 pub use provider::{
@@ -68,6 +68,7 @@ pub fn default_provider(config: &GitHubIntegrationConfig) -> Result<Box<dyn Code
     Ok(Box::new(GitHubProvider::new(
         account,
         &config.repo,
+        &config.base_branch,
         config.api_base.as_deref(),
     )?))
 }

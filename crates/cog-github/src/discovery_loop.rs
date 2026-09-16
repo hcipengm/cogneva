@@ -994,7 +994,7 @@ impl GitHubDiscoveryLoop {
         let is_fix = self
             .act_on_decision(kind, issue.number, &key, decision, &mut conversation)
             .await?;
-        if is_fix && self.config.auto_create_pr {
+        if is_fix && self.config.auto_submit_fixes {
             self.submit_fix_task(issue, &conversation).await?;
             self.submitted.insert(key.clone());
         }
@@ -1504,7 +1504,7 @@ impl GitHubDiscoveryLoop {
         let is_fix = self
             .act_on_decision(kind, pr.number, &key, decision, &mut conversation)
             .await?;
-        if is_fix && self.config.auto_create_pr {
+        if is_fix && self.config.auto_submit_fixes {
             self.submit_pr_intent_task(pr).await?;
             self.submitted.insert(key.clone());
         }
@@ -1691,7 +1691,7 @@ impl GitHubDiscoveryLoop {
                 }
             }
             let diff = match crate::cross_validation::fetch_pr_diff(
-                &self.config.pr_workdir_path(),
+                &self.config.git_workdir_path(),
                 &pr.base_branch,
                 &pr.head_branch,
             )
@@ -2592,7 +2592,7 @@ mod tests {
     /// three-dot diff `fetch_pr_diff` expects. The repo is nested under the
     /// tempdir so `../origin.git` resolves inside this test's unique dir
     /// (parallel tests must not share `/tmp`). Returns the tempdir (kept alive
-    /// for the test) and the repo path to use as `pr_workdir`.
+    /// for the test) and the repo path to use as `git_workdir`.
     fn git_workdir_with_pr_branch() -> (tempfile::TempDir, std::path::PathBuf) {
         let workdir = tempfile::tempdir().unwrap();
         let root = workdir.path().join("repo");
@@ -2661,7 +2661,7 @@ mod tests {
     /// from the fingerprint, never hard-coded).
     fn cv_config(workdir: &std::path::Path) -> GitHubIntegrationConfig {
         let mut cfg = config();
-        cfg.pr_workdir = workdir.display().to_string();
+        cfg.git_workdir = workdir.display().to_string();
         cfg.bot_identity.fingerprint =
             Some("a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into());
         cfg

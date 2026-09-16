@@ -102,6 +102,44 @@ pub trait ChangeSink: Send + Sync + std::fmt::Debug {
     async fn submit_change(&self, change: GeneratedChange) -> crate::SFResult<String>;
 }
 
+/// A revision the sandbox has built and deployed, sitting in a local
+/// repository the caller can read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LandedSource {
+    /// Local repository holding `rev`.
+    pub repo: std::path::PathBuf,
+    /// Commit the sandbox built and deployed.
+    pub rev: String,
+}
+
+/// Flows a change the sandbox has verified onto the upstream base branch.
+///
+/// Implemented by the platform integration, which owns the git egress and the
+/// CI signal; consumed by the evolution mainline, which calls it only after
+/// the sandbox deploy succeeded. No branch and no pull request are involved:
+/// the commit reaches the base branch directly, and a failing CI run on that
+/// commit is answered by reverting the branch and re-driving generation once.
+#[async_trait::async_trait]
+pub trait ChangeLanding: Send + Sync + std::fmt::Debug {
+    /// Land `change` on the base branch.
+    ///
+    /// Durable: the intent survives a process restart (switching to the newly
+    /// built binary replaces this process), and an unfinished landing is
+    /// retried by the channel's own loop. Idempotent per change: one already
+    /// on the base branch is not landed twice.
+    async fn land(
+        &self,
+        change: &GeneratedChange,
+        source: Option<&LandedSource>,
+    ) -> crate::SFResult<String>;
+
+    /// Record a generated change that no sandbox has verified yet, so the
+    /// channel reports it rather than dropping it silently. Such a change is
+    /// landed only when a mainline later verifies it (or the owner approves
+    /// it explicitly).
+    async fn record_unverified(&self, change: &GeneratedChange) -> crate::SFResult<()>;
+}
+
 /// Owner policy for flowing evolved changes back upstream as PRs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
