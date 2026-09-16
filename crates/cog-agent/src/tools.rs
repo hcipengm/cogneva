@@ -667,7 +667,10 @@ pub mod builtins {
     pub fn read_file() -> Tool {
         Tool {
             name: "read_file".into(),
-            description: "Read the contents of a file".into(),
+            description: "Read the contents of a file. Relative paths resolve against \
+                          the task's working directory, which is the repository root \
+                          when a checkout is provisioned."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -682,7 +685,9 @@ pub mod builtins {
     pub fn write_file() -> Tool {
         Tool {
             name: "write_file".into(),
-            description: "Write content to a file".into(),
+            description: "Write content to a file. Relative paths resolve against the \
+                          task's working directory."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -700,7 +705,9 @@ pub mod builtins {
             name: "run_command".into(),
             description: "Run a shell command with full shell syntax: pipes, redirects, \
                           variable expansion, and scripts written via write_file are all \
-                          supported."
+                          supported. The command runs in the task's working directory; when \
+                          a repository checkout is provisioned it is already rooted there, \
+                          so work on the repo in place instead of cloning it again."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
