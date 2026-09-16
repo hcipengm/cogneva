@@ -504,6 +504,15 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 .with_target_dir(&self_evolution.workspaces.target_dir);
 
                 let binary_switcher = ctx.consume_service::<dyn cog_core::BinarySwitcher>();
+                // 变更上游通道（平台集成侧实现）：沙盒验过的提交经它落到主分支。
+                // 平台账号未连接时缺席——本轮照常构建部署，只是不回流上游。
+                let landing = ctx.consume_service::<dyn cog_core::ChangeLanding>();
+                if landing.is_none() {
+                    info!(
+                        "no ChangeLanding service; verified changes stay in the sandbox \
+                         and are not landed upstream"
+                    );
+                }
                 let audit_stream = ctx.consume_service::<dyn cog_core::AuditStream>();
                 if audit_stream.is_none() {
                     warn!("AuditStream not published; change operations will not be audited");
@@ -714,6 +723,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                 evolution_metrics: evolution_metrics.as_ref(),
                                 promoter: promoter.as_ref(),
                                 workspaces: &cycle_workspaces,
+                                landing: landing.as_ref(),
                             };
                             if let Err(e) =
                                 run_evolution_cycle(deps, &cycle_instance, &cycle_version).await
@@ -1362,6 +1372,9 @@ struct CycleDeps<'a> {
     evolution_metrics: Option<&'a Arc<dyn cog_core::EvolutionMetrics>>,
     promoter: Option<&'a Arc<crate::AutoPromoter>>,
     workspaces: &'a Arc<crate::workspace::WorkspaceManager>,
+    /// 变更上游通道：沙盒验收过的提交经它落到主分支。缺席时只做本地
+    /// 构建部署，不做上游落地。
+    landing: Option<&'a Arc<dyn cog_core::ChangeLanding>>,
 }
 
 /// Run one pass of the self-evolution auto-deploy pipeline.
@@ -1428,6 +1441,7 @@ async fn run_evolution_cycle_in(
         evolution_metrics,
         promoter,
         workspaces,
+        landing,
     } = deps;
     let Some(evo_engine) = engine.evolution.as_ref() else {
         return Ok(());
@@ -1510,6 +1524,52 @@ async fn run_evolution_cycle_in(
                 commit = %artifact.commit_hash,
                 "Change committed and built"
             );
+
+            // 沙盒已经验过这个提交（apply → test → release build）：把它落到
+            // 主分支上，而不是把这个变更留在沙盒里。落地必须先于二进制切换——
+            // 切换会 exec 掉本进程，之后的代码在真实部署里永远不会执行。
+            // 落地失败不放行部署：镜像里跑着主分支没有的代码，是最难排查的
+            // 那种分叉。
+            if let Some(landing) = landing {
+                let landed = cog_core::GeneratedChange {
+                    change_id: artifact.change_id.clone(),
+                    goal: change.description.clone(),
+                    content: change.content.clone(),
+                    affected_files: cog_core::parse_diff_affected_files(&change.content)
+                        .unwrap_or_default(),
+                    ..Default::default()
+                };
+                let source = cog_core::LandedSource {
+                    repo: workspaces.bare_repo().to_path_buf(),
+                    rev: artifact.commit_hash.clone(),
+                };
+                match landing.land(&landed, Some(&source)).await {
+                    Ok(rev) => info!(
+                        change_id = %artifact.change_id,
+                        rev = %rev,
+                        "Change landed on the base branch"
+                    ),
+                    Err(e) => {
+                        warn!(
+                            change_id = %artifact.change_id,
+                            error = %e,
+                            "Landing on the base branch failed; change left undeployed"
+                        );
+                        let _ = engine
+                            .record_change_outcome(
+                                &artifact.change_id,
+                                false,
+                                &format!("Landing failed: {}", e),
+                            )
+                            .await;
+                        if let Some(m) = evolution_metrics {
+                            m.record_event(true).await;
+                            m.record_change_failed().await;
+                        }
+                        continue;
+                    }
+                }
+            }
 
             if !config.auto_deploy {
                 info!(change_id = %artifact.change_id, "Build artifact awaiting manual deploy");
@@ -1661,6 +1721,11 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "BinarySwitcher",
+            required: false,
+        },
+        // 平台集成缺席（未连平台账号）时进化照常跑，只是变更不回上游。
+        cog_core::ConsumeSpec {
+            type_name: "ChangeLanding",
             required: false,
         },
         cog_core::ConsumeSpec {

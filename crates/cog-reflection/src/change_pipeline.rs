@@ -121,18 +121,20 @@ impl ChangePipeline {
                 .unwrap_or("unknown")
                 .to_string();
 
-            // If the engine has a more accurate status, prefer it.
-            let status = if let Some(engine) = engine {
-                engine
+            // The engine knows this change's own status and the goal it was
+            // generated for; the directory alone knows neither.
+            let record = match engine {
+                Some(engine) => engine
                     .list_results()
                     .await
                     .into_iter()
-                    .find(|r| r.artifact_id == artifact_id)
-                    .map(|r| r.status)
-                    .unwrap_or(EvolutionStatus::CompileChecked)
-            } else {
-                EvolutionStatus::CompileChecked
+                    .find(|r| r.artifact_id == artifact_id),
+                None => None,
             };
+            let status = record
+                .as_ref()
+                .map(|r| r.status)
+                .unwrap_or(EvolutionStatus::CompileChecked);
 
             if !matches!(
                 status,
@@ -141,10 +143,19 @@ impl ChangePipeline {
                 continue;
             }
 
+            // The description becomes the landed commit's subject line, so it
+            // must carry the change's goal rather than the scratch file it was
+            // read from. After a restart the in-memory record is gone and the
+            // path is all that is left.
+            let description = record
+                .map(|r| r.description)
+                .filter(|d| !d.trim().is_empty())
+                .unwrap_or_else(|| format!("Code change from {}", path.display()));
+
             results.push(EvolutionResult {
                 kind: EvolutionKind::CodeChange,
                 artifact_id,
-                description: format!("Code change from {}", path.display()),
+                description,
                 content,
                 status,
                 created_at: chrono::Utc::now(),

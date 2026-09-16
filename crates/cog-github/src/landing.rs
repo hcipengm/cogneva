@@ -304,22 +304,6 @@ impl MainChannel {
         ensure_contribution_allowed(&change.content)?;
 
         if !owner_approved {
-            if policy.require_self_review {
-                let Some(score) = change.self_review_score else {
-                    return Err(CogGitHubError::PrivacyRejected(format!(
-                        "change {} carries no self-review score; held back \
-                         (landing policy requires one)",
-                        change.change_id
-                    )));
-                };
-                if score < policy.min_self_review_score {
-                    return Err(CogGitHubError::PrivacyRejected(format!(
-                        "change {} self-review {score:.2} is below the required {:.2}",
-                        change.change_id, policy.min_self_review_score
-                    )));
-                }
-            }
-
             let changed_lines = count_changed_lines(&change.content);
             if changed_lines > policy.max_changed_lines {
                 return Err(CogGitHubError::PrivacyRejected(format!(
@@ -361,11 +345,26 @@ impl MainChannel {
             // The sandbox built and deployed this commit: it, not the original
             // diff, is the verified truth, so replay its delta onto the base.
             Some(src) => {
-                run_git(
-                    &wt,
-                    &["fetch", "--no-tags", &src.repo.to_string_lossy(), &src.rev],
+                // The sandbox commits on a detached worktree HEAD, so the rev
+                // hangs off no advertised ref and `upload-pack` refuses to
+                // serve it by SHA. Pin it under a private ref in the source
+                // repo first; the ref is left behind on purpose — it also keeps
+                // the object alive for the promotion pipeline that publishes
+                // the same commit afterwards.
+                let repo = src.repo.to_string_lossy().to_string();
+                let rev = run_git(
+                    &src.repo,
+                    &["rev-parse", &format!("{}^{{commit}}", src.rev)],
                 )
-                .await?;
+                .await?
+                .trim()
+                .to_string();
+                let pinned = format!(
+                    "refs/cogneva/landing/{}",
+                    crate::pending_changes::slug(&change.change_id)
+                );
+                run_git(&src.repo, &["update-ref", &pinned, &rev]).await?;
+                run_git(&wt, &["fetch", "--no-tags", &repo, &pinned]).await?;
                 run_git(&wt, &["cherry-pick", "--no-commit", "FETCH_HEAD"]).await?;
             }
             None => {
@@ -1194,30 +1193,6 @@ mod tests {
     fn changed_line_count_ignores_diff_headers() {
         let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n";
         assert_eq!(count_changed_lines(diff), 2);
-    }
-
-    #[tokio::test]
-    async fn policy_holds_back_a_change_without_a_self_review_score() {
-        let ch = GeneratedChange {
-            self_review_score: None,
-            ..change("c1", &diff_touching(&["crates/cog-github/src/lib.rs"]))
-        };
-        let err = channel(Default::default())
-            .check_policy(&ch, false)
-            .unwrap_err();
-        assert!(err.to_string().contains("self-review"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn policy_holds_back_a_low_scored_change() {
-        let ch = GeneratedChange {
-            self_review_score: Some(0.5),
-            ..change("c1", &diff_touching(&["crates/cog-github/src/lib.rs"]))
-        };
-        let err = channel(Default::default())
-            .check_policy(&ch, false)
-            .unwrap_err();
-        assert!(err.to_string().contains("below the required"), "{err}");
     }
 
     #[tokio::test]

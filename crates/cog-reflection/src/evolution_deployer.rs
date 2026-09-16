@@ -173,9 +173,11 @@ impl EvolutionDeployer {
             return Err(SFError::IO(format!("git commit failed: {}", stderr)));
         }
 
-        // Return the short commit hash.
+        // Full hash: the artifact hash travels out of this process (landing
+        // pins it as a ref, promotion republishes it), and an abbreviation is
+        // only unambiguous against one object store at one point in time.
         let hash_output = tokio::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
+            .args(["rev-parse", "HEAD"])
             .current_dir(workdir)
             .output()
             .await

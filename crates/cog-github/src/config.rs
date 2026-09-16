@@ -304,15 +304,16 @@ impl GitHubIntegrationConfig {
 /// There is deliberately no `enabled` field: whether changes go upstream at
 /// all is the contribution policy's decision (`auto`/`ask`/`local`), and a
 /// second switch would let the two disagree.
+///
+/// The gates here bound what a change may touch, not how good it is: quality
+/// is already settled by the sandbox, which pre-checks, applies, tests and
+/// release-builds the change before this channel is ever called. A
+/// self-review score would be a second opinion on a question already
+/// answered — and only one of the two change producers writes one, so
+/// gating on it would silently stop the other producer from ever landing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LandingPolicy {
-    /// Require a machine-readable self-review score on the change. A change
-    /// without a parseable score is held back instead of landing — missing
-    /// evidence is not evidence of quality.
-    pub require_self_review: bool,
-    /// Minimum self-review score a change must carry to land.
-    pub min_self_review_score: f32,
     /// Maximum number of changed lines a change may touch.
     pub max_changed_lines: usize,
     /// Path prefixes that forbid landing when touched.
@@ -339,8 +340,6 @@ pub struct LandingPolicy {
 impl Default for LandingPolicy {
     fn default() -> Self {
         Self {
-            require_self_review: true,
-            min_self_review_score: 0.80,
             max_changed_lines: 200,
             forbidden_paths: vec![
                 ".github/workflows".into(),
