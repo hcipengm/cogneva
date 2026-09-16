@@ -412,6 +412,15 @@
           },
           "severity": "critical",
           "summary": "cogneva workload container last exit was OOMKilled; memory footprint exceeds its limit"
+        },
+        {
+          "name": "ralph_loop_terminations_high",
+          "promql": "increase(ralph_terminations_total[30m])",
+          "condition": {
+            "greater_than": 20.0
+          },
+          "severity": "warning",
+          "summary": "Ralph loops stopped {value} times in the last 30m without passing their goal; the evolution chain is burning budget instead of converging (the reason label distinguishes budget_exhausted from stagnated)"
         }
       ]
     },
