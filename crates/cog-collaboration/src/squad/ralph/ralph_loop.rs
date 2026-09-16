@@ -41,9 +41,11 @@ pub struct RalphIteration {
     /// Hard-progress readings for this iteration. Persisted so the stall
     /// verdict survives a restart: an iteration's outcome is only comparable
     /// against its predecessor, and the predecessor may live in another
-    /// process. `None` for entries written before this was recorded, and for
-    /// branches whose snapshot shape carries no score/artifacts — such an
-    /// entry is undecidable, never counted as progress nor as its absence.
+    /// process. `None` only on entries archived before the field existed —
+    /// those are skipped as unobserved, never read as zeroes. A live iteration
+    /// always records a reading: no score *and* no artifact is not an
+    /// undecidable case, it is the plain statement that the iteration bought
+    /// nothing, which is exactly what the stall verdict is looking for.
     #[serde(default)]
     pub progress: Option<IterationProgress>,
 }
@@ -295,10 +297,10 @@ impl RalphLoop {
     }
 
     /// 尾部这一窗内在分数或产物上没有抬升过——第一个读数只立基线，之后每个
-    /// 读数都必须严格超过此前的最好成绩。窗口内读数缺失（本次改动前归档的
-    /// 记录、无分/无产物的分支）按"未观测"处理，既不当作进展也不当作停滞：
-    /// 少于两个读数就无从比较，一律返回 false，把判断交回给逐字判据。缺了这道
-    /// 下限，一个只是没被观测过的窗口会被 `all` 的空真判成"没进展"。
+    /// 读数都必须严格超过此前的最好成绩。窗口内缺失的读数（本次改动前归档的
+    /// 记录没有这个字段）按"未观测"处理，跳过而不是当成零分零产物：少于两个
+    /// 读数就无从比较，一律返回 false，把判断交回给逐字判据。缺了这道下限，
+    /// 一个只是没被观测过的窗口会被 `all` 的空真判成"没进展"。
     fn tail_bought_no_progress(&self, tail: &[RalphIteration]) -> bool {
         let readings: Vec<IterationProgress> = tail.iter().filter_map(|it| it.progress).collect();
         let Some((baseline, rest)) = readings.split_first() else {
@@ -1284,6 +1286,29 @@ mod tests {
             readings(30, 100),
         ));
         assert!(!ralph.is_stagnated());
+    }
+
+    /// 既无分又无制品不是"不可判定"：三个读数全零就是确定的"这一轮什么都没
+    /// 买到"，同样要判停滞。若把它当作未观测而跳过，这类链条（不产出也不被
+    /// 评分）会绕过停滞判据、每轮烧满预算——正是本次修复要消灭的形态。
+    #[test]
+    fn zero_readings_are_no_progress_not_undecidable() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 2,
+        });
+        for i in 1..=2 {
+            ralph.history.push(failed_iteration_with_readings(
+                i,
+                "nothing produced, nothing scored",
+                IterationProgress {
+                    score: 0,
+                    artifact_count: 0,
+                    artifact_bytes: 0,
+                },
+            ));
+        }
+        assert!(ralph.is_stagnated());
     }
 
     /// 有真进展就不判停滞——哪怕措辞一轮比一轮难听。
