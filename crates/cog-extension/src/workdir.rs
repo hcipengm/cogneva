@@ -498,9 +498,13 @@ impl WorkdirRouter {
         });
         let fetch = Arc::clone(self);
         tokio::spawn(async move {
+            // Refresh immediately in the background rather than on the startup
+            // critical path: a hung offline fetch must never delay the HTTP
+            // listener past the liveness grace window (which would crash-loop
+            // the pod). Failure only records a metric and retries next tick.
             loop {
-                tokio::time::sleep(fetch.cfg.fetch_interval).await;
                 fetch.fetch_once().await;
+                tokio::time::sleep(fetch.cfg.fetch_interval).await;
             }
         });
     }

@@ -57,7 +57,9 @@ spec:
                 echo "sandbox volume empty; seeding bare repo from https://github.com/hcipengm/cogneva.git ..."
                 # 种子失败不阻塞启动：主进程见裸仓缺失即回落无工作树模式，
                 # 下次重启 init 再试，离线集群不会因此永久卡在 Init 阶段。
-                if git clone --bare https://github.com/hcipengm/cogneva.git /tmp/seed.git; then
+                # http.connectTimeout/lowSpeed 给网络操作兜底，否则离线时
+                # git 会长时间挂在连接上拖慢 Init 与整 Pod 就绪。
+                if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare https://github.com/hcipengm/cogneva.git /tmp/seed.git; then
                   cp -a /tmp/seed.git/. "$root/repo.git/"
                   rm -rf /tmp/seed.git
                 else
@@ -69,7 +71,7 @@ spec:
                 git --git-dir="$root/repo.git" remote add upstream https://github.com/hcipengm/cogneva.git
                 # +main:main advances the local main that task worktrees are cut
                 # from; a plain fetch would only update remote-tracking refs.
-                if ! git --git-dir="$root/repo.git" fetch upstream --tags --force '+main:main'; then
+                if ! git --git-dir="$root/repo.git" -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force '+main:main'; then
                   echo "WARN: sandbox seed fetch failed (offline?); serving seeded refs"
                 fi
                 git --git-dir="$root/repo.git" worktree prune || true

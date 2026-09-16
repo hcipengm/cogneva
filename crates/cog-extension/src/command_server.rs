@@ -241,7 +241,9 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::error!(error = %e, "workdir recovery failed; serving without router");
                 router()
             } else {
-                workdir.fetch_once().await;
+                // Recovery is local and fast and stays on the startup path; the
+                // first upstream fetch runs inside spawn_maintenance so a stalled
+                // network cannot block the HTTP listener (and liveness probe).
                 workdir.spawn_maintenance();
                 tracing::info!(
                     workspaces = %workdir.config().workspaces_root.display(),
