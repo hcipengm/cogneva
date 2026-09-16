@@ -294,18 +294,23 @@ impl RalphLoop {
         identical_failure || self.tail_bought_no_progress(tail)
     }
 
-    /// 尾部这一窗内在分数或产物上没有抬升过——第一轮只立基线，之后每一轮
-    /// 都必须严格超过前一轮。窗口内读数缺失（旧记录、无分/无产物的分支）
-    /// 按"未观测"处理，既不当作进展也不当作停滞；整窗都不可判定时返回
-    /// false，把判断交回给逐字判据。
+    /// 尾部这一窗内在分数或产物上没有抬升过——第一个读数只立基线，之后每个
+    /// 读数都必须严格超过此前的最好成绩。窗口内读数缺失（本次改动前归档的
+    /// 记录、无分/无产物的分支）按"未观测"处理，既不当作进展也不当作停滞：
+    /// 少于两个读数就无从比较，一律返回 false，把判断交回给逐字判据。缺了这道
+    /// 下限，一个只是没被观测过的窗口会被 `all` 的空真判成"没进展"。
     fn tail_bought_no_progress(&self, tail: &[RalphIteration]) -> bool {
-        let mut readings = tail.iter().filter_map(|it| it.progress);
-        let Some(mut best) = readings.next() else {
+        let readings: Vec<IterationProgress> = tail.iter().filter_map(|it| it.progress).collect();
+        let Some((baseline, rest)) = readings.split_first() else {
             return false;
         };
-        readings.all(|cur| {
+        if rest.is_empty() {
+            return false;
+        }
+        let mut best = *baseline;
+        rest.iter().all(|cur| {
             if cur.beats(&best) {
-                best = cur;
+                best = *cur;
                 false
             } else {
                 true
@@ -1252,6 +1257,33 @@ mod tests {
             ));
         }
         assert!(ralph.is_stagnated());
+    }
+
+    /// 只有一个读数无从比较：本次改动前归档的记录没有读数，重驱的第一轮会
+    /// 让窗口里只出现一个读数。空真会把"没观测过"判成"没进展"，第一轮就
+    /// 掐掉整个目标。
+    #[test]
+    fn single_reading_is_not_evidence_of_no_progress() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 3,
+        });
+        ralph.history.push(failed_iteration(
+            1,
+            ResetStrategy::Identical,
+            "stale entry without readings",
+        ));
+        ralph.history.push(failed_iteration(
+            2,
+            ResetStrategy::Identical,
+            "another stale entry",
+        ));
+        ralph.history.push(failed_iteration_with_readings(
+            3,
+            "first observed",
+            readings(30, 100),
+        ));
+        assert!(!ralph.is_stagnated());
     }
 
     /// 有真进展就不判停滞——哪怕措辞一轮比一轮难听。
