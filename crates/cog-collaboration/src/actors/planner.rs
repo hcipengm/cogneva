@@ -195,7 +195,7 @@ impl PlannerActor {
             "context": ctx,
         });
 
-        let mut output = match self.agent.prompt(input).await {
+        let mut output = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
                 // 校验 schema：算子显式配置优先，否则用 skill 声明的 schema（均仅告警）。
                 let effective_schema = self.output_schema.as_ref().or_else(|| {

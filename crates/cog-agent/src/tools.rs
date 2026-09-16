@@ -5,6 +5,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Real execution identity of one agent run. Carried explicitly from the
+/// actor (which knows the DAG task) through the runtime into sandbox requests,
+/// so the executor pod can attribute and route work per task.
+#[derive(Debug, Clone)]
+pub struct ToolScope {
+    pub task_id: String,
+    pub agent_id: String,
+}
+
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: Arc<std::sync::RwLock<HashMap<String, Tool>>>,
@@ -12,6 +21,10 @@ pub struct ToolRegistry {
     guardrail: Option<Arc<dyn cog_core::Guardrail>>,
     plugin_registry: Option<Arc<dyn cog_core::PluginRegistry>>,
     wasm_timeout: Duration,
+    /// When true, shell-class tools reject calls without a [`ToolScope`].
+    /// Evolution pods turn this on so no command can reach the executor under
+    /// a synthetic identity; default off keeps embedded/main-app behavior.
+    require_identity: bool,
 }
 
 impl ToolRegistry {
@@ -22,7 +35,17 @@ impl ToolRegistry {
             guardrail: None,
             plugin_registry: None,
             wasm_timeout: Duration::from_secs(30),
+            require_identity: false,
         }
+    }
+
+    pub fn with_require_identity(mut self, require: bool) -> Self {
+        self.require_identity = require;
+        self
+    }
+
+    pub fn set_require_identity(&mut self, require: bool) {
+        self.require_identity = require;
     }
 
     pub fn with_wasm_timeout(mut self, secs: u64) -> Self {
@@ -73,6 +96,19 @@ impl ToolRegistry {
         &self,
         name: &str,
         arguments: serde_json::Value,
+    ) -> SFResult<serde_json::Value> {
+        self.execute_scoped(name, arguments, None).await
+    }
+
+    /// Execute a tool with the real run identity. `None` scope means the
+    /// caller never established task identity (legacy/embedded path); the
+    /// synthetic id gets an `unscoped-` prefix so logs can tell the two apart,
+    /// and when `require_identity` is on shell tools are rejected outright.
+    pub async fn execute_scoped(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        scope: Option<&ToolScope>,
     ) -> SFResult<serde_json::Value> {
         let tool = self
             .tools
@@ -133,8 +169,12 @@ impl ToolRegistry {
                     ));
                 };
                 let req = SandboxRequest {
-                    task_id: format!("tool-{}", name),
-                    agent_id: plugin_id.clone(),
+                    task_id: scope
+                        .map(|s| s.task_id.clone())
+                        .unwrap_or_else(|| format!("unscoped-tool-{}", name)),
+                    agent_id: scope
+                        .map(|s| s.agent_id.clone())
+                        .unwrap_or_else(|| plugin_id.clone()),
                     payload: SandboxPayload::Wasm {
                         bytes,
                         entry: export_name.clone(),
@@ -147,6 +187,12 @@ impl ToolRegistry {
                 Ok(result.into_json())
             }
             ToolImplementation::Shell(op) => {
+                if scope.is_none() && self.require_identity {
+                    return Err(cog_core::SFError::Agent(format!(
+                        "tool '{name}' requires task identity (require_tool_identity=true); \
+                         call through prompt_for_task"
+                    )));
+                }
                 let backend = self.sandbox_backend.as_ref().ok_or_else(|| {
                     cog_core::SFError::Agent("SandboxBackend not configured for shell tool".into())
                 })?;
@@ -191,8 +237,12 @@ impl ToolRegistry {
                         }
                     };
                 let req = SandboxRequest {
-                    task_id: format!("shell-{}", uuid::Uuid::new_v4()),
-                    agent_id: format!("tool-{}", name),
+                    task_id: scope
+                        .map(|s| s.task_id.clone())
+                        .unwrap_or_else(|| format!("unscoped-shell-{}", uuid::Uuid::new_v4())),
+                    agent_id: scope
+                        .map(|s| s.agent_id.clone())
+                        .unwrap_or_else(|| format!("unscoped-tool-{}", name)),
                     payload,
                     input: arguments,
                     timeout: self.wasm_timeout,
@@ -419,6 +469,188 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("SandboxBackend not configured"));
+    }
+
+    /// Records the identity stamped on every request so tests can assert what
+    /// the sandbox plane actually sees.
+    #[derive(Default)]
+    struct RecordingBackend {
+        seen: tokio::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for RecordingBackend {
+        async fn execute(&self, req: &SandboxRequest) -> SFResult<cog_core::SandboxResult> {
+            self.seen
+                .lock()
+                .await
+                .push((req.task_id.clone(), req.agent_id.clone()));
+            Ok(cog_core::SandboxResult {
+                exit_code: 0,
+                ..Default::default()
+            })
+        }
+
+        async fn precompile(&self, _bytes: &[u8]) -> SFResult<String> {
+            Err(cog_core::SFError::Agent("unsupported".into()))
+        }
+    }
+
+    struct StubPluginRegistry;
+
+    #[async_trait::async_trait]
+    impl cog_core::PluginRegistry for StubPluginRegistry {
+        async fn discover(&self, _source: &str) -> SFResult<Vec<cog_core::PluginManifest>> {
+            Ok(vec![])
+        }
+        async fn fetch(&self, _manifest: &cog_core::PluginManifest) -> SFResult<Vec<u8>> {
+            Ok(vec![])
+        }
+        async fn load(
+            &self,
+            _bytes: &[u8],
+            _manifest: &cog_core::PluginManifest,
+        ) -> SFResult<cog_core::PluginHandle> {
+            Err(cog_core::SFError::Agent("not loadable".into()))
+        }
+        async fn unload(&self, _handle: &cog_core::PluginHandle) -> SFResult<()> {
+            Ok(())
+        }
+        async fn fetch_by_id(&self, _plugin_id: &str) -> SFResult<Vec<u8>> {
+            Ok(vec![])
+        }
+    }
+
+    fn scope(task_id: &str, agent_id: &str) -> ToolScope {
+        ToolScope {
+            task_id: task_id.into(),
+            agent_id: agent_id.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_shell_carries_real_task_identity() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry =
+            ToolRegistry::new().with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        registry
+            .execute_scoped(
+                "run_command",
+                serde_json::json!({"command": "echo hi"}),
+                Some(&scope("dag-task-7", "worker-3")),
+            )
+            .await
+            .unwrap();
+
+        let seen = backend.seen.lock().await.clone();
+        assert_eq!(seen, vec![("dag-task-7".into(), "worker-3".into())]);
+    }
+
+    #[tokio::test]
+    async fn unscoped_shell_gets_distinct_synthetic_identity() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry =
+            ToolRegistry::new().with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        registry
+            .execute("run_command", serde_json::json!({"command": "echo hi"}))
+            .await
+            .unwrap();
+
+        let seen = backend.seen.lock().await.clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.starts_with("unscoped-shell-"));
+        assert_eq!(seen[0].1, "unscoped-tool-run_command");
+    }
+
+    #[tokio::test]
+    async fn require_identity_rejects_unscoped_shell_but_allows_scoped() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry = ToolRegistry::new()
+            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>)
+            .with_require_identity(true);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        let err = registry
+            .execute("run_command", serde_json::json!({"command": "echo hi"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("requires task identity"));
+        assert!(backend.seen.lock().await.is_empty());
+
+        registry
+            .execute_scoped(
+                "run_command",
+                serde_json::json!({"command": "echo hi"}),
+                Some(&scope("dag-task-9", "worker-1")),
+            )
+            .await
+            .unwrap();
+        let seen = backend.seen.lock().await.clone();
+        assert_eq!(seen, vec![("dag-task-9".into(), "worker-1".into())]);
+    }
+
+    #[tokio::test]
+    async fn scope_does_not_leak_between_runs() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry =
+            ToolRegistry::new().with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        for (task, agent) in [("dag-a", "w-1"), ("dag-b", "w-2")] {
+            registry
+                .execute_scoped(
+                    "run_command",
+                    serde_json::json!({"command": "echo hi"}),
+                    Some(&scope(task, agent)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let seen = backend.seen.lock().await.clone();
+        assert_eq!(
+            seen,
+            vec![
+                ("dag-a".into(), "w-1".into()),
+                ("dag-b".into(), "w-2".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn require_identity_does_not_reject_unscoped_wasm() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry = ToolRegistry::new()
+            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>)
+            .with_plugin_registry(Arc::new(StubPluginRegistry))
+            .with_require_identity(true);
+        cog_core::ToolRegistry::register(
+            &registry,
+            Tool {
+                name: "wasm_echo".into(),
+                description: "test wasm tool".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                implementation: ToolImplementation::Wasm {
+                    plugin_id: "plugin-42".into(),
+                    export_name: "run".into(),
+                },
+            },
+        );
+
+        registry
+            .execute("wasm_echo", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let seen = backend.seen.lock().await.clone();
+        assert_eq!(
+            seen,
+            vec![("unscoped-tool-wasm_echo".into(), "plugin-42".into())]
+        );
     }
 }
 

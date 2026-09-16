@@ -594,7 +594,18 @@ impl AgentRuntime {
         input: serde_json::Value,
         llm: &dyn cog_core::LlmClient,
     ) -> SFResult<serde_json::Value> {
-        tracing::info!(agent_id = %self.config.agent_id, "AgentRuntime::run started");
+        self.run_scoped(input, llm, None).await
+    }
+
+    /// Run with an explicit DAG task identity. Tool calls inside this run
+    /// carry `task_id` and the runtime's own agent id into sandbox requests.
+    pub async fn run_scoped(
+        &mut self,
+        input: serde_json::Value,
+        llm: &dyn cog_core::LlmClient,
+        run_task_id: Option<&str>,
+    ) -> SFResult<serde_json::Value> {
+        tracing::info!(agent_id = %self.config.agent_id, task_id = run_task_id.unwrap_or(""), "AgentRuntime::run started");
         self.state = RuntimeState::Idle;
         self.steps.clear();
 
@@ -823,7 +834,14 @@ impl AgentRuntime {
                 }
 
                 self.state = RuntimeState::Acting;
-                let result = self.tools.execute(&tc.name, tc.arguments.clone()).await;
+                let scope = run_task_id.map(|tid| crate::tools::ToolScope {
+                    task_id: tid.to_string(),
+                    agent_id: self.config.agent_id.clone(),
+                });
+                let result = self
+                    .tools
+                    .execute_scoped(&tc.name, tc.arguments.clone(), scope.as_ref())
+                    .await;
 
                 self.state = RuntimeState::Observing;
                 let is_error = result.is_err();

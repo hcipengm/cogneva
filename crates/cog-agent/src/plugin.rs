@@ -46,7 +46,15 @@ impl cog_core::SystemPlugin for AgentPlugin {
         }
 
         // Snapshot config values to drop immutable borrow before publishing.
-        let (data_dir, tool_timeout_secs, nats_config, hook_engine_config, _agent_config, mbc) = {
+        let (
+            data_dir,
+            tool_timeout_secs,
+            nats_config,
+            hook_engine_config,
+            _agent_config,
+            mbc,
+            require_tool_identity,
+        ) = {
             let config = ctx.config();
             (
                 config.app.data_dir.clone(),
@@ -55,6 +63,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 config.hook_engine.clone(),
                 config.agent.clone(),
                 config.multi_backend_consumer.clone(),
+                config.system.require_tool_identity,
             )
         };
 
@@ -157,7 +166,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 .with_wasm_timeout(tool_timeout_secs)
                 .with_sandbox_backend(sandbox_backend)
                 .with_guardrail(guardrail)
-                .with_plugin_registry(plugin_registry),
+                .with_plugin_registry(plugin_registry)
+                .with_require_identity(require_tool_identity),
         );
         // Built-in execution tools. Without these the registry advertises zero
         // tool definitions and squads can plan but never act on the

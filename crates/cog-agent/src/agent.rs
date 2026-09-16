@@ -11,6 +11,9 @@ use futures::StreamExt;
 
 pub enum AgentCommand {
     Prompt {
+        /// DAG task identity to stamp onto tool/sandbox calls. None = legacy
+        /// unscoped prompt.
+        task_id: Option<String>,
         input: serde_json::Value,
         result_tx: oneshot::Sender<SFResult<serde_json::Value>>,
     },
@@ -435,6 +438,24 @@ impl Agent {
     /// State machine: `Idle → Active → Completing → Idle` on success,
     /// `Active → Dead` on failure.
     pub async fn prompt(&self, input: serde_json::Value) -> SFResult<serde_json::Value> {
+        self.dispatch_prompt(None, input).await
+    }
+
+    /// Inherent counterpart of [`cog_core::Agent::prompt_for_task`] for callers
+    /// holding the concrete type.
+    pub async fn prompt_for_task(
+        &self,
+        task_id: &str,
+        input: serde_json::Value,
+    ) -> SFResult<serde_json::Value> {
+        self.dispatch_prompt(Some(task_id.to_string()), input).await
+    }
+
+    async fn dispatch_prompt(
+        &self,
+        task_id: Option<String>,
+        input: serde_json::Value,
+    ) -> SFResult<serde_json::Value> {
         self.start().await;
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -446,7 +467,11 @@ impl Agent {
                 .as_ref()
                 .ok_or_else(|| SFError::Agent("Agent not started".into()))?;
             cmd_tx
-                .send(AgentCommand::Prompt { input, result_tx })
+                .send(AgentCommand::Prompt {
+                    task_id,
+                    input,
+                    result_tx,
+                })
                 .await
                 .map_err(|_| SFError::Agent("Command channel closed".into()))?;
         }
@@ -962,6 +987,14 @@ impl cog_core::Agent for Agent {
         self.prompt(input).await
     }
 
+    async fn prompt_for_task(
+        &self,
+        task_id: &str,
+        input: serde_json::Value,
+    ) -> cog_core::SFResult<serde_json::Value> {
+        self.prompt_for_task(task_id, input).await
+    }
+
     async fn start(&self) {
         self.start().await;
     }
@@ -1131,8 +1164,14 @@ async fn run_agent_task(
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            AgentCommand::Prompt { input, result_tx } => {
-                let result = agent_loop.run(input, llm.as_ref()).await;
+            AgentCommand::Prompt {
+                task_id,
+                input,
+                result_tx,
+            } => {
+                let result = agent_loop
+                    .run_scoped(input, llm.as_ref(), task_id.as_deref())
+                    .await;
                 let _ = result_tx.send(result);
             }
             AgentCommand::Continue { input, result_tx } => {

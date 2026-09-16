@@ -84,6 +84,20 @@ impl Default for RuntimeConfig {
 #[async_trait]
 pub trait Agent: Send + Sync {
     async fn prompt(&self, input: serde_json::Value) -> crate::SFResult<serde_json::Value>;
+
+    /// Prompt on behalf of a concrete task. Implementations that execute
+    /// tools must stamp `task_id` onto the run scope so sandbox requests carry
+    /// the real DAG task identity instead of a per-call synthetic id.
+    /// Default delegates to [`Agent::prompt`] (no scoping), so existing
+    /// implementations compile unchanged.
+    async fn prompt_for_task(
+        &self,
+        task_id: &str,
+        input: serde_json::Value,
+    ) -> crate::SFResult<serde_json::Value> {
+        let _ = task_id;
+        self.prompt(input).await
+    }
     async fn start(&self);
     async fn snapshot(&self, task_id: String) -> crate::SFResult<crate::snapshot::AgentCheckpoint>;
     async fn restore(&self, snapshot: &crate::snapshot::AgentCheckpoint) -> crate::SFResult<()>;
@@ -375,6 +389,98 @@ pub fn generate_agent_id(hostname: &str, pod_ip: &str, role: &str, uuid: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal Agent that records the input seen by `prompt` so the default
+    /// `prompt_for_task` delegation can be verified without cog-agent.
+    struct PromptOnlyAgent;
+
+    #[async_trait::async_trait]
+    impl Agent for PromptOnlyAgent {
+        async fn prompt(&self, input: serde_json::Value) -> crate::SFResult<serde_json::Value> {
+            Ok(serde_json::json!({ "saw": input }))
+        }
+        async fn start(&self) {}
+        async fn snapshot(
+            &self,
+            _task_id: String,
+        ) -> crate::SFResult<crate::snapshot::AgentCheckpoint> {
+            unimplemented!()
+        }
+        async fn restore(
+            &self,
+            _snapshot: &crate::snapshot::AgentCheckpoint,
+        ) -> crate::SFResult<()> {
+            unimplemented!()
+        }
+        async fn continue_(&self, _input: serde_json::Value) -> crate::SFResult<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn steer(&self, _instruction: String) -> crate::SFResult<()> {
+            unimplemented!()
+        }
+        async fn abort(&self) -> crate::SFResult<()> {
+            unimplemented!()
+        }
+        async fn reset(&self) -> crate::SFResult<()> {
+            unimplemented!()
+        }
+        async fn state(&self) -> crate::SFResult<crate::AgentState> {
+            unimplemented!()
+        }
+        async fn wait_for_idle(&self) -> crate::SFResult<()> {
+            unimplemented!()
+        }
+        async fn restore_from_id(&self, _checkpoint_id: &str) -> crate::SFResult<()> {
+            unimplemented!()
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::AgentEvent> {
+            unimplemented!()
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[crate::Message],
+            _options: &crate::ChatOptions,
+        ) -> crate::SFResult<crate::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &crate::CompleteOptions,
+        ) -> crate::SFResult<crate::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+        async fn read_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+        ) -> crate::SFResult<Option<String>> {
+            unimplemented!()
+        }
+        async fn write_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> crate::SFResult<()> {
+            unimplemented!()
+        }
+        async fn receive_message(&self, _msg: InboxMessage) -> crate::SFResult<()> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_for_task_default_delegates_to_prompt() {
+        let agent = PromptOnlyAgent;
+        let out = agent
+            .prompt_for_task("dag-task-1", serde_json::json!({"k": "v"}))
+            .await
+            .unwrap();
+        // The blanket default carries no scoping machinery; it must behave
+        // exactly like prompt for implementors that do not override it.
+        assert_eq!(out["saw"]["k"], "v");
+    }
 
     #[test]
     fn agent_registration_construction() {

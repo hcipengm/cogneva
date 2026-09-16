@@ -74,7 +74,7 @@ impl MergerActor {
             input["response_format"] = serde_json::json!("json");
         }
 
-        let mut output = match self.agent.prompt(input).await {
+        let mut output = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
                 if let Some(ref schema) = self.output_schema {
                     crate::actors::validate_against_schema(schema, &result.to_string(), "merger");

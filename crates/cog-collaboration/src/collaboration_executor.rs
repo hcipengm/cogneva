@@ -430,7 +430,9 @@ impl CollaborationExecutor {
             .to_string();
 
         let mode_selector = self.mode_selector_with_agent().await;
-        let (pge_mode, reason) = mode_selector.select_mode(&goal, Some(&profile)).await;
+        let (pge_mode, reason) = mode_selector
+            .select_mode(&goal, Some(&profile), Some(&task.id))
+            .await;
 
         info!(task_id=%task.id, ?pge_mode, %reason, "ModeSelectorActor decision");
 
@@ -542,7 +544,9 @@ impl CollaborationExecutor {
         let is_self_evolution = Self::is_self_evolution_task(task);
 
         let mode_selector = self.mode_selector_with_agent().await;
-        let (pge_mode, reason) = mode_selector.select_mode(&goal, Some(&profile)).await;
+        let (pge_mode, reason) = mode_selector
+            .select_mode(&goal, Some(&profile), Some(&task.id))
+            .await;
 
         info!(
             task_id=%task.id,

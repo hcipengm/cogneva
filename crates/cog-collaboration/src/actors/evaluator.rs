@@ -197,7 +197,7 @@ impl EvaluatorActor {
             "context": ctx,
         });
 
-        let mut output = match self.agent.prompt(input).await {
+        let mut output = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
                 let effective_schema = self.output_schema.as_ref().or_else(|| {
                     self.prompt_skill

@@ -68,6 +68,7 @@ impl ModeSelectorActor {
         &self,
         goal: &str,
         profile: Option<&TaskProfile>,
+        task_id: Option<&str>,
     ) -> (PgeMode, String) {
         let goal_lower = goal.to_lowercase();
 
@@ -120,6 +121,7 @@ impl ModeSelectorActor {
                     ml_context.as_ref(),
                     knowledge_context.as_ref(),
                     agent.as_ref(),
+                    task_id,
                 )
                 .await
             {
@@ -235,10 +237,14 @@ impl ModeSelectorActor {
         ml_context: Option<&String>,
         knowledge_context: Option<&String>,
         agent: &dyn Agent,
+        task_id: Option<&str>,
     ) -> Option<(PgeMode, String)> {
         let input = self.build_input(goal, profile, ml_context, knowledge_context);
 
-        let result = agent.prompt(input).await.ok()?;
+        let result = match task_id {
+            Some(tid) => agent.prompt_for_task(tid, input).await.ok()?,
+            None => agent.prompt(input).await.ok()?,
+        };
         let result_str = serde_json::to_string_pretty(&result).unwrap_or_default();
         crate::actors::maybe_self_review(agent, &self.self_review, &result_str, "mode_selector")
             .await;

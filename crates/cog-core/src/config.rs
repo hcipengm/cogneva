@@ -548,6 +548,13 @@ pub struct SystemConfig {
     /// commands run in-process (embedded/development mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_executor_url: Option<String>,
+    /// When true, shell/exec tools reject calls that carry no task identity:
+    /// only invocations reached through `Agent::prompt_for_task` (squad DAG
+    /// tasks) may execute commands in the sandbox. Default false keeps legacy
+    /// entry points (direct prompt, continue, ReAct loop) working; the
+    /// self-evolution deployment profile sets this true as a fail-closed gate.
+    #[serde(default)]
+    pub require_tool_identity: bool,
     /// gRPC client reconnect interval (seconds).
     pub grpc_reconnect_interval_secs: u64,
     /// Health probe default timeout (seconds).
@@ -602,6 +609,7 @@ impl Default for SystemConfig {
             partition_maintenance_interval_secs: 3600,
             tool_timeout_secs: 30,
             sandbox_executor_url: None,
+            require_tool_identity: false,
             grpc_reconnect_interval_secs: 5,
             probe_timeout_secs: 5,
             http_timeout_secs: 10,
