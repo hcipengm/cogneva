@@ -19,6 +19,7 @@ use cog_core::{
 use crate::conversation::{ConversationState, IssueConversation};
 use crate::discovery::IssueDiscovery;
 use crate::error::Result;
+use crate::merge_executor::MergeExecutor;
 use crate::outcome_recorder::OutcomeRecorder;
 use crate::provider::{CiFailureEvent, CodePlatformProvider, PlatformIssue};
 use crate::triage::{IssueTriage, TriageDecision};
@@ -110,6 +111,9 @@ pub struct GitHubDiscoveryLoop {
     /// (on Gitee they are independent sequences).
     conversations: HashMap<String, IssueConversation>,
     recorder: OutcomeRecorder,
+    /// 自产 PR 的自动合并执行器。判定全部确定性（无 LLM 调用），合并成功
+    /// 后触发部署意图。与发现循环同节奏，不另起循环。
+    merge_executor: MergeExecutor,
     /// Intent guard keys (`"<kind>:<number>"`) that already produced a task
     /// this process lifetime — covers both issues and PRs.
     submitted: std::collections::HashSet<String>,
@@ -392,6 +396,8 @@ impl GitHubDiscoveryLoop {
         orchestrator: Option<Arc<dyn OrchestratorControl>>,
         reflection: Option<Arc<dyn cog_core::ReflectionEngine>>,
     ) -> Self {
+        // Built before `config` moves into the struct.
+        let merge_executor = MergeExecutor::new(&config);
         Self {
             provider,
             triage,
@@ -401,6 +407,7 @@ impl GitHubDiscoveryLoop {
             discovery: IssueDiscovery::new(),
             conversations: HashMap::new(),
             recorder: OutcomeRecorder::new(),
+            merge_executor,
             submitted: std::collections::HashSet::new(),
             ci_submitted: std::collections::HashSet::new(),
             awaiting_clarification: std::collections::HashSet::new(),
@@ -714,6 +721,29 @@ impl GitHubDiscoveryLoop {
 
         // A2A 交叉验证：把公版上他人 bot PR 拉进本实例沙盒验证并回评。
         self.poll_cross_validation().await;
+
+        // 自产 PR 的自动合并环。判定全部确定性、不调 LLM；门禁全过的合并并
+        // 触发部署，需人工介入的标注一次后停判，自愈型障碍下轮静默重试。
+        // 走到这里说明 LLM 池可用（本轮开头已短路降级态），不会在半盲态
+        // 执行不可逆动作。
+        let stats = self
+            .merge_executor
+            .run_once(
+                self.provider.as_ref(),
+                self.orchestrator.as_deref(),
+                self.reflection.as_deref(),
+            )
+            .await;
+        if stats.merged > 0 || stats.blocked > 0 || stats.failed > 0 {
+            tracing::info!(
+                examined = stats.examined,
+                merged = stats.merged,
+                waiting = stats.waiting,
+                blocked = stats.blocked,
+                failed = stats.failed,
+                "merge loop round complete"
+            );
+        }
 
         if let Some(ref reflection) = self.reflection {
             if let Err(e) = self

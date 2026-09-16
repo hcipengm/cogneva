@@ -128,6 +128,10 @@ impl cog_core::SystemPlugin for GitHubPlugin {
     }
 
     async fn init(&mut self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // 合并环决策计数：无指标时"无可合并产物"与"合并器失效"外观一致，
+        // 因此无条件发布，与集成是否启用无关。
+        ctx.publish_observable(crate::observable::global_merge_observable());
+
         // 贡献策略控制器：网关 admin API 经它读写属主档位、列暂存、按确认补发；
         // 无论通道是否已连接都发布，UI 才能在任何状态下读档/列暂存。
         let controller = crate::contribution::ContributionController::new_shared();

@@ -20,6 +20,13 @@ pub enum MergeDecision {
     Wait {
         /// Why merging is held back.
         reason: String,
+        /// Whether the obstacle needs a human to clear (failing CI,
+        /// over-budget change, forbidden path/label, requested review) as
+        /// opposed to one that clears itself (CI still pending, cooldown
+        /// still running, policy disabled). Terminal obstacles are annotated
+        /// once and stop being re-judged; recoverable ones are retried
+        /// silently next round.
+        terminal: bool,
     },
 }
 
@@ -32,12 +39,14 @@ impl MergeDecider {
         if !policy.enabled {
             return MergeDecision::Wait {
                 reason: "auto-merge policy disabled".into(),
+                terminal: false,
             };
         }
 
         if pr.state != "open" {
             return MergeDecision::Wait {
                 reason: format!("PR is not open (state: {})", pr.state),
+                terminal: false,
             };
         }
 
@@ -48,12 +57,16 @@ impl MergeDecider {
                     Some(true) => unreachable!(),
                     None => "CI status unknown".into(),
                 },
+                // A red CI needs a new commit, not patience; a signal that has
+                // not reported yet clears itself on the next round.
+                terminal: pr.ci_passed == Some(false),
             };
         }
 
         if policy.require_no_review_requested && pr.review_requested {
             return MergeDecision::Wait {
                 reason: "human review requested".into(),
+                terminal: true,
             };
         }
 
@@ -63,6 +76,7 @@ impl MergeDecider {
                     "changed lines {} exceed budget {}",
                     pr.changed_lines, policy.max_changed_lines
                 ),
+                terminal: true,
             };
         }
 
@@ -70,6 +84,7 @@ impl MergeDecider {
             if policy.forbidden_paths.iter().any(|p| path_matches(p, file)) {
                 return MergeDecision::Wait {
                     reason: format!("touches forbidden path: {}", file),
+                    terminal: true,
                 };
             }
         }
@@ -81,6 +96,7 @@ impl MergeDecider {
         {
             return MergeDecision::Wait {
                 reason: format!("forbidden label: {}", label),
+                terminal: true,
             };
         }
 
@@ -88,6 +104,7 @@ impl MergeDecider {
         if Utc::now() - pr.created_at < cooldown {
             return MergeDecision::Wait {
                 reason: format!("cooldown of {}h not elapsed", policy.cooldown_hours),
+                terminal: false,
             };
         }
 

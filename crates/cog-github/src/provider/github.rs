@@ -75,6 +75,79 @@ impl GitHubProvider {
     pub fn account(&self) -> &GitHubAccount {
         &self.account
     }
+
+    /// CI verdict for a PR head, from check runs first and legacy commit
+    /// statuses second.
+    ///
+    /// The base repo is queried for the head **SHA** (Actions reports
+    /// `pull_request` workflow runs against the head SHA in the base repo);
+    /// a PR whose head lives in a fork also has its fork queried, because
+    /// reading only the base repo would show an empty set for exactly the
+    /// cross-fork PRs the auto-fork flow produces. Querying the head *branch
+    /// name* — what this used to do — finds nothing for fork heads and, worse,
+    /// yields a `Pending` combined status with zero statuses for
+    /// Actions-only repos, which reads as a hard failure.
+    ///
+    /// `None` means "no evidence", never "probably fine": an empty signal set
+    /// and a still-running run both return `None` so the merge gate waits
+    /// instead of guessing. Only a completed non-passing conclusion returns
+    /// `Some(false)`, which is what makes the gate terminal.
+    async fn ci_verdict(&self, pr: &octocrab::models::pulls::PullRequest) -> Option<bool> {
+        let sha = pr.head.sha.clone();
+        let mut targets = vec![(self.owner.clone(), self.repo.clone())];
+        if let Some(repo) = pr.head.repo.as_ref() {
+            if let Some(owner) = repo.owner.as_ref() {
+                if owner.login != self.owner || repo.name != self.repo {
+                    targets.push((owner.login.clone(), repo.name.clone()));
+                }
+            }
+        }
+
+        let mut conclusions: Vec<String> = Vec::new();
+        let mut pending = false;
+        let mut saw_signal = false;
+        for (owner, repo) in &targets {
+            let runs = self
+                .client
+                .checks(owner, repo)
+                .list_check_runs_for_git_ref(octocrab::params::repos::Commitish(sha.clone()))
+                .send()
+                .await;
+            // An API error is not evidence either way; fall through to the
+            // status path and ultimately to None.
+            if let Ok(list) = runs {
+                for run in list.check_runs {
+                    saw_signal = true;
+                    match run.conclusion {
+                        Some(conclusion) => conclusions.push(conclusion),
+                        None => pending = true,
+                    }
+                }
+            }
+        }
+        if let Some(verdict) = fold_ci_signals(saw_signal, pending, &conclusions) {
+            return Some(verdict);
+        }
+
+        for (owner, repo) in &targets {
+            let route = format!("/repos/{owner}/{repo}/commits/{sha}/status");
+            let status = self
+                .client
+                .get::<octocrab::models::CombinedStatus, _, _>(route, None::<&()>)
+                .await;
+            if let Ok(status) = status {
+                if status.total_count > 0 {
+                    return match status.state {
+                        octocrab::models::StatusState::Success => Some(true),
+                        octocrab::models::StatusState::Failure
+                        | octocrab::models::StatusState::Error => Some(false),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    }
 }
 
 #[async_trait]
@@ -384,20 +457,7 @@ impl CodePlatformProvider for GitHubProvider {
             .await
             .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
 
-        let ci_passed = match self
-            .client
-            .repos(&self.owner, &self.repo)
-            .combined_status_for_ref(&octocrab::params::repos::Reference::Branch(
-                pr.head.ref_field.clone(),
-            ))
-            .await
-        {
-            Ok(status) => Some(matches!(
-                status.state,
-                octocrab::models::StatusState::Success
-            )),
-            Err(_) => None,
-        };
+        let ci_passed = self.ci_verdict(&pr).await;
 
         let state = if pr.merged_at.is_some() {
             "merged".to_string()
@@ -604,6 +664,29 @@ pub(crate) fn split_repo(repo: &str) -> Result<(String, String)> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
+/// Whether one completed run's conclusion counts as passing.
+///
+/// `neutral` and `skipped` pass: they are what a path-filtered or
+/// condition-gated job reports, and GitHub's own required-check evaluation
+/// treats them as satisfied. Anything unrecognised fails closed.
+fn ci_conclusion_passes(conclusion: &str) -> bool {
+    matches!(conclusion, "success" | "neutral" | "skipped")
+}
+
+/// Fold collected check-run signals into a verdict; `None` means no evidence.
+///
+/// Split out from the network path so the three-way outcome (`Some(true)` /
+/// `Some(false)` / `None`) can be tested without a live platform.
+fn fold_ci_signals(saw_signal: bool, pending: bool, conclusions: &[String]) -> Option<bool> {
+    if !saw_signal {
+        return None;
+    }
+    if pending {
+        return None;
+    }
+    Some(conclusions.iter().all(|c| ci_conclusion_passes(c)))
+}
+
 /// Keep the last `cap` bytes of `text`, starting on a char boundary.
 fn log_tail(text: &str, cap: usize) -> String {
     if text.len() <= cap {
@@ -658,6 +741,30 @@ mod tests {
         let v = serde_json::json!({});
         assert!(github_can_push(&v, "Upstream", "upstream"));
         assert!(!github_can_push(&v, "alice", "upstream"));
+    }
+
+    #[test]
+    fn ci_signals_need_evidence_before_they_say_anything() {
+        let none: Vec<String> = Vec::new();
+        // No runs at all: unknown, not "passed" and not "failed" — the merge
+        // gate waits on this rather than blocking or merging blind.
+        assert_eq!(fold_ci_signals(false, false, &none), None);
+        // Runs exist but none finished: still unknown.
+        assert_eq!(fold_ci_signals(true, true, &none), None);
+        // A finished run plus one still running: unknown, because the pending
+        // one may yet fail.
+        assert_eq!(fold_ci_signals(true, true, &["success".to_string()]), None);
+    }
+
+    #[test]
+    fn ci_signals_verdict_comes_from_completed_runs() {
+        let passed = vec!["success".to_string(), "skipped".to_string()];
+        assert_eq!(fold_ci_signals(true, false, &passed), Some(true));
+        let failed = vec!["success".to_string(), "failure".to_string()];
+        assert_eq!(fold_ci_signals(true, false, &failed), Some(false));
+        // Unknown conclusions fail closed.
+        let unknown = vec!["startup_failure".to_string()];
+        assert_eq!(fold_ci_signals(true, false, &unknown), Some(false));
     }
 
     #[test]

@@ -295,6 +295,44 @@ pub struct AutoMergePolicy {
     pub cooldown_hours: u64,
     /// Whether a human can override auto-merge via labels.
     pub require_human_review_override: bool,
+    /// Require a machine-readable self-review score on the PR before merging.
+    /// A PR without a parseable score waits instead of merging — missing
+    /// evidence is not evidence of quality.
+    pub require_self_review: bool,
+    /// Minimum self-review score a PR must carry to merge.
+    pub min_self_review_score: f32,
+    /// Also require the sandbox gate signals the publisher embeds in the PR
+    /// metadata block. Off by default: the sandbox environment does not yet
+    /// match the deployment target closely enough for its cargo gates to be
+    /// authoritative.
+    pub local_gate_signals: bool,
+    /// Which platform self-produced change PRs are opened on and merged from.
+    /// `github` is the default: it is the end with a complete CI signal, so
+    /// the merge gates have something authoritative to read. The other end
+    /// receives `main` by mirror instead of by PR.
+    pub merge_target_platform: MergeTargetPlatform,
+    /// Reap self-produced PRs left open on the non-target platform (whether
+    /// from before this policy existed or from a misconfigured publisher)
+    /// instead of leaving them for a human. Unattended operation leaves no
+    /// open tail behind.
+    pub legacy_pr_reap: bool,
+    /// Submit a deployment intent task after a merge, so a merged change
+    /// reaches the canary pipeline instead of stopping at `main`.
+    pub trigger_deploy_after_merge: bool,
+}
+
+/// Which platform auto-merge operates on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeTargetPlatform {
+    /// GitHub: complete Actions/check-runs CI signal, so the gates are
+    /// authoritative.
+    #[default]
+    Github,
+    /// Gitee: no open CI API, so CI-dependent gates cannot pass there.
+    Gitee,
+    /// Follow whichever platform is configured as the primary provider.
+    Primary,
 }
 
 impl Default for AutoMergePolicy {
@@ -317,6 +355,12 @@ impl Default for AutoMergePolicy {
             ],
             cooldown_hours: 24,
             require_human_review_override: true,
+            require_self_review: true,
+            min_self_review_score: 0.80,
+            local_gate_signals: false,
+            merge_target_platform: MergeTargetPlatform::Github,
+            legacy_pr_reap: true,
+            trigger_deploy_after_merge: true,
         }
     }
 }
@@ -395,6 +439,15 @@ impl BotIdentityConfig {
         self.instance()
             .map(|i| i.git_name)
             .unwrap_or_else(|| self.name.clone())
+    }
+
+    /// 本实例在 PR metadata 块里署名的句柄。发布侧写、合并侧读，两侧必须
+    /// 共用这一份逻辑：任何偏差都会让自家产出的 PR 被判成他人 PR 而永不
+    /// 自动合并。
+    pub fn own_handle(&self) -> String {
+        self.instance()
+            .map(|i| i.handle)
+            .unwrap_or_else(|| self.git_author_name())
     }
 
     /// 提交作者邮箱：优先实例邮箱（per-instance，可归因），回退静态配置。
