@@ -639,6 +639,75 @@ mod tests {
         assert!(!cfg.enabled);
     }
 
+    /// 随仓库发布的配置模板操作员会照抄。代码里改了字段名、模板没跟上（或反
+    /// 过来）在运行时完全无声：serde 忽略未知键、缺的键取默认值，集成照常启
+    /// 动，只是那几个开关悄悄失效。只有逐键比对能发现，所以在这里比一次。
+    fn assert_surface_matches(file: &std::path::Path) {
+        let raw = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let doc: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", file.display()));
+
+        let mut expected: Vec<String> = serde_json::to_value(GitHubIntegrationConfig::default())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let section = doc
+            .get("github_integration")
+            .unwrap_or_else(|| panic!("{} has no github_integration section", file.display()));
+        let mut actual: Vec<String> = section
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| !k.starts_with('_'))
+            .cloned()
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            expected,
+            actual,
+            "{} github_integration drifted from GitHubIntegrationConfig",
+            file.display()
+        );
+
+        let policy = section
+            .get("landing_policy")
+            .expect("landing_policy section");
+        let mut expected: Vec<String> = serde_json::to_value(LandingPolicy::default())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let mut actual: Vec<String> = policy
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| !k.starts_with('_'))
+            .cloned()
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            expected,
+            actual,
+            "{} landing_policy drifted from LandingPolicy",
+            file.display()
+        );
+    }
+
+    #[test]
+    fn shipped_config_templates_track_the_field_surface() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_surface_matches(&root.join("cogneva.example.json"));
+        assert_surface_matches(&root.join("deploy/helm/cogneva/files/cogneva.json"));
+    }
+
     #[test]
     fn reads_section() {
         let dir = std::env::temp_dir().join(format!("cog-github-cfg-{}", std::process::id()));

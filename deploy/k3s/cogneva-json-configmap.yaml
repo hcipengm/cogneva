@@ -534,13 +534,13 @@ data:
           "path": "/webhooks/github",
           "gateway_verified": true
         },
-        "pr_workdir": "",
-        "_comment_pr_workdir": "Local git working copy the change publisher uses. Empty derives one under the data dir (COGNEVA_DATA_DIR/pr-workdir); whether changes actually go upstream is the contribution policy's decision, not a path setting. Git transport goes through the security gateway HTTPS proxy (COGNEVA_GIT_PROXY_BASE, set in deployment env); no token or deploy key lives in this pod.",
-        "auto_create_pr": true,
+        "git_workdir": "",
+        "_comment_git_workdir": "Local git working copy the landing channel commits and pushes from. Empty derives one under the data dir (COGNEVA_DATA_DIR/git-workdir); whether changes actually go upstream is the contribution policy's decision, not a path setting. Git transport goes through the security gateway HTTPS proxy (COGNEVA_GIT_PROXY_BASE, set in deployment env); no token or deploy key lives in this pod.",
+        "api_base": null,
+        "_comment_api_base": "GitHub API base override. Point it at the security gateway passthrough endpoint (COGNEVA_GITHUB_API_BASE, e.g. http://cogneva-security-gateway:8081/github) so this process holds no platform token; leave null to talk to api.github.com directly with the token_env/inline token.",
+        "auto_submit_fixes": true,
         "landing_policy": {
-          "_comment": "Gates a generated change must clear before its commit lands on the base branch, and what happens when CI on a landed commit fails. Whether changes go upstream at all is the contribution policy's decision (auto/ask/local) — there is no separate on/off switch here.",
-          "require_self_review": true,
-          "min_self_review_score": 0.8,
+          "_comment": "Bounds what a landed change may touch, and what happens when CI on a landed commit fails. Quality is settled by the sandbox (pre-check, apply, test, release build) before the channel is called, so there is no score gate here; whether changes go upstream at all is the contribution policy's decision (auto/ask/local), so there is no on/off switch either.",
           "max_changed_lines": 200,
           "forbidden_paths": [
             ".github/workflows",
@@ -550,7 +550,9 @@ data:
           ],
           "revert_on_ci_failure": true,
           "redrive_on_ci_failure": true,
-          "ci_watch_timeout_secs": 1800
+          "ci_watch_timeout_secs": 1800,
+          "ci_poll_interval_secs": 60,
+          "max_land_attempts": 3
         },
         "human_required_labels": [
           "security",
