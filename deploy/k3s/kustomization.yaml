@@ -16,6 +16,7 @@ resources:
   - github-webhook-service.yaml
   - gateway-deployment.yaml
   - gateway-service.yaml
+  - sandbox-pvc.yaml
   - sandbox-executor-deployment.yaml
   - sandbox-executor-service.yaml
   - evolution-configmap.yaml

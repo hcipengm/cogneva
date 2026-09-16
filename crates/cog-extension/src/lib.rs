@@ -12,6 +12,7 @@ pub mod executor;
 pub mod plugin;
 pub mod registry;
 pub mod runtime;
+pub mod workdir;
 
 #[cfg(feature = "rhai")]
 pub use runtime::script::RhaiRuntime;

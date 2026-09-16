@@ -1,0 +1,19 @@
+# 沙箱执行器专属卷：执行器自有裸仓库、每任务工作树、共享 CARGO_TARGET_DIR。
+# 与进化侧卷物理分离，互不共享工作树。卸载保留，重装继续使用同一批工作区。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-sandbox-pvc
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: sandbox-executor
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: local-path

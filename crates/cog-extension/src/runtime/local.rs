@@ -5,6 +5,8 @@
 //! development mode). Production cluster deployments route these payloads to
 //! the executor pod via [`super::remote::RemoteExecutor`] instead.
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use cog_core::{
     CommandEvent, CommandEventStream, SFResult, SandboxBackend, SandboxPayload, SandboxRequest,
@@ -29,15 +31,29 @@ impl Default for LocalExecutor {
 /// Spawn `sh -c <command>` and drive stdout/stderr/exit into an event channel.
 /// Shared by the local backend and the executor server; kills the child on
 /// timeout.
+///
+/// `workdir` overrides the child cwd (the executor anchors it to the caller's
+/// task worktree); `cargo_target` is injected as `CARGO_TARGET_DIR` so trees
+/// share one externalized build cache. Both are `None` for embedded usage,
+/// preserving process-default behaviour.
 pub(crate) fn spawn_command(
     command: &str,
     timeout: std::time::Duration,
+    workdir: Option<&Path>,
+    cargo_target: Option<&Path>,
 ) -> SFResult<tokio::sync::mpsc::Receiver<CommandEvent>> {
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = workdir {
+        cmd.current_dir(dir);
+    }
+    if let Some(target) = cargo_target {
+        cmd.env("CARGO_TARGET_DIR", target);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| cog_core::SFError::IO(format!("spawn sh: {}", e)))?;
 
@@ -162,7 +178,7 @@ impl SandboxBackend for LocalExecutor {
         match &req.payload {
             SandboxPayload::Command { command } => {
                 tracing::warn!(command = %command, "local command execution (no remote executor configured)");
-                let rx = spawn_command(command, req.timeout)?;
+                let rx = spawn_command(command, req.timeout, None, None)?;
                 Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|event| (event, rx))
                 })))

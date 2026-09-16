@@ -6,9 +6,13 @@
 //! secrets and holds no credentials — isolation is the pod boundary, so
 //! commands may use full shell syntax by design.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use axum::{
     body::Body,
-    http::StatusCode,
+    extract::State,
+    http::{header, StatusCode},
     response::Response,
     routing::{get, post},
     Json, Router,
@@ -16,6 +20,15 @@ use axum::{
 use cog_core::{CommandEvent, SandboxPayload};
 use futures::StreamExt;
 use serde::Deserialize;
+
+use crate::workdir::{self, WorkdirRouter};
+
+#[derive(Clone)]
+struct AppState {
+    /// Per-task worktree router; absent when the executor runs without a
+    /// seeded bare repo (tests, embedded usage), keeping legacy cwd semantics.
+    workdir: Option<Arc<WorkdirRouter>>,
+}
 
 /// Hard ceiling on command duration regardless of what the client asks for.
 const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -73,12 +86,52 @@ fn single_shot(result: std::io::Result<String>) -> tokio::sync::mpsc::Receiver<C
     rx
 }
 
-async fn execute_handler(Json(req): Json<ExecuteRequest>) -> Response {
+/// Resolve the task worktree for a request. A valid task id anchors the
+/// command cwd and relative file paths; routing errors fail the request
+/// instead of silently falling back to a shared directory. When the router is
+/// enabled, every command additionally receives the shared CARGO_TARGET_DIR.
+async fn resolve_workdir(
+    state: &AppState,
+    task_id: Option<&str>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), Response> {
+    let Some(router) = state.workdir.as_ref() else {
+        return Ok((None, None));
+    };
+    match task_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => match router.route(id).await {
+            Ok(dir) => Ok((Some(dir), Some(router.target_dir().to_path_buf()))),
+            Err(e) => {
+                router.metrics().inc_error("route");
+                Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("task worktree unavailable: {e}"),
+                ))
+            }
+        },
+        None => {
+            // The business side must stamp identity (require_tool_identity);
+            // an unstamped request still runs for compatibility, but outside
+            // any task tree and is counted for observability.
+            router.metrics().inc_unscoped();
+            tracing::warn!("sandbox request without task id; running outside per-task worktree");
+            Ok((None, Some(router.target_dir().to_path_buf())))
+        }
+    }
+}
+
+async fn execute_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ExecuteRequest>,
+) -> Response {
     let timeout = req
         .timeout_ms
         .map(std::time::Duration::from_millis)
         .unwrap_or(DEFAULT_TIMEOUT)
         .min(MAX_TIMEOUT);
+    let (workdir, cargo_target) = match resolve_workdir(&state, req.task_id.as_deref()).await {
+        Ok(resolved) => resolved,
+        Err(resp) => return resp,
+    };
     match req.payload {
         SandboxPayload::Command { ref command } => {
             if command.trim().is_empty() {
@@ -87,23 +140,40 @@ async fn execute_handler(Json(req): Json<ExecuteRequest>) -> Response {
             tracing::info!(
                 task_id = req.task_id.as_deref().unwrap_or(""),
                 agent_id = req.agent_id.as_deref().unwrap_or(""),
+                workdir = ?workdir,
                 command = %command,
                 "sandbox executor running command"
             );
-            match crate::runtime::local::spawn_command(command, timeout) {
+            match crate::runtime::local::spawn_command(
+                command,
+                timeout,
+                workdir.as_deref(),
+                cargo_target.as_deref(),
+            ) {
                 Ok(rx) => stream_response(rx),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             }
         }
         SandboxPayload::ReadFile { ref path } => {
-            let result = tokio::fs::read_to_string(path).await;
+            let anchored = workdir::anchor_path(workdir.as_deref(), path);
+            let result = tokio::fs::read_to_string(&anchored).await;
             stream_response(single_shot(result))
         }
         SandboxPayload::WriteFile {
             ref path,
             ref content,
         } => {
-            let result = tokio::fs::write(path, content).await.map(|_| String::new());
+            let anchored = workdir::anchor_path(workdir.as_deref(), path);
+            if let Some(parent) = anchored.parent() {
+                if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        return stream_response(single_shot(Err(e)));
+                    }
+                }
+            }
+            let result = tokio::fs::write(&anchored, content)
+                .await
+                .map(|_| String::new());
             stream_response(single_shot(result))
         }
         SandboxPayload::Wasm { .. } => error_response(
@@ -113,11 +183,37 @@ async fn execute_handler(Json(req): Json<ExecuteRequest>) -> Response {
     }
 }
 
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    let body = state
+        .workdir
+        .as_ref()
+        .map(|r| r.metrics().render())
+        .unwrap_or_default();
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(body))
+        .expect("static response")
+}
+
+/// Router without per-task worktrees (tests and any no-volume deployment).
 pub fn router() -> Router {
+    app_router(AppState { workdir: None })
+}
+
+/// Full router wiring a provisioned workdir router.
+pub fn app_router_with_workdir(workdir: Arc<WorkdirRouter>) -> Router {
+    app_router(AppState {
+        workdir: Some(workdir),
+    })
+}
+
+fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(health))
         .route("/health/ready", get(health))
+        .route("/metrics", get(metrics_handler))
         .route("/execute", post(execute_handler))
+        .with_state(state)
 }
 
 /// Entry point for the `sandbox-executor` subcommand.
@@ -135,8 +231,31 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(9090);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+
+    // With a provisioned volume the executor seeds its own bare repo and routes
+    // every stamped request into a per-task worktree; without it the legacy
+    // process-cwd behaviour stays intact for embedded and test usage.
+    let app = match WorkdirRouter::from_env().await {
+        Some(workdir) => {
+            if let Err(e) = workdir.recover().await {
+                tracing::error!(error = %e, "workdir recovery failed; serving without router");
+                router()
+            } else {
+                workdir.fetch_once().await;
+                workdir.spawn_maintenance();
+                tracing::info!(
+                    workspaces = %workdir.config().workspaces_root.display(),
+                    bare = %workdir.config().bare_repo.display(),
+                    "per-task workdir router enabled"
+                );
+                app_router_with_workdir(workdir)
+            }
+        }
+        None => router(),
+    };
+
     tracing::info!(addr = %addr, "sandbox executor listening");
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, router()).await?;
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
 }
 

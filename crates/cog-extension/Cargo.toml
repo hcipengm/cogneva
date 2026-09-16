@@ -29,6 +29,7 @@ urlencoding = "2.1"
 futures = { workspace = true }
 reqwest = { workspace = true }
 axum = { workspace = true }
+prometheus = { workspace = true }
 
 # Signature verification (ed25519)
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
@@ -51,3 +52,4 @@ rhai = { version = "1.21", optional = true, features = ["sync", "serde"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"

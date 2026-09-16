@@ -131,6 +131,18 @@ evolution:
 # 不挂 Secret、不挂 ServiceAccount token；关掉后主应用/进化的工具调用将无执行面。
 sandboxExecutor:
   enabled: true
+  # 执行器专属持久卷：自有裸仓库 + 每任务工作树 + 共享 CARGO_TARGET_DIR，
+  # 与进化侧卷物理分离，互不共享工作树。
+  storage: 5Gi
+  # 空 = 跟随集群默认 SC（与 pg/redis 同策略，不绑厂商）。
+  storageClass: ""
+  # 空卷首挂时零凭证公开 https seed 裸仓库；后台按间隔 fetch（失败不阻塞）。
+  gitSeedUrl: https://github.com/hcipengm/cogneva.git
+  # 每任务工作树生命周期（秒）：空闲超 TTL 回收，数量超上限按 LRU 驱逐。
+  workspaceTtlSecs: 21600
+  workspaceGcIntervalSecs: 600
+  repoFetchIntervalSecs: 300
+  maxTaskWorkspaces: 8
   resources:
     requests:
       cpu: 100m
