@@ -93,7 +93,7 @@ fn single_shot(result: std::io::Result<String>) -> tokio::sync::mpsc::Receiver<C
 async fn resolve_workdir(
     state: &AppState,
     task_id: Option<&str>,
-) -> Result<(Option<PathBuf>, Option<PathBuf>), Response> {
+) -> Result<(Option<PathBuf>, Option<PathBuf>), Box<Response>> {
     let Some(router) = state.workdir.as_ref() else {
         return Ok((None, None));
     };
@@ -102,10 +102,10 @@ async fn resolve_workdir(
             Ok(dir) => Ok((Some(dir), Some(router.target_dir().to_path_buf()))),
             Err(e) => {
                 router.metrics().inc_error("route");
-                Err(error_response(
+                Err(Box::new(error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("task worktree unavailable: {e}"),
-                ))
+                )))
             }
         },
         None => {
@@ -130,7 +130,7 @@ async fn execute_handler(
         .min(MAX_TIMEOUT);
     let (workdir, cargo_target) = match resolve_workdir(&state, req.task_id.as_deref()).await {
         Ok(resolved) => resolved,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     match req.payload {
         SandboxPayload::Command { ref command } => {
