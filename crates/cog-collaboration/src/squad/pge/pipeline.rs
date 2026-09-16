@@ -117,10 +117,9 @@ impl PgePipeline {
     ) -> PgePipelineResult {
         let evaluation = EvaluationResult {
             verdict: Verdict::Fail,
-            feedback: format!(
-                "{}: generator produced no artifacts (environment/protocol failure)",
-                crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX
-            ),
+            feedback: generation
+                .terminal_env_failure_reason()
+                .unwrap_or_else(|| crate::squad::pge::types::NO_ARTIFACTS_REASON.to_string()),
             score: Some(0),
             criteria: Vec::new(),
             details: None,

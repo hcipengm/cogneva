@@ -204,8 +204,14 @@ impl GeneratorActor {
             }
             Err(e) => {
                 tracing::warn!("Generator prompt failed: {}", e);
+                // A prompt that never reached its upstream is not the generator
+                // choosing to produce nothing. Carry the real error through
+                // content: the in-band token keeps is_terminal_env_failure true,
+                // so the pipeline still stops instead of paying for identical
+                // retries, while feedback and the learning chain name the actual
+                // cause instead of a generator defect that is not there.
                 GeneratorOutput {
-                    content: serde_json::Value::Null,
+                    content: serde_json::Value::String(format!("environment_error: {e}")),
                     artifacts: Vec::new(),
                 }
             }

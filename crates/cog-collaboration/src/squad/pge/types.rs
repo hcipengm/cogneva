@@ -49,6 +49,12 @@ pub struct GeneratorOutput {
 /// for attempts that must fail again.
 pub const TERMINAL_ENV_FAILURE_PREFIX: &str = "terminal_env_failure";
 
+/// Failure reason for a run that produced nothing and carried no cause of its
+/// own. One definition, so every producer of this feedback — pipeline, Ralph,
+/// roundtable escalation — reports the identical string.
+pub const NO_ARTIFACTS_REASON: &str =
+    "terminal_env_failure: generator produced no artifacts (environment/protocol failure)";
+
 impl GeneratorOutput {
     /// True when the generator produced nothing for a deterministic reason:
     /// it reported an environment/protocol failure (tools never executed,
@@ -67,6 +73,24 @@ impl GeneratorOutput {
         };
         let t = text.to_ascii_lowercase();
         t.contains("environment_error") || t.contains("tool_pipeline_broken")
+    }
+
+    /// Failure reason in the wire format outer loops match on, carrying the
+    /// generator's own error when it has one. A prompt that never reached the
+    /// upstream reports that failure; only a run that produced nothing without
+    /// a cause of its own falls back to [`NO_ARTIFACTS_REASON`]. Reporting the
+    /// generic label for an upstream outage blames a generator defect that does
+    /// not exist and sends the learning chain after it. `None` when this is not
+    /// a terminal environment failure.
+    pub fn terminal_env_failure_reason(&self) -> Option<String> {
+        if !self.is_terminal_env_failure() {
+            return None;
+        }
+        let detail = match &self.content {
+            serde_json::Value::String(s) if !s.trim().is_empty() => s.trim(),
+            _ => return Some(NO_ARTIFACTS_REASON.to_string()),
+        };
+        Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: {detail}"))
     }
 }
 
@@ -277,5 +301,48 @@ mod tests {
         let mut result = pass_result(Vec::new());
         result.enforce_criteria_evidence(false);
         assert_eq!(result.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn carried_upstream_error_is_the_reported_reason() {
+        // What the generator now emits when its prompt never reached an upstream.
+        let output = GeneratorOutput {
+            content: serde_json::Value::String(
+                "environment_error: Agent execution error: API error: upstream unavailable".into(),
+            ),
+            artifacts: Vec::new(),
+        };
+        let reason = output.terminal_env_failure_reason().unwrap();
+        assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
+        assert!(
+            reason.contains("upstream unavailable"),
+            "the real cause must survive into the reason, got: {reason}"
+        );
+        assert_ne!(reason, NO_ARTIFACTS_REASON);
+    }
+
+    #[test]
+    fn bare_empty_output_reports_the_generic_reason() {
+        let output = GeneratorOutput {
+            content: serde_json::Value::Null,
+            artifacts: Vec::new(),
+        };
+        assert_eq!(
+            output.terminal_env_failure_reason().as_deref(),
+            Some(NO_ARTIFACTS_REASON)
+        );
+    }
+
+    #[test]
+    fn artifacts_present_is_not_a_terminal_failure() {
+        let output = GeneratorOutput {
+            content: serde_json::Value::String("environment_error".into()),
+            artifacts: vec![Artifact {
+                name: "changes.diff".into(),
+                content: "diff --git a/x b/x".into(),
+                artifact_type: "change".into(),
+            }],
+        };
+        assert!(output.terminal_env_failure_reason().is_none());
     }
 }
