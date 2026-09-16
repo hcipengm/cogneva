@@ -125,6 +125,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_DECOMPOSITION_ORPHAN_STALL_AFTER_SECS".into(),
         "dag_executor.decomposition_orphan_stall_after_secs".into(),
     );
+    m.insert(
+        "COGNEVA_DECOMPOSITION_ORPHAN_ALERT_DWELL_SECS".into(),
+        "dag_executor.decomposition_orphan_alert_dwell_secs".into(),
+    );
     m.insert("COGNEVA_HTTP_PORT".into(), "gateway.http_port".into());
     m.insert("COGNEVA_WS_PORT".into(), "gateway.ws_port".into());
     m.insert("COGNEVA_METRICS_PORT".into(), "gateway.metrics_port".into());

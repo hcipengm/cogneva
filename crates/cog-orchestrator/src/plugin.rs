@@ -363,6 +363,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                     orphan_cfg.decomposition_orphan_watch_enabled,
                                     orphan_cfg.decomposition_orphan_poll_interval_secs,
                                     orphan_cfg.decomposition_orphan_stall_after_secs,
+                                    orphan_cfg.decomposition_orphan_alert_dwell_secs,
                                     reconcile_sink,
                                     reconcile_shutdown,
                                 )

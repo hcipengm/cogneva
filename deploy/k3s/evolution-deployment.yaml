@@ -99,6 +99,9 @@ spec:
             # 进化链 fail-closed：Shell 工具必须携带真实 DAG task 身份。
             - name: COGNEVA_REQUIRE_TOOL_IDENTITY
               value: "true"
+            # 孤儿巡检单一持有者：进化 Pod 关闭，避免与主应用双跑压短告警停留窗口。
+            - name: COGNEVA_DECOMPOSITION_ORPHAN_WATCH_ENABLED
+              value: "false"
             # 沙盒零凭证（设计 §2.6.1）：LLM 调用经安全网关 8081 OpenAI 兼容
             # 透传端点，真实 key 只存在于安全网关 Pod；cogneva.json 的
             # llm_routing 只有网关透传一个后端，api_key 为写死的非敏感占位，

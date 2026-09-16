@@ -230,6 +230,13 @@ pub struct DagExecutorConfig {
     /// before the reconciler terminates it and raises an alert (seconds).
     #[serde(default = "default_decomposition_orphan_stall_after_secs")]
     pub decomposition_orphan_stall_after_secs: u64,
+    /// Minimum lifetime of an orphan alert before it may resolve (seconds). The
+    /// alert consumer (signal watcher) polls on its own cadence; resolving the
+    /// moment the placeholder is terminal can make the firing window shorter
+    /// than one consumer poll, so the alert stays up for at least this long.
+    /// Default is twice the default reconciler / watcher poll interval.
+    #[serde(default = "default_decomposition_orphan_alert_dwell_secs")]
+    pub decomposition_orphan_alert_dwell_secs: u64,
 }
 
 impl Default for DagExecutorConfig {
@@ -254,6 +261,7 @@ impl Default for DagExecutorConfig {
             decomposition_orphan_poll_interval_secs:
                 default_decomposition_orphan_poll_interval_secs(),
             decomposition_orphan_stall_after_secs: default_decomposition_orphan_stall_after_secs(),
+            decomposition_orphan_alert_dwell_secs: default_decomposition_orphan_alert_dwell_secs(),
         }
     }
 }
@@ -386,6 +394,9 @@ fn default_decomposition_orphan_poll_interval_secs() -> u64 {
 }
 fn default_decomposition_orphan_stall_after_secs() -> u64 {
     1800
+}
+fn default_decomposition_orphan_alert_dwell_secs() -> u64 {
+    600
 }
 
 /// Configuration for the Hot/Warm/Cold tier migrator.
