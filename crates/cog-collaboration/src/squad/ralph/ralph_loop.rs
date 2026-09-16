@@ -80,6 +80,20 @@ fn iteration_progress(
     }
 }
 
+/// 不可恢复终止在指标面上的分类标签。只认全链路已经共用的两个 wire 前缀，
+/// 其余归到 `unrecoverable`——分类轴必须与其它消费同一个 reason 的地方一致
+/// （squad executor 决定不再升级策略时用的就是这两个前缀），否则"停在哪一类"
+/// 在日志与指标里会对不上。
+fn termination_class(reason: &str) -> &'static str {
+    if reason.starts_with(crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX) {
+        "terminal_env_failure"
+    } else if reason.starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX) {
+        "degenerate_loop"
+    } else {
+        "unrecoverable"
+    }
+}
+
 /// 全局重置策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResetStrategy {
@@ -320,6 +334,26 @@ impl RalphLoop {
         })
     }
 
+    /// 不可恢复终止的统一形态（与停滞、预算同构）：Warn 日志 + 指标 +
+    /// Unrecoverable 判定。分类取自 reason 前缀而不是另立判据——前缀本来就是
+    /// 全链路共用的 wire 标记（squad executor 也按它决定不再升级策略），
+    /// 另立一套只会在两处之间分叉。原因落进指标面之前，"分解为什么停"只存在
+    /// 于日志里，告警面看不见。
+    fn unrecoverable_verdict(&self, reason: String) -> RalphVerdict {
+        let class = termination_class(&reason);
+        tracing::warn!(
+            reason = %reason,
+            class,
+            "Ralph Loop terminated without a recoverable strategy"
+        );
+        crate::observable::global_observable().record_ralph_termination(class);
+        RalphVerdict::Unrecoverable {
+            reason,
+            iterations: self.history.len() as u32,
+            history: self.history.clone(),
+        }
+    }
+
     /// 停滞终止的统一形态：Warn 日志 + 指标 + Unrecoverable 判定，
     /// 历史与结论随 verdict 归档，不是无声消失。
     fn stagnated_verdict(&self) -> RalphVerdict {
@@ -454,12 +488,7 @@ impl RalphLoop {
             // 确定性失败的结论优先于停滞：环境/协议的失败自带"重试无用"
             // 的语义，比笼统的"没进展"更该被上层看到。
             if let FailureAnalysis::Unrecoverable(reason) = &analysis {
-                let total_iterations = self.history.len() as u32;
-                return RalphVerdict::Unrecoverable {
-                    reason: reason.clone(),
-                    iterations: total_iterations,
-                    history: self.history.clone(),
-                };
+                return self.unrecoverable_verdict(reason.clone());
             }
 
             if self.is_stagnated() {
@@ -557,12 +586,7 @@ impl RalphLoop {
             }
 
             if let FailureAnalysis::Unrecoverable(reason) = &analysis {
-                let total_iterations = self.history.len() as u32;
-                return RalphVerdict::Unrecoverable {
-                    reason: reason.clone(),
-                    iterations: total_iterations,
-                    history: self.history.clone(),
-                };
+                return self.unrecoverable_verdict(reason.clone());
             }
 
             if self.is_stagnated() {
@@ -1317,6 +1341,63 @@ mod tests {
             ));
         }
         assert!(ralph.is_stagnated());
+    }
+
+    #[test]
+    fn termination_class_follows_the_shared_wire_prefixes() {
+        use crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX;
+        use crate::squad::pge::types::{NO_ARTIFACTS_REASON, TERMINAL_ENV_FAILURE_PREFIX};
+
+        // The exact reason the pipeline and Ralph both produce, and the exact
+        // reason the squad executor keys off to stop upgrading strategies.
+        assert_eq!(
+            termination_class(NO_ARTIFACTS_REASON),
+            "terminal_env_failure"
+        );
+        assert_eq!(
+            termination_class(&format!(
+                "{TERMINAL_ENV_FAILURE_PREFIX}: generator prompt failed: HTTP 503"
+            )),
+            "terminal_env_failure"
+        );
+        assert_eq!(
+            termination_class(&format!("{DEGENERATE_LOOP_PREFIX}: flat across the window")),
+            "degenerate_loop"
+        );
+        // Everything else still has to land somewhere countable.
+        assert_eq!(
+            termination_class("Ralph Loop stagnated: no progress signal"),
+            "unrecoverable"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_stop_is_counted_on_the_metric_plane() {
+        use crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX;
+        use cog_core::Observable;
+
+        let ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 5,
+            stagnation_window: 2,
+        });
+        let verdict = ralph.unrecoverable_verdict(format!(
+            "{TERMINAL_ENV_FAILURE_PREFIX}: upstream unavailable"
+        ));
+        match verdict {
+            RalphVerdict::Unrecoverable { reason, .. } => {
+                assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
+            }
+            other => panic!("expected Unrecoverable, got {other:?}"),
+        }
+        let metrics = crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap();
+        assert!(
+            metrics.iter().any(|m| m.name == "ralph_terminations_total"
+                && m.labels.get("reason").map(String::as_str) == Some("terminal_env_failure")),
+            "terminal env failures must be visible as ralph_terminations_total{{reason=...}}"
+        );
     }
 
     /// 有真进展就不判停滞——哪怕措辞一轮比一轮难听。
