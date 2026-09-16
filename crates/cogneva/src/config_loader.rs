@@ -109,6 +109,22 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_ARCHIVE_POLL_INTERVAL_SECS".into(),
         "dag_executor.archive_poll_interval_secs".into(),
     );
+    m.insert(
+        "COGNEVA_DECOMPOSITION_MAX_ATTEMPTS".into(),
+        "dag_executor.decomposition_max_attempts".into(),
+    );
+    m.insert(
+        "COGNEVA_DECOMPOSITION_ORPHAN_WATCH_ENABLED".into(),
+        "dag_executor.decomposition_orphan_watch_enabled".into(),
+    );
+    m.insert(
+        "COGNEVA_DECOMPOSITION_ORPHAN_POLL_INTERVAL_SECS".into(),
+        "dag_executor.decomposition_orphan_poll_interval_secs".into(),
+    );
+    m.insert(
+        "COGNEVA_DECOMPOSITION_ORPHAN_STALL_AFTER_SECS".into(),
+        "dag_executor.decomposition_orphan_stall_after_secs".into(),
+    );
     m.insert("COGNEVA_HTTP_PORT".into(), "gateway.http_port".into());
     m.insert("COGNEVA_WS_PORT".into(), "gateway.ws_port".into());
     m.insert("COGNEVA_METRICS_PORT".into(), "gateway.metrics_port".into());

@@ -58,6 +58,12 @@ pub struct ActionPlanOrchestrator {
     vector_backend: Option<Arc<dyn VectorBackend>>,
     vector_collection: String,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Decomposition attempts per goal delivery before an empty result is
+    /// treated as a hard failure (clamped to >= 1).
+    decomposition_max_attempts: u32,
+    /// Optional persistent alert port for decomposition failures. Attached
+    /// after plugin init (the store is published by another plugin).
+    alert_sink: tokio::sync::RwLock<Option<Arc<dyn cog_core::PersistentAlertSink>>>,
 }
 
 impl std::fmt::Debug for ActionPlanOrchestrator {
@@ -101,6 +107,8 @@ impl ActionPlanOrchestrator {
             vector_backend: None,
             vector_collection: "patterns".into(),
             embedder: None,
+            decomposition_max_attempts: 2,
+            alert_sink: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -171,6 +179,23 @@ impl ActionPlanOrchestrator {
     pub fn with_dag_executor(mut self, dag: Arc<dyn cog_core::DagExecutor>) -> Self {
         self.dag_executor = Some(dag);
         self
+    }
+
+    /// Configure how many times decomposition is retried within one goal
+    /// delivery when it returns zero atomic tasks.
+    pub fn with_decomposition_max_attempts(mut self, attempts: u32) -> Self {
+        self.decomposition_max_attempts = attempts.max(1);
+        self
+    }
+
+    /// Attach the persistent alert port. Used by plugin wiring after init,
+    /// once the storage plugin has published the sink.
+    pub async fn attach_alert_sink(&self, sink: Arc<dyn cog_core::PersistentAlertSink>) {
+        *self.alert_sink.write().await = Some(sink);
+    }
+
+    async fn alert_sink(&self) -> Option<Arc<dyn cog_core::PersistentAlertSink>> {
+        self.alert_sink.read().await.clone()
     }
 
     /// Read-only access to the pattern DB (used in tests and for diagnostics).
@@ -642,17 +667,42 @@ impl ActionPlanOrchestrator {
         // via Squad → RalphLoop → PGE → SelfReview and returns the final task list.
         // ActionPlanner does not perform its own LLM evaluation — it only checks
         // markers and injects the result returned by Collaboration.
-        let plan = if !tasks.is_empty() {
+        if !tasks.is_empty() {
             tracing::info!(
                 goal = %goal,
                 task_count = %tasks.len(),
                 "Tasks present but not verified; routing to Collaboration for evaluation / decomposition"
             );
-            self.decompose_goal(goal, skill_registry, Some(&tasks))
-                .await?
-        } else {
-            self.decompose_goal(goal, skill_registry, None).await?
-        };
+        }
+
+        // An empty atomic-task result must never be treated as success:
+        // persisting the originals as non-executable placeholders with zero
+        // children would strand them Pending forever (they are invisible to
+        // the scheduler and nothing ever fails them). LLM decomposition is
+        // non-deterministic, so retry within this delivery up to the
+        // configured bound; hard errors still propagate immediately for
+        // stream redelivery.
+        let attempts = self.decomposition_max_attempts.max(1);
+        let mut plan = None;
+        for attempt in 1..=attempts {
+            let candidate = if !tasks.is_empty() {
+                self.decompose_goal(goal, skill_registry, Some(&tasks))
+                    .await?
+            } else {
+                self.decompose_goal(goal, skill_registry, None).await?
+            };
+            if candidate.tasks.is_empty() {
+                tracing::warn!(
+                    goal = %goal,
+                    attempt,
+                    max_attempts = attempts,
+                    "decomposition returned zero atomic tasks"
+                );
+                continue;
+            }
+            plan = Some(candidate);
+            break;
+        }
 
         if self.dag_executor.is_none() {
             tracing::warn!(
@@ -660,11 +710,50 @@ impl ActionPlanOrchestrator {
             );
         }
 
-        // Inject original tasks as non-executable placeholders so the hierarchy
-        // (goal → overall task → atomic tasks) is fully preserved for tracing.
+        let Some(plan) = plan else {
+            // Exhausted: fail loudly instead of mummifying the originals.
+            // Failed rows + a persistent alert make the dead-end visible;
+            // signal watcher turns the firing alert into a fresh fix intent.
+            let reason =
+                format!("decomposition produced no executable tasks after {attempts} attempt(s)");
+            tracing::error!(goal = %goal, goal_id = %goal_id, "{reason}");
+            self.fire_decomposition_alert(
+                cog_core::ALERT_RULE_DECOMPOSITION_EMPTY,
+                &goal_id,
+                tasks.first().map(|t| t.id.as_str()),
+                attempts,
+                tasks.first().map(|t| &t.input),
+                &reason,
+            )
+            .await;
+            let mut failed_ids = Vec::new();
+            if let Some(ref dag) = self.dag_executor {
+                let now = Utc::now();
+                let mut failed_rows = Vec::with_capacity(tasks.len());
+                for mut original in tasks {
+                    original.goal_id = Some(goal_id.clone());
+                    original.is_executable = false;
+                    original.status = cog_core::TaskStatus::Failed;
+                    original.error = Some(reason.clone());
+                    original.updated_at = now;
+                    failed_ids.push(original.id.clone());
+                    failed_rows.push(original);
+                }
+                // Batch injection is idempotent: redelivery after a partial
+                // write skips rows that already landed instead of erroring.
+                dag.add_tasks_batch(failed_rows).await?;
+            }
+            return Ok(failed_ids);
+        };
+
+        // Inject placeholders + children as ONE idempotent batch so a
+        // partial write / crash is compensable on redelivery: originals are
+        // non-executable hierarchy markers only when at least one child
+        // exists, and duplicate rows are skipped rather than rejected.
         let mut all_injected_ids: Vec<String> = Vec::new();
         if let Some(ref dag) = self.dag_executor {
             let now = Utc::now();
+            let mut batch = Vec::new();
             for mut original in tasks {
                 original.goal_id = Some(goal_id.clone());
                 original.is_executable = false;
@@ -677,14 +766,10 @@ impl ActionPlanOrchestrator {
                     timestamp: Some(now),
                 });
                 all_injected_ids.push(original.id.clone());
-                dag.add_task(original).await?;
+                batch.push(original);
             }
 
-            let source = if !plan.tasks.is_empty() {
-                cog_core::ActionPlannerSource::Decomposed
-            } else {
-                cog_core::ActionPlannerSource::Optimized
-            };
+            let source = cog_core::ActionPlannerSource::Decomposed;
             for at in &plan.tasks {
                 let mut task = Self::atomic_task_to_task(at);
                 task.goal_id = Some(goal_id.clone());
@@ -703,8 +788,9 @@ impl ActionPlanOrchestrator {
                     timestamp: Some(now),
                 });
                 all_injected_ids.push(task.id.clone());
-                dag.add_task(task).await?;
+                batch.push(task);
             }
+            dag.add_tasks_batch(batch).await?;
         }
 
         tracing::info!(
@@ -713,6 +799,46 @@ impl ActionPlanOrchestrator {
             "Goal decomposed and injected into DagExecutor"
         );
         Ok(all_injected_ids)
+    }
+
+    /// Drive a decomposition alert through the persistent alert port when
+    /// one is attached; degrade to error logging otherwise so the condition
+    /// stays visible even without the observability plugin.
+    async fn fire_decomposition_alert(
+        &self,
+        rule: &str,
+        goal_id: &str,
+        task_id: Option<&str>,
+        attempts: u32,
+        original_input: Option<&serde_json::Value>,
+        reason: &str,
+    ) {
+        let task_part = task_id.unwrap_or("-");
+        let dedup_key = format!("{rule}:{goal_id}:{task_part}");
+        let message = format!(
+            "goal {goal_id} task {task_part}: {reason}; self-discovery will re-drive the work via a new intent"
+        );
+        let labels = serde_json::json!({
+            "goal_id": goal_id,
+            "parent_task_id": task_id,
+            "attempts": attempts,
+            "source": "action_planner",
+            "original_input": original_input,
+        });
+        if let Some(sink) = self.alert_sink().await {
+            let draft = cog_core::PersistentAlertDraft {
+                rule: rule.to_string(),
+                dedup_key: dedup_key.clone(),
+                severity: cog_core::AlertSeverity::Warning.as_str().to_string(),
+                message: message.clone(),
+                labels,
+            };
+            if let Err(e) = sink.set_persistent_alert(true, &draft).await {
+                tracing::error!(rule, dedup_key = %dedup_key, error = %e, "failed to persist decomposition alert");
+            }
+        } else {
+            tracing::error!(rule, dedup_key = %dedup_key, labels = %labels, "{message} (no persistent alert sink attached)");
+        }
     }
 
     /// Retrieve top-k patterns from the pattern DB using semantic similarity.
@@ -1668,6 +1794,177 @@ mod tests {
             .decompose_goal("do something", &registry, None)
             .await;
         assert!(result.is_err());
+    }
+
+    fn atomic_task(id: &str) -> AtomicTask {
+        AtomicTask {
+            id: id.into(),
+            name: format!("Task {id}"),
+            skill_id: Some("s1".into()),
+            description: None,
+            estimated_tokens: 10_000,
+            skill_gap: false,
+            blocked_by: vec![],
+            blocks: vec![],
+            input: serde_json::json!({}),
+            output_entities: vec![],
+            estimated_seconds: 600,
+        }
+    }
+
+    /// TaskExecutor that replies a scripted sequence of atomic-task lists,
+    /// repeating the final entry once the queue is drained.
+    struct ScriptedAtomicExecutor {
+        replies: std::sync::Mutex<Vec<Vec<AtomicTask>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskExecutor for ScriptedAtomicExecutor {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+
+        async fn execute(&self, _task: &Task) -> SFResult<TaskResult> {
+            let mut guard = self.replies.lock().unwrap();
+            let atomic_tasks = if guard.len() > 1 {
+                guard.remove(0)
+            } else {
+                guard.first().cloned().unwrap_or_default()
+            };
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({ "atomic_tasks": atomic_tasks }),
+                metadata: TaskResultMetadata::new("mock").with_score(0.85),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAlertSink {
+        calls: std::sync::Mutex<Vec<(bool, String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::PersistentAlertSink for RecordingAlertSink {
+        async fn set_persistent_alert(
+            &self,
+            condition: bool,
+            draft: &cog_core::PersistentAlertDraft,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push((
+                condition,
+                draft.rule.clone(),
+                draft.dedup_key.clone(),
+            ));
+            Ok(())
+        }
+
+        async fn list_active_persistent_alerts(
+            &self,
+            _rule_prefix: &str,
+            _limit: i64,
+        ) -> Vec<cog_core::PersistedAlert> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_decomposition_fails_originals_and_fires_alert() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-empty-decomp".to_string()));
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let registry = SkillRegistry::new();
+        let original = hint_task("sig-alert-1");
+        let ids = planner
+            .process_goal_impl("fix firing alert", vec![original], &registry)
+            .await
+            .expect("exhausted decomposition acks with failed originals");
+
+        assert_eq!(ids, vec!["sig-alert-1".to_string()]);
+        let stored = dag.get_task("sig-alert-1").await.expect("original stored");
+        assert_eq!(stored.status, cog_core::TaskStatus::Failed);
+        assert!(!stored.is_executable);
+        assert!(stored
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("no executable tasks")));
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0);
+        assert_eq!(calls[0].1, cog_core::ALERT_RULE_DECOMPOSITION_EMPTY);
+        assert!(calls[0].2.ends_with(":sig-alert-1"));
+    }
+
+    #[tokio::test]
+    async fn nonempty_decomposition_injects_placeholder_and_child_in_one_batch() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-nonempty-decomp".to_string()));
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![atomic_task("child-1")]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(2);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let registry = SkillRegistry::new();
+        let ids = planner
+            .process_goal_impl(
+                "fix firing alert",
+                vec![hint_task("sig-alert-2")],
+                &registry,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["sig-alert-2".to_string(), "child-1".to_string()]);
+
+        let parent = dag.get_task("sig-alert-2").await.unwrap();
+        assert_eq!(parent.status, cog_core::TaskStatus::Pending);
+        assert!(!parent.is_executable);
+        let child = dag.get_task("child-1").await.unwrap();
+        assert_eq!(child.status, cog_core::TaskStatus::Pending);
+        assert!(child.is_executable);
+        assert_eq!(child.parent_task_id.as_deref(), Some("sig-alert-2"));
+        assert_eq!(child.goal_id, parent.goal_id);
+        assert!(sink.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_decomposition_retried_within_delivery_recovers() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-retry-decomp".to_string()));
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![], vec![atomic_task("child-9")]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(2);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let registry = SkillRegistry::new();
+        let ids = planner
+            .process_goal_impl(
+                "fix firing alert",
+                vec![hint_task("sig-alert-3")],
+                &registry,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["sig-alert-3".to_string(), "child-9".to_string()]);
+        let parent = dag.get_task("sig-alert-3").await.unwrap();
+        assert_eq!(parent.status, cog_core::TaskStatus::Pending);
+        assert!(dag.get_task("child-9").await.is_some());
+        assert!(sink.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -303,3 +303,49 @@ pub trait ActiveAlertSource: Send + Sync {
     /// Alerts currently in the `firing` state, newest first.
     async fn list_active_alerts(&self, limit: i64) -> Vec<PersistedAlert>;
 }
+
+/// Rule name for alerts raised when goal decomposition ends without any
+/// executable task after the bounded retries.
+pub const ALERT_RULE_DECOMPOSITION_EMPTY: &str = "decomposition_empty";
+/// Rule name for alerts raised by the stalled-orphan reconciler: a
+/// non-executable parent placeholder with no children stuck pending.
+pub const ALERT_RULE_DECOMPOSITION_ORPHANED: &str = "decomposition_orphaned";
+
+/// A persistent alert condition a plugin wants driven into the alert state
+/// machine. Mirrors the storage crate's `NewAlert` without coupling callers
+/// to the concrete PostgreSQL store.
+#[derive(Debug, Clone)]
+pub struct PersistentAlertDraft {
+    pub rule: String,
+    /// Stable identity of this alert instance; re-evaluating the same
+    /// condition must reuse the same key.
+    pub dedup_key: String,
+    pub severity: String,
+    pub message: String,
+    pub labels: serde_json::Value,
+}
+
+/// Write-side handle over persisted alerts, symmetric to
+/// [`ActiveAlertSource`]. Producers that detect durable fault conditions
+/// (stalled DAG tasks, exhausted retries) raise alerts through this port so
+/// self-discovery can turn them into work without depending on the storage
+/// crate.
+#[async_trait::async_trait]
+pub trait PersistentAlertSink: Send + Sync {
+    /// Drive one alert condition: `true` guarantees a firing row, `false`
+    /// resolves the row for this dedup key. Errors are returned, never
+    /// panicked: an alerting hiccup must not break the caller's main path.
+    async fn set_persistent_alert(
+        &self,
+        condition: bool,
+        draft: &PersistentAlertDraft,
+    ) -> Result<(), String>;
+
+    /// Firing alerts whose rule starts with `rule_prefix`, newest first.
+    /// Used by supervisors to adopt rows raised before a restart.
+    async fn list_active_persistent_alerts(
+        &self,
+        rule_prefix: &str,
+        limit: i64,
+    ) -> Vec<PersistedAlert>;
+}

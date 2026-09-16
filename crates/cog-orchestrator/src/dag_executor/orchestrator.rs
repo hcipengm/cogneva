@@ -944,6 +944,132 @@ impl DagExecutor {
         ready
     }
 
+    /// Pure classifier for decomposition orphans: Pending, non-executable
+    /// parent placeholders that no task claims as its parent and that have
+    /// not been touched since `stall_before`. Such tasks can never be
+    /// scheduled and never fail on their own — they only exist when
+    /// decomposition persisted the placeholder without any children
+    /// (empty LLM result, partial write, crash mid-injection).
+    pub fn decomposition_orphans<'a>(
+        tasks: impl IntoIterator<Item = &'a Task>,
+        stall_before: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<String> {
+        let tasks: Vec<&Task> = tasks.into_iter().collect();
+        let has_child: std::collections::HashSet<&str> = tasks
+            .iter()
+            .filter_map(|t| t.parent_task_id.as_deref())
+            .collect();
+        tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .filter(|t| !t.is_executable)
+            .filter(|t| !has_child.contains(t.id.as_str()))
+            .filter(|t| t.updated_at < stall_before)
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// Scan the DAG for childless non-executable placeholders stalled in
+    /// Pending since before `stall_before`.
+    pub async fn find_decomposition_orphans(
+        &self,
+        stall_before: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<Task> {
+        let tasks = self.all_tasks_unified().await;
+        let ids: std::collections::HashSet<String> =
+            Self::decomposition_orphans(&tasks, stall_before)
+                .into_iter()
+                .collect();
+        tasks.into_iter().filter(|t| ids.contains(&t.id)).collect()
+    }
+
+    /// Validate that a task is a terminable orphan: Pending non-executable
+    /// placeholder with no child task pointing at it.
+    fn ensure_terminable_orphan<'a>(
+        task_id: &str,
+        tasks: impl Iterator<Item = &'a Task>,
+    ) -> SFResult<()> {
+        let tasks: Vec<&Task> = tasks.collect();
+        let task = tasks.iter().find(|t| t.id == task_id).ok_or_else(|| {
+            cog_core::SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: "Task not found".into(),
+            }
+        })?;
+        if task.status != TaskStatus::Pending || task.is_executable {
+            return Err(cog_core::SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: format!(
+                    "Task {} is not a pending non-executable placeholder (status={:?})",
+                    task_id, task.status
+                ),
+            });
+        }
+        if tasks
+            .iter()
+            .any(|t| t.parent_task_id.as_deref() == Some(task_id))
+        {
+            return Err(cog_core::SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: format!(
+                    "Task {} still has child tasks; only a childless placeholder can be terminated as a decomposition orphan",
+                    task_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Move a stalled decomposition orphan from Pending straight to Failed
+    /// without retry/cascade semantics: the task was never runnable and has
+    /// no edges, so the regular fail_task path (retry matrix, dependents
+    /// cancellation) does not apply.
+    pub async fn terminate_decomposition_orphan(
+        &self,
+        task_id: &str,
+        reason: String,
+    ) -> SFResult<()> {
+        if let Some(be) = self.fg().cloned() {
+            let all = be.dag_get_all_tasks(&self.workspace_id).await?;
+            Self::ensure_terminable_orphan(task_id, all.iter())?;
+            let task_error = reason.clone();
+            self.store_transition(
+                task_id,
+                &[TaskStatus::Pending],
+                "Cannot terminate decomposition orphan in {} state",
+                move |t| {
+                    t.status = TaskStatus::Failed;
+                    t.error = Some(task_error.clone());
+                },
+                Some(cog_core::TaskEvent::TaskFailed {
+                    task_id: task_id.into(),
+                    error: reason,
+                    retried: false,
+                    cancelled: Vec::new(),
+                    timestamp: chrono::Utc::now(),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        let mut inner = self.inner.write().await;
+        Self::ensure_terminable_orphan(task_id, inner.tasks.values())?;
+        let task = inner.tasks.get_mut(task_id).expect("validated above");
+        task.status = TaskStatus::Failed;
+        task.error = Some(reason.clone());
+        task.updated_at = chrono::Utc::now();
+        drop(inner);
+        self.emit_event(cog_core::TaskEvent::TaskFailed {
+            task_id: task_id.into(),
+            error: reason,
+            retried: false,
+            cancelled: Vec::new(),
+            timestamp: chrono::Utc::now(),
+        });
+        self.persist_state().await;
+        Ok(())
+    }
+
     pub async fn schedule_task(&self, task_id: &str) -> SFResult<()> {
         if self.fg().is_some() {
             return self
@@ -2203,5 +2329,130 @@ mod tests {
         pod_a.delete_task("child").await.unwrap();
         assert!(pod_b.get_task("child").await.is_none());
         assert_eq!(pod_b.get_all_tasks().await.len(), 1);
+    }
+
+    fn placeholder(id: &str, updated_at: chrono::DateTime<chrono::Utc>) -> Task {
+        let mut t = Task::new(id, TaskType::Generator, serde_json::json!({}));
+        t.is_executable = false;
+        t.updated_at = updated_at;
+        t
+    }
+
+    #[test]
+    fn test_decomposition_orphans_classifier() {
+        let now = chrono::Utc::now();
+        let stale = now - chrono::Duration::minutes(60);
+        let fresh = now - chrono::Duration::minutes(1);
+        let stall_before = now - chrono::Duration::minutes(30);
+
+        // Stale childless non-executable placeholder is the only orphan.
+        let orphan = placeholder("orphan", stale);
+
+        // Same shape but a child task points at it: not an orphan.
+        let parent_with_child = placeholder("parent", stale);
+        let mut child = Task::new("child", TaskType::Generator, serde_json::json!({}));
+        child.parent_task_id = Some("parent".into());
+
+        // Executable pending task, even stale and childless: runnable, not orphan.
+        let mut runnable = Task::new("runnable", TaskType::Generator, serde_json::json!({}));
+        runnable.updated_at = stale;
+
+        // Fresh childless placeholder: within the stall window, not orphan yet.
+        let fresh_placeholder = placeholder("fresh", fresh);
+
+        // Already-terminated placeholder is no longer stuck Pending.
+        let mut terminated = placeholder("terminated", stale);
+        terminated.status = TaskStatus::Failed;
+
+        let tasks = [
+            orphan,
+            parent_with_child,
+            child,
+            runnable,
+            fresh_placeholder,
+            terminated,
+        ];
+        let orphans = DagExecutor::decomposition_orphans(tasks.iter(), stall_before);
+        assert_eq!(orphans, vec!["orphan".to_string()]);
+
+        // Boundary: updated_at exactly at stall_before is not older → not orphan.
+        let boundary = placeholder("boundary", stall_before);
+        assert!(DagExecutor::decomposition_orphans([&boundary], stall_before).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_and_terminate_stale_orphan_in_memory() {
+        let dag = DagExecutor::new("ws-orphan".into());
+        let stale = chrono::Utc::now() - chrono::Duration::minutes(60);
+
+        let parent = placeholder("sig-alert-stale", stale);
+        let mut child = Task::new("child-1", TaskType::Generator, serde_json::json!({}));
+        child.parent_task_id = Some("parent-live".into());
+        let live_parent = placeholder("parent-live", stale);
+
+        dag.add_task(parent).await.unwrap();
+        dag.add_task(live_parent).await.unwrap();
+        dag.add_task(child).await.unwrap();
+
+        let stall_before = chrono::Utc::now() - chrono::Duration::minutes(30);
+        let orphans = dag.find_decomposition_orphans(stall_before).await;
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id, "sig-alert-stale");
+
+        dag.terminate_decomposition_orphan(
+            "sig-alert-stale",
+            "decomposition produced no executable tasks".into(),
+        )
+        .await
+        .unwrap();
+
+        let view = dag.get_task("sig-alert-stale").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Failed);
+        assert!(!view.is_executable);
+        assert!(view
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("no executable tasks"));
+
+        // Once terminated it drops out of future scans.
+        assert!(dag
+            .find_decomposition_orphans(stall_before)
+            .await
+            .is_empty());
+
+        // Terminating a placeholder that still has children is rejected.
+        let err = dag
+            .terminate_decomposition_orphan("parent-live", "must fail".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("still has child tasks"));
+    }
+
+    #[tokio::test]
+    async fn test_terminate_stale_orphan_in_store_mode() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-orphan-fg".into()).with_state_backend(backend);
+        let stale = chrono::Utc::now() - chrono::Duration::minutes(60);
+        dag.add_task(placeholder("sig-alert-store", stale))
+            .await
+            .unwrap();
+
+        let stall_before = chrono::Utc::now() - chrono::Duration::minutes(30);
+        assert_eq!(
+            dag.find_decomposition_orphans(stall_before)
+                .await
+                .into_iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec!["sig-alert-store".to_string()]
+        );
+
+        dag.terminate_decomposition_orphan("sig-alert-store", "empty plan".into())
+            .await
+            .unwrap();
+        let view = dag.get_task("sig-alert-store").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Failed);
+        assert!(view.error.as_deref().unwrap().contains("empty plan"));
     }
 }

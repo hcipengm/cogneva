@@ -443,6 +443,167 @@ impl DagExecutorRuntime {
 
         Ok(())
     }
+
+    /// Background reconciliation for decomposition orphans: non-executable
+    /// parent placeholders with zero children stuck Pending (empty
+    /// decomposition, partial write, crash mid-injection). Each stalled
+    /// orphan is terminated (Pending → Failed) and raises a persistent
+    /// alert so signal watcher re-drives the work as a fresh intent; alerts
+    /// resolve once the parent task reaches a terminal state. Rows raised
+    /// before a restart are adopted from the alert store on the first tick.
+    pub async fn run_orphan_reconciler(
+        &self,
+        enabled: bool,
+        poll_interval_secs: u64,
+        stall_after_secs: u64,
+        sink: Option<Arc<dyn cog_core::PersistentAlertSink>>,
+        shutdown: ShutdownSignal,
+    ) {
+        if !enabled {
+            tracing::info!("decomposition orphan reconciler disabled by config");
+            return;
+        }
+        let interval_secs = poll_interval_secs.max(30);
+        let stall_secs = stall_after_secs.max(60);
+        tracing::info!(
+            interval_secs,
+            stall_after_secs = stall_secs,
+            alert_sink = sink.is_some(),
+            "decomposition orphan reconciler started"
+        );
+
+        // dedup_key → parent task id, for keys this watcher owns.
+        let mut firing: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut adopted = false;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => break,
+                _ = ticker.tick() => {
+                    if !adopted {
+                        adopted = true;
+                        if let Some(sink) = &sink {
+                            for alert in sink
+                                .list_active_persistent_alerts("decomposition_", 1000)
+                                .await
+                            {
+                                if let Some(parent) = alert
+                                    .labels
+                                    .get("parent_task_id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty() && *s != "-")
+                                {
+                                    firing.insert(alert.dedup_key.clone(), parent.to_string());
+                                }
+                            }
+                        }
+                    }
+                    let stall = chrono::Duration::seconds(stall_secs as i64);
+                    orphan_reconcile_tick(&self.orchestrator, sink.as_ref(), &stall, &mut firing)
+                        .await;
+                }
+            }
+        }
+    }
+}
+
+/// One reconciler pass. Split out as a free function so the adoption/firing
+/// bookkeeping stays testable without a running timer.
+async fn orphan_reconcile_tick(
+    orchestrator: &Arc<DagExecutor>,
+    sink: Option<&Arc<dyn cog_core::PersistentAlertSink>>,
+    stall: &chrono::Duration,
+    firing: &mut std::collections::HashMap<String, String>,
+) {
+    let stall_before = chrono::Utc::now() - *stall;
+    let orphans = orchestrator.find_decomposition_orphans(stall_before).await;
+    // Keys fired in this pass must survive until the next pass: signal_watcher
+    // polls firing rows on its own cadence, so resolving within the same pass
+    // would let it miss the alert and defeat the re-drive.
+    let mut newly_fired: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for orphan in orphans {
+        let goal_id = orphan.goal_id.as_deref().unwrap_or("-");
+        let task_id = orphan.id.clone();
+        let dedup_key = format!(
+            "{}:{goal_id}:{task_id}",
+            cog_core::ALERT_RULE_DECOMPOSITION_ORPHANED
+        );
+        let reason = "decomposition orphan: non-executable parent task has no children after the stall threshold";
+        let message = format!(
+            "goal {goal_id} task {task_id}: {reason}; the placeholder is terminated and the work is re-driven via a new intent"
+        );
+        let labels = serde_json::json!({
+            "goal_id": goal_id,
+            "parent_task_id": task_id,
+            "source": "orphan_reconciler",
+            "original_input": orphan.input,
+        });
+        if let Some(sink) = sink {
+            let draft = cog_core::PersistentAlertDraft {
+                rule: cog_core::ALERT_RULE_DECOMPOSITION_ORPHANED.to_string(),
+                dedup_key: dedup_key.clone(),
+                severity: cog_core::AlertSeverity::Warning.as_str().to_string(),
+                message: message.clone(),
+                labels,
+            };
+            if let Err(e) = sink.set_persistent_alert(true, &draft).await {
+                tracing::warn!(task_id = %task_id, error = %e, "failed to fire decomposition orphan alert");
+            }
+        } else {
+            tracing::error!(task_id = %task_id, "{message} (no persistent alert sink attached)");
+        }
+        firing.insert(dedup_key.clone(), task_id.clone());
+        newly_fired.insert(dedup_key);
+        if let Err(e) = orchestrator
+            .terminate_decomposition_orphan(&task_id, reason.to_string())
+            .await
+        {
+            tracing::warn!(task_id = %task_id, error = %e, "failed to terminate decomposition orphan");
+        } else {
+            tracing::error!(task_id = %task_id, goal_id = %goal_id, "terminated stalled decomposition orphan");
+        }
+    }
+
+    // Resolve owned alerts whose parent task is now terminal or gone.
+    let mut resolved = Vec::new();
+    for (key, parent_id) in firing.iter() {
+        if newly_fired.contains(key) {
+            continue;
+        }
+        let task = orchestrator.get_task(parent_id).await;
+        let done = match task {
+            Some(t) => matches!(
+                t.status,
+                cog_core::TaskStatus::Completed
+                    | cog_core::TaskStatus::Failed
+                    | cog_core::TaskStatus::Cancelled
+            ),
+            None => true,
+        };
+        if done {
+            resolved.push(key.clone());
+        }
+    }
+    for key in resolved {
+        let rule = key.split(':').next().unwrap_or(&key).to_string();
+        if let Some(sink) = sink {
+            let draft = cog_core::PersistentAlertDraft {
+                rule,
+                dedup_key: key.clone(),
+                severity: cog_core::AlertSeverity::Info.as_str().to_string(),
+                message: String::new(),
+                labels: serde_json::json!({}),
+            };
+            if let Err(e) = sink.set_persistent_alert(false, &draft).await {
+                tracing::warn!(key = %key, error = %e, "failed to resolve decomposition alert");
+                continue;
+            }
+        }
+        firing.remove(&key);
+        tracing::info!(key = %key, "decomposition alert resolved");
+    }
 }
 
 #[cfg(test)]
@@ -614,5 +775,231 @@ mod consumer_ack_tests {
         let _ = handle.await.unwrap();
 
         assert_eq!(acks, vec!["gid-1".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod orphan_reconciler_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use cog_core::{MessageStream, TaskStatus, TaskType};
+    use std::sync::Mutex;
+
+    type Calls = Vec<(bool, String, String)>;
+
+    #[derive(Default)]
+    struct RecordingAlertSink {
+        calls: Mutex<Calls>,
+        active: Mutex<Vec<cog_core::PersistedAlert>>,
+    }
+
+    #[async_trait]
+    impl cog_core::PersistentAlertSink for RecordingAlertSink {
+        async fn set_persistent_alert(
+            &self,
+            condition: bool,
+            draft: &cog_core::PersistentAlertDraft,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push((
+                condition,
+                draft.rule.clone(),
+                draft.dedup_key.clone(),
+            ));
+            Ok(())
+        }
+
+        async fn list_active_persistent_alerts(
+            &self,
+            rule_prefix: &str,
+            _limit: i64,
+        ) -> Vec<cog_core::PersistedAlert> {
+            self.active
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| a.rule.starts_with(rule_prefix))
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// MessageBackend never touched by the reconciler; satisfies the runtime
+    /// constructor only.
+    struct NullBackend;
+
+    #[async_trait]
+    impl MessageBackend for NullBackend {
+        async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
+            Ok(())
+        }
+        async fn subscribe(&self, _subject: &str, _group: &str) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn subscribe_from(
+            &self,
+            _subject: &str,
+            _group: &str,
+            _start_id: &str,
+        ) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn create_consumer_group(&self, _stream: &str, _group: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn ack(&self, _stream: &str, _group: &str, _ids: &[String]) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    fn placeholder(id: &str, age_minutes: i64) -> Task {
+        let mut t = Task::new(id, TaskType::Generator, serde_json::json!({}));
+        t.is_executable = false;
+        t.updated_at = chrono::Utc::now() - chrono::Duration::minutes(age_minutes);
+        t
+    }
+
+    fn test_runtime(dag: Arc<DagExecutor>) -> DagExecutorRuntime {
+        DagExecutorRuntime::new_with_backend(
+            DagExecutorConfig {
+                redis_url: "memory".into(),
+                workspace_id: "ws-orphan".into(),
+                consumer_group: "grp-orphan".into(),
+                max_retries: 1,
+            },
+            NullBackend,
+        )
+        .with_orchestrator(dag)
+    }
+
+    #[tokio::test]
+    async fn tick_fires_terminates_then_resolves_orphan() {
+        let dag = Arc::new(DagExecutor::new("ws-orphan-tick".into()));
+        dag.add_task(placeholder("orphan-1", 60)).await.unwrap();
+
+        let recording = Arc::new(RecordingAlertSink::default());
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
+        let stall = chrono::Duration::minutes(30);
+        let mut firing = std::collections::HashMap::new();
+
+        // First pass: fire the alert and terminate the placeholder together.
+        orphan_reconcile_tick(&dag, Some(&sink), &stall, &mut firing).await;
+
+        let view = dag.get_task("orphan-1").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Failed);
+        let key = "decomposition_orphaned:-:orphan-1";
+        assert_eq!(firing.len(), 1);
+        assert!(firing.contains_key(key));
+        assert_eq!(
+            *recording.calls.lock().unwrap(),
+            vec![(true, "decomposition_orphaned".into(), key.into())]
+        );
+
+        // Second pass: parent is terminal → resolve, firing map emptied.
+        orphan_reconcile_tick(&dag, Some(&sink), &stall, &mut firing).await;
+        assert!(firing.is_empty());
+        assert_eq!(
+            recording.calls.lock().unwrap()[1],
+            (false, "decomposition_orphaned".into(), key.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_leaves_fresh_placeholder_alone() {
+        let dag = Arc::new(DagExecutor::new("ws-orphan-fresh".into()));
+        dag.add_task(placeholder("fresh-1", 1)).await.unwrap();
+
+        let recording = Arc::new(RecordingAlertSink::default());
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
+        let stall = chrono::Duration::minutes(30);
+        let mut firing = std::collections::HashMap::new();
+
+        orphan_reconcile_tick(&dag, Some(&sink), &stall, &mut firing).await;
+        assert!(firing.is_empty());
+        assert!(recording.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            dag.get_task("fresh-1").await.unwrap().status,
+            TaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn adopted_alert_resolves_when_parent_already_terminal() {
+        // Restart adoption: the alert row predates this process and the parent
+        // task has since Failed; the first tick must resolve the adopted key.
+        let dag = Arc::new(DagExecutor::new("ws-orphan-adopt".into()));
+        let mut adopted_parent = placeholder("orphan-old", 120);
+        adopted_parent.status = TaskStatus::Failed;
+        dag.add_task(adopted_parent).await.unwrap();
+
+        let recording = Arc::new(RecordingAlertSink::default());
+        let key = "decomposition_orphaned:goal-x:orphan-old".to_string();
+        recording
+            .active
+            .lock()
+            .unwrap()
+            .push(cog_core::PersistedAlert {
+                rule: cog_core::ALERT_RULE_DECOMPOSITION_ORPHANED.into(),
+                dedup_key: key.clone(),
+                severity: "warning".into(),
+                state: "firing".into(),
+                message: String::new(),
+                labels: serde_json::json!({"parent_task_id": "orphan-old"}),
+                fired_at: chrono::Utc::now(),
+            });
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
+
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let runtime = test_runtime(dag);
+        let handle = tokio::spawn(async move {
+            runtime
+                .run_orphan_reconciler(true, 30, 60, Some(sink), shutdown_clone)
+                .await;
+        });
+
+        for _ in 0..50 {
+            if recording
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(c, _, k)| !*c && k == &key)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        shutdown.trigger();
+        let _ = handle.await;
+
+        assert!(
+            recording
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(c, _, k)| !*c && k == &key),
+            "adopted alert not resolved: {:?}",
+            recording.calls.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_reconciler_returns_immediately() {
+        let dag = Arc::new(DagExecutor::new("ws-orphan-off".into()));
+        dag.add_task(placeholder("orphan-x", 60)).await.unwrap();
+        let recording = Arc::new(RecordingAlertSink::default());
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
+
+        let runtime = test_runtime(dag.clone());
+        runtime
+            .run_orphan_reconciler(false, 30, 60, Some(sink), ShutdownSignal::new())
+            .await;
+
+        assert!(recording.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            dag.get_task("orphan-x").await.unwrap().status,
+            TaskStatus::Pending
+        );
     }
 }

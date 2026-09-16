@@ -225,6 +225,56 @@ impl cog_core::ActiveAlertSource for PostgresAlertStore {
     }
 }
 
+/// Write-side core contract: lets other crates drive durable alert state
+/// machines (decomposition failure, stalled DAG tasks) through the same
+/// PostgreSQL-backed store as infra alerts.
+#[async_trait::async_trait]
+impl cog_core::PersistentAlertSink for PostgresAlertStore {
+    async fn set_persistent_alert(
+        &self,
+        condition: bool,
+        draft: &cog_core::PersistentAlertDraft,
+    ) -> Result<(), String> {
+        let alert = NewAlert {
+            rule: draft.rule.clone(),
+            dedup_key: draft.dedup_key.clone(),
+            severity: draft.severity.clone(),
+            message: draft.message.clone(),
+            labels: draft.labels.clone(),
+        };
+        self.set_alert(condition, &alert)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn list_active_persistent_alerts(
+        &self,
+        rule_prefix: &str,
+        limit: i64,
+    ) -> Vec<cog_core::PersistedAlert> {
+        match self.list_active(limit).await {
+            Ok(records) => records
+                .into_iter()
+                .filter(|r| r.rule.starts_with(rule_prefix))
+                .map(|r| cog_core::PersistedAlert {
+                    rule: r.rule,
+                    dedup_key: r.dedup_key,
+                    severity: r.severity,
+                    state: r.state,
+                    message: r.message,
+                    labels: r.labels,
+                    fired_at: r.fired_at,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "listing active alerts for prefix failed");
+                Vec::new()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

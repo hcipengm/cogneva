@@ -274,6 +274,8 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                         let store = Arc::new(store);
                         let source: Arc<dyn cog_core::ActiveAlertSource> = store.clone();
                         ctx.publish_service(source);
+                        let sink: Arc<dyn cog_core::PersistentAlertSink> = store.clone();
+                        ctx.publish_service(sink);
                         Some(store)
                     }
                     Err(e) => {

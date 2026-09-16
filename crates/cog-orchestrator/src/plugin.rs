@@ -8,6 +8,7 @@ pub struct OrchestratorPlugin {
     initialized: bool,
     shared_orchestrator: Option<Arc<crate::DagExecutor>>,
     exec_loop: Option<Arc<crate::TaskExecutorRouter>>,
+    action_planner: Option<Arc<crate::ActionPlanOrchestrator>>,
 }
 
 impl OrchestratorPlugin {
@@ -17,6 +18,7 @@ impl OrchestratorPlugin {
             initialized: false,
             shared_orchestrator: None,
             exec_loop: None,
+            action_planner: None,
         }
     }
 }
@@ -145,12 +147,15 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             }
         };
 
+        let decomposition_max_attempts =
+            ctx.config().dag_executor.decomposition_max_attempts.max(1);
         let mut action_plan_orchestrator = crate::ActionPlanOrchestrator::new()
             .with_object_backend(object_backend)
             .with_max_pattern_db_size(pattern_db_max_size)
             .with_max_pattern_age_days(pattern_max_age_days)
             .with_task_executor(exec_loop_arc.clone())
-            .with_dag_executor(shared_orchestrator.clone());
+            .with_dag_executor(shared_orchestrator.clone())
+            .with_decomposition_max_attempts(decomposition_max_attempts);
 
         if let Some(vb) = ctx.consume_service::<dyn cog_core::VectorBackend>() {
             info!("VectorBackend connected for pattern-db hybrid retrieval");
@@ -186,7 +191,9 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             }
         }
 
-        let planner: Arc<dyn cog_core::ActionPlanner> = Arc::new(action_plan_orchestrator);
+        let planner_concrete = Arc::new(action_plan_orchestrator);
+        self.action_planner = Some(planner_concrete.clone());
+        let planner: Arc<dyn cog_core::ActionPlanner> = planner_concrete;
 
         // ── Build DagExecutorRuntime ──
         let runtime_backend = match message_backend.clone() {
@@ -238,6 +245,18 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // Persistent alert port, published by the observability plugin in
+        // init; attach before any goal message can be processed.
+        let alert_sink = ctx.consume_service::<dyn cog_core::PersistentAlertSink>();
+        if alert_sink.is_none() {
+            warn!("no PersistentAlertSink; decomposition failures degrade to error logging");
+        }
+        if let Some(planner) = &self.action_planner {
+            if let Some(sink) = alert_sink.clone() {
+                planner.attach_alert_sink(sink).await;
+            }
+        }
+
         if let Some(ref orch) = self.shared_orchestrator {
             // Start archive background loop
             if ctx.config().dag_executor.archive_enabled {
@@ -313,6 +332,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
 
                         // Periodic ready-task publisher.
                         let pub_shutdown = dag_shutdown.clone();
+                        let publisher_runtime = runtime.clone();
                         tokio::spawn(async move {
                             let mut interval = tokio::time::interval(
                                 std::time::Duration::from_secs(ready_task_poll_interval_secs),
@@ -322,13 +342,31 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             loop {
                                 tokio::select! {
                                     _ = interval.tick() => {
-                                        if let Err(e) = runtime.publish_ready_tasks().await {
+                                        if let Err(e) = publisher_runtime.publish_ready_tasks().await
+                                        {
                                             tracing::warn!("publish_ready_tasks failed: {e}");
                                         }
                                     }
                                     _ = pub_shutdown.wait() => break,
                                 }
                             }
+                        });
+
+                        // Decomposition orphan reconciler.
+                        let reconcile_shutdown = dag_shutdown.clone();
+                        let reconcile_runtime = runtime.clone();
+                        let reconcile_sink = alert_sink.clone();
+                        let orphan_cfg = ctx.config().dag_executor.clone();
+                        tokio::spawn(async move {
+                            reconcile_runtime
+                                .run_orphan_reconciler(
+                                    orphan_cfg.decomposition_orphan_watch_enabled,
+                                    orphan_cfg.decomposition_orphan_poll_interval_secs,
+                                    orphan_cfg.decomposition_orphan_stall_after_secs,
+                                    reconcile_sink,
+                                    reconcile_shutdown,
+                                )
+                                .await;
                         });
 
                         // TaskExecutorRouter task consumer.

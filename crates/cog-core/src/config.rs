@@ -215,6 +215,21 @@ pub struct DagExecutorConfig {
     /// Interval between archive scans (seconds).
     #[serde(default = "default_archive_poll_interval_secs")]
     pub archive_poll_interval_secs: u64,
+    /// Number of decomposition attempts within one goal delivery before an
+    /// empty atomic-task result is treated as a hard failure (minimum 1).
+    #[serde(default = "default_decomposition_max_attempts")]
+    pub decomposition_max_attempts: u32,
+    /// Enable the background reconciler that terminates non-executable
+    /// parent placeholders with no children stuck in Pending.
+    #[serde(default = "default_decomposition_orphan_watch_enabled")]
+    pub decomposition_orphan_watch_enabled: bool,
+    /// Reconciler scan interval (seconds).
+    #[serde(default = "default_decomposition_orphan_poll_interval_secs")]
+    pub decomposition_orphan_poll_interval_secs: u64,
+    /// How long a childless non-executable placeholder may stay Pending
+    /// before the reconciler terminates it and raises an alert (seconds).
+    #[serde(default = "default_decomposition_orphan_stall_after_secs")]
+    pub decomposition_orphan_stall_after_secs: u64,
 }
 
 impl Default for DagExecutorConfig {
@@ -234,6 +249,11 @@ impl Default for DagExecutorConfig {
             archive_enabled: default_archive_enabled(),
             archive_after_secs: default_archive_after_secs(),
             archive_poll_interval_secs: default_archive_poll_interval_secs(),
+            decomposition_max_attempts: default_decomposition_max_attempts(),
+            decomposition_orphan_watch_enabled: default_decomposition_orphan_watch_enabled(),
+            decomposition_orphan_poll_interval_secs:
+                default_decomposition_orphan_poll_interval_secs(),
+            decomposition_orphan_stall_after_secs: default_decomposition_orphan_stall_after_secs(),
         }
     }
 }
@@ -354,6 +374,18 @@ fn default_archive_after_secs() -> u64 {
 }
 fn default_archive_poll_interval_secs() -> u64 {
     300
+}
+fn default_decomposition_max_attempts() -> u32 {
+    2
+}
+fn default_decomposition_orphan_watch_enabled() -> bool {
+    true
+}
+fn default_decomposition_orphan_poll_interval_secs() -> u64 {
+    300
+}
+fn default_decomposition_orphan_stall_after_secs() -> u64 {
+    1800
 }
 
 /// Configuration for the Hot/Warm/Cold tier migrator.
