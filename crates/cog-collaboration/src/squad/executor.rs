@@ -834,10 +834,16 @@ fn build_contributions_from_verdict(
     };
 
     let evaluation = extract_evaluation(&snapshot);
-    let learnings = evaluation
-        .as_ref()
-        .map(learnings_from_evaluation)
-        .unwrap_or_default();
+    let learnings = match unrecoverable_reason.as_deref() {
+        // 终止原因是这一轮真正的结论，最后一条迭代的反馈只是过程。用过程
+        // 当摘要会把死因写错：预算耗尽被记成"生成器没有产出"，于是整条
+        // 自省链路照着错误的方向找病根。
+        Some(reason) => vec![learning_from_termination(reason, evaluation.as_ref())],
+        None => evaluation
+            .as_ref()
+            .map(learnings_from_evaluation)
+            .unwrap_or_default(),
+    };
     let errors = unrecoverable_reason
         .map(|reason| {
             vec![cog_core::ErrorEntry::new(
@@ -968,6 +974,38 @@ fn learnings_from_evaluation(
     vec![learning]
 }
 
+/// 终止型判定（不可修复 / 预算耗尽 / 停滞 / 确定性环境失败）对应的学习：
+/// 摘要与建议动作取**终止原因**，最后一条迭代的评分细则作为过程证据附在
+/// 细节里。复发匹配按摘要聚合，摘要写错就等于把同类失败归错了类。
+fn learning_from_termination(
+    reason: &str,
+    last_evaluation: Option<&crate::squad::pge::types::EvaluationResult>,
+) -> cog_core::Learning {
+    let context_detail = last_evaluation
+        .filter(|e| !e.criteria.is_empty())
+        .map(|e| {
+            let lines = e
+                .criteria
+                .iter()
+                .map(|c| format!("- {}: {}/100 — {}", c.name, c.score, c.comment))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\nlast iteration criteria:\n{lines}")
+        })
+        .unwrap_or_default();
+    let mut learning = cog_core::Learning::new(
+        cog_core::LearningCategory::Correction,
+        cog_core::Priority::High,
+        cog_core::Area::Backend,
+        reason.chars().take(200).collect::<String>(),
+        format!("{reason}{context_detail}"),
+        reason,
+        cog_core::LearningSource::SelfReview,
+    );
+    learning.tags.push("squad-reflection".into());
+    learning
+}
+
 /// 运行 Squad 级反思（若配置了 reflection 引擎）。
 async fn run_squad_reflection(
     squad_reflection: &Option<Arc<dyn cog_core::SquadReflection>>,
@@ -1028,6 +1066,7 @@ mod tests {
                 pge_passed: false,
                 feedback: "evaluator: criteria unmet".into(),
                 snapshot: pipeline_snapshot("fail", "evaluator: criteria unmet"),
+                progress: None,
             }],
         };
         let contributions = build_contributions_from_verdict(&verdict, "squad-x");
@@ -1087,6 +1126,7 @@ mod tests {
                     "roundtable": {"transcript": []},
                     "evaluation": evaluation_json("partial", "roundtable rejected"),
                 }),
+                progress: None,
             }],
         };
         let contributions = build_contributions_from_verdict(&verdict, "squad-z");
@@ -1094,15 +1134,19 @@ mod tests {
             .iter()
             .find(|c| c.role == "generator")
             .expect("generator contribution");
+        // 摘要取自终止原因，不是最后一轮的反馈；第二轮桌的快照形状（无 plan、
+        // 只有 roundtable + evaluation）仍然要能贡献评分细则。
         assert_eq!(generator.learnings.len(), 1);
+        assert_eq!(generator.learnings[0].summary, "max iterations");
         assert!(matches!(
             generator.learnings[0].priority,
-            cog_core::Priority::Medium
+            cog_core::Priority::High
         ));
+        assert!(generator.learnings[0].details.contains("tests pass"));
     }
 
     #[test]
-    fn malformed_evaluation_snapshot_does_not_panic() {
+    fn malformed_evaluation_snapshot_still_yields_termination_learning() {
         let verdict = RalphVerdict::Unrecoverable {
             reason: "broken".into(),
             iterations: 1,
@@ -1112,6 +1156,7 @@ mod tests {
                 pge_passed: false,
                 feedback: String::new(),
                 snapshot: serde_json::json!({"plan": {}, "evaluation": "not-an-object"}),
+                progress: None,
             }],
         };
         let contributions = build_contributions_from_verdict(&verdict, "squad-w");
@@ -1119,7 +1164,12 @@ mod tests {
             .iter()
             .find(|c| c.role == "generator")
             .expect("generator contribution");
-        assert!(generator.learnings.is_empty());
+        // 终止原因是这一轮真正的结论，与快照能否解析无关：解析失败只让细则
+        // 为空，摘要仍如实写"broken"。若摘要转而依赖快照，这类记录就会退回
+        // 到用过程冒充死因的老毛病。
+        assert_eq!(generator.learnings.len(), 1);
+        assert_eq!(generator.learnings[0].summary, "broken");
+        assert_eq!(generator.learnings[0].details, "broken");
         assert_eq!(generator.errors.len(), 1);
     }
 }

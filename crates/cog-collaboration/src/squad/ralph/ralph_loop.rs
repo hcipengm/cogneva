@@ -1,8 +1,10 @@
 //! Loop 1 — Ralph Loop（Squad 外层质量控制循环）。
 //! - 停止条件：PGE Pass、判定"不可修复"、停滞检测、或迭代预算耗尽。
 //! - 全局重置策略（非局部修补）：Identical / Modified / Escalated。
-//! - 迭代预算（max_iterations）是有界止损：无人值守场景没有操作者盯流
-//!   调 prompt，不收敛的链必须在预算内终止，不能"视为无限"地烧。
+//! - 迭代预算（max_iterations）是**一次执行**的有界止损：无人值守场景没有
+//!   操作者盯流调 prompt，不收敛的链必须在预算内终止，不能"视为无限"地烧。
+//!   预算不跨执行累计——持久化的历史是给下一次执行看的反馈与停滞证据，
+//!   不是被消耗掉的额度。
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::squad::pge::pipeline::PgePipeline;
@@ -36,6 +38,44 @@ pub struct RalphIteration {
     pub pge_passed: bool,
     pub feedback: String,
     pub snapshot: serde_json::Value,
+    /// Hard-progress readings for this iteration. Persisted so the stall
+    /// verdict survives a restart: an iteration's outcome is only comparable
+    /// against its predecessor, and the predecessor may live in another
+    /// process. `None` for entries written before this was recorded, and for
+    /// branches whose snapshot shape carries no score/artifacts — such an
+    /// entry is undecidable, never counted as progress nor as its absence.
+    #[serde(default)]
+    pub progress: Option<IterationProgress>,
+}
+
+/// What one iteration bought, in the only terms that mean progress: a better
+/// evaluation score, or a bigger deliverable.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct IterationProgress {
+    pub score: u32,
+    pub artifact_count: usize,
+    pub artifact_bytes: usize,
+}
+
+impl IterationProgress {
+    /// Strictly better than `prev` on score or artifact size. Wording changes
+    /// are not progress — a loop that rephrases the same failure is spinning.
+    fn beats(&self, prev: &Self) -> bool {
+        self.score > prev.score
+            || self.artifact_count > prev.artifact_count
+            || self.artifact_bytes > prev.artifact_bytes
+    }
+}
+
+fn iteration_progress(
+    generation: &crate::squad::pge::types::GeneratorOutput,
+    evaluation: &EvaluationResult,
+) -> IterationProgress {
+    IterationProgress {
+        score: evaluation.score.unwrap_or(0),
+        artifact_count: generation.artifacts.len(),
+        artifact_bytes: generation.artifacts.iter().map(|a| a.content.len()).sum(),
+    }
 }
 
 /// 全局重置策略。
@@ -74,11 +114,13 @@ pub struct SemanticFailureAnalysis {
 /// Ralph Loop 配置。
 #[derive(Debug, Clone, Copy)]
 pub struct RalphLoopConfig {
-    /// 迭代预算硬上限。达到即终止并归档结论——不收敛的链继续迭代只是
-    /// 燃烧 token（实证：曾有不收敛链跑到 600+ 迭代零通过）。
+    /// 单次执行的迭代预算硬上限。达到即终止并归档结论——不收敛的链继续
+    /// 迭代只是燃烧 token（实证：曾有不收敛链跑到 600+ 迭代零通过）。
     pub max_iterations: u32,
-    /// 停滞窗口：最近这么多轮全部失败、重置策略全部 Identical、且
-    /// 归一化反馈逐字相同，判定为停滞并终止。0 = 关闭停滞检测。
+    /// 停滞窗口：最近这么多轮不买进展即判定停滞并终止。两条判据任一命中
+    /// 都算停滞——归一化反馈逐字相同（同一失败原样重放），或没有任何硬
+    /// 进展（分数未升且产物未增长，即换着说法重复同一个失败）。0 = 关闭
+    /// 停滞检测。
     pub stagnation_window: u32,
 }
 
@@ -102,6 +144,12 @@ pub struct RalphLoop {
     config: RalphLoopConfig,
     llm_provider: Option<Arc<dyn cog_core::LlmClient>>,
     /// 跨重试累积的迭代历史，支持 Ralph Loop 跨 Squad 重试复用历史。
+    ///
+    /// 它是**上下文**，不是额度：每次执行的迭代都从 1 开始计数，已归档的
+    /// 历史只提供两件东西——上一轮的反馈，以及"这个目标还没有买过进展"的
+    /// 证据。历史曾经同时充当终身计数器，于是一个逐次成功的任务会把自己
+    /// 的成功逐条记成消耗，攒满预算后永久返回"预算耗尽"且不再执行：系统
+    /// 一旦失败过就再也无法用改进后的代码重试同一个目标。
     history: Vec<RalphIteration>,
     /// History persistence: when set, the history is loaded from the task's
     /// context board before the first iteration and written back after every
@@ -140,7 +188,19 @@ impl RalphLoop {
         self
     }
 
+    /// How many trailing iterations are worth keeping. A later execution only
+    /// consumes two things from the archive: the feedback of the most recent
+    /// attempt and the evidence behind the stall verdict. Everything older is
+    /// dead weight — and it used to be worse than dead weight, because the
+    /// archive doubled as a lifetime counter.
+    fn history_keep(&self) -> usize {
+        (self.config.stagnation_window as usize).max(1)
+    }
+
     /// Load a previously persisted history, replacing the in-memory one.
+    /// Only the tail is kept: the archive's job is to carry the last verdict
+    /// forward, and reading back every iteration ever run made a re-drive pay
+    /// for history it would never look at.
     /// Best-effort: a missing or unreadable board starts from empty.
     async fn load_history(&mut self) {
         let (Some(task_id), Some(backend)) = (&self.history_task_id, &self.state_backend) else {
@@ -150,10 +210,16 @@ impl RalphLoop {
             Ok(Some(board)) => {
                 if let Some(raw) = board.fields.get(RALPH_HISTORY_FIELD) {
                     match serde_json::from_str::<Vec<RalphIteration>>(raw) {
-                        Ok(history) if !history.is_empty() => {
+                        Ok(mut history) if !history.is_empty() => {
+                            let total = history.len();
+                            let keep = self.history_keep();
+                            if total > keep {
+                                history.drain(..total - keep);
+                            }
                             tracing::info!(
                                 task_id,
-                                iterations = history.len(),
+                                archived = total,
+                                restored = history.len(),
                                 "Ralph history restored from state backend"
                             );
                             self.history = history;
@@ -172,13 +238,15 @@ impl RalphLoop {
         }
     }
 
-    /// Persist the current history. Best-effort: history loss degrades a
-    /// restart to a fresh run, it must never fail the loop itself.
+    /// Persist the current history's tail. Best-effort: history loss degrades
+    /// a restart to a fresh run, it must never fail the loop itself.
     async fn persist_history(&self) {
         let (Some(task_id), Some(backend)) = (&self.history_task_id, &self.state_backend) else {
             return;
         };
-        match serde_json::to_string(&self.history) {
+        let keep = self.history_keep();
+        let start = self.history.len().saturating_sub(keep);
+        match serde_json::to_string(&self.history[start..]) {
             Ok(raw) => {
                 if let Err(e) = backend
                     .set_board_field(task_id, RALPH_HISTORY_FIELD, &raw)
@@ -191,9 +259,15 @@ impl RalphLoop {
         }
     }
 
-    /// 停滞判定：最近 stagnation_window 轮全部失败、重置策略全部
-    /// Identical、且归一化反馈逐字相同——循环在原地空转，继续迭代
-    /// 只是燃烧 token。纯确定性判据，不引入额外 LLM 调用。
+    /// 停滞判定：最近 stagnation_window 轮没有买到任何进展——继续迭代只是
+    /// 原地烧钱。两条判据任一命中即成立：
+    /// 1. 归一化反馈逐字相同：同一个失败原样重放；
+    /// 2. 没有任何硬进展：分数未升且产物未增长。模型常把同一个失败换着说法
+    ///    重写一遍（"第 18 种失败模式"、"第 6 次仍是诚实的空操作"），逐字判据
+    ///    抓不到，但这类改写同样没有买到任何东西。
+    ///
+    /// 有重置策略变化或任一轮通过则不判停滞：前者说明还在换手段，后者说明
+    /// 目标可达。纯确定性判据，不引入额外 LLM 调用。
     fn is_stagnated(&self) -> bool {
         let window = self.config.stagnation_window as usize;
         if window == 0 || self.history.len() < window {
@@ -216,7 +290,27 @@ impl RalphLoop {
                 .to_lowercase()
         };
         let first = normalize(&tail[0].feedback);
-        tail.iter().all(|it| normalize(&it.feedback) == first)
+        let identical_failure = tail.iter().all(|it| normalize(&it.feedback) == first);
+        identical_failure || self.tail_bought_no_progress(tail)
+    }
+
+    /// 尾部这一窗内在分数或产物上没有抬升过——第一轮只立基线，之后每一轮
+    /// 都必须严格超过前一轮。窗口内读数缺失（旧记录、无分/无产物的分支）
+    /// 按"未观测"处理，既不当作进展也不当作停滞；整窗都不可判定时返回
+    /// false，把判断交回给逐字判据。
+    fn tail_bought_no_progress(&self, tail: &[RalphIteration]) -> bool {
+        let mut readings = tail.iter().filter_map(|it| it.progress);
+        let Some(mut best) = readings.next() else {
+            return false;
+        };
+        readings.all(|cur| {
+            if cur.beats(&best) {
+                best = cur;
+                false
+            } else {
+                true
+            }
+        })
     }
 
     /// 停滞终止的统一形态：Warn 日志 + 指标 + Unrecoverable 判定，
@@ -226,7 +320,7 @@ impl RalphLoop {
         tracing::warn!(
             iterations = total_iterations,
             window = self.config.stagnation_window,
-            "Ralph Loop stagnated: identical failure repeated across the window; terminating"
+            "Ralph Loop stagnated: no progress across the window; terminating"
         );
         crate::observable::global_observable().record_ralph_termination("stagnated");
         RalphVerdict::Unrecoverable {
@@ -240,12 +334,13 @@ impl RalphLoop {
     }
 
     /// 预算耗尽的统一形态（与停滞同构，便于下游按 reason 前缀分类）。
+    /// 这里耗尽的总是**本次执行**的预算；下一次执行重新起步，不继承消耗。
     fn budget_exhausted_verdict(&self) -> RalphVerdict {
         let total_iterations = self.history.len() as u32;
         tracing::warn!(
             iterations = total_iterations,
             max_iterations = self.config.max_iterations,
-            "Ralph Loop exhausted its iteration budget; terminating"
+            "Ralph Loop exhausted this run's iteration budget; terminating"
         );
         crate::observable::global_observable().record_ralph_termination("budget_exhausted");
         RalphVerdict::Unrecoverable {
@@ -269,9 +364,11 @@ impl RalphLoop {
         evaluator: &EvaluatorActor,
     ) -> RalphVerdict {
         self.load_history().await;
-        let start_iteration = self.history.len() as u32 + 1;
 
-        for iteration in start_iteration..=self.config.max_iterations {
+        // 本轮自己的预算：归档历史提供反馈与停滞证据，不从预算里扣。
+        // 起算点跟着历史走曾让预算变成目标的终身配额——攒满之后每次重驱
+        // 都瞬间"耗尽"且一轮都不跑，连已经能通过的目标也被永久判死。
+        for iteration in 1..=self.config.max_iterations {
             crate::observable::global_observable().record_round();
             if iteration > 1 {
                 context["ralph_iteration"] = serde_json::json!(iteration);
@@ -314,6 +411,10 @@ impl RalphLoop {
                 FailureAnalysis::Unrecoverable(_) => ResetStrategy::Identical,
             };
 
+            let progress = Some(iteration_progress(
+                &pge_result.final_generation,
+                &pge_result.final_evaluation,
+            ));
             let snapshot = serde_json::json!({
                 "plan": pge_result.final_plan,
                 "generation": pge_result.final_generation,
@@ -326,6 +427,7 @@ impl RalphLoop {
                 pge_passed: passed,
                 feedback: feedback.clone(),
                 snapshot,
+                progress,
             });
             self.persist_history().await;
 
@@ -338,22 +440,23 @@ impl RalphLoop {
                 };
             }
 
+            // 确定性失败的结论优先于停滞：环境/协议的失败自带"重试无用"
+            // 的语义，比笼统的"没进展"更该被上层看到。
+            if let FailureAnalysis::Unrecoverable(reason) = &analysis {
+                let total_iterations = self.history.len() as u32;
+                return RalphVerdict::Unrecoverable {
+                    reason: reason.clone(),
+                    iterations: total_iterations,
+                    history: self.history.clone(),
+                };
+            }
+
             if self.is_stagnated() {
                 return self.stagnated_verdict();
             }
 
-            match analysis {
-                FailureAnalysis::Recoverable(strategy) => {
-                    context["reset_strategy"] = serde_json::json!(format!("{:?}", strategy));
-                }
-                FailureAnalysis::Unrecoverable(reason) => {
-                    let total_iterations = self.history.len() as u32;
-                    return RalphVerdict::Unrecoverable {
-                        reason,
-                        iterations: total_iterations,
-                        history: self.history.clone(),
-                    };
-                }
+            if let FailureAnalysis::Recoverable(strategy) = analysis {
+                context["reset_strategy"] = serde_json::json!(format!("{:?}", strategy));
             }
         }
 
@@ -368,9 +471,9 @@ impl RalphLoop {
         roundtable: &PgeRoundtable,
     ) -> RalphVerdict {
         self.load_history().await;
-        let start_iteration = self.history.len() as u32 + 1;
 
-        for iteration in start_iteration..=self.config.max_iterations {
+        // 与 Pipeline 同构：预算属于本次执行，历史只提供反馈与停滞证据。
+        for iteration in 1..=self.config.max_iterations {
             crate::observable::global_observable().record_round();
             if iteration > 1 {
                 context["ralph_iteration"] = serde_json::json!(iteration);
@@ -413,6 +516,10 @@ impl RalphLoop {
                 FailureAnalysis::Unrecoverable(_) => ResetStrategy::Identical,
             };
 
+            let progress = Some(iteration_progress(
+                &rt_result.final_generation,
+                &rt_result.final_evaluation,
+            ));
             let snapshot = serde_json::json!({ "roundtable": rt_result });
 
             self.history.push(RalphIteration {
@@ -421,6 +528,7 @@ impl RalphLoop {
                 pge_passed: passed,
                 feedback: feedback.clone(),
                 snapshot: snapshot.clone(),
+                progress,
             });
             self.persist_history().await;
 
@@ -433,22 +541,21 @@ impl RalphLoop {
                 };
             }
 
+            if let FailureAnalysis::Unrecoverable(reason) = &analysis {
+                let total_iterations = self.history.len() as u32;
+                return RalphVerdict::Unrecoverable {
+                    reason: reason.clone(),
+                    iterations: total_iterations,
+                    history: self.history.clone(),
+                };
+            }
+
             if self.is_stagnated() {
                 return self.stagnated_verdict();
             }
 
-            match analysis {
-                FailureAnalysis::Recoverable(strategy) => {
-                    context["reset_strategy"] = serde_json::json!(format!("{:?}", strategy));
-                }
-                FailureAnalysis::Unrecoverable(reason) => {
-                    let total_iterations = self.history.len() as u32;
-                    return RalphVerdict::Unrecoverable {
-                        reason,
-                        iterations: total_iterations,
-                        history: self.history.clone(),
-                    };
-                }
+            if let FailureAnalysis::Recoverable(strategy) = analysis {
+                context["reset_strategy"] = serde_json::json!(format!("{:?}", strategy));
             }
         }
 
@@ -873,6 +980,7 @@ mod tests {
                 pge_passed: false,
                 feedback: "Code needs improvement".into(),
                 snapshot: serde_json::Value::Null,
+                progress: None,
             },
             RalphIteration {
                 iteration: 2,
@@ -880,6 +988,7 @@ mod tests {
                 pge_passed: false,
                 feedback: "Code needs improvement".into(),
                 snapshot: serde_json::Value::Null,
+                progress: None,
             },
         ];
 
@@ -992,6 +1101,7 @@ mod tests {
             pge_passed: false,
             feedback: feedback.to_string(),
             snapshot: serde_json::json!({}),
+            progress: None,
         }
     }
 
@@ -1093,6 +1203,79 @@ mod tests {
                 .history
                 .push(failed_iteration(i, ResetStrategy::Identical, "same"));
         }
+        assert!(!ralph.is_stagnated());
+    }
+
+    fn failed_iteration_with_readings(
+        iteration: u32,
+        feedback: &str,
+        progress: IterationProgress,
+    ) -> RalphIteration {
+        RalphIteration {
+            iteration,
+            reset_strategy: ResetStrategy::Identical,
+            pge_passed: false,
+            feedback: feedback.to_string(),
+            snapshot: serde_json::json!({}),
+            progress: Some(progress),
+        }
+    }
+
+    fn readings(score: u32, artifact_bytes: usize) -> IterationProgress {
+        IterationProgress {
+            score,
+            artifact_count: 1,
+            artifact_bytes,
+        }
+    }
+
+    /// 换着说法重复同一个失败同样算停滞：逐字判据抓不到改写，但这一窗在分数
+    /// 和产物上都没有抬升，继续迭代只是原地烧钱。
+    #[test]
+    fn stagnation_detected_when_window_buys_no_hard_progress() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 3,
+        });
+        for (i, feedback) in [
+            "第 16 种失败模式",
+            "第 17 次仍是诚实的空操作",
+            "换个说法：依然没有任何产出",
+        ]
+        .iter()
+        .enumerate()
+        {
+            ralph.history.push(failed_iteration_with_readings(
+                i as u32 + 1,
+                feedback,
+                readings(30, 100),
+            ));
+        }
+        assert!(ralph.is_stagnated());
+    }
+
+    /// 有真进展就不判停滞——哪怕措辞一轮比一轮难听。
+    #[test]
+    fn no_stagnation_when_hard_progress_appears() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 3,
+        });
+        ralph.history.push(failed_iteration_with_readings(
+            1,
+            "missing tests",
+            readings(30, 100),
+        ));
+        ralph.history.push(failed_iteration_with_readings(
+            2,
+            "return type wrong",
+            readings(30, 100),
+        ));
+        ralph.history.push(failed_iteration_with_readings(
+            3,
+            "one test still red",
+            readings(60, 400),
+        ));
         assert!(!ralph.is_stagnated());
     }
 
@@ -1468,9 +1651,12 @@ mod tests {
             RalphVerdict::Unrecoverable { history, .. } => history,
             other => panic!("expected Unrecoverable, got {:?}", other),
         };
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].iteration, 1);
-        assert_eq!(history[1].iteration, 2);
+        // 重启的这一轮跑自己的预算（2 轮），此前那 1 条只是作为上下文被恢复，
+        // 不从中扣除。iteration 是各轮自己的序号，跨轮重复是正常的。
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].iteration, 1); // restored from the first run
+        assert_eq!(history[1].iteration, 1); // the restart's own budget starts at 1
+        assert_eq!(history[2].iteration, 2);
 
         // The board itself holds the full resumed history.
         let raw = backend
@@ -1481,7 +1667,61 @@ mod tests {
             .cloned()
             .expect("history field must be persisted");
         let stored: Vec<RalphIteration> = serde_json::from_str(&raw).unwrap();
-        assert_eq!(stored.len(), 2);
+        assert_eq!(stored.len(), 3);
+    }
+
+    /// 回归：历史攒满预算后重驱仍然要跑完本轮预算。曾经的起算点跟着
+    /// `history.len()` 走，于是 `max_iterations` 变成目标的终身配额——攒满
+    /// 之后每次重驱都在第一轮之前就"预算耗尽"，一轮都不执行，连已经能通过
+    /// 的目标也被永久判死。
+    #[tokio::test]
+    async fn ralph_budget_is_per_run_not_a_lifetime_quota() {
+        let backend = Arc::new(BoardMockBackend::new());
+        // 旧账法下攒满的目标：历史饱和在 50 条。
+        let saturated: Vec<RalphIteration> = (1..=50)
+            .map(|i| failed_iteration(i, ResetStrategy::Modified, &format!("attempt {}", i)))
+            .collect();
+        backend.fields.lock().unwrap().insert(
+            ("task-quota".to_string(), RALPH_HISTORY_FIELD.to_string()),
+            serde_json::to_string(&saturated).unwrap(),
+        );
+
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(Arc::new(pass_planner()));
+        let generator = GeneratorActor::new(Arc::new(pass_generator()));
+
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 2,
+            ..Default::default()
+        })
+        .with_history_store("task-quota".into(), backend.clone());
+        let verdict = ralph
+            .run_pipeline(
+                "goal",
+                serde_json::json!({}),
+                &pipeline,
+                &planner,
+                &generator,
+                &EvaluatorActor::new(Arc::new(fail_evaluator())),
+            )
+            .await;
+
+        let history = match verdict {
+            RalphVerdict::Unrecoverable { history, .. } => history,
+            other => panic!("expected Unrecoverable, got {:?}", other),
+        };
+        // 50 条饱和历史只保留最后一窗作为上下文，本轮自己的 2 轮照跑：
+        // 起算点若仍跟着历史走，这里会是 5（0 轮执行）而不是 7。
+        assert_eq!(ralph.history_keep(), 5);
+        assert_eq!(history.len(), 7);
+        assert_eq!(history[5].iteration, 1);
+        assert_eq!(history[6].iteration, 2);
     }
 
     #[tokio::test]
