@@ -535,12 +535,12 @@ data:
           "gateway_verified": true
         },
         "pr_workdir": "",
-        "_comment_pr_workdir": "Local git clone used by the PR publisher (ChangeSink). Empty disables change-to-PR publishing. Git transport goes through the security gateway HTTPS proxy (COGNEVA_GIT_PROXY_BASE, set in deployment env); no token or deploy key lives in this pod.",
+        "_comment_pr_workdir": "Local git working copy the change publisher uses. Empty derives one under the data dir (COGNEVA_DATA_DIR/pr-workdir); whether changes actually go upstream is the contribution policy's decision, not a path setting. Git transport goes through the security gateway HTTPS proxy (COGNEVA_GIT_PROXY_BASE, set in deployment env); no token or deploy key lives in this pod.",
         "auto_create_pr": true,
-        "auto_merge_policy": {
-          "enabled": true,
-          "require_ci_pass": true,
-          "require_no_review_requested": false,
+        "landing_policy": {
+          "_comment": "Gates a generated change must clear before its commit lands on the base branch, and what happens when CI on a landed commit fails. Whether changes go upstream at all is the contribution policy's decision (auto/ask/local) — there is no separate on/off switch here.",
+          "require_self_review": true,
+          "min_self_review_score": 0.8,
           "max_changed_lines": 200,
           "forbidden_paths": [
             ".github/workflows",
@@ -548,13 +548,9 @@ data:
             "secrets/",
             "*.lock"
           ],
-          "forbidden_labels": [
-            "security",
-            "breaking-change",
-            "manual-only"
-          ],
-          "cooldown_hours": 24,
-          "require_human_review_override": true
+          "revert_on_ci_failure": true,
+          "redrive_on_ci_failure": true,
+          "ci_watch_timeout_secs": 1800
         },
         "human_required_labels": [
           "security",

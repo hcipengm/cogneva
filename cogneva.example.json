@@ -487,10 +487,10 @@
       "path": "/webhooks/github"
     },
     "auto_create_pr": true,
-    "auto_merge_policy": {
-      "enabled": true,
-      "require_ci_pass": true,
-      "require_no_review_requested": false,
+    "landing_policy": {
+      "_comment": "Gates a generated change must clear before its commit lands on the base branch, and what happens when CI on a landed commit fails. Whether changes go upstream at all is the contribution policy's decision (auto/ask/local) — there is no separate on/off switch here.",
+      "require_self_review": true,
+      "min_self_review_score": 0.8,
       "max_changed_lines": 200,
       "forbidden_paths": [
         ".github/workflows",
@@ -498,13 +498,9 @@
         "secrets/",
         "*.lock"
       ],
-      "forbidden_labels": [
-        "security",
-        "breaking-change",
-        "manual-only"
-      ],
-      "cooldown_hours": 24,
-      "require_human_review_override": true
+      "revert_on_ci_failure": true,
+      "redrive_on_ci_failure": true,
+      "ci_watch_timeout_secs": 1800
     },
     "human_required_labels": [
       "security",

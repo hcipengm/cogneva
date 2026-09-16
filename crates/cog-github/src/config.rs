@@ -213,8 +213,9 @@ pub struct GitHubIntegrationConfig {
     pub max_issues_per_scan: usize,
     /// Whether to automatically create PRs when a change is generated.
     pub auto_create_pr: bool,
-    /// Policy for deciding whether a PR can be automatically merged.
-    pub auto_merge_policy: AutoMergePolicy,
+    /// Policy governing whether a generated change may land on the base
+    /// branch, and what happens when the CI run for a landed commit fails.
+    pub landing_policy: LandingPolicy,
     /// Labels that force human review before any action is taken.
     pub human_required_labels: Vec<String>,
     /// Labels that cause the issue to be skipped entirely.
@@ -227,8 +228,9 @@ pub struct GitHubIntegrationConfig {
     pub conversation: ConversationConfig,
     /// Webhook 事件入口（discovery_mode=events/both 时生效）。
     pub webhook: WebhookConfig,
-    /// Local git working copy used by the PR publisher. Empty disables
-    /// change-to-PR publishing (the ChangeSink is not registered).
+    /// Local git working copy used by the PR publisher. Leave empty to derive
+    /// one from the data dir (see [`GitHubIntegrationConfig::pr_workdir_path`]);
+    /// set it to place the clone somewhere specific.
     pub pr_workdir: String,
     /// GitHub API 基址覆盖：指向安全网关透传端点（如
     /// `http://cogneva-security-gateway:8081/github`）。设置后本进程不再
@@ -251,7 +253,7 @@ impl Default for GitHubIntegrationConfig {
             poll_interval_secs: 300,
             max_issues_per_scan: 50,
             auto_create_pr: true,
-            auto_merge_policy: AutoMergePolicy::default(),
+            landing_policy: LandingPolicy::default(),
             human_required_labels: vec!["security".into(), "breaking-change".into()],
             forbidden_labels: vec!["wontfix".into(), "manual-only".into()],
             allowed_issue_states: vec!["open".into()],
@@ -273,74 +275,64 @@ impl GitHubIntegrationConfig {
             .find(|a| !a.username().is_empty())
             .ok_or_else(|| SFError::Validation("no GitHub account configured".into()))
     }
+
+    /// The git working copy the PR publisher clones into.
+    ///
+    /// An empty `pr_workdir` means "not configured", not "publishing off": a
+    /// derived default under the data dir keeps the change-to-PR channel live
+    /// without a hand-edited path in the deployment config. Whether changes
+    /// are actually published is the contribution policy's decision
+    /// (`ContributionPolicy::Local` never sends them upstream), and turning
+    /// the whole integration off is `enabled`.
+    pub fn pr_workdir_path(&self) -> std::path::PathBuf {
+        if !self.pr_workdir.trim().is_empty() {
+            return std::path::PathBuf::from(self.pr_workdir.trim());
+        }
+        let dir = std::env::var("COGNEVA_DATA_DIR")
+            .ok()
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| "/var/lib/cogneva-data".into());
+        std::path::Path::new(dir.trim()).join("pr-workdir")
+    }
 }
 
-/// Policy for automatically merging a generated PR.
+/// Gate a generated change must clear before its commit may land on the base
+/// branch, plus the response when the CI run for a landed commit fails.
+///
+/// There is deliberately no `enabled` field: whether changes go upstream at
+/// all is the contribution policy's decision (`auto`/`ask`/`local`), and a
+/// second switch would let the two disagree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AutoMergePolicy {
-    /// Whether auto-merge is enabled at all.
-    pub enabled: bool,
-    /// Require CI checks to pass before auto-merge.
-    pub require_ci_pass: bool,
-    /// Wait if any reviewer has been requested.
-    pub require_no_review_requested: bool,
-    /// Maximum number of changed lines allowed for auto-merge.
-    pub max_changed_lines: usize,
-    /// File paths that forbid auto-merge when touched.
-    pub forbidden_paths: Vec<String>,
-    /// Labels that forbid auto-merge when present.
-    pub forbidden_labels: Vec<String>,
-    /// Minimum hours to wait after PR creation before merging.
-    pub cooldown_hours: u64,
-    /// Whether a human can override auto-merge via labels.
-    pub require_human_review_override: bool,
-    /// Require a machine-readable self-review score on the PR before merging.
-    /// A PR without a parseable score waits instead of merging — missing
+pub struct LandingPolicy {
+    /// Require a machine-readable self-review score on the change. A change
+    /// without a parseable score is held back instead of landing — missing
     /// evidence is not evidence of quality.
     pub require_self_review: bool,
-    /// Minimum self-review score a PR must carry to merge.
+    /// Minimum self-review score a change must carry to land.
     pub min_self_review_score: f32,
-    /// Also require the sandbox gate signals the publisher embeds in the PR
-    /// metadata block. Off by default: the sandbox environment does not yet
-    /// match the deployment target closely enough for its cargo gates to be
-    /// authoritative.
-    pub local_gate_signals: bool,
-    /// Which platform self-produced change PRs are opened on and merged from.
-    /// `github` is the default: it is the end with a complete CI signal, so
-    /// the merge gates have something authoritative to read. The other end
-    /// receives `main` by mirror instead of by PR.
-    pub merge_target_platform: MergeTargetPlatform,
-    /// Reap self-produced PRs left open on the non-target platform (whether
-    /// from before this policy existed or from a misconfigured publisher)
-    /// instead of leaving them for a human. Unattended operation leaves no
-    /// open tail behind.
-    pub legacy_pr_reap: bool,
-    /// Submit a deployment intent task after a merge, so a merged change
-    /// reaches the canary pipeline instead of stopping at `main`.
-    pub trigger_deploy_after_merge: bool,
+    /// Maximum number of changed lines a change may touch.
+    pub max_changed_lines: usize,
+    /// Path prefixes that forbid landing when touched.
+    pub forbidden_paths: Vec<String>,
+    /// Push a revert commit when the CI run for a landed commit fails, so the
+    /// base branch returns to green within seconds instead of staying red
+    /// until a human intervenes.
+    pub revert_on_ci_failure: bool,
+    /// Re-drive generation once from the CI failure log after a revert. One
+    /// attempt only: a change that breaks CI twice is out of the generator's
+    /// reach and is left to a human.
+    pub redrive_on_ci_failure: bool,
+    /// How long to watch a landed commit's CI before giving up on that
+    /// revision (seconds).
+    pub ci_watch_timeout_secs: u64,
 }
 
-/// Which platform auto-merge operates on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MergeTargetPlatform {
-    /// GitHub: complete Actions/check-runs CI signal, so the gates are
-    /// authoritative.
-    #[default]
-    Github,
-    /// Gitee: no open CI API, so CI-dependent gates cannot pass there.
-    Gitee,
-    /// Follow whichever platform is configured as the primary provider.
-    Primary,
-}
-
-impl Default for AutoMergePolicy {
+impl Default for LandingPolicy {
     fn default() -> Self {
         Self {
-            enabled: true,
-            require_ci_pass: true,
-            require_no_review_requested: false,
+            require_self_review: true,
+            min_self_review_score: 0.80,
             max_changed_lines: 200,
             forbidden_paths: vec![
                 ".github/workflows".into(),
@@ -348,19 +340,9 @@ impl Default for AutoMergePolicy {
                 "secrets/".into(),
                 "*.lock".into(),
             ],
-            forbidden_labels: vec![
-                "security".into(),
-                "breaking-change".into(),
-                "manual-only".into(),
-            ],
-            cooldown_hours: 24,
-            require_human_review_override: true,
-            require_self_review: true,
-            min_self_review_score: 0.80,
-            local_gate_signals: false,
-            merge_target_platform: MergeTargetPlatform::Github,
-            legacy_pr_reap: true,
-            trigger_deploy_after_merge: true,
+            revert_on_ci_failure: true,
+            redrive_on_ci_failure: true,
+            ci_watch_timeout_secs: 1800,
         }
     }
 }
@@ -439,15 +421,6 @@ impl BotIdentityConfig {
         self.instance()
             .map(|i| i.git_name)
             .unwrap_or_else(|| self.name.clone())
-    }
-
-    /// 本实例在 PR metadata 块里署名的句柄。发布侧写、合并侧读，两侧必须
-    /// 共用这一份逻辑：任何偏差都会让自家产出的 PR 被判成他人 PR 而永不
-    /// 自动合并。
-    pub fn own_handle(&self) -> String {
-        self.instance()
-            .map(|i| i.handle)
-            .unwrap_or_else(|| self.git_author_name())
     }
 
     /// 提交作者邮箱：优先实例邮箱（per-instance，可归因），回退静态配置。

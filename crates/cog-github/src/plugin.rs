@@ -128,10 +128,6 @@ impl cog_core::SystemPlugin for GitHubPlugin {
     }
 
     async fn init(&mut self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
-        // 合并环决策计数：无指标时"无可合并产物"与"合并器失效"外观一致，
-        // 因此无条件发布，与集成是否启用无关。
-        ctx.publish_observable(crate::observable::global_merge_observable());
-
         // 贡献策略控制器：网关 admin API 经它读写属主档位、列暂存、按确认补发；
         // 无论通道是否已连接都发布，UI 才能在任何状态下读档/列暂存。
         let controller = crate::contribution::ContributionController::new_shared();
@@ -164,53 +160,50 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     info!(repo = %config.repo, "GitHubPlugin initialized");
 
                     // Change-to-PR publishing (ChangeSink) for autonomous fixes.
-                    // Disabled when pr_workdir is not configured.
-                    if !config.pr_workdir.is_empty() {
-                        let token = config
-                            .primary_account()
-                            .ok()
-                            .and_then(|a| a.resolve_token().ok());
-                        match crate::pr_publisher::ensure_workdir(&config, token.as_deref()).await {
-                            Ok(workdir) => {
-                                let sink = Arc::new(crate::pr_publisher::GitHubChangeSink::new(
-                                    crate::pr_publisher::GitHubPrPublisher::new(
-                                        workdir.clone(),
-                                        config.clone(),
-                                    ),
-                                    provider.clone(),
-                                    controller.clone(),
-                                ));
-                                // 属主在 UI 点"提交 PR"时经 ContributionControl::flush_pending
-                                // 调用同一 sink，绕过策略门禁（点击即批准）。
-                                controller.set_sink(sink.clone());
-                                // The channel is live: flush changes staged
-                                // before it was connected (best effort;
-                                // failures stay staged for the next start).
-                                // ask/local 档不自动回流：ask 等属主逐条确认，
-                                // local 永不提交上游。
-                                if !controller.should_stage() {
-                                    let flushed =
-                                        crate::pending_changes::drain_into(sink.as_ref()).await;
-                                    if flushed > 0 {
-                                        info!(count = flushed, "flushed staged changes to PRs");
-                                    }
+                    // 工作目录未配置时从数据目录派生，通道默认就是通的；真正的
+                    // 发布开关是贡献策略（auto/ask/local），不是路径是否填了值。
+                    let token = config
+                        .primary_account()
+                        .ok()
+                        .and_then(|a| a.resolve_token().ok());
+                    match crate::pr_publisher::ensure_workdir(&config, token.as_deref()).await {
+                        Ok(workdir) => {
+                            let sink = Arc::new(crate::pr_publisher::GitHubChangeSink::new(
+                                crate::pr_publisher::GitHubPrPublisher::new(
+                                    workdir.clone(),
+                                    config.clone(),
+                                ),
+                                provider.clone(),
+                                controller.clone(),
+                            ));
+                            // 属主在 UI 点"提交 PR"时经 ContributionControl::flush_pending
+                            // 调用同一 sink，绕过策略门禁（点击即批准）。
+                            controller.set_sink(sink.clone());
+                            // The channel is live: flush changes staged
+                            // before it was connected (best effort;
+                            // failures stay staged for the next start).
+                            // ask/local 档不自动回流：ask 等属主逐条确认，
+                            // local 永不提交上游。
+                            if !controller.should_stage() {
+                                let flushed =
+                                    crate::pending_changes::drain_into(sink.as_ref()).await;
+                                if flushed > 0 {
+                                    info!(count = flushed, "flushed staged changes to PRs");
                                 }
-                                ctx.publish_service::<dyn cog_core::ChangeSink>(sink);
-                                pr_sink_published = true;
-                                info!(workdir = %workdir.display(), "GitHub ChangeSink published");
                             }
-                            Err(e) => {
-                                warn!(error = %e, "GitHub PR workdir unavailable; ChangeSink not published");
-                            }
+                            ctx.publish_service::<dyn cog_core::ChangeSink>(sink);
+                            pr_sink_published = true;
+                            info!(workdir = %workdir.display(), "GitHub ChangeSink published");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "GitHub PR workdir unavailable; ChangeSink not published");
                         }
                     }
 
                     // 向导在进程运行期间补配 token（写入网关 Secret 后滚动重启
                     // 网关，本进程并不重启）时，上面的启动 drain 不会重跑；
                     // 后台周期补发让暂存变更在通道接通后的下一个周期自动提交。
-                    if !config.pr_workdir.is_empty() {
-                        spawn_staged_drain(config.clone(), provider.clone(), controller.clone());
-                    }
+                    spawn_staged_drain(config.clone(), provider.clone(), controller.clone());
 
                     self.provider = Some(provider);
                     self.config = Some(config.clone());
@@ -448,7 +441,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     requires: &[],
     // 池全灭时按 SchedulerGate 跳过 LLM 依赖轮次；supervisor 缺席也能跑。
     optional_requires: &["supervisor"],
-    provides: &["CodePlatformProvider", "ContributionControl"],
+    provides: &["CodePlatformProvider", "ContributionControl", "ChangeSink"],
     consumes: &[cog_core::ConsumeSpec {
         type_name: "SchedulerGate",
         required: false,

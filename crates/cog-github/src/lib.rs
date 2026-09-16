@@ -4,8 +4,7 @@
 //!
 //! ```text
 //! IssueDiscovery → IssueTriage → IssueConversation → Task
-//!   → (Collaboration generates change) → PrPublisher → MergeDecider
-//!   → OutcomeRecorder → ReflectionEngine
+//!   → (Collaboration generates change) → OutcomeRecorder → ReflectionEngine
 //! ```
 //!
 //! Configuration contract types (`GitHubIntegrationConfig`, `GitHubAccount`,
@@ -22,9 +21,6 @@ pub mod discovery;
 pub mod discovery_loop;
 pub mod error;
 pub mod identity;
-pub mod merge_decider;
-pub mod merge_executor;
-pub mod observable;
 pub mod outcome_recorder;
 pub mod pending_changes;
 pub mod plugin;
@@ -41,9 +37,6 @@ pub use conversation::{ConversationState, ConversationTurn, IssueConversation};
 pub use discovery::IssueDiscovery;
 pub use discovery_loop::GitHubDiscoveryLoop;
 pub use identity::{machine_fingerprint, InstanceIdentity, NAME_POOL};
-pub use merge_decider::{MergeDecider, MergeDecision};
-pub use merge_executor::{MergeExecutor, MergeRoundStats};
-pub use observable::{global_merge_observable, MergeObservable};
 pub use outcome_recorder::OutcomeRecorder;
 pub use pr_publisher::{GitHubChangeSink, GitHubPrPublisher};
 pub use provider::gitee::GiteeProvider;
@@ -100,6 +93,6 @@ pub fn gitee_provider(
 }
 
 pub use config::{
-    AutoMergePolicy, BotAccount, BotIdentityConfig, ConversationConfig, GitHubAccount,
-    GitHubIntegrationConfig, GiteeIntegrationConfig, HumanAccount, WebhookConfig,
+    BotAccount, BotIdentityConfig, ConversationConfig, GitHubAccount, GitHubIntegrationConfig,
+    GiteeIntegrationConfig, HumanAccount, LandingPolicy, WebhookConfig,
 };

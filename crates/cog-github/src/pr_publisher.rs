@@ -623,7 +623,7 @@ impl cog_core::ChangeSink for GitHubChangeSink {
     }
 }
 
-/// Ensure `config.pr_workdir` is a usable git clone of the target repo.
+/// Ensure the configured PR workdir is a usable git clone of the target repo.
 ///
 /// Missing directories are created by cloning. Remote selection (first match
 /// wins): `COGNEVA_GIT_PROXY_BASE` set → `{base}/github/{repo}.git` via the
@@ -640,7 +640,7 @@ pub async fn ensure_workdir(
     config: &GitHubIntegrationConfig,
     token: Option<&str>,
 ) -> Result<PathBuf> {
-    let workdir = PathBuf::from(&config.pr_workdir);
+    let workdir = config.pr_workdir_path();
     let url = remote_url(config, token);
     if is_git_workdir(&workdir).await {
         if git_proxy_base().is_some() {
