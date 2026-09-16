@@ -18,8 +18,11 @@ spec:
   selector:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: sandbox-executor
+  # 端口名是观测面的契约：ServiceMonitor 按端口名（http / metrics）挑端点，
+  # 叫 executor 的服务在 Prometheus 里等于不存在——执行器的 /metrics 一直在
+  # 产出却从没被采集过。targetPort 仍指向容器的 executor 端口名。
   ports:
-    - name: executor
+    - name: http
       port: 9090
       targetPort: executor
       protocol: TCP

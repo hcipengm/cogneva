@@ -397,6 +397,15 @@
           },
           "severity": "warning",
           "summary": "Ralph loops stopped {value} times in the last 30m without passing their goal; the evolution chain is burning budget instead of converging (the reason label distinguishes budget_exhausted from stagnated)"
+        },
+        {
+          "name": "cogneva_workload_metrics_unscraped",
+          "promql": "avg_over_time((count(kube_pod_container_info{namespace=\"cogneva\", image=~\".*cogneva.*\"} and on(pod) kube_pod_status_phase{namespace=\"cogneva\", phase=\"Running\"} == 1 unless on(pod) kube_pod_owner{namespace=\"cogneva\", owner_kind=\"Job\"}) - count(up{namespace=\"cogneva\"}))[15m:1m])",
+          "condition": {
+            "greater_than": 0.5
+          },
+          "severity": "warning",
+          "summary": "On average {value} running cogneva workload(s) had no Prometheus scrape target over the last 15m: their /metrics is produced but never collected, so every alert they would raise is invisible (usual causes: the workload has no Service, its Service port is not named http or metrics, or a NetworkPolicy blocks the monitoring namespace)"
         }
       ]
     },
