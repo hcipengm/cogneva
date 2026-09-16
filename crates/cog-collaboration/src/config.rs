@@ -116,10 +116,12 @@ impl PgeSettings {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RalphSettings {
-    /// 单链迭代预算硬上限。
+    /// 单次执行的迭代预算硬上限。预算按次计，不跨执行累计：同一个目标被
+    /// 重新调度时重新起步，已归档的历史只提供反馈与停滞证据。
     pub max_iterations: u32,
-    /// 停滞窗口：最近这么多轮全部失败、重置策略全部 Identical、且
-    /// 归一化反馈逐字相同即终止。0 = 关闭停滞检测。
+    /// 停滞窗口：最近这么多轮不买进展即终止——归一化反馈逐字相同（同一失败
+    /// 原样重放），或分数未升且产物未增长的改写重放（读数不足两个不下结论）。
+    /// 这个值同时决定归档历史保留的尾部长度。0 = 关闭停滞检测。
     pub stagnation_window: u32,
 }
 
