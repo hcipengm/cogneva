@@ -27,7 +27,7 @@ impl LlmJudge {
         Self {
             provider,
             prompt_template,
-            options: ChatOptions::default(),
+            options: ChatOptions::default().with_actor("eval"),
         }
     }
 

@@ -199,7 +199,8 @@ impl EvolutionEngine {
         let options = ChatOptions {
             response_format: ResponseFormat::Json,
             ..Default::default()
-        };
+        }
+        .with_actor("evolution");
 
         let response = self.llm.chat(&messages, &options).await?;
         let text: String = response
@@ -326,7 +327,8 @@ impl EvolutionEngine {
             temperature: Some(0.3),
             max_tokens: Some(512),
             ..Default::default()
-        };
+        }
+        .with_actor("evolution");
 
         let response = self.llm.chat(&messages, &options).await?;
         let text: String = response
@@ -497,7 +499,8 @@ impl EvolutionEngine {
             temperature: Some(0.3),
             max_tokens: Some(512),
             ..Default::default()
-        };
+        }
+        .with_actor("evolution");
 
         let response = self.llm.chat(&messages, &options).await?;
         let text: String = response
@@ -694,7 +697,7 @@ impl EvolutionEngine {
 
             let messages = vec![Message::system(system_prompt), Message::user(prompt)];
 
-            let options = ChatOptions::default();
+            let options = ChatOptions::default().with_actor("evolution");
             let response = self.llm.chat(&messages, &options).await?;
             let text: String = response
                 .content

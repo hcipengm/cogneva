@@ -184,7 +184,7 @@ impl LlmWikiMaintainer {
         execute_structured(
             self.llm.as_ref(),
             &[Message::user(prompt)],
-            &ChatOptions::default(),
+            &ChatOptions::default().with_actor("wiki"),
         )
         .await
     }
@@ -208,7 +208,7 @@ impl LlmWikiMaintainer {
         let scan: ContradictionScan = execute_structured(
             self.llm.as_ref(),
             &[Message::user(prompt)],
-            &ChatOptions::default(),
+            &ChatOptions::default().with_actor("wiki"),
         )
         .await?;
         Ok(scan.contradictions)
@@ -413,7 +413,10 @@ impl WikiMaintainer for LlmWikiMaintainer {
         };
         let resp = self
             .llm
-            .chat(&[Message::user(prompt)], &ChatOptions::default())
+            .chat(
+                &[Message::user(prompt)],
+                &ChatOptions::default().with_actor("wiki"),
+            )
             .await?;
         let answer = resp
             .content

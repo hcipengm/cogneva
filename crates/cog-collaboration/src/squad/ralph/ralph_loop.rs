@@ -571,7 +571,8 @@ Respond with **only** a JSON object matching this schema:\n\
             // JSON. Parsing is done manually below.
             response_format: cog_core::ResponseFormat::Text,
             ..Default::default()
-        };
+        }
+        .with_actor("ralph");
 
         let response = llm.chat(&messages, &options).await?;
         if let Some(ref err) = response.error_message {

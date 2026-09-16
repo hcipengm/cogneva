@@ -63,7 +63,8 @@ impl SkillExtractor {
         let options = ChatOptions {
             response_format: ResponseFormat::Json,
             ..Default::default()
-        };
+        }
+        .with_actor("skill_extractor");
 
         let response = self.llm.chat(&messages, &options).await?;
         let text: String = response

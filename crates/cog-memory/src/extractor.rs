@@ -251,7 +251,7 @@ impl LlmMemoryExtractor {
     pub fn new(provider: Arc<dyn LlmClient>, embedding_dim: usize) -> Self {
         Self {
             provider,
-            options: ChatOptions::default(),
+            options: ChatOptions::default().with_actor("memory"),
             embedding_dim,
             embedder: None,
         }

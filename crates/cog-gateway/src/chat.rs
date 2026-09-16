@@ -59,7 +59,7 @@ async fn is_actionable_intent(llm: &Arc<dyn cog_core::LlmClient>, content: &str)
         cog_core::Message::system(INTENT_CLASSIFY_PROMPT),
         cog_core::Message::user(content),
     ];
-    let options = cog_core::ChatOptions::default();
+    let options = cog_core::ChatOptions::default().with_actor("intent_gateway");
     let res = tokio::time::timeout(
         std::time::Duration::from_secs(CLASSIFY_TIMEOUT_SECS),
         llm.chat(&messages, &options),
@@ -229,7 +229,8 @@ pub async fn run_chat_turn(
     let options = cog_core::ChatOptions {
         response_format: cog_core::ResponseFormat::Text,
         ..Default::default()
-    };
+    }
+    .with_actor("web_chat");
 
     // 4. Stream the reply: deltas are forwarded as they arrive.
     let mut stream = match tokio::time::timeout(
