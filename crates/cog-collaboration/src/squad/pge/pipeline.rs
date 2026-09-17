@@ -242,6 +242,7 @@ impl PgePipeline {
                 )
                 .await;
             evaluation.enforce_criteria_evidence(!criteria.is_empty());
+            evaluation.enforce_change_artifact_integrity(generation.change_artifact_defect(task));
 
             let mut local_repairs: Vec<LocalRepairAttempt> = Vec::new();
             let mut repair_stall = StallDetector::new(self.config.stall_threshold);
@@ -293,6 +294,8 @@ impl PgePipeline {
                     )
                     .await;
                 evaluation.enforce_criteria_evidence(!criteria.is_empty());
+                evaluation
+                    .enforce_change_artifact_integrity(generation.change_artifact_defect(task));
 
                 local_repairs.push(LocalRepairAttempt {
                     repair_iteration,

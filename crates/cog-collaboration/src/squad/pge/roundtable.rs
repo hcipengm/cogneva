@@ -493,6 +493,7 @@ impl PgeRoundtable {
             )
             .await;
         evaluation.enforce_criteria_evidence(!criteria.is_empty());
+        evaluation.enforce_change_artifact_integrity(generation.change_artifact_defect(task));
 
         (plan, generation, evaluation)
     }
@@ -586,6 +587,8 @@ impl PgeRoundtable {
                     )
                     .await;
                 evaluation.enforce_criteria_evidence(!criteria.is_empty());
+                evaluation
+                    .enforce_change_artifact_integrity(generation.change_artifact_defect(&task));
 
                 PgeBranchResult {
                     branch_id,

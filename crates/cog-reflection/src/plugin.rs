@@ -701,19 +701,13 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     let cycle_instance = instance_id.clone();
                     let cycle_version = version.clone();
 
-                    let pool_gate = self.pool_gate.clone();
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(poll_interval);
                         loop {
                             interval.tick().await;
-                            // 变更生成整条链都依赖 LLM：池全灭时空转只会烧配额、
-                            // 刷日志，跳过本轮；池恢复后自动继续。
-                            if pool_gate.llm_paused() {
-                                info!(
-                                    "LLM upstream pool unavailable; skipping self-evolution cycle"
-                                );
-                                continue;
-                            }
+                            // 本轮是纯确定性消费：同步工作树、取出待验变更、apply/test/
+                            // build、落地、切二进制，全程不调 LLM。上游全灭时跳过它，只会让
+                            // 一条已经生成好的变更干等（生成侧的池门在 discovery 那边）。
                             let deps = CycleDeps {
                                 pipeline: &pipeline,
                                 deployer: &deployer,
@@ -1501,7 +1495,15 @@ async fn run_evolution_cycle_in(
             .await;
 
         if !result.test_passed {
-            warn!(change_id = %result.change_id, "Change failed tests; skipping deploy");
+            // The reason is already in the result; carrying it into the log is
+            // what makes a rejection diagnosable without digging the artifact
+            // out of the sandbox by hand.
+            let reason: String = result.test_output.chars().take(500).collect();
+            warn!(
+                change_id = %result.change_id,
+                reason = %reason,
+                "Change failed tests; skipping deploy"
+            );
             let _ = engine
                 .record_change_outcome(&result.change_id, false, &result.test_output)
                 .await;

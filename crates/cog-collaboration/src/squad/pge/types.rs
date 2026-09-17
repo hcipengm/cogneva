@@ -56,6 +56,34 @@ pub const NO_ARTIFACTS_REASON: &str =
     "terminal_env_failure: generator produced no artifacts (environment/protocol failure)";
 
 impl GeneratorOutput {
+    /// Structural defect of this run's change artifact, if any.
+    ///
+    /// A self-evolution run's deliverable is a unified diff that a later apply
+    /// gate consumes verbatim. The evaluator is an LLM: it can judge whether
+    /// the change looks right, but it cannot see that a hunk header's declared
+    /// line counts disagree with the hunk body, so it passes artifacts that
+    /// `git apply` will reject. Naming the defect here lets the repair loop
+    /// hand the exact arithmetic back to the generator instead of the artifact
+    /// travelling downstream to die as an opaque "corrupt patch".
+    pub fn change_artifact_defect(&self, task: &cog_core::Task) -> Option<String> {
+        if !task.is_self_evolution() {
+            return None;
+        }
+        self.artifacts.iter().find_map(|artifact| {
+            let is_change = artifact.artifact_type == "change"
+                || artifact.name.to_lowercase().ends_with(".diff");
+            if !is_change {
+                return None;
+            }
+            cog_core::diff_structural_defect(&artifact.content).map(|defect| {
+                format!(
+                    "change artifact '{}' is not an appliable unified diff: {}",
+                    artifact.name, defect
+                )
+            })
+        })
+    }
+
     /// True when the generator produced nothing for a deterministic reason:
     /// it reported an environment/protocol failure (tools never executed,
     /// explicit `environment_error`), or it returned no artifacts and no
@@ -181,6 +209,23 @@ impl EvaluationResult {
             );
         }
     }
+
+    /// Deterministic gate on the artifact itself: a change that `git apply`
+    /// cannot consume is not a deliverable, however sound the surrounding
+    /// prose. The evaluator only judges intent, so a structurally broken diff
+    /// would otherwise pass and be discovered — unattributably — at the apply
+    /// gate much later. Downgrade a Pass to Fail and carry the precise defect
+    /// into the feedback so the repair loop can fix it; when the verdict
+    /// already failed, still append the defect so the repair sees both reasons.
+    pub fn enforce_change_artifact_integrity(&mut self, defect: Option<String>) {
+        let Some(defect) = defect else { return };
+        if self.verdict == Verdict::Pass {
+            self.verdict = Verdict::Fail;
+            self.feedback = format!("{defect}; original feedback: {}", self.feedback);
+        } else if !self.feedback.contains(&defect) {
+            self.feedback = format!("{}; {defect}", self.feedback);
+        }
+    }
 }
 
 /// A single local repair cycle inside a pipeline attempt.
@@ -266,6 +311,100 @@ mod tests {
         let value = serde_json::to_value(&output).unwrap();
         let back: PlannerOutput = serde_json::from_value(value).unwrap();
         assert_eq!(back.acceptance_criteria, output.acceptance_criteria);
+    }
+
+    fn self_evolution_task() -> cog_core::Task {
+        cog_core::Task::new(
+            "t-1",
+            cog_core::TaskType::Custom("self_evolution".into()),
+            serde_json::json!({ "evolution_mode": "generate_change" }),
+        )
+    }
+
+    fn plain_task() -> cog_core::Task {
+        cog_core::Task::new(
+            "t-2",
+            cog_core::TaskType::Custom("summarize".into()),
+            serde_json::json!({ "goal": "summarize" }),
+        )
+    }
+
+    fn change_output(diff: &str) -> GeneratorOutput {
+        GeneratorOutput {
+            content: serde_json::json!({}),
+            artifacts: vec![crate::squad::pge::types::Artifact {
+                name: "changes.diff".into(),
+                content: diff.into(),
+                artifact_type: "change".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn an_unappliable_change_artifact_is_named_as_a_defect() {
+        let output = change_output(
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,15 +1,49 @@\n fn a() {}\n+fn b() {}\n",
+        );
+        let defect = output
+            .change_artifact_defect(&self_evolution_task())
+            .expect("a malformed diff must be reported");
+        assert!(defect.contains("changes.diff"), "{defect}");
+    }
+
+    #[test]
+    fn a_sound_change_artifact_has_no_defect() {
+        let output = change_output("--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n");
+        assert_eq!(output.change_artifact_defect(&self_evolution_task()), None);
+    }
+
+    #[test]
+    fn a_plain_task_is_never_checked_for_change_integrity() {
+        let output = change_output("not a diff at all");
+        assert_eq!(output.change_artifact_defect(&plain_task()), None);
+    }
+
+    #[test]
+    fn a_pass_over_an_unappliable_change_is_downgraded() {
+        let mut evaluation = EvaluationResult {
+            verdict: Verdict::Pass,
+            feedback: "looks correct".into(),
+            score: Some(95),
+            criteria: Vec::new(),
+            details: None,
+        };
+        evaluation.enforce_change_artifact_integrity(Some("hunk header miscounts".into()));
+        assert_eq!(evaluation.verdict, Verdict::Fail);
+        assert!(evaluation.feedback.contains("hunk header miscounts"));
+        assert!(evaluation.feedback.contains("looks correct"));
+    }
+
+    #[test]
+    fn an_already_failed_verdict_still_learns_the_defect() {
+        let mut evaluation = EvaluationResult {
+            verdict: Verdict::Fail,
+            feedback: "criteria not met".into(),
+            score: Some(20),
+            criteria: Vec::new(),
+            details: None,
+        };
+        evaluation.enforce_change_artifact_integrity(Some("hunk header miscounts".into()));
+        assert_eq!(evaluation.verdict, Verdict::Fail);
+        assert!(evaluation.feedback.contains("criteria not met"));
+        assert!(evaluation.feedback.contains("hunk header miscounts"));
+    }
+
+    #[test]
+    fn a_sound_artifact_leaves_a_pass_untouched() {
+        let mut evaluation = EvaluationResult {
+            verdict: Verdict::Pass,
+            feedback: "looks correct".into(),
+            score: Some(95),
+            criteria: Vec::new(),
+            details: None,
+        };
+        evaluation.enforce_change_artifact_integrity(None);
+        assert_eq!(evaluation.verdict, Verdict::Pass);
+        assert_eq!(evaluation.feedback, "looks correct");
     }
 
     fn pass_result(criteria: Vec<Criterion>) -> EvaluationResult {

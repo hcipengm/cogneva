@@ -228,6 +228,142 @@ pub fn parse_diff_affected_files(content: &str) -> crate::SFResult<Vec<String>> 
     Ok(files)
 }
 
+/// Structural check of a unified diff: every hunk must carry exactly the
+/// number of lines its header declares.
+///
+/// `git apply` rejects a mismatch with "corrupt patch at line N", but only
+/// after the artifact has travelled to the apply gate, where the reason is a
+/// line number nobody can act on. Running the same arithmetic as a pure
+/// function lets the defect be named where the diff was just written, while
+/// the generator can still be asked to repair the header.
+///
+/// Returns a description of the first defect, or `None` when the diff is
+/// structurally sound. The walk mirrors `git apply`: a hunk ends as soon as
+/// both declared counts are consumed, so a following line that is neither a
+/// hunk nor a file header is the same corruption git would report.
+pub fn diff_structural_defect(content: &str) -> Option<String> {
+    let mut file = String::from("<unknown>");
+    let mut hunk: Option<(usize, u64, u64, u64, u64)> = None;
+
+    for (idx, line) in content.lines().enumerate() {
+        let lineno = idx + 1;
+
+        if let Some((hunk_line, old_declared, new_declared, old_seen, new_seen)) = hunk {
+            match line.chars().next() {
+                Some('+') => {
+                    hunk = Some((
+                        hunk_line,
+                        old_declared,
+                        new_declared,
+                        old_seen,
+                        new_seen + 1,
+                    ))
+                }
+                Some('-') => {
+                    hunk = Some((
+                        hunk_line,
+                        old_declared,
+                        new_declared,
+                        old_seen + 1,
+                        new_seen,
+                    ))
+                }
+                Some('\\') => {}
+                // Context line. A blank line loses its leading space in some
+                // emitters; git reads it as context, so this does too.
+                _ => {
+                    hunk = Some((
+                        hunk_line,
+                        old_declared,
+                        new_declared,
+                        old_seen + 1,
+                        new_seen + 1,
+                    ))
+                }
+            }
+            if let Some((_, od, nd, os, ns)) = hunk {
+                if os >= od && ns >= nd {
+                    hunk = None;
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("--- ") {
+            let path = rest.split_whitespace().next().unwrap_or(rest.trim());
+            file = path.strip_prefix("a/").unwrap_or(path).to_string();
+            continue;
+        }
+        if line.starts_with("+++ ") || line.starts_with("diff --git ") {
+            continue;
+        }
+        if line.starts_with("@@") {
+            match parse_hunk_header(line) {
+                Some((old_declared, new_declared)) => {
+                    hunk = Some((lineno, old_declared, new_declared, 0, 0))
+                }
+                None => {
+                    return Some(format!(
+                        "{file}:{lineno}: unparsable hunk header, git apply will reject the diff: {line}"
+                    ))
+                }
+            }
+            continue;
+        }
+        if line.is_empty() || is_git_extended_header(line) {
+            continue;
+        }
+        return Some(format!(
+            "{file}:{lineno}: unexpected line outside any hunk, git apply will reject the diff as corrupt: {line}"
+        ));
+    }
+
+    if let Some((hunk_line, old_declared, new_declared, old_seen, new_seen)) = hunk {
+        return Some(format!(
+            "{file}:{hunk_line}: hunk header declares {old_declared} old / {new_declared} new lines \
+             but the diff ends after {old_seen} old / {new_seen} new, git apply will reject it as corrupt"
+        ));
+    }
+
+    None
+}
+
+/// Parse the `-old,count +new,count` fields of a hunk header. A missing count
+/// means one line, matching the unified-diff grammar.
+fn parse_hunk_header(line: &str) -> Option<(u64, u64)> {
+    let inner = line.strip_prefix("@@")?;
+    let end = inner.find("@@")?;
+    let mut fields = inner[..end].split_whitespace();
+    let old = fields.next()?.strip_prefix('-')?;
+    let new = fields.next()?.strip_prefix('+')?;
+    let count = |spec: &str| -> Option<u64> {
+        match spec.split_once(',') {
+            Some((_, c)) => c.parse().ok(),
+            None => Some(1),
+        }
+    };
+    Some((count(old)?, count(new)?))
+}
+
+/// Git's per-file extended headers, which sit between `diff --git` and the
+/// first hunk and carry no hunk body.
+fn is_git_extended_header(line: &str) -> bool {
+    const PREFIXES: [&str; 11] = [
+        "index ",
+        "new file mode ",
+        "deleted file mode ",
+        "old mode ",
+        "new mode ",
+        "similarity index ",
+        "copy from ",
+        "copy to ",
+        "rename from ",
+        "rename to ",
+        "Binary files ",
+    ];
+    PREFIXES.iter().any(|p| line.starts_with(p))
+}
+
 // ============================================================================
 // Crew / Squad reflection types (migrated from cog-reflection to break
 // cog-collaboration → cog-reflection dependency).
@@ -565,5 +701,76 @@ mod tests {
         }
         assert_eq!(ContributionPolicy::parse("bogus"), None);
         assert_eq!(ContributionPolicy::default(), ContributionPolicy::Auto);
+    }
+
+    #[test]
+    fn a_well_formed_diff_has_no_defect() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n\
+                    index 1111111..2222222 100644\n\
+                    --- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,3 +1,4 @@\n\
+                    \x20fn a() {}\n\
+                    \x20fn b() {}\n\
+                    -fn c() {}\n\
+                    +fn c() { /* changed */ }\n\
+                    +fn d() {}\n";
+        assert_eq!(diff_structural_defect(diff), None);
+    }
+
+    #[test]
+    fn a_hunk_header_that_overstates_its_body_is_flagged() {
+        // The shape that reached the apply gate and died as "corrupt patch":
+        // the header claims 15 old / 49 new while the body carries one line.
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n\
+                    --- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,15 +1,49 @@\n\
+                    \x20fn a() {}\n\
+                    +fn b() {}\n";
+        let defect = diff_structural_defect(diff).expect("count mismatch must be reported");
+        assert!(defect.contains("src/a.rs"), "{defect}");
+        assert!(defect.contains("15"), "{defect}");
+    }
+
+    #[test]
+    fn a_truncated_hunk_is_flagged() {
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,5 +1,5 @@\n\
+                    \x20fn a() {}\n";
+        assert!(diff_structural_defect(diff).is_some());
+    }
+
+    #[test]
+    fn an_omitted_hunk_count_means_one_line() {
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -7 +7 @@\n\
+                    -old\n\
+                    +new\n";
+        assert_eq!(diff_structural_defect(diff), None);
+    }
+
+    #[test]
+    fn a_blank_body_line_counts_as_context() {
+        // Some emitters strip the leading space from blank context lines.
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,3 +1,3 @@\n\
+                    \x20fn a() {}\n\
+                    \n\
+                    \x20fn c() {}\n";
+        assert_eq!(diff_structural_defect(diff), None);
+    }
+
+    #[test]
+    fn the_reported_defect_names_the_file_and_the_hunk_line() {
+        let diff = "--- a/src/deep/nested.rs\n\
+                    +++ b/src/deep/nested.rs\n\
+                    @@ -1,2 +1,2 @@\n\
+                    \x20one\n";
+        let defect = diff_structural_defect(diff).unwrap();
+        assert!(defect.contains("src/deep/nested.rs:3"), "{defect}");
     }
 }

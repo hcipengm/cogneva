@@ -678,6 +678,7 @@ impl CollaborationExecutor {
                     &goal,
                     &Self::pge_mode_str(&result.pge_mode),
                     task.input.get("issue_number").and_then(|v| v.as_u64()),
+                    &task.id,
                 );
                 let extracted = !changes.is_empty();
                 for change in changes {
@@ -772,11 +773,33 @@ impl CollaborationExecutor {
         base
     }
 
+    /// Derive a change's identity from the task that produced it plus a digest
+    /// of its content.
+    ///
+    /// The artifact is always named `changes.diff`, so using that name as the
+    /// change id made every generated change share one identity: they wrote
+    /// the same file on disk, overwrote each other's engine record, and — once
+    /// the first one landed — every later change looked "already landed" to
+    /// the landing idempotency check and was silently skipped forever. The
+    /// task id keeps the id traceable; the content digest keeps distinct
+    /// changes distinct while still collapsing an identical re-submission.
+    fn change_id_for(task_id: &str, content: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(content.as_bytes());
+        let short = digest
+            .iter()
+            .take(6)
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        format!("{}-{}", task_id, short)
+    }
+
     fn extract_changes(
         squad_result: &crate::squad::SquadResult,
         goal: &str,
         pge_mode: &str,
         issue_number: Option<u64>,
+        task_id: &str,
     ) -> Vec<cog_core::GeneratedChange> {
         let mut changes = Vec::new();
         let Some(ref result_val) = squad_result.result else {
@@ -814,8 +837,9 @@ impl CollaborationExecutor {
                 }
             };
 
+            let change_id = Self::change_id_for(task_id, &artifact.content);
             changes.push(cog_core::GeneratedChange {
-                change_id: artifact.name.clone(),
+                change_id,
                 goal: goal.into(),
                 content: artifact.content,
                 affected_files,
@@ -931,5 +955,38 @@ impl CollaborationExecutor {
             240
         };
         base + size_factor + type_factor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CollaborationExecutor;
+
+    #[test]
+    fn distinct_content_from_distinct_tasks_gets_distinct_ids() {
+        let a = CollaborationExecutor::change_id_for("github-pr-58", "diff A");
+        let b = CollaborationExecutor::change_id_for("github-pr-59", "diff B");
+        assert_ne!(a, b);
+        assert!(a.starts_with("github-pr-58-"), "{a}");
+    }
+
+    #[test]
+    fn the_same_content_from_the_same_task_collapses() {
+        // Landing idempotency is keyed on the change id, so a re-submission of
+        // an unchanged diff must resolve to the same id.
+        assert_eq!(
+            CollaborationExecutor::change_id_for("github-pr-58", "diff A"),
+            CollaborationExecutor::change_id_for("github-pr-58", "diff A")
+        );
+    }
+
+    #[test]
+    fn changed_content_from_the_same_task_is_a_new_change() {
+        // A repair produces different content and must not look "already
+        // landed" just because it came from the same task.
+        assert_ne!(
+            CollaborationExecutor::change_id_for("github-pr-58", "diff A"),
+            CollaborationExecutor::change_id_for("github-pr-58", "diff A fixed")
+        );
     }
 }
