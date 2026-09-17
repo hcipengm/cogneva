@@ -1,4 +1,4 @@
-use cog_core::{SFError, SFResult, Task, TaskStatus};
+use cog_core::{SFError, SFResult, Task, TaskStatus, UpstreamFailure};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -746,6 +746,7 @@ impl DagExecutor {
         &self,
         task_id: &str,
         error: String,
+        cause: Option<UpstreamFailure>,
     ) -> SFResult<(bool, Vec<String>, bool)> {
         let be = self.fg().expect("store mode");
         let task = self.store_task(task_id).await?;
@@ -764,7 +765,13 @@ impl DagExecutor {
         .await?;
         let max_retries = self.retry_matrix.max_retries(&task.task_type);
         let (retried, cancelled) = be
-            .dag_fail_task(&self.workspace_id, task_id, error.clone(), max_retries)
+            .dag_fail_task(
+                &self.workspace_id,
+                task_id,
+                error.clone(),
+                cause,
+                max_retries,
+            )
             .await?;
         for dep_id in &cancelled {
             self.emit_event(cog_core::TaskEvent::TaskCancelled {
@@ -840,10 +847,13 @@ impl DagExecutor {
                 timeout_seconds: t.timeout_seconds,
                 timestamp: chrono::Utc::now(),
             });
+            // 超时是编排层观测到的事实，不是传输层给的信号：没有状态码可依，
+            // 类型留空，让下游知道这次失败只有文本。
             if let Ok((retried, cancelled, dlq_pushed)) = self
                 .fail_task(
                     &t.id,
                     format!("Task timed out after {} seconds", t.timeout_seconds),
+                    None,
                 )
                 .await
             {
@@ -1328,9 +1338,10 @@ impl DagExecutor {
         &self,
         task_id: &str,
         error: String,
+        cause: Option<UpstreamFailure>,
     ) -> SFResult<(bool, Vec<String>, bool)> {
         if self.fg().is_some() {
-            return self.fail_task_store(task_id, error).await;
+            return self.fail_task_store(task_id, error, cause).await;
         }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
@@ -1369,6 +1380,7 @@ impl DagExecutor {
             task.retry_count = retry_count + 1;
             task.status = TaskStatus::Pending;
             task.error = Some(error.clone());
+            task.error_cause = cause;
             task.updated_at = chrono::Utc::now();
 
             drop(inner);
@@ -1393,6 +1405,7 @@ impl DagExecutor {
         } else {
             task.status = TaskStatus::Failed;
             task.error = Some(error.clone());
+            task.error_cause = cause;
             task.updated_at = chrono::Utc::now();
 
             // Mark that DLQ push is needed; callers should call `push_to_dlq` async.
@@ -1412,6 +1425,9 @@ impl DagExecutor {
                             "Cascade cancelled: upstream task '{}' permanently failed with error: {}",
                             task_id, error
                         ));
+                        // 级联取消的原因是"上游永久失败"，不是上游拒绝我们：
+                        // 类型不跟着传递。
+                        t.error_cause = None;
                         t.updated_at = chrono::Utc::now();
                         cancelled.push(dep_id.clone());
                         drop(inner);
@@ -1547,6 +1563,7 @@ impl DagExecutor {
                         "Cascade cancelled: upstream task '{}' was cancelled",
                         task_id
                     ));
+                    t.error_cause = None;
                     t.updated_at = chrono::Utc::now();
                     cancelled.push(dep_id.clone());
                     drop(inner);
@@ -1586,6 +1603,7 @@ impl DagExecutor {
                         t.status = TaskStatus::Pending;
                         t.retry_count = 0;
                         t.error = None;
+                        t.error_cause = None;
                         t.started_at = None;
                     },
                     Some(cog_core::TaskEvent::TaskRetried {
@@ -1623,6 +1641,7 @@ impl DagExecutor {
         task.status = TaskStatus::Pending;
         task.retry_count = 0;
         task.error = None;
+        task.error_cause = None;
         task.started_at = None;
         task.updated_at = chrono::Utc::now();
         let task_snapshot = task.clone();
@@ -1699,6 +1718,7 @@ impl DagExecutor {
                 .fail_task(
                     &task_id,
                     format!("Task timed out after {} seconds", timeout_seconds),
+                    None,
                 )
                 .await
             {
@@ -1977,8 +1997,13 @@ impl cog_core::DagExecutor for DagExecutor {
         self.complete_task(task_id, result).await
     }
 
-    async fn fail_task(&self, task_id: &str, error: String) -> SFResult<(bool, Vec<String>, bool)> {
-        self.fail_task(task_id, error).await
+    async fn fail_task(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+    ) -> SFResult<(bool, Vec<String>, bool)> {
+        self.fail_task(task_id, error, cause).await
     }
 
     async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
@@ -2256,7 +2281,8 @@ mod tests {
 
         pod_a.schedule_task("root").await.unwrap();
         pod_b.start_task("root").await.unwrap();
-        let (retried, cancelled, _dlq) = pod_b.fail_task("root", "boom".into()).await.unwrap();
+        let (retried, cancelled, _dlq) =
+            pod_b.fail_task("root", "boom".into(), None).await.unwrap();
         assert!(!retried);
         assert!(cancelled.contains(&"mid".to_string()));
         assert!(cancelled.contains(&"leaf".to_string()));
@@ -2270,6 +2296,33 @@ mod tests {
             pod_a.get_task("leaf").await.unwrap().status,
             TaskStatus::Cancelled
         );
+    }
+
+    /// 失败的类型随任务记录落库并跨 pod 可读：读记录的人（例如按类型决定
+    /// 退避的消费方）拿到的是类型，不是那句文本。
+    #[tokio::test]
+    async fn test_fg_failure_cause_is_stored_and_readable_across_pods() {
+        let (pod_a, pod_b) = fg_pods();
+        pod_a
+            .add_task(Task::new("t1", TaskType::Generator, serde_json::json!({})))
+            .await
+            .unwrap();
+        pod_a.schedule_task("t1").await.unwrap();
+        pod_b.start_task("t1").await.unwrap();
+
+        pod_b
+            .fail_task(
+                "t1",
+                "LLM upstream refused (quota_exhausted): spent".into(),
+                Some(UpstreamFailure::QuotaExhausted),
+            )
+            .await
+            .unwrap();
+
+        let view = pod_a.get_task("t1").await.unwrap();
+        assert_eq!(view.error_cause, Some(UpstreamFailure::QuotaExhausted));
+        // 文本照旧保存：类型是给判定的，人读的还是那一句。
+        assert!(view.error.unwrap().contains("quota_exhausted"));
     }
 
     #[tokio::test]
@@ -2296,7 +2349,7 @@ mod tests {
             .unwrap();
         pod_a.schedule_task("t1").await.unwrap();
         pod_b.start_task("t1").await.unwrap();
-        let (retried, _, _) = pod_b.fail_task("t1", "flaky".into()).await.unwrap();
+        let (retried, _, _) = pod_b.fail_task("t1", "flaky".into(), None).await.unwrap();
         assert!(retried);
 
         // 重试历史写共享存储，pod A 直接可读

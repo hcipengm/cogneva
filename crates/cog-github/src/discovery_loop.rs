@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::GitHubIntegrationConfig;
 use cog_core::{
-    ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, Task, TaskStatus, TaskType,
+    ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, SFError, Task, TaskStatus,
+    TaskType,
 };
 
 use crate::conversation::{ConversationState, IssueConversation};
@@ -1090,8 +1091,12 @@ impl GitHubDiscoveryLoop {
                     return decision;
                 }
                 Err(e) => {
+                    // 类型要在这里现形：这次判断退化成关键字规则，而"上游根本
+                    // 没服务这次调用"和"模型吐了垃圾"是两回事，日志里必须能分。
                     tracing::warn!(
                         %key,
+                        terminal = e.is_terminal_upstream_failure(),
+                        cause = ?e.upstream_failure(),
                         error = %e,
                         "assess task failed; falling back to local rules heuristic"
                     );
@@ -1228,10 +1233,18 @@ impl GitHubDiscoveryLoop {
                         return Ok(decision);
                     }
                     TaskStatus::Failed => {
-                        return Err(crate::error::CogGitHubError::Provider(format!(
-                            "assess task {id} failed: {}",
-                            t.error.unwrap_or_default()
-                        )));
+                        let reason = t.error.unwrap_or_default();
+                        // 失败带类型时把类型原样带出来，别压成 Provider 的散文：
+                        // 上层只允许按类型判"这次失败重发是否可能成功"，读文本等于
+                        // 把判定权交给上游当天的措辞。没有类型可依才退回文本。
+                        return Err(match t.error_cause {
+                            Some(cause) => {
+                                CogGitHubError::Upstream(SFError::Upstream { cause, reason })
+                            }
+                            None => CogGitHubError::Provider(format!(
+                                "assess task {id} failed: {reason}"
+                            )),
+                        });
                     }
                     TaskStatus::Cancelled => {
                         // Cancellation is a veto: with deterministic ids the
@@ -1849,6 +1862,71 @@ mod tests {
         )));
     }
 
+    /// 任务失败的类型从记录原样回到错误对象上，判定因此按类型走。没有类型的
+    /// 失败仍然是散文，不允许被读成终止性。
+    #[tokio::test]
+    async fn assess_failure_keeps_the_type_it_was_recorded_with() {
+        let provider: Arc<dyn CodePlatformProvider> = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let typed = Arc::new(
+            MockOrchestrator::new().with_failed_assess_cause(UpstreamFailure::QuotaExhausted),
+        );
+        let loop_ = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            config(),
+            Some(typed.clone()),
+            None,
+        );
+        let title = "the issue list is slow".to_string();
+        let body = "curl /health takes 500ms".to_string();
+        let labels: Vec<String> = vec![];
+        let intent = IntentContext {
+            kind: IntentKind::Issue,
+            number: 42,
+            title: &title,
+            body: &body,
+            labels: &labels,
+            author: "alice",
+        };
+        let control: Arc<dyn OrchestratorControl> = typed;
+        let err = loop_
+            .run_assess_task(&control, &intent, "thread", &[])
+            .await
+            .expect_err("a failed assess task yields no verdict");
+        assert!(is_terminal_failure(&err), "{err}");
+        match err {
+            CogGitHubError::Upstream(SFError::Upstream { cause, reason }) => {
+                assert_eq!(cause, UpstreamFailure::QuotaExhausted);
+                assert_eq!(reason, "mock assess failure");
+            }
+            other => panic!("failure lost its type on the way to the decision: {other}"),
+        }
+
+        // 同一路径上没有类型的失败：散文照旧，不参与终止性判定。
+        let prose = Arc::new(MockOrchestrator::new().with_failed_assess());
+        let loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(prose.clone()),
+            None,
+        );
+        let control: Arc<dyn OrchestratorControl> = prose;
+        let err = loop_
+            .run_assess_task(&control, &intent, "thread", &[])
+            .await
+            .expect_err("a failed assess task yields no verdict");
+        assert!(!is_terminal_failure(&err), "{err}");
+        assert!(matches!(err, CogGitHubError::Provider(_)), "{err}");
+    }
+
     #[test]
     fn terminal_backoff_grows_exponentially_and_caps() {
         let d = |n: u32| terminal_backoff_delay(n, 300).as_secs();
@@ -1979,6 +2057,8 @@ mod tests {
         /// the task as Failed so the fallback path can be exercised without
         /// waiting out the real poll timeout.
         assess_verdict: Mutex<Option<serde_json::Value>>,
+        /// 失败的任务记录上带的类型，模拟执行器把 `SFError` 的类型随记录落库。
+        assess_failure_cause: Mutex<Option<UpstreamFailure>>,
         /// Result returned for a `pr_cross_validate` task. `None` reports the
         /// task as Failed; the default is a passing verdict JSON.
         cv_verdict: Mutex<Option<serde_json::Value>>,
@@ -2001,6 +2081,7 @@ mod tests {
                     "tests": "cargo test: 512 passed",
                     "eval": "not applicable",
                 }))),
+                assess_failure_cause: Mutex::new(None),
             }
         }
 
@@ -2011,6 +2092,12 @@ mod tests {
 
         fn with_failed_assess(self) -> Self {
             *self.assess_verdict.lock().unwrap() = None;
+            self
+        }
+
+        fn with_failed_assess_cause(self, cause: UpstreamFailure) -> Self {
+            *self.assess_verdict.lock().unwrap() = None;
+            *self.assess_failure_cause.lock().unwrap() = Some(cause);
             self
         }
 
@@ -2083,6 +2170,7 @@ mod tests {
             &self,
             _t: &str,
             _e: String,
+            _c: Option<cog_core::UpstreamFailure>,
         ) -> cog_core::SFResult<(bool, Vec<String>, bool)> {
             unimplemented!()
         }
@@ -2128,6 +2216,7 @@ mod tests {
                 None => {
                     task.status = TaskStatus::Failed;
                     task.error = Some("mock assess failure".into());
+                    task.error_cause = *self.assess_failure_cause.lock().unwrap();
                 }
             }
             Some(task)

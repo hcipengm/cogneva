@@ -1,3 +1,4 @@
+use crate::contract::llm::UpstreamFailure;
 use crate::{SFResult, Task};
 use async_trait::async_trait;
 
@@ -57,7 +58,15 @@ pub trait OrchestratorControl: Send + Sync {
 
     /// Mark a running task as failed and drive retry / cancellation logic.
     /// Returns `(retried, cancelled_ids, dlq_pushed)`.
-    async fn fail_task(&self, task_id: &str, error: String) -> SFResult<(bool, Vec<String>, bool)>;
+    ///
+    /// `error` 是给人读的文本，`cause` 是它的类型（传输层给过信号时才有）。
+    /// 两个一起传：判定读类型，日志读文本，不让下游回头去解析措辞。
+    async fn fail_task(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+    ) -> SFResult<(bool, Vec<String>, bool)>;
 
     /// Cancel a task and return cascaded cancellations.
     async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>>;
@@ -126,7 +135,13 @@ pub trait DagExecutor: Send + Sync {
     ) -> SFResult<Vec<String>>;
 
     /// Mark a running task as failed. Returns `(retried, cancelled_ids, dlq_pushed)`.
-    async fn fail_task(&self, task_id: &str, error: String) -> SFResult<(bool, Vec<String>, bool)>;
+    /// `cause` 是 `error` 的类型，见 [`OrchestratorControl::fail_task`]。
+    async fn fail_task(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+    ) -> SFResult<(bool, Vec<String>, bool)>;
 
     /// Cancel a task and cascade-cancel all downstream dependents.
     async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>>;

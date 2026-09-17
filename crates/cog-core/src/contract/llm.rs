@@ -131,7 +131,7 @@ pub struct CompleteOptions {
 /// error text. Matching on text is how a quota outage gets recorded as a
 /// content defect: the words differ per upstream and per locale, while the
 /// status code does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamFailure {
     /// The upstream asked us to slow down. Retrying after the advertised delay

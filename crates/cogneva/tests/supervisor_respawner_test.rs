@@ -51,12 +51,12 @@ async fn dead_agent_with_retryable_tasks_triggers_retry() {
         for _ in 0..3 {
             orch.schedule_task(id).await.unwrap();
             orch.start_task(id).await.unwrap();
-            let (retried, _, _) = orch.fail_task(id, "boom".into()).await.unwrap();
+            let (retried, _, _) = orch.fail_task(id, "boom".into(), None).await.unwrap();
             assert!(retried, "expected retry within budget");
         }
         orch.schedule_task(id).await.unwrap();
         orch.start_task(id).await.unwrap();
-        let (retried, _, _) = orch.fail_task(id, "boom".into()).await.unwrap();
+        let (retried, _, _) = orch.fail_task(id, "boom".into(), None).await.unwrap();
         assert!(
             !retried,
             "expected permanent failure after exhausting retries"
@@ -102,7 +102,7 @@ async fn retryable_failed_tasks_trigger_crew_retry() {
     for _ in 0..4 {
         orch.schedule_task("t-1").await.unwrap();
         orch.start_task("t-1").await.unwrap();
-        let _ = orch.fail_task("t-1", "boom".into()).await.unwrap();
+        let _ = orch.fail_task("t-1", "boom".into(), None).await.unwrap();
     }
     assert_eq!(
         orch.get_task("t-1").await.unwrap().status,

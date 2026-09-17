@@ -2071,7 +2071,12 @@ mod tests {
         async fn complete_task(&self, _t: &str, _r: serde_json::Value) -> SFResult<Vec<String>> {
             unimplemented!()
         }
-        async fn fail_task(&self, _t: &str, _e: String) -> SFResult<(bool, Vec<String>, bool)> {
+        async fn fail_task(
+            &self,
+            _t: &str,
+            _e: String,
+            _c: Option<cog_core::UpstreamFailure>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
             unimplemented!()
         }
         async fn cancel_task(&self, _t: &str) -> SFResult<Vec<String>> {

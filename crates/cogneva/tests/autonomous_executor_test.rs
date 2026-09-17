@@ -513,7 +513,7 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
             .error
             .unwrap_or_else(|| "Squad execution failed".into());
 
-        let _ = orch.fail_task(task_id, error.clone()).await;
+        let _ = orch.fail_task(task_id, error.clone(), None).await;
 
         // Hook: OnTaskFail
         if let Some(ref engine) = state.gateway_state.hook_engine {

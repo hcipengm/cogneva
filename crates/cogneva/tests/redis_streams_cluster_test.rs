@@ -37,6 +37,7 @@ fn make_task(id: &str, task_type: TaskType, blocked_by: Vec<String>, workspace: 
         input: serde_json::json!({}),
         result: None,
         error: None,
+        error_cause: None,
         blocked_by,
         blocks: vec![],
         priority: 1,

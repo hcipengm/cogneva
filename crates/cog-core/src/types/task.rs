@@ -1,3 +1,4 @@
+use crate::contract::llm::UpstreamFailure;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -72,6 +73,12 @@ pub struct Task {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 失败原因的类型，仅当传输层给过信号（HTTP 状态码）时才填。
+    ///
+    /// [`Self::error`] 是给人看的文本，它随上游措辞和语言变化；任何判定读这个
+    /// 字段。为 `None` 表示这次失败只有文本可依——那时下游不得从文本里猜类型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_cause: Option<UpstreamFailure>,
     pub blocked_by: Vec<String>,
     pub blocks: Vec<String>,
     pub priority: i32,
@@ -170,6 +177,10 @@ pub enum DagMessage {
         timestamp: DateTime<Utc>,
         task_id: String,
         error: String,
+        /// `error` 的类型化原因。错误在总线上以文本存活，类型靠这个字段过桥；
+        /// 老版本发布者不带它，反序列化按 `None` 处理。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_cause: Option<UpstreamFailure>,
         sender: String,
         recipient: String,
     },
@@ -202,6 +213,7 @@ impl Task {
             input,
             result: None,
             error: None,
+            error_cause: None,
             blocked_by: Vec::new(),
             blocks: Vec::new(),
             priority: 1,
@@ -252,6 +264,50 @@ impl Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 失败的类型必须能过桥：任务记录与失败消息都要带着它往返，且没有这个
+    /// 字段的老发布者发的消息仍要能被读成"没有类型"。
+    #[test]
+    fn failure_cause_survives_the_wire_and_older_messages_do_not() {
+        let mut task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        task.error = Some("LLM upstream refused (quota_exhausted): spent".into());
+        task.error_cause = Some(UpstreamFailure::QuotaExhausted);
+        let json = serde_json::to_string(&task).unwrap();
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.error_cause, Some(UpstreamFailure::QuotaExhausted));
+
+        let msg = DagMessage::TaskFailed {
+            message_id: "m1".into(),
+            timestamp: Utc::now(),
+            task_id: "t1".into(),
+            error: "boom".into(),
+            error_cause: Some(UpstreamFailure::Auth),
+            sender: "executor-loop".into(),
+            recipient: "dag-executor".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        match serde_json::from_str::<DagMessage>(&json).unwrap() {
+            DagMessage::TaskFailed { error_cause, .. } => {
+                assert_eq!(error_cause, Some(UpstreamFailure::Auth))
+            }
+            other => panic!("expected TaskFailed, got {other:?}"),
+        }
+
+        // 老发布者的消息里没有这个字段：只能读成"没有类型可依"，不能猜。
+        let older = serde_json::json!({
+            "type": "task_failed",
+            "message_id": "m2",
+            "timestamp": Utc::now(),
+            "task_id": "t2",
+            "error": "quota exceeded",
+            "sender": "executor-loop",
+            "recipient": "dag-executor",
+        });
+        match serde_json::from_value::<DagMessage>(older).unwrap() {
+            DagMessage::TaskFailed { error_cause, .. } => assert_eq!(error_cause, None),
+            other => panic!("expected TaskFailed, got {other:?}"),
+        }
+    }
 
     #[test]
     fn self_evolution_task_type_is_self_evolution() {

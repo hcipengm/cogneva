@@ -8,7 +8,7 @@ use cog_core::{
     AgentEvent, AgentState, ClusterOverview, ContextBoard, Event, EventFilter, LogEntry,
     MetricSample, MetricsBackend, ObservabilityGateway, RawLogIndex, RawLogIndexEntry,
     RawLogIndexStore, RawLogQuery, SFError, SFResult, SquadState, SquadStatus, StateBackend,
-    TaskCheckpoint, TaskMetrics, VectorBackend, VectorSearchResult,
+    TaskCheckpoint, TaskMetrics, UpstreamFailure, VectorBackend, VectorSearchResult,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -407,6 +407,7 @@ impl StateBackend for MemoryStateBackend {
         workspace_id: &str,
         task_id: &str,
         error: String,
+        cause: Option<UpstreamFailure>,
         max_retries: u32,
     ) -> SFResult<(bool, Vec<String>)> {
         let mut store = self
@@ -420,6 +421,7 @@ impl StateBackend for MemoryStateBackend {
             reason: "Task not found".into(),
         })?;
         task.error = Some(error.clone());
+        task.error_cause = cause;
         task.updated_at = chrono::Utc::now();
 
         if task.retry_count < max_retries {
@@ -444,6 +446,7 @@ impl StateBackend for MemoryStateBackend {
                         "Cascade cancelled: upstream task '{}' permanently failed with error: {}",
                         task_id, error
                     ));
+                    t.error_cause = None;
                     t.updated_at = chrono::Utc::now();
                     cancelled.push(dep_id.clone());
                 }
@@ -481,6 +484,9 @@ impl StateBackend for MemoryStateBackend {
         }
         task.status = cog_core::TaskStatus::Cancelled;
         task.error = Some(reason.clone());
+        // 取消的理由是编排层给的，不是上游给的：类型跟着理由一起换掉，
+        // 别让上一次失败的 cause 留在一条已取消的记录上。
+        task.error_cause = None;
         task.updated_at = chrono::Utc::now();
 
         let downstream = collect_downstream_derived(tasks, task_id);

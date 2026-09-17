@@ -8,6 +8,7 @@
 // - `cog-memory` uses `cog-storage` clients to implement the permanent
 //   memory domain layer (Raw → Schema → Summary).
 
+use crate::contract::llm::UpstreamFailure;
 use crate::{SFError, SFResult};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -410,11 +411,13 @@ pub trait StateBackend: Send + Sync {
     /// `retry_count < max_retries`: bump retry_count, back to `Pending`,
     /// returns `(true, [])`. Otherwise `Failed` + recursive cascade-cancel
     /// of all non-terminal downstream tasks, returns `(false, cancelled)`.
+    /// `cause` 与 `error` 一起落到任务记录上：文本给人读，类型给判定读。
     async fn dag_fail_task(
         &self,
         workspace_id: &str,
         task_id: &str,
         _error: String,
+        _cause: Option<UpstreamFailure>,
         _max_retries: u32,
     ) -> SFResult<(bool, Vec<String>)> {
         let _ = workspace_id;

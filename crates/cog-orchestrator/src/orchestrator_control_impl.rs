@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cog_core::{OrchestratorControl, SFResult, Task};
+use cog_core::{OrchestratorControl, SFResult, Task, UpstreamFailure};
 use std::sync::Arc;
 
 /// High-level orchestrator control that composes a [`cog_core::DagExecutor`]
@@ -105,8 +105,13 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.complete_task(task_id, result).await
     }
 
-    async fn fail_task(&self, task_id: &str, error: String) -> SFResult<(bool, Vec<String>, bool)> {
-        self.dag_executor.fail_task(task_id, error).await
+    async fn fail_task(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+    ) -> SFResult<(bool, Vec<String>, bool)> {
+        self.dag_executor.fail_task(task_id, error, cause).await
     }
 
     async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {

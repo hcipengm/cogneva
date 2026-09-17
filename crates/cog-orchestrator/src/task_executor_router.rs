@@ -346,7 +346,10 @@ impl TaskExecutorRouter {
                     message_id: format!("res-{}", task.id),
                     timestamp: chrono::Utc::now(),
                     task_id: task.id.clone(),
+                    // 文本给人读，类型给判定读。`e` 是 SFError，类型在这里
+                    // 就地取出，不让下游回头去解析那句 Display。
                     error: e.to_string(),
+                    error_cause: e.upstream_failure(),
                     sender: "executor-loop".into(),
                     recipient: "dag-executor".into(),
                 };

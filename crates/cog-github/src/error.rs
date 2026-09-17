@@ -69,6 +69,15 @@ impl CogGitHubError {
             _ => false,
         }
     }
+
+    /// The typed cause, when the failure crossed the DAG bus with one. `None`
+    /// means only prose survived — callers must not classify from that.
+    pub fn upstream_failure(&self) -> Option<cog_core::UpstreamFailure> {
+        match self {
+            Self::Upstream(e) => e.upstream_failure(),
+            _ => None,
+        }
+    }
 }
 
 /// Result type alias for `cog-github`.

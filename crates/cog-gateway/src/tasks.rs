@@ -372,7 +372,8 @@ pub async fn fail_task_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (retried, cancelled, dlq) = state
         .orchestrator
-        .fail_task(&id, req.error)
+        // HTTP 调用方只给了文本，没有传输层信号可依——类型留空，不猜。
+        .fail_task(&id, req.error, None)
         .await
         .map_err(|e| ApiError::internal(format!("fail failed: {}", e)))?;
     broadcast_task_status(&state, &id, "Failed", None);

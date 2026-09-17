@@ -4,7 +4,10 @@ use serde_json;
 use sqlx::PgPool;
 use std::collections::HashMap;
 
-use cog_core::{AgentState, ContextBoard, Event, SFError, SFResult, StateBackend, TaskCheckpoint};
+use cog_core::{
+    AgentState, ContextBoard, Event, SFError, SFResult, StateBackend, TaskCheckpoint,
+    UpstreamFailure,
+};
 
 /// PostgreSQL-backed state backend.
 pub struct PostgresStateBackend {
@@ -798,6 +801,7 @@ impl StateBackend for PostgresStateBackend {
         workspace_id: &str,
         task_id: &str,
         error: String,
+        cause: Option<UpstreamFailure>,
         max_retries: u32,
     ) -> SFResult<(bool, Vec<String>)> {
         let mut tx = self
@@ -825,6 +829,7 @@ impl StateBackend for PostgresStateBackend {
             reason: "Task not found".into(),
         })?;
         task.error = Some(error.clone());
+        task.error_cause = cause;
         task.updated_at = Utc::now();
 
         let mut dirty: Vec<String> = vec![task_id.to_string()];
@@ -861,6 +866,7 @@ impl StateBackend for PostgresStateBackend {
                                 "Cascade cancelled: upstream task '{}' permanently failed with error: {}",
                                 task_id, error
                             ));
+                            t.error_cause = None;
                             t.updated_at = Utc::now();
                             cancelled.push(child.clone());
                             dirty.push(child.clone());
@@ -934,6 +940,7 @@ impl StateBackend for PostgresStateBackend {
         }
         task.status = cog_core::TaskStatus::Cancelled;
         task.error = Some(reason);
+        task.error_cause = None;
         task.updated_at = Utc::now();
 
         let mut dirty: Vec<String> = vec![task_id.to_string()];

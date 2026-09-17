@@ -249,8 +249,17 @@ impl DagExecutorRuntime {
                             tracing::warn!(task_id = %task_id, msg_id = %msg_id, "Failed to ack result message: {e}");
                         }
                     }
-                    DagMessage::TaskFailed { task_id, error, .. } => {
-                        match self.orchestrator.fail_task(&task_id, error.clone()).await {
+                    DagMessage::TaskFailed {
+                        task_id,
+                        error,
+                        error_cause,
+                        ..
+                    } => {
+                        match self
+                            .orchestrator
+                            .fail_task(&task_id, error.clone(), error_cause)
+                            .await
+                        {
                             Ok((retried, cancelled, _dlq_pushed)) => {
                                 tracing::warn!(
                                     task_id = %task_id,

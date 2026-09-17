@@ -142,6 +142,7 @@ impl cog_core::TaskExecutionCallback for GatewayTaskRunner {
             }
             Err(e) => {
                 let error = e.to_string();
+                let cause = e.upstream_failure();
                 warn!("Task {} failed: {}", task_id, error);
                 if let Some(ref engine) = self.state.hook_engine {
                     engine.emit_detached(
@@ -150,14 +151,18 @@ impl cog_core::TaskExecutionCallback for GatewayTaskRunner {
                             .with_payload(serde_json::json!({"error": &error})),
                     );
                 }
-                let (_retried, _cancelled, _dlq) =
-                    match self.state.orchestrator.fail_task(&task_id, error).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!("TaskRunner failed to fail task {}: {}", task_id, e);
-                            (false, Vec::new(), false)
-                        }
-                    };
+                let (_retried, _cancelled, _dlq) = match self
+                    .state
+                    .orchestrator
+                    .fail_task(&task_id, error, cause)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("TaskRunner failed to fail task {}: {}", task_id, e);
+                        (false, Vec::new(), false)
+                    }
+                };
             }
         }
 

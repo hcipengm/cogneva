@@ -11,6 +11,7 @@ fn make_test_task(id: &str) -> Task {
         input: serde_json::json!({"goal": "test"}),
         result: None,
         error: None,
+        error_cause: None,
         blocked_by: vec![],
         blocks: vec![],
         priority: 1,
@@ -115,6 +116,7 @@ async fn consumer_loop_retries_on_task_failed_result() {
         timestamp: chrono::Utc::now(),
         task_id: "task-fail".into(),
         error: "simulated failure".into(),
+        error_cause: None,
         sender: "executor".into(),
         recipient: "orchestrator".into(),
     };
