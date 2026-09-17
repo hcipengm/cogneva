@@ -1928,7 +1928,9 @@ mod tests {
 
         let mut ralph = RalphLoop::with_config(RalphLoopConfig {
             max_iterations: 2,
-            ..Default::default()
+            // 窗口显式给值：这条用例断言的是"保留多少条上下文、本轮跑几轮"，
+            // 用默认值会让窗口默认值一改就红，那是锁实现细节而不是锁行为。
+            stagnation_window: 3,
         })
         .with_history_store("task-quota".into(), backend.clone());
         let verdict = ralph
@@ -1947,11 +1949,63 @@ mod tests {
             other => panic!("expected Unrecoverable, got {:?}", other),
         };
         // 50 条饱和历史只保留最后一窗作为上下文，本轮自己的 2 轮照跑：
-        // 起算点若仍跟着历史走，这里会是 5（0 轮执行）而不是 7。
-        assert_eq!(ralph.history_keep(), 5);
-        assert_eq!(history.len(), 7);
-        assert_eq!(history[5].iteration, 1);
-        assert_eq!(history[6].iteration, 2);
+        // 起算点若仍跟着历史走，这里会是 3（0 轮执行）而不是 5。
+        assert_eq!(ralph.history_keep(), 3);
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[3].iteration, 1);
+        assert_eq!(history[4].iteration, 2);
+    }
+
+    /// 生成器报出确定性环境/协议失败时，终止原因是那条失败本身，而不是
+    /// "停滞"。两者都是 Unrecoverable，但语义不同：环境失败自带"重试无用"，
+    /// 会被上层按前缀跳过策略升级；停滞只是"这一轮没买到东西"。窗口取 1 让
+    /// 停滞判据在同一次迭代后必然成立，于是"谁优先"是可判的——把终止顺序
+    /// 换回去，reason 就会变成 "Ralph Loop stagnated: ..."。
+    #[tokio::test]
+    async fn a_terminal_environment_failure_outranks_stagnation() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 0,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(Arc::new(pass_planner()));
+        let generator = GeneratorActor::new(Arc::new(MockAgent {
+            response: serde_json::json!({
+                "content": "environment_error: HTTP 503 upstream unavailable",
+                "artifacts": [],
+            }),
+        }));
+
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 3,
+            stagnation_window: 1,
+        });
+        let verdict = ralph
+            .run_pipeline(
+                "goal",
+                serde_json::json!({}),
+                &pipeline,
+                &planner,
+                &generator,
+                &EvaluatorActor::new(Arc::new(fail_evaluator())),
+            )
+            .await;
+
+        match verdict {
+            RalphVerdict::Unrecoverable { reason, .. } => {
+                assert!(
+                    reason.starts_with(crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX),
+                    "the environment failure must be reported, not the stall: {reason}"
+                );
+                assert!(
+                    reason.contains("HTTP 503 upstream unavailable"),
+                    "the reason must carry the generator's own cause: {reason}"
+                );
+            }
+            other => panic!("expected Unrecoverable, got {other:?}"),
+        }
     }
 
     #[tokio::test]
