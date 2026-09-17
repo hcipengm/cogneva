@@ -167,6 +167,46 @@ impl ChangePipeline {
         Ok(results)
     }
 
+    /// Take a change out of the pending queue, keeping it under `retired/` for
+    /// a post-mortem.
+    ///
+    /// The queue is the change directory itself and carries no memory of its
+    /// own: the statuses live in the engine, which every restart empties. Once
+    /// a record is gone a leftover `.diff` is indistinguishable from a brand
+    /// new one — it reads back as `CompileChecked` — so a change that can never
+    /// apply is re-applied on every cycle for the life of the deployment,
+    /// recording a learning each time and holding the landing channel shut.
+    /// Recording the outcome is the audit trail; retiring the artifact is what
+    /// makes a rejection final.
+    pub async fn retire_change(&self, artifact_id: &str, reason: &str) -> SFResult<()> {
+        let from = self.change_dir.join(format!("{artifact_id}.diff"));
+        if !from.exists() {
+            return Ok(());
+        }
+
+        let retired_dir = self.change_dir.join("retired");
+        tokio::fs::create_dir_all(&retired_dir).await.map_err(|e| {
+            SFError::IO(format!(
+                "Failed to create retire dir {}: {}",
+                retired_dir.display(),
+                e
+            ))
+        })?;
+
+        let to = retired_dir.join(format!("{artifact_id}.diff"));
+        tokio::fs::rename(&from, &to).await.map_err(|e| {
+            SFError::IO(format!("Failed to retire change {}: {}", from.display(), e))
+        })?;
+
+        info!(
+            change_id = %artifact_id,
+            reason = %reason,
+            retired_to = %to.display(),
+            "Change retired from the pending queue"
+        );
+        Ok(())
+    }
+
     /// Apply a single change to the working tree and run the workspace test suite.
     ///
     /// On success:
@@ -189,7 +229,26 @@ impl ChangePipeline {
     ) -> SFResult<ApplyResult> {
         info!(change_id = %change.artifact_id, "Applying evolution change");
 
-        let files_changed = Self::parse_diff(&change.content)?;
+        // 判定类失败一律走 `Ok(ApplyResult { test_passed: false, .. })`，`Err` 只留给
+        // "管线没能对一个变更做出判定"（工作树脏、git 起不来这类环境问题）。调用方
+        // 据此决定要不要把变更移出待处理队列：环境问题重试有意义，判定不是。把解析/
+        // 校验的失败塞进 `Err` 会让这条界线失效——分不清"这个变更不行"和"现在这个
+        // 环境不行"，一个有效变更可能因一次 git 抖动被永久退休。
+        // `SFError::Validation` 是"对变更本身的断言"，其余变体是环境。
+        let files_changed = match Self::parse_diff(&change.content) {
+            Ok(files) => files,
+            Err(SFError::Validation(e)) => {
+                warn!(change_id = %change.artifact_id, error = %e, "Change is not a usable diff");
+                return Ok(ApplyResult {
+                    change_id: change.artifact_id.clone(),
+                    files_changed: Vec::new(),
+                    test_passed: false,
+                    test_output: format!("Change is not a usable diff: {e}"),
+                    new_status: EvolutionStatus::ValidationFailed,
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         // 晋级门入口：黑名单命中（依赖清单/密钥材料）直接拒收，
         // 不做 apply、不跑测试，状态落 Rejected 留审计痕迹。
@@ -213,7 +272,20 @@ impl ChangePipeline {
             }
         }
 
-        Self::validate_change_files(&files_changed, workdir)?;
+        match Self::validate_change_files(&files_changed, workdir) {
+            Ok(()) => {}
+            Err(SFError::Validation(e)) => {
+                warn!(change_id = %change.artifact_id, error = %e, "Change touches a file it may not");
+                return Ok(ApplyResult {
+                    change_id: change.artifact_id.clone(),
+                    files_changed,
+                    test_passed: false,
+                    test_output: format!("Change touches a forbidden or missing path: {e}"),
+                    new_status: EvolutionStatus::ValidationFailed,
+                });
+            }
+            Err(e) => return Err(e),
+        }
         self.ensure_clean_workspace(workdir).await?;
 
         if let Err(e) = self.git_apply_check(workdir, &change.content).await {
@@ -937,5 +1009,144 @@ index 1111111..2222222 100644
         let temp = tempfile::tempdir().unwrap();
         let pipeline = ChangePipeline::new(temp.path(), temp.path().join("changes"), true);
         assert!(pipeline.promotion_policy.is_none());
+    }
+
+    /// 对变更本身的判定必须以 `Ok(test_passed = false)` 返回，不能是 `Err`。
+    /// 调用方靠这个区分"变更不行"（要移出队列，重试无意义）和"环境不行"（要留着重
+    /// 试）；判成 `Err` 会让一个语法就不合法的变更每次周期被重新提交一遍。
+    #[tokio::test]
+    async fn an_unparsable_change_is_a_verdict_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), temp.path().join("changes"), true);
+        let change = crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::CodeChange,
+            artifact_id: "garbage-1".into(),
+            description: "not a diff at all".into(),
+            content: "this is not a unified diff\n".into(),
+            status: crate::types::EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test(&change)
+            .await
+            .expect("不可解析的变更是一个判定，不是管线错误");
+        assert!(!result.test_passed);
+        assert_eq!(
+            result.new_status,
+            crate::types::EvolutionStatus::ValidationFailed
+        );
+    }
+
+    /// 另一侧：工作树脏是环境问题，必须保持 `Err`。若它变成 `Ok(test_passed = false)`，
+    /// 一次并发残留就会把一个完好的变更永久退休掉。
+    #[tokio::test]
+    async fn a_dirty_workspace_stays_an_error_so_the_change_is_not_retired() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(root.join("a.txt"), "a\n").await.unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "seed"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+
+        // 变更指向真实存在的 a.txt，本身完全合法——失败只来自工作树状态。
+        let change = crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::CodeChange,
+            artifact_id: "ok-1".into(),
+            description: "valid change".into(),
+            content: r#"diff --git a/a.txt b/a.txt
+index 1111111..2222222 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1,2 @@
+ a
++b
+"#
+            .into(),
+            status: crate::types::EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        // 弄脏工作树。
+        tokio::fs::write(root.join("a.txt"), "dirty\n")
+            .await
+            .unwrap();
+
+        let pipeline = ChangePipeline::new(root, root.join("changes"), true);
+        assert!(
+            pipeline.apply_and_test(&change).await.is_err(),
+            "工作树脏是环境问题，必须走 Err 而不是判定"
+        );
+    }
+
+    /// 退休必须真的把变更移出待处理队列。队列就是变更目录本身，`pending_changes`
+    /// 不认识 `retired/`，所以这一移动是让"拒绝"成为终局的唯一手段：留在原地的
+    /// 记录会在进程重启后失去它的状态，被读成一个全新的待处理变更。
+    #[tokio::test]
+    async fn retiring_a_change_removes_it_from_the_pending_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+
+        let id = "task-1-abc123";
+        tokio::fs::write(change_dir.join(format!("{id}.diff")), "not a real diff\n")
+            .await
+            .unwrap();
+        assert_eq!(pipeline.pending_changes(None).await.unwrap().len(), 1);
+
+        pipeline.retire_change(id, "corrupt patch").await.unwrap();
+
+        assert!(
+            pipeline.pending_changes(None).await.unwrap().is_empty(),
+            "退休后的变更不得再出现在待处理队列里"
+        );
+        assert!(
+            change_dir
+                .join("retired")
+                .join(format!("{id}.diff"))
+                .exists(),
+            "变更要留在 retired/ 供事后取证，不是被删掉"
+        );
+    }
+
+    /// 缺席即无事：调用方可能在失败路径上重复调用，或对一条已被别的分支退休的
+    /// 变更再调一次，这都不该变成错误。
+    #[tokio::test]
+    async fn retiring_an_absent_change_is_a_no_op() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+
+        pipeline
+            .retire_change("never-existed", "n/a")
+            .await
+            .unwrap();
+
+        assert!(!change_dir.join("retired").exists());
     }
 }

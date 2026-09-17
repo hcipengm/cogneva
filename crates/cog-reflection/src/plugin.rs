@@ -1383,6 +1383,34 @@ struct CycleDeps<'a> {
     landing: Option<&'a Arc<dyn cog_core::ChangeLanding>>,
 }
 
+/// 记录一次终局失败，并把变更移出待处理队列。
+///
+/// 两件事必须一起做：登记结论是审计线索，移出队列才让"拒绝"成为终局。队列本身
+/// 就是变更目录，不带任何记忆；结论保存在引擎内存里，进程一重启就没了。记录一旦
+/// 消失，目录里遗留的 .diff 和刚生成的变更完全无法区分（都读成 CompileChecked），
+/// 于是一个永远打不上的变更会在部署存续期内每轮被重新 apply、每次都记一条学习，
+/// 还把落地通道一直占住。
+///
+/// 只在"对变更本身的确定性判据"上退休（解析/校验/apply/测试），环境类失败
+/// （校验管线报错、构建、落地、部署）不移除：那些是环境的问题，环境修好后同一个
+/// 变更还该能落地。判据与环境的边界由 `apply_and_test_in` 的返回类型划开——判定走
+/// `Ok(test_passed = false)`，环境走 `Err`。
+async fn fail_and_retire_change(
+    engine: &crate::ReflectionEngine,
+    pipeline: &crate::ChangePipeline,
+    change_id: &str,
+    reason: &str,
+) {
+    let _ = engine.record_change_outcome(change_id, false, reason).await;
+    if let Err(e) = pipeline.retire_change(change_id, reason).await {
+        warn!(
+            change_id = %change_id,
+            error = %e,
+            "Change could not be retired; it stays in the pending queue"
+        );
+    }
+}
+
 /// Run one pass of the self-evolution auto-deploy pipeline.
 ///
 /// 每轮演进独占一棵工作树（轮内多个变更串行复用），轮首刷新回基线：任何检出
@@ -1474,7 +1502,11 @@ async fn run_evolution_cycle_in(
         let result = match pipeline.apply_and_test_in(&change, workdir).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(error = %e, "Change apply/test failed");
+                // `Err` 意味着管线没能对这个变更做出判定（工作树脏、git 起不来），
+                // 判定类失败都以 `Ok(test_passed = false)` 返回并在下面处理。环境
+                // 问题可以靠重试自愈，变更本身未必有毛病，所以只记结论、不移出队列
+                // ——在这里退休会因一次环境抖动丢掉一个好变更。
+                warn!(error = %e, "Change apply/test could not reach a verdict");
                 let _ = engine
                     .record_change_outcome(
                         &change.artifact_id,
@@ -1501,12 +1533,11 @@ async fn run_evolution_cycle_in(
             let reason: String = result.test_output.chars().take(500).collect();
             warn!(
                 change_id = %result.change_id,
+                status = ?result.new_status,
                 reason = %reason,
-                "Change failed tests; skipping deploy"
+                "Change rejected; skipping deploy"
             );
-            let _ = engine
-                .record_change_outcome(&result.change_id, false, &result.test_output)
-                .await;
+            fail_and_retire_change(engine, pipeline, &result.change_id, &result.test_output).await;
             change_failed = true;
         } else if !config.auto_apply || config.manual_approve {
             info!(change_id = %result.change_id, "Change awaiting manual approval");
