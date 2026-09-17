@@ -27,6 +27,12 @@ pub struct CollaborationObservable {
     /// Ralph Loop 终止计数，按终止原因分类（stagnated / budget_exhausted）。
     /// 不收敛链被有界止损是核心健康信号，必须可观测。
     ralph_terminations: Arc<Mutex<HashMap<String, u64>>>,
+    /// 自进化任务的结果计数，按结局分类（submitted / no_artifacts /
+    /// submit_failed / no_sink）。一个跑完却没有产出变更的自进化任务在
+    /// 此之前与成功完全无法区分：squad 报 success、输出 JSON 里只是没有
+    /// change_ids，既没有日志也没有指标，于是"生成侧不出货"能沉默地持续
+    /// 下去。落地通道有没有货必须可数。
+    change_yields: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -54,6 +60,12 @@ impl CollaborationObservable {
     pub fn record_ralph_termination(&self, reason: &str) {
         if let Ok(mut map) = self.ralph_terminations.try_lock() {
             *map.entry(reason.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    pub fn record_change_yield(&self, outcome: &str) {
+        if let Ok(mut map) = self.change_yields.try_lock() {
+            *map.entry(outcome.to_string()).or_insert(0) += 1;
         }
     }
 }
@@ -88,6 +100,13 @@ impl Observable for CollaborationObservable {
                         .with_label("reason", reason),
                 );
             }
+            let yields = self.change_yields.lock().await;
+            for (outcome, count) in yields.iter() {
+                metrics.push(
+                    RawMetric::new("self_evolution_change_yield_total", *count as f64)
+                        .with_label("outcome", outcome),
+                );
+            }
         }
         Ok(metrics)
     }
@@ -98,5 +117,50 @@ impl Observable for CollaborationObservable {
 
     fn available_dimensions(&self) -> Vec<String> {
         vec!["D8".into()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::observability::Observable;
+
+    fn metric(metrics: &[RawMetric], name: &str) -> Option<RawMetric> {
+        metrics.iter().find(|m| m.name == name).cloned()
+    }
+
+    #[tokio::test]
+    async fn change_yield_is_counted_per_outcome() {
+        let obs = CollaborationObservable::new();
+        obs.record_change_yield("no_artifacts");
+        obs.record_change_yield("no_artifacts");
+        obs.record_change_yield("submitted");
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let yields: Vec<&RawMetric> = metrics
+            .iter()
+            .filter(|m| m.name == "self_evolution_change_yield_total")
+            .collect();
+        assert_eq!(yields.len(), 2);
+        let no_artifacts = yields
+            .iter()
+            .find(|m| m.labels.get("outcome").map(String::as_str) == Some("no_artifacts"))
+            .expect("no_artifacts outcome is reported");
+        assert_eq!(no_artifacts.value, 2.0);
+        let submitted = yields
+            .iter()
+            .find(|m| m.labels.get("outcome").map(String::as_str) == Some("submitted"))
+            .expect("submitted outcome is reported");
+        assert_eq!(submitted.value, 1.0);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_never_yielded_reports_nothing() {
+        // Absence of the series is the honest state: no self-evolution run has
+        // finished yet. A zero-valued series would claim a measurement that
+        // was never taken.
+        let obs = CollaborationObservable::new();
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert!(metric(&metrics, "self_evolution_change_yield_total").is_none());
     }
 }

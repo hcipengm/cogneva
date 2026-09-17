@@ -98,14 +98,7 @@ impl EvaluatorActor {
 
         // Self-evolution change validation: ensure generated artifacts are valid
         // unified diffs targeting safe source paths.
-        let is_self_evolution = matches!(
-            &task.task_type,
-            cog_core::TaskType::Custom(s) if s == "self_evolution"
-        ) || ctx
-            .get("evolution_mode")
-            .and_then(|v| v.as_str())
-            .map(|s| s == "generate_change")
-            .unwrap_or(false);
+        let is_self_evolution = task.is_self_evolution();
 
         // For self-evolution tasks the only thing that matters is whether the
         // generated change artifact is a valid unified diff targeting safe paths.

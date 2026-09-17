@@ -541,7 +541,7 @@ impl CollaborationExecutor {
             .unwrap_or(&task.id)
             .to_string();
 
-        let is_self_evolution = Self::is_self_evolution_task(task);
+        let is_self_evolution = task.is_self_evolution();
 
         let mode_selector = self.mode_selector_with_agent().await;
         let (pge_mode, reason) = mode_selector
@@ -666,11 +666,12 @@ impl CollaborationExecutor {
         // hand them to every ChangeSink (fan-out).
         let mut change_ids = Vec::new();
         if is_self_evolution {
-            if self.change_sinks.is_empty() {
+            let outcome = if self.change_sinks.is_empty() {
                 tracing::warn!(
                     task_id=%task.id,
                     "Self-evolution task succeeded but no ChangeSink is configured"
                 );
+                "no_sink"
             } else {
                 let changes = Self::extract_changes(
                     &result,
@@ -678,6 +679,7 @@ impl CollaborationExecutor {
                     &Self::pge_mode_str(&result.pge_mode),
                     task.input.get("issue_number").and_then(|v| v.as_u64()),
                 );
+                let extracted = !changes.is_empty();
                 for change in changes {
                     for sink in &self.change_sinks {
                         match sink.submit_change(change.clone()).await {
@@ -691,7 +693,23 @@ impl CollaborationExecutor {
                         }
                     }
                 }
-            }
+                if !change_ids.is_empty() {
+                    "submitted"
+                } else if extracted {
+                    "submit_failed"
+                } else {
+                    // The squad reported success but produced no change: a run
+                    // that spends a whole PGE budget and yields nothing to land
+                    // is a failed evolution step. Counted so it cannot hide
+                    // behind a successful-looking task result.
+                    tracing::warn!(
+                        task_id=%task.id,
+                        "Self-evolution run yielded no change artifact; nothing to land"
+                    );
+                    "no_artifacts"
+                }
+            };
+            crate::observable::global_observable().record_change_yield(outcome);
         }
 
         let output = if change_ids.is_empty() {
@@ -734,16 +752,6 @@ impl CollaborationExecutor {
                 tracing::warn!(task_id = %task.id, error = %e, "Failed to archive execution");
             }
         });
-    }
-
-    fn is_self_evolution_task(task: &Task) -> bool {
-        // Explicit self-evolution task type, or any task that opts into the
-        // change-generation flow via the evolution_mode marker in its input
-        // (e.g. platform_ci_fix / platform_issue_fix from the GitHub integration).
-        matches!(
-            &task.task_type,
-            TaskType::Custom(s) if s == "self_evolution"
-        ) || task.input.get("evolution_mode").and_then(|v| v.as_str()) == Some("generate_change")
     }
 
     fn pge_mode_str(mode: &crate::profile::PgeMode) -> String {
@@ -923,40 +931,5 @@ impl CollaborationExecutor {
             240
         };
         base + size_factor + type_factor
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn self_evolution_task_type_matches() {
-        let task = Task::new(
-            "t1",
-            TaskType::Custom("self_evolution".into()),
-            serde_json::json!({}),
-        );
-        assert!(CollaborationExecutor::is_self_evolution_task(&task));
-    }
-
-    #[test]
-    fn evolution_mode_marker_routes_to_change_flow() {
-        let task = Task::new(
-            "t2",
-            TaskType::Custom("platform_ci_fix".into()),
-            serde_json::json!({"evolution_mode": "generate_change"}),
-        );
-        assert!(CollaborationExecutor::is_self_evolution_task(&task));
-    }
-
-    #[test]
-    fn plain_task_is_not_self_evolution() {
-        let task = Task::new(
-            "t3",
-            TaskType::Custom("platform_ci_fix".into()),
-            serde_json::json!({}),
-        );
-        assert!(!CollaborationExecutor::is_self_evolution_task(&task));
     }
 }

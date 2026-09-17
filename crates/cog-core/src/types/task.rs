@@ -220,6 +220,25 @@ impl Task {
         }
     }
 
+    /// Whether this task opts into the self-evolution change-generation flow.
+    ///
+    /// Producers mark the task's own input with
+    /// `evolution_mode == "generate_change"`; `TaskType::Custom("self_evolution")`
+    /// is the equivalent explicit form, and `platform_issue_fix` /
+    /// `platform_ci_fix` use the input marker. One definition, because the
+    /// routing decision, the planner, the generator and the evaluator must all
+    /// answer the same question.
+    ///
+    /// Read it from the task, never from a role-shaped prompt context. Those
+    /// carry only the fields a role needs — the generator nests the whole task
+    /// input under `input` and the evaluator omits it — so a predicate that
+    /// inspects the built context silently never matches, and change generation
+    /// degrades into ordinary narrative output.
+    pub fn is_self_evolution(&self) -> bool {
+        matches!(&self.task_type, TaskType::Custom(s) if s == "self_evolution")
+            || self.input.get("evolution_mode").and_then(|v| v.as_str()) == Some("generate_change")
+    }
+
     pub fn is_ready(&self, dag: &TaskDAG) -> bool {
         self.blocked_by.iter().all(|dep_id| {
             dag.tasks
@@ -227,5 +246,57 @@ impl Task {
                 .map(|t| t.status == TaskStatus::Completed)
                 .unwrap_or(false)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_evolution_task_type_is_self_evolution() {
+        let task = Task::new(
+            "t1",
+            TaskType::Custom("self_evolution".into()),
+            serde_json::json!({}),
+        );
+        assert!(task.is_self_evolution());
+    }
+
+    #[test]
+    fn evolution_mode_marker_is_self_evolution() {
+        // The marker is how the platform integrations opt in: the task type is
+        // the platform's own (platform_issue_fix / platform_ci_fix), not
+        // self_evolution.
+        let task = Task::new(
+            "t2",
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({"goal": "fix it", "evolution_mode": "generate_change"}),
+        );
+        assert!(task.is_self_evolution());
+    }
+
+    #[test]
+    fn other_evolution_modes_and_plain_tasks_are_not_self_evolution() {
+        let baseline = Task::new(
+            "t3",
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({"evolution_mode": "baseline_port"}),
+        );
+        assert!(!baseline.is_self_evolution());
+
+        let plain = Task::new(
+            "t4",
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({"goal": "fix it"}),
+        );
+        assert!(!plain.is_self_evolution());
+
+        let generated = Task::new(
+            "t5",
+            TaskType::Custom("generator".into()),
+            serde_json::json!({}),
+        );
+        assert!(!generated.is_self_evolution());
     }
 }

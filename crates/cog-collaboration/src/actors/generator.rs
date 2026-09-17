@@ -109,14 +109,7 @@ impl GeneratorActor {
         );
 
         // Inject self-evolution change-generation instructions when requested.
-        let is_self_evolution = matches!(
-            &task.task_type,
-            cog_core::TaskType::Custom(s) if s == "self_evolution"
-        ) || ctx
-            .get("evolution_mode")
-            .and_then(|v| v.as_str())
-            .map(|s| s == "generate_change")
-            .unwrap_or(false);
+        let is_self_evolution = task.is_self_evolution();
 
         if is_self_evolution {
             ctx["change_generation"] = serde_json::json!({

@@ -589,13 +589,11 @@ impl ActionPlanOrchestrator {
     ) -> SFResult<Vec<String>> {
         // Self-evolution tasks are human intents that should be executed
         // atomically by the collaboration pipeline without decomposition.
-        let all_self_evolution = !tasks.is_empty()
-            && tasks.iter().all(|t| {
-                matches!(
-                    &t.task_type,
-                    TaskType::Custom(s) if s == "self_evolution"
-                )
-            });
+        // Matching the task type alone is not enough: the platform
+        // integrations opt in with the `evolution_mode` input marker while
+        // keeping their own task type. Decomposing one of those drops the
+        // marker into children that never generate a change.
+        let all_self_evolution = !tasks.is_empty() && tasks.iter().all(|t| t.is_self_evolution());
 
         if all_self_evolution {
             tracing::info!(
@@ -1936,6 +1934,45 @@ mod tests {
         assert_eq!(child.parent_task_id.as_deref(), Some("sig-alert-2"));
         assert_eq!(child.goal_id, parent.goal_id);
         assert!(sink.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn evolution_marker_task_skips_decomposition_and_stays_executable() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-evolution-route".to_string()));
+        // Decomposition would hand back a child. Routing the marked task
+        // through decomposition is exactly the defect this guards: the child
+        // carries no marker, so it generates narrative output instead of a
+        // change and the intent never reaches the landing channel.
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![atomic_task("child-should-not-exist")]]),
+            }))
+            .with_dag_executor(dag.clone());
+
+        let registry = SkillRegistry::new();
+        let marked = Task::new(
+            "github-issue-10",
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({"goal": "fix it", "evolution_mode": "generate_change"}),
+        );
+        let ids = planner
+            .process_goal_impl("fix it", vec![marked], &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec!["github-issue-10".to_string()]);
+        assert!(dag.get_task("child-should-not-exist").await.is_none());
+        let stored = dag.get_task("github-issue-10").await.unwrap();
+        assert!(stored.is_executable);
+        assert_eq!(stored.status, cog_core::TaskStatus::Pending);
+        // Self-evolution runs a whole multi-agent pipeline in one task and
+        // needs the longer budget.
+        assert_eq!(stored.timeout_seconds, 3600);
+        assert_eq!(
+            stored.input["evolution_mode"],
+            serde_json::json!("generate_change")
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use cog_core::{Agent, KnowledgeBackend, Task, TaskType};
+use cog_core::{Agent, KnowledgeBackend, Task};
 
 use crate::squad::pge::types::PlannerOutput;
 
@@ -108,15 +108,7 @@ impl PlannerActor {
         // downstream PGE pipeline can parse. Change artifacts are produced by the
         // Generator later, so we explicitly tell the planner not to emit XML or
         // change content here.
-        let is_self_evolution = matches!(
-            &task.task_type,
-            TaskType::Custom(s) if s == "self_evolution"
-        ) || task
-            .input
-            .get("evolution_mode")
-            .and_then(|v| v.as_str())
-            .map(|s| s == "generate_change")
-            .unwrap_or(false);
+        let is_self_evolution = task.is_self_evolution();
 
         if is_self_evolution {
             ctx["evolution_mode"] = serde_json::json!("generate_change");
