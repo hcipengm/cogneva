@@ -172,6 +172,79 @@ const FATAL_WAITING_REASONS: &[&str] = &[
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
 const ROLLOUT_POLL_SECS: u64 = 5;
 
+/// 超时诊断里保留的事件条数。错误记录不是日志转储：只要够指出病因。
+const DIAGNOSIS_EVENT_LIMIT: usize = 3;
+
+/// 把 Pod 采样行折成诊断。空字段是「没有该信号」而不是「信号为空」，不进
+/// 诊断——否则满行空的 `waiting=` 会把真正的 `Pending` 病因埋掉。
+///
+/// 每行形如 `name|phase|ready|waitingReason|waitingMessage`（竖线显式占位，
+/// omitempty 的字段缺失时不会顶掉后面字段的位置）。
+fn summarize_pod_states(out: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for line in out.lines() {
+        let f: Vec<&str> = line.trim().split('|').map(str::trim).collect();
+        if f.len() < 5 || f[0].is_empty() {
+            continue;
+        }
+        let mut seg = format!("{} {}", f[0], if f[1].is_empty() { "?" } else { f[1] });
+        seg.push_str(if f[2] == "true" {
+            " ready"
+        } else {
+            " not-ready"
+        });
+        if !f[3].is_empty() {
+            seg.push_str(&format!(" waiting={}", f[3]));
+        }
+        if !f[4].is_empty() {
+            seg.push_str(&format!(" ({})", f[4]));
+        }
+        parts.push(seg);
+    }
+    parts.join("; ")
+}
+
+/// 从 Pod 采样行里取出名字，供事件过滤用。
+fn pod_names_of(pods_out: &str) -> Vec<String> {
+    pods_out
+        .lines()
+        .filter_map(|l| l.trim().split('|').next())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 把事件行折成诊断，只留与本次部署相关的最近几条。
+///
+/// 全命名空间的事件绝大多数与这次滚动无关，不过滤就会把真正的
+/// `FailedScheduling` 挤出记录。相关性按**名字精确匹配**判：Deployment 本身的
+/// 事件，或作用对象是这次采样到的那个 Pod。不能用「部署名前缀」匹配——`cogneva`
+/// 的前缀能套住 `cogneva-evolution` / `cogneva-sandbox-executor` 的全部 Pod，
+/// 那会把别的部署的病因记到这次滚动头上。
+///
+/// 每行形如 `kind|name|reason|message`。
+fn summarize_events(out: &str, deployment: &str, pod_names: &[String], limit: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in out.lines() {
+        let f: Vec<&str> = line.trim().split('|').collect();
+        if f.len() < 4 || f[2].trim().is_empty() {
+            continue;
+        }
+        let (kind, name) = (f[0].trim(), f[1].trim());
+        let related = (kind == "Deployment" && name == deployment)
+            || (kind == "Pod" && pod_names.iter().any(|p| p == name));
+        if !related {
+            continue;
+        }
+        let text = format!("{} {}: {}", name, f[2].trim(), f[3].trim());
+        if !lines.contains(&text) {
+            lines.push(text);
+        }
+    }
+    let start = lines.len().saturating_sub(limit);
+    lines[start..].join("; ")
+}
+
 /// 「观测能力故障」的标记与识别。apiserver 不可达、证书握手超时、连接被拒、
 /// 查询整体超时，说的是**我们看不到集群**，不是**看清楚了集群里的版本有问题**。
 /// 两者混进同一个判据，一次网络抖动就会把刚推上去的好版本回滚回旧版；这台
@@ -2044,6 +2117,13 @@ impl RolloutExecutor {
                     .get_or_insert_with(|| now + Duration::from_secs(self.rollout_timeout_secs))
             };
             if now >= deadline {
+                // 超时才采样：正常路径一次 kubectl 都不多花。
+                let diagnosis = self.rollout_diagnosis(t).await;
+                let suffix = if diagnosis.is_empty() {
+                    String::new()
+                } else {
+                    format!("; pods: {diagnosis}")
+                };
                 return Err(if !observed_ever {
                     // 一次都没看到过部署态：这是观测能力故障，不是版本结论。
                     SFError::IO(format!(
@@ -2054,12 +2134,12 @@ impl RolloutExecutor {
                 } else if starting {
                     SFError::Agent(format!(
                         "deployment/{} stuck in startup phase after {}s \
-                         (init containers not finished; last deployment state: {note})",
+                         (init containers not finished; last deployment state: {note}{suffix})",
                         t.deployment, self.startup_timeout_secs
                     ))
                 } else {
                     SFError::Agent(format!(
-                        "rollout of deployment/{} did not complete within {}s (last: {note})",
+                        "rollout of deployment/{} did not complete within {}s (last: {note}{suffix})",
                         t.deployment, self.rollout_timeout_secs
                     ))
                 });
@@ -2102,6 +2182,68 @@ impl RolloutExecutor {
             }
         }
         Ok(())
+    }
+
+    /// 滚动超时时采样现场：Pod 相位、容器等待原因/消息、本次部署最近的事件。
+    ///
+    /// 副本计数（`spec|updated|ready|unavailable`）只给结论不给原因——「Pod
+    /// 排不上队一直 Pending」与「容器起来了但一直不 ready」在这个向量里长得
+    /// 一模一样，处置却相反。事件窗口只有一小时，不留现场就只能等人回到集群
+    /// 去猜，那时连证据都过期了。
+    ///
+    /// 采样是尽力而为：任何一步取不到都留空，观测失败不变成第二个错误。
+    async fn rollout_diagnosis(&self, t: &RolloutTarget) -> String {
+        let selector = pod_selector(&t.name, &t.component);
+        let pods = self
+            .run_kubectl(
+                &[
+                    "get",
+                    "pods",
+                    "-l",
+                    &selector,
+                    "-o",
+                    "jsonpath={range .items[*]}{.metadata.name}|{.status.phase}|\
+                     {.status.containerStatuses[0].ready}|\
+                     {.status.containerStatuses[0].state.waiting.reason}|\
+                     {.status.containerStatuses[0].state.waiting.message}{\"\\n\"}{end}",
+                ],
+                30,
+            )
+            .await
+            .unwrap_or_default();
+        // 只取 Warning：正常滚动事件（ScalingReplicaSet 等）说明不了病因，
+        // 排不上队与探针不过都落在 Warning 里。
+        let events = self
+            .run_kubectl(
+                &[
+                    "get",
+                    "events",
+                    "--field-selector",
+                    "type=Warning",
+                    "--sort-by=.lastTimestamp",
+                    "-o",
+                    "jsonpath={range .items[*]}{.involvedObject.kind}|{.involvedObject.name}|\
+                     {.reason}|{.message}{\"\\n\"}{end}",
+                ],
+                30,
+            )
+            .await
+            .unwrap_or_default();
+        let mut out = summarize_pod_states(&pods);
+        let ev = summarize_events(
+            &events,
+            &t.deployment,
+            &pod_names_of(&pods),
+            DIAGNOSIS_EVENT_LIMIT,
+        );
+        if !ev.is_empty() {
+            if !out.is_empty() {
+                out.push_str("; ");
+            }
+            out.push_str("events: ");
+            out.push_str(&ev);
+        }
+        out
     }
 
     /// Pod 健康信号：双标签选择器，查 restartCount/ready/waiting reason。
@@ -2380,6 +2522,72 @@ mod tests {
         );
         assert_eq!(endpoint_host_port("no-port"), None);
         assert_eq!(endpoint_host_port("host:notaport"), None);
+    }
+
+    #[test]
+    fn pod_diagnosis_drops_empty_waiting_fields_and_keeps_the_cause() {
+        let out = "p-a|Running|true|||\n\
+                   p-b|Pending|false|Unschedulable|0/1 nodes are available: 1 Insufficient memory\n";
+        let s = summarize_pod_states(out);
+        assert!(s.contains("p-a Running ready"));
+        assert!(s.contains("p-b Pending not-ready waiting=Unschedulable (0/1 nodes are available: 1 Insufficient memory)"));
+        // 只有 Pending 那个 Pod 带等待原因：空等待字段不落进诊断。
+        assert_eq!(s.matches("waiting=").count(), 1);
+        // 半行（字段缺失）不进诊断，也不让后面的行顶掉位置。
+        assert!(summarize_pod_states("broken|Pending\n").is_empty());
+    }
+
+    #[test]
+    fn events_diagnosis_keeps_only_this_deployment() {
+        let out = "\
+Deployment|other-deployment|ScalingReplicaSet|unrelated scale
+Pod|other-app-abc-z|FailedScheduling|unrelated scheduling
+Pod|cogneva-sandbox-executor-abc-x|FailedScheduling|0/1 nodes are available: 1 Insufficient memory
+Pod|cogneva-sandbox-executor-abc-y|Unhealthy|Readiness probe failed
+";
+        let pods = "cogneva-sandbox-executor-abc-x|Pending|false||\n\
+                    cogneva-sandbox-executor-abc-y|Running|false||\n";
+        let s = summarize_events(out, "cogneva-sandbox-executor", &pod_names_of(pods), 3);
+        assert!(s.contains("FailedScheduling"));
+        assert!(s.contains("Readiness probe failed"));
+        assert!(!s.contains("unrelated"));
+    }
+
+    #[test]
+    fn events_diagnosis_keeps_the_latest_bounded_number() {
+        let out = "\
+Pod|cogneva-sandbox-executor-abc-x|FailedScheduling|oldest
+Pod|cogneva-sandbox-executor-abc-x|Unhealthy|middle
+Pod|cogneva-sandbox-executor-abc-y|BackOff|newest
+";
+        let pods = "cogneva-sandbox-executor-abc-x|Pending|false||\n\
+                    cogneva-sandbox-executor-abc-y|Running|false||\n";
+        let s = summarize_events(out, "cogneva-sandbox-executor", &pod_names_of(pods), 2);
+        assert!(!s.contains("oldest"));
+        assert!(s.contains("middle"));
+        assert!(s.contains("newest"));
+    }
+
+    /// 前缀匹配会把 `cogneva` 的前缀套到 `cogneva-evolution` /
+    /// `cogneva-sandbox-executor` 的全部 Pod 上，把别的部署的病因记到本次滚动
+    /// 头上。相关性必须按采样到的确切 Pod 名判。
+    #[test]
+    fn events_diagnosis_does_not_borrow_other_deployments_pods() {
+        let out = "\
+Pod|cogneva-evolution-abc-x|BackOff|evolution crashed
+Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
+";
+        let pods = "cogneva-5c75d664c6-8hq7t|Running|true||\n";
+        let s = summarize_events(out, "cogneva", &pod_names_of(pods), 5);
+        assert!(s.is_empty(), "{s}");
+    }
+
+    /// Deployment 自身的事件（ScalingReplicaSet 等）不因名字不是 Pod 名而被丢。
+    #[test]
+    fn events_diagnosis_keeps_the_deployment_own_events() {
+        let out = "Deployment|cogneva-sandbox-executor|ScalingReplicaSet|Scaled up replica set\n";
+        let s = summarize_events(out, "cogneva-sandbox-executor", &[], 5);
+        assert!(s.contains("Scaled up replica set"));
     }
 
     #[test]
