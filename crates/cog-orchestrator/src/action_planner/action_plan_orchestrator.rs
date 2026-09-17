@@ -1447,6 +1447,7 @@ mod tests {
                 usage: cog_core::Usage::default(),
                 stop_reason: cog_core::StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -1467,6 +1468,7 @@ mod tests {
                 usage: cog_core::Usage::default(),
                 stop_reason: cog_core::StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             };
             let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(10);

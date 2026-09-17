@@ -1,5 +1,6 @@
 //! Error types for `cog-github`.
 
+use cog_core::SFError;
 use thiserror::Error;
 
 /// Errors returned by `cog-github`.
@@ -20,6 +21,13 @@ pub enum CogGitHubError {
     /// The GitHub integration configuration is invalid.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// The platform core refused work this loop handed it, with the original
+    /// error kept instead of flattened to prose. The *type* is the cause —
+    /// quota, credentials, transport — and it is the only thing a retry
+    /// decision is allowed to read.
+    #[error("upstream failure: {0}")]
+    Upstream(#[from] SFError),
 
     /// The GitHub API provider returned an error.
     #[error("provider error: {0}")]
@@ -43,6 +51,24 @@ pub enum CogGitHubError {
     /// An I/O operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl CogGitHubError {
+    /// Whether re-issuing this work next tick is known, by type, to be futile:
+    /// the same request cannot succeed until an external window resets or
+    /// credentials change.
+    ///
+    /// Only [`Self::Upstream`] can answer yes. A [`Self::Provider`] error
+    /// carries prose and nothing else, so nothing can be concluded from it —
+    /// deciding otherwise would mean matching on an upstream's wording, which
+    /// differs per provider and per locale and silently stops matching the day
+    /// one of them rewords.
+    pub fn is_terminal_upstream_failure(&self) -> bool {
+        match self {
+            Self::Upstream(e) => e.is_terminal_upstream_failure(),
+            _ => false,
+        }
+    }
 }
 
 /// Result type alias for `cog-github`.

@@ -95,6 +95,7 @@ impl MockLLMProvider {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             };
 
@@ -169,6 +170,7 @@ impl LLMProvider for MockLLMProvider {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             }),
             MockResponse::Err(msg) => Err(cog_core::SFError::LLM(msg)),

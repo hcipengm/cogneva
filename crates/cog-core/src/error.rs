@@ -1,3 +1,5 @@
+use crate::contract::llm::UpstreamFailure;
+
 /// 统一错误类型。参考 pi-ai 的契约：所有错误编码在流中，不直接抛出。
 #[derive(Debug, thiserror::Error)]
 pub enum SFError {
@@ -9,6 +11,15 @@ pub enum SFError {
     /// "上游挂了"，下游于是把一条永远抽不出来的消息一直延后重投。
     #[error("LLM provider error: {0}")]
     LLM(String),
+
+    /// 上游在协议层明确拒绝了这次调用，原因取自传输信号（HTTP 状态码）而不是
+    /// 上游自由文本。与 [`Self::LLM`] 的区别是**原因有类型**：调用方可以据此
+    /// 判断该延后重试、该按意图退避、还是该换钥匙，不必再去解析 message。
+    #[error("LLM upstream refused ({cause}): {reason}")]
+    Upstream {
+        cause: UpstreamFailure,
+        reason: String,
+    },
 
     #[error("Agent execution error: {0}")]
     Agent(String),
@@ -70,7 +81,33 @@ impl SFError {
     /// 输入终结掉；内容类失败（答复解析不了、校验不过、任务本身失败）重试多
     /// 少次都是同一个结果，才是死信。
     pub fn is_environment_failure(&self) -> bool {
-        matches!(self, SFError::LLM(_) | SFError::Timeout)
+        match self {
+            SFError::LLM(_) | SFError::Timeout => true,
+            // 上游明确拒绝：限流、配额、鉴权、服务端故障、连不上。请求本身不
+            // 合法那一档不算——那是我们自己的请求写错了，归到环境里就又是一次
+            // 把自身缺陷记成外部故障。
+            SFError::Upstream { cause, .. } => cause.is_environment_failure(),
+            _ => false,
+        }
+    }
+
+    /// 这次失败是"重试同一请求在外部窗口复位或凭证更换前不可能成功"，还是
+    /// "过一会儿再试可能就成了"。
+    ///
+    /// 判据同样只看类型。只有上游明确说了配额耗尽或鉴权被拒才算终止性——限流
+    /// 是分钟级信号，服务端 5xx 和传输层故障本身就是瞬时的，把这几档也按终止
+    /// 处理会让系统在一条本来能恢复的路上睡死。
+    pub fn is_terminal_upstream_failure(&self) -> bool {
+        matches!(self, SFError::Upstream { cause, .. } if cause.is_terminal())
+    }
+
+    /// 这次失败若带有类型化原因，取出来。调用方拿它做判断，不必回头去解析
+    /// message。
+    pub fn upstream_failure(&self) -> Option<UpstreamFailure> {
+        match self {
+            SFError::Upstream { cause, .. } => Some(*cause),
+            _ => None,
+        }
     }
 }
 
@@ -83,6 +120,7 @@ impl From<std::io::Error> for SFError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::llm::UpstreamFailure;
 
     /// 分类落在类型上：文本里写满 timeout / quota 也不改变它的类别，反之环境
     /// 类失败也不靠文本被认出来。
@@ -99,6 +137,81 @@ mod tests {
         assert!(
             !SFError::Serialization(serde_json::from_str::<i32>("not json").unwrap_err())
                 .is_environment_failure()
+        );
+    }
+
+    /// 上游拒绝这条路径上，环境类与「我们自己请求写错了」必须分开：后者的
+    /// message 里写满 quota 也只是措辞，类别由 status 翻出来的取值决定。
+    #[test]
+    fn upstream_refusal_is_environment_unless_our_request_was_malformed() {
+        let refused = |cause| SFError::Upstream {
+            cause,
+            reason: "quota exceeded".into(),
+        };
+
+        assert!(refused(UpstreamFailure::RateLimited).is_environment_failure());
+        assert!(refused(UpstreamFailure::QuotaExhausted).is_environment_failure());
+        assert!(refused(UpstreamFailure::Auth).is_environment_failure());
+        assert!(refused(UpstreamFailure::ServerError).is_environment_failure());
+        assert!(refused(UpstreamFailure::Transport).is_environment_failure());
+
+        assert!(!refused(UpstreamFailure::BadRequest).is_environment_failure());
+    }
+
+    /// 终止性只认"外部窗口复位或换钥匙才会有不同结果"的两档；限流与 5xx 是
+    /// 瞬时信号，按终止处理会让恢复侧睡死。
+    #[test]
+    fn terminal_covers_only_quota_and_credentials() {
+        let refused = |cause| SFError::Upstream {
+            cause,
+            reason: String::new(),
+        };
+
+        assert!(refused(UpstreamFailure::QuotaExhausted).is_terminal_upstream_failure());
+        assert!(refused(UpstreamFailure::Auth).is_terminal_upstream_failure());
+
+        assert!(!refused(UpstreamFailure::RateLimited).is_terminal_upstream_failure());
+        assert!(!refused(UpstreamFailure::ServerError).is_terminal_upstream_failure());
+        assert!(!refused(UpstreamFailure::Transport).is_terminal_upstream_failure());
+        assert!(!refused(UpstreamFailure::BadRequest).is_terminal_upstream_failure());
+
+        // 没有状态码可依的失败不猜：LLM(_) 只说明上游没服务这次调用。
+        assert!(!SFError::LLM("quota exceeded".into()).is_terminal_upstream_failure());
+    }
+
+    /// 状态码到原因的翻译是纯函数，边界的取值要落在预期的档位上。
+    #[test]
+    fn status_maps_to_the_expected_cause() {
+        assert_eq!(
+            UpstreamFailure::from_status(429),
+            UpstreamFailure::RateLimited
+        );
+        assert_eq!(
+            UpstreamFailure::from_status(402),
+            UpstreamFailure::QuotaExhausted
+        );
+        assert_eq!(UpstreamFailure::from_status(401), UpstreamFailure::Auth);
+        assert_eq!(UpstreamFailure::from_status(403), UpstreamFailure::Auth);
+        assert_eq!(
+            UpstreamFailure::from_status(500),
+            UpstreamFailure::ServerError
+        );
+        assert_eq!(
+            UpstreamFailure::from_status(503),
+            UpstreamFailure::ServerError
+        );
+        assert_eq!(
+            UpstreamFailure::from_status(400),
+            UpstreamFailure::BadRequest
+        );
+        assert_eq!(
+            UpstreamFailure::from_status(422),
+            UpstreamFailure::BadRequest
+        );
+        // 没见过的码不往环境上靠。
+        assert_eq!(
+            UpstreamFailure::from_status(418),
+            UpstreamFailure::BadRequest
         );
     }
 }

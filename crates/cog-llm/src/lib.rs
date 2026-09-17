@@ -30,7 +30,7 @@ pub use observed::ObservedLlmClient;
 pub use provider::{anthropic, google, ollama, openai};
 pub use registry::ProviderRegistry;
 pub use resilience::{BackoffStrategy, ResilientProvider, RetryPolicy};
-pub use routing::{is_rate_limit_or_quota_error, RoutingProvider};
+pub use routing::RoutingProvider;
 pub use stream::{parse_sse_stream, LLMStream};
 
 pub mod plugin;
@@ -63,6 +63,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -85,6 +86,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             };
             let (stream, mut producer) = AssistantMessageEventStream::with_capacity(10);
@@ -124,6 +126,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             };
             let (stream, mut producer) = AssistantMessageEventStream::with_capacity(10);
@@ -213,6 +216,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Error,
                 error_message: Some(self.reason.clone()),
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             })
         }

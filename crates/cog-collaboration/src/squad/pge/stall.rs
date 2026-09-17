@@ -21,11 +21,7 @@
 //! being retried silently.
 
 use super::types::EvaluationResult;
-
-/// Feedback prefix marking a run stopped by stall detection. Outer loops
-/// (squad escalation) match on this prefix to skip paid retries — same
-/// convention as the terminal environment failure prefix.
-pub const DEGENERATE_LOOP_PREFIX: &str = "degenerate_loop";
+use cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX;
 
 /// 声明本次运行是退化环：带前缀的 feedback 只在构造一次，同时记一次
 /// 「已声明」。边界若把这段文本翻成别的 reason，这个分类的序列就会结构性

@@ -120,7 +120,7 @@ impl PgePipeline {
         let declared = plan
             .terminal_env_failure_reason()
             .or_else(|| generation.terminal_env_failure_reason())
-            .unwrap_or_else(|| crate::squad::pge::types::NO_ARTIFACTS_REASON.to_string());
+            .unwrap_or_else(crate::squad::pge::types::no_artifacts_reason);
         let evaluation = EvaluationResult {
             verdict: Verdict::Fail,
             // 声明这次运行按终止性环境故障处置；边界会不会把它记成同一分类，
@@ -435,7 +435,7 @@ impl PgePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX;
+    use cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX;
 
     /// Test-only mock implementing the object-level [`cog_core::Agent`] trait.
     /// All methods except [`prompt`] are no-op stubs.
@@ -1242,7 +1242,7 @@ mod tests {
 
         let feedback = &result.final_evaluation.feedback;
         assert!(
-            feedback.starts_with(crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX),
+            feedback.starts_with(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX),
             "外层按前缀识别终止性失败，实到: {feedback}"
         );
         assert!(

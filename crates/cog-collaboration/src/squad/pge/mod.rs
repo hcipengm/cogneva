@@ -12,9 +12,7 @@ pub use roundtable::{
     parse_evaluation_result, parse_generator_output, parse_planner_output, PgeRoundtable,
     PgeRoundtableConfig, PgeRoundtableResult,
 };
-pub use stall::{
-    made_progress, ProgressSignals, StallDetector, StallVerdict, DEGENERATE_LOOP_PREFIX,
-};
+pub use stall::{made_progress, ProgressSignals, StallDetector, StallVerdict};
 pub use types::{
     Artifact, Criterion, EvaluationResult, GeneratorOutput, PgeRoundtableIteration, PlannerOutput,
     TaskSpec, Verdict,

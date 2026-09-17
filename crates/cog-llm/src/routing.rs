@@ -4,7 +4,7 @@
 //! backend，自然实现"主 API 恢复后切回"。
 
 use async_trait::async_trait;
-use cog_core::{AssistantMessageEvent, Message, SFError, SFResult};
+use cog_core::{AssistantMessageEvent, Message, SFError, SFResult, UpstreamFailure};
 use futures::StreamExt;
 use std::sync::Arc;
 use tracing::warn;
@@ -12,20 +12,37 @@ use tracing::warn;
 use crate::{AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions};
 use cog_core::LlmClient as LLMProvider;
 
-/// 检测错误消息是否表示 429 或 402。
-/// 基于字符串匹配，零改动现有 provider 实现。
-pub fn is_rate_limit_or_quota_error(error_message: Option<&str>) -> bool {
-    let Some(msg) = error_message else {
-        return false;
-    };
+/// 从我们自己写出的错误文本里取回状态码。
+///
+/// 首字节之前从事件流里冒出来的 `Error` 事件不携带类型化原因——事件本身没有
+/// 放状态码的地方——而这类事件常见于"响应不是 2xx"。provider 在那种情况下写的
+/// 是固定格式 `API error (HTTP <code>)`，这里取回的是这个自有的代号，不是上游
+/// 的用词。取不到就返回 `None`，不猜。
+fn status_from_own_message(msg: &str) -> Option<u16> {
+    const MARKER: &str = "(HTTP ";
+    let start = msg.find(MARKER)? + MARKER.len();
+    let rest = &msg[start..];
+    let end = rest.find(')')?;
+    rest[..end].trim().parse().ok()
+}
+
+/// 既没有类型化原因、也取不回我们自己的代号时，退到上游惯用的措辞上认。
+///
+/// 这一条是**降级路径**，不是判据的常态：有状态码的地方一律走
+/// [`UpstreamFailure`]。认词的做法只在拿不到更硬信号时才启用，因为各家上游的
+/// 措辞既不相同也不稳定——网关返回的体里曾出现 `retry_after_seconds` 恰好含
+/// 数字而真实原因另有其物，凭文本判会把这类噪声当信号。返回的两个标志分别
+/// 对应"像限流"和"像配额"，由调用方与各自的开关配对。
+fn text_failover_flags(msg: &str) -> (bool, bool) {
     let lower = msg.to_lowercase();
-    lower.contains("429")
-        || lower.contains("402")
-        || lower.contains("rate limit")
-        || lower.contains("quota exceeded")
-        || lower.contains("payment required")
+    let rate = lower.contains("rate limit")
         || lower.contains("too many requests")
+        || lower.contains("429");
+    let quota = lower.contains("quota exceeded")
+        || lower.contains("payment required")
         || lower.contains("insufficient_quota")
+        || lower.contains("402");
+    (rate, quota)
 }
 
 /// 多后端故障转移 Provider。
@@ -58,30 +75,35 @@ impl RoutingProvider {
         }
     }
 
-    fn should_failover(&self, error_message: Option<&str>) -> bool {
-        if !self.retry_on_429 && !self.retry_on_402 {
-            return false;
+    /// 这个原因是否值得换下一个后端。
+    ///
+    /// 只有"换一个上游可能就成了"的两档才换：限流是分钟级信号，配额耗尽在
+    /// 别的端点上未必同样耗尽。鉴权被拒、请求不合法换后端没用——那是我们这一
+    /// 侧或凭证的问题，多试几个只会把同一个错误多报几遍。
+    fn allows_failover(&self, cause: UpstreamFailure) -> bool {
+        match cause {
+            UpstreamFailure::RateLimited => self.retry_on_429,
+            UpstreamFailure::QuotaExhausted => self.retry_on_402,
+            _ => false,
         }
-        let Some(msg) = error_message else {
+    }
+
+    /// 是否切换到下一个后端。
+    ///
+    /// 判据的优先序是定的：有类型化原因就只认它；没有类型、但我们自己的错误
+    /// 文本里带着状态码代号，就从代号翻出原因再判；两者都没有才退到认词。
+    fn should_failover(&self, failure: Option<UpstreamFailure>, message: Option<&str>) -> bool {
+        if let Some(cause) = failure {
+            return self.allows_failover(cause);
+        }
+        let Some(msg) = message else {
             return false;
         };
-        let lower = msg.to_lowercase();
-        if self.retry_on_429
-            && (lower.contains("429")
-                || lower.contains("rate limit")
-                || lower.contains("too many requests"))
-        {
-            return true;
+        if let Some(status) = status_from_own_message(msg) {
+            return self.allows_failover(UpstreamFailure::from_status(status));
         }
-        if self.retry_on_402
-            && (lower.contains("402")
-                || lower.contains("quota exceeded")
-                || lower.contains("payment required")
-                || lower.contains("insufficient_quota"))
-        {
-            return true;
-        }
-        false
+        let (rate, quota) = text_failover_flags(msg);
+        (rate && self.retry_on_429) || (quota && self.retry_on_402)
     }
 
     /// Wrap a backend stream so a rate-limit/quota `Error` event that arrives
@@ -125,7 +147,7 @@ impl RoutingProvider {
                     match &ev {
                         AssistantMessageEvent::Error { error, .. } => {
                             let text = error.content();
-                            if probe.should_failover(Some(&text)) && idx + 1 < attempts {
+                            if probe.should_failover(None, Some(&text)) && idx + 1 < attempts {
                                 warn!(
                                     "Backend {} stream failed pre-content ({}), failing over to backend {}",
                                     idx, text, idx + 1
@@ -205,7 +227,9 @@ impl LLMProvider for RoutingProvider {
                 Err(e) => {
                     let err_str = format!("{e}");
                     warn!("Backend {} chat_stream failed: {}", i, err_str);
-                    if self.should_failover(Some(&err_str)) && i + 1 < attempts {
+                    if self.should_failover(e.upstream_failure(), Some(&err_str))
+                        && i + 1 < attempts
+                    {
                         continue;
                     }
                     return Err(e);
@@ -243,7 +267,9 @@ impl LLMProvider for RoutingProvider {
                 Err(e) => {
                     let err_str = format!("{e}");
                     warn!("Backend {} chat_stream failed: {}", i, err_str);
-                    if self.should_failover(Some(&err_str)) && i + 1 < attempts {
+                    if self.should_failover(e.upstream_failure(), Some(&err_str))
+                        && i + 1 < attempts
+                    {
                         continue;
                     }
                     return Err(e);
@@ -276,26 +302,37 @@ impl LLMProvider for RoutingProvider {
                 obs.record_call(tokens_in, tokens_out, latency_ms);
             }
 
-            if self.should_failover(response.error_message.as_deref()) {
+            if self.should_failover(response.upstream_failure, response.error_message.as_deref()) {
                 if i + 1 < attempts {
                     warn!(
-                        "Backend {} returned rate-limit/quota error ({}), failing over to backend {}",
-                        i,
-                        response.error_message.as_deref().unwrap_or("unknown"),
-                        i + 1
+                        backend = i,
+                        cause = ?response.upstream_failure,
+                        error = response.error_message.as_deref().unwrap_or("unknown"),
+                        "Backend refused this call; failing over to the next backend"
                     );
                     continue;
                 }
-                return Err(SFError::LLM(response.error_message.unwrap_or_else(|| {
-                    "All LLM backends exhausted due to rate limits or quota errors".into()
-                })));
+                // 换无可换：把**这次失败的原始原因**带出去，而不是另造一句
+                // 笼统的话。下游据此区分该等窗口复位还是该重试，丢在这里就
+                // 只能再猜一遍文本。
+                return Err(match response.upstream_failure {
+                    Some(cause) => SFError::Upstream {
+                        cause,
+                        reason: response.error_message.unwrap_or_default(),
+                    },
+                    None => SFError::LLM(
+                        response
+                            .error_message
+                            .unwrap_or_else(|| "All LLM backends refused this call".into()),
+                    ),
+                });
             }
 
             return Ok(response);
         }
 
         Err(SFError::LLM(
-            "All LLM backends exhausted due to rate limits or quota errors".into(),
+            "All LLM backends exhausted without a typed refusal".into(),
         ))
     }
 
@@ -343,6 +380,7 @@ mod tests {
                     StopReason::Stop
                 },
                 error_message: self.error_msg.clone(),
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -369,6 +407,7 @@ mod tests {
                     StopReason::Stop
                 },
                 error_message: self.error_msg.clone(),
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             };
             let (stream, mut producer) = AssistantMessageEventStream::with_capacity(10);
@@ -549,15 +588,66 @@ mod tests {
         assert_eq!(text, "hello from primary");
     }
 
+    /// 判据的优先序：类型化原因在场时，文本说什么都不改变结论。上游把配额写成
+    /// 不带惯用词的措辞时，靠认词认不出，靠状态码才认得出。
     #[test]
-    fn test_is_rate_limit_or_quota_error() {
-        assert!(is_rate_limit_or_quota_error(Some("429 rate limit")));
-        assert!(is_rate_limit_or_quota_error(Some("402 payment required")));
-        assert!(is_rate_limit_or_quota_error(Some("quota exceeded")));
-        assert!(!is_rate_limit_or_quota_error(Some(
-            "500 internal server error"
-        )));
-        assert!(!is_rate_limit_or_quota_error(None));
+    fn typed_cause_decides_even_when_the_text_says_nothing() {
+        let router = RoutingProvider::new(Vec::new(), 3, true, true);
+
+        assert!(router.should_failover(Some(UpstreamFailure::QuotaExhausted), None));
+        assert!(router.should_failover(
+            Some(UpstreamFailure::RateLimited),
+            Some("temporarily out of capacity")
+        ));
+
+        // 类型说"不该换"，文本再怎么像限流也不换。
+        assert!(
+            !router.should_failover(Some(UpstreamFailure::Auth), Some("429 rate limit exceeded"))
+        );
+        assert!(!router.should_failover(Some(UpstreamFailure::ServerError), Some("quota exceeded")));
+    }
+
+    /// 没有类型时先认我们自己的状态码代号，再退到认词。
+    #[test]
+    fn own_status_marker_beats_vendor_wording() {
+        let router = RoutingProvider::new(Vec::new(), 3, true, true);
+
+        // 代号是 503（服务端故障）→ 不换，哪怕体里写着 "rate limit"。
+        assert!(
+            !router.should_failover(None, Some("API error (HTTP 503): upstream said rate limit"))
+        );
+        assert!(router.should_failover(None, Some("API error (HTTP 429): slow down")));
+        assert!(router.should_failover(None, Some("API error (HTTP 402): pay up")));
+    }
+
+    /// 两个开关各自管一档；关掉的那档不换后端。
+    #[test]
+    fn each_switch_gates_its_own_cause() {
+        let only_429 = RoutingProvider::new(Vec::new(), 3, true, false);
+        assert!(only_429.should_failover(Some(UpstreamFailure::RateLimited), None));
+        assert!(!only_429.should_failover(Some(UpstreamFailure::QuotaExhausted), None));
+
+        let only_402 = RoutingProvider::new(Vec::new(), 3, false, true);
+        assert!(!only_402.should_failover(Some(UpstreamFailure::RateLimited), None));
+        assert!(only_402.should_failover(Some(UpstreamFailure::QuotaExhausted), None));
+    }
+
+    /// 状态码代号的解析只看我们自己写的那种固定形状，取不到就不认。
+    #[test]
+    fn status_marker_parsing_is_exact() {
+        assert_eq!(
+            status_from_own_message("API error (HTTP 429): x"),
+            Some(429)
+        );
+        assert_eq!(
+            status_from_own_message("API error (HTTP 503): x"),
+            Some(503)
+        );
+        assert_eq!(status_from_own_message("429 rate limit"), None);
+        assert_eq!(
+            status_from_own_message("HTTP error: connection reset"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -688,6 +778,7 @@ mod tests {
                     usage: crate::Usage::default(),
                     stop_reason: StopReason::Stop,
                     error_message: None,
+                    upstream_failure: None,
                     timestamp: chrono::Utc::now(),
                 };
                 producer.end(response);

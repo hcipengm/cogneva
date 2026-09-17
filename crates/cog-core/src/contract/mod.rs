@@ -19,6 +19,7 @@ pub mod net;
 pub mod notification;
 pub mod observability;
 pub mod orchestrator;
+pub mod outcome;
 pub mod plugin;
 pub mod promotion;
 pub mod protocol;

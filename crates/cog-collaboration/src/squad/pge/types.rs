@@ -1,3 +1,4 @@
+use cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX;
 use serde::{Deserialize, Serialize};
 
 /// Specification of a single atomic task produced by the Planner.
@@ -77,16 +78,19 @@ pub struct GeneratorOutput {
     pub artifacts: Vec<Artifact>,
 }
 
-/// Prefix marking a run whose failure cause is deterministic (environment or
-/// upstream protocol), so retry/upgrade loops can stop instead of re-paying
-/// for attempts that must fail again.
-pub const TERMINAL_ENV_FAILURE_PREFIX: &str = "terminal_env_failure";
-
 /// Failure reason for a run that produced nothing and carried no cause of its
 /// own. One definition, so every producer of this feedback — pipeline, Ralph,
 /// roundtable escalation — reports the identical string.
-pub const NO_ARTIFACTS_REASON: &str =
-    "terminal_env_failure: generator produced no artifacts (environment/protocol failure)";
+///
+/// Composed from the shared prefix rather than spelled out: a literal copy
+/// would keep compiling after the prefix changes and quietly stop being
+/// classified, which reads downstream as "the environment stopped failing"
+/// while the failures keep happening.
+pub fn no_artifacts_reason() -> String {
+    format!(
+        "{TERMINAL_ENV_FAILURE_PREFIX}: generator produced no artifacts (environment/protocol failure)"
+    )
+}
 
 impl GeneratorOutput {
     /// Structural defect of this run's change artifact, if any.
@@ -139,7 +143,7 @@ impl GeneratorOutput {
     /// Failure reason in the wire format outer loops match on, carrying the
     /// generator's own error when it has one. A prompt that never reached the
     /// upstream reports that failure; only a run that produced nothing without
-    /// a cause of its own falls back to [`NO_ARTIFACTS_REASON`]. Reporting the
+    /// a cause of its own falls back to [`no_artifacts_reason`]. Reporting the
     /// generic label for an upstream outage blames a generator defect that does
     /// not exist and sends the learning chain after it. `None` when this is not
     /// a terminal environment failure.
@@ -149,7 +153,7 @@ impl GeneratorOutput {
         }
         let detail = match &self.content {
             serde_json::Value::String(s) if !s.trim().is_empty() => s.trim(),
-            _ => return Some(NO_ARTIFACTS_REASON.to_string()),
+            _ => return Some(no_artifacts_reason()),
         };
         Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: {detail}"))
     }
@@ -521,7 +525,7 @@ mod tests {
             reason.contains("upstream unavailable"),
             "the real cause must survive into the reason, got: {reason}"
         );
-        assert_ne!(reason, NO_ARTIFACTS_REASON);
+        assert_ne!(reason, no_artifacts_reason());
     }
 
     #[test]
@@ -531,8 +535,8 @@ mod tests {
             artifacts: Vec::new(),
         };
         assert_eq!(
-            output.terminal_env_failure_reason().as_deref(),
-            Some(NO_ARTIFACTS_REASON)
+            output.terminal_env_failure_reason(),
+            Some(no_artifacts_reason())
         );
     }
 

@@ -471,9 +471,7 @@ impl RalphLoop {
                     pge_result
                         .final_generation
                         .terminal_env_failure_reason()
-                        .unwrap_or_else(|| {
-                            crate::squad::pge::types::NO_ARTIFACTS_REASON.to_string()
-                        }),
+                        .unwrap_or_else(crate::squad::pge::types::no_artifacts_reason),
                 ))
             } else {
                 self.analyze_failure(&pge_result.final_evaluation, &self.history)
@@ -576,9 +574,7 @@ impl RalphLoop {
                     rt_result
                         .final_generation
                         .terminal_env_failure_reason()
-                        .unwrap_or_else(|| {
-                            crate::squad::pge::types::NO_ARTIFACTS_REASON.to_string()
-                        }),
+                        .unwrap_or_else(crate::squad::pge::types::no_artifacts_reason),
                 ))
             } else {
                 Self::analyze_roundtable_failure(&rt_result, &self.history)
@@ -648,7 +644,7 @@ impl RalphLoop {
         // classified, non-retryable, no semantic analysis needed.
         if evaluation
             .feedback
-            .starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX)
+            .starts_with(cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX)
         {
             return FailureAnalysis::Unrecoverable(evaluation.feedback.clone());
         }
@@ -829,7 +825,7 @@ Respond with **only** a JSON object matching this schema:\n\
         // 退化辩论环在 feedback 上留了标记，和 Pipeline 侧同一条判据。
         // 若这里只看 verdict 再回一个常量 reason，标记就被丢掉：真因（停滞）
         // 会被归成兜底的 unrecoverable，下游按前缀做的不可重试判定也失配。
-        if feedback.starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX) {
+        if feedback.starts_with(cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX) {
             return FailureAnalysis::Unrecoverable(feedback.clone());
         }
 
@@ -1440,7 +1436,7 @@ mod tests {
 
     #[test]
     fn a_degenerate_roundtable_keeps_its_class_instead_of_falling_back() {
-        use crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX;
+        use cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX;
 
         let result = roundtable_result(
             Verdict::Fail,
@@ -1486,7 +1482,7 @@ mod tests {
 
     #[tokio::test]
     async fn unrecoverable_stop_is_counted_on_the_metric_plane() {
-        use crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX;
+        use cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX;
         use cog_core::Observable;
 
         let ralph = RalphLoop::with_config(RalphLoopConfig {
@@ -1565,6 +1561,7 @@ mod tests {
                 usage: cog_core::Usage::default(),
                 stop_reason: cog_core::StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             };
             producer.end(response);
@@ -1596,6 +1593,7 @@ mod tests {
                 usage: cog_core::Usage::default(),
                 stop_reason: cog_core::StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -2172,7 +2170,7 @@ mod tests {
         match verdict {
             RalphVerdict::Unrecoverable { reason, .. } => {
                 assert!(
-                    reason.starts_with(crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX),
+                    reason.starts_with(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX),
                     "the environment failure must be reported, not the stall: {reason}"
                 );
                 assert!(

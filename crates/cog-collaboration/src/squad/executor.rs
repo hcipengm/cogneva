@@ -650,8 +650,8 @@ impl SquadExecutor {
         let is_terminal = matches!(
             &verdict,
             RalphVerdict::Unrecoverable { reason, .. }
-                if reason.starts_with(crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX)
-                    || reason.starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX)
+                if reason.starts_with(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX)
+                    || reason.starts_with(cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX)
         );
         let can_upgrade = squad.config.max_retries > 0 && !is_terminal;
         let should_upgrade = can_upgrade

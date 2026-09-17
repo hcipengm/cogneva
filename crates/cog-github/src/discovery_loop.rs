@@ -18,7 +18,7 @@ use cog_core::{
 
 use crate::conversation::{ConversationState, IssueConversation};
 use crate::discovery::IssueDiscovery;
-use crate::error::Result;
+use crate::error::{CogGitHubError, Result};
 use crate::outcome_recorder::OutcomeRecorder;
 use crate::provider::{CiFailureEvent, CodePlatformProvider, PlatformIssue};
 use crate::triage::{IssueTriage, TriageDecision};
@@ -48,30 +48,27 @@ const CROSS_VALIDATE_TASK_TIMEOUT_SECS: u64 = 3600;
 /// lag while keeping probe cost at one failed call per intent per window.
 const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 
-/// Markers of deterministic (terminal) upstream failures: retrying the same
+/// Whether a failed processing attempt is deterministic: retrying the same
 /// intent next tick cannot succeed until an external window resets
-/// (quota/billing) or credentials/config change (auth/protocol). Rate-limit
-/// errors are deliberately NOT included — those are transient per-minute
-/// signals and must keep the normal next-tick retry.
-fn is_terminal_upstream_failure(err: &str) -> bool {
-    const MARKERS: [&str; 11] = [
-        // PGE/generator classified environment-protocol failure (wire marker).
-        "terminal_env_failure",
-        // Provider quota/billing terminations observed in production.
-        "access_terminated_error",
-        "usage limit",
-        "insufficient_balance",
-        "insufficient balance",
-        "quota exceeded",
-        // Credential failures: retrying cannot fix them.
-        "invalid_api_key",
-        "invalid api key",
-        "incorrect api key",
-        "authentication_error",
-        "authentication error",
-    ];
-    let t = err.to_ascii_lowercase();
-    MARKERS.iter().any(|m| t.contains(m))
+/// (quota/billing) or credentials change (auth/protocol).
+///
+/// The type decides first, because the type is what the transport observed
+/// (an HTTP status) and it does not change with wording. Text is consulted for
+/// exactly one thing: our own in-band wire marker, which a producer upstream
+/// of us wrote to declare the run an environment/protocol failure. The
+/// upstream's own prose is never matched — the same condition is spelled
+/// differently per provider and per locale, so prose matching both records one
+/// cause under several names and goes blind the day an upstream rewords.
+///
+/// Rate limits are excluded by construction:
+/// [`cog_core::SFError::is_terminal_upstream_failure`] only credits quota and
+/// credentials, and per-minute signals must keep the normal next-tick retry.
+fn is_terminal_failure(err: &CogGitHubError) -> bool {
+    if err.is_terminal_upstream_failure() {
+        return true;
+    }
+    err.to_string()
+        .contains(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX)
 }
 
 /// Exponential backoff for consecutive terminal failures: first failure
@@ -553,10 +550,10 @@ impl GitHubDiscoveryLoop {
         key: &str,
         label: &str,
         number: u64,
-        err: &dyn std::fmt::Display,
+        err: &CogGitHubError,
     ) {
         let text = err.to_string();
-        if !is_terminal_upstream_failure(&text) {
+        if !is_terminal_failure(err) {
             tracing::warn!(
                 label,
                 number,
@@ -952,10 +949,7 @@ impl GitHubDiscoveryLoop {
             }),
         );
 
-        let task_ids = orchestrator
-            .submit_goal_auto(&goal, vec![task])
-            .await
-            .map_err(|e| crate::error::CogGitHubError::Provider(e.to_string()))?;
+        let task_ids = orchestrator.submit_goal_auto(&goal, vec![task]).await?;
         tracing::info!(
             run_id = event.run_id,
             workflow = %event.workflow_name,
@@ -1220,10 +1214,7 @@ impl GitHubDiscoveryLoop {
         });
         task.timeout_seconds = ASSESS_TASK_TIMEOUT_SECS;
 
-        let ids = orchestrator
-            .submit_goal_auto(&goal, vec![task])
-            .await
-            .map_err(|e| crate::error::CogGitHubError::Provider(e.to_string()))?;
+        let ids = orchestrator.submit_goal_auto(&goal, vec![task]).await?;
         let id = ids.into_iter().next().unwrap_or(task_id);
 
         let deadline = Instant::now() + Duration::from_secs(ASSESS_WAIT_TIMEOUT_SECS);
@@ -1445,10 +1436,7 @@ impl GitHubDiscoveryLoop {
             }),
         );
 
-        let task_ids = orchestrator
-            .submit_goal_auto(&goal, vec![task])
-            .await
-            .map_err(|e| crate::error::CogGitHubError::Provider(e.to_string()))?;
+        let task_ids = orchestrator.submit_goal_auto(&goal, vec![task]).await?;
         tracing::info!(
             issue = issue.number,
             tasks = ?task_ids,
@@ -1543,10 +1531,7 @@ impl GitHubDiscoveryLoop {
             }),
         );
 
-        let task_ids = orchestrator
-            .submit_goal_auto(&goal, vec![task])
-            .await
-            .map_err(|e| crate::error::CogGitHubError::Provider(e.to_string()))?;
+        let task_ids = orchestrator.submit_goal_auto(&goal, vec![task]).await?;
         tracing::info!(
             pr = pr.number,
             tasks = ?task_ids,
@@ -1795,34 +1780,73 @@ mod tests {
         CiJobLog, CreatePullRequest, PlatformComment, PlatformPullRequest, PullRequestDetail,
     };
     use chrono::Utc;
+    use cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX;
+    use cog_core::{SFError, UpstreamFailure};
     use std::sync::Mutex;
 
+    /// The decision reads the cause the transport observed, not how the
+    /// provider spelled it. A quota refusal is terminal because of its 402,
+    /// whatever the body says; the same words on an untyped error conclude
+    /// nothing.
     #[test]
-    fn terminal_failure_markers_match_production_payloads() {
-        // Real provider quota payload observed in production.
-        let quota = r#"Agent execution error: LLM stream error: API error: {"error":{"message":"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends.","type":"access_terminated_error"}}"#;
-        assert!(is_terminal_upstream_failure(quota));
-        // Wrapped decompose failure as surfaced to the discovery loop.
-        let env = "provider error: Agent execution error: Decomposition failed: \
-                   terminal_env_failure: generator produced no artifacts \
-                   (environment/protocol failure)";
-        assert!(is_terminal_upstream_failure(env));
-        assert!(is_terminal_upstream_failure("HTTP 429: quota exceeded"));
-        assert!(is_terminal_upstream_failure(
-            "invalid_api_key: check credentials"
-        ));
-        assert!(is_terminal_upstream_failure("Error: insufficient balance"));
+    fn terminal_follows_the_type_not_the_provider_wording() {
+        let refused = |cause| {
+            CogGitHubError::Upstream(SFError::Upstream {
+                cause,
+                reason: "prose the provider chose".into(),
+            })
+        };
+
+        assert!(refused(UpstreamFailure::QuotaExhausted).is_terminal_upstream_failure());
+        assert!(refused(UpstreamFailure::Auth).is_terminal_upstream_failure());
+
+        // Rate limits and server/transport faults are transient signals: they
+        // must keep the normal next-tick retry.
+        assert!(!refused(UpstreamFailure::RateLimited).is_terminal_upstream_failure());
+        assert!(!refused(UpstreamFailure::ServerError).is_terminal_upstream_failure());
+        assert!(!refused(UpstreamFailure::Transport).is_terminal_upstream_failure());
+        assert!(!refused(UpstreamFailure::BadRequest).is_terminal_upstream_failure());
+
+        // No status was observed, so nothing about determinism is known —
+        // even when the body says "quota".
+        assert!(
+            !CogGitHubError::Upstream(SFError::LLM("weekly usage limit reached".into()))
+                .is_terminal_upstream_failure()
+        );
     }
 
+    /// The one text the decision may read is our own in-band wire marker: a
+    /// producer upstream of us declared the run a deterministic
+    /// environment/protocol failure. The upstream's prose is never read.
     #[test]
-    fn transient_failures_are_not_terminal() {
-        // Rate limits are per-minute transient signals: must keep next-tick retry.
-        assert!(!is_terminal_upstream_failure(
-            "rate_limit_exceeded: retry later"
+    fn only_our_own_wire_marker_is_read_from_text() {
+        let wired = CogGitHubError::Provider(format!(
+            "provider error: Decomposition failed: \
+             {TERMINAL_ENV_FAILURE_PREFIX}: generator produced no artifacts"
         ));
-        assert!(!is_terminal_upstream_failure("connection reset by peer"));
-        assert!(!is_terminal_upstream_failure("task timed out after 120s"));
-        assert!(!is_terminal_upstream_failure(""));
+        assert!(is_terminal_failure(&wired));
+
+        // Real provider quota payload observed in production: alarming prose,
+        // but no type and no marker of ours, so no backoff window is opened
+        // from it.
+        let prose = CogGitHubError::Provider(
+            r#"Agent execution error: LLM stream error: API error: {"error":{"message":"You've reached your weekly (7-day) usage limit.","type":"access_terminated_error"}}"#
+                .into(),
+        );
+        assert!(!is_terminal_failure(&prose));
+
+        assert!(!is_terminal_failure(&CogGitHubError::Provider(
+            "rate_limit_exceeded: retry later".into()
+        )));
+        assert!(!is_terminal_failure(&CogGitHubError::Provider(
+            "connection reset by peer".into()
+        )));
+        assert!(!is_terminal_failure(&CogGitHubError::Provider(
+            "task timed out after 120s".into()
+        )));
+        assert!(!is_terminal_failure(&CogGitHubError::Provider(
+            String::new()
+        )));
     }
 
     #[test]
@@ -1855,14 +1879,25 @@ mod tests {
             "pr:54",
             "pull request",
             54,
-            &"Decomposition failed: terminal_env_failure: generator produced no artifacts",
+            &CogGitHubError::Upstream(SFError::Upstream {
+                cause: UpstreamFailure::QuotaExhausted,
+                reason: "weekly usage limit reached".into(),
+            }),
         );
         assert!(loop_.in_terminal_backoff("pr:54"));
         assert!(!loop_.in_terminal_backoff("pr:55"));
         assert_eq!(loop_.terminal_backoff["pr:54"].consecutive, 1);
 
         // A second terminal failure grows the streak (window doubled).
-        loop_.note_processing_failure("pr:54", "pull request", 54, &"access_terminated_error");
+        loop_.note_processing_failure(
+            "pr:54",
+            "pull request",
+            54,
+            &CogGitHubError::Upstream(SFError::Upstream {
+                cause: UpstreamFailure::Auth,
+                reason: "invalid api key".into(),
+            }),
+        );
         assert_eq!(loop_.terminal_backoff["pr:54"].consecutive, 2);
 
         // Success clears the window — recovery needs no manual reset.
@@ -1870,7 +1905,12 @@ mod tests {
         assert!(!loop_.in_terminal_backoff("pr:54"));
 
         // Transient failures keep the historical retry-every-round behavior.
-        loop_.note_processing_failure("issue:7", "issue", 7, &"connection reset by peer");
+        loop_.note_processing_failure(
+            "issue:7",
+            "issue",
+            7,
+            &CogGitHubError::Provider("connection reset by peer".into()),
+        );
         assert!(!loop_.in_terminal_backoff("issue:7"));
     }
 

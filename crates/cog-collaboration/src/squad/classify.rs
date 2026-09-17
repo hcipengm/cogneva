@@ -13,8 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX;
-use crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX;
+use cog_core::contract::outcome::{DEGENERATE_LOOP_PREFIX, TERMINAL_ENV_FAILURE_PREFIX};
 
 /// 终止性环境/协议故障的分类标签，与 [`TERMINAL_ENV_FAILURE_PREFIX`] 配对。
 pub const TERMINAL_ENV_FAILURE_CLASS: &str = "terminal_env_failure";
@@ -76,14 +75,13 @@ pub fn unreachable_classes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX;
-    use crate::squad::pge::types::{NO_ARTIFACTS_REASON, TERMINAL_ENV_FAILURE_PREFIX};
+    use crate::squad::pge::types::no_artifacts_reason;
 
     #[test]
     fn classify_follows_the_shared_wire_prefixes() {
         // The exact reason the pipeline and Ralph both produce, and the exact
         // reason the squad executor keys off to stop upgrading strategies.
-        assert_eq!(classify(NO_ARTIFACTS_REASON), TERMINAL_ENV_FAILURE_CLASS);
+        assert_eq!(classify(&no_artifacts_reason()), TERMINAL_ENV_FAILURE_CLASS);
         assert_eq!(
             classify(&format!(
                 "{TERMINAL_ENV_FAILURE_PREFIX}: generator prompt failed: HTTP 503"

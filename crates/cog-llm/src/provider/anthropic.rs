@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use cog_core::{AssistantMessageEvent, ContentBlock, Message, SFError, SFResult, StopReason};
+use cog_core::{
+    AssistantMessageEvent, ContentBlock, Message, SFError, SFResult, StopReason, UpstreamFailure,
+};
 use futures::{AsyncBufReadExt, StreamExt, TryStreamExt};
 use serde_json::json;
 use std::sync::Arc;
@@ -240,6 +242,7 @@ impl LLMProvider for AnthropicProvider {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             };
 
@@ -291,9 +294,13 @@ impl LLMProvider for AnthropicProvider {
             };
 
             if !http_response.is_success() {
+                let status = http_response.status;
                 let text = http_response.drain_text().await;
                 response.stop_reason = StopReason::Error;
-                response.error_message = Some(format!("API error: {}", text));
+                // 状态码是这次失败的**类型**，文本只是它的措辞。留在这里，
+                // 下游的故障转移与退避就不必再去猜上游用了哪些词。
+                response.upstream_failure = Some(UpstreamFailure::from_status(status));
+                response.error_message = Some(format!("API error (HTTP {status}): {text}"));
                 if producer
                     .push(AssistantMessageEvent::Error {
                         reason: StopReason::Error,

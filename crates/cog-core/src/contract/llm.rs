@@ -123,6 +123,80 @@ pub struct CompleteOptions {
     pub api_key: Option<String>,
 }
 
+/// Why an upstream call was refused, taken from the transport signal (an HTTP
+/// status) rather than from the provider's own prose.
+///
+/// Every consumer that has to decide something about a failure — failover,
+/// per-intent backoff, pausing — reads this instead of pattern-matching the
+/// error text. Matching on text is how a quota outage gets recorded as a
+/// content defect: the words differ per upstream and per locale, while the
+/// status code does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamFailure {
+    /// The upstream asked us to slow down. Retrying after the advertised delay
+    /// can succeed on its own.
+    RateLimited,
+    /// The allowance is spent or payment is required. No retry helps until an
+    /// external window resets or billing changes.
+    QuotaExhausted,
+    /// The upstream rejected our credentials. No retry helps until the key
+    /// changes.
+    Auth,
+    /// The upstream itself faulted. Transient by nature.
+    ServerError,
+    /// The upstream rejected the request as malformed. This is our request
+    /// being wrong, not the environment — it must never be reported as an
+    /// environment failure.
+    BadRequest,
+    /// No HTTP status was obtained at all (connection, DNS, timeout).
+    Transport,
+}
+
+impl UpstreamFailure {
+    /// Translate a status code into the cause. Codes outside the recognised
+    /// set are treated as a request-side fault, which keeps an unknown
+    /// condition from being credited to the environment.
+    pub fn from_status(status: u16) -> Self {
+        match status {
+            429 => Self::RateLimited,
+            402 => Self::QuotaExhausted,
+            401 | 403 => Self::Auth,
+            400 | 404 | 405 | 415 | 422 => Self::BadRequest,
+            500..=599 => Self::ServerError,
+            _ => Self::BadRequest,
+        }
+    }
+
+    /// Whether re-issuing the identical request could succeed with no external
+    /// change. Quota and credentials only move when a window resets or a key is
+    /// replaced, so retrying those on a timer buys nothing.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::QuotaExhausted | Self::Auth)
+    }
+
+    /// Whether the environment failed to serve us, as opposed to the request
+    /// being malformed. A malformed request is a defect on our side and must be
+    /// reported as one.
+    pub fn is_environment_failure(self) -> bool {
+        !matches!(self, Self::BadRequest)
+    }
+}
+
+impl std::fmt::Display for UpstreamFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::Auth => "auth_rejected",
+            Self::ServerError => "server_error",
+            Self::BadRequest => "bad_request",
+            Self::Transport => "transport",
+        };
+        f.write_str(name)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatResponse {
     pub content: Vec<ContentBlock>,
@@ -133,6 +207,11 @@ pub struct ChatResponse {
     pub usage: Usage,
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
+    /// Typed cause of [`Self::error_message`], when the transport supplied a
+    /// signal to derive it from. `None` means the failure was described in
+    /// prose only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_failure: Option<UpstreamFailure>,
     pub timestamp: DateTime<chrono::Utc>,
 }
 

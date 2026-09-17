@@ -74,6 +74,7 @@ impl LLMProvider for MockProvider {
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
+            upstream_failure: None,
             timestamp: chrono::Utc::now(),
         })
     }
@@ -98,6 +99,7 @@ impl LLMProvider for MockProvider {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                upstream_failure: None,
                 timestamp: chrono::Utc::now(),
             };
 
