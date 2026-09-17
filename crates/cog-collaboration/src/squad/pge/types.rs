@@ -27,6 +27,39 @@ pub struct PlannerOutput {
     pub acceptance_criteria: Vec<String>,
 }
 
+impl PlannerOutput {
+    /// True when the planner's prompt never reached its upstream, so the empty
+    /// plan it reports is the transport failing rather than the planner
+    /// deciding there is nothing to do. Both look identical to every downstream
+    /// consumer — an empty plan is a valid plan — so the cause has to travel
+    /// in-band.
+    pub fn is_terminal_env_failure(&self) -> bool {
+        match &self.plan {
+            serde_json::Value::String(s) => {
+                let t = s.to_ascii_lowercase();
+                t.contains("environment_error") || t.contains("tool_pipeline_broken")
+            }
+            _ => false,
+        }
+    }
+
+    /// Failure reason in the wire format outer loops match on, carrying the
+    /// planner's own error. `None` when the plan was actually produced.
+    pub fn terminal_env_failure_reason(&self) -> Option<String> {
+        if !self.is_terminal_env_failure() {
+            return None;
+        }
+        match &self.plan {
+            serde_json::Value::String(s) if !s.trim().is_empty() => {
+                Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: {}", s.trim()))
+            }
+            _ => Some(format!(
+                "{TERMINAL_ENV_FAILURE_PREFIX}: planner produced no plan (environment/protocol failure)"
+            )),
+        }
+    }
+}
+
 /// A named artifact produced by the Generator.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct Artifact {
@@ -311,6 +344,37 @@ mod tests {
         let value = serde_json::to_value(&output).unwrap();
         let back: PlannerOutput = serde_json::from_value(value).unwrap();
         assert_eq!(back.acceptance_criteria, output.acceptance_criteria);
+    }
+
+    /// 一个真计划（哪怕内容为空）不是环境失败：空计划是合法计划，把它判成
+    /// 环境故障会让正常的"无事可做"也终止整条链。
+    #[test]
+    fn an_empty_but_real_plan_is_not_an_environment_failure() {
+        let output = PlannerOutput {
+            summary: "nothing to decompose".into(),
+            plan: serde_json::json!({}),
+            sub_tasks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+        };
+        assert!(!output.is_terminal_env_failure());
+        assert!(output.terminal_env_failure_reason().is_none());
+    }
+
+    /// 传输失败要能被识别成终止性环境失败，并且把真因带出去。
+    #[test]
+    fn a_plan_that_never_reached_its_upstream_carries_the_real_cause() {
+        let output = PlannerOutput {
+            summary: "Planner prompt did not reach its upstream: HTTP 503".into(),
+            plan: serde_json::Value::String(
+                "environment_error: HTTP 503 upstream unavailable".into(),
+            ),
+            sub_tasks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+        };
+        assert!(output.is_terminal_env_failure());
+        let reason = output.terminal_env_failure_reason().unwrap();
+        assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
+        assert!(reason.contains("HTTP 503 upstream unavailable"));
     }
 
     fn self_evolution_task() -> cog_core::Task {

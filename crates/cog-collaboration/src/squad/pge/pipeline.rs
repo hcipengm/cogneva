@@ -115,10 +115,13 @@ impl PgePipeline {
         generation: GeneratorOutput,
         mut history: Vec<PgePipelineAttempt>,
     ) -> PgePipelineResult {
+        // 计划侧的原因优先：本轮 planner 都没到上游时，拿生成侧兜底文案会把
+        // 责任记在一个从未被调用过的生成器头上。
         let evaluation = EvaluationResult {
             verdict: Verdict::Fail,
-            feedback: generation
+            feedback: plan
                 .terminal_env_failure_reason()
+                .or_else(|| generation.terminal_env_failure_reason())
                 .unwrap_or_else(|| crate::squad::pge::types::NO_ARTIFACTS_REASON.to_string()),
             score: Some(0),
             criteria: Vec::new(),
@@ -169,6 +172,21 @@ impl PgePipeline {
                     None,
                 )
                 .await;
+
+            // 计划侧的确定性环境失败：planner 的 prompt 没到上游，重试必然同样
+            // 失败。在这里收口，既不白花一次生成，也不把一个空计划当成正常计划
+            // 一路送进评估。
+            if plan.is_terminal_env_failure() {
+                tracing::warn!(
+                    attempt,
+                    "Planner reported terminal environment failure; aborting pipeline without generation"
+                );
+                let generation = GeneratorOutput {
+                    content: serde_json::Value::Null,
+                    artifacts: Vec::new(),
+                };
+                return Self::terminal_result(attempt, plan, generation, history);
+            }
 
             // Stage 2: Generator (initial attempt).
             let prev_eval_json = last_evaluation
@@ -1090,5 +1108,146 @@ mod tests {
                 .map(|r| r["feedback"].as_str().unwrap_or("")),
             Some("reviewer agrees")
         );
+    }
+
+    /// Agent whose prompt never reaches an upstream.
+    struct FailingAgent;
+
+    #[async_trait::async_trait]
+    impl cog_core::Agent for FailingAgent {
+        async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+            Err(cog_core::SFError::LLM(
+                "HTTP 503 upstream unavailable".into(),
+            ))
+        }
+        async fn start(&self) {}
+        async fn snapshot(
+            &self,
+            _task_id: String,
+        ) -> cog_core::SFResult<cog_core::AgentCheckpoint> {
+            Ok(cog_core::AgentCheckpoint {
+                checkpoint_id: String::new(),
+                task_id: String::new(),
+                agent_state: serde_json::Value::Null,
+                context_window: Vec::new(),
+                event_offset: 0,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+        async fn restore(&self, _snapshot: &cog_core::AgentCheckpoint) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn continue_(
+            &self,
+            _input: serde_json::Value,
+        ) -> cog_core::SFResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn steer(&self, _instruction: String) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn abort(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn reset(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
+            Ok(cog_core::AgentState::Idle)
+        }
+        async fn wait_for_idle(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn restore_from_id(&self, _checkpoint_id: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(1);
+            producer.end(cog_core::ChatResponse::default());
+            Ok(stream)
+        }
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            self.chat_stream(&[], &cog_core::ChatOptions::default())
+                .await
+        }
+        async fn read_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+        ) -> cog_core::SFResult<Option<String>> {
+            Ok(None)
+        }
+        async fn write_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<cog_core::AgentEvent> {
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            rx
+        }
+        async fn receive_message(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 计划侧的上游故障必须终止本次运行，并且说出真因。若 planner 把失败吞成
+    /// 一个空计划，这里会看到一次成功的生成和一次对空计划的评估——一次传输故障
+    /// 被静默降级成正常流程，外层也拿不到终止性标记。
+    #[tokio::test]
+    async fn a_planner_that_never_reached_its_upstream_ends_the_run_and_says_why() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 3,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(std::sync::Arc::new(FailingAgent));
+        // 生成器若被调用会回一个可辨认的内容，用它证明这轮根本没走到生成。
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"content": "SHOULD_NOT_RUN", "artifacts": []}),
+        }));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "", "criteria": []}),
+        }));
+
+        let task = test_task("decompose a goal");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        let feedback = &result.final_evaluation.feedback;
+        assert!(
+            feedback.starts_with(crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX),
+            "外层按前缀识别终止性失败，实到: {feedback}"
+        );
+        assert!(
+            feedback.contains("HTTP 503 upstream unavailable"),
+            "反馈必须指向真实原因，实到: {feedback}"
+        );
+        assert_eq!(
+            result.final_generation.content,
+            serde_json::Value::Null,
+            "计划侧已经失败，不该再为同一个上游买一次生成"
+        );
+        assert_eq!(result.attempts, 1, "环境类失败不该被重试");
     }
 }

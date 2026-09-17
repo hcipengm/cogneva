@@ -202,25 +202,34 @@ impl PlannerActor {
             }
             Err(e) => {
                 tracing::warn!("Planner prompt failed: {}", e);
+                // 没到上游的 prompt 不是 planner 判断"无事可做"。空计划在下游
+                // 与真计划完全同形，吞掉错误就等于把一次传输失败静默降级成一个
+                // 合法的空任务集，整条链照常往下跑。把真因带在 content 里：线格
+                // 上的标记让外层把它认成终止性环境失败，反馈与学习链指向真实
+                // 原因，而不是一个根本不存在的 planner 缺陷。
                 PlannerOutput {
-                    summary: format!("Fallback plan for: {}", goal),
-                    plan: serde_json::json!({}),
+                    summary: format!("Planner prompt did not reach its upstream: {e}"),
+                    plan: serde_json::Value::String(format!("environment_error: {e}")),
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
                 }
             }
         };
+        // 上游已经失败时不能再走自审：那会为同一个不可用的上游再买一次调用，
+        // 而且改写的输出会把上面带下来的真因覆盖掉，降级重新变得无声。
         let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
-        if let Some(revised) = crate::actors::maybe_self_review(
-            self.agent.as_ref(),
-            &self.self_review,
-            &output_str,
-            "planner",
-        )
-        .await
-        {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&revised) {
-                output = crate::squad::pge::parse_planner_output(&value, goal);
+        if !output.is_terminal_env_failure() {
+            if let Some(revised) = crate::actors::maybe_self_review(
+                self.agent.as_ref(),
+                &self.self_review,
+                &output_str,
+                "planner",
+            )
+            .await
+            {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&revised) {
+                    output = crate::squad::pge::parse_planner_output(&value, goal);
+                }
             }
         }
         output
