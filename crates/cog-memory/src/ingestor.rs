@@ -279,7 +279,12 @@ impl PullGate {
             let s = self.state.lock().unwrap();
             if let Some(at) = s.pool_checked_at {
                 if now.duration_since(at) < Duration::from_secs(self.check_secs) {
-                    return s.pool_until.filter(|t| *t > now).map(|t| t - now);
+                    if let Some(until) = s.pool_until.filter(|t| *t > now) {
+                        return Some(until - now);
+                    }
+                    // 缓存放算出的暂停时刻已到，不等于"池好了"——它只说明该
+                    // 重新判断了。就此返回 None（= 可拉取）会让闸门在上一次
+                    // 暂停窗到期的瞬间开一条缝，恰好把不该花的尝试放进去。
                 }
             }
         }
@@ -303,10 +308,17 @@ impl PullGate {
     /// 快照给出的等待时长：到最早恢复时刻，但封顶。配额复位时刻可能远在几天
     /// 之后，也可能因为上游说法不一致而不准——睡死了就错过恢复，所以按上限
     /// 醒来重判。
+    ///
+    /// 池报不可用、却没给出未来的恢复时刻（时刻已过或缺失）时，恢复点是未知
+    /// 而不是"马上就好"：按常规复查节拍重判，别给 1 秒——那会让闸门以每秒
+    /// 一次的频率去读同一份什么都没变的快照。
     fn snapshot_wait(&self, status: cog_core::LlmPoolStatus) -> Duration {
         let now = chrono::Utc::now().timestamp();
         let until = status.earliest_recovery_unix.saturating_sub(now).max(0) as u64;
-        Duration::from_secs(until.clamp(1, self.max_secs))
+        if until == 0 {
+            return Duration::from_secs(self.check_secs.clamp(1, self.max_secs));
+        }
+        Duration::from_secs(until.min(self.max_secs))
     }
 
     /// 现在是否该暂停拉取；返回需要等待的时长。
@@ -1682,12 +1694,14 @@ mod tests {
     }
 
     /// 恢复时刻可能远在几天之后，也可能因为上游说法不一致而不准：等待时长
-    /// 必须封顶，睡死了就错过恢复。
+    /// 必须封顶，睡死了就错过恢复。时刻已过则是"恢复点未知"而不是"马上就好"，
+    /// 按常规复查节拍重判；给 1 秒会让闸门每秒去读一份什么都没变的快照。
     #[tokio::test]
     async fn snapshot_wait_is_capped_and_never_zero() {
         let config = MemoryIngestorConfig {
             pull_pause_initial_secs: 60,
             pull_pause_max_secs: 1800,
+            pool_check_secs: 30,
             ..Default::default()
         };
         let gate = PullGate::new(None, &config);
@@ -1708,8 +1722,57 @@ mod tests {
                 earliest_recovery_unix: now - 60,
                 unavailable_upstreams: vec![],
             }),
-            Duration::from_secs(1),
-            "a stale recovery time must still park for a moment"
+            Duration::from_secs(30),
+            "an elapsed recovery time must re-check at the pool cadence"
+        );
+        assert_eq!(
+            gate.snapshot_wait(cog_core::LlmPoolStatus {
+                unavailable: true,
+                earliest_recovery_unix: 0,
+                unavailable_upstreams: vec![],
+            }),
+            Duration::from_secs(30),
+            "a snapshot carrying no recovery time must not be read as an imminent recovery"
+        );
+    }
+
+    /// 回归：网关每次重算恢复时刻，它会前后移动。上一次暂停窗到期的那一瞬间
+    /// 必须重新读快照重判，不能把"没有生效中的暂停窗"读成"池可用"——那正是
+    /// 闸门开一条缝、把不该花的尝试放进来的情形。集群实测过：5 分钟内出现
+    /// 2 次暂停 1 次恢复，中间那 59 秒闸门是开的。
+    #[tokio::test]
+    async fn an_elapsed_pause_window_re_reads_instead_of_opening_the_gate() {
+        // 恢复时刻落在过去：快照仍报不可用，但给出的时刻已经过期。
+        let pool = Arc::new(TogglePool::new(true, chrono::Utc::now().timestamp() - 60));
+        let gate = PullGate::new(
+            Some(pool.clone()),
+            &MemoryIngestorConfig {
+                pool_check_secs: 300,
+                ..quick_retry_config()
+            },
+        );
+
+        let first = gate.blocked_for().await;
+        assert!(first.is_some(), "an unavailable pool must close the gate");
+        // 把暂停窗直接推到过去，模拟窗到期而缓存仍然新鲜。
+        {
+            let mut s = gate.state.lock().unwrap();
+            s.pool_until = Some(std::time::Instant::now() - Duration::from_secs(1));
+        }
+        assert!(
+            gate.blocked_for().await.is_some(),
+            "an expired pause window means re-judge, not pool healthy"
+        );
+
+        pool.set(false);
+        {
+            let mut s = gate.state.lock().unwrap();
+            s.pool_checked_at = None;
+            s.pool_until = None;
+        }
+        assert!(
+            gate.blocked_for().await.is_none(),
+            "the gate must still open once the snapshot actually reports health"
         );
     }
 
