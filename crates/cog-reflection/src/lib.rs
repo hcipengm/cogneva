@@ -1228,6 +1228,79 @@ mod tests {
         }
     }
 
+    /// A backend that never reached a model: the call itself is reported as
+    /// successful, with no content and the reason in `error_message`.
+    struct UnreachableLlm {
+        reason: String,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for UnreachableLlm {
+        async fn chat(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::ChatResponse> {
+            Ok(cog_core::ChatResponse {
+                content: Vec::new(),
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                response_id: None,
+                usage: cog_core::Usage::default(),
+                stop_reason: cog_core::StopReason::Error,
+                error_message: Some(self.reason.clone()),
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            Err(cog_core::SFError::LLM(self.reason.clone()))
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            Err(cog_core::SFError::LLM(self.reason.clone()))
+        }
+
+        async fn health_check(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn test_code_change_generation_records_nothing_when_the_upstream_never_answered() {
+        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(UnreachableLlm {
+            reason: r#"API error: {"error":"所有 LLM 上游当前不可用"}"#.into(),
+        });
+        let evolution = EvolutionEngine::new(
+            llm,
+            Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
+            None,
+        );
+
+        let err = evolution
+            .generate_code_change("a module", "a learning")
+            .await
+            .expect_err("an upstream outage is not a produced change");
+
+        assert!(
+            err.to_string().contains("所有 LLM 上游当前不可用"),
+            "the provider's reason must survive: {err}"
+        );
+        assert!(
+            evolution.list_results().await.is_empty(),
+            "a change that was never generated must not be recorded as one"
+        );
+    }
+
     #[tokio::test]
     async fn test_process_tool_result_sends_to_tool_sink() {
         let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));

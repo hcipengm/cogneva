@@ -189,10 +189,86 @@ mod tests {
         }
     }
 
+    /// A backend that never reached a model. It answers with a failure the way a
+    /// provider does when the upstream is unreachable: `chat` reports the call
+    /// itself as successful and leaves the reason in `error_message`, with the
+    /// content empty.
+    struct UnreachableUpstreamProvider {
+        reason: String,
+    }
+
+    #[async_trait]
+    impl LLMProvider for UnreachableUpstreamProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<ChatResponse> {
+            Ok(ChatResponse {
+                content: Vec::new(),
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                response_id: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some(self.reason.clone()),
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<AssistantMessageEventStream> {
+            Err(SFError::LLM(self.reason.clone()))
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &CompleteOptions,
+        ) -> SFResult<AssistantMessageEventStream> {
+            Err(SFError::LLM(self.reason.clone()))
+        }
+
+        async fn health_check(&self) -> bool {
+            false
+        }
+    }
+
     #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
     struct Person {
         name: String,
         age: u32,
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_upstream_is_not_reported_as_a_json_error() {
+        // Empty content parses as a JSON syntax error, so a caller that only
+        // looks at the parse failure reads an environment outage as the model
+        // emitting garbage. The provider's own reason has to survive.
+        let reason = r#"API error: {"error":"所有 LLM 上游当前不可用"}"#;
+        let provider = UnreachableUpstreamProvider {
+            reason: reason.to_string(),
+        };
+
+        let result: SFResult<Person> = execute_structured(
+            &provider,
+            &[Message::user("give me a person")],
+            &ChatOptions::default(),
+        )
+        .await;
+
+        let err = result.expect_err("an errored response is not a person");
+        match err {
+            SFError::LLM(msg) => assert!(
+                msg.contains("所有 LLM 上游当前不可用"),
+                "the provider's reason must survive: {msg}"
+            ),
+            other => panic!("expected SFError::LLM carrying the reason, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

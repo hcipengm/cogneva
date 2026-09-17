@@ -699,6 +699,16 @@ impl EvolutionEngine {
 
             let options = ChatOptions::default().with_actor("evolution");
             let response = self.llm.chat(&messages, &options).await?;
+            // A backend that could not serve the request answers with no content
+            // and the reason in `error_message`. Falling through with that empty
+            // text records an empty change as a conceptual answer awaiting
+            // review — an outage counted as a produced artifact, and the yield
+            // record then blames generation instead of the environment.
+            if let Some(reason) = response.error_message.as_deref() {
+                return Err(cog_core::SFError::LLM(format!(
+                    "change generation failed: {reason}"
+                )));
+            }
             let text: String = response
                 .content
                 .iter()

@@ -211,6 +211,18 @@ where
     opts.response_format = ResponseFormat::Json;
 
     let response = provider.chat(&msgs, &opts).await?;
+    // A backend that could not serve the request still arrives as `Ok`: the
+    // reason travels in `error_message` with `stop_reason: Error`, and the
+    // content is empty. Parsing that empty content reports a JSON syntax error
+    // and drops the cause, so an unreachable upstream reads as "the model
+    // emitted garbage" — a defect in the model rather than in the environment.
+    // Callers classifying on the error text act on the difference, so the
+    // provider's own reason is what has to come out of here.
+    if response.error_message.is_some() || response.stop_reason == StopReason::Error {
+        return Err(SFError::LLM(response.error_message.unwrap_or_else(|| {
+            "provider reported an error without a message".into()
+        })));
+    }
     let text = response
         .content
         .iter()

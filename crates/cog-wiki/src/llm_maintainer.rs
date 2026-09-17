@@ -418,6 +418,14 @@ impl WikiMaintainer for LlmWikiMaintainer {
                 &ChatOptions::default().with_actor("wiki"),
             )
             .await?;
+        // A backend that never reached a model answers with no content and the
+        // reason in `error_message`. An empty answer is not an answer: archiving
+        // it would file a blank page as documentation of the question.
+        if let Some(reason) = resp.error_message.as_deref() {
+            return Err(cog_core::SFError::LLM(format!(
+                "wiki query failed: {reason}"
+            )));
+        }
         let answer = resp
             .content
             .iter()

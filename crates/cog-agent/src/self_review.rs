@@ -1,6 +1,6 @@
 use cog_core::{
-    execute_structured, ChatOptions, ChatResponse, LlmClient, Message, ResponseFormat, SFResult,
-    SelfReviewConfig, SelfReviewResult,
+    execute_structured, ChatOptions, ChatResponse, LlmClient, Message, ResponseFormat, SFError,
+    SFResult, SelfReviewConfig, SelfReviewResult,
 };
 
 /// Observation of an agent output.
@@ -248,7 +248,19 @@ impl SelfReviewLoop {
         .with_actor("self_review");
 
         let response = llm.chat(&[user_msg], &options).await?;
+        // A backend that could not serve the request answers with no content and
+        // the reason in `error_message`. Returning that as a revision would hand
+        // the caller an empty string where the caller had a deliverable, and an
+        // empty string is a different string, so it would be applied.
+        if let Some(reason) = response.error_message.as_deref() {
+            return Err(SFError::LLM(format!("self-review revise failed: {reason}")));
+        }
         let revised = extract_text(&response);
+        // The same guarantee for a provider that succeeded without producing
+        // anything: no revision is not an empty revision.
+        if revised.trim().is_empty() {
+            return Ok(original.to_string());
+        }
 
         Ok(revised)
     }

@@ -202,6 +202,100 @@ async fn test_revise_returns_original_on_pass() {
     assert_eq!(revised, "original");
 }
 
+/// A provider standing in for a backend that answered without usable content:
+/// either it never reached a model, in which case the reason rides in
+/// `error_message`, or it finished having produced nothing at all.
+struct SilentProvider {
+    error_message: Option<String>,
+}
+
+#[async_trait]
+impl cog_core::LlmClient for SilentProvider {
+    async fn chat(&self, _messages: &[Message], _options: &ChatOptions) -> SFResult<ChatResponse> {
+        Ok(ChatResponse {
+            content: Vec::new(),
+            api: "silent".into(),
+            provider: "silent".into(),
+            model: "silent".into(),
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: if self.error_message.is_some() {
+                StopReason::Error
+            } else {
+                StopReason::Stop
+            },
+            error_message: self.error_message.clone(),
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _options: &ChatOptions,
+    ) -> SFResult<AssistantMessageEventStream> {
+        let (stream, _) =
+            AssistantMessageEventStream::with_capacity(cog_core::DEFAULT_STREAM_CAPACITY);
+        Ok(stream)
+    }
+
+    async fn complete_stream(
+        &self,
+        _prompt: &str,
+        _options: &CompleteOptions,
+    ) -> SFResult<AssistantMessageEventStream> {
+        let (stream, _) =
+            AssistantMessageEventStream::with_capacity(cog_core::DEFAULT_STREAM_CAPACITY);
+        Ok(stream)
+    }
+
+    async fn health_check(&self) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn test_revise_keeps_the_original_when_the_upstream_never_answered() {
+    let provider = SilentProvider {
+        error_message: Some(r#"API error: {"error":"所有 LLM 上游当前不可用"}"#.into()),
+    };
+    let result = SelfReviewResult::NeedRevision {
+        critique: "bad".into(),
+        suggestions: vec!["fix it".into()],
+        score: 0.3,
+    };
+
+    let err = SelfReviewLoop::revise(&result, "original", &provider)
+        .await
+        .expect_err("a backend that never answered has no revision to give");
+
+    assert!(
+        err.to_string().contains("所有 LLM 上游当前不可用"),
+        "the provider's reason must survive: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_revise_keeps_the_original_when_nothing_was_produced() {
+    let provider = SilentProvider {
+        error_message: None,
+    };
+    let result = SelfReviewResult::NeedRevision {
+        critique: "bad".into(),
+        suggestions: vec!["fix it".into()],
+        score: 0.3,
+    };
+
+    let revised = SelfReviewLoop::revise(&result, "original", &provider)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        revised, "original",
+        "no revision is not an empty revision: applying it would erase the deliverable"
+    );
+}
+
 #[tokio::test]
 async fn test_full_review_passes_immediately() {
     let provider = DummyProvider::new(vec![
