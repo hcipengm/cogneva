@@ -433,6 +433,19 @@ pub struct MainlineDeployerConfig {
     /// 回滚。此值是启动阶段自己的上界：init 真卡死时不能无限等，否则拿不到
     /// 干净回滚。
     pub startup_timeout_secs: u64,
+    /// 滚动判定 Job 容器的资源面（requests/limits，K8s 量纲字符串）。
+    ///
+    /// 这个容器不声明资源时 QoS 是 BestEffort，而 BestEffort 正是节点内存压力
+    /// 下最先被驱逐的一档。它偏偏是决定"回滚不回滚"的那个进程：被驱逐会让
+    /// 部署器把一次观测中断记成一次版本失败，集群还被留在滚到一半的状态上
+    /// （Job 没跑完，它自己的回滚也没走）。默认值按该容器实测的常驻量给
+    /// ——它常态是每 5 秒轮询一次的等待态，实测 CPU 0m / 内存 5Mi——按这个
+    /// 数定 requests 是为了不让它常年锁住调度额度（本机节点 requests 已占
+    /// 九成），limits 只承接 kubectl 子进程的尖峰。
+    pub job_cpu_request: String,
+    pub job_memory_request: String,
+    pub job_cpu_limit: String,
+    pub job_memory_limit: String,
     /// 空闲心跳日志的最小间隔（秒）。SameRev 收敛路径静默返回（无推进即
     /// 无日志），单凭日志无法证明部署器存活；心跳按该间隔打一条 INFO
     /// 状态摘要（bare HEAD / last_good / in_flight / 失败计数）。0 表示
@@ -472,6 +485,10 @@ impl Default for MainlineDeployerConfig {
             max_attempts_per_rev: 2,
             rollout_timeout_secs: 300,
             startup_timeout_secs: 900,
+            job_cpu_request: "10m".into(),
+            job_memory_request: "32Mi".into(),
+            job_cpu_limit: "500m".into(),
+            job_memory_limit: "256Mi".into(),
             heartbeat_log_secs: 3600,
             manifest_dir: "deploy/k3s".into(),
             deliver_manifests: true,
@@ -597,6 +614,18 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS") {
             self.startup_timeout_secs =
                 parse("COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_REQUEST") {
+            self.job_cpu_request = v;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_REQUEST") {
+            self.job_memory_request = v;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT") {
+            self.job_cpu_limit = v;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT") {
+            self.job_memory_limit = v;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS") {
             self.heartbeat_log_secs = parse("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS", &v)?;
@@ -846,5 +875,39 @@ mod tests {
         assert!(cfg
             .apply_env_with(|k| bad.get(k).map(|s| s.to_string()))
             .is_err());
+    }
+
+    #[test]
+    fn rollout_budget_and_job_resources_come_from_the_config_surface() {
+        let env: HashMap<&str, &str> = [
+            ("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_TIMEOUT_SECS", "420"),
+            ("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_REQUEST", "20m"),
+            (
+                "COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_REQUEST",
+                "64Mi",
+            ),
+            ("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT", "1"),
+            (
+                "COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT",
+                "512Mi",
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut cfg = MainlineDeployerConfig::default();
+        // 默认值不与配置面脱钩：就绪预算仍是 300s，Job 有显式 requests/limits
+        // （缺任何一项都会退化成 BestEffort）。
+        assert_eq!(cfg.rollout_timeout_secs, 300);
+        assert!(!cfg.job_cpu_request.is_empty());
+        assert!(!cfg.job_memory_request.is_empty());
+        assert!(!cfg.job_cpu_limit.is_empty());
+        assert!(!cfg.job_memory_limit.is_empty());
+        cfg.apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap();
+        assert_eq!(cfg.rollout_timeout_secs, 420);
+        assert_eq!(cfg.job_cpu_request, "20m");
+        assert_eq!(cfg.job_memory_request, "64Mi");
+        assert_eq!(cfg.job_cpu_limit, "1");
+        assert_eq!(cfg.job_memory_limit, "512Mi");
     }
 }

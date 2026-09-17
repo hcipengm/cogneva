@@ -269,6 +269,40 @@ fn is_cluster_unreachable(msg: &str) -> bool {
     CLUSTER_UNREACHABLE_PATTERNS.iter().any(|p| msg.contains(p))
 }
 
+/// 「集群放不下新 Pod」的标记，与 cluster-unreachable 同一类：它说的是**这次
+/// 滚动没有败在版本上**。判据来自调度器自己的类型化判决——新 Pod 的
+/// `PodScheduled=False / Unschedulable`，不是从散文里猜的措辞。
+///
+/// 排不上队时新 Pod 一个都没起来，谈不上新版本的好坏：回滚要把旧镜像重新
+/// 调度一遍，而它带着同样的 requests，同样排不进去，只会多一轮churn 并把
+/// 一个可能正常的版本换掉。真正的边界在版本**改没改调度需求**上——改了
+/// （这次上线把 requests 调大了）就是版本的事，该回滚；没改就与版本无关。
+const PLACEMENT_BLOCKED_MARKER: &str = "placement blocked";
+
+fn is_placement_blocked(msg: &str) -> bool {
+    msg.contains(PLACEMENT_BLOCKED_MARKER)
+}
+
+/// 从 Pod 采样行里挑出被调度器判为排不上队的 Pod，连同它的消息。
+///
+/// 每行形如 `name|phase|scheduledStatus|reason|message`。只认
+/// `PodScheduled=False` 且 `reason=Unschedulable` 的组合：这是调度器给出的
+/// 结论；Pod 还 Pending 但未被判决（刚创建、条件未上报）不算，字段缺失的
+/// 半行整条丢弃。
+fn unschedulable_pods(out: &str) -> Vec<(String, String)> {
+    let mut v = Vec::new();
+    for line in out.lines() {
+        let f: Vec<&str> = line.trim().split('|').map(str::trim).collect();
+        if f.len() < 5 || f[0].is_empty() {
+            continue;
+        }
+        if f[2] == "False" && f[3] == "Unschedulable" {
+            v.push((f[0].to_string(), f[4].to_string()));
+        }
+    }
+    v
+}
+
 /// deployment 是否已滚完：observedGeneration 追上 generation，且
 /// updated/ready 副本数达期望。解析不出（滚动交替期的空输出、omitempty
 /// 字段缺失）一律当未收敛，由外层按预算继续轮询。纯函数：只看 kubectl
@@ -1246,6 +1280,23 @@ impl MainlineDeployer {
                             "imagePullPolicy": "IfNotPresent",
                             "command": ["/opt/cogneva/cogneva"],
                             "args": args,
+                            // 不声明资源的容器 QoS 是 BestEffort，也就是节点内存
+                            // 压力下最先被驱逐的一档。这个容器偏偏是决定"回滚不
+                            // 回滚"的判定进程：它被驱逐，部署器就把一次观测中断
+                            // 记成一次版本失败，而且集群停在滚到一半的状态上
+                            // （Job 没跑完，它自己的回滚也没走）。requests 按实测
+                            // 常驻量给（每 5 秒轮询一次的等待态，实测 0m/5Mi），
+                            // 不去常年锁住调度额度；limits 承接 kubectl 子进程尖峰。
+                            "resources": {
+                                "requests": {
+                                    "cpu": self.cfg.job_cpu_request,
+                                    "memory": self.cfg.job_memory_request,
+                                },
+                                "limits": {
+                                    "cpu": self.cfg.job_cpu_limit,
+                                    "memory": self.cfg.job_memory_limit,
+                                },
+                            },
                         }],
                     },
                 },
@@ -2039,7 +2090,11 @@ impl RolloutExecutor {
     /// 由外部网络决定、与本次要上线的版本无关，算进就绪预算就会让一次慢
     /// 克隆把好版本判成败。两段都仍需有界：主容器永不 ready 的场景不能
     /// 无限等，Job 被 activeDeadlineSeconds 杀掉不会走 Job 自己的回滚。
-    async fn wait_rollout_complete(&self, t: &RolloutTarget) -> SFResult<()> {
+    ///
+    /// 超时那一刻再分一次因：新 Pod 被调度器判为 Unschedulable 且本次滚动没有
+    /// 改动这个部署的调度需求时，超时说的是**集群放不下**，不是版本不好（见
+    /// PLACEMENT_BLOCKED_MARKER）。`prev_demand` 是 apply 之前快照的 resources。
+    async fn wait_rollout_complete(&self, t: &RolloutTarget, prev_demand: &str) -> SFResult<()> {
         let startup_deadline =
             std::time::Instant::now() + Duration::from_secs(self.startup_timeout_secs);
         // 延迟到首次进入就绪阶段才起算：启动阶段的耗时不算在内。
@@ -2124,11 +2179,40 @@ impl RolloutExecutor {
                 } else {
                     format!("; pods: {diagnosis}")
                 };
+                // 排不上队：只有"这次上线没动调度需求"才归环境。取不到当前
+                // 需求时按"动过"处理——判不准就往版本侧靠，宁可多回滚一次，
+                // 不把新版本自己调大 requests 造成的排不上队放过去。
+                let blocked = self.unschedulable_state(t).await;
+                let demand_unchanged = !blocked.is_empty()
+                    && self
+                        .current_scheduling_demand(t)
+                        .await
+                        .map(|d| d == prev_demand)
+                        .unwrap_or(false);
                 return Err(if !observed_ever {
                     // 一次都没看到过部署态：这是观测能力故障，不是版本结论。
                     SFError::IO(format!(
                         "{CLUSTER_UNREACHABLE_MARKER}: rollout of deployment/{} did not complete \
                          within {}s and its {phase} phase was never observed ({last_unreachable})",
+                        t.deployment, budget
+                    ))
+                } else if demand_unchanged {
+                    let detail = blocked
+                        .iter()
+                        .map(|(n, m)| {
+                            if m.is_empty() {
+                                n.clone()
+                            } else {
+                                format!("{n}: {m}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    SFError::IO(format!(
+                        "{PLACEMENT_BLOCKED_MARKER}: rollout of deployment/{} did not complete \
+                         within {}s ({phase} phase) — the scheduler never placed its pod(s) \
+                         ({detail}) and this revision did not change the deployment's resource \
+                         demands, so the revision is not what failed (last: {note}{suffix})",
                         t.deployment, budget
                     ))
                 } else if starting {
@@ -2246,6 +2330,48 @@ impl RolloutExecutor {
         out
     }
 
+    /// 本次部署里被调度器判为排不上队的 Pod。判据取调度器写在 Pod 条件上的
+    /// `PodScheduled=False / Unschedulable`，与诊断采样走两条路：诊断是给人看
+    /// 的现场，这里是机器判据，不能靠读诊断文本反推。
+    ///
+    /// 采样尽力而为：取不到就返回空（当作"没有这个信号"），观测失败不产生
+    /// 第二个错误。
+    async fn unschedulable_state(&self, t: &RolloutTarget) -> Vec<(String, String)> {
+        let selector = pod_selector(&t.name, &t.component);
+        let out = self
+            .run_kubectl(
+                &[
+                    "get",
+                    "pods",
+                    "-l",
+                    &selector,
+                    "-o",
+                    "jsonpath={range .items[*]}{.metadata.name}|{.status.phase}|\
+                     {.status.conditions[?(@.type==\"PodScheduled\")].status}|\
+                     {.status.conditions[?(@.type==\"PodScheduled\")].reason}|\
+                     {.status.conditions[?(@.type==\"PodScheduled\")].message}{\"\\n\"}{end}",
+                ],
+                30,
+            )
+            .await
+            .unwrap_or_default();
+        unschedulable_pods(&out)
+    }
+
+    /// 快照部署当前的调度需求（容器 resources），供判定「排不上队是不是这次
+    /// 上线改出来的」。只看 requests 侧：调大 requests 是版本自己把 Pod 顶出
+    /// 节点，那正是要回滚的情形；其它字段的差异不构成本次滚动的调度理由。
+    async fn current_scheduling_demand(&self, t: &RolloutTarget) -> SFResult<String> {
+        let jsonpath = format!(
+            "jsonpath={{.spec.template.spec.containers[?(@.name==\"{}\")].resources}}",
+            t.container
+        );
+        let out = self
+            .run_kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath], 30)
+            .await?;
+        Ok(out.trim().to_string())
+    }
+
     /// Pod 健康信号：双标签选择器，查 restartCount/ready/waiting reason。
     /// `allow_pending` 宽限期内容忍 not-ready，但致命等待态（拉不到镜像、
     /// 配置错误、CrashLoop）无论宽限与否立即判病。空输出是选择器失效，
@@ -2326,17 +2452,27 @@ impl RolloutExecutor {
         // 端点零歧义，Legacy 首轮（节点 localhost/cogneva:local）也能精确回退。
         // 快照失败则一次变更都不发生（线上原样）。
         let mut prevs: Vec<(String, String)> = Vec::new();
+        let mut prev_demands: Vec<(String, String)> = Vec::new();
         for t in &plan.targets {
             let img = self.current_image(t).await?;
+            // 调度需求与镜像一起快照：apply 之后才分得清"排不上队"是这次
+            // 上线把 requests 调大了（版本的事），还是节点本来就满（不是）。
+            let demand = self.current_scheduling_demand(t).await?;
             info!(deployment = %t.deployment, prev = %img, "mainline rollout: snapshot prev image");
             prevs.push((t.deployment.clone(), img));
+            prev_demands.push((t.deployment.clone(), demand));
         }
         let mut done: Vec<&RolloutTarget> = Vec::new();
         for target in &plan.targets {
+            let prev_demand = prev_demands
+                .iter()
+                .find(|(d, _)| d == &target.deployment)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default();
             if let Err(e) = self.apply_target(plan, target).await {
                 return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
-            if let Err(e) = self.wait_rollout_complete(target).await {
+            if let Err(e) = self.wait_rollout_complete(target, prev_demand).await {
                 done.push(target);
                 return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
@@ -2363,21 +2499,35 @@ impl RolloutExecutor {
         Ok(())
     }
 
-    /// 失败收尾：只有**观测到的版本缺陷**才回滚。集群访问故障（apiserver
-    /// 不可达、握手超时）说的是我们看不到集群，既不足以判版本好，也不构成
-    /// 回滚理由——回滚同样要经 apiserver，多半一起失败，而这个动作本身还会
-    /// 把一个可能已经正常收敛的版本拽回旧的。此时让 Job 非零退出（部署器下轮
-    /// 重试），集群保持在刚推上去的新版本上。
+    /// 失败收尾：只有**观测到的版本缺陷**才回滚。两类失败不构成版本结论：
+    ///
+    /// - 集群访问故障（apiserver 不可达、握手超时）：我们看不到集群，既不足以
+    ///   判版本好，回滚也同样要经 apiserver、多半一起失败，而这个动作本身还会
+    ///   把一个可能已经正常收敛的版本拽回旧的。
+    /// - 集群放不下新 Pod：新 Pod 一个都没起来，谈不上新版本的好坏；回滚要把
+    ///   旧镜像重新调度一遍，而它带着同样的 requests，同样排不进去。只有本次
+    ///   上线自己改动了调度需求时才归版本（那一支带的是普通超时错误，不进这里）。
+    ///
+    /// 两种都让 Job 非零退出（部署器下轮重试），集群保持在刚推上去的新版本上。
     async fn fail_without_blind_rollback(
         &self,
         e: SFError,
         done: &[&RolloutTarget],
         prevs: &[(String, String)],
     ) -> SFResult<()> {
-        if is_cluster_unreachable(&e.to_string()) {
+        let msg = e.to_string();
+        if is_cluster_unreachable(&msg) {
             warn!(
                 error = %e,
                 "cluster unreachable during the rollout; keeping the new revision (no rollback)"
+            );
+            return Err(e);
+        }
+        if is_placement_blocked(&msg) {
+            warn!(
+                error = %e,
+                "the scheduler never placed the new pods and this revision did not raise its \
+                 resource demands; keeping the new revision (no rollback)"
             );
             return Err(e);
         }
@@ -2403,11 +2553,14 @@ impl RolloutExecutor {
                 warn!(deployment = %t.deployment, "no prev snapshot; skip rollback");
                 continue;
             };
+            // 回退前的调度需求：与新版本那一侧同一判据，好让"回退的 Pod 也排
+            // 不进去"在日志里读成同一件事（节点满了），不被当成回退本身失败。
+            let live_demand = self.current_scheduling_demand(t).await.unwrap_or_default();
             if let Err(e) = self.set_image(t, prev).await {
                 warn!(deployment = %t.deployment, error = %e, "rollback set image failed");
                 continue;
             }
-            if let Err(e) = self.wait_rollout_complete(t).await {
+            if let Err(e) = self.wait_rollout_complete(t, &live_demand).await {
                 warn!(deployment = %t.deployment, error = %e, "rollback wait failed");
             }
         }
@@ -2535,6 +2688,39 @@ mod tests {
         assert_eq!(s.matches("waiting=").count(), 1);
         // 半行（字段缺失）不进诊断，也不让后面的行顶掉位置。
         assert!(summarize_pod_states("broken|Pending\n").is_empty());
+    }
+
+    #[test]
+    fn unschedulable_pods_takes_the_scheduler_verdict_only() {
+        let out = "p-a|Running|True||\n\
+                   p-b|Pending|False|Unschedulable|0/1 nodes are available: 1 Insufficient memory\n\
+                   p-c|Pending|False|NotReady|some other condition\n\
+                   p-d|Pending|||\n\
+                   p-e|Pending|False|Unschedulable\n";
+        let got = unschedulable_pods(out);
+        // 只有被调度器判为 Unschedulable 的整行进判据。
+        assert_eq!(
+            got,
+            vec![(
+                "p-b".to_string(),
+                "0/1 nodes are available: 1 Insufficient memory".to_string()
+            )]
+        );
+        // 已调度（True）、别的 reason、条件未上报、半行一律不算。
+        assert!(unschedulable_pods("p-a|Running|True||\n").is_empty());
+        assert!(unschedulable_pods("").is_empty());
+    }
+
+    #[test]
+    fn placement_marker_is_recognized_and_distinct_from_unreachable() {
+        let e = format!("{PLACEMENT_BLOCKED_MARKER}: rollout of deployment/x did not complete");
+        assert!(is_placement_blocked(&e));
+        // 放不下与看不到是两回事：一个说集群满了，一个说我们没看见集群，
+        // 判据不能互相命中，否则其中一类的处置会被另一类借走。
+        assert!(!is_cluster_unreachable(&e));
+        assert!(!is_placement_blocked(&format!(
+            "{CLUSTER_UNREACHABLE_MARKER}: never observed"
+        )));
     }
 
     #[test]
@@ -3100,6 +3286,10 @@ exit 0
             max_attempts_per_rev: 2,
             rollout_timeout_secs: 60,
             startup_timeout_secs: 900,
+            job_cpu_request: "7m".into(),
+            job_memory_request: "21Mi".into(),
+            job_cpu_limit: "333m".into(),
+            job_memory_limit: "199Mi".into(),
             heartbeat_log_secs: 3600,
             manifest_dir: "deploy/k3s".into(),
             // 测试夹具仓库没有 deploy/k3s 清单树；这些用例走 set image 旧路径。
@@ -4825,6 +5015,20 @@ exit 0
         );
         assert!(log.contains("--manifests-dir"), "job args missing: {log}");
         assert!(log.contains("\"mountPath\": \"/manifests\""), "{log}");
+        // 判定进程不能是 BestEffort：Job Pod 模板自带显式 requests/limits，
+        // 且取值来自配置面（夹具用的是与默认值不同的数，命中即证明没写死）。
+        assert!(
+            log.contains("\"resources\""),
+            "job must declare resources: {log}"
+        );
+        for needle in [
+            "\"cpu\": \"7m\"",
+            "\"memory\": \"21Mi\"",
+            "\"cpu\": \"333m\"",
+            "\"memory\": \"199Mi\"",
+        ] {
+            assert!(log.contains(needle), "missing {needle}: {log}");
+        }
         // support.yaml 只带命名空间级资源（Namespace 集群级被跳过），
         // 四个 deployment 清单镜像全部改写为节点 pull 端点引用。
         assert!(log.contains("kind: ConfigMap"), "{log}");
