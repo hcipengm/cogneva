@@ -14,7 +14,8 @@
 //! 挂载了清单目录时先 apply 支撑资源（新镜像启动所需的 RBAC/ConfigMap/
 //! Service 等先就位），再按固定顺序滚动四个 deployment（网关代理面先行、
 //! 进化宿主最后）——目标有随镜像下发的清单则 apply 整份清单，否则回落
-//! set image；每个部署过 rollout 完成 + Pod 健康双门禁，全部滚完后 soak
+//! set image；每个部署等 rollout 完成（收敛判据归到本次滚动自己的副本上，
+//! 未就绪的新副本按就绪探针自身的判定周期给预算），全部滚完后 soak
 //! 观察窗复查；任一失败把已滚部署反向 set image 回 prev tag。
 //!
 //! 清单随镜像走解决的是拓扑滞后：只 set image 时，chart 里与工作负载一起
@@ -34,6 +35,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use cog_core::{SFError, SFResult, ShutdownSignal};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -175,52 +177,199 @@ const ROLLOUT_POLL_SECS: u64 = 5;
 /// 超时诊断里保留的事件条数。错误记录不是日志转储：只要够指出病因。
 const DIAGNOSIS_EVENT_LIMIT: usize = 3;
 
+/// 就绪门禁在探针判定周期之外额外给出的余量：镜像已在节点上时，容器从起进程
+/// 到开始监听这一段的实测开销。集群实证（网关 Pod，探针 5|10|1|3）：起容器到
+/// 1/1 相隔 42 秒，而它的判定周期是 5 + 3×(10+1) = 38 秒，差值约 4 秒；这里取
+/// 15 秒是给这一段留的宽裕上界——它探针一次都还没开始判，不能算进探针预算。
+const CONTAINER_STARTUP_ALLOWANCE_SECS: u64 = 15;
+
+/// 就绪探针自己的四个旋钮。门禁的预算从这里推，不拍固定秒数：探针调周期，
+/// 预算跟着动；判据的宽度窄于 kubelet 自己的判定周期，就会重演「比探针更早
+/// 开枪、把一个正在起来的版本判死」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeCycle {
+    initial_delay: u64,
+    period: u64,
+    timeout: u64,
+    failure_threshold: u64,
+}
+
+impl ProbeCycle {
+    /// 缺格兜底值取 k8s 默认探针的同值（initialDelay 默认 0）。它只在采样行
+    /// 确实拿到了、但某些格为空时逐格生效：一个部署没有就绪探针时四格全空，
+    /// 而 running 即 ready 的容器本来就不存在"探针还没通过"的窗口。
+    const DEFAULT: Self = Self {
+        initial_delay: 0,
+        period: 10,
+        timeout: 1,
+        failure_threshold: 3,
+    };
+
+    /// 解析采样行 `initialDelay|period|timeout|failureThreshold`。逐格兜底：
+    /// 探针只写了部分字段（或该部署根本没有就绪探针）时，缺的那格用默认值，
+    /// 不整条丢弃——丢掉一整格会让预算突然缩回默认值。
+    fn parse(out: &str) -> Self {
+        let f = sample_fields(out);
+        let get = |i: usize, dflt: u64| f.get(i).and_then(|v| v.parse().ok()).unwrap_or(dflt);
+        Self {
+            initial_delay: get(0, Self::DEFAULT.initial_delay),
+            period: get(1, Self::DEFAULT.period),
+            timeout: get(2, Self::DEFAULT.timeout),
+            failure_threshold: get(3, Self::DEFAULT.failure_threshold),
+        }
+    }
+
+    /// 门禁预算 = 探针自己的判定周期 + 容器进程启动开销。
+    ///
+    /// 判定周期 = initialDelay（之前 kubelet 一次都不探）+ failureThreshold ×
+    /// (period + timeout)（每次探测最多花 timeout，两次之间隔 period；阈值满之前
+    /// kubelet 不会下「这容器一直不 ready」的结论）。这就是"探针还没通过"这件事
+    /// 在 kubelet 眼里的正常时长，门禁不该比它更早开枪。
+    fn budget(&self) -> Duration {
+        let judgements = self
+            .failure_threshold
+            .saturating_mul(self.period.saturating_add(self.timeout));
+        let cycle = self.initial_delay.saturating_add(judgements);
+        Duration::from_secs(cycle.saturating_add(CONTAINER_STARTUP_ALLOWANCE_SECS))
+    }
+}
+
 /// 把 kubectl 采样输出的一行切成字段。所有采样查询都用竖线显式占位，所以
 /// 「字段缺失」表现为空串而不是少一列——这一条约定只在这里写一次。
 fn sample_fields(line: &str) -> Vec<&str> {
     line.trim().split('|').map(str::trim).collect()
 }
 
-/// 把 Pod 采样行折成诊断。空字段是「没有该信号」而不是「信号为空」，不进
-/// 诊断——否则满行空的 `waiting=` 会把真正的 `Pending` 病因埋掉。
+/// 一条 Pod 现场。每行形如
+/// `name|phase|ready|waitingReason|waitingMessage|startedAt|deletionTimestamp`，
+/// 竖线显式占位：未起来的容器没有 startedAt、健康的容器没有 waiting，omitempty
+/// 的字段缺失时不会顶掉后面字段的位置。后两列用 `get` 取，所以只有前五列的
+/// 采样行照样能解析。
 ///
-/// 每行形如 `name|phase|ready|waitingReason|waitingMessage`（竖线显式占位，
-/// omitempty 的字段缺失时不会顶掉后面字段的位置）。
-fn summarize_pod_states(out: &str) -> String {
-    let mut parts: Vec<String> = Vec::new();
+/// 这是诊断与就绪门禁**共用**的一批现场——两者问的本来就是同一件事：这个 Pod
+/// 现在卡在哪一步。拆成两条查询会让同一个 Pod 在两条路径上给出不同说法。
+struct PodSample {
+    name: String,
+    phase: String,
+    ready: bool,
+    waiting_reason: String,
+    waiting_message: String,
+    /// 主容器当前的启动时刻；容器还没起来时为 None。
+    started_at: Option<DateTime<Utc>>,
+    /// 正在删除中：旧副本 Terminating。它可能仍然 ready，但不属于本次滚动。
+    terminating: bool,
+}
+
+impl PodSample {
+    /// 主容器已运行的时长；容器还没起来时为 None——「没起来」与「刚起来」是
+    /// 两件事，前者不该显示成 0s。
+    fn uptime(&self, now: DateTime<Utc>) -> Option<Duration> {
+        self.started_at
+            .map(|t| now.signed_duration_since(t))
+            .and_then(|d| d.to_std().ok())
+    }
+}
+
+/// 解析 Pod 采样输出。字段残缺的半行整条丢弃。
+fn pod_samples(out: &str) -> Vec<PodSample> {
+    let mut v = Vec::new();
     for line in out.lines() {
         let f = sample_fields(line);
         if f.len() < 5 || f[0].is_empty() {
             continue;
         }
-        let mut seg = format!("{} {}", f[0], if f[1].is_empty() { "?" } else { f[1] });
-        seg.push_str(if f[2] == "true" {
-            " ready"
-        } else {
-            " not-ready"
+        v.push(PodSample {
+            name: f[0].to_string(),
+            phase: f[1].to_string(),
+            ready: f[2] == "true",
+            waiting_reason: f[3].to_string(),
+            waiting_message: f[4].to_string(),
+            started_at: f
+                .get(5)
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc)),
+            terminating: f.get(6).is_some_and(|s| !s.is_empty()),
         });
-        if !f[3].is_empty() {
-            seg.push_str(&format!(" waiting={}", f[3]));
+    }
+    v
+}
+
+/// 把 Pod 采样折成诊断。空字段是「没有该信号」而不是「信号为空」，不进诊断
+/// ——否则满行空的 `waiting=` 会把真正的 `Pending` 病因埋掉。Terminating 的旧
+/// 副本单独标出来：它的 not-ready 是正常的关停过程，不是本次滚动的病情。
+fn summarize_pod_states(samples: &[PodSample], now: DateTime<Utc>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for p in samples {
+        let mut seg = format!(
+            "{} {}",
+            p.name,
+            if p.phase.is_empty() { "?" } else { &p.phase }
+        );
+        seg.push_str(if p.ready { " ready" } else { " not-ready" });
+        if !p.waiting_reason.is_empty() {
+            seg.push_str(&format!(" waiting={}", p.waiting_reason));
         }
-        if !f[4].is_empty() {
-            seg.push_str(&format!(" ({})", f[4]));
+        if !p.waiting_message.is_empty() {
+            seg.push_str(&format!(" ({})", p.waiting_message));
+        }
+        if let Some(ran) = p.uptime(now) {
+            seg.push_str(&format!(" ran={}s", ran.as_secs()));
+        }
+        if p.terminating {
+            seg.push_str(" terminating");
         }
         parts.push(seg);
     }
     parts.join("; ")
 }
 
-/// 从 Pod 采样行里取出名字，供事件过滤用。
-fn pod_names_of(pods_out: &str) -> Vec<String> {
-    pods_out
-        .lines()
-        .filter_map(|l| {
-            sample_fields(l)
-                .first()
-                .filter(|n| !n.is_empty())
-                .map(|n| (*n).to_string())
-        })
-        .collect()
+/// 本次滚动自己的 Pod（排除正在删除的旧副本）是否全部就绪。
+///
+/// deployment 的计数器凑得出「滚完了」：旧副本 Terminating 但还 Ready 时它仍
+/// 可能计入 readyReplicas，而新副本尚未 ready 却已算进 updatedReplicas，两个数
+/// 一凑就是假收敛。收敛必须归到这次滚动自己的副本上，所以再直接看一眼 Pod。
+///
+/// 采样为空（一次都没取到）返回 None：没有观测就不下结论，收敛与否交回外层预算
+/// 与 soak 复查——空集合是「没有证据」，不是「健康」。
+fn rollout_pods_ready(samples: &[PodSample]) -> Option<bool> {
+    let own: Vec<&PodSample> = samples.iter().filter(|p| !p.terminating).collect();
+    if own.is_empty() {
+        return None;
+    }
+    Some(own.iter().all(|p| p.ready))
+}
+
+/// 自己的副本里有没有必死等待态（拉不到镜像、配置错误、CrashLoop）。这些副本
+/// 永远等不到 ready，等下去只会把预算烧完；判据与超时路径同一份枚举。
+fn rollout_pods_fatal(samples: &[PodSample]) -> Option<String> {
+    samples
+        .iter()
+        .filter(|p| !p.terminating)
+        .find(|p| FATAL_WAITING_REASONS.contains(&p.waiting_reason.as_str()))
+        .map(|p| format!("{} waiting={}", p.name, p.waiting_reason))
+}
+
+/// 就绪预算的起算点：自己的、尚未就绪的副本里**最近**启动的那个容器。取最近的
+/// 是因为门禁问的是「最新副本给了多久」——按更老的副本起算会让新副本刚起来就被
+/// 判超时。容器还没起来（无 startedAt）就不起算：那一段是调度与拉镜像，由外层
+/// 预算兜底。
+fn readiness_anchor(samples: &[PodSample]) -> Option<DateTime<Utc>> {
+    samples
+        .iter()
+        .filter(|p| !p.terminating && !p.ready)
+        .filter_map(|p| p.started_at)
+        .max()
+}
+
+/// 未就绪的副本是否已经用完整段就绪预算。没有起算点时一律不判超预算。
+fn readiness_overdue(samples: &[PodSample], budget: Duration, now: DateTime<Utc>) -> bool {
+    let Some(anchor) = readiness_anchor(samples) else {
+        return false;
+    };
+    now.signed_duration_since(anchor)
+        .to_std()
+        .map(|ran| ran >= budget)
+        .unwrap_or(false)
 }
 
 /// 把事件行折成诊断，只留与本次部署相关的最近几条。
@@ -2178,6 +2327,9 @@ impl RolloutExecutor {
         // 延迟到首次进入就绪阶段才起算：启动阶段的耗时不算在内。
         let mut readiness_deadline: Option<std::time::Instant> = None;
         let has_init_containers = self.init_containers_exist(t).await.unwrap_or(true);
+        // 探针配置在整段滚动里不变，进循环前取一次（放在循环里会让每次轮询都多
+        // 一条 kubectl）；取不到就一直是 None，到真的要用它判超预算时再补读。
+        let mut readiness_probe = self.readiness_probe(t).await;
         // 是否亲眼见过 init 还在跑。刚 apply 时选择器匹配到的仍是旧 Pod，它的
         // init 早已结束，"当前没有未完成的 init"于是立刻成立、就绪预算从 t0
         // 起算，然后整段耗在一次仍在外网克隆的 init 上——好版本被判超时回滚。
@@ -2210,26 +2362,61 @@ impl RolloutExecutor {
                 Ok(out) => {
                     observed_ever = true;
                     if rollout_converged(&out) {
-                        return Ok(());
-                    }
-                    // 滚动中新旧 Pod 交替、containerStatuses 可能暂时缺失，
-                    // 空输出/查询失败在这里不当致命（与 pods_healthy 不同），
-                    // 只认明确的致命等待态。
-                    self.fatal_pod_state(t).await?;
-                    if !has_init_containers {
-                        // 没有 init 容器就没有启动阶段，直接吃就绪预算。
-                        starting = false;
-                    } else if let Ok(progress) = self.init_containers_progress(t).await {
-                        if progress.lines().any(|l| l.trim() == "|") {
-                            seen_init_running = true;
-                            starting = true;
-                        } else {
-                            // 没有未完成的 init，但没见过它跑过就不算结束：匹配到的
-                            // 可能是旧 Pod，也可能是新 Pod 的 init 状态还没上报。
-                            starting = !seen_init_running;
+                        let samples = self.sample_rollout_pods(t).await;
+                        match rollout_pods_ready(&samples) {
+                            Some(true) => return Ok(()),
+                            Some(false) => {
+                                if let Some(fatal) = rollout_pods_fatal(&samples) {
+                                    return Err(SFError::Agent(format!(
+                                        "pod of deployment/{} in fatal waiting state {fatal}",
+                                        t.deployment
+                                    )));
+                                }
+                                self.fatal_pod_state(t).await?;
+                                // 新副本还在起来。按就绪探针自己的判定周期给预算，
+                                // 预算内不算失败（见 ProbeCycle::budget）——门禁比
+                                // kubelet 更早开枪，就会把一个十秒后就就绪的正常
+                                // 版本判死。
+                                if readiness_probe.is_none() {
+                                    readiness_probe = self.readiness_probe(t).await;
+                                }
+                                if let Some(cycle) = readiness_probe {
+                                    let budget = cycle.budget();
+                                    if readiness_overdue(&samples, budget, Utc::now()) {
+                                        let err = self
+                                            .readiness_gate_error(t, budget.as_secs())
+                                            .await;
+                                        return Err(err);
+                                    }
+                                }
+                            }
+                            // 采样取不到：没有观测就不下结论，收敛与否交给外层
+                            // 预算与 soak 复查兜底。
+                            None => {}
                         }
+                        // 收敛态下 init 必然已结束，不重进启动阶段。
+                        starting = false;
+                        note = out;
+                    } else {
+                        // 滚动中新旧 Pod 交替、containerStatuses 可能暂时缺失，
+                        // 空输出/查询失败在这里不当致命（与 pods_healthy 不同），
+                        // 只认明确的致命等待态。
+                        self.fatal_pod_state(t).await?;
+                        if !has_init_containers {
+                            // 没有 init 容器就没有启动阶段，直接吃就绪预算。
+                            starting = false;
+                        } else if let Ok(progress) = self.init_containers_progress(t).await {
+                            if progress.lines().any(|l| l.trim() == "|") {
+                                seen_init_running = true;
+                                starting = true;
+                            } else {
+                                // 没有未完成的 init，但没见过它跑过就不算结束：匹配到的
+                                // 可能是旧 Pod，也可能是新 Pod 的 init 状态还没上报。
+                                starting = !seen_init_running;
+                            }
+                        }
+                        note = out;
                     }
-                    note = out;
                 }
                 Err(e) if is_cluster_unreachable(&e.to_string()) => {
                     last_unreachable = e.to_string();
@@ -2329,17 +2516,14 @@ impl RolloutExecutor {
         Ok(())
     }
 
-    /// 滚动超时时采样现场：Pod 相位、容器等待原因/消息、本次部署最近的事件。
+    /// 本次部署的 Pod 现场采样：相位、ready、等待原因/消息、主容器启动时刻、
+    /// 是否正在删除。诊断与就绪门禁共用这一条查询——两者要的是同一批现场，
+    /// 拆成两条会让同一个 Pod 在两条路径上给出不同说法。
     ///
-    /// 副本计数（`spec|updated|ready|unavailable`）只给结论不给原因——「Pod
-    /// 排不上队一直 Pending」与「容器起来了但一直不 ready」在这个向量里长得
-    /// 一模一样，处置却相反。事件窗口只有一小时，不留现场就只能等人回到集群
-    /// 去猜，那时连证据都过期了。
-    ///
-    /// 采样是尽力而为：任何一步取不到都留空，观测失败不变成第二个错误。
-    async fn rollout_diagnosis(&self, t: &RolloutTarget) -> String {
+    /// 采样尽力而为：取不到就返回空，观测失败不产生第二个错误。
+    async fn sample_rollout_pods(&self, t: &RolloutTarget) -> Vec<PodSample> {
         let selector = pod_selector(&t.name, &t.component);
-        let pods = self
+        let out = self
             .run_kubectl(
                 &[
                     "get",
@@ -2350,12 +2534,70 @@ impl RolloutExecutor {
                     "jsonpath={range .items[*]}{.metadata.name}|{.status.phase}|\
                      {.status.containerStatuses[0].ready}|\
                      {.status.containerStatuses[0].state.waiting.reason}|\
-                     {.status.containerStatuses[0].state.waiting.message}{\"\\n\"}{end}",
+                     {.status.containerStatuses[0].state.waiting.message}|\
+                     {.status.containerStatuses[0].state.running.startedAt}|\
+                     {.metadata.deletionTimestamp}{\"\\n\"}{end}",
                 ],
                 30,
             )
             .await
             .unwrap_or_default();
+        pod_samples(&out)
+    }
+
+    /// 主力容器的就绪探针参数。
+    ///
+    /// 查询拿到行（哪怕字段全空，即该部署没有就绪探针）就逐格兜底解析：没有探针
+    /// 的容器 running 即 ready，本来就不存在"探针还没通过"的窗口，用默认值算出的
+    /// 预算不影响结论。查询本身失败则返回 None——**不**退回默认值，因为默认预算
+    /// （48s）比真实部署的预算（网关 53s）短，拿它判就等于门禁比 kubelet 更早
+    /// 开枪，正是这条判定要消灭的错误。读不到就不判，交回外层 deadline。
+    async fn readiness_probe(&self, t: &RolloutTarget) -> Option<ProbeCycle> {
+        let out = self
+            .run_kubectl(
+                &[
+                    "get",
+                    "deployment",
+                    &t.deployment,
+                    "-o",
+                    "jsonpath={.spec.template.spec.containers[0].readinessProbe.initialDelaySeconds}|\
+                     {.spec.template.spec.containers[0].readinessProbe.periodSeconds}|\
+                     {.spec.template.spec.containers[0].readinessProbe.timeoutSeconds}|\
+                     {.spec.template.spec.containers[0].readinessProbe.failureThreshold}",
+                ],
+                30,
+            )
+            .await
+            .ok()?;
+        // 空输出是查询没生效（路径写错、对象不存在），不是「这个部署没有探针」：
+        // 后者仍会返回一行的空字段（竖线占位）。空输出同样不判。
+        if out.trim().is_empty() {
+            return None;
+        }
+        Some(ProbeCycle::parse(&out))
+    }
+
+    /// 就绪门禁判败的错误：说明判败依据是探针自己的判定周期用完了，并带上现场。
+    async fn readiness_gate_error(&self, t: &RolloutTarget, budget_secs: u64) -> SFError {
+        let msg = format!(
+            "rollout of deployment/{} converged but its own pod(s) are still not ready after the \
+             readiness probe's own budget ({}s = initialDelay + failureThreshold x (period + \
+             timeout) + container startup)",
+            t.deployment, budget_secs
+        );
+        self.with_scene(t, msg).await
+    }
+
+    /// 滚动超时时采样现场：Pod 相位、容器等待原因/消息、本次部署最近的事件。
+    ///
+    /// 副本计数（`spec|updated|ready|unavailable`）只给结论不给原因——「Pod
+    /// 排不上队一直 Pending」与「容器起来了但一直不 ready」在这个向量里长得
+    /// 一模一样，处置却相反。事件窗口只有一小时，不留现场就只能等人回到集群
+    /// 去猜，那时连证据都过期了。
+    ///
+    /// 采样是尽力而为：任何一步取不到都留空，观测失败不变成第二个错误。
+    async fn rollout_diagnosis(&self, t: &RolloutTarget) -> String {
+        let samples = self.sample_rollout_pods(t).await;
         // 只取 Warning：正常滚动事件（ScalingReplicaSet 等）说明不了病因，
         // 排不上队与探针不过都落在 Warning 里。
         let events = self
@@ -2374,13 +2616,9 @@ impl RolloutExecutor {
             )
             .await
             .unwrap_or_default();
-        let mut out = summarize_pod_states(&pods);
-        let ev = summarize_events(
-            &events,
-            &t.deployment,
-            &pod_names_of(&pods),
-            DIAGNOSIS_EVENT_LIMIT,
-        );
+        let mut out = summarize_pod_states(&samples, Utc::now());
+        let names: Vec<String> = samples.iter().map(|p| p.name.clone()).collect();
+        let ev = summarize_events(&events, &t.deployment, &names, DIAGNOSIS_EVENT_LIMIT);
         if !ev.is_empty() {
             if !out.is_empty() {
                 out.push_str("; ");
@@ -2433,15 +2671,18 @@ impl RolloutExecutor {
     }
 
     /// Pod 健康信号：双标签选择器，查 restartCount/ready/waiting reason。
-    /// `allow_pending` 宽限期内容忍 not-ready，但致命等待态（拉不到镜像、
-    /// 配置错误、CrashLoop）无论宽限与否立即判病。空输出是选择器失效，
-    /// 不能当健康。
+    /// 致命等待态（拉不到镜像、配置错误、CrashLoop）与非零重启立即判病。
+    /// 空输出是选择器失效，不能当健康。
+    ///
+    /// 只用于 soak 复查：滚动期的「新副本还没就绪」由 wait_rollout_complete
+    /// 按探针周期给预算，那里的宽限是有刻度的，这里的 fixed 判病只面对已经
+    /// 滚完并静置了一段的目标。
     ///
     /// 查询走 probe：集群不可达时就地重试到就绪预算耗尽，耗尽才带标记返回
     /// 「这一轮什么都没看到」。它**不是**健康结论——把它当结论会让一次抖动
     /// 直接触发回滚，把刚推上去的四部署又拽回旧版。重试预算沿用就绪预算，
     /// 不新开第二套旋钮：它已经是可配的「愿意等多久」上界。
-    async fn pods_healthy(&self, t: &RolloutTarget, allow_pending: bool) -> SFResult<()> {
+    async fn pods_healthy(&self, t: &RolloutTarget) -> SFResult<()> {
         let selector = pod_selector(&t.name, &t.component);
         let out = self
             .probe(
@@ -2468,29 +2709,41 @@ impl RolloutExecutor {
             let ready = parts.next().unwrap_or("false");
             let waiting_reason = parts.next().unwrap_or("");
             if FATAL_WAITING_REASONS.contains(&waiting_reason) {
-                return Err(SFError::Agent(format!(
+                let msg = format!(
                     "pod of deployment/{} in fatal waiting state {waiting_reason}: {line}",
                     t.deployment
-                )));
+                );
+                return Err(self.with_scene(t, msg).await);
             }
-            if ready != "true" && !allow_pending {
-                return Err(SFError::Agent(format!(
-                    "pod of deployment/{} not ready: {line}",
-                    t.deployment
-                )));
+            if ready != "true" {
+                let msg = format!("pod of deployment/{} not ready: {line}", t.deployment);
+                return Err(self.with_scene(t, msg).await);
             }
             if restarts > self.restart_threshold {
-                return Err(SFError::Agent(format!(
+                let msg = format!(
                     "pod of deployment/{} restarting ({} restarts, threshold {}): {line}",
                     t.deployment, restarts, self.restart_threshold
-                )));
+                );
+                return Err(self.with_scene(t, msg).await);
             }
         }
         Ok(())
     }
 
-    /// 先落地支撑清单（如随镜像下发），再按计划顺序滚动四部署，逐部署
-    /// 双门禁，全滚完后 soak 复查；任一失败把已滚目标反向 set image 回
+    /// 给判败记录补上现场：与超时路径同一套采样（Pod 名/相位/ready/等待原因与
+    /// 消息/容器已运行时长）。判败是这条判定唯一的产出，只留一串内部采样列
+    /// （`0 false`）说不出病因，等人回到集群时事件早已过期。
+    async fn with_scene(&self, t: &RolloutTarget, msg: String) -> SFError {
+        let diagnosis = self.rollout_diagnosis(t).await;
+        if diagnosis.is_empty() {
+            SFError::Agent(msg)
+        } else {
+            SFError::Agent(format!("{msg}; pods: {diagnosis}"))
+        }
+    }
+
+    /// 先落地支撑清单（如随镜像下发），再按计划顺序滚动四部署，逐部署等
+    /// rollout 完成，全滚完后 soak 复查；任一失败把已滚目标反向 set image 回
     /// prev tag（不用 rollout undo——多目标无事务性，undo 还会连带回退
     /// 其他字段）。回滚只回退 image：支撑资源不反向删改（apply 是幂等
     /// upsert，旧镜像配新支撑资源可运行；删改支撑资源反而可能把在跑
@@ -2536,12 +2789,6 @@ impl RolloutExecutor {
                 done.push(target);
                 return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
-            // 宽限期：新副本 ContainerCreating 时 not-ready 属正常。
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            if let Err(e) = self.pods_healthy(target, false).await {
-                done.push(target);
-                return self.fail_without_blind_rollback(e, &done, &prevs).await;
-            }
             done.push(target);
         }
 
@@ -2551,7 +2798,7 @@ impl RolloutExecutor {
         );
         tokio::time::sleep(Duration::from_secs(self.soak_secs)).await;
         for target in &plan.targets {
-            if let Err(e) = self.pods_healthy(target, false).await {
+            if let Err(e) = self.pods_healthy(target).await {
                 return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
         }
@@ -2739,15 +2986,201 @@ mod tests {
 
     #[test]
     fn pod_diagnosis_drops_empty_waiting_fields_and_keeps_the_cause() {
+        let now = Utc::now();
         let out = "p-a|Running|true|||\n\
                    p-b|Pending|false|Unschedulable|0/1 nodes are available: 1 Insufficient memory\n";
-        let s = summarize_pod_states(out);
+        let s = summarize_pod_states(&pod_samples(out), now);
         assert!(s.contains("p-a Running ready"));
         assert!(s.contains("p-b Pending not-ready waiting=Unschedulable (0/1 nodes are available: 1 Insufficient memory)"));
         // 只有 Pending 那个 Pod 带等待原因：空等待字段不落进诊断。
         assert_eq!(s.matches("waiting=").count(), 1);
         // 半行（字段缺失）不进诊断，也不让后面的行顶掉位置。
-        assert!(summarize_pod_states("broken|Pending\n").is_empty());
+        assert!(summarize_pod_states(&pod_samples("broken|Pending\n"), now).is_empty());
+    }
+
+    /// 判败记录要能分开「新副本还在起来」与「旧副本正在关停」：两者都是
+    /// not-ready，处置却相反。前者带运行时长，后者带 terminating 标记。
+    #[test]
+    fn pod_diagnosis_carries_uptime_and_flags_terminating_replicas() {
+        let now = DateTime::parse_from_rfc3339("2026-09-17T15:47:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let out = "gw-7tpmm|Running|false|ContainersNotReady|containers with unready status: [gw]|\
+                   2026-09-17T15:46:29Z|\n\
+                   gw-old|Running|false|||2026-09-17T12:00:00Z|2026-09-17T15:46:27Z\n";
+        let s = summarize_pod_states(&pod_samples(out), now);
+        let segs: Vec<&str> = s.split("; ").collect();
+        assert_eq!(segs.len(), 2, "{s}");
+        // 新副本：起来 32 秒还没就绪，且没有 terminating 标记——这是本次滚动的病情。
+        assert!(
+            segs[0].contains("gw-7tpmm Running not-ready waiting=ContainersNotReady"),
+            "{s}"
+        );
+        assert!(segs[0].contains("ran=32s"), "{s}");
+        assert!(!segs[0].contains("terminating"), "{s}");
+        // 旧副本：正在关停，被单独标出，不能与前者混为一谈。
+        assert!(segs[1].contains("gw-old Running not-ready"), "{s}");
+        assert!(segs[1].contains("ran=13621s"), "{s}");
+        assert!(segs[1].contains("terminating"), "{s}");
+    }
+
+    /// 就绪门禁的预算从探针配置推出来，不是固定秒数：探针调周期，预算跟着动。
+    #[test]
+    fn readiness_budget_follows_the_probe_configuration() {
+        // 集群实测的三个探针（initialDelay 5 / period 10 / timeout 1 / threshold 3）：
+        // 5 + 3 × (10 + 1) + 15 = 53s。网关那个 Pod 起容器到就绪实测 42s，落在里面。
+        let live = ProbeCycle {
+            initial_delay: 5,
+            period: 10,
+            timeout: 1,
+            failure_threshold: 3,
+        };
+        assert_eq!(live.budget(), Duration::from_secs(53));
+        assert_eq!(ProbeCycle::parse("5|10|1|3"), live);
+        // 探针调慢，预算跟着长；探针调快，预算跟着短。四项都得进预算：
+        // 少算 initialDelay 或 timeout 都会让门禁窄于 kubelet 自己的判定周期。
+        let slower = ProbeCycle { period: 30, ..live };
+        assert_eq!(slower.budget(), Duration::from_secs(5 + 3 * 31 + 15));
+        assert!(slower.budget() > live.budget());
+        let no_delay = ProbeCycle {
+            initial_delay: 0,
+            ..live
+        };
+        assert!(no_delay.budget() < live.budget());
+        let longer_timeout = ProbeCycle { timeout: 5, ..live };
+        assert!(longer_timeout.budget() > live.budget());
+        let eager = ProbeCycle {
+            initial_delay: 0,
+            period: 1,
+            timeout: 1,
+            failure_threshold: 1,
+        };
+        assert_eq!(eager.budget(), Duration::from_secs(17));
+        assert!(eager.budget() < live.budget());
+    }
+
+    /// 读不到探针配置（没有就绪探针、查询失败）时逐格兜底到 k8s 默认探针同值，
+    /// 而不是整体退化成一个拍出来的常数。
+    #[test]
+    fn a_missing_probe_configuration_falls_back_per_field() {
+        // 完全没有探针：四格都空。
+        assert_eq!(ProbeCycle::parse("|||"), ProbeCycle::DEFAULT);
+        assert_eq!(ProbeCycle::parse(""), ProbeCycle::DEFAULT);
+        assert_eq!(ProbeCycle::DEFAULT.budget(), Duration::from_secs(48));
+        // 只写了部分字段：缺的那格单独兜底，已有的那格照样生效。
+        assert_eq!(
+            ProbeCycle::parse("|30|1|3"),
+            ProbeCycle {
+                period: 30,
+                ..ProbeCycle::DEFAULT
+            }
+        );
+        assert_eq!(
+            ProbeCycle::parse("|||5").failure_threshold,
+            5,
+            "写了一格就取那一格"
+        );
+    }
+
+    /// 预算内不算失败、预算耗尽才判败，且起算点是「最近启动的那个未就绪副本」。
+    #[test]
+    fn readiness_overdue_only_fires_after_the_containers_own_budget() {
+        let budget = ProbeCycle::DEFAULT.budget();
+        let started = DateTime::parse_from_rfc3339("2026-09-17T15:46:29Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let row = |name: &str, ready: bool, started_at: &str, deleting: &str| {
+            format!(
+                "{name}|Running|{ready}|||{started_at}|{deleting}\n",
+                ready = if ready { "true" } else { "false" }
+            )
+        };
+        let at = |secs: i64| started + chrono::Duration::seconds(secs);
+
+        // 起了 32 秒：预算（兜底探针 48s）还没用完——正是那个被误杀的版本当时的处境。
+        let fresh = pod_samples(&row("gw-1", false, "2026-09-17T15:46:29Z", ""));
+        assert!(!readiness_overdue(&fresh, budget, at(32)));
+        // 就用满预算那一刻才算超。
+        assert!(!readiness_overdue(&fresh, budget, at(47)));
+        assert!(readiness_overdue(&fresh, budget, at(48)));
+        assert!(readiness_overdue(&fresh, budget, at(600)));
+
+        // 起算点取最近的未就绪副本：更老的副本不能把新副本拖进超时。
+        let mixed = pod_samples(&format!(
+            "{}{}",
+            row("gw-old", false, "2026-09-17T15:00:00Z", ""),
+            row("gw-new", false, "2026-09-17T15:46:29Z", "")
+        ));
+        assert!(!readiness_overdue(&mixed, budget, at(32)));
+
+        // 已经就绪的副本不参与起算；正在关停的旧副本同样不参与。
+        let ready = pod_samples(&row("gw-1", true, "2026-09-17T15:00:00Z", ""));
+        assert!(!readiness_overdue(&ready, budget, at(3600)));
+        let terminating = pod_samples(&row(
+            "gw-old",
+            false,
+            "2026-09-17T15:00:00Z",
+            "2026-09-17T15:46:27Z",
+        ));
+        assert!(!readiness_overdue(&terminating, budget, at(3600)));
+        // 容器还没起来（无 startedAt）：不起算，交给外层预算。
+        let not_started = pod_samples(&row("gw-1", false, "", ""));
+        assert!(!readiness_overdue(&not_started, budget, at(600)));
+    }
+
+    /// 收敛必须归到本次滚动自己的副本上：旧副本 Terminating 但还 ready 不能算数，
+    /// 它正是把「新副本还没就绪」凑成「滚完了」的那一半。
+    #[test]
+    fn convergence_only_counts_this_rollouts_own_replicas() {
+        let rows = |s: &str| pod_samples(s);
+        // 只有旧副本（Terminating，还 ready）：没有本次滚动的副本可判，不给结论。
+        assert_eq!(
+            rollout_pods_ready(&rows(
+                "gw-old|Running|true|||2026-09-17T15:00:00Z|2026-09-17T15:46:27Z\n"
+            )),
+            None
+        );
+        // 采样取不到（查询失败/选择器失效）：空集合是「没有证据」，不是「健康」。
+        assert_eq!(rollout_pods_ready(&[]), None);
+        // 旧副本 ready + 新副本 not-ready：这曾经凑成假收敛，必须判未就绪。
+        let mixed = rows(
+            "gw-old|Running|true|||2026-09-17T15:00:00Z|2026-09-17T15:46:27Z\n\
+             gw-new|Running|false|ContainersNotReady|x|2026-09-17T15:46:29Z|\n",
+        );
+        assert_eq!(rollout_pods_ready(&mixed), Some(false));
+        // 新副本就绪、旧副本还在关停：本次滚动自己的副本齐了，算收敛。
+        let done = rows(
+            "gw-old|Running|false|||2026-09-17T15:00:00Z|2026-09-17T15:46:27Z\n\
+             gw-new|Running|true|||2026-09-17T15:46:29Z|\n",
+        );
+        assert_eq!(rollout_pods_ready(&done), Some(true));
+    }
+
+    /// 必死等待态立即判败（不必等预算烧完），且不认正在关停的旧副本。
+    #[test]
+    fn fatal_pods_are_caught_immediately_and_only_on_own_replicas() {
+        assert_eq!(
+            rollout_pods_fatal(&pod_samples(
+                "gw-1|Running|false|CrashLoopBackOff|back-off|2026-09-17T15:46:29Z|\n"
+            )),
+            Some("gw-1 waiting=CrashLoopBackOff".to_string())
+        );
+        // 旧副本的必死态不是本次滚动的病情：它正在被替换掉。
+        assert_eq!(
+            rollout_pods_fatal(&pod_samples(
+                "gw-old|Running|false|CrashLoopBackOff|x|2026-09-17T15:00:00Z|2026-09-17T15:46:27Z\n"
+            )),
+            None
+        );
+        // 正在起来（等待原因是正常的创建中）不算必死。
+        assert_eq!(
+            rollout_pods_fatal(&pod_samples("gw-1|Pending|false|ContainerCreating|||\n")),
+            None
+        );
+        assert_eq!(
+            rollout_pods_fatal(&pod_samples("gw-1|Running|true|||2026-09-17T15:46:29Z|\n")),
+            None
+        );
     }
 
     #[test]
@@ -2858,6 +3291,11 @@ mod tests {
         )));
     }
 
+    /// 采样行里的 Pod 名，供事件相关性过滤用（诊断走的是同一条：从 PodSample 取名字）。
+    fn pod_names(pods: &str) -> Vec<String> {
+        pod_samples(pods).iter().map(|p| p.name.clone()).collect()
+    }
+
     #[test]
     fn events_diagnosis_keeps_only_this_deployment() {
         let out = "\
@@ -2868,7 +3306,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|Readiness probe failed
 ";
         let pods = "cogneva-sandbox-executor-abc-x|Pending|false||\n\
                     cogneva-sandbox-executor-abc-y|Running|false||\n";
-        let s = summarize_events(out, "cogneva-sandbox-executor", &pod_names_of(pods), 3);
+        let s = summarize_events(out, "cogneva-sandbox-executor", &pod_names(pods), 3);
         assert!(s.contains("FailedScheduling"));
         assert!(s.contains("Readiness probe failed"));
         assert!(!s.contains("unrelated"));
@@ -2883,7 +3321,7 @@ Pod|cogneva-sandbox-executor-abc-y|BackOff|newest
 ";
         let pods = "cogneva-sandbox-executor-abc-x|Pending|false||\n\
                     cogneva-sandbox-executor-abc-y|Running|false||\n";
-        let s = summarize_events(out, "cogneva-sandbox-executor", &pod_names_of(pods), 2);
+        let s = summarize_events(out, "cogneva-sandbox-executor", &pod_names(pods), 2);
         assert!(!s.contains("oldest"));
         assert!(s.contains("middle"));
         assert!(s.contains("newest"));
@@ -2899,7 +3337,7 @@ Pod|cogneva-evolution-abc-x|BackOff|evolution crashed
 Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
 ";
         let pods = "cogneva-5c75d664c6-8hq7t|Running|true||\n";
-        let s = summarize_events(out, "cogneva", &pod_names_of(pods), 5);
+        let s = summarize_events(out, "cogneva", &pod_names(pods), 5);
         assert!(s.is_empty(), "{s}");
     }
 
@@ -4325,21 +4763,21 @@ exit 0
             name: "cogneva".into(),
         };
 
-        // ImagePullBackOff 立即判病（即使宽限期）。
+        // ImagePullBackOff 立即判病。
         std::fs::write(&pods_file, "0 false ImagePullBackOff").unwrap();
-        assert!(executor.pods_healthy(&target, true).await.is_err());
+        assert!(executor.pods_healthy(&target).await.is_err());
 
         // 重启超阈值。
         std::fs::write(&pods_file, "2 true ").unwrap();
-        assert!(executor.pods_healthy(&target, false).await.is_err());
+        assert!(executor.pods_healthy(&target).await.is_err());
 
         // 空输出（选择器失效）判病。
         std::fs::write(&pods_file, "").unwrap();
-        assert!(executor.pods_healthy(&target, false).await.is_err());
+        assert!(executor.pods_healthy(&target).await.is_err());
 
         // 健康。
         std::fs::write(&pods_file, "0 true ").unwrap();
-        assert!(executor.pods_healthy(&target, false).await.is_ok());
+        assert!(executor.pods_healthy(&target).await.is_ok());
     }
 
     /// fake kubectl：init 容器进度与 deployment 状态按轮次推进。第 1 轮
@@ -4384,6 +4822,9 @@ case "$*" in
     n=$((n+1)); echo "$n" > '{count}'
     if [ "$n" -ge 2 ]; then echo "1|1|1|1|1|"; else echo "1|1|1|1|0|1"; fi
     ;;
+  # Pod 现场查询（就绪门禁与诊断共用）也含 waiting.reason，必须比它先匹配：
+  # 被诊断那支接走会返回空串，门禁读成"没有可判的副本"而不判收敛。
+  *"deletionTimestamp"*) echo "p-new|Running|true|||2026-09-17T15:46:29Z|" ;;
   *"restartCount"*) echo "0 true " ;;
   *"waiting.reason"*) ;;
   *"get pods"*) ;;
@@ -4479,6 +4920,7 @@ case "$*" in
     n=$((n+1)); echo "$n" > '{count}'
     if [ "$n" -ge 3 ]; then echo "1|1|1|1|1|"; else echo "1|1|1|1|0|1"; fi
     ;;
+  *"deletionTimestamp"*) echo "p-new|Running|true|||2026-09-17T15:46:29Z|" ;;
   *"restartCount"*) echo "0 true " ;;
   *"waiting.reason"*) ;;
   *) echo ok ;;
@@ -4602,6 +5044,261 @@ exit 0
         );
     }
 
+    /// 假 kubectl：deployment 计数器**一开始就报收敛**（这正是集群实证里那个
+    /// 假收敛：旧副本 Terminating 但还 ready 计入 readyReplicas，新副本还没
+    /// ready 却已算进 updatedReplicas），而 Pod 现场查询里那个副本前
+    /// `ready_after - 1` 次轮询是 not-ready，主容器启动时刻由 `started` 决定
+    /// （交给 shell 的 date 算，好覆盖「刚起来」与「早就起来」两种处境）。
+    fn fake_kubectl_readiness_gate(dir: &Path, started: &str, ready_after: u64) -> String {
+        let log = dir.join("kubectl.log");
+        let count = dir.join("pods.count");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"deletionTimestamp"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    started=$(date -u -d '{started}' +%Y-%m-%dT%H:%M:%SZ)
+    if [ "$n" -ge {ready_after} ]; then
+      echo "gw-1|Running|true|||$started|"
+    else
+      echo "gw-1|Running|false|ContainersNotReady|containers with unready status: [gw]|$started|"
+    fi
+    ;;
+  *"terminated.finishedAt"*) echo "" ;;
+  *"readinessProbe"*) echo "5|10|1|3" ;;
+  *"generation"*) echo "1|1|1|1|1|" ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) echo "" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = count.display(),
+            started = started,
+            ready_after = ready_after
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 假 kubectl：Pod 现场查询返回两个副本——旧副本已打 deletionTimestamp、
+    /// 关停中不再 ready、主容器起于一小时前；新副本（本次滚动的）已 ready 且刚
+    /// 起来。部署计数器是收敛的，所以「收敛且自己的副本都就绪」这个结论只能
+    /// 从 Pod 现场、且只看非 terminating 的那批推出来。
+    fn fake_kubectl_old_replica_terminating(dir: &Path) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"deletionTimestamp"*)
+    old=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)
+    new=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    echo "gw-old|Running|false|ContainersNotReady|containers with unready status: [gw]|$old|2026-09-17T15:46:00Z"
+    echo "gw-new|Running|true|||$new|"
+    ;;
+  *"terminated.finishedAt"*) echo "" ;;
+  *"readinessProbe"*) echo "5|10|1|3" ;;
+  *"generation"*) echo "1|1|1|1|1|" ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) echo "" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 假 kubectl：就绪探针查询前 `blind_probe_reads` 次失败，之后返回集群实测的
+    /// `5|10|1|3`；部署计数器收敛，Pod 现场是一个早已起来、始终 not-ready 的副本。
+    fn fake_kubectl_blind_probe_reads(dir: &Path, blind_probe_reads: u64) -> String {
+        let log = dir.join("kubectl.log");
+        let count = dir.join("probe.count");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"readinessProbe"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    if [ "$n" -le {blind_probe_reads} ]; then
+      echo "error: unable to connect to the server" >&2
+      exit 1
+    fi
+    echo "5|10|1|3"
+    ;;
+  *"deletionTimestamp"*)
+    started=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)
+    echo "gw-1|Running|false|ContainersNotReady|containers with unready status: [gw]|$started|"
+    ;;
+  *"terminated.finishedAt"*) echo "" ;;
+  *"generation"*) echo "1|1|1|1|1|" ;;
+  *"restartCount"*) echo "0 false " ;;
+  *"waiting.reason"*) echo "" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = count.display(),
+            blind_probe_reads = blind_probe_reads
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 探针配置读不到时不能拿兜底值顶上：兜底预算（48s）比这个部署真实配置出来
+    /// 的预算（53s）短，拿它判就是门禁比 kubelet 更早开枪——正是本故事要消灭的
+    /// 那类错误，只是换了一条更窄的触发路径。读不到就不判，下一轮补读；补读到
+    /// 之后用真实预算判，所以这里的判败文案必须报真实值 53s。
+    #[tokio::test]
+    async fn an_unreadable_probe_configuration_is_not_replaced_by_a_guess() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_blind_probe_reads(&bin_dir, 1);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 60, 300);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        let err = executor.run(&plan).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("readiness probe's own budget"), "{msg}");
+        assert!(
+            msg.contains("53s"),
+            "the verdict must use the deployment's real probe config, not a \
+             fallback budget: {msg}"
+        );
+        assert!(!msg.contains("48s"), "{msg}");
+    }
+
+    /// 集群实证（2026-09-17 15:46:26Z 上线 2c33cfb）：security-gateway 新 Pod
+    /// 15:46:29 起容器，部署器 15:47:01 以 `not ready: 0 false` 判败回滚，而该
+    /// Pod 在 15:47:11 就是 1/1——比门禁晚十秒就绪。就绪探针 period=10 ×
+    /// failureThreshold=3 是 kubelet 自己判「这容器一直不 ready」的周期，门禁
+    /// 不该比它更早开枪：新副本在探针自己的周期内还没就绪，不算失败。
+    #[tokio::test]
+    async fn a_replica_that_becomes_ready_within_the_probes_own_budget_is_not_judged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        // 刚起容器（date 取当前时刻 → 运行时长 ≈ 0，远在 53s 预算内），
+        // 第二次轮询就绪。
+        let kubectl = fake_kubectl_readiness_gate(&bin_dir, "now", 2);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 60, 60);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        executor
+            .run(&plan)
+            .await
+            .expect("a replica still starting must not fail the rollout");
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            !calls.contains("main-old"),
+            "no rollback may be issued while the new replica is within its probe budget: {calls}"
+        );
+    }
+
+    /// 收敛必须归到本次滚动自己的副本上：旧副本正在删除（deletionTimestamp 已
+    /// 打上、关停中已不 ready、起容器于很久以前）时，若把它也算进"本部署的
+    /// Pod"，那个陈旧的启动时刻会立刻吃满就绪预算，于是一个已经就绪的新副本
+    /// 配一个正在关停的旧副本，会把一次成功的滚动判成失败。
+    ///
+    /// 部署计数器在这种现场下确实是收敛的（旧副本已被排除在计数之外），所以
+    /// 这条只有直接看 Pod、且只看属于本次滚动的 Pod 才判得对——锁的是
+    /// `wait_rollout_complete` 里那条归因，不是它下面的纯函数。
+    #[tokio::test]
+    async fn a_terminating_replica_does_not_condemn_a_rollout_that_is_actually_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_old_replica_terminating(&bin_dir);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 60, 60);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        executor
+            .run(&plan)
+            .await
+            .expect("a terminating old replica must not fail the rollout");
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            !calls.contains("main-old"),
+            "a rollout whose own replica is ready must not roll back: {calls}"
+        );
+    }
+
+    /// 反面：预算用完还是没就绪才判败，且判败记录自带现场（Pod 名、相位、
+    /// 就绪状态、等待原因与消息、容器已运行时长）——不能只剩内部采样列。
+    #[tokio::test]
+    async fn a_replica_that_never_readies_inside_the_budget_fails_with_the_scene() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        // 主容器已起来一小时仍未就绪：远超 period×failureThreshold + 启动开销。
+        let kubectl = fake_kubectl_readiness_gate(&bin_dir, "-1 hour", 100_000);
+        // 就绪预算 300s：判败必须来自探针自己的预算，不是外层超时。
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 300, 300);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        let err = executor.run(&plan).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("readiness probe's own budget"), "{msg}");
+        // 预算取自那个部署的探针配置（假 kubectl 给的是集群实测值 5|10|1|3），
+        // 不是任何写死的秒数。
+        assert!(
+            msg.contains("53s"),
+            "the budget must come from the probe config: {msg}"
+        );
+        // 现场：Pod 名、相位、ready、等待原因与消息、容器已运行时长。
+        assert!(msg.contains("gw-1 Running not-ready"), "{msg}");
+        assert!(msg.contains("waiting=ContainersNotReady"), "{msg}");
+        assert!(msg.contains("ran=360"), "{msg}");
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            calls.contains(
+                "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
+            ),
+            "a replica that never readies is a revision failure and must roll back: {calls}"
+        );
+    }
+
     #[test]
     fn cluster_unreachable_is_not_a_verdict_about_the_revision() {
         // 观测能力故障：apiserver 不可达、握手超时、连接被拒、查询整体超时。
@@ -4667,6 +5364,8 @@ case "$*" in
     fi
     echo "1|1|1|1|1|" ;;
   *"terminated.finishedAt"*) echo "" ;;
+  # Pod 现场查询（就绪门禁与诊断共用）同时含 waiting.reason，必须比它先匹配。
+  *"deletionTimestamp"*) echo "p-new|Running|true|||2026-09-17T15:46:29Z|" ;;
   # 健康查询的 jsonpath 同时含 restartCount 与 waiting.reason，必须先前
   # 者优先，否则健康查询被后者接走、返回空串被当成"没有 Pod"。
   *"restartCount"*) echo "0 true " ;;
