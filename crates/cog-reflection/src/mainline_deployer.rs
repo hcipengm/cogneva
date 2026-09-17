@@ -442,6 +442,72 @@ fn is_placement_blocked(msg: &str) -> bool {
     msg.contains(PLACEMENT_BLOCKED_MARKER)
 }
 
+/// 滚动 Job 的进程退出码里「环境类失败」那一档。Job 内的判定进程按这个码告诉
+/// 部署器：这次失败说不出新版本的好坏。取值沿用 sysexits 的 EX_TEMPFAIL——
+/// 语义正是"此刻不成、换个时刻可能就成了"，与"任何非零即失败"（版本类走 1）不
+/// 冲突。部署器只在 Job 已失败时读一次终止码，正常路径不多花一次 kubectl。
+///
+/// 只认这一个确切的码：137/143 这类信号终止码同时对应 OOM、驱逐与
+/// `activeDeadlineSeconds` 到点，判不出类别，按版本类靠。
+const ROLLOUT_EXIT_ENVIRONMENT: i32 = 75;
+
+/// 滚动失败的类别。分的是**这次失败说不说得出新版本的问题**，部署器据此决定
+/// 要不要把这次失败记进本 rev 的尝试预算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FailureClass {
+    /// 观测到的版本缺陷：探针不过、启动卡死、支撑清单 apply 失败、镜像拉不下来。
+    /// 该回滚，也该占一次尝试——同一处反复失败就该停下来等人。
+    #[default]
+    Version,
+    /// 集群环境问题：调度器放不下新 Pod，或我们看不到集群。两种都说不出新版本
+    /// 的好坏，Job 不回滚，部署器也不该把它记成"这个版本试过一次"——否则一次
+    /// 纯容量问题就会按尝试上限把一个本来正常的版本搁置，而要等下一版才解封。
+    Environment,
+}
+
+impl FailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            FailureClass::Version => "version",
+            FailureClass::Environment => "environment",
+        }
+    }
+}
+
+/// 滚动失败连同它的类别一起带出 `RolloutExecutor::run`。判定进程与部署器在
+/// 同一个 crate，类别走类型而不是让部署器回头解析 Job 日志里的字符串。
+#[derive(Debug)]
+pub struct RolloutFailure {
+    /// 这次失败属于哪一类。部署器据此决定要不要计入本 rev 的尝试预算。
+    pub class: FailureClass,
+    /// 原始错误，措辞与判据都不变（Job 日志、错误文本原样保留）。
+    pub error: SFError,
+}
+
+impl RolloutFailure {
+    fn version(error: SFError) -> Self {
+        Self {
+            class: FailureClass::Version,
+            error,
+        }
+    }
+
+    fn environment(error: SFError) -> Self {
+        Self {
+            class: FailureClass::Environment,
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for RolloutFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for RolloutFailure {}
+
 /// 把部署 `.spec` 归一化成可逐字节比较的「放置面」。
 ///
 /// 只抹掉两处不影响放置的易变内容：容器镜像（本次上线改的正是它，留着就每次都算
@@ -627,14 +693,25 @@ enum AdvanceDecision {
     MaxAttempts,
 }
 
+/// 上一条失败 rev 的记账。冷却、次数、上限回答的是同一个问题——"这个 rev 现在
+/// 还能不能再试"——所以合成一格，免得三个数各走各的。
+#[derive(Debug, Clone, Copy)]
+struct RetryBudget {
+    /// 冷却窗截止时刻（unix 秒）。
+    cooldown_until: i64,
+    /// 当前 bare rev 就是刚失败的那个（状态里的 `failed_rev` 命中了它）。
+    retry_of_failed_rev: bool,
+    /// 已记的**版本类**失败次数；环境类失败不占这个预算。
+    attempts: u32,
+    max_attempts: u32,
+}
+
 fn evaluate_advance(
     bare_rev: &str,
     deployed: &DeployedState,
     is_ancestor: bool,
     now_ts: i64,
-    cooldown_until: i64,
-    attempts: u32,
-    max_attempts: u32,
+    retry: RetryBudget,
 ) -> AdvanceDecision {
     match deployed {
         DeployedState::Legacy => AdvanceDecision::Advance,
@@ -646,13 +723,14 @@ fn evaluate_advance(
             if !is_ancestor {
                 return AdvanceDecision::NotAncestor;
             }
-            // 冷却只挡"重试同一失败 rev"（attempts>0 意味着 bare 就是失败 rev，
-            // 见调用处的 keyed 计数）。冷却若连新 rev 一起挡，fix-forward 提交
+            // 冷却挡的是"重试刚失败的这个 rev"，由 failed_rev 判，不能借 attempts:
+            // 环境类失败不占尝试预算（attempts 保持 0），而它恰恰是最该被冷却挡住、
+            // 等节点腾出空间的那一档。冷却若连新 rev 一起挡，fix-forward 提交
             // （修的正是上次失败原因）会被无谓延迟一个冷却窗。
-            if attempts > 0 && now_ts < cooldown_until {
+            if retry.retry_of_failed_rev && now_ts < retry.cooldown_until {
                 return AdvanceDecision::InCooldown;
             }
-            if attempts >= max_attempts {
+            if retry.attempts >= retry.max_attempts {
                 return AdvanceDecision::MaxAttempts;
             }
             AdvanceDecision::Advance
@@ -690,7 +768,12 @@ struct MainlineState {
     in_flight: Option<InFlight>,
     failed_rev: Option<String>,
     failed_cooldown_until: i64,
+    /// **版本类**失败次数；环境类失败不占这个预算（见 [`FailureClass`]）。
     failed_attempts: u32,
+    /// `failed_rev` 那次失败的类别。决定重试时能否复用镜像，old state.json
+    /// 没有这一格，缺省按版本类（保守：宁可重建）。
+    #[serde(default)]
+    failed_class: FailureClass,
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,6 +1149,7 @@ impl MainlineDeployer {
                     state.in_flight = None;
                     state.failed_rev = None;
                     state.failed_attempts = 0;
+                    state.failed_class = FailureClass::default();
                     state.failed_cooldown_until = 0;
                     self.save_state(&state)?;
                     return Ok(());
@@ -1095,14 +1179,26 @@ impl MainlineDeployer {
                         return Ok(());
                     }
                     JobStatus::Failed => {
-                        warn!(rev = %rev12(&inflight.rev), "mainline rollout job failed; rollback handled by job itself");
-                        let attempts = if state.failed_rev.as_deref() == Some(inflight.rev.as_str())
-                        {
-                            state.failed_attempts + 1
-                        } else {
-                            1
+                        // 类别取自 Job 的终止码（环境类不回滚也不计尝试），不是
+                        // 从 Job 日志里找字符串。
+                        let class = self.job_failure_class(&job_name(&inflight.rev)).await;
+                        let same_rev = state.failed_rev.as_deref() == Some(inflight.rev.as_str());
+                        let attempts = match (class, same_rev) {
+                            // 环境类失败不是版本结论：不占尝试预算，只设冷却，
+                            // 等节点腾出空间后在冷却窗后再来。
+                            (FailureClass::Environment, true) => state.failed_attempts,
+                            (FailureClass::Environment, false) => 0,
+                            (FailureClass::Version, true) => state.failed_attempts + 1,
+                            (FailureClass::Version, false) => 1,
                         };
+                        warn!(
+                            rev = %rev12(&inflight.rev),
+                            class = class.as_str(),
+                            attempts,
+                            "mainline rollout job failed (rollback, if any, handled by the job itself)"
+                        );
                         state.failed_rev = Some(inflight.rev.clone());
+                        state.failed_class = class;
                         state.failed_attempts = attempts;
                         state.failed_cooldown_until =
                             chrono::Utc::now().timestamp() + self.cfg.failure_cooldown_secs as i64;
@@ -1150,7 +1246,8 @@ impl MainlineDeployer {
         }
         let deployed = normalized;
 
-        let attempts = if state.failed_rev.as_deref() == Some(bare.as_str()) {
+        let retry_of_failed_rev = state.failed_rev.as_deref() == Some(bare.as_str());
+        let attempts = if retry_of_failed_rev {
             state.failed_attempts
         } else {
             0
@@ -1165,9 +1262,12 @@ impl MainlineDeployer {
             &deployed,
             is_ancestor,
             now,
-            state.failed_cooldown_until,
-            attempts,
-            self.cfg.max_attempts_per_rev,
+            RetryBudget {
+                cooldown_until: state.failed_cooldown_until,
+                retry_of_failed_rev,
+                attempts,
+                max_attempts: self.cfg.max_attempts_per_rev,
+            },
         );
         match decision {
             AdvanceDecision::Advance => {}
@@ -1192,9 +1292,11 @@ impl MainlineDeployer {
         // 不可变 tag 与 rev 一一对应：registry 上已有 `main-<rev>` 就说明
         // 该 rev 早已构建过（清单被重下发打回浮动签后，四部署只是需要重新
         // pin 回去），直接派 Job 滚动即可，4C 机器上省掉一次全程构建。
-        // 该 rev 此前失败过就老老实实重建——半推成功留下的坏 tag 不能靠
-        // 复用来"修复"，否则会在同一处反复失败。
-        if state.failed_rev.as_deref() != Some(bare.as_str())
+        // 该 rev 此前**版本类**失败过就老老实实重建——半推成功留下的坏 tag
+        // 不能靠复用来"修复"，否则会在同一处反复失败。环境类失败不在此列：
+        // 那一支的构建与推送都成功了（卡住的是调度），重试复用同一个 tag 是
+        // 对的，也免得在本来就排不进 Pod 的节点上再跑一遍全程构建。
+        if (!retry_of_failed_rev || state.failed_class == FailureClass::Environment)
             && self.registry_tag_exists(&push_tag).await
         {
             info!(rev = %rev12(&bare), tag = %push_tag, "immutable image already in registry; re-pinning without a rebuild");
@@ -1694,6 +1796,49 @@ impl MainlineDeployer {
             Ok(JobStatus::Running)
         }
     }
+
+    /// Job 已失败时，问它的判定进程**是哪一类**失败。Job 的 Pod 模板是
+    /// `backoffLimit: 0` + `restartPolicy: Never`，一个 Pod 一次运行，终止码
+    /// 就是这个进程的退出码。
+    ///
+    /// 采不到（Pod 已删、查询失败、码不可解析）按**版本类**靠：类别判不准
+    /// 时，把环境类误记成版本类只是多花一次尝试预算，反过来则是一个真坏的
+    /// 版本被无限重试、永不停下——代价不对称，往记账侧取。
+    async fn job_failure_class(&self, name: &str) -> FailureClass {
+        let out = match self
+            .kubectl(
+                &[
+                    "get",
+                    "pods",
+                    "-l",
+                    &format!("job-name={name}"),
+                    "-o",
+                    "jsonpath={range .items[*]}{.status.containerStatuses[0].state.terminated.exitCode}{\"\\n\"}{end}",
+                ],
+                30,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(
+                    job = %name,
+                    error = %e,
+                    "could not read the rollout job's exit code; treating its failure as version-class"
+                );
+                return FailureClass::Version;
+            }
+        };
+        let code = out
+            .lines()
+            .filter_map(|l| l.trim().parse::<i32>().ok())
+            .next_back();
+        if code == Some(ROLLOUT_EXIT_ENVIRONMENT) {
+            FailureClass::Environment
+        } else {
+            FailureClass::Version
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1724,11 +1869,18 @@ fn heartbeat_message(state: &MainlineState, bare_rev: &str, now_unix: i64) -> St
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
     format!(
-        "bare={} last_good={} in_flight={} failed_rev={} failed_attempts={} cooldown_remaining_secs={}",
+        "bare={} last_good={} in_flight={} failed_rev={} failed_class={} failed_attempts={} cooldown_remaining_secs={}",
         rev12(bare_rev),
         state.last_good_rev.as_deref().map(rev12).unwrap_or("none"),
         in_flight,
         state.failed_rev.as_deref().map(rev12).unwrap_or("none"),
+        // 环境类失败不计尝试次数，`failed_rev` 与 `failed_attempts=0` 会同时出现；
+        // 不说出类别，这一行读起来就像记账坏了。
+        state
+            .failed_rev
+            .as_ref()
+            .map(|_| state.failed_class.as_str())
+            .unwrap_or("none"),
         state.failed_attempts,
         (state.failed_cooldown_until - now_unix).max(0),
     )
@@ -2748,17 +2900,18 @@ impl RolloutExecutor {
     /// 其他字段）。回滚只回退 image：支撑资源不反向删改（apply 是幂等
     /// upsert，旧镜像配新支撑资源可运行；删改支撑资源反而可能把在跑
     /// 集群打坏）。
-    pub async fn run(&self, plan: &RolloutPlan) -> SFResult<()> {
+    pub async fn run(&self, plan: &RolloutPlan) -> Result<(), RolloutFailure> {
         // 支撑资源先于任何镜像变更就位：新二进制启动依赖的 RBAC/ConfigMap/
         // Service 若晚于滚动落地，新 Pod 会因缺依赖 crashloop 触发无谓回滚。
-        // 失败直接中止，此时一个镜像都没动（线上原样）。
+        // 失败直接中止，此时一个镜像都没动（线上原样）：坏的是这份清单，归版本类。
         if let Some(dir) = &plan.manifests_dir {
             let support = Path::new(dir).join("support.yaml");
             if support.is_file() && support.metadata().map(|m| m.len() > 0).unwrap_or(false) {
                 let support_arg = support.to_string_lossy().to_string();
                 info!(manifest = %support_arg, "mainline rollout: applying support manifests");
                 self.run_kubectl(&["apply", "-f", &support_arg], 120)
-                    .await?;
+                    .await
+                    .map_err(RolloutFailure::version)?;
             }
         }
         // 任何镜像变更之前先快照各部署当前镜像作为回滚目标：per-target、
@@ -2767,10 +2920,16 @@ impl RolloutExecutor {
         let mut prevs: Vec<(String, String)> = Vec::new();
         let mut prev_shapes: Vec<(String, String)> = Vec::new();
         for t in &plan.targets {
-            let img = self.current_image(t).await?;
+            let img = self
+                .current_image(t)
+                .await
+                .map_err(RolloutFailure::version)?;
             // 放置面与镜像一起快照：apply 之后才分得清"排不上队"是这次上线
             // 自己加了排不上的约束（版本的事），还是节点本来就满（不是）。
-            let shape = self.current_placement_shape(t).await?;
+            let shape = self
+                .current_placement_shape(t)
+                .await
+                .map_err(RolloutFailure::version)?;
             info!(deployment = %t.deployment, prev = %img, "mainline rollout: snapshot prev image");
             prevs.push((t.deployment.clone(), img));
             prev_shapes.push((t.deployment.clone(), shape));
@@ -2816,19 +2975,23 @@ impl RolloutExecutor {
     ///   上线自己改动了放置面时才归版本（那一支带的是普通超时错误，不进这里）。
     ///
     /// 两种都让 Job 非零退出（部署器下轮重试），集群保持在刚推上去的新版本上。
+    ///
+    /// 这里是**唯一**给失败定类别的地方：两支不回滚的判成环境类，其余（含
+    /// 回滚过的那一支）判成版本类。类别随 [`RolloutFailure`] 带到 CLI，翻成
+    /// 进程退出码交给部署器，部署器据此决定占不占尝试预算。
     async fn fail_without_blind_rollback(
         &self,
         e: SFError,
         done: &[&RolloutTarget],
         prevs: &[(String, String)],
-    ) -> SFResult<()> {
+    ) -> Result<(), RolloutFailure> {
         let msg = e.to_string();
         if is_cluster_unreachable(&msg) {
             warn!(
                 error = %e,
                 "cluster unreachable during the rollout; keeping the new revision (no rollback)"
             );
-            return Err(e);
+            return Err(RolloutFailure::environment(e));
         }
         if is_placement_blocked(&msg) {
             warn!(
@@ -2836,10 +2999,10 @@ impl RolloutExecutor {
                 "the scheduler never placed the new pods and this revision did not change the \
                  deployment's placement shape; keeping the new revision (no rollback)"
             );
-            return Err(e);
+            return Err(RolloutFailure::environment(e));
         }
         self.rollback(&e, done, prevs).await;
-        Err(e)
+        Err(RolloutFailure::version(e))
     }
 
     /// 尽力回滚：已滚目标按快照的各自 prev 镜像反向 set image 并等收敛
@@ -2952,8 +3115,17 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         timeout,
         startup_timeout,
     );
-    executor.run(&plan).await?;
-    Ok(())
+    match executor.run(&plan).await {
+        Ok(()) => Ok(()),
+        // 环境类失败：用独立退出码告诉部署器"这次失败说不出新版本的好坏"，
+        // 让它不把这次失败记进本 rev 的尝试预算。`process::exit` 不走返回路径，
+        // 因为 Box<dyn Error> 出去一律是 1，区分不出类别。
+        Err(f) if f.class == FailureClass::Environment => {
+            tracing::error!(error = %f, exit_code = ROLLOUT_EXIT_ENVIRONMENT, "mainline rollout failed for environment reasons");
+            std::process::exit(ROLLOUT_EXIT_ENVIRONMENT);
+        }
+        Err(f) => Err(Box::new(f)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3426,12 +3598,14 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_rev: None,
             failed_cooldown_until: 0,
             failed_attempts: 0,
+            failed_class: FailureClass::Version,
         };
         let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", 100);
         assert!(msg.contains("bare=4dfd51ff1209"), "{msg}");
         assert!(msg.contains("last_good=4dfd51ff1209"), "{msg}");
         assert!(msg.contains("in_flight=none"), "{msg}");
         assert!(msg.contains("failed_rev=none"), "{msg}");
+        assert!(msg.contains("failed_class=none"), "{msg}");
         assert!(msg.contains("failed_attempts=0"), "{msg}");
         assert!(msg.contains("cooldown_remaining_secs=0"), "{msg}");
     }
@@ -3448,12 +3622,31 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_rev: Some("112233445566aabb".into()),
             failed_cooldown_until: 1500,
             failed_attempts: 2,
+            failed_class: FailureClass::Version,
         };
         let msg = heartbeat_message(&state, "aabbccddeeff0011", 1000);
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
         assert!(msg.contains("failed_rev=112233445566"), "{msg}");
+        assert!(msg.contains("failed_class=version"), "{msg}");
         assert!(msg.contains("failed_attempts=2"), "{msg}");
         assert!(msg.contains("cooldown_remaining_secs=500"), "{msg}");
+    }
+
+    /// 环境类失败不计尝试次数，`failed_rev` 与 `failed_attempts=0` 会同时出现：
+    /// 心跳必须说出类别，否则这一行读起来像记账坏了。
+    #[test]
+    fn heartbeat_message_names_an_environment_class_failure() {
+        let state = MainlineState {
+            failed_rev: Some("112233445566aabb".into()),
+            failed_cooldown_until: 1500,
+            failed_attempts: 0,
+            failed_class: FailureClass::Environment,
+            ..Default::default()
+        };
+        let msg = heartbeat_message(&state, "112233445566aabb", 1000);
+        assert!(msg.contains("failed_rev=112233445566"), "{msg}");
+        assert!(msg.contains("failed_class=environment"), "{msg}");
+        assert!(msg.contains("failed_attempts=0"), "{msg}");
     }
 
     #[test]
@@ -3558,44 +3751,62 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let bare = "bb2222222222";
         let main = |r: &str| DeployedState::Main(r.into());
         let now = 1000i64;
+        let other = main("aa1111111111");
+        let retry = |cooldown_until, retry_of_failed_rev, attempts| RetryBudget {
+            cooldown_until,
+            retry_of_failed_rev,
+            attempts,
+            max_attempts: 2,
+        };
         // 同 rev 不前进
         assert_eq!(
-            evaluate_advance(bare, &main(bare), true, now, 0, 0, 2),
+            evaluate_advance(bare, &main(bare), true, now, retry(0, false, 0)),
             AdvanceDecision::SameRev
         );
         // 非祖先（分叉/倒退）拒
         assert_eq!(
-            evaluate_advance(bare, &main("aa1111111111"), false, now, 0, 0, 2),
+            evaluate_advance(bare, &other, false, now, retry(0, false, 0)),
             AdvanceDecision::NotAncestor
         );
-        // 冷却中且目标是失败 rev 本身（attempts>0）才挡
+        // 冷却挡的是"重试刚失败的这个 rev"，由 failed_rev 判而非 attempts：
+        // attempts=0 正是环境类失败（不占预算）的形状，它同样要被冷却挡住。
         assert_eq!(
-            evaluate_advance(bare, &main("aa1111111111"), true, now, 2000, 1, 2),
+            evaluate_advance(bare, &other, true, now, retry(2000, true, 0)),
+            AdvanceDecision::InCooldown
+        );
+        // 版本类失败同样在冷却窗内被挡
+        assert_eq!(
+            evaluate_advance(bare, &other, true, now, retry(2000, true, 1)),
             AdvanceDecision::InCooldown
         );
         // 冷却窗内推进到新 rev（fix-forward）不挡：新提交可能正是修复
         assert_eq!(
-            evaluate_advance(bare, &main("aa1111111111"), true, now, 2000, 0, 2),
+            evaluate_advance(bare, &other, true, now, retry(2000, false, 0)),
+            AdvanceDecision::Advance
+        );
+        // 环境类失败重试不占预算：冷却过了就照常再试，不会撞上尝试上限。
+        assert_eq!(
+            evaluate_advance(bare, &other, true, now, retry(0, true, 0)),
             AdvanceDecision::Advance
         );
         // 超次数
         assert_eq!(
-            evaluate_advance(bare, &main("aa1111111111"), true, now, 0, 2, 2),
+            evaluate_advance(bare, &other, true, now, retry(0, true, 2)),
             AdvanceDecision::MaxAttempts
         );
         // 正常前进
         assert_eq!(
-            evaluate_advance(bare, &main("aa1111111111"), true, now, 0, 1, 2),
+            evaluate_advance(bare, &other, true, now, retry(0, true, 1)),
             AdvanceDecision::Advance
         );
         // 迁移首轮（Legacy）直接前进
         assert_eq!(
-            evaluate_advance(bare, &DeployedState::Legacy, false, now, 0, 0, 2),
+            evaluate_advance(bare, &DeployedState::Legacy, false, now, retry(0, false, 0)),
             AdvanceDecision::Advance
         );
         // 混合态不前进
         assert_eq!(
-            evaluate_advance(bare, &DeployedState::Mixed, true, now, 0, 0, 2),
+            evaluate_advance(bare, &DeployedState::Mixed, true, now, retry(0, false, 0)),
             AdvanceDecision::Mixed
         );
     }
@@ -3619,6 +3830,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_rev: None,
             failed_cooldown_until: 0,
             failed_attempts: 0,
+            failed_class: FailureClass::Environment,
         };
         let text = serde_json::to_string(&state).unwrap();
         let back: MainlineState = serde_json::from_str(&text).unwrap();
@@ -4573,6 +4785,241 @@ exit 0
             serde_json::from_str(&std::fs::read_to_string(state_dir.join("state.json")).unwrap())
                 .unwrap();
         assert_eq!(state.in_flight.unwrap().phase, Phase::Dispatched);
+    }
+
+    /// fake kubectl：四部署停在 old_image，同 rev 的滚动 Job 报失败，其 Pod 的
+    /// 终止码按参数给（部署器据此定类别）。
+    fn fake_kubectl_failed_job(dir: &Path, old_image: &str, exit_code: &str) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"job-name="*) echo "{exit_code}" ;;
+  *"get job"*) echo "|1|" ;;
+  *"get deployment"*) echo "{old_image}" ;;
+  *"delete"*) echo 'job.batch "x" deleted' ;;
+  *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 预置 state.json，返回它的路径。
+    fn seed_state(root: &Path, state: MainlineState) -> PathBuf {
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+        state_dir.join("state.json")
+    }
+
+    fn read_state(path: &Path) -> MainlineState {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Job 的失败类别取自它自己的终止码。这里是那条确定性通道的入口：
+    /// 部署器不读 Job 日志、不解析错误文本。
+    #[tokio::test]
+    async fn rollout_job_exit_code_carries_the_failure_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake = PathBuf::from("/nonexistent");
+        let class_of = |name: &str, body: &str| {
+            let (root, bin_dir, fake) = (root.to_path_buf(), bin_dir.clone(), fake.clone());
+            let name = name.to_string();
+            let body = body.to_string();
+            async move {
+                write_fake_bin(&bin_dir, &name, &body);
+                let cfg = test_config(&root, &fake, "noop", &bin_dir.join(&name).to_string_lossy());
+                MainlineDeployer::new(cfg, test_workspaces(&root, &fake))
+                    .job_failure_class("j")
+                    .await
+            }
+        };
+        assert_eq!(
+            class_of("k75", "#!/bin/sh\necho 75\nexit 0\n").await,
+            FailureClass::Environment
+        );
+        // 1（版本类退出）、空（Pod 还没终止）、137（信号终止：OOM / 驱逐 / 到点
+        // 被杀都长这样，类别判不出）一律按版本类靠：判不准就往记账侧取。
+        assert_eq!(
+            class_of("k1", "#!/bin/sh\necho 1\nexit 0\n").await,
+            FailureClass::Version
+        );
+        assert_eq!(
+            class_of("kempty", "#!/bin/sh\nexit 0\n").await,
+            FailureClass::Version
+        );
+        assert_eq!(
+            class_of("k137", "#!/bin/sh\necho 137\nexit 0\n").await,
+            FailureClass::Version
+        );
+        // 采样失败（apiserver 不可达）同样按版本类，且不产生第二个错误。
+        assert_eq!(
+            class_of("kerr", "#!/bin/sh\necho 'no route to host' >&2\nexit 1\n").await,
+            FailureClass::Version
+        );
+    }
+
+    /// 环境类失败不是版本结论：不占本 rev 的尝试次数，但仍设冷却（不空转），
+    /// 且 rev 仍记着（下轮走"重试它"这条判据）。
+    #[tokio::test]
+    async fn an_environment_class_failure_does_not_consume_the_attempt_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl = fake_kubectl_failed_job(
+            &bin_dir,
+            &main_image("localhost:30500", &rev_a),
+            &ROLLOUT_EXIT_ENVIRONMENT.to_string(),
+        );
+        let buildah = fake_buildah(&bin_dir, "");
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        // 上一轮已经记过一次版本类失败：环境类这次不该把它推到上限。
+        let state_path = seed_state(
+            root,
+            MainlineState {
+                in_flight: Some(InFlight {
+                    rev: rev_b.clone(),
+                    phase: Phase::Dispatched,
+                }),
+                failed_rev: Some(rev_b.clone()),
+                failed_attempts: 1,
+                failed_class: FailureClass::Version,
+                ..Default::default()
+            },
+        );
+
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+        deployer.poll_once().await.unwrap();
+
+        let state = read_state(&state_path);
+        assert_eq!(state.failed_attempts, 1, "环境类失败不占尝试预算");
+        assert_eq!(state.failed_class, FailureClass::Environment);
+        assert_eq!(state.failed_rev.as_deref(), Some(rev_b.as_str()));
+        assert!(state.in_flight.is_none());
+        assert!(
+            state.failed_cooldown_until > chrono::Utc::now().timestamp(),
+            "环境类失败仍要冷却，否则部署器会在同一个满节点上空转"
+        );
+        // 类别必须来自 Job 的 Pod 终止码：这条查询没发生就说明判据换了来源。
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            calls.contains(&format!("job-name={}", job_name(&rev_b))),
+            "exit code query missing: {calls}"
+        );
+    }
+
+    /// 版本类失败照旧占一次：同一处反复失败要能停下来等人。
+    #[tokio::test]
+    async fn a_version_class_failure_consumes_an_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl =
+            fake_kubectl_failed_job(&bin_dir, &main_image("localhost:30500", &rev_a), "1");
+        let buildah = fake_buildah(&bin_dir, "");
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let state_path = seed_state(
+            root,
+            MainlineState {
+                in_flight: Some(InFlight {
+                    rev: rev_b.clone(),
+                    phase: Phase::Dispatched,
+                }),
+                failed_rev: Some(rev_b.clone()),
+                failed_attempts: 1,
+                failed_class: FailureClass::Version,
+                ..Default::default()
+            },
+        );
+
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+        deployer.poll_once().await.unwrap();
+
+        let state = read_state(&state_path);
+        assert_eq!(state.failed_attempts, 2);
+        assert_eq!(state.failed_class, FailureClass::Version);
+    }
+
+    /// 环境类失败过的 rev，其镜像构建与推送都成功过（卡住的是调度）：重试直接
+    /// 复用 registry 上的不可变 tag，不在本来就把 Pod 排不进去的节点上再跑一遍
+    /// 全程构建。
+    #[tokio::test]
+    async fn an_environment_class_failure_retries_without_a_rebuild() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl =
+            fake_kubectl_failed_job(&bin_dir, &main_image("localhost:30500", &rev_a), "1");
+        // 版本号写全 rev：把复用条件改坏时构建会真的跑起来，让"没有重建"这条
+        // 断言（而不是构建本身的报错）成为红灯。
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        let (endpoint, handle) = fake_registry(vec![http_200("{}")]).await;
+        let push_tag = main_image(&endpoint, &rev_b);
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.registry = endpoint;
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+        // 上一轮：同一个 rev 环境类失败，镜像已在 registry 上。
+        let state_path = seed_state(
+            root,
+            MainlineState {
+                failed_rev: Some(rev_b.clone()),
+                failed_attempts: 0,
+                failed_class: FailureClass::Environment,
+                ..Default::default()
+            },
+        );
+
+        let deployer = MainlineDeployer::new(cfg, ws);
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        assert!(
+            !bin_dir.join("buildah.log").exists(),
+            "an environment-class retry must reuse the immutable tag, not rebuild"
+        );
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            calls.contains("apply -f -"),
+            "the rollout job must be re-dispatched: {calls}"
+        );
+        assert!(
+            calls.contains(&main_image("localhost:30500", &rev_b)),
+            "re-dispatched job must carry the same immutable tag: {calls}"
+        );
+        let state = read_state(&state_path);
+        assert_eq!(state.in_flight.unwrap().phase, Phase::Dispatched);
+        // 假 registry 只被问了一次：就是"这个 tag 在不在"。
+        let reqs = handle.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].contains(&format!("/v2/cogneva/manifests/{push_tag}")),
+            "the one registry read must be the tag-presence probe: {:?}",
+            reqs[0]
+        );
     }
 
     #[tokio::test]

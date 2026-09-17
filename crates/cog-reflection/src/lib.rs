@@ -86,8 +86,8 @@ pub use gitops_publisher::GitOpsPublisher;
 pub use gitops_puller::{parse_tag_message, run_puller_loop, GitOpsPuller, PromotionCandidate};
 pub use image_rollout::ImageRollout;
 pub use mainline_deployer::{
-    run_mainline_loop, run_rollout_cli, MainlineDeployer, RolloutExecutor, RolloutPlan,
-    RolloutTarget,
+    run_mainline_loop, run_rollout_cli, FailureClass, MainlineDeployer, RolloutExecutor,
+    RolloutFailure, RolloutPlan, RolloutTarget,
 };
 pub use matcher::{DefaultLearningMatcher, LearningMatcher};
 pub use meta_learning::MetaLearningEngine;
