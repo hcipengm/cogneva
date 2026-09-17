@@ -203,6 +203,8 @@ struct PullGateState {
     /// 快照判据的缓存：读到时刻与推断的暂停截止点。
     pool_checked_at: Option<std::time::Instant>,
     pool_until: Option<std::time::Instant>,
+    /// 当前是否已经播报过"暂停中"。播报只认状态翻转，不认被挡下的条数。
+    announced_pause: bool,
 }
 
 /// 拉取闸门：把"现在该不该从事件面拉下一条"收敛成一个判据，输入有两路。
@@ -266,11 +268,6 @@ impl PullGate {
             s.local_secs.saturating_mul(2).min(self.max_secs)
         };
         s.local_until = Some(now + Duration::from_secs(s.local_secs));
-        warn!(
-            consecutive_failures = s.consecutive_failures,
-            pause_secs = s.local_secs,
-            "Memory ingest pull paused: LLM upstream unavailable"
-        );
     }
 
     /// 快照判据：池不可用时给出等待时长。按 [`Self::check_secs`] 缓存快照，
@@ -313,6 +310,10 @@ impl PullGate {
     }
 
     /// 现在是否该暂停拉取；返回需要等待的时长。
+    ///
+    /// 两路输入在这里合成一个判据，也在这里合成一处播报。闸门关着时逐条
+    /// 播报会把一次断供刷成上万行；完全不播报又让"上游挂了、摄取停摆"和
+    /// "本来就没有活可干"在 INFO 级别长得一模一样，谁都没法从日志上分开。
     async fn blocked_for(&self) -> Option<Duration> {
         let now = std::time::Instant::now();
         let local = {
@@ -320,9 +321,32 @@ impl PullGate {
             s.local_until.filter(|t| *t > now).map(|t| t - now)
         };
         let shared = self.shared_wait().await;
-        match (local, shared) {
+        let wait = match (local, shared) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or_default().max(b.unwrap_or_default())),
+        };
+        self.announce(wait);
+        wait
+    }
+
+    /// 暂停/恢复各只报一次，认状态翻转而不是认被挡下的条数。
+    fn announce(&self, wait: Option<Duration>) {
+        let mut s = self.state.lock().unwrap();
+        match (wait, s.announced_pause) {
+            (Some(d), false) => {
+                s.announced_pause = true;
+                warn!(
+                    wait_secs = d.as_secs(),
+                    "Memory ingest pull paused: LLM upstream unavailable"
+                );
+            }
+            (None, true) => {
+                s.announced_pause = false;
+                // 说的是"暂停条件消失了、接下来会再试"，不是"上游确认好了"：
+                // 没有池快照时，闸门开只代表本地窗口到期。
+                info!("Memory ingest pull resumed: pausing condition cleared");
+            }
+            _ => {}
         }
     }
 }
@@ -1620,6 +1644,40 @@ mod tests {
         assert!(
             ingestor.pull_gate.blocked_for().await.is_none(),
             "the gate must reopen once the snapshot reports a healthy pool"
+        );
+    }
+
+    /// 闸门的暂停/恢复只报翻转。断供期间每条被挡下的消息都报一次会把日志
+    /// 刷成上万行，而一次都不报又让"上游挂了停摆"和"没活可干"在 INFO 级别
+    /// 无从分辨。翻转标志就是播报判据，反复调用不该再次翻转。
+    #[tokio::test]
+    async fn gate_announces_the_pause_once_per_transition() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let pool = Arc::new(TogglePool::new(true, chrono::Utc::now().timestamp() + 300));
+        let ingestor = MemoryIngestor::new(backend, Arc::new(UnreachableExtractor::new()))
+            .with_config(MemoryIngestorConfig {
+                pool_check_secs: 1,
+                ..quick_retry_config()
+            })
+            .with_pool_status_source(pool.clone());
+        let announced = || ingestor.pull_gate.state.lock().unwrap().announced_pause;
+
+        assert!(ingestor.pull_gate.blocked_for().await.is_some());
+        assert!(announced(), "closing the gate must be announced");
+        for _ in 0..50 {
+            assert!(ingestor.pull_gate.blocked_for().await.is_some());
+        }
+        assert!(
+            announced(),
+            "still-paused calls must not re-announce; the flag only moves on a flip"
+        );
+
+        pool.set(false);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(ingestor.pull_gate.blocked_for().await.is_none());
+        assert!(
+            !announced(),
+            "reopening the gate must be announced exactly once"
         );
     }
 
