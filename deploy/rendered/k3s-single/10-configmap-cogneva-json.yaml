@@ -443,6 +443,15 @@ data:
               "summary": "Ralph loops stopped {value} times in the last 30m without passing their goal; the evolution chain is burning budget instead of converging (the reason label distinguishes budget_exhausted from stagnated)"
             },
             {
+              "name": "self_evolution_yields_no_change",
+              "promql": "increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|submit_failed\"}[6h])",
+              "condition": {
+                "greater_than": 2.0
+              },
+              "severity": "warning",
+              "summary": "Self-evolution chains reported success {value} time(s) in the last 6h while producing no change to land (no_artifacts: the pipeline yielded no valid diff; submit_failed: every sink rejected it); the landing channel stays empty and the loop silently stops evolving"
+            },
+            {
               "name": "cogneva_workload_metrics_unscraped",
               "promql": "avg_over_time((count(kube_pod_container_info{namespace=\"cogneva\", image=~\".*cogneva.*\"} and on(pod) kube_pod_status_phase{namespace=\"cogneva\", phase=\"Running\"} == 1 unless on(pod) kube_pod_owner{namespace=\"cogneva\", owner_kind=\"Job\"}) - count(up{namespace=\"cogneva\"}))[15m:1m])",
               "condition": {
