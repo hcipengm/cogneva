@@ -316,3 +316,7 @@ mainlineDeployer:
   soakSecs: 120
   failureCooldownSecs: 3600
   cargoBuildJobs: 2
+  # 滚动启动阶段的上界（秒）：Pod 的 init 容器（仓库种子/镜像拉取）未结束时
+  # 不吃就绪预算、只吃这个上界。种子是网络克隆，耗时随集群到上游的链路变化，
+  # 链路慢就调大这里，不要靠放宽就绪预算。
+  startupTimeoutSecs: 900

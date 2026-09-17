@@ -1052,6 +1052,8 @@ impl MainlineDeployer {
             self.cfg.restart_threshold.to_string(),
             "--timeout".into(),
             self.cfg.rollout_timeout_secs.to_string(),
+            "--startup-timeout".into(),
+            self.cfg.startup_timeout_secs.to_string(),
         ];
         let mut volumes: Vec<serde_json::Value> = Vec::new();
         let mut mounts: Vec<serde_json::Value> = Vec::new();
@@ -1099,7 +1101,14 @@ impl MainlineDeployer {
             },
             "spec": {
                 "backoffLimit": 0,
-                "activeDeadlineSeconds": self.cfg.rollout_timeout_secs * 6 + self.cfg.soak_secs,
+                // 上界必须覆盖最坏情况：每个目标最多吃 startup + rollout + 15s
+                // 宽限（到点即判败回滚）；Job 被 activeDeadlineSeconds 杀掉
+                // 走不到 Job 自己的回滚，留短了会把集群停在半滚状态。
+                "activeDeadlineSeconds": (self.cfg.startup_timeout_secs
+                    + self.cfg.rollout_timeout_secs
+                    + 15)
+                    * self.cfg.targets.len().max(1) as u64
+                    + self.cfg.soak_secs,
                 "ttlSecondsAfterFinished": 86400,
                 "template": {
                     "metadata": {
@@ -1740,6 +1749,7 @@ pub struct RolloutExecutor {
     soak_secs: u64,
     restart_threshold: u32,
     rollout_timeout_secs: u64,
+    startup_timeout_secs: u64,
 }
 
 impl RolloutExecutor {
@@ -1749,6 +1759,7 @@ impl RolloutExecutor {
         soak_secs: u64,
         restart_threshold: u32,
         rollout_timeout_secs: u64,
+        startup_timeout_secs: u64,
     ) -> Self {
         Self {
             kubectl: kubectl.into(),
@@ -1756,6 +1767,7 @@ impl RolloutExecutor {
             soak_secs,
             restart_threshold,
             rollout_timeout_secs,
+            startup_timeout_secs,
         }
     }
 
@@ -1833,12 +1845,44 @@ impl RolloutExecutor {
         Ok(img)
     }
 
+    /// 选择器命中的 Pod 的 init 容器进度：每个 init 容器一行，形如
+    /// `<finishedAt>|`，未结束的只有分隔符。空输出表示没有任何 init 容器
+    /// （无 init 的部署恒为空）。未完成用分隔符而不是空行标记，因为
+    /// run_kubectl 会 trim 掉首尾空白，纯空行到不了这里。查询失败按"没有
+    /// 在启动"处理：退回改动前的就绪预算，不因一次查询抖动把预算放宽。
+    async fn init_containers_progress(&self, t: &RolloutTarget) -> String {
+        let selector = pod_selector(&t.name, &t.component);
+        self.run_kubectl(
+            &[
+                "get",
+                "pods",
+                "-l",
+                &selector,
+                "-o",
+                "jsonpath={range .items[*]}{range .status.initContainerStatuses[*]}{.state.terminated.finishedAt}{\"|\"}{end}{end}",
+            ],
+            30,
+        )
+        .await
+        .unwrap_or_default()
+    }
+
     /// 轮询 deployment rollout 完成：observedGeneration 追上 generation 且
     /// updated/ready 副本数达期望（短查询，Job 在爆炸半径外不怕被杀）。
     /// 轮询同时查 Pod 致命等待态：崩溃镜像永远不会 ready，干等 rollout 超时
     /// （默认 300s）既拖慢回滚又让故障窗口白白拉长，命中即早退触发回滚。
+    ///
+    /// 两段预算：Pod 的 init 容器还没结束时是**启动阶段**，只吃
+    /// startup_timeout_secs；init 全部结束后才开始吃 rollout_timeout_secs
+    /// 的**就绪**预算。种子这类 init 步骤必须早于主容器结束，但它的耗时
+    /// 由外部网络决定、与本次要上线的版本无关，算进就绪预算就会让一次慢
+    /// 克隆把好版本判成败。两段都仍需有界：主容器永不 ready 的场景不能
+    /// 无限等，Job 被 activeDeadlineSeconds 杀掉不会走 Job 自己的回滚。
     async fn wait_rollout_complete(&self, t: &RolloutTarget) -> SFResult<()> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(self.rollout_timeout_secs);
+        let startup_deadline =
+            std::time::Instant::now() + Duration::from_secs(self.startup_timeout_secs);
+        // 延迟到首次进入就绪阶段才起算：启动阶段的耗时不算在内。
+        let mut readiness_deadline: Option<std::time::Instant> = None;
         loop {
             let out = self
                 .run_kubectl(
@@ -1878,19 +1922,36 @@ impl RolloutExecutor {
             // 滚动中新旧 Pod 交替、containerStatuses 可能暂时缺失，空输出/查询
             // 失败在这里不当致命（与 pods_healthy 不同），只认明确的致命等待态。
             self.fatal_pod_state(t).await?;
-            if std::time::Instant::now() >= deadline {
-                return Err(SFError::Agent(format!(
-                    "rollout of deployment/{} did not complete within {}s (last: {out})",
-                    t.deployment, self.rollout_timeout_secs
-                )));
+            let init_progress = self.init_containers_progress(t).await;
+            let starting = init_progress.lines().any(|l| l.trim() == "|");
+            let now = std::time::Instant::now();
+            if starting {
+                if now >= startup_deadline {
+                    return Err(SFError::Agent(format!(
+                        "deployment/{} stuck in startup phase after {}s \
+                         (init containers not finished; last deployment state: {out})",
+                        t.deployment, self.startup_timeout_secs
+                    )));
+                }
+            } else {
+                let deadline = *readiness_deadline
+                    .get_or_insert_with(|| now + Duration::from_secs(self.rollout_timeout_secs));
+                if now >= deadline {
+                    return Err(SFError::Agent(format!(
+                        "rollout of deployment/{} did not complete within {}s (last: {out})",
+                        t.deployment, self.rollout_timeout_secs
+                    )));
+                }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 
-    /// 只查致命等待态（拉不到镜像、配置错误、CrashLoop）。滚动交替期
-    /// containerStatuses 缺失或查询临时失败均返回 Ok——由调用方的超时与
-    /// 后续 pods_healthy 兜底，这里只负责让"必死"的滚动快速失败。
+    /// 只查致命等待态（拉不到镜像、配置错误、CrashLoop），init 容器与主
+    /// 容器一并查：init 拉不到镜像时主容器只报 PodInitializing，不算致命，
+    /// 只看主容器就会把启动阶段的上界白白耗光。滚动交替期 containerStatuses
+    /// 缺失或查询临时失败均返回 Ok——由调用方的超时与后续 pods_healthy 兜底，
+    /// 这里只负责让"必死"的滚动快速失败。
     async fn fatal_pod_state(&self, t: &RolloutTarget) -> SFResult<()> {
         let selector = pod_selector(&t.name, &t.component);
         let out = match self
@@ -1901,7 +1962,7 @@ impl RolloutExecutor {
                     "-l",
                     &selector,
                     "-o",
-                    "jsonpath={range .items[*]}{.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}",
+                    "jsonpath={range .items[*]}{range .status.initContainerStatuses[*]}{.state.waiting.reason}{\"\\n\"}{end}{.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}",
                 ],
                 30,
             )
@@ -2080,6 +2141,7 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
     let mut soak_secs = 120u64;
     let mut restart_threshold = 1u32;
     let mut timeout = 300u64;
+    let mut startup_timeout = 900u64;
     let mut kubectl = "kubectl".to_string();
     let mut manifests_dir: Option<String> = None;
     let mut i = 0;
@@ -2110,6 +2172,10 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
                 timeout = value(i)?.parse()?;
                 i += 2;
             }
+            "--startup-timeout" => {
+                startup_timeout = value(i)?.parse()?;
+                i += 2;
+            }
             "--kubectl" => {
                 kubectl = value(i)?;
                 i += 2;
@@ -2127,7 +2193,14 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = MainlineDeployerConfig::default();
     let mut plan = RolloutPlan::from_config(&cfg, tag);
     plan.manifests_dir = manifests_dir;
-    let executor = RolloutExecutor::new(kubectl, ns, soak_secs, restart_threshold, timeout);
+    let executor = RolloutExecutor::new(
+        kubectl,
+        ns,
+        soak_secs,
+        restart_threshold,
+        timeout,
+        startup_timeout,
+    );
     executor.run(&plan).await?;
     Ok(())
 }
@@ -2669,6 +2742,7 @@ exit 0
             failure_cooldown_secs: 60,
             max_attempts_per_rev: 2,
             rollout_timeout_secs: 60,
+            startup_timeout_secs: 900,
             heartbeat_log_secs: 3600,
             manifest_dir: "deploy/k3s".into(),
             // 测试夹具仓库没有 deploy/k3s 清单树；这些用例走 set image 旧路径。
@@ -2789,6 +2863,17 @@ exit 0
         assert!(
             !kubectl_calls.contains(&format!("--tag {push_tag}")),
             "rollout --tag must not use push endpoint: {kubectl_calls}"
+        );
+        // 两段预算必须一起下发：只带就绪预算会让种子的网络耗时重新算进
+        // 就绪预算（本次故障的成因），只带启动预算则主容器永不 ready 时
+        // 没有上界。JSON 里数组元素各占一行，去空白后校验紧邻关系。
+        let compact: String = kubectl_calls
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("\"--timeout\",\"60\",\"--startup-timeout\",\"900\""),
+            "job args must carry both the readiness and the startup budget: {kubectl_calls}"
         );
 
         // 沙盒构建必须显式注入完整 rev：build.rs 回退只嵌 7 位短 sha，
@@ -3413,6 +3498,7 @@ exit 0
             1,
             1,
             1,
+            1,
         );
         let cfg = MainlineDeployerConfig::default();
         let plan = RolloutPlan::from_config(&cfg, "localhost:30500/cogneva:main-new".into());
@@ -3478,6 +3564,7 @@ exit 0
             1,
             1,
             300,
+            900,
         );
         let cfg = MainlineDeployerConfig::default();
         let plan = RolloutPlan::from_config(&cfg, "localhost:30500/cogneva:main-new".into());
@@ -3547,7 +3634,7 @@ exit 0
         let bin_dir = tmp.path().to_path_buf();
         let pods_file = bin_dir.join("pods.out");
         let kubectl = fake_kubectl_pods_from_file(&bin_dir, &pods_file);
-        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60, 900);
         let target = RolloutTarget {
             deployment: "cogneva".into(),
             container: "cogneva".into(),
@@ -3570,6 +3657,154 @@ exit 0
         // 健康。
         std::fs::write(&pods_file, "0 true ").unwrap();
         assert!(executor.pods_healthy(&target, false).await.is_ok());
+    }
+
+    /// fake kubectl：init 容器进度与 deployment 状态按轮次推进。第 1 轮
+    /// init 未结束（与真实 jsonpath 缺失 finishedAt 同形：只有分隔符）且未
+    /// 收敛，第 2 轮 init 结束且收敛。`rollout_timeout` 传 0 让"任何一次
+    /// 就绪预算消耗"立刻判败——用例只可能因为启动阶段不吃就绪预算而通过。
+    fn fake_kubectl_slow_init(dir: &Path, init_never_finishes: bool) -> String {
+        let log = dir.join("kubectl.log");
+        let count = dir.join("poll.count");
+        let finish_cond = if init_never_finishes {
+            "false"
+        } else {
+            r#"[ "$n" -ge 2 ]"#
+        };
+        let init_body = format!(
+            r#"n=$(cat '{count}' 2>/dev/null || echo 1)
+    if {finish_cond}; then echo "2026-09-17T03:17:10Z|"; else echo "|"; fi
+    "#,
+            count = count.display(),
+            finish_cond = finish_cond
+        );
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"terminated.finishedAt"*)
+    {init_body}
+    ;;
+  *"generation"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    if [ "$n" -ge 2 ]; then echo "1|1|1|1|1|"; else echo "1|1|1|1|0|1"; fi
+    ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) ;;
+  *"get pods"*) ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = count.display(),
+            init_body = init_body
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 单个带 init 容器的目标（执行器）：种子步骤是网络克隆，耗时与本次
+    /// 上线的版本无关。
+    fn sandbox_executor_plan(tag: &str) -> RolloutPlan {
+        RolloutPlan {
+            tag: tag.to_string(),
+            targets: vec![RolloutTarget {
+                deployment: "cogneva-sandbox-executor".into(),
+                container: "sandbox-executor".into(),
+                component: "sandbox-executor".into(),
+                name: "cogneva".into(),
+            }],
+            manifests_dir: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_phase_does_not_consume_the_readiness_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_slow_init(&bin_dir, false);
+        // 就绪预算 0：启动阶段一旦被算进就绪预算，首轮即判败回滚。
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 0, 300);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        executor
+            .run(&plan)
+            .await
+            .expect("slow init must not spend the readiness budget");
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            !calls.contains("set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"),
+            "no rollback should happen: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_init_container_that_never_finishes_hits_the_startup_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_slow_init(&bin_dir, true);
+        // 启动预算 0、就绪预算 300：判败必须来自启动阶段的上界，说明两段
+        // 预算是分开的——init 卡死不能靠就绪预算兜底（那正是好版本被误回滚
+        // 的成因），也不能无限等（等不到干净回滚）。
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 300, 0);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        let err = executor.run(&plan).await.unwrap_err();
+        assert!(err.to_string().contains("stuck in startup phase"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_fatal_init_container_waiting_state_fails_fast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        // init 容器拉不到镜像：主容器只报 PodInitializing（非致命），只看
+        // 主容器就会把启动阶段的上界耗光才判败。
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"terminated.finishedAt"*) echo "|" ;;
+  *"generation"*) echo "1|1|1|1|0|1" ;;
+  *"waiting.reason"*) printf 'ImagePullBackOff\nPodInitializing\n' ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            300,
+            300,
+        );
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        let err = executor.run(&plan).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fatal waiting state ImagePullBackOff"),
+            "{err}"
+        );
     }
 
     #[test]

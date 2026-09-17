@@ -86,6 +86,8 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: {{ .Values.mainlineDeployer.soakSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: {{ .Values.mainlineDeployer.failureCooldownSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: {{ .Values.mainlineDeployer.cargoBuildJobs | int | quote }}
+  # 启动阶段（Pod 的 init 容器未结束）的上界，与就绪预算分开计。
+  COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS: {{ .Values.mainlineDeployer.startupTimeoutSecs | int | quote }}
   {{- if .Values.gitops.kubectlBin.enabled }}
   # 滚动 Job Pod 挂载宿主 k3s 二进制作为 kubectl（镜像不内置 kubectl）。
   COGNEVA_MAINLINE_DEPLOYER_KUBECTL_HOST_PATH: {{ .Values.gitops.kubectlBin.hostPath | quote }}

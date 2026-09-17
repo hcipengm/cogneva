@@ -423,8 +423,16 @@ pub struct MainlineDeployerConfig {
     pub failure_cooldown_secs: u64,
     /// 同一 rev 最多尝试次数（超过则等下一个 rev）。
     pub max_attempts_per_rev: u32,
-    /// 单个 deployment 滚动等待超时（秒）。
+    /// 单个 deployment 滚动等待超时（秒）。只计"就绪"预算：Pod 的 init
+    /// 容器还在跑时不计入（见 startup_timeout_secs）。
     pub rollout_timeout_secs: u64,
+    /// 单个 deployment 启动阶段的上界（秒）：Pod 的 init 容器尚未结束时
+    /// 滚动处于启动阶段，此阶段不计入 rollout_timeout_secs。种子/镜像拉取
+    /// 是必须在主容器之前结束的背景准备工作，其耗时与本次要上线的版本
+    /// 无关；把它算进就绪预算，一次慢克隆就能把好版本拖过预算判成失败
+    /// 回滚。此值是启动阶段自己的上界：init 真卡死时不能无限等，否则拿不到
+    /// 干净回滚。
+    pub startup_timeout_secs: u64,
     /// 空闲心跳日志的最小间隔（秒）。SameRev 收敛路径静默返回（无推进即
     /// 无日志），单凭日志无法证明部署器存活；心跳按该间隔打一条 INFO
     /// 状态摘要（bare HEAD / last_good / in_flight / 失败计数）。0 表示
@@ -463,6 +471,7 @@ impl Default for MainlineDeployerConfig {
             failure_cooldown_secs: 3600,
             max_attempts_per_rev: 2,
             rollout_timeout_secs: 300,
+            startup_timeout_secs: 900,
             heartbeat_log_secs: 3600,
             manifest_dir: "deploy/k3s".into(),
             deliver_manifests: true,
@@ -584,6 +593,10 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_TIMEOUT_SECS") {
             self.rollout_timeout_secs =
                 parse("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_TIMEOUT_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS") {
+            self.startup_timeout_secs =
+                parse("COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS", &v)?;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS") {
             self.heartbeat_log_secs = parse("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS", &v)?;
