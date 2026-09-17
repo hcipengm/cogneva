@@ -1,10 +1,11 @@
 //! Observable implementation for cog-collaboration.
 //! Exposes D8 (Multi-Agent Collaboration) raw metrics.
 
+use crate::squad::classify;
 use async_trait::async_trait;
 use cog_core::observability::{Observable, RawMetric, TraceFragment};
 use cog_core::SFResult;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -33,6 +34,14 @@ pub struct CollaborationObservable {
     /// change_ids，既没有日志也没有指标，于是"生成侧不出货"能沉默地持续
     /// 下去。落地通道有没有货必须可数。
     change_yields: Arc<Mutex<HashMap<String, u64>>>,
+    /// 分类声明的计数（产生端：写出带前缀 reason/feedback 时记一次）。
+    /// 与 [`Self::ralph_terminations`]（记录端）构成分类可达性自查的两端。
+    /// 用同步锁而非 `try_lock` 丢弃：这一端是「有没有声明」的证据本身，
+    /// 计数漏记只会让矛盾看不见——自查建在会丢证据的计数上就没有意义。
+    announced_classes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// 已报过的不可达分类。日志只在不成立→成立的那一刻报一次（矛盾是状态，
+    /// 不是事件），gauge 则每轮照常打——序列恒 0 的事实必须一直看得见。
+    unreachable_reported: Arc<Mutex<HashSet<String>>>,
 }
 
 impl CollaborationObservable {
@@ -68,6 +77,16 @@ impl CollaborationObservable {
             *map.entry(outcome.to_string()).or_insert(0) += 1;
         }
     }
+
+    /// 记一次分类声明（产生端调用）。临界区只有一次 map 插入，同步加锁
+    /// 换取不丢证据。
+    pub fn announce_class(&self, class: &str) {
+        let mut map = self
+            .announced_classes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(class.to_string()).or_insert(0) += 1;
+    }
 }
 
 #[async_trait]
@@ -100,11 +119,39 @@ impl Observable for CollaborationObservable {
                         .with_label("reason", reason),
                 );
             }
+            // 记录端取一份快照就放锁：自查若把 terminations 的锁一直拿着，
+            // 记录端的 `try_lock` 会在这段时间里丢记录，反而造出假的"记录端
+            // 恒为 0"，自查自己把自己骗了。
+            let recorded = terminations.clone();
+            drop(terminations);
             let yields = self.change_yields.lock().await;
             for (outcome, count) in yields.iter() {
                 metrics.push(
                     RawMetric::new("self_evolution_change_yield_total", *count as f64)
                         .with_label("outcome", outcome),
+                );
+            }
+
+            // 分类可达性自查：某个已声明的分类在产生端声明过，却在记录端从未
+            // 落成终止——事件在日志里不断发生而指标序列恒为 0，说明中间边界
+            // 把分类丢了。这一层必须自己说出来，不能等外部拿日志和指标对账。
+            let announced = self
+                .announced_classes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for class in classify::unreachable_classes(&announced, &recorded) {
+                let mut reported = self.unreachable_reported.lock().await;
+                if reported.insert(class.to_string()) {
+                    tracing::warn!(
+                        class,
+                        "declared failure class was announced but never recorded; \
+                         its series stays at zero while the events keep happening"
+                    );
+                }
+                metrics.push(
+                    RawMetric::new("collab_classification_unreachable", 1.0)
+                        .with_label("class", class),
                 );
             }
         }
@@ -162,5 +209,47 @@ mod tests {
         let obs = CollaborationObservable::new();
         let metrics = obs.collect_metrics("D8").await.unwrap();
         assert!(metric(&metrics, "self_evolution_change_yield_total").is_none());
+    }
+
+    fn unreachable(metrics: &[RawMetric]) -> Vec<String> {
+        metrics
+            .iter()
+            .filter(|m| m.name == "collab_classification_unreachable")
+            .filter_map(|m| m.labels.get("class").cloned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_declared_class_that_was_never_recorded_is_reported() {
+        let obs = CollaborationObservable::new();
+        obs.announce_class(classify::DEGENERATE_LOOP_CLASS);
+        obs.record_ralph_termination(classify::UNCLASSIFIED_CLASS);
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            unreachable(&metrics),
+            vec![classify::DEGENERATE_LOOP_CLASS.to_string()],
+            "a class declared but never recorded is the contradiction the plane must surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_class_recorded_after_being_declared_clears_the_contradiction() {
+        let obs = CollaborationObservable::new();
+        obs.announce_class(classify::DEGENERATE_LOOP_CLASS);
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert_eq!(unreachable(&metrics).len(), 1);
+
+        obs.record_ralph_termination(classify::DEGENERATE_LOOP_CLASS);
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert!(unreachable(&metrics).is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_declared_reports_no_unreachable_class() {
+        let obs = CollaborationObservable::new();
+        obs.record_ralph_termination("stagnated");
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert!(unreachable(&metrics).is_empty());
     }
 }

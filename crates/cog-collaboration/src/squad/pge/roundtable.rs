@@ -3,7 +3,7 @@ use crate::actors::{
 };
 use crate::squad::pge::context_board::ContextBoard;
 use crate::squad::pge::stall::{
-    ProgressSignals, StallDetector, StallVerdict, DEGENERATE_LOOP_PREFIX,
+    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict,
 };
 use crate::squad::pge::types::{
     Artifact, BranchMergeStrategy, Criterion, EvaluationResult, GeneratorOutput, MergeSummary,
@@ -295,13 +295,11 @@ impl PgeRoundtable {
                     "degenerate debate loop detected; stopping roundtable early"
                 );
                 if let Some(last) = history.last_mut() {
-                    last.evaluation.feedback = format!(
-                        "{}: {} consecutive iterations bought no progress \
+                    last.evaluation.feedback = degenerate_loop_feedback(format!(
+                        "{} consecutive iterations bought no progress \
                          (evaluation score and criteria both flat); stopped early: {}",
-                        DEGENERATE_LOOP_PREFIX,
-                        self.config.stall_threshold,
-                        last.evaluation.feedback
-                    );
+                        self.config.stall_threshold, last.evaluation.feedback
+                    ));
                 }
                 break;
             }

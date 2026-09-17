@@ -27,6 +27,16 @@ use super::types::EvaluationResult;
 /// convention as the terminal environment failure prefix.
 pub const DEGENERATE_LOOP_PREFIX: &str = "degenerate_loop";
 
+/// 声明本次运行是退化环：带前缀的 feedback 只在构造一次，同时记一次
+/// 「已声明」。边界若把这段文本翻成别的 reason，这个分类的序列就会结构性
+/// 恒 0，可达性自查靠这次计数把分叉自己报出来。
+pub fn degenerate_loop_feedback(detail: String) -> String {
+    crate::squad::classify::declare(
+        crate::squad::classify::DEGENERATE_LOOP_CLASS,
+        format!("{DEGENERATE_LOOP_PREFIX}: {detail}"),
+    )
+}
+
 /// The evaluator's judgement of one attempt, reduced to what progress can be
 /// measured on. Persisted with the Ralph iteration history, so it doubles as
 /// the record of "what this round was worth" across restarts.

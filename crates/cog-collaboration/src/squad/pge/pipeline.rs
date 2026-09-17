@@ -16,7 +16,7 @@
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::squad::pge::stall::{
-    ProgressSignals, StallDetector, StallVerdict, DEGENERATE_LOOP_PREFIX,
+    degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict,
 };
 use crate::squad::pge::types::{
     EvaluationResult, GeneratorOutput, LocalRepairAttempt, PlannerOutput, Verdict,
@@ -117,12 +117,18 @@ impl PgePipeline {
     ) -> PgePipelineResult {
         // 计划侧的原因优先：本轮 planner 都没到上游时，拿生成侧兜底文案会把
         // 责任记在一个从未被调用过的生成器头上。
+        let declared = plan
+            .terminal_env_failure_reason()
+            .or_else(|| generation.terminal_env_failure_reason())
+            .unwrap_or_else(|| crate::squad::pge::types::NO_ARTIFACTS_REASON.to_string());
         let evaluation = EvaluationResult {
             verdict: Verdict::Fail,
-            feedback: plan
-                .terminal_env_failure_reason()
-                .or_else(|| generation.terminal_env_failure_reason())
-                .unwrap_or_else(|| crate::squad::pge::types::NO_ARTIFACTS_REASON.to_string()),
+            // 声明这次运行按终止性环境故障处置；边界会不会把它记成同一分类，
+            // 由分类可达性自查比对（声明过却从未被记录 = 分类被丢了）。
+            feedback: crate::squad::classify::declare(
+                crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+                declared,
+            ),
             score: Some(0),
             criteria: Vec::new(),
             details: None,
@@ -379,11 +385,11 @@ impl PgePipeline {
                 let signals = ProgressSignals::from_evaluation(&evaluation);
                 if matches!(stall.observe(signals), StallVerdict::Stalled) {
                     let mut evaluation = evaluation;
-                    evaluation.feedback = format!(
-                        "{}: {} consecutive attempts bought no progress \
+                    evaluation.feedback = degenerate_loop_feedback(format!(
+                        "{} consecutive attempts bought no progress \
                          (evaluation score and criteria both flat); stopped early: {}",
-                        DEGENERATE_LOOP_PREFIX, self.config.stall_threshold, evaluation.feedback
-                    );
+                        self.config.stall_threshold, evaluation.feedback
+                    ));
                     tracing::warn!(attempt, "degenerate loop detected; stopping pipeline early");
                     history.push(PgePipelineAttempt {
                         attempt,
@@ -429,6 +435,7 @@ impl PgePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX;
 
     /// Test-only mock implementing the object-level [`cog_core::Agent`] trait.
     /// All methods except [`prompt`] are no-op stubs.

@@ -1,3 +1,4 @@
+pub mod classify;
 pub mod executor;
 pub mod pge;
 pub mod ralph;

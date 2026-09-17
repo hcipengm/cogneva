@@ -7,6 +7,7 @@
 //!   不是被消耗掉的额度。
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
+use crate::squad::classify::{classify, declare, TERMINAL_ENV_FAILURE_CLASS};
 use crate::squad::pge::pipeline::PgePipeline;
 use crate::squad::pge::roundtable::{PgeRoundtable, PgeRoundtableResult};
 use crate::squad::pge::stall::{made_progress, ProgressSignals};
@@ -49,20 +50,6 @@ pub struct RalphIteration {
     /// nothing, which is exactly what the stall verdict is looking for.
     #[serde(default)]
     pub progress: Option<ProgressSignals>,
-}
-
-/// 不可恢复终止在指标面上的分类标签。只认全链路已经共用的两个 wire 前缀，
-/// 其余归到 `unrecoverable`——分类轴必须与其它消费同一个 reason 的地方一致
-/// （squad executor 决定不再升级策略时用的就是这两个前缀），否则"停在哪一类"
-/// 在日志与指标里会对不上。
-fn termination_class(reason: &str) -> &'static str {
-    if reason.starts_with(crate::squad::pge::types::TERMINAL_ENV_FAILURE_PREFIX) {
-        "terminal_env_failure"
-    } else if reason.starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX) {
-        "degenerate_loop"
-    } else {
-        "unrecoverable"
-    }
 }
 
 /// 全局重置策略。
@@ -313,7 +300,7 @@ impl RalphLoop {
     /// 另立一套只会在两处之间分叉。原因落进指标面之前，"分解为什么停"只存在
     /// 于日志里，告警面看不见。
     fn unrecoverable_verdict(&self, reason: String) -> RalphVerdict {
-        let class = termination_class(&reason);
+        let class = classify(&reason);
         tracing::warn!(
             reason = %reason,
             class,
@@ -411,14 +398,15 @@ impl RalphLoop {
             } else if pge_result.final_generation.is_terminal_env_failure() {
                 // Deterministic environment/protocol failure: no reset
                 // strategy can fix it, stop before another paid iteration.
-                FailureAnalysis::Unrecoverable(
+                FailureAnalysis::Unrecoverable(declare(
+                    TERMINAL_ENV_FAILURE_CLASS,
                     pge_result
                         .final_generation
                         .terminal_env_failure_reason()
                         .unwrap_or_else(|| {
                             crate::squad::pge::types::NO_ARTIFACTS_REASON.to_string()
                         }),
-                )
+                ))
             } else {
                 self.analyze_failure(&pge_result.final_evaluation, &self.history)
                     .await
@@ -515,14 +503,15 @@ impl RalphLoop {
             let analysis = if passed {
                 FailureAnalysis::Recoverable(ResetStrategy::Identical)
             } else if rt_result.final_generation.is_terminal_env_failure() {
-                FailureAnalysis::Unrecoverable(
+                FailureAnalysis::Unrecoverable(declare(
+                    TERMINAL_ENV_FAILURE_CLASS,
                     rt_result
                         .final_generation
                         .terminal_env_failure_reason()
                         .unwrap_or_else(|| {
                             crate::squad::pge::types::NO_ARTIFACTS_REASON.to_string()
                         }),
-                )
+                ))
             } else {
                 Self::analyze_roundtable_failure(&rt_result, &self.history)
             };
@@ -1353,34 +1342,6 @@ mod tests {
         assert!(!ralph.is_stagnated());
     }
 
-    #[test]
-    fn termination_class_follows_the_shared_wire_prefixes() {
-        use crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX;
-        use crate::squad::pge::types::{NO_ARTIFACTS_REASON, TERMINAL_ENV_FAILURE_PREFIX};
-
-        // The exact reason the pipeline and Ralph both produce, and the exact
-        // reason the squad executor keys off to stop upgrading strategies.
-        assert_eq!(
-            termination_class(NO_ARTIFACTS_REASON),
-            "terminal_env_failure"
-        );
-        assert_eq!(
-            termination_class(&format!(
-                "{TERMINAL_ENV_FAILURE_PREFIX}: generator prompt failed: HTTP 503"
-            )),
-            "terminal_env_failure"
-        );
-        assert_eq!(
-            termination_class(&format!("{DEGENERATE_LOOP_PREFIX}: flat across the window")),
-            "degenerate_loop"
-        );
-        // Everything else still has to land somewhere countable.
-        assert_eq!(
-            termination_class("Ralph Loop stagnated: no progress signal"),
-            "unrecoverable"
-        );
-    }
-
     fn roundtable_result(verdict: Verdict, feedback: &str) -> PgeRoundtableResult {
         use crate::squad::pge::types::{EvaluationResult, GeneratorOutput, PlannerOutput};
 
@@ -1420,7 +1381,7 @@ mod tests {
         match RalphLoop::analyze_roundtable_failure(&result, &[]) {
             FailureAnalysis::Unrecoverable(reason) => {
                 assert!(reason.starts_with(DEGENERATE_LOOP_PREFIX));
-                assert_eq!(termination_class(&reason), "degenerate_loop");
+                assert_eq!(classify(&reason), "degenerate_loop");
             }
             other => panic!("expected Unrecoverable, got {other:?}"),
         }

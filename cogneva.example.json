@@ -399,6 +399,15 @@
           "summary": "Ralph loops stopped {value} times in the last 30m without passing their goal; the evolution chain is burning budget instead of converging (the reason label distinguishes budget_exhausted from stagnated)"
         },
         {
+          "name": "declared_failure_class_unrecorded",
+          "promql": "collab_classification_unreachable",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "A declared failure class is being announced while its series stays at zero, so the classification is being lost between the producer and the termination record; the class label names which one"
+        },
+        {
           "name": "self_evolution_yields_no_change",
           "promql": "increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|submit_failed\"}[6h])",
           "condition": {
