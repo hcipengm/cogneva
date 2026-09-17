@@ -169,6 +169,53 @@ const FATAL_WAITING_REASONS: &[&str] = &[
     "CrashLoopBackOff",
 ];
 
+/// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
+const ROLLOUT_POLL_SECS: u64 = 5;
+
+/// 「观测能力故障」的标记与识别。apiserver 不可达、证书握手超时、连接被拒、
+/// 查询整体超时，说的是**我们看不到集群**，不是**看清楚了集群里的版本有问题**。
+/// 两者混进同一个判据，一次网络抖动就会把刚推上去的好版本回滚回旧版；这台
+/// 机器上部署器自己的构建负载正是抖动来源之一（4C 满载时 apiserver 会短暂
+/// 掉握手）。带标记的错误由调用方归入「本轮没有观测」，不作版本结论。
+const CLUSTER_UNREACHABLE_MARKER: &str = "cluster unreachable";
+
+const CLUSTER_UNREACHABLE_PATTERNS: &[&str] = &[
+    CLUSTER_UNREACHABLE_MARKER,
+    "Unable to connect to the server",
+    "TLS handshake timeout",
+    "connection refused",
+    "no route to host",
+    "i/o timeout",
+    "Client.Timeout",
+    "timed out after",
+];
+
+/// 错误文本是否是集群访问故障（而非版本缺陷）。纯函数：判据只认文本，
+/// 不依赖任何现场状态。
+fn is_cluster_unreachable(msg: &str) -> bool {
+    CLUSTER_UNREACHABLE_PATTERNS.iter().any(|p| msg.contains(p))
+}
+
+/// deployment 是否已滚完：observedGeneration 追上 generation，且
+/// updated/ready 副本数达期望。解析不出（滚动交替期的空输出、omitempty
+/// 字段缺失）一律当未收敛，由外层按预算继续轮询。纯函数：只看 kubectl
+/// 的输出文本。
+fn rollout_converged(out: &str) -> bool {
+    let parts: Vec<&str> = out.split('|').collect();
+    if parts.len() < 5 {
+        return false;
+    }
+    let gen: u64 = parts[0].parse().unwrap_or(0);
+    let obs: u64 = parts[1].parse().unwrap_or(0);
+    let spec: u32 = parts[2].parse().unwrap_or(0);
+    let updated: u32 = parts[3].parse().unwrap_or(0);
+    let ready: u32 = parts[4].parse().unwrap_or(0);
+    // unavailable 必须为 0：RollingUpdate 新旧副本并存时，旧副本仍 ready 会让
+    // ready==spec 提前成立，但新崩溃副本计入 unavailable，不能判完成。
+    let unavailable: u32 = parts.get(5).and_then(|v| v.parse().ok()).unwrap_or(0);
+    obs >= gen && gen > 0 && updated == spec && ready == spec && unavailable == 0 && spec > 0
+}
+
 /// Pod 双标签选择器：主应用/网关/执行器的 name 标签都是 `cogneva`，
 /// 单标签会跨部署误判（gitops puller 旧代码只用 name= 的同源缺陷）。
 fn pod_selector(name: &str, component: &str) -> String {
@@ -1845,12 +1892,34 @@ impl RolloutExecutor {
         Ok(img)
     }
 
+    /// 带集群访问容忍的查询：把「查不到集群」与「查到的结果不健康」分开。
+    /// 前者就地在 budget_secs 内按轮询节拍重试，不产生任何滚动结论；预算耗尽
+    /// 仍不可达才返回带标记的错误，调用方据此判「本轮没有观测到任何东西」。
+    /// 后者（查询成功但输出表明版本有问题）立即返回，那是真的版本结论。
+    /// 非集群访问类的失败（选择器非法、资源不存在）同样立即返回——它们也是
+    /// 明确的观测结果，不该被静默重试吞掉。
+    async fn probe(&self, args: &[&str], timeout_secs: u64, budget_secs: u64) -> SFResult<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(budget_secs);
+        loop {
+            match self.run_kubectl(args, timeout_secs).await {
+                Ok(out) => return Ok(out),
+                Err(e) if is_cluster_unreachable(&e.to_string()) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(SFError::IO(format!("{CLUSTER_UNREACHABLE_MARKER}: {e}")));
+                    }
+                    tokio::time::sleep(Duration::from_secs(ROLLOUT_POLL_SECS)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// 选择器命中的 Pod 的 init 容器进度：每个 init 容器一行，形如
     /// `<finishedAt>|`，未结束的只有分隔符。空输出表示没有任何 init 容器
     /// （无 init 的部署恒为空）。未完成用分隔符而不是空行标记，因为
-    /// run_kubectl 会 trim 掉首尾空白，纯空行到不了这里。查询失败按"没有
-    /// 在启动"处理：退回改动前的就绪预算，不因一次查询抖动把预算放宽。
-    async fn init_containers_progress(&self, t: &RolloutTarget) -> String {
+    /// run_kubectl 会 trim 掉首尾空白，纯空行到不了这里。查询失败时调用方
+    /// 沿用当前相位继续计预算，不因一次查询抖动把预算放宽。
+    async fn init_containers_progress(&self, t: &RolloutTarget) -> SFResult<String> {
         let selector = pod_selector(&t.name, &t.component);
         self.run_kubectl(
             &[
@@ -1864,7 +1933,6 @@ impl RolloutExecutor {
             30,
         )
         .await
-        .unwrap_or_default()
     }
 
     /// 轮询 deployment rollout 完成：observedGeneration 追上 generation 且
@@ -1883,8 +1951,16 @@ impl RolloutExecutor {
             std::time::Instant::now() + Duration::from_secs(self.startup_timeout_secs);
         // 延迟到首次进入就绪阶段才起算：启动阶段的耗时不算在内。
         let mut readiness_deadline: Option<std::time::Instant> = None;
+        // 是否成功取到过部署态。一次都没取到时，"预算耗尽"说明的是我们看不到
+        // 集群，不是这个版本不收敛——那种结论必须带标记交回调用方，不能变成
+        // 回滚指令。
+        let mut observed_ever = false;
+        let mut last_unreachable = String::new();
         loop {
-            let out = self
+            // 拿不到观测时沿用当前相位计预算：还没进就绪阶段就仍然是启动阶段。
+            let mut starting = readiness_deadline.is_none();
+            let mut note = String::new();
+            match self
                 .run_kubectl(
                     &[
                         "get",
@@ -1897,53 +1973,62 @@ impl RolloutExecutor {
                     ],
                     30,
                 )
-                .await?;
-            let parts: Vec<&str> = out.split('|').collect();
-            if parts.len() >= 5 {
-                let gen: u64 = parts[0].parse().unwrap_or(0);
-                let obs: u64 = parts[1].parse().unwrap_or(0);
-                let spec: u32 = parts[2].parse().unwrap_or(0);
-                let updated: u32 = parts[3].parse().unwrap_or(0);
-                let ready: u32 = parts[4].parse().unwrap_or(0);
-                // unavailable 必须为 0：RollingUpdate 新旧副本并存时，旧副本
-                // 仍 ready 会让 ready==spec 提前成立，但新崩溃副本计入
-                // unavailable，不能判完成（等致命态/超时兜底）。
-                let unavailable: u32 = parts.get(5).and_then(|v| v.parse().ok()).unwrap_or(0);
-                if obs >= gen
-                    && gen > 0
-                    && updated == spec
-                    && ready == spec
-                    && unavailable == 0
-                    && spec > 0
-                {
-                    return Ok(());
+                .await
+            {
+                Ok(out) => {
+                    observed_ever = true;
+                    if rollout_converged(&out) {
+                        return Ok(());
+                    }
+                    // 滚动中新旧 Pod 交替、containerStatuses 可能暂时缺失，
+                    // 空输出/查询失败在这里不当致命（与 pods_healthy 不同），
+                    // 只认明确的致命等待态。
+                    self.fatal_pod_state(t).await?;
+                    if let Ok(progress) = self.init_containers_progress(t).await {
+                        starting = progress.lines().any(|l| l.trim() == "|");
+                    }
+                    note = out;
                 }
+                Err(e) if is_cluster_unreachable(&e.to_string()) => {
+                    last_unreachable = e.to_string();
+                }
+                Err(e) => return Err(e),
             }
-            // 滚动中新旧 Pod 交替、containerStatuses 可能暂时缺失，空输出/查询
-            // 失败在这里不当致命（与 pods_healthy 不同），只认明确的致命等待态。
-            self.fatal_pod_state(t).await?;
-            let init_progress = self.init_containers_progress(t).await;
-            let starting = init_progress.lines().any(|l| l.trim() == "|");
             let now = std::time::Instant::now();
-            if starting {
-                if now >= startup_deadline {
-                    return Err(SFError::Agent(format!(
-                        "deployment/{} stuck in startup phase after {}s \
-                         (init containers not finished; last deployment state: {out})",
-                        t.deployment, self.startup_timeout_secs
-                    )));
-                }
+            // 就绪预算从首次进入该阶段起算，启动阶段的耗时不算在内。
+            let (budget, phase) = if starting {
+                (self.startup_timeout_secs, "startup")
             } else {
-                let deadline = *readiness_deadline
-                    .get_or_insert_with(|| now + Duration::from_secs(self.rollout_timeout_secs));
-                if now >= deadline {
-                    return Err(SFError::Agent(format!(
-                        "rollout of deployment/{} did not complete within {}s (last: {out})",
+                (self.rollout_timeout_secs, "readiness")
+            };
+            let deadline = if starting {
+                startup_deadline
+            } else {
+                *readiness_deadline
+                    .get_or_insert_with(|| now + Duration::from_secs(self.rollout_timeout_secs))
+            };
+            if now >= deadline {
+                return Err(if !observed_ever {
+                    // 一次都没看到过部署态：这是观测能力故障，不是版本结论。
+                    SFError::IO(format!(
+                        "{CLUSTER_UNREACHABLE_MARKER}: rollout of deployment/{} did not complete \
+                         within {}s and its {phase} phase was never observed ({last_unreachable})",
+                        t.deployment, budget
+                    ))
+                } else if starting {
+                    SFError::Agent(format!(
+                        "deployment/{} stuck in startup phase after {}s \
+                         (init containers not finished; last deployment state: {note})",
+                        t.deployment, self.startup_timeout_secs
+                    ))
+                } else {
+                    SFError::Agent(format!(
+                        "rollout of deployment/{} did not complete within {}s (last: {note})",
                         t.deployment, self.rollout_timeout_secs
-                    )));
-                }
+                    ))
+                });
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(ROLLOUT_POLL_SECS)).await;
         }
     }
 
@@ -1987,10 +2072,15 @@ impl RolloutExecutor {
     /// `allow_pending` 宽限期内容忍 not-ready，但致命等待态（拉不到镜像、
     /// 配置错误、CrashLoop）无论宽限与否立即判病。空输出是选择器失效，
     /// 不能当健康。
+    ///
+    /// 查询走 probe：集群不可达时就地重试到就绪预算耗尽，耗尽才带标记返回
+    /// 「这一轮什么都没看到」。它**不是**健康结论——把它当结论会让一次抖动
+    /// 直接触发回滚，把刚推上去的四部署又拽回旧版。重试预算沿用就绪预算，
+    /// 不新开第二套旋钮：它已经是可配的「愿意等多久」上界。
     async fn pods_healthy(&self, t: &RolloutTarget, allow_pending: bool) -> SFResult<()> {
         let selector = pod_selector(&t.name, &t.component);
         let out = self
-            .run_kubectl(
+            .probe(
                 &[
                     "get",
                     "pods",
@@ -2000,6 +2090,7 @@ impl RolloutExecutor {
                     "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}",
                 ],
                 30,
+                self.rollout_timeout_secs,
             )
             .await?;
         if out.trim().is_empty() {
@@ -2065,20 +2156,17 @@ impl RolloutExecutor {
         let mut done: Vec<&RolloutTarget> = Vec::new();
         for target in &plan.targets {
             if let Err(e) = self.apply_target(plan, target).await {
-                self.rollback(&done, &prevs).await;
-                return Err(e);
+                return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
             if let Err(e) = self.wait_rollout_complete(target).await {
                 done.push(target);
-                self.rollback(&done, &prevs).await;
-                return Err(e);
+                return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
             // 宽限期：新副本 ContainerCreating 时 not-ready 属正常。
             tokio::time::sleep(Duration::from_secs(15)).await;
             if let Err(e) = self.pods_healthy(target, false).await {
                 done.push(target);
-                self.rollback(&done, &prevs).await;
-                return Err(e);
+                return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
             done.push(target);
         }
@@ -2090,12 +2178,33 @@ impl RolloutExecutor {
         tokio::time::sleep(Duration::from_secs(self.soak_secs)).await;
         for target in &plan.targets {
             if let Err(e) = self.pods_healthy(target, false).await {
-                self.rollback(&done, &prevs).await;
-                return Err(e);
+                return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
         }
         info!(tag = %plan.tag, "mainline rollout complete and healthy");
         Ok(())
+    }
+
+    /// 失败收尾：只有**观测到的版本缺陷**才回滚。集群访问故障（apiserver
+    /// 不可达、握手超时）说的是我们看不到集群，既不足以判版本好，也不构成
+    /// 回滚理由——回滚同样要经 apiserver，多半一起失败，而这个动作本身还会
+    /// 把一个可能已经正常收敛的版本拽回旧的。此时让 Job 非零退出（部署器下轮
+    /// 重试），集群保持在刚推上去的新版本上。
+    async fn fail_without_blind_rollback(
+        &self,
+        e: SFError,
+        done: &[&RolloutTarget],
+        prevs: &[(String, String)],
+    ) -> SFResult<()> {
+        if is_cluster_unreachable(&e.to_string()) {
+            warn!(
+                error = %e,
+                "cluster unreachable during the rollout; keeping the new revision (no rollback)"
+            );
+            return Err(e);
+        }
+        self.rollback(done, prevs).await;
+        Err(e)
     }
 
     /// 尽力回滚：已滚目标按快照的各自 prev 镜像反向 set image 并等收敛
@@ -3804,6 +3913,144 @@ exit 0
             err.to_string()
                 .contains("fatal waiting state ImagePullBackOff"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn cluster_unreachable_is_not_a_verdict_about_the_revision() {
+        // 观测能力故障：apiserver 不可达、握手超时、连接被拒、查询整体超时。
+        for msg in [
+            "kubectl get deployment x -o jsonpath=... failed: Unable to connect to the server: net/http: TLS handshake timeout",
+            "kubectl get pods ... failed: dial tcp 127.0.0.1:6443: connect: connection refused",
+            "kubectl get pods ... timed out after 30s",
+            "cluster unreachable: nothing was observed",
+        ] {
+            assert!(is_cluster_unreachable(msg), "{msg}");
+        }
+        // 真实的版本结论不能被误判成观测故障——否则该回滚的就不回滚了。
+        for msg in [
+            "pod of deployment/cogneva in fatal waiting state CrashLoopBackOff",
+            "Error from server (NotFound): deployments.apps \"cogneva\" not found",
+            "deployment/cogneva has no image for container cogneva",
+            "rollout of deployment/cogneva did not complete within 300s (last: 1|1|1|1|0|1)",
+        ] {
+            assert!(!is_cluster_unreachable(msg), "{msg}");
+        }
+    }
+
+    #[test]
+    fn convergence_needs_ready_replicas_and_no_unavailable_ones() {
+        assert!(rollout_converged("1|1|1|1|1|"));
+        assert!(rollout_converged("1|1|1|1|1|0"));
+        // 旧副本仍 ready 让 ready==spec 提前成立，但新副本 unavailable。
+        assert!(!rollout_converged("1|1|1|1|1|1"));
+        // observedGeneration 没追上 generation：清单刚提交，控制器还没认。
+        assert!(!rollout_converged("2|1|1|1|1|0"));
+        // 滚动交替期的空输出/缺字段一律当未收敛。
+        assert!(!rollout_converged(""));
+        assert!(!rollout_converged("1|1|1"));
+    }
+
+    /// 假 kubectl：观测类查询（generation）在前 `blind_queries` 次以集群不可达
+    /// 失败，之后正常收敛；其余查询一律正常。用来区分「看不到集群」与
+    /// 「看清楚了这个版本有问题」。
+    fn fake_kubectl_blind_observations(dir: &Path, blind_queries: u64) -> String {
+        let log = dir.join("kubectl.log");
+        let count = dir.join("blind.count");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"generation"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    if [ "$n" -le {blind_queries} ]; then
+      echo "Unable to connect to the server: net/http: TLS handshake timeout" >&2
+      exit 1
+    fi
+    echo "1|1|1|1|1|" ;;
+  *"terminated.finishedAt"*) echo "" ;;
+  # 健康查询的 jsonpath 同时含 restartCount 与 waiting.reason，必须先前
+  # 者优先，否则健康查询被后者接走、返回空串被当成"没有 Pod"。
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) echo "" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = count.display(),
+            blind_queries = blind_queries
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 回归：2026-09-17 04:56 集群实证。四目标 apply 完、soak 结束后复查遇到
+    /// `Unable to connect to the server: net/http: TLS handshake timeout`
+    /// （部署器自己的构建负载把 apiserver 短暂打到掉握手），旧逻辑把它当成
+    /// 滚动失败，`rolling back count=4` 把刚推上去的四个部署全滚回旧版。
+    /// 观测能力故障不是版本结论，必须既不回滚、也不当作收敛。
+    #[tokio::test]
+    async fn a_cluster_that_cannot_be_observed_does_not_roll_back_the_pushed_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        // 永远观测不到部署态：正常路径之外的每一次查询都不可达。
+        let kubectl = fake_kubectl_blind_observations(&bin_dir, 100_000);
+        // 启动预算 6s：两三轮回合就判「预算耗尽且从未观测到」。
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 6, 6);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        let err = executor
+            .run(&plan)
+            .await
+            .expect_err("an unobservable cluster must not be reported as a healthy rollout");
+        assert!(
+            is_cluster_unreachable(&err.to_string()),
+            "the failure must carry the unreachable marker so the caller keeps the new revision: {err}"
+        );
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            !calls.contains("main-old"),
+            "no rollback command may be issued when nothing was observed: {calls}"
+        );
+        assert!(
+            calls.contains("set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-new"),
+            "the revision must still have been pushed before the blackout: {calls}"
+        );
+    }
+
+    /// 反面：抖动会过去。几次观测失败之后集群恢复，滚动应当照常收敛，既不
+    /// 回滚也不误报失败——容忍的是短暂不可达，不是无边界的等待。
+    #[tokio::test]
+    async fn a_transient_blackout_clearing_up_lets_the_rollout_converge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_blind_observations(&bin_dir, 2);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 60, 60);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        executor
+            .run(&plan)
+            .await
+            .expect("a temporary blackout must not fail a rollout that then converges");
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            !calls.contains("main-old"),
+            "a recovered blackout must not leave a rollback behind: {calls}"
         );
     }
 
