@@ -434,14 +434,9 @@ pub struct MainlineDeployerConfig {
     /// 干净回滚。
     pub startup_timeout_secs: u64,
     /// 滚动判定 Job 容器的资源面（requests/limits，K8s 量纲字符串）。
-    ///
-    /// 这个容器不声明资源时 QoS 是 BestEffort，而 BestEffort 正是节点内存压力
-    /// 下最先被驱逐的一档。它偏偏是决定"回滚不回滚"的那个进程：被驱逐会让
-    /// 部署器把一次观测中断记成一次版本失败，集群还被留在滚到一半的状态上
-    /// （Job 没跑完，它自己的回滚也没走）。默认值按该容器实测的常驻量给
-    /// ——它常态是每 5 秒轮询一次的等待态，实测 CPU 0m / 内存 5Mi——按这个
-    /// 数定 requests 是为了不让它常年锁住调度额度（本机节点 requests 已占
-    /// 九成），limits 只承接 kubectl 子进程的尖峰。
+    /// 缺任何一项都会让该容器的 QoS 落回 BestEffort。默认 requests 按容器
+    /// 实测常驻量给（轮询等待态 0m / 5Mi），limits 承接 kubectl 子进程尖峰；
+    /// 为什么不能让这个容器是 BestEffort 见 Job 清单处的注释。
     pub job_cpu_request: String,
     pub job_memory_request: String,
     pub job_cpu_limit: String,

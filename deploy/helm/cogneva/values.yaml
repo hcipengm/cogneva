@@ -323,11 +323,9 @@ mainlineDeployer:
   # 滚动就绪阶段的上界（秒）：init 全部结束后，单个 deployment 收敛的预算。
   # 默认值不改（300s），只把上界变成可调。
   rolloutTimeoutSecs: 300
-  # 滚动判定 Job 容器的资源面。这个容器是"回滚不回滚"的判定进程，不声明
-  # 资源时 QoS 是 BestEffort——节点内存压力下最先被驱逐的那一档；被驱逐会
-  # 让部署器把一次观测中断记成一次版本失败，集群还会停在滚到一半的状态。
-  # requests 按该容器实测常驻量（每 5 秒轮询的等待态，实测 0m/5Mi）给，不
-  # 常年锁住调度额度；limits 承接 kubectl 子进程的尖峰。
+  # 滚动判定 Job 容器的资源面：不声明时 QoS 落回 BestEffort，而它是决定
+  # "回滚不回滚"的判定进程，被驱逐会让一次观测中断被记成一次版本失败。
+  # requests 按该容器实测常驻量给（轮询等待态 0m/5Mi），不常年锁调度额度。
   rolloutJob:
     cpuRequest: 10m
     memoryRequest: 32Mi

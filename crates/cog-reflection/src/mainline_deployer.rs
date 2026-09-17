@@ -175,6 +175,12 @@ const ROLLOUT_POLL_SECS: u64 = 5;
 /// 超时诊断里保留的事件条数。错误记录不是日志转储：只要够指出病因。
 const DIAGNOSIS_EVENT_LIMIT: usize = 3;
 
+/// 把 kubectl 采样输出的一行切成字段。所有采样查询都用竖线显式占位，所以
+/// 「字段缺失」表现为空串而不是少一列——这一条约定只在这里写一次。
+fn sample_fields(line: &str) -> Vec<&str> {
+    line.trim().split('|').map(str::trim).collect()
+}
+
 /// 把 Pod 采样行折成诊断。空字段是「没有该信号」而不是「信号为空」，不进
 /// 诊断——否则满行空的 `waiting=` 会把真正的 `Pending` 病因埋掉。
 ///
@@ -183,7 +189,7 @@ const DIAGNOSIS_EVENT_LIMIT: usize = 3;
 fn summarize_pod_states(out: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     for line in out.lines() {
-        let f: Vec<&str> = line.trim().split('|').map(str::trim).collect();
+        let f = sample_fields(line);
         if f.len() < 5 || f[0].is_empty() {
             continue;
         }
@@ -208,9 +214,12 @@ fn summarize_pod_states(out: &str) -> String {
 fn pod_names_of(pods_out: &str) -> Vec<String> {
     pods_out
         .lines()
-        .filter_map(|l| l.trim().split('|').next())
-        .filter(|n| !n.is_empty())
-        .map(str::to_string)
+        .filter_map(|l| {
+            sample_fields(l)
+                .first()
+                .filter(|n| !n.is_empty())
+                .map(|n| (*n).to_string())
+        })
         .collect()
 }
 
@@ -226,17 +235,17 @@ fn pod_names_of(pods_out: &str) -> Vec<String> {
 fn summarize_events(out: &str, deployment: &str, pod_names: &[String], limit: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
     for line in out.lines() {
-        let f: Vec<&str> = line.trim().split('|').collect();
-        if f.len() < 4 || f[2].trim().is_empty() {
+        let f = sample_fields(line);
+        if f.len() < 4 || f[2].is_empty() {
             continue;
         }
-        let (kind, name) = (f[0].trim(), f[1].trim());
+        let (kind, name) = (f[0], f[1]);
         let related = (kind == "Deployment" && name == deployment)
             || (kind == "Pod" && pod_names.iter().any(|p| p == name));
         if !related {
             continue;
         }
-        let text = format!("{} {}: {}", name, f[2].trim(), f[3].trim());
+        let text = format!("{} {}: {}", name, f[2], f[3]);
         if !lines.contains(&text) {
             lines.push(text);
         }
@@ -274,13 +283,81 @@ fn is_cluster_unreachable(msg: &str) -> bool {
 /// `PodScheduled=False / Unschedulable`，不是从散文里猜的措辞。
 ///
 /// 排不上队时新 Pod 一个都没起来，谈不上新版本的好坏：回滚要把旧镜像重新
-/// 调度一遍，而它带着同样的 requests，同样排不进去，只会多一轮churn 并把
-/// 一个可能正常的版本换掉。真正的边界在版本**改没改调度需求**上——改了
-/// （这次上线把 requests 调大了）就是版本的事，该回滚；没改就与版本无关。
+/// 调度一遍，而它带着同样的放置面，同样排不进去，只会多一轮 churn 并把
+/// 一个可能正常的版本换掉。真正的边界在版本**改没改放置面**上——改了
+/// （这次上线把 requests 调大、加了排不上的 nodeSelector）就是版本的事，该
+/// 回滚；没改就与版本无关。
 const PLACEMENT_BLOCKED_MARKER: &str = "placement blocked";
 
 fn is_placement_blocked(msg: &str) -> bool {
     msg.contains(PLACEMENT_BLOCKED_MARKER)
+}
+
+/// 把部署 `.spec` 归一化成可逐字节比较的「放置面」。
+///
+/// 只抹掉两处不影响放置的易变内容：容器镜像（本次上线改的正是它，留着就每次都算
+/// "改过"）与 Pod 模板的 annotations（重启戳、配置校验和，纯噪声）。其余全部留下，
+/// 包括 requests / limits、nodeSelector、affinity、tolerations、init 容器、侧车、
+/// replicas 与滚动策略的 maxSurge——它们都能让新 Pod 排不进去。
+///
+/// 解析不了就原样返回，调用方按"与快照不同"处理。
+fn normalize_placement_shape(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.to_string();
+    };
+    if let Some(m) = v
+        .pointer_mut("/template/metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        m.remove("annotations");
+    }
+    for path in [
+        "/template/spec/containers",
+        "/template/spec/initContainers",
+        "/template/spec/ephemeralContainers",
+    ] {
+        if let Some(list) = v
+            .pointer_mut(path)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for c in list.iter_mut() {
+                if let Some(o) = c.as_object_mut() {
+                    o.remove("image");
+                }
+            }
+        }
+    }
+    v.to_string()
+}
+
+/// 这条超时算不算"集群放不下"（环境类）；是就给出排不上队的 Pod 与调度器消息。
+///
+/// 环境类只在两个条件同时成立时给出：调度器确实判了排不上队，且部署的放置面
+/// 与滚动前逐字节一致——放置面没变，说明不是这次上线把 Pod 顶出节点的。
+/// 任一侧读空、或读不到当前放置面（`None`）一律不给环境结论：判不准就往版本侧
+/// 靠，宁可多回滚一次，不放走"新版本自己加了排不上的约束"。
+fn environment_class(
+    blocked: &[(String, String)],
+    prev_shape: &str,
+    now_shape: Option<&str>,
+) -> Option<String> {
+    if blocked.is_empty() || prev_shape.is_empty() || now_shape != Some(prev_shape) {
+        return None;
+    }
+    Some(
+        blocked
+            .iter()
+            .map(|(n, m)| {
+                if m.is_empty() {
+                    n.clone()
+                } else {
+                    format!("{n}: {m}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 /// 从 Pod 采样行里挑出被调度器判为排不上队的 Pod，连同它的消息。
@@ -288,16 +365,20 @@ fn is_placement_blocked(msg: &str) -> bool {
 /// 每行形如 `name|phase|scheduledStatus|reason|message`。只认
 /// `PodScheduled=False` 且 `reason=Unschedulable` 的组合：这是调度器给出的
 /// 结论；Pod 还 Pending 但未被判决（刚创建、条件未上报）不算，字段缺失的
-/// 半行整条丢弃。
+/// 半行整条丢弃。判据落在 reason 字段上，不靠字段个数：调度器没给 message 时
+/// 那一格是空的，按个数卡会把一条真的排不上队丢掉，反而误判成版本缺陷。
 fn unschedulable_pods(out: &str) -> Vec<(String, String)> {
     let mut v = Vec::new();
     for line in out.lines() {
-        let f: Vec<&str> = line.trim().split('|').map(str::trim).collect();
-        if f.len() < 5 || f[0].is_empty() {
+        let f = sample_fields(line);
+        if f.len() < 4 || f[0].is_empty() {
             continue;
         }
         if f[2] == "False" && f[3] == "Unschedulable" {
-            v.push((f[0].to_string(), f[4].to_string()));
+            v.push((
+                f[0].to_string(),
+                f.get(4).copied().unwrap_or("").to_string(),
+            ));
         }
     }
     v
@@ -1280,13 +1361,10 @@ impl MainlineDeployer {
                             "imagePullPolicy": "IfNotPresent",
                             "command": ["/opt/cogneva/cogneva"],
                             "args": args,
-                            // 不声明资源的容器 QoS 是 BestEffort，也就是节点内存
-                            // 压力下最先被驱逐的一档。这个容器偏偏是决定"回滚不
-                            // 回滚"的判定进程：它被驱逐，部署器就把一次观测中断
-                            // 记成一次版本失败，而且集群停在滚到一半的状态上
-                            // （Job 没跑完，它自己的回滚也没走）。requests 按实测
-                            // 常驻量给（每 5 秒轮询一次的等待态，实测 0m/5Mi），
-                            // 不去常年锁住调度额度；limits 承接 kubectl 子进程尖峰。
+                            // 不声明资源时 QoS 是 BestEffort——节点内存压力下最先
+                            // 被驱逐的一档，而这个容器偏偏是决定"回滚不回滚"的判定
+                            // 进程：它被驱逐，部署器就把一次观测中断记成一次版本失败，
+                            // 集群还停在滚到一半的状态（Job 没跑完，它自己的回滚也没走）。
                             "resources": {
                                 "requests": {
                                     "cpu": self.cfg.job_cpu_request,
@@ -2092,9 +2170,9 @@ impl RolloutExecutor {
     /// 无限等，Job 被 activeDeadlineSeconds 杀掉不会走 Job 自己的回滚。
     ///
     /// 超时那一刻再分一次因：新 Pod 被调度器判为 Unschedulable 且本次滚动没有
-    /// 改动这个部署的调度需求时，超时说的是**集群放不下**，不是版本不好（见
-    /// PLACEMENT_BLOCKED_MARKER）。`prev_demand` 是 apply 之前快照的 resources。
-    async fn wait_rollout_complete(&self, t: &RolloutTarget, prev_demand: &str) -> SFResult<()> {
+    /// 改动这个部署的放置面时，超时说的是**集群放不下**，不是版本不好（见
+    /// PLACEMENT_BLOCKED_MARKER）。`prev_shape` 是 apply 之前快照的放置面。
+    async fn wait_rollout_complete(&self, t: &RolloutTarget, prev_shape: &str) -> SFResult<()> {
         let startup_deadline =
             std::time::Instant::now() + Duration::from_secs(self.startup_timeout_secs);
         // 延迟到首次进入就绪阶段才起算：启动阶段的耗时不算在内。
@@ -2179,16 +2257,10 @@ impl RolloutExecutor {
                 } else {
                     format!("; pods: {diagnosis}")
                 };
-                // 排不上队：只有"这次上线没动调度需求"才归环境。取不到当前
-                // 需求时按"动过"处理——判不准就往版本侧靠，宁可多回滚一次，
-                // 不把新版本自己调大 requests 造成的排不上队放过去。
-                let blocked = self.unschedulable_state(t).await;
-                let demand_unchanged = !blocked.is_empty()
-                    && self
-                        .current_scheduling_demand(t)
-                        .await
-                        .map(|d| d == prev_demand)
-                        .unwrap_or(false);
+                // 排不上队：只有"这次上线没动放置面"才归环境。
+                let blocked = self.sample_unschedulable_pods(t).await;
+                let now_shape = self.current_placement_shape(t).await.ok();
+                let environment = environment_class(&blocked, prev_shape, now_shape.as_deref());
                 return Err(if !observed_ever {
                     // 一次都没看到过部署态：这是观测能力故障，不是版本结论。
                     SFError::IO(format!(
@@ -2196,23 +2268,12 @@ impl RolloutExecutor {
                          within {}s and its {phase} phase was never observed ({last_unreachable})",
                         t.deployment, budget
                     ))
-                } else if demand_unchanged {
-                    let detail = blocked
-                        .iter()
-                        .map(|(n, m)| {
-                            if m.is_empty() {
-                                n.clone()
-                            } else {
-                                format!("{n}: {m}")
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ");
+                } else if let Some(detail) = environment {
                     SFError::IO(format!(
                         "{PLACEMENT_BLOCKED_MARKER}: rollout of deployment/{} did not complete \
                          within {}s ({phase} phase) — the scheduler never placed its pod(s) \
-                         ({detail}) and this revision did not change the deployment's resource \
-                         demands, so the revision is not what failed (last: {note}{suffix})",
+                         ({detail}) and this revision did not change the deployment's placement \
+                         shape, so the revision is not what failed (last: {note}{suffix})",
                         t.deployment, budget
                     ))
                 } else if starting {
@@ -2336,7 +2397,7 @@ impl RolloutExecutor {
     ///
     /// 采样尽力而为：取不到就返回空（当作"没有这个信号"），观测失败不产生
     /// 第二个错误。
-    async fn unschedulable_state(&self, t: &RolloutTarget) -> Vec<(String, String)> {
+    async fn sample_unschedulable_pods(&self, t: &RolloutTarget) -> Vec<(String, String)> {
         let selector = pod_selector(&t.name, &t.component);
         let out = self
             .run_kubectl(
@@ -2358,18 +2419,17 @@ impl RolloutExecutor {
         unschedulable_pods(&out)
     }
 
-    /// 快照部署当前的调度需求（容器 resources），供判定「排不上队是不是这次
-    /// 上线改出来的」。只看 requests 侧：调大 requests 是版本自己把 Pod 顶出
-    /// 节点，那正是要回滚的情形；其它字段的差异不构成本次滚动的调度理由。
-    async fn current_scheduling_demand(&self, t: &RolloutTarget) -> SFResult<String> {
-        let jsonpath = format!(
-            "jsonpath={{.spec.template.spec.containers[?(@.name==\"{}\")].resources}}",
-            t.container
-        );
+    /// 快照部署当前的放置面，供判定「排不上队是不是这次上线改出来的」。
+    /// 取整份 `.spec` 归一化（见 normalize_placement_shape）而不是只读某个容器的
+    /// requests：能把 Pod 顶出节点的字段远不止 requests。
+    async fn current_placement_shape(&self, t: &RolloutTarget) -> SFResult<String> {
         let out = self
-            .run_kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath], 30)
+            .run_kubectl(
+                &["get", "deployment", &t.deployment, "-o", "jsonpath={.spec}"],
+                30,
+            )
             .await?;
-        Ok(out.trim().to_string())
+        Ok(normalize_placement_shape(&out))
     }
 
     /// Pod 健康信号：双标签选择器，查 restartCount/ready/waiting reason。
@@ -2452,19 +2512,19 @@ impl RolloutExecutor {
         // 端点零歧义，Legacy 首轮（节点 localhost/cogneva:local）也能精确回退。
         // 快照失败则一次变更都不发生（线上原样）。
         let mut prevs: Vec<(String, String)> = Vec::new();
-        let mut prev_demands: Vec<(String, String)> = Vec::new();
+        let mut prev_shapes: Vec<(String, String)> = Vec::new();
         for t in &plan.targets {
             let img = self.current_image(t).await?;
-            // 调度需求与镜像一起快照：apply 之后才分得清"排不上队"是这次
-            // 上线把 requests 调大了（版本的事），还是节点本来就满（不是）。
-            let demand = self.current_scheduling_demand(t).await?;
+            // 放置面与镜像一起快照：apply 之后才分得清"排不上队"是这次上线
+            // 自己加了排不上的约束（版本的事），还是节点本来就满（不是）。
+            let shape = self.current_placement_shape(t).await?;
             info!(deployment = %t.deployment, prev = %img, "mainline rollout: snapshot prev image");
             prevs.push((t.deployment.clone(), img));
-            prev_demands.push((t.deployment.clone(), demand));
+            prev_shapes.push((t.deployment.clone(), shape));
         }
         let mut done: Vec<&RolloutTarget> = Vec::new();
         for target in &plan.targets {
-            let prev_demand = prev_demands
+            let prev_shape = prev_shapes
                 .iter()
                 .find(|(d, _)| d == &target.deployment)
                 .map(|(_, v)| v.as_str())
@@ -2472,7 +2532,7 @@ impl RolloutExecutor {
             if let Err(e) = self.apply_target(plan, target).await {
                 return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
-            if let Err(e) = self.wait_rollout_complete(target, prev_demand).await {
+            if let Err(e) = self.wait_rollout_complete(target, prev_shape).await {
                 done.push(target);
                 return self.fail_without_blind_rollback(e, &done, &prevs).await;
             }
@@ -2505,8 +2565,8 @@ impl RolloutExecutor {
     ///   判版本好，回滚也同样要经 apiserver、多半一起失败，而这个动作本身还会
     ///   把一个可能已经正常收敛的版本拽回旧的。
     /// - 集群放不下新 Pod：新 Pod 一个都没起来，谈不上新版本的好坏；回滚要把
-    ///   旧镜像重新调度一遍，而它带着同样的 requests，同样排不进去。只有本次
-    ///   上线自己改动了调度需求时才归版本（那一支带的是普通超时错误，不进这里）。
+    ///   旧镜像重新调度一遍，而它带着同样的放置面，同样排不进去。只有本次
+    ///   上线自己改动了放置面时才归版本（那一支带的是普通超时错误，不进这里）。
     ///
     /// 两种都让 Job 非零退出（部署器下轮重试），集群保持在刚推上去的新版本上。
     async fn fail_without_blind_rollback(
@@ -2526,8 +2586,8 @@ impl RolloutExecutor {
         if is_placement_blocked(&msg) {
             warn!(
                 error = %e,
-                "the scheduler never placed the new pods and this revision did not raise its \
-                 resource demands; keeping the new revision (no rollback)"
+                "the scheduler never placed the new pods and this revision did not change the \
+                 deployment's placement shape; keeping the new revision (no rollback)"
             );
             return Err(e);
         }
@@ -2553,14 +2613,14 @@ impl RolloutExecutor {
                 warn!(deployment = %t.deployment, "no prev snapshot; skip rollback");
                 continue;
             };
-            // 回退前的调度需求：与新版本那一侧同一判据，好让"回退的 Pod 也排
+            // 回退前的放置面：与新版本那一侧同一判据，好让"回退的 Pod 也排
             // 不进去"在日志里读成同一件事（节点满了），不被当成回退本身失败。
-            let live_demand = self.current_scheduling_demand(t).await.unwrap_or_default();
+            let live_shape = self.current_placement_shape(t).await.unwrap_or_default();
             if let Err(e) = self.set_image(t, prev).await {
                 warn!(deployment = %t.deployment, error = %e, "rollback set image failed");
                 continue;
             }
-            if let Err(e) = self.wait_rollout_complete(t, &live_demand).await {
+            if let Err(e) = self.wait_rollout_complete(t, &live_shape).await {
                 warn!(deployment = %t.deployment, error = %e, "rollback wait failed");
             }
         }
@@ -2696,19 +2756,94 @@ mod tests {
                    p-b|Pending|False|Unschedulable|0/1 nodes are available: 1 Insufficient memory\n\
                    p-c|Pending|False|NotReady|some other condition\n\
                    p-d|Pending|||\n\
-                   p-e|Pending|False|Unschedulable\n";
+                   p-e|Pending|False|Unschedulable|\n";
         let got = unschedulable_pods(out);
-        // 只有被调度器判为 Unschedulable 的整行进判据。
+        // 只有被调度器判为 Unschedulable 的整行进判据。调度器没给 message 的那条
+        // （p-e）照样算数：判据在 reason 上，不在字段个数上。
         assert_eq!(
             got,
-            vec![(
-                "p-b".to_string(),
-                "0/1 nodes are available: 1 Insufficient memory".to_string()
-            )]
+            vec![
+                (
+                    "p-b".to_string(),
+                    "0/1 nodes are available: 1 Insufficient memory".to_string()
+                ),
+                ("p-e".to_string(), String::new()),
+            ]
         );
-        // 已调度（True）、别的 reason、条件未上报、半行一律不算。
+        // 字段残缺、名字为空、已调度（True）、别的 reason、条件未上报一律不算。
+        assert!(unschedulable_pods("p-f|Pending|False\n").is_empty());
+        assert!(unschedulable_pods("|Pending|False|Unschedulable|\n").is_empty());
         assert!(unschedulable_pods("p-a|Running|True||\n").is_empty());
         assert!(unschedulable_pods("").is_empty());
+    }
+
+    #[test]
+    fn environment_class_needs_an_unchanged_placement_shape() {
+        let blocked = vec![(
+            "cogneva-abc-x".to_string(),
+            "0/1 nodes are available: 1 Insufficient memory".to_string(),
+        )];
+        let shape = "{\"replicas\":1,\"template\":{\"spec\":{\"containers\":[{}]}}}";
+        // 调度器判了排不上队 + 这次上线没动放置面 ⇒ 环境类，给出 Pod 与消息。
+        let v = environment_class(&blocked, shape, Some(shape)).expect("environment class");
+        assert!(v.contains("cogneva-abc-x"));
+        assert!(v.contains("Insufficient memory"));
+        // 放置面变了 ⇒ 版本类，照常回滚。
+        assert!(environment_class(&blocked, shape, Some("{\"replicas\":2}")).is_none());
+        // 读不到当前放置面、或快照本身是空的 ⇒ 判不准就往版本侧靠。
+        assert!(environment_class(&blocked, shape, None).is_none());
+        assert!(environment_class(&blocked, "", Some("")).is_none());
+        // 没有排不上队这个信号 ⇒ 这条超时与放置无关。
+        assert!(environment_class(&[], shape, Some(shape)).is_none());
+    }
+
+    /// 这条是「集群放不下」判定面的核心回归锁：能把 Pod 顶出节点的改动远不止
+    /// 某个容器的 requests。只比 requests 会把「新版本给自己加了排不上的约束」
+    /// 误判成「集群满了」，于是不回滚一个真的坏了的版本——那是全量停机。
+    #[test]
+    fn placement_shape_only_ignores_the_image_and_restart_stamps() {
+        let base = r#"{"replicas":1,"template":{"metadata":{"annotations":{"cogneva.io/restartedAt":"1"},"labels":{"app":"x"}},"spec":{"nodeSelector":{"disk":"ssd"},"containers":[{"name":"c","image":"old","resources":{"requests":{"cpu":"100m"}}}]}}}"#;
+        let new_image = base.replace("\"image\":\"old\"", "\"image\":\"new\"");
+        let new_stamp = base.replace("\"restartedAt\":\"1\"", "\"restartedAt\":\"2\"");
+        assert_eq!(
+            normalize_placement_shape(base),
+            normalize_placement_shape(&new_image)
+        );
+        // 重启戳与配置校验和是纯噪声，改动它不构成版本变化。
+        assert_eq!(
+            normalize_placement_shape(base),
+            normalize_placement_shape(&new_stamp)
+        );
+        // 其余任何一处改动都必须留下差异：requests、nodeSelector、多一个侧车、
+        // replicas、maxSurge——它们都能让新 Pod 排不进去而 requests 一个字不变。
+        for changed in [
+            base.replace("\"cpu\":\"100m\"", "\"cpu\":\"2\""),
+            base.replace("\"disk\":\"ssd\"", "\"disk\":\"hdd\""),
+            base.replace(
+                "{\"name\":\"c\"",
+                "{\"name\":\"side\",\"image\":\"s\"},{\"name\":\"c\"",
+            ),
+            base.replace("\"replicas\":1", "\"replicas\":2"),
+            base.replace(
+                "\"spec\":{",
+                "\"spec\":{\"affinity\":{\"nodeAffinity\":{}},",
+            ),
+            base.replace(
+                "\"replicas\":1",
+                "\"replicas\":1,\"strategy\":{\"rollingUpdate\":{\"maxSurge\":1}}",
+            ),
+        ] {
+            assert_ne!(
+                normalize_placement_shape(base),
+                normalize_placement_shape(&changed),
+                "改动必须留下差异: {changed}"
+            );
+        }
+        // 解析不了就原样返回：非空即与快照不同，判不准往版本侧靠。
+        assert_eq!(normalize_placement_shape(" not json "), "not json");
+        assert_eq!(normalize_placement_shape(""), "");
+        // 归一化结果里不再有镜像字段。
+        assert!(!normalize_placement_shape(base).contains("image"));
     }
 
     #[test]
