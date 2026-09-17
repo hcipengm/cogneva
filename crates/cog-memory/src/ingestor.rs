@@ -78,9 +78,19 @@ pub struct MemoryIngestorConfig {
     /// 启动时是否对账扫描：把已归档但没有 summary 的 raw 重新入队。覆盖
     /// 崩溃/重启丢掉的在途抽取，以及任何"归档成功但抽取缺席"的残留。
     pub startup_reconcile: bool,
-    /// 对账扫描只回看最近这么多个小时的 raw——更早的缺口随时间失去修复
-    /// 价值，全量扫老数据只会拖慢启动。
+    /// 对账扫描只回看最近这么多个小时的 raw。
     pub reconcile_lookback_hours: u64,
+    /// 周期对账间隔（秒）；0 = 只在启动时对账。启动对账覆盖不了"断供比对账
+    /// 窗口更长"的情形，周期重扫才让"归档必有抽取"不依赖重启时机。
+    pub reconcile_interval_secs: u64,
+    /// 连续多少次环境类抽取失败后暂停拉取。
+    pub pull_pause_after_failures: u32,
+    /// 暂停拉取的初始时长（秒），每次再次触发翻倍。
+    pub pull_pause_initial_secs: u64,
+    /// 暂停拉取的封顶时长（秒）。
+    pub pull_pause_max_secs: u64,
+    /// 读取池状态快照的最小间隔（秒）。
+    pub pool_check_secs: u64,
     /// 积压深度告警起点：深度首次达到该值及之后每翻倍一次打一条 WARN，
     /// 让吞不下的事件洪峰在日志里可见而不是静默排队。
     pub backlog_warn_at: usize,
@@ -107,6 +117,11 @@ impl Default for MemoryIngestorConfig {
             extraction_concurrency: 4,
             startup_reconcile: true,
             reconcile_lookback_hours: 24,
+            reconcile_interval_secs: 600,
+            pull_pause_after_failures: 3,
+            pull_pause_initial_secs: 60,
+            pull_pause_max_secs: 1800,
+            pool_check_secs: 30,
             backlog_warn_at: 64,
             bus_group: "memory-ingestor".into(),
             bus_claim_interval_secs: 30,
@@ -126,6 +141,11 @@ impl From<&IngestConfig> for MemoryIngestorConfig {
             extraction_concurrency: c.extraction_concurrency,
             startup_reconcile: c.startup_reconcile,
             reconcile_lookback_hours: c.reconcile_lookback_hours,
+            reconcile_interval_secs: c.reconcile_interval_secs,
+            pull_pause_after_failures: c.pull_pause_after_failures,
+            pull_pause_initial_secs: c.pull_pause_initial_secs,
+            pull_pause_max_secs: c.pull_pause_max_secs,
+            pool_check_secs: c.pool_check_secs,
             backlog_warn_at: c.backlog_warn_at,
             bus_group: c.bus_group.clone(),
             bus_claim_interval_secs: c.bus_claim_interval_secs,
@@ -174,6 +194,139 @@ impl BusAck {
     }
 }
 
+#[derive(Default)]
+struct PullGateState {
+    consecutive_failures: u32,
+    /// 本地判据推出的暂停截止点与对应时长（时长用于下次翻倍）。
+    local_until: Option<std::time::Instant>,
+    local_secs: u64,
+    /// 快照判据的缓存：读到时刻与推断的暂停截止点。
+    pool_checked_at: Option<std::time::Instant>,
+    pool_until: Option<std::time::Instant>,
+}
+
+/// 拉取闸门：把"现在该不该从事件面拉下一条"收敛成一个判据，输入有两路。
+///
+/// 一路是网关发布的池状态快照——跨进程、在花掉任何一次尝试之前就知道；
+/// 另一路是摄取器自己的连续环境失败计数——本地事实，网关说不出话时（Redis
+/// 无键、网关重启把进程内健康表清零）仍然成立。两路任一要求暂停就暂停，时长
+/// 取较大者；都不要求时照常拉取。
+///
+/// 暂停的做法是**不拉取**，而不是"拉了再丢"：消息留在事件面里未经投递，既不
+/// 计入投递次数也不写死信，上游一恢复就原样重放。
+struct PullGate {
+    pool: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
+    after_failures: u32,
+    initial_secs: u64,
+    max_secs: u64,
+    check_secs: u64,
+    state: std::sync::Mutex<PullGateState>,
+}
+
+impl PullGate {
+    fn new(
+        pool: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
+        config: &MemoryIngestorConfig,
+    ) -> Self {
+        Self {
+            pool,
+            after_failures: config.pull_pause_after_failures.max(1),
+            initial_secs: config.pull_pause_initial_secs.max(1),
+            max_secs: config.pull_pause_max_secs.max(1),
+            check_secs: config.pool_check_secs.max(1),
+            state: std::sync::Mutex::new(PullGateState::default()),
+        }
+    }
+
+    /// 一次抽取成功：连续失败清零，本地暂停解除。
+    fn note_success(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.consecutive_failures = 0;
+        s.local_until = None;
+        s.local_secs = 0;
+        s.pool_checked_at = None;
+        s.pool_until = None;
+    }
+
+    /// 一次环境类失败。连续失败到阈值就开一段暂停窗，时长按触发次数翻倍、
+    /// 封顶；窗内的并发失败不重复计数，免得一次事故把窗口一次推到顶。
+    fn note_environment_failure(&self) {
+        let now = std::time::Instant::now();
+        let mut s = self.state.lock().unwrap();
+        if s.local_until.is_some_and(|t| now < t) {
+            return;
+        }
+        s.consecutive_failures = s.consecutive_failures.saturating_add(1);
+        if s.consecutive_failures < self.after_failures {
+            return;
+        }
+        s.local_secs = if s.local_secs == 0 {
+            self.initial_secs
+        } else {
+            s.local_secs.saturating_mul(2).min(self.max_secs)
+        };
+        s.local_until = Some(now + Duration::from_secs(s.local_secs));
+        warn!(
+            consecutive_failures = s.consecutive_failures,
+            pause_secs = s.local_secs,
+            "Memory ingest pull paused: LLM upstream unavailable"
+        );
+    }
+
+    /// 快照判据：池不可用时给出等待时长。按 [`Self::check_secs`] 缓存快照，
+    /// 免得每拉一条都去问一遍同一份答案。
+    async fn shared_wait(&self) -> Option<Duration> {
+        let source = self.pool.as_ref()?;
+        let now = std::time::Instant::now();
+        {
+            let s = self.state.lock().unwrap();
+            if let Some(at) = s.pool_checked_at {
+                if now.duration_since(at) < Duration::from_secs(self.check_secs) {
+                    return s.pool_until.filter(|t| *t > now).map(|t| t - now);
+                }
+            }
+        }
+        let snapshot = source.status().await;
+        let wait = snapshot
+            .filter(|st| st.unavailable)
+            .map(|st| self.snapshot_wait(st));
+        let now = std::time::Instant::now();
+        let until = wait.map(|d| now + d);
+        let mut s = self.state.lock().unwrap();
+        s.pool_checked_at = Some(now);
+        s.pool_until = until;
+        if let Some(closes_at) = until {
+            if closes_at > now {
+                return Some(closes_at - now);
+            }
+        }
+        None
+    }
+
+    /// 快照给出的等待时长：到最早恢复时刻，但封顶。配额复位时刻可能远在几天
+    /// 之后，也可能因为上游说法不一致而不准——睡死了就错过恢复，所以按上限
+    /// 醒来重判。
+    fn snapshot_wait(&self, status: cog_core::LlmPoolStatus) -> Duration {
+        let now = chrono::Utc::now().timestamp();
+        let until = status.earliest_recovery_unix.saturating_sub(now).max(0) as u64;
+        Duration::from_secs(until.clamp(1, self.max_secs))
+    }
+
+    /// 现在是否该暂停拉取；返回需要等待的时长。
+    async fn blocked_for(&self) -> Option<Duration> {
+        let now = std::time::Instant::now();
+        let local = {
+            let s = self.state.lock().unwrap();
+            s.local_until.filter(|t| *t > now).map(|t| t - now)
+        };
+        let shared = self.shared_wait().await;
+        match (local, shared) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or_default().max(b.unwrap_or_default())),
+        }
+    }
+}
+
 /// Background service that listens to the AgentEvent broadcast stream and
 /// automatically archives + extracts memories when conversations end.
 /// Spawn this with [`MemoryIngestor::spawn`] and drop the returned handle
@@ -182,19 +335,34 @@ pub struct MemoryIngestor {
     backend: Arc<dyn MemoryBackend>,
     extractor: Arc<dyn MemoryExtractor>,
     config: MemoryIngestorConfig,
+    pull_gate: Arc<PullGate>,
 }
 
 impl MemoryIngestor {
     pub fn new(backend: Arc<dyn MemoryBackend>, extractor: Arc<dyn MemoryExtractor>) -> Self {
+        let config = MemoryIngestorConfig::default();
+        let pull_gate = Arc::new(PullGate::new(None, &config));
         Self {
             backend,
             extractor,
-            config: MemoryIngestorConfig::default(),
+            config,
+            pull_gate,
         }
     }
 
     pub fn with_config(mut self, config: MemoryIngestorConfig) -> Self {
+        self.pull_gate = Arc::new(PullGate::new(self.pull_gate.pool.clone(), &config));
         self.config = config;
+        self
+    }
+
+    /// 接线池状态快照来源。缺席时闸门退化为纯本地判据——上游断供仍然会被
+    /// 拦住，只是要花掉阈值次尝试才知道。
+    pub fn with_pool_status_source(
+        mut self,
+        source: Arc<dyn cog_core::LlmPoolStatusSource>,
+    ) -> Self {
+        self.pull_gate = Arc::new(PullGate::new(Some(source), &self.config));
         self
     }
 
@@ -212,6 +380,8 @@ impl MemoryIngestor {
         let inner = Arc::new(self);
 
         inner.start_dispatcher(job_rx, backlog.clone());
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        inner.start_reconcile_ticker(&job_tx, backlog.clone(), stopping.clone());
 
         tokio::spawn(async move {
             info!("MemoryIngestor started");
@@ -246,6 +416,7 @@ impl MemoryIngestor {
                 }
             }
             // 关掉入口：派发循环收完残余任务后自然退出，在途抽取跑完。
+            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
             drop(job_tx);
         });
 
@@ -270,6 +441,8 @@ impl MemoryIngestor {
         let group = inner.config.bus_group.clone();
 
         inner.start_dispatcher(job_rx, backlog.clone());
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        inner.start_reconcile_ticker(&job_tx, backlog.clone(), stopping.clone());
 
         // pending 清扫：把"投递给了已死消费者、始终没 ack"的消息认领回来。
         // JetStream 靠 ack_wait 自动红投，claim_pending 默认返回空；Redis
@@ -290,6 +463,12 @@ impl MemoryIngestor {
                     interval.tick().await;
                     if job_tx.is_closed() {
                         break;
+                    }
+                    if inner.pull_gate.blocked_for().await.is_some() {
+                        // 认领也是一种投递：闸门关着时认领回来的消息只会再失败
+                        // 一遍并占用投递次数，一样留到恢复后再接。
+                        debug!("Memory ingest claim paused: LLM upstream unavailable");
+                        continue;
                     }
                     match bus
                         .claim_pending(
@@ -351,7 +530,22 @@ impl MemoryIngestor {
                             stopped = true;
                             break;
                         }
-                        item = futures::StreamExt::next(&mut stream) => {
+                        item = async {
+                            // 闸门关着就不拉：拉下一条就是投递给一个已知接不住
+                            // 的摄取器，消息白白走一遍失败与红投计数，而留在流里
+                            // 什么都不损失。
+                            loop {
+                                if let Some(wait) = inner.pull_gate.blocked_for().await {
+                                    debug!(
+                                        wait_secs = wait.as_secs(),
+                                        "Memory ingest pull paused: LLM upstream unavailable"
+                                    );
+                                    tokio::time::sleep(wait).await;
+                                    continue;
+                                }
+                                return futures::StreamExt::next(&mut stream).await;
+                            }
+                        } => {
                             match item {
                                 Some(Ok((id, payload))) => {
                                     inner.enqueue_bus_payload(&job_tx, &backlog, &bus, &channel, id, &payload);
@@ -370,6 +564,7 @@ impl MemoryIngestor {
                 }
             }
             // 关掉入口：派发循环收完残余任务后自然退出，在途抽取跑完。
+            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
             drop(job_tx);
         });
 
@@ -476,27 +671,50 @@ impl MemoryIngestor {
         }
         debug!("Archived raw source: {}", raw.id);
 
+        // 闸门关着时连试都不试：上游已经连撞了阈值次同一堵墙，这一次的重试与
+        // 退避只是把同样的墙再撞一遍。raw 已归档，重驱动留给对账。
+        if self.pull_gate.blocked_for().await.is_some() {
+            debug!("Memory ingestion deferred for {}: pull gate closed", raw.id);
+            return false;
+        }
+
         let label = format!("ingest {}", raw.id);
-        if let Err(e) = self
+        match self
             .retry_with_backoff(&label, || self.ingest_missing(&raw))
             .await
         {
-            error!(
-                "Memory ingestion failed for {} after {} retries: {}",
-                raw.id, self.config.max_retries, e
-            );
-            if self.config.enable_dlq {
-                if let Err(dlq_err) = self.write_dlq(&raw, &e.to_string()).await {
-                    warn!("Failed to write DLQ entry: {}", dlq_err);
-                    // DLQ 都写不进：不 ack 留给总线红投，比静默终结响亮。
-                    return false;
-                }
+            Ok(()) => {
+                self.pull_gate.note_success();
+                true
             }
-            // 抽取失败但已落 DLQ：事件有了终结记录，ack 掉不再红投——
-            // 否则同一条坏消息会按 max_deliver 反复抽同样的错。
-            return self.config.enable_dlq;
+            Err(e) if e.is_environment_failure() => {
+                // 上游没接住，不是这条消息的毛病。写死信等于用一次容量故障
+                // 决定哪些事件永远进不了记忆，ack 掉更会把唯一的恢复路径压到
+                // 对账窗口上——留在事件面等重投，并让闸门暂停后续拉取。
+                warn!(
+                    "Memory ingestion deferred for {} (upstream unavailable, {} retries spent): {}",
+                    raw.id, self.config.max_retries, e
+                );
+                self.pull_gate.note_environment_failure();
+                false
+            }
+            Err(e) => {
+                error!(
+                    "Memory ingestion failed for {} after {} retries: {}",
+                    raw.id, self.config.max_retries, e
+                );
+                if self.config.enable_dlq {
+                    if let Err(dlq_err) = self.write_dlq(&raw, &e.to_string()).await {
+                        warn!("Failed to write DLQ entry: {}", dlq_err);
+                        // DLQ 都写不进：不 ack 留给总线红投，比静默终结响亮。
+                        return false;
+                    }
+                }
+                // 抽取失败但已落 DLQ：事件有了终结记录，ack 掉不再红投——
+                // 否则同一条坏消息会按 max_deliver 反复抽同样的错。
+                self.config.enable_dlq
+            }
         }
-        true
     }
 
     /// 补齐 raw 缺失的层：schema 或 summary 已存在就跳过对应抽取。对账重放
@@ -527,6 +745,41 @@ impl MemoryIngestor {
         }
 
         Ok(())
+    }
+
+    /// 周期对账：启动对账只覆盖"进程崩溃到重启"这一小段，一次上游断供比对账
+    /// 回看窗更长时，断供早期已归档未抽取的 raw 会掉出窗口、再也不会被补驱动。
+    /// 按间隔重扫让"归档必有抽取"不依赖重启时机；闸门关着时跳过，上游恢复后
+    /// 的下一拍再补。间隔为 0 表示只在启动时对账。
+    fn start_reconcile_ticker(
+        self: &Arc<Self>,
+        job_tx: &mpsc::UnboundedSender<QueuedRaw>,
+        backlog: Arc<std::sync::atomic::AtomicUsize>,
+        stopping: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let secs = self.config.reconcile_interval_secs;
+        if secs == 0 {
+            return;
+        }
+        let inner = self.clone();
+        let job_tx = job_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(secs));
+            interval.tick().await; // 第一拍即启动对账已覆盖的那一次
+            loop {
+                interval.tick().await;
+                // 退出判据取显式的停止标志，不靠"通道已关"：这个任务自己握着
+                // 一个 job_tx，通道不会因为主循环退出而关闭，靠它判会一直重扫。
+                if stopping.load(std::sync::atomic::Ordering::SeqCst) || job_tx.is_closed() {
+                    break;
+                }
+                if inner.pull_gate.blocked_for().await.is_some() {
+                    debug!("Memory ingest reconcile paused: LLM upstream unavailable");
+                    continue;
+                }
+                inner.reconcile(&job_tx, &backlog).await;
+            }
+        });
     }
 
     /// 启动对账：扫最近窗口内的会话 raw，把没有 summary 的重新入队。
@@ -1167,5 +1420,374 @@ mod tests {
             "the good event behind poison must still be processed"
         );
         assert_eq!(archived_count(&backend).await, 1);
+    }
+
+    /// 上游断供的抽取器：每次调用都以环境类错误返回（传输/配额/超时）。
+    /// 它代表"调用没被接住"，与"这条消息内容抽不出来"是两回事。
+    struct UnreachableExtractor {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl UnreachableExtractor {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn unreachable<T>() -> SFResult<T> {
+        Err(cog_core::SFError::LLM("all upstreams unavailable".into()))
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryExtractor for UnreachableExtractor {
+        async fn extract_schema(&self, _source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            unreachable()
+        }
+
+        async fn generate_summary(&self, _source: &RawSource) -> SFResult<SummaryEntry> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            unreachable()
+        }
+    }
+
+    /// 内容坏掉的抽取器：同一条消息重试多少次都是同一个错——这类才是死信。
+    struct ContentBrokenExtractor;
+
+    #[async_trait::async_trait]
+    impl MemoryExtractor for ContentBrokenExtractor {
+        async fn extract_schema(&self, _source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
+            Err(cog_core::SFError::Validation("nothing extractable".into()))
+        }
+
+        async fn generate_summary(&self, _source: &RawSource) -> SFResult<SummaryEntry> {
+            Err(cog_core::SFError::Validation("nothing extractable".into()))
+        }
+    }
+
+    /// 快照来源：可由测试直接翻转的池状态。
+    struct TogglePool {
+        down: std::sync::atomic::AtomicBool,
+        earliest_recovery_unix: i64,
+    }
+
+    impl TogglePool {
+        fn new(down: bool, earliest_recovery_unix: i64) -> Self {
+            Self {
+                down: std::sync::atomic::AtomicBool::new(down),
+                earliest_recovery_unix,
+            }
+        }
+
+        fn set(&self, down: bool) {
+            self.down.store(down, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for TogglePool {
+        async fn status(&self) -> Option<cog_core::LlmPoolStatus> {
+            if !self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            Some(cog_core::LlmPoolStatus {
+                unavailable: true,
+                earliest_recovery_unix: self.earliest_recovery_unix,
+                unavailable_upstreams: vec!["a|m".into()],
+            })
+        }
+    }
+
+    fn transcript_raw(agent_id: &str) -> RawSource {
+        RawSource::new(
+            bounded_raw_id("agent", agent_id, Utc::now()),
+            "default",
+            "conversation/transcript",
+            b"[]".to_vec(),
+        )
+    }
+
+    fn quick_retry_config() -> MemoryIngestorConfig {
+        MemoryIngestorConfig {
+            max_retries: 0,
+            retry_base_delay_ms: 1,
+            pull_pause_after_failures: 1,
+            pull_pause_initial_secs: 60,
+            pull_pause_max_secs: 1800,
+            ..Default::default()
+        }
+    }
+
+    /// 核心回归：上游接不住这次调用时，消息既不许写死信、也不许被终结——
+    /// 写死信等于用一次容量故障决定哪些事件永远进不了记忆。归档照做（它是
+    /// 重驱动的前提），抽取延后，闸门随即关掉停止后续拉取。
+    #[tokio::test]
+    async fn environment_failure_defers_instead_of_dead_lettering() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let extractor = Arc::new(UnreachableExtractor::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), extractor.clone())
+            .with_config(quick_retry_config());
+        let raw = transcript_raw("outage");
+
+        assert!(
+            !ingestor.process(raw.clone()).await,
+            "an upstream outage must not be reported as done"
+        );
+        assert_eq!(
+            backend
+                .list_raw("default", Some("conversation/transcript"))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the raw must be archived so reconcile can re-drive it"
+        );
+        assert!(
+            backend.list_raw("dlq", None).await.unwrap().is_empty(),
+            "an upstream outage must not be dead-lettered"
+        );
+        assert!(
+            ingestor.pull_gate.blocked_for().await.is_some(),
+            "the pull gate must close on environment failures"
+        );
+
+        // 闸门关着时连试都不试：同一条消息再处理一次不该再消耗上游调用。
+        let calls = extractor.calls();
+        assert!(!ingestor.process(raw).await);
+        assert_eq!(
+            extractor.calls(),
+            calls,
+            "no upstream attempt may be spent while the gate is closed"
+        );
+    }
+
+    /// 反面对照：内容本身抽不出来的消息仍然走死信并算处理完结，别让这个
+    /// 修复退化成"永远不写死信、永远不终结"。
+    #[tokio::test]
+    async fn content_failure_still_dead_letters_and_finishes() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(ContentBrokenExtractor))
+            .with_config(quick_retry_config());
+
+        assert!(
+            ingestor.process(transcript_raw("broken")).await,
+            "a poisoned message is finished once it is dead-lettered"
+        );
+        assert_eq!(
+            backend.list_raw("dlq", None).await.unwrap().len(),
+            1,
+            "content failures must still be dead-lettered"
+        );
+        assert!(
+            ingestor.pull_gate.blocked_for().await.is_none(),
+            "a content failure says nothing about the upstream pool"
+        );
+    }
+
+    /// B 面：网关发布的池快照让摄取器在花掉任何一次尝试之前就停手——这是
+    /// 本地失败计数做不到的（它至少要撞够阈值次才知道墙在那儿）。
+    #[tokio::test]
+    async fn pool_snapshot_closes_the_gate_before_any_attempt() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let extractor = Arc::new(UnreachableExtractor::new());
+        let pool = Arc::new(TogglePool::new(true, chrono::Utc::now().timestamp() + 300));
+        let ingestor = MemoryIngestor::new(backend, extractor.clone())
+            .with_config(MemoryIngestorConfig {
+                pool_check_secs: 1,
+                ..quick_retry_config()
+            })
+            .with_pool_status_source(pool.clone());
+
+        assert!(
+            ingestor.pull_gate.blocked_for().await.is_some(),
+            "a snapshot marking the pool down must close the gate on its own"
+        );
+        assert!(!ingestor.process(transcript_raw("pooled")).await);
+        assert_eq!(
+            extractor.calls(),
+            0,
+            "the snapshot must spare the upstream attempt entirely"
+        );
+
+        pool.set(false);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            ingestor.pull_gate.blocked_for().await.is_none(),
+            "the gate must reopen once the snapshot reports a healthy pool"
+        );
+    }
+
+    /// 恢复时刻可能远在几天之后，也可能因为上游说法不一致而不准：等待时长
+    /// 必须封顶，睡死了就错过恢复。
+    #[tokio::test]
+    async fn snapshot_wait_is_capped_and_never_zero() {
+        let config = MemoryIngestorConfig {
+            pull_pause_initial_secs: 60,
+            pull_pause_max_secs: 1800,
+            ..Default::default()
+        };
+        let gate = PullGate::new(None, &config);
+        let now = chrono::Utc::now().timestamp();
+
+        assert_eq!(
+            gate.snapshot_wait(cog_core::LlmPoolStatus {
+                unavailable: true,
+                earliest_recovery_unix: now + 86_400 * 30,
+                unavailable_upstreams: vec![],
+            }),
+            Duration::from_secs(1800),
+            "a month-away recovery must be capped"
+        );
+        assert_eq!(
+            gate.snapshot_wait(cog_core::LlmPoolStatus {
+                unavailable: true,
+                earliest_recovery_unix: now - 60,
+                unavailable_upstreams: vec![],
+            }),
+            Duration::from_secs(1),
+            "a stale recovery time must still park for a moment"
+        );
+    }
+
+    /// C 面：断供比对账回看窗更长时，启动对账补不回断供早期归档的 raw。
+    /// 周期重扫让"归档必有抽取"不再依赖重启时机。
+    #[tokio::test]
+    async fn periodic_reconcile_redrives_without_a_restart() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        backend
+            .archive_raw(&transcript_raw("archived-before-restart"))
+            .await
+            .unwrap();
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_config(MemoryIngestorConfig {
+                startup_reconcile: false,
+                reconcile_interval_secs: 1,
+                ..Default::default()
+            });
+        let (event_tx, _) = broadcast::channel::<AgentEvent>(16);
+        let _handle = ingestor.spawn(event_tx.subscribe());
+
+        let backend2 = backend.clone();
+        assert!(
+            wait_for(move || {
+                let backend = backend2.clone();
+                Box::pin(async move { summary_count(&backend).await >= 1 })
+            })
+            .await,
+            "the ticker must re-drive raws the startup pass never saw"
+        );
+    }
+
+    /// 停机契约：周期对账是摄取器的一部分，随它一起停。这个任务自己握着一个
+    /// job_tx，退出判据必须是显式的停止标志，否则"通道已关"永远不成立。
+    #[tokio::test]
+    async fn reconcile_ticker_stops_with_the_ingestor() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_config(MemoryIngestorConfig {
+                startup_reconcile: false,
+                reconcile_interval_secs: 1,
+                ..Default::default()
+            });
+        let (event_tx, _) = broadcast::channel::<AgentEvent>(16);
+        let handle = ingestor.spawn(event_tx.subscribe());
+
+        backend
+            .archive_raw(&transcript_raw("while-running"))
+            .await
+            .unwrap();
+        let backend2 = backend.clone();
+        assert!(
+            wait_for(move || {
+                let backend = backend2.clone();
+                Box::pin(async move { summary_count(&backend).await >= 1 })
+            })
+            .await,
+            "the ticker must be running before the stop"
+        );
+
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        backend
+            .archive_raw(&transcript_raw("after-stop"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            summary_count(&backend).await,
+            1,
+            "a stopped ingestor must not keep re-driving the archive"
+        );
+    }
+
+    /// 间隔为 0 的单飞契约：只在启动时对账，运行期不再重扫。
+    #[tokio::test]
+    async fn reconcile_interval_zero_keeps_startup_only() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        backend
+            .archive_raw(&transcript_raw("never-redriven"))
+            .await
+            .unwrap();
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_config(MemoryIngestorConfig {
+                startup_reconcile: false,
+                reconcile_interval_secs: 0,
+                ..Default::default()
+            });
+        let (event_tx, _) = broadcast::channel::<AgentEvent>(16);
+        let _handle = ingestor.spawn(event_tx.subscribe());
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            summary_count(&backend).await,
+            0,
+            "reconcile_interval_secs=0 must not schedule any re-scan"
+        );
+    }
+
+    /// 周期对账也吃闸门：池不可用时重扫只是把同一堵墙再撞一遍，留到恢复后
+    /// 的下一拍再补。
+    #[tokio::test]
+    async fn periodic_reconcile_waits_for_the_pool() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        backend
+            .archive_raw(&transcript_raw("waiting-for-pool"))
+            .await
+            .unwrap();
+        let pool = Arc::new(TogglePool::new(true, chrono::Utc::now().timestamp() + 60));
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_config(MemoryIngestorConfig {
+                startup_reconcile: false,
+                reconcile_interval_secs: 1,
+                pool_check_secs: 1,
+                ..Default::default()
+            })
+            .with_pool_status_source(pool.clone());
+        let (event_tx, _) = broadcast::channel::<AgentEvent>(16);
+        let _handle = ingestor.spawn(event_tx.subscribe());
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            summary_count(&backend).await,
+            0,
+            "reconcile must not run while the pool snapshot says down"
+        );
+
+        pool.set(false);
+        let backend2 = backend.clone();
+        assert!(
+            wait_for(move || {
+                let backend = backend2.clone();
+                Box::pin(async move { summary_count(&backend).await >= 1 })
+            })
+            .await,
+            "reconcile must catch up on the first tick after recovery"
+        );
     }
 }

@@ -182,6 +182,20 @@ pub struct LlmPoolStatus {
     pub unavailable_upstreams: Vec<String>,
 }
 
+/// Reads the cross-process pool snapshot published by the security gateway.
+///
+/// The gateway is the only process holding upstream credentials, so it owns the
+/// verdict on whether the pool can serve a request; everything that must hold
+/// work back while it cannot shares this one source rather than forming its own
+/// opinion from local failures. `None` means the snapshot is absent or unusable
+/// — no evidence of a healthy pool, and no evidence of a sick one — which is
+/// why consumers keep a local fallback instead of treating `None` as "fine".
+#[async_trait::async_trait]
+pub trait LlmPoolStatusSource: Send + Sync {
+    /// Current snapshot, or `None` when the pool is healthy / unknown.
+    async fn status(&self) -> Option<LlmPoolStatus>;
+}
+
 /// Health issue identified for an Agent / Crew / Squad.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

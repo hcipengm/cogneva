@@ -340,8 +340,10 @@ impl EvolutionEngine {
 
         let json_str = Self::extract_json(&text);
 
-        let hook_json: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| cog_core::SFError::LLM(format!("Failed to parse hook JSON: {e}")))?;
+        // 答复拿到了、只是这条输入下的回答解不出来——内容类失败，不能记成
+        // 上游故障：那会把死信拖成无限延后重投。
+        let hook_json: serde_json::Value =
+            serde_json::from_str(json_str).map_err(cog_core::SFError::Serialization)?;
 
         // Validate required fields.
         let id = hook_json.get("id").and_then(|v| v.as_str());
@@ -512,8 +514,8 @@ impl EvolutionEngine {
 
         let json_str = Self::extract_json(&text);
 
-        let tool_json: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| cog_core::SFError::LLM(format!("Failed to parse tool JSON: {e}")))?;
+        let tool_json: serde_json::Value =
+            serde_json::from_str(json_str).map_err(cog_core::SFError::Serialization)?;
 
         let name = tool_json.get("name").and_then(|v| v.as_str());
         let description = tool_json.get("description").and_then(|v| v.as_str());

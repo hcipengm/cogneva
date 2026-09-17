@@ -50,9 +50,7 @@ pub use event_aggregator::{EventAggregator, EventAggregatorStats};
 pub use health_checker::{HealthChecker, HealthCheckerConfig, HealthReport};
 pub use heartbeat_driver::HeartbeatDriver;
 pub use lifecycle_coordinator::{LifecycleCoordinator, LifecycleReport, RecoveredCheckpoint};
-pub use llm_pool_guard::{
-    LlmPoolGuard, LlmPoolStatusSource, PoolTransition, RedisLlmPoolStatusSource,
-};
+pub use llm_pool_guard::{LlmPoolGuard, PoolTransition, RedisLlmPoolStatusSource};
 pub use multi_backend_consumer::MultiBackendEventConsumer;
 pub use quota_enforcer::{QuotaEnforcer, QuotaSnapshot};
 pub use registry::{AgentInfo, AgentRegistry, CrewInfo};

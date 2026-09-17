@@ -13,6 +13,9 @@ pub struct SupervisorPlugin {
     initialized: bool,
     supervisor: Option<Arc<crate::Supervisor>>,
     scheduler_gate: Option<Arc<crate::SchedulerGate>>,
+    /// 池状态来源在 `init` 建好并发布，`start` 只把它接进守护循环。判定本身
+    /// 由网关独占，这个来源是消费方共用的那一个观测面。
+    pool_source: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -24,6 +27,7 @@ impl SupervisorPlugin {
             initialized: false,
             supervisor: None,
             scheduler_gate: None,
+            pool_source: None,
             shutdown_tx: Mutex::new(None),
             task_handle: Mutex::new(None),
         }
@@ -37,27 +41,36 @@ impl Default for SupervisorPlugin {
 }
 
 impl SupervisorPlugin {
-    /// Start the LLM upstream pool awareness loop. Needs both the scheduler
-    /// gate and a Redis URL (the gateway publishes the pool snapshot there);
-    /// without Redis this is a single-process deployment, so the loop is not
-    /// started and the gate stays under operator control only.
-    async fn spawn_llm_pool_guard(&self, ctx: &cog_core::PluginContext) {
-        let Some(gate) = self.scheduler_gate.clone() else {
-            return;
-        };
+    /// 建好并发布池状态来源。发布放在 `init` 而不是 `start`：`start` 是所有
+    /// 插件并行跑的，摄取器在 `start` 里取这个服务，只有 `init` 阶段发布才
+    /// 保证它一定取得到。同一个实例既驱动调度器的 LLM 类暂停，也供摄取器
+    /// 判断"该不该拉下一条"——池的判定只有网关一个观测面，消费方共用这一个
+    /// 来源而不是各读一遍 Redis。
+    async fn init_llm_pool_source(&mut self, ctx: &cog_core::PluginContext) {
         let redis_url = ctx.config().dag_executor.redis_url.clone();
         if redis_url.is_empty() {
             info!("LLM pool guard disabled: no redis_url configured");
             return;
         }
-        let source =
-            match crate::llm_pool_guard::RedisLlmPoolStatusSource::connect(&redis_url).await {
-                Ok(source) => Arc::new(source),
-                Err(e) => {
-                    warn!("LLM pool guard disabled: redis connect failed: {e}");
-                    return;
-                }
-            };
+        match crate::llm_pool_guard::RedisLlmPoolStatusSource::connect(&redis_url).await {
+            Ok(source) => {
+                let source: Arc<dyn cog_core::LlmPoolStatusSource> = Arc::new(source);
+                ctx.publish_service(source.clone());
+                self.pool_source = Some(source);
+            }
+            Err(e) => warn!("LLM pool guard disabled: redis connect failed: {e}"),
+        }
+    }
+
+    /// Start the LLM upstream pool awareness loop. Needs both the scheduler
+    /// gate and a Redis URL (the gateway publishes the pool snapshot there);
+    /// without Redis this is a single-process deployment, so the loop is not
+    /// started and the gate stays under operator control only.
+    fn spawn_llm_pool_guard(&self, ctx: &cog_core::PluginContext) {
+        let (Some(gate), Some(source)) = (self.scheduler_gate.clone(), self.pool_source.clone())
+        else {
+            return;
+        };
         let Some(event_tx) =
             ctx.consume::<tokio::sync::broadcast::Sender<cog_core::SupervisorEvent>>()
         else {
@@ -202,6 +215,9 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
             );
         }
 
+        // ── LLM upstream pool verdict source (published for consumers) ──
+        self.init_llm_pool_source(ctx).await;
+
         self.supervisor = Some(supervisor);
         self.scheduler_gate = Some(scheduler_gate);
         self.initialized = true;
@@ -227,7 +243,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         // ── LLM upstream pool awareness ──
         // Pool health is owned by the security gateway; this loop reads its
         // cross-process snapshot and pauses only the LLM-dependent class.
-        self.spawn_llm_pool_guard(ctx).await;
+        self.spawn_llm_pool_guard(ctx);
 
         // ── Multi-backend consumer ──
         let mbc = ctx.config().multi_backend_consumer.clone();
@@ -299,6 +315,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         "AlertStore",
         "HeartbeatRegistry",
         "SchedulerGate",
+        "LlmPoolStatusSource",
         "SupervisorConfigTx",
         "Sender<SupervisorEvent>",
         "BinarySwitcher",

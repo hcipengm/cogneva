@@ -14,17 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cog_core::{LlmPoolStatus, SupervisorEvent, TaskClass};
+use cog_core::{LlmPoolStatus, LlmPoolStatusSource, SupervisorEvent, TaskClass};
 use tokio::sync::broadcast;
 
 use crate::scheduler_gate::SchedulerGate;
-
-/// Source of the cross-process pool snapshot.
-#[async_trait::async_trait]
-pub trait LlmPoolStatusSource: Send + Sync {
-    /// Current snapshot, or `None` when the pool is healthy / unknown.
-    async fn status(&self) -> Option<LlmPoolStatus>;
-}
 
 /// Reads the snapshot the gateway writes to Redis.
 pub struct RedisLlmPoolStatusSource {

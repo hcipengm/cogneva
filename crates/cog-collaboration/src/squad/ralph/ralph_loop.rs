@@ -792,9 +792,9 @@ Respond with **only** a JSON object matching this schema:\n\
             text.as_str()
         };
 
-        let semantic: SemanticFailureAnalysis = serde_json::from_str(json_str).map_err(|e| {
-            cog_core::SFError::LLM(format!("Failed to parse semantic analysis JSON: {e}"))
-        })?;
+        // 答复拿到了、只是解不出来：内容类失败，不是上游故障。
+        let semantic: SemanticFailureAnalysis =
+            serde_json::from_str(json_str).map_err(cog_core::SFError::Serialization)?;
 
         tracing::info!(
             "Semantic failure analysis: type={}, strategy={}",

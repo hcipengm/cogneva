@@ -69,6 +69,25 @@ pub struct IngestConfig {
     pub startup_reconcile: bool,
     /// 对账只回看最近这么多个小时的 raw。
     pub reconcile_lookback_hours: u64,
+    /// 周期对账间隔（秒）；0 表示只在启动时对账。
+    ///
+    /// 启动对账只覆盖"进程崩溃到重启"这一小段。一次上游断供比对账回看窗更长
+    /// 时，断供早期已归档未抽取的 raw 会掉出窗口、再也不会被补驱动——周期重扫
+    /// 让"归档必有抽取"不再依赖重启时机。
+    pub reconcile_interval_secs: u64,
+    /// 连续多少次环境类抽取失败后暂停拉取。
+    ///
+    /// 上游断供时重试与继续拉取都只是把同一堵墙撞一遍；暂停让事件留在事件面里
+    /// 原样等重放，而不是被逐条终结掉。
+    pub pull_pause_after_failures: u32,
+    /// 暂停拉取的初始时长（秒），每次再次触发翻倍。
+    pub pull_pause_initial_secs: u64,
+    /// 暂停拉取的封顶时长（秒）。恢复时刻由上游给出时可能很远，睡死了就错过
+    /// 恢复，所以按这个上限醒来重判。
+    pub pull_pause_max_secs: u64,
+    /// 读取池状态快照的最小间隔（秒）。快照本身由网关按自己的节拍写，读得太密
+    /// 只是把同一个答案取回来。
+    pub pool_check_secs: u64,
     /// 积压深度告警起点（达到后每翻倍打一条 WARN）。
     pub backlog_warn_at: usize,
     /// 总线消费组名（durable consumer / consumer group）。
@@ -91,6 +110,11 @@ impl Default for IngestConfig {
             extraction_concurrency: 4,
             startup_reconcile: true,
             reconcile_lookback_hours: 24,
+            reconcile_interval_secs: 600,
+            pull_pause_after_failures: 3,
+            pull_pause_initial_secs: 60,
+            pull_pause_max_secs: 1800,
+            pool_check_secs: 30,
             backlog_warn_at: 64,
             bus_group: "memory-ingestor".into(),
             bus_claim_interval_secs: 30,

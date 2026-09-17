@@ -329,8 +329,17 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             } else {
                 Arc::new(crate::RuleBasedExtractor::new())
             };
-            let ingestor =
+            let mut ingestor =
                 crate::MemoryIngestor::new(backend, extractor).with_config((&memory.ingest).into());
+            // 池状态来源由 supervisor 在 init 发布（init_all 先于 start_all），
+            // 缺席时闸门退化为纯本地判据：上游断供仍会被拦住，只是要花掉阈值
+            // 次尝试才知道。
+            match ctx.consume_service::<dyn cog_core::LlmPoolStatusSource>() {
+                Some(source) => ingestor = ingestor.with_pool_status_source(source),
+                None => warn!(
+                    "No LlmPoolStatusSource published; ingest pull gate falls back to local failure counting"
+                ),
+            }
             info!("Memory auto-ingest enabled");
             // 事件面开关与发布侧同开同关：开启后 AgentEnd 只上持久总线，
             // 摄取器必须从总线消费（ack 后完成），广播上不再有活体 AgentEnd。
@@ -438,6 +447,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "EventPlaneBackend",
+            required: false,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "LlmPoolStatusSource",
             required: false,
         },
     ],
