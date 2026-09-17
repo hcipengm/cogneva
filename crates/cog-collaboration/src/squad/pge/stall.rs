@@ -2,93 +2,81 @@
 //! spend buys progress, never whether spend crossed a flat cap.
 //!
 //! Each pipeline attempt / roundtable iteration yields a [`ProgressSignals`]
-//! snapshot. An attempt counts as progress when ANY signal moved versus the
-//! previous one:
+//! snapshot. An attempt counts as progress when the **evaluator's own
+//! judgement** moved versus the previous one:
 //!
-//! - evaluation score improved
-//! - artifacts grew (count or total bytes)
-//! - the failure class is novel (normalized feedback signature changed — a
-//!   new error class is new information, even at the same score)
+//! - the overall evaluation score improved
+//! - at least one acceptance criterion was judged better and none worse
 //!
-//! A generation that merely rephrases content while score, artifacts, and
-//! error class all stay flat is spin, not progress. After `threshold`
-//! consecutive non-progress attempts the loop is declared degenerate: the
-//! caller stops paying for further attempts and marks the run with
-//! [`DEGENERATE_LOOP_PREFIX`] so outer layers treat it as non-retryable and
-//! the failure record becomes reflection fuel instead of being retried
-//! silently.
+//! Nothing about the generation itself is a reading, and the constructor takes
+//! only the evaluation so there is no way to reintroduce one. Artifact size and
+//! the wording of the feedback were both removed: both are proxies a loop can
+//! move without getting any closer to passing — padding a deliverable, or
+//! rephrasing the same failure so its fingerprint changes. When neither the
+//! score nor the criteria move, the round bought nothing, however different it
+//! looked. After `threshold` consecutive non-progress attempts the loop is
+//! declared degenerate: the caller stops paying for further attempts and marks
+//! the run with [`DEGENERATE_LOOP_PREFIX`] so outer layers treat it as
+//! non-retryable and the failure record becomes reflection fuel instead of
+//! being retried silently.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
-use super::types::{EvaluationResult, GeneratorOutput};
+use super::types::EvaluationResult;
 
 /// Feedback prefix marking a run stopped by stall detection. Outer loops
 /// (squad escalation) match on this prefix to skip paid retries — same
 /// convention as the terminal environment failure prefix.
 pub const DEGENERATE_LOOP_PREFIX: &str = "degenerate_loop";
 
-/// Progress signals extracted from one attempt/iteration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The evaluator's judgement of one attempt, reduced to what progress can be
+/// measured on. Persisted with the Ralph iteration history, so it doubles as
+/// the record of "what this round was worth" across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProgressSignals {
+    #[serde(default)]
     pub score: Option<u32>,
-    pub artifact_count: usize,
-    pub artifact_bytes: usize,
-    /// Normalized fingerprint of the evaluator feedback — identifies the
-    /// error *class*, insensitive to run ids, numbers, and timestamps.
-    pub feedback_signature: u64,
+    /// Per-criterion evaluations as (criterion name, score). Names come from
+    /// the plan's acceptance criteria, so the same criterion is comparable
+    /// across attempts while the emitted order is not relied on.
+    #[serde(default)]
+    pub criteria: Vec<(String, u32)>,
 }
 
 impl ProgressSignals {
-    pub fn from_attempt(generation: &GeneratorOutput, evaluation: &EvaluationResult) -> Self {
+    pub fn from_evaluation(evaluation: &EvaluationResult) -> Self {
         Self {
             score: evaluation.score,
-            artifact_count: generation.artifacts.len(),
-            artifact_bytes: generation.artifacts.iter().map(|a| a.content.len()).sum(),
-            feedback_signature: feedback_signature(&evaluation.feedback),
+            criteria: evaluation
+                .criteria
+                .iter()
+                .map(|c| (c.name.clone(), c.score))
+                .collect(),
         }
     }
 }
 
-/// Normalize feedback into an error-class signature: strip digits (run ids,
-/// line numbers), collapse whitespace, lowercase, cap length — then hash.
-/// Same root cause must map to the same signature across attempts.
-fn feedback_signature(feedback: &str) -> u64 {
-    let first_line = feedback.lines().next().unwrap_or("").trim();
-    let mut sig = String::with_capacity(first_line.len());
-    let mut last_space = true;
-    for ch in first_line.chars() {
-        if ch.is_ascii_digit() {
-            if !last_space {
-                sig.push(' ');
-                last_space = true;
-            }
-            continue;
-        }
-        if ch.is_whitespace() {
-            if !last_space {
-                sig.push(' ');
-            }
-            last_space = true;
-            continue;
-        }
-        sig.push(ch.to_ascii_lowercase());
-        last_space = false;
-    }
-    let normalized: String = sig.trim().chars().take(80).collect();
-    let mut hasher = DefaultHasher::new();
-    normalized.hash(&mut hasher);
-    hasher.finish()
+/// Did `cur` make progress over `prev`? Progress is the evaluator moving:
+/// a higher overall score, or at least one acceptance criterion judged better.
+pub fn made_progress(prev: &ProgressSignals, cur: &ProgressSignals) -> bool {
+    cur.score.unwrap_or(0) > prev.score.unwrap_or(0) || criteria_improved(prev, cur)
 }
 
-/// Did `cur` make progress over `prev`? Progress means the evaluation moved
-/// (score up), the deliverable grew (more/larger artifacts), or the failure
-/// mode shifted to a class not seen in the previous attempt.
-fn made_progress(prev: &ProgressSignals, cur: &ProgressSignals) -> bool {
-    cur.score.unwrap_or(0) > prev.score.unwrap_or(0)
-        || cur.artifact_count > prev.artifact_count
-        || cur.artifact_bytes > prev.artifact_bytes
-        || cur.feedback_signature != prev.feedback_signature
+/// Per-criterion movement, compared by name over the criteria both readings
+/// judged. Better means some shared criterion scored strictly higher and none
+/// scored lower: trading one acceptance criterion away to gain another is a
+/// different result, not a better one.
+fn criteria_improved(prev: &ProgressSignals, cur: &ProgressSignals) -> bool {
+    let mut gained = false;
+    for (name, score) in &cur.criteria {
+        let Some((_, before)) = prev.criteria.iter().find(|(n, _)| n == name) else {
+            continue;
+        };
+        if score > before {
+            gained = true;
+        } else if score < before {
+            return false;
+        }
+    }
+    gained
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,22 +134,7 @@ impl StallDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::squad::pge::types::Artifact;
-
-    fn generation(artifact_bytes: usize) -> GeneratorOutput {
-        GeneratorOutput {
-            content: serde_json::json!({"code": "x"}),
-            artifacts: if artifact_bytes == 0 {
-                Vec::new()
-            } else {
-                vec![Artifact {
-                    name: "a".into(),
-                    content: "x".repeat(artifact_bytes),
-                    artifact_type: "text".into(),
-                }]
-            },
-        }
-    }
+    use crate::squad::pge::types::Criterion;
 
     fn evaluation(score: u32, feedback: &str) -> EvaluationResult {
         EvaluationResult {
@@ -173,31 +146,44 @@ mod tests {
         }
     }
 
+    fn with_criteria(score: u32, criteria: &[(&str, u32)]) -> EvaluationResult {
+        let mut e = evaluation(score, "criterion run");
+        e.criteria = criteria
+            .iter()
+            .map(|(name, score)| Criterion {
+                name: (*name).into(),
+                score: *score,
+                comment: String::new(),
+            })
+            .collect();
+        e
+    }
+
     #[test]
     fn flat_signals_stall_after_threshold() {
         let mut d = StallDetector::new(2);
         // baseline
         assert_eq!(
-            d.observe(ProgressSignals::from_attempt(
-                &generation(0),
-                &evaluation(30, "missing tests")
-            )),
+            d.observe(ProgressSignals::from_evaluation(&evaluation(
+                30,
+                "missing tests"
+            ))),
             StallVerdict::Progressing
         );
         // flat 1
         assert_eq!(
-            d.observe(ProgressSignals::from_attempt(
-                &generation(0),
-                &evaluation(30, "missing tests")
-            )),
+            d.observe(ProgressSignals::from_evaluation(&evaluation(
+                30,
+                "missing tests"
+            ))),
             StallVerdict::Progressing
         );
         // flat 2 → stalled
         assert_eq!(
-            d.observe(ProgressSignals::from_attempt(
-                &generation(0),
-                &evaluation(30, "missing tests")
-            )),
+            d.observe(ProgressSignals::from_evaluation(&evaluation(
+                30,
+                "missing tests"
+            ))),
             StallVerdict::Stalled
         );
     }
@@ -205,71 +191,77 @@ mod tests {
     #[test]
     fn score_improvement_resets_streak() {
         let mut d = StallDetector::new(2);
-        d.observe(ProgressSignals::from_attempt(
-            &generation(0),
-            &evaluation(30, "missing tests"),
-        ));
-        d.observe(ProgressSignals::from_attempt(
-            &generation(0),
-            &evaluation(30, "missing tests"),
-        ));
+        d.observe(ProgressSignals::from_evaluation(&evaluation(
+            30,
+            "missing tests",
+        )));
+        d.observe(ProgressSignals::from_evaluation(&evaluation(
+            30,
+            "missing tests",
+        )));
         // score improves → streak cleared
         assert_eq!(
-            d.observe(ProgressSignals::from_attempt(
-                &generation(0),
-                &evaluation(45, "missing tests"),
-            )),
+            d.observe(ProgressSignals::from_evaluation(&evaluation(
+                45,
+                "missing tests",
+            ))),
             StallVerdict::Progressing
         );
         // needs two fresh flat attempts to stall again
         assert_eq!(
-            d.observe(ProgressSignals::from_attempt(
-                &generation(0),
-                &evaluation(45, "missing tests"),
-            )),
+            d.observe(ProgressSignals::from_evaluation(&evaluation(
+                45,
+                "missing tests",
+            ))),
             StallVerdict::Progressing
         );
     }
 
+    /// 换个说法重述同一个失败不是进展：反馈措辞不进入读数，所以改写既不能
+    /// 制造"新错误类"，也不能把停滞判据骗过去。
     #[test]
-    fn artifact_growth_counts_as_progress() {
+    fn reworded_failure_is_not_progress() {
         let mut d = StallDetector::new(1);
-        d.observe(ProgressSignals::from_attempt(
-            &generation(10),
-            &evaluation(30, "incomplete"),
-        ));
-        // same score, same error class, but artifacts grew
+        d.observe(ProgressSignals::from_evaluation(&evaluation(
+            30,
+            "missing tests",
+        )));
         assert_eq!(
-            d.observe(ProgressSignals::from_attempt(
-                &generation(20),
-                &evaluation(30, "incomplete"),
-            )),
-            StallVerdict::Progressing
+            d.observe(ProgressSignals::from_evaluation(&evaluation(
+                30,
+                "tests are absent, add them",
+            ))),
+            StallVerdict::Stalled
         );
     }
 
+    /// 评估标准项真的被判定得更好了才算进展——分不动但某一项从 40 抬到 100
+    /// 是实打实的收敛。
     #[test]
-    fn novel_error_class_counts_as_progress() {
-        let mut d = StallDetector::new(1);
-        d.observe(ProgressSignals::from_attempt(
-            &generation(0),
-            &evaluation(30, "missing tests"),
+    fn criteria_improvement_is_progress() {
+        let prev = ProgressSignals::from_evaluation(&with_criteria(
+            70,
+            &[("compiles", 100), ("has tests", 40)],
         ));
-        // same score/artifacts, but the failure mode shifted — new information
-        assert_eq!(
-            d.observe(ProgressSignals::from_attempt(
-                &generation(0),
-                &evaluation(30, "wrong API usage"),
-            )),
-            StallVerdict::Progressing
-        );
+        let cur = ProgressSignals::from_evaluation(&with_criteria(
+            70,
+            &[("compiles", 100), ("has tests", 100)],
+        ));
+        assert!(made_progress(&prev, &cur));
     }
 
+    /// 一项涨、另一项跌是权衡不是进展：接受标准不能被互相抵消。
     #[test]
-    fn feedback_signature_ignores_digits() {
-        let a = feedback_signature("CI run 34075549276 failed on job 12");
-        let b = feedback_signature("CI run 999 failed on job 3");
-        assert_eq!(a, b);
+    fn criteria_trade_off_is_not_progress() {
+        let prev = ProgressSignals::from_evaluation(&with_criteria(
+            70,
+            &[("compiles", 100), ("has tests", 40)],
+        ));
+        let cur = ProgressSignals::from_evaluation(&with_criteria(
+            70,
+            &[("compiles", 60), ("has tests", 100)],
+        ));
+        assert!(!made_progress(&prev, &cur));
     }
 
     #[test]
@@ -277,10 +269,7 @@ mod tests {
         let mut d = StallDetector::new(0);
         for _ in 0..10 {
             assert_eq!(
-                d.observe(ProgressSignals::from_attempt(
-                    &generation(0),
-                    &evaluation(30, "same"),
-                )),
+                d.observe(ProgressSignals::from_evaluation(&evaluation(30, "same"))),
                 StallVerdict::Progressing
             );
         }

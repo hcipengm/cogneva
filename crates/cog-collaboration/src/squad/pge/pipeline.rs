@@ -37,7 +37,7 @@ pub struct PgePipelineConfig {
     /// while the plan remains unchanged. 0 disables local repair.
     pub local_repair_max: u32,
     /// Consecutive non-progress attempts that declare the run a degenerate
-    /// loop (score/artifacts/error-class all flat) and stop it early. The
+    /// loop (evaluation score and criteria both flat) and stop it early. The
     /// criterion is whether spend buys progress, never a flat spend cap.
     /// 0 disables stall detection.
     pub stall_threshold: u32,
@@ -326,8 +326,7 @@ impl PgePipeline {
                 // early instead of burning the full local_repair_max budget.
                 if !matches!(evaluation.verdict, Verdict::Pass)
                     && matches!(
-                        repair_stall
-                            .observe(ProgressSignals::from_attempt(&generation, &evaluation,),),
+                        repair_stall.observe(ProgressSignals::from_evaluation(&evaluation),),
                         StallVerdict::Stalled
                     )
                 {
@@ -377,12 +376,12 @@ impl PgePipeline {
             // The prefixed feedback lets outer loops classify the failure as
             // non-retryable and route it to reflection as learning material.
             if !passed {
-                let signals = ProgressSignals::from_attempt(&generation, &evaluation);
+                let signals = ProgressSignals::from_evaluation(&evaluation);
                 if matches!(stall.observe(signals), StallVerdict::Stalled) {
                     let mut evaluation = evaluation;
                     evaluation.feedback = format!(
                         "{}: {} consecutive attempts bought no progress \
-                         (score/artifacts/error-class flat); stopped early: {}",
+                         (evaluation score and criteria both flat); stopped early: {}",
                         DEGENERATE_LOOP_PREFIX, self.config.stall_threshold, evaluation.feedback
                     );
                     tracing::warn!(attempt, "degenerate loop detected; stopping pipeline early");

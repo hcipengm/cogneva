@@ -49,7 +49,7 @@ pub struct PgeRoundtableConfig {
     /// [`BranchMergeStrategy::Custom`].
     pub merger: Option<MergerActor>,
     /// Consecutive non-progress iterations that declare the debate a
-    /// degenerate loop (score/artifacts/error-class all flat) and stop it
+    /// degenerate loop (evaluation score and criteria both flat) and stop it
     /// early. The criterion is whether spend buys progress, never a flat
     /// spend cap. 0 disables stall detection.
     pub stall_threshold: u32,
@@ -281,12 +281,12 @@ impl PgeRoundtable {
                 break;
             }
 
-            // Degenerate-loop guard: consecutive iterations buying no progress
-            // (score/artifacts/error-class flat) mean more rounds only rephrase
-            // the same failure. Mark the run and stop before spending more.
+            // Degenerate-loop guard: consecutive iterations the evaluator
+            // judged no better mean more rounds only rephrase the same failure.
+            // Mark the run and stop before spending more.
             if !matches!(evaluation.verdict, Verdict::Pass)
                 && matches!(
-                    stall.observe(ProgressSignals::from_attempt(&generation, &evaluation,),),
+                    stall.observe(ProgressSignals::from_evaluation(&evaluation),),
                     StallVerdict::Stalled
                 )
             {
@@ -297,7 +297,7 @@ impl PgeRoundtable {
                 if let Some(last) = history.last_mut() {
                     last.evaluation.feedback = format!(
                         "{}: {} consecutive iterations bought no progress \
-                         (score/artifacts/error-class flat); stopped early: {}",
+                         (evaluation score and criteria both flat); stopped early: {}",
                         DEGENERATE_LOOP_PREFIX,
                         self.config.stall_threshold,
                         last.evaluation.feedback

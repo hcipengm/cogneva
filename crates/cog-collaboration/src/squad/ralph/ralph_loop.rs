@@ -9,6 +9,7 @@
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::squad::pge::pipeline::PgePipeline;
 use crate::squad::pge::roundtable::{PgeRoundtable, PgeRoundtableResult};
+use crate::squad::pge::stall::{made_progress, ProgressSignals};
 use crate::squad::pge::types::{EvaluationResult, Verdict};
 use cog_core::{Task, TaskType};
 use std::sync::Arc;
@@ -38,46 +39,16 @@ pub struct RalphIteration {
     pub pge_passed: bool,
     pub feedback: String,
     pub snapshot: serde_json::Value,
-    /// Hard-progress readings for this iteration. Persisted so the stall
-    /// verdict survives a restart: an iteration's outcome is only comparable
-    /// against its predecessor, and the predecessor may live in another
-    /// process. `None` only on entries archived before the field existed —
-    /// those are skipped as unobserved, never read as zeroes. A live iteration
-    /// always records a reading: no score *and* no artifact is not an
+    /// Progress readings for this iteration. Persisted so the stall verdict
+    /// survives a restart: an iteration's outcome is only comparable against
+    /// its predecessor, and the predecessor may live in another process.
+    /// `None` only on entries archived before the field existed — those are
+    /// skipped as unobserved, never read as zeroes. A live iteration always
+    /// records a reading: an evaluation that moved nowhere is not an
     /// undecidable case, it is the plain statement that the iteration bought
     /// nothing, which is exactly what the stall verdict is looking for.
     #[serde(default)]
-    pub progress: Option<IterationProgress>,
-}
-
-/// What one iteration bought, in the only terms that mean progress: a better
-/// evaluation score, or a bigger deliverable.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct IterationProgress {
-    pub score: u32,
-    pub artifact_count: usize,
-    pub artifact_bytes: usize,
-}
-
-impl IterationProgress {
-    /// Strictly better than `prev` on score or artifact size. Wording changes
-    /// are not progress — a loop that rephrases the same failure is spinning.
-    fn beats(&self, prev: &Self) -> bool {
-        self.score > prev.score
-            || self.artifact_count > prev.artifact_count
-            || self.artifact_bytes > prev.artifact_bytes
-    }
-}
-
-fn iteration_progress(
-    generation: &crate::squad::pge::types::GeneratorOutput,
-    evaluation: &EvaluationResult,
-) -> IterationProgress {
-    IterationProgress {
-        score: evaluation.score.unwrap_or(0),
-        artifact_count: generation.artifacts.len(),
-        artifact_bytes: generation.artifacts.iter().map(|a| a.content.len()).sum(),
-    }
+    pub progress: Option<ProgressSignals>,
 }
 
 /// 不可恢复终止在指标面上的分类标签。只认全链路已经共用的两个 wire 前缀，
@@ -134,8 +105,8 @@ pub struct RalphLoopConfig {
     /// 迭代只是燃烧 token（实证：曾有不收敛链跑到 600+ 迭代零通过）。
     pub max_iterations: u32,
     /// 停滞窗口：最近这么多轮不买进展即判定停滞并终止。两条判据任一命中
-    /// 都算停滞——归一化反馈逐字相同（同一失败原样重放），或没有任何硬
-    /// 进展（分数未升且产物未增长，即换着说法重复同一个失败）。0 = 关闭
+    /// 都算停滞——归一化反馈逐字相同（同一失败原样重放），或评估结论没有
+    /// 抬升（分数与标准项都平，即换着说法重复同一个失败）。0 = 关闭
     /// 停滞检测。
     pub stagnation_window: u32,
 }
@@ -310,23 +281,25 @@ impl RalphLoop {
         identical_failure || self.tail_bought_no_progress(tail)
     }
 
-    /// 尾部这一窗内在分数或产物上没有抬升过——第一个读数只立基线，之后每个
-    /// 读数都必须严格超过此前的最好成绩。窗口内缺失的读数（本次改动前归档的
-    /// 记录没有这个字段）按"未观测"处理，跳过而不是当成零分零产物：少于两个
-    /// 读数就无从比较，一律返回 false，把判断交回给逐字判据。缺了这道下限，
-    /// 一个只是没被观测过的窗口会被 `all` 的空真判成"没进展"。
+    /// 尾部这一窗内评估结论没有抬升过——第一个读数只立基线，之后每个读数都
+    /// 必须严格超过此前的最好成绩。判据与 pipeline/roundtable 的停滞检测共用
+    /// 同一个 [`made_progress`]，全链路对"什么算进展"只有一套口径。窗口内缺失
+    /// 的读数（本次改动前归档的记录没有这个字段）按"未观测"处理，跳过而不是
+    /// 当成零分：少于两个读数就无从比较，一律返回 false，把判断交回给逐字判据。
+    /// 缺了这道下限，一个只是没被观测过的窗口会被 `all` 的空真判成"没进展"。
     fn tail_bought_no_progress(&self, tail: &[RalphIteration]) -> bool {
-        let readings: Vec<IterationProgress> = tail.iter().filter_map(|it| it.progress).collect();
+        let readings: Vec<ProgressSignals> =
+            tail.iter().filter_map(|it| it.progress.clone()).collect();
         let Some((baseline, rest)) = readings.split_first() else {
             return false;
         };
         if rest.is_empty() {
             return false;
         }
-        let mut best = *baseline;
+        let mut best = baseline.clone();
         rest.iter().all(|cur| {
-            if cur.beats(&best) {
-                best = *cur;
+            if made_progress(&best, cur) {
+                best = cur.clone();
                 false
             } else {
                 true
@@ -456,8 +429,7 @@ impl RalphLoop {
                 FailureAnalysis::Unrecoverable(_) => ResetStrategy::Identical,
             };
 
-            let progress = Some(iteration_progress(
-                &pge_result.final_generation,
+            let progress = Some(ProgressSignals::from_evaluation(
                 &pge_result.final_evaluation,
             ));
             let snapshot = serde_json::json!({
@@ -560,8 +532,7 @@ impl RalphLoop {
                 FailureAnalysis::Unrecoverable(_) => ResetStrategy::Identical,
             };
 
-            let progress = Some(iteration_progress(
-                &rt_result.final_generation,
+            let progress = Some(ProgressSignals::from_evaluation(
                 &rt_result.final_evaluation,
             ));
             let snapshot = serde_json::json!({ "roundtable": rt_result });
@@ -1262,7 +1233,7 @@ mod tests {
     fn failed_iteration_with_readings(
         iteration: u32,
         feedback: &str,
-        progress: IterationProgress,
+        progress: ProgressSignals,
     ) -> RalphIteration {
         RalphIteration {
             iteration,
@@ -1274,11 +1245,12 @@ mod tests {
         }
     }
 
-    fn readings(score: u32, artifact_bytes: usize) -> IterationProgress {
-        IterationProgress {
-            score,
-            artifact_count: 1,
-            artifact_bytes,
+    /// 读数只有评估器给出的分数与标准项，产物大小不在其中——这正是本次要
+    /// 消灭的代理量：把产物堆大并不能换来窗口内的"买到进展"。
+    fn readings(score: u32) -> ProgressSignals {
+        ProgressSignals {
+            score: Some(score),
+            criteria: Vec::new(),
         }
     }
 
@@ -1301,7 +1273,7 @@ mod tests {
             ralph.history.push(failed_iteration_with_readings(
                 i as u32 + 1,
                 feedback,
-                readings(30, 100),
+                readings(30),
             ));
         }
         assert!(ralph.is_stagnated());
@@ -1329,12 +1301,12 @@ mod tests {
         ralph.history.push(failed_iteration_with_readings(
             3,
             "first observed",
-            readings(30, 100),
+            readings(30),
         ));
         assert!(!ralph.is_stagnated());
     }
 
-    /// 既无分又无制品不是"不可判定"：三个读数全零就是确定的"这一轮什么都没
+    /// 既无分又无标准项不是"不可判定"：读数全零就是确定的"这一轮什么都没
     /// 买到"，同样要判停滞。若把它当作未观测而跳过，这类链条（不产出也不被
     /// 评分）会绕过停滞判据、每轮烧满预算——正是本次修复要消灭的形态。
     #[test]
@@ -1347,14 +1319,38 @@ mod tests {
             ralph.history.push(failed_iteration_with_readings(
                 i,
                 "nothing produced, nothing scored",
-                IterationProgress {
-                    score: 0,
-                    artifact_count: 0,
-                    artifact_bytes: 0,
+                ProgressSignals {
+                    score: Some(0),
+                    criteria: Vec::new(),
                 },
             ));
         }
         assert!(ralph.is_stagnated());
+    }
+
+    /// 窗口里评估分数真的抬过就不算停滞：读数语义化不等于把判据变严，
+    /// 只是把"进展"的锚点从代理量换成评估器自己的判断。
+    #[test]
+    fn a_higher_evaluation_score_in_the_window_is_progress() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 3,
+        });
+        for (i, (score, feedback)) in [
+            (10u32, "missing tests"),
+            (10, "return type wrong"),
+            (85, "one case still red"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            ralph.history.push(failed_iteration_with_readings(
+                i as u32 + 1,
+                feedback,
+                readings(*score),
+            ));
+        }
+        assert!(!ralph.is_stagnated());
     }
 
     #[test]
@@ -1498,17 +1494,17 @@ mod tests {
         ralph.history.push(failed_iteration_with_readings(
             1,
             "missing tests",
-            readings(30, 100),
+            readings(30),
         ));
         ralph.history.push(failed_iteration_with_readings(
             2,
             "return type wrong",
-            readings(30, 100),
+            readings(30),
         ));
         ralph.history.push(failed_iteration_with_readings(
             3,
             "one test still red",
-            readings(60, 400),
+            readings(60),
         ));
         assert!(!ralph.is_stagnated());
     }
