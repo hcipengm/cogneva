@@ -27,7 +27,9 @@ pub struct CollaborationObservable {
     round_count: AtomicU64,
     /// Ralph Loop 终止计数，按终止原因分类（stagnated / budget_exhausted）。
     /// 不收敛链被有界止损是核心健康信号，必须可观测。
-    ralph_terminations: Arc<Mutex<HashMap<String, u64>>>,
+    /// 同步锁而非 `try_lock`：这是分类可达性自查的记录端，一次丢失会被
+    /// 读成「这个分类从没被记录过」而报出并不存在的分叉。
+    ralph_terminations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     /// 自进化任务的结果计数，按结局分类（submitted / no_artifacts /
     /// submit_failed / no_sink）。一个跑完却没有产出变更的自进化任务在
     /// 此之前与成功完全无法区分：squad 报 success、输出 JSON 里只是没有
@@ -67,9 +69,11 @@ impl CollaborationObservable {
     }
 
     pub fn record_ralph_termination(&self, reason: &str) {
-        if let Ok(mut map) = self.ralph_terminations.try_lock() {
-            *map.entry(reason.to_string()).or_insert(0) += 1;
-        }
+        let mut map = self
+            .ralph_terminations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(reason.to_string()).or_insert(0) += 1;
     }
 
     pub fn record_change_yield(&self, outcome: &str) {
@@ -112,18 +116,19 @@ impl Observable for CollaborationObservable {
                     );
                 }
             }
-            let terminations = self.ralph_terminations.lock().await;
-            for (reason, count) in terminations.iter() {
+            // 同步锁取一份快照即放：临时 guard 在语句结束就释放，不会跨
+            // `.await` 持有，也不会把记录端挡在门外。
+            let recorded = self
+                .ralph_terminations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for (reason, count) in recorded.iter() {
                 metrics.push(
                     RawMetric::new("ralph_terminations_total", *count as f64)
                         .with_label("reason", reason),
                 );
             }
-            // 记录端取一份快照就放锁：自查若把 terminations 的锁一直拿着，
-            // 记录端的 `try_lock` 会在这段时间里丢记录，反而造出假的"记录端
-            // 恒为 0"，自查自己把自己骗了。
-            let recorded = terminations.clone();
-            drop(terminations);
             let yields = self.change_yields.lock().await;
             for (outcome, count) in yields.iter() {
                 metrics.push(
