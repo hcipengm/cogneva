@@ -364,43 +364,68 @@ impl Default for AppConfig {
 // Load functions
 // ---------------------------------------------------------------------------
 
-/// Load configuration using the full 5-layer stack.
-pub fn load() -> AppConfig {
+/// Read one config file layer.
+///
+/// A file that is simply absent contributes nothing and is not an error — that
+/// is the normal state of optional layers. A file that **exists** but cannot be
+/// read or parsed is an error: reporting it as an empty layer would let a
+/// truncated write (editors and `File::create` both truncate before writing)
+/// or a half-swapped configmap volume masquerade as a valid, near-empty
+/// configuration.
+fn read_config_layer(path: &str) -> SFResult<Option<serde_json::Value>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(cog_core::SFError::Config(format!(
+                "config file {path} is unreadable: {e}"
+            )))
+        }
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        cog_core::SFError::Config(format!("config file {path} is not valid JSON: {e}"))
+    })?;
+    interpolate_env_vars(&mut value);
+    Ok(Some(value))
+}
+
+/// Apply one layer's JSON on top of the config accumulated so far.
+fn apply_config_layer(
+    config: AppConfig,
+    path: &str,
+    value: serde_json::Value,
+) -> SFResult<AppConfig> {
+    let merged = merge_config_value(serde_json::to_value(&config).unwrap_or_default(), value)
+        .map_err(|e| {
+            cog_core::SFError::Config(format!("config file {path} cannot be merged: {e}"))
+        })?;
+    serde_json::from_value::<AppConfig>(merged).map_err(|e| {
+        cog_core::SFError::Config(format!("config file {path} does not match the schema: {e}"))
+    })
+}
+
+/// Load configuration using the full 5-layer stack, reporting a config file
+/// that exists but cannot be used.
+///
+/// Callers that must distinguish "loaded" from "fell back to defaults" — the
+/// hot-reload watcher in particular — use this. Boot-time callers that only
+/// need a usable config use [`load`].
+pub fn try_load() -> SFResult<AppConfig> {
     let mut config = AppConfig::default();
 
     // Layer 1: base config file
     let base_path =
         std::env::var("COGNEVA_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into());
-
-    if let Ok(base_json) = std::fs::read_to_string(&base_path) {
-        if let Ok(mut base_value) = serde_json::from_str::<serde_json::Value>(&base_json) {
-            interpolate_env_vars(&mut base_value);
-            if let Ok(merged) = merge_config_value(
-                serde_json::to_value(&config).unwrap_or_default(),
-                base_value,
-            ) {
-                if let Ok(merged_config) = serde_json::from_value::<AppConfig>(merged) {
-                    config = merged_config;
-                }
-            }
-        }
+    if let Some(base_value) = read_config_layer(&base_path)? {
+        config = apply_config_layer(config, &base_path, base_value)?;
     }
 
     // Layer 2: environment-specific config
     let env = std::env::var("COGNEVA_ENV").unwrap_or_else(|_| "development".into());
     let env_path = base_path.replace(".json", &format!(".{env}.json"));
     if env_path != base_path {
-        if let Ok(env_json) = std::fs::read_to_string(&env_path) {
-            if let Ok(mut env_value) = serde_json::from_str::<serde_json::Value>(&env_json) {
-                interpolate_env_vars(&mut env_value);
-                if let Ok(merged) =
-                    merge_config_value(serde_json::to_value(&config).unwrap_or_default(), env_value)
-                {
-                    if let Ok(merged_config) = serde_json::from_value::<AppConfig>(merged) {
-                        config = merged_config;
-                    }
-                }
-            }
+        if let Some(env_value) = read_config_layer(&env_path)? {
+            config = apply_config_layer(config, &env_path, env_value)?;
         }
     }
 
@@ -408,7 +433,24 @@ pub fn load() -> AppConfig {
     // overwrite values already loaded from files.
     apply_env_overrides(&mut config);
 
-    config
+    Ok(config)
+}
+
+/// Load configuration using the full 5-layer stack, falling back to defaults
+/// when no usable config is found. The fallback is logged: a silent default is
+/// indistinguishable from a configured one downstream.
+pub fn load() -> AppConfig {
+    match try_load() {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!("Falling back to default configuration: {e}");
+            // Layer 3 still applies: env vars are the last-resort configuration
+            // surface and must survive an unusable file.
+            let mut config = AppConfig::default();
+            apply_env_overrides(&mut config);
+            config
+        }
+    }
 }
 
 /// Build an [`AppConfig`] from environment variables only.
@@ -1076,5 +1118,59 @@ mod tests {
         let _g = EnvGuard::remove("COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED");
         let config = from_env();
         assert!(config.self_evolution.executor_enabled);
+    }
+
+    /// A config file that exists but is not valid JSON is a reportable failure,
+    /// not an empty layer: `load()` used to swallow it and hand back defaults.
+    #[test]
+    fn test_try_load_reports_a_present_but_unparsable_file() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cogneva.json");
+        // The exact state a truncate-then-write leaves behind on a modify event.
+        std::fs::File::create(&path).unwrap();
+        let _g = EnvGuard::set("COGNEVA_CONFIG_PATH", &path.to_string_lossy());
+
+        let err = try_load().expect_err("an unparsable config must not load as Ok");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not valid JSON"),
+            "the error must name the cause, got: {msg}"
+        );
+        assert!(
+            msg.contains("cogneva.json"),
+            "the error must name the file, got: {msg}"
+        );
+    }
+
+    /// An absent file is the normal state of an optional layer, not a failure.
+    #[test]
+    fn test_try_load_treats_an_absent_file_as_no_layer() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let _g = EnvGuard::set("COGNEVA_CONFIG_PATH", &path.to_string_lossy());
+
+        let config = try_load().expect("an absent config file is not an error");
+        // Layer 0 defaults still stand.
+        assert_eq!(config.app.name, AppConfig::default().app.name);
+    }
+
+    /// The boot-time entry point keeps its old contract: unusable file, still
+    /// returns a usable config, env overrides still applied.
+    #[test]
+    fn test_load_falls_back_to_defaults_and_still_applies_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cogneva.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+        let _g = EnvGuard::set("COGNEVA_CONFIG_PATH", &path.to_string_lossy());
+        let _g2 = EnvGuard::set("COGNEVA_APP_NAME", "from-env");
+
+        let config = load();
+        assert_eq!(
+            config.app.name, "from-env",
+            "env is the last-resort surface and must survive an unusable file"
+        );
     }
 }

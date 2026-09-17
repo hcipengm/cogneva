@@ -21,6 +21,9 @@ impl ConfigWatcher {
     /// On creation the current [`crate::config_loader::load`] result is sent as the initial
     /// value.  Every time one of the watched files is modified the config is
     /// reloaded and subscribers receive the new value.
+    /// A reload that cannot be read or parsed is *not* published — the last
+    /// known-good value stands and the failure is logged — so a partially
+    /// written file never reaches subscribers as a degraded configuration.
     /// The returned [`notify::RecommendedWatcher`] must be kept alive; dropping
     /// it stops the background watcher thread.
     pub fn new(paths: Vec<PathBuf>) -> SFResult<(Self, notify::RecommendedWatcher)> {
@@ -31,9 +34,25 @@ impl ConfigWatcher {
             move |res: Result<notify::Event, notify::Error>| match res {
                 Ok(event) => {
                     if event.kind.is_modify() || event.kind.is_create() {
-                        let new_config = crate::config_loader::load();
-                        if tx.send(new_config).is_err() {
-                            tracing::debug!("ConfigWatcher: all subscribers dropped");
+                        // A modify event fires the moment a file is truncated —
+                        // before the writer has put anything back — and configmap
+                        // volumes swap a symlink underneath the watched path. A
+                        // failed read must not be published: `load()` would hand
+                        // back the default config, silently stripping the running
+                        // app of its entire configuration. Keep the last
+                        // known-good value and say so instead.
+                        match crate::config_loader::try_load() {
+                            Ok(new_config) => {
+                                if tx.send(new_config).is_err() {
+                                    tracing::debug!("ConfigWatcher: all subscribers dropped");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    paths = ?event.paths,
+                                    "ConfigWatcher: reload failed, keeping the last known-good configuration: {e}"
+                                );
+                            }
                         }
                     }
                 }
@@ -153,6 +172,63 @@ mod watcher_tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(sub.borrow().app.name, "test-v2");
+    }
+
+    /// A modify event fires while the file is still truncated — that is exactly
+    /// what a `File::create` + `write_all` save looks like from the watcher's
+    /// side. Reloading then fails, and publishing the default config it would
+    /// fall back to strips the running app of its whole configuration.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_partially_written_config_is_never_published() {
+        let _lock = crate::config_loader::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("cogneva.json");
+        std::fs::write(
+            &config_path,
+            br#"{"app": {"name": "test-v1", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "config_dir": "/tmp", "app_dir": "/tmp"}}"#,
+        )
+        .unwrap();
+
+        let _g1 = crate::config_loader::EnvGuard::set(
+            "COGNEVA_CONFIG_PATH",
+            &config_path.to_string_lossy(),
+        );
+        let _g2 = crate::config_loader::EnvGuard::remove("COGNEVA_APP_NAME");
+
+        let (watcher, _notify_watcher) = ConfigWatcher::new(vec![config_path.clone()]).unwrap();
+        let mut sub = watcher.subscribe();
+        assert_eq!(sub.borrow().app.name, "test-v1");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The truncated state a writer leaves behind mid-save.
+        std::fs::File::create(&config_path).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            sub.borrow().app.name,
+            "test-v1",
+            "a truncated config must not be published as a degraded default"
+        );
+        assert!(
+            !matches!(sub.has_changed(), Ok(true)),
+            "no notification may be pending for a reload that failed"
+        );
+
+        // The watcher is still live: the next complete write still lands.
+        std::fs::write(
+            &config_path,
+            br#"{"app": {"name": "test-v2", "version": "1.0.0", "log_level": "info", "data_dir": "/tmp", "config_dir": "/tmp", "app_dir": "/tmp"}}"#,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sub.changed())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(sub.borrow().app.name, "test-v2");
     }
 }
