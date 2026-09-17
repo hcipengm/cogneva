@@ -1935,6 +1935,26 @@ impl RolloutExecutor {
         .await
     }
 
+    /// 这个部署带不带 init 容器。没有 init 容器的部署不存在启动阶段，一上来
+    /// 就该吃就绪预算。查询失败按"带"处理：宁可把一次慢 init 记在启动预算上
+    /// 晚一点判败（版本仍有机会被判清白），也不要把它算成就绪超时、把一个
+    /// 好版本判成败。
+    async fn init_containers_exist(&self, t: &RolloutTarget) -> SFResult<bool> {
+        let out = self
+            .run_kubectl(
+                &[
+                    "get",
+                    "deployment",
+                    &t.deployment,
+                    "-o",
+                    "jsonpath={.spec.template.spec.initContainers[*].name}",
+                ],
+                30,
+            )
+            .await?;
+        Ok(!out.trim().is_empty())
+    }
+
     /// 轮询 deployment rollout 完成：observedGeneration 追上 generation 且
     /// updated/ready 副本数达期望（短查询，Job 在爆炸半径外不怕被杀）。
     /// 轮询同时查 Pod 致命等待态：崩溃镜像永远不会 ready，干等 rollout 超时
@@ -1951,6 +1971,12 @@ impl RolloutExecutor {
             std::time::Instant::now() + Duration::from_secs(self.startup_timeout_secs);
         // 延迟到首次进入就绪阶段才起算：启动阶段的耗时不算在内。
         let mut readiness_deadline: Option<std::time::Instant> = None;
+        let has_init_containers = self.init_containers_exist(t).await.unwrap_or(true);
+        // 是否亲眼见过 init 还在跑。刚 apply 时选择器匹配到的仍是旧 Pod，它的
+        // init 早已结束，"当前没有未完成的 init"于是立刻成立、就绪预算从 t0
+        // 起算，然后整段耗在一次仍在外网克隆的 init 上——好版本被判超时回滚。
+        // 只有先见过 init 在跑，后面的"没有未完成的 init"才真的意味着 init 结束。
+        let mut seen_init_running = false;
         // 是否成功取到过部署态。一次都没取到时，"预算耗尽"说明的是我们看不到
         // 集群，不是这个版本不收敛——那种结论必须带标记交回调用方，不能变成
         // 回滚指令。
@@ -1984,8 +2010,18 @@ impl RolloutExecutor {
                     // 空输出/查询失败在这里不当致命（与 pods_healthy 不同），
                     // 只认明确的致命等待态。
                     self.fatal_pod_state(t).await?;
-                    if let Ok(progress) = self.init_containers_progress(t).await {
-                        starting = progress.lines().any(|l| l.trim() == "|");
+                    if !has_init_containers {
+                        // 没有 init 容器就没有启动阶段，直接吃就绪预算。
+                        starting = false;
+                    } else if let Ok(progress) = self.init_containers_progress(t).await {
+                        if progress.lines().any(|l| l.trim() == "|") {
+                            seen_init_running = true;
+                            starting = true;
+                        } else {
+                            // 没有未完成的 init，但没见过它跑过就不算结束：匹配到的
+                            // 可能是旧 Pod，也可能是新 Pod 的 init 状态还没上报。
+                            starting = !seen_init_running;
+                        }
                     }
                     note = out;
                 }
@@ -2203,15 +2239,19 @@ impl RolloutExecutor {
             );
             return Err(e);
         }
-        self.rollback(done, prevs).await;
+        self.rollback(&e, done, prevs).await;
         Err(e)
     }
 
     /// 尽力回滚：已滚目标按快照的各自 prev 镜像反向 set image 并等收敛
     /// （不用 rollout undo——多目标无事务性，undo 还会连带回退其他字段）。
     /// 回滚本身失败只 warn（人工介入兜底），不掩盖原始错误。
-    async fn rollback(&self, done: &[&RolloutTarget], prevs: &[(String, String)]) {
-        warn!(count = done.len(), "mainline rollout failed; rolling back");
+    async fn rollback(&self, cause: &SFError, done: &[&RolloutTarget], prevs: &[(String, String)]) {
+        warn!(
+            count = done.len(),
+            error = %cause,
+            "mainline rollout failed; rolling back"
+        );
         for t in done.iter().rev() {
             let Some(prev) = prevs
                 .iter()
@@ -3591,6 +3631,7 @@ case "$*" in
       *cogneva-security-gateway*) echo "1|0|1|0|0|" ;;
       *) echo "1|1|1|1|1|" ;;
     esac ;;
+  *"initContainers"*) ;;
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"get pods"*) echo "0 true " ;;
   *) echo ok ;;
@@ -3874,6 +3915,118 @@ exit 0
 
         let err = executor.run(&plan).await.unwrap_err();
         assert!(err.to_string().contains("stuck in startup phase"), "{err}");
+    }
+
+    /// 假 kubectl：第一轮轮询里选择器匹配到的还是旧 Pod（它的 init 早已结束），
+    /// 新 Pod 的 init 从第二轮起才在跑，第三轮滚动收敛。
+    fn fake_kubectl_old_pod_outlives_the_new_pod_init(dir: &Path) -> String {
+        let log = dir.join("kubectl.log");
+        let count = dir.join("poll.count");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"terminated.finishedAt"*)
+    n=$(cat '{count}' 2>/dev/null || echo 1)
+    if [ "$n" -ge 2 ]; then echo "|"; else echo "2026-09-17T03:17:10Z|"; fi
+    ;;
+  *"generation"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    if [ "$n" -ge 3 ]; then echo "1|1|1|1|1|"; else echo "1|1|1|1|0|1"; fi
+    ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = count.display()
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 集群实证：种子克隆在外网跑了 299s，而就绪预算 300s 从"看到旧 Pod 的
+    /// 已结束 init"那一刻起算，克隆一结束、新副本刚起步就被判超时、好版本
+    /// 被回滚。旧 Pod 的 init 早就结束，不能当成本次滚动的 init 进度。
+    #[tokio::test]
+    async fn a_finished_init_from_the_old_pod_does_not_start_the_readiness_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_old_pod_outlives_the_new_pod_init(&bin_dir);
+        // 就绪预算 0：只要在旧 Pod 的已结束 init 上起算了就绪预算，首轮即判败回滚。
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 0, 300);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        executor
+            .run(&plan)
+            .await
+            .expect("the old pod's finished init must not be read as this rollout's progress");
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            !calls.contains(
+                "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
+            ),
+            "no rollback should happen: {calls}"
+        );
+    }
+
+    /// 反面：没有 init 容器的部署不存在启动阶段，就绪预算必须照旧从第一轮起算。
+    /// "没见过 init 在跑"这条判据只能用在带 init 容器的部署上，否则主容器永不
+    /// ready 的版本会被一路拖到启动预算才判败。
+    #[tokio::test]
+    async fn a_deployment_without_init_containers_still_spends_the_readiness_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"initContainers"*) ;;
+  *"generation"*) echo "1|1|1|1|0|1" ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        // 就绪预算 0、启动预算 300：判败必须来自就绪预算。
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            0,
+            300,
+        );
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        let err = executor.run(&plan).await.unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "rollout of deployment/cogneva-sandbox-executor did not complete within 0s"
+            ),
+            "{err}"
+        );
     }
 
     #[tokio::test]
