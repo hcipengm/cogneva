@@ -796,9 +796,23 @@ Respond with **only** a JSON object matching this schema:\n\
         result: &PgeRoundtableResult,
         history: &[RalphIteration],
     ) -> FailureAnalysis {
-        // 若最终 verdict 为 Fail，视为无有效输出（verdict 是核心信号，score 仅作参考）
+        let feedback = &result.final_evaluation.feedback;
+
+        // 退化辩论环在 feedback 上留了标记，和 Pipeline 侧同一条判据。
+        // 若这里只看 verdict 再回一个常量 reason，标记就被丢掉：真因（停滞）
+        // 会被归成兜底的 unrecoverable，下游按前缀做的不可重试判定也失配。
+        if feedback.starts_with(crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX) {
+            return FailureAnalysis::Unrecoverable(feedback.clone());
+        }
+
+        // 若最终 verdict 为 Fail，视为无有效输出（verdict 是核心信号，score 仅作参考）。
+        // reason 取真实 feedback，落盘与指标才带得动定位信息；feedback 为空时才回退常量。
         if matches!(result.final_evaluation.verdict, Verdict::Fail) {
-            return FailureAnalysis::Unrecoverable("Roundtable produced no viable output".into());
+            return FailureAnalysis::Unrecoverable(if feedback.trim().is_empty() {
+                "Roundtable produced no viable output".into()
+            } else {
+                feedback.clone()
+            });
         }
 
         // 检测 Roundtable 是否卡住（连续相同 verdict）
@@ -1369,6 +1383,80 @@ mod tests {
             termination_class("Ralph Loop stagnated: no progress signal"),
             "unrecoverable"
         );
+    }
+
+    fn roundtable_result(verdict: Verdict, feedback: &str) -> PgeRoundtableResult {
+        use crate::squad::pge::types::{EvaluationResult, GeneratorOutput, PlannerOutput};
+
+        PgeRoundtableResult {
+            iterations: 1,
+            consensus_reached: false,
+            final_plan: PlannerOutput {
+                summary: String::new(),
+                plan: serde_json::json!({}),
+                sub_tasks: Vec::new(),
+                acceptance_criteria: Vec::new(),
+            },
+            final_generation: GeneratorOutput {
+                content: serde_json::json!({}),
+                artifacts: Vec::new(),
+            },
+            final_evaluation: EvaluationResult {
+                verdict,
+                feedback: feedback.to_string(),
+                score: None,
+                criteria: Vec::new(),
+                details: None,
+            },
+            history: Vec::new(),
+            context_board: None,
+        }
+    }
+
+    #[test]
+    fn a_degenerate_roundtable_keeps_its_class_instead_of_falling_back() {
+        use crate::squad::pge::stall::DEGENERATE_LOOP_PREFIX;
+
+        let result = roundtable_result(
+            Verdict::Fail,
+            &format!("{DEGENERATE_LOOP_PREFIX}: 3 consecutive iterations bought no progress"),
+        );
+        match RalphLoop::analyze_roundtable_failure(&result, &[]) {
+            FailureAnalysis::Unrecoverable(reason) => {
+                assert!(reason.starts_with(DEGENERATE_LOOP_PREFIX));
+                assert_eq!(termination_class(&reason), "degenerate_loop");
+            }
+            other => panic!("expected Unrecoverable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_roundtable_failure_carries_its_real_reason_when_it_has_one() {
+        let result = roundtable_result(
+            Verdict::Fail,
+            "change artifact 'changes.diff' is not an appliable unified diff: jwt.rs:55: \
+             unexpected line outside any hunk",
+        );
+        match RalphLoop::analyze_roundtable_failure(&result, &[]) {
+            FailureAnalysis::Unrecoverable(reason) => {
+                assert!(
+                    reason.contains("unexpected line outside any hunk"),
+                    "the reason must survive the ralph boundary, got: {reason}"
+                );
+            }
+            other => panic!("expected Unrecoverable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_silent_roundtable_failure_falls_back_to_the_constant_reason() {
+        let result = roundtable_result(Verdict::Fail, "   ");
+        match RalphLoop::analyze_roundtable_failure(&result, &[]) {
+            FailureAnalysis::Unrecoverable(reason) => {
+                assert_eq!(reason, "Roundtable produced no viable output");
+            }
+            other => panic!("expected Unrecoverable, got {other:?}"),
+        }
     }
 
     #[tokio::test]
