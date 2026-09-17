@@ -112,6 +112,33 @@ impl Default for RalphLoopConfig {
 /// accumulated feedback instead of restarting blind.
 const RALPH_HISTORY_FIELD: &str = "ralph_history";
 
+/// Event type under which a finished iteration is appended to the cold
+/// archive. The board holds the tail because that is all a restart consumes;
+/// this channel is append-only and keeps the whole sequence, which is what
+/// post-hoc root-cause analysis of a non-converging run needs.
+pub const RALPH_ITERATION_EVENT: &str = "ralph_iteration";
+
+/// Read back a task's archived iterations, oldest first. `limit` bounds one
+/// call because the event store has no streaming read, and a re-driven task
+/// keeps appending to the same sequence rather than replacing it — so a caller
+/// that expects more pages by raising the limit.
+pub async fn archived_iterations(
+    backend: &dyn cog_core::StateBackend,
+    task_id: &str,
+    limit: usize,
+) -> cog_core::SFResult<Vec<RalphIteration>> {
+    backend
+        .get_events(task_id, 0, limit)
+        .await?
+        .into_iter()
+        .filter(|event| event.event_type == RALPH_ITERATION_EVENT)
+        .map(|event| {
+            serde_json::from_value::<RalphIteration>(event.payload)
+                .map_err(cog_core::SFError::Serialization)
+        })
+        .collect()
+}
+
 /// Ralph Loop 外层质量控制循环。
 #[derive(Default)]
 pub struct RalphLoop {
@@ -231,6 +258,47 @@ impl RalphLoop {
             }
             Err(e) => tracing::warn!(task_id, "Ralph history serialize failed: {}", e),
         }
+    }
+
+    /// Append the iteration to the cold archive. The board keeps only the tail,
+    /// so without this the earlier iterations of a non-converging run exist
+    /// nowhere and the whole-sequence analysis that root-causes the ratchet has
+    /// nothing to read. Best-effort: a cold archive that is down degrades
+    /// forensics, it must never fail the loop.
+    async fn archive_iteration(&self, iteration: &RalphIteration) {
+        let (Some(task_id), Some(backend)) = (&self.history_task_id, &self.state_backend) else {
+            return;
+        };
+        let payload = match serde_json::to_value(iteration) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(task_id, "Ralph iteration archive serialize failed: {}", e);
+                return;
+            }
+        };
+        let event = cog_core::Event {
+            // Assigned by the backend when it appends.
+            offset: 0,
+            task_id: task_id.clone(),
+            event_type: RALPH_ITERATION_EVENT.to_string(),
+            payload,
+            timestamp: chrono::Utc::now(),
+        };
+        if let Err(e) = backend.append_event(task_id, &event).await {
+            tracing::warn!(task_id, "Ralph iteration archive append failed: {}", e);
+        }
+    }
+
+    /// Record one finished iteration: keep it in memory, append it to the cold
+    /// archive in full, and write the board tail. The three are one step
+    /// because an iteration that reaches only some of them is exactly the loss
+    /// this separation is meant to prevent.
+    async fn record_iteration(&mut self, iteration: RalphIteration) {
+        self.history.push(iteration);
+        if let Some(latest) = self.history.last() {
+            self.archive_iteration(latest).await;
+        }
+        self.persist_history().await;
     }
 
     /// 停滞判定：最近 stagnation_window 轮没有买到任何进展——继续迭代只是
@@ -426,15 +494,15 @@ impl RalphLoop {
                 "evaluation": pge_result.final_evaluation,
             });
 
-            self.history.push(RalphIteration {
+            self.record_iteration(RalphIteration {
                 iteration,
                 reset_strategy,
                 pge_passed: passed,
                 feedback: feedback.clone(),
                 snapshot,
                 progress,
-            });
-            self.persist_history().await;
+            })
+            .await;
 
             if passed {
                 let total_iterations = self.history.len() as u32;
@@ -526,15 +594,15 @@ impl RalphLoop {
             ));
             let snapshot = serde_json::json!({ "roundtable": rt_result });
 
-            self.history.push(RalphIteration {
+            self.record_iteration(RalphIteration {
                 iteration,
                 reset_strategy,
                 pge_passed: passed,
                 feedback: feedback.clone(),
                 snapshot: snapshot.clone(),
                 progress,
-            });
-            self.persist_history().await;
+            })
+            .await;
 
             if passed {
                 let total_iterations = self.history.len() as u32;
@@ -1656,15 +1724,28 @@ mod tests {
         );
     }
 
-    /// In-memory board-only StateBackend for history persistence tests.
+    /// In-memory board + append-only event store for history persistence tests.
     struct BoardMockBackend {
         fields: std::sync::Mutex<std::collections::HashMap<(String, String), String>>,
+        events: std::sync::Mutex<std::collections::HashMap<String, Vec<cog_core::Event>>>,
+        /// When set, every append fails, so a test can hold the loop to its
+        /// promise that a dead cold archive never fails the run.
+        reject_appends: bool,
     }
 
     impl BoardMockBackend {
         fn new() -> Self {
             Self {
                 fields: std::sync::Mutex::new(std::collections::HashMap::new()),
+                events: std::sync::Mutex::new(std::collections::HashMap::new()),
+                reject_appends: false,
+            }
+        }
+
+        fn rejecting_appends() -> Self {
+            Self {
+                reject_appends: true,
+                ..Self::new()
             }
         }
     }
@@ -1711,19 +1792,31 @@ mod tests {
 
         async fn append_event(
             &self,
-            _task_id: &str,
-            _event: &cog_core::Event,
+            task_id: &str,
+            event: &cog_core::Event,
         ) -> cog_core::SFResult<u64> {
-            Ok(0)
+            if self.reject_appends {
+                return Err(cog_core::SFError::Agent("event store unavailable".into()));
+            }
+            let mut events = self.events.lock().unwrap();
+            let list = events.entry(task_id.to_string()).or_default();
+            list.push(event.clone());
+            Ok(list.len() as u64)
         }
 
         async fn get_events(
             &self,
-            _task_id: &str,
-            _offset: u64,
-            _limit: usize,
+            task_id: &str,
+            offset: u64,
+            limit: usize,
         ) -> cog_core::SFResult<Vec<cog_core::Event>> {
-            Ok(Vec::new())
+            let events = self.events.lock().unwrap();
+            let Some(list) = events.get(task_id) else {
+                return Ok(Vec::new());
+            };
+            let start = (offset as usize).min(list.len());
+            let end = (start + limit).min(list.len());
+            Ok(list[start..end].to_vec())
         }
 
         async fn get_board(
@@ -1859,6 +1952,128 @@ mod tests {
             .expect("history field must be persisted");
         let stored: Vec<RalphIteration> = serde_json::from_str(&raw).unwrap();
         assert_eq!(stored.len(), 3);
+    }
+
+    /// 冷归档要留住 board 不再留的那部分。一轮不收敛的执行在 board 上只剩
+    /// 尾窗——重启只消费这些——但根因分析要的正是被删掉的那些轮次。
+    #[tokio::test]
+    async fn every_iteration_is_archived_even_when_the_board_keeps_only_the_tail() {
+        let backend = Arc::new(BoardMockBackend::new());
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(Arc::new(pass_planner()));
+        let generator = GeneratorActor::new(Arc::new(pass_generator()));
+
+        // 每轮都换重置策略：判据是"还在换手段就不算停滞"，循环于是不会在
+        // 第 1 轮就被停滞判据截停；它最终停在第 3 轮——评估器每次报同一个
+        // 失败，控制流判据在那里认定"同一失败重复"。
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 5,
+            stagnation_window: 1,
+        })
+        .with_llm_provider(Arc::new(MockSemanticLlm {
+            response_json: r#"{"failure_type":"Contradiction","root_cause":"plan vs output","recommended_strategy":"Modified","suggested_modifications":"align"}"#.into(),
+        }))
+        .with_history_store("task-archive".into(), backend.clone());
+
+        let verdict = ralph
+            .run_pipeline(
+                "goal",
+                serde_json::json!({}),
+                &pipeline,
+                &planner,
+                &generator,
+                &EvaluatorActor::new(Arc::new(fail_evaluator())),
+            )
+            .await;
+        let history = match verdict {
+            RalphVerdict::Unrecoverable { history, .. } => history,
+            other => panic!("expected Unrecoverable, got {:?}", other),
+        };
+        assert_eq!(history.len(), 3, "the run stops at the repeated failure");
+
+        let archived = archived_iterations(backend.as_ref(), "task-archive", 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            archived.len(),
+            3,
+            "every iteration reaches the cold archive"
+        );
+        assert_eq!(
+            archived.iter().map(|it| it.iteration).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the archive keeps the order the loop produced"
+        );
+
+        let raw = backend
+            .fields
+            .lock()
+            .unwrap()
+            .get(&("task-archive".to_string(), RALPH_HISTORY_FIELD.to_string()))
+            .cloned()
+            .expect("history field must be persisted");
+        let stored: Vec<RalphIteration> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the board still holds only the stagnation window"
+        );
+    }
+
+    /// 冷归档是尽力而为：它挂了只能让取证少一份，绝不能把循环本身带下去。
+    #[tokio::test]
+    async fn an_archive_that_cannot_be_written_does_not_fail_the_loop() {
+        let backend = Arc::new(BoardMockBackend::rejecting_appends());
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(Arc::new(pass_planner()));
+        let generator = GeneratorActor::new(Arc::new(pass_generator()));
+
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 2,
+            stagnation_window: 2,
+        })
+        .with_history_store("task-archive-down".into(), backend.clone());
+
+        let verdict = ralph
+            .run_pipeline(
+                "goal",
+                serde_json::json!({}),
+                &pipeline,
+                &planner,
+                &generator,
+                &EvaluatorActor::new(Arc::new(fail_evaluator())),
+            )
+            .await;
+        assert!(
+            matches!(verdict, RalphVerdict::Unrecoverable { .. }),
+            "a dead cold archive must not change what the loop decides"
+        );
+
+        // The board is a separate write and still lands.
+        let raw = backend
+            .fields
+            .lock()
+            .unwrap()
+            .get(&(
+                "task-archive-down".to_string(),
+                RALPH_HISTORY_FIELD.to_string(),
+            ))
+            .cloned()
+            .expect("board persistence is independent of the archive");
+        let stored: Vec<RalphIteration> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(stored.len(), 2);
     }
 
     /// 回归：历史攒满预算后重驱仍然要跑完本轮预算。曾经的起算点跟着
