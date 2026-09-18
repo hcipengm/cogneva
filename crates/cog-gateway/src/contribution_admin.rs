@@ -335,16 +335,41 @@ fn decode_secret_key(secret: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 /// Fetch and parse the `contribution-config` JSON document from the cluster
-/// Secret. Missing / unparsable yields an empty object (policy defaults to
-/// `auto` downstream).
-pub(crate) async fn read_contrib_config(kube: &KubeClient) -> serde_json::Value {
-    let secret = match kube.get_json(&secret_api_path(kube.namespace())).await {
-        Ok(s) => s,
-        Err(_) => return json!({}),
-    };
-    decode_secret_key(&secret, SECRET_CONTRIB_CONFIG)
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| json!({}))
+/// Secret.
+///
+/// `None` means the document **could not be read** — apiserver refused, the
+/// request failed, or the stored payload no longer parses. `Some` object with
+/// no keys means it was read and simply holds nothing yet. The two must not be
+/// collapsed: a writer that reads "could not read" as "empty" overwrites every
+/// field it did not set itself, and a reader that does so reports a restored
+/// policy it never saw.
+pub(crate) async fn read_contrib_config(kube: &KubeClient) -> Option<serde_json::Value> {
+    let secret = kube
+        .get_json(&secret_api_path(kube.namespace()))
+        .await
+        .ok()?;
+    match decode_secret_key(&secret, SECRET_CONTRIB_CONFIG) {
+        // 还没写过这份文档：那是「空的」，不是「没读到」。
+        None => Some(json!({})),
+        // 存了但解析不出来：当没读到——猜一份出来写回去就是覆盖。
+        Some(raw) => serde_json::from_str(&raw).ok(),
+    }
+}
+
+/// Merge a new policy into the config document read back from the Secret.
+///
+/// `None` in, `None` out: without the current document there is nothing to
+/// merge into, and the caller must refuse the write rather than persist a
+/// document containing only the policy — that would drop the provider, the
+/// account and the token's lifetime, which the refresher reads to know when to
+/// renew.
+pub(crate) fn merge_policy(
+    existing: Option<serde_json::Value>,
+    policy: cog_core::ContributionPolicy,
+) -> Option<serde_json::Value> {
+    let mut config = existing?;
+    config["policy"] = json!(policy.as_str());
+    Some(config)
 }
 
 /// The owner policy stored in the config document; absent → `Auto` (default
@@ -658,12 +683,20 @@ pub(crate) async fn persist_connected(
         "mode": if oauth.is_some() { "oauth" } else { "manual_or_device" },
         "account": account,
     });
-    // 重新连接不清空属主的回流策略：从既有配置继承 policy 字段。
-    let existing_policy = read_contrib_config(kube)
-        .await
-        .get("policy")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    // 重新连接不清空属主的回流策略：从既有配置继承 policy 字段。读不到就只剩
+    // 默认值，所以这次降级必须留痕——重连会顺手把属主设的 local/ask 退回 auto。
+    let existing_policy = match read_contrib_config(kube).await {
+        Some(config) => config
+            .get("policy")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        None => {
+            tracing::warn!(
+                "contribution reconnect: stored config unreadable, the previous policy is not carried over"
+            );
+            None
+        }
+    };
     if let Some(policy) = existing_policy {
         config_json_val["policy"] = json!(policy);
     }
@@ -1619,22 +1652,31 @@ pub async fn contribution_policy_set_handler(
     if let Some(control) = &state.contribution_control {
         control.set_policy(policy);
     }
-    let persisted = match KubeClient::in_cluster() {
+    let (persisted, persist_error) = match KubeClient::in_cluster() {
         Ok(kube) => {
-            let mut config = read_contrib_config(&kube).await;
-            config["policy"] = json!(policy.as_str());
-            let raw = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
-            kube.patch(
-                &format!(
-                    "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-                    kube.namespace()
+            // 读不到既有文档就不写：这次写入是整文档覆盖，`{}` 打底会把
+            // provider / account / token 时效一起抹掉，刷新循环随后静默失效。
+            match merge_policy(read_contrib_config(&kube).await, policy) {
+                None => (
+                    false,
+                    Some("读不到现有贡献配置，未写入以免覆盖其余字段".to_string()),
                 ),
-                json!({ "stringData": { SECRET_CONTRIB_CONFIG: raw } }),
-            )
-            .await
-            .is_ok()
+                Some(config) => {
+                    let raw = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+                    match kube
+                        .patch(
+                            &secret_api_path(kube.namespace()),
+                            json!({ "stringData": { SECRET_CONTRIB_CONFIG: raw } }),
+                        )
+                        .await
+                    {
+                        Ok(()) => (true, None),
+                        Err(e) => (false, Some(e)),
+                    }
+                }
+            }
         }
-        Err(_) => false,
+        Err(e) => (false, Some(e)),
     };
     (
         StatusCode::OK,
@@ -1642,6 +1684,7 @@ pub async fn contribution_policy_set_handler(
             "ok": true,
             "policy": policy.as_str(),
             "persisted": persisted,
+            "persist_error": persist_error,
         })),
     )
         .into_response()
@@ -1797,7 +1840,7 @@ fn secret_api_path(namespace: &str) -> String {
 ///
 /// 判不出来（建不出 in-cluster 客户端、探测本身报错）按**属主**处理：那可能是
 /// 启动瞬间的抖动，属主不该因此被静默停掉；后续每次刷新仍会照常报告。
-async fn is_contribution_secret_owner() -> bool {
+pub(crate) async fn is_contribution_secret_owner() -> bool {
     let kube = match KubeClient::in_cluster() {
         Ok(kube) => kube,
         Err(e) => {
@@ -1980,6 +2023,25 @@ mod tests {
         assert!(priv_body
             .windows(pub_blob.len())
             .any(|w| w == pub_blob.as_slice()));
+    }
+
+    #[test]
+    fn policy_merge_keeps_the_rest_of_the_document_and_refuses_to_invent_one() {
+        // 读到既有文档：只动 policy，别的字段原样留着。
+        let existing = json!({
+            "provider": "gitee",
+            "mode": "oauth",
+            "account": "hcipengm",
+            "expires_in": 86400,
+        });
+        let merged = merge_policy(Some(existing), cog_core::ContributionPolicy::Ask).unwrap();
+        assert_eq!(merged["policy"], json!("ask"));
+        assert_eq!(merged["provider"], json!("gitee"));
+        assert_eq!(merged["account"], json!("hcipengm"));
+        assert_eq!(merged["expires_in"], json!(86400));
+        // 读不到：不产出文档，让调用方拒绝这次写入。产出 `{"policy": …}` 会把
+        // 上面这些字段连同刷新循环所依赖的时效信息一起覆盖掉。
+        assert!(merge_policy(None, cog_core::ContributionPolicy::Ask).is_none());
     }
 
     #[test]

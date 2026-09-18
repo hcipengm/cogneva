@@ -274,14 +274,28 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // 网关持有 Secret 访问权，平台插件进程内只留活档）。
         if let Some(control) = state.contribution_control.clone() {
             tokio::spawn(async move {
-                if let Ok(kube) = crate::llm_admin::KubeClient::in_cluster() {
-                    let config = crate::contribution_admin::read_contrib_config(&kube).await;
-                    let policy = crate::contribution_admin::policy_from_config(&config);
-                    control.set_policy(policy);
-                    info!(
-                        policy = policy.as_str(),
-                        "contribution policy restored from cluster secret"
-                    );
+                // 只有读得到 Secret 的那个进程才是属主。其余部署（进化 / 沙盒 /
+                // 网关）同一个二进制同样会走到这里，读不到却照旧宣称「已从集群
+                // Secret 恢复」——把一次读不到说成了成功。
+                if !crate::contribution_admin::is_contribution_secret_owner().await {
+                    return;
+                }
+                let Ok(kube) = crate::llm_admin::KubeClient::in_cluster() else {
+                    warn!("contribution policy not restored: no in-cluster client");
+                    return;
+                };
+                match crate::contribution_admin::read_contrib_config(&kube).await {
+                    Some(config) => {
+                        let policy = crate::contribution_admin::policy_from_config(&config);
+                        control.set_policy(policy);
+                        info!(
+                            policy = policy.as_str(),
+                            "contribution policy restored from cluster secret"
+                        );
+                    }
+                    None => warn!(
+                        "contribution policy not restored: the stored config could not be read"
+                    ),
                 }
             });
         }
