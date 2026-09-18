@@ -20,6 +20,7 @@
 //! 每个集群的晋级节奏、看护、回滚、熔断都是本地决策——一个集群
 //! 金丝雀失败只影响自己，不影响其他集群。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -679,6 +680,16 @@ impl GitOpsPuller {
             60,
         )
         .await?;
+        // 换镜像之前记下本部署已在跑的副本。此后新出现的副本才是候选，
+        // 看护要观测的是它。拿不到这份名单就整轮关掉指标闸门（readiness 与
+        // restart 仍在看），而不是把新旧混作一组自比自。
+        let pre_rollout = match self.pre_rollout_pods().await {
+            Some(set) => Some(set),
+            None => {
+                warn!("could not list pre-rollout pods; canary metrics gate disabled");
+                None
+            }
+        };
         self.run(
             &k,
             &[
@@ -712,7 +723,7 @@ impl GitOpsPuller {
             info!("deployment already paused (orphaned canary scene); continuing");
         }
 
-        let watch = self.watch_canary().await;
+        let watch = self.watch_canary(pre_rollout.as_ref()).await;
         match watch {
             Ok(()) => {
                 if let Err(e) = self
@@ -853,10 +864,16 @@ impl GitOpsPuller {
 
     /// 金丝雀看护：watch 期内周期性检查新副本 readiness 与 restart
     /// count；配置了 metrics_url 时另做阈值比对。任何异常立即返回 Err。
-    async fn watch_canary(&self) -> SFResult<()> {
+    async fn watch_canary(&self, pre_rollout: Option<&HashSet<String>>) -> SFResult<()> {
         let watch_secs = self.config.canary_watch_secs;
         let interval = std::cmp::max(watch_secs / 20, 5);
-        let baseline = self.baseline_signals(interval).await;
+        let baseline = match pre_rollout {
+            Some(pre) => self.baseline_signals(interval, pre).await,
+            None => None,
+        };
+        if pre_rollout.is_some() && baseline.is_none() {
+            warn!("canary metrics baseline unavailable; error-rate and p99 gates stay idle");
+        }
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_secs(watch_secs);
         // 宽限期：金丝雀刚 set image 时新副本还在 ContainerCreating，
@@ -865,29 +882,38 @@ impl GitOpsPuller {
         // 金丝雀侧的速率也必须是它自己的两个点：累积语义下新副本的计数器从零
         // 起步，拿旧版本的累积量当参考点相减只会得到负增量。参考点取第一次
         // 成功抓取并保留整段看护期，样本量随时间增长，不必靠单次间隔凑够。
-        let mut canary_reference: Option<(CanarySignals, CounterSemantics)> = None;
+        // 连同被观测的副本集合一起记住：副本被换掉时那两点就不再是一段连续
+        // 历史，必须重新起一个参考点。
+        let mut canary_reference: Option<(String, CanarySignals, CounterSemantics)> = None;
 
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(interval)).await;
             self.check_pods_healthy(started.elapsed() < grace).await?;
-            if let (Some(base), Ok(Some((current, semantics)))) =
-                (&baseline, self.scrape_metrics().await)
-            {
-                let reference = match canary_reference {
-                    Some((signals, s)) if s == semantics => signals,
-                    // 首次抓取，或语义在换版中途变过：以这一读为新参考点。
-                    _ => {
-                        canary_reference = Some((current, semantics));
-                        current
-                    }
-                };
-                self.compare_metrics(base, reference, &current, semantics)?;
-            }
+            let (Some(pre), Some(base)) = (pre_rollout, &baseline) else {
+                continue;
+            };
+            let Ok((_, new_ips)) = self.canary_pod_groups(pre).await else {
+                continue;
+            };
+            let Some((current, semantics)) = self.scrape_group(&new_ips).await else {
+                // 新副本还没起来（拉镜像中）或抓不到：没有候选的证据就不判。
+                continue;
+            };
+            let observed = new_ips.join(",");
+            let reference = match &canary_reference {
+                Some((seen, signals, s)) if *seen == observed && *s == semantics => *signals,
+                // 首次观测，或观测对象/语义变过：以这一读为新参考点。
+                _ => {
+                    canary_reference = Some((observed, current, semantics));
+                    current
+                }
+            };
+            self.compare_metrics(base, reference, &current, semantics)?;
         }
         Ok(())
     }
 
-    /// 看护开始时的两次抓取，间隔 `sample_secs`，用来看旧版本自己的错误率。
+    /// 看护开始时的两次抓取，间隔 `sample_secs`，用来看**旧版本自己**的错误率。
     ///
     /// 一次抓取只是一个点：正文若按累积计数器解释，单点只是「进程启动以来的
     /// 总量」，读不出任何速率，用它当基线等于拿整段进程历史的平均错误率去比，
@@ -896,23 +922,33 @@ impl GitOpsPuller {
     /// 两次都在 `set image` 之后，但都取自**旧副本**——金丝雀暂停期间旧副本
     /// 不缩容，它仍在跑旧版本，两点相减得到的是旧版本的速率。参考点因此不能
     /// 跨到金丝雀那一侧去用：那是另一个进程的计数器。
-    async fn baseline_signals(&self, sample_secs: u64) -> Option<CanaryBaseline> {
-        let (first, semantics) = self.scrape_metrics().await.ok().flatten()?;
+    async fn baseline_signals(
+        &self,
+        sample_secs: u64,
+        pre_rollout: &HashSet<String>,
+    ) -> Option<CanaryBaseline> {
+        let (old_ips, _) = self.canary_pod_groups(pre_rollout).await.ok()?;
+        // 旧副本一个都抓不到就当没有基线：拿候选自己当基线等于自比自。
+        let (first, semantics) = self.scrape_group(&old_ips).await?;
         tokio::time::sleep(Duration::from_secs(sample_secs.max(1))).await;
-        let second = match self.scrape_metrics().await {
-            Ok(Some((signals, _))) => signals,
+        let (second, second_semantics) = match self.scrape_group(&old_ips).await {
+            Some(v) => v,
             // 第二次抓不到就退回单点：窗口求和语义下单点仍给出速率，累积语义下
             // 由 error_rate 自己判「没有证据」，不会伪造一个数。
-            _ => first,
+            None => (first, semantics),
         };
-        Some(CanaryBaseline {
-            semantics,
-            rate: error_rate(
+        // 两次之间语义变过，相减就不是一段连续历史：不给速率，闸门照 skipped 走。
+        let rate = (second_semantics == semantics).then(|| {
+            error_rate(
                 first,
                 second,
                 semantics,
                 self.config.canary_min_requests_for_rate,
-            ),
+            )
+        });
+        Some(CanaryBaseline {
+            semantics,
+            rate: rate.flatten(),
             p99_ms: second.p99_ms,
         })
     }
@@ -983,15 +1019,121 @@ impl GitOpsPuller {
         Ok(())
     }
 
-    /// 抓取 metrics URL（可选）。返回正文里的原始计数与它声明的语义。
-    async fn scrape_metrics(&self) -> SFResult<Option<(CanarySignals, CounterSemantics)>> {
-        let Some(url) = &self.metrics_url else {
-            return Ok(None);
-        };
+    /// 抓取一个 metrics 地址（可选）。返回正文里的原始计数与它声明的语义。
+    async fn scrape_metrics_at(
+        &self,
+        url: &str,
+    ) -> SFResult<Option<(CanarySignals, CounterSemantics)>> {
         let body = self
             .run("curl", &["-sf", "--max-time", "10", url], None, 15)
             .await?;
         Ok(Some(parse_prometheus_signals(&body)))
+    }
+
+    /// 抓取一组副本并合成一个读数。
+    ///
+    /// 只在同一版本的副本之间合成：它们是同一个进程模型的多个实例，合成出的
+    /// 是这一版的整体画像。跨版本（新旧副本）合成是另一回事，那正是判据要
+    /// 分开比的东西，绝不在这里做。
+    ///
+    /// 组内任一副本抓不到就返回 `None`——半个组的读数不是这一版的读数，
+    /// 拿它下结论等于拿不完整的证据判版本好坏。
+    async fn scrape_group(&self, ips: &[String]) -> Option<(CanarySignals, CounterSemantics)> {
+        let base = self.metrics_url.as_deref()?;
+        if ips.is_empty() {
+            return None;
+        }
+        let mut total = CanarySignals {
+            errors: 0.0,
+            requests: 0.0,
+            p99_ms: 0.0,
+        };
+        let mut semantics: Option<CounterSemantics> = None;
+        for ip in ips {
+            let url = metrics_url_for_pod(base, ip)?;
+            let Ok(Some((signals, s))) = self.scrape_metrics_at(&url).await else {
+                warn!(pod_ip = %ip, "canary metrics scrape failed; skipping this group");
+                return None;
+            };
+            match semantics {
+                Some(prev) if prev != s => {
+                    warn!(
+                        pod_ip = %ip,
+                        "replicas of one version disagree on counter semantics; \
+                         refusing to combine them"
+                    );
+                    return None;
+                }
+                _ => semantics = Some(s),
+            }
+            total.errors += signals.errors;
+            total.requests += signals.requests;
+            total.p99_ms = total.p99_ms.max(signals.p99_ms);
+        }
+        semantics.map(|s| (total, s))
+    }
+
+    /// 看护范围内本部署的副本，返回 (名字, podIP)。还没有 IP 的副本
+    /// （ContainerCreating）也列出来，它的 IP 为空串。
+    async fn list_canary_pods(&self) -> SFResult<Vec<(String, String)>> {
+        let out = self
+            .run(
+                &self.config.kubectl_bin.clone(),
+                &[
+                    "-n",
+                    &self.config.namespace,
+                    "get",
+                    "pods",
+                    "-l",
+                    &format!("app.kubernetes.io/name={}", self.config.deployment),
+                    "-o",
+                    "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.status.podIP}{\"\\n\"}{end}",
+                ],
+                None,
+                30,
+            )
+            .await?;
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let name = parts.next()?;
+                Some((name.to_string(), parts.next().unwrap_or("").to_string()))
+            })
+            .collect())
+    }
+
+    /// 看护范围内的副本，按「本次滚动之前就存在」分成旧组与新组（各返回 podIP）。
+    ///
+    /// 旧组跑上一版、新组跑候选，判据只在两组之间比才有意义。判据取"滚动前
+    /// 已有的 Pod 名单"而不是镜像名或创建时间：浮动签重推时新旧镜像同名，
+    /// 创建时间又要跟本进程记录的滚动起点对标，两者都不如名字集合直接。
+    async fn canary_pod_groups(
+        &self,
+        pre_rollout: &HashSet<String>,
+    ) -> SFResult<(Vec<String>, Vec<String>)> {
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for (name, ip) in self.list_canary_pods().await? {
+            // 没有 IP 的副本抓不了，不进入任何一组：新副本还在拉镜像时
+            // 新组为空，看护自然判"没有证据"。
+            if ip.is_empty() {
+                continue;
+            }
+            if pre_rollout.contains(&name) {
+                old.push(ip);
+            } else {
+                new.push(ip);
+            }
+        }
+        Ok((old, new))
+    }
+
+    /// 本次滚动开始前已在跑的 Pod 名单。拿不到时返回 `None`：宁可整轮跳过
+    /// 指标闸门，也不能把新旧副本混作一组去比。
+    async fn pre_rollout_pods(&self) -> Option<HashSet<String>> {
+        let pods = self.list_canary_pods().await.ok()?;
+        Some(pods.into_iter().map(|(name, _)| name).collect())
     }
 
     /// 金丝雀看护的阈值比对。
@@ -1128,6 +1270,34 @@ pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::Shut
             }
         }
     }
+}
+
+/// 把配置里的指标地址套到某个副本上：只换 host，scheme/端口/路径照旧。
+///
+/// 配置里那个 `localhost` 的含义是「每个 Pod 自己的那个端点」，而不是「拉取
+/// 进程所在 Pod 的端点」。看护要读的是被观测的副本，所以把 host 换成它的
+/// Pod IP。地址形态解析不出来时返回 `None`：宁可这一轮不抓，也不要拿一个
+/// 猜出来的地址去下结论。
+fn metrics_url_for_pod(base: &str, ip: &str) -> Option<String> {
+    let (scheme, rest) = base.split_once("://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    // 端口跟着配置走；裸 host 或端口非数字时按没有端口处理。
+    let port = match authority.rsplit_once(':') {
+        Some((_, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            format!(":{p}")
+        }
+        _ => String::new(),
+    };
+    // IPv6 字面量要带方括号，否则拼出的 authority 无法解析。
+    let host = if ip.contains(':') {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
+    };
+    Some(format!("{scheme}://{host}{port}{path}"))
 }
 
 /// 正文里声明 `_total` 系列取值含义的注释行前缀。缺省（旧版正文）按窗口求和
@@ -1516,6 +1686,109 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
             rate,
             p99_ms,
         }
+    }
+
+    /// 配置里的 `localhost` 读作「每个 Pod 自己的端点」，套到被观测的副本上
+    /// 时只换 host，scheme、端口、路径都照配置走。
+    #[test]
+    fn metrics_url_takes_the_observed_pods_host() {
+        assert_eq!(
+            metrics_url_for_pod("http://localhost:8080/metrics", "10.42.0.7").as_deref(),
+            Some("http://10.42.0.7:8080/metrics")
+        );
+        // 非默认端口与带子路径的地址同样只换 host。
+        assert_eq!(
+            metrics_url_for_pod("https://localhost:9091/probe/metrics", "10.42.0.9").as_deref(),
+            Some("https://10.42.0.9:9091/probe/metrics")
+        );
+        // 配置里没有端口时不留孤零零的冒号。
+        assert_eq!(
+            metrics_url_for_pod("http://localhost/metrics", "10.42.0.8").as_deref(),
+            Some("http://10.42.0.8/metrics")
+        );
+        // 配置里没有路径时补根路径。
+        assert_eq!(
+            metrics_url_for_pod("http://localhost:8080", "10.42.0.8").as_deref(),
+            Some("http://10.42.0.8:8080/")
+        );
+        // IPv6 字面量要带方括号，否则拼出来的 authority 解析不了。
+        assert_eq!(
+            metrics_url_for_pod("http://localhost:8080/metrics", "fd00::1").as_deref(),
+            Some("http://[fd00::1]:8080/metrics")
+        );
+        // 形态不对就不猜地址，这一轮不抓。
+        assert_eq!(
+            metrics_url_for_pod("localhost:8080/metrics", "10.42.0.7"),
+            None
+        );
+    }
+
+    /// 副本按「滚动前是否已在跑」分成旧组与新组：新组才是候选，判据要打在
+    /// 它身上。还没有 IP 的副本不进任何一组——它是还在拉镜像的候选，不是证据。
+    #[tokio::test]
+    async fn canary_splits_replicas_by_whether_they_preceded_the_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let kubectl = crate::test_support::write_executable(
+            dir.path(),
+            "kubectl",
+            "#!/bin/sh\nprintf 'cogneva-old 10.42.0.5\\ncogneva-new 10.42.0.6\\ncogneva-starting \\n'\n",
+        );
+        let puller = GitOpsPuller::new(
+            GitOpsConfig {
+                kubectl_bin: kubectl.to_string_lossy().into_owned(),
+                namespace: "cogneva".into(),
+                deployment: "cogneva".into(),
+                ..Default::default()
+            },
+            Arc::new(cog_storage::MemoryStateBackend::new()),
+            "c".into(),
+        );
+
+        // 滚动前的名单就是当下在跑的全部副本，含还没拿到 IP 的那个
+        // （它的名字仍然出现，否则滚动后它会被误当成候选）。
+        assert_eq!(
+            puller.pre_rollout_pods().await.unwrap(),
+            [
+                "cogneva-old".to_string(),
+                "cogneva-new".to_string(),
+                "cogneva-starting".to_string()
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let pre: HashSet<String> = ["cogneva-old".to_string()].into_iter().collect();
+        let (old, new) = puller.canary_pod_groups(&pre).await.unwrap();
+        assert_eq!(old, vec!["10.42.0.5"]);
+        // 候选是滚动后才出现的那个；还没拿到 IP 的不算候选。
+        assert_eq!(new, vec!["10.42.0.6"]);
+    }
+
+    /// 滚动前名单里的副本一个都没抓到时，不能退化成"什么都算候选"——
+    /// 那会把旧副本当成候选去比，重演自比自。
+    #[tokio::test]
+    async fn canary_with_empty_pre_rollout_set_has_no_baseline_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let kubectl = crate::test_support::write_executable(
+            dir.path(),
+            "kubectl",
+            "#!/bin/sh\nprintf 'cogneva-old 10.42.0.5\\n'\n",
+        );
+        let puller = GitOpsPuller::new(
+            GitOpsConfig {
+                kubectl_bin: kubectl.to_string_lossy().into_owned(),
+                namespace: "cogneva".into(),
+                deployment: "cogneva".into(),
+                ..Default::default()
+            },
+            Arc::new(cog_storage::MemoryStateBackend::new()),
+            "c".into(),
+        );
+        // 空名单（列举失败时也走这条）：唯一在跑的副本被当成候选而不是旧组，
+        // 于是基线取不到、指标闸门整轮跳过，而不是拿它跟自己比。
+        let (old, new) = puller.canary_pod_groups(&HashSet::new()).await.unwrap();
+        assert!(old.is_empty());
+        assert_eq!(new, vec!["10.42.0.5"]);
     }
 
     /// 窗口求和语义下的阈值行为与拆分前一致：正文仍是旧版形态时，
