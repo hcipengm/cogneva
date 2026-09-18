@@ -191,6 +191,13 @@ spec:
               # 报"No LLM backends configured"（2026-08-04 实测定位）
               mountPath: /etc/cogneva
               readOnly: true
+            # prompt 模板与主应用同源。缺这个挂载时本进程的 prompt 注册表是空的：
+            # 目录读不到只 warn、热重载 watcher 直接 ERROR，之后每次渲染都静默
+            # 回退到代码里的兜底字符串——热更新与版本化在这个 Pod 上整体失效，
+            # 而它恰恰是跑 EvolutionEngine 的那一半。
+            - name: prompts
+              mountPath: /etc/cogneva/prompts
+              readOnly: true
             # 主线部署器构建侧在本 Pod 内调 kubectl（查四部署镜像、apply 滚动
             # Job）。k3s 多调用二进制 argv[0]=kubectl 即 kubectl，版本与集群一致。
             - name: kubectl-bin
@@ -237,6 +244,9 @@ spec:
           # 与主部署一致走 ConfigMap；hostPath 指开发机路径在空白机上必挂失败
           configMap:
             name: cogneva-json
+        - name: prompts
+          configMap:
+            name: cogneva-prompts
         - name: kubectl-bin
           # 宿主 k3s 二进制挂载为 Pod 内 kubectl（argv[0]=kubectl 的多调用二进制，
           # 版本与集群天然一致）；bootstrap 先装 k3s 再部署，文件必然存在。

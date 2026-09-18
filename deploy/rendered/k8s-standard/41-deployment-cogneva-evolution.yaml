@@ -178,6 +178,13 @@ spec:
               # ConfigMap 挂成同名目录，进程读文件失败静默回退默认配置
               mountPath: /etc/cogneva
               readOnly: true
+            # prompt 模板与主应用同源。缺这个挂载时本进程的 prompt 注册表是空的：
+            # 目录读不到只 warn、热重载 watcher 直接 ERROR，之后每次渲染都静默
+            # 回退到代码里的兜底字符串——热更新与版本化在这个 Pod 上整体失效，
+            # 而它恰恰是跑 EvolutionEngine 的那一半。
+            - name: prompts
+              mountPath: /etc/cogneva/prompts
+              readOnly: true
           resources:
             limits:
               cpu: 4000m
@@ -202,3 +209,6 @@ spec:
         - name: cogneva-json
           configMap:
             name: cogneva-json
+        - name: prompts
+          configMap:
+            name: cogneva-prompts
