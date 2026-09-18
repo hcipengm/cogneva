@@ -5,6 +5,7 @@
 //! development mode). Production cluster deployments route these payloads to
 //! the executor pod via [`super::remote::RemoteExecutor`] instead.
 
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -25,6 +26,26 @@ impl LocalExecutor {
 impl Default for LocalExecutor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Name the common signals so a record reads without a lookup: 137 and 139
+/// differ only in which signal arrived, and SIGKILL (usually the cgroup memory
+/// limit) calls for different handling than SIGSEGV (code actually crashed).
+/// Unknown signals return an empty string so the caller reports the number alone.
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        _ => "",
     }
 }
 
@@ -104,7 +125,28 @@ pub(crate) fn spawn_command(
         })
         .await;
         let code = match exited {
-            Ok(Ok(status)) => status.code().unwrap_or(-1),
+            // `code()` is only set on a normal exit: a signal-terminated child
+            // (the cgroup OOM killer, a crash, an external kill) reports None,
+            // and this branch used to collapse into the same -1 as a timeout --
+            // the two deaths looked identical downstream and the signal number
+            // was dropped. Report it with the shell's 128+signal convention
+            // (SIGKILL -> 137, SIGTERM -> 143, matching what k8s reports for an
+            // OOMKilled container) and name the signal in stderr, since 137 by
+            // itself cannot be told apart from a process calling exit(137).
+            Ok(Ok(status)) => match (status.code(), status.signal()) {
+                (Some(c), _) => c,
+                (None, Some(sig)) => {
+                    let named = signal_name(sig);
+                    let data = if named.is_empty() {
+                        format!("command killed by signal {sig}")
+                    } else {
+                        format!("command killed by signal {sig} ({named})")
+                    };
+                    let _ = tx.send(CommandEvent::Stderr { data }).await;
+                    128 + sig
+                }
+                (None, None) => -1,
+            },
             Ok(Err(_)) => -1,
             Err(_) => {
                 let _ = child.kill().await;
@@ -243,6 +285,43 @@ mod tests {
         let result = backend.execute(&req).await.unwrap();
         assert_eq!(result.exit_code, -1);
         assert!(result.stderr.contains("timed out"));
+    }
+
+    /// A signal death must not look like a timeout or like any other failure:
+    /// the code carries which signal arrived (128+signal, the convention k8s
+    /// uses for OOMKilled) and stderr names it. A cgroup OOM kill and a code
+    /// crash have to be told apart from a plain non-zero exit by whoever reads
+    /// the result.
+    #[tokio::test]
+    async fn local_backend_names_the_signal_that_killed_the_command() {
+        let backend = LocalExecutor::new();
+
+        let oom = backend.execute(&cmd("kill -9 $$")).await.unwrap();
+        assert_eq!(oom.exit_code, 137, "SIGKILL must not collapse into -1");
+        assert!(
+            oom.stderr.contains("killed by signal 9 (SIGKILL)"),
+            "the record must name the signal: {}",
+            oom.stderr
+        );
+
+        // A second signal proves the number is carried, not hard-coded.
+        let term = backend.execute(&cmd("kill -15 $$")).await.unwrap();
+        assert_eq!(term.exit_code, 143);
+        assert!(
+            term.stderr.contains("signal 15 (SIGTERM)"),
+            "{}",
+            term.stderr
+        );
+    }
+
+    /// A command that exits 137 on its own is a normal exit and must not be
+    /// dressed up as a signal death.
+    #[tokio::test]
+    async fn a_self_reported_exit_code_is_not_read_as_a_signal() {
+        let backend = LocalExecutor::new();
+        let result = backend.execute(&cmd("exit 137")).await.unwrap();
+        assert_eq!(result.exit_code, 137);
+        assert!(result.stderr.is_empty(), "{}", result.stderr);
     }
 
     #[tokio::test]
