@@ -2541,18 +2541,18 @@ fn render_docs(docs: &[serde_yaml::Value]) -> SFResult<String> {
     Ok(out)
 }
 
-/// 支撑包在**消费侧**的复核：把包里不属于滚动面的文档（安装面 kind，判定见
+/// 下发包在**消费侧**的复核：把包里不属于滚动面的文档（安装面 kind，判定见
 /// [`namespace_docs`]）摘掉后写到 `out`，返回可 apply 的路径；全被摘掉时返回
-/// None（没有属于滚动面的对象可 apply）。
+/// None（没有属于滚动面的对象可 apply）。支撑包与目标清单都走这里——它们同源。
 ///
-/// 为什么消费侧要自己复核一遍：支撑包由**部署器**组装，而部署器跑的是当前
+/// 为什么消费侧要自己复核一遍：两个包都由**部署器**组装，而部署器跑的是当前
 /// 已部署的 rev，消费它的 Job 跑的是**本次目标 rev**——两者通常不是同一个
 /// 二进制，部署器永远落后于它要上的版本。所以"包里已经清干净了"这个前提，
 /// 只在组包者与消费者同 rev 时成立。留下一个安装面对象（例如一份与既有绑定
 /// 不一致的卷声明）会让 apply 被准入拒绝，而这一步在"一个镜像都没动"的
 /// 中止点上，拒绝会被读成对本次版本的否定——整条落地通道因此停摆。
-fn stage_support_manifest(text: &str, out: &Path) -> SFResult<Option<PathBuf>> {
-    let docs = namespace_docs(text, "support.yaml")?;
+fn stage_rollout_manifest(text: &str, origin: &str, out: &Path) -> SFResult<Option<PathBuf>> {
+    let docs = namespace_docs(text, origin)?;
     if docs.is_empty() {
         return Ok(None);
     }
@@ -2685,18 +2685,45 @@ impl RolloutExecutor {
     /// 把单个目标滚到新镜像：优先 apply 随镜像下发的整份 deployment 清单
     /// （携带拓扑/配置漂移修正），清单缺失才回落 set image（只动 image 字段）。
     /// 两条路径都只负责"提交变更"，收敛判定与回滚仍由调用方统一处理。
+    ///
+    /// 清单在 apply 前过一次消费侧复核（同 [`stage_rollout_manifest`]）：组包者跑
+    /// 的是当前已部署的 rev，执行这份清单的却是本次目标 rev，两者通常不同——所以
+    /// "包里已经清干净了"不能当前提。留下一个安装面对象会让 apply 被准入拒绝，而
+    /// 这次拒绝会被读成对目标版本的否定，整条落地通道停在一个没看清集群的中止点上。
     async fn apply_target(&self, plan: &RolloutPlan, t: &RolloutTarget) -> SFResult<()> {
         if let Some(dir) = &plan.manifests_dir {
-            let path = Path::new(dir).join(target_manifest_key(&t.deployment));
+            let key = target_manifest_key(&t.deployment);
+            let path = Path::new(dir).join(&key);
             if path.is_file() {
-                let path_arg = path.to_string_lossy().to_string();
-                info!(deployment = %t.deployment, manifest = %path_arg, "mainline rollout: apply target manifest");
-                return self
-                    .run_kubectl(&["apply", "-f", &path_arg], 60)
+                let text = tokio::fs::read_to_string(&path)
                     .await
-                    .map(|_| ());
+                    .map_err(|e| SFError::IO(format!("read {}: {e}", path.display())))?;
+                let staged = stage_rollout_manifest(
+                    &text,
+                    &key,
+                    &std::env::temp_dir().join(format!("mainline-target-{}.yaml", t.deployment)),
+                )?;
+                if let Some(staged_path) = staged {
+                    let path_arg = staged_path.to_string_lossy().to_string();
+                    info!(
+                        deployment = %t.deployment,
+                        source = %path.display(),
+                        manifest = %path_arg,
+                        "mainline rollout: apply target manifest"
+                    );
+                    return self
+                        .run_kubectl(&["apply", "-f", &path_arg], 60)
+                        .await
+                        .map(|_| ());
+                }
+                warn!(
+                    deployment = %t.deployment,
+                    source = %path.display(),
+                    "target manifest carries no rollout-face object; falling back to set image"
+                );
+            } else {
+                warn!(deployment = %t.deployment, "no target manifest in bundle; falling back to set image");
             }
-            warn!(deployment = %t.deployment, "no target manifest in bundle; falling back to set image");
         }
         self.set_image(t, &plan.tag).await
     }
@@ -3296,8 +3323,9 @@ impl RolloutExecutor {
                     .await
                     .map_err(|e| SFError::IO(format!("read {}: {e}", support.display())))
                     .map_err(classify_before_any_change)?;
-                let staged = stage_support_manifest(
+                let staged = stage_rollout_manifest(
                     &text,
+                    "support.yaml",
                     &std::env::temp_dir().join("mainline-support.yaml"),
                 )
                 .map_err(classify_before_any_change)?;
@@ -6698,7 +6726,7 @@ exit 0
     /// 那条跳过规则），而 apply 它必然被准入拒。复核必须在 apply 之前把这类
     /// 文档摘掉，让一次上线不因"包与历史不一致"整体中止。
     #[test]
-    fn staged_support_manifest_drops_install_surface_docs() {
+    fn staged_rollout_manifest_drops_install_surface_docs() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("support.yaml");
         let text = "\
@@ -6717,7 +6745,7 @@ spec:
     requests:
       storage: 24Gi
 ";
-        let path = stage_support_manifest(text, &out)
+        let path = stage_rollout_manifest(text, "support.yaml", &out)
             .unwrap()
             .expect("configmap survives filtering");
         assert_eq!(path, out);
@@ -6727,24 +6755,50 @@ spec:
         assert!(!body.contains("24Gi"), "{body}");
     }
 
+    /// 目标清单走的是同一个复核：它与支撑包同源，也同样由落后的组包者产出。
+    #[test]
+    fn staged_rollout_manifest_drops_install_surface_docs_from_a_target_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("target.yaml");
+        let text = "\
+---
+kind: Deployment
+metadata:
+  name: cogneva
+---
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-data-pvc
+";
+        let path = stage_rollout_manifest(text, "deploy-cogneva.yaml", &out)
+            .unwrap()
+            .expect("deployment survives filtering");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("kind: Deployment"), "{body}");
+        assert!(!body.contains("PersistentVolumeClaim"), "{body}");
+    }
+
     /// 整包都是安装面对象时没有可 apply 的东西——不写空文件（`kubectl apply`
     /// 对空输入报错，那会把"本来无需 apply"变成一次假失败）。
     #[test]
-    fn staged_support_manifest_reports_nothing_when_only_install_surface() {
+    fn staged_rollout_manifest_reports_nothing_when_only_install_surface() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("support.yaml");
         let text = "kind: PersistentVolumeClaim\nmetadata:\n  name: p\n";
-        assert!(stage_support_manifest(text, &out).unwrap().is_none());
+        assert!(stage_rollout_manifest(text, "support.yaml", &out)
+            .unwrap()
+            .is_none());
         assert!(!out.exists());
     }
 
     /// 复核不能把 Secret 这道红线放过去：它既不属滚动面，也不许出现在任何清单里。
     #[test]
-    fn staged_support_manifest_still_rejects_secret() {
+    fn staged_rollout_manifest_still_rejects_secret() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("support.yaml");
         let text = "kind: Secret\nmetadata:\n  name: s\n";
-        assert!(stage_support_manifest(text, &out).is_err());
+        let err = stage_rollout_manifest(text, "deploy-cogneva.yaml", &out).unwrap_err();
+        assert!(err.to_string().contains("deploy-cogneva.yaml"), "{err}");
     }
 
     /// 授权被拒不是版本结论：apiserver 说"不许你做"，读到的不是新版本的好坏。
