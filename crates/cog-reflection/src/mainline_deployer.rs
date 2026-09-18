@@ -461,15 +461,48 @@ fn is_observation_tool_failure(msg: &str) -> bool {
     msg.contains(OBSERVATION_TOOL_MARKER)
 }
 
-/// 镜像一次都还没动时失败的归类。此时没有回滚对象，要判的只是"这次失败说不说
-/// 得出新版本的问题"：观测能力故障说不出，归环境类，否则归版本类。
+/// 「集群不许我们做这件事」的标记：apiserver 的 RBAC 拒绝。发布集里出现这个 SA
+/// 不该持有的对象时，apply 在动镜像之前就被拒；此时新版本的好坏一个字都没读到，
+/// 真正要改的是发布集或权限授予（两者都在安装面/人工那一侧）。
 ///
-/// 这里只有这两类观测故障会出现——调度器判决得等新 Pod 出现，快照阶段还没有
-/// 新 Pod。归环境类是为了不占尝试预算：拿一次纯粹的可达性抖动或一个坏掉的工具
-/// 路径去消耗本 rev 的尝试，会按上限把一个本来正常的版本搁置到下个 rev。
+/// 判据只认 apiserver 自己的授权措辞，不用裸 `forbidden` 这个词：组包侧自己的
+/// 「Secret in manifest bundle is forbidden」也含它，判据混在一起会把组包错误读成
+/// 授权拒绝。授权的动词面是封闭的（get/list/watch/create/update/patch/delete/
+/// deletecollection），逐个列全，免得某一种动词被漏掉后掉回版本类。
+const AUTHORIZATION_DENIED_MARKER: &str = "authorization denied";
+
+const AUTHORIZATION_DENIED_PATTERNS: &[&str] = &[
+    AUTHORIZATION_DENIED_MARKER,
+    "is forbidden: User",
+    "cannot get resource",
+    "cannot list resource",
+    "cannot watch resource",
+    "cannot create resource",
+    "cannot update resource",
+    "cannot patch resource",
+    "cannot delete resource",
+    "cannot deletecollection resource",
+];
+
+fn is_authorization_denied(msg: &str) -> bool {
+    AUTHORIZATION_DENIED_PATTERNS
+        .iter()
+        .any(|p| msg.contains(p))
+}
+
+/// 镜像一次都还没动时失败的归类。此时没有回滚对象，要判的只是"这次失败说不说
+/// 得出新版本的问题"：观测能力故障与授权被拒都说不出，归环境类，否则归版本类。
+///
+/// 快照阶段只有这三类非版本失败会出现——调度器判决得等新 Pod 出现，这里还没有
+/// 新 Pod。归环境类是为了不占尝试预算：拿一次纯粹的可达性抖动、一个坏掉的工具
+/// 路径、或一纸发布集与授权面对不齐的拒绝去消耗本 rev 的尝试，会按上限把一个
+/// 本来正常的版本搁置到下个 rev。
 fn classify_before_any_change(e: SFError) -> RolloutFailure {
     let msg = e.to_string();
-    if is_cluster_unreachable(&msg) || is_observation_tool_failure(&msg) {
+    if is_cluster_unreachable(&msg)
+        || is_observation_tool_failure(&msg)
+        || is_authorization_denied(&msg)
+    {
         RolloutFailure::environment(e)
     } else {
         RolloutFailure::version(e)
@@ -2135,10 +2168,18 @@ fn parse_kustomization_resources(text: &str) -> SFResult<Vec<String>> {
 /// 变更必须走安装面/人工核准（bootstrap 以管理员身份 apply 全量清单）。
 const RBAC_KINDS: &[&str] = &["Role", "RoleBinding"];
 
+/// 资源治理 kind：与权限面同路，不经循环面下发。它们的数值由 chart values 与
+/// 操作面标定（profile 决定开关与上限），而发布集是从提交好的静态清单组包的——
+/// 那是一份钉死的默认值。让循环每 rev 下发它，等于用这份默认值覆盖运维调过的
+/// 天花板：调高就是自治系统给自己抬资源上限，调低就是把不认识的运维标定打回去。
+/// 创建归安装面（helm / 预渲染 apply），调整归 values 或人工。
+const GOVERNANCE_KINDS: &[&str] = &["ResourceQuota", "LimitRange"];
+
 /// 拆分多文档 YAML 并过滤进支撑包：Secret 硬报错（零带外凭证红线，密钥
-/// 永不进清单链路）；集群级 kind 与权限面 kind（Role/RoleBinding）跳过
-/// 并记日志（前者由安装面管理，后者见 [`RBAC_KINDS`] 的反提权理由）；
-/// 空文档（`---` 分隔产生）跳过。
+/// 永不进清单链路）；集群级 kind、权限面 kind（Role/RoleBinding）与治理
+/// kind（ResourceQuota/LimitRange）跳过并记日志（前者由安装面管理，后两者
+/// 见 [`RBAC_KINDS`] 与 [`GOVERNANCE_KINDS`] 的理由）；空文档（`---` 分隔
+/// 产生）跳过。
 fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Value>> {
     let mut docs = Vec::new();
     for doc in serde_yaml::Deserializer::from_str(yaml_text) {
@@ -2159,6 +2200,10 @@ fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Val
         }
         if RBAC_KINDS.contains(&kind) {
             warn!(origin = %origin, kind = %kind, "manifest bundle: skipping RBAC kind; permission changes must be applied out-of-band");
+            continue;
+        }
+        if GOVERNANCE_KINDS.contains(&kind) {
+            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping resource governance kind; the ceiling is the operator's and is applied at install time, not by the loop");
             continue;
         }
         docs.push(v);
@@ -2241,6 +2286,10 @@ fn patch_deployment_image(
         }
         if RBAC_KINDS.contains(&kind) {
             warn!(origin = %origin, kind = %kind, "manifest bundle: skipping RBAC kind; permission changes must be applied out-of-band");
+            continue;
+        }
+        if GOVERNANCE_KINDS.contains(&kind) {
+            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping resource governance kind; the ceiling is the operator's and is applied at install time, not by the loop");
             continue;
         }
         if kind == "Deployment" {
@@ -6273,9 +6322,11 @@ exit 0
     }
 
     #[test]
-    fn namespace_docs_skips_cluster_scoped_and_rbac_and_rejects_secret() {
-        // 多文档：Namespace（集群级）与 Role（权限面）跳过，ConfigMap/Service 保留，空文档跳过。
-        let yaml = "---\nkind: Namespace\nmetadata:\n  name: x\n---\nkind: ConfigMap\nmetadata:\n  name: c\n---\nkind: Role\nmetadata:\n  name: r\nrules: []\n---\nkind: RoleBinding\nmetadata:\n  name: rb\n---\nkind: Service\nmetadata:\n  name: svc\n---\n";
+    fn namespace_docs_skips_cluster_scoped_rbac_and_governance_and_rejects_secret() {
+        // 多文档：Namespace（集群级）、Role/RoleBinding（权限面）与
+        // ResourceQuota/LimitRange（治理面）跳过，ConfigMap/Service 保留，
+        // 空文档跳过。
+        let yaml = "---\nkind: Namespace\nmetadata:\n  name: x\n---\nkind: ConfigMap\nmetadata:\n  name: c\n---\nkind: Role\nmetadata:\n  name: r\nrules: []\n---\nkind: RoleBinding\nmetadata:\n  name: rb\n---\nkind: ResourceQuota\nmetadata:\n  name: cogneva-quota\n---\nkind: LimitRange\nmetadata:\n  name: cogneva-limits\n---\nkind: Service\nmetadata:\n  name: svc\n---\n";
         let docs = namespace_docs(yaml, "mixed.yaml").unwrap();
         let kinds: Vec<&str> = docs
             .iter()
@@ -6286,6 +6337,97 @@ exit 0
         let secret = "kind: Secret\nmetadata:\n  name: s\n";
         let err = namespace_docs(secret, "secret.yaml").unwrap_err();
         assert!(err.to_string().contains("forbidden"), "{err}");
+    }
+
+    /// 治理对象就在发布集里（元启动的自建集群走 `kubectl apply -k deploy/k3s`，
+    /// 该文件必须留在 `resources` 里），但一份都不许进支撑包：数值来自 chart
+    /// values，随包下发就是拿静态清单里的默认值覆盖运维调过的天花板。
+    #[test]
+    fn build_rollout_bundle_drops_resource_governance_from_support() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "evolution-deployment.yaml".to_string(),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        );
+        files.insert(
+            "resource-quota.yaml".to_string(),
+            "kind: ResourceQuota\nmetadata:\n  name: cogneva-quota\nspec:\n  hard:\n    pods: \"40\"\n---\nkind: LimitRange\nmetadata:\n  name: cogneva-limits\nspec:\n  limits: []\n"
+                .to_string(),
+        );
+        files.insert(
+            "configmap.yaml".to_string(),
+            "kind: ConfigMap\nmetadata:\n  name: c\ndata:\n  k: v\n".to_string(),
+        );
+        let kustomization = "resources:\n  - resource-quota.yaml\n  - configmap.yaml\n  - deployment.yaml\n  - evolution-deployment.yaml\n";
+        let bundle = build_rollout_bundle(&files, kustomization, &bundle_targets(), "img").unwrap();
+        assert!(bundle.support_yaml.contains("kind: ConfigMap"));
+        assert!(
+            !bundle.support_yaml.contains("ResourceQuota"),
+            "quota must not travel with the rollout: {}",
+            bundle.support_yaml
+        );
+        assert!(
+            !bundle.support_yaml.contains("LimitRange"),
+            "limits must not travel with the rollout: {}",
+            bundle.support_yaml
+        );
+    }
+
+    /// 授权被拒不是版本结论：apiserver 说"不许你做"，读到的不是新版本的好坏。
+    /// 判据只认 apiserver 的授权措辞，组包侧自己的 "Secret ... is forbidden"
+    /// 不会被误读（否则一个组包错误会被记成本 rev 的一次尝试）。
+    #[test]
+    fn authorization_denial_is_an_environment_failure_not_a_version_verdict() {
+        let denial =
+            "kubectl apply -f support.yaml failed: resourcequotas \"cogneva-quota\" is forbidden: \
+                      User \"system:serviceaccount:cogneva:cogneva-evolution\" cannot get resource \
+                      \"resourcequotas\" in API group \"\" in the namespace \"cogneva\"";
+        assert!(is_authorization_denied(denial));
+        assert_eq!(
+            classify_before_any_change(SFError::IO(denial.to_string())).class,
+            FailureClass::Environment
+        );
+        // 谁也不许借走它的判定。
+        assert!(!is_cluster_unreachable(denial));
+        assert!(!is_placement_blocked(denial));
+        assert!(!is_observation_tool_failure(denial));
+        // 动词面逐个列全，任何一种都算授权拒绝。
+        for verb in [
+            "get",
+            "list",
+            "watch",
+            "create",
+            "update",
+            "patch",
+            "delete",
+            "deletecollection",
+        ] {
+            let t = format!(
+                "X is forbidden: User \"u\" cannot {verb} resource \"v\" in API group \"\""
+            );
+            assert!(is_authorization_denied(&t), "{verb} must be recognized");
+        }
+        // 反面：组包侧的 forbidden 与普通 apply 失败都不是授权拒绝，仍归版本类。
+        let bundle_err = SFError::Config(
+            "secret.yaml: Secret in manifest bundle is forbidden; secrets never travel through manifests"
+                .into(),
+        );
+        assert!(!is_authorization_denied(&bundle_err.to_string()));
+        assert_eq!(
+            classify_before_any_change(bundle_err).class,
+            FailureClass::Version
+        );
+        assert_eq!(
+            classify_before_any_change(SFError::IO(
+                "kubectl apply -f support.yaml failed: invalid manifest".into()
+            ))
+            .class,
+            FailureClass::Version
+        );
     }
 
     #[test]
