@@ -413,7 +413,6 @@ mod tests {
             let (stream, mut producer) = AssistantMessageEventStream::with_capacity(10);
             let _ = producer
                 .push(AssistantMessageEvent::Start {
-                    partial: Message::assistant(content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -423,7 +422,6 @@ mod tests {
                         .push(AssistantMessageEvent::TextDelta {
                             content_index: 0,
                             delta: "partial".into(),
-                            partial: Message::assistant(content.clone()),
                             timestamp: chrono::Utc::now(),
                         })
                         .await;
@@ -440,7 +438,6 @@ mod tests {
                     .push(AssistantMessageEvent::TextEnd {
                         content_index: 0,
                         content: self.response_text.clone(),
-                        partial: Message::assistant(content),
                         timestamp: chrono::Utc::now(),
                     })
                     .await;
@@ -760,7 +757,6 @@ mod tests {
                         .push(AssistantMessageEvent::TextDelta {
                             content_index: 0,
                             delta: format!("chunk{i}"),
-                            partial: Message::assistant(content.clone()),
                             timestamp: chrono::Utc::now(),
                         })
                         .await

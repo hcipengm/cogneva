@@ -105,7 +105,6 @@ impl LLMProvider for MockProvider {
 
             let _ = producer
                 .push(AssistantMessageEvent::Start {
-                    partial: Message::assistant(response.content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -115,7 +114,6 @@ impl LLMProvider for MockProvider {
             let _ = producer
                 .push(AssistantMessageEvent::TextStart {
                     content_index: idx,
-                    partial: Message::assistant(response.content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -125,7 +123,6 @@ impl LLMProvider for MockProvider {
                 .push(AssistantMessageEvent::TextDelta {
                     content_index: idx,
                     delta: response_text.clone(),
-                    partial: Message::assistant(response.content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -134,7 +131,6 @@ impl LLMProvider for MockProvider {
                 .push(AssistantMessageEvent::TextEnd {
                     content_index: idx,
                     content: response_text,
-                    partial: Message::assistant(response.content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -150,7 +146,6 @@ impl LLMProvider for MockProvider {
                     .push(AssistantMessageEvent::ToolCallEnd {
                         content_index: 1,
                         tool_call: tc,
-                        partial: Message::assistant(response.content.clone()),
                         timestamp: chrono::Utc::now(),
                     })
                     .await;

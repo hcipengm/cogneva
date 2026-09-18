@@ -207,7 +207,6 @@ impl LLMProvider for GoogleProvider {
 
             if producer
                 .push(AssistantMessageEvent::Start {
-                    partial: Message::assistant(response.content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await
@@ -362,9 +361,6 @@ impl LLMProvider for GoogleProvider {
                                                         .push(AssistantMessageEvent::TextEnd {
                                                             content_index: idx.saturating_sub(1),
                                                             content: t.to_string(),
-                                                            partial: Message::assistant(
-                                                                response.content.clone(),
-                                                            ),
                                                             timestamp: chrono::Utc::now(),
                                                         })
                                                         .await
@@ -379,9 +375,6 @@ impl LLMProvider for GoogleProvider {
                                             if producer
                                                 .push(AssistantMessageEvent::ThinkingStart {
                                                     content_index: idx,
-                                                    partial: Message::assistant(
-                                                        response.content.clone(),
-                                                    ),
                                                     timestamp: chrono::Utc::now(),
                                                 })
                                                 .await
@@ -399,9 +392,6 @@ impl LLMProvider for GoogleProvider {
                                             .push(AssistantMessageEvent::ThinkingDelta {
                                                 content_index: idx,
                                                 delta: text.to_string(),
-                                                partial: Message::assistant(
-                                                    response.content.clone(),
-                                                ),
                                                 timestamp: chrono::Utc::now(),
                                             })
                                             .await
@@ -418,9 +408,6 @@ impl LLMProvider for GoogleProvider {
                                                         .push(AssistantMessageEvent::ThinkingEnd {
                                                             content_index: idx.saturating_sub(1),
                                                             content: t.to_string(),
-                                                            partial: Message::assistant(
-                                                                response.content.clone(),
-                                                            ),
                                                             timestamp: chrono::Utc::now(),
                                                         })
                                                         .await
@@ -435,9 +422,6 @@ impl LLMProvider for GoogleProvider {
                                             if producer
                                                 .push(AssistantMessageEvent::TextStart {
                                                     content_index: idx,
-                                                    partial: Message::assistant(
-                                                        response.content.clone(),
-                                                    ),
                                                     timestamp: chrono::Utc::now(),
                                                 })
                                                 .await
@@ -455,9 +439,6 @@ impl LLMProvider for GoogleProvider {
                                             .push(AssistantMessageEvent::TextDelta {
                                                 content_index: idx,
                                                 delta: text.to_string(),
-                                                partial: Message::assistant(
-                                                    response.content.clone(),
-                                                ),
                                                 timestamp: chrono::Utc::now(),
                                             })
                                             .await
@@ -504,13 +485,7 @@ impl LLMProvider for GoogleProvider {
 
                                     let idx = response.content.len();
                                     if let Some(ref block) = current_block {
-                                        finish_block(
-                                            block,
-                                            idx.saturating_sub(1),
-                                            &producer,
-                                            &response.content,
-                                        )
-                                        .await;
+                                        finish_block(block, idx.saturating_sub(1), &producer).await;
                                     }
                                     current_block = None;
 
@@ -520,7 +495,6 @@ impl LLMProvider for GoogleProvider {
                                     if producer
                                         .push(AssistantMessageEvent::ToolCallStart {
                                             content_index: idx,
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -532,7 +506,6 @@ impl LLMProvider for GoogleProvider {
                                         .push(AssistantMessageEvent::ToolCallDelta {
                                             content_index: idx,
                                             delta: args.to_string(),
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -569,7 +542,6 @@ impl LLMProvider for GoogleProvider {
                                                     serde_json::Value::Null
                                                 },
                                             },
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -595,7 +567,7 @@ impl LLMProvider for GoogleProvider {
             // Finish any remaining block
             if let Some(ref block) = current_block {
                 let idx = response.content.len().saturating_sub(1);
-                finish_block(block, idx, &producer, &response.content).await;
+                finish_block(block, idx, &producer).await;
             }
 
             // Calculate cost from usage and model cost metadata
@@ -698,7 +670,6 @@ async fn finish_block(
     block: &ContentBlock,
     idx: usize,
     producer: &crate::AssistantMessageEventProducer,
-    content: &[ContentBlock],
 ) {
     match block {
         ContentBlock::Text { text, .. } => {
@@ -706,7 +677,6 @@ async fn finish_block(
                 .push(AssistantMessageEvent::TextEnd {
                     content_index: idx,
                     content: text.clone(),
-                    partial: Message::assistant(content.to_vec()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -716,7 +686,6 @@ async fn finish_block(
                 .push(AssistantMessageEvent::ThinkingEnd {
                     content_index: idx,
                     content: thinking.clone(),
-                    partial: Message::assistant(content.to_vec()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;

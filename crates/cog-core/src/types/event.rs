@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::message::{Message, ToolCall};
+use super::ContentBlock;
 
 /// Stop reason for LLM response termination.
 /// Aligns with pi-ai's StopReason.
@@ -18,74 +19,68 @@ pub enum StopReason {
 
 /// Raw LLM-level event protocol.
 /// Aligns with pi-ai's AssistantMessageEvent.
-/// Each incremental event carries `partial: Message` — a snapshot of the
-/// accumulated message state at this point in the stream. This lets consumers
-/// observe the current full state without maintaining their own accumulator.
+///
+/// Each variant carries only what changed. The accumulated message is not
+/// repeated per event: the provider already holds the accumulator it builds
+/// these events from, and a snapshot per event made the persisted size of one
+/// message grow with `message_length × delta_count` — a planner run of 422
+/// stream updates weighed 16.7 MB while the deltas' own text weighed 6.4 KB.
+/// Consumers fold the deltas with [`AssistantMessageEvent::apply`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantMessageEvent {
     Start {
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
     TextStart {
         content_index: usize,
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
     TextDelta {
         content_index: usize,
         delta: String,
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
     TextEnd {
         content_index: usize,
         content: String,
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
     ThinkingStart {
         content_index: usize,
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
     ThinkingDelta {
         content_index: usize,
         delta: String,
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
     ThinkingEnd {
         content_index: usize,
         content: String,
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
     ToolCallStart {
         content_index: usize,
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
     ToolCallDelta {
         content_index: usize,
         delta: String,
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
     ToolCallEnd {
         content_index: usize,
         tool_call: ToolCall,
-        partial: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
@@ -108,6 +103,136 @@ pub enum AssistantMessageEvent {
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
+}
+
+impl AssistantMessageEvent {
+    /// Fold one incremental event into the message being accumulated.
+    ///
+    /// This is the single accumulator for an assistant stream. The runtime uses
+    /// it to build the message, and anything replaying a trace folds the same
+    /// deltas the same way, so the two cannot drift.
+    ///
+    /// Total by construction: a block announced at an index past the current
+    /// content pads the gap rather than panicking, so a malformed stream
+    /// degrades to an extra empty block instead of taking the process down.
+    pub fn apply(&self, message: &mut Message) {
+        match self {
+            // Carries the whole finalized message, so it supersedes anything
+            // the deltas have built so far.
+            AssistantMessageEvent::Done {
+                message: done_message,
+                ..
+            } => *message = done_message.clone(),
+            AssistantMessageEvent::Error { .. } => {}
+            event => {
+                let Message::Assistant { content, .. } = message else {
+                    return;
+                };
+                match event {
+                    AssistantMessageEvent::Start { .. } => content.clear(),
+                    AssistantMessageEvent::TextStart { content_index, .. } => {
+                        block_at(content, *content_index, || ContentBlock::text(""));
+                    }
+                    AssistantMessageEvent::TextDelta {
+                        content_index,
+                        delta,
+                        ..
+                    } => {
+                        if let ContentBlock::Text { text, .. } =
+                            block_at(content, *content_index, || ContentBlock::text(""))
+                        {
+                            text.push_str(delta);
+                        }
+                    }
+                    AssistantMessageEvent::TextEnd {
+                        content_index,
+                        content: final_text,
+                        ..
+                    } => {
+                        if let ContentBlock::Text { text, .. } =
+                            block_at(content, *content_index, || ContentBlock::text(""))
+                        {
+                            text.clone_from(final_text);
+                        }
+                    }
+                    AssistantMessageEvent::ThinkingStart { content_index, .. } => {
+                        block_at(content, *content_index, || ContentBlock::thinking(""));
+                    }
+                    AssistantMessageEvent::ThinkingDelta {
+                        content_index,
+                        delta,
+                        ..
+                    } => {
+                        if let ContentBlock::Thinking { thinking, .. } =
+                            block_at(content, *content_index, || ContentBlock::thinking(""))
+                        {
+                            thinking.push_str(delta);
+                        }
+                    }
+                    AssistantMessageEvent::ThinkingEnd {
+                        content_index,
+                        content: final_thinking,
+                        ..
+                    } => {
+                        if let ContentBlock::Thinking { thinking, .. } =
+                            block_at(content, *content_index, || ContentBlock::thinking(""))
+                        {
+                            thinking.clone_from(final_thinking);
+                        }
+                    }
+                    AssistantMessageEvent::ToolCallStart { content_index, .. } => {
+                        block_at(content, *content_index, || {
+                            ContentBlock::tool_call(
+                                "",
+                                "",
+                                serde_json::Value::Object(Default::default()),
+                            )
+                        });
+                    }
+                    // A tool call's arguments stream in as JSON fragments, which
+                    // have no representation in the block's parsed `arguments`.
+                    // The assembled call arrives with ToolCallEnd, so this event
+                    // exists for token-level progress, not for the accumulator.
+                    AssistantMessageEvent::ToolCallDelta { .. } => {}
+                    AssistantMessageEvent::ToolCallEnd {
+                        content_index,
+                        tool_call,
+                        ..
+                    } => {
+                        let assembled = ContentBlock::tool_call(
+                            tool_call.id.clone(),
+                            tool_call.name.clone(),
+                            tool_call.arguments.clone(),
+                        );
+                        let slot = block_at(content, *content_index, || assembled.clone());
+                        *slot = assembled;
+                    }
+                    // Token accounting rides on the terminal message, which
+                    // Done carries; these two are handled before the borrow.
+                    AssistantMessageEvent::Usage { .. }
+                    | AssistantMessageEvent::Done { .. }
+                    | AssistantMessageEvent::Error { .. } => {}
+                }
+            }
+        }
+    }
+}
+
+/// The content block at `index`, creating it if the announced index is at or
+/// past the end. Gaps are padded with empty text blocks so the announced index
+/// keeps meaning for the deltas that follow it.
+fn block_at(
+    content: &mut Vec<ContentBlock>,
+    index: usize,
+    make: impl FnOnce() -> ContentBlock,
+) -> &mut ContentBlock {
+    if index >= content.len() {
+        while content.len() < index {
+            content.push(ContentBlock::text(""));
+        }
+        content.push(make());
+    }
+    &mut content[index]
 }
 
 /// Agent lifecycle event protocol (semantic layer).
@@ -419,31 +544,133 @@ pub enum StreamEvent {
 mod tests {
     use super::*;
 
-    /// The accumulated assistant message must have exactly one carrier per
-    /// `MessageUpdate`. The variant used to carry it twice — once inside
-    /// `assistant_event` and once as a sibling field the producer filled from
-    /// the same value — which doubled the size of every persisted trace and
-    /// made the trace collector's buffer accounting count ~half the bytes it
-    /// claimed to bound.
+    /// A delta event must carry only what changed. Each one used to also carry
+    /// the whole accumulated message as `partial`, so a persisted message grew
+    /// with `message_length × delta_count`: one planner run of 422 deltas
+    /// weighed 16.7 MB while its own delta text weighed 6.4 KB. Consumers fold
+    /// the deltas with [`AssistantMessageEvent::apply`] instead, and this test
+    /// fails the moment a snapshot field is reintroduced.
     #[test]
-    fn message_update_carries_the_snapshot_once() {
-        let marker = "SENTINEL-CONTENT-9f3a".repeat(64);
-        let event = AgentEvent::MessageUpdate {
-            agent_id: "planner-1".into(),
-            assistant_event: AssistantMessageEvent::TextDelta {
+    fn delta_events_carry_no_message_snapshot() {
+        let cases = [
+            serde_json::to_value(AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "x".into(),
-                partial: Message::assistant_text(marker.clone()),
+                timestamp: Utc::now(),
+            })
+            .unwrap(),
+            serde_json::to_value(AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "x".into(),
+                timestamp: Utc::now(),
+            })
+            .unwrap(),
+            serde_json::to_value(AssistantMessageEvent::ToolCallDelta {
+                content_index: 0,
+                delta: "x".into(),
+                timestamp: Utc::now(),
+            })
+            .unwrap(),
+        ];
+
+        for value in cases {
+            let fields = value.as_object().unwrap();
+            let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["content_index", "delta", "timestamp", "type"],
+                "a delta event grew beyond its own delta: {value}"
+            );
+        }
+    }
+
+    /// The runtime builds the assistant message by folding this stream, and
+    /// `Done` carries the provider's own copy of the same message. If the fold
+    /// ever disagrees with it, replaying a trace reconstructs something the live
+    /// run never produced.
+    #[test]
+    fn folding_a_delta_stream_reproduces_the_done_message() {
+        let expected = Message::assistant(vec![
+            ContentBlock::text("Hello"),
+            ContentBlock::thinking("why"),
+            ContentBlock::tool_call("c1", "read", serde_json::json!({ "path": "a.rs" })),
+        ]);
+
+        let events = [
+            AssistantMessageEvent::Start {
                 timestamp: Utc::now(),
             },
-            timestamp: Utc::now(),
-        };
+            AssistantMessageEvent::TextStart {
+                content_index: 0,
+                timestamp: Utc::now(),
+            },
+            AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "Hel".into(),
+                timestamp: Utc::now(),
+            },
+            AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "lo".into(),
+                timestamp: Utc::now(),
+            },
+            AssistantMessageEvent::ThinkingStart {
+                content_index: 1,
+                timestamp: Utc::now(),
+            },
+            AssistantMessageEvent::ThinkingDelta {
+                content_index: 1,
+                delta: "why".into(),
+                timestamp: Utc::now(),
+            },
+            AssistantMessageEvent::ToolCallStart {
+                content_index: 2,
+                timestamp: Utc::now(),
+            },
+            AssistantMessageEvent::ToolCallDelta {
+                content_index: 2,
+                delta: "{\"path\":".into(),
+                timestamp: Utc::now(),
+            },
+            AssistantMessageEvent::ToolCallEnd {
+                content_index: 2,
+                tool_call: ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": "a.rs" }),
+                },
+                timestamp: Utc::now(),
+            },
+            AssistantMessageEvent::Usage {
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                total_tokens: 7,
+                timestamp: Utc::now(),
+            },
+        ];
 
-        let json = serde_json::to_string(&event).unwrap();
+        let mut folded = Message::assistant(Vec::new());
+        for event in &events {
+            event.apply(&mut folded);
+        }
+        let Message::Assistant { content, .. } = &folded else {
+            panic!("folding a delta stream did not produce an assistant message");
+        };
         assert_eq!(
-            json.matches(&marker).count(),
-            1,
-            "the snapshot is duplicated in the serialized event"
+            content,
+            expected.content_blocks().unwrap(),
+            "the folded stream disagrees with the message the provider finalized"
         );
+
+        // Done supersedes whatever the deltas built, and the fold must land on
+        // exactly the message it carries.
+        AssistantMessageEvent::Done {
+            reason: StopReason::ToolUse,
+            message: expected.clone(),
+            timestamp: Utc::now(),
+        }
+        .apply(&mut folded);
+        assert_eq!(folded, expected);
     }
 }

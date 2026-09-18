@@ -1014,7 +1014,6 @@ mod tests {
         let event = cog_core::AssistantMessageEvent::TextEnd {
             content_index: 0,
             content: text.to_string(),
-            partial: cog_core::Message::assistant_text("test"),
             timestamp: chrono::Utc::now(),
         };
         let _ = producer.try_push(event);

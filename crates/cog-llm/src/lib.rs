@@ -92,7 +92,6 @@ mod tests {
             let (stream, mut producer) = AssistantMessageEventStream::with_capacity(10);
             let _ = producer
                 .push(AssistantMessageEvent::Start {
-                    partial: Message::assistant(content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -100,7 +99,6 @@ mod tests {
                 .push(AssistantMessageEvent::TextEnd {
                     content_index: 0,
                     content: self.response_text.clone(),
-                    partial: Message::assistant(content),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -133,7 +131,6 @@ mod tests {
 
             let _ = producer
                 .push(AssistantMessageEvent::Start {
-                    partial: Message::assistant(content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -151,7 +148,6 @@ mod tests {
                     let _ = producer
                         .push(AssistantMessageEvent::TextStart {
                             content_index: 0,
-                            partial: Message::assistant(content.clone()),
                             timestamp: chrono::Utc::now(),
                         })
                         .await;
@@ -160,7 +156,6 @@ mod tests {
                     .push(AssistantMessageEvent::TextDelta {
                         content_index: 0,
                         delta: text,
-                        partial: Message::assistant(content.clone()),
                         timestamp: chrono::Utc::now(),
                     })
                     .await;
@@ -170,7 +165,6 @@ mod tests {
                 .push(AssistantMessageEvent::TextEnd {
                     content_index: 0,
                     content: self.response_text.clone(),
-                    partial: Message::assistant(content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;

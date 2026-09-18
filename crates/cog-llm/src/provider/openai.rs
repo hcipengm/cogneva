@@ -512,7 +512,6 @@ impl LLMProvider for OpenAIProvider {
 
             if producer
                 .push(AssistantMessageEvent::Start {
-                    partial: Message::assistant(response.content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await
@@ -770,15 +769,13 @@ impl LLMProvider for OpenAIProvider {
                                             active_tool_index = None;
                                         }
                                         let prev_idx = idx.saturating_sub(1);
-                                        finish_block(block, prev_idx, &producer, &response.content)
-                                            .await;
+                                        finish_block(block, prev_idx, &producer).await;
                                     }
                                     current_block = Some(ContentBlock::text(content));
                                     response.content.push(current_block.clone().unwrap());
                                     if producer
                                         .push(AssistantMessageEvent::TextStart {
                                             content_index: idx,
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -796,7 +793,6 @@ impl LLMProvider for OpenAIProvider {
                                     .push(AssistantMessageEvent::TextDelta {
                                         content_index: idx,
                                         delta: content.to_string(),
-                                        partial: Message::assistant(response.content.clone()),
                                         timestamp: chrono::Utc::now(),
                                     })
                                     .await
@@ -832,22 +828,13 @@ impl LLMProvider for OpenAIProvider {
                                                 active_tool_index = None;
                                             }
                                             let prev_idx = idx.saturating_sub(1);
-                                            finish_block(
-                                                block,
-                                                prev_idx,
-                                                &producer,
-                                                &response.content,
-                                            )
-                                            .await;
+                                            finish_block(block, prev_idx, &producer).await;
                                         }
                                         current_block = Some(ContentBlock::thinking(reasoning));
                                         response.content.push(current_block.clone().unwrap());
                                         if producer
                                             .push(AssistantMessageEvent::ThinkingStart {
                                                 content_index: idx,
-                                                partial: Message::assistant(
-                                                    response.content.clone(),
-                                                ),
                                                 timestamp: chrono::Utc::now(),
                                             })
                                             .await
@@ -865,7 +852,6 @@ impl LLMProvider for OpenAIProvider {
                                         .push(AssistantMessageEvent::ThinkingDelta {
                                             content_index: idx,
                                             delta: reasoning.to_string(),
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -913,23 +899,11 @@ impl LLMProvider for OpenAIProvider {
                                                 finalize_tool_call(b, &acc.args);
                                             }
                                             let block = response.content[acc.content_pos].clone();
-                                            finish_block(
-                                                &block,
-                                                acc.content_pos,
-                                                &producer,
-                                                &response.content,
-                                            )
-                                            .await;
+                                            finish_block(&block, acc.content_pos, &producer).await;
                                         }
                                     } else if let Some(block) = current_block.take() {
                                         let prev_idx = response.content.len().saturating_sub(1);
-                                        finish_block(
-                                            &block,
-                                            prev_idx,
-                                            &producer,
-                                            &response.content,
-                                        )
-                                        .await;
+                                        finish_block(&block, prev_idx, &producer).await;
                                     }
                                     active_tool_index = Some(tc_index);
                                     current_block = None;
@@ -962,9 +936,6 @@ impl LLMProvider for OpenAIProvider {
                                         if producer
                                             .push(AssistantMessageEvent::ToolCallStart {
                                                 content_index: content_pos,
-                                                partial: Message::assistant(
-                                                    response.content.clone(),
-                                                ),
                                                 timestamp: chrono::Utc::now(),
                                             })
                                             .await
@@ -990,7 +961,6 @@ impl LLMProvider for OpenAIProvider {
                                     .push(AssistantMessageEvent::ToolCallDelta {
                                         content_index: content_pos,
                                         delta: args_chunk.to_string(),
-                                        partial: Message::assistant(response.content.clone()),
                                         timestamp: chrono::Utc::now(),
                                     })
                                     .await
@@ -1033,14 +1003,14 @@ impl LLMProvider for OpenAIProvider {
             if let Some(active) = active_tool_index {
                 if let Some(acc) = tool_accs.get(&active) {
                     let block = response.content[acc.content_pos].clone();
-                    finish_block(&block, acc.content_pos, &producer, &response.content).await;
+                    finish_block(&block, acc.content_pos, &producer).await;
                 }
             } else if let Some(block) = current_block.take() {
                 if let Some(last) = response.content.last_mut() {
                     *last = block.clone();
                 }
                 let idx = response.content.len().saturating_sub(1);
-                finish_block(&block, idx, &producer, &response.content).await;
+                finish_block(&block, idx, &producer).await;
             }
 
             // Text-protocol tool-call fallback: some upstreams emit
@@ -1238,7 +1208,6 @@ async fn finish_block(
     block: &ContentBlock,
     idx: usize,
     producer: &crate::AssistantMessageEventProducer,
-    content: &[ContentBlock],
 ) {
     match block {
         ContentBlock::Text { text, .. } => {
@@ -1246,7 +1215,6 @@ async fn finish_block(
                 .push(AssistantMessageEvent::TextEnd {
                     content_index: idx,
                     content: text.clone(),
-                    partial: Message::assistant(content.to_vec()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -1256,7 +1224,6 @@ async fn finish_block(
                 .push(AssistantMessageEvent::ThinkingEnd {
                     content_index: idx,
                     content: thinking.clone(),
-                    partial: Message::assistant(content.to_vec()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -1275,7 +1242,6 @@ async fn finish_block(
                         name: name.clone(),
                         arguments: arguments.clone(),
                     },
-                    partial: Message::assistant(content.to_vec()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;

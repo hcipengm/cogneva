@@ -141,7 +141,6 @@ impl LLMProvider for OllamaProvider {
 
             if producer
                 .push(AssistantMessageEvent::Start {
-                    partial: Message::assistant(response.content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await
@@ -251,9 +250,6 @@ impl LLMProvider for OllamaProvider {
                                             .push(AssistantMessageEvent::TextEnd {
                                                 content_index: idx.saturating_sub(1),
                                                 content: text.to_string(),
-                                                partial: Message::assistant(
-                                                    response.content.clone(),
-                                                ),
                                                 timestamp: chrono::Utc::now(),
                                             })
                                             .await
@@ -268,7 +264,6 @@ impl LLMProvider for OllamaProvider {
                                 if producer
                                     .push(AssistantMessageEvent::TextStart {
                                         content_index: idx,
-                                        partial: Message::assistant(response.content.clone()),
                                         timestamp: chrono::Utc::now(),
                                     })
                                     .await
@@ -286,7 +281,6 @@ impl LLMProvider for OllamaProvider {
                                 .push(AssistantMessageEvent::TextDelta {
                                     content_index: idx,
                                     delta: content.to_string(),
-                                    partial: Message::assistant(response.content.clone()),
                                     timestamp: chrono::Utc::now(),
                                 })
                                 .await
@@ -310,7 +304,6 @@ impl LLMProvider for OllamaProvider {
                                         .push(AssistantMessageEvent::TextEnd {
                                             content_index: idx,
                                             content: block.as_text().unwrap_or("").to_string(),
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -347,7 +340,6 @@ impl LLMProvider for OllamaProvider {
                                 if producer
                                     .push(AssistantMessageEvent::ToolCallStart {
                                         content_index: idx,
-                                        partial: Message::assistant(response.content.clone()),
                                         timestamp: chrono::Utc::now(),
                                     })
                                     .await
@@ -383,7 +375,6 @@ impl LLMProvider for OllamaProvider {
                                                 serde_json::Value::Null
                                             },
                                         },
-                                        partial: Message::assistant(response.content.clone()),
                                         timestamp: chrono::Utc::now(),
                                     })
                                     .await
@@ -417,7 +408,6 @@ impl LLMProvider for OllamaProvider {
                         .push(AssistantMessageEvent::TextEnd {
                             content_index: idx,
                             content: block.as_text().unwrap_or("").to_string(),
-                            partial: Message::assistant(response.content.clone()),
                             timestamp: chrono::Utc::now(),
                         })
                         .await

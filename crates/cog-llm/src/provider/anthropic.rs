@@ -248,7 +248,6 @@ impl LLMProvider for AnthropicProvider {
 
             if producer
                 .push(AssistantMessageEvent::Start {
-                    partial: Message::assistant(response.content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await
@@ -377,7 +376,6 @@ impl LLMProvider for AnthropicProvider {
                                     if producer
                                         .push(AssistantMessageEvent::TextStart {
                                             content_index: block_index,
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -392,7 +390,6 @@ impl LLMProvider for AnthropicProvider {
                                     if producer
                                         .push(AssistantMessageEvent::ThinkingStart {
                                             content_index: block_index,
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -416,7 +413,6 @@ impl LLMProvider for AnthropicProvider {
                                     if producer
                                         .push(AssistantMessageEvent::ThinkingStart {
                                             content_index: block_index,
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -446,7 +442,6 @@ impl LLMProvider for AnthropicProvider {
                                     if producer
                                         .push(AssistantMessageEvent::ToolCallStart {
                                             content_index: block_index,
-                                            partial: Message::assistant(response.content.clone()),
                                             timestamp: chrono::Utc::now(),
                                         })
                                         .await
@@ -474,9 +469,6 @@ impl LLMProvider for AnthropicProvider {
                                             .push(AssistantMessageEvent::TextDelta {
                                                 content_index: block_index,
                                                 delta: text.to_string(),
-                                                partial: Message::assistant(
-                                                    response.content.clone(),
-                                                ),
                                                 timestamp: chrono::Utc::now(),
                                             })
                                             .await
@@ -498,9 +490,6 @@ impl LLMProvider for AnthropicProvider {
                                             .push(AssistantMessageEvent::ThinkingDelta {
                                                 content_index: block_index,
                                                 delta: thinking.to_string(),
-                                                partial: Message::assistant(
-                                                    response.content.clone(),
-                                                ),
                                                 timestamp: chrono::Utc::now(),
                                             })
                                             .await
@@ -528,9 +517,6 @@ impl LLMProvider for AnthropicProvider {
                                             .push(AssistantMessageEvent::ToolCallDelta {
                                                 content_index: block_index,
                                                 delta: partial_json.to_string(),
-                                                partial: Message::assistant(
-                                                    response.content.clone(),
-                                                ),
                                                 timestamp: chrono::Utc::now(),
                                             })
                                             .await
@@ -574,7 +560,7 @@ impl LLMProvider for AnthropicProvider {
                                     }
                                 }
                             }
-                            finish_block(block, block_index, &producer, &response.content).await;
+                            finish_block(block, block_index, &producer).await;
                         }
                         current_block = None;
                         current_tool_args_buffer = None;
@@ -649,7 +635,7 @@ impl LLMProvider for AnthropicProvider {
                         }
                     }
                 }
-                finish_block(block, block_index, &producer, &response.content).await;
+                finish_block(block, block_index, &producer).await;
             }
 
             // Calculate cost from usage and model cost metadata
@@ -782,7 +768,6 @@ async fn finish_block(
     block: &ContentBlock,
     idx: usize,
     producer: &crate::AssistantMessageEventProducer,
-    content: &[ContentBlock],
 ) {
     match block {
         ContentBlock::Text { text, .. } => {
@@ -790,7 +775,6 @@ async fn finish_block(
                 .push(AssistantMessageEvent::TextEnd {
                     content_index: idx,
                     content: text.clone(),
-                    partial: Message::assistant(content.to_vec()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -800,7 +784,6 @@ async fn finish_block(
                 .push(AssistantMessageEvent::ThinkingEnd {
                     content_index: idx,
                     content: thinking.clone(),
-                    partial: Message::assistant(content.to_vec()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -819,7 +802,6 @@ async fn finish_block(
                         name: name.clone(),
                         arguments: arguments.clone(),
                     },
-                    partial: Message::assistant(content.to_vec()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;

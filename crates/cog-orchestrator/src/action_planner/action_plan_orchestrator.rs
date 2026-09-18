@@ -1474,7 +1474,6 @@ mod tests {
             let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(10);
             let _ = producer
                 .push(cog_core::AssistantMessageEvent::Start {
-                    partial: cog_core::Message::assistant(content.clone()),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
@@ -1482,7 +1481,6 @@ mod tests {
                 .push(cog_core::AssistantMessageEvent::TextEnd {
                     content_index: 0,
                     content: text,
-                    partial: cog_core::Message::assistant(content),
                     timestamp: chrono::Utc::now(),
                 })
                 .await;

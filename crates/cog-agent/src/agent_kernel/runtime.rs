@@ -1092,26 +1092,13 @@ impl AgentRuntime {
                     return Err(err);
                 }
             };
-            match &event {
-                AssistantMessageEvent::TextStart { partial, .. }
-                | AssistantMessageEvent::TextDelta { partial, .. }
-                | AssistantMessageEvent::ThinkingStart { partial, .. }
-                | AssistantMessageEvent::ThinkingDelta { partial, .. }
-                | AssistantMessageEvent::ToolCallStart { partial, .. }
-                | AssistantMessageEvent::ToolCallDelta { partial, .. } => {
-                    final_message = partial.clone();
-                }
-                AssistantMessageEvent::Done { message, .. } => {
-                    final_message = message.clone();
-                }
-                AssistantMessageEvent::Error { error, .. } => {
-                    return Err(SFError::Agent(format!(
-                        "LLM stream error: {}",
-                        error.content()
-                    )));
-                }
-                _ => {}
+            if let AssistantMessageEvent::Error { error, .. } = &event {
+                return Err(SFError::Agent(format!(
+                    "LLM stream error: {}",
+                    error.content()
+                )));
             }
+            event.apply(&mut final_message);
 
             self.emit_event(AgentEvent::MessageUpdate {
                 agent_id: self.config.agent_id.clone(),
@@ -1676,7 +1663,6 @@ mod tests {
                         .push(AssistantMessageEvent::TextDelta {
                             content_index: 0,
                             delta,
-                            partial: Message::assistant_text(text.clone()),
                             timestamp: chrono::Utc::now(),
                         })
                         .await;
