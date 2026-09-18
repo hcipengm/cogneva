@@ -442,6 +442,35 @@ fn is_placement_blocked(msg: &str) -> bool {
     msg.contains(PLACEMENT_BLOCKED_MARKER)
 }
 
+/// 「观测工具本身起不来」的标记，与前两类同一族：说的是**我们没能观测**，不是
+/// 观测到版本有毛病。kubectl 二进制缺失、没有可执行位、正被写入（ETXTBSY）这
+/// 类 exec 失败下一次查询都没发出去。
+///
+/// 单列一类而不是并进 cluster-unreachable：那一类的语义是"重试可能等到"
+/// （apiserver 抖动、握手超时），`probe` 会按轮询节拍在预算内重试；工具起不来
+/// 在本进程生命周期里重试多少次都一样，必须就地返回——但归的还是环境类，
+/// 因为它同样说不出新版本的好坏，而回滚只退镜像，修不好一个坏掉的工具路径。
+const OBSERVATION_TOOL_MARKER: &str = "observation tool unavailable";
+
+fn is_observation_tool_failure(msg: &str) -> bool {
+    msg.contains(OBSERVATION_TOOL_MARKER)
+}
+
+/// 镜像一次都还没动时失败的归类。此时没有回滚对象，要判的只是"这次失败说不说
+/// 得出新版本的问题"：观测能力故障说不出，归环境类，否则归版本类。
+///
+/// 这里只有这两类观测故障会出现——调度器判决得等新 Pod 出现，快照阶段还没有
+/// 新 Pod。归环境类是为了不占尝试预算：拿一次纯粹的可达性抖动或一个坏掉的工具
+/// 路径去消耗本 rev 的尝试，会按上限把一个本来正常的版本搁置到下个 rev。
+fn classify_before_any_change(e: SFError) -> RolloutFailure {
+    let msg = e.to_string();
+    if is_cluster_unreachable(&msg) || is_observation_tool_failure(&msg) {
+        RolloutFailure::environment(e)
+    } else {
+        RolloutFailure::version(e)
+    }
+}
+
 /// 滚动 Job 的进程退出码里「环境类失败」那一档。Job 内的判定进程按这个码告诉
 /// 部署器：这次失败说不出新版本的好坏。取值沿用 sysexits 的 EX_TEMPFAIL——
 /// 语义正是"此刻不成、换个时刻可能就成了"，与"任何非零即失败"（版本类走 1）不
@@ -2407,7 +2436,12 @@ impl RolloutExecutor {
         let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
             .await
             .map_err(|_| SFError::IO(format!("{cmdline} timed out after {timeout_secs}s")))?
-            .map_err(|e| SFError::IO(format!("failed to run kubectl: {e}")))?;
+            .map_err(|e| {
+                SFError::IO(format!(
+                    "{OBSERVATION_TOOL_MARKER}: cannot run {}: {e}",
+                    self.kubectl
+                ))
+            })?;
         if !output.status.success() {
             return Err(SFError::IO(format!(
                 "{cmdline} failed: {}",
@@ -3018,7 +3052,8 @@ impl RolloutExecutor {
     pub async fn run(&self, plan: &RolloutPlan) -> Result<(), RolloutFailure> {
         // 支撑资源先于任何镜像变更就位：新二进制启动依赖的 RBAC/ConfigMap/
         // Service 若晚于滚动落地，新 Pod 会因缺依赖 crashloop 触发无谓回滚。
-        // 失败直接中止，此时一个镜像都没动（线上原样）：坏的是这份清单，归版本类。
+        // 失败直接中止，此时一个镜像都没动（线上原样）：清单确实坏就归版本类，
+        // 但如果根本没看清集群（不可达/工具起不来）就不作版本结论。
         if let Some(dir) = &plan.manifests_dir {
             let support = Path::new(dir).join("support.yaml");
             if support.is_file() && support.metadata().map(|m| m.len() > 0).unwrap_or(false) {
@@ -3026,7 +3061,7 @@ impl RolloutExecutor {
                 info!(manifest = %support_arg, "mainline rollout: applying support manifests");
                 self.run_kubectl(&["apply", "-f", &support_arg], 120)
                     .await
-                    .map_err(RolloutFailure::version)?;
+                    .map_err(classify_before_any_change)?;
             }
         }
         // 任何镜像变更之前先快照各部署当前镜像作为回滚目标：per-target、
@@ -3038,13 +3073,13 @@ impl RolloutExecutor {
             let img = self
                 .current_image(t)
                 .await
-                .map_err(RolloutFailure::version)?;
+                .map_err(classify_before_any_change)?;
             // 放置面与镜像一起快照：apply 之后才分得清"排不上队"是这次上线
             // 自己加了排不上的约束（版本的事），还是节点本来就满（不是）。
             let shape = self
                 .current_placement_shape(t)
                 .await
-                .map_err(RolloutFailure::version)?;
+                .map_err(classify_before_any_change)?;
             info!(deployment = %t.deployment, prev = %img, "mainline rollout: snapshot prev image");
             prevs.push((t.deployment.clone(), img));
             prev_shapes.push((t.deployment.clone(), shape));
@@ -3080,7 +3115,7 @@ impl RolloutExecutor {
         Ok(())
     }
 
-    /// 失败收尾：只有**观测到的版本缺陷**才回滚。两类失败不构成版本结论：
+    /// 失败收尾：只有**观测到的版本缺陷**才回滚。三类失败不构成版本结论：
     ///
     /// - 集群访问故障（apiserver 不可达、握手超时）：我们看不到集群，既不足以
     ///   判版本好，回滚也同样要经 apiserver、多半一起失败，而这个动作本身还会
@@ -3088,8 +3123,11 @@ impl RolloutExecutor {
     /// - 集群放不下新 Pod：新 Pod 一个都没起来，谈不上新版本的好坏；回滚要把
     ///   旧镜像重新调度一遍，而它带着同样的放置面，同样排不进去。只有本次
     ///   上线自己改动了放置面时才归版本（那一支带的是普通超时错误，不进这里）。
+    /// - 观测工具本身起不来（kubectl 缺失/没有可执行位/被占用）：我们连一次查询
+    ///   都没发出去，说不出新版本的好坏；而且回滚只退镜像，修不好一个坏掉的工具
+    ///   路径，只会把新版本换掉而又重复失败一轮。
     ///
-    /// 两种都让 Job 非零退出（部署器下轮重试），集群保持在刚推上去的新版本上。
+    /// 三类都让 Job 非零退出（部署器下轮重试），集群保持在刚推上去的新版本上。
     ///
     /// 这里是**唯一**给失败定类别的地方：两支不回滚的判成环境类，其余（含
     /// 回滚过的那一支）判成版本类。类别随 [`RolloutFailure`] 带到 CLI，翻成
@@ -3113,6 +3151,14 @@ impl RolloutExecutor {
                 error = %e,
                 "the scheduler never placed the new pods and this revision did not change the \
                  deployment's placement shape; keeping the new revision (no rollback)"
+            );
+            return Err(RolloutFailure::environment(e));
+        }
+        if is_observation_tool_failure(&msg) {
+            warn!(
+                error = %e,
+                "the observation tool itself could not be run; keeping the new revision (no \
+                 rollback) — rolling the image back cannot repair a broken tool path"
             );
             return Err(RolloutFailure::environment(e));
         }
@@ -3602,6 +3648,22 @@ mod tests {
         assert!(!is_placement_blocked(&format!(
             "{CLUSTER_UNREACHABLE_MARKER}: never observed"
         )));
+    }
+
+    /// 观测工具起不来是第三类，谁也不许借走它的判定：它既不是"看不到集群"
+    /// （那一类会按轮询节拍重试，而工具起不来重试多少次都一样），也不是版本结论。
+    #[test]
+    fn the_observation_tool_marker_is_its_own_class() {
+        let e = format!(
+            "{OBSERVATION_TOOL_MARKER}: cannot run /tmp/fake-kubectl: Permission denied (os error 13)"
+        );
+        assert!(is_observation_tool_failure(&e));
+        assert!(!is_cluster_unreachable(&e));
+        assert!(!is_placement_blocked(&e));
+        // 真实 exec 失败文本里没有任何访问故障措辞，所以它必须靠自己的标记被认出。
+        assert!(!is_cluster_unreachable(
+            "failed to run kubectl: Text file busy (os error 26)"
+        ));
     }
 
     /// 采样行里的 Pod 名，供事件相关性过滤用（诊断走的是同一条：从 PodSample 取名字）。
@@ -6080,6 +6142,47 @@ exit 0
         assert!(
             calls.contains("set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-new"),
             "the revision must still have been pushed before the blackout: {calls}"
+        );
+    }
+
+    /// 回归（本轮新发现）：观测工具本身起不来时要说得出病因，而且不能当版本
+    /// 结论。旧逻辑的 exec 失败文本落在任何判据之外，`fail_without_blind_rollback`
+    /// 认不出它，直接回滚刚推上去的好版本——而回滚只退镜像，一个坏掉的工具路径
+    /// 下一轮同样起不来，等于用一次无谓回滚换掉一个可能正常的版本。
+    ///
+    /// 真实形态见过两种：CI 上的 `failed to run kubectl: Text file busy`（文件正
+    /// 被写入），以及二进制没有可执行位。这里用后者，稳定可复现。
+    #[tokio::test]
+    async fn a_rollout_whose_observation_tool_cannot_start_names_it_and_keeps_the_revision() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        // 文件在、内容也对，就是没有可执行位：spawn 直接 EACCES，一次查询都没发出去。
+        let path = bin_dir.join("fake-kubectl");
+        std::fs::write(&path, "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let executor =
+            RolloutExecutor::new(path.to_string_lossy().to_string(), "cogneva", 0, 1, 6, 6);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        let err = executor
+            .run(&plan)
+            .await
+            .expect_err("a rollout whose observation tool cannot start must fail");
+        assert_eq!(
+            err.class,
+            FailureClass::Environment,
+            "a tool that cannot start says nothing about the revision: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            is_observation_tool_failure(&msg),
+            "the failure must carry the observation-tool marker: {msg}"
+        );
+        assert!(
+            msg.contains("fake-kubectl"),
+            "the record must name which binary could not be run: {msg}"
         );
     }
 
