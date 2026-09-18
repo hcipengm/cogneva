@@ -270,8 +270,4 @@ data:
         description: "GeneratorActor system prompt"
         tags: ["collaboration", "generation"]
         active: true
-    kind: ConfigMap
-    metadata:
-      name: cogneva-prompts
-      namespace: cogneva
     

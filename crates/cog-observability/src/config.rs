@@ -18,6 +18,29 @@ pub struct ObservabilityExportersConfig {
     pub elasticsearch: ElasticsearchConfig,
     pub infra_watch: InfraWatchConfig,
     pub trace_collector: TraceCollectorConfig,
+    pub data_volume_watch: DataVolumeWatchConfig,
+}
+
+/// Persistent-volume footprint watcher: measures the application data
+/// directory and publishes it as a gauge so the deployment can compare it
+/// against the volume's declared size.
+///
+/// The claim name is the one fact the process cannot derive — it knows the
+/// directory it writes, not which claim backs it — so the deployment supplies
+/// it, per workload, because two workloads mount two different claims at the
+/// same path. A claim is also the switch: no claim means the directory is not
+/// claim-backed here, and the watcher stays off. There is deliberately no
+/// separate enable flag, so the watcher cannot be turned on without naming
+/// what it measures.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DataVolumeWatchConfig {
+    /// Name of the persistent volume claim backing the application data
+    /// directory. Empty disables the watcher.
+    pub claim: String,
+    /// How often the directory is re-measured. Clamped up to
+    /// [`crate::data_volume::MIN_SCAN_INTERVAL_SECS`].
+    pub interval_secs: u64,
 }
 
 /// Trace collector in-memory buffering policy. Squad agents can run for
@@ -264,6 +287,11 @@ const OBS_ENV: &[(&str, &str)] = &[
         "COGNEVA_TRACE_BUFFER_MAX_BYTES",
         "trace_collector.buffer_max_bytes",
     ),
+    ("COGNEVA_DATA_VOLUME_CLAIM", "data_volume_watch.claim"),
+    (
+        "COGNEVA_DATA_VOLUME_INTERVAL_SECS",
+        "data_volume_watch.interval_secs",
+    ),
 ];
 
 impl ObservabilityExportersConfig {
@@ -322,6 +350,27 @@ mod tests {
         assert_eq!(cfg.loki.endpoint, "http://loki:3100");
         let dbg = format!("{:?}", cfg.clickhouse);
         assert!(!dbg.contains("p@ss"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn data_volume_watch_is_off_until_a_claim_is_named() {
+        // 缺省即关闭：卷名是部署侧才知道的事实，代码不能替它猜一张卷。
+        let cfg = ObservabilityExportersConfig::default();
+        assert!(cfg.data_volume_watch.claim.is_empty());
+        assert_eq!(cfg.data_volume_watch.interval_secs, 0);
+
+        let dir = std::env::temp_dir().join(format!("cog-obs-vol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        std::fs::write(
+            &path,
+            r#"{"observability": {"data_volume_watch": {"claim": "cogneva-data-pvc", "interval_secs": 300}}}"#,
+        )
+        .unwrap();
+        let cfg = ObservabilityExportersConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.data_volume_watch.claim, "cogneva-data-pvc");
+        assert_eq!(cfg.data_volume_watch.interval_secs, 300);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

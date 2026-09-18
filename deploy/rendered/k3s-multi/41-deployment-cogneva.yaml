@@ -151,6 +151,11 @@ spec:
               value: "main"
             - name: COGNEVA_GITOPS_METRICS_URL
               value: "http://localhost:8080/metrics"
+            # 数据卷占用只由写它的进程量得出来：目录型卷的"容量"是整个节点文件系统，
+            # 声明量与实际占用之间没有任何东西对账。进程知道自己写哪个目录、不知道
+            # 目录背后是哪张 PVC，所以由部署侧指名（与上面挂载的 claimName 同一个）。
+            - name: COGNEVA_DATA_VOLUME_CLAIM
+              value: "cogneva-data-pvc"
             # 主应用是控制面，不是变更执行器：基础 cogneva.json 对全部 Pod 打开
             # self_evolution.enabled，若不在这里关掉执行器，本 Pod 会每轮跑进化
             # 循环 / 基线移植，与专用进化 worker 抢同一实例指纹、裸仓库与工作树

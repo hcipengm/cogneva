@@ -58,7 +58,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: {{ .Values.appData.storage }}
+      storage: {{ .Values.evolution.dataStorage }}
   {{- with .Values.appData.storageClass }}
   storageClassName: {{ . }}
   {{- end }}
@@ -219,6 +219,10 @@ spec:
             # 压短告警停留窗口。
             - name: COGNEVA_DECOMPOSITION_ORPHAN_WATCH_ENABLED
               value: {{ ternary "true" "false" .Values.evolution.orphanReconcilerEnabled | quote }}
+            # 本 Pod 挂在 /var/lib/cogneva-data 上的声明与主应用不是同一张，占用要
+            # 分开量：两个进程写同一个路径，但各自的卷互不相干。
+            - name: COGNEVA_DATA_VOLUME_CLAIM
+              value: "cogneva-evolution-data-pvc"
             # 沙盒零凭证：LLM/平台流量经安全网关透传，真实 key 只在网关 Pod。
             # 缺这三个 env 时 Provider 直连公网平台——集群仅网关在 egress 白名单，直连必败。
             - name: PG_PASSWORD

@@ -16,4 +16,4 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: local-path
+  # 不写 storageClassName：跟随集群默认 SC（与 pg/redis/qdrant 同策略）。

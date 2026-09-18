@@ -464,12 +464,25 @@
           },
           "severity": "warning",
           "summary": "On average {value} running cogneva workload(s) had no Prometheus scrape target over the last 15m: their /metrics is produced but never collected, so every alert they would raise is invisible (usual causes: the workload has no Service, its Service port is not named http or metrics, or a NetworkPolicy blocks the monitoring namespace)"
+        },
+        {
+          "name": "data_volume_over_declared_size",
+          "promql": "cogneva_data_volume_used_bytes / on(namespace, persistentvolumeclaim) kube_persistentvolumeclaim_resource_requests_storage_bytes",
+          "condition": {
+            "greater_than": 1.0
+          },
+          "severity": "warning",
+          "summary": "Volume holds {value}x its declared size: the workload writes past the PVC's requests.storage, and nothing enforces that request, so the declared size is not a ceiling. For a directory-backed volume the excess lands on the node filesystem and the per-volume capacity the kubelet reports is the node's, not this volume's. Either the declaration is wrong for what this deployment writes, or the growth belongs somewhere else"
         }
       ]
     },
     "trace_collector": {
       "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。",
       "buffer_max_bytes": 16777216
+    },
+    "data_volume_watch": {
+      "_comment": "应用数据目录的占用量由写它的进程自己量成 gauge cogneva_data_volume_used_bytes 并带上卷名，规则拿它除以 kube-state-metrics 报的 requests.storage。同一份 cogneva.json 挂给多个 Pod，各自挂的卷不是同一张，所以卷名由各部署用自己的 env 指名（COGNEVA_DATA_VOLUME_CLAIM），不写在这里；claim 为空即整个观测关闭。",
+      "interval_secs": 300
     }
   },
   "self_review": {

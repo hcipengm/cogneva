@@ -53,7 +53,14 @@ resourceGovernance:
 # 也一并清零。主应用与进化 Pod 各挂一个卷：两者以不同 UID 运行，共享同一 RWO 卷
 # 时 kubelet 的 fsGroup 会互相改属主。
 appData:
-  storage: 5Gi
+  # 声明量是策略的函数：稳态占用 ≈ 热窗口内的写入量 + 压缩后的 warm 层 +
+  # 记忆/数仓等杂项。热窗口内的写入量随 agent 活动量变化，是这里唯一必须由
+  # 部署方复核的输入（本机一整天全速跑：主应用 ≈ 18G 热 trace + 0.2G warm +
+  # 0.7G memory ≈ 19G，取 24Gi 留头寸）。写小了不会有任何系统报错——目录型
+  # 卷不强制 requests.storage，声明与实际之间没有对账机制；应用自己把实测
+  # 占用发成 cogneva_data_volume_used_bytes，由规则 data_volume_over_declared_size
+  # 比对，这是唯一能发现声明写小的观测面。
+  storage: 24Gi
   # 空 = 跟随集群默认 SC（与 pg/redis/qdrant 同策略，不绑厂商）。
   storageClass: ""
 
@@ -142,6 +149,11 @@ evolution:
     storage: 5Gi
   sandboxStorage: 20Gi
   sourceStorage: 10Gi
+  # 进化 Pod 的 /var/lib/cogneva-data 是另一张卷、另一个写入者，声明必须分开：
+  # 同一路径两个进程，各自的卷互不相干，共用一份声明必然对其中一个说谎。
+  # 它比主应用重得多——同一热窗口内跑步进化的 ralph/自评审，一天 ≈ 50G 热
+  # trace（主应用同期 ≈ 18G），取 64Gi 留头寸。推导同 appData.storage。
+  dataStorage: 64Gi
   # 工作树动态分配：部署器与每个进化任务各自从裸仓库检出 git worktree，
   # 任一方把检出停在哪里都不再影响另一方。共享 CARGO_TARGET_DIR 故意留在
   # 工作树之外（source PVC 的克隆根内），工作树可整棵重建而不丢增量编译缓存。

@@ -2,6 +2,7 @@ pub mod alert_store;
 pub mod alerts;
 pub mod analytics;
 pub mod config;
+pub mod data_volume;
 pub mod explainability;
 pub mod explainability_pg;
 pub mod infra_watch;

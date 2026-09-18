@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # 部署拓扑 parity 校验：Helm chart 是应用拓扑的唯一权威源，deploy/k3s/ 静态清单
 # （bootstrap 消费）必须与 chart 的 k3s profile 渲染结果能力对齐——工作负载一个
-# 不少、env/卷/挂载/端口/SA 字段不弱。任何一侧改动后跑本脚本，差异即失败。
+# 不少、env/卷/挂载/端口/SA 字段不弱、配置文档一段不缺。任何一侧改动后跑本
+# 脚本，差异即失败。
+#
+# ConfigMap 里真正的配置面常常不是 ConfigMap 的键，而是被嵌进某个值里的整份
+# 文档（cogneva.json 挂进来时键只有一个，少掉的字段藏在值里），所以值是 JSON
+# 的按字段逐层比，不能只比键名。
 #
 # 用法：bash deploy/scripts/check-deploy-parity.sh [仓库根目录]
 set -euo pipefail
@@ -32,7 +37,7 @@ helm template cogneva deploy/helm/cogneva \
   > "$TMP/helm.yaml"
 
 python3 - "$TMP/k3s.yaml" "$TMP/helm.yaml" <<'PYEOF'
-import sys, yaml
+import sys, json, yaml
 
 def load(path):
     return {(d['kind'], d['metadata']['name']): d
@@ -76,7 +81,49 @@ def svc(doc):
                             for p in s.get('ports', []))}
 
 def cm(doc):
-    return {'keys': sorted(doc.get('data', {}).keys())}
+    return doc.get('data', {})
+
+def shortened(v, limit=200):
+    """A value can be a whole document; printing it raw buries every other
+    finding, so cap the excerpt but keep the size visible."""
+    s = repr(v)
+    return s if len(s) <= limit else f"{s[:limit]}…(+{len(s) - limit} chars)"
+
+def cfg_value(raw):
+    """The config document a ConfigMap value carries. JSON first (cogneva.json),
+    then YAML (prompt and manifest fragments), else plain text with only
+    trailing whitespace normalized — a block scalar's final newline differs
+    between `|` and `|-` styles without the content differing."""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+    try:
+        return yaml.safe_load(raw)
+    except yaml.YAMLError:
+        pass
+    return '\n'.join(line.rstrip() for line in raw.rstrip().splitlines())
+
+def json_diff(a, b, path=''):
+    """Yield every place two config trees disagree, by path."""
+    if type(a) is not type(b):
+        yield f"{path}: k3s={shortened(a)} helm={shortened(b)}"
+    elif isinstance(a, dict):
+        for k in sorted(set(a) | set(b)):
+            if k not in a:
+                yield f"{path}.{k}: helm-only ({shortened(b[k])})"
+            elif k not in b:
+                yield f"{path}.{k}: k3s-only ({shortened(a[k])})"
+            else:
+                yield from json_diff(a[k], b[k], f"{path}.{k}")
+    elif isinstance(a, list):
+        if len(a) != len(b):
+            yield f"{path}: k3s has {len(a)} entries, helm {len(b)}"
+        else:
+            for i, (x, y) in enumerate(zip(a, b)):
+                yield from json_diff(x, y, f"{path}[{i}]")
+    elif a != b:
+        yield f"{path}: k3s={shortened(a)} helm={shortened(b)}"
 
 k, h = load(sys.argv[1]), load(sys.argv[2])
 errors = []
@@ -114,22 +161,27 @@ for name in sorted(set(k) & set(h)):
             errors.append(f"Service/{name[1]} port k3s-only: {x}")
         for x in sorted(set(ha['ports']) - set(ka['ports'])):
             errors.append(f"Service/{name[1]} port helm-only: {x}")
-    elif kind in ('ResourceQuota', 'LimitRange'):
-        # 治理对象的数值是能力面的一部分（上限定小了，扩容时新 Pod 会被
-        # 直接拒绝），所以整份 spec 逐字段比，不接受"名字对上就算对齐"。
-        if k[name].get('spec') != h[name].get('spec'):
-            errors.append(f"{kind}/{name[1]} spec: k3s={k[name].get('spec')!r} "
-                          f"helm={h[name].get('spec')!r}")
+    elif kind in ('ResourceQuota', 'LimitRange', 'PersistentVolumeClaim'):
+        # 治理对象与卷声明的数值是能力面的一部分（上限定小了扩容时新 Pod 会被
+        # 直接拒绝，卷声明写小了应用会写爆也无人报错），所以整份 spec 逐字段
+        # 比，不接受"名字对上就算对齐"。
+        for d in json_diff(k[name].get('spec'), h[name].get('spec'), 'spec'):
+            errors.append(f"{kind}/{name[1]}/{d}")
     elif kind == 'ConfigMap':
         ka, ha = cm(k[name]), cm(h[name])
-        for x in sorted(set(ka['keys']) - set(ha['keys'])):
+        for x in sorted(set(ka) - set(ha)):
             errors.append(f"ConfigMap/{name[1]} key k3s-only: {x}")
-        for x in sorted(set(ha['keys']) - set(ka['keys'])):
+        for x in sorted(set(ha) - set(ka)):
             errors.append(f"ConfigMap/{name[1]} key helm-only: {x}")
+        # 值里的配置文档逐字段比。挂进来的 cogneva.json 键只有一个，真正的配置
+        # 面全在值里，只比键名会让「少一段配置」无声通过。
+        for x in sorted(set(ka) & set(ha)):
+            for d in json_diff(cfg_value(ka[x]), cfg_value(ha[x]), x):
+                errors.append(f"ConfigMap/{name[1]}/{d}")
 
 if errors:
     print("PARITY 校验失败：")
     for e in errors: print("  - " + e)
     sys.exit(1)
-print(f"PARITY OK：{len(k)} 个资源，工作负载字段（env/卷/挂载/端口/SA）全对齐")
+print(f"PARITY OK：{len(k)} 个资源，工作负载字段与卷声明全对齐")
 PYEOF

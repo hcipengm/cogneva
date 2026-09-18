@@ -156,7 +156,8 @@ data:
 
       reflection:evolution_change_system:
         content: |
-          Respond with a Markdown code block containing the code change as a unified git diff.
+          Respond with a Markdown code block containing the code change as a
+          unified git diff.
         version: "1.0.0"
         description: "EvolutionEngine change system instruction"
         tags: ["reflection", "evolution"]

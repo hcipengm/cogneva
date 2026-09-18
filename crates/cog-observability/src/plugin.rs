@@ -21,6 +21,9 @@ pub struct ObservabilityPlugin {
     /// Per-agent trace buffer budget, read in `init` from config and applied
     /// to the collection task in `start`.
     trace_buffer_max_bytes: usize,
+    /// Data-directory footprint gauge, created in `init` when the deployment
+    /// names a backing claim and scanned by a task spawned in `start`.
+    data_volume: Option<Arc<crate::data_volume::DataVolumeObservable>>,
 }
 
 impl ObservabilityPlugin {
@@ -32,6 +35,7 @@ impl ObservabilityPlugin {
             trace_tier_migrator: None,
             alert_store: None,
             trace_buffer_max_bytes: crate::config::TraceCollectorConfig::default().buffer_max_bytes,
+            data_volume: None,
         }
     }
 }
@@ -262,6 +266,22 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         ctx.publish_service(evolution_metrics);
         info!("ObservabilityPlugin evolution metrics published");
 
+        // ── Data directory footprint ──
+        // The volume's declared size is compared against this gauge; nothing
+        // else measures what a directory-backed volume actually holds, so
+        // without it an overrun has no observation face at all.
+        if !observability.data_volume_watch.claim.is_empty() {
+            let volume = Arc::new(crate::data_volume::DataVolumeObservable::new(
+                observability.data_volume_watch.claim.clone(),
+            ));
+            ctx.publish_observable(volume.clone());
+            self.data_volume = Some(volume);
+            info!(
+                claim = %observability.data_volume_watch.claim,
+                "ObservabilityPlugin data volume footprint published"
+            );
+        }
+
         // ── Persistent alert state machine ──
         // Created here (not in start) so the read-side ActiveAlertSource is
         // published before any plugin's start runs — init_all completes
@@ -338,8 +358,23 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             });
         }
 
-        // ── Alert bridge: notification outlet + persistent state machine ──
+        // ── Data directory footprint ──
         let obs_cfg = crate::ObservabilityExportersConfig::load()?;
+        if let Some(ref volume) = self.data_volume {
+            let data_dir = std::path::PathBuf::from(&ctx.config().app.data_dir);
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            tokio::spawn(crate::data_volume::run_data_volume_watch(
+                data_dir,
+                volume.clone(),
+                obs_cfg.data_volume_watch.interval_secs,
+                shutdown,
+            ));
+        }
+
+        // ── Alert bridge: notification outlet + persistent state machine ──
         let alert_store = self.alert_store.clone();
         let webhook =
             if obs_cfg.alertmanager.enabled && !obs_cfg.alertmanager.webhook_url.is_empty() {
