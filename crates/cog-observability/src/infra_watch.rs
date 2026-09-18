@@ -230,11 +230,41 @@ pub async fn query_prometheus(
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     if !resp.is_success() {
-        return Err(format!("prometheus returned {}", resp.status));
+        return Err(match describe_api_error(&resp.body) {
+            Some(detail) => format!("prometheus returned {}: {detail}", resp.status),
+            None => format!("prometheus returned {}", resp.status),
+        });
     }
     let body: serde_json::Value =
         serde_json::from_slice(&resp.body).map_err(|e| format!("invalid JSON: {e}"))?;
     parse_vector_response(&body)
+}
+
+/// The reason Prometheus rejected a query, read from the response body.
+///
+/// The status code alone cannot carry the decision: Prometheus answers 422 for
+/// every execution failure, and those are not interchangeable — a duplicate
+/// series in the match group clears up on its own, while a rule that can never
+/// evaluate is broken configuration. `errorType` plus `error` says which. None
+/// when the body is not the API's error shape (a proxy in the path, a partial
+/// read), so the caller still reports the bare status instead of nothing.
+fn describe_api_error(body: &[u8]) -> Option<String> {
+    /// Prometheus messages embed the whole match group; enough to recognise
+    /// the cause, not enough to flood the alert row.
+    const MAX_CHARS: usize = 300;
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let kind = v.get("errorType").and_then(|e| e.as_str())?;
+    let msg = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+    let full = format!("{kind}: {msg}");
+    if full.chars().count() <= MAX_CHARS {
+        return Some(full);
+    }
+    Some(
+        full.chars()
+            .take(MAX_CHARS)
+            .chain(std::iter::once('…'))
+            .collect(),
+    )
 }
 
 /// Parse a Prometheus instant-vector response body into samples. Anything
@@ -505,6 +535,34 @@ mod tests {
             urlencoding("up{job=\"x\"} > 0"),
             "up%7Bjob%3D%22x%22%7D%20%3E%200"
         );
+    }
+
+    /// The status code is not the diagnosis: Prometheus puts the cause in the
+    /// body, and two rules can both answer 422 for unrelated reasons.
+    #[test]
+    fn describe_api_error_reads_the_reason_from_the_body() {
+        let body = br#"{"status":"error","errorType":"execution","error":"found duplicate series for the match group {namespace=\"cogneva\"} on the right hand-side"}"#;
+        let detail = describe_api_error(body).unwrap();
+        assert!(detail.starts_with("execution: "), "{detail}");
+        assert!(detail.contains("duplicate series"), "{detail}");
+    }
+
+    /// A body that is not the API's error shape must still yield a reportable
+    /// status rather than a bogus detail.
+    #[test]
+    fn describe_api_error_gives_nothing_for_a_foreign_body() {
+        assert!(describe_api_error(b"<html>502 Bad Gateway</html>").is_none());
+        assert!(describe_api_error(br#"{"status":"error"}"#).is_none());
+    }
+
+    /// `error` carries the whole match group; the alert row does not need it.
+    #[test]
+    fn describe_api_error_bounds_what_it_carries() {
+        let long = "x".repeat(5000);
+        let body = format!(r#"{{"status":"error","errorType":"bad_data","error":"{long}"}}"#);
+        let detail = describe_api_error(body.as_bytes()).unwrap();
+        assert_eq!(detail.chars().count(), 301, "capped plus an ellipsis");
+        assert!(detail.ends_with('…'));
     }
 
     /// HTTP client stub: fails every request until flipped to succeed.
