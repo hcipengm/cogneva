@@ -1,5 +1,6 @@
 //! Execution runtimes — WASM (wasmtime) and Rhai scripting.
 
+pub mod cgroup;
 pub mod composite;
 pub mod loader;
 pub mod local;

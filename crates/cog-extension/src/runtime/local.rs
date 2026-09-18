@@ -49,6 +49,35 @@ fn signal_name(sig: i32) -> &'static str {
     }
 }
 
+/// The stderr note for a death by signal. A `SIGKILL` reaches here from three
+/// places that need different responses -- the cgroup memory limit, an outside
+/// kill, a crash -- and only the counter in the command's cgroup can say which,
+/// so the memory cause is named only when that counter rose across the command.
+fn signal_death_note(sig: i32, facts: &super::cgroup::MemoryFacts, oom: bool) -> String {
+    let named = signal_name(sig);
+    let signal = if named.is_empty() {
+        format!("signal {sig}")
+    } else {
+        format!("signal {sig} ({named})")
+    };
+    if !oom {
+        return format!("command killed by {signal}");
+    }
+    match (facts.limit_bytes, facts.peak_bytes) {
+        (Some(limit), Some(peak)) => format!(
+            "command killed by {signal}: the container memory limit OOM-killed it \
+             (limit {limit} bytes, peak reached {peak} bytes)"
+        ),
+        (Some(limit), None) => format!(
+            "command killed by {signal}: the container memory limit OOM-killed it \
+             (limit {limit} bytes)"
+        ),
+        (None, _) => {
+            format!("command killed by {signal}: the container memory limit OOM-killed it")
+        }
+    }
+}
+
 /// Spawn `sh -c <command>` and drive stdout/stderr/exit into an event channel.
 /// Shared by the local backend and the executor server; kills the child on
 /// timeout.
@@ -74,6 +103,9 @@ pub(crate) fn spawn_command(
     if let Some(target) = cargo_target {
         cmd.env("CARGO_TARGET_DIR", target);
     }
+    // Read before the child exists: the kill count is cumulative, so the only
+    // way to charge a kill to this command is to know where it started.
+    let memory_before = super::cgroup::read();
     let mut child = cmd
         .spawn()
         .map_err(|e| cog_core::SFError::IO(format!("spawn sh: {}", e)))?;
@@ -136,12 +168,12 @@ pub(crate) fn spawn_command(
             Ok(Ok(status)) => match (status.code(), status.signal()) {
                 (Some(c), _) => c,
                 (None, Some(sig)) => {
-                    let named = signal_name(sig);
-                    let data = if named.is_empty() {
-                        format!("command killed by signal {sig}")
-                    } else {
-                        format!("command killed by signal {sig} ({named})")
-                    };
+                    let facts = super::cgroup::read();
+                    let oom = super::cgroup::MemoryFacts::oom_kill_between(&memory_before, &facts);
+                    if oom {
+                        super::cgroup::record_oom_kill(facts.limit_bytes, facts.peak_bytes);
+                    }
+                    let data = signal_death_note(sig, &facts, oom);
                     let _ = tx.send(CommandEvent::Stderr { data }).await;
                     128 + sig
                 }
@@ -311,6 +343,54 @@ mod tests {
             term.stderr.contains("signal 15 (SIGTERM)"),
             "{}",
             term.stderr
+        );
+    }
+
+    /// The memory cause is named only when the cgroup counter moved across the
+    /// command, and then it carries the ceiling that was hit. Guessing it from
+    /// the signal number alone would blame the memory limit for an outside
+    /// kill, and a build that dies of an actual OOM with no numbers attached
+    /// leaves the reader unable to tell a too-small limit from a bad change.
+    #[test]
+    fn a_memory_limit_kill_names_the_ceiling_and_nothing_else_claims_one() {
+        let facts = super::super::cgroup::MemoryFacts {
+            limit_bytes: Some(1073741824),
+            peak_bytes: Some(1073741824),
+            oom_kills: Some(7),
+        };
+        let oom = signal_death_note(9, &facts, true);
+        assert!(oom.contains("signal 9 (SIGKILL)"), "{oom}");
+        assert!(oom.contains("memory limit OOM-killed"), "{oom}");
+        assert!(oom.contains("limit 1073741824 bytes"), "{oom}");
+        assert!(oom.contains("peak reached 1073741824 bytes"), "{oom}");
+
+        // The counter read fine but did not move: the kill came from elsewhere
+        // and the note must not mention memory at all.
+        let outside = signal_death_note(9, &facts, false);
+        assert_eq!(outside, "command killed by signal 9 (SIGKILL)");
+
+        // Counter rose but the cgroup published no ceiling: still an OOM kill,
+        // just without a number to quote.
+        let unmeasured = signal_death_note(
+            9,
+            &super::super::cgroup::MemoryFacts {
+                oom_kills: Some(1),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(
+            unmeasured.contains("memory limit OOM-killed"),
+            "{unmeasured}"
+        );
+        assert!(!unmeasured.contains("bytes"), "{unmeasured}");
+    }
+
+    #[test]
+    fn an_unknown_signal_number_is_still_reported() {
+        assert_eq!(
+            signal_death_note(64, &Default::default(), false),
+            "command killed by signal 64"
         );
     }
 

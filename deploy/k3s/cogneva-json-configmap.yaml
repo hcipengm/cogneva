@@ -441,6 +441,15 @@ data:
               "summary": "cogneva workload container last exit was OOMKilled; memory footprint exceeds its limit"
             },
             {
+              "name": "sandbox_command_oom_killed",
+              "promql": "increase(sandbox_oom_kills_total[30m])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The sandbox container's memory limit killed {value} command(s) in the last 30m. A child process dying here leaves the container itself running, so nothing reaches the container-level OOMKilled signal, and the build that died reads downstream as an ordinary failure with empty output; a command that keeps dying at the limit needs a bigger limit, not a different change"
+            },
+            {
               "name": "ralph_loop_terminations_high",
               "promql": "increase(ralph_terminations_total[30m])",
               "condition": {

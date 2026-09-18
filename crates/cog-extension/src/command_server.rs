@@ -184,11 +184,15 @@ async fn execute_handler(
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> Response {
-    let body = state
+    // The memory ceiling belongs on the same surface as the worktree counters:
+    // it is the other half of "why did this build die", and it applies even
+    // where no workdir router was provisioned.
+    let mut body = state
         .workdir
         .as_ref()
         .map(|r| r.metrics().render())
         .unwrap_or_default();
+    body.push_str(&crate::runtime::cgroup::render());
     Response::builder()
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
         .body(Body::from(body))
