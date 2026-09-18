@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, Request, State, WebSocketUpgrade},
+    extract::{MatchedPath, Path, Query, Request, State, WebSocketUpgrade},
     http::{header, Method, StatusCode},
     middleware::{from_fn, Next},
     response::{IntoResponse, Response},
@@ -839,6 +839,11 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
                 let metrics = state.metrics_backend.clone();
                 let method = req.method().to_string();
                 let uri = req.uri().path().to_string();
+                // 指标标签取路由模板（`/api/v1/tasks/{id}`）而不是原始路径：原始
+                // 路径把每个 task id 都变成一条独立序列，序列数随请求数线性增长，
+                // 而序列没有任何回收路径，抓取正文与标签索引会随运行时间无限膨胀。
+                // 原始路径仍原样进 RawRecord——那是逐请求的流水，不是被聚合的序列。
+                let endpoint = metric_endpoint_label(req.extensions().get::<MatchedPath>());
                 let request_id = uuid::Uuid::new_v4().to_string();
 
                 // Extract or generate distributed tracing context.
@@ -908,7 +913,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
                     if let Some(ref mb) = metrics {
                         let mut labels = HashMap::new();
                         labels.insert("method".into(), method.clone());
-                        labels.insert("endpoint".into(), uri.clone());
+                        labels.insert("endpoint".into(), endpoint.clone());
                         labels.insert("status".into(), status.to_string());
                         if let Err(e) = mb
                             .record_counter("http_requests_total", 1.0, labels.clone())
@@ -979,6 +984,24 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
             ])
     }
 }
+
+/// The `endpoint` label every HTTP metric is keyed by.
+///
+/// It has to be the route pattern rather than the request path: a path carries
+/// the identity of whatever object the caller asked for, so keying a series on
+/// it mints a new series per object ever requested. Those series are never
+/// reclaimed, so both the exposition and the label index grow with traffic
+/// forever. A request that matched no route has no pattern, and its path is the
+/// least trustworthy thing to key on — anything can be requested — so it
+/// collapses into one constant series instead.
+fn metric_endpoint_label(matched: Option<&MatchedPath>) -> String {
+    matched
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| UNMATCHED_ENDPOINT_LABEL.to_string())
+}
+
+/// Label value for requests that matched no route.
+const UNMATCHED_ENDPOINT_LABEL: &str = "unmatched";
 
 /// Prometheus metrics endpoint — serves memory operation counters,
 /// latency histograms, and task operation counters from the MetricsBackend
@@ -2445,4 +2468,59 @@ async fn a2a_agent_card_handler(State(state): State<Arc<GatewayState>>) -> Respo
         },
     };
     (StatusCode::OK, Json(json!(card))).into_response()
+}
+
+#[cfg(test)]
+mod http_metric_label_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    /// 无路由匹配时不能退回原始路径：那等于把任意请求路径（扫描器随便打什么
+    /// 都算）变成序列名，卡口就又开了。
+    #[test]
+    fn request_without_a_route_falls_back_to_one_constant_label() {
+        assert_eq!(metric_endpoint_label(None), UNMATCHED_ENDPOINT_LABEL);
+    }
+
+    /// 标签取自路由模板的那一半：一个动态段被请求多少次都落在同一条序列上。
+    ///
+    /// 这条断言必须经过真正的 Router 才算数——模板是路由层塞进 extensions 的，
+    /// 一旦中间件与路由的相对位置变了（例如换成在匹配之前就包裹整棵树的挂法），
+    /// 取到的就永远是 None，而纯函数单测发现不了这种接线错误。
+    #[tokio::test]
+    async fn dynamic_segment_requests_share_one_series_label() {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
+
+        let app = Router::new()
+            .route("/api/v1/tasks/{id}", get(|| async { "ok" }))
+            .layer(from_fn(move |req: Request, next: Next| {
+                let sink = sink.clone();
+                async move {
+                    let label = metric_endpoint_label(req.extensions().get::<MatchedPath>());
+                    sink.lock().unwrap().push(label);
+                    next.run(req).await
+                }
+            }));
+
+        for id in ["7f3a", "91bd"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/tasks/{id}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec!["/api/v1/tasks/{id}".to_string(); 2]
+        );
+    }
 }
