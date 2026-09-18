@@ -1446,31 +1446,75 @@ async fn run_evolution_cycle(
     deps.workspaces.refresh(&workspace, base.clone()).await?;
     info!(path = %workspace.path.display(), "evolution cycle workspace ready");
 
-    // 引擎用基线树做 diff 可应用性校验，它必须与被校验的变更处在同一基线：
-    // 基线树停在旧提交时，新基线带进来的改动会让本来合法的变更在 --check
-    // 阶段被误判为打不上，变更被丢弃却看不出原因。基线与本轮工作树同源，
-    // 就地移动 HEAD 即可。
-    match deps
+    // 引擎基线树在这里只保证存在；它停在哪由本轮工作树的实际 HEAD 决定，
+    // 见 `align_engine_baseline`。这里若顺手 reset 一次，同步到主线后反而
+    // 把基线留在解析出的旧基线上。
+    if let Err(e) = deps
         .workspaces
         .ensure_persistent(WorkspaceSpec::persistent(
             "engine-baseline",
             WorkspaceKind::EngineBaseline,
-            base.clone(),
+            base,
         ))
         .await
     {
-        Ok(baseline) => {
-            if let Err(e) = deps.workspaces.refresh(&baseline, base).await {
-                warn!(
-                    error = %e,
-                    "engine baseline refresh failed; change validation keeps the previous baseline"
-                );
-            }
-        }
-        Err(e) => warn!(error = %e, "engine baseline workspace unavailable"),
+        warn!(error = %e, "engine baseline workspace unavailable");
     }
 
     run_evolution_cycle_in(deps, &workspace.path).await
+}
+
+/// 把引擎基线工作树挪到本轮工作树的 HEAD。
+///
+/// 引擎拿基线树跑 `git apply --check` 校验生成的变更，而变更真正被应用与测试
+/// 的是本轮工作树。两棵树停在不同的提交上时，校验结论说的是另一棵树：主线新
+/// 带进来的改动会让本来合法的变更被判成打不上，随后被丢弃却说不出原因。读不
+/// 到本轮 HEAD 就不移动——没有证据时沿用上一轮基线，好过按猜的提交去 reset。
+async fn align_engine_baseline(
+    workspaces: &Arc<crate::workspace::WorkspaceManager>,
+    workdir: &std::path::Path,
+) {
+    use crate::workspace::{BaseRef, WorkspaceKind, WorkspaceSpec};
+
+    let Some(head) = workspaces.head_of(workdir).await else {
+        warn!(
+            path = %workdir.display(),
+            "cycle workspace HEAD unreadable; engine baseline left where it was"
+        );
+        return;
+    };
+    let baseline = match workspaces
+        .ensure_persistent(WorkspaceSpec::persistent(
+            "engine-baseline",
+            WorkspaceKind::EngineBaseline,
+            BaseRef::Commit(head.clone()),
+        ))
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "engine baseline workspace unavailable; change validation keeps the previous baseline"
+            );
+            return;
+        }
+    };
+    if workspaces.head_of(&baseline.path).await.as_deref() == Some(head.as_str()) {
+        return;
+    }
+    if let Err(e) = workspaces
+        .refresh(&baseline, BaseRef::Commit(head.clone()))
+        .await
+    {
+        warn!(
+            error = %e,
+            head = %head,
+            "engine baseline refresh failed; change validation keeps the previous baseline"
+        );
+    } else {
+        info!(head = %head, "engine baseline aligned to the round workspace");
+    }
 }
 
 async fn run_evolution_cycle_in(
@@ -1497,6 +1541,10 @@ async fn run_evolution_cycle_in(
     if let Err(e) = pipeline.sync_with_upstream_in(workdir).await {
         warn!(error = %e, "Sandbox source sync failed; continuing with current tree");
     }
+
+    // 校验基线跟着本轮工作树走：同步后工作树已经在新主线上，基线还停在
+    // 解析出的版本 tag 上就是两个提交。
+    align_engine_baseline(workspaces, workdir).await;
 
     let changes = pipeline.pending_changes(Some(evo_engine)).await?;
     if changes.is_empty() {
@@ -1940,6 +1988,141 @@ mod tests {
         assert!(
             expected_binary.exists(),
             "binary should be copied to binary_dir/cogneva in sandbox mode"
+        );
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// 裸仓库带两个提交：`old` 相当于版本 tag，`new` 相当于已前进的上游主线。
+    fn seed_two_commits(root: &std::path::Path) -> (std::path::PathBuf, String, String) {
+        let work = root.join("seed");
+        std::fs::create_dir_all(&work).unwrap();
+        git_in(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("a.txt"), "a\n").unwrap();
+        git_in(&work, &["add", "-A"]);
+        git_in(&work, &["commit", "-qm", "a"]);
+        let old = git_in(&work, &["rev-parse", "HEAD"]);
+        std::fs::write(work.join("b.txt"), "b\n").unwrap();
+        git_in(&work, &["add", "-A"]);
+        git_in(&work, &["commit", "-qm", "b"]);
+        let new = git_in(&work, &["rev-parse", "HEAD"]);
+        let bare = root.join("bare.git");
+        git_in(
+            root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        (bare, old, new)
+    }
+
+    async fn seeded_workspaces(
+        root: &std::path::Path,
+        old: &str,
+    ) -> Arc<crate::workspace::WorkspaceManager> {
+        use crate::workspace::{BaseRef, WorkspaceKind, WorkspaceSpec};
+        let bare = root.join("bare.git");
+        let workspaces = Arc::new(crate::workspace::WorkspaceManager::new(
+            &bare,
+            root.join("workspaces"),
+            root.join("target"),
+        ));
+        // 轮首：解析出的基线是版本 tag，工作树与基线都停在旧提交。
+        workspaces
+            .ensure_persistent(WorkspaceSpec::persistent(
+                "cycle-t",
+                WorkspaceKind::Cycle,
+                BaseRef::Commit(old.to_string()),
+            ))
+            .await
+            .unwrap();
+        workspaces
+            .ensure_persistent(WorkspaceSpec::persistent(
+                "engine-baseline",
+                WorkspaceKind::EngineBaseline,
+                BaseRef::Commit(old.to_string()),
+            ))
+            .await
+            .unwrap();
+        workspaces
+    }
+
+    /// 引擎拿基线树跑 `git apply --check`，变更却在轮工作树里应用与测试：两棵树
+    /// 必须停在同一个提交，否则校验结论说的是另一棵树。轮内工作树被同步到上游
+    /// 主线之后，基线要跟着走。
+    #[tokio::test]
+    async fn engine_baseline_follows_the_round_workspace_head() {
+        use crate::workspace::BaseRef;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_bare, old, new) = seed_two_commits(tmp.path());
+        let workspaces = seeded_workspaces(tmp.path(), &old).await;
+        let cycle = workspaces.cycle_workspace("t");
+
+        // 同步到上游主线：工作树前进了，基线还停在轮首的版本 tag 上。
+        let ws = workspaces
+            .ensure_persistent(crate::workspace::WorkspaceSpec::persistent(
+                "cycle-t",
+                crate::workspace::WorkspaceKind::Cycle,
+                BaseRef::Commit(old.clone()),
+            ))
+            .await
+            .unwrap();
+        workspaces
+            .refresh(&ws, BaseRef::Commit(new.clone()))
+            .await
+            .unwrap();
+        let baseline = workspaces.engine_baseline_workspace();
+        assert_eq!(
+            workspaces.head_of(&baseline).await.as_deref(),
+            Some(old.as_str()),
+            "前提：基线此刻还停在旧提交"
+        );
+
+        align_engine_baseline(&workspaces, &cycle).await;
+
+        assert_eq!(
+            workspaces.head_of(&baseline).await.as_deref(),
+            Some(new.as_str()),
+            "基线与校验对象必须停在同一个提交"
+        );
+    }
+
+    /// 读不到轮工作树的 HEAD 就不移动基线：没有证据时沿用上一轮的基线，好过按
+    /// 猜的提交去 reset。
+    #[tokio::test]
+    async fn engine_baseline_stays_put_when_round_head_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_bare, old, _new) = seed_two_commits(tmp.path());
+        let workspaces = seeded_workspaces(tmp.path(), &old).await;
+        let baseline = workspaces.engine_baseline_workspace();
+
+        align_engine_baseline(&workspaces, &tmp.path().join("not-a-repo")).await;
+
+        assert_eq!(
+            workspaces.head_of(&baseline).await.as_deref(),
+            Some(old.as_str()),
+            "没有 HEAD 证据时基线不能被移动"
         );
     }
 }

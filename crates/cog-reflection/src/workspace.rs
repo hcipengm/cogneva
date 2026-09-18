@@ -345,6 +345,16 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// 某棵工作树当前的 HEAD。读不到返回 `None`——调用方据此保持原状，而不是
+    /// 猜一个提交去移动别人。
+    pub async fn head_of(&self, path: &Path) -> Option<String> {
+        self.git_in(path, &["rev-parse", "HEAD"])
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     pub async fn list(&self) -> SFResult<Vec<WorktreeEntry>> {
         let out = self.git_bare(&["worktree", "list", "--porcelain"]).await?;
         // 裸仓库自身也会出现在 git 的列表里，但它不是分配出去的工作树。
