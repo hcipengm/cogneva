@@ -599,6 +599,81 @@ fn unschedulable_pods(out: &str) -> Vec<(String, String)> {
     v
 }
 
+/// 一条准入被拒的 ReplicaSet 现场。
+///
+/// ReplicaSet 是唯一知道「Pod 压根没被建出来」的对象：配额超限、校验失败这类
+/// 准入拒绝发生在 API 层，失败落在 RS 的 `ReplicaFailure` 条件上，而**没有 Pod
+/// 对象**——只看 Pod 的采样一条都取不到，等回到集群时那条 `FailedCreate` 事件
+/// 也早过了一小时窗口。
+struct ReplicaSetFailure {
+    name: String,
+    reason: String,
+    message: String,
+}
+
+impl ReplicaSetFailure {
+    /// 条件里没给的字段留空，拼接时不留空段——`FailedCreate: ` 后面跟空串比只
+    /// 写 reason 更难读。
+    fn detail(&self) -> String {
+        match (self.reason.is_empty(), self.message.is_empty()) {
+            (false, false) => format!("{}: {}", self.reason, self.message),
+            (false, true) => self.reason.clone(),
+            (true, false) => self.message.clone(),
+            (true, true) => String::new(),
+        }
+    }
+}
+
+/// 从 ReplicaSet 采样行里挑出**本次滚动**里准入被拒的副本集。
+///
+/// 每行形如 `name|specReplicas|failureStatus|reason|message`，查询已按条件类型
+/// 过滤到 `ReplicaFailure`。两个判据缺一不可：
+///
+/// - `failureStatus == True`：条件以 `False` 留存说的是那次失败已经过去。RS 是
+///   长期对象，一条历史失败会一直挂在它上面，把它记成本次病因就是拿旧账当新病情。
+/// - `specReplicas != 0`：同一个部署的历代 RS 都带这套标签，选择器会全捞回来，
+///   而只有期望副本数不为零的那个才是这次上线要的。读不出副本数的残行同样不算。
+///
+/// 第二条判据**依赖当前四个部署的滚动策略都是「先缩旧再建新」**（`maxSurge=0/
+/// maxUnavailable=1` 或 `Recreate`），旧 RS 在超时时已被缩到 0，所以非零的只剩
+/// 本次那个。若将来哪个目标改成 `maxSurge>0`，新旧 RS 会同时非零，这里会把上一
+/// 代的历史失败一起记成病因——届时判据要再加上「RS 的 Pod 模板与目标镜像同源」。
+fn replicaset_failures(out: &str) -> Vec<ReplicaSetFailure> {
+    let mut v = Vec::new();
+    for line in out.lines() {
+        let f = sample_fields(line);
+        if f.len() < 4 || f[0].is_empty() {
+            continue;
+        }
+        let desired: u32 = match f[1].parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if desired == 0 || f[2] != "True" {
+            continue;
+        }
+        v.push(ReplicaSetFailure {
+            name: f[0].to_string(),
+            reason: f[3].to_string(),
+            message: f.get(4).copied().unwrap_or("").to_string(),
+        });
+    }
+    v
+}
+
+/// 追加一段现场到诊断串：段间用 `; ` 分隔，空段不占位。空字段是「没有该信号」
+/// 而不是「信号为空」，留一个空段只会把真正的病因埋进一串分隔符里。
+fn push_diagnosis_segment(out: &mut String, label: &str, body: &str) {
+    if body.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push_str("; ");
+    }
+    out.push_str(label);
+    out.push_str(body);
+}
+
 /// deployment 是否已滚完：observedGeneration 追上 generation，且
 /// updated/ready 副本数达期望。解析不出（滚动交替期的空输出、omitempty
 /// 字段缺失）一律当未收敛，由外层按预算继续轮询。纯函数：只看 kubectl
@@ -2740,7 +2815,8 @@ impl RolloutExecutor {
         self.with_scene(t, msg).await
     }
 
-    /// 滚动超时时采样现场：Pod 相位、容器等待原因/消息、本次部署最近的事件。
+    /// 滚动超时时采样现场：Pod 相位、容器等待原因/消息、准入被拒的副本集、
+    /// 本次部署最近的事件。
     ///
     /// 副本计数（`spec|updated|ready|unavailable`）只给结论不给原因——「Pod
     /// 排不上队一直 Pending」与「容器起来了但一直不 ready」在这个向量里长得
@@ -2750,6 +2826,7 @@ impl RolloutExecutor {
     /// 采样是尽力而为：任何一步取不到都留空，观测失败不变成第二个错误。
     async fn rollout_diagnosis(&self, t: &RolloutTarget) -> String {
         let samples = self.sample_rollout_pods(t).await;
+        let replicasets = self.sample_replicaset_failures(t).await;
         // 只取 Warning：正常滚动事件（ScalingReplicaSet 等）说明不了病因，
         // 排不上队与探针不过都落在 Warning 里。
         let events = self
@@ -2769,15 +2846,22 @@ impl RolloutExecutor {
             .await
             .unwrap_or_default();
         let mut out = summarize_pod_states(&samples, Utc::now());
+        let rs = replicasets
+            .iter()
+            .map(|r| {
+                let d = r.detail();
+                if d.is_empty() {
+                    r.name.clone()
+                } else {
+                    format!("{} {}", r.name, d)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        push_diagnosis_segment(&mut out, "replicasets: ", &rs);
         let names: Vec<String> = samples.iter().map(|p| p.name.clone()).collect();
         let ev = summarize_events(&events, &t.deployment, &names, DIAGNOSIS_EVENT_LIMIT);
-        if !ev.is_empty() {
-            if !out.is_empty() {
-                out.push_str("; ");
-            }
-            out.push_str("events: ");
-            out.push_str(&ev);
-        }
+        push_diagnosis_segment(&mut out, "events: ", &ev);
         out
     }
 
@@ -2807,6 +2891,37 @@ impl RolloutExecutor {
             .await
             .unwrap_or_default();
         unschedulable_pods(&out)
+    }
+
+    /// 本次部署里准入被拒的 ReplicaSet（配额超限、校验失败）。判据取 RS 自己
+    /// 上报的类型化条件 `ReplicaFailure`，不靠读事件文本反推。
+    ///
+    /// 单列一条查询的理由：准入被拒时 **Pod 对象根本不存在**，Pod 采样一条都
+    /// 取不到，而那条 `FailedCreate` 的 Warning 事件挂在 RS 上，事件过滤只留
+    /// 同名 Deployment 与采样到的 Pod，会被整条丢掉。没有这条查询，一次因配额
+    /// 拒绝而超时的滚动在记录里只剩副本计数，病因是空的。
+    ///
+    /// 采样尽力而为：取不到就返回空，观测失败不产生第二个错误。
+    async fn sample_replicaset_failures(&self, t: &RolloutTarget) -> Vec<ReplicaSetFailure> {
+        let selector = pod_selector(&t.name, &t.component);
+        let out = self
+            .run_kubectl(
+                &[
+                    "get",
+                    "replicasets",
+                    "-l",
+                    &selector,
+                    "-o",
+                    "jsonpath={range .items[*]}{.metadata.name}|{.spec.replicas}|\
+                     {.status.conditions[?(@.type==\"ReplicaFailure\")].status}|\
+                     {.status.conditions[?(@.type==\"ReplicaFailure\")].reason}|\
+                     {.status.conditions[?(@.type==\"ReplicaFailure\")].message}{\"\\n\"}{end}",
+                ],
+                30,
+            )
+            .await
+            .unwrap_or_default();
+        replicaset_failures(&out)
     }
 
     /// 快照部署当前的放置面，供判定「排不上队是不是这次上线改出来的」。
@@ -3380,6 +3495,32 @@ mod tests {
         assert!(unschedulable_pods("|Pending|False|Unschedulable|\n").is_empty());
         assert!(unschedulable_pods("p-a|Running|True||\n").is_empty());
         assert!(unschedulable_pods("").is_empty());
+    }
+
+    #[test]
+    fn replicaset_failures_take_this_rollouts_admission_rejection_only() {
+        let out = "gw-new|1|True|FailedCreate|pods \"gw-new-x\" is forbidden: exceeded quota: cogneva-quota\n\
+                   gw-old|0|True|FailedCreate|pods \"gw-old-x\" is forbidden: exceeded quota: cogneva-quota\n\
+                   gw-healed|1|False|FailedCreate|pods \"gw-healed-x\" is forbidden\n\
+                   gw-ok|1|||\n";
+        let got = replicaset_failures(out);
+        // 只有「期望副本数不为零 + 条件为 True」的那条进现场：旧 RS 的失败是
+        // 上一轮的账，条件被翻回 False 说明那次拒绝已过去。
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "gw-new");
+        assert_eq!(got[0].reason, "FailedCreate");
+        assert_eq!(
+            got[0].detail(),
+            "FailedCreate: pods \"gw-new-x\" is forbidden: exceeded quota: cogneva-quota"
+        );
+        // 条件里没给 message 时只留 reason，不留 `FailedCreate: ` 这样的空尾巴。
+        let no_msg = replicaset_failures("gw-nodesired|1|True|FailedCreate|\n");
+        assert_eq!(no_msg[0].detail(), "FailedCreate");
+        // 残行、名字为空、副本数读不出、查询整体为空：一律不算。
+        assert!(replicaset_failures("gw-x|1|True\n").is_empty());
+        assert!(replicaset_failures("|1|True|FailedCreate|m\n").is_empty());
+        assert!(replicaset_failures("gw-x||True|FailedCreate|m\n").is_empty());
+        assert!(replicaset_failures("").is_empty());
     }
 
     #[test]
@@ -5743,6 +5884,84 @@ exit 0
                 "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
             ),
             "a replica that never readies is a revision failure and must roll back: {calls}"
+        );
+    }
+
+    /// 假 kubectl：准入被拒的现场——deployment 永不收敛（期望 1 副本、建成 0），
+    /// **一个 Pod 都没有**（配额拒绝发生在建 Pod 之前），RS 上有
+    /// `ReplicaFailure=True / FailedCreate`，且同时挂着上一轮那条已被缩到 0 副本
+    /// 的旧 RS。
+    fn fake_kubectl_admission_rejected(dir: &Path) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *"initContainers[*].name"*) echo "" ;;
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"ReplicaFailure"*)
+    echo "cogneva-sandbox-executor-6d9f4c|1|True|FailedCreate|pods \"cogneva-sandbox-executor-6d9f4c-9xq2p\" is forbidden: exceeded quota: cogneva-quota, requested: limits.cpu=500m, used: limits.cpu=16500m, limited: limits.cpu=17"
+    echo "cogneva-sandbox-executor-57bc1f|0|True|FailedCreate|pods \"cogneva-sandbox-executor-57bc1f-zzzzz\" is forbidden: exceeded quota: cogneva-quota"
+    ;;
+  *"generation"*) echo "1|1|1|0|0|1" ;;
+  *"deletionTimestamp"*) echo "" ;;
+  *"PodScheduled"*) echo "" ;;
+  *"readinessProbe"*) echo "5|10|1|3" ;;
+  *"restartCount"*) echo "" ;;
+  *"waiting.reason"*) echo "" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 准入被拒不产生 Pod 对象，Pod 采样一条都取不到；那条 `FailedCreate` 事件
+    /// 又挂在 RS 上被事件过滤丢掉。记录必须靠 RS 自己的类型化条件说出「配额
+    /// 超限」，否则一次集群放不下新副本的超时在记录里看着就像版本坏了，等人回到
+    /// 集群时事件窗口早过了。
+    #[tokio::test]
+    async fn an_admission_rejection_is_named_in_the_timeout_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_admission_rejected(&bin_dir);
+        // 就绪预算 0：第一轮轮询即判超时，用例不空等。
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 0, 300);
+        let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
+
+        let err = executor.run(&plan).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("replicasets: cogneva-sandbox-executor-6d9f4c FailedCreate"),
+            "the record must name the admission rejection: {msg}"
+        );
+        assert!(msg.contains("exceeded quota"), "{msg}");
+        // 旧 RS（期望副本数已被缩到 0）的历史失败不进现场：拿旧账当新病情，
+        // 会把上一次的病因记到这一次头上。
+        assert!(!msg.contains("57bc1f"), "{msg}");
+
+        // 判定不变：这一轮只改诊断，准入受阻仍按版本类处置（回滚）。把结论
+        // 也锁在这里，是为了让「准入受阻算不算环境」那半个问题改判时，
+        // 必须显式改这条用例，而不是悄悄漂移。
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            calls.contains(
+                "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
+            ),
+            "diagnosis-only change must not alter the verdict: {calls}"
         );
     }
 
