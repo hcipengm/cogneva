@@ -73,6 +73,11 @@ for doc in docs:
 os.remove(src)
 print(f"{profile}: {len(written)} resources rendered")
 PY
+  # 渲染产物自身必须自洽：治理额度/上下限与卷声明、容器声明之间的矛盾在
+  # 安装面才炸，且炸出来的是"声明越界"而不是"版本不好"，但足以让落地通道
+  # 停下。这里就挡住，并把头寸打出来（数值该是多少是 values 的事，本步只
+  # 管彼此不矛盾）。
+  bash "$SCRIPT_DIR/check-governance-consistency.sh" "$out_dir"
 }
 
 if [[ "${1:-}" == "--check" ]]; then

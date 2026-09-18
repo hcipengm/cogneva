@@ -27,6 +27,6 @@ spec:
         memory: "16Mi"
     - type: PersistentVolumeClaim
       max:
-        storage: "50Gi"
+        storage: "80Gi"
       min:
         storage: "1Gi"

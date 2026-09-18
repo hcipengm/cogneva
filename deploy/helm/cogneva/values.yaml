@@ -33,7 +33,15 @@ resourceGovernance:
     limitsCpu: "17"
     limitsMemory: 34Gi
     pods: "40"
-    requestsStorage: 110Gi
+    # 存储声明是**命名空间内全部 PVC 之和的上限**，不是某个卷的容量：目录型卷
+    # 不强制 requests.storage，写多少都不影响落盘，它唯一的作用是拒绝一份声明
+    # 总量越界的清单。所以它必须 ≥ 本 chart 自己声明的和，否则这套清单装不进
+    # 自己的命名空间（实机事故：声明和 188Gi vs 上限 110Gi，PVC 全被拒，落地
+    # 通道断了整天）；而它也不能远高于声明和，否则这个上限就失去意义。当前
+    # 声明和 265Gi（单节点 profile，不含 git-remote），取 300Gi 留 35Gi 头寸。
+    # 每个声明的推导在各自字段旁；渲染期门禁 check-governance-consistency.sh
+    # 会按渲染产物重算这个和并打印头寸，改声明忘记同步这里会直接失败。
+    requestsStorage: 300Gi
   limitRange:
     defaultCpu: 500m
     defaultMemory: 512Mi
@@ -43,7 +51,10 @@ resourceGovernance:
     maxMemory: 8Gi
     minCpu: 10m
     minMemory: 16Mi
-    pvcMaxStorage: 50Gi
+    # 单个 PVC 的上限：必须 ≥ 本 chart 最大的那份卷声明（当前是进化源码卷
+    # 72Gi，实测 target/ 已 57Gi 且随构建增长）。定小了不是"更安全"——同一份
+    # 声明在安装面直接被拒，装不进来；渲染期门禁对每条声明逐个核这个上限。
+    pvcMaxStorage: 80Gi
     pvcMinStorage: 1Gi
 
 # 应用数据目录根（/var/lib/cogneva-data）：实例身份 identity.json、学习数仓
@@ -148,11 +159,14 @@ evolution:
     seedUrl: https://github.com/hcipengm/cogneva.git
     storage: 5Gi
   sandboxStorage: 20Gi
-  sourceStorage: 10Gi
+  # 源码卷：给共享 CARGO_TARGET_DIR 用的（工作树在它之外，可整棵重建而不丢
+  # 增量编译缓存）。本机实测 target/ 已 57Gi——这是全场最大的一笔，也是唯一
+  # 一笔"声明写小了会直接卡住构建"的（缓存被挤掉就每次全量重编），取 72Gi。
+  sourceStorage: 72Gi
   # 进化 Pod 的 /var/lib/cogneva-data 是另一张卷、另一个写入者，声明必须分开：
   # 同一路径两个进程，各自的卷互不相干，共用一份声明必然对其中一个说谎。
-  # 它比主应用重得多——同一热窗口内跑步进化的 ralph/自评审，一天 ≈ 50G 热
-  # trace（主应用同期 ≈ 18G），取 64Gi 留头寸。推导同 appData.storage。
+  # 实测 49Gi（几乎全是 raw-logs 的存量轨迹），取 64Gi 留头寸。推导同
+  # appData.storage：raw-logs 只降层不删除，存量会随冷层长期停留。
   dataStorage: 64Gi
   # 工作树动态分配：部署器与每个进化任务各自从裸仓库检出 git worktree，
   # 任一方把检出停在哪里都不再影响另一方。共享 CARGO_TARGET_DIR 故意留在
@@ -234,7 +248,8 @@ clusterRegistry:
   enabled: true
   image: registry:2
   nodePort: 30500
-  storage: 5Gi
+  # 金丝雀 overlay 逐 rev 累积，实测已 7.4Gi，取 10Gi。
+  storage: 10Gi
   resources:
     requests:
       cpu: 20m
@@ -271,7 +286,8 @@ backends:
   seaweedfs:
     enabled: true
     image: chrislusf/seaweedfs:3.71
-    storage: 10Gi
+    # 承载永久记忆的 Raw 层与冷层：只增不减，实测已 15Gi，取 20Gi。
+    storage: 20Gi
 
 # 明文默认值仅用于开发；生产请用 --set-file 或外部 Secret（然后 secrets.create=false）
 secrets:

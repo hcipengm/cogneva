@@ -1673,7 +1673,137 @@ async fn deploy_via_apply(profile: Profile) -> Result<()> {
         ],
     )
     .await?;
+    // 卷声明在绑定后不可变（理由见 retain_existing_claims）：已存在的先摘出本次
+    // apply 的输入集合、保留既有绑定并报出差异，否则一份改过的声明会被准入拒绝，
+    // 而 `kubectl apply -f <目录>` 一处失败即中止整批——改过声明量的那几份卷就能
+    // 把整套清单的安装一起打停。其余资源不受影响，仍整目录 apply。
+    let kept = retain_existing_claims(&rendered).await?;
+    if kept > 0 {
+        info!(
+            count = kept,
+            "existing volume claims kept as bound (their spec is immutable, so they are not re-applied)"
+        );
+    }
     run("kubectl", &["apply", "-f", &rendered.to_string_lossy()]).await
+}
+
+/// 卷声明是安装面对象，不是循环面对象：绑定后的 PVC spec 除 `resources.requests`
+/// 外不可变（那个例外还要 StorageClass 支持扩容，local-path 不支持），
+/// StorageClass 一旦绑定更是永远改不回来。对已存在的卷声明 apply 一份不同的声明
+/// 必然被准入拒绝，而 `kubectl apply -f <目录>` 一处失败即中止整批。
+///
+/// 所以这里把已存在的卷声明从本次 apply 的输入里摘掉（临时产物目录是本进程独占
+/// 的一次性拷贝，摘掉不动仓库里的清单），保留既有绑定，并把声明量与在用值的差异
+/// 打出来。摘掉不等于"忽略"：声明够不够用由运行期持续的
+/// `data_volume_over_declared_size` 规则对着在用 PVC 比对，比一次安装期的校核更
+/// 贴近事实。
+///
+/// 返回摘掉（即已存在）的卷声明条数。
+async fn retain_existing_claims(rendered: &Path) -> Result<usize> {
+    let mut kept = 0usize;
+    for entry in std::fs::read_dir(rendered)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let Some((name, declared)) = claim_declaration(&text) else {
+            continue;
+        };
+        // 取不到在用值（不存在、查询失败、集群不可达）就当不存在，交给 apply 去
+        // 创建：集群真的不可达时后续 apply 会报出真实错误，不在这里吞掉。
+        let Some(live) = live_claim_storage(&name).await else {
+            continue;
+        };
+        if quantity_bytes(declared.as_deref()) != quantity_bytes(Some(&live)) {
+            warn!(
+                claim = %name,
+                declared = declared.as_deref().unwrap_or("<none>"),
+                live = %live,
+                "existing volume claim keeps its bound declaration; the manifest declares a different size and cannot be applied (a bound claim's spec is immutable, and this storage class may not support expansion)"
+            );
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("移出已存在的卷声明失败：{}", path.display()))?;
+        kept += 1;
+    }
+    Ok(kept)
+}
+
+/// 从一份清单文本认出卷声明：返回（名字，声明的 requests.storage）。不是
+/// PersistentVolumeClaim 的文档、以及解析不了的文本一律返回 None（后者留在
+/// apply 输入集合里，让 kubectl 报出真实语法错误）。
+fn claim_declaration(text: &str) -> Option<(String, Option<String>)> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
+    if doc.get("kind")?.as_str()? != "PersistentVolumeClaim" {
+        return None;
+    }
+    let name = doc.get("metadata")?.get("name")?.as_str()?.to_string();
+    let declared = doc
+        .get("spec")
+        .and_then(|s| s.get("resources"))
+        .and_then(|r| r.get("requests"))
+        .and_then(|r| r.get("storage"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
+    Some((name, declared))
+}
+
+/// 集群里这条卷声明在用的 requests.storage。查不到（不存在、kubectl 失败、
+/// 集群不可达）返回 None——调用方按"不存在"处理，由后续 apply 报出真实错误。
+async fn live_claim_storage(name: &str) -> Option<String> {
+    let out = Command::new("kubectl")
+        .args([
+            "-n",
+            "cogneva",
+            "get",
+            "pvc",
+            name,
+            "-o",
+            "jsonpath={.spec.resources.requests.storage}",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// K8s 数量串 → 字节数，只认十进制与二进制后缀。两位声明量比"不同"时用它，
+/// 免得 `5Gi` 与 API 规范化后的 `5368709120` 被读成差异。认不出返回 None。
+fn quantity_bytes(text: Option<&str>) -> Option<f64> {
+    let text = text?.trim();
+    let digits_end = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (num, suffix) = text.split_at(digits_end);
+    let value: f64 = num.parse().ok()?;
+    let factor = match suffix {
+        "" => 1.0,
+        "m" => 1e-3,
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        "P" => 1e15,
+        "E" => 1e18,
+        "Ki" => 1024.0,
+        "Mi" => 1024f64.powi(2),
+        "Gi" => 1024f64.powi(3),
+        "Ti" => 1024f64.powi(4),
+        "Pi" => 1024f64.powi(5),
+        "Ei" => 1024f64.powi(6),
+        _ => return None,
+    };
+    Some(value * factor)
 }
 
 /// helm 投递：chart + 同一套 profile values。profile 为渲染 apply 固化了
@@ -2201,5 +2331,55 @@ mod profile_tests {
             super::cn_mirror_image("quay.io/buildah/stable:latest", m),
             "quay.nju.edu.cn/buildah/stable:latest"
         );
+    }
+}
+
+#[cfg(test)]
+mod install_claim_tests {
+    use super::{claim_declaration, quantity_bytes};
+
+    #[test]
+    fn claim_declaration_only_matches_volume_claims() {
+        let pvc = "kind: PersistentVolumeClaim\nmetadata:\n  name: cogneva-data-pvc\nspec:\n  resources:\n    requests:\n      storage: 24Gi\n";
+        assert_eq!(
+            claim_declaration(pvc),
+            Some(("cogneva-data-pvc".to_string(), Some("24Gi".to_string())))
+        );
+        // 声明里没写 requests.storage（目录型卷）：仍算卷声明，量是 None
+        let bare = "kind: PersistentVolumeClaim\nmetadata:\n  name: p\nspec: {}\n";
+        assert_eq!(claim_declaration(bare), Some(("p".to_string(), None)));
+        // 非卷声明与解析不了的文本都不认，留在 apply 输入集合里
+        let deploy = "kind: Deployment\nmetadata:\n  name: cogneva\nspec: {}\n";
+        assert_eq!(claim_declaration(deploy), None);
+        assert_eq!(claim_declaration("kind: [unclosed"), None);
+    }
+
+    #[test]
+    fn quantity_bytes_reads_decimal_and_binary_suffixes() {
+        assert_eq!(quantity_bytes(Some("1")), Some(1.0));
+        assert_eq!(quantity_bytes(Some("5Gi")), Some(5.0 * 1024f64.powi(3)));
+        assert_eq!(quantity_bytes(Some("64Mi")), Some(64.0 * 1024f64.powi(2)));
+        assert_eq!(quantity_bytes(Some("300G")), Some(300e9));
+        assert_eq!(quantity_bytes(Some("500m")), Some(0.5));
+        // 认不出的量返回 None（拿去比"不同"时只会多报不会漏报）
+        assert_eq!(quantity_bytes(Some("abc")), None);
+        assert_eq!(quantity_bytes(Some("5Zi")), None);
+        assert_eq!(quantity_bytes(None), None);
+    }
+
+    /// 安装期报差异的判据：API 规范化后的等价值不算差异，声明量真的不同才算。
+    #[test]
+    fn claim_size_comparison_ignores_representation_and_keeps_real_diffs() {
+        // 同一份量的两种写法（清单写 5Gi、API 规范化成字节数）不算差异
+        assert_eq!(
+            quantity_bytes(Some("5Gi")),
+            quantity_bytes(Some("5368709120"))
+        );
+        assert_eq!(quantity_bytes(Some("24Gi")), quantity_bytes(Some("24Gi")));
+        // 真实事故形态：声明比在用值小（源码卷 10Gi vs 在用 57Gi）与大（72Gi vs 10Gi）
+        assert_ne!(quantity_bytes(Some("10Gi")), quantity_bytes(Some("57Gi")));
+        assert_ne!(quantity_bytes(Some("72Gi")), quantity_bytes(Some("10Gi")));
+        // 清单没声明量而在用有量 → 算差异，不能当成一致
+        assert_ne!(quantity_bytes(None), quantity_bytes(Some("10Gi")));
     }
 }

@@ -3,8 +3,10 @@
 # 默认值并夹紧单容器上下限。数值按单节点 K3s（≥4C8G 空白机）设定，已计入
 # 常设镜像分发器开销（image-server 100m/64Mi + 每节点 importer 200m/1Gi）；
 # 多节点每增一个节点多 200m/1Gi，生产 K8s 分支请按集群规模上调。
-# 存储额度含对象存储（SeaweedFS 10Gi，承载永久记忆 Raw 层）：内存类后端
-# 各 10Gi、对象存储 10Gi，合计已接近上限，因此比最初设定的 100Gi 上调 10Gi。
+# 存储额度是命名空间内全部 PVC 声明之和的上限（目录型卷不强制 requests.storage，
+# 它唯一的作用是拒绝声明总量越界的清单），必须 ≥ 本套清单自己声明的和：当前
+# 265Gi，取 300Gi 留 35Gi 头寸。单卷上限 80Gi 必须 ≥ 最大的那份声明（进化源码
+# 卷 72Gi）。渲染期门禁 check-governance-consistency.sh 按渲染产物重算并打印头寸。
 #
 # 本文件是 **parity 基线兼 GitOps 消费物**，不是数值的权威源：数值定义在
 # chart 的 resourceGovernance values，chart 渲染出的 spec 与这里逐字段相等
@@ -24,7 +26,7 @@ spec:
     limits.cpu: "17"
     limits.memory: "34Gi"
     pods: "40"
-    requests.storage: 110Gi
+    requests.storage: 300Gi
 ---
 apiVersion: v1
 kind: LimitRange
@@ -51,6 +53,6 @@ spec:
         memory: 16Mi
     - type: PersistentVolumeClaim
       max:
-        storage: 50Gi
+        storage: 80Gi
       min:
         storage: 1Gi

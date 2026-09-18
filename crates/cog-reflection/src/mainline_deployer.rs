@@ -2175,11 +2175,20 @@ const RBAC_KINDS: &[&str] = &["Role", "RoleBinding"];
 /// 创建归安装面（helm / 预渲染 apply），调整归 values 或人工。
 const GOVERNANCE_KINDS: &[&str] = &["ResourceQuota", "LimitRange"];
 
+/// 卷声明 kind：创建与调整都归安装面，不进循环面。绑定后的 PVC spec 除了
+/// `resources.requests` 之外不可变，而那个例外还要 StorageClass 支持扩容
+/// （local-path 不支持）；StorageClass 一旦绑定更是永远改不回来。所以循环
+/// 每 rev 重放同一份声明时，只要声明与集群里已绑定的那份不同，apply 必被
+/// 拒——那是"这份声明和历史不一致"，不是"新版本不好"，却会让一次本该成功的
+/// 滚动整个失败。声明的数值由 chart values 标定、由渲染期门禁与卷声明上限
+/// 校核，落盘现状由 `data_volume_over_declared_size` 规则比对声明量发现。
+const STORAGE_CLAIM_KINDS: &[&str] = &["PersistentVolumeClaim"];
+
 /// 拆分多文档 YAML 并过滤进支撑包：Secret 硬报错（零带外凭证红线，密钥
-/// 永不进清单链路）；集群级 kind、权限面 kind（Role/RoleBinding）与治理
-/// kind（ResourceQuota/LimitRange）跳过并记日志（前者由安装面管理，后两者
-/// 见 [`RBAC_KINDS`] 与 [`GOVERNANCE_KINDS`] 的理由）；空文档（`---` 分隔
-/// 产生）跳过。
+/// 永不进清单链路）；集群级 kind、权限面 kind（Role/RoleBinding）、治理
+/// kind（ResourceQuota/LimitRange）与卷声明 kind（PersistentVolumeClaim）
+/// 跳过并记日志（由安装面管理，理由见 [`RBAC_KINDS`]、[`GOVERNANCE_KINDS`]
+/// 与 [`STORAGE_CLAIM_KINDS`]）；空文档（`---` 分隔产生）跳过。
 fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Value>> {
     let mut docs = Vec::new();
     for doc in serde_yaml::Deserializer::from_str(yaml_text) {
@@ -2204,6 +2213,10 @@ fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Val
         }
         if GOVERNANCE_KINDS.contains(&kind) {
             warn!(origin = %origin, kind = %kind, "manifest bundle: skipping resource governance kind; the ceiling is the operator's and is applied at install time, not by the loop");
+            continue;
+        }
+        if STORAGE_CLAIM_KINDS.contains(&kind) {
+            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping volume claim; a bound claim's spec is immutable and is created at install time, not by the loop");
             continue;
         }
         docs.push(v);
@@ -2256,8 +2269,8 @@ fn patch_container_image(
 ///
 /// 目标清单允许多文档（如 Deployment + 配套 Service 同文件）：目标
 /// Deployment 必须恰好出现一个且名字精确匹配，其余命名空间级文档原样
-/// 随目标下发；与支撑包同一套红线——Secret 硬报错、集群级 kind 与
-/// RBAC kind 跳过。单文档 `from_str` 会在多文档文件上报错并卡死整条
+/// 随目标下发；与支撑包同一套红线——Secret 硬报错、集群级 kind、RBAC
+/// kind、治理 kind 与卷声明 kind 跳过。单文档 `from_str` 会在多文档文件上报错并卡死整条
 /// 发布链路（旧版二进制的实机事故形态），故按文档流解析。
 fn patch_deployment_image(
     yaml_text: &str,
@@ -2290,6 +2303,10 @@ fn patch_deployment_image(
         }
         if GOVERNANCE_KINDS.contains(&kind) {
             warn!(origin = %origin, kind = %kind, "manifest bundle: skipping resource governance kind; the ceiling is the operator's and is applied at install time, not by the loop");
+            continue;
+        }
+        if STORAGE_CLAIM_KINDS.contains(&kind) {
+            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping volume claim; a bound claim's spec is immutable and is created at install time, not by the loop");
             continue;
         }
         if kind == "Deployment" {
@@ -6322,11 +6339,11 @@ exit 0
     }
 
     #[test]
-    fn namespace_docs_skips_cluster_scoped_rbac_and_governance_and_rejects_secret() {
-        // 多文档：Namespace（集群级）、Role/RoleBinding（权限面）与
-        // ResourceQuota/LimitRange（治理面）跳过，ConfigMap/Service 保留，
-        // 空文档跳过。
-        let yaml = "---\nkind: Namespace\nmetadata:\n  name: x\n---\nkind: ConfigMap\nmetadata:\n  name: c\n---\nkind: Role\nmetadata:\n  name: r\nrules: []\n---\nkind: RoleBinding\nmetadata:\n  name: rb\n---\nkind: ResourceQuota\nmetadata:\n  name: cogneva-quota\n---\nkind: LimitRange\nmetadata:\n  name: cogneva-limits\n---\nkind: Service\nmetadata:\n  name: svc\n---\n";
+    fn namespace_docs_skips_install_surface_kinds_and_rejects_secret() {
+        // 多文档：Namespace（集群级）、Role/RoleBinding（权限面）、
+        // ResourceQuota/LimitRange（治理面）与 PersistentVolumeClaim（卷声明面）
+        // 跳过，ConfigMap/Service 保留，空文档跳过。
+        let yaml = "---\nkind: Namespace\nmetadata:\n  name: x\n---\nkind: ConfigMap\nmetadata:\n  name: c\n---\nkind: Role\nmetadata:\n  name: r\nrules: []\n---\nkind: RoleBinding\nmetadata:\n  name: rb\n---\nkind: ResourceQuota\nmetadata:\n  name: cogneva-quota\n---\nkind: LimitRange\nmetadata:\n  name: cogneva-limits\n---\nkind: PersistentVolumeClaim\nmetadata:\n  name: cogneva-data-pvc\nspec:\n  resources:\n    requests:\n      storage: 24Gi\n---\nkind: Service\nmetadata:\n  name: svc\n---\n";
         let docs = namespace_docs(yaml, "mixed.yaml").unwrap();
         let kinds: Vec<&str> = docs
             .iter()
@@ -6373,6 +6390,45 @@ exit 0
         assert!(
             !bundle.support_yaml.contains("LimitRange"),
             "limits must not travel with the rollout: {}",
+            bundle.support_yaml
+        );
+    }
+
+    /// 卷声明就在发布集里（自建集群走 `kubectl apply -k deploy/k3s` 建卷，该文件
+    /// 必须留在 `resources` 里），但一份都不许进支撑包：绑定后的 PVC spec 不可变，
+    /// 循环每 rev 重放一份与集群里不同的声明必然被拒，而那不是关于新版本的结论
+    /// ——三个 PVC 拒绝曾让落地通道断了一整天。创建与调整归安装面。
+    #[test]
+    fn build_rollout_bundle_drops_volume_claims_from_support() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "evolution-deployment.yaml".to_string(),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        );
+        files.insert(
+            "app-data-pvc.yaml".to_string(),
+            "kind: PersistentVolumeClaim\nmetadata:\n  name: cogneva-data-pvc\nspec:\n  resources:\n    requests:\n      storage: 24Gi\n"
+                .to_string(),
+        );
+        files.insert(
+            "configmap.yaml".to_string(),
+            "kind: ConfigMap\nmetadata:\n  name: c\ndata:\n  k: v\n".to_string(),
+        );
+        let kustomization = "resources:\n  - app-data-pvc.yaml\n  - configmap.yaml\n  - deployment.yaml\n  - evolution-deployment.yaml\n";
+        let bundle = build_rollout_bundle(&files, kustomization, &bundle_targets(), "img").unwrap();
+        assert!(bundle.support_yaml.contains("kind: ConfigMap"));
+        assert!(
+            !bundle.support_yaml.contains("PersistentVolumeClaim"),
+            "a claim must not travel with the rollout: {}",
+            bundle.support_yaml
+        );
+        assert!(
+            !bundle.support_yaml.contains("24Gi"),
+            "the claim's size must not survive into the bundle: {}",
             bundle.support_yaml
         );
     }

@@ -17,4 +17,4 @@ spec:
     limits.cpu: "17"
     limits.memory: "34Gi"
     pods: "40"
-    requests.storage: "110Gi"
+    requests.storage: "300Gi"
