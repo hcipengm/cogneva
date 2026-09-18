@@ -28,6 +28,26 @@ pub struct MetricSample {
     pub labels: HashMap<String, String>,
 }
 
+/// Comment prefix in a Prometheus exposition body that declares how its
+/// `_total` series are meant to be read.
+///
+/// The producer and the scrape-side consumer live in different crates and
+/// version independently, so the declaration travels in the body itself rather
+/// than in a shared config value that only one side would be holding at any
+/// given moment. A body without this marker is read as a sliding-window sum,
+/// which is what every producer emitted before the marker existed.
+pub const COUNTER_SEMANTICS_MARKER: &str = "# cogneva_counter_semantics";
+
+/// The `_total` series are cumulative since recording began, matching
+/// Prometheus's `counter` type: rates come from differencing two scrapes.
+pub const COUNTER_SEMANTICS_CUMULATIVE: &str = "cumulative";
+
+/// The marker line a producer writes to declare cumulative `_total` series.
+/// Includes no trailing newline.
+pub fn cumulative_semantics_declaration() -> String {
+    format!("{COUNTER_SEMANTICS_MARKER} {COUNTER_SEMANTICS_CUMULATIVE}")
+}
+
 /// Runtime metrics-collection abstraction for time-series data.
 /// Infrastructure-layer metrics trait for runtime health recording.
 /// Implementations: Memory (testing), Prometheus (production).
@@ -72,6 +92,16 @@ pub trait MetricsBackend: Send + Sync {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>>;
+
+    /// Query the cumulative value of every label set of a counter.
+    ///
+    /// This is the counter's total since the backend began recording it, not a
+    /// window of it. Prometheus consumers derive rates by differencing
+    /// successive scrapes, so a series declared `counter` has to be monotonic;
+    /// a windowed value decreases as old samples age out and makes `rate()`
+    /// meaningless. Backends that cannot answer this return an empty set
+    /// rather than a windowed approximation.
+    async fn query_counter_totals(&self, name: &str) -> SFResult<Vec<MetricSample>>;
 
     /// Query histogram samples for a metric over a time range.
     async fn query_histogram_range(

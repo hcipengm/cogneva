@@ -152,6 +152,38 @@ impl MetricsBackend for MockMetricsBackend {
         Ok(samples)
     }
 
+    async fn query_counter_totals(&self, name: &str) -> SFResult<Vec<MetricSample>> {
+        let records = self.records.lock().unwrap();
+        let mut totals: std::collections::HashMap<String, MetricSample> =
+            std::collections::HashMap::new();
+        for r in records
+            .iter()
+            .filter(|r| r.kind == MetricKind::Counter && r.name == name)
+        {
+            let mut pairs: Vec<(&String, &String)> = r.labels.iter().collect();
+            pairs.sort_unstable();
+            let key = pairs
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            match totals.get_mut(&key) {
+                Some(existing) => existing.value += r.value,
+                None => {
+                    totals.insert(
+                        key,
+                        MetricSample {
+                            timestamp: r.timestamp,
+                            value: r.value,
+                            labels: r.labels.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(totals.into_values().collect())
+    }
+
     async fn query_histogram_range(
         &self,
         name: &str,

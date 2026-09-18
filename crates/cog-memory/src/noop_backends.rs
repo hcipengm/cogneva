@@ -67,6 +67,10 @@ impl MetricsBackend for NoopMetricsBackend {
         Ok(Vec::new())
     }
 
+    async fn query_counter_totals(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+        Ok(Vec::new())
+    }
+
     async fn query_histogram_range(
         &self,
         _name: &str,

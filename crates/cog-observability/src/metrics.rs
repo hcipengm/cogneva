@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cog_core::{MetricSample, MetricsBackend, SFError, SFResult};
+use prometheus::core::Collector;
 use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Registry,
 };
@@ -244,6 +245,37 @@ impl MetricsBackend for PrometheusMetricsBackend {
         _end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>> {
         Ok(Vec::new())
+    }
+
+    /// The registry holds real cumulative counters, so the total of every label
+    /// set is readable directly from the `CounterVec` children.
+    async fn query_counter_totals(&self, name: &str) -> SFResult<Vec<MetricSample>> {
+        let full = self.full_name(name);
+        let store = self
+            .counters
+            .lock()
+            .map_err(|_| SFError::Agent("counter lock poisoned".into()))?;
+        let mut samples = Vec::new();
+        for vec in store.values() {
+            for family in vec.collect() {
+                if family.get_name() != full {
+                    continue;
+                }
+                for metric in family.get_metric() {
+                    let labels: HashMap<String, String> = metric
+                        .get_label()
+                        .iter()
+                        .map(|l| (l.get_name().to_string(), l.get_value().to_string()))
+                        .collect();
+                    samples.push(MetricSample {
+                        timestamp: Utc::now(),
+                        value: metric.get_counter().get_value(),
+                        labels,
+                    });
+                }
+            }
+        }
+        Ok(samples)
     }
 
     async fn query_histogram_range(

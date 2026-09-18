@@ -1011,13 +1011,15 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
 
     // Serve MetricsBackend time-series metrics if available
     if let Some(mb) = state.metrics_backend.as_ref() {
+        // Only the histograms are read over a window; that is what a summary's
+        // quantiles describe. Counters are read from their cumulative totals
+        // instead, because a `_total` series has to be monotonic for
+        // `rate()`/`increase()` to mean anything, and a window sum shrinks as
+        // samples age out.
         let end = chrono::Utc::now();
-        let start = end - chrono::Duration::seconds(300); // last 5 minutes
+        let start = end - chrono::Duration::seconds(300);
 
-        match mb
-            .query_counter_range("memory_operations_total", start, end)
-            .await
-        {
+        match mb.query_counter_totals("memory_operations_total").await {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_counters(
                     "memory_operations_total",
@@ -1046,10 +1048,7 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
             }
         }
 
-        match mb
-            .query_counter_range("task_operations_total", start, end)
-            .await
-        {
+        match mb.query_counter_totals("task_operations_total").await {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_counters(
                     "task_operations_total",
@@ -1062,10 +1061,7 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
             }
         }
 
-        match mb
-            .query_counter_range("http_requests_total", start, end)
-            .await
-        {
+        match mb.query_counter_totals("http_requests_total").await {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_counters(
                     "http_requests_total",
@@ -1094,10 +1090,7 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
             }
         }
 
-        match mb
-            .query_counter_range("tier_migration_total", start, end)
-            .await
-        {
+        match mb.query_counter_totals("tier_migration_total").await {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_counters(
                     "tier_migration_total",
@@ -1108,6 +1101,21 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
             Err(e) => {
                 tracing::warn!("Failed to query tier migration counters: {}", e);
             }
+        }
+
+        // Declare what the `_total` series above mean. The scrape side versions
+        // independently of this binary, so the declaration has to travel in the
+        // body; without it a scraper has to assume the older windowed reading and
+        // its rate math silently stops matching what this body produced. It goes
+        // in front so a reader meets it before the series it describes, and only
+        // into a body that already has series: a body carrying nothing but this
+        // comment would stop being empty, and emptiness is what tells the caller
+        // the endpoint has nothing to serve.
+        if !body.is_empty() {
+            body.insert_str(
+                0,
+                &format!("{}\n", cog_core::cumulative_semantics_declaration()),
+            );
         }
     }
 

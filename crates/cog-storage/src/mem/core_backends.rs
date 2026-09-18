@@ -769,6 +769,19 @@ impl MemoryMetricsBackend {
         });
     }
 
+    /// Group key for a label set. Derived from label names so that two samples
+    /// carrying the same labels never land in different groups just because
+    /// their maps happen to iterate differently.
+    fn label_key(labels: &HashMap<String, String>) -> String {
+        let mut pairs: Vec<(&String, &String)> = labels.iter().collect();
+        pairs.sort_unstable();
+        pairs
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     fn query_range(
         store: &HashMap<String, Vec<MetricSample>>,
         name: &str,
@@ -856,6 +869,24 @@ impl MetricsBackend for MemoryMetricsBackend {
             .read()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         Ok(Self::query_range(&store, name, start, end))
+    }
+
+    async fn query_counter_totals(&self, name: &str) -> SFResult<Vec<MetricSample>> {
+        let store = self
+            .counters
+            .read()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        let mut totals: HashMap<String, MetricSample> = HashMap::new();
+        for sample in store.get(name).map(Vec::as_slice).unwrap_or_default() {
+            let key = Self::label_key(&sample.labels);
+            match totals.get_mut(&key) {
+                Some(existing) => existing.value += sample.value,
+                None => {
+                    totals.insert(key, sample.clone());
+                }
+            }
+        }
+        Ok(totals.into_values().collect())
     }
 
     async fn query_histogram_range(

@@ -26,7 +26,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::GitOpsConfig;
-use cog_core::{PromotionLedger, PromotionRecord, PromotionStatus, SFError, SFResult};
+use cog_core::{
+    PromotionLedger, PromotionRecord, PromotionStatus, SFError, SFResult,
+    COUNTER_SEMANTICS_CUMULATIVE, COUNTER_SEMANTICS_MARKER,
+};
 use tracing::{info, warn};
 
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。
@@ -1300,11 +1303,6 @@ fn metrics_url_for_pod(base: &str, ip: &str) -> Option<String> {
     Some(format!("{scheme}://{host}{port}{path}"))
 }
 
-/// 正文里声明 `_total` 系列取值含义的注释行前缀。缺省（旧版正文）按窗口求和
-/// 处理，这是当时的真实行为：拿一个还没这么声明自己的正文按累积语义去相减，
-/// 会得到纯噪声。
-const COUNTER_SEMANTICS_MARKER: &str = "# cogneva_counter_semantics";
-
 /// 一次抓取到的原始计数。错误率不在这里算：怎么算取决于正文声明的计数器
 /// 语义，而那只有拿到两次抓取的对比方才知道。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1382,7 +1380,7 @@ fn parse_prometheus_signals(body: &str) -> (CanarySignals, CounterSemantics) {
     for line in body.lines() {
         if let Some(rest) = line.strip_prefix(COUNTER_SEMANTICS_MARKER) {
             semantics = match rest.trim() {
-                "cumulative" => CounterSemantics::Cumulative,
+                COUNTER_SEMANTICS_CUMULATIVE => CounterSemantics::Cumulative,
                 _ => CounterSemantics::Windowed,
             };
         } else if line.starts_with("http_requests_total") {
@@ -1932,12 +1930,15 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
         assert_eq!(windowed_rate(signals), Some(0.2));
     }
 
+    /// 正文由生产侧的那份声明拼出来：两侧各写一份字面量就会各自漂移，
+    /// 而漂移的表现是抓取端静默退回窗口语义，不报错。
     #[test]
-    fn marker_reads_the_body_as_cumulative() {
-        let body = "# cogneva_counter_semantics cumulative\n\
-                    http_requests_total{status=\"200\"} 40\n\
-                    http_requests_total{status=\"500\"} 10\n";
-        let (_, semantics) = parse_prometheus_signals(body);
+    fn producer_declaration_reads_the_body_as_cumulative() {
+        let body = format!(
+            "{}\nhttp_requests_total{{status=\"200\"}} 40\nhttp_requests_total{{status=\"500\"}} 10\n",
+            cog_core::cumulative_semantics_declaration()
+        );
+        let (_, semantics) = parse_prometheus_signals(&body);
         assert_eq!(semantics, CounterSemantics::Cumulative);
         // 增量下限用请求增量比对，不受错误数影响。
         assert_eq!(

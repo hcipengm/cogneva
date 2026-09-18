@@ -55,6 +55,43 @@ async fn test_memory_record_and_query_counter() {
     assert_eq!(samples[1].value, 2.0);
 }
 
+/// A counter's total is cumulative over everything recorded, not over a
+/// window: a series declared `counter` must never decrease, otherwise
+/// `rate()` over successive scrapes reports nonsense.
+#[tokio::test]
+async fn counter_total_is_cumulative_per_label_set() {
+    let backend = MemoryMetricsBackend::new();
+    let mut other = HashMap::new();
+    other.insert("agent_id".to_string(), "a-2".to_string());
+
+    backend
+        .record_counter("requests", 1.0, labels())
+        .await
+        .unwrap();
+    backend
+        .record_counter("requests", 2.0, labels())
+        .await
+        .unwrap();
+    backend
+        .record_counter("requests", 5.0, other)
+        .await
+        .unwrap();
+
+    let totals = backend.query_counter_totals("requests").await.unwrap();
+    assert_eq!(totals.len(), 2, "one total per label set: {totals:?}");
+
+    let a1 = totals
+        .iter()
+        .find(|s| s.labels.get("agent_id").map(String::as_str) == Some("a-1"))
+        .expect("a-1 total");
+    let a2 = totals
+        .iter()
+        .find(|s| s.labels.get("agent_id").map(String::as_str) == Some("a-2"))
+        .expect("a-2 total");
+    assert_eq!(a1.value, 3.0);
+    assert_eq!(a2.value, 5.0);
+}
+
 #[tokio::test]
 async fn test_memory_record_and_query_histogram() {
     let backend = MemoryMetricsBackend::new();
