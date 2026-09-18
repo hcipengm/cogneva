@@ -16,6 +16,12 @@ image:
 secrets:
   create: false
 
+resourceGovernance:
+  # 沿用 chart 默认的单节点标定值。多节点每增一个节点要按
+  # +200m limits.cpu / +1Gi limits.memory 上调（分发器 DaemonSet 逐节点常驻），
+  # 渲染期拿不到节点数，由元启动按探测到的节点数经 --set 覆盖。
+  enabled: true
+
 evolution:
   gitRemote:
     mode: pvc

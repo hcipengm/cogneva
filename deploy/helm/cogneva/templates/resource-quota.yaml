@@ -1,0 +1,49 @@
+{{- if .Values.resourceGovernance.enabled }}
+{{- $q := .Values.resourceGovernance.quota }}
+{{- $l := .Values.resourceGovernance.limitRange }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: cogneva-quota
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: resource-governance
+spec:
+  hard:
+    requests.cpu: {{ $q.requestsCpu | quote }}
+    requests.memory: {{ $q.requestsMemory | quote }}
+    limits.cpu: {{ $q.limitsCpu | quote }}
+    limits.memory: {{ $q.limitsMemory | quote }}
+    pods: {{ $q.pods | quote }}
+    requests.storage: {{ $q.requestsStorage | quote }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: cogneva-limits
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: resource-governance
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: {{ $l.defaultCpu | quote }}
+        memory: {{ $l.defaultMemory | quote }}
+      defaultRequest:
+        cpu: {{ $l.defaultRequestCpu | quote }}
+        memory: {{ $l.defaultRequestMemory | quote }}
+      max:
+        cpu: {{ $l.maxCpu | quote }}
+        memory: {{ $l.maxMemory | quote }}
+      min:
+        cpu: {{ $l.minCpu | quote }}
+        memory: {{ $l.minMemory | quote }}
+    - type: PersistentVolumeClaim
+      max:
+        storage: {{ $l.pvcMaxStorage | quote }}
+      min:
+        storage: {{ $l.pvcMinStorage | quote }}
+{{- end }}

@@ -46,7 +46,8 @@ except ImportError:
     sys.exit("需要 python3-yaml（与 check-deploy-parity.sh 同一依赖）")
 
 order = {
-    "Namespace": "00", "StorageClass": "05", "Secret": "08",
+    "Namespace": "00", "ResourceQuota": "01", "LimitRange": "02",
+    "StorageClass": "05", "Secret": "08",
     "ConfigMap": "10", "ServiceAccount": "15", "Role": "16",
     "ClusterRole": "16", "RoleBinding": "17", "ClusterRoleBinding": "17",
     "PersistentVolumeClaim": "20", "Service": "30",

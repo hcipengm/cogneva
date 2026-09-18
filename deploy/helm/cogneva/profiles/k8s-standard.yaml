@@ -21,6 +21,15 @@ image:
 secrets:
   create: false
 
+resourceGovernance:
+  # 生产集群默认不开：配额是**天花板**，数值按单节点 K3s 标定，直接套到规模未知的
+  # 生产集群上，会在扩容时静默拒绝新 Pod（`FailedCreate: exceeded quota`），
+  # 代价比"暂时没有天花板"更大。本 profile 的定位就是"按集群规模上调"（元启动
+  # 第三步原文），所以这里要求运维/元启动显式给出数值后启用：
+  #   --set resourceGovernance.enabled=true --set resourceGovernance.quota.limitsCpu=...
+  # K3s 两个 profile 保持默认开启（数值即按其标定）。
+  enabled: false
+
 storage:
   localRetainClass:
     create: false

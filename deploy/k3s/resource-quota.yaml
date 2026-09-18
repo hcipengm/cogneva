@@ -5,6 +5,10 @@
 # 多节点每增一个节点多 200m/1Gi，生产 K8s 分支请按集群规模上调。
 # 存储额度含对象存储（SeaweedFS 10Gi，承载永久记忆 Raw 层）：内存类后端
 # 各 10Gi、对象存储 10Gi，合计已接近上限，因此比最初设定的 100Gi 上调 10Gi。
+#
+# 本文件是 **parity 基线兼 GitOps 消费物**，不是数值的权威源：数值定义在
+# chart 的 resourceGovernance values，chart 渲染出的 spec 与这里逐字段相等
+# （check-deploy-parity.sh 会比），改一处不改另一处当场红。
 apiVersion: v1
 kind: ResourceQuota
 metadata:

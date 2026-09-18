@@ -114,6 +114,12 @@ for name in sorted(set(k) & set(h)):
             errors.append(f"Service/{name[1]} port k3s-only: {x}")
         for x in sorted(set(ha['ports']) - set(ka['ports'])):
             errors.append(f"Service/{name[1]} port helm-only: {x}")
+    elif kind in ('ResourceQuota', 'LimitRange'):
+        # 治理对象的数值是能力面的一部分（上限定小了，扩容时新 Pod 会被
+        # 直接拒绝），所以整份 spec 逐字段比，不接受"名字对上就算对齐"。
+        if k[name].get('spec') != h[name].get('spec'):
+            errors.append(f"{kind}/{name[1]} spec: k3s={k[name].get('spec')!r} "
+                          f"helm={h[name].get('spec')!r}")
     elif kind == 'ConfigMap':
         ka, ha = cm(k[name]), cm(h[name])
         for x in sorted(set(ka['keys']) - set(ha['keys'])):

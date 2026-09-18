@@ -14,6 +14,38 @@ storage:
   evolution: "local-path"
   retain: "cogneva-local-retain"
 
+# 资源治理（元启动第三步：限制 Agent/沙盒把节点资源耗尽）。ResourceQuota 约束
+# 命名空间总量，LimitRange 给未声明 resources 的容器兜底并夹紧单容器上下限——
+# 缺了前者，一次失控的沙盒任务就能占满节点；缺了后者，没写 resources 的容器
+# （安全网关就没写）按**无限**算，配额也就形同虚设。
+#
+# 数值按**单节点 K3s（≥4C8G 空白机）**标定：常设镜像分发开销
+# （image-server 100m/64Mi + 每节点 importer 200m/1Gi）已计入，并留出滚动期的
+# 瞬时增量（主线滚动 Job 500m/256Mi；四个业务部署都是单副本且 maxSurge=0，
+# 滚动靠先删旧 Pod 再建新 Pod 腾位，不额外占位）。多节点每增一个节点按
+# +200m limits.cpu / +1Gi limits.memory 上调——**渲染期拿不到节点数**，所以这是
+# 由元启动/运维按集群规模经 --set 覆盖的项，不是自动伸缩。
+resourceGovernance:
+  enabled: true
+  quota:
+    requestsCpu: "6"
+    requestsMemory: 12Gi
+    limitsCpu: "17"
+    limitsMemory: 34Gi
+    pods: "40"
+    requestsStorage: 110Gi
+  limitRange:
+    defaultCpu: 500m
+    defaultMemory: 512Mi
+    defaultRequestCpu: 50m
+    defaultRequestMemory: 64Mi
+    maxCpu: "4"
+    maxMemory: 8Gi
+    minCpu: 10m
+    minMemory: 16Mi
+    pvcMaxStorage: 50Gi
+    pvcMinStorage: 1Gi
+
 # 应用数据目录根（/var/lib/cogneva-data）：实例身份 identity.json、学习数仓
 # warehouse、进化策略 policies、记忆 memory、原始日志 raw-logs、对象存储后端都
 # 落在这里。必须跨 Pod 重启存活——身份文件一旦丢失，实例名就会随每次重启的机器

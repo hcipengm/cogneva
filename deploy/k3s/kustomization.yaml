@@ -2,6 +2,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - namespace.yaml
+  - resource-quota.yaml
   - storage-class.yaml
   - configmap.yaml
   # Secret 不在此 apply：内部密钥由 init-secrets.sh 随机生成，带外凭证由向导写入，
