@@ -3240,9 +3240,17 @@ mod tests {
             .timestamp();
         assert_eq!(ark.unwrap(), expected);
 
-        let kimi = parse_reset_at("Your quota will reset at 09-18 15:39:00 UTC.");
+        // 无年份格式的契约是「补出最近的那次将来时刻」。钉一个具体日期会让
+        // 断言变成日历的函数：那个时刻一过就永久变红，红的还不是被测代码。
+        // 按当前时刻构造，断言的是补年份与解析本身。
+        let soon = (Utc::now() + chrono::Duration::minutes(30)).format("%m-%d %H:%M:%S");
+        let kimi = parse_reset_at(&format!("Your quota will reset at {soon} UTC."));
         assert!(kimi.is_some(), "无年份 + 时区缩写必须能解析");
-        assert!(kimi.unwrap() > Utc::now().timestamp(), "解析结果应在未来");
+        let lead = kimi.unwrap() - Utc::now().timestamp();
+        assert!(
+            (25 * 60..=35 * 60).contains(&lead),
+            "应解析到最近的将来，实际 {lead}s"
+        );
 
         assert!(parse_reset_at("no reset time here").is_none());
         assert!(parse_reset_at("").is_none());
