@@ -490,18 +490,60 @@ fn is_authorization_denied(msg: &str) -> bool {
         .any(|p| msg.contains(p))
 }
 
-/// 镜像一次都还没动时失败的归类。此时没有回滚对象，要判的只是"这次失败说不说
-/// 得出新版本的问题"：观测能力故障与授权被拒都说不出，归环境类，否则归版本类。
+/// 「集群此刻装不下这份请求」：apiserver 的准入拒绝，主体是容量或策略约束，不是
+/// "你没权限"。配额打满（ResourceQuota）、单容器资源越出区间（LimitRange）、被
+/// PodSecurity 拒掉，读到的都是集群此刻的状态。与授权拒绝同一族——新版本的好坏
+/// 一个字都没读到，要改的是集群容量或策略面，两者都在安装面/人工那一侧。
 ///
-/// 快照阶段只有这三类非版本失败会出现——调度器判决得等新 Pod 出现，这里还没有
+/// 单列一类而不是并进授权拒绝：两者的措辞面不重叠（授权拒绝带 `User "..."` 主体、
+/// 动词面是封闭枚举），合成一条后回归测试就没法逐项断言是哪条判据接住的。
+///
+/// 判据同样不认裸 `forbidden`：组包侧自己的措辞也含它，混在一起会把组包错误读成
+/// 环境类，反而放走一个真坏的版本。
+const ADMISSION_POLICY_DENIED_PATTERNS: &[&str] = &[
+    // ResourceQuota：`... is forbidden: exceeded quota: cogneva-quota, requested: ...`
+    "exceeded quota",
+    // LimitRange：`... is forbidden: [maximum cpu usage per Container is 2, but limit is 4]`
+    "usage per Container is",
+    // PodSecurity：`... violates PodSecurity "restricted:latest": ...`
+    "violates PodSecurity",
+];
+
+/// 手上的原文（kubectl 的原话）里有没有准入拒绝的措辞。只用于镜像一次都还没动
+/// 时的归类——那一步除了上游原文没有别的观测面。
+fn is_admission_policy_denied(msg: &str) -> bool {
+    ADMISSION_POLICY_DENIED_PATTERNS
+        .iter()
+        .any(|p| msg.contains(p))
+}
+
+/// 判定进程给「准入面把新副本挡在建 Pod 之前」打的标记，与调度器判决的
+/// PLACEMENT_BLOCKED 互斥：前者 Pod 对象压根没被创建，后者 Pod 建了但排不上队。
+///
+/// 与上面那组措辞刻意分成两条判据。超时记录里除了标记还附着一份给人看的现场采样
+/// （ReplicaSet 的 `FailedCreate` 消息），措辞与上游原文完全同形；若用措辞做第二
+/// 遍判据，「这次上线自己把 requests 调过了配额」那一支也会被读成环境类——而环境
+/// 类不占尝试预算，一个真坏的版本会就此无限重试下去。
+const ADMISSION_DENIED_MARKER: &str = "admission policy denied";
+
+fn is_admission_denied(msg: &str) -> bool {
+    msg.contains(ADMISSION_DENIED_MARKER)
+}
+
+/// 镜像一次都还没动时失败的归类。此时没有回滚对象，要判的只是"这次失败说不说
+/// 得出新版本的问题"：观测能力故障、授权被拒、以及撞上集群容量或策略约束的准入
+/// 拒绝都说不出，归环境类，否则归版本类。
+///
+/// 快照阶段只有这四类非版本失败会出现——调度器判决得等新 Pod 出现，这里还没有
 /// 新 Pod。归环境类是为了不占尝试预算：拿一次纯粹的可达性抖动、一个坏掉的工具
-/// 路径、或一纸发布集与授权面对不齐的拒绝去消耗本 rev 的尝试，会按上限把一个
-/// 本来正常的版本搁置到下个 rev。
+/// 路径、一纸发布集与授权面对不齐的拒绝、或一个打满的配额去消耗本 rev 的尝试，
+/// 会按上限把一个本来正常的版本搁置到下个 rev。
 fn classify_before_any_change(e: SFError) -> RolloutFailure {
     let msg = e.to_string();
     if is_cluster_unreachable(&msg)
         || is_observation_tool_failure(&msg)
         || is_authorization_denied(&msg)
+        || is_admission_policy_denied(&msg)
     {
         RolloutFailure::environment(e)
     } else {
@@ -613,18 +655,26 @@ fn normalize_placement_shape(raw: &str) -> String {
     v.to_string()
 }
 
+/// 这次上线动没动过部署的放置面。两个"判不准"都算动过：滚动前的快照是空的
+/// （没采到），或读不到当前的面。
+///
+/// 判不准就往版本侧靠——宁可多回滚一次，也不放走"新版本自己把 Pod 顶出节点 /
+/// 自己超过了配额"的那一支：环境类不占尝试预算，误放会让一个真坏的版本无限重试。
+fn placement_shape_unchanged(prev_shape: &str, now_shape: Option<&str>) -> bool {
+    !prev_shape.is_empty() && now_shape == Some(prev_shape)
+}
+
 /// 这条超时算不算"集群放不下"（环境类）；是就给出排不上队的 Pod 与调度器消息。
 ///
 /// 环境类只在两个条件同时成立时给出：调度器确实判了排不上队，且部署的放置面
 /// 与滚动前逐字节一致——放置面没变，说明不是这次上线把 Pod 顶出节点的。
-/// 任一侧读空、或读不到当前放置面（`None`）一律不给环境结论：判不准就往版本侧
-/// 靠，宁可多回滚一次，不放走"新版本自己加了排不上的约束"。
+/// 任一侧读空、或读不到当前放置面（`None`）一律不给环境结论。
 fn environment_class(
     blocked: &[(String, String)],
     prev_shape: &str,
     now_shape: Option<&str>,
 ) -> Option<String> {
-    if blocked.is_empty() || prev_shape.is_empty() || now_shape != Some(prev_shape) {
+    if blocked.is_empty() || !placement_shape_unchanged(prev_shape, now_shape) {
         return None;
     }
     Some(
@@ -726,6 +776,29 @@ fn replicaset_failures(out: &str) -> Vec<ReplicaSetFailure> {
         });
     }
     v
+}
+
+/// 本次滚动里被准入面拒掉的新副本，返回可直接读的原因。
+///
+/// 与 [`environment_class`] 共用同一条边界：只有当这次上线**没动过放置面**时，
+/// 拒掉新副本的才是集群此刻的容量或策略面（配额被别的部署占满、LimitRange 被
+/// 改窄），而不是这份变更自己。变更自己把 requests 调过了配额、加了个越界的
+/// LimitRange 值，都是这份变更的毛病，该回滚也该占一次尝试。
+///
+/// 判据来自 RS 自己的类型化条件（准入拒绝不产生 Pod 对象，Pod 采样一条都取不到），
+/// 不读渲染好的诊断串——那份文本是给人看的现场。
+fn admission_rejection(
+    failures: &[ReplicaSetFailure],
+    prev_shape: &str,
+    now_shape: Option<&str>,
+) -> Option<String> {
+    if !placement_shape_unchanged(prev_shape, now_shape) {
+        return None;
+    }
+    failures
+        .iter()
+        .find(|f| is_admission_policy_denied(&f.detail()))
+        .map(ReplicaSetFailure::detail)
 }
 
 /// 追加一段现场到诊断串：段间用 `; ` 分隔，空段不占位。空字段是「没有该信号」
@@ -1943,9 +2016,14 @@ impl MainlineDeployer {
     /// `backoffLimit: 0` + `restartPolicy: Never`，一个 Pod 一次运行，终止码
     /// 就是这个进程的退出码。
     ///
-    /// 采不到（Pod 已删、查询失败、码不可解析）按**版本类**靠：类别判不准
-    /// 时，把环境类误记成版本类只是多花一次尝试预算，反过来则是一个真坏的
-    /// 版本被无限重试、永不停下——代价不对称，往记账侧取。
+    /// 一个 Pod 都没有时（终止码读不到、也没得读）改问 Job 的 Failed 条件：准入面
+    /// 把 Pod 挡在创建之外时（配额打满、LimitRange 越界），判定进程根本不存在，
+    /// 它的退出码永远不会有，而原因就写在条件消息里。这一档能判成环境类就判——
+    /// 它和"码读不出来"不是一回事，是**采错了地方**而不是采不到。
+    ///
+    /// 采不到（Pod 已删、查询失败、码不可解析、条件消息为空）仍按**版本类**靠：
+    /// 类别判不准时，把环境类误记成版本类只是多花一次尝试预算，反过来则是一个真坏
+    /// 的版本被无限重试、永不停下——代价不对称，往记账侧取。
     async fn job_failure_class(&self, name: &str) -> FailureClass {
         let out = match self
             .kubectl(
@@ -1975,10 +2053,51 @@ impl MainlineDeployer {
             .lines()
             .filter_map(|l| l.trim().parse::<i32>().ok())
             .next_back();
-        if code == Some(ROLLOUT_EXIT_ENVIRONMENT) {
+        if let Some(code) = code {
+            return if code == ROLLOUT_EXIT_ENVIRONMENT {
+                FailureClass::Environment
+            } else {
+                FailureClass::Version
+            };
+        }
+        let reason = self.job_failed_condition(name).await.unwrap_or_default();
+        if is_cluster_unreachable(&reason)
+            || is_observation_tool_failure(&reason)
+            || is_authorization_denied(&reason)
+            || is_admission_policy_denied(&reason)
+        {
+            warn!(
+                job = %name,
+                reason = %reason,
+                "rollout job's pod was never created; classified from the job's failure condition"
+            );
             FailureClass::Environment
         } else {
             FailureClass::Version
+        }
+    }
+
+    /// Job 的 Failed 条件消息。Pod 被准入面挡在创建之外时，这是唯一留下原因的
+    /// 观测面——Job 本身建得出来，Pod 建不出来。
+    async fn job_failed_condition(&self, name: &str) -> Option<String> {
+        let out = self
+            .kubectl(
+                &[
+                    "get",
+                    "job",
+                    name,
+                    "-o",
+                    "jsonpath={.status.conditions[?(@.type==\"Failed\")].message}",
+                ],
+                30,
+            )
+            .await
+            .ok()?;
+        let text = out.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
         }
     }
 }
@@ -2796,16 +2915,18 @@ impl RolloutExecutor {
             };
             if now >= deadline {
                 // 超时才采样：正常路径一次 kubectl 都不多花。
-                let diagnosis = self.rollout_diagnosis(t).await;
+                let replicasets = self.sample_replicaset_failures(t).await;
+                let diagnosis = self.rollout_diagnosis(t, &replicasets).await;
                 let suffix = if diagnosis.is_empty() {
                     String::new()
                 } else {
                     format!("; pods: {diagnosis}")
                 };
-                // 排不上队：只有"这次上线没动放置面"才归环境。
+                // 排不上队与准入被拒：都只有"这次上线没动放置面"才归环境。
                 let blocked = self.sample_unschedulable_pods(t).await;
                 let now_shape = self.current_placement_shape(t).await.ok();
                 let environment = environment_class(&blocked, prev_shape, now_shape.as_deref());
+                let denied = admission_rejection(&replicasets, prev_shape, now_shape.as_deref());
                 return Err(if !observed_ever {
                     // 一次都没看到过部署态：这是观测能力故障，不是版本结论。
                     SFError::IO(format!(
@@ -2819,6 +2940,15 @@ impl RolloutExecutor {
                          within {}s ({phase} phase) — the scheduler never placed its pod(s) \
                          ({detail}) and this revision did not change the deployment's placement \
                          shape, so the revision is not what failed (last: {note}{suffix})",
+                        t.deployment, budget
+                    ))
+                } else if let Some(detail) = denied {
+                    SFError::IO(format!(
+                        "{ADMISSION_DENIED_MARKER}: rollout of deployment/{} did not complete \
+                         within {}s ({phase} phase) — the API server rejected its pod(s) before \
+                         any of them were created ({detail}) and this revision did not change the \
+                         deployment's placement shape, so the revision is not what failed \
+                         (last: {note}{suffix})",
                         t.deployment, budget
                     ))
                 } else if starting {
@@ -2954,10 +3084,16 @@ impl RolloutExecutor {
     /// 一模一样，处置却相反。事件窗口只有一小时，不留现场就只能等人回到集群
     /// 去猜，那时连证据都过期了。
     ///
+    /// 准入被拒的副本集由调用方采样后传进来：那一份同时是归类用的机器判据
+    /// （[`admission_rejection`]），两次判定不能各查一遍——查两遍就有两种答案。
+    ///
     /// 采样是尽力而为：任何一步取不到都留空，观测失败不变成第二个错误。
-    async fn rollout_diagnosis(&self, t: &RolloutTarget) -> String {
+    async fn rollout_diagnosis(
+        &self,
+        t: &RolloutTarget,
+        replicasets: &[ReplicaSetFailure],
+    ) -> String {
         let samples = self.sample_rollout_pods(t).await;
-        let replicasets = self.sample_replicaset_failures(t).await;
         // 只取 Warning：正常滚动事件（ScalingReplicaSet 等）说明不了病因，
         // 排不上队与探针不过都落在 Warning 里。
         let events = self
@@ -3132,7 +3268,8 @@ impl RolloutExecutor {
     /// 消息/容器已运行时长）。判败是这条判定唯一的产出，只留一串内部采样列
     /// （`0 false`）说不出病因，等人回到集群时事件早已过期。
     async fn with_scene(&self, t: &RolloutTarget, msg: String) -> SFError {
-        let diagnosis = self.rollout_diagnosis(t).await;
+        let replicasets = self.sample_replicaset_failures(t).await;
+        let diagnosis = self.rollout_diagnosis(t, &replicasets).await;
         if diagnosis.is_empty() {
             SFError::Agent(msg)
         } else {
@@ -3242,13 +3379,20 @@ impl RolloutExecutor {
     /// - 集群放不下新 Pod：新 Pod 一个都没起来，谈不上新版本的好坏；回滚要把
     ///   旧镜像重新调度一遍，而它带着同样的放置面，同样排不进去。只有本次
     ///   上线自己改动了放置面时才归版本（那一支带的是普通超时错误，不进这里）。
+    /// - 准入面把新副本挡在建 Pod 之前（配额打满、LimitRange/ PodSecurity 越界）：
+    ///   新版本的容器一次都没起来，读到的只是集群此刻装不下，同样要等集群容量或
+    ///   策略面变化，不是这份变更的结论。
     /// - 观测工具本身起不来（kubectl 缺失/没有可执行位/被占用）：我们连一次查询
     ///   都没发出去，说不出新版本的好坏；而且回滚只退镜像，修不好一个坏掉的工具
     ///   路径，只会把新版本换掉而又重复失败一轮。
     ///
-    /// 三类都让 Job 非零退出（部署器下轮重试），集群保持在刚推上去的新版本上。
+    /// 四类都让 Job 非零退出（部署器下轮重试），集群保持在刚推上去的新版本上。
     ///
-    /// 这里是**唯一**给失败定类别的地方：两支不回滚的判成环境类，其余（含
+    /// 准入那一类只认判定进程打的标记、不认措辞：超时记录里还附着一份给人看的
+    /// 现场采样，措辞与上游原文同形，用措辞再判一遍会把"变更自己把 requests 调过
+    /// 了配额"那一支也放成环境类，而环境类不占尝试预算，会无限重试一个真坏的版本。
+    ///
+    /// 这里是**唯一**给失败定类别的地方：不回滚的几支判成环境类，其余（含
     /// 回滚过的那一支）判成版本类。类别随 [`RolloutFailure`] 带到 CLI，翻成
     /// 进程退出码交给部署器，部署器据此决定占不占尝试预算。
     async fn fail_without_blind_rollback(
@@ -3262,6 +3406,14 @@ impl RolloutExecutor {
             warn!(
                 error = %e,
                 "cluster unreachable during the rollout; keeping the new revision (no rollback)"
+            );
+            return Err(RolloutFailure::environment(e));
+        }
+        if is_admission_denied(&msg) {
+            warn!(
+                error = %e,
+                "the API server rejected the new pods and this revision did not change the \
+                 deployment's placement shape; keeping the new revision (no rollback)"
             );
             return Err(RolloutFailure::environment(e));
         }
@@ -5192,6 +5344,26 @@ exit 0
             class_of("kerr", "#!/bin/sh\necho 'no route to host' >&2\nexit 1\n").await,
             FailureClass::Version
         );
+        // 一个 Pod 都没有、但 Job 的 Failed 条件写明了准入面拒绝：判定进程压根没被
+        // 创建出来，退出码永远不会有，这一档要从条件消息里读成环境类——它与"码读不
+        // 出来"不是一回事，是采错了地方。
+        assert_eq!(
+            class_of(
+                "kquota",
+                "#!/bin/sh\ncase \"$*\" in\n  *\"job-name=\"*) exit 0 ;;\n  *\"get job\"*) echo 'Error creating: pods \"j-x\" is forbidden: exceeded quota: cogneva-quota, requested: requests.cpu=200m, used: requests.cpu=6, limited: requests.cpu=6' ;;\n  *) exit 0 ;;\nesac\nexit 0\n"
+            )
+            .await,
+            FailureClass::Environment
+        );
+        // 反面：条件消息为空时仍按版本类靠，别把"没读到"读成环境类。
+        assert_eq!(
+            class_of(
+                "kquotaempty",
+                "#!/bin/sh\ncase \"$*\" in\n  *\"job-name=\"*) exit 0 ;;\n  *) exit 0 ;;\nesac\nexit 0\n"
+            )
+            .await,
+            FailureClass::Version
+        );
     }
 
     /// 环境类失败不是版本结论：不占本 rev 的尝试次数，但仍设冷却（不空转），
@@ -6134,16 +6306,57 @@ exit 0
         // 会把上一次的病因记到这一次头上。
         assert!(!msg.contains("57bc1f"), "{msg}");
 
-        // 判定不变：这一轮只改诊断，准入受阻仍按版本类处置（回滚）。把结论
-        // 也锁在这里，是为了让「准入受阻算不算环境」那半个问题改判时，
-        // 必须显式改这条用例，而不是悄悄漂移。
+        // 归类：新版本的容器一次都没起来，读出的是集群此刻放不下，不是这份变更的
+        // 好坏 ⇒ 环境类，不回滚、不占本 rev 的尝试预算（占满了就会把一份本来正常
+        // 的变更搁置到下个 rev）。这条用例此前锁的是相反结论，改判时显式翻过来。
+        assert_eq!(err.class, FailureClass::Environment);
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert!(
-            calls.contains(
+            !calls.contains(
                 "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old"
             ),
-            "diagnosis-only change must not alter the verdict: {calls}"
+            "an admission rejection must not roll the revision back: {calls}"
         );
+    }
+
+    /// 准入被拒算不算环境类，与「排不上队」共用同一条边界：**只有这次上线没动过
+    /// 放置面**时才是集群此刻的问题。变更自己把 requests 调过了配额、加了个越界的
+    /// LimitRange 值，都是这份变更的毛病——环境类不占尝试预算，误放会无限重试。
+    ///
+    /// 判不准（读不到当前面、快照为空）同样往版本侧靠；校验类失败压根不是准入面
+    /// 拒绝，不能混进来。
+    #[test]
+    fn an_admission_rejection_is_environment_only_when_the_shape_did_not_change() {
+        let shape = "{\"template\":{\"spec\":{\"containers\":[{}]}}}";
+        let quota = vec![ReplicaSetFailure {
+            name: "cogneva-x-1a2b3".to_string(),
+            reason: "FailedCreate".to_string(),
+            message: "pods \"cogneva-x-1a2b3-c4d5e\" is forbidden: exceeded quota: \
+                      cogneva-quota, requested: limits.cpu=500m, used: limits.cpu=16500m"
+                .to_string(),
+        }];
+        let denied = admission_rejection(&quota, shape, Some(shape)).expect("environment class");
+        assert!(denied.contains("exceeded quota"), "{denied}");
+
+        // 这次上线自己把请求调过了配额 ⇒ 版本类（那一支带的是普通超时错误，标记
+        // 不打，照常回滚）。
+        let raised = "{\"template\":{\"spec\":{\"containers\":[{\"resources\":\
+                      {\"requests\":{\"cpu\":\"4\"}}}]}}}";
+        assert!(admission_rejection(&quota, shape, Some(raised)).is_none());
+        // 判不准就往版本侧靠。
+        assert!(admission_rejection(&quota, shape, None).is_none());
+        assert!(admission_rejection(&quota, "", Some(shape)).is_none());
+        // 没有准入被拒这个信号 ⇒ 这条超时与准入无关。
+        assert!(admission_rejection(&[], shape, Some(shape)).is_none());
+        // 校验类失败（无效字段值）不是准入面拒绝：那是这份变更写错了清单。
+        let invalid = vec![ReplicaSetFailure {
+            name: "cogneva-x-1a2b3".to_string(),
+            reason: "FailedCreate".to_string(),
+            message: "pods \"cogneva-x-1a2b3-c4d5e\" is invalid: \
+                      spec.containers[0].image: Required value"
+                .to_string(),
+        }];
+        assert!(admission_rejection(&invalid, shape, Some(shape)).is_none());
     }
 
     #[test]
@@ -6585,6 +6798,65 @@ spec:
             .class,
             FailureClass::Version
         );
+    }
+
+    /// 准入面拒绝（配额打满、LimitRange 越界、PodSecurity）不是版本结论：apiserver
+    /// 说的是"集群此刻装不下这份请求"，不是"新版本有毛病"。实测集群 `cogneva-quota`
+    /// 的 requests.storage 已 110Gi/110Gi 打满——任何带新增 PVC 的发布集都会在这一档
+    /// 被拒；把它记成本 rev 的一次尝试，会按上限搁置一个本来正常的版本。
+    #[test]
+    fn admission_policy_denial_is_an_environment_failure_not_a_version_verdict() {
+        let quota = "error when creating \"STDIN\": pods \"cogneva-mainline-x\" is forbidden: \
+                    exceeded quota: cogneva-quota, requested: requests.cpu=200m, \
+                    used: requests.cpu=2180m, limited: requests.cpu=6";
+        assert!(is_admission_policy_denied(quota));
+        assert_eq!(
+            classify_before_any_change(SFError::IO(quota.to_string())).class,
+            FailureClass::Environment
+        );
+        // 配额拒绝带 `is forbidden` 却不带 `User "..."` 主体——正因如此它此前从
+        // 授权判据的缝里漏过去、掉回了版本类。两条判据各管各的措辞面。
+        assert!(!is_authorization_denied(quota));
+
+        for msg in [
+            "pods \"x\" is forbidden: [maximum cpu usage per Container is 2, but limit is 4]",
+            "pods \"x\" violates PodSecurity \"restricted:latest\": allowPrivilegeEscalation != false",
+        ] {
+            assert!(is_admission_policy_denied(msg), "{msg}");
+            assert_eq!(
+                classify_before_any_change(SFError::IO(msg.into())).class,
+                FailureClass::Environment,
+                "{msg}"
+            );
+        }
+
+        // 反面：清单本身坏掉是版本的事。判据不许认裸 `forbidden`，否则组包侧的错误
+        // 会被读成环境类，反而放走一个真坏的版本。
+        for msg in [
+            "kubectl apply -f support.yaml failed: invalid manifest",
+            "secret.yaml: Secret in manifest bundle is forbidden; secrets never travel through manifests",
+            "error when creating \"STDIN\": Service \"s\" is invalid: spec.ports[0].port: Invalid value",
+        ] {
+            assert!(!is_admission_policy_denied(msg), "{msg}");
+            assert_eq!(
+                classify_before_any_change(SFError::IO(msg.into())).class,
+                FailureClass::Version,
+                "{msg}"
+            );
+        }
+
+        // 滚动阶段的归类只认判定进程打的标记，不认措辞：超时记录里附着的现场
+        // 采样与上游原文同形，用措辞再判一遍会把「这次上线自己把请求调过了配额」
+        // 那一支也放成环境类，而环境类不占尝试预算，一个真坏的版本会无限重试。
+        let timeout_with_scene = format!(
+            "rollout of deployment/x did not complete within 300s \
+             (last: 1|1|0|1|0|1); pods: replicasets: x FailedCreate: {quota}"
+        );
+        assert!(is_admission_policy_denied(&timeout_with_scene));
+        assert!(!is_admission_denied(&timeout_with_scene));
+        assert!(is_admission_denied(&format!(
+            "{ADMISSION_DENIED_MARKER}: rollout of deployment/x did not complete within 300s"
+        )));
     }
 
     #[test]
