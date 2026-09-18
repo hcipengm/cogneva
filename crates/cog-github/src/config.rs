@@ -198,6 +198,12 @@ impl Default for WebhookConfig {
 pub struct GitHubIntegrationConfig {
     /// Master switch for the GitHub integration.
     pub enabled: bool,
+    /// 本进程是否承担发现循环。同一个二进制在多个部署里各自构造插件表，
+    /// 发现循环对外有副作用（上游追问、提交修复意图），而记账的 intent guard
+    /// 是进程私有的（每 Pod 一份数据卷）——两个进程各扫一遍，等于每个意图被
+    /// 处理两次：同一句澄清追问发两遍，且谁也看不见对方已处理过。属主是
+    /// 主应用，因为事件入口结构上只路由到它，轮询只是它的周期兜底。
+    pub discovery_enabled: bool,
     /// Discovery mode: `polling`, `events`, or `both`.
     pub discovery_mode: String,
     /// Target repository in `owner/repo` format.
@@ -245,6 +251,7 @@ impl Default for GitHubIntegrationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            discovery_enabled: true,
             discovery_mode: "polling".into(),
             repo: String::new(),
             base_branch: "main".into(),
@@ -474,6 +481,7 @@ const GITHUB_ENV: &[(&str, &str)] = &[
     ("COGNEVA_GITHUB_REPO", "repo"),
     ("COGNEVA_GITHUB_BASE_BRANCH", "base_branch"),
     ("COGNEVA_GITHUB_API_BASE", "api_base"),
+    ("COGNEVA_GITHUB_DISCOVERY_ENABLED", "discovery_enabled"),
     ("COGNEVA_GITHUB_APP_SLUG", "bot_identity.app_slug"),
     (
         "COGNEVA_GITHUB_WEBHOOK_GATEWAY_VERIFIED",
@@ -586,6 +594,42 @@ impl GiteeIntegrationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 发现循环属主开关：默认必须是开的。默认若跟成关，单部署安装升级后会静默
+    /// 失去发现能力——这正是新增开关最容易造成的退化。置位的是部署（进化 Pod
+    /// 走 env 关掉），所以两条路径都要能生效。
+    #[test]
+    fn discovery_owner_switch_defaults_on_and_honors_file_and_env() {
+        assert!(GitHubIntegrationConfig::default().discovery_enabled);
+
+        let dir = std::env::temp_dir().join(format!("cog-github-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        std::fs::write(
+            &path,
+            r#"{"github_integration": {"enabled": true, "discovery_enabled": false}}"#,
+        )
+        .unwrap();
+        assert!(
+            !GitHubIntegrationConfig::load_from(&path)
+                .unwrap()
+                .discovery_enabled
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"github_integration": {"enabled": true, "discovery_enabled": true}}"#,
+        )
+        .unwrap();
+        std::env::set_var("COGNEVA_GITHUB_DISCOVERY_ENABLED", "false");
+        let cfg = GitHubIntegrationConfig::load_from(&path).unwrap();
+        std::env::remove_var("COGNEVA_GITHUB_DISCOVERY_ENABLED");
+        assert!(
+            !cfg.discovery_enabled,
+            "env override must reach the discovery owner switch"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn test_primary_account() {

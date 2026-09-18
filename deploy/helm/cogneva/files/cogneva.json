@@ -545,6 +545,8 @@
   "github_integration": {
     "_comment": "GitHub integration for self-evolution. Tokens are resolved from environment variables and never enter the sandbox. discovery_mode=both: polling is the periodic fallback, webhook events (via the security gateway, gateway_verified) give second-level response.",
     "enabled": true,
+    "_comment_discovery_enabled": "Whether THIS process runs the discovery loops. One binary serves several deployments (main app, evolution pod, security gateway, sandbox executor) and each of the first two builds its own plugin table, so without this switch both scan the same upstream items and ask the same clarification twice: intent guards are per-pod files, so neither can see the other already acted. The owner is the main app — webhook events structurally reach only it, and polling is its periodic fallback. Deployment sets this false on the evolution pod.",
+    "discovery_enabled": true,
     "discovery_mode": "both",
     "repo": "hcipengm/cogneva",
     "base_branch": "main",

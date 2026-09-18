@@ -43,6 +43,11 @@ data:
   # 沙盒只推不拉：拉取端（poll/金丝雀/回滚）跑在主部署 Pod，那里有
   # kubectl 与 RBAC；本 Pod 起拉取端只会每轮报错。
   COGNEVA_GITOPS_PULLER_ENABLED: "false"
+  # 发现循环只有一个属主：主应用。issue/评论事件经网关只路由到主应用，轮询是
+  # 它的周期兜底；本 Pod 里的发现循环对外副作用相同（追问、提交修复意图），而
+  # 记账的 intent guard 是进程私有的（各挂各的数据卷）——两个进程各扫一遍，同一
+  # 句追问会发两遍，谁也看不见对方已处理。只关发现，落地监视照跑。
+  COGNEVA_GITHUB_DISCOVERY_ENABLED: "false"
   # Disable memory/vector backends in the evolution worker to avoid downloading
   # embedding models inside the sandbox on every boot.
   COGNEVA_MEMORY_ENABLED: "false"

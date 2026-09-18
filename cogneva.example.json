@@ -492,6 +492,8 @@
   "github_integration": {
     "_comment": "GitHub integration for self-evolution. Tokens are resolved from environment variables and never enter the sandbox.",
     "enabled": false,
+    "_comment_discovery_enabled": "Whether THIS process runs the discovery loops. One binary serves several deployments and each builds its own plugin table, so when two processes are up they otherwise scan the same upstream items and ask the same clarification twice (intent guards are per-pod files). Leave true unless this deployment is a secondary process of an installation whose main app already discovers.",
+    "discovery_enabled": true,
     "discovery_mode": "polling",
     "repo": "owner/cogneva",
     "base_branch": "main",

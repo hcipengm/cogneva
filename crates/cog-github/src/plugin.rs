@@ -131,6 +131,24 @@ impl GitHubPlugin {
             loop_state: Mutex::new(None),
         }
     }
+
+    /// 登记已起的后台任务，shutdown 时统一停。句柄为空就不登记：留下一个没有
+    /// 任何任务的 LoopState，只会让 shutdown 多做一次空转。
+    fn store_loops(
+        &self,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        handles: Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        if handles.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.loop_state.lock() {
+            *guard = Some(LoopState {
+                shutdown_tx,
+                handles,
+            });
+        }
+    }
 }
 
 impl Default for GitHubPlugin {
@@ -306,6 +324,22 @@ impl cog_core::SystemPlugin for GitHubPlugin {
             info!("landing CI watch started");
         }
 
+        // discovery_mode 由 github_integration 承载，Gitee 继承同一策略。
+        let loop_cfg = self
+            .config
+            .clone()
+            .or_else(|| self.gitee.as_ref().map(|(c, _)| c.clone()))
+            .unwrap_or_default();
+
+        // 非属主进程不建发现循环。落地监视（上面已起）不在此列：它盯的是本进程
+        // 自己推上去的提交，两个进程各有各的工作树与落盘记录。句柄照常登记，
+        // 否则这条早退会把已经起好的监视一并丢掉。
+        if !loop_cfg.discovery_enabled {
+            info!("discovery loops not started: this process does not own discovery");
+            self.store_loops(tx, handles);
+            return Ok(());
+        }
+
         // GitHub / Gitee 两个平台的 discovery loop 集中创建，轮询与事件
         // 入口共享同一实例（事件驱动与周期兜底互补）。
         let mk_loop = |config: &crate::config::GitHubIntegrationConfig,
@@ -330,15 +364,10 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         };
         let gitee_shared = self.gitee.as_ref().map(|(cfg, p)| mk_loop(cfg, p));
         if github_shared.is_none() && gitee_shared.is_none() {
+            self.store_loops(tx, handles);
             return Ok(());
         }
 
-        // discovery_mode 由 github_integration 承载，Gitee 继承同一策略。
-        let loop_cfg = self
-            .config
-            .clone()
-            .or_else(|| self.gitee.as_ref().map(|(c, _)| c.clone()))
-            .unwrap_or_default();
         let mode = loop_cfg.discovery_mode.as_str();
         let use_polling = mode == "polling" || mode == "both";
         let use_events = mode == "events" || mode == "both";
@@ -347,6 +376,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                 mode,
                 "discovery_mode 无法识别（polling/events/both），集成不启动"
             );
+            self.store_loops(tx, handles);
             return Ok(());
         }
 
@@ -443,15 +473,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
             }
         }
 
-        if handles.is_empty() {
-            return Ok(());
-        }
-        if let Ok(mut guard) = self.loop_state.lock() {
-            *guard = Some(LoopState {
-                shutdown_tx: tx,
-                handles,
-            });
-        }
+        self.store_loops(tx, handles);
         Ok(())
     }
 
