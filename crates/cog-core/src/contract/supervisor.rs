@@ -167,19 +167,58 @@ pub trait SchedulerGate: Send + Sync {
 /// Redis key carrying the LLM upstream pool status between the security
 /// gateway (which owns upstream health) and the scheduler side (which decides
 /// whether LLM-dependent work may run). The gateway writes it with a TTL
-/// bounded by the earliest known recovery, so a crashed gateway cannot wedge
-/// the scheduler open or closed forever.
+/// bounded by the next attempt, so a crashed gateway cannot wedge the
+/// scheduler open or closed forever.
 pub const LLM_POOL_STATUS_KEY: &str = "llm:pool:status";
 
 /// Cross-process snapshot of LLM upstream pool health.
+///
+/// Two bounds travel side by side instead of being collapsed into one number,
+/// because they rest on different evidence. An upstream that reported a quota
+/// reset time is stating a fact about itself; a suspect window that will merely
+/// expire is our own retry cadence and says nothing about whether that upstream
+/// will serve again. Publishing the cadence as "recovery" asserts knowledge of
+/// an external system that nothing here has, and it understates a real outage:
+/// one upstream resets in six hours while the rest sit behind a sixty-second
+/// backoff, and the single number reports one minute.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmPoolStatus {
     /// `true` when no configured upstream can currently serve a request.
     pub unavailable: bool,
-    /// Earliest known upstream recovery as unix seconds; `0` when unknown.
-    pub earliest_recovery_unix: i64,
+    /// Earliest quota-reset time reported by any suspect upstream, unix
+    /// seconds; `0` when none reported one. Evidence about the upstreams.
+    #[serde(default)]
+    pub evidenced_recovery_unix: i64,
+    /// Earliest time a suspect upstream will be probed again, unix seconds;
+    /// `0` when nothing is suspect. Our own retry cadence, not evidence.
+    ///
+    /// Carries an alias for the pre-split field, whose value was the same
+    /// combined bound under a name that claimed more: a payload written by a
+    /// process still running the old build parses with identical meaning
+    /// instead of failing and dropping the pause entirely for the length of a
+    /// rollout. Both bounds default, so a missing field reads as "no such
+    /// evidence" rather than an error.
+    #[serde(default, alias = "earliest_recovery_unix")]
+    pub next_attempt_unix: i64,
     /// Identity (`base_url|model`) of the unusable upstreams.
     pub unavailable_upstreams: Vec<String>,
+}
+
+impl LlmPoolStatus {
+    /// Seconds from `now_unix` until the pool might serve a request again.
+    ///
+    /// `None` means no bound lies in the future — the recovery point is unknown
+    /// rather than imminent, so callers fall back to their own recheck cadence
+    /// instead of polling once a second. A bound already in the past is no
+    /// future opening either: the upstream said its quota resets at a time that
+    /// came and went without a call succeeding.
+    pub fn wait_secs(&self, now_unix: i64) -> Option<u64> {
+        [self.evidenced_recovery_unix, self.next_attempt_unix]
+            .into_iter()
+            .filter(|t| *t > now_unix)
+            .map(|t| (t - now_unix) as u64)
+            .min()
+    }
 }
 
 /// Reads the cross-process pool snapshot published by the security gateway.
@@ -314,9 +353,13 @@ pub enum SupervisorEvent {
     /// rejected, unreachable). LLM-dependent work is paused until recovery;
     /// mechanical work keeps running.
     LlmUpstreamPoolDown {
-        /// Earliest known upstream recovery time as unix seconds; `0` when no
-        /// upstream reported a reset time, so the alert can say "unknown".
-        earliest_recovery_unix: i64,
+        /// Earliest quota-reset time reported by any suspect upstream, unix
+        /// seconds; `0` when none reported one, so the alert says the recovery
+        /// time is unreported rather than inventing one.
+        evidenced_recovery_unix: i64,
+        /// Earliest time a suspect upstream will be probed again, unix seconds.
+        /// Retry cadence, not an upstream fact, and worded as such downstream.
+        next_attempt_unix: i64,
         /// Identity of the unusable upstreams (`base_url|model`).
         unavailable: Vec<String>,
         timestamp: DateTime<Utc>,
@@ -428,5 +471,63 @@ impl SupervisorEvent {
             SupervisorEvent::ScaleRecommendation { .. } => "scale_recommendation",
             SupervisorEvent::AgentEventReported { .. } => "agent_event_reported",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_secs_takes_the_nearer_future_bound() {
+        let status = LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: 1_000,
+            next_attempt_unix: 400,
+            unavailable_upstreams: vec![],
+        };
+        assert_eq!(status.wait_secs(100), Some(300), "the nearer bound decides");
+    }
+
+    #[test]
+    fn wait_secs_is_none_when_no_bound_lies_ahead() {
+        let status = LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: 50,
+            next_attempt_unix: 0,
+            unavailable_upstreams: vec![],
+        };
+        // A reset that has already elapsed is not a future opening: the upstream
+        // named a time that came and went without a call succeeding.
+        assert_eq!(status.wait_secs(100), None);
+        assert_eq!(
+            LlmPoolStatus {
+                unavailable: true,
+                ..Default::default()
+            }
+            .wait_secs(100),
+            None
+        );
+    }
+
+    /// The payload changed shape here: what used to travel as one collapsed
+    /// `earliest_recovery_unix` now travels as two bounds. A process still
+    /// running the old build publishes the old field, and during a rollout the
+    /// new build reads it — dropping that payload would silently unpause
+    /// LLM-dependent work against a dead pool for the length of the rollout.
+    /// The old value was the same combined bound under a name that claimed
+    /// more, so it loads as the retry bound with identical meaning.
+    #[test]
+    fn pre_split_payload_still_loads_as_the_retry_bound() {
+        let legacy = r#"{"unavailable":true,"earliest_recovery_unix":1789744595,
+                         "unavailable_upstreams":["https://a|m"]}"#;
+        let status: LlmPoolStatus = serde_json::from_str(legacy).expect("old payload parses");
+        assert!(status.unavailable);
+        assert_eq!(status.next_attempt_unix, 1_789_744_595);
+        assert_eq!(
+            status.evidenced_recovery_unix, 0,
+            "the old field carried no evidence about any upstream"
+        );
+        assert_eq!(status.wait_secs(1_789_744_595 - 10), Some(10));
     }
 }

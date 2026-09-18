@@ -386,6 +386,52 @@ struct UpstreamHealth {
     quota_reset_unix: Option<i64>,
 }
 
+/// 池内两个恢复上界，来源不同、结论强度也不同，因此分开持有而不是先取 min
+/// 再当"最早恢复"播报。
+///
+/// * `evidenced_unix`：某个嫌疑上游**自己报告**的配额恢复时刻里最早的一个。
+///   这是关于上游状态的证据。
+/// * `next_probe_unix`：我们自己的嫌疑窗到期时刻里最早的一个。这只是"我们下次
+///   会再试一次"，对上游会不会恢复没有任何断言。
+///
+/// 两者都为 0 表示池内没有嫌疑上游。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RecoveryBounds {
+    evidenced_unix: i64,
+    next_probe_unix: i64,
+}
+
+impl RecoveryBounds {
+    /// 池内最早可能重新承接请求的时刻：两个上界里更早的那个。等待时长、重试
+    /// 提示、跨进程信号的 TTL 都取这个数——它们要的是"什么时候值得再试"，
+    /// 不是对上游恢复的断言。
+    fn next_attempt_unix(self) -> i64 {
+        match (self.evidenced_unix, self.next_probe_unix) {
+            (0, probe) => probe,
+            (evidenced, 0) => evidenced,
+            (evidenced, probe) => evidenced.min(probe),
+        }
+    }
+}
+
+/// 两个"0 表示未知"的 unix 时刻里更早的那个。
+fn earlier_known(a: i64, b: i64) -> i64 {
+    match (a, b) {
+        (0, x) | (x, 0) => x,
+        (x, y) => x.min(y),
+    }
+}
+
+/// unix 秒 → RFC3339；0（未知）与越界值都渲染成 `unknown`。
+fn unix_to_rfc3339(unix: i64) -> String {
+    if unix <= 0 {
+        return "unknown".into();
+    }
+    DateTime::from_timestamp(unix, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// 池健康表：key = base_url|model（上游在池内的身份）。纯进程内状态，
 /// 重启即清零——代价只是每个坏上游多试一次，换来的是无持久化依赖。
 #[derive(Default)]
@@ -459,27 +505,35 @@ impl LlmHealthTable {
         !upstreams.is_empty() && upstreams.iter().all(|u| self.is_suspect(u))
     }
 
-    /// 池内最早可能恢复的 unix 秒：取嫌疑上游里最近的一个上界
-    /// （有配额恢复时刻用时刻，否则用窗口到期时间）；无嫌疑上游返回 0。
-    fn earliest_recovery(&self, upstreams: &[LlmUpstream]) -> i64 {
+    /// 池内两个恢复上界，按来源分开给；无嫌疑上游时两者都是 0。
+    ///
+    /// 不在这里先取 min 再当成一个"最早恢复"往外播：上游报了配额恢复时刻的那
+    /// 一支是关于上游的证据，窗口到期的那一支只是我们自己的重试节拍。合并后，
+    /// 一个上游 6 小时后配额才复位、其余上游只是被退避窗挡着时，这个数会报成
+    /// 60 秒——把一次 6 小时的断供说成 1 分钟，而它同时还是调度侧暂停时长的
+    /// 输入，于是连暂停也会提前解除。
+    fn recovery_bounds(&self, upstreams: &[LlmUpstream]) -> RecoveryBounds {
         let now_instant = std::time::Instant::now();
         let now_unix = Utc::now().timestamp();
         let states = self.states.lock().unwrap();
-        upstreams
-            .iter()
-            .filter_map(|u| {
-                let h = states.get(&Self::key(u))?;
-                let until = h.suspect_until?;
-                if now_instant >= until {
-                    return None;
-                }
-                Some(match h.quota_reset_unix {
-                    Some(reset) => reset,
-                    None => now_unix + until.duration_since(now_instant).as_secs() as i64,
-                })
-            })
-            .min()
-            .unwrap_or(0)
+        let mut bounds = RecoveryBounds::default();
+        for u in upstreams {
+            let Some(h) = states.get(&Self::key(u)) else {
+                continue;
+            };
+            let Some(until) = h.suspect_until else {
+                continue;
+            };
+            if now_instant >= until {
+                continue;
+            }
+            let probe = now_unix + until.duration_since(now_instant).as_secs() as i64;
+            bounds.next_probe_unix = earlier_known(bounds.next_probe_unix, probe);
+            if let Some(reset) = h.quota_reset_unix {
+                bounds.evidenced_unix = earlier_known(bounds.evidenced_unix, reset);
+            }
+        }
+        bounds
     }
 
     /// 逐上游健康快照：`(身份, 是否健康, 连续失败数, 配额恢复时刻)`。
@@ -617,7 +671,7 @@ impl AppState {
     }
 
     /// 池级熔断判定：给定协议面候选，只要没有一个上游当下能承接请求
-    /// （全在嫌疑窗内），就返回 `Retry-After` 秒数（到最早恢复时刻，至少 60s），
+    /// （全在嫌疑窗内），就返回 `Retry-After` 秒数（到下次可试时刻，至少 60s），
     /// 否则 None。调用方据此在入口快速失败，不再逐个上游重试。
     ///
     /// 判据必须与"池不可用"的其它观测面同源（告警、调度侧暂停、Redis 信号都取
@@ -632,17 +686,17 @@ impl AppState {
         if !self.llm_health.all_suspect(&owned) {
             return None;
         }
-        let earliest = self.llm_health.earliest_recovery(&owned);
-        let wait = earliest.saturating_sub(Utc::now().timestamp()).max(60) as u64;
+        let next_attempt = self.llm_health.recovery_bounds(&owned).next_attempt_unix();
+        let wait = next_attempt.saturating_sub(Utc::now().timestamp()).max(60) as u64;
         Some(wait)
     }
 }
 
 /// 池状态快照发往 Redis 的 TTL 秒数：下界给探测节拍留出续期余量，
 /// 上界防止网关崩溃后调度侧被永久钉在暂停态。
-fn pool_status_ttl_secs(state: &AppState, earliest_recovery_unix: i64) -> u64 {
+fn pool_status_ttl_secs(state: &AppState, next_attempt_unix: i64) -> u64 {
     let now = Utc::now().timestamp();
-    let until = earliest_recovery_unix.saturating_sub(now).max(0) as u64;
+    let until = next_attempt_unix.saturating_sub(now).max(0) as u64;
     until
         .max(state.config.pool_check_secs.saturating_mul(3))
         .clamp(30, 7 * 24 * 3600)
@@ -950,7 +1004,7 @@ fn record_upstream_state(
 
 /// 把池状态写入/清除跨进程 Redis 信号。网关崩了也不会把调度侧永久钉在
 /// 暂停态：键带 TTL，节拍内持续续期，恢复即刻删除。
-async fn publish_pool_signal(state: &AppState, down: bool, earliest_recovery_unix: i64) {
+async fn publish_pool_signal(state: &AppState, down: bool, bounds: RecoveryBounds) {
     let Some(conn) = &state.redis else {
         return;
     };
@@ -965,7 +1019,8 @@ async fn publish_pool_signal(state: &AppState, down: bool, earliest_recovery_uni
             .collect();
         let status = cog_core::LlmPoolStatus {
             unavailable: true,
-            earliest_recovery_unix,
+            evidenced_recovery_unix: bounds.evidenced_unix,
+            next_attempt_unix: bounds.next_probe_unix,
             unavailable_upstreams: unavailable,
         };
         let payload = match serde_json::to_string(&status) {
@@ -975,7 +1030,7 @@ async fn publish_pool_signal(state: &AppState, down: bool, earliest_recovery_uni
                 return;
             }
         };
-        let ttl = pool_status_ttl_secs(state, earliest_recovery_unix);
+        let ttl = pool_status_ttl_secs(state, bounds.next_attempt_unix());
         let res: redis::RedisResult<()> = redis::cmd("SET")
             .arg(cog_core::LLM_POOL_STATUS_KEY)
             .arg(payload)
@@ -1003,16 +1058,9 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
     let Some(alerts) = &state.pool_obs.alerts else {
         return;
     };
-    let earliest = state
+    let bounds = state
         .llm_health
-        .earliest_recovery(&state.config.llm_upstreams);
-    let eta = if earliest > 0 {
-        DateTime::from_timestamp(earliest, 0)
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_else(|| "unknown".into())
-    } else {
-        "unknown".into()
-    };
+        .recovery_bounds(&state.config.llm_upstreams);
     let unavailable: Vec<String> = state
         .config
         .llm_upstreams
@@ -1020,27 +1068,47 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
         .filter(|u| state.llm_health.is_suspect(u))
         .map(LlmHealthTable::key)
         .collect();
+    // 两种上界分开措辞：上游报了配额恢复时刻就是一条关于上游的事实，只够说明
+    // "我们下次会再试"的退避节拍不能借"恢复"这个词播出去，否则读告警的人会以为
+    // 上游一分钟后就回来。
+    let recovery_note = match bounds.evidenced_unix {
+        0 => format!(
+            "没有任何上游报告恢复时刻，{} 起按退避节拍重试",
+            unix_to_rfc3339(bounds.next_probe_unix)
+        ),
+        evidenced => format!(
+            "上游报告的最早恢复时刻 {}，退避重试节拍 {}",
+            unix_to_rfc3339(evidenced),
+            unix_to_rfc3339(bounds.next_probe_unix)
+        ),
+    };
     let alert = NewAlert {
         rule: "llm_upstream_pool_down".into(),
         dedup_key: "llm_upstream_pool_down".into(),
         severity: "critical".into(),
         message: if down {
             format!(
-                "所有 {} 个 LLM 上游不可用（最早恢复 {}）；LLM 依赖型任务已暂停，请补充可联通的上游",
+                "所有 {} 个 LLM 上游不可用（{}）；LLM 依赖型任务已暂停，请补充可联通的上游",
                 unavailable.len(),
-                eta
+                recovery_note
             )
         } else {
             "LLM 上游池已恢复，LLM 依赖型任务自动继续".into()
         },
         labels: serde_json::json!({
             "unavailable": unavailable,
-            "earliest_recovery_unix": earliest,
+            "evidenced_recovery_unix": bounds.evidenced_unix,
+            "next_attempt_unix": bounds.next_probe_unix,
         }),
     };
     match alerts.set_alert(down, &alert).await {
         Ok(AlertTransition::Fired) => {
-            tracing::error!(earliest_recovery = %eta, "池全灭告警已落 PG（firing）");
+            tracing::error!(
+                evidenced_recovery_unix = bounds.evidenced_unix,
+                next_attempt_unix = bounds.next_probe_unix,
+                note = %recovery_note,
+                "池全灭告警已落 PG（firing）"
+            );
         }
         Ok(AlertTransition::Resolved) => {
             tracing::info!("池全灭告警已落 PG（resolved）");
@@ -1070,7 +1138,7 @@ async fn refresh_pool_state(state: &AppState) {
     } else {
         state.pool_down.load(Ordering::SeqCst)
     };
-    let earliest = state.llm_health.earliest_recovery(upstreams);
+    let bounds = state.llm_health.recovery_bounds(upstreams);
 
     for (key, healthy, _failures, _reset) in state.llm_health.snapshot(upstreams) {
         record_gauge(
@@ -1088,21 +1156,32 @@ async fn refresh_pool_state(state: &AppState) {
         &[],
     )
     .await;
+    // 两个上界各自成一条序列：把它们合成一条就等于把"我们的重试节拍"和
+    // "上游报告的恢复时刻"在观测面上再粘回去，看图的人分不出被画出来的那个
+    // 到底是哪种证据。
     record_gauge(
         state,
-        "llm_pool_earliest_recovery_seconds",
-        earliest as f64,
+        "llm_pool_evidenced_recovery_unix",
+        bounds.evidenced_unix as f64,
+        &[],
+    )
+    .await;
+    record_gauge(
+        state,
+        "llm_pool_next_attempt_unix",
+        bounds.next_probe_unix as f64,
         &[],
     )
     .await;
 
-    publish_pool_signal(state, down, earliest).await;
+    publish_pool_signal(state, down, bounds).await;
 
     let was_down = state.pool_down.swap(down, Ordering::SeqCst);
     if down != was_down {
         if down {
             tracing::error!(
-                earliest_recovery_unix = earliest,
+                evidenced_recovery_unix = bounds.evidenced_unix,
+                next_attempt_unix = bounds.next_probe_unix,
                 upstreams = ?upstreams.iter().map(LlmHealthTable::key).collect::<Vec<_>>(),
                 "LLM 上游池全灭，进入熔断；LLM 依赖型任务应暂停，需补充可联通的上游"
             );
@@ -3283,21 +3362,30 @@ mod tests {
         let far = Utc::now().timestamp() + 7_200;
 
         assert!(!table.all_suspect(&pool));
-        assert_eq!(table.earliest_recovery(&pool), 0);
+        assert_eq!(table.recovery_bounds(&pool), RecoveryBounds::default());
 
         // 配额窗：窗口被拉到恢复时刻，且给出恢复时间上界。
         table.note_failure(&a, 300, Some(far));
         assert!(table.is_suspect(&a));
         assert!(!table.all_suspect(&pool), "还有健康上游时池未全灭");
-        assert_eq!(table.earliest_recovery(&pool), far);
+        assert_eq!(table.recovery_bounds(&pool).evidenced_unix, far);
 
         // 第二个上游只是瞬时失败（无 reset）→ 同样计入"全灭"：它当下也承接不了。
         table.note_failure(&b, 300, None);
         assert!(table.all_suspect(&pool));
-        // b 的退避窗只有 300s，比 a 的配额恢复上界近，故池的最早恢复取 b 的窗口。
-        let earliest = table.earliest_recovery(&pool);
-        assert!(earliest < far, "取最早的那个上界：b 的退避窗更近");
-        assert!(earliest > Utc::now().timestamp());
+        // b 的退避窗（300s）比 a 的配额恢复上界（7200s）近，等待用的一刻取 b 的窗；
+        // 但 a 报告过的恢复时刻不能被它顶掉——那是两种证据。合并成一个数就会把
+        // "上游说 6 小时后才可能恢复"播成"5 分钟后"，读告警的人被提前安慰。
+        let bounds = table.recovery_bounds(&pool);
+        assert_eq!(
+            bounds.evidenced_unix, far,
+            "上游报告的恢复时刻是证据，不被退避节拍顶掉"
+        );
+        assert!(
+            bounds.next_probe_unix < far,
+            "等待用的一刻取更近的那个：b 的退避窗更近"
+        );
+        assert!(bounds.next_attempt_unix() > Utc::now().timestamp());
 
         // 恢复一个即离开"全灭"。
         table.note_success(&a);
@@ -3402,8 +3490,12 @@ mod tests {
             "应有逐上游健康 gauge"
         );
         assert!(
-            text.contains(&format!("llm_pool_earliest_recovery_seconds {far}")),
-            "应暴露最早恢复时刻: {text}"
+            text.contains(&format!("llm_pool_evidenced_recovery_unix {far}")),
+            "应暴露上游报告的恢复时刻: {text}"
+        );
+        assert!(
+            text.contains("llm_pool_next_attempt_unix"),
+            "退避重试节拍要自成一条序列，不能被当成恢复时刻: {text}"
         );
 
         // 恢复要凭据：上游实证成功才解除锁存。
@@ -3440,7 +3532,8 @@ mod tests {
     fn restart_seeds_pool_verdict_from_cross_process_signal() {
         let down = cog_core::LlmPoolStatus {
             unavailable: true,
-            earliest_recovery_unix: Utc::now().timestamp() + 600,
+            evidenced_recovery_unix: Utc::now().timestamp() + 600,
+            next_attempt_unix: Utc::now().timestamp() + 600,
             unavailable_upstreams: vec!["https://a.example.com|m1".into()],
         };
         let raw = serde_json::to_string(&down).unwrap();

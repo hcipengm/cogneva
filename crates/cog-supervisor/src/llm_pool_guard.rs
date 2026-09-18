@@ -115,12 +115,14 @@ impl LlmPoolGuard {
                 match self.enforce().await {
                     PoolTransition::Down(status) => {
                         tracing::warn!(
-                            earliest_recovery_unix = status.earliest_recovery_unix,
+                            evidenced_recovery_unix = status.evidenced_recovery_unix,
+                            next_attempt_unix = status.next_attempt_unix,
                             upstreams = ?status.unavailable_upstreams,
                             "LLM 上游池全灭，暂停 LLM 依赖型任务"
                         );
                         let _ = event_tx.send(SupervisorEvent::LlmUpstreamPoolDown {
-                            earliest_recovery_unix: status.earliest_recovery_unix,
+                            evidenced_recovery_unix: status.evidenced_recovery_unix,
+                            next_attempt_unix: status.next_attempt_unix,
                             unavailable: status.unavailable_upstreams,
                             timestamp: chrono::Utc::now(),
                         });
@@ -174,7 +176,8 @@ mod tests {
     fn down_status() -> LlmPoolStatus {
         LlmPoolStatus {
             unavailable: true,
-            earliest_recovery_unix: 1_800_000_000,
+            evidenced_recovery_unix: 1_800_000_000,
+            next_attempt_unix: 1_799_999_400,
             unavailable_upstreams: vec!["a|m".into(), "b|m".into()],
         }
     }

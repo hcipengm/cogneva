@@ -145,9 +145,28 @@ impl AlertStore {
                     resolved: false,
                 })
             }
-            SupervisorEvent::LlmUpstreamPoolDown { earliest_recovery_unix, unavailable, timestamp } => {
-                let eta = if *earliest_recovery_unix > 0 {
-                    DateTime::<Utc>::from_timestamp(*earliest_recovery_unix, 0)
+            SupervisorEvent::LlmUpstreamPoolDown {
+                evidenced_recovery_unix,
+                next_attempt_unix,
+                unavailable,
+                timestamp,
+            } => {
+                // The two bounds are worded apart on purpose: a reset time an
+                // upstream reported is a fact about that upstream, while the
+                // backoff expiry is only when we will try again. Calling the
+                // latter an "earliest recovery" tells the reader an upstream
+                // will be back at a time nothing has evidence for.
+                let recovery = match evidenced_recovery_unix {
+                    0 => "no upstream reported a recovery time".to_string(),
+                    at => format!(
+                        "earliest recovery reported by an upstream: {}",
+                        DateTime::<Utc>::from_timestamp(*at, 0)
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_else(|| "unknown".into())
+                    ),
+                };
+                let next_attempt = if *next_attempt_unix > 0 {
+                    DateTime::<Utc>::from_timestamp(*next_attempt_unix, 0)
                         .map(|t| t.to_rfc3339())
                         .unwrap_or_else(|| "unknown".into())
                 } else {
@@ -158,8 +177,9 @@ impl AlertStore {
                     severity: AlertSeverity::Critical,
                     event_type: "llm_upstream_pool_down".to_string(),
                     message: format!(
-                        "All {} LLM upstreams unavailable (earliest recovery: {eta}); \
-                         LLM-dependent tasks paused, supply a reachable upstream",
+                        "All {} LLM upstreams unavailable ({recovery}; next attempt: \
+                         {next_attempt}); LLM-dependent tasks paused, supply a reachable \
+                         upstream",
                         unavailable.len()
                     ),
                     agent_id: None,
@@ -235,7 +255,8 @@ mod tests {
     #[test]
     fn pool_down_maps_to_critical_unresolved_alert() {
         let event = SupervisorEvent::LlmUpstreamPoolDown {
-            earliest_recovery_unix: 1_789_315_200,
+            evidenced_recovery_unix: 1_789_315_200,
+            next_attempt_unix: 1_789_314_600,
             unavailable: vec!["https://a.example|model-a".into()],
             timestamp: Utc::now(),
         };
@@ -245,20 +266,41 @@ mod tests {
         assert!(!alert.resolved);
         assert!(
             alert.message.contains("2026-09-13"),
-            "含最早恢复时间: {}",
+            "含上游报告的最早恢复时间: {}",
             alert.message
         );
     }
 
+    /// 上游一个恢复时刻都没报过时，告警必须直说"没有证据"，不能把退避窗到期
+    /// 写成"最早恢复"——那等于替一个我们没有任何证据的外部系统下结论。
     #[test]
-    fn pool_down_with_unknown_recovery_still_alerts() {
+    fn pool_down_without_any_reported_reset_says_so() {
         let event = SupervisorEvent::LlmUpstreamPoolDown {
-            earliest_recovery_unix: 0,
+            evidenced_recovery_unix: 0,
+            next_attempt_unix: 1_789_314_600,
             unavailable: vec!["https://a.example|model-a".into()],
             timestamp: Utc::now(),
         };
-        let alert = AlertStore::event_to_alert(&event).expect("未知恢复时间也要告警");
-        assert!(alert.message.contains("unknown"), "{}", alert.message);
+        let alert = AlertStore::event_to_alert(&event).expect("没有恢复时刻也要告警");
+        assert!(
+            alert
+                .message
+                .contains("no upstream reported a recovery time"),
+            "没有恢复证据就得直说没有: {}",
+            alert.message
+        );
+        assert!(
+            !alert
+                .message
+                .contains("earliest recovery reported by an upstream"),
+            "没有任何上游报告过，就不能写成有: {}",
+            alert.message
+        );
+        assert!(
+            alert.message.contains("next attempt"),
+            "退避节拍要作为独立的时刻报出来: {}",
+            alert.message
+        );
     }
 
     #[test]

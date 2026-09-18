@@ -356,22 +356,35 @@ mod tests {
     /// The state machine is the part worth pinning down; `set_alert` is pure
     /// decision logic over the stored state. Exercise it against the same
     /// branch table the SQL implements.
+    const POOL_MESSAGE: &str =
+        "all four upstreams unavailable (no upstream reported a recovery time; \
+         next attempt unix 1789744595)";
+
     fn stored(state: &str) -> StoredAlert {
         StoredAlert {
             state: state.into(),
             severity: "critical".into(),
-            message: "all four upstreams unavailable (earliest recovery 04:56)".into(),
-            labels: serde_json::json!({"earliest_recovery_unix": 1_789_744_595_i64}),
+            message: POOL_MESSAGE.into(),
+            labels: serde_json::json!({
+                "evidenced_recovery_unix": 0,
+                "next_attempt_unix": 1_789_744_595_i64,
+            }),
         }
     }
 
-    fn alert(message: &str, recovery: i64, severity: &str) -> NewAlert {
+    fn alert(message: &str, next_attempt: i64, severity: &str) -> NewAlert {
+        // Both bounds, as the real alert carries them: a fixture that dropped
+        // one would make an unchanged reading look like a changed one and hide
+        // the very behaviour under test.
         NewAlert {
             rule: "llm_upstream_pool_down".into(),
             dedup_key: "llm_upstream_pool_down".into(),
             severity: severity.into(),
             message: message.into(),
-            labels: serde_json::json!({"earliest_recovery_unix": recovery}),
+            labels: serde_json::json!({
+                "evidenced_recovery_unix": 0,
+                "next_attempt_unix": next_attempt,
+            }),
         }
     }
 
@@ -406,11 +419,12 @@ mod tests {
     #[test]
     fn firing_row_is_rewritten_when_the_reading_moves() {
         let open = stored("firing");
-        // A recovery estimate that has since been pushed forward.
+        // A retry estimate that has since been pushed forward.
         assert!(payload_differs(
             &open,
             &alert(
-                "all four upstreams unavailable (earliest recovery 16:30)",
+                "all four upstreams unavailable (no upstream reported a recovery time; \
+                 next attempt unix 1789749020)",
                 1_789_749_020,
                 "critical"
             )
@@ -418,19 +432,11 @@ mod tests {
         // The reading may move in any of the three fields, not just the message.
         assert!(payload_differs(
             &open,
-            &alert(
-                "all four upstreams unavailable (earliest recovery 04:56)",
-                1_789_744_595,
-                "warning"
-            )
+            &alert(POOL_MESSAGE, 1_789_744_595, "warning")
         ));
         assert!(payload_differs(
             &open,
-            &alert(
-                "all four upstreams unavailable (earliest recovery 04:56)",
-                1_799_129_599,
-                "critical"
-            )
+            &alert(POOL_MESSAGE, 1_799_129_599, "critical")
         ));
     }
 
@@ -441,11 +447,7 @@ mod tests {
         let open = stored("firing");
         assert!(!payload_differs(
             &open,
-            &alert(
-                "all four upstreams unavailable (earliest recovery 04:56)",
-                1_789_744_595,
-                "critical"
-            )
+            &alert(POOL_MESSAGE, 1_789_744_595, "critical")
         ));
     }
 }

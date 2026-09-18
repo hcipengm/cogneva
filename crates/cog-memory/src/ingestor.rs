@@ -305,19 +305,18 @@ impl PullGate {
         None
     }
 
-    /// 快照给出的等待时长：到最早恢复时刻，但封顶。配额复位时刻可能远在几天
-    /// 之后，也可能因为上游说法不一致而不准——睡死了就错过恢复，所以按上限
-    /// 醒来重判。
+    /// 快照给出的等待时长：到池内下一个可能承接请求的时刻，但封顶。配额复位
+    /// 时刻可能远在几天之后，也可能因为上游说法不一致而不准——睡死了就错过
+    /// 恢复，所以按上限醒来重判。
     ///
-    /// 池报不可用、却没给出未来的恢复时刻（时刻已过或缺失）时，恢复点是未知
-    /// 而不是"马上就好"：按常规复查节拍重判，别给 1 秒——那会让闸门以每秒
-    /// 一次的频率去读同一份什么都没变的快照。
+    /// 等待取两个上界里更近的那个：上游报告的恢复时刻，或我们自己的退避窗到期
+    /// （那时会再试一次，试成了就是恢复）。池报不可用、两个上界都不在未来时，
+    /// 恢复点是未知而不是"马上就好"：按常规复查节拍重判，别给 1 秒——那会让
+    /// 闸门以每秒一次的频率去读同一份什么都没变的快照。
     fn snapshot_wait(&self, status: cog_core::LlmPoolStatus) -> Duration {
-        let now = chrono::Utc::now().timestamp();
-        let until = status.earliest_recovery_unix.saturating_sub(now).max(0) as u64;
-        if until == 0 {
+        let Some(until) = status.wait_secs(chrono::Utc::now().timestamp()) else {
             return Duration::from_secs(self.check_secs.clamp(1, self.max_secs));
-        }
+        };
         Duration::from_secs(until.min(self.max_secs))
     }
 
@@ -1510,14 +1509,14 @@ mod tests {
     /// 快照来源：可由测试直接翻转的池状态。
     struct TogglePool {
         down: std::sync::atomic::AtomicBool,
-        earliest_recovery_unix: i64,
+        evidenced_recovery_unix: i64,
     }
 
     impl TogglePool {
-        fn new(down: bool, earliest_recovery_unix: i64) -> Self {
+        fn new(down: bool, evidenced_recovery_unix: i64) -> Self {
             Self {
                 down: std::sync::atomic::AtomicBool::new(down),
-                earliest_recovery_unix,
+                evidenced_recovery_unix,
             }
         }
 
@@ -1534,7 +1533,8 @@ mod tests {
             }
             Some(cog_core::LlmPoolStatus {
                 unavailable: true,
-                earliest_recovery_unix: self.earliest_recovery_unix,
+                evidenced_recovery_unix: self.evidenced_recovery_unix,
+                next_attempt_unix: 0,
                 unavailable_upstreams: vec!["a|m".into()],
             })
         }
@@ -1710,7 +1710,8 @@ mod tests {
         assert_eq!(
             gate.snapshot_wait(cog_core::LlmPoolStatus {
                 unavailable: true,
-                earliest_recovery_unix: now + 86_400 * 30,
+                evidenced_recovery_unix: now + 86_400 * 30,
+                next_attempt_unix: 0,
                 unavailable_upstreams: vec![],
             }),
             Duration::from_secs(1800),
@@ -1719,7 +1720,8 @@ mod tests {
         assert_eq!(
             gate.snapshot_wait(cog_core::LlmPoolStatus {
                 unavailable: true,
-                earliest_recovery_unix: now - 60,
+                evidenced_recovery_unix: now - 60,
+                next_attempt_unix: 0,
                 unavailable_upstreams: vec![],
             }),
             Duration::from_secs(30),
@@ -1728,11 +1730,36 @@ mod tests {
         assert_eq!(
             gate.snapshot_wait(cog_core::LlmPoolStatus {
                 unavailable: true,
-                earliest_recovery_unix: 0,
+                evidenced_recovery_unix: 0,
+                next_attempt_unix: 0,
                 unavailable_upstreams: vec![],
             }),
             Duration::from_secs(30),
             "a snapshot carrying no recovery time must not be read as an imminent recovery"
+        );
+        // 只有退避节拍、没有任何上游报告恢复时刻：等待仍按那个节拍走，不能
+        // 因为"没有恢复证据"就退回常规复查节拍——退避窗到期时本来就该再试一次。
+        assert_eq!(
+            gate.snapshot_wait(cog_core::LlmPoolStatus {
+                unavailable: true,
+                evidenced_recovery_unix: 0,
+                next_attempt_unix: now + 120,
+                unavailable_upstreams: vec![],
+            }),
+            Duration::from_secs(120),
+            "a retry-cadence bound still sets the wait, it is just not called a recovery"
+        );
+        // 两个上界并存时取更近的那个：上游说 30 天后才复位，但退避窗 120 秒后
+        // 就会再试一次，那才是下一次可能承接请求的时刻。
+        assert_eq!(
+            gate.snapshot_wait(cog_core::LlmPoolStatus {
+                unavailable: true,
+                evidenced_recovery_unix: now + 86_400 * 30,
+                next_attempt_unix: now + 120,
+                unavailable_upstreams: vec![],
+            }),
+            Duration::from_secs(120),
+            "the nearer of the two bounds decides the wait"
         );
     }
 
