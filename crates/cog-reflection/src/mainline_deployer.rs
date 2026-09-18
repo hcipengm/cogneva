@@ -2402,18 +2402,44 @@ pub fn build_rollout_bundle(
     }
     // 声明了清单的目标之间不允许共用同一文件：patched 里同名条目会被
     // remove 吃掉，第二个目标报"was not patched"硬错误，不会静默错配。
-    let mut support_yaml = String::new();
-    for d in &support_docs {
-        support_yaml.push_str("---\n");
-        support_yaml.push_str(
-            &serde_yaml::to_string(d)
-                .map_err(|e| SFError::Config(format!("serialize support doc: {e}")))?,
-        );
-    }
+    let support_yaml = render_docs(&support_docs)?;
     Ok(RolloutBundle {
         support_yaml,
         targets: target_manifests,
     })
+}
+
+/// 一组文档 → 多文档 YAML（`---` 分隔）。组包与消费侧复核共用同一份序列化。
+fn render_docs(docs: &[serde_yaml::Value]) -> SFResult<String> {
+    let mut out = String::new();
+    for d in docs {
+        out.push_str("---\n");
+        out.push_str(
+            &serde_yaml::to_string(d)
+                .map_err(|e| SFError::Config(format!("serialize support doc: {e}")))?,
+        );
+    }
+    Ok(out)
+}
+
+/// 支撑包在**消费侧**的复核：把包里不属于滚动面的文档（安装面 kind，判定见
+/// [`namespace_docs`]）摘掉后写到 `out`，返回可 apply 的路径；全被摘掉时返回
+/// None（没有属于滚动面的对象可 apply）。
+///
+/// 为什么消费侧要自己复核一遍：支撑包由**部署器**组装，而部署器跑的是当前
+/// 已部署的 rev，消费它的 Job 跑的是**本次目标 rev**——两者通常不是同一个
+/// 二进制，部署器永远落后于它要上的版本。所以"包里已经清干净了"这个前提，
+/// 只在组包者与消费者同 rev 时成立。留下一个安装面对象（例如一份与既有绑定
+/// 不一致的卷声明）会让 apply 被准入拒绝，而这一步在"一个镜像都没动"的
+/// 中止点上，拒绝会被读成对本次版本的否定——整条落地通道因此停摆。
+fn stage_support_manifest(text: &str, out: &Path) -> SFResult<Option<PathBuf>> {
+    let docs = namespace_docs(text, "support.yaml")?;
+    if docs.is_empty() {
+        return Ok(None);
+    }
+    std::fs::write(out, render_docs(&docs)?)
+        .map_err(|e| SFError::IO(format!("write {}: {e}", out.display())))?;
+    Ok(Some(out.to_path_buf()))
 }
 
 /// 发布集去重校验：kustomization resources 不允许重复条目（重复会让
@@ -3128,11 +3154,33 @@ impl RolloutExecutor {
         if let Some(dir) = &plan.manifests_dir {
             let support = Path::new(dir).join("support.yaml");
             if support.is_file() && support.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                let support_arg = support.to_string_lossy().to_string();
-                info!(manifest = %support_arg, "mainline rollout: applying support manifests");
-                self.run_kubectl(&["apply", "-f", &support_arg], 120)
+                // 挂载点是只读 ConfigMap，复核后的包落到可写目录再 apply。
+                let text = tokio::fs::read_to_string(&support)
                     .await
+                    .map_err(|e| SFError::IO(format!("read {}: {e}", support.display())))
                     .map_err(classify_before_any_change)?;
+                let staged = stage_support_manifest(
+                    &text,
+                    &std::env::temp_dir().join("mainline-support.yaml"),
+                )
+                .map_err(classify_before_any_change)?;
+                match staged {
+                    Some(path) => {
+                        let support_arg = path.to_string_lossy().to_string();
+                        info!(
+                            source = %support.display(),
+                            manifest = %support_arg,
+                            "mainline rollout: applying support manifests"
+                        );
+                        self.run_kubectl(&["apply", "-f", &support_arg], 120)
+                            .await
+                            .map_err(classify_before_any_change)?;
+                    }
+                    None => warn!(
+                        source = %support.display(),
+                        "mainline rollout: support bundle carries no rollout-face object; nothing to apply"
+                    ),
+                }
             }
         }
         // 任何镜像变更之前先快照各部署当前镜像作为回滚目标：per-target、
@@ -6431,6 +6479,59 @@ exit 0
             "the claim's size must not survive into the bundle: {}",
             bundle.support_yaml
         );
+    }
+
+    /// 消费侧的包是**落后的组包者**写出来的：卷声明由旧二进制留在包里（它没有
+    /// 那条跳过规则），而 apply 它必然被准入拒。复核必须在 apply 之前把这类
+    /// 文档摘掉，让一次上线不因"包与历史不一致"整体中止。
+    #[test]
+    fn staged_support_manifest_drops_install_surface_docs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("support.yaml");
+        let text = "\
+---
+kind: ConfigMap
+metadata:
+  name: c
+data:
+  k: v
+---
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-data-pvc
+spec:
+  resources:
+    requests:
+      storage: 24Gi
+";
+        let path = stage_support_manifest(text, &out)
+            .unwrap()
+            .expect("configmap survives filtering");
+        assert_eq!(path, out);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("kind: ConfigMap"), "{body}");
+        assert!(!body.contains("PersistentVolumeClaim"), "{body}");
+        assert!(!body.contains("24Gi"), "{body}");
+    }
+
+    /// 整包都是安装面对象时没有可 apply 的东西——不写空文件（`kubectl apply`
+    /// 对空输入报错，那会把"本来无需 apply"变成一次假失败）。
+    #[test]
+    fn staged_support_manifest_reports_nothing_when_only_install_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("support.yaml");
+        let text = "kind: PersistentVolumeClaim\nmetadata:\n  name: p\n";
+        assert!(stage_support_manifest(text, &out).unwrap().is_none());
+        assert!(!out.exists());
+    }
+
+    /// 复核不能把 Secret 这道红线放过去：它既不属滚动面，也不许出现在任何清单里。
+    #[test]
+    fn staged_support_manifest_still_rejects_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("support.yaml");
+        let text = "kind: Secret\nmetadata:\n  name: s\n";
+        assert!(stage_support_manifest(text, &out).is_err());
     }
 
     /// 授权被拒不是版本结论：apiserver 说"不许你做"，读到的不是新版本的好坏。
