@@ -11,23 +11,53 @@
 //! 纯函数无 IO，配置来自 [`crate::PromotionGateConfig`]。
 
 use crate::PromotionGateConfig;
+use cog_core::PromotionGateKind;
 
 /// 晋级门判定结果。
+///
+/// 每个变体都带 [`PromotionGateKind`]：分类的依据在判定的那一刻最清楚，等到
+/// 台账里只剩一句理由文本就再也取不回来了。理由文本给人看，kind 给聚合用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateVerdict {
-    /// 黑名单命中：依赖清单、密钥材料。拒绝进入沙盒执行管线。
-    Reject { reason: String },
+    /// 黑名单命中或影响面不可确认。拒绝进入沙盒执行管线。
+    Reject {
+        kind: PromotionGateKind,
+        reason: String,
+    },
     /// L0：仅配置 / prompt 变化，走热更新通道。
     AutoConfig,
     /// L1：白名单低风险代码，走自动金丝雀晋级。
     AutoRollout,
     /// L2：核心路径 / 超大 diff / 模糊地带，机器全绿后转人工审批。
-    RequireApproval { reason: String },
+    RequireApproval {
+        kind: PromotionGateKind,
+        reason: String,
+    },
 }
 
 impl GateVerdict {
     pub fn is_auto(&self) -> bool {
         matches!(self, GateVerdict::AutoConfig | GateVerdict::AutoRollout)
+    }
+
+    /// 判定的类型化结果。
+    pub fn kind(&self) -> PromotionGateKind {
+        match self {
+            GateVerdict::Reject { kind, .. } => *kind,
+            GateVerdict::AutoConfig => PromotionGateKind::AutoConfig,
+            GateVerdict::AutoRollout => PromotionGateKind::AutoRollout,
+            GateVerdict::RequireApproval { kind, .. } => *kind,
+        }
+    }
+
+    /// 判定理由：拒收与转人工带具体原因；自动通道没有可说的理由，返回 None。
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            GateVerdict::Reject { reason, .. } | GateVerdict::RequireApproval { reason, .. } => {
+                Some(reason)
+            }
+            GateVerdict::AutoConfig | GateVerdict::AutoRollout => None,
+        }
     }
 }
 
@@ -71,6 +101,7 @@ fn matches_any(path: &str, prefixes: &[String]) -> bool {
 pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfig) -> GateVerdict {
     if files.is_empty() {
         return GateVerdict::Reject {
+            kind: PromotionGateKind::RejectUnmeasured,
             reason: "change 未触及任何文件，无法确认影响面".into(),
         };
     }
@@ -79,11 +110,13 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
         let name = file_name(f);
         if policy.forbidden_names.iter().any(|n| n == name) {
             return GateVerdict::Reject {
+                kind: PromotionGateKind::RejectProtected,
                 reason: format!("触及受保护文件 {name}（依赖清单/密钥文件禁止自动进化）"),
             };
         }
         if has_forbidden_extension(f, &policy.forbidden_extensions) {
             return GateVerdict::Reject {
+                kind: PromotionGateKind::RejectProtected,
                 reason: format!("触及受保护扩展名 {f}（密钥/证书材料禁止自动进化）"),
             };
         }
@@ -91,6 +124,7 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
 
     if diff_lines > policy.max_diff_lines {
         return GateVerdict::RequireApproval {
+            kind: PromotionGateKind::ApprovalDiffOverLimit,
             reason: format!("diff {diff_lines} 行超过上限 {} 行", policy.max_diff_lines),
         };
     }
@@ -104,6 +138,7 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
 
     if let Some(core) = files.iter().find(|f| matches_any(f, &policy.core_prefixes)) {
         return GateVerdict::RequireApproval {
+            kind: PromotionGateKind::ApprovalCorePath,
             reason: format!("触及核心路径 {core}"),
         };
     }
@@ -116,6 +151,7 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
     }
 
     GateVerdict::RequireApproval {
+        kind: PromotionGateKind::ApprovalUnclassified,
         reason: "触及未列入白名单的路径，模糊地带从严转人工".into(),
     }
 }
@@ -259,7 +295,10 @@ mod tests {
     fn oversized_diff_requires_approval() {
         let v = classify(&files(&["docs/big.md"]), 501, &policy());
         match v {
-            GateVerdict::RequireApproval { reason } => assert!(reason.contains("501")),
+            GateVerdict::RequireApproval { kind, reason } => {
+                assert!(reason.contains("501"));
+                assert_eq!(kind, PromotionGateKind::ApprovalDiffOverLimit);
+            }
             other => panic!("expected RequireApproval, got {other:?}"),
         }
     }
@@ -288,11 +327,13 @@ mod tests {
         assert!(GateVerdict::AutoConfig.is_auto());
         assert!(GateVerdict::AutoRollout.is_auto());
         assert!(!GateVerdict::Reject {
-            reason: String::new()
+            kind: PromotionGateKind::RejectUnmeasured,
+            reason: String::new(),
         }
         .is_auto());
         assert!(!GateVerdict::RequireApproval {
-            reason: String::new()
+            kind: PromotionGateKind::ApprovalUnclassified,
+            reason: String::new(),
         }
         .is_auto());
     }

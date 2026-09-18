@@ -258,7 +258,7 @@ impl ChangePipeline {
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .collect();
             let diff_lines = crate::promotion_gate::count_diff_lines(&change.content);
-            if let crate::GateVerdict::Reject { reason } =
+            if let crate::GateVerdict::Reject { reason, .. } =
                 crate::promotion_gate::classify(&files, diff_lines, policy)
             {
                 warn!(change_id = %change.artifact_id, reason = %reason, "Change rejected by promotion gate");

@@ -125,6 +125,15 @@ pub struct PromotionTrendWeek {
     pub rolled_back: u64,
     pub failed: u64,
     pub awaiting_review: u64,
+    /// 由分级判定（而非运行时暂停/熔断/配额）转入人工审批的数量。
+    /// 这是分级阈值本身的代价：它多起来说明阈值在拦变更，而不是这些变更有问题，
+    /// 该调的是阈值。运行时降级不计入，两类原因不能并成一个数。
+    #[serde(default)]
+    pub awaiting_by_gate: u64,
+    /// `awaiting_by_gate` 中因 diff 行数超上限转入人工的数量，直接对应
+    /// `max_diff_lines` 这一个旋钮，是调它时唯一需要的证据。
+    #[serde(default)]
+    pub awaiting_over_diff_limit: u64,
     /// 成功率 = promoted / (promoted + rolled_back + failed)；无完结对
     /// 决样本（全在审批中）时为 None。
     pub success_rate: Option<f64>,

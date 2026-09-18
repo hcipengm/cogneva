@@ -36,6 +36,8 @@ pub fn aggregate(
                 rolled_back: 0,
                 failed: 0,
                 awaiting_review: 0,
+                awaiting_by_gate: 0,
+                awaiting_over_diff_limit: 0,
                 success_rate: None,
             }
         })
@@ -51,7 +53,15 @@ pub fn aggregate(
             PromotionStatus::Promoted => bucket.promoted += 1,
             PromotionStatus::RolledBack => bucket.rolled_back += 1,
             PromotionStatus::Failed => bucket.failed += 1,
-            PromotionStatus::AwaitingApproval => bucket.awaiting_review += 1,
+            PromotionStatus::AwaitingApproval => {
+                bucket.awaiting_review += 1;
+                if let Some(kind) = rec.gate_kind.filter(|k| k.is_gate_diverted()) {
+                    bucket.awaiting_by_gate += 1;
+                    if kind == cog_core::PromotionGateKind::ApprovalDiffOverLimit {
+                        bucket.awaiting_over_diff_limit += 1;
+                    }
+                }
+            }
             PromotionStatus::Pending => {}
         }
     }
@@ -96,7 +106,7 @@ pub fn aggregate(
 /// 把报告写成 markdown（人读）。
 pub fn render_markdown(report: &PromotionTrendReport) -> String {
     let mut out = format!(
-        "# 晋级周报（生成于 {}）\n\n| 周 | 晋级 | 回滚 | 失败 | 审批中 | 成功率 |\n|---|---|---|---|---|---|\n",
+        "# 晋级周报（生成于 {}）\n\n| 周 | 晋级 | 回滚 | 失败 | 审批中 | 门拦 | 超行数 | 成功率 |\n|---|---|---|---|---|---|---|---|\n",
         report.generated_at.format("%Y-%m-%d %H:%M UTC")
     );
     for w in &report.weeks {
@@ -105,10 +115,22 @@ pub fn render_markdown(report: &PromotionTrendReport) -> String {
             .map(|r| format!("{:.0}%", r * 100.0))
             .unwrap_or_else(|| "–".into());
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
-            w.week, w.promoted, w.rolled_back, w.failed, w.awaiting_review, rate
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            w.week,
+            w.promoted,
+            w.rolled_back,
+            w.failed,
+            w.awaiting_review,
+            w.awaiting_by_gate,
+            w.awaiting_over_diff_limit,
+            rate
         ));
     }
+    out.push_str(
+        "\n> 门拦 = 分级阈值把变更转入人工审批的数（阈值本身的代价，越多说明阈值在拦，\
+         该调的是阈值而不是这些变更）；超行数 = 其中因 diff 行数超上限转入人工的数，\
+         直接对应 max_diff_lines 这一个旋钮。\n",
+    );
     if let Some(ref alert) = report.alert {
         out.push_str(&format!("\n> **趋势告警**：{alert}\n"));
     }
@@ -223,8 +245,20 @@ mod tests {
             status,
             outcome: String::new(),
             eval_summary: None,
+            gate_kind: None,
             created_at: t,
             updated_at: t,
+        }
+    }
+
+    fn rec_with_gate(
+        weeks_ago: i64,
+        status: PromotionStatus,
+        gate_kind: cog_core::PromotionGateKind,
+    ) -> PromotionRecord {
+        PromotionRecord {
+            gate_kind: Some(gate_kind),
+            ..rec(weeks_ago, status)
         }
     }
 
@@ -270,6 +304,43 @@ mod tests {
             rec(0, PromotionStatus::Promoted),
         ];
         assert!(aggregate(&records, Utc::now()).alert.is_none());
+    }
+
+    #[test]
+    fn gate_diverted_approvals_are_counted_apart_from_runtime_downgrades() {
+        // 同一周里三条待审批，只有两条是分级阈值自己拦下的；第三条是自动
+        // 通道被运行时条件降级，门没参与，不能算进门槛代价。
+        let records = vec![
+            rec_with_gate(
+                0,
+                PromotionStatus::AwaitingApproval,
+                cog_core::PromotionGateKind::ApprovalDiffOverLimit,
+            ),
+            rec_with_gate(
+                0,
+                PromotionStatus::AwaitingApproval,
+                cog_core::PromotionGateKind::ApprovalCorePath,
+            ),
+            rec_with_gate(
+                0,
+                PromotionStatus::AwaitingApproval,
+                cog_core::PromotionGateKind::AutoRollout,
+            ),
+        ];
+        let week = &aggregate(&records, Utc::now()).weeks[WINDOW_WEEKS - 1];
+        assert_eq!(week.awaiting_review, 3);
+        assert_eq!(week.awaiting_by_gate, 2);
+        // 只有超行数那一条落在具体旋钮上。
+        assert_eq!(week.awaiting_over_diff_limit, 1);
+    }
+
+    #[test]
+    fn legacy_approval_without_a_gate_kind_is_not_a_gate_cost() {
+        let records = vec![rec(0, PromotionStatus::AwaitingApproval)];
+        let week = &aggregate(&records, Utc::now()).weeks[WINDOW_WEEKS - 1];
+        assert_eq!(week.awaiting_review, 1);
+        assert_eq!(week.awaiting_by_gate, 0);
+        assert_eq!(week.awaiting_over_diff_limit, 0);
     }
 
     #[test]

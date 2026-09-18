@@ -167,6 +167,7 @@ impl PostgresStateBackend {
                 id TEXT PRIMARY KEY,
                 change_id TEXT NOT NULL,
                 level TEXT NOT NULL,
+                gate_kind TEXT,
                 decision_reason TEXT NOT NULL,
                 cluster TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -175,6 +176,17 @@ impl PostgresStateBackend {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        // 迁移：分级判定按类型留档（可空，旧记录与拉取端不产生该列值时留空）。
+        sqlx::query(
+            r#"
+            ALTER TABLE cog_evolution_promotions
+            ADD COLUMN IF NOT EXISTS gate_kind TEXT
             "#,
         )
         .execute(&self.pool)
@@ -1066,14 +1078,15 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
         sqlx::query(
             r#"
             INSERT INTO cog_evolution_promotions
-                (id, change_id, level, decision_reason, cluster, status, outcome, eval_summary, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                (id, change_id, level, gate_kind, decision_reason, cluster, status, outcome, eval_summary, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
         .bind(&rec.id)
         .bind(&rec.change_id)
         .bind(&rec.level)
+        .bind(rec.gate_kind.map(|k| k.as_str()))
         .bind(&rec.decision_reason)
         .bind(&rec.cluster)
         .bind(rec.status.as_str())
@@ -1133,6 +1146,7 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
             String,
             String,
             String,
+            Option<String>,
             String,
             String,
             String,
@@ -1142,8 +1156,8 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
             chrono::DateTime<Utc>,
         )> = sqlx::query_as(
             r#"
-            SELECT id, change_id, level, decision_reason, cluster, status, outcome,
-                   eval_summary, created_at, updated_at
+            SELECT id, change_id, level, gate_kind, decision_reason, cluster, status,
+                   outcome, eval_summary, created_at, updated_at
             FROM cog_evolution_promotions
             ORDER BY updated_at DESC
             LIMIT $1
@@ -1161,6 +1175,7 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
                     id,
                     change_id,
                     level,
+                    gate_kind,
                     decision_reason,
                     cluster,
                     status,
@@ -1173,6 +1188,9 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
                         id,
                         change_id,
                         level,
+                        gate_kind: gate_kind
+                            .as_deref()
+                            .and_then(cog_core::PromotionGateKind::parse),
                         decision_reason,
                         cluster,
                         status: cog_core::PromotionStatus::parse(&status)

@@ -1011,6 +1011,8 @@ impl GitOpsPuller {
             id: uuid::Uuid::new_v4().to_string(),
             change_id: candidate.change_id.clone(),
             level: candidate.level.clone(),
+            // 拉取端执行的是推送端已经分好的级，自己不做分级。
+            gate_kind: None,
             decision_reason: format!("gitops pull ({})", self.cluster),
             cluster: self.cluster.clone(),
             status,
@@ -1232,6 +1234,7 @@ mod tests {
                 id: "r1".into(),
                 change_id: "p-1".into(),
                 level: "l1_rollout".into(),
+                gate_kind: None,
                 decision_reason: "test".into(),
                 cluster: "cluster-b".into(),
                 status: PromotionStatus::Promoted,

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use cog_core::{PromotionLedger, PromotionRecord, PromotionStatus, SFResult};
+use cog_core::{PromotionGateKind, PromotionLedger, PromotionRecord, PromotionStatus, SFResult};
 use tracing::{info, warn};
 
 use crate::promotion_gate::{classify, count_diff_lines, GateVerdict};
@@ -149,6 +149,7 @@ impl AutoPromoter {
                     "unknown",
                     PromotionStatus::Failed,
                     &format!("eval gate rejected: {summary}"),
+                    None,
                     change.eval_summary.as_deref(),
                 )
                 .await?;
@@ -178,9 +179,16 @@ impl AutoPromoter {
         }
 
         let (level, auto) = match &verdict {
-            GateVerdict::Reject { reason } => {
-                self.record(&change_id, "unknown", PromotionStatus::Failed, reason, None)
-                    .await?;
+            GateVerdict::Reject { reason, .. } => {
+                self.record(
+                    &change_id,
+                    "unknown",
+                    PromotionStatus::Failed,
+                    reason,
+                    Some(verdict.kind()),
+                    None,
+                )
+                .await?;
                 return Ok(());
             }
             GateVerdict::AutoConfig => ("l0_config", true),
@@ -189,7 +197,14 @@ impl AutoPromoter {
         };
 
         // 自动通道的降级条件：暂停 / 熔断 / 配额 / 无出口。
-        let decision_reason = format!("{verdict:?}");
+        //
+        // 判定理由按原文留下：分级在这里只输出一个 kind，具体是哪条规则
+        // （超行数 / 核心路径 / 模糊地带）此前被这句通用文案顶掉，台账里就只剩
+        // "需要人看"而说不出为什么，也再量不出阈值实际拦下了多少变更。
+        let decision_reason = match verdict.reason() {
+            Some(reason) => reason.to_string(),
+            None => format!("分级判定 {}", verdict.kind().as_str()),
+        };
         let downgrade = if !auto {
             Some("分级判定需人工审批".to_string())
         } else if self.switch.as_ref().is_some_and(|s| s.is_paused()) {
@@ -211,11 +226,14 @@ impl AutoPromoter {
 
         if let Some(reason) = downgrade {
             warn!(change_id = %change_id, reason = %reason, "Promotion downgraded to manual approval");
+            // 降级理由替换掉分级理由，但 kind 仍然留下分级结果，人工审批与
+            // 门槛代价的统计都不受降级文案影响。
             self.record(
                 &change_id,
                 level,
                 PromotionStatus::AwaitingApproval,
                 &reason,
+                Some(verdict.kind()),
                 change.eval_summary.as_deref(),
             )
             .await?;
@@ -231,6 +249,7 @@ impl AutoPromoter {
                 level,
                 PromotionStatus::Pending,
                 &decision_reason,
+                Some(verdict.kind()),
                 change.eval_summary.as_deref(),
             )
             .await?;
@@ -306,6 +325,8 @@ impl AutoPromoter {
                 level,
                 PromotionStatus::Pending,
                 "人工审批通过",
+                // 人批的这条记录不带分级结论：它属于审批，不属于分级。
+                None,
                 change.eval_summary.as_deref(),
             )
             .await?;
@@ -395,6 +416,7 @@ impl AutoPromoter {
         level: &str,
         status: PromotionStatus,
         reason: &str,
+        gate_kind: Option<PromotionGateKind>,
         eval_summary: Option<&str>,
     ) -> SFResult<String> {
         let now = Utc::now();
@@ -402,6 +424,7 @@ impl AutoPromoter {
             id: uuid::Uuid::new_v4().to_string(),
             change_id: change_id.to_string(),
             level: level.to_string(),
+            gate_kind,
             decision_reason: reason.to_string(),
             cluster: self.cluster.clone(),
             status,
@@ -603,6 +626,7 @@ mod tests {
                     id: format!("old-{i}"),
                     change_id: format!("old-{i}"),
                     level: "l1_rollout".into(),
+                    gate_kind: None,
                     decision_reason: "test".into(),
                     cluster: "publisher".into(),
                     status: PromotionStatus::Promoted,
@@ -642,6 +666,7 @@ mod tests {
                     id: format!("rb-{i}"),
                     change_id: format!("rb-{i}"),
                     level: "l1_rollout".into(),
+                    gate_kind: None,
                     decision_reason: "test".into(),
                     cluster: "publisher".into(),
                     status: PromotionStatus::RolledBack,
@@ -679,6 +704,7 @@ mod tests {
                     id: format!("s-{i}"),
                     change_id: format!("s-{i}"),
                     level: "l1_rollout".into(),
+                    gate_kind: None,
                     decision_reason: "test".into(),
                     cluster: "publisher".into(),
                     status: *status,

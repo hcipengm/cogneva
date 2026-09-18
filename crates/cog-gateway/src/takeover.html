@@ -1431,9 +1431,11 @@ async function loadTrend() {
       bar.className = 'bar ' + cls;
       bar.style.height = h + 'px';
       const decided = (w.promoted || 0) + (w.rolled_back || 0) + (w.failed || 0);
+      const byGate = w.awaiting_by_gate || 0;
+      const overDiff = w.awaiting_over_diff_limit || 0;
       bar.title = LANG === 'zh'
-        ? `${w.week}：晋级 ${w.promoted}，回滚 ${w.rolled_back}，失败 ${w.failed}，待审 ${w.awaiting_review}（已决 ${decided}）`
-        : `${w.week}: promoted ${w.promoted}, rolled back ${w.rolled_back}, failed ${w.failed}, awaiting ${w.awaiting_review} (decided ${decided})`;
+        ? `${w.week}：晋级 ${w.promoted}，回滚 ${w.rolled_back}，失败 ${w.failed}，待审 ${w.awaiting_review}（已决 ${decided}）；其中质量门拦下 ${byGate}（超行数 ${overDiff}）`
+        : `${w.week}: promoted ${w.promoted}, rolled back ${w.rolled_back}, failed ${w.failed}, awaiting ${w.awaiting_review} (decided ${decided}); gate-diverted ${byGate} (over diff limit ${overDiff})`;
       const wk = document.createElement('div');
       wk.className = 'wk';
       wk.textContent = (w.week || '').replace(/^\d+-/, '');
