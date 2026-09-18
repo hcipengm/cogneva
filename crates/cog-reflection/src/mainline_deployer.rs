@@ -443,13 +443,18 @@ fn is_placement_blocked(msg: &str) -> bool {
 }
 
 /// 「观测工具本身起不来」的标记，与前两类同一族：说的是**我们没能观测**，不是
-/// 观测到版本有毛病。kubectl 二进制缺失、没有可执行位、正被写入（ETXTBSY）这
-/// 类 exec 失败下一次查询都没发出去。
+/// 观测到版本有毛病。kubectl 二进制缺失、没有可执行位这类 exec 失败下一次查询
+/// 都没发出去。
 ///
 /// 单列一类而不是并进 cluster-unreachable：那一类的语义是"重试可能等到"
 /// （apiserver 抖动、握手超时），`probe` 会按轮询节拍在预算内重试；工具起不来
 /// 在本进程生命周期里重试多少次都一样，必须就地返回——但归的还是环境类，
 /// 因为它同样说不出新版本的好坏，而回滚只退镜像，修不好一个坏掉的工具路径。
+///
+/// ETXTBSY（"文件正被写入"）也会落进这个标记，但它是这一类里唯一一个"重试就
+/// 会好"的成员——起因是装可执行文件时把写描述符漏给了并发 fork 的兄弟进程，
+/// 已在落位路径上从源头消除。真在生产上撞到一次，代价也只是本 rev 按环境类
+/// 失败返回，不回滚、不占尝试预算。
 const OBSERVATION_TOOL_MARKER: &str = "observation tool unavailable";
 
 fn is_observation_tool_failure(msg: &str) -> bool {
@@ -6151,7 +6156,9 @@ exit 0
     /// 下一轮同样起不来，等于用一次无谓回滚换掉一个可能正常的版本。
     ///
     /// 真实形态见过两种：CI 上的 `failed to run kubectl: Text file busy`（文件正
-    /// 被写入），以及二进制没有可执行位。这里用后者，稳定可复现。
+    /// 被写入），以及二进制没有可执行位。前者是瞬时的、且起因在测试自己身上（装
+    /// 可执行文件的写描述符被并发 fork 的兄弟进程继承走），已改由子进程拷贝落成品
+    /// 从源头消除，就不再拿它当回归用例；这里用后者，稳定可复现。
     #[tokio::test]
     async fn a_rollout_whose_observation_tool_cannot_start_names_it_and_keeps_the_revision() {
         use std::os::unix::fs::PermissionsExt;
