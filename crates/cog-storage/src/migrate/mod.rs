@@ -113,10 +113,19 @@ pub struct Migrator {
     pub migrations_dir: PathBuf,
 }
 
-impl Default for Migrator {
-    fn default() -> Self {
-        Self::new("crates/cog-storage/migrations")
+/// Where the migration scripts live, anchored on the application directory.
+///
+/// The scripts ship with the image under that directory. Resolving them against
+/// the process working directory instead made a workload that starts elsewhere
+/// skip the entire run without failing — while connecting to the same database
+/// as the workload that did migrate. An empty `app_dir` leaves the relative path
+/// unchanged, which is all a caller that never set one can support.
+pub fn migrations_dir(app_dir: &str) -> PathBuf {
+    const RELATIVE: &str = "crates/cog-storage/migrations";
+    if app_dir.is_empty() {
+        return PathBuf::from(RELATIVE);
     }
+    Path::new(app_dir).join(RELATIVE)
 }
 
 impl Migrator {
@@ -402,6 +411,23 @@ mod tests {
     #[test]
     fn parse_filename_invalid() {
         assert!(parse_migration_filename("README.md", Path::new("/tmp/README.md")).is_none());
+    }
+
+    /// The scripts must resolve the same way whatever the process working
+    /// directory is, so a configured application directory has to be an
+    /// absolute anchor rather than a prefix the caller happens to start in.
+    #[test]
+    fn migrations_dir_anchors_on_the_application_directory() {
+        assert_eq!(
+            migrations_dir("/opt/cogneva"),
+            Path::new("/opt/cogneva/crates/cog-storage/migrations")
+        );
+        // No application directory configured: nothing to anchor on, so the
+        // relative path is returned unchanged instead of being invented.
+        assert_eq!(
+            migrations_dir(""),
+            Path::new("crates/cog-storage/migrations")
+        );
     }
 
     #[test]

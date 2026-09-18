@@ -54,6 +54,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             raw_logger_config,
             _tier_migrator_enabled,
             data_dir,
+            app_dir,
             storage_provider_config,
         ) = {
             let config = ctx.config();
@@ -88,13 +89,14 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 config.raw_logger.clone(),
                 config.tier_migrator.enabled,
                 config.app.data_dir.clone(),
+                config.app.app_dir.clone(),
                 config.providers.storage.clone(),
             )
         };
 
         // ── PostgreSQL pools ──
         let (users_pool, messages_pool, config_pool, explain_pool) = if let Some(url) = db_url {
-            let migrator = crate::migrate::Migrator::default();
+            let migrator = crate::migrate::Migrator::new(crate::migrate::migrations_dir(&app_dir));
             match migrator.run(&url).await {
                 Ok(()) => info!("Database migrations applied successfully"),
                 Err(e) => {

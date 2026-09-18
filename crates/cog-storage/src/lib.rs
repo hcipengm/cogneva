@@ -83,7 +83,8 @@ pub use media::LiveKitMediaBackend;
 pub use tier::migrator::{is_compressed, parse_log_date, tier_policy_from_config, TierMigrator};
 
 pub use migrate::{
-    detect_driver, discover_up_migrations, Direction, Driver, Migration, MigrationStatus, Migrator,
+    detect_driver, discover_up_migrations, migrations_dir, Direction, Driver, Migration,
+    MigrationStatus, Migrator,
 };
 
 pub use dlq::MemoryDeadLetterQueue;
