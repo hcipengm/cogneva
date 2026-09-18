@@ -27,12 +27,58 @@ pub struct NewAlert {
 /// What a `set_alert` call changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertTransition {
-    /// The condition already matched the stored state; nothing changed.
+    /// The condition already matched the stored state. The row's payload may
+    /// still have been refreshed; callers key their notifications on the
+    /// state edge, not on this variant.
     NoChange,
     /// A new firing alert was recorded.
     Fired,
     /// An open alert was marked resolved.
     Resolved,
+}
+
+/// The mutable payload of one stored row, read back before deciding what a
+/// `set_alert` call has to write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredAlert {
+    pub state: String,
+    pub severity: String,
+    pub message: String,
+    pub labels: Value,
+}
+
+impl StoredAlert {
+    fn is_firing(&self) -> bool {
+        self.state == "firing"
+    }
+}
+
+/// State transition for one evaluation, given the stored row (if any).
+///
+/// Pure so the branch table the SQL implements can be asserted directly.
+fn decide(condition: bool, stored: Option<&StoredAlert>) -> AlertTransition {
+    let firing = stored.is_some_and(StoredAlert::is_firing);
+    match (condition, firing) {
+        (true, false) => AlertTransition::Fired,
+        (false, true) => AlertTransition::Resolved,
+        _ => AlertTransition::NoChange,
+    }
+}
+
+/// Whether an already-firing row's payload describes a different condition
+/// reading than the one just evaluated.
+///
+/// A firing alert is a live projection of a condition that is still true, so
+/// its message and labels must track the current evaluation. Leaving them at
+/// the firing edge freezes whatever was true at that instant and keeps
+/// presenting it as the current reading: a recovery estimate that has since
+/// passed, a usage value that has since grown. Consumers cannot tell a stale
+/// snapshot from a fresh one, so the refresh happens here rather than at each
+/// reader.
+fn payload_differs(stored: &StoredAlert, alert: &NewAlert) -> bool {
+    stored.severity != alert.severity
+        || stored.message != alert.message
+        || stored.labels != alert.labels
 }
 
 /// One stored alert row.
@@ -97,20 +143,30 @@ impl PostgresAlertStore {
     /// `condition = true` guarantees an open `firing` row exists (creating it
     /// on the first call); `false` resolves the open row if any. Callers get
     /// the edge transition so they log/notify once, not every tick.
+    ///
+    /// A row that is already firing keeps its state and `fired_at` — the edge
+    /// is history — but has its payload rewritten whenever the new evaluation
+    /// reads differently, so an open alert describes the condition now rather
+    /// than the moment it started.
     pub async fn set_alert(
         &self,
         condition: bool,
         alert: &NewAlert,
     ) -> anyhow::Result<AlertTransition> {
-        let current: Option<String> =
-            sqlx::query_scalar("SELECT state FROM alerts WHERE dedup_key = $1")
+        let stored =
+            sqlx::query("SELECT state, severity, message, labels FROM alerts WHERE dedup_key = $1")
                 .bind(&alert.dedup_key)
                 .fetch_optional(&self.pool)
-                .await?;
-        let firing = current.as_deref() == Some("firing");
+                .await?
+                .map(|row| StoredAlert {
+                    state: row.get("state"),
+                    severity: row.get("severity"),
+                    message: row.get("message"),
+                    labels: row.get("labels"),
+                });
 
-        match (condition, firing) {
-            (true, false) => {
+        match decide(condition, stored.as_ref()) {
+            AlertTransition::Fired => {
                 let now = Utc::now();
                 sqlx::query(
                     r#"
@@ -139,7 +195,7 @@ impl PostgresAlertStore {
                 .await?;
                 Ok(AlertTransition::Fired)
             }
-            (false, true) => {
+            AlertTransition::Resolved => {
                 let now = Utc::now();
                 sqlx::query(
                     "UPDATE alerts SET state = 'resolved', resolved_at = $2, updated_at = $2 \
@@ -151,7 +207,25 @@ impl PostgresAlertStore {
                 .await?;
                 Ok(AlertTransition::Resolved)
             }
-            _ => Ok(AlertTransition::NoChange),
+            AlertTransition::NoChange => {
+                if let Some(open) = stored.as_ref().filter(|s| s.is_firing()) {
+                    if payload_differs(open, alert) {
+                        let now = Utc::now();
+                        sqlx::query(
+                            "UPDATE alerts SET severity = $2, message = $3, labels = $4, \
+                             updated_at = $5 WHERE dedup_key = $1 AND state = 'firing'",
+                        )
+                        .bind(&alert.dedup_key)
+                        .bind(&alert.severity)
+                        .bind(&alert.message)
+                        .bind(&alert.labels)
+                        .bind(now)
+                        .execute(&self.pool)
+                        .await?;
+                    }
+                }
+                Ok(AlertTransition::NoChange)
+            }
         }
     }
 
@@ -282,23 +356,96 @@ mod tests {
     /// The state machine is the part worth pinning down; `set_alert` is pure
     /// decision logic over the stored state. Exercise it against the same
     /// branch table the SQL implements.
-    fn decide(condition: bool, stored: Option<&str>) -> AlertTransition {
-        let firing = stored == Some("firing");
-        match (condition, firing) {
-            (true, false) => AlertTransition::Fired,
-            (false, true) => AlertTransition::Resolved,
-            _ => AlertTransition::NoChange,
+    fn stored(state: &str) -> StoredAlert {
+        StoredAlert {
+            state: state.into(),
+            severity: "critical".into(),
+            message: "all four upstreams unavailable (earliest recovery 04:56)".into(),
+            labels: serde_json::json!({"earliest_recovery_unix": 1_789_744_595_i64}),
+        }
+    }
+
+    fn alert(message: &str, recovery: i64, severity: &str) -> NewAlert {
+        NewAlert {
+            rule: "llm_upstream_pool_down".into(),
+            dedup_key: "llm_upstream_pool_down".into(),
+            severity: severity.into(),
+            message: message.into(),
+            labels: serde_json::json!({"earliest_recovery_unix": recovery}),
         }
     }
 
     #[test]
     fn alert_state_machine_edges() {
         assert_eq!(decide(true, None), AlertTransition::Fired);
-        assert_eq!(decide(true, Some("firing")), AlertTransition::NoChange);
+        assert_eq!(
+            decide(true, Some(&stored("firing"))),
+            AlertTransition::NoChange
+        );
         // Re-raising a resolved alert fires again.
-        assert_eq!(decide(true, Some("resolved")), AlertTransition::Fired);
-        assert_eq!(decide(false, Some("firing")), AlertTransition::Resolved);
+        assert_eq!(
+            decide(true, Some(&stored("resolved"))),
+            AlertTransition::Fired
+        );
+        assert_eq!(
+            decide(false, Some(&stored("firing"))),
+            AlertTransition::Resolved
+        );
         assert_eq!(decide(false, None), AlertTransition::NoChange);
-        assert_eq!(decide(false, Some("resolved")), AlertTransition::NoChange);
+        assert_eq!(
+            decide(false, Some(&stored("resolved"))),
+            AlertTransition::NoChange
+        );
+    }
+
+    /// A firing alert is a projection of a condition that is still true, so a
+    /// new evaluation that reads differently has to rewrite the row. The
+    /// failure this guards against is silent: the row keeps answering with the
+    /// reading taken at the firing edge, and a consumer reading it later cannot
+    /// tell that from a fresh one.
+    #[test]
+    fn firing_row_is_rewritten_when_the_reading_moves() {
+        let open = stored("firing");
+        // A recovery estimate that has since been pushed forward.
+        assert!(payload_differs(
+            &open,
+            &alert(
+                "all four upstreams unavailable (earliest recovery 16:30)",
+                1_789_749_020,
+                "critical"
+            )
+        ));
+        // The reading may move in any of the three fields, not just the message.
+        assert!(payload_differs(
+            &open,
+            &alert(
+                "all four upstreams unavailable (earliest recovery 04:56)",
+                1_789_744_595,
+                "warning"
+            )
+        ));
+        assert!(payload_differs(
+            &open,
+            &alert(
+                "all four upstreams unavailable (earliest recovery 04:56)",
+                1_799_129_599,
+                "critical"
+            )
+        ));
+    }
+
+    /// Re-evaluating an unchanged condition writes nothing: the refresh exists
+    /// to keep the payload true, not to churn the row on every tick.
+    #[test]
+    fn firing_row_is_left_alone_when_the_reading_is_identical() {
+        let open = stored("firing");
+        assert!(!payload_differs(
+            &open,
+            &alert(
+                "all four upstreams unavailable (earliest recovery 04:56)",
+                1_789_744_595,
+                "critical"
+            )
+        ));
     }
 }
