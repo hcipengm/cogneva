@@ -409,6 +409,15 @@ async fn detect_api_style(
     Err(last_err)
 }
 
+/// apiserver 的判决里，哪些码明确定性为「这个进程不持有该权限」。
+///
+/// 只认 401/403：它们是权限与凭证的判决，与故障无关。其余非 2xx 都留有余地
+/// （404 资源还没建、5xx/429 apiserver 侧的问题），归「还要继续观察」——
+/// 属主不能因为一次启动抖动就被判成「这不是它的活」而静默停摆。
+fn apiserver_denies_ownership(status: u16) -> bool {
+    matches!(status, 401 | 403)
+}
+
 /// Minimal in-cluster Kubernetes API client (service account token + CA).
 pub(crate) struct KubeClient {
     http: reqwest::Client,
@@ -459,6 +468,23 @@ impl KubeClient {
     /// 当前命名空间。
     pub(crate) fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// 本进程**能不能** GET 该 apiserver 路径——一次能力探测，不取数据。
+    ///
+    /// 用来回答「这份资源是不是本进程的活」：同一份资源在同一个二进制里被多个
+    /// deployment 共享，能碰到它的只有一个（凭 ServiceAccount 的角色绑定）。判据
+    /// 必须是 apiserver 自己的权限判决，不能是「集群里存在这份资源」这种每个进程
+    /// 都成立的事实。
+    pub(crate) async fn can_get(&self, path: &str) -> Result<bool, String> {
+        let resp = self
+            .http
+            .get(format!("{API_BASE}{path}"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("请求 apiserver 失败: {e}"))?;
+        Ok(!apiserver_denies_ownership(resp.status().as_u16()))
     }
 
     pub(crate) async fn patch(&self, path: &str, body: serde_json::Value) -> Result<(), String> {
@@ -531,5 +557,25 @@ impl KubeClient {
             }),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apiserver_denies_ownership;
+
+    #[test]
+    fn only_permission_verdicts_deny_ownership() {
+        // 权限与凭证的判决：明确定性为「不是本进程的活」。
+        assert!(apiserver_denies_ownership(401));
+        assert!(apiserver_denies_ownership(403));
+        // 其余一律不算：资源还没建、apiserver 侧的故障、限流，都不能把属主
+        // 判成非属主——那会让刷新任务在属主进程里被静默停掉。
+        for status in [200, 201, 404, 409, 429, 500, 503] {
+            assert!(
+                !apiserver_denies_ownership(status),
+                "status {status} must not be read as a permission verdict"
+            );
+        }
     }
 }

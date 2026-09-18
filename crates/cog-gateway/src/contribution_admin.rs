@@ -338,13 +338,7 @@ fn decode_secret_key(secret: &serde_json::Value, key: &str) -> Option<String> {
 /// Secret. Missing / unparsable yields an empty object (policy defaults to
 /// `auto` downstream).
 pub(crate) async fn read_contrib_config(kube: &KubeClient) -> serde_json::Value {
-    let secret = match kube
-        .get_json(&format!(
-            "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-            kube.namespace()
-        ))
-        .await
-    {
+    let secret = match kube.get_json(&secret_api_path(kube.namespace())).await {
         Ok(s) => s,
         Err(_) => return json!({}),
     };
@@ -1788,16 +1782,66 @@ pub async fn contribution_disconnect_handler(
         .into_response()
 }
 
+/// cogneva-secrets 的 apiserver 路径。探测与读取必须指向同一个资源，
+/// 所以由同一个函数拼出来。
+fn secret_api_path(namespace: &str) -> String {
+    format!("/api/v1/namespaces/{namespace}/secrets/cogneva-secrets")
+}
+
+/// 本进程是不是刷新任务的属主：只有能读写 cogneva-secrets 的那个才算。
+///
+/// 「集群里配了 Gitee OAuth 应用」是每个进程都能问到的集群级事实，不足以回答
+/// 这个问题——刷新要把新 token 写回 Secret 并滚动安全网关，部署里只有主应用的
+/// ServiceAccount 绑了 `cogneva-llm-admin`（secrets get/patch + 网关 deployment
+/// patch）。判据取 apiserver 自己的权限判决。
+///
+/// 判不出来（建不出 in-cluster 客户端、探测本身报错）按**属主**处理：那可能是
+/// 启动瞬间的抖动，属主不该因此被静默停掉；后续每次刷新仍会照常报告。
+async fn is_contribution_secret_owner() -> bool {
+    let kube = match KubeClient::in_cluster() {
+        Ok(kube) => kube,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "gitee token refresher: no in-cluster client to probe secret access; starting the loop"
+            );
+            return true;
+        }
+    };
+    match kube.can_get(&secret_api_path(kube.namespace())).await {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "gitee token refresher: secret access probe failed; starting the loop"
+            );
+            true
+        }
+    }
+}
+
 /// Hourly refresher for Gitee OAuth tokens: the access token expires in 24h,
 /// so when less than GITEE_REFRESH_THRESHOLD_SECS remains the loop exchanges
 /// the refresh token for a new pair, patches the Secret and rolls the gateway
 /// so egress picks the fresh token up. PAT-mode installs have no refresh
 /// material and are skipped.
+///
+/// Spawned from the gateway plugin, which every deployment of the binary loads:
+/// only the process that can read the contribution secret runs the loop.
 pub fn spawn_gitee_token_refresher(
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !gitee_oauth_available().await {
+            return;
+        }
+        // 不做属主判定，非属主进程每小时都会以 403 失败一次，永远不成功；更糟的
+        // 是一旦有人给它补上权限，两个进程就会拿同一个单次有效的 refresh token
+        // 互相抢（token 每次使用都轮换）。
+        if !is_contribution_secret_owner().await {
+            tracing::info!(
+                "gitee token refresher not started: this process cannot read the contribution secret"
+            );
             return;
         }
         let mut interval = tokio::time::interval(Duration::from_secs(GITEE_REFRESH_INTERVAL_SECS));
@@ -1817,12 +1861,7 @@ pub fn spawn_gitee_token_refresher(
 
 async fn gitee_refresh_tick() -> Result<(), String> {
     let kube = KubeClient::in_cluster()?;
-    let secret = kube
-        .get_json(&format!(
-            "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-            kube.namespace()
-        ))
-        .await?;
+    let secret = kube.get_json(&secret_api_path(kube.namespace())).await?;
     let decode = |key: &str| -> Option<String> {
         let b64 = secret.get("data")?.get(key)?.as_str()?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
