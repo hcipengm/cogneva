@@ -16,9 +16,19 @@
 //!    watcher, supervisor bridge) are faults something already judged
 //!    alert-worthy; each becomes an intent keyed by its dedup key.
 //!
-//! Every intent uses a deterministic id so the orchestrator's idempotent
-//! skip dedupes across ticks and pod restarts; a local state file adds
-//! cooldowns so a persisting signal re-reports instead of going silent.
+//! Every intent carries a deterministic id, which lets the watcher ask the
+//! task store whether the signal is already in hand before submitting: the
+//! orchestrator raises on a duplicate id rather than skipping it, so the
+//! idempotence has to live here. A task already in hand is left alone (and
+//! spends no cooldown, so a later failure is noticed on the next tick, not a
+//! whole cooldown later); a task that failed while its signal persists is
+//! re-driven; a task that never reached the orchestrator spends no cooldown
+//! either, so the next tick retries instead of the signal going quiet.
+//!
+//! Only the process that owns the change-execution role runs this loop. The
+//! plugin table is loaded whole by every deployment, and producing intents is
+//! an outward side effect: a control plane doing it too submits every signal
+//! twice, and the loser only learns of it as a duplicate-task error.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,7 +38,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use cog_core::{OrchestratorControl, Task, TaskStatus, TaskType};
 
@@ -150,20 +160,19 @@ async fn save_state(state: &SignalGuardState) {
     }
 }
 
-/// True when `key` was never reported or its cooldown elapsed; records the
-/// report time when reporting is allowed.
-fn may_report(
-    state: &mut SignalGuardState,
+/// True when `key` was never reported or its cooldown elapsed. Pure check: the
+/// report is recorded by [`report_outcome`] only once an intent actually
+/// landed, so a submission that never reached the orchestrator is retried on
+/// the next tick instead of being silenced for a whole cooldown.
+fn cooldown_elapsed(
+    state: &SignalGuardState,
     key: &str,
     cooldown_secs: i64,
     now: DateTime<Utc>,
 ) -> bool {
     match state.reported.get(key) {
-        Some(last) if (now - *last).num_seconds() < cooldown_secs => false,
-        _ => {
-            state.reported.insert(key.to_string(), now);
-            true
-        }
+        Some(last) => (now - *last).num_seconds() >= cooldown_secs,
+        None => true,
     }
 }
 
@@ -201,28 +210,111 @@ fn short_hash(text: &str) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Submit one internal evolution intent. Deterministic id → orchestrator
-/// idempotent skip dedupes repeats across ticks and restarts.
+/// What this tick should do about a signal, given whether a task for it is
+/// already in the store.
+#[derive(Debug, PartialEq, Eq)]
+enum IntentAction {
+    /// No task yet — submit one.
+    Submit,
+    /// A previous attempt ended in failure while the signal is still present —
+    /// reset it so it runs again.
+    Redrive,
+    /// A task exists and has not failed — leave it alone.
+    None,
+}
+
+fn intent_action(existing: Option<&TaskStatus>) -> IntentAction {
+    match existing {
+        None => IntentAction::Submit,
+        Some(TaskStatus::Failed) => IntentAction::Redrive,
+        Some(_) => IntentAction::None,
+    }
+}
+
+/// Result of one submission attempt. "Nothing needed doing" and "the intent
+/// never reached the orchestrator" must stay distinct: conflating them makes an
+/// idempotent hit look like a broken channel, and a broken channel look like
+/// work already in hand.
+#[derive(Debug)]
+enum IntentOutcome {
+    /// A new task was created.
+    Registered,
+    /// A task for this signal is already in hand and has not failed; no action
+    /// taken and no cooldown spent, so the next tick still notices if it fails.
+    Tracked,
+    /// A failed attempt was reset and will run again.
+    Redriven,
+    /// Nothing was registered (orchestrator unavailable); retry next tick.
+    Failed(String),
+}
+
+/// Submit one internal evolution intent, or drive the existing one forward.
+/// The id is deterministic, so reading the task store first is what makes
+/// repeats across ticks and pod restarts idempotent — the orchestrator's
+/// self-evolution routing raises on a duplicate id instead of skipping it.
 async fn submit_intent(
     orch: &Arc<dyn OrchestratorControl>,
     task_id: String,
     task_kind: &str,
     goal: String,
     detail: serde_json::Value,
-) {
-    let task = Task::new(
-        task_id.clone(),
-        TaskType::Custom(task_kind.into()),
-        serde_json::json!({
-            "goal": goal,
-            "evolution_mode": "generate_change",
-            "task_kind": task_kind,
-            "signal": detail,
-        }),
-    );
-    match orch.submit_goal_auto(&goal, vec![task]).await {
-        Ok(ids) => info!(task = %task_id, tasks = ?ids, "self-discovery intent submitted"),
-        Err(e) => warn!(task = %task_id, error = %e, "self-discovery intent submit failed"),
+) -> IntentOutcome {
+    let existing = orch.get_task(&task_id).await;
+    match intent_action(existing.as_ref().map(|t| &t.status)) {
+        IntentAction::None => IntentOutcome::Tracked,
+        IntentAction::Redrive => match orch.retry_task(&task_id).await {
+            Ok(()) => IntentOutcome::Redriven,
+            Err(e) => IntentOutcome::Failed(format!("retry {task_id}: {e}")),
+        },
+        IntentAction::Submit => {
+            let task = Task::new(
+                task_id,
+                TaskType::Custom(task_kind.into()),
+                serde_json::json!({
+                    "goal": goal,
+                    "evolution_mode": "generate_change",
+                    "task_kind": task_kind,
+                    "signal": detail,
+                }),
+            );
+            match orch.submit_goal_auto(&goal, vec![task]).await {
+                Ok(_) => IntentOutcome::Registered,
+                Err(e) => IntentOutcome::Failed(e.to_string()),
+            }
+        }
+    }
+}
+
+/// Account one attempt against the signal's cooldown. Only attempts that
+/// actually moved the signal forward spend the cooldown; a submission that
+/// never landed leaves the key unrecorded so the next tick retries, and an
+/// in-flight task stays unrecorded so a failure is noticed promptly rather
+/// than after a full cooldown. Returns true when the signal is in hand.
+fn report_outcome(
+    state: &mut SignalGuardState,
+    key: &str,
+    outcome: IntentOutcome,
+    now: DateTime<Utc>,
+) -> bool {
+    match outcome {
+        IntentOutcome::Registered => {
+            state.reported.insert(key.to_string(), now);
+            info!(signal = %key, "self-discovery intent submitted");
+            true
+        }
+        IntentOutcome::Redriven => {
+            state.reported.insert(key.to_string(), now);
+            info!(signal = %key, "self-discovery intent re-driven; the previous attempt had failed");
+            true
+        }
+        IntentOutcome::Tracked => {
+            debug!(signal = %key, "self-discovery intent already tracked; nothing to submit");
+            true
+        }
+        IntentOutcome::Failed(e) => {
+            warn!(signal = %key, error = %e, "self-discovery intent not registered; retrying next tick");
+            false
+        }
     }
 }
 
@@ -257,7 +349,7 @@ async fn tick(
             continue;
         }
         let key = format!("failure:{sig}");
-        if !may_report(&mut state, &key, config.report_cooldown_secs, now) {
+        if !cooldown_elapsed(&state, &key, config.report_cooldown_secs, now) {
             continue;
         }
         dirty = true;
@@ -272,7 +364,7 @@ async fn tick(
             config.failure_window_secs,
             sample_ids.join(", ")
         );
-        submit_intent(
+        let outcome = submit_intent(
             orch,
             format!("self-signal-failure-{hash}"),
             "self_signal",
@@ -286,6 +378,7 @@ async fn tick(
             }),
         )
         .await;
+        report_outcome(&mut state, &key, outcome, now);
     }
 
     // 2. Queue backlog anomaly.
@@ -295,7 +388,7 @@ async fn tick(
         .count();
     if backlog >= config.backlog_threshold {
         let key = "backlog".to_string();
-        if may_report(&mut state, &key, config.report_cooldown_secs, now) {
+        if cooldown_elapsed(&state, &key, config.report_cooldown_secs, now) {
             dirty = true;
             let dlq = orch.dlq_len().await.unwrap_or(0);
             let goal = format!(
@@ -303,7 +396,7 @@ async fn tick(
                  pending/scheduled (DLQ: {dlq}). Determine why tasks are not \
                  draining and fix the bottleneck."
             );
-            submit_intent(
+            let outcome = submit_intent(
                 orch,
                 "self-signal-backlog".to_string(),
                 "self_signal",
@@ -316,6 +409,7 @@ async fn tick(
                 }),
             )
             .await;
+            report_outcome(&mut state, &key, outcome, now);
         }
     }
 
@@ -326,7 +420,6 @@ async fn tick(
             None => true,
         };
         if due {
-            state.last_audit = Some(now);
             dirty = true;
             let period = now.format("%Y%m%d").to_string();
             let goal = "Audit this repository for security and reliability \
@@ -338,9 +431,10 @@ async fn tick(
                         its fix; list the remaining findings in the change \
                         description."
                 .to_string();
-            submit_intent(
+            let key = format!("self-audit-{period}");
+            let outcome = submit_intent(
                 orch,
-                format!("self-audit-{period}"),
+                key.clone(),
                 "self_audit",
                 goal,
                 serde_json::json!({
@@ -349,6 +443,11 @@ async fn tick(
                 }),
             )
             .await;
+            // 节拍只在审计任务确实在手时才推进：提交没落地就撤销本轮，
+            // 下一轮重试，否则一次编排器抖动会让审计整整晚一个周期。
+            if report_outcome(&mut state, &key, outcome, now) {
+                state.last_audit = Some(now);
+            }
         }
     }
 
@@ -361,7 +460,7 @@ async fn tick(
             let alerts = source.list_active_alerts(100).await;
             for alert in alerts.into_iter().take(config.alert_channel_max_per_tick) {
                 let key = format!("alert:{}", alert.dedup_key);
-                if !may_report(&mut state, &key, config.report_cooldown_secs, now) {
+                if !cooldown_elapsed(&state, &key, config.report_cooldown_secs, now) {
                     continue;
                 }
                 dirty = true;
@@ -378,7 +477,7 @@ async fn tick(
                     alert.labels,
                     alert.fired_at.to_rfc3339(),
                 );
-                submit_intent(
+                let outcome = submit_intent(
                     orch,
                     format!("self-signal-alert-{hash}"),
                     "self_signal",
@@ -392,6 +491,7 @@ async fn tick(
                     }),
                 )
                 .await;
+                report_outcome(&mut state, &key, outcome, now);
             }
         }
     }
@@ -450,12 +550,91 @@ mod tests {
     }
 
     #[test]
-    fn may_report_enforces_cooldown() {
+    fn cooldown_elapsed_only_after_the_window() {
         let mut state = SignalGuardState::default();
         let now = Utc::now();
-        assert!(may_report(&mut state, "k", 3600, now));
-        assert!(!may_report(&mut state, "k", 3600, now));
-        let later = now + chrono::Duration::seconds(3601);
-        assert!(may_report(&mut state, "k", 3600, later));
+        assert!(cooldown_elapsed(&state, "k", 3600, now));
+        state.reported.insert("k".into(), now);
+        assert!(!cooldown_elapsed(&state, "k", 3600, now));
+        assert!(cooldown_elapsed(
+            &state,
+            "k",
+            3600,
+            now + chrono::Duration::seconds(3601)
+        ));
+    }
+
+    #[test]
+    fn a_submission_that_never_landed_does_not_spend_the_cooldown() {
+        let mut state = SignalGuardState::default();
+        let now = Utc::now();
+        assert!(!report_outcome(
+            &mut state,
+            "alert:x",
+            IntentOutcome::Failed("orchestrator unreachable".into()),
+            now
+        ));
+        assert!(
+            cooldown_elapsed(&state, "alert:x", 86400, now),
+            "提交没落地就不能计冷却，否则一次编排器抖动会让信号静默一整个周期"
+        );
+    }
+
+    #[test]
+    fn a_landed_submission_spends_the_cooldown() {
+        let mut state = SignalGuardState::default();
+        let now = Utc::now();
+        assert!(report_outcome(
+            &mut state,
+            "alert:x",
+            IntentOutcome::Registered,
+            now
+        ));
+        assert!(!cooldown_elapsed(&state, "alert:x", 86400, now));
+        assert!(report_outcome(
+            &mut state,
+            "alert:y",
+            IntentOutcome::Redriven,
+            now
+        ));
+        assert!(!cooldown_elapsed(&state, "alert:y", 86400, now));
+    }
+
+    #[test]
+    fn a_tracked_signal_stays_unrecorded_so_a_later_failure_is_seen() {
+        let mut state = SignalGuardState::default();
+        let now = Utc::now();
+        assert!(report_outcome(
+            &mut state,
+            "alert:x",
+            IntentOutcome::Tracked,
+            now
+        ));
+        assert!(
+            cooldown_elapsed(&state, "alert:x", 86400, now),
+            "任务还在手上就不该记账：它一旦失败，下一轮要立刻能发现并重新驱动"
+        );
+    }
+
+    #[test]
+    fn intent_action_maps_task_state_to_the_right_move() {
+        assert_eq!(intent_action(None), IntentAction::Submit);
+        assert_eq!(
+            intent_action(Some(&TaskStatus::Failed)),
+            IntentAction::Redrive
+        );
+        for live in [
+            TaskStatus::Pending,
+            TaskStatus::Scheduled,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Cancelled,
+        ] {
+            assert_eq!(
+                intent_action(Some(&live)),
+                IntentAction::None,
+                "{live:?} 不该再提交或重驱动"
+            );
+        }
     }
 }

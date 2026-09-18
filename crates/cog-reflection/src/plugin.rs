@@ -757,38 +757,49 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         }
         // 自发现信号 watcher 不依赖沙盒边界门禁：它只读 orchestrator 任务
         // 状态并提交内部意图，不碰 git 写操作。
+        //
+        // 但提交意图是**对外副作用**，而插件表在每个部署里都整表加载：主应用
+        // 与进化 worker 都跑这个循环的话，同一个信号会被提交两遍，后到的那份
+        // 只会撞上「任务已存在」，日志里看起来像提交失败。属主按执行器职责定
+        // ——只有承担变更执行的那份部署产出自我发现意图。配置解析失败仍要在
+        // 任何部署上响亮失败，所以先读配置再判属主。
+        let sw_config = match crate::SignalWatcherConfig::load() {
+            Ok(cfg) => cfg,
+            Err(e) => return Err(e),
+        };
+        let owns_self_discovery = ctx.config().self_evolution.executor_enabled;
         let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
-        match (crate::SignalWatcherConfig::load(), orchestrator.clone()) {
-            (Ok(sw_config), Some(orch)) if sw_config.enabled => {
-                let shutdown = cog_core::ShutdownSignal::new();
-                if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
-                    let shutdown = shutdown.clone();
-                    let mut rx = broadcast_tx.0.subscribe();
-                    tokio::spawn(async move {
-                        let _ = rx.recv().await;
-                        shutdown.trigger();
-                    });
-                }
-                // Persisted-alert channel: published by the observability
-                // plugin in init, so it is guaranteed visible here.
-                let alert_source = ctx.consume_service::<dyn cog_core::ActiveAlertSource>();
-                if alert_source.is_none() {
-                    info!("signal watcher: no ActiveAlertSource; persisted-alert channel off");
-                }
-                tokio::spawn(crate::run_signal_watcher_loop(
-                    orch,
-                    sw_config,
-                    shutdown,
-                    alert_source,
-                ));
+        if !sw_config.enabled {
+            info!("signal watcher disabled by config");
+        } else if !owns_self_discovery {
+            info!(
+                "signal watcher: this process is not the change executor; \
+                 self-discovery intents disabled"
+            );
+        } else if let Some(orch) = orchestrator.clone() {
+            let shutdown = cog_core::ShutdownSignal::new();
+            if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                let shutdown = shutdown.clone();
+                let mut rx = broadcast_tx.0.subscribe();
+                tokio::spawn(async move {
+                    let _ = rx.recv().await;
+                    shutdown.trigger();
+                });
             }
-            (Ok(_), None) => {
-                info!("signal watcher: no orchestrator; self-discovery intents disabled");
+            // Persisted-alert channel: published by the observability
+            // plugin in init, so it is guaranteed visible here.
+            let alert_source = ctx.consume_service::<dyn cog_core::ActiveAlertSource>();
+            if alert_source.is_none() {
+                info!("signal watcher: no ActiveAlertSource; persisted-alert channel off");
             }
-            (Ok(_), Some(_)) => {
-                info!("signal watcher disabled by config");
-            }
-            (Err(e), _) => return Err(e),
+            tokio::spawn(crate::run_signal_watcher_loop(
+                orch,
+                sw_config,
+                shutdown,
+                alert_source,
+            ));
+        } else {
+            info!("signal watcher: no orchestrator; self-discovery intents disabled");
         }
 
         if !self.porter_armed {
