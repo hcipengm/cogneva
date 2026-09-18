@@ -947,39 +947,7 @@ impl GitOpsPuller {
         let body = self
             .run("curl", &["-sf", "--max-time", "10", url], None, 15)
             .await?;
-        let mut error_total = 0.0f64;
-        let mut request_total = 0.0f64;
-        let mut p99 = 0.0f64;
-        for line in body.lines() {
-            if line.starts_with("http_requests_total") && line.contains("status=\"5") {
-                error_total += line
-                    .split_whitespace()
-                    .last()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.0);
-            } else if line.starts_with("http_requests_total") {
-                request_total += line
-                    .split_whitespace()
-                    .last()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.0);
-            } else if line.starts_with("http_request_duration_seconds")
-                && line.contains("quantile=\"0.99\"")
-            {
-                p99 = line
-                    .split_whitespace()
-                    .last()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(0.0)
-                    * 1000.0;
-            }
-        }
-        let error_rate = if request_total > 0.0 {
-            error_total / request_total
-        } else {
-            0.0
-        };
-        Ok(Some((error_rate, p99)))
+        Ok(Some(parse_prometheus_signals(&body)))
     }
 
     fn compare_metrics(&self, baseline: &(f64, f64), current: &(f64, f64)) -> SFResult<()> {
@@ -1080,9 +1048,102 @@ pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::Shut
     }
 }
 
+/// 从 Prometheus 文本面读出错误率与 p99 延迟（毫秒）。
+/// 纯函数：输入是抓取到的正文，输出只由正文决定，便于对着真实输出形态做断言。
+fn parse_prometheus_signals(body: &str) -> (f64, f64) {
+    let mut error_total = 0.0f64;
+    let mut request_total = 0.0f64;
+    let mut p99 = 0.0f64;
+    for line in body.lines() {
+        if line.starts_with("http_requests_total") {
+            // 5xx 也是请求。把它排除在分母外会把错误率系统性放大，
+            // 于是好版本被少报的成功数判成坏版本。
+            let value = parse_series_value(line);
+            request_total += value;
+            if line.contains("status=\"5") {
+                error_total += value;
+            }
+        } else if line.starts_with("http_request_duration_ms") && line.contains("quantile=\"0.99\"")
+        {
+            // 网关把请求延迟以毫秒记在 `http_request_duration_ms` 下；正文里
+            // 从不存在以秒记的同名序列，按那个名字读会让 p99 恒为 0，
+            // 延迟回归闸门永远不响。
+            // 每个端点各有一条 p99，取最差的那条：闸门要盯的是最先越界的端点，
+            // 「最后一行赢」会让结论取决于正文行序。
+            p99 = p99.max(parse_series_value(line));
+        }
+    }
+    let error_rate = if request_total > 0.0 {
+        error_total / request_total
+    } else {
+        0.0
+    };
+    (error_rate, p99)
+}
+
+fn parse_series_value(line: &str) -> f64 {
+    line.split_whitespace()
+        .last()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 正文取自网关 `/metrics` 的真实输出形态：延迟以毫秒记在
+    /// `http_request_duration_ms` 下，没有以秒命名的同名序列。
+    #[test]
+    fn parses_error_rate_and_p99_from_gateway_body() {
+        let body = "\
+# TYPE http_requests_total counter
+http_requests_total{endpoint=\"/api/v1/tasks\",method=\"POST\",status=\"201\"} 90
+http_requests_total{endpoint=\"/api/v1/tasks\",method=\"POST\",status=\"500\"} 10
+# TYPE http_request_duration_ms summary
+http_request_duration_ms{endpoint=\"/api/v1/tasks\",method=\"POST\",quantile=\"0.5\"} 12.5
+http_request_duration_ms{endpoint=\"/api/v1/tasks\",method=\"POST\",quantile=\"0.99\"} 840.25
+http_request_duration_ms_count{endpoint=\"/api/v1/tasks\",method=\"POST\"} 100
+http_request_duration_ms_sum{endpoint=\"/api/v1/tasks\",method=\"POST\"} 12345.6
+";
+        let (error_rate, p99) = parse_prometheus_signals(body);
+        assert!((error_rate - 0.1).abs() < 1e-9, "error_rate={error_rate}");
+        assert!((p99 - 840.25).abs() < 1e-9, "p99={p99}");
+    }
+
+    /// 分母是全部请求：5xx 既算错误也算请求。把它剔出分母会让错误率虚高，
+    /// 拿虚高的数字去卡回归阈值，好版本会被判成坏版本。
+    #[test]
+    fn error_rate_counts_failures_in_the_denominator_too() {
+        let body = "\
+http_requests_total{endpoint=\"/a\",method=\"GET\",status=\"200\"} 100
+http_requests_total{endpoint=\"/a\",method=\"GET\",status=\"503\"} 100
+";
+        let (error_rate, _) = parse_prometheus_signals(body);
+        assert!((error_rate - 0.5).abs() < 1e-9, "error_rate={error_rate}");
+    }
+
+    /// 多端点各有一条 p99 时取最差的那条，结论不随正文行序变化。
+    #[test]
+    fn p99_is_the_worst_endpoint_regardless_of_line_order() {
+        let body = "\
+http_request_duration_ms{endpoint=\"/a\",quantile=\"0.99\"} 50
+http_request_duration_ms{endpoint=\"/b\",quantile=\"0.99\"} 900
+http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
+";
+        let (_, p99) = parse_prometheus_signals(body);
+        assert!((p99 - 900.0).abs() < 1e-9, "p99={p99}");
+    }
+
+    /// p99 缺失或窗口内没有请求时读作 0：没有证据就不判回归，
+    /// 但也不能把「读不到」当成「延迟很好」写进任何结论。
+    #[test]
+    fn missing_p99_reads_zero() {
+        let body = "# TYPE http_requests_total counter\nhttp_requests_total{status=\"200\"} 5\n";
+        let (error_rate, p99) = parse_prometheus_signals(body);
+        assert!((error_rate - 0.0).abs() < 1e-9);
+        assert!((p99 - 0.0).abs() < 1e-9);
+    }
 
     #[test]
     fn parse_tag_message_full() {
