@@ -229,6 +229,7 @@
     "archive_poll_interval_secs": 300
   },
   "gateway": {
+    "_comment": "JWT 签名密钥不在配置文件中明文存放：运行时从环境变量 COGNEVA_JWT_SECRET 读取（由安装器生成并注入集群 Secret，见 deploy/helm/cogneva/templates/secret.yaml 与 deploy/scripts/init-secrets.sh）。要求长度 ≥32 字节且不得使用公开占位符 'change-me-in-production'，否则启动被拒绝（fail-fast，见 crates/cog-auth/src/jwt.rs）；未设置时回退为每次启动随机生成的临时密钥（重启后所有 token 失效）。access_token_ttl_minutes=0 表示用内置默认值。",
     "http_port": 8080,
     "ws_port": 8081,
     "metrics_port": 9090,

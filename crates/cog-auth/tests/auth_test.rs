@@ -11,6 +11,17 @@ use uuid::Uuid;
 // JWT tests
 // ---------------------------------------------------------------------------
 
+/// Strong-enough HMAC secret for integration tests (>= 32 bytes, distinct
+/// from the public placeholder `JwtConfig::default()` carries).
+const TEST_HMAC_SECRET: &str = "test-hmac-secret-0123456789abcdef0123456789abcdef";
+
+fn test_jwt_config() -> JwtConfig {
+    JwtConfig {
+        secret: TEST_HMAC_SECRET.into(),
+        ..Default::default()
+    }
+}
+
 fn test_user() -> User {
     User {
         id: Uuid::new_v4(),
@@ -28,7 +39,7 @@ fn test_user() -> User {
 
 #[test]
 fn jwt_generate_and_verify() {
-    let mgr = JwtManager::new(JwtConfig::default());
+    let mgr = JwtManager::new(test_jwt_config());
     let user = test_user();
     let (access, refresh) = mgr
         .generate_token(
@@ -50,7 +61,7 @@ fn jwt_generate_and_verify() {
 
 #[test]
 fn jwt_refresh_access_token() {
-    let mgr = JwtManager::new(JwtConfig::default());
+    let mgr = JwtManager::new(test_jwt_config());
     let user = test_user();
     let (access, refresh) = mgr.generate_token(&user, vec![], vec![]).unwrap();
 
@@ -67,10 +78,8 @@ fn jwt_refresh_access_token() {
 
 #[test]
 fn jwt_expired_token_fails() {
-    let config = JwtConfig {
-        access_token_ttl_minutes: -5,
-        ..Default::default()
-    };
+    let mut config = test_jwt_config();
+    config.access_token_ttl_minutes = -5;
     let mgr = JwtManager::new(config);
     let user = test_user();
     let (access, _) = mgr.generate_token(&user, vec![], vec![]).unwrap();
@@ -85,7 +94,7 @@ fn jwt_expired_token_fails() {
 
 #[test]
 fn jwt_invalid_token_fails() {
-    let mgr = JwtManager::new(JwtConfig::default());
+    let mgr = JwtManager::new(test_jwt_config());
     let err = mgr.verify_token("not-a-valid-jwt").unwrap_err();
     let msg = err.to_string();
     assert!(

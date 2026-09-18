@@ -3,11 +3,6 @@
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Well-known placeholder from `JwtConfig::default()`. Refused at startup
-/// outside demo mode: HS256 with a public secret means anyone can forge an
-/// admin token offline.
-const KNOWN_WEAK_SECRET: &str = "change-me-in-production";
-
 /// Auth plugin that self-assembles and publishes JWT manager and session manager.
 pub struct AuthPlugin {
     initialized: bool,
@@ -81,8 +76,9 @@ impl cog_core::SystemPlugin for AuthPlugin {
 /// the `COGNEVA_JWT_SECRET` env (injected from the install-time generated
 /// cluster Secret). Unset env falls back to a per-boot random secret with a
 /// loud warning — safe against forgery, but every token dies on restart, so
-/// real deployments must inject the Secret. The known placeholder is refused
-/// unless demo login is explicitly enabled.
+/// real deployments must inject the Secret. Short secrets and the known
+/// placeholder are refused unless demo login is explicitly enabled; the same
+/// rule is enforced again inside `JwtManager::new` as a last line of defense.
 fn resolve_jwt_config(config: &cog_core::Config) -> cog_core::SFResult<crate::jwt::JwtConfig> {
     let mut cfg = crate::jwt::JwtConfig {
         access_token_ttl_minutes: config.gateway.effective_access_token_ttl_minutes() as i64,
@@ -90,13 +86,23 @@ fn resolve_jwt_config(config: &cog_core::Config) -> cog_core::SFResult<crate::jw
     };
     match std::env::var("COGNEVA_JWT_SECRET") {
         Ok(secret) if !secret.is_empty() => {
-            if secret == KNOWN_WEAK_SECRET && !config.gateway.demo_login_enabled {
+            // Throwaway demo deployments (gateway.demo_login_enabled) grant an
+            // admin token to any credentials, so the secret is meaningless
+            // there; allow the weak secret only in that explicit case.
+            let demo = config.gateway.demo_login_enabled;
+            if !demo
+                && (secret.len() < crate::jwt::MIN_HMAC_SECRET_LEN
+                    || secret == crate::jwt::KNOWN_WEAK_SECRET)
+            {
                 return Err(cog_core::SFError::Config(format!(
-                    "COGNEVA_JWT_SECRET is the known placeholder '{KNOWN_WEAK_SECRET}'; \
-                     set a random secret (the installer generates one) or enable \
-                     gateway.demo_login_enabled for throwaway demos"
+                    "COGNEVA_JWT_SECRET must be a random value of at least {} bytes and must \
+                     not be the public placeholder '{}'; set a random secret (the installer \
+                     generates one) or enable gateway.demo_login_enabled for throwaway demos",
+                    crate::jwt::MIN_HMAC_SECRET_LEN,
+                    crate::jwt::KNOWN_WEAK_SECRET
                 )));
             }
+            cfg.allow_weak_secret = demo;
             cfg.secret = secret;
         }
         _ => {
