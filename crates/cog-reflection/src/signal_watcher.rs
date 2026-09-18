@@ -176,6 +176,28 @@ fn cooldown_elapsed(
     }
 }
 
+/// The firing alerts this tick should act on: drop the ones still inside their
+/// cooldown, then stop once `max` are left.
+///
+/// The cap bounds the work a single tick creates, so it has to count the alerts
+/// actually selected rather than the first `max` rows the store returned. The
+/// store hands them back newest-first, so truncating there lets a cluster of
+/// newly fired alerts hide every older one behind them for as long as they keep
+/// firing — which is exactly when a long-standing fault most needs to be seen.
+fn select_alerts<'a>(
+    alerts: &'a [cog_core::PersistedAlert],
+    state: &SignalGuardState,
+    max: usize,
+    cooldown_secs: i64,
+    now: DateTime<Utc>,
+) -> Vec<&'a cog_core::PersistedAlert> {
+    alerts
+        .iter()
+        .filter(|a| cooldown_elapsed(state, &format!("alert:{}", a.dedup_key), cooldown_secs, now))
+        .take(max)
+        .collect()
+}
+
 /// Normalize a task error into a recurrence signature: same root cause must
 /// map to the same signature regardless of run ids, numbers, timestamps.
 fn error_signature(error: &str) -> String {
@@ -458,11 +480,15 @@ async fn tick(
     if config.alert_channel_enabled {
         if let Some(source) = alert_source {
             let alerts = source.list_active_alerts(100).await;
-            for alert in alerts.into_iter().take(config.alert_channel_max_per_tick) {
+            let selected = select_alerts(
+                &alerts,
+                &state,
+                config.alert_channel_max_per_tick,
+                config.report_cooldown_secs,
+                now,
+            );
+            for alert in selected {
                 let key = format!("alert:{}", alert.dedup_key);
-                if !cooldown_elapsed(&state, &key, config.report_cooldown_secs, now) {
-                    continue;
-                }
                 dirty = true;
                 let hash = short_hash(&key);
                 let goal = format!(
@@ -636,5 +662,49 @@ mod tests {
                 "{live:?} 不该再提交或重驱动"
             );
         }
+    }
+
+    fn firing(dedup_key: &str) -> cog_core::PersistedAlert {
+        cog_core::PersistedAlert {
+            rule: "test_rule".into(),
+            dedup_key: dedup_key.into(),
+            severity: "warning".into(),
+            state: "firing".into(),
+            message: "m".into(),
+            labels: serde_json::json!({}),
+            fired_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn alerts_in_cooldown_do_not_hide_the_ones_queued_behind_them() {
+        let now = Utc::now();
+        // Store order is newest-first, so "old" sits behind the two that just
+        // fired and are now cooling down.
+        let alerts = vec![firing("new1"), firing("new2"), firing("old")];
+        let mut state = SignalGuardState::default();
+        state.reported.insert("alert:new1".into(), now);
+        state.reported.insert("alert:new2".into(), now);
+
+        let picked = select_alerts(&alerts, &state, 1, 86400, now);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(
+            picked[0].dedup_key, "old",
+            "上限卡的是本轮产出多少意图，先把窗口截断会让冷却中的告警长期挡住排在后面的"
+        );
+    }
+
+    #[test]
+    fn the_cap_still_bounds_how_many_alerts_one_tick_acts_on() {
+        let now = Utc::now();
+        let alerts = vec![firing("a"), firing("b"), firing("c")];
+        let picked = select_alerts(&alerts, &SignalGuardState::default(), 2, 86400, now);
+        assert_eq!(
+            picked
+                .iter()
+                .map(|a| a.dedup_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
     }
 }
