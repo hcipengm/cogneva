@@ -58,15 +58,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         }
 
         // Snapshot config values to drop immutable borrow before publishing.
-        let (
-            app_name,
-            app_version,
-            log_level,
-            observability,
-            metrics,
-            tier_migrator_hot_days,
-            tier_migrator_warm_days,
-        ) = {
+        let (app_name, app_version, log_level, observability, metrics, tier_migrator) = {
             let config = ctx.config();
             (
                 config.app.name.clone(),
@@ -75,8 +67,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 // observability 是 cog-observability 自有配置段，自读 cogneva.json。
                 crate::ObservabilityExportersConfig::load()?,
                 config.metrics.clone(),
-                (config.tier_migrator.hot_duration_secs / 86400) as u32,
-                (config.tier_migrator.warm_duration_secs / 86400) as u32,
+                config.tier_migrator.clone(),
             )
         };
 
@@ -247,10 +238,14 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // ── Trace tier migrator ──
         let trace_tier_migrator = Arc::new(crate::snapshot::TraceTierMigrator::new(
             trace_store.clone(),
-            tier_migrator_hot_days,
-            tier_migrator_warm_days,
+            tier_migrator.clone(),
         ));
         ctx.publish(trace_tier_migrator.clone());
+        // Published as an observable as well: the infra alert rules read
+        // Prometheus, and only observables are rendered on the /metrics
+        // endpoint's raw-metric path. A migration whose overruns never reach
+        // Prometheus has no observer outside its own log.
+        ctx.publish_observable(trace_tier_migrator.clone());
         info!("ObservabilityPlugin trace tier migrator published");
 
         self.trace_collector = Some(trace_collector);
@@ -337,14 +332,13 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // ── Trace tier migrator ──
         if let Some(ref trace_tier_migrator) = self.trace_tier_migrator {
             let trace_migrator = trace_tier_migrator.clone();
-            let interval_secs = ctx.config().system.trace_migrator_interval_secs;
+            let interval = trace_migrator.scan_interval();
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
             tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+                let mut interval = tokio::time::interval(interval);
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {

@@ -715,6 +715,25 @@ impl TraceStore for MemoryTraceStore {
         result.truncate(limit);
         Ok(result)
     }
+
+    async fn list_meta_in_tier(
+        &self,
+        tier: cog_core::StorageTier,
+        limit: usize,
+    ) -> SFResult<Vec<cog_core::TraceMeta>> {
+        let store = self
+            .traces
+            .read()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        let mut result: Vec<_> = store
+            .values()
+            .filter(|t| t.tier == tier)
+            .map(cog_core::TraceMeta::from_trace)
+            .collect();
+        result.sort_by_key(|a| a.created_at);
+        result.truncate(limit);
+        Ok(result)
+    }
 }
 
 pub use crate::mem::object_backends::MemoryObjectBackend;

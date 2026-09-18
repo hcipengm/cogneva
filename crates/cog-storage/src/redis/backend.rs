@@ -106,6 +106,13 @@ impl RedisBackend {
             .map_err(|e| map_redis_err("zrevrange", e))
     }
 
+    pub async fn zrange(&self, key: &str, start: isize, stop: isize) -> SFResult<Vec<String>> {
+        let mut c = self.conn.clone();
+        c.zrange(key, start, stop)
+            .await
+            .map_err(|e| map_redis_err("zrange", e))
+    }
+
     // ─── Health ───
 
     pub async fn ping(&self) -> SFResult<String> {

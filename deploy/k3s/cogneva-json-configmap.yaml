@@ -16,7 +16,6 @@ data:
         "shutdown_timeout_ms": 30000,
         "timeout_checker_interval_secs": 30,
         "stale_task_detector_poll_secs": 15,
-        "trace_migrator_interval_secs": 3600,
         "tool_timeout_secs": 30,
         "sandbox_executor_url": "http://cogneva-sandbox-executor:9090",
         "require_tool_identity": false,
@@ -80,6 +79,7 @@ data:
         "COGNEVA_TIER_WARM_DURATION_SECS": "tier_migrator.warm_duration_secs",
         "COGNEVA_TIER_SCAN_INTERVAL_SECS": "tier_migrator.scan_interval_secs",
         "COGNEVA_TIER_COLD_KEY_PREFIX": "tier_migrator.cold_key_prefix",
+        "COGNEVA_TIER_TRACE_SCAN_BATCH": "tier_migrator.trace_scan_batch",
         "COGNEVA_METRICS_ENABLED": "metrics.enabled",
         "COGNEVA_SUPERVISOR_HEALTH_INTERVAL_SECS": "supervisor.health_interval_secs",
         "COGNEVA_SUPERVISOR_QUOTA_INTERVAL_SECS": "supervisor.quota_interval_secs",
@@ -320,7 +320,8 @@ data:
         "warm_compression_level": 3,
         "cold_compression_level": 9,
         "scan_interval_secs": 3600,
-        "cold_key_prefix": "raw"
+        "cold_key_prefix": "raw",
+        "trace_scan_batch": 5000
       },
       "supervisor": {
         "health_interval_secs": 10,
@@ -483,6 +484,33 @@ data:
               },
               "severity": "warning",
               "summary": "Volume holds {value}x its declared size: the workload writes past the PVC's requests.storage, and nothing enforces that request, so the declared size is not a ceiling. For a directory-backed volume the excess lands on the node filesystem and the per-volume capacity the kubelet reports is the node's, not this volume's. Either the declaration is wrong for what this deployment writes, or the growth belongs somewhere else"
+            },
+            {
+              "name": "trace_tier_demotion_stalled",
+              "promql": "(cogneva_trace_tier_overdue > 0) and (cogneva_trace_tier_overdue == (cogneva_trace_tier_overdue offset 3h))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Traces past their tier's age number {value} on tier {tier}, exactly as they did 3h ago: the demotion chain is not moving them, so the hot tier keeps growing. Any non-zero count that does not come down over three scans is a move that fails every pass, not a backlog being worked through. Nothing deletes traces, so this chain is the only thing standing between a permanent trace store and the node filesystem"
+            },
+            {
+              "name": "trace_tier_migration_stale",
+              "promql": "time() - max(cogneva_trace_tier_last_pass_seconds) > 6 * max(cogneva_trace_tier_scan_interval_seconds)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "No trace tier migration pass has run for {value} seconds past six times the configured scan interval: the background loop has stopped, so tier demotion is not happening at all. The threshold scales with the deployment's own cadence rather than a fixed number"
+            },
+            {
+              "name": "trace_tier_migration_failing",
+              "promql": "increase(cogneva_trace_tier_pass_failures_total[1h])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Trace tier migration failed to complete {value} time(s) in the last hour: the trace store could not be listed, so a pass has nothing to look at and no tier can be demoted. A pass that runs but cannot move individual entries is reported as an overdue count instead"
             }
           ]
         },
@@ -653,3 +681,4 @@ data:
         "max_issues_per_scan": 50
       }
     }
+

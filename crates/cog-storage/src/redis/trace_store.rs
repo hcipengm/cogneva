@@ -34,6 +34,18 @@ impl RedisTraceStore {
     fn meta_key(trace_id: &str) -> String {
         format!("trace:meta:{}", trace_id)
     }
+
+    /// Metadata for one trace, falling back to the full trace when the
+    /// metadata key has expired but the trace itself has not.
+    async fn meta_of(&self, trace_id: &str) -> SFResult<Option<TraceMeta>> {
+        match self.backend.get_bytes(&Self::meta_key(trace_id)).await? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(self
+                .load(trace_id)
+                .await?
+                .map(|t| TraceMeta::from_trace(&t))),
+        }
+    }
 }
 
 #[async_trait]
@@ -141,18 +153,39 @@ impl TraceStore for RedisTraceStore {
 
         let mut metas = Vec::new();
         for id in trace_ids {
-            let meta_key = Self::meta_key(&id);
-            match self.backend.get_bytes(&meta_key).await? {
-                Some(bytes) => {
-                    let meta: TraceMeta = serde_json::from_slice(&bytes)?;
+            if let Some(meta) = self.meta_of(&id).await? {
+                metas.push(meta);
+            }
+        }
+        Ok(metas)
+    }
+
+    /// Tier-scoped, oldest first. Redis keeps every trace in one index, so the
+    /// tier is only visible in each entry's metadata; the ascending walk is
+    /// therefore bounded by the index, which is in turn bounded by the TTL —
+    /// entries older than that no longer exist to be migrated.
+    async fn list_meta_in_tier(
+        &self,
+        tier: cog_core::StorageTier,
+        limit: usize,
+    ) -> SFResult<Vec<TraceMeta>> {
+        let trace_ids =
+            self.backend
+                .zrange(INDEX_KEY, 0, -1)
+                .await
+                .map_err(|e| SFError::Adapter {
+                    provider: "redis".into(),
+                    message: format!("trace list_meta_in_tier zrange failed: {e}"),
+                })?;
+
+        let mut metas = Vec::new();
+        for id in trace_ids {
+            if metas.len() >= limit {
+                break;
+            }
+            if let Some(meta) = self.meta_of(&id).await? {
+                if meta.tier == tier {
                     metas.push(meta);
-                }
-                None => {
-                    // Metadata expired concurrently — fall back to loading the
-                    // full trace and extracting metadata if the trace still exists.
-                    if let Some(trace) = self.load(&id).await? {
-                        metas.push(TraceMeta::from_trace(&trace));
-                    }
                 }
             }
         }

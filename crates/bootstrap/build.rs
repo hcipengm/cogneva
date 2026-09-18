@@ -56,9 +56,18 @@ fn collect_files(repo_root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>)
         let path = entry.path();
         if path.is_dir() {
             collect_files(repo_root, &path, out);
-        } else {
-            let rel = path.strip_prefix(repo_root).unwrap().to_path_buf();
-            out.push((rel.to_string_lossy().replace('\\', "/"), path));
+            continue;
         }
+        // 点文件不是资产：render-deploy.sh 中途失败会残留 .rendered.yaml 这类中间产物，
+        // 一旦被打进 include_bytes!，源文件随后消失就会让整个 workspace 编译不过。
+        let hidden = path
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with('.'))
+            .unwrap_or(false);
+        if hidden {
+            continue;
+        }
+        let rel = path.strip_prefix(repo_root).unwrap().to_path_buf();
+        out.push((rel.to_string_lossy().replace('\\', "/"), path));
     }
 }

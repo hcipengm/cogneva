@@ -173,6 +173,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_TIER_COLD_KEY_PREFIX".into(),
         "tier_migrator.cold_key_prefix".into(),
     );
+    m.insert(
+        "COGNEVA_TIER_TRACE_SCAN_BATCH".into(),
+        "tier_migrator.trace_scan_batch".into(),
+    );
     // observability exporters
     // business-specific
     m.insert("COGNEVA_METRICS_ENABLED".into(), "metrics.enabled".into());

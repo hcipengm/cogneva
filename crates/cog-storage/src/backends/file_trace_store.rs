@@ -7,24 +7,14 @@
 //!   traces are saved with a different tier than their current location.
 
 use async_trait::async_trait;
-use cog_core::{AgentTrace, SFError, SFResult, TraceMeta, TraceStore};
-
-/// Return the zstd compression level for a tier.
-#[allow(dead_code)]
-fn tier_compression_level(tier: cog_core::StorageTier) -> i32 {
-    match tier {
-        cog_core::StorageTier::Hot => 0,
-        cog_core::StorageTier::Warm => 3,
-        cog_core::StorageTier::Cold => 9,
-    }
-}
+use cog_core::{AgentTrace, SFError, SFResult, StorageTier, TraceMeta, TraceStore};
 
 /// Return the subdirectory name for a tier.
-fn tier_subdir(tier: cog_core::StorageTier) -> &'static str {
+fn tier_subdir(tier: StorageTier) -> &'static str {
     match tier {
-        cog_core::StorageTier::Hot => "hot",
-        cog_core::StorageTier::Warm => "warm",
-        cog_core::StorageTier::Cold => "cold",
+        StorageTier::Hot => "hot",
+        StorageTier::Warm => "warm",
+        StorageTier::Cold => "cold",
     }
 }
 
@@ -72,35 +62,29 @@ impl FileTraceStore {
     }
 
     /// Get the tier directory path.
-    fn tier_dir(&self, tier: cog_core::StorageTier) -> std::path::PathBuf {
+    fn tier_dir(&self, tier: StorageTier) -> std::path::PathBuf {
         self.base_dir.join(tier_subdir(tier))
     }
 
     /// Get the trace data file path for a given tier.
-    fn trace_path(&self, tier: cog_core::StorageTier, trace_id: &str) -> std::path::PathBuf {
+    fn trace_path(&self, tier: StorageTier, trace_id: &str) -> std::path::PathBuf {
         let dir = self.tier_dir(tier);
         let stem = file_stem(trace_id);
         match tier {
-            cog_core::StorageTier::Hot => dir.join(format!("{}.trace", stem)),
-            cog_core::StorageTier::Warm | cog_core::StorageTier::Cold => {
-                dir.join(format!("{}.trace.zst", stem))
-            }
+            StorageTier::Hot => dir.join(format!("{}.trace", stem)),
+            StorageTier::Warm | StorageTier::Cold => dir.join(format!("{}.trace.zst", stem)),
         }
     }
 
     /// Get the metadata file path for a given tier.
-    fn meta_path(&self, tier: cog_core::StorageTier, trace_id: &str) -> std::path::PathBuf {
+    fn meta_path(&self, tier: StorageTier, trace_id: &str) -> std::path::PathBuf {
         self.tier_dir(tier)
             .join(format!("{}.meta.json", file_stem(trace_id)))
     }
 
     /// Search all tiers for a trace and return which tier contains it.
-    async fn find_trace_tier(&self, trace_id: &str) -> Option<cog_core::StorageTier> {
-        for &tier in &[
-            cog_core::StorageTier::Hot,
-            cog_core::StorageTier::Warm,
-            cog_core::StorageTier::Cold,
-        ] {
+    async fn find_trace_tier(&self, trace_id: &str) -> Option<StorageTier> {
+        for &tier in &[StorageTier::Hot, StorageTier::Warm, StorageTier::Cold] {
             let meta_path = self.meta_path(tier, trace_id);
             if tokio::fs::try_exists(&meta_path).await.unwrap_or(false) {
                 return Some(tier);
@@ -134,9 +118,48 @@ impl FileTraceStore {
     }
 
     /// Remove a trace from a specific tier (best effort).
-    async fn remove_from_tier(&self, tier: cog_core::StorageTier, trace_id: &str) {
+    async fn remove_from_tier(&self, tier: StorageTier, trace_id: &str) {
         let _ = tokio::fs::remove_file(self.trace_path(tier, trace_id)).await;
         let _ = tokio::fs::remove_file(self.meta_path(tier, trace_id)).await;
+    }
+
+    /// Read every parseable metadata file in one tier directory.
+    ///
+    /// Entries that cannot be read or parsed are skipped rather than failing
+    /// the listing: one unreadable file must not hide the tier's other
+    /// thousands, in particular not from a migration looking for its backlog.
+    async fn tier_metas(&self, tier: StorageTier) -> SFResult<Vec<TraceMeta>> {
+        let tier_dir = self.tier_dir(tier);
+        if !tokio::fs::try_exists(&tier_dir).await.unwrap_or(false) {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = match tokio::fs::read_dir(&tier_dir).await {
+            Ok(e) => e,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut metas = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| SFError::IO(e.to_string()))?
+        {
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.ends_with(".meta.json"))
+            {
+                continue;
+            }
+            if let Ok(meta_json) = tokio::fs::read_to_string(&path).await {
+                if let Ok(meta) = serde_json::from_str::<TraceMeta>(&meta_json) {
+                    metas.push(meta);
+                }
+            }
+        }
+        Ok(metas)
     }
 }
 
@@ -203,106 +226,40 @@ impl TraceStore for FileTraceStore {
 
     async fn delete(&self, trace_id: &str) -> SFResult<()> {
         // Remove from all tiers (best effort)
-        for &tier in &[
-            cog_core::StorageTier::Hot,
-            cog_core::StorageTier::Warm,
-            cog_core::StorageTier::Cold,
-        ] {
+        for &tier in &[StorageTier::Hot, StorageTier::Warm, StorageTier::Cold] {
             self.remove_from_tier(tier, trace_id).await;
         }
         Ok(())
     }
 
     async fn list(&self, limit: usize) -> SFResult<Vec<AgentTrace>> {
+        // Metadata first: the newest `limit` are the only traces returned, so
+        // reading the heavy payload of every trace before sorting is work
+        // thrown away. A trace whose metadata is gone cannot be loaded anyway
+        // — `load` needs it for the compression level.
         let mut traces = Vec::new();
-
-        // Scan all tiers
-        for &tier in &[
-            cog_core::StorageTier::Hot,
-            cog_core::StorageTier::Warm,
-            cog_core::StorageTier::Cold,
-        ] {
-            let tier_dir = self.tier_dir(tier);
-            if !tokio::fs::try_exists(&tier_dir).await.unwrap_or(false) {
-                continue;
-            }
-
-            let mut entries = match tokio::fs::read_dir(&tier_dir).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            while let Some(entry) = entries
-                .next_entry()
-                .await
-                .map_err(|e| SFError::IO(e.to_string()))?
-            {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json")
-                    && path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(|s| s.ends_with(".meta.json"))
-                {
-                    if let Ok(meta_json) = tokio::fs::read_to_string(&path).await {
-                        if let Ok(meta) = serde_json::from_str::<TraceMeta>(&meta_json) {
-                            if let Ok(Some(trace)) = self.load(&meta.trace_id).await {
-                                traces.push(trace);
-                            }
-                        }
-                    }
-                }
+        for meta in self.list_meta(limit).await? {
+            if let Ok(Some(trace)) = self.load(&meta.trace_id).await {
+                traces.push(trace);
             }
         }
-
-        // Sort by creation time (newest first) and limit
-        traces.sort_by_key(|a| std::cmp::Reverse(a.created_at));
-        traces.truncate(limit);
         Ok(traces)
     }
 
     async fn list_meta(&self, limit: usize) -> SFResult<Vec<TraceMeta>> {
         let mut metas = Vec::new();
-
-        // Scan all tiers
-        for &tier in &[
-            cog_core::StorageTier::Hot,
-            cog_core::StorageTier::Warm,
-            cog_core::StorageTier::Cold,
-        ] {
-            let tier_dir = self.tier_dir(tier);
-            if !tokio::fs::try_exists(&tier_dir).await.unwrap_or(false) {
-                continue;
-            }
-
-            let mut entries = match tokio::fs::read_dir(&tier_dir).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            while let Some(entry) = entries
-                .next_entry()
-                .await
-                .map_err(|e| SFError::IO(e.to_string()))?
-            {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json")
-                    && path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(|s| s.ends_with(".meta.json"))
-                {
-                    if let Ok(meta_json) = tokio::fs::read_to_string(&path).await {
-                        if let Ok(meta) = serde_json::from_str::<TraceMeta>(&meta_json) {
-                            metas.push(meta);
-                        }
-                    }
-                }
-            }
+        for tier in [StorageTier::Hot, StorageTier::Warm, StorageTier::Cold] {
+            metas.extend(self.tier_metas(tier).await?);
         }
-
         // Sort by creation time (newest first) and limit
         metas.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        metas.truncate(limit);
+        Ok(metas)
+    }
+
+    async fn list_meta_in_tier(&self, tier: StorageTier, limit: usize) -> SFResult<Vec<TraceMeta>> {
+        let mut metas = self.tier_metas(tier).await?;
+        metas.sort_by_key(|a| a.created_at);
         metas.truncate(limit);
         Ok(metas)
     }
@@ -322,7 +279,7 @@ mod tests {
             event_count: 0,
             byte_size: 0,
             version: "test".into(),
-            tier: cog_core::StorageTier::Hot,
+            tier: StorageTier::Hot,
             compression: 0,
             checksum: String::new(),
             events: Vec::new(),
@@ -330,6 +287,62 @@ mod tests {
             llm_responses: Vec::new(),
             tool_calls: Vec::new(),
         }
+    }
+
+    fn aged_trace(trace_id: &str, tier: StorageTier, age_days: i64) -> AgentTrace {
+        let mut trace = test_trace(trace_id);
+        trace.tier = tier;
+        trace.compression = if tier == StorageTier::Hot { 0 } else { 3 };
+        trace.created_at = chrono::Utc::now() - chrono::Duration::days(age_days);
+        trace
+    }
+
+    /// Migration works from the oldest end of a tier, so a listing that
+    /// selects from the recent end returns nothing usable the moment the store
+    /// outgrows the limit — which is exactly when there is a backlog to clear.
+    #[tokio::test]
+    async fn oldest_entries_stay_visible_when_the_limit_is_exceeded() {
+        let dir = std::env::temp_dir().join(format!("fts-{}", uuid::Uuid::new_v4()));
+        let store = FileTraceStore::new(&dir);
+
+        // old-0 is the oldest of the warm entries, old-4 the newest.
+        for i in 0..5 {
+            store
+                .save(&aged_trace(&format!("old-{i}"), StorageTier::Warm, 40 - i))
+                .await
+                .unwrap();
+        }
+        for i in 0..10 {
+            store
+                .save(&aged_trace(
+                    &format!("new-{i}"),
+                    StorageTier::Hot,
+                    i as i64 % 3,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // The recent-end listing the migration used to read: the limit applies
+        // across all tiers, so no warm entry survives it at all.
+        let recent = store.list_meta(2).await.unwrap();
+        assert!(
+            recent.iter().all(|m| m.tier == StorageTier::Hot),
+            "precondition: the newest entries are all hot, got {:?}",
+            recent.iter().map(|m| m.tier).collect::<Vec<_>>()
+        );
+
+        let oldest_warm = store.list_meta_in_tier(StorageTier::Warm, 2).await.unwrap();
+        assert_eq!(
+            oldest_warm
+                .iter()
+                .map(|m| m.trace_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-0", "old-1"],
+            "the oldest warm entries are the ones aging toward cold"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[test]

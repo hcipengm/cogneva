@@ -125,6 +125,24 @@ pub trait TraceStore: Send + Sync {
     /// Backends that cannot support metadata-only queries should fall back
     /// to loading full traces and extracting [`TraceMeta`] via [`TraceMeta::from_trace`].
     async fn list_meta(&self, limit: usize) -> SFResult<Vec<TraceMeta>>;
+
+    /// List lightweight metadata for the `limit` oldest traces in `tier`,
+    /// oldest first.
+    ///
+    /// The opposite end of the age axis from [`Self::list_meta`], and the end
+    /// migration works from: an entry that has aged out of a tier is one of
+    /// that tier's oldest, so selecting from the recent end hides exactly the
+    /// entries being looked for once the tier holds more than `limit`. The
+    /// tier is part of the query rather than a filter applied afterwards so
+    /// each tier's own backlog is what bounds the answer.
+    ///
+    /// No default implementation: a backend that quietly answered from the
+    /// recent end would reproduce the defect this exists to prevent.
+    async fn list_meta_in_tier(
+        &self,
+        tier: crate::StorageTier,
+        limit: usize,
+    ) -> SFResult<Vec<TraceMeta>>;
 }
 
 /// 状态快照存储契约（`SnapshotStore` 的继任者）。

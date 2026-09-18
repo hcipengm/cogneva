@@ -130,4 +130,41 @@ impl TraceStore for S3TraceStore {
         metas.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         Ok(metas)
     }
+
+    async fn list_meta_in_tier(
+        &self,
+        tier: cog_core::StorageTier,
+        limit: usize,
+    ) -> SFResult<Vec<cog_core::TraceMeta>> {
+        // Object keys carry no timestamp — the prefix is the whole namespace —
+        // so ordering by age means reading every object, as `list_meta` above
+        // does. The tier lives inside each object's metadata.
+        let keys = self
+            .backend
+            .list(Some(&self.prefix))
+            .await
+            .map_err(|e| SFError::Adapter {
+                provider: "s3".into(),
+                message: format!("trace list_meta_in_tier failed: {e}"),
+            })?;
+
+        let mut metas: Vec<cog_core::TraceMeta> = Vec::new();
+        for key in keys {
+            match self.backend.get(&key).await {
+                Ok(Some(bytes)) => {
+                    if let Ok(decompressed) = zstd::decode_all(&bytes[..]) {
+                        if let Ok(trace) = serde_json::from_slice::<AgentTrace>(&decompressed) {
+                            if trace.tier == tier {
+                                metas.push(cog_core::TraceMeta::from_trace(&trace));
+                            }
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+        metas.sort_by_key(|a| a.created_at);
+        metas.truncate(limit);
+        Ok(metas)
+    }
 }

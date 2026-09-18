@@ -1,6 +1,6 @@
 //! Hot/Warm/Cold tier migration for raw-data files.
 
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -183,10 +183,6 @@ impl TierMigrator {
             .map_err(|e| SFError::IO(e.to_string()))?;
         let modified: DateTime<Utc> = modified.into();
         let age = Utc::now() - modified;
-        let hot_age = ChronoDuration::from_std(self.policy.hot_duration)
-            .map_err(|e| SFError::Config(e.to_string()))?;
-        let warm_age = ChronoDuration::from_std(self.policy.warm_duration)
-            .map_err(|e| SFError::Config(e.to_string()))?;
 
         let file_name = path
             .file_name()
@@ -196,16 +192,16 @@ impl TierMigrator {
 
         let log_date = parse_log_date(&file_name).unwrap_or_else(|| modified.date_naive());
 
-        // ── Cold-tier promotion ───────────────────────────────
-        if age >= hot_age + warm_age {
-            return Ok(Some(self.promote_to_cold(stream, path, log_date).await?));
+        match cog_core::tier_for_age(age, self.policy.hot_duration, self.policy.warm_duration) {
+            // ── Cold-tier promotion ───────────────────────────────
+            StorageTier::Cold => Ok(Some(self.promote_to_cold(stream, path, log_date).await?)),
+            // ── Warm-tier promotion ───────────────────────────────
+            // Already-compressed files are past this transition.
+            StorageTier::Warm if !is_compressed(&file_name) => {
+                Ok(Some(self.promote_to_warm(stream, path, log_date).await?))
+            }
+            StorageTier::Warm | StorageTier::Hot => Ok(None),
         }
-        // ── Warm-tier promotion ───────────────────────────────
-        if age >= hot_age && !is_compressed(&file_name) {
-            return Ok(Some(self.promote_to_warm(stream, path, log_date).await?));
-        }
-
-        Ok(None)
     }
 
     async fn promote_to_warm(

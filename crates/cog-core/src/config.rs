@@ -404,7 +404,6 @@ fn default_decomposition_orphan_alert_dwell_secs() -> u64 {
 /// in the hot tier. Durations are seconds so the JSON config stays compact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct TierMigratorConfig {
     pub enabled: bool,
     pub hot_duration_secs: u64,
@@ -413,6 +412,34 @@ pub struct TierMigratorConfig {
     pub cold_compression_level: i32,
     pub scan_interval_secs: u64,
     pub cold_key_prefix: String,
+    /// How many traces the trace migrator examines per tier per pass.
+    /// Entries are taken oldest first, so this bounds one pass' work rather
+    /// than what migration can eventually reach; it only has to exceed the
+    /// arrivals during one scan interval, or the backlog grows without ever
+    /// being examined to the end.
+    pub trace_scan_batch: u64,
+}
+
+/// The defaults are the shipped configuration, not the zero value of each
+/// type. A derived `Default` would give every duration 0, which reads as "every
+/// entry is past its tier from the moment it is written" — the raw-log migrator
+/// would then upload and remove local files on its first pass, and the trace
+/// migrator would demote everything to cold. A section omitted from the config
+/// file must behave like the one that ships, so a config typo cannot turn into
+/// an unbounded migration.
+impl Default for TierMigratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hot_duration_secs: 86_400,
+            warm_duration_secs: 604_800,
+            warm_compression_level: 3,
+            cold_compression_level: 9,
+            scan_interval_secs: 3_600,
+            cold_key_prefix: "raw".into(),
+            trace_scan_batch: 5_000,
+        }
+    }
 }
 
 /// Agent registration and heartbeat configuration.
@@ -579,8 +606,6 @@ pub struct SystemConfig {
     pub timeout_checker_interval_secs: u64,
     /// Stale-task detector poll interval (seconds).
     pub stale_task_detector_poll_secs: u64,
-    /// Trace tier migrator run interval (seconds).
-    pub trace_migrator_interval_secs: u64,
     /// Interval between monthly-partition maintenance rounds (seconds).
     pub partition_maintenance_interval_secs: u64,
     /// WASM tool execution timeout (seconds).
@@ -648,7 +673,6 @@ impl Default for SystemConfig {
             shutdown_timeout_ms: 30_000,
             timeout_checker_interval_secs: 30,
             stale_task_detector_poll_secs: 15,
-            trace_migrator_interval_secs: 3600,
             partition_maintenance_interval_secs: 3600,
             tool_timeout_secs: 30,
             sandbox_executor_url: None,
@@ -1023,5 +1047,22 @@ fn set_json_path_at(current: &mut serde_json::Value, parts: &[&str], leaf: serde
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deployment config that predates `trace_scan_batch` must still scan:
+    /// the struct derives `Default`, so a zero would parse cleanly and leave
+    /// the migrator examining nothing while looking configured.
+    #[test]
+    fn trace_scan_batch_falls_back_to_a_usable_default() {
+        let cfg: TierMigratorConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.trace_scan_batch, 5000);
+
+        let cfg: TierMigratorConfig = serde_json::from_str(r#"{"trace_scan_batch": 123}"#).unwrap();
+        assert_eq!(cfg.trace_scan_batch, 123);
     }
 }

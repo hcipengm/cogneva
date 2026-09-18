@@ -801,6 +801,30 @@ impl std::str::FromStr for StorageTier {
     }
 }
 
+/// The tier an entry of `age` belongs in.
+///
+/// One answer shared by raw-log and trace migration, because both read the same
+/// configured durations: derived separately, each could move its own boundary
+/// while the config read the same. `warm_duration` is the time spent in warm,
+/// so warm ends at `hot_duration + warm_duration`. An age that is negative or
+/// unrepresentable in [`std::time::Duration`] (a clock skew placing a timestamp
+/// in the future) is treated as zero, leaving that entry where it is rather
+/// than demoting it on the strength of a bad timestamp.
+pub fn tier_for_age(
+    age: chrono::Duration,
+    hot_duration: std::time::Duration,
+    warm_duration: std::time::Duration,
+) -> StorageTier {
+    let age = age.to_std().unwrap_or_default();
+    if age < hot_duration {
+        StorageTier::Hot
+    } else if age < hot_duration + warm_duration {
+        StorageTier::Warm
+    } else {
+        StorageTier::Cold
+    }
+}
+
 /// Tier-migration policy. Durations are measured from the file's modification
 /// timestamp.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
