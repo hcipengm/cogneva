@@ -379,9 +379,15 @@ impl MemoryBackend for CompositeMemoryBackend {
     }
 
     async fn health_check(&self) -> SFResult<()> {
-        // Exercise both layers so the check fails fast if either is broken.
-        let _ = self.schema.list_schema("default").await?;
-        let _ = self.summary.list_summary("default").await?;
+        // Exercise both layers so the check fails fast if either is broken, but
+        // read one row at most: the `list_*` variants materialize the whole
+        // namespace, which on the schema table is hundreds of megabytes of rows
+        // and JSON pushed through the connection per call. This sits on the
+        // readiness probe's path, so a corpus-sized read here grows with the
+        // data until the probe exceeds its timeout and calls a healthy process
+        // unready.
+        self.schema.search_schema("default", "", 1).await?;
+        self.summary.get_summary("default", "").await?;
         Ok(())
     }
 
@@ -532,5 +538,171 @@ impl MemoryBackend for CompositeMemoryBackend {
             entries_decayed: decayed,
             entries_archived: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::RelationDirection;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Which read paths a layer was asked to serve. A health check may take the
+    /// bounded one; the namespace-sized one is what a probe must never cost.
+    #[derive(Default)]
+    struct ReadTally {
+        one_row: AtomicUsize,
+        whole_namespace: AtomicUsize,
+    }
+
+    impl ReadTally {
+        fn one_row(&self) -> usize {
+            self.one_row.load(Ordering::SeqCst)
+        }
+
+        fn whole_namespace(&self) -> usize {
+            self.whole_namespace.load(Ordering::SeqCst)
+        }
+    }
+
+    struct CountingSchema {
+        tally: Arc<ReadTally>,
+    }
+
+    #[async_trait]
+    impl SchemaBackend for CountingSchema {
+        async fn store_schema(&self, _namespace: &str, _entry: &SchemaEntry) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn get_schema(&self, _namespace: &str, _id: &str) -> SFResult<Option<SchemaEntry>> {
+            Ok(None)
+        }
+
+        async fn search_schema(
+            &self,
+            _namespace: &str,
+            _query: &str,
+            _limit: usize,
+        ) -> SFResult<Vec<SchemaSearchResult>> {
+            self.tally.one_row.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn schema_for_raw(
+            &self,
+            _namespace: &str,
+            _raw_id: &str,
+        ) -> SFResult<Vec<SchemaEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_schema(&self, _namespace: &str) -> SFResult<Vec<SchemaEntry>> {
+            self.tally.whole_namespace.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn delete_schema(&self, _namespace: &str, _id: &str) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn query_relations(
+            &self,
+            _namespace: &str,
+            _entity: &str,
+            _direction: RelationDirection,
+            _relation_type: Option<&str>,
+        ) -> SFResult<Vec<SchemaEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn update_schema(&self, _namespace: &str, _entry: &SchemaEntry) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    struct CountingSummary {
+        tally: Arc<ReadTally>,
+    }
+
+    #[async_trait]
+    impl SummaryBackend for CountingSummary {
+        async fn store_summary(&self, _namespace: &str, _entry: &SummaryEntry) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn get_summary(&self, _namespace: &str, _id: &str) -> SFResult<Option<SummaryEntry>> {
+            self.tally.one_row.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        async fn search_summary(
+            &self,
+            _namespace: &str,
+            _query_embedding: &[f32],
+            _top_k: usize,
+            _time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        ) -> SFResult<Vec<SummarySearchResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn summary_for_raw(
+            &self,
+            _namespace: &str,
+            _raw_id: &str,
+        ) -> SFResult<Vec<SummaryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_summary(&self, _namespace: &str) -> SFResult<Vec<SummaryEntry>> {
+            self.tally.whole_namespace.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn delete_summary(&self, _namespace: &str, _id: &str) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn update_summary(&self, _namespace: &str, _entry: &SummaryEntry) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    fn counting_composite(tally: Arc<ReadTally>) -> (CompositeMemoryBackend, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = CompositeMemoryBackend::new(
+            Arc::new(cog_storage::FileObjectBackend::new(tmp.path())),
+            Arc::new(cog_storage::MemoryVectorBackend::new()),
+            4,
+        )
+        .with_schema_backend(Arc::new(CountingSchema {
+            tally: tally.clone(),
+        }))
+        .with_summary_backend(Arc::new(CountingSummary { tally }));
+        (backend, tmp)
+    }
+
+    /// A readiness probe hits this several times a minute, so the health check
+    /// has to stay bounded: reading the namespace makes the probe cost grow
+    /// with the corpus until it overruns its timeout and a healthy process is
+    /// called unready. Both layers must still be exercised, or the check would
+    /// stop detecting a broken layer at all.
+    #[tokio::test]
+    async fn health_check_reads_one_row_per_layer_instead_of_the_namespace() {
+        let tally = Arc::new(ReadTally::default());
+        let (backend, _tmp) = counting_composite(tally.clone());
+
+        backend.health_check().await.unwrap();
+
+        assert_eq!(
+            tally.one_row(),
+            2,
+            "health check must exercise both the schema and the summary layer"
+        );
+        assert_eq!(
+            tally.whole_namespace(),
+            0,
+            "health check must not load a whole namespace through either layer"
+        );
     }
 }
