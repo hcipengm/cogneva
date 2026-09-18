@@ -544,12 +544,30 @@ Cogneva 支持**元启动（Meta-bootstrap）**：从一台空白机器（Linux 
 
 ### 🪟 Windows
 
+Windows 与 Linux/macOS 是**同一条一键命令**，只是背后多一层：K3s 不能原生运行于 Windows，`bootstrap.ps1` 会先准备 WSL2 + Ubuntu 作为 Linux 运行层，再在 WSL 内执行与 Linux 完全相同的引导命令。
+
+**环境要求**（除下列外，其余全部由引导器自动安装）：
+
+- **Windows 10 2004+（内部版本 19041+）或 Windows 11**，且 BIOS/UEFI 已开启虚拟化（VT-x/AMD-V，WSL2 必需）；
+- **管理员权限的 PowerShell**：Windows PowerShell 5.1（系统自带）或 PowerShell 7+，右键"以管理员身份运行"即可；
+- **可访问 GitHub 的网络**（受限网络会自动切换国内镜像，见下）；
+- **无需预装任何东西**：不必手动安装 WSL、Rust 工具链、Docker 或集群——引导器会在 WSL 内自动安装并自修复全部依赖（含 Rust、容器运行时、K3s/buildah 等），宿主零侵入。
+
+**快速开始**：
+
 ```powershell
 # 管理员 PowerShell
 iwr -useb https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.ps1 | iex
 ```
 
-脚本自动安装 WSL2 + Ubuntu（如需重启会提示，重启后重跑本脚本即可，幂等），然后在 WSL 内执行同一条一键命令。WSL2 默认开启 localhostForwarding，WebUI 直接在浏览器访问 <http://localhost:8080>。强制国内镜像：先下载脚本再传参，如 `& ([scriptblock]::Create((iwr -useb <地址>).Content)) -CnMirror 1`。
+1. 开始菜单搜索 **PowerShell**（或"终端"），右键选择**以管理员身份运行**；
+2. 粘贴上面这条命令并回车——脚本发现缺 WSL2 + Ubuntu 会自动安装，随后在 WSL 内进入与 Linux 相同的全自动元启动；
+3. 若 Windows 提示需要**重启**（安装 WSL 组件后通常需要），重启后再次运行**同一条命令**即可——脚本幂等，会从断点继续；
+4. 等待 WSL 内引导完成：首次运行需下载 Ubuntu 与全部依赖，耗时取决于网速；
+5. 完成。WSL2 默认开启 localhostForwarding，WebUI 直接在浏览器访问 <http://localhost:8080>，按首次弹出的 LLM 配置向导完成接入；
+6. 日常管理：`wsl -d Ubuntu` 进入 Linux 层，`wsl --shutdown` 停止运行。
+
+强制国内镜像：先下载脚本再传参，如 `& ([scriptblock]::Create((iwr -useb <地址>).Content)) -CnMirror 1`。
 
 > 第一个地址是 GitHub 官方 raw 地址；如果访问不通（比如国内受限网络），命令会自动切换到 Gitee 镜像下载，无需手动选择。脚本内部拉取源码时同样会自动回退到 Gitee 仓库。
 
