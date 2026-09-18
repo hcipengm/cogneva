@@ -12,13 +12,21 @@ use cog_core::{SelfReviewConfig, SelfReviewResult};
 struct DummyProvider {
     /// Responses returned in order for each `chat` call.
     responses: std::sync::Mutex<Vec<String>>,
+    /// Actor header of every call, in order, so a test can assert which
+    /// component a review's token spend was charged to.
+    actors: std::sync::Mutex<Vec<String>>,
 }
 
 impl DummyProvider {
     fn new(responses: Vec<String>) -> Self {
         Self {
             responses: std::sync::Mutex::new(responses),
+            actors: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn actors(&self) -> Vec<String> {
+        self.actors.lock().unwrap().clone()
     }
 
     fn pop_response(&self) -> String {
@@ -32,7 +40,14 @@ impl DummyProvider {
 
 #[async_trait]
 impl cog_core::LlmClient for DummyProvider {
-    async fn chat(&self, _messages: &[Message], _options: &ChatOptions) -> SFResult<ChatResponse> {
+    async fn chat(&self, _messages: &[Message], options: &ChatOptions) -> SFResult<ChatResponse> {
+        self.actors.lock().unwrap().push(
+            options
+                .headers
+                .get(cog_core::LLM_ACTOR_HEADER)
+                .cloned()
+                .unwrap_or_else(|| "none".into()),
+        );
         let text = self.pop_response();
         Ok(ChatResponse {
             content: vec![ContentBlock::text(text)],
@@ -114,7 +129,9 @@ async fn test_critique_parses_llm_json() {
 
     let _loop = SelfReviewLoop::new(SelfReviewConfig::default());
     let obs = SelfReviewLoop::observe("some output");
-    let critique = SelfReviewLoop::critique(&obs, "", &provider).await.unwrap();
+    let critique = SelfReviewLoop::critique(&obs, "", "self_review", &provider)
+        .await
+        .unwrap();
 
     assert_eq!(critique.issues, vec!["bug1"]);
     assert_eq!(critique.missing, vec!["test"]);
@@ -134,13 +151,55 @@ async fn test_compare_parses_llm_json() {
         strengths: vec!["strength1".into()],
         raw: "raw".into(),
     };
-    let comparison = SelfReviewLoop::compare(&critique, &[], &provider)
+    let comparison = SelfReviewLoop::compare(&critique, &[], "self_review", &provider)
         .await
         .unwrap();
 
     assert_eq!(comparison.gaps, vec!["gap1"]);
     assert_eq!(comparison.aligned, vec!["aligned1"]);
     assert!((comparison.score - 0.75).abs() < f32::EPSILON);
+}
+
+/// Self-review runs on behalf of every agent, so its spend has to be charged
+/// to the agent under review. A single constant label would merge all of them
+/// into one bucket and leave nothing to hold a per-agent budget against.
+#[tokio::test]
+async fn test_review_charges_its_token_spend_to_the_calling_agent() {
+    let provider = DummyProvider::new(vec![
+        r#"{"issues":[],"missing":[],"strengths":[]}"#.into(),
+        r#"{"gaps":[],"aligned":[],"score":1.0}"#.into(),
+    ]);
+    let loop_ = SelfReviewLoop::new(SelfReviewConfig::default())
+        .with_actor(cog_agent::self_review::self_review_actor("generator"));
+
+    let _ = loop_.review("draft", &provider).await.unwrap();
+
+    assert_eq!(
+        provider.actors(),
+        vec![
+            "self_review:generator".to_string(),
+            "self_review:generator".to_string()
+        ],
+        "critique and compare must both carry the reviewed agent's identity"
+    );
+}
+
+/// A caller that does not identify itself still gets a bounded label rather
+/// than an empty header.
+#[tokio::test]
+async fn test_review_without_a_caller_names_the_component_alone() {
+    let provider = DummyProvider::new(vec![
+        r#"{"issues":[],"missing":[],"strengths":[]}"#.into(),
+        r#"{"gaps":[],"aligned":[],"score":1.0}"#.into(),
+    ]);
+    let loop_ = SelfReviewLoop::new(SelfReviewConfig::default());
+
+    let _ = loop_.review("draft", &provider).await.unwrap();
+
+    assert_eq!(
+        provider.actors(),
+        vec!["self_review".to_string(), "self_review".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -182,7 +241,7 @@ async fn test_revise_returns_revised_text() {
         suggestions: vec!["fix it".into()],
         score: 0.3,
     };
-    let revised = SelfReviewLoop::revise(&result, "original", &provider)
+    let revised = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
         .await
         .unwrap();
 
@@ -197,7 +256,7 @@ async fn test_revise_returns_original_on_pass() {
         score: 1.0,
         summary: "great".into(),
     };
-    let revised = SelfReviewLoop::revise(&result, "original", &provider)
+    let revised = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
         .await
         .unwrap();
 
@@ -268,7 +327,7 @@ async fn test_revise_keeps_the_original_when_the_upstream_never_answered() {
         score: 0.3,
     };
 
-    let err = SelfReviewLoop::revise(&result, "original", &provider)
+    let err = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
         .await
         .expect_err("a backend that never answered has no revision to give");
 
@@ -289,7 +348,7 @@ async fn test_revise_keeps_the_original_when_nothing_was_produced() {
         score: 0.3,
     };
 
-    let revised = SelfReviewLoop::revise(&result, "original", &provider)
+    let revised = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
         .await
         .unwrap();
 

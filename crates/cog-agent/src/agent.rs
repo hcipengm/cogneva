@@ -855,11 +855,19 @@ impl Agent {
         output: &str,
         config: &cog_core::SelfReviewConfig,
     ) -> SFResult<cog_core::SelfReviewResult> {
-        let loop_ = crate::self_review::SelfReviewLoop::new(config.clone());
+        let loop_ =
+            crate::self_review::SelfReviewLoop::new(config.clone()).with_actor(self.review_actor());
         loop_
             .review(output, self.llm.as_ref())
             .await
             .map(|(_, result)| result)
+    }
+
+    /// Token-attribution label for reviews this agent runs on its own output.
+    /// The role is part of the label so review spend lands in the same
+    /// per-agent bucket as the rest of the agent's calls.
+    fn review_actor(&self) -> String {
+        crate::self_review::self_review_actor(&self.config.role)
     }
 
     /// Review an output and return the (possibly revised) text along with the
@@ -869,7 +877,8 @@ impl Agent {
         output: &str,
         config: &cog_core::SelfReviewConfig,
     ) -> SFResult<(String, cog_core::SelfReviewResult)> {
-        let loop_ = crate::self_review::SelfReviewLoop::new(config.clone());
+        let loop_ =
+            crate::self_review::SelfReviewLoop::new(config.clone()).with_actor(self.review_actor());
         loop_.review(output, self.llm.as_ref()).await
     }
 

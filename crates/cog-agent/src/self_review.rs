@@ -51,6 +51,20 @@ struct ComparisonOutput {
     score: f32,
 }
 
+/// Actor label for reviews whose caller did not identify itself. Self-review
+/// runs on behalf of every agent, so a fixed label here would merge all of
+/// their review spend into one bucket and make a per-agent budget impossible;
+/// the label therefore defaults to the component alone.
+pub const DEFAULT_SELF_REVIEW_ACTOR: &str = "self_review";
+
+/// The actor label a review on behalf of `role` reports its token spend under.
+/// The gateway bounds the label vocabulary by accepting only short lowercase
+/// tokens, so a role outside that vocabulary is charged to `unknown` rather
+/// than to a bucket nobody asked for.
+pub fn self_review_actor(role: &str) -> String {
+    format!("{DEFAULT_SELF_REVIEW_ACTOR}:{role}")
+}
+
 /// Self-Review Loop: a 5-step quality gate for agent outputs.
 /// ```text
 /// Observe → Critique → Compare → Decide → Revise → Log
@@ -58,11 +72,22 @@ struct ComparisonOutput {
 #[derive(Debug, Clone)]
 pub struct SelfReviewLoop {
     pub config: SelfReviewConfig,
+    actor: String,
 }
 
 impl SelfReviewLoop {
     pub fn new(config: SelfReviewConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            actor: DEFAULT_SELF_REVIEW_ACTOR.to_string(),
+        }
+    }
+
+    /// Report this loop's token spend under `actor`, so a caller that reviews
+    /// on behalf of a specific agent can be charged for it.
+    pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
+        self.actor = actor.into();
+        self
     }
 
     /// Run self-review on any serializable output.
@@ -103,11 +128,12 @@ impl SelfReviewLoop {
 
             // Step 2: Critique
             let spec = self.config.spec.as_deref().unwrap_or("");
-            let critique = SelfReviewLoop::critique(&observation, spec, llm).await?;
+            let critique = SelfReviewLoop::critique(&observation, spec, &self.actor, llm).await?;
 
             // Step 3: Compare
             let comparison =
-                SelfReviewLoop::compare(&critique, &self.config.best_practices, llm).await?;
+                SelfReviewLoop::compare(&critique, &self.config.best_practices, &self.actor, llm)
+                    .await?;
 
             // Step 4: Decide
             let result = SelfReviewLoop::decide(&comparison, self.config.quality_threshold);
@@ -118,7 +144,8 @@ impl SelfReviewLoop {
                 }
                 SelfReviewResult::NeedRevision { .. } => {
                     // Step 5: Revise
-                    current_output = SelfReviewLoop::revise(&result, &current_output, llm).await?;
+                    current_output =
+                        SelfReviewLoop::revise(&result, &current_output, &self.actor, llm).await?;
 
                     // If this was the last allowed iteration, return the revised output
                     // with the last NeedRevision result so callers can log it.
@@ -151,6 +178,7 @@ impl SelfReviewLoop {
     pub async fn critique(
         obs: &Observation,
         spec: &str,
+        actor: &str,
         llm: &dyn LlmClient,
     ) -> SFResult<Critique> {
         let user_payload = serde_json::json!({
@@ -158,7 +186,7 @@ impl SelfReviewLoop {
             "spec": spec,
         });
         let user_msg = Message::user(user_payload.to_string());
-        let options = ChatOptions::default().with_actor("self_review");
+        let options = ChatOptions::default().with_actor(actor);
 
         let output = execute_structured::<CritiqueOutput>(llm, &[user_msg], &options).await?;
         let raw = serde_json::to_string(&output).unwrap_or_default();
@@ -175,6 +203,7 @@ impl SelfReviewLoop {
     pub async fn compare(
         critique: &Critique,
         best_practices: &[String],
+        actor: &str,
         llm: &dyn LlmClient,
     ) -> SFResult<Comparison> {
         let user_payload = serde_json::json!({
@@ -184,7 +213,7 @@ impl SelfReviewLoop {
             "best_practices": best_practices,
         });
         let user_msg = Message::user(user_payload.to_string());
-        let options = ChatOptions::default().with_actor("self_review");
+        let options = ChatOptions::default().with_actor(actor);
 
         let output = execute_structured::<ComparisonOutput>(llm, &[user_msg], &options).await?;
         let raw = serde_json::to_string(&output).unwrap_or_default();
@@ -223,6 +252,7 @@ impl SelfReviewLoop {
     pub async fn revise(
         result: &SelfReviewResult,
         original: &str,
+        actor: &str,
         llm: &dyn LlmClient,
     ) -> SFResult<String> {
         let (critique, suggestions) = match result {
@@ -245,7 +275,7 @@ impl SelfReviewLoop {
             response_format: ResponseFormat::Text,
             ..Default::default()
         }
-        .with_actor("self_review");
+        .with_actor(actor);
 
         let response = llm.chat(&[user_msg], &options).await?;
         // A backend that could not serve the request answers with no content and
