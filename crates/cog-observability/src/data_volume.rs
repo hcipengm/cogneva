@@ -262,6 +262,47 @@ mod tests {
         );
     }
 
+    /// Every pod of a deployment publishes this gauge, so a rollout leaves two
+    /// pods reporting the same claim until the old one exits. A bare numerator
+    /// then has two series per join key and the whole expression fails to
+    /// evaluate ("many-to-one matching must be explicit"), which blinds the
+    /// rule for the length of every rollout. Aggregating the numerator by the
+    /// join keys is what keeps the two readings collapsing into one.
+    #[test]
+    fn rollout_overlap_cannot_break_the_volume_rule() {
+        let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let text = fs::read_to_string(&chart).expect("chart config readable");
+        let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
+        let rule = root
+            .pointer("/observability/infra_watch/rules")
+            .and_then(|v| v.as_array())
+            .and_then(|rules| {
+                rules
+                    .iter()
+                    .find(|r| r["name"] == DATA_VOLUME_USED_METRIC_RULE)
+            })
+            .unwrap_or_else(|| panic!("rule {DATA_VOLUME_USED_METRIC_RULE} missing"));
+        let promql = rule["promql"].as_str().expect("promql is a string");
+
+        let join_keys = "namespace, persistentvolumeclaim";
+        let aggregated = format!("by ({join_keys}) ({DATA_VOLUME_USED_METRIC})");
+        let at = promql.find(&aggregated).unwrap_or_else(|| {
+            panic!("the numerator must be aggregated by {join_keys} before the division, got: {promql}")
+        });
+        assert!(
+            promql.contains(&format!("on({join_keys})")),
+            "the join must be on the claim identity, got: {promql}"
+        );
+        // The overlapping readings measure the same directory, so the
+        // aggregation may collapse them but must not add them up.
+        let operator = promql[..at].split_whitespace().last().unwrap_or("");
+        assert!(
+            !matches!(operator, "sum" | "count"),
+            "`{operator}` would inflate the numerator instead of collapsing the overlap, got: {promql}"
+        );
+    }
+
     #[tokio::test]
     async fn scan_publishes_the_measured_bytes() {
         let root = scratch("loop");
