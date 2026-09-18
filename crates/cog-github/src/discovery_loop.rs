@@ -984,7 +984,7 @@ impl GitHubDiscoveryLoop {
             labels: &issue.labels,
             author: &issue.author,
         };
-        let decision = self.judge_intent(&intent, &conversation).await;
+        let decision = self.judge_intent(&intent, &conversation).await?;
 
         let is_fix = self
             .act_on_decision(kind, issue.number, &key, decision, &mut conversation)
@@ -1061,13 +1061,22 @@ impl GitHubDiscoveryLoop {
     /// a lightweight multimodal `platform_intent_assess` task reads the body,
     /// the whole comment thread, and any fetched media blocks and returns a
     /// semantic verdict (fix / clarify / skip / escalate). Without an
-    /// orchestrator, or when the assess task fails, this degrades to the local
-    /// model-free rules heuristic so the loop stays autonomous.
+    /// orchestrator, or after a transient assess failure, this degrades to the
+    /// local model-free rules heuristic so the loop stays autonomous.
+    ///
+    /// A **terminal** assess failure (quota, credentials, protocol) is not a
+    /// transient one and must not degrade: the keyword heuristic cannot read a
+    /// screenshot or the thread, so its "needs clarification" becomes a real
+    /// comment posted on the issue and its "worth fixing" becomes a real change
+    /// submitted for review. Taking an irreversible outward action on a guessed
+    /// verdict is worse than taking none. It is returned as an error so the
+    /// caller arms the per-intent terminal backoff with it — the intent is
+    /// re-judged once the window expires, when the upstream is back.
     async fn judge_intent(
         &self,
         intent: &IntentContext<'_>,
         conversation: &IssueConversation,
-    ) -> TriageDecision {
+    ) -> Result<TriageDecision> {
         let key = intent.kind.key(intent.number);
         let issue = intent.to_platform_issue();
 
@@ -1075,7 +1084,7 @@ impl GitHubDiscoveryLoop {
         // forbidden/human-required label is certain, must not spend an assess
         // round-trip, and must not depend on the model honoring it.
         if let Some(decision) = IssueTriage::rules_decision(&issue, &self.config) {
-            return decision;
+            return Ok(decision);
         }
 
         let reply_thread = conversation.triage_context();
@@ -1088,14 +1097,26 @@ impl GitHubDiscoveryLoop {
             {
                 Ok(decision) => {
                     tracing::debug!(%key, "actionability verdict from multimodal assess task");
-                    return decision;
+                    return Ok(decision);
                 }
-                Err(e) => {
-                    // 类型要在这里现形：这次判断退化成关键字规则，而"上游根本
-                    // 没服务这次调用"和"模型吐了垃圾"是两回事，日志里必须能分。
+                Err(e) if is_terminal_failure(&e) => {
+                    // 与退避的是同一个判据：这里分出来的"终止性"必须和
+                    // note_processing_failure 认的终止性是同一个判据，否则会出现
+                    // "判定说不终止、退避说终止"两套结论。
                     tracing::warn!(
                         %key,
-                        terminal = e.is_terminal_upstream_failure(),
+                        cause = ?e.upstream_failure(),
+                        error = %e,
+                        "assess task failed terminally; deferring this intent rather than \
+                         judging it with the local rules heuristic"
+                    );
+                    return Err(e);
+                }
+                Err(e) => {
+                    // 非终止性（抖动、限流）：退化成本地规则，循环保持自治，
+                    // 下一轮照常重判。
+                    tracing::warn!(
+                        %key,
                         cause = ?e.upstream_failure(),
                         error = %e,
                         "assess task failed; falling back to local rules heuristic"
@@ -1110,9 +1131,10 @@ impl GitHubDiscoveryLoop {
         // rules already short-circuited above, so re-running them here only
         // repeats a cheap, side-effect-free check. Media cannot be read on this
         // path, so a screenshot-only thread still asks the reporter for text.
-        self.triage
+        Ok(self
+            .triage
             .evaluate(&issue, &self.config, &reply_thread)
-            .await
+            .await)
     }
 
     /// Download the intent's media attachments through the zero-credential
@@ -1500,7 +1522,7 @@ impl GitHubDiscoveryLoop {
             labels: &pr.labels,
             author: &pr.author,
         };
-        let decision = self.judge_intent(&intent, &conversation).await;
+        let decision = self.judge_intent(&intent, &conversation).await?;
 
         let is_fix = self
             .act_on_decision(kind, pr.number, &key, decision, &mut conversation)
@@ -2436,6 +2458,62 @@ mod tests {
         assert!(
             types.iter().any(|t| t == "platform_issue_fix"),
             "heuristic fallback should still submit a fix for a clear issue; got {types:?}"
+        );
+    }
+
+    /// A terminal assess failure must not be answered with the keyword
+    /// heuristic. The heuristic cannot read the screenshot or the thread, so
+    /// acting on its verdict posts a real comment or submits a real change on a
+    /// guess — an irreversible outward action taken during an outage that will
+    /// pass. The intent is deferred instead, through the same per-intent
+    /// terminal backoff any other terminal processing failure arms, and is
+    /// re-judged once the window expires.
+    #[tokio::test]
+    async fn a_terminal_assess_failure_defers_the_intent_instead_of_guessing() {
+        // Deliberately the same clear, reproducible body as the heuristic
+        // fallback case below: the heuristic would confidently submit a fix for
+        // it, which is exactly the guess that must not be acted on.
+        let provider = Arc::new(MockProvider {
+            issues: vec![issue(
+                9,
+                "The /health endpoint is slow. Expected under 50ms, actual 500ms. Reproduce: curl it.",
+            )],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(
+            MockOrchestrator::new().with_failed_assess_cause(UpstreamFailure::QuotaExhausted),
+        );
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider.clone(),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        loop_.run_once().await.unwrap();
+
+        let types = orchestrator.task_types.lock().unwrap();
+        assert!(
+            types.iter().any(|t| t == "platform_intent_assess"),
+            "the assess task must have been attempted: {types:?}"
+        );
+        assert!(
+            !types.iter().any(|t| t == "platform_issue_fix"),
+            "a terminal failure must not be answered with a heuristic fix: {types:?}"
+        );
+        drop(types);
+        assert!(
+            provider.comments.lock().unwrap().is_empty(),
+            "a terminal failure must not post a question either"
+        );
+        assert!(
+            loop_.terminal_backoff.contains_key("issue:9"),
+            "the intent must be armed for a retry once the upstream is back"
         );
     }
 
