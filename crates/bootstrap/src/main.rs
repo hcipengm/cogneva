@@ -1569,6 +1569,12 @@ async fn detect_delivery(cluster_existed: bool) -> Delivery {
     Delivery::Apply
 }
 
+/// helm 客户端版本的唯一权威源。安装期按它下载 helm，CI 的部署 parity /
+/// 渲染新鲜度门禁也按它装同一个版本——那两处门禁是**字节级**比对渲染产物的，
+/// 而不同 helm 版本渲染块标量的尾随空白不同，放任 CI 自行取版本会让门禁在
+/// 与代码无关的地方红。
+const HELM_VERSION: &str = "v4.2.4";
+
 /// 确保 helm 客户端可用。仅在"复用既有集群、绿地部署、需要 helm 投递"时调用——
 /// 元启动自建集群的命门链路永远走预渲染 apply，不下载 helm。
 /// 下载候选：CN 首选华为云 helm 镜像（get.helm.sh 背后是 GitHub releases，
@@ -1577,8 +1583,8 @@ async fn ensure_helm() -> bool {
     if command_exists("helm").await {
         return true;
     }
-    // 钉版本：与本机实测一致的 v4 稳定版；helm 3/4 包内布局相同（linux-<arch>/helm）。
-    let version = "v4.2.4";
+    // helm 3/4 包内布局相同（linux-<arch>/helm）。
+    let version = HELM_VERSION;
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",

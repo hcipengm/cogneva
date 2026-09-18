@@ -138,7 +138,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # 新鲜度门禁是**字节级**比对（重渲染后 diff 已提交产物），而 helm 各版本
+      # 渲染块标量的尾随空白不同：放任 setup-helm 取 latest，一次取不到就静默
+      # 回落它内置的默认版本（实测 3.18.4 与 4.x 在这份 chart 上产出不同字节），
+      # 门禁会在与代码无关的地方红。版本从引导器的 HELM_VERSION 读——安装期就是
+      # 用它下载 helm 的，不在这里再抄一份。
+      - name: Resolve pinned Helm version
+        id: helmver
+        run: |
+          v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
+          [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
+          echo "Resolved helm $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
       - uses: azure/setup-helm@v4
+        with:
+          version: ${{ steps.helmver.outputs.version }}
       - uses: azure/setup-kubectl@v4
       - name: Install pyyaml
         run: sudo apt-get update && sudo apt-get install -y python3-yaml
