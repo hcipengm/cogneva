@@ -856,21 +856,65 @@ impl GitOpsPuller {
     async fn watch_canary(&self) -> SFResult<()> {
         let watch_secs = self.config.canary_watch_secs;
         let interval = std::cmp::max(watch_secs / 20, 5);
-        let baseline = self.scrape_metrics().await.ok().flatten();
+        let baseline = self.baseline_signals(interval).await;
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_secs(watch_secs);
         // 宽限期：金丝雀刚 set image 时新副本还在 ContainerCreating，
         // not-ready 属正常；宽限过后仍不 ready 才算异常。
         let grace = Duration::from_secs(std::cmp::max(90, watch_secs / 4));
+        // 金丝雀侧的速率也必须是它自己的两个点：累积语义下新副本的计数器从零
+        // 起步，拿旧版本的累积量当参考点相减只会得到负增量。参考点取第一次
+        // 成功抓取并保留整段看护期，样本量随时间增长，不必靠单次间隔凑够。
+        let mut canary_reference: Option<(CanarySignals, CounterSemantics)> = None;
 
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(interval)).await;
             self.check_pods_healthy(started.elapsed() < grace).await?;
-            if let (Some(base), Ok(Some(current))) = (&baseline, self.scrape_metrics().await) {
-                self.compare_metrics(base, &current)?;
+            if let (Some(base), Ok(Some((current, semantics)))) =
+                (&baseline, self.scrape_metrics().await)
+            {
+                let reference = match canary_reference {
+                    Some((signals, s)) if s == semantics => signals,
+                    // 首次抓取，或语义在换版中途变过：以这一读为新参考点。
+                    _ => {
+                        canary_reference = Some((current, semantics));
+                        current
+                    }
+                };
+                self.compare_metrics(base, reference, &current, semantics)?;
             }
         }
         Ok(())
+    }
+
+    /// 看护开始时的两次抓取，间隔 `sample_secs`，用来看旧版本自己的错误率。
+    ///
+    /// 一次抓取只是一个点：正文若按累积计数器解释，单点只是「进程启动以来的
+    /// 总量」，读不出任何速率，用它当基线等于拿整段进程历史的平均错误率去比，
+    /// 金丝雀自己回归时这个数几乎不动。所以取两个点做差。
+    ///
+    /// 两次都在 `set image` 之后，但都取自**旧副本**——金丝雀暂停期间旧副本
+    /// 不缩容，它仍在跑旧版本，两点相减得到的是旧版本的速率。参考点因此不能
+    /// 跨到金丝雀那一侧去用：那是另一个进程的计数器。
+    async fn baseline_signals(&self, sample_secs: u64) -> Option<CanaryBaseline> {
+        let (first, semantics) = self.scrape_metrics().await.ok().flatten()?;
+        tokio::time::sleep(Duration::from_secs(sample_secs.max(1))).await;
+        let second = match self.scrape_metrics().await {
+            Ok(Some((signals, _))) => signals,
+            // 第二次抓不到就退回单点：窗口求和语义下单点仍给出速率，累积语义下
+            // 由 error_rate 自己判「没有证据」，不会伪造一个数。
+            _ => first,
+        };
+        Some(CanaryBaseline {
+            semantics,
+            rate: error_rate(
+                first,
+                second,
+                semantics,
+                self.config.canary_min_requests_for_rate,
+            ),
+            p99_ms: second.p99_ms,
+        })
     }
 
     /// k8s 信号：deployment 任一 pod 处于非 Ready/重启次数上升即异常。
@@ -939,8 +983,8 @@ impl GitOpsPuller {
         Ok(())
     }
 
-    /// 抓取 metrics URL（可选）。返回 (error_rate, p99_ms)。
-    async fn scrape_metrics(&self) -> SFResult<Option<(f64, f64)>> {
+    /// 抓取 metrics URL（可选）。返回正文里的原始计数与它声明的语义。
+    async fn scrape_metrics(&self) -> SFResult<Option<(CanarySignals, CounterSemantics)>> {
         let Some(url) = &self.metrics_url else {
             return Ok(None);
         };
@@ -950,19 +994,57 @@ impl GitOpsPuller {
         Ok(Some(parse_prometheus_signals(&body)))
     }
 
-    fn compare_metrics(&self, baseline: &(f64, f64), current: &(f64, f64)) -> SFResult<()> {
-        let (base_err, base_p99) = *baseline;
-        let (err, p99) = *current;
-        if err > base_err * self.config.canary_error_rate_multiplier && err > 0.01 {
-            return Err(SFError::Agent(format!(
-                "canary error rate regressed: {err:.4} > baseline {base_err:.4} x {}",
-                self.config.canary_error_rate_multiplier
-            )));
-        }
+    /// 金丝雀看护的阈值比对。
+    ///
+    /// 两侧的速率各自由本侧的两个点得出（`baseline.rate` 是旧版本自己的，
+    /// `reference`→`current` 是候选自己的），不能拿一侧的参考点去减另一侧的
+    /// 计数——那是两个进程各自的计数器，相减没有意义。
+    ///
+    /// p99 与计数器语义无关，任何一轮都先看。错误率两边必须用同一种语义解读：
+    /// 语义在换版那一轮会从窗口求和切成累积，跨语义相除得到的不是任何一版的
+    /// 错误率。这种情况下显式记日志并跳过错误率这一项，而不是硬算出一个数
+    /// 把好版本回滚掉。
+    fn compare_metrics(
+        &self,
+        baseline: &CanaryBaseline,
+        reference: CanarySignals,
+        current: &CanarySignals,
+        semantics: CounterSemantics,
+    ) -> SFResult<()> {
+        let base_p99 = baseline.p99_ms;
+        let p99 = current.p99_ms;
         if base_p99 > 0.0 && p99 > base_p99 * self.config.canary_p99_multiplier {
             return Err(SFError::Agent(format!(
                 "canary p99 regressed: {p99:.0}ms > baseline {base_p99:.0}ms x {}",
                 self.config.canary_p99_multiplier
+            )));
+        }
+        if baseline.semantics != semantics {
+            warn!(
+                baseline = ?baseline.semantics,
+                current = ?semantics,
+                "counter semantics changed mid-canary; error-rate gate skipped for this tick"
+            );
+            return Ok(());
+        }
+        let min_requests = self.config.canary_min_requests_for_rate;
+        let Some(err) = error_rate(reference, *current, semantics, min_requests) else {
+            warn!(
+                requests_added = current.requests - reference.requests,
+                min_requests, "canary error rate has no evidence yet; gate skipped for this tick"
+            );
+            return Ok(());
+        };
+        // 基线速率取不到时不能拿 0 去比：那等于「任何超过 1% 的错误率都判回归」，
+        // 会无差别回滚好版本。没有基线的相对判据就没有这条判据——跳过并记日志。
+        let Some(base_err) = baseline.rate else {
+            warn!("canary baseline error rate has no evidence; gate skipped");
+            return Ok(());
+        };
+        if err > base_err * self.config.canary_error_rate_multiplier && err > 0.01 {
+            return Err(SFError::Agent(format!(
+                "canary error rate regressed: {err:.4} > baseline {base_err:.4} x {}",
+                self.config.canary_error_rate_multiplier
             )));
         }
         Ok(())
@@ -1048,14 +1130,92 @@ pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::Shut
     }
 }
 
-/// 从 Prometheus 文本面读出错误率与 p99 延迟（毫秒）。
+/// 正文里声明 `_total` 系列取值含义的注释行前缀。缺省（旧版正文）按窗口求和
+/// 处理，这是当时的真实行为：拿一个还没这么声明自己的正文按累积语义去相减，
+/// 会得到纯噪声。
+const COUNTER_SEMANTICS_MARKER: &str = "# cogneva_counter_semantics";
+
+/// 一次抓取到的原始计数。错误率不在这里算：怎么算取决于正文声明的计数器
+/// 语义，而那只有拿到两次抓取的对比方才知道。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CanarySignals {
+    errors: f64,
+    requests: f64,
+    p99_ms: f64,
+}
+
+/// 正文声明的计数器取值含义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterSemantics {
+    /// `_total` 是自进程启动以来的累积量：两次抓取相减就是这中间发生的事，
+    /// 速率只能由增量得出。
+    Cumulative,
+    /// `_total` 是一段滑动窗口内样本的求和：它会随样本老化而下降，两点相减
+    /// 只是窗口边界的抖动，唯一可用的速率是「值本身相除」。
+    Windowed,
+}
+
+/// 旧版本自己的观测：两次抓取算出的速率，加上用于比对的 p99。
+///
+/// 这里只留「旧版本是什么样」，不留任何供金丝雀侧相减的计数点——两侧是不同
+/// 进程的计数器，差要各算各的。
+#[derive(Debug, Clone, Copy)]
+struct CanaryBaseline {
+    semantics: CounterSemantics,
+    /// 旧版本自身的错误率；正文证据不足以算出它时是 `None`。
+    rate: Option<f64>,
+    /// 旧版本的 p99 延迟（毫秒）。
+    p99_ms: f64,
+}
+
+/// 两次抓取之间的错误率，按正文声明的计数器语义解释。
+///
+/// 累积语义下用「生命周期总量」相除，得到的是整段进程历史的平均错误率——
+/// 金丝雀自己回归时它几乎不动，闸门形同虚设。两次抓取之间新增样本不足
+/// `min_requests` 时返回 `None`：一条 5xx 就能把很小的增量抬到任意高的比值，
+/// 据此下结论会把好版本判成回归。没有证据就是没有证据，返回 `None` 而不是 0。
+fn error_rate(
+    baseline: CanarySignals,
+    current: CanarySignals,
+    semantics: CounterSemantics,
+    min_requests: f64,
+) -> Option<f64> {
+    match semantics {
+        CounterSemantics::Windowed => {
+            if current.requests > 0.0 {
+                Some(current.errors / current.requests)
+            } else {
+                None
+            }
+        }
+        CounterSemantics::Cumulative => {
+            let requests = current.requests - baseline.requests;
+            let errors = current.errors - baseline.errors;
+            // 累积计数器只会上升；下降说明取值与自称的语义不符（或进程重启
+            // 把计数器清零），此时的增量不能拿来算速率。
+            if requests < min_requests || errors < 0.0 {
+                None
+            } else {
+                Some(errors / requests)
+            }
+        }
+    }
+}
+
+/// 从 Prometheus 文本面读出原始计数与它声明的计数器语义。
 /// 纯函数：输入是抓取到的正文，输出只由正文决定，便于对着真实输出形态做断言。
-fn parse_prometheus_signals(body: &str) -> (f64, f64) {
+fn parse_prometheus_signals(body: &str) -> (CanarySignals, CounterSemantics) {
     let mut error_total = 0.0f64;
     let mut request_total = 0.0f64;
     let mut p99 = 0.0f64;
+    let mut semantics = CounterSemantics::Windowed;
     for line in body.lines() {
-        if line.starts_with("http_requests_total") {
+        if let Some(rest) = line.strip_prefix(COUNTER_SEMANTICS_MARKER) {
+            semantics = match rest.trim() {
+                "cumulative" => CounterSemantics::Cumulative,
+                _ => CounterSemantics::Windowed,
+            };
+        } else if line.starts_with("http_requests_total") {
             // 5xx 也是请求。把它排除在分母外会把错误率系统性放大，
             // 于是好版本被少报的成功数判成坏版本。
             let value = parse_series_value(line);
@@ -1073,12 +1233,14 @@ fn parse_prometheus_signals(body: &str) -> (f64, f64) {
             p99 = p99.max(parse_series_value(line));
         }
     }
-    let error_rate = if request_total > 0.0 {
-        error_total / request_total
-    } else {
-        0.0
-    };
-    (error_rate, p99)
+    (
+        CanarySignals {
+            errors: error_total,
+            requests: request_total,
+            p99_ms: p99,
+        },
+        semantics,
+    )
 }
 
 fn parse_series_value(line: &str) -> f64 {
@@ -1091,6 +1253,11 @@ fn parse_series_value(line: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 窗口求和语义下的错误率，就是改造前的「值本身相除」。
+    fn windowed_rate(signals: CanarySignals) -> Option<f64> {
+        error_rate(signals, signals, CounterSemantics::Windowed, f64::INFINITY)
+    }
 
     /// 正文取自网关 `/metrics` 的真实输出形态：延迟以毫秒记在
     /// `http_request_duration_ms` 下，没有以秒命名的同名序列。
@@ -1106,9 +1273,14 @@ http_request_duration_ms{endpoint=\"/api/v1/tasks\",method=\"POST\",quantile=\"0
 http_request_duration_ms_count{endpoint=\"/api/v1/tasks\",method=\"POST\"} 100
 http_request_duration_ms_sum{endpoint=\"/api/v1/tasks\",method=\"POST\"} 12345.6
 ";
-        let (error_rate, p99) = parse_prometheus_signals(body);
-        assert!((error_rate - 0.1).abs() < 1e-9, "error_rate={error_rate}");
-        assert!((p99 - 840.25).abs() < 1e-9, "p99={p99}");
+        let (signals, _) = parse_prometheus_signals(body);
+        let rate = windowed_rate(signals).expect("有请求就有速率");
+        assert!((rate - 0.1).abs() < 1e-9, "error_rate={rate}");
+        assert!(
+            (signals.p99_ms - 840.25).abs() < 1e-9,
+            "p99={}",
+            signals.p99_ms
+        );
     }
 
     /// 分母是全部请求：5xx 既算错误也算请求。把它剔出分母会让错误率虚高，
@@ -1119,8 +1291,9 @@ http_request_duration_ms_sum{endpoint=\"/api/v1/tasks\",method=\"POST\"} 12345.6
 http_requests_total{endpoint=\"/a\",method=\"GET\",status=\"200\"} 100
 http_requests_total{endpoint=\"/a\",method=\"GET\",status=\"503\"} 100
 ";
-        let (error_rate, _) = parse_prometheus_signals(body);
-        assert!((error_rate - 0.5).abs() < 1e-9, "error_rate={error_rate}");
+        let (signals, _) = parse_prometheus_signals(body);
+        let rate = windowed_rate(signals).expect("有请求就有速率");
+        assert!((rate - 0.5).abs() < 1e-9, "error_rate={rate}");
     }
 
     /// 多端点各有一条 p99 时取最差的那条，结论不随正文行序变化。
@@ -1131,8 +1304,12 @@ http_request_duration_ms{endpoint=\"/a\",quantile=\"0.99\"} 50
 http_request_duration_ms{endpoint=\"/b\",quantile=\"0.99\"} 900
 http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
 ";
-        let (_, p99) = parse_prometheus_signals(body);
-        assert!((p99 - 900.0).abs() < 1e-9, "p99={p99}");
+        let (signals, _) = parse_prometheus_signals(body);
+        assert!(
+            (signals.p99_ms - 900.0).abs() < 1e-9,
+            "p99={}",
+            signals.p99_ms
+        );
     }
 
     /// p99 缺失或窗口内没有请求时读作 0：没有证据就不判回归，
@@ -1140,9 +1317,9 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
     #[test]
     fn missing_p99_reads_zero() {
         let body = "# TYPE http_requests_total counter\nhttp_requests_total{status=\"200\"} 5\n";
-        let (error_rate, p99) = parse_prometheus_signals(body);
-        assert!((error_rate - 0.0).abs() < 1e-9);
-        assert!((p99 - 0.0).abs() < 1e-9);
+        let (signals, _) = parse_prometheus_signals(body);
+        assert_eq!(windowed_rate(signals), Some(0.0));
+        assert_eq!(signals.p99_ms, 0.0);
     }
 
     #[test]
@@ -1317,28 +1494,197 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
         assert!(!puller_c.already_processed("p-1").await.unwrap());
     }
 
-    #[test]
-    fn metrics_comparison_thresholds() {
-        let puller = GitOpsPuller::new(
+    fn test_puller() -> GitOpsPuller {
+        GitOpsPuller::new(
             GitOpsConfig::default(),
             Arc::new(cog_storage::MemoryStateBackend::new()),
             "c".into(),
-        );
+        )
+    }
+
+    fn signals(errors: f64, requests: f64, p99_ms: f64) -> CanarySignals {
+        CanarySignals {
+            errors,
+            requests,
+            p99_ms,
+        }
+    }
+
+    fn baseline(semantics: CounterSemantics, rate: Option<f64>, p99_ms: f64) -> CanaryBaseline {
+        CanaryBaseline {
+            semantics,
+            rate,
+            p99_ms,
+        }
+    }
+
+    /// 窗口求和语义下的阈值行为与拆分前一致：正文仍是旧版形态时，
+    /// 看护判据不能因为这次改造而变宽或变严。
+    #[test]
+    fn windowed_semantics_keeps_the_existing_thresholds() {
+        let puller = test_puller();
+        let base = baseline(CounterSemantics::Windowed, Some(0.02), 100.0);
+        let windowed = CounterSemantics::Windowed;
+        let read = signals(2.0, 100.0, 120.0);
         // 基线错误率 2%，现 2.5%（1.25x，未超 1.5x）→ 通过。
         assert!(puller
-            .compare_metrics(&(0.02, 100.0), &(0.025, 120.0))
+            .compare_metrics(&base, read, &signals(2.5, 100.0, 120.0), windowed)
             .is_ok());
         // 现 4%（2x）→ 回归。
         assert!(puller
-            .compare_metrics(&(0.02, 100.0), &(0.04, 120.0))
+            .compare_metrics(&base, read, &signals(4.0, 100.0, 120.0), windowed)
             .is_err());
         // p99 100ms → 140ms（1.4x > 1.3x）→ 回归。
         assert!(puller
-            .compare_metrics(&(0.02, 100.0), &(0.02, 140.0))
+            .compare_metrics(&base, read, &signals(2.0, 100.0, 140.0), windowed)
             .is_err());
         // p99 125ms（1.25x）→ 通过。
         assert!(puller
-            .compare_metrics(&(0.02, 100.0), &(0.02, 125.0))
+            .compare_metrics(&base, read, &signals(2.0, 100.0, 125.0), windowed)
             .is_ok());
+    }
+
+    /// 累积语义下要比的是**增量**错误率。生命周期比值在这里是 5%，远超基线，
+    /// 但这一段窗口内新发生的 200 个请求一个都没错——判成回归就是在回滚一个
+    /// 好版本，而闸门本来要盯的正是「这段时间有没有变坏」。
+    #[test]
+    fn cumulative_semantics_judges_the_delta_not_the_lifetime_ratio() {
+        let puller = test_puller();
+        let base = baseline(CounterSemantics::Cumulative, Some(0.01), 100.0);
+        let at = signals(50.0, 1_000.0, 100.0);
+        let cumulative = CounterSemantics::Cumulative;
+        assert!(puller
+            .compare_metrics(&base, at, &signals(50.0, 1_200.0, 100.0), cumulative)
+            .is_ok());
+        // 增量里真的变坏了：200 个新请求错 20 个（10%）。
+        assert!(puller
+            .compare_metrics(&base, at, &signals(70.0, 1_200.0, 100.0), cumulative)
+            .is_err());
+    }
+
+    /// 候选侧速率必须由候选自己的两个点得出。新副本的累积计数器从零起步，
+    /// 拿旧版本的累积量当参考点只会得到负增量，闸门整轮哑火。
+    #[test]
+    fn cumulative_semantics_differences_the_candidates_own_counters() {
+        let puller = test_puller();
+        let base = baseline(CounterSemantics::Cumulative, Some(0.01), 100.0);
+        // 新副本刚起来：计数器归零。
+        let at = signals(0.0, 0.0, 100.0);
+        let cumulative = CounterSemantics::Cumulative;
+        // 500 个请求错 1 个（0.2%），好于基线 → 通过。
+        assert!(puller
+            .compare_metrics(&base, at, &signals(1.0, 500.0, 100.0), cumulative)
+            .is_ok());
+        // 同一段窗口内错 20 个（4%）→ 回归。基线取的是旧版本的累积量，
+        // 若误用它当参考点，这里会算出负增量而静默放过。
+        assert!(puller
+            .compare_metrics(&base, at, &signals(20.0, 500.0, 100.0), cumulative)
+            .is_err());
+    }
+
+    /// 增量太小时一条 5xx 就能把比值抬到任意高：20 个新请求错 1 个是 5%，
+    /// 基线 1% 的 5 倍，据此回滚就是拿噪声当好版本缺陷。样本不足时不判，
+    /// 而不是判通过或者判回归。
+    #[test]
+    fn cumulative_semantics_refuses_to_judge_on_too_few_new_requests() {
+        let puller = test_puller();
+        let base = baseline(CounterSemantics::Cumulative, Some(0.01), 100.0);
+        let at = signals(10.0, 1_000.0, 100.0);
+        let cumulative = CounterSemantics::Cumulative;
+        assert!(puller
+            .compare_metrics(&base, at, &signals(11.0, 1_020.0, 100.0), cumulative)
+            .is_ok());
+        // 增量够大且确实变坏，同一个基线就该判回归——上面那次通过的原因
+        // 只能是样本不足，不能是判据根本不看错误率。
+        assert!(puller
+            .compare_metrics(&base, at, &signals(60.0, 1_200.0, 100.0), cumulative)
+            .is_err());
+    }
+
+    /// 基线速率取不到时不能拿 0 当基线：那等于「任何超过 1% 的错误率都判回归」，
+    /// 好版本会被无差别回滚。没有基线的相对量就没有相对判据。
+    #[test]
+    fn missing_baseline_rate_does_not_roll_back_a_good_version() {
+        let puller = test_puller();
+        let base = baseline(CounterSemantics::Cumulative, None, 100.0);
+        assert!(puller
+            .compare_metrics(
+                &base,
+                signals(10.0, 1_000.0, 100.0),
+                &signals(50.0, 1_200.0, 100.0),
+                CounterSemantics::Cumulative
+            )
+            .is_ok());
+    }
+
+    /// 换版那一轮正文的语义会从窗口求和切成累积。跨语义相除得到的不是任何
+    /// 一版的错误率，只能拒绝比较；p99 仍要照常判。
+    #[test]
+    fn semantics_change_mid_canary_skips_the_error_rate_gate() {
+        let puller = test_puller();
+        let base = baseline(CounterSemantics::Windowed, Some(0.02), 100.0);
+        let at = signals(2.0, 100.0, 100.0);
+        assert!(puller
+            .compare_metrics(
+                &base,
+                at,
+                &signals(9.0, 100.0, 100.0),
+                CounterSemantics::Cumulative
+            )
+            .is_ok());
+        assert!(puller
+            .compare_metrics(
+                &base,
+                at,
+                &signals(2.0, 100.0, 140.0),
+                CounterSemantics::Cumulative
+            )
+            .is_err());
+    }
+
+    /// 正文没有语义标记时按窗口求和处理：旧版正文的行为不能因为这次改造
+    /// 而变成按增量解读（那会把窗口边界的抖动当成速率）。
+    #[test]
+    fn absent_marker_reads_the_body_as_windowed() {
+        let body = "# TYPE http_requests_total counter\n\
+                    http_requests_total{status=\"200\"} 40\n\
+                    http_requests_total{status=\"500\"} 10\n\
+                    http_request_duration_ms{quantile=\"0.99\"} 88\n";
+        let (signals, semantics) = parse_prometheus_signals(body);
+        assert_eq!(semantics, CounterSemantics::Windowed);
+        assert_eq!(signals.requests, 50.0);
+        assert_eq!(signals.errors, 10.0);
+        assert_eq!(signals.p99_ms, 88.0);
+        // 5xx 也在分母里：排除它会系统性放大错误率。
+        assert_eq!(windowed_rate(signals), Some(0.2));
+    }
+
+    #[test]
+    fn marker_reads_the_body_as_cumulative() {
+        let body = "# cogneva_counter_semantics cumulative\n\
+                    http_requests_total{status=\"200\"} 40\n\
+                    http_requests_total{status=\"500\"} 10\n";
+        let (_, semantics) = parse_prometheus_signals(body);
+        assert_eq!(semantics, CounterSemantics::Cumulative);
+        // 增量下限用请求增量比对，不受错误数影响。
+        assert_eq!(
+            error_rate(
+                signals(5.0, 100.0, 0.0),
+                signals(15.0, 300.0, 0.0),
+                CounterSemantics::Cumulative,
+                100.0
+            ),
+            Some(0.05)
+        );
+        // 计数器下降说明自称的语义与取值不符，不能拿负增量算速率。
+        assert_eq!(
+            error_rate(
+                signals(5.0, 300.0, 0.0),
+                signals(6.0, 100.0, 0.0),
+                CounterSemantics::Cumulative,
+                10.0
+            ),
+            None
+        );
     }
 }

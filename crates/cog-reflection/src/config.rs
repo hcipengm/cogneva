@@ -208,6 +208,10 @@ impl PromotionGateConfig {
         if let Some(v) = get("COGNEVA_GITOPS_CANARY_P99_MULTIPLIER") {
             g.canary_p99_multiplier = parse("COGNEVA_GITOPS_CANARY_P99_MULTIPLIER", &v)?;
         }
+        if let Some(v) = get("COGNEVA_GITOPS_CANARY_MIN_REQUESTS_FOR_RATE") {
+            g.canary_min_requests_for_rate =
+                parse("COGNEVA_GITOPS_CANARY_MIN_REQUESTS_FOR_RATE", &v)?;
+        }
         if let Some(v) = get("COGNEVA_GITOPS_PULLER_ENABLED") {
             g.puller_enabled = parse("COGNEVA_GITOPS_PULLER_ENABLED", &v)?;
         }
@@ -329,6 +333,10 @@ pub struct GitOpsConfig {
     pub canary_error_rate_multiplier: f64,
     /// 看护阈值：P99 延迟超过基线该倍数判定回归。
     pub canary_p99_multiplier: f64,
+    /// 累积计数器语义下，两次抓取之间至少要新增多少个请求才允许对错误率
+    /// 下结论。增量太小时一条 5xx 就能把比值抬到任意高，好版本会被判成回归；
+    /// 一版错误率下限 1%，要把 1% 与 0% 分出来需要百量级的样本，故默认 100。
+    pub canary_min_requests_for_rate: f64,
     /// 拉取端开关：推送端（沙盒进化 Pod）置 false，只发布晋级产物，
     /// 不在本进程跑 poll/金丝雀（沙盒无 kubectl，也不该操作生产部署）。
     pub puller_enabled: bool,
@@ -355,6 +363,7 @@ impl Default for GitOpsConfig {
             canary_watch_secs: 600,
             canary_error_rate_multiplier: 1.5,
             canary_p99_multiplier: 1.3,
+            canary_min_requests_for_rate: 100.0,
             puller_enabled: true,
             git_user_name: "Cogneva Self-Evolution".into(),
             git_user_email: "self-evolution@cogneva.ai".into(),
