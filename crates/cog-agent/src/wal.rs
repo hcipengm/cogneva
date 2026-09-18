@@ -108,14 +108,12 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
         AgentEvent::MessageUpdate {
             agent_id,
             assistant_event,
-            message,
             timestamp,
         } => (
             WalEventType::MessageDelta,
             json!({
                 "agent_id": agent_id,
                 "assistant_event": assistant_event,
-                "message": message,
                 "timestamp": timestamp
             }),
         ),

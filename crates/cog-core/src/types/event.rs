@@ -159,10 +159,17 @@ pub enum AgentEvent {
         timestamp: DateTime<Utc>,
     },
     /// Message content updated (carries raw LLM event).
+    ///
+    /// The accumulated message travels in `assistant_event` — every
+    /// snapshot-carrying variant carries it as `partial`. It is deliberately
+    /// not repeated as a sibling field: the producer used to set that sibling
+    /// from `partial`, so both halves of the struct held byte-identical copies
+    /// of a message that grows with every delta. One of them then doubled the
+    /// size of every persisted trace and of the trace collector's in-memory
+    /// buffer accounting.
     MessageUpdate {
         agent_id: String,
         assistant_event: AssistantMessageEvent,
-        message: Message,
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
@@ -406,4 +413,37 @@ pub enum StreamEvent {
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The accumulated assistant message must have exactly one carrier per
+    /// `MessageUpdate`. The variant used to carry it twice — once inside
+    /// `assistant_event` and once as a sibling field the producer filled from
+    /// the same value — which doubled the size of every persisted trace and
+    /// made the trace collector's buffer accounting count ~half the bytes it
+    /// claimed to bound.
+    #[test]
+    fn message_update_carries_the_snapshot_once() {
+        let marker = "SENTINEL-CONTENT-9f3a".repeat(64);
+        let event = AgentEvent::MessageUpdate {
+            agent_id: "planner-1".into(),
+            assistant_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "x".into(),
+                partial: Message::assistant_text(marker.clone()),
+                timestamp: Utc::now(),
+            },
+            timestamp: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json.matches(&marker).count(),
+            1,
+            "the snapshot is duplicated in the serialized event"
+        );
+    }
 }

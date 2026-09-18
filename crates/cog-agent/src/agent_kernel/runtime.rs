@@ -1116,7 +1116,6 @@ impl AgentRuntime {
             self.emit_event(AgentEvent::MessageUpdate {
                 agent_id: self.config.agent_id.clone(),
                 assistant_event: event,
-                message: final_message.clone(),
                 timestamp: chrono::Utc::now(),
             })
             .await?;
