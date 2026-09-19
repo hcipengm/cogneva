@@ -387,11 +387,18 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     if webhook.is_some() && http_client.is_none() {
                         info!("webhook configured but no HttpClient; alerts persist only");
                     }
+                    let persistent_store = alert_store.is_some();
                     let bridged =
                         spawn_alert_bridge(webhook.clone(), http_client, alert_store, &supervisor);
-                    if bridged.is_some() {
-                        info!("Alertmanager webhook bridge started");
-                    }
+                    // Report both outlets, not just the webhook one. With no
+                    // Alertmanager wired the bridge still runs and still
+                    // persists, so logging only on a live webhook left "is the
+                    // bridge running?" with no answer in the logs.
+                    info!(
+                        webhook = bridged.is_some(),
+                        persistent_store,
+                        "alert bridge started: supervisor events fan out to these outlets"
+                    );
                 }
                 None => info!("alert bridge skipped: no Supervisor available"),
             }
