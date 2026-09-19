@@ -71,10 +71,15 @@ impl MemoryExtractor for RuleBasedExtractor {
 
         let mut entries = Vec::new();
 
-        for (name, key) in Self::parse_entities(&text) {
+        // Ids are scoped to the source. `store_schema` upserts on `id`, so a
+        // position-only id (`schema-entity-0`) is the same primary key for
+        // every source: the second source ingested overwrites the first
+        // source's rows and rewrites their `raw_uri`, so the loss leaves no
+        // trace to notice it by.
+        for (idx, (name, key)) in Self::parse_entities(&text).into_iter().enumerate() {
             entries.push(
                 SchemaEntry::new(
-                    format!("schema-entity-{}", entries.len()),
+                    format!("schema-entity-{}-{}", source.id, idx),
                     &source.namespace,
                     SchemaKind::Entity,
                     name,
@@ -85,10 +90,10 @@ impl MemoryExtractor for RuleBasedExtractor {
             );
         }
 
-        for (from, to, key) in Self::parse_relations(&text) {
+        for (idx, (from, to, key)) in Self::parse_relations(&text).into_iter().enumerate() {
             entries.push(
                 SchemaEntry::new(
-                    format!("schema-relation-{}", entries.len()),
+                    format!("schema-relation-{}-{}", source.id, idx),
                     &source.namespace,
                     SchemaKind::Relation,
                     format!("{} -> {}", from, to),
@@ -103,10 +108,10 @@ impl MemoryExtractor for RuleBasedExtractor {
             );
         }
 
-        for (name, key) in Self::parse_events(&text) {
+        for (idx, (name, key)) in Self::parse_events(&text).into_iter().enumerate() {
             entries.push(
                 SchemaEntry::new(
-                    format!("schema-event-{}", entries.len()),
+                    format!("schema-event-{}-{}", source.id, idx),
                     &source.namespace,
                     SchemaKind::Event,
                     name,
@@ -407,5 +412,67 @@ impl MemoryExtractor for LlmMemoryExtractor {
             source_ref,
         )
         .with_importance(importance))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::{MemoryBackend, MemoryExtractor};
+
+    fn raw(id: &str, body: &str) -> RawSource {
+        RawSource::new(id, "default", "text/plain", body.as_bytes().to_vec())
+    }
+
+    /// Two raws carrying the same `@entity:` line are two entities observed
+    /// twice, not one entity. Ids are the store's primary key, so a
+    /// position-only id would make the second raw's rows overwrite the first
+    /// raw's rows — and rewrite their `raw_uri` — leaving nothing behind that
+    /// says a row went missing.
+    #[tokio::test]
+    async fn rule_based_schema_ids_are_scoped_to_their_source() {
+        let extractor = RuleBasedExtractor::new();
+        let first = extractor
+            .extract_schema(&raw("raw-a", "@entity: security gateway\n"))
+            .await
+            .unwrap();
+        let second = extractor
+            .extract_schema(&raw("raw-b", "@entity: security gateway\n"))
+            .await
+            .unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(
+            first[0].id, second[0].id,
+            "the same name from two sources must not share a primary key"
+        );
+
+        let backend = crate::MemoryMemoryBackend::new();
+        backend.store_schema("default", &first[0]).await.unwrap();
+        backend.store_schema("default", &second[0]).await.unwrap();
+
+        let rows = backend.list_schema("default").await.unwrap();
+        assert_eq!(rows.len(), 2, "both sources' rows must survive the store");
+        let uris: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.source_ref.raw_uri.as_str()).collect();
+        assert_eq!(uris.len(), 2, "each row must keep its own source");
+    }
+
+    /// Re-extracting the same raw must produce the same ids, so the store's
+    /// upsert updates in place instead of appending a second copy.
+    #[tokio::test]
+    async fn rule_based_schema_ids_are_stable_across_extraction() {
+        let extractor = RuleBasedExtractor::new();
+        let source = raw(
+            "raw-a",
+            "@entity: alpha\n@relation: alpha->beta\n@event: deploy\n",
+        );
+        let once = extractor.extract_schema(&source).await.unwrap();
+        let twice = extractor.extract_schema(&source).await.unwrap();
+
+        let ids = |v: &[SchemaEntry]| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&once), ids(&twice));
+        assert_eq!(once.len(), 3);
     }
 }

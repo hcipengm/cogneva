@@ -251,9 +251,13 @@ impl CausalExtractor {
     }
 
     fn infer_assertion(&self, entry: &SchemaEntry) -> Option<CausalAssertion> {
+        // Relations carry their kind under `relation_type` — the key the
+        // extractors write and the key `query_relations` filters on. Reading
+        // `type` here matched nothing, so every graph came back with nodes and
+        // no edges while still looking like a complete answer.
         let relation_type = entry
             .properties
-            .get("type")
+            .get("relation_type")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_lowercase();
@@ -341,5 +345,58 @@ impl<'a> CausalQuery<'a> {
     /// "X 和 Y 之间有多少条因果路径？" — 连通性。
     pub fn path_count(&self, from: &str, to: &str, max_depth: usize) -> usize {
         self.graph.causal_paths(from, to, max_depth).len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::SourceRef;
+
+    fn relation(properties: serde_json::Value) -> SchemaEntry {
+        SchemaEntry::new(
+            "schema-relation-raw-a-0",
+            "default",
+            SchemaKind::Relation,
+            "a -> b",
+            "a_to_b",
+            SourceRef::new("memory://raw-a", "llm/v1"),
+        )
+        .with_properties(properties)
+    }
+
+    /// The extractors write the relation's kind under `relation_type`, and
+    /// `query_relations` filters on the same key. A reader looking for `type`
+    /// finds nothing on every relation ever written, so the graph it builds
+    /// has nodes and no edges while still looking like a complete answer.
+    #[test]
+    fn a_relation_is_classified_by_the_key_its_writers_use() {
+        let extractor = CausalExtractor::new();
+        assert_eq!(
+            extractor.infer_assertion(&relation(serde_json::json!({
+                "relation_type": "causes",
+                "from": "a",
+                "to": "b",
+            }))),
+            Some(CausalAssertion::Causes)
+        );
+        assert_eq!(
+            extractor.infer_assertion(&relation(serde_json::json!({
+                "relation_type": "prevents",
+            }))),
+            Some(CausalAssertion::Inhibits)
+        );
+        assert_eq!(
+            extractor.infer_assertion(&relation(serde_json::json!({
+                "relation_type": "enables",
+            }))),
+            Some(CausalAssertion::Enables)
+        );
+        assert_eq!(
+            extractor.infer_assertion(&relation(serde_json::json!({
+                "relation_type": "unrelated_to",
+            }))),
+            None
+        );
     }
 }
