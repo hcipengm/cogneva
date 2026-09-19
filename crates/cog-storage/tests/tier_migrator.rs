@@ -122,6 +122,58 @@ async fn an_unrotated_file_is_left_alone_however_old() {
         .is_none());
 }
 
+/// A rotation past the warm window leaves the local disk entirely: the payload
+/// goes to the object backend under a date-partitioned key, the index row says
+/// cold, and the local file is gone. The upload is verified before the source
+/// is deleted, so a backend that silently drops the object cannot lose the file.
+#[tokio::test]
+async fn an_aged_rotation_older_than_the_warm_window_moves_to_cold() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = aged_file(
+        dir.path(),
+        "transport_raw",
+        "2026-09-01.jsonl",
+        Duration::from_secs(1_555_200),
+    );
+    let (migrator, objects, index) = migrator(dir.path());
+
+    let stats = migrator.run_once().await.unwrap();
+
+    assert_eq!(stats.cold_promotions, 1);
+    assert_eq!(stats.warm_promotions, 0);
+    assert!(
+        !path.exists(),
+        "the source should be gone after a verified upload"
+    );
+    assert!(
+        !dir.path()
+            .join("transport_raw/2026-09-01.jsonl.zst")
+            .exists(),
+        "cold promotion must not leave a warm copy behind"
+    );
+
+    let payload = objects
+        .get("raw/transport_raw/date=2026-09-01/2026-09-01.jsonl.zst")
+        .await
+        .unwrap()
+        .expect("the payload should be in the object backend");
+    assert_eq!(
+        zstd::stream::decode_all(&payload[..]).unwrap(),
+        b"{\"recorded_by\":\"tier-test\"}\n"
+    );
+
+    let rows = index.query(&RawLogQuery::default()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tier, StorageTier::Cold);
+    assert!(
+        rows[0]
+            .file_path
+            .ends_with("raw/transport_raw/date=2026-09-01/2026-09-01.jsonl.zst"),
+        "index should point at the uploaded object, got {}",
+        rows[0].file_path
+    );
+}
+
 /// The spawned loop has to make progress within the process's lifetime, and a
 /// process that is replaced every few tens of minutes never reaches the far end
 /// of a one-hour interval. A first pass that waits for one would therefore
