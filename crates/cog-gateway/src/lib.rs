@@ -1017,6 +1017,258 @@ const UNMATCHED_ENDPOINT_LABEL: &str = "unmatched";
 /// narrower than the cadence would blank the series between passes.
 const GAUGE_LOOKBACK_SECS: i64 = 3600;
 
+/// Descriptions for the counter series. Not a list of what to serve — that
+/// comes from the backend, see [`listed_metric_names`]. What lives here is only
+/// what a name cannot say about itself.
+const COUNTER_HELP: &[(&str, &str)] = &[
+    (
+        "memory_operations_total",
+        "Total number of memory backend operations",
+    ),
+    (
+        "memory_operation_errors_total",
+        "Total number of failed memory backend operations",
+    ),
+    (
+        "task_operations_total",
+        "Total number of task lifecycle operations",
+    ),
+    ("http_requests_total", "Total number of HTTP requests"),
+    (
+        "tier_migration_total",
+        "Total number of storage tier migrations",
+    ),
+    (
+        "llm_calls_total",
+        "Total number of LLM upstream calls by result",
+    ),
+    (
+        "llm_tokens_total",
+        "Total LLM tokens consumed, split by input and output",
+    ),
+    (
+        "llm_upstream_client_errors_total",
+        "Total LLM upstream calls rejected as malformed requests",
+    ),
+    (
+        "llm_upstream_failures_total",
+        "Total LLM upstream failures, excluding rate limits",
+    ),
+    (
+        "agent_steps_total",
+        "Total number of agent loop iterations executed",
+    ),
+    (
+        "tool_calls_total",
+        "Total number of tool invocations by tool and status",
+    ),
+];
+
+/// Descriptions for the histogram series. See [`COUNTER_HELP`].
+const HISTOGRAM_HELP: &[(&str, &str)] = &[
+    (
+        "memory_operation_latency_ms",
+        "Memory backend operation latency in milliseconds",
+    ),
+    (
+        "http_request_duration_ms",
+        "HTTP request duration in milliseconds",
+    ),
+    (
+        "llm_call_latency_ms",
+        "LLM upstream call latency in milliseconds",
+    ),
+    (
+        "tool_call_latency_ms",
+        "Tool invocation latency in milliseconds",
+    ),
+];
+
+/// Descriptions for the gauge series. See [`COUNTER_HELP`].
+const GAUGE_HELP: &[(&str, &str)] = &[
+    (
+        "memory_unextracted_raw",
+        "Archived raw sources still missing a summary, as last scanned",
+    ),
+    (
+        "memory_unextracted_raw_aged_out",
+        "Subset of the above that aged past the re-drive window; the system \
+         will not pick these up again without a budgeted backfill",
+    ),
+    (
+        "metrics_samples_rows",
+        "Rows currently held in the metrics sample log",
+    ),
+    (
+        "metrics_samples_retention_seconds",
+        "How far back the metrics sample log is kept",
+    ),
+    (
+        "llm_upstream_healthy",
+        "Whether each LLM upstream is considered usable, 1 or 0",
+    ),
+    (
+        "llm_pool_available",
+        "Whether any LLM upstream is usable, 1 or 0",
+    ),
+    (
+        "llm_pool_evidenced_recovery_unix",
+        "Recovery instant an upstream itself reported, as a Unix timestamp; \
+         0 when no upstream has given one",
+    ),
+    (
+        "llm_pool_next_attempt_unix",
+        "When the next pool probe is due, as a Unix timestamp",
+    ),
+];
+
+/// Description for one series, from the table matching its kind.
+///
+/// A name the table does not cover is one somebody recorded and never
+/// documented. Serving it with a placeholder is still better than the two
+/// alternatives: dropping it loses the series entirely, and refusing to serve
+/// it turns a missing sentence into a missing measurement. The placeholder
+/// names the fix so the omission is actionable rather than merely visible.
+fn metric_help(help: &[(&str, &str)], name: &str) -> String {
+    match help.iter().find(|(known, _)| *known == name) {
+        Some((_, text)) => (*text).to_string(),
+        None => format!(
+            "Undocumented metric {name}: no description is registered for it in the \
+             exposition's help table"
+        ),
+    }
+}
+
+/// The names to serve for one kind, asked of the backend rather than written
+/// down here.
+///
+/// A hand-written list is a second producer surface, and it can only ever lose:
+/// whoever records a new metric has no way to make this side notice, so the new
+/// series gets recorded, stored, and then silently dropped from every scrape.
+/// Asking the backend means a recorded metric reaches the exposition by
+/// construction. The backend answers with names it holds data for, so a name
+/// that nothing has recorded yet is absent — that absence is the truth about a
+/// declared-but-never-produced series, not a gap to paper over.
+///
+/// If the backend cannot enumerate, fall back to the described names. That is
+/// exactly what this endpoint served before enumeration existed, so an
+/// enumeration failure degrades to the old behaviour rather than to an empty
+/// exposition.
+async fn listed_metric_names(
+    backend: &dyn cog_core::MetricsBackend,
+    metric_type: cog_core::MetricType,
+    help: &[(&str, &str)],
+) -> Vec<String> {
+    match backend.list_metric_names(metric_type).await {
+        Ok(mut names) => {
+            names.sort_unstable();
+            names.dedup();
+            names
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to list {} metric names, serving the described set: {}",
+                metric_type.as_str(),
+                e
+            );
+            help.iter().map(|(name, _)| (*name).to_string()).collect()
+        }
+    }
+}
+
+/// Render every series the backend holds, in Prometheus text format.
+///
+/// Takes the backend rather than the gateway state so the rendering can be
+/// exercised against an in-memory backend — this function is where the
+/// producer surface and the exposition have to agree, and an agreement nothing
+/// tests is the kind that drifts.
+async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
+    let mut body = String::new();
+
+    // Only the histograms are read over a window; that is what a summary's
+    // quantiles describe. Counters are read from their cumulative totals
+    // instead, because a `_total` series has to be monotonic for
+    // `rate()`/`increase()` to mean anything, and a window sum shrinks as
+    // samples age out.
+    let end = chrono::Utc::now();
+    let start = end - chrono::Duration::seconds(300);
+
+    for name in listed_metric_names(mb, cog_core::MetricType::Counter, COUNTER_HELP).await {
+        match mb.query_counter_totals(&name).await {
+            Ok(samples) => {
+                body.push_str(&prometheus_render::render_counters(
+                    &name,
+                    &metric_help(COUNTER_HELP, &name),
+                    &samples,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query counter {}: {}", name, e);
+            }
+        }
+    }
+
+    for name in listed_metric_names(mb, cog_core::MetricType::Histogram, HISTOGRAM_HELP).await {
+        match mb.query_histogram_range(&name, start, end).await {
+            Ok(samples) => {
+                body.push_str(&prometheus_render::render_histograms(
+                    &name,
+                    &metric_help(HISTOGRAM_HELP, &name),
+                    &samples,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query histogram {}: {}", name, e);
+            }
+        }
+    }
+
+    // Gauges get a lookback wider than the scrape window: the pass that
+    // produces them runs on a minutes-scale cadence, and a window sized for a
+    // scrape would drop the series between two passes — the reader would see
+    // "no data" where the truth is "nothing is pending". Each sample carries
+    // its own timestamp, so a value that stopped being refreshed is still
+    // readable as stale rather than as fresh.
+    for name in listed_metric_names(mb, cog_core::MetricType::Gauge, GAUGE_HELP).await {
+        match mb
+            .query_gauge_range(
+                &name,
+                end - chrono::Duration::seconds(GAUGE_LOOKBACK_SECS),
+                end,
+            )
+            .await
+        {
+            Ok(samples) => {
+                body.push_str(&prometheus_render::render_gauges(
+                    &name,
+                    &metric_help(GAUGE_HELP, &name),
+                    &samples,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query gauge {}: {}", name, e);
+            }
+        }
+    }
+
+    // Declare what the `_total` series mean. The scrape side versions
+    // independently of this binary, so the declaration has to travel in the
+    // body; without it a scraper has to assume the older windowed reading and
+    // its rate math silently stops matching what this body produced. It goes in
+    // front so a reader meets it before the series it describes, and only into a
+    // body that already has series: a body carrying nothing but this comment
+    // would stop being empty, and emptiness is what tells the caller the
+    // endpoint has nothing to serve.
+    if !body.is_empty() {
+        body.insert_str(
+            0,
+            &format!("{}\n", cog_core::cumulative_semantics_declaration()),
+        );
+    }
+
+    body
+}
+
 /// Prometheus metrics endpoint — serves memory operation counters,
 /// latency histograms, and task operation counters from the MetricsBackend
 /// in text format, plus prometheus registry metrics from MetricsExporter.
@@ -1025,181 +1277,7 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
 
     // Serve MetricsBackend time-series metrics if available
     if let Some(mb) = state.metrics_backend.as_ref() {
-        // Only the histograms are read over a window; that is what a summary's
-        // quantiles describe. Counters are read from their cumulative totals
-        // instead, because a `_total` series has to be monotonic for
-        // `rate()`/`increase()` to mean anything, and a window sum shrinks as
-        // samples age out.
-        let end = chrono::Utc::now();
-        let start = end - chrono::Duration::seconds(300);
-
-        match mb.query_counter_totals("memory_operations_total").await {
-            Ok(samples) => {
-                body.push_str(&prometheus_render::render_counters(
-                    "memory_operations_total",
-                    "Total number of memory backend operations",
-                    &samples,
-                ));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to query counters: {}", e);
-            }
-        }
-
-        match mb
-            .query_histogram_range("memory_operation_latency_ms", start, end)
-            .await
-        {
-            Ok(samples) => {
-                body.push_str(&prometheus_render::render_histograms(
-                    "memory_operation_latency_ms",
-                    "Memory backend operation latency in milliseconds",
-                    &samples,
-                ));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to query histograms: {}", e);
-            }
-        }
-
-        match mb.query_counter_totals("task_operations_total").await {
-            Ok(samples) => {
-                body.push_str(&prometheus_render::render_counters(
-                    "task_operations_total",
-                    "Total number of task lifecycle operations",
-                    &samples,
-                ));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to query task counters: {}", e);
-            }
-        }
-
-        match mb.query_counter_totals("http_requests_total").await {
-            Ok(samples) => {
-                body.push_str(&prometheus_render::render_counters(
-                    "http_requests_total",
-                    "Total number of HTTP requests",
-                    &samples,
-                ));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to query http request counters: {}", e);
-            }
-        }
-
-        match mb
-            .query_histogram_range("http_request_duration_ms", start, end)
-            .await
-        {
-            Ok(samples) => {
-                body.push_str(&prometheus_render::render_histograms(
-                    "http_request_duration_ms",
-                    "HTTP request duration in milliseconds",
-                    &samples,
-                ));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to query http request histograms: {}", e);
-            }
-        }
-
-        match mb.query_counter_totals("tier_migration_total").await {
-            Ok(samples) => {
-                body.push_str(&prometheus_render::render_counters(
-                    "tier_migration_total",
-                    "Total number of tier migration operations",
-                    &samples,
-                ));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to query tier migration counters: {}", e);
-            }
-        }
-
-        // Gauges get a lookback wider than the scrape window: the pass that
-        // produces this one runs on a minutes-scale cadence, and a window sized
-        // for a scrape would drop the series between two passes — the reader
-        // would see "no data" where the truth is "nothing is pending". The
-        // sample's own timestamp travels with the value so a value that stopped
-        // being refreshed is still readable as stale rather than as fresh.
-        for (name, help) in [
-            (
-                "memory_unextracted_raw",
-                "Archived raw sources still missing a summary, as last scanned",
-            ),
-            (
-                "memory_unextracted_raw_aged_out",
-                "Subset of the above that aged past the re-drive window; the system \
-                 will not pick these up again without a budgeted backfill",
-            ),
-        ] {
-            match mb
-                .query_gauge_range(
-                    name,
-                    end - chrono::Duration::seconds(GAUGE_LOOKBACK_SECS),
-                    end,
-                )
-                .await
-            {
-                Ok(samples) => {
-                    body.push_str(&prometheus_render::render_gauges(name, help, &samples));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to query memory ingest backlog gauge {}: {}",
-                        name,
-                        e
-                    );
-                }
-            }
-        }
-
-        // How much the metrics sample log holds and how far back it reaches.
-        // The retention sweeper keeps the table bounded, but a bound nobody can
-        // see is no different from no bound at all: the last time this table
-        // grew without limit it was found by hand, five days and 830 MiB later.
-        for (name, help) in [
-            (
-                "metrics_samples_rows",
-                "Rows currently held in the metrics sample log",
-            ),
-            (
-                "metrics_samples_retention_seconds",
-                "How far back the metrics sample log is kept",
-            ),
-        ] {
-            match mb
-                .query_gauge_range(
-                    name,
-                    end - chrono::Duration::seconds(GAUGE_LOOKBACK_SECS),
-                    end,
-                )
-                .await
-            {
-                Ok(samples) => {
-                    body.push_str(&prometheus_render::render_gauges(name, help, &samples));
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to query {}: {}", name, e);
-                }
-            }
-        }
-
-        // Declare what the `_total` series above mean. The scrape side versions
-        // independently of this binary, so the declaration has to travel in the
-        // body; without it a scraper has to assume the older windowed reading and
-        // its rate math silently stops matching what this body produced. It goes
-        // in front so a reader meets it before the series it describes, and only
-        // into a body that already has series: a body carrying nothing but this
-        // comment would stop being empty, and emptiness is what tells the caller
-        // the endpoint has nothing to serve.
-        if !body.is_empty() {
-            body.insert_str(
-                0,
-                &format!("{}\n", cog_core::cumulative_semantics_declaration()),
-            );
-        }
+        body.push_str(&render_backend_metrics(&**mb).await);
     }
 
     // Append prometheus registry metrics from MetricsExporter if available
@@ -2559,6 +2637,112 @@ async fn a2a_agent_card_handler(State(state): State<Arc<GatewayState>>) -> Respo
         },
     };
     (StatusCode::OK, Json(json!(card))).into_response()
+}
+
+#[cfg(test)]
+mod metrics_exposition_tests {
+    use super::*;
+    use cog_core::MetricsBackend;
+    use std::collections::HashMap;
+
+    /// 记一条 gauge，名字故意不在帮助表里——模拟"有人新增产出面但没来这边登记"。
+    async fn backend_with_extra_gauge() -> cog_storage::mem::MemoryMetricsBackend {
+        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+        mb.record_gauge("some_future_gauge", 7.0, HashMap::new())
+            .await
+            .unwrap();
+        mb.record_counter("some_future_counter_total", 3.0, HashMap::new())
+            .await
+            .unwrap();
+        mb
+    }
+
+    /// 这条是本修复的核心回归：端点服务的序列集合必须由后端枚举决定，而不是由
+    /// 这里的一份手写字面量决定。手写清单在旧实现下会静默丢掉新 gauge——它就
+    /// 是这次发现的缺陷。断言走的是 `render_backend_metrics`，也就是端点真正
+    /// 用来拼 body 的那条路径。
+    #[tokio::test]
+    async fn a_gauge_the_help_table_never_heard_of_still_reaches_the_body() {
+        let mb = backend_with_extra_gauge().await;
+        let body = render_backend_metrics(&mb).await;
+
+        assert!(
+            body.contains("some_future_gauge 7"),
+            "后端持有的 gauge 必须出现在暴露面上: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "# HELP some_future_gauge {}",
+                metric_help(GAUGE_HELP, "some_future_gauge")
+            )),
+            "无描述的序列也要带 HELP，且要指出缺的是哪一步: {body}"
+        );
+        assert!(
+            body.contains("some_future_counter_total{} 3"),
+            "后端持有的 counter 必须出现在暴露面上: {body}"
+        );
+    }
+
+    /// 帮助表是渲染用的，不是筛选用的：它多出来的名字不能凭自己造出序列。
+    #[tokio::test]
+    async fn a_described_name_nothing_recorded_is_absent() {
+        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+        let body = render_backend_metrics(&mb).await;
+
+        assert!(body.is_empty(), "空后端不能凭空产出序列: {body}");
+        assert!(
+            !body.contains("task_operations_total"),
+            "没有任何样本的名字不该被渲染出来: {body}"
+        );
+    }
+
+    /// 描述表的覆盖面：产出侧真实存在、且名字不是自解释的那几个，必须有描述，
+    /// 否则线上会看到一串"未登记"占位符。这条把"忘了写描述"从运行期搬到编译
+    /// 期管不到的测试期。
+    #[test]
+    fn recorded_production_names_are_described() {
+        for name in [
+            "memory_operations_total",
+            "memory_operation_errors_total",
+            "http_requests_total",
+            "tier_migration_total",
+            "agent_steps_total",
+            "llm_calls_total",
+            "llm_tokens_total",
+            "tool_calls_total",
+        ] {
+            assert!(
+                !metric_help(COUNTER_HELP, name).starts_with("Undocumented"),
+                "counter {name} 缺描述"
+            );
+        }
+        for name in [
+            "memory_operation_latency_ms",
+            "http_request_duration_ms",
+            "llm_call_latency_ms",
+            "tool_call_latency_ms",
+        ] {
+            assert!(
+                !metric_help(HISTOGRAM_HELP, name).starts_with("Undocumented"),
+                "histogram {name} 缺描述"
+            );
+        }
+        for name in [
+            "memory_unextracted_raw",
+            "memory_unextracted_raw_aged_out",
+            "metrics_samples_rows",
+            "metrics_samples_retention_seconds",
+            "llm_upstream_healthy",
+            "llm_pool_available",
+            "llm_pool_evidenced_recovery_unix",
+            "llm_pool_next_attempt_unix",
+        ] {
+            assert!(
+                !metric_help(GAUGE_HELP, name).starts_with("Undocumented"),
+                "gauge {name} 缺描述"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

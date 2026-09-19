@@ -1742,6 +1742,25 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn list_metric_names(
+            &self,
+            metric_type: cog_core::MetricType,
+        ) -> cog_core::SFResult<Vec<String>> {
+            if metric_type != cog_core::MetricType::Gauge {
+                return Ok(Vec::new());
+            }
+            let mut names: Vec<String> = self
+                .gauges
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            Ok(names)
+        }
+
         async fn health_check(&self) -> cog_core::SFResult<()> {
             Ok(())
         }

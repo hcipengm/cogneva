@@ -208,6 +208,23 @@ impl MetricsBackend for MockMetricsBackend {
         Ok(samples)
     }
 
+    async fn list_metric_names(&self, metric_type: cog_core::MetricType) -> SFResult<Vec<String>> {
+        let kind = match metric_type {
+            cog_core::MetricType::Gauge => MetricKind::Gauge,
+            cog_core::MetricType::Counter => MetricKind::Counter,
+            cog_core::MetricType::Histogram => MetricKind::Histogram,
+        };
+        let records = self.records.lock().unwrap();
+        let mut names: Vec<String> = records
+            .iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
+    }
+
     async fn health_check(&self) -> SFResult<()> {
         Ok(())
     }

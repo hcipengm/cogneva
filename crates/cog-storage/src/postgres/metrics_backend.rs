@@ -4,7 +4,7 @@ use serde_json;
 use sqlx::PgPool;
 use std::collections::HashMap;
 
-use cog_core::{MetricSample, MetricsBackend, SFError, SFResult};
+use cog_core::{MetricSample, MetricType, MetricsBackend, SFError, SFResult};
 
 /// PostgreSQL-backed metrics backend.
 pub struct PostgresMetricsBackend {
@@ -256,6 +256,29 @@ impl MetricsBackend for PostgresMetricsBackend {
         end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>> {
         self.query_range("histogram", name, start, end).await
+    }
+
+    async fn list_metric_names(&self, metric_type: MetricType) -> SFResult<Vec<String>> {
+        // Counters are read from their own table, so a counter name is one that
+        // table holds -- listing them from the sample log instead would offer
+        // names whose totals row has not been written yet, and the read that
+        // follows would come back empty.
+        let rows: Vec<(String,)> = match metric_type {
+            MetricType::Counter => sqlx::query_as(
+                "SELECT DISTINCT name FROM cog_metric_counter_totals ORDER BY name",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?,
+            _ => sqlx::query_as(
+                "SELECT DISTINCT name FROM cog_metrics_samples WHERE metric_type = $1 ORDER BY name",
+            )
+            .bind(metric_type.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?,
+        };
+        Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 
     async fn health_check(&self) -> SFResult<()> {

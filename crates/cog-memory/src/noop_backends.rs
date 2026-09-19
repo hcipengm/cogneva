@@ -80,6 +80,13 @@ impl MetricsBackend for NoopMetricsBackend {
         Ok(Vec::new())
     }
 
+    async fn list_metric_names(&self, _metric_type: cog_core::MetricType) -> SFResult<Vec<String>> {
+        // Nothing was ever recorded, so there is nothing to enumerate. Answering
+        // with an empty set is the truthful answer, and it keeps "no metrics"
+        // distinguishable from "metrics exist but this backend cannot list them".
+        Ok(Vec::new())
+    }
+
     async fn health_check(&self) -> SFResult<()> {
         Ok(())
     }

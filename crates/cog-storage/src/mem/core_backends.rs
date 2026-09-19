@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use cog_core::{
     AgentEvent, AgentState, ClusterOverview, ContextBoard, Event, EventFilter, LogEntry,
-    MetricSample, MetricsBackend, ObservabilityGateway, RawLogIndex, RawLogIndexEntry,
+    MetricSample, MetricType, MetricsBackend, ObservabilityGateway, RawLogIndex, RawLogIndexEntry,
     RawLogIndexStore, RawLogQuery, SFError, SFResult, SquadState, SquadStatus, StateBackend,
     TaskCheckpoint, TaskMetrics, UpstreamFailure, VectorBackend, VectorSearchResult,
 };
@@ -900,6 +900,19 @@ impl MetricsBackend for MemoryMetricsBackend {
             .read()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         Ok(Self::query_range(&store, name, start, end))
+    }
+
+    async fn list_metric_names(&self, metric_type: MetricType) -> SFResult<Vec<String>> {
+        let store = match metric_type {
+            MetricType::Gauge => &self.gauges,
+            MetricType::Counter => &self.counters,
+            MetricType::Histogram => &self.histograms,
+        }
+        .read()
+        .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        let mut names: Vec<String> = store.keys().cloned().collect();
+        names.sort_unstable();
+        Ok(names)
     }
 
     async fn health_check(&self) -> SFResult<()> {

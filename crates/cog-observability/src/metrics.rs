@@ -287,6 +287,31 @@ impl MetricsBackend for PrometheusMetricsBackend {
         Ok(Vec::new())
     }
 
+    async fn list_metric_names(&self, metric_type: cog_core::MetricType) -> SFResult<Vec<String>> {
+        // The per-kind maps are keyed by `name:label-keys`, so one recorded name
+        // appears once per label set it has seen; the name is the part before
+        // the first colon, and the caller wants each name once.
+        fn names_of<V>(store: &std::sync::Mutex<HashMap<String, V>>) -> SFResult<Vec<String>> {
+            let store = store
+                .lock()
+                .map_err(|_| SFError::Agent("metrics lock poisoned".into()))?;
+            let mut names: Vec<String> = store
+                .keys()
+                .filter_map(|key| key.split(':').next())
+                .map(str::to_string)
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            Ok(names)
+        }
+
+        match metric_type {
+            cog_core::MetricType::Gauge => names_of(&self.gauges),
+            cog_core::MetricType::Counter => names_of(&self.counters),
+            cog_core::MetricType::Histogram => names_of(&self.histograms),
+        }
+    }
+
     async fn health_check(&self) -> SFResult<()> {
         let _ = self.registry.gather();
         Ok(())

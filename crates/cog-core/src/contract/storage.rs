@@ -111,8 +111,46 @@ pub trait MetricsBackend: Send + Sync {
         end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>>;
 
+    /// The names this backend can currently answer [`MetricType`] queries for.
+    ///
+    /// An exposition that hard-codes the names it expects loses every metric a
+    /// producer adds later: the producer side has no way to make the consumer
+    /// notice. Asking the backend instead means a recorded metric reaches the
+    /// exposition, and the only thing left for a human to add is its
+    /// description.
+    ///
+    /// Names are those the backend holds data for, not every name the code
+    /// mentions: a name nothing has recorded yet is absent, which is what makes
+    /// "declared but never produced" visible rather than papered over.
+    async fn list_metric_names(&self, metric_type: MetricType) -> SFResult<Vec<String>>;
+
     /// Check whether the backend is healthy and accessible.
     async fn health_check(&self) -> SFResult<()>;
+}
+
+/// Which of the three metric kinds a name is recorded under.
+///
+/// The kinds are not interchangeable at read time: a gauge is read over a
+/// window and takes its newest sample, a counter is read from its cumulative
+/// total because a `_total` series has to stay monotonic, and a histogram is
+/// read over a window. A caller asking for names therefore has to say which
+/// kind it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetricType {
+    Gauge,
+    Counter,
+    Histogram,
+}
+
+impl MetricType {
+    /// The string this kind is stored under in `cog_metrics_samples`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MetricType::Gauge => "gauge",
+            MetricType::Counter => "counter",
+            MetricType::Histogram => "histogram",
+        }
+    }
 }
 
 /// Runtime object-storage abstraction for large blobs (files, snapshots, raw sources).
