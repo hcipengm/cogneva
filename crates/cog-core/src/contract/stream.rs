@@ -6,6 +6,27 @@ use std::pin::Pin;
 /// Each item is a tuple of `(message_id, payload_bytes)`.
 pub type MessageStream = Pin<Box<dyn futures::Stream<Item = SFResult<(String, Vec<u8>)>> + Send>>;
 
+/// A consumer group's pending state: entries delivered to some consumer that
+/// never acknowledged them.
+///
+/// This is the state a `subscribe` (new messages only) can never recover from
+/// on its own, and the reason an age is reported alongside the count: an entry
+/// that is being processed and an entry abandoned by a consumer that died have
+/// the same count and differ only in how long they have been outstanding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingStats {
+    /// Entries pending right now, being processed or abandoned.
+    pub count: u64,
+    /// Entries pending longer than the caller's reclaim threshold — i.e. work
+    /// a reclaim pass running on its configured cadence would already have
+    /// taken back. Non-zero means the reclaim path is not keeping up with its
+    /// own policy.
+    pub unreclaimed_count: u64,
+    /// How long the longest-outstanding of those has been pending, in
+    /// milliseconds. Zero when there are none.
+    pub unreclaimed_oldest_idle_ms: u64,
+}
+
 /// Abstract message-queue backend for the DagExecutor layer.
 /// Implementations may target Redis Streams, NATS, Kafka, or in-memory
 /// channels for testing.  The trait is intentionally low-level (raw bytes)
@@ -71,6 +92,27 @@ pub trait MessageBackend: Send + Sync {
     ) -> SFResult<Vec<(String, Vec<u8>)>> {
         Ok(Vec::new())
     }
+
+    /// Read a consumer group's pending state without changing it.
+    ///
+    /// `idle_threshold_ms` splits "being processed" from "abandoned": only the
+    /// outstanding time tells the two apart, and callers pass the threshold
+    /// they reclaim at, so the unreclaimed figures answer "is the reclaim path
+    /// keeping up with its own policy?" instead of comparing against a number
+    /// invented here.
+    ///
+    /// `None` means this backend holds no pending state to report — either it
+    /// brokers no persistent queue, or it has no reclaim path, in which case a
+    /// count of what is piling up would say nothing about whether anything can
+    /// come back. Required rather than defaulted for the same reason as
+    /// [`Self::ack`]: a backend that does have pending messages must not
+    /// silently inherit "nothing is pending" through a trait object call.
+    async fn pending_stats(
+        &self,
+        stream: &str,
+        group: &str,
+        idle_threshold_ms: u64,
+    ) -> SFResult<Option<PendingStats>>;
 
     /// Publish a message to the dead-letter queue for the given stream.
     /// The default implementation appends to a `{stream}:dlq` subject.

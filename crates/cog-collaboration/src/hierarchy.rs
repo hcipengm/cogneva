@@ -548,6 +548,15 @@ mod tests {
         async fn ack(&self, _stream: &str, _group: &str, _ids: &[String]) -> SFResult<()> {
             Ok(())
         }
+
+        async fn pending_stats(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _idle_threshold_ms: u64,
+        ) -> SFResult<Option<cog_core::PendingStats>> {
+            Ok(None)
+        }
     }
 
     // --- identifier helpers --------------------------------------------------

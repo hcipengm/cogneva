@@ -6,6 +6,13 @@ use redis::{AsyncCommands, RedisError};
 
 use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
 
+/// Upper bound on how many over-threshold entries one measurement lists. The
+/// total pending count is exact either way; the over-threshold pair below
+/// saturates at this page, and a saturated page is itself the finding — it
+/// means the reclaim path has stopped taking anything back, which the
+/// reported age says just as plainly.
+const PENDING_STATS_PAGE: usize = 1024;
+
 /// Redis Streams-backed [`MessageBackend`].
 pub struct RedisMessageBackend {
     client: redis::Client,
@@ -222,6 +229,92 @@ impl MessageBackend for RedisMessageBackend {
         Ok(messages)
     }
 
+    async fn pending_stats(
+        &self,
+        stream: &str,
+        group: &str,
+        idle_threshold_ms: u64,
+    ) -> SFResult<Option<cog_core::PendingStats>> {
+        let mut conn = self.connection.clone();
+
+        // Summary form: total pending. Read first so the two commands that
+        // follow — which list entries — are only issued against a non-empty
+        // PEL, and so a total that exceeds what one page can list is still
+        // reported truthfully.
+        let summary: redis::Value = redis::cmd("XPENDING")
+            .arg(stream)
+            .arg(group)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        let count = match &summary {
+            redis::Value::Array(items) => match items.first() {
+                Some(redis::Value::Int(n)) => (*n).max(0) as u64,
+                other => {
+                    // An unrecognised shape must not be read as an empty PEL:
+                    // "could not tell" and "nothing stranded" are the two
+                    // answers this report exists to keep apart.
+                    return Err(SFError::Redis(format!(
+                        "XPENDING summary had unexpected shape: {other:?}"
+                    )));
+                }
+            },
+            other => {
+                return Err(SFError::Redis(format!(
+                    "XPENDING summary had unexpected shape: {other:?}"
+                )))
+            }
+        };
+
+        let mut stats = cog_core::PendingStats {
+            count,
+            ..Default::default()
+        };
+        if count == 0 {
+            return Ok(Some(stats));
+        }
+
+        // Only entries already past the threshold: the reclaim pass takes back
+        // exactly these on its next tick, so anything still listed here at the
+        // next measurement is one it failed to take back.
+        let entries: redis::Value = redis::cmd("XPENDING")
+            .arg(stream)
+            .arg(group)
+            .arg("IDLE")
+            .arg(idle_threshold_ms)
+            .arg("-")
+            .arg("+")
+            .arg(PENDING_STATS_PAGE)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        let entries = match entries {
+            redis::Value::Array(items) => items,
+            other => {
+                return Err(SFError::Redis(format!(
+                    "XPENDING page had unexpected shape: {other:?}"
+                )))
+            }
+        };
+        for entry in entries {
+            let idle = match entry {
+                redis::Value::Array(fields) => fields.get(2).and_then(|v| match v {
+                    redis::Value::Int(n) => Some((*n).max(0) as u64),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            let Some(idle) = idle else {
+                return Err(SFError::Redis(
+                    "XPENDING entry had unexpected shape".to_string(),
+                ));
+            };
+            stats.unreclaimed_count += 1;
+            stats.unreclaimed_oldest_idle_ms = stats.unreclaimed_oldest_idle_ms.max(idle);
+        }
+        Ok(Some(stats))
+    }
+
     async fn dlq(&self, stream: &str, msg_id: &str, reason: &str) -> SFResult<()> {
         let payload = serde_json::json!({
             "original_id": msg_id,
@@ -378,6 +471,96 @@ mod tests {
 
         backend.ack(stream, group, &[id]).await.unwrap();
         assert_eq!(pending_count(&mut raw, stream, group).await, 0);
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    #[tokio::test]
+    async fn test_pending_stats_separates_in_flight_from_abandoned() {
+        // The count alone cannot tell a message being processed from one a dead
+        // consumer left behind; only the idle threshold can, so the reading is
+        // asserted against two thresholds over the same PEL.
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let stream = "cog-test:pending-stats";
+        let group = "pending-stats-group";
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+        backend.create_consumer_group(stream, group).await.unwrap();
+
+        // Nothing has been delivered, so the PEL is empty and both figures are
+        // zero rather than absent: this backend does hold pending state.
+        let empty = backend
+            .pending_stats(stream, group, 0)
+            .await
+            .expect("pending_stats on empty PEL")
+            .expect("streams backend reports pending state");
+        assert_eq!(empty.count, 0);
+        assert_eq!(empty.unreclaimed_count, 0);
+        assert_eq!(empty.unreclaimed_oldest_idle_ms, 0);
+
+        backend.publish(stream, b"one").await.unwrap();
+        let mut sub = backend.subscribe(stream, group).await.unwrap();
+        let (id, bytes) =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
+                Ok(Some(Ok(msg))) => msg,
+                _ => {
+                    eprintln!("SKIP: Redis stream read timed out or failed");
+                    return;
+                }
+            };
+        assert_eq!(bytes, b"one");
+
+        // Delivered and not yet acked: pending, but nothing a reclaim pass
+        // running on its current threshold would take back from a live
+        // consumer — which is what a generous threshold must report.
+        let in_flight = backend
+            .pending_stats(stream, group, 600_000)
+            .await
+            .expect("pending_stats with a generous threshold")
+            .expect("streams backend reports pending state");
+        assert_eq!(in_flight.count, 1);
+        assert_eq!(
+            in_flight.unreclaimed_count, 0,
+            "an entry still inside the threshold is in flight, not abandoned"
+        );
+
+        // The same entry against a threshold of zero is past it, so it is
+        // exactly the work a reclaim pass would take back.
+        let abandoned = backend
+            .pending_stats(stream, group, 0)
+            .await
+            .expect("pending_stats with a zero threshold")
+            .expect("streams backend reports pending state");
+        assert_eq!(abandoned.count, 1);
+        assert_eq!(abandoned.unreclaimed_count, 1);
+
+        backend.ack(stream, group, &[id]).await.unwrap();
+        let acked = backend
+            .pending_stats(stream, group, 0)
+            .await
+            .expect("pending_stats after ack")
+            .expect("streams backend reports pending state");
+        assert_eq!(acked.count, 0);
+        assert_eq!(acked.unreclaimed_count, 0);
 
         let _: i64 = redis::cmd("DEL")
             .arg(stream)

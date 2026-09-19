@@ -1,5 +1,6 @@
 //! Observable implementation for cog-orchestrator.
-//! Exposes D1 (Outcome) and D8 (Multi-Agent Collaboration) raw metrics.
+//! Exposes D1 (Outcome) and D8 (Multi-Agent Collaboration) raw metrics, plus
+//! the live pending state of the streams this process consumes.
 
 use async_trait::async_trait;
 use cog_core::observability::{Observable, RawMetric, TraceFragment};
@@ -14,6 +15,210 @@ pub fn global_observable() -> Arc<OrchestratorObservable> {
     GLOBAL
         .get_or_init(|| Arc::new(OrchestratorObservable::new()))
         .clone()
+}
+
+static STREAM_PENDING: OnceLock<Arc<StreamPendingObservable>> = OnceLock::new();
+
+/// The process-wide record of what each consumed stream is holding without an
+/// ack. One instance per process: the consumers that feed it are the ones that
+/// know which groups they read, and the exposition asks this one place.
+pub fn stream_pending_observable() -> Arc<StreamPendingObservable> {
+    STREAM_PENDING
+        .get_or_init(|| Arc::new(StreamPendingObservable::new()))
+        .clone()
+}
+
+/// Entries pending right now on one consumed stream.
+pub const STREAM_PENDING_COUNT_METRIC: &str = "cogneva_stream_pending_count";
+/// Entries pending longer than the reclaim threshold — work a reclaim pass
+/// running on its configured cadence would already have taken back.
+pub const STREAM_PENDING_UNRECLAIMED_METRIC: &str = "cogneva_stream_pending_unreclaimed_count";
+/// How long the longest-outstanding of those has been pending. This is the
+/// series an alert can be built on: it is the age of the thing that should not
+/// exist, so a threshold can be a multiple of the deployment's own reclaim
+/// policy instead of a number picked here.
+pub const STREAM_PENDING_UNRECLAIMED_AGE_METRIC: &str =
+    "cogneva_stream_pending_unreclaimed_oldest_idle_seconds";
+/// The reclaim threshold the figures above were measured against.
+pub const STREAM_PENDING_CLAIM_IDLE_METRIC: &str = "cogneva_stream_pending_claim_idle_seconds";
+/// Unix seconds of the last measurement that succeeded. A stuck reader leaves
+/// the rows above frozen rather than absent, so staleness has to be its own
+/// series — otherwise a dead reclaim loop reads exactly like a clean stream.
+pub const STREAM_PENDING_MEASURE_LAST_METRIC: &str = "cogneva_stream_pending_measure_last_seconds";
+/// The cadence the measurement is supposed to run at, so the staleness rule's
+/// threshold is a multiple of what this deployment actually configured.
+pub const STREAM_PENDING_MEASURE_INTERVAL_METRIC: &str =
+    "cogneva_stream_pending_measure_interval_seconds";
+/// Measurements that failed. A reader that is running but cannot ask the
+/// backend is a different fault from one that stopped, and both leave the age
+/// above untrustworthy.
+pub const STREAM_PENDING_MEASURE_FAILURES_METRIC: &str =
+    "cogneva_stream_pending_measure_failures_total";
+
+/// Names of the rules that consume these gauges, so the pairing can be
+/// asserted rather than assumed.
+pub const STREAM_PENDING_UNRECLAIMED_METRIC_RULE: &str = "stream_pending_unreclaimed";
+pub const STREAM_PENDING_STALE_METRIC_RULE: &str = "stream_pending_measure_stale";
+pub const STREAM_PENDING_FAILURES_METRIC_RULE: &str = "stream_pending_measure_failing";
+
+/// What one stream's last measurement found. Kept per stream because the
+/// streams are independent: one clean stream must not hide another's stranded
+/// message, and a per-stream gauge is what lets a rule name which one.
+#[derive(Clone, Copy)]
+struct StreamPendingState {
+    count: u64,
+    unreclaimed_count: u64,
+    unreclaimed_oldest_idle_ms: u64,
+    claim_idle_ms: u64,
+    measure_interval_secs: u64,
+    last_measure_seconds: u64,
+    measure_failures: u64,
+}
+
+/// Pending state of the streams this process consumes, fed by the consumer
+/// loops themselves. The loops that reclaim pending messages are the only
+/// place that knows both the stream name and the threshold it reclaims at, so
+/// measuring there keeps one copy of that knowledge instead of a second list
+/// to drift.
+#[derive(Default)]
+pub struct StreamPendingObservable {
+    streams: tokio::sync::Mutex<HashMap<String, StreamPendingState>>,
+}
+
+impl StreamPendingObservable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Measure one stream and record the result.
+    ///
+    /// A backend that reports no pending state (in-memory, or one with no
+    /// reclaim path) records nothing: an absent series is the truth about
+    /// "nothing here can strand a message", and a zero would be a number
+    /// nothing measured.
+    ///
+    /// A failed measurement keeps the previous figures and does not advance
+    /// `last_measure_seconds`: the numbers stay readable as "the last thing we
+    /// knew", while the staleness and failure series say how old that is.
+    pub async fn measure(
+        &self,
+        backend: &dyn cog_core::MessageBackend,
+        stream: &str,
+        group: &str,
+        claim_idle_ms: u64,
+        measure_interval_secs: u64,
+    ) {
+        let mut streams = self.streams.lock().await;
+        let entry = streams
+            .entry(stream.to_string())
+            .or_insert(StreamPendingState {
+                count: 0,
+                unreclaimed_count: 0,
+                unreclaimed_oldest_idle_ms: 0,
+                claim_idle_ms,
+                measure_interval_secs,
+                last_measure_seconds: 0,
+                measure_failures: 0,
+            });
+        entry.claim_idle_ms = claim_idle_ms;
+        entry.measure_interval_secs = measure_interval_secs;
+
+        match backend.pending_stats(stream, group, claim_idle_ms).await {
+            Ok(Some(stats)) => {
+                entry.count = stats.count;
+                entry.unreclaimed_count = stats.unreclaimed_count;
+                entry.unreclaimed_oldest_idle_ms = stats.unreclaimed_oldest_idle_ms;
+                entry.last_measure_seconds = chrono::Utc::now().timestamp().max(0) as u64;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                entry.measure_failures = entry.measure_failures.saturating_add(1);
+                tracing::warn!(
+                    stream = %stream,
+                    group = %group,
+                    "pending measurement failed: {e}"
+                );
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Observable for StreamPendingObservable {
+    /// The dimension is ignored on purpose, exactly as for the trace tier
+    /// gauges: the metrics endpoint asks every observable for one dimension,
+    /// so an observable answering only its own would be absent from the scrape
+    /// — invisible rather than unlabelled.
+    async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
+        let streams = self.streams.lock().await;
+        let mut out = Vec::new();
+        for (stream, state) in streams.iter() {
+            // The liveness pair needs a measurement to be stale against, which
+            // is why it is emitted only once one has succeeded. Without that
+            // anchor a stream that was never measured and a stream measured and
+            // found clean are the same absence of evidence.
+            if state.last_measure_seconds == 0 {
+                continue;
+            }
+            out.push(
+                RawMetric::new(STREAM_PENDING_COUNT_METRIC, state.count as f64)
+                    .with_label("stream", stream.as_str()),
+            );
+            out.push(
+                RawMetric::new(
+                    STREAM_PENDING_UNRECLAIMED_METRIC,
+                    state.unreclaimed_count as f64,
+                )
+                .with_label("stream", stream.as_str()),
+            );
+            out.push(
+                RawMetric::new(
+                    STREAM_PENDING_UNRECLAIMED_AGE_METRIC,
+                    state.unreclaimed_oldest_idle_ms as f64 / 1000.0,
+                )
+                .with_label("stream", stream.as_str()),
+            );
+            out.push(
+                RawMetric::new(
+                    STREAM_PENDING_CLAIM_IDLE_METRIC,
+                    state.claim_idle_ms as f64 / 1000.0,
+                )
+                .with_label("stream", stream.as_str()),
+            );
+            out.push(
+                RawMetric::new(
+                    STREAM_PENDING_MEASURE_INTERVAL_METRIC,
+                    state.measure_interval_secs as f64,
+                )
+                .with_label("stream", stream.as_str()),
+            );
+            out.push(
+                RawMetric::new(
+                    STREAM_PENDING_MEASURE_LAST_METRIC,
+                    state.last_measure_seconds as f64,
+                )
+                .with_label("stream", stream.as_str()),
+            );
+            if state.measure_failures > 0 {
+                out.push(
+                    RawMetric::new(
+                        STREAM_PENDING_MEASURE_FAILURES_METRIC,
+                        state.measure_failures as f64,
+                    )
+                    .with_label("stream", stream.as_str()),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
+        Ok(Vec::new())
+    }
+
+    fn available_dimensions(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 use tokio::sync::Mutex;
@@ -90,5 +295,233 @@ impl Observable for OrchestratorObservable {
 
     fn available_dimensions(&self) -> Vec<String> {
         vec!["D1".into(), "D8".into()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::{MessageBackend, MessageStream, PendingStats, SFError};
+
+    /// What the stub answers when asked for a stream's pending state.
+    enum Reply {
+        Stats(PendingStats),
+        /// A backend with no pending state to report.
+        Unobservable,
+        Failing,
+    }
+
+    struct StubBackend(Reply);
+
+    #[async_trait]
+    impl MessageBackend for StubBackend {
+        async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
+            Ok(())
+        }
+        async fn subscribe(&self, _subject: &str, _group: &str) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn subscribe_from(
+            &self,
+            _subject: &str,
+            _group: &str,
+            _start_id: &str,
+        ) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn create_consumer_group(&self, _stream: &str, _group: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn ack(&self, _stream: &str, _group: &str, _ids: &[String]) -> SFResult<()> {
+            Ok(())
+        }
+        async fn pending_stats(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _idle_threshold_ms: u64,
+        ) -> SFResult<Option<PendingStats>> {
+            match self.0 {
+                Reply::Stats(stats) => Ok(Some(stats)),
+                Reply::Unobservable => Ok(None),
+                Reply::Failing => Err(SFError::Redis("stub failure".into())),
+            }
+        }
+    }
+
+    const STREAM: &str = "orchestrator:results:ws-obs-test";
+    const GROUP: &str = "cgrp-obs-test";
+    const CLAIM_IDLE_MS: u64 = 600_000;
+
+    fn metric<'a>(metrics: &'a [RawMetric], name: &str) -> Option<&'a RawMetric> {
+        metrics.iter().find(|m| m.name == name)
+    }
+
+    async fn measured(reply: Reply) -> Vec<RawMetric> {
+        let observer = StreamPendingObservable::new();
+        let backend = StubBackend(reply);
+        observer
+            .measure(&backend, STREAM, GROUP, CLAIM_IDLE_MS, 60)
+            .await;
+        observer.collect_metrics("D8").await.unwrap()
+    }
+
+    /// The gauges carry the stream the figures belong to: with several streams
+    /// consumed by one process, an unlabelled number would leave the reader
+    /// unable to tell which one is holding the stranded message.
+    #[tokio::test]
+    async fn pending_gauges_are_published_per_stream() {
+        let metrics = measured(Reply::Stats(PendingStats {
+            count: 3,
+            unreclaimed_count: 1,
+            unreclaimed_oldest_idle_ms: 1_800_000,
+        }))
+        .await;
+
+        for name in [
+            STREAM_PENDING_COUNT_METRIC,
+            STREAM_PENDING_UNRECLAIMED_METRIC,
+            STREAM_PENDING_UNRECLAIMED_AGE_METRIC,
+            STREAM_PENDING_CLAIM_IDLE_METRIC,
+            STREAM_PENDING_MEASURE_LAST_METRIC,
+        ] {
+            let m = metric(&metrics, name).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(m.labels.get("stream").map(String::as_str), Some(STREAM));
+        }
+        assert_eq!(
+            metric(&metrics, STREAM_PENDING_COUNT_METRIC).unwrap().value,
+            3.0
+        );
+        assert_eq!(
+            metric(&metrics, STREAM_PENDING_UNRECLAIMED_METRIC)
+                .unwrap()
+                .value,
+            1.0
+        );
+        // Seconds, so the deployed rule's threshold can be written in the same
+        // unit as the idle threshold the sweeper reclaims at.
+        assert_eq!(
+            metric(&metrics, STREAM_PENDING_UNRECLAIMED_AGE_METRIC)
+                .unwrap()
+                .value,
+            1800.0
+        );
+        assert_eq!(
+            metric(&metrics, STREAM_PENDING_CLAIM_IDLE_METRIC)
+                .unwrap()
+                .value,
+            600.0
+        );
+        assert_eq!(
+            metric(&metrics, STREAM_PENDING_MEASURE_INTERVAL_METRIC)
+                .unwrap()
+                .value,
+            60.0
+        );
+        // No failure has happened, so there is no failure series to read.
+        assert!(metric(&metrics, STREAM_PENDING_MEASURE_FAILURES_METRIC).is_none());
+    }
+
+    /// A stream nobody measured must be absent, not zero: a zero would claim
+    /// the stream is clean, which is the opposite of "nobody looked".
+    #[tokio::test]
+    async fn an_unmeasured_stream_publishes_nothing() {
+        let observer = StreamPendingObservable::new();
+        assert!(observer.collect_metrics("D8").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_backend_without_pending_state_publishes_nothing() {
+        assert!(measured(Reply::Unobservable).await.is_empty());
+    }
+
+    /// A failing read must not present the previous figures as fresh, and must
+    /// not erase them either: the age is the last thing known, and staleness
+    /// plus the failure count are what tell the reader how much to trust it.
+    #[tokio::test]
+    async fn a_failed_measurement_keeps_the_last_reading_and_counts_itself() {
+        let observer = StreamPendingObservable::new();
+        let ok = StubBackend(Reply::Stats(PendingStats {
+            count: 2,
+            unreclaimed_count: 1,
+            unreclaimed_oldest_idle_ms: 900_000,
+        }));
+        observer
+            .measure(&ok, STREAM, GROUP, CLAIM_IDLE_MS, 60)
+            .await;
+        let after_ok = observer.collect_metrics("D8").await.unwrap();
+        let last_ok = metric(&after_ok, STREAM_PENDING_MEASURE_LAST_METRIC)
+            .unwrap()
+            .value;
+
+        let failing = StubBackend(Reply::Failing);
+        observer
+            .measure(&failing, STREAM, GROUP, CLAIM_IDLE_MS, 60)
+            .await;
+        observer
+            .measure(&failing, STREAM, GROUP, CLAIM_IDLE_MS, 60)
+            .await;
+        let after_failures = observer.collect_metrics("D8").await.unwrap();
+
+        assert_eq!(
+            metric(&after_failures, STREAM_PENDING_UNRECLAIMED_AGE_METRIC)
+                .unwrap()
+                .value,
+            900.0
+        );
+        assert_eq!(
+            metric(&after_failures, STREAM_PENDING_MEASURE_LAST_METRIC)
+                .unwrap()
+                .value,
+            last_ok,
+            "a failed read must not move the last-successful timestamp forward"
+        );
+        assert_eq!(
+            metric(&after_failures, STREAM_PENDING_MEASURE_FAILURES_METRIC)
+                .unwrap()
+                .value,
+            2.0
+        );
+    }
+
+    /// A rename on either side of a gauge/rule pair leaves both halves
+    /// internally consistent and the signal silently absent, so the deployed
+    /// rules are pinned against the metric names this module publishes.
+    #[test]
+    fn deployed_rules_query_the_metrics_this_module_publishes() {
+        let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let text = std::fs::read_to_string(&chart)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
+        let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
+        let rules = root
+            .pointer("/observability/infra_watch/rules")
+            .and_then(|v| v.as_array())
+            .expect("infra_watch.rules present");
+
+        for (rule_name, metric) in [
+            (
+                STREAM_PENDING_UNRECLAIMED_METRIC_RULE,
+                STREAM_PENDING_UNRECLAIMED_AGE_METRIC,
+            ),
+            (
+                STREAM_PENDING_STALE_METRIC_RULE,
+                STREAM_PENDING_MEASURE_LAST_METRIC,
+            ),
+            (
+                STREAM_PENDING_FAILURES_METRIC_RULE,
+                STREAM_PENDING_MEASURE_FAILURES_METRIC,
+            ),
+        ] {
+            let rule = rules
+                .iter()
+                .find(|r| r["name"] == rule_name)
+                .unwrap_or_else(|| panic!("rule {rule_name} missing"));
+            let promql = rule["promql"].as_str().expect("promql is a string");
+            assert!(
+                promql.contains(metric),
+                "rule {rule_name} must query {metric}, got: {promql}"
+            );
+        }
     }
 }

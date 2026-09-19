@@ -116,13 +116,27 @@ impl TaskExecutorRouter {
             let sweep_pipe = pipe.clone();
             let sweep_slots = claim_slots.clone();
             tokio::spawn(async move {
+                // 观测面：清扫器是唯一同时知道"扫哪条流"和"按什么阈值扫"的地方，
+                // 由它把 pending 状态报给指标面。先量一次再进循环，让系列在首个
+                // 节拍前就存在——否则一个从没量过的流和一个量过发现干净的流
+                // 在抓取面上都是"没有证据"。
+                let observer = crate::observable::stream_pending_observable();
+                observer
+                    .measure(
+                        &*sweep_task_backend,
+                        &sweep_pipe.ready_stream,
+                        &sweep_pipe.group,
+                        PENDING_IDLE_MS,
+                        CLAIM_INTERVAL.as_secs(),
+                    )
+                    .await;
                 let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
                 loop {
                     tokio::select! {
                         biased;
                         _ = sweep_shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            let claimed = match sweep_task_backend
+                            match sweep_task_backend
                                 .claim_pending(
                                     &sweep_pipe.ready_stream,
                                     &sweep_pipe.group,
@@ -131,41 +145,51 @@ impl TaskExecutorRouter {
                                 )
                                 .await
                             {
-                                Ok(claimed) => claimed,
+                                Ok(claimed) if !claimed.is_empty() => {
+                                    tracing::warn!(
+                                        stream = %sweep_pipe.ready_stream,
+                                        count = claimed.len(),
+                                        "Claimed idle pending ready messages for re-execution"
+                                    );
+                                    for (msg_id, bytes) in claimed {
+                                        // 先拿许可再派发：限制重执行并发，shutdown
+                                        // 时也不再起新执行；许可在处理任务内持有到
+                                        // 执行结束。
+                                        let permit = tokio::select! {
+                                            _ = sweep_shutdown.wait() => break,
+                                            acquired = sweep_slots.clone().acquire_owned() => match acquired {
+                                                Ok(permit) => permit,
+                                                Err(_) => break,
+                                            },
+                                        };
+                                        sweeper.spawn_ready_processing(
+                                            sweep_pipe.clone(),
+                                            msg_id,
+                                            bytes,
+                                            permit,
+                                        );
+                                    }
+                                }
+                                Ok(_) => {}
                                 Err(e) => {
                                     tracing::warn!(
                                         stream = %sweep_pipe.ready_stream,
                                         "Pending claim sweep failed: {e}"
                                     );
-                                    continue;
                                 }
-                            };
-                            if claimed.is_empty() {
-                                continue;
                             }
-                            tracing::warn!(
-                                stream = %sweep_pipe.ready_stream,
-                                count = claimed.len(),
-                                "Claimed idle pending ready messages for re-execution"
-                            );
-                            for (msg_id, bytes) in claimed {
-                                // 先拿许可再派发：限制重执行并发，shutdown
-                                // 时也不再起新执行；许可在处理任务内持有到
-                                // 执行结束。
-                                let permit = tokio::select! {
-                                    _ = sweep_shutdown.wait() => break,
-                                    acquired = sweep_slots.clone().acquire_owned() => match acquired {
-                                        Ok(permit) => permit,
-                                        Err(_) => break,
-                                    },
-                                };
-                                sweeper.spawn_ready_processing(
-                                    sweep_pipe.clone(),
-                                    msg_id,
-                                    bytes,
-                                    permit,
-                                );
-                            }
+                            // 每轮必量，包括认领失败那一轮：报出去的是这一轮扫完仍然
+                            // 超龄的那部分，也就是清扫器没能收回的工作。认领失败时这
+                            // 个数最该被看见，走到 continue 就会把它漏掉。
+                            observer
+                                .measure(
+                                    &*sweep_task_backend,
+                                    &sweep_pipe.ready_stream,
+                                    &sweep_pipe.group,
+                                    PENDING_IDLE_MS,
+                                    CLAIM_INTERVAL.as_secs(),
+                                )
+                                .await;
                         }
                     }
                 }
@@ -475,6 +499,14 @@ mod ready_pipeline_tests {
         ) -> SFResult<Vec<(String, Vec<u8>)>> {
             Ok(Vec::new())
         }
+        async fn pending_stats(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _idle_threshold_ms: u64,
+        ) -> SFResult<Option<cog_core::PendingStats>> {
+            Ok(None)
+        }
         async fn dlq(&self, _stream: &str, _msg_id: &str, _reason: &str) -> SFResult<()> {
             Ok(())
         }
@@ -684,6 +716,14 @@ mod ready_pipeline_tests {
             _count: usize,
         ) -> SFResult<Vec<(String, Vec<u8>)>> {
             Ok(Vec::new())
+        }
+        async fn pending_stats(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _idle_threshold_ms: u64,
+        ) -> SFResult<Option<cog_core::PendingStats>> {
+            Ok(None)
         }
         async fn dlq(&self, _stream: &str, _msg_id: &str, _reason: &str) -> SFResult<()> {
             Ok(())

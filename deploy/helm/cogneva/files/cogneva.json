@@ -530,6 +530,33 @@
           },
           "severity": "warning",
           "summary": "Trace tier migration failed to complete {value} time(s) in the last hour: the trace store could not be listed, so a pass has nothing to look at and no tier can be demoted. A pass that runs but cannot move individual entries is reported as an overdue count instead"
+        },
+        {
+          "name": "stream_pending_unreclaimed",
+          "promql": "cogneva_stream_pending_unreclaimed_oldest_idle_seconds > 2 * cogneva_stream_pending_claim_idle_seconds",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "A message on {stream} has been pending for {value}s, past twice the idle threshold the reclaim pass takes messages back at. That pass runs every configured interval, so surviving one means the message is stranded: the task it belongs to is stuck and nothing else will move it. The threshold is a multiple of the deployment's own reclaim idle, so changing the reclaim policy changes this with it"
+        },
+        {
+          "name": "stream_pending_measure_stale",
+          "promql": "time() - max by (stream, pod) (cogneva_stream_pending_measure_last_seconds) > 6 * max by (stream, pod) (cogneva_stream_pending_measure_interval_seconds)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "Pending state for {stream} has not been measured for {value}s, more than six of the configured measurement intervals. The reclaim loop that publishes it is not running, so a stranded message on this stream would be invisible again — the state this measurement exists to expose"
+        },
+        {
+          "name": "stream_pending_measure_failing",
+          "promql": "increase(cogneva_stream_pending_measure_failures_total[1h])",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "Pending state for {stream} failed to be measured {value} time(s) in the last hour. The reclaim loop is running but cannot read the queue, so its last published figures are not evidence about the present"
         }
       ]
     },

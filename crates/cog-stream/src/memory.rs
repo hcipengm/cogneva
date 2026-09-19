@@ -163,4 +163,16 @@ impl MessageBackend for MemoryMessageBackend {
     async fn ack(&self, _stream: &str, _group: &str, _ids: &[String]) -> SFResult<()> {
         Ok(())
     }
+
+    /// Nothing to report: a subscriber reads the in-process buffer, so an
+    /// unacked message is not held anywhere that outlives the process holding
+    /// it, and there is no reclaim path for it to be recovered by.
+    async fn pending_stats(
+        &self,
+        _stream: &str,
+        _group: &str,
+        _idle_threshold_ms: u64,
+    ) -> SFResult<Option<cog_core::PendingStats>> {
+        Ok(None)
+    }
 }

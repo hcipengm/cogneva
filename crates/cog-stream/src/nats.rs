@@ -301,6 +301,23 @@ impl MessageBackend for NatsMessageBackend {
         Ok(())
     }
 
+    /// Nothing to report. The messages this process has delivered and not
+    /// acked live in a local map, so it can only ever describe its own
+    /// in-flight work; a message abandoned by a consumer that died is exactly
+    /// what it cannot see. JetStream tracks ack-pending broker-side, but this
+    /// backend has no reclaim path, so a count of what is piling up would say
+    /// nothing about whether anything can come back. Reporting the local map
+    /// instead of saying "unobservable" would answer a healthy-looking number
+    /// to the one question that matters.
+    async fn pending_stats(
+        &self,
+        _stream: &str,
+        _group: &str,
+        _idle_threshold_ms: u64,
+    ) -> SFResult<Option<cog_core::PendingStats>> {
+        Ok(None)
+    }
+
     async fn dlq(&self, stream: &str, msg_id: &str, reason: &str) -> SFResult<()> {
         let payload = serde_json::json!({
             "original_id": msg_id,

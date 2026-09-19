@@ -241,6 +241,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
 
         // Observable publish (pin-style)
         ctx.publish_observable(crate::observable::global_observable());
+        // Stream pending state is a live gauge of what the consumer loops are
+        // holding unacked, not a per-dimension rollup, so it goes up as its own
+        // observable that answers whatever dimension is asked.
+        ctx.publish_observable(crate::observable::stream_pending_observable());
         info!("OrchestratorPlugin observable published");
 
         self.initialized = true;

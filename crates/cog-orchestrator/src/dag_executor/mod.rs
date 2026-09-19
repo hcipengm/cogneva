@@ -181,6 +181,20 @@ impl DagExecutorRuntime {
             let interval_secs = self.config.result_claim_interval_secs.max(1);
             let batch = self.config.result_claim_batch;
             tokio::spawn(async move {
+                // 观测面：清扫器是唯一同时知道"扫哪条流"和"按什么阈值扫"的地方，
+                // 由它把 pending 状态报给指标面。先量一次再进循环，让系列在首个
+                // 节拍前就存在——否则一个从没量过的流和一个量过发现干净的流
+                // 在抓取面上都是"没有证据"。
+                let observer = crate::observable::stream_pending_observable();
+                observer
+                    .measure(
+                        &*sweeper.backend,
+                        &stream,
+                        &group,
+                        claim_idle_ms,
+                        interval_secs,
+                    )
+                    .await;
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 loop {
@@ -188,29 +202,41 @@ impl DagExecutorRuntime {
                         biased;
                         _ = sweep_shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            let claimed = match sweeper
+                            match sweeper
                                 .backend
                                 .claim_pending(&stream, &group, claim_idle_ms, batch)
                                 .await
                             {
-                                Ok(claimed) => claimed,
+                                Ok(claimed) => {
+                                    for (msg_id, bytes) in claimed {
+                                        tracing::warn!(
+                                            stream = %stream, msg_id = %msg_id,
+                                            "reclaimed a result message left pending by a consumer that never acked it"
+                                        );
+                                        sweeper
+                                            .handle_result_message(&stream, &group, &msg_id, &bytes)
+                                            .await;
+                                    }
+                                }
                                 Err(e) => {
                                     tracing::warn!(
                                         stream = %stream,
                                         "result pending claim sweep failed: {e}"
                                     );
-                                    continue;
                                 }
-                            };
-                            for (msg_id, bytes) in claimed {
-                                tracing::warn!(
-                                    stream = %stream, msg_id = %msg_id,
-                                    "reclaimed a result message left pending by a consumer that never acked it"
-                                );
-                                sweeper
-                                    .handle_result_message(&stream, &group, &msg_id, &bytes)
-                                    .await;
                             }
+                            // 每轮必量，包括认领失败那一轮：报出去的是这一轮扫完仍然
+                            // 超龄的那部分，也就是清扫器没能收回的工作。认领失败时这
+                            // 个数最该被看见，走到 continue 就会把它漏掉。
+                            observer
+                                .measure(
+                                    &*sweeper.backend,
+                                    &stream,
+                                    &group,
+                                    claim_idle_ms,
+                                    interval_secs,
+                                )
+                                .await;
                         }
                     }
                 }
@@ -713,7 +739,7 @@ async fn orphan_reconcile_tick(
 mod consumer_ack_tests {
     use super::*;
     use async_trait::async_trait;
-    use cog_core::MessageStream;
+    use cog_core::{MessageStream, Observable};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -731,6 +757,13 @@ mod consumer_ack_tests {
         /// `claim_pending` hands back. Draining on read mirrors XAUTOCLAIM
         /// taking ownership of the PEL entry.
         pending: Arc<Mutex<PendingLog>>,
+        /// How long the pending entries have been outstanding. A real queue
+        /// ages them itself; the script has to be told, because the age is what
+        /// separates "just handed over" from "abandoned".
+        pending_idle_ms: Arc<Mutex<u64>>,
+        /// Refuse to hand entries back, the way a reclaim pass that is broken
+        /// or unreachable would, so a test can look at what is left behind.
+        hold_claims: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl ScriptedBackend {
@@ -748,6 +781,15 @@ mod consumer_ack_tests {
                 .lock()
                 .unwrap()
                 .push((msg_id.to_string(), bytes));
+        }
+
+        fn set_pending_idle_ms(&self, ms: u64) {
+            *self.pending_idle_ms.lock().unwrap() = ms;
+        }
+
+        fn hold_claims(&self) {
+            self.hold_claims
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         fn acked_ids(&self) -> Vec<String> {
@@ -801,7 +843,34 @@ mod consumer_ack_tests {
             _min_idle_ms: u64,
             _count: usize,
         ) -> SFResult<Vec<(String, Vec<u8>)>> {
+            if self.hold_claims.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(Vec::new());
+            }
             Ok(std::mem::take(&mut *self.pending.lock().unwrap()))
+        }
+        /// The same split a real queue makes: an entry counts as unreclaimed
+        /// once its outstanding time passes the caller's threshold.
+        async fn pending_stats(
+            &self,
+            _stream: &str,
+            _group: &str,
+            idle_threshold_ms: u64,
+        ) -> SFResult<Option<cog_core::PendingStats>> {
+            let count = self.pending.lock().unwrap().len() as u64;
+            let idle = *self.pending_idle_ms.lock().unwrap();
+            let unreclaimed = if count > 0 && idle > idle_threshold_ms {
+                cog_core::PendingStats {
+                    count,
+                    unreclaimed_count: count,
+                    unreclaimed_oldest_idle_ms: idle,
+                }
+            } else {
+                cog_core::PendingStats {
+                    count,
+                    ..Default::default()
+                }
+            };
+            Ok(Some(unreclaimed))
         }
     }
 
@@ -968,6 +1037,100 @@ mod consumer_ack_tests {
         assert_eq!(task.status, cog_core::TaskStatus::Completed);
     }
 
+    /// Poll the process-wide pending observable until the stream shows up, so
+    /// the assertion is about a measurement the sweep actually made rather than
+    /// about a sleep having been long enough.
+    async fn wait_for_stream_metrics(stream: &str) -> Vec<cog_core::observability::RawMetric> {
+        let observer = crate::observable::stream_pending_observable();
+        for _ in 0..100 {
+            let metrics = observer.collect_metrics("D8").await.unwrap();
+            if metrics
+                .iter()
+                .any(|m| m.labels.get("stream").map(String::as_str) == Some(stream))
+            {
+                return metrics;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("no pending metrics published for {stream} within 5s");
+    }
+
+    /// The reclaim pass has to report what it is holding. A message stranded by
+    /// a dead consumer stayed invisible for two and a half days precisely
+    /// because the loop that could see it published nothing: the fix that takes
+    /// the message back is only half the repair, the other half is a number
+    /// something can alert on.
+    #[tokio::test]
+    async fn the_sweep_publishes_what_it_could_not_reclaim() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-observe-test".into(),
+            consumer_group: "grp-observe-test".into(),
+            max_retries: 1,
+            result_claim_idle_secs: 600,
+            result_claim_interval_secs: 1,
+            result_claim_batch: 16,
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+        let stream = "orchestrator:results:ws-observe-test".to_string();
+
+        // A result delivered to a consumer that died, 601s stale, on a reclaim
+        // pass that cannot take it back.
+        let msg = DagMessage::TaskComplete {
+            message_id: "m-observed".into(),
+            timestamp: chrono::Utc::now(),
+            task_id: "task-observed".into(),
+            result: serde_json::json!({"ok": true}),
+            sender: "exec".into(),
+            recipient: "dag".into(),
+        };
+        backend.abandon("rid-observed", serde_json::to_vec(&msg).unwrap());
+        backend.set_pending_idle_ms(601_000);
+        backend.hold_claims();
+
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
+        let metrics = wait_for_stream_metrics(&stream).await;
+        shutdown.trigger();
+        let _ = handle.await.unwrap();
+
+        let of = |name: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == name
+                        && m.labels.get("stream").map(String::as_str) == Some(stream.as_str())
+                })
+                .unwrap_or_else(|| panic!("{name} not published for {stream}"))
+                .value
+        };
+        assert_eq!(
+            of(crate::observable::STREAM_PENDING_COUNT_METRIC),
+            1.0,
+            "the pending entry itself must be reported"
+        );
+        assert_eq!(
+            of(crate::observable::STREAM_PENDING_UNRECLAIMED_METRIC),
+            1.0,
+            "an entry the reclaim pass could not take back is the finding"
+        );
+        assert_eq!(
+            of(crate::observable::STREAM_PENDING_UNRECLAIMED_AGE_METRIC),
+            601.0
+        );
+        assert_eq!(
+            of(crate::observable::STREAM_PENDING_CLAIM_IDLE_METRIC),
+            600.0,
+            "the rule compares the age against the threshold the pass actually uses"
+        );
+        assert!(
+            of(crate::observable::STREAM_PENDING_MEASURE_LAST_METRIC) > 0.0,
+            "a measured stream must carry the timestamp its staleness is judged against"
+        );
+    }
+
     #[tokio::test]
     async fn processed_goal_is_acked() {
         let backend = ScriptedBackend::default();
@@ -1066,6 +1229,14 @@ mod orphan_reconciler_tests {
         }
         async fn ack(&self, _stream: &str, _group: &str, _ids: &[String]) -> SFResult<()> {
             Ok(())
+        }
+        async fn pending_stats(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _idle_threshold_ms: u64,
+        ) -> SFResult<Option<cog_core::PendingStats>> {
+            Ok(None)
         }
     }
 
