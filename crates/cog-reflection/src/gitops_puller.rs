@@ -1378,6 +1378,12 @@ fn parse_prometheus_signals(body: &str) -> (CanarySignals, CounterSemantics) {
     let mut p99 = 0.0f64;
     let mut semantics = CounterSemantics::Windowed;
     for line in body.lines() {
+        // 探针与抓取器的序列不进判据：它们不可能失败，留在分母里会让一个只影响
+        // 业务端点的回归读不出来。过滤必须落在读侧——抓到的正文可能来自还在跑
+        // 旧版本的副本，也可能带着生产者停下之前写下的累计量。
+        if cog_core::series_endpoint(line).is_some_and(cog_core::is_infra_endpoint) {
+            continue;
+        }
         if let Some(rest) = line.strip_prefix(COUNTER_SEMANTICS_MARKER) {
             semantics = match rest.trim() {
                 COUNTER_SEMANTICS_CUMULATIVE => CounterSemantics::Cumulative,
@@ -1462,6 +1468,30 @@ http_requests_total{endpoint=\"/a\",method=\"GET\",status=\"503\"} 100
         let (signals, _) = parse_prometheus_signals(body);
         let rate = windowed_rate(signals).expect("有请求就有速率");
         assert!((rate - 0.5).abs() < 1e-9, "error_rate={rate}");
+    }
+
+    /// 探针与抓取器的序列不进分母。它们的量级压过业务流量，留在里面会把错误率
+    /// 稀释到接近 0，闸门 `err > base_err * multiplier && err > 0.01` 就永远不成立
+    /// ——判据结构性失效，而不是判成通过。
+    #[test]
+    fn infra_series_stay_out_of_the_error_rate() {
+        let body = "\
+http_requests_total{endpoint=\"/health/live\",method=\"GET\",status=\"200\"} 100000
+http_requests_total{endpoint=\"/health/ready\",method=\"GET\",status=\"200\"} 100000
+http_requests_total{endpoint=\"/metrics\",method=\"GET\",status=\"200\"} 100000
+http_requests_total{endpoint=\"/api/v1/tasks\",method=\"POST\",status=\"201\"} 90
+http_requests_total{endpoint=\"/api/v1/tasks\",method=\"POST\",status=\"500\"} 10
+http_request_duration_ms{endpoint=\"/health/live\",method=\"GET\",quantile=\"0.99\"} 1
+http_request_duration_ms{endpoint=\"/api/v1/tasks\",method=\"POST\",quantile=\"0.99\"} 840.25
+";
+        let (signals, _) = parse_prometheus_signals(body);
+        let rate = windowed_rate(signals).expect("有请求就有速率");
+        assert!((rate - 0.1).abs() < 1e-9, "error_rate={rate}");
+        assert!(
+            (signals.p99_ms - 840.25).abs() < 1e-9,
+            "p99={}",
+            signals.p99_ms
+        );
     }
 
     /// 多端点各有一条 p99 时取最差的那条，结论不随正文行序变化。

@@ -844,6 +844,11 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
                 // 而序列没有任何回收路径，抓取正文与标签索引会随运行时间无限膨胀。
                 // 原始路径仍原样进 RawRecord——那是逐请求的流水，不是被聚合的序列。
                 let endpoint = metric_endpoint_label(req.extensions().get::<MatchedPath>());
+                // 探针与抓取器的定时请求既不是业务流量也没有用户意图，进同一个
+                // 计数器只会把错误率分母垫高——它们不可能失败，而业务流量可以降到
+                // 零，于是一个只影响业务端点的回归会藏在里面读不出来。raw 流水同理：
+                // 逐请求的流水是给人看的，探针把它撑大几个数量级。
+                let infra = cog_core::is_infra_endpoint(&endpoint);
                 let request_id = uuid::Uuid::new_v4().to_string();
 
                 // Extract or generate distributed tracing context.
@@ -883,49 +888,51 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
                             .insert(axum::http::header::HeaderName::from_static("x-span-id"), hv);
                     }
 
-                    let record = cog_core::RawRecord {
-                        meta: cog_core::RawMeta {
-                            version: "1.0".into(),
-                            stream: "transport_raw".into(),
-                            recorded_at: chrono::Utc::now(),
-                            recorded_by: "cog-gateway".into(),
-                            sequence: 0,
-                            trace_id: trace_ctx.trace_id.clone(),
-                            span_id: Some(trace_ctx.span_id.clone()),
-                        },
-                        context: cog_core::RawContext::default(),
-                        payload: cog_core::RawPayload {
-                            direction: "inbound".into(),
-                            transport: "http".into(),
-                            format: Some("json".into()),
-                            raw: serde_json::json!({
-                                "method": method,
-                                "uri": uri,
-                                "status": status,
-                            }),
-                        },
-                    };
+                    if !infra {
+                        let record = cog_core::RawRecord {
+                            meta: cog_core::RawMeta {
+                                version: "1.0".into(),
+                                stream: "transport_raw".into(),
+                                recorded_at: chrono::Utc::now(),
+                                recorded_by: "cog-gateway".into(),
+                                sequence: 0,
+                                trace_id: trace_ctx.trace_id.clone(),
+                                span_id: Some(trace_ctx.span_id.clone()),
+                            },
+                            context: cog_core::RawContext::default(),
+                            payload: cog_core::RawPayload {
+                                direction: "inbound".into(),
+                                transport: "http".into(),
+                                format: Some("json".into()),
+                                raw: serde_json::json!({
+                                    "method": method,
+                                    "uri": uri,
+                                    "status": status,
+                                }),
+                            },
+                        };
 
-                    if let Err(e) = logger.write(record).await {
-                        tracing::warn!("RawLogger write failed (http): {}", e);
-                    }
-
-                    if let Some(ref mb) = metrics {
-                        let mut labels = HashMap::new();
-                        labels.insert("method".into(), method.clone());
-                        labels.insert("endpoint".into(), endpoint.clone());
-                        labels.insert("status".into(), status.to_string());
-                        if let Err(e) = mb
-                            .record_counter("http_requests_total", 1.0, labels.clone())
-                            .await
-                        {
-                            tracing::warn!("Failed to record http request counter: {}", e);
+                        if let Err(e) = logger.write(record).await {
+                            tracing::warn!("RawLogger write failed (http): {}", e);
                         }
-                        if let Err(e) = mb
-                            .record_histogram("http_request_duration_ms", duration_ms, labels)
-                            .await
-                        {
-                            tracing::warn!("Failed to record http request histogram: {}", e);
+
+                        if let Some(ref mb) = metrics {
+                            let mut labels = HashMap::new();
+                            labels.insert("method".into(), method.clone());
+                            labels.insert("endpoint".into(), endpoint.clone());
+                            labels.insert("status".into(), status.to_string());
+                            if let Err(e) = mb
+                                .record_counter("http_requests_total", 1.0, labels.clone())
+                                .await
+                            {
+                                tracing::warn!("Failed to record http request counter: {}", e);
+                            }
+                            if let Err(e) = mb
+                                .record_histogram("http_request_duration_ms", duration_ms, labels)
+                                .await
+                            {
+                                tracing::warn!("Failed to record http request histogram: {}", e);
+                            }
                         }
                     }
 

@@ -359,3 +359,85 @@ pub trait EvolutionMetrics: Send + Sync {
     async fn record_change_applied(&self);
     async fn record_change_failed(&self);
 }
+
+// ─── Infrastructure vs business traffic ────────────────────────────────────
+
+/// Whether an `endpoint` label names an infrastructure route rather than
+/// business work.
+///
+/// Liveness probes (`/health`, `/health/live`, `/health/ready`) and the
+/// scraper's own poll of `/metrics` run on a fixed timer, always answer 2xx,
+/// and carry no user intent. Folded into the same counter as business
+/// requests they pad the denominator of every ratio computed over it: probes
+/// tick several times a minute while real traffic can fall to zero, so the
+/// ratio ends up dominated by requests that cannot fail and a regression
+/// affecting only business endpoints hides inside it.
+///
+/// The producer keeps these routes out of the business series; consumers
+/// filter them out of any body that still carries them, because a scrape can
+/// reach a replica running an older revision, or read counter totals written
+/// before the producer stopped emitting them. Liveness stays observed: a
+/// failing probe surfaces as the pod's readiness state and restart count.
+pub fn is_infra_endpoint(endpoint: &str) -> bool {
+    endpoint == "/health"
+        || endpoint.starts_with("/health/")
+        || endpoint == "/metrics"
+        || endpoint.starts_with("/metrics/")
+}
+
+/// The `endpoint` label of a rendered Prometheus series line, if it has one.
+/// `None` for lines without the label: an unclassified series must not be
+/// mistaken for infrastructure, since dropping it would lose real traffic.
+pub fn series_endpoint(line: &str) -> Option<&str> {
+    let rest = line.split_once("endpoint=\"")?.1;
+    rest.split_once('"').map(|(value, _)| value)
+}
+
+#[cfg(test)]
+mod infra_endpoint_tests {
+    use super::{is_infra_endpoint, series_endpoint};
+
+    #[test]
+    fn classified_as_infra() {
+        for endpoint in [
+            "/health",
+            "/health/live",
+            "/health/ready",
+            "/metrics",
+            "/metrics/",
+        ] {
+            assert!(is_infra_endpoint(endpoint), "{endpoint} must be infra");
+        }
+    }
+
+    #[test]
+    fn business_routes_are_not_infra() {
+        // `/healthz` and `/metrics-report` only share a prefix with the probe
+        // routes; treating them as infra would drop real traffic.
+        for endpoint in [
+            "/healthz",
+            "/metrics-report",
+            "/api/v1/tasks",
+            "/",
+            "unmatched",
+        ] {
+            assert!(!is_infra_endpoint(endpoint), "{endpoint} must not be infra");
+        }
+    }
+
+    #[test]
+    fn reads_endpoint_label() {
+        let line =
+            "http_requests_total{method=\"GET\",endpoint=\"/health/ready\",status=\"200\"} 42";
+        assert_eq!(series_endpoint(line), Some("/health/ready"));
+    }
+
+    #[test]
+    fn absent_label_is_not_infra() {
+        // A series without the label carries no classification; it must fall
+        // through to the caller's default rather than be dropped.
+        let line = "http_requests_total{method=\"GET\",status=\"200\"} 42";
+        assert_eq!(series_endpoint(line), None);
+        assert!(!series_endpoint(line).is_some_and(is_infra_endpoint));
+    }
+}
