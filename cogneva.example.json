@@ -54,6 +54,7 @@
     "COGNEVA_RAW_LOGGER_ENABLED": "raw_logger.enabled",
     "COGNEVA_RAW_LOGGER_BASE_DIR": "raw_logger.base_dir",
     "COGNEVA_RAW_LOGGER_BUFFER_SIZE": "raw_logger.max_buffer_size",
+    "COGNEVA_RAW_LOGGER_FLUSH_INTERVAL_SECS": "raw_logger.flush_interval_secs",
     "COGNEVA_MEMORY_ENABLED": "memory.enabled",
     "COGNEVA_MEMORY_BACKEND_TYPE": "memory.backend_type",
     "COGNEVA_MEMORY_BASE_DIR": "memory.base_dir",
@@ -250,11 +251,13 @@
   },
   "raw_logger": {
     "_comment": "enabled=false 是给手工安装的安全默认；随 chart 发布的部署把它打开，值写在 chart 的 files/cogneva.json 与本文件同名段落里。base_dir 同时是 trace 存储的根（<base_dir>/traces），改它等于换 trace 落点。",
+    "_comment_flush_interval_secs": "落盘由两个条件触发：缓冲满 max_buffer_size 条，或距上次落盘满 flush_interval_secs 秒。低流量 stream 可以长时间够不到条数阈值，那期间写下的记录全在进程内存里，进程一挂即失——所以时间上界不能省。置 0 只留条数阈值。",
     "enabled": false,
     "base_dir": "/var/lib/cogneva-data/raw-logs",
     "max_buffer_size": 1000,
-    "format": "jsonl",
-    "zstd_level": null
+    "format": "proto",
+    "zstd_level": null,
+    "flush_interval_secs": 1
   },
   "memory": {
     "_comment": "Memory backend — enabled by default for self-evolution persistence.",
@@ -265,6 +268,8 @@
     "auto_ingest": true
   },
   "tier_migrator": {
+    "_comment": "跟 raw_logger.enabled 一起翻：日志没开时无物可迁。随 chart 发布的部署把两者都打开，值写在 chart 的 files/cogneva.json 与本文件同名段落里。",
+    "_comment_owner": "hot/warm/cold 迁移必须只有一个属主：raw_log_index 按 (stream, log_date) 唯一，冷层对象键又不带进程身份，一键多写就会让一个部署的记录覆盖另一个部署的索引行（对象存储同键亦然）。属主是主应用 Pod，进化 Pod 在 deploy 侧的 COGNEVA_TIER_MIGRATOR_ENABLED=false 关掉它。",
     "enabled": false,
     "hot_duration_secs": 86400,
     "warm_duration_secs": 604800,

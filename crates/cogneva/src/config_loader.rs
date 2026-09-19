@@ -151,6 +151,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_RAW_LOGGER_BUFFER_SIZE".into(),
         "raw_logger.max_buffer_size".into(),
     );
+    m.insert(
+        "COGNEVA_RAW_LOGGER_FLUSH_INTERVAL_SECS".into(),
+        "raw_logger.flush_interval_secs".into(),
+    );
     // memory
     // tier_migrator
     m.insert(

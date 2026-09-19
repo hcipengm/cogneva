@@ -252,6 +252,20 @@ pub struct RawLoggerConfig {
     /// unset, matching the design doc's "warm tier" recommendation.
     #[serde(default)]
     pub zstd_level: Option<i32>,
+    /// How often buffered records are forced to disk.
+    ///
+    /// The record count alone is not enough: at a low traffic rate a stream can
+    /// sit under `max_buffer_size` for hours, so everything written since the
+    /// last flush — up to that many records — dies with the process. The raw
+    /// stream is the traceability backbone, so the exposure is bounded by time
+    /// as well as by count. Zero or unset disables the timer and leaves only
+    /// the count trigger.
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+}
+
+fn default_flush_interval_secs() -> u64 {
+    1
 }
 
 impl Default for RawLoggerConfig {
@@ -262,6 +276,7 @@ impl Default for RawLoggerConfig {
             max_buffer_size: 1000,
             format: RawLoggerFormat::default(),
             zstd_level: None,
+            flush_interval_secs: default_flush_interval_secs(),
         }
     }
 }

@@ -52,6 +52,11 @@ data:
   # 记账的 intent guard 是进程私有的（各挂各的数据卷）——两个进程各扫一遍，同一
   # 句追问会发两遍，谁也看不见对方已处理。只关发现，落地监视照跑。
   COGNEVA_GITHUB_DISCOVERY_ENABLED: "false"
+  # 分层迁移同样只有一个属主：主应用。raw_log_index 按 (stream, log_date) 唯一，
+  # 冷层对象键也不带进程身份，而两个 Pod 写的 stream 名完全一样
+  # （transport_raw/system_raw/...）——两边同时扫，后写的会盖掉先写的索引行与
+  # 对象，先归档的那份找不回且不报错。属主给主应用，本 Pod 只保留热层落盘。
+  COGNEVA_TIER_MIGRATOR_ENABLED: "false"
   COGNEVA_MEMORY_ENABLED: "false"
   COGNEVA_VECTOR_BACKEND_REQUIRED: "false"
   COGNEVA_STRICT_PERSISTENCE: "false"

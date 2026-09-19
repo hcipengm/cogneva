@@ -190,7 +190,14 @@ impl TierMigrator {
             .ok_or_else(|| SFError::IO(format!("invalid file name {}", path.display())))?
             .to_string();
 
-        let log_date = parse_log_date(&file_name).unwrap_or_else(|| modified.date_naive());
+        // Only the logger's own rotations are eligible. It names them
+        // `YYYY-MM-DD.<ext>`. Anything else under a stream directory is a live
+        // append stream — the audit chain is one flat `audit.jsonl`, not a
+        // rotation — and moving it out from under its writer both cuts the
+        // stream and leaves the writer appending to an unlinked file.
+        let Some(log_date) = parse_log_date(&file_name) else {
+            return Ok(None);
+        };
 
         match cog_core::tier_for_age(age, self.policy.hot_duration, self.policy.warm_duration) {
             // ── Cold-tier promotion ───────────────────────────────

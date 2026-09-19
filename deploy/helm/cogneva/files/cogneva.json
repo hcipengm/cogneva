@@ -60,6 +60,7 @@
     "COGNEVA_RAW_LOGGER_ENABLED": "raw_logger.enabled",
     "COGNEVA_RAW_LOGGER_BASE_DIR": "raw_logger.base_dir",
     "COGNEVA_RAW_LOGGER_BUFFER_SIZE": "raw_logger.max_buffer_size",
+    "COGNEVA_RAW_LOGGER_FLUSH_INTERVAL_SECS": "raw_logger.flush_interval_secs",
     "COGNEVA_MEMORY_ENABLED": "memory.enabled",
     "COGNEVA_MEMORY_BACKEND_TYPE": "memory.backend_type",
     "COGNEVA_MEMORY_EMBEDDING_DIMENSION": "memory.embedding_dimension",
@@ -265,11 +266,14 @@
   },
   "raw_logger": {
     "_comment": "这里写的已是部署的生效值，不再由 cogneva-config 的同名 env 覆盖：同一个设置在两个地方各写一份，读配置文件的人就推不出 runtime 用的是哪份，而 base_dir 还兼着 trace 存储的根（<base_dir>/traces），改错了不报错，只把 trace 写到另一个目录去。env 映射仍留在本文件的 env 段，要按环境改动时走那里。",
+    "_comment_format": "proto：记录按长度分隔的 protobuf 落地（<stream>/<YYYY-MM-DD>.proto.bin），比 jsonl 省去字段名开销，也是分层迁移压缩的输入。读取侧同时认 jsonl 与 proto，所以存量 .jsonl 文件不用搬。",
+    "_comment_flush_interval_secs": "落盘由两个条件触发：缓冲满 max_buffer_size 条，或距上次落盘满 flush_interval_secs 秒。低流量 stream 可以长时间够不到条数阈值，那期间写下的记录全在进程内存里，进程一挂即失——所以时间上界不能省。置 0 只留条数阈值。",
     "enabled": true,
     "base_dir": "/var/lib/cogneva-data/raw-logs",
     "max_buffer_size": 1000,
-    "format": "jsonl",
-    "zstd_level": null
+    "format": "proto",
+    "zstd_level": null,
+    "flush_interval_secs": 1
   },
   "memory": {
     "_comment": "Memory backend — composite puts Raw on the shared ObjectBackend, Schema and the Summary entry store on PostgreSQL, and the summary vectors on the shared VectorBackend, so both pods read one dataset and it survives a restart.",
@@ -305,7 +309,9 @@
     }
   },
   "tier_migrator": {
-    "enabled": false,
+    "_comment": "hot→warm 就地 zstd 压缩并删除源文件，warm→cold 上传对象存储再删本地，两步都不可逆——热层保留 hot_duration_secs，warm 保留 warm_duration_secs。",
+    "_comment_owner": "迁移必须只有一个属主：raw_log_index 按 (stream, log_date) 唯一，冷层对象键又不带进程身份，两个部署同时扫就会互相覆盖索引行与对象（谁后写谁赢，先写的那份不可找回且不报错）。属主是主应用 Pod；进化 Pod 在 app-config 里置 COGNEVA_TIER_MIGRATOR_ENABLED=false。",
+    "enabled": true,
     "hot_duration_secs": 86400,
     "warm_duration_secs": 604800,
     "warm_compression_level": 3,

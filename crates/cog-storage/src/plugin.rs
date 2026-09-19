@@ -609,12 +609,16 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 max_buffer_size: raw_logger_config.max_buffer_size,
                 format: raw_logger_config.format,
                 zstd_level: raw_logger_config.zstd_level,
+                flush_interval_secs: raw_logger_config.flush_interval_secs,
             };
             // 生效值先报出来。这条配置有不止一个来源（配置文件与 env 覆盖），
             // 光看哪一层写了什么推不出最后用的是哪份；能读的只有这里。
             info!(
-                "Raw logger configured: base_dir={} format={:?} max_buffer_size={}",
-                logger_config.base_dir, logger_config.format, logger_config.max_buffer_size
+                "Raw logger configured: base_dir={} format={:?} max_buffer_size={} flush_interval_secs={}",
+                logger_config.base_dir,
+                logger_config.format,
+                logger_config.max_buffer_size,
+                logger_config.flush_interval_secs
             );
             match crate::FileRawLogger::new(
                 logger_config,
