@@ -737,6 +737,22 @@ async fn record_counter_add(state: &AppState, name: &str, amount: f64, labels: &
     }
 }
 
+/// 记一次 histogram 观测。与 counter 同源：写失败只降级为 debug，不碰请求路径。
+async fn record_histogram(state: &AppState, name: &str, value: f64, labels: &[(&str, &str)]) {
+    let map: HashMap<String, String> = labels
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    if let Err(e) = state
+        .pool_obs
+        .metrics
+        .record_histogram(name, value, map)
+        .await
+    {
+        tracing::debug!(error = %e, metric = name, "指标写入失败");
+    }
+}
+
 /// 发一条时序明细到 ClickHouse。高吞吐、append-only，正是这类数据的去处；
 /// 未配置后端时静默跳过。
 fn record_event(state: &AppState, event: AnalyticsEvent) {
@@ -773,12 +789,22 @@ async fn record_llm_call(
     actor: &str,
 ) {
     let key = LlmHealthTable::key(upstream);
-    record_counter(
-        state,
-        "llm_calls_total",
-        &[("upstream", &key), ("result", result), ("actor", actor)],
-    )
-    .await;
+    // `model` travels alongside `upstream` rather than instead of it: a pool
+    // fails over between endpoints that serve the same model, so "which model
+    // is slow" and "which endpoint is slow" are two different questions and
+    // only the composite key answers the second. Both are bounded by the
+    // configured upstream list, not by request input.
+    let labels = [
+        ("upstream", key.as_str()),
+        ("model", upstream.model.as_str()),
+        ("result", result),
+        ("actor", actor),
+    ];
+    record_counter(state, "llm_calls_total", &labels).await;
+    // The latency the caller already measured, landed here as well as in the
+    // ClickHouse detail. Without it the per-model latency panel has no series
+    // to read: the detail row is not something PromQL can query.
+    record_histogram(state, "llm_call_latency_ms", latency_ms as f64, &labels).await;
     record_event(
         state,
         AnalyticsEvent::new("llm_call")

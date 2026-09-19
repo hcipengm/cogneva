@@ -68,7 +68,7 @@ data:
             "targets": [
               {
                 "expr": "rate(llm_calls_total[5m])",
-                "legendFormat": "{{model}} - {{status}}",
+                "legendFormat": "{{model}} - {{result}}",
                 "datasource": {"type": "prometheus", "uid": "${datasource}"}
               }
             ],

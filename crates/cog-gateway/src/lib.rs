@@ -1020,6 +1020,13 @@ const GAUGE_LOOKBACK_SECS: i64 = 3600;
 /// Descriptions for the counter series. Not a list of what to serve — that
 /// comes from the backend, see [`listed_metric_names`]. What lives here is only
 /// what a name cannot say about itself.
+///
+/// The rule for membership: something in this codebase records the name. A
+/// series nothing produces is not an undocumented measurement, it is an absent
+/// one, and describing it here would assert a reading that never arrives. The
+/// `llm_` entries are recorded by the security gateway rather than by this
+/// process; they are described here so a reader comparing two expositions meets
+/// one wording.
 const COUNTER_HELP: &[(&str, &str)] = &[
     (
         "memory_operations_total",
@@ -1028,10 +1035,6 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     (
         "memory_operation_errors_total",
         "Total number of failed memory backend operations",
-    ),
-    (
-        "task_operations_total",
-        "Total number of task lifecycle operations",
     ),
     ("http_requests_total", "Total number of HTTP requests"),
     (
@@ -1054,14 +1057,6 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "llm_upstream_failures_total",
         "Total LLM upstream failures, excluding rate limits",
     ),
-    (
-        "agent_steps_total",
-        "Total number of agent loop iterations executed",
-    ),
-    (
-        "tool_calls_total",
-        "Total number of tool invocations by tool and status",
-    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].
@@ -1073,14 +1068,6 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
     (
         "http_request_duration_ms",
         "HTTP request duration in milliseconds",
-    ),
-    (
-        "llm_call_latency_ms",
-        "LLM upstream call latency in milliseconds",
-    ),
-    (
-        "tool_call_latency_ms",
-        "Tool invocation latency in milliseconds",
     ),
 ];
 
@@ -2700,28 +2687,25 @@ mod metrics_exposition_tests {
     /// 否则线上会看到一串"未登记"占位符。这条把"忘了写描述"从运行期搬到编译
     /// 期管不到的测试期。
     #[test]
-    fn recorded_production_names_are_described() {
+    fn produced_names_are_described() {
+        // 名单取自本仓库真正的产出落点；描述表里不该出现产出面没有的名字，
+        // 否则那张表就从"描述"变成了"宣称"——宣称一个永远不来的读数。
         for name in [
             "memory_operations_total",
             "memory_operation_errors_total",
             "http_requests_total",
             "tier_migration_total",
-            "agent_steps_total",
             "llm_calls_total",
             "llm_tokens_total",
-            "tool_calls_total",
+            "llm_upstream_client_errors_total",
+            "llm_upstream_failures_total",
         ] {
             assert!(
                 !metric_help(COUNTER_HELP, name).starts_with("Undocumented"),
                 "counter {name} 缺描述"
             );
         }
-        for name in [
-            "memory_operation_latency_ms",
-            "http_request_duration_ms",
-            "llm_call_latency_ms",
-            "tool_call_latency_ms",
-        ] {
+        for name in ["memory_operation_latency_ms", "http_request_duration_ms"] {
             assert!(
                 !metric_help(HISTOGRAM_HELP, name).starts_with("Undocumented"),
                 "histogram {name} 缺描述"
@@ -2740,6 +2724,26 @@ mod metrics_exposition_tests {
             assert!(
                 !metric_help(GAUGE_HELP, name).starts_with("Undocumented"),
                 "gauge {name} 缺描述"
+            );
+        }
+    }
+
+    /// 反向断言：产出面没有的名字不得出现在描述表里。上和下两条一起才把
+    /// "表 == 产出面" 这个等式钉住——只断上面那条，多一个凭空写下的名字不会红。
+    #[test]
+    fn names_nothing_produces_are_not_described() {
+        for name in [
+            "task_operations_total",
+            "agent_steps_total",
+            "tool_calls_total",
+            "llm_call_latency_ms",
+            "tool_call_latency_ms",
+        ] {
+            assert!(
+                metric_help(COUNTER_HELP, name).starts_with("Undocumented")
+                    && metric_help(HISTOGRAM_HELP, name).starts_with("Undocumented")
+                    && metric_help(GAUGE_HELP, name).starts_with("Undocumented"),
+                "{name} 没有任何产出落点，不该被描述"
             );
         }
     }

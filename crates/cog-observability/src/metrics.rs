@@ -158,6 +158,23 @@ impl PrometheusMetricsBackend {
             .map_err(|e| SFError::Agent(format!("prometheus label lookup: {}", e)))
     }
 
+    fn histogram_buckets(name: &str) -> Vec<f64> {
+        // The unit has to match the observations. A seconds-scale scheme fed
+        // millisecond values puts every observation in the top bucket, and
+        // `histogram_quantile` then reports that bucket's boundary as if it
+        // were the measured latency — a plausible-looking number that is not a
+        // measurement. The `_ms` suffix is the series' own unit declaration, so
+        // it selects the scheme; a name that declares no unit keeps the
+        // seconds-scale default.
+        if name.ends_with("_ms") {
+            // 1 ms doubling up to ~65 s: covers a fast local call and a slow
+            // model turn without spending buckets below a millisecond.
+            prometheus::exponential_buckets(1.0, 2.0, 17).unwrap_or_default()
+        } else {
+            prometheus::exponential_buckets(0.001, 2.0, 15).unwrap_or_default()
+        }
+    }
+
     fn get_or_create_histogram(
         &self,
         name: &str,
@@ -173,7 +190,7 @@ impl PrometheusMetricsBackend {
         if !store.contains_key(&key) {
             let hist_vec = HistogramVec::new(
                 HistogramOpts::new(self.full_name(name), format!("Histogram for {}", name))
-                    .buckets(prometheus::exponential_buckets(0.001, 2.0, 15).unwrap_or_default()),
+                    .buckets(Self::histogram_buckets(name)),
                 &sorted_keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )
             .map_err(|e| SFError::Agent(format!("prometheus histogram init: {}", e)))?;
@@ -384,5 +401,45 @@ impl TaskMetricsRecorder {
             .backend
             .record_counter("agent_steps_total", 1.0, labels)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 毫秒量级的观测必须落在多个桶里。秒量级的桶界配毫秒值会把每一条观测都塞进
+    /// 最上面的桶，`histogram_quantile` 于是把桶上界当作实测延迟报出来——一个看起来
+    /// 合理、却不是测量的数。这条断言钉住"单位对上"，而不是钉住具体桶界。
+    #[test]
+    fn millisecond_series_get_a_bucket_scheme_that_resolves_milliseconds() {
+        let buckets = PrometheusMetricsBackend::histogram_buckets("llm_call_latency_ms");
+        let finite: Vec<f64> = buckets.iter().copied().filter(|b| b.is_finite()).collect();
+
+        assert!(
+            finite.first().copied().unwrap_or(f64::MAX) <= 1.0,
+            "最下面的桶界要在 1ms 以内，否则快调用分不出来: {finite:?}"
+        );
+        assert!(
+            finite.last().copied().unwrap_or(0.0) >= 30_000.0,
+            "最上面的桶界要盖过慢模型的一分钟级延迟: {finite:?}"
+        );
+        // 300ms 这种典型观测不该和最上面的桶界贴在同一个桶里。
+        assert!(
+            finite.iter().any(|b| *b >= 256.0 && *b < 512.0),
+            "300ms 量级的观测要有自己的桶界，否则 P95 被粗化成桶上界: {finite:?}"
+        );
+    }
+
+    /// 不带 `_ms` 的名字保留秒量级默认，免得给一个按秒记的序列套上毫秒桶界。
+    #[test]
+    fn a_series_that_declares_no_unit_keeps_the_seconds_scale_default() {
+        let buckets = PrometheusMetricsBackend::histogram_buckets("some_future_duration");
+        let finite: Vec<f64> = buckets.iter().copied().filter(|b| b.is_finite()).collect();
+
+        assert!(
+            finite.first().copied().unwrap_or(f64::MAX) <= 0.01,
+            "单位未声明时保持秒量级默认: {finite:?}"
+        );
     }
 }
