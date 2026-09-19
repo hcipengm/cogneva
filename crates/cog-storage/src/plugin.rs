@@ -610,6 +610,12 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 format: raw_logger_config.format,
                 zstd_level: raw_logger_config.zstd_level,
             };
+            // 生效值先报出来。这条配置有不止一个来源（配置文件与 env 覆盖），
+            // 光看哪一层写了什么推不出最后用的是哪份；能读的只有这里。
+            info!(
+                "Raw logger configured: base_dir={} format={:?} max_buffer_size={}",
+                logger_config.base_dir, logger_config.format, logger_config.max_buffer_size
+            );
             match crate::FileRawLogger::new(
                 logger_config,
                 Arc::new(cog_protocol::convert::ProtoCodec),
@@ -620,10 +626,19 @@ impl cog_core::SystemPlugin for StoragePlugin {
                     info!("FileRawLogger enabled");
                     Arc::new(logger)
                 }
+                // 退回 Noop 会让进程照常跑、日志静默断流，事后翻目录才发现少了
+                // 东西。严格要求持久化时直接拒绝启动，否则至少要把"现在没有
+                // raw 日志"连同生效目录一起说出来，而不是留个无声的兜底。
                 Err(e) => {
+                    if strict_persistence {
+                        return Err(cog_core::SFError::Config(format!(
+                            "raw logging is enabled but the logger could not be created (strict_persistence=true): {e}"
+                        )));
+                    }
                     warn!(
-                        "Failed to create FileRawLogger: {}. Falling back to Noop.",
-                        e
+                        "Raw logging is enabled but the logger could not be created: {}. \
+                         Raw records and the log-based replay path are OFF; nothing will be written under {}.",
+                        e, raw_logger_config.base_dir
                     );
                     Arc::new(crate::NoopRawLogger::new())
                 }

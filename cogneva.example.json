@@ -249,8 +249,9 @@
     "interval_secs": 15
   },
   "raw_logger": {
+    "_comment": "enabled=false 是给手工安装的安全默认；随 chart 发布的部署把它打开，值写在 chart 的 files/cogneva.json 与本文件同名段落里。base_dir 同时是 trace 存储的根（<base_dir>/traces），改它等于换 trace 落点。",
     "enabled": false,
-    "base_dir": "/var/lib/cogneva-data/raw",
+    "base_dir": "/var/lib/cogneva-data/raw-logs",
     "max_buffer_size": 1000,
     "format": "jsonl",
     "zstd_level": null

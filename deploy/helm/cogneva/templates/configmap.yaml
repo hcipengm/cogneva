@@ -30,9 +30,9 @@ data:
   COGNEVA_WS_PORT: "8081"
   COGNEVA_METRICS_PORT: "9090"
 
-  COGNEVA_RAW_LOGGER_ENABLED: "true"
-  COGNEVA_RAW_LOGGER_BASE_DIR: "/var/lib/cogneva-data/raw-logs"
-  COGNEVA_RAW_LOGGER_BUFFER_SIZE: "1000"
+  # raw_logger 段不在这里覆盖：与下面的 memory 段同理，同一件事在文件里写一份、
+  # 在 env 里再写一份，读文件的人推不出 runtime 用的是哪份——文件里曾写着
+  # enabled=false 与一个打不开的目录，实跑却是 true 与 raw-logs。要改改文件。
 
   # memory 段不在这里覆盖：cog-memory 自读 cogneva.json 的 memory 段，
   # 这里再写一份就会与文件打架（曾经写死 enabled=false 把文件里的 true 顶掉，

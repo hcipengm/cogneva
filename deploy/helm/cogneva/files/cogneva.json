@@ -264,8 +264,9 @@
     "interval_secs": 15
   },
   "raw_logger": {
-    "enabled": false,
-    "base_dir": "/var/lib/cogneva-data/raw",
+    "_comment": "这里写的已是部署的生效值，不再由 cogneva-config 的同名 env 覆盖：同一个设置在两个地方各写一份，读配置文件的人就推不出 runtime 用的是哪份，而 base_dir 还兼着 trace 存储的根（<base_dir>/traces），改错了不报错，只把 trace 写到另一个目录去。env 映射仍留在本文件的 env 段，要按环境改动时走那里。",
+    "enabled": true,
+    "base_dir": "/var/lib/cogneva-data/raw-logs",
     "max_buffer_size": 1000,
     "format": "jsonl",
     "zstd_level": null
