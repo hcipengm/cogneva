@@ -1374,11 +1374,14 @@ impl RawLogIndexStore for MemoryRawLogIndexStore {
             .entries
             .lock()
             .map_err(|_| SFError::Agent("raw_log_index lock poisoned".into()))?;
-        // Treat (stream_name, log_date) as the primary key so re-runs are idempotent.
-        if let Some(slot) = guard
-            .iter_mut()
-            .find(|e| e.stream_name == entry.stream_name && e.log_date == entry.log_date)
-        {
+        // The primary key is (stream_name, log_date, format) so re-runs are
+        // idempotent without collapsing the two files one date can hold when the
+        // configured format changed mid-day.
+        if let Some(slot) = guard.iter_mut().find(|e| {
+            e.stream_name == entry.stream_name
+                && e.log_date == entry.log_date
+                && e.format == entry.format
+        }) {
             *slot = entry;
         } else {
             guard.push(entry);

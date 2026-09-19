@@ -237,6 +237,63 @@ impl RawLoggerFormat {
     }
 }
 
+/// The format a persisted raw-log file is written in, read off its name.
+///
+/// A raw file is identified by `(stream, date, format)`. The logger rotates by
+/// date *and* by format: changing the configured format opens a second file for
+/// the same stream and date rather than re-encoding the first, so one
+/// `(stream, date)` can hold two files. Anything that keys a file by
+/// `(stream, date)` alone — the index that locates archived files, for one —
+/// collapses those two onto a single key and silently drops the loser.
+///
+/// This is deliberately narrower than [`RawLoggerFormat`]: after warm-tier
+/// compression a `proto.bin` file is named `proto.bin.zst`, which is also the
+/// extension `ProtoZstd` writes, so the logger format is not recoverable from a
+/// name. The pre-compression extension is, and that is what this records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RawFileFormat {
+    Jsonl,
+    Proto,
+}
+
+impl RawFileFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            Self::Proto => "proto",
+        }
+    }
+
+    /// The format a rotation file was written in. Warm-tier files keep the
+    /// extension they were compressed from (`2026-09-14.jsonl.zst`), so the
+    /// compression suffix comes off first. `None` means the name is not one the
+    /// logger writes, and the caller must leave the file alone rather than
+    /// invent a key for it.
+    pub fn from_file_name(file_name: &str) -> Option<Self> {
+        let name = file_name.strip_suffix(".zst").unwrap_or(file_name);
+        if name.ends_with(&format!(".{}", RawLoggerFormat::Jsonl.extension())) {
+            Some(Self::Jsonl)
+        } else if name.ends_with(&format!(".{}", RawLoggerFormat::Proto.extension())) {
+            Some(Self::Proto)
+        } else {
+            None
+        }
+    }
+}
+
+impl std::str::FromStr for RawFileFormat {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "jsonl" => Ok(Self::Jsonl),
+            "proto" => Ok(Self::Proto),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Configuration for `FileRawLogger`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RawLoggerConfig {
@@ -909,6 +966,9 @@ pub struct RawLogIndexEntry {
     pub hour: u8,
     pub stream_name: String,
     pub log_date: NaiveDate,
+    /// Part of the key alongside `stream_name` and `log_date`: one day can hold
+    /// two files for the same stream when the format changed mid-day.
+    pub format: RawFileFormat,
     pub file_path: String,
     pub tier: StorageTier,
     pub size_bytes: u64,

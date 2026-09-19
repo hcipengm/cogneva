@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cog_core::{
-    MetricsBackend, ObjectBackend, RawLogIndexEntry, RawLogIndexStore, SFError, SFResult,
-    ShutdownSignal, StorageTier, TierMigratorConfig, TierPolicy,
+    MetricsBackend, ObjectBackend, RawFileFormat, RawLogIndexEntry, RawLogIndexStore, SFError,
+    SFResult, ShutdownSignal, StorageTier, TierMigratorConfig, TierPolicy,
 };
 
 /// Background migrator. Use [`TierMigrator::spawn`] to start a periodic loop
@@ -207,15 +207,23 @@ impl TierMigrator {
         let Some(log_date) = parse_log_date(&file_name) else {
             return Ok(None);
         };
+        // The format is part of the file's key, so a name whose format cannot
+        // be read is a file this migrator has no key for. Uploading it under a
+        // guessed key would put two distinct files on one index row.
+        let Some(format) = RawFileFormat::from_file_name(&file_name) else {
+            return Ok(None);
+        };
 
         match cog_core::tier_for_age(age, self.policy.hot_duration, self.policy.warm_duration) {
             // ── Cold-tier promotion ───────────────────────────────
-            StorageTier::Cold => Ok(Some(self.promote_to_cold(stream, path, log_date).await?)),
+            StorageTier::Cold => Ok(Some(
+                self.promote_to_cold(stream, path, log_date, format).await?,
+            )),
             // ── Warm-tier promotion ───────────────────────────────
             // Already-compressed files are past this transition.
-            StorageTier::Warm if !is_compressed(&file_name) => {
-                Ok(Some(self.promote_to_warm(stream, path, log_date).await?))
-            }
+            StorageTier::Warm if !is_compressed(&file_name) => Ok(Some(
+                self.promote_to_warm(stream, path, log_date, format).await?,
+            )),
             StorageTier::Warm | StorageTier::Hot => Ok(None),
         }
     }
@@ -225,6 +233,7 @@ impl TierMigrator {
         stream: &str,
         path: &Path,
         log_date: NaiveDate,
+        format: RawFileFormat,
     ) -> SFResult<MigrationAction> {
         let raw = tokio::fs::read(path)
             .await
@@ -237,9 +246,29 @@ impl TierMigrator {
             path.extension().and_then(|s| s.to_str()).unwrap_or("jsonl"),
         ));
 
-        tokio::fs::write(&warm_path, &compressed)
-            .await
-            .map_err(|e| SFError::IO(e.to_string()))?;
+        // `proto.bin` + `.zst` is the same name as `ProtoZstd` gives a file, so
+        // a deployment that switched between those two formats on one day has a
+        // live file where this compression wants to write. Overwriting it would
+        // destroy that day's records with every step reporting success — so an
+        // existing destination is only accepted when it already holds this exact
+        // payload (a resumed pass), and is an error otherwise.
+        match tokio::fs::read(&warm_path).await {
+            Ok(existing) if existing != compressed => {
+                return Err(SFError::IO(format!(
+                    "warm-tier destination {} already holds different data; refusing to overwrite",
+                    warm_path.display()
+                )));
+            }
+            // A byte-identical destination is a pass resuming after it wrote the
+            // copy. The index upsert below still has to run: the crash may have
+            // landed between the write and the upsert.
+            Ok(_) => {}
+            Err(_) => {
+                tokio::fs::write(&warm_path, &compressed)
+                    .await
+                    .map_err(|e| SFError::IO(e.to_string()))?;
+            }
+        }
         // Only delete the source after the compressed copy is durable.
         tokio::fs::remove_file(path)
             .await
@@ -259,6 +288,7 @@ impl TierMigrator {
             event_count: 0,
             stream_name: stream.into(),
             log_date,
+            format,
             file_path: warm_path.to_string_lossy().into_owned(),
             tier: StorageTier::Warm,
             size_bytes: compressed.len() as u64,
@@ -279,6 +309,7 @@ impl TierMigrator {
         stream: &str,
         path: &Path,
         log_date: NaiveDate,
+        format: RawFileFormat,
     ) -> SFResult<MigrationAction> {
         // Read whatever's on disk (already-compressed warm file or raw hot file).
         let raw = tokio::fs::read(path)
@@ -325,6 +356,7 @@ impl TierMigrator {
             event_count: 0,
             stream_name: stream.into(),
             log_date,
+            format,
             file_path: uri,
             tier: StorageTier::Cold,
             size_bytes: payload.len() as u64,

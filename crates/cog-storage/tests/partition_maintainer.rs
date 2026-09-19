@@ -17,7 +17,7 @@
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use sqlx::PgPool;
 
-use cog_core::{RawLogIndexEntry, RawLogIndexStore, RawLogQuery, StorageTier};
+use cog_core::{RawFileFormat, RawLogIndexEntry, RawLogIndexStore, RawLogQuery, StorageTier};
 use cog_storage::partition_maintainer::{PartitionMaintainer, PartitionedTable};
 use cog_storage::PostgresRawLogIndexStore;
 
@@ -163,7 +163,8 @@ async fn rows_parked_in_default_are_moved_when_their_partition_appears() {
 /// fails only at runtime, so the round trip is checked here. The throwaway
 /// database starts empty, so the migrations are applied first. Rows use
 /// far-future dates so they land in the DEFAULT partition, and are deleted
-/// again. `(stream_name, log_date)` is the key, so each row needs its own date.
+/// again. `(stream_name, log_date, format)` is the key, so each row needs its
+/// own date or format.
 #[tokio::test]
 #[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
 async fn raw_log_index_round_trips_every_tier() {
@@ -176,19 +177,24 @@ async fn raw_log_index_round_trips_every_tier() {
     let store = PostgresRawLogIndexStore::new(pool.clone());
     let created_at = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
     let rows = [
-        (1u32, 3u8, StorageTier::Hot),
-        (2, 4, StorageTier::Warm),
-        (3, 5, StorageTier::Cold),
+        (1u32, 3u8, StorageTier::Hot, RawFileFormat::Jsonl),
+        (2, 4, StorageTier::Warm, RawFileFormat::Jsonl),
+        (3, 5, StorageTier::Cold, RawFileFormat::Jsonl),
+        // Same stream and date as the first row, different format: the file set
+        // one date can hold. A key without `format` would make this overwrite
+        // row 1 and leave its file unnamed.
+        (1, 6, StorageTier::Warm, RawFileFormat::Proto),
     ];
     let first_date = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
     let last_date = NaiveDate::from_ymd_opt(2099, 1, 3).unwrap();
 
-    for (day, hour, tier) in rows {
+    for (day, hour, tier, format) in rows {
         store
             .upsert(RawLogIndexEntry {
                 hour,
                 stream_name: "system_raw".into(),
                 log_date: NaiveDate::from_ymd_opt(2099, 1, day).unwrap(),
+                format,
                 file_path: format!("/probe/{hour}"),
                 tier,
                 size_bytes: 1024,
@@ -211,8 +217,8 @@ async fn raw_log_index_round_trips_every_tier() {
     };
 
     let found = store.query(&window()).await.unwrap();
-    assert_eq!(found.len(), 3, "the rows just written should be readable");
-    for (_, hour, tier) in rows {
+    assert_eq!(found.len(), 4, "the rows just written should be readable");
+    for (_, hour, tier, format) in rows {
         let back = found
             .iter()
             .find(|e| e.hour == hour)
@@ -221,6 +227,7 @@ async fn raw_log_index_round_trips_every_tier() {
             back.tier, tier,
             "tier {tier:?} did not survive the round trip"
         );
+        assert_eq!(back.format, format, "format did not survive the round trip");
         assert_eq!(back.file_path, format!("/probe/{hour}"));
         assert_eq!(back.event_count, 7);
     }
@@ -243,8 +250,9 @@ async fn raw_log_index_round_trips_every_tier() {
         })
         .await
         .unwrap();
-    assert_eq!(by_tier.len(), 1, "only the warm row should match");
-    assert_eq!(by_tier[0].hour, 4);
+    assert_eq!(by_tier.len(), 2, "only the warm rows should match");
+    let warm_hours: Vec<u8> = by_tier.iter().map(|e| e.hour).collect();
+    assert!(warm_hours.contains(&4) && warm_hours.contains(&6));
 
     let limited = store
         .query(&RawLogQuery {

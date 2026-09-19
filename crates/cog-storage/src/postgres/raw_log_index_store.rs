@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{PgPool, Row};
 
-use cog_core::{RawLogIndexEntry, RawLogIndexStore, RawLogQuery, SFError, SFResult, StorageTier};
+use cog_core::{
+    RawFileFormat, RawLogIndexEntry, RawLogIndexStore, RawLogQuery, SFError, SFResult, StorageTier,
+};
 
 /// PostgreSQL-backed raw log index store.
 pub struct PostgresRawLogIndexStore {
@@ -28,11 +30,11 @@ impl RawLogIndexStore for PostgresRawLogIndexStore {
         sqlx::query(
             r#"
             INSERT INTO raw_log_index (
-                stream_name, log_date, hour, storage_path, size_bytes,
+                stream_name, log_date, format, hour, storage_path, size_bytes,
                 event_count, checksum, first_at, last_at, tier, created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (stream_name, log_date) DO UPDATE SET
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (stream_name, log_date, format) DO UPDATE SET
                 hour         = EXCLUDED.hour,
                 storage_path = EXCLUDED.storage_path,
                 size_bytes   = EXCLUDED.size_bytes,
@@ -46,6 +48,7 @@ impl RawLogIndexStore for PostgresRawLogIndexStore {
         )
         .bind(&entry.stream_name)
         .bind(entry.log_date)
+        .bind(entry.format.as_str())
         .bind(entry.hour as i16)
         .bind(&entry.file_path)
         .bind(entry.size_bytes as i64)
@@ -69,7 +72,7 @@ impl RawLogIndexStore for PostgresRawLogIndexStore {
         // bindings.
         let rows = sqlx::query(
             r#"
-            SELECT stream_name, log_date, hour, storage_path, size_bytes,
+            SELECT stream_name, log_date, format, hour, storage_path, size_bytes,
                    event_count, checksum, first_at, last_at, tier, created_at
             FROM raw_log_index
             WHERE ($1::text IS NULL OR stream_name = $1)
@@ -95,14 +98,19 @@ impl RawLogIndexStore for PostgresRawLogIndexStore {
     }
 }
 
-/// A malformed tier is reported rather than defaulted, so a schema mismatch
-/// cannot masquerade as a tier decision.
+/// A malformed tier or format is reported rather than defaulted, so a schema
+/// mismatch cannot masquerade as a tier decision or split one file's rows across
+/// two keys.
 fn row_to_entry(row: &sqlx::postgres::PgRow) -> SFResult<RawLogIndexEntry> {
     let column = |name: &str| SFError::Database(format!("raw_log_index.{name} unreadable"));
     let tier: String = row.try_get("tier").map_err(|_| column("tier"))?;
     let tier = tier
         .parse::<StorageTier>()
         .map_err(|_| SFError::Database(format!("unknown storage tier in raw_log_index: {tier}")))?;
+    let format: String = row.try_get("format").map_err(|_| column("format"))?;
+    let format = format.parse::<RawFileFormat>().map_err(|_| {
+        SFError::Database(format!("unknown file format in raw_log_index: {format}"))
+    })?;
 
     Ok(RawLogIndexEntry {
         hour: row.try_get::<i16, _>("hour").map_err(|_| column("hour"))? as u8,
@@ -112,6 +120,7 @@ fn row_to_entry(row: &sqlx::postgres::PgRow) -> SFResult<RawLogIndexEntry> {
         log_date: row
             .try_get::<NaiveDate, _>("log_date")
             .map_err(|_| column("log_date"))?,
+        format,
         file_path: row
             .try_get("storage_path")
             .map_err(|_| column("storage_path"))?,

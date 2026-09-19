@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use cog_core::{
-    MetricsBackend, ObjectBackend, RawLogIndexStore, RawLogQuery, ShutdownSignal, StorageTier,
-    TierPolicy,
+    MetricsBackend, ObjectBackend, RawFileFormat, RawLogIndexStore, RawLogQuery, ShutdownSignal,
+    StorageTier, TierPolicy,
 };
 use cog_storage::{
     MemoryMetricsBackend, MemoryObjectBackend, MemoryRawLogIndexStore, TierMigrator,
@@ -84,6 +84,93 @@ async fn an_aged_rotation_is_compressed_in_place_and_indexed() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].stream_name, "transport_raw");
     assert_eq!(rows[0].tier, StorageTier::Warm);
+}
+
+/// One day can hold two files for one stream when the configured format changed
+/// mid-day: the logger opens a second file rather than re-encoding the first.
+/// The index key includes the format, so each keeps its own row. Keyed on
+/// `(stream, date)` alone, the second promotion overwrote the first row and the
+/// first file's archived name was recorded nowhere.
+#[tokio::test]
+async fn two_formats_on_one_date_keep_separate_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    aged_file(
+        dir.path(),
+        "system_raw",
+        "2026-09-14.jsonl",
+        Duration::from_secs(172_800),
+    );
+    aged_file(
+        dir.path(),
+        "system_raw",
+        "2026-09-14.proto.bin",
+        Duration::from_secs(172_800),
+    );
+    let (migrator, _objects, index) = migrator(dir.path());
+
+    let stats = migrator.run_once().await.unwrap();
+
+    assert_eq!(stats.warm_promotions, 2, "both files must be promoted");
+    assert!(dir.path().join("system_raw/2026-09-14.jsonl.zst").exists());
+    assert!(dir
+        .path()
+        .join("system_raw/2026-09-14.proto.bin.zst")
+        .exists());
+
+    let rows = index.query(&RawLogQuery::default()).await.unwrap();
+    assert_eq!(rows.len(), 2, "one row per file, not one row per date");
+    let formats: std::collections::HashSet<RawFileFormat> = rows.iter().map(|r| r.format).collect();
+    assert_eq!(formats.len(), 2, "the two rows must differ in format");
+    for row in &rows {
+        assert!(
+            std::path::Path::new(&row.file_path).exists(),
+            "every index row must name a file that is really there: {}",
+            row.file_path
+        );
+    }
+}
+
+/// Warm-tier compression appends `.zst` to the extension it found, which for a
+/// `proto.bin` file is the same name `ProtoZstd` writes. A deployment that
+/// switched between those two formats on one day therefore has a live file where
+/// the compression wants to write. Overwriting it would destroy that day's
+/// records while every step reported success.
+#[tokio::test]
+async fn compression_does_not_overwrite_a_file_it_did_not_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let stream_dir = dir.path().join("system_raw");
+    std::fs::create_dir_all(&stream_dir).unwrap();
+    let source = aged_file(
+        dir.path(),
+        "system_raw",
+        "2026-09-14.proto.bin",
+        Duration::from_secs(172_800),
+    );
+    let occupied = stream_dir.join("2026-09-14.proto.bin.zst");
+    std::fs::write(&occupied, b"a different format's records").unwrap();
+    let (migrator, _objects, index) = migrator(dir.path());
+
+    let stats = migrator.run_once().await.unwrap();
+
+    assert_eq!(
+        stats.errors, 1,
+        "the collision must be reported, not resolved"
+    );
+    assert_eq!(stats.warm_promotions, 0);
+    assert_eq!(
+        std::fs::read(&occupied).unwrap(),
+        b"a different format's records",
+        "the occupying file must be left untouched"
+    );
+    assert!(
+        source.exists(),
+        "the source must stay where it is rather than be deleted unarchived"
+    );
+    assert!(index
+        .query(&RawLogQuery::default())
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// The audit chain is one flat file the logger never rotates. Archiving it

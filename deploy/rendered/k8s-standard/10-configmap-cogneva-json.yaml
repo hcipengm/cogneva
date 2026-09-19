@@ -336,7 +336,7 @@ data:
       },
       "tier_migrator": {
         "_comment": "hot→warm 就地 zstd 压缩并删除源文件，warm→cold 上传对象存储再删本地，两步都不可逆——热层保留 hot_duration_secs，warm 保留 warm_duration_secs。",
-        "_comment_owner": "迁移必须只有一个属主：raw_log_index 按 (stream, log_date) 唯一，冷层对象键又不带进程身份，两个部署同时扫就会互相覆盖索引行与对象（谁后写谁赢，先写的那份不可找回且不报错）。属主是主应用 Pod；进化 Pod 在 app-config 里置 COGNEVA_TIER_MIGRATOR_ENABLED=false。",
+        "_comment_owner": "迁移必须只有一个属主：raw_log_index 按 (stream, log_date, format) 唯一，冷层对象键又不带进程身份，两个部署同时扫就会互相覆盖索引行与对象（谁后写谁赢，先写的那份不可找回且不报错）。属主是主应用 Pod；进化 Pod 在 app-config 里置 COGNEVA_TIER_MIGRATOR_ENABLED=false。",
         "enabled": true,
         "hot_duration_secs": 86400,
         "warm_duration_secs": 604800,
