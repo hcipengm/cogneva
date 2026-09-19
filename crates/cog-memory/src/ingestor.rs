@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -371,6 +372,7 @@ pub struct MemoryIngestor {
     extractor: Arc<dyn MemoryExtractor>,
     config: MemoryIngestorConfig,
     pull_gate: Arc<PullGate>,
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl MemoryIngestor {
@@ -382,7 +384,14 @@ impl MemoryIngestor {
             extractor,
             config,
             pull_gate,
+            metrics: None,
         }
+    }
+
+    /// 接上指标面，用来发布对账扫到的积压量。
+    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn with_config(mut self, config: MemoryIngestorConfig) -> Self {
@@ -421,7 +430,12 @@ impl MemoryIngestor {
         tokio::spawn(async move {
             info!("MemoryIngestor started");
             if inner.config.startup_reconcile {
-                inner.reconcile(&job_tx, &backlog).await;
+                // 与周期对账同一条判据：扫描照跑（它是纯 SQL 加对象存储读，
+                // 产出的是积压量这个观测），闸门关着就只报不入队——往一个已知
+                // 接不住的上游灌活，换来的是重试与死信，不是进度。积压本身现在
+                // 有 gauge 报出来，窗口逼近时看得见。
+                let upstream_available = inner.pull_gate.blocked_for().await.is_none();
+                inner.reconcile(&job_tx, &backlog, upstream_available).await;
             }
             loop {
                 tokio::select! {
@@ -536,7 +550,9 @@ impl MemoryIngestor {
         tokio::spawn(async move {
             info!("MemoryIngestor bus consumer started (channel={channel}, group={group})");
             if inner.config.startup_reconcile {
-                inner.reconcile(&job_tx, &backlog).await;
+                // 同 quiescent 启动路径：扫描照跑，闸门关着只报不入队。
+                let upstream_available = inner.pull_gate.blocked_for().await.is_none();
+                inner.reconcile(&job_tx, &backlog, upstream_available).await;
             }
             // durable 消费组：已存在时创建是幂等 no-op，失败也不挡订阅——
             // 订阅失败下面的重订阅循环会接着退避重试。
@@ -808,11 +824,13 @@ impl MemoryIngestor {
                 if stopping.load(std::sync::atomic::Ordering::SeqCst) || job_tx.is_closed() {
                     break;
                 }
-                if inner.pull_gate.blocked_for().await.is_some() {
-                    debug!("Memory ingest reconcile paused: LLM upstream unavailable");
-                    continue;
-                }
-                inner.reconcile(&job_tx, &backlog).await;
+                // 扫描不需要 LLM：它是一条 SQL 加一次对象存储读，产出的是
+                // 「还有多少 raw 没有 summary」这个观测。上游断供时把它一并跳过，
+                // 等于在最需要知道积压规模的时候关掉唯一的观测面，而且恢复之后
+                // 那些已经掉出回看窗的 raw 再也不会被捡起来。所以扫描照跑，
+                // 只把入队那一步按住——那一步之后才真的去调 LLM。
+                let upstream_available = inner.pull_gate.blocked_for().await.is_none();
+                inner.reconcile(&job_tx, &backlog, upstream_available).await;
             }
         });
     }
@@ -823,10 +841,23 @@ impl MemoryIngestor {
         &self,
         job_tx: &mpsc::UnboundedSender<QueuedRaw>,
         backlog: &std::sync::atomic::AtomicUsize,
+        upstream_available: bool,
     ) {
         match self.collect_unextracted().await {
             Ok(raws) => {
+                // 无论能不能入队都先把积压量报出去：这是「记忆静默丢失」唯一
+                // 的观测面，它必须在最坏的时候也在。没有 summary 的 raw 不会
+                // 自己报出来——判定「做完了没」就是一条 summary 存在性查询，
+                // 缺席查不出缺席。
+                self.report_unextracted(raws.len()).await;
                 if raws.is_empty() {
+                    return;
+                }
+                if !upstream_available {
+                    info!(
+                        "Memory ingest reconcile found {} unextracted raw sources; holding them until the LLM upstream returns",
+                        raws.len()
+                    );
                     return;
                 }
                 info!(
@@ -843,6 +874,21 @@ impl MemoryIngestor {
                 }
             }
             Err(e) => warn!("Memory ingest reconcile scan failed: {}", e),
+        }
+    }
+
+    /// 把「扫到的未抽取 raw 数」发布成 gauge。没有指标面时只记日志：
+    /// 观测缺席不该让对账这一步失败。
+    async fn report_unextracted(&self, count: usize) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            debug!("Memory ingest reconcile: {} unextracted raw sources", count);
+            return;
+        };
+        if let Err(e) = metrics
+            .record_gauge("memory_unextracted_raw", count as f64, HashMap::new())
+            .await
+        {
+            warn!("Failed to record memory_unextracted_raw gauge: {}", e);
         }
     }
 
@@ -1549,6 +1595,93 @@ mod tests {
         )
     }
 
+    /// 只留 gauge：对账要断言的就是积压量这一个观测。
+    #[derive(Default)]
+    struct RecordingMetrics {
+        gauges: std::sync::Mutex<Vec<(String, f64)>>,
+    }
+
+    impl RecordingMetrics {
+        fn latest(&self, name: &str) -> Option<f64> {
+            self.gauges
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| *v)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::MetricsBackend for RecordingMetrics {
+        async fn record_gauge(
+            &self,
+            name: &str,
+            value: f64,
+            _labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.gauges.lock().unwrap().push((name.to_string(), value));
+            Ok(())
+        }
+
+        async fn record_counter(
+            &self,
+            _name: &str,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn record_histogram(
+            &self,
+            _name: &str,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn query_gauge_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<Utc>,
+            _end: chrono::DateTime<Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_counter_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<Utc>,
+            _end: chrono::DateTime<Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_counter_totals(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_histogram_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<Utc>,
+            _end: chrono::DateTime<Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn health_check(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
     fn quick_retry_config() -> MemoryIngestorConfig {
         MemoryIngestorConfig {
             max_retries: 0,
@@ -1936,6 +2069,58 @@ mod tests {
             })
             .await,
             "reconcile must catch up on the first tick after recovery"
+        );
+    }
+
+    /// 闸门关着时扫描照跑，积压量照报。上游断供正是最需要知道欠了多少记忆的
+    /// 时刻——把观测和入队一起跳过，恢复时就没有任何数字说明断供期间丢了多少。
+    #[tokio::test]
+    async fn reconcile_reports_backlog_while_the_gate_is_closed() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        backend
+            .archive_raw(&transcript_raw("held-back"))
+            .await
+            .unwrap();
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone());
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, false).await;
+
+        assert_eq!(
+            metrics.latest("memory_unextracted_raw"),
+            Some(1.0),
+            "the backlog gauge must be published even while the upstream is down"
+        );
+        assert!(
+            job_rx.try_recv().is_err(),
+            "a closed gate must not enqueue work the upstream cannot serve"
+        );
+    }
+
+    /// 闸门开着时同一份扫描结果直接入队：观测与入队是同一次扫描的两个后果，
+    /// 不能因为上报而少入队。
+    #[tokio::test]
+    async fn reconcile_enqueues_when_the_upstream_is_available() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        backend
+            .archive_raw(&transcript_raw("ready-to-go"))
+            .await
+            .unwrap();
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone());
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        assert_eq!(metrics.latest("memory_unextracted_raw"), Some(1.0));
+        assert!(
+            job_rx.try_recv().is_ok(),
+            "an open gate must re-drive the scanned raw sources"
         );
     }
 }

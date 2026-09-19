@@ -310,6 +310,7 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         }
 
         let memory_backend = ctx.consume_service::<dyn cog_core::MemoryBackend>();
+        let metrics_backend = ctx.consume_service::<dyn cog_core::MetricsBackend>();
         let embed_provider = ctx.consume_service::<dyn cog_core::EmbeddingProvider>();
         let llm_provider = ctx.consume_service::<dyn cog_core::LlmClient>();
         let event_tx = ctx
@@ -331,6 +332,9 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             };
             let mut ingestor =
                 crate::MemoryIngestor::new(backend, extractor).with_config((&memory.ingest).into());
+            if let Some(ref metrics) = metrics_backend {
+                ingestor = ingestor.with_metrics(metrics.clone());
+            }
             // 池状态来源由 supervisor 在 init 发布（init_all 先于 start_all），
             // 缺席时闸门退化为纯本地判据：上游断供仍会被拦住，只是要花掉阈值
             // 次尝试才知道。
