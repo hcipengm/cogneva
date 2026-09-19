@@ -1156,9 +1156,22 @@ impl GitOpsPuller {
         current: &CanarySignals,
         semantics: CounterSemantics,
     ) -> SFResult<()> {
+        // 分位数只在抓取窗口内有请求时才存在：窗口内没请求，正文里就没有这条
+        // 序列，读出来是 0。用 0 当基线去比会把任何一次观测都判成回归，所以两种
+        // 缺证据都跳过——但必须各自记日志。这条闸门是回滚好版本的依据，静默跳过
+        // 会让"没测到"和"测了没回归"在日志上长得一样，一条长期无效的判据就此消失
+        // 得无声无息。
         let base_p99 = baseline.p99_ms;
         let p99 = current.p99_ms;
-        if base_p99 > 0.0 && p99 > base_p99 * self.config.canary_p99_multiplier {
+        if base_p99 <= 0.0 {
+            warn!(
+                "canary p99 gate skipped: baseline recorded no observation inside the scrape window"
+            );
+        } else if p99 <= 0.0 {
+            warn!(
+                "canary p99 gate skipped: candidate recorded no observation inside the scrape window"
+            );
+        } else if p99 > base_p99 * self.config.canary_p99_multiplier {
             return Err(SFError::Agent(format!(
                 "canary p99 regressed: {p99:.0}ms > baseline {base_p99:.0}ms x {}",
                 self.config.canary_p99_multiplier

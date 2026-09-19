@@ -48,8 +48,10 @@ impl AlertManager {
     }
 
     /// Evaluate a single metric sample against all rules.
-    /// Callers (e.g. `PrometheusMetricsBackend` or task recorders) invoke
-    /// this every time a metric is recorded so alerts react immediately.
+    ///
+    /// Push path: the caller supplies the sample. Sampling is not done here,
+    /// so a rule fires only for samples some caller hands to this method —
+    /// building a manager with rules is not the same as evaluating them.
     pub fn evaluate(
         &self,
         metric_name: &str,
