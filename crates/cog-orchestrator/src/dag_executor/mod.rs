@@ -25,6 +25,27 @@ pub struct DagExecutorConfig {
     pub workspace_id: String,
     pub consumer_group: String,
     pub max_retries: u32,
+    /// 结果流上一条消息允许保持未 ack 的时长，超过即被清扫器认领并重走处理。
+    /// 必须大于最长处理时长，否则正在处理的消息会被判死而并发重投。
+    pub result_claim_idle_secs: u64,
+    /// 结果流 pending 清扫的节拍。
+    pub result_claim_interval_secs: u64,
+    /// 单轮最多认领多少条。
+    pub result_claim_batch: usize,
+}
+
+impl Default for DagExecutorConfig {
+    fn default() -> Self {
+        Self {
+            redis_url: String::new(),
+            workspace_id: String::new(),
+            consumer_group: String::new(),
+            max_retries: 3,
+            result_claim_idle_secs: 600,
+            result_claim_interval_secs: 60,
+            result_claim_batch: 16,
+        }
+    }
 }
 
 /// DagExecutor 运行时。
@@ -143,6 +164,59 @@ impl DagExecutorRuntime {
             }
         }
 
+        // 死信恢复：处理途中死掉的 pod 会把消息留在组内 pending，
+        // `subscribe`（XREADGROUP ">"）只读新消息，永远不会重投——而本循环的
+        // 失败分支正是靠重投才成立（"Keep the message pending: redelivery …"）。
+        // 没有这一步，一次瞬时 complete_task/publish_ready_tasks 失败或一次崩溃
+        // 就让那条结果永久丢失：任务在该进程的内存 DAG 里停在 running，依赖它的
+        // 下游再也不就绪，且没有任何面能看出丢了什么。
+        // 阈值必须大于最长处理时长，否则正在处理的消息会被并发重投；重投是
+        // at-least-once，已终态任务会被上面的拒绝分支 ack 丢弃，不会重复迁移。
+        let claim_idle_ms = self.config.result_claim_idle_secs.saturating_mul(1000);
+        {
+            let sweeper = self.clone();
+            let stream = result_stream.clone();
+            let group = group_name.clone();
+            let sweep_shutdown = shutdown.clone();
+            let interval_secs = self.config.result_claim_interval_secs.max(1);
+            let batch = self.config.result_claim_batch;
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = sweep_shutdown.wait() => break,
+                        _ = ticker.tick() => {
+                            let claimed = match sweeper
+                                .backend
+                                .claim_pending(&stream, &group, claim_idle_ms, batch)
+                                .await
+                            {
+                                Ok(claimed) => claimed,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        stream = %stream,
+                                        "result pending claim sweep failed: {e}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            for (msg_id, bytes) in claimed {
+                                tracing::warn!(
+                                    stream = %stream, msg_id = %msg_id,
+                                    "reclaimed a result message left pending by a consumer that never acked it"
+                                );
+                                sweeper
+                                    .handle_result_message(&stream, &group, &msg_id, &bytes)
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         // Resubscribe on stream failure/end: exiting the task would freeze the
         // consumer group until the next pod restart (a single transient error
         // historically stalled groups for days).
@@ -177,142 +251,8 @@ impl DagExecutorRuntime {
                     }
                 };
 
-                let msg: DagMessage = match serde_json::from_slice(&bytes) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        // Poison message: no future bytes can parse better, so ack
-                        // it out instead of letting the sweeper redeliver forever.
-                        tracing::warn!(msg_id = %msg_id, "Failed to deserialize DagMessage: {e}");
-                        if let Err(e) = self
-                            .backend
-                            .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                            .await
-                        {
-                            tracing::warn!(msg_id = %msg_id, "Failed to ack poison result message: {e}");
-                        }
-                        continue;
-                    }
-                };
-
-                match msg {
-                    DagMessage::TaskComplete {
-                        task_id, result, ..
-                    } => {
-                        match self
-                            .orchestrator
-                            .complete_task(&task_id, result.clone())
-                            .await
-                        {
-                            Ok(scheduled) => {
-                                tracing::info!(
-                                    task_id = %task_id,
-                                    scheduled = scheduled.len(),
-                                    "Task completed via message queue"
-                                );
-                            }
-                            Err(e @ cog_core::SFError::TaskFailed { .. }) => {
-                                // Duplicate/stale result for an already-terminal or
-                                // unknown task: reprocessing can never succeed, so
-                                // ack and drop instead of spinning on redelivery.
-                                tracing::warn!(
-                                    task_id = %task_id, msg_id = %msg_id,
-                                    "result message rejected by DAG ({e}); dropping"
-                                );
-                                if let Err(e) = self
-                                    .backend
-                                    .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        task_id = %task_id, msg_id = %msg_id,
-                                        "Failed to ack stale result message: {e}"
-                                    );
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(task_id = %task_id, "complete_task failed: {e}");
-                                continue;
-                            }
-                        }
-                        if let Err(e) = self.publish_ready_tasks().await {
-                            // Keep the message pending: redelivery hits the
-                            // terminal-task reject above but retries scheduling.
-                            tracing::warn!("publish_ready_tasks after complete failed: {e}");
-                            continue;
-                        }
-                        if let Err(e) = self
-                            .backend
-                            .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                            .await
-                        {
-                            tracing::warn!(task_id = %task_id, msg_id = %msg_id, "Failed to ack result message: {e}");
-                        }
-                    }
-                    DagMessage::TaskFailed {
-                        task_id,
-                        error,
-                        error_cause,
-                        ..
-                    } => {
-                        match self
-                            .orchestrator
-                            .fail_task(&task_id, error.clone(), error_cause)
-                            .await
-                        {
-                            Ok((retried, cancelled, _dlq_pushed)) => {
-                                tracing::warn!(
-                                    task_id = %task_id,
-                                    retried,
-                                    cancelled = cancelled.len(),
-                                    "Task failed via message queue"
-                                );
-                            }
-                            Err(e @ cog_core::SFError::TaskFailed { .. }) => {
-                                tracing::warn!(
-                                    task_id = %task_id, msg_id = %msg_id,
-                                    "failure result rejected by DAG ({e}); dropping"
-                                );
-                                if let Err(e) = self
-                                    .backend
-                                    .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        task_id = %task_id, msg_id = %msg_id,
-                                        "Failed to ack stale failure message: {e}"
-                                    );
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(task_id = %task_id, "fail_task failed: {e}");
-                                continue;
-                            }
-                        }
-                        if let Err(e) = self.publish_ready_tasks().await {
-                            tracing::warn!("publish_ready_tasks after fail failed: {e}");
-                            continue;
-                        }
-                        if let Err(e) = self
-                            .backend
-                            .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                            .await
-                        {
-                            tracing::warn!(task_id = %task_id, msg_id = %msg_id, "Failed to ack failure message: {e}");
-                        }
-                    }
-                    _ => {
-                        tracing::debug!(msg_id = %msg_id, "Ignoring non-result DagMessage variant");
-                        if let Err(e) = self
-                            .backend
-                            .ack(&result_stream, &group_name, std::slice::from_ref(&msg_id))
-                            .await
-                        {
-                            tracing::warn!(msg_id = %msg_id, "Failed to ack unhandled result message: {e}");
-                        }
-                    }
-                }
+                self.handle_result_message(&result_stream, &group_name, &msg_id, &bytes)
+                    .await;
             }
 
             tokio::select! {
@@ -322,6 +262,124 @@ impl DagExecutorRuntime {
         }
 
         Ok(())
+    }
+
+    /// Apply one result message to the DAG and ack it.
+    ///
+    /// Shared by the live subscription and the pending sweeper so a reclaimed
+    /// message takes exactly the path a freshly delivered one takes. A second
+    /// implementation for the reclaimed case would drift, and that is the path
+    /// that is by definition the least exercised.
+    ///
+    /// A message is only acked once its state transition has been applied.
+    /// Every early return below leaves it pending on purpose, so the sweeper
+    /// retries it — a transient failure must not silently strand a result.
+    async fn handle_result_message(
+        &self,
+        result_stream: &str,
+        group_name: &str,
+        msg_id: &str,
+        bytes: &[u8],
+    ) {
+        let msg: DagMessage = match serde_json::from_slice(bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                // Poison message: no future bytes can parse better, so ack it
+                // out instead of letting the sweeper redeliver it forever.
+                tracing::warn!(msg_id = %msg_id, "Failed to deserialize DagMessage: {e}");
+                self.ack_result(result_stream, group_name, msg_id).await;
+                return;
+            }
+        };
+
+        match msg {
+            DagMessage::TaskComplete {
+                task_id, result, ..
+            } => {
+                match self
+                    .orchestrator
+                    .complete_task(&task_id, result.clone())
+                    .await
+                {
+                    Ok(scheduled) => {
+                        tracing::info!(
+                            task_id = %task_id,
+                            scheduled = scheduled.len(),
+                            "Task completed via message queue"
+                        );
+                    }
+                    Err(e @ cog_core::SFError::TaskFailed { .. }) => {
+                        // Duplicate/stale result for an already-terminal or
+                        // unknown task: reprocessing can never succeed, so
+                        // ack and drop instead of spinning on redelivery.
+                        tracing::warn!(
+                            task_id = %task_id, msg_id = %msg_id,
+                            "result message rejected by DAG ({e}); dropping"
+                        );
+                        self.ack_result(result_stream, group_name, msg_id).await;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id = %task_id, "complete_task failed: {e}");
+                        return;
+                    }
+                }
+                if let Err(e) = self.publish_ready_tasks().await {
+                    tracing::warn!("publish_ready_tasks after complete failed: {e}");
+                    return;
+                }
+                self.ack_result(result_stream, group_name, msg_id).await;
+            }
+            DagMessage::TaskFailed {
+                task_id,
+                error,
+                error_cause,
+                ..
+            } => {
+                match self
+                    .orchestrator
+                    .fail_task(&task_id, error.clone(), error_cause)
+                    .await
+                {
+                    Ok((retried, cancelled, _dlq_pushed)) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            retried,
+                            cancelled = cancelled.len(),
+                            "Task failed via message queue"
+                        );
+                    }
+                    Err(e @ cog_core::SFError::TaskFailed { .. }) => {
+                        tracing::warn!(
+                            task_id = %task_id, msg_id = %msg_id,
+                            "failure result rejected by DAG ({e}); dropping"
+                        );
+                        self.ack_result(result_stream, group_name, msg_id).await;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id = %task_id, "fail_task failed: {e}");
+                        return;
+                    }
+                }
+                if let Err(e) = self.publish_ready_tasks().await {
+                    tracing::warn!("publish_ready_tasks after fail failed: {e}");
+                    return;
+                }
+                self.ack_result(result_stream, group_name, msg_id).await;
+            }
+            _ => {
+                tracing::debug!(msg_id = %msg_id, "Ignoring non-result DagMessage variant");
+                self.ack_result(result_stream, group_name, msg_id).await;
+            }
+        }
+    }
+
+    async fn ack_result(&self, result_stream: &str, group_name: &str, msg_id: &str) {
+        let ids = [msg_id.to_string()];
+        if let Err(e) = self.backend.ack(result_stream, group_name, &ids).await {
+            tracing::warn!(msg_id = %msg_id, "Failed to ack result message: {e}");
+        }
     }
 
     /// Consume goal messages from the `goals:{workspace_id}` stream and inject
@@ -661,6 +719,7 @@ mod consumer_ack_tests {
 
     type Queue = HashMap<String, Vec<(String, Vec<u8>)>>;
     type AckLog = Vec<(String, String, Vec<String>)>;
+    type PendingLog = Vec<(String, Vec<u8>)>;
 
     /// Scripted backend: subscribe replays a fixed queue per subject then
     /// blocks forever; ack calls are recorded for assertions.
@@ -668,6 +727,10 @@ mod consumer_ack_tests {
     struct ScriptedBackend {
         queues: Arc<Mutex<Queue>>,
         acks: Arc<Mutex<AckLog>>,
+        /// Entries already delivered to some consumer but never acked — what
+        /// `claim_pending` hands back. Draining on read mirrors XAUTOCLAIM
+        /// taking ownership of the PEL entry.
+        pending: Arc<Mutex<PendingLog>>,
     }
 
     impl ScriptedBackend {
@@ -677,6 +740,13 @@ mod consumer_ack_tests {
                 .unwrap()
                 .entry(subject.to_string())
                 .or_default()
+                .push((msg_id.to_string(), bytes));
+        }
+
+        fn abandon(&self, msg_id: &str, bytes: Vec<u8>) {
+            self.pending
+                .lock()
+                .unwrap()
                 .push((msg_id.to_string(), bytes));
         }
 
@@ -724,18 +794,35 @@ mod consumer_ack_tests {
                 .push((stream.to_string(), group.to_string(), ids.to_vec()));
             Ok(())
         }
+        async fn claim_pending(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _min_idle_ms: u64,
+            _count: usize,
+        ) -> SFResult<Vec<(String, Vec<u8>)>> {
+            Ok(std::mem::take(&mut *self.pending.lock().unwrap()))
+        }
     }
 
     fn test_runtime(backend: ScriptedBackend) -> DagExecutorRuntime {
-        DagExecutorRuntime::new_with_backend(
+        test_runtime_with(
+            backend,
             DagExecutorConfig {
                 redis_url: "memory".into(),
                 workspace_id: "ws-ack-test".into(),
                 consumer_group: "grp-ack-test".into(),
                 max_retries: 1,
+                ..DagExecutorConfig::default()
             },
-            backend,
         )
+    }
+
+    fn test_runtime_with(
+        backend: ScriptedBackend,
+        config: DagExecutorConfig,
+    ) -> DagExecutorRuntime {
+        DagExecutorRuntime::new_with_backend(config, backend)
     }
 
     async fn wait_for_acks(backend: &ScriptedBackend, n: usize) -> Vec<String> {
@@ -793,6 +880,92 @@ mod consumer_ack_tests {
         let _ = handle.await.unwrap();
 
         assert_eq!(acks, vec!["rid-poison".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn abandoned_result_is_reclaimed_and_applied() {
+        // Regression: `subscribe` reads with XREADGROUP ">" (new messages only),
+        // so a result delivered to a consumer that died before acking was never
+        // seen again — the task sat Running in the DAG forever and its
+        // dependents never became ready. The live loop must not be the only way
+        // a result reaches the DAG.
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-ack-test".into(),
+            consumer_group: "grp-ack-test".into(),
+            max_retries: 1,
+            result_claim_idle_secs: 0,
+            result_claim_interval_secs: 1,
+            result_claim_batch: 16,
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+
+        let task = cog_core::Task {
+            id: "task-reclaimed".into(),
+            task_type: cog_core::TaskType::DagNode,
+            status: cog_core::TaskStatus::Pending,
+            input: serde_json::json!({}),
+            result: None,
+            error: None,
+            error_cause: None,
+            blocked_by: vec![],
+            blocks: vec![],
+            priority: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            agent_id: None,
+            workspace_id: Some("ws-ack-test".into()),
+            retry_count: 0,
+            max_retries: 1,
+            started_at: None,
+            timeout_seconds: 30,
+            action_planner_meta: None,
+            goal_id: Some("goal-reclaimed".into()),
+            parent_task_id: None,
+            is_executable: true,
+        };
+        runtime
+            .orchestrator()
+            .submit_goal("goal-reclaimed", vec![task])
+            .await
+            .unwrap();
+        // complete_task only accepts a Running task.
+        runtime
+            .orchestrator()
+            .schedule_task("task-reclaimed")
+            .await
+            .unwrap();
+        runtime
+            .orchestrator()
+            .start_task("task-reclaimed")
+            .await
+            .unwrap();
+
+        // Nothing on the live subscribe path: the result exists only as a
+        // pending, unacked entry.
+        let msg = DagMessage::TaskComplete {
+            message_id: "m-pending".into(),
+            timestamp: chrono::Utc::now(),
+            task_id: "task-reclaimed".into(),
+            result: serde_json::json!({"ok": true}),
+            sender: "exec".into(),
+            recipient: "dag".into(),
+        };
+        backend.abandon("rid-pending", serde_json::to_vec(&msg).unwrap());
+
+        let dag = runtime.orchestrator().clone();
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
+        let acks = wait_for_acks(&backend, 1).await;
+        shutdown.trigger();
+        let _ = handle.await.unwrap();
+
+        assert_eq!(acks, vec!["rid-pending".to_string()]);
+        // The point is the state transition, not merely draining the entry.
+        let task = dag.get_task("task-reclaimed").await.expect("task present");
+        assert_eq!(task.status, cog_core::TaskStatus::Completed);
     }
 
     #[tokio::test]
@@ -910,6 +1083,7 @@ mod orphan_reconciler_tests {
                 workspace_id: "ws-orphan".into(),
                 consumer_group: "grp-orphan".into(),
                 max_retries: 1,
+                ..DagExecutorConfig::default()
             },
             NullBackend,
         )

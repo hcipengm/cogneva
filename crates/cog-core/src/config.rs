@@ -237,6 +237,20 @@ pub struct DagExecutorConfig {
     /// Default is twice the default reconciler / watcher poll interval.
     #[serde(default = "default_decomposition_orphan_alert_dwell_secs")]
     pub decomposition_orphan_alert_dwell_secs: u64,
+    /// How long a task-result message may stay unacknowledged before the
+    /// consumer's sweep reclaims and replays it (seconds). A result is acked
+    /// only after its state transition is applied, so anything still pending
+    /// after this long belongs to a consumer that died mid-handling. Must
+    /// exceed the longest result-handling time, or an in-flight message is
+    /// reclaimed concurrently.
+    #[serde(default = "default_result_claim_idle_secs")]
+    pub result_claim_idle_secs: u64,
+    /// Cadence of the result pending sweep (seconds).
+    #[serde(default = "default_result_claim_interval_secs")]
+    pub result_claim_interval_secs: u64,
+    /// Maximum result messages reclaimed per sweep.
+    #[serde(default = "default_result_claim_batch")]
+    pub result_claim_batch: usize,
 }
 
 impl Default for DagExecutorConfig {
@@ -262,6 +276,9 @@ impl Default for DagExecutorConfig {
                 default_decomposition_orphan_poll_interval_secs(),
             decomposition_orphan_stall_after_secs: default_decomposition_orphan_stall_after_secs(),
             decomposition_orphan_alert_dwell_secs: default_decomposition_orphan_alert_dwell_secs(),
+            result_claim_idle_secs: default_result_claim_idle_secs(),
+            result_claim_interval_secs: default_result_claim_interval_secs(),
+            result_claim_batch: default_result_claim_batch(),
         }
     }
 }
@@ -397,6 +414,15 @@ fn default_decomposition_orphan_stall_after_secs() -> u64 {
 }
 fn default_decomposition_orphan_alert_dwell_secs() -> u64 {
     600
+}
+fn default_result_claim_idle_secs() -> u64 {
+    600
+}
+fn default_result_claim_interval_secs() -> u64 {
+    60
+}
+fn default_result_claim_batch() -> usize {
+    16
 }
 
 /// Configuration for the Hot/Warm/Cold tier migrator.

@@ -2,7 +2,7 @@
 //! Redis-backed MessageBackend and verify task hand-off consistency.
 
 use chrono::Utc;
-use cog_core::{DagMessage, MessageBackend, SFResult, Task, TaskStatus, TaskType};
+use cog_core::{DagMessage, MessageBackend, SFResult, ShutdownSignal, Task, TaskStatus, TaskType};
 use cog_orchestrator::{DagExecutorConfig, DagExecutorRuntime};
 use cog_stream::RedisMessageBackend;
 use futures::StreamExt;
@@ -64,6 +64,7 @@ async fn make_runtime(id: &str, workspace: &str) -> SFResult<DagExecutorRuntime>
         workspace_id: workspace.into(),
         consumer_group: format!("cg-{}", id),
         max_retries: 2,
+        ..DagExecutorConfig::default()
     };
     Ok(DagExecutorRuntime::new_with_backend(config, backend))
 }
@@ -316,6 +317,118 @@ async fn test_orchestrator_state_shared_via_backend() {
     assert!(
         msg.is_some(),
         "B should see A's ready task on the shared stream"
+    );
+
+    cleanup_streams(ws).await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: A result left pending by a consumer that died mid-handling is
+// reclaimed and applied.
+//
+// `subscribe` reads with XREADGROUP ">" (new messages only), so a message
+// delivered but never acked is invisible to the live loop forever. Without the
+// pending sweep the task stays Running in that process's in-memory DAG and its
+// dependents never become ready, with no surface reporting the loss.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_pending_result_is_reclaimed_and_applied() {
+    if !redis_available().await {
+        eprintln!("SKIP: Redis not available");
+        return;
+    }
+    let ws = "cluster-test-ws-4";
+    cleanup_streams(ws).await;
+
+    let backend = RedisMessageBackend::new(REDIS_URL).await.unwrap();
+    let rt = Arc::new(DagExecutorRuntime::new_with_backend(
+        DagExecutorConfig {
+            redis_url: REDIS_URL.into(),
+            workspace_id: ws.into(),
+            consumer_group: "cg-reclaim".into(),
+            max_retries: 2,
+            // Reclaim anything already idle, on a fast tick.
+            result_claim_idle_secs: 0,
+            result_claim_interval_secs: 1,
+            result_claim_batch: 16,
+        },
+        backend,
+    ));
+
+    rt.submit_goal(
+        "g-reclaim",
+        vec![make_task("rc1", TaskType::DagNode, vec![], ws)],
+    )
+    .await
+    .unwrap();
+    rt.publish_ready_tasks().await.unwrap();
+    // complete_task only accepts a Running task.
+    rt.orchestrator().start_task("rc1").await.unwrap();
+
+    // A consumer joins the group, receives the result, then dies before acking.
+    let result_stream = format!("orchestrator:results:{}", ws);
+    let doomed = RedisMessageBackend::new(REDIS_URL).await.unwrap();
+    doomed
+        .create_consumer_group(&result_stream, "cg-reclaim")
+        .await
+        .unwrap();
+    let mut doomed_stream = doomed
+        .subscribe(&result_stream, "cg-reclaim")
+        .await
+        .unwrap();
+
+    let msg = DagMessage::TaskComplete {
+        message_id: Uuid::new_v4().to_string(),
+        timestamp: Utc::now(),
+        task_id: "rc1".into(),
+        result: serde_json::json!({"status": "ok"}),
+        sender: "agent-a".into(),
+        recipient: "orchestrator".into(),
+    };
+    doomed
+        .publish(&result_stream, &serde_json::to_vec(&msg).unwrap())
+        .await
+        .unwrap();
+
+    let delivered = tokio::time::timeout(Duration::from_secs(3), doomed_stream.next())
+        .await
+        .ok()
+        .flatten();
+    assert!(
+        delivered.is_some(),
+        "doomed consumer should receive the result"
+    );
+    drop(doomed_stream);
+
+    // The live consumer starts only after the entry is already pending, so the
+    // state transition can only happen through the sweeper.
+    let shutdown = ShutdownSignal::new();
+    let consumer = rt.clone();
+    let consumer_shutdown = shutdown.clone();
+    let consumer_handle = tokio::spawn(async move {
+        let _ = consumer.run_consumer(consumer_shutdown).await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut status = TaskStatus::Pending;
+    while Instant::now() < deadline {
+        if let Some(task) = rt.orchestrator().get_task("rc1").await {
+            status = task.status;
+            if status == TaskStatus::Completed {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(5), consumer_handle).await;
+
+    assert_eq!(
+        status,
+        TaskStatus::Completed,
+        "a result left pending by a dead consumer must be reclaimed and applied"
     );
 
     cleanup_streams(ws).await;

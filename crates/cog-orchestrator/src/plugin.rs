@@ -209,6 +209,9 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             workspace_id,
             consumer_group,
             max_retries,
+            result_claim_idle_secs: ctx.config().dag_executor.result_claim_idle_secs,
+            result_claim_interval_secs: ctx.config().dag_executor.result_claim_interval_secs,
+            result_claim_batch: ctx.config().dag_executor.result_claim_batch,
         };
         let skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>> =
             ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();

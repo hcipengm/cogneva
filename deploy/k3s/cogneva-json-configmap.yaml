@@ -64,6 +64,9 @@ data:
         "COGNEVA_DECOMPOSITION_ORPHAN_POLL_INTERVAL_SECS": "dag_executor.decomposition_orphan_poll_interval_secs",
         "COGNEVA_DECOMPOSITION_ORPHAN_STALL_AFTER_SECS": "dag_executor.decomposition_orphan_stall_after_secs",
         "COGNEVA_DECOMPOSITION_ORPHAN_ALERT_DWELL_SECS": "dag_executor.decomposition_orphan_alert_dwell_secs",
+        "COGNEVA_RESULT_CLAIM_IDLE_SECS": "dag_executor.result_claim_idle_secs",
+        "COGNEVA_RESULT_CLAIM_INTERVAL_SECS": "dag_executor.result_claim_interval_secs",
+        "COGNEVA_RESULT_CLAIM_BATCH": "dag_executor.result_claim_batch",
         "COGNEVA_HTTP_PORT": "gateway.http_port",
         "COGNEVA_WS_PORT": "gateway.ws_port",
         "COGNEVA_METRICS_PORT": "gateway.metrics_port",
@@ -255,7 +258,10 @@ data:
         "batch_persistence_interval_secs": 5,
         "archive_enabled": true,
         "archive_after_secs": 3600,
-        "archive_poll_interval_secs": 300
+        "archive_poll_interval_secs": 300,
+        "result_claim_idle_secs": 600,
+        "result_claim_interval_secs": 60,
+        "result_claim_batch": 16
       },
       "gateway": {
         "http_port": 8080,

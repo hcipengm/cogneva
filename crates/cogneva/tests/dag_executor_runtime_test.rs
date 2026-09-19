@@ -39,6 +39,7 @@ async fn consumer_loop_updates_state_from_results() {
             workspace_id: "ws-1".into(),
             consumer_group: "cg-1".into(),
             max_retries: 3,
+            ..DagExecutorConfig::default()
         },
         backend.clone(),
     );
@@ -93,6 +94,7 @@ async fn consumer_loop_retries_on_task_failed_result() {
             workspace_id: "ws-2".into(),
             consumer_group: "cg-2".into(),
             max_retries: 3,
+            ..DagExecutorConfig::default()
         },
         backend.clone(),
     );
@@ -150,6 +152,7 @@ async fn consumer_loop_respects_shutdown_signal() {
             workspace_id: "ws-3".into(),
             consumer_group: "cg-3".into(),
             max_retries: 3,
+            ..DagExecutorConfig::default()
         },
         backend.clone(),
     );
@@ -174,6 +177,7 @@ async fn publisher_publishes_ready_tasks() {
             workspace_id: "ws-4".into(),
             consumer_group: "cg-4".into(),
             max_retries: 3,
+            ..DagExecutorConfig::default()
         },
         backend.clone(),
     );
