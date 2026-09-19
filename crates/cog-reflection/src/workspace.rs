@@ -29,6 +29,10 @@ pub const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
 /// git 子命令超时：worktree add 要检出全树，给足余量。
 const GIT_TIMEOUT_SECS: u64 = 120;
 
+/// 工作树仓库里上游主线的引用名（`local` 远程的 `main`）。与
+/// `change_pipeline::sync_with_upstream_in` 对齐到的那个引用是同一个。
+const MAINLINE_REF: &str = "local/main";
+
 /// 陈旧 git 锁的最小判定年龄。本进程的 git 子命令全部带 120s 超时且超时即杀
 /// （kill_on_drop），活着的命令不可能持锁超过该值；超龄锁只可能是被杀进程
 /// （OOM、节点重启、竞态互踩）留下的尸体，清掉并重试是唯一自愈路径——否则
@@ -291,6 +295,29 @@ impl WorkspaceManager {
         self.git_bare(&["rev-parse", "--verify", "--quiet", rev])
             .await
             .is_ok()
+    }
+
+    /// 本轮演进的起点。解析出的基线是版本 tag 时，它必落在主线历史上且落后于
+    /// 主线，而本轮紧接着会同步到上游主线：先回退到 tag 再前进到主线，两个提交
+    /// 之间的每个文件都被改写两次。路径稳定换来的增量缓存按 mtime 判新鲜度，
+    /// 于是这条路等于每轮把全部本地 crate 重新编一遍。
+    ///
+    /// 改用主线引用做起点只需一次 reset。实例自己的 evol 分支是显式基线，保持
+    /// 不动；主线引用取不到时回落到原基线，不把整轮中断在一个缺失的引用上。
+    pub async fn round_base(&self, ws: &Workspace, base: BaseRef) -> BaseRef {
+        if matches!(base, BaseRef::Branch(_)) {
+            return base;
+        }
+        match self
+            .git_in(
+                &ws.path,
+                &["rev-parse", "--verify", "--quiet", MAINLINE_REF],
+            )
+            .await
+        {
+            Ok(_) => BaseRef::Branch(MAINLINE_REF.to_string()),
+            Err(_) => base,
+        }
     }
 
     /// 常驻工作树：不存在 / 损坏 / 未登记则按 `spec.base` 重建；已存在则只补
@@ -1238,6 +1265,65 @@ mod tests {
         assert!(matches!(
             mgr.resolve_base("local", "0.6.0").await,
             BaseRef::Branch(b) if b == "main"
+        ));
+    }
+
+    #[tokio::test]
+    async fn round_base_aligns_to_the_mainline_instead_of_rewinding_to_the_version_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, rev_a, rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare);
+        // 版本 tag 停在旧提交、主线在新提交——这正是「先回退到 tag 再前进到主线」
+        // 会把两个提交之间的每个文件改写两次的形状。
+        in_bare(&bare, &["tag", "v0.5.7", &rev_a]);
+        let tag = BaseRef::Tag("v0.5.7".to_string());
+
+        let ws = mgr
+            .ensure_persistent(WorkspaceSpec::persistent(
+                "cycle-local",
+                WorkspaceKind::Cycle,
+                tag.clone(),
+            ))
+            .await
+            .unwrap();
+        // 还没同步过：没有 local/main 可对齐，回落到原基线，而不是把整轮断在
+        // 一个缺失的引用上。
+        assert!(matches!(
+            mgr.round_base(&ws, tag.clone()).await,
+            BaseRef::Tag(t) if t == "v0.5.7"
+        ));
+
+        // 第一轮同步会建出 local/main；此后起点必须对齐主线。
+        git(&ws.path, &["fetch", "-q", "local", "main"]);
+        assert_eq!(git_out(&ws.path, &["rev-parse", "local/main"]), rev_b);
+        assert!(matches!(
+            mgr.round_base(&ws, tag).await,
+            BaseRef::Branch(b) if b == "local/main"
+        ));
+    }
+
+    #[tokio::test]
+    async fn round_base_keeps_an_explicit_evol_branch_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _rev_a, rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare);
+        in_bare(&bare, &["branch", "evol/local", &rev_b]);
+        let base = BaseRef::Branch("evol/local".to_string());
+
+        let ws = mgr
+            .ensure_persistent(WorkspaceSpec::persistent(
+                "cycle-local",
+                WorkspaceKind::Cycle,
+                base.clone(),
+            ))
+            .await
+            .unwrap();
+        git(&ws.path, &["fetch", "-q", "local", "main"]);
+
+        // 移植分支是显式基线：即使 local/main 可取也不改用它。
+        assert!(matches!(
+            mgr.round_base(&ws, base).await,
+            BaseRef::Branch(b) if b == "evol/local"
         ));
     }
 

@@ -1478,7 +1478,11 @@ async fn run_evolution_cycle(
             base.clone(),
         ))
         .await?;
-    deps.workspaces.refresh(&workspace, base.clone()).await?;
+    // 起点取本轮真正要工作的那棵树。版本 tag 落在主线历史上且落后于主线，而本轮
+    // 马上会同步到主线；回退到 tag 再前进等于把两者之间每个文件重写两次，mtime
+    // 一变，路径稳定换来的增量缓存就没了——正是上面那段注释要避免的事。
+    let round_base = deps.workspaces.round_base(&workspace, base.clone()).await;
+    deps.workspaces.refresh(&workspace, round_base).await?;
     info!(path = %workspace.path.display(), "evolution cycle workspace ready");
 
     // 引擎基线树在这里只保证存在；它停在哪由本轮工作树的实际 HEAD 决定，
