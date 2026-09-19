@@ -156,7 +156,13 @@ evolution:
   gitRemote:
     mode: pvc
     hostPath: /var/lib/cogneva-data/git-remote
-    seedUrl: https://github.com/hcipengm/cogneva.git
+    # 有序镜像列表：第一个是首选上游，其余按序回退。可达性按主机不对称——
+    # 实测 github 从集群内间歇黑洞而 gitee 秒级应答——只配一个地址时，该
+    # 主机不可达期间的 release tag 刷新会静默失效，裸仓永远停在 seed 时的
+    # tag；空卷首次 seed 更会直接失败。两个都列上，任一可达即可用。
+    seedUrls:
+      - https://github.com/hcipengm/cogneva.git
+      - https://gitee.com/hcipengm/cogneva.git
     storage: 5Gi
   sandboxStorage: 20Gi
   # 源码卷：给共享 CARGO_TARGET_DIR 用的（工作树在它之外，可整棵重建而不丢
@@ -198,7 +204,11 @@ sandboxExecutor:
   # 空 = 跟随集群默认 SC（与 pg/redis 同策略，不绑厂商）。
   storageClass: ""
   # 空卷首挂时零凭证公开 https seed 裸仓库；后台按间隔 fetch（失败不阻塞）。
-  gitSeedUrl: https://github.com/hcipengm/cogneva.git
+  # 有序镜像列表：第一个是首选上游，其余按序回退。单一地址会在该主机不可达
+  # 期间把工作树静默留在旧 main（实测本集群 github 探测 44% 失败、gitee 0.86s）。
+  gitSeedUrls:
+    - https://github.com/hcipengm/cogneva.git
+    - https://gitee.com/hcipengm/cogneva.git
   # 每任务工作树生命周期（秒）：空闲超 TTL 回收，数量超上限按 LRU 驱逐。
   workspaceTtlSecs: 21600
   workspaceGcIntervalSecs: 600

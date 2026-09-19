@@ -53,27 +53,37 @@ spec:
               set -e
               root=/opt/cogneva/sandbox
               mkdir -p "$root/workspaces" "$root/src/target" "$root/repo.git"
+              # 镜像按序尝试，第一个可达的胜出：可达性按主机不对称（实测本集群
+              # github 间歇黑洞、gitee 秒级应答），只配一个地址时该主机不可达期间
+              # 空卷种子会失败、工作树会静默停在旧 main。
+              mirrors="https://github.com/hcipengm/cogneva.git,https://gitee.com/hcipengm/cogneva.git"
               if [ ! -f "$root/repo.git/HEAD" ]; then
-                echo "sandbox volume empty; seeding bare repo from https://github.com/hcipengm/cogneva.git ..."
                 # 种子失败不阻塞启动：主进程见裸仓缺失即回落无工作树模式，
                 # 下次重启 init 再试，离线集群不会因此永久卡在 Init 阶段。
                 # http.connectTimeout/lowSpeed 给网络操作兜底，否则离线时
                 # git 会长时间挂在连接上拖慢 Init 与整 Pod 就绪。
-                if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare https://github.com/hcipengm/cogneva.git /tmp/seed.git; then
-                  cp -a /tmp/seed.git/. "$root/repo.git/"
+                for m in $(echo "$mirrors" | tr ',' ' '); do
+                  echo "sandbox volume empty; seeding bare repo from $m ..."
+                  if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare "$m" /tmp/seed.git; then
+                    cp -a /tmp/seed.git/. "$root/repo.git/"
+                    rm -rf /tmp/seed.git
+                    break
+                  fi
                   rm -rf /tmp/seed.git
-                else
-                  echo "WARN: sandbox bare repo seed failed (offline?); executor starts without per-task worktrees"
-                fi
+                done
+                [ -f "$root/repo.git/HEAD" ] || echo "WARN: sandbox bare repo seed failed on every mirror (offline?); executor starts without per-task worktrees"
               fi
               if [ -f "$root/repo.git/HEAD" ]; then
-                git --git-dir="$root/repo.git" remote remove upstream 2>/dev/null || true
-                git --git-dir="$root/repo.git" remote add upstream https://github.com/hcipengm/cogneva.git
-                # +main:main advances the local main that task worktrees are cut
-                # from; a plain fetch would only update remote-tracking refs.
-                if ! git --git-dir="$root/repo.git" -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force '+main:main'; then
-                  echo "WARN: sandbox seed fetch failed (offline?); serving seeded refs"
-                fi
+                for m in $(echo "$mirrors" | tr ',' ' '); do
+                  git --git-dir="$root/repo.git" remote remove upstream 2>/dev/null || true
+                  git --git-dir="$root/repo.git" remote add upstream "$m"
+                  # +main:main advances the local main that task worktrees are cut
+                  # from; a plain fetch would only update remote-tracking refs.
+                  if git --git-dir="$root/repo.git" -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force '+main:main'; then
+                    break
+                  fi
+                  echo "WARN: sandbox seed fetch from $m failed (offline?); trying the next mirror"
+                done
                 git --git-dir="$root/repo.git" worktree prune || true
               fi
           volumeMounts:
@@ -104,8 +114,9 @@ spec:
               value: /opt/cogneva/sandbox/repo.git
             - name: CARGO_TARGET_DIR
               value: /opt/cogneva/sandbox/src/target
-            - name: SANDBOX_REPO_SEED_URL
-              value: "https://github.com/hcipengm/cogneva.git"
+            # 有序镜像列表（逗号分隔）：第一个首选，其余按序回退。
+            - name: SANDBOX_REPO_SEED_URLS
+              value: "https://github.com/hcipengm/cogneva.git,https://gitee.com/hcipengm/cogneva.git"
             - name: SANDBOX_WORKSPACE_TTL_SECS
               value: "21600"
             - name: SANDBOX_WORKSPACE_GC_INTERVAL_SECS

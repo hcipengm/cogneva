@@ -52,7 +52,7 @@ pub struct WorkdirConfig {
     pub workspaces_root: PathBuf,
     pub bare_repo: PathBuf,
     pub target_dir: PathBuf,
-    pub seed_url: Option<String>,
+    pub seed_urls: Vec<String>,
     pub ttl: Duration,
     pub gc_interval: Duration,
     pub fetch_interval: Duration,
@@ -85,11 +85,16 @@ impl WorkdirConfig {
             workspaces_root: path("SANDBOX_WORKSPACES_ROOT", DEFAULT_WORKSPACES_ROOT),
             bare_repo: path("SANDBOX_BARE_REPO", DEFAULT_BARE_REPO),
             target_dir: path("CARGO_TARGET_DIR", DEFAULT_TARGET_DIR),
-            // A leftover `__PLACEHOLDER__` from an unrendered static manifest
-            // must never be treated as a usable URL.
-            seed_url: std::env::var("SANDBOX_REPO_SEED_URL")
+            // Ordered mirrors, not one URL: reachability is per host and
+            // uneven — measured from this pod, one mirror answered in under a
+            // second while the other stalled to a 20s timeout — so a single
+            // upstream leaves the worktrees on stale refs for as long as that
+            // host is unreachable. A leftover `__PLACEHOLDER__` from an
+            // unrendered static manifest is never a usable URL.
+            seed_urls: std::env::var("SANDBOX_REPO_SEED_URLS")
                 .ok()
-                .filter(|u| is_usable_url(u)),
+                .map(|v| split_seed_urls(&v))
+                .unwrap_or_default(),
 
             ttl: secs("SANDBOX_WORKSPACE_TTL_SECS", DEFAULT_TTL_SECS, 1),
             gc_interval: secs(
@@ -112,6 +117,16 @@ impl WorkdirConfig {
 fn is_usable_url(url: &str) -> bool {
     let u = url.trim();
     !u.is_empty() && !u.contains("__")
+}
+
+/// Split a comma-separated mirror list into usable URLs, preserving order:
+/// the first entry is the preferred upstream and the rest are fallbacks.
+fn split_seed_urls(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|u| is_usable_url(u))
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -443,6 +458,13 @@ impl WorkdirRouter {
 
     /// Fetch upstream refs/tags into the bare repo. Never fatal: offline
     /// executors keep serving the refs present at seed.
+    ///
+    /// Every configured mirror is tried in order. Reachability is per host and
+    /// uneven — measured from this pod, one mirror stalled to a 20s timeout
+    /// while the other answered in 0.86s, and 19 of 43 consecutive attempts
+    /// against the single configured host failed outright — so stopping at the
+    /// first failure left the worktrees on a stale baseline with nothing but a
+    /// warning to show for it.
     pub async fn fetch_once(&self) {
         if self
             .git_bare(&["remote", "get-url", "upstream"])
@@ -454,7 +476,7 @@ impl WorkdirRouter {
                 .await
                 .ok()
                 .filter(|u| is_usable_url(u));
-            let url = self.cfg.seed_url.clone().or(origin);
+            let url = self.cfg.seed_urls.first().cloned().or(origin);
             let Some(url) = url else {
                 warn!("no usable upstream remote for sandbox bare repo; skipping fetch");
                 self.metrics.fetch_failures.inc();
@@ -466,18 +488,65 @@ impl WorkdirRouter {
                 return;
             }
         }
-        // A bare `fetch upstream` only writes refs/remotes/upstream/* and never
-        // advances the local `main` that new worktrees are cut from; the
-        // `+main:main` refspec fast-forces the local branch to upstream so the
-        // 300s background fetch actually freshens the baseline. Existing
-        // detached task trees keep pointing at their own commit.
-        match self
-            .git_bare(&["fetch", "upstream", "--tags", "--force", "+main:main"])
+
+        let mut current = self
+            .git_bare(&["remote", "get-url", "upstream"])
             .await
-        {
-            Ok(_) => info!("sandbox bare repo fetched from upstream"),
-            Err(e) => {
-                warn!(error = %e, "sandbox bare repo upstream fetch failed; serving seeded refs");
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        // Whatever the remote already points at is tried last, so a bare repo
+        // seeded without a configured mirror list still refreshes itself.
+        let mut mirrors = self.cfg.seed_urls.clone();
+        if !current.is_empty() && !mirrors.contains(&current) {
+            mirrors.push(current.clone());
+        }
+
+        let mut failure: Option<(String, SFError)> = None;
+        for mirror in &mirrors {
+            if &current != mirror {
+                if let Err(e) = self
+                    .git_bare(&["remote", "set-url", "upstream", mirror])
+                    .await
+                {
+                    warn!(error = %e, mirror = %mirror, "could not repoint upstream remote");
+                    continue;
+                }
+                current = mirror.clone();
+            }
+            // A bare `fetch upstream` only writes refs/remotes/upstream/* and
+            // never advances the local `main` that new worktrees are cut from;
+            // the `+main:main` refspec fast-forces the local branch to upstream
+            // so the 300s background fetch actually freshens the baseline.
+            // Existing detached task trees keep pointing at their own commit.
+            match self
+                .git_bare(&["fetch", "upstream", "--tags", "--force", "+main:main"])
+                .await
+            {
+                Ok(_) => {
+                    info!(mirror = %mirror, "sandbox bare repo fetched from upstream");
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, mirror = %mirror, "sandbox mirror unreachable; trying the next");
+                    failure = Some((mirror.clone(), e));
+                }
+            }
+        }
+
+        match failure {
+            Some((mirror, e)) => {
+                warn!(
+                    error = %e,
+                    mirror = %mirror,
+                    tried = mirrors.len(),
+                    "every sandbox upstream mirror failed; serving seeded refs"
+                );
+                self.metrics.fetch_failures.inc();
+            }
+            None => {
+                warn!("no usable upstream remote for sandbox bare repo; skipping fetch");
                 self.metrics.fetch_failures.inc();
             }
         }
@@ -800,22 +869,26 @@ mod tests {
         std::env::set_var("SANDBOX_WORKSPACE_GC_INTERVAL_SECS", "1");
         std::env::set_var("SANDBOX_REPO_FETCH_INTERVAL_SECS", "1");
         std::env::set_var("SANDBOX_MAX_TASK_WORKSPACES", "0");
-        std::env::set_var("SANDBOX_REPO_SEED_URL", "__GIT_SEED_URL__");
+        std::env::set_var(
+            "SANDBOX_REPO_SEED_URLS",
+            "__GIT_SEED_URL__, https://gitee.com/o/r.git",
+        );
         let cfg = WorkdirConfig::from_env();
         assert!(cfg.ttl >= Duration::from_secs(1));
         assert!(cfg.gc_interval >= Duration::from_secs(10));
         assert!(cfg.fetch_interval >= Duration::from_secs(30));
         assert_eq!(cfg.max_workspaces, 1);
-        assert!(
-            cfg.seed_url.is_none(),
-            "unresolved placeholder is not a usable URL"
+        assert_eq!(
+            cfg.seed_urls,
+            vec!["https://gitee.com/o/r.git".to_string()],
+            "an unresolved placeholder is dropped, the real mirror survives"
         );
         for key in [
             "SANDBOX_WORKSPACE_TTL_SECS",
             "SANDBOX_WORKSPACE_GC_INTERVAL_SECS",
             "SANDBOX_REPO_FETCH_INTERVAL_SECS",
             "SANDBOX_MAX_TASK_WORKSPACES",
-            "SANDBOX_REPO_SEED_URL",
+            "SANDBOX_REPO_SEED_URLS",
         ] {
             std::env::remove_var(key);
         }
@@ -841,6 +914,24 @@ mod tests {
         assert!(is_usable_url("https://github.com/o/r.git"));
         assert!(!is_usable_url("__GIT_SEED_URL__"));
         assert!(!is_usable_url("  "));
+    }
+
+    #[test]
+    fn seed_urls_preserve_mirror_order() {
+        assert_eq!(
+            split_seed_urls("https://github.com/o/r.git,https://gitee.com/o/r.git"),
+            vec![
+                "https://github.com/o/r.git".to_string(),
+                "https://gitee.com/o/r.git".to_string()
+            ],
+            "the first entry stays the preferred upstream, the rest are fallbacks"
+        );
+        assert!(split_seed_urls("__GIT_SEED_URL__").is_empty());
+        assert!(split_seed_urls("").is_empty());
+        assert_eq!(
+            split_seed_urls("  https://gitee.com/o/r.git  ,  "),
+            vec!["https://gitee.com/o/r.git".to_string()]
+        );
     }
 
     #[test]
@@ -924,17 +1015,88 @@ mod tests {
     }
 
     fn router(root: &Path, bare: &Path, max: usize, ttl: Duration) -> Arc<WorkdirRouter> {
+        router_with_mirrors(root, bare, max, ttl, Vec::new())
+    }
+
+    fn router_with_mirrors(
+        root: &Path,
+        bare: &Path,
+        max: usize,
+        ttl: Duration,
+        seed_urls: Vec<String>,
+    ) -> Arc<WorkdirRouter> {
         let cfg = WorkdirConfig {
             workspaces_root: root.join("workspaces"),
             bare_repo: bare.to_path_buf(),
             target_dir: root.join("src").join("target"),
-            seed_url: None,
+            seed_urls,
             ttl,
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: max,
         };
         WorkdirRouter::new(cfg).unwrap()
+    }
+
+    /// Clone `bare`, add one commit on `main`, push it back, return the new head.
+    fn advance_bare(bare: &Path, work: &Path) -> String {
+        std::fs::create_dir_all(work).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q"])
+            .arg(bare)
+            .arg(work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clone from {bare:?} failed");
+        std::fs::write(work.join("ADVANCE"), "1\n").unwrap();
+        git(&["add", "-A"], work);
+        git(&["commit", "-qm", "advance"], work);
+        git(&["push", "-q", "origin", "main"], work);
+        git_out(work, &["rev-parse", "HEAD"])
+    }
+
+    #[tokio::test]
+    async fn fetch_once_fails_over_to_the_next_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mirror_root = tmp.path().join("mirror-b");
+        let mirror = seed_bare(&mirror_root);
+        let want = advance_bare(&mirror, &tmp.path().join("mirror-b-work"));
+
+        let router_root = tmp.path().join("router");
+        let bare = seed_bare(&router_root);
+        let before = git_out(&bare, &["rev-parse", "main"]);
+
+        let r = router_with_mirrors(
+            &router_root,
+            &bare,
+            8,
+            DEFAULT_TTL_SECS_FALLBACK,
+            vec![
+                tmp.path().join("missing-mirror.git").display().to_string(),
+                mirror.display().to_string(),
+            ],
+        );
+
+        r.fetch_once().await;
+
+        assert_eq!(
+            git_out(&bare, &["rev-parse", "main"]),
+            want,
+            "the reachable mirror must still advance the baseline"
+        );
+        assert_ne!(before, want);
+        assert_eq!(
+            r.metrics.fetch_failures.get(),
+            0.0,
+            "a mirror that answered is not a fetch failure"
+        );
+        assert_eq!(
+            git_out(&bare, &["remote", "get-url", "upstream"]),
+            mirror.display().to_string(),
+            "the working mirror is kept for subsequent fetches"
+        );
     }
 
     #[tokio::test]

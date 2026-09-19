@@ -576,6 +576,11 @@ async fn ensure_git() -> Result<()> {
     bail!("git 不可用且自动安装失败，请手动安装 git 后重新运行引导器");
 }
 
+/// 上游公开仓库的两个镜像。可达性按主机不对称——实测本集群内 github 间歇黑洞
+/// 而 gitee 秒级应答——所以凡按序尝试的地方都从这一份取地址，不各写一份字面量。
+const GIT_MIRROR_GITHUB: &str = "https://github.com/hcipengm/cogneva.git";
+const GIT_MIRROR_GITEE: &str = "https://gitee.com/hcipengm/cogneva.git";
+
 /// 自进化 git 远程：evolution worker 的 hostPath bare 仓库（沙盒与宿主双向同步
 /// 通道，清单里写死 /var/lib/cogneva-data/git-remote）。空白机上该目录不存在
 /// 会导致 evolution Pod FailedMount，必须在部署清单前创建并 seed 源码。
@@ -594,17 +599,11 @@ async fn ensure_git_remote() -> Result<()> {
     if let Some(parent) = remote.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // 地址与 chart evolution.gitRemote.seedUrl 同源；CN 走 Gitee，失败回落另一地址。
+    // 地址与 chart evolution.gitRemote.seedUrls 同源；CN 走 Gitee，失败回落另一地址。
     let (primary, fallback) = if cn_mirror() {
-        (
-            "https://gitee.com/hcipengm/cogneva.git",
-            "https://github.com/hcipengm/cogneva.git",
-        )
+        (GIT_MIRROR_GITEE, GIT_MIRROR_GITHUB)
     } else {
-        (
-            "https://github.com/hcipengm/cogneva.git",
-            "https://gitee.com/hcipengm/cogneva.git",
-        )
+        (GIT_MIRROR_GITHUB, GIT_MIRROR_GITEE)
     };
     info!(
         "初始化自进化 git 远程仓库（从上游完整 clone）→ {}",
@@ -1321,15 +1320,9 @@ async fn ensure_source_tree() -> Result<PathBuf> {
     let dir = make_workdir("src")?;
     let bare = Path::new("/var/lib/cogneva-data/git-remote");
     let upstream = if cn_mirror() {
-        [
-            "https://gitee.com/hcipengm/cogneva.git",
-            "https://github.com/hcipengm/cogneva.git",
-        ]
+        [GIT_MIRROR_GITEE, GIT_MIRROR_GITHUB]
     } else {
-        [
-            "https://github.com/hcipengm/cogneva.git",
-            "https://gitee.com/hcipengm/cogneva.git",
-        ]
+        [GIT_MIRROR_GITHUB, GIT_MIRROR_GITEE]
     };
     let mut attempts: Vec<Vec<&str>> = Vec::new();
     if bare.join("HEAD").exists() {
@@ -1873,8 +1866,9 @@ fn cn_mirror_image(image: &str, mirror: &str) -> String {
 }
 
 /// CN 网络下的 helm values 覆盖：镜像 tag 直接从 chart values.yaml 读取再改
-/// 前缀（不硬编码 tag，chart 升版不漂移），seed 地址改 Gitee——与
-/// render_manifests_for_cluster 的文本替换同义，两条投递路径网络适配一致。
+/// 前缀（不硬编码 tag，chart 升版不漂移），seed 镜像列表整体倒序成 Gitee 优先
+/// ——与 render_manifests_for_cluster 的整表旋转同义，两条投递路径网络适配一致。
+/// 只置首位会把另一个镜像挤掉，CN 下 Gitee 不可达时就没有回退项了。
 fn cn_helm_value_overrides(mirror: &str) -> Result<Vec<(String, String)>> {
     let values_path = repo_root().join("deploy/helm/cogneva/values.yaml");
     let parsed: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&values_path)?)?;
@@ -1906,18 +1900,39 @@ fn cn_helm_value_overrides(mirror: &str) -> Result<Vec<(String, String)>> {
     ] {
         out.push((key.to_string(), cn_mirror_image(&image_at(path)?, mirror)));
     }
-    out.push((
-        "evolution.gitRemote.seedUrl".into(),
-        "https://gitee.com/hcipengm/cogneva.git".into(),
-    ));
+    for (key, url) in [
+        ("evolution.gitRemote.seedUrls[0]", GIT_MIRROR_GITEE),
+        ("evolution.gitRemote.seedUrls[1]", GIT_MIRROR_GITHUB),
+        ("sandboxExecutor.gitSeedUrls[0]", GIT_MIRROR_GITEE),
+        ("sandboxExecutor.gitSeedUrls[1]", GIT_MIRROR_GITHUB),
+    ] {
+        out.push((key.to_string(), url.to_string()));
+    }
     Ok(out)
+}
+
+/// CN 网络下把 seed 镜像列表整体倒序（Gitee 置首）而不只留一个地址。清单里两个
+/// 镜像都列着，只做「交换」才能保住回退项：逐个字符串替换会把两个都改成 Gitee。
+/// 哨兵占位使交换对出现次数不敏感（两个 URL 出现几次就换几对）。
+fn prefer_gitee_seed_mirrors(text: &str) -> String {
+    const SENTINEL: &str = "__GIT_MIRROR_SWAP__";
+    if !text.contains(GIT_MIRROR_GITHUB) {
+        return text.to_string();
+    }
+    if !text.contains(GIT_MIRROR_GITEE) {
+        // 只列了一个镜像（老清单/自定义 values）：直接换成 Gitee，与旧行为一致。
+        return text.replace(GIT_MIRROR_GITHUB, GIT_MIRROR_GITEE);
+    }
+    text.replace(GIT_MIRROR_GITHUB, SENTINEL)
+        .replace(GIT_MIRROR_GITEE, GIT_MIRROR_GITHUB)
+        .replace(SENTINEL, GIT_MIRROR_GITEE)
 }
 
 /// 按运行网络环境处理预渲染 profile 产物副本。环境差异（containerd socket、
 /// StorageClass、git-remote hostPath/PVC、ingress class）已在 CI 渲染时固化
 /// 进各 profile，这里只做与网络可达性相关的替换：
 /// - CN 模式 → 公开镜像加国内镜像站前缀（Docker Hub 被墙）；
-/// - CN 模式 → git-remote seed 地址改用 Gitee（GitHub 拉取受限）。
+/// - CN 模式 → seed 镜像列表倒序成 Gitee 优先（GitHub 拉取受限）。
 ///
 /// 返回处理后的目录（kubectl apply 后即弃）。
 async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
@@ -1939,11 +1954,7 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
             text = text.replace(from.as_str(), to.as_str());
         }
         if cn {
-            // profile 产物烘焙的是 GitHub seed 地址；CN 网络改用 Gitee。
-            text = text.replace(
-                "https://github.com/hcipengm/cogneva.git",
-                "https://gitee.com/hcipengm/cogneva.git",
-            );
+            text = prefer_gitee_seed_mirrors(&text);
         }
         std::fs::write(out.join(entry.file_name()), text)?;
     }
@@ -2336,6 +2347,30 @@ mod profile_tests {
         assert_eq!(
             super::cn_mirror_image("quay.io/buildah/stable:latest", m),
             "quay.nju.edu.cn/buildah/stable:latest"
+        );
+    }
+
+    #[test]
+    fn cn_seed_mirror_list_is_reordered_not_collapsed() {
+        let gh = super::GIT_MIRROR_GITHUB;
+        let gt = super::GIT_MIRROR_GITEE;
+        // 两个镜像都在：倒序，不能把 GitHub 那条吞掉
+        assert_eq!(
+            super::prefer_gitee_seed_mirrors(&format!("[{gh}, {gt}]")),
+            format!("[{gt}, {gh}]")
+        );
+        // 同一 URL 出现多次也要成对交换，且结果都是合法地址
+        assert_eq!(
+            super::prefer_gitee_seed_mirrors(&format!("{gh}|{gh}|{gt}")),
+            format!("{gt}|{gt}|{gh}")
+        );
+        // 只列了一个镜像：退化成直接替换，与旧行为一致
+        assert_eq!(super::prefer_gitee_seed_mirrors(gh), gt);
+        assert_eq!(super::prefer_gitee_seed_mirrors(gt), gt);
+        // 与 seed 无关的文本原样保留
+        assert_eq!(
+            super::prefer_gitee_seed_mirrors("kind: Deployment"),
+            "kind: Deployment"
         );
     }
 }

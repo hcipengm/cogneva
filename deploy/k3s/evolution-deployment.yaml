@@ -45,21 +45,39 @@ spec:
               set -e
               git config --global --add safe.directory /host-git
               git config --global --add safe.directory /opt/cogneva/sandbox/workspaces
+              # 镜像按序尝试，第一个可达的胜出：可达性按主机不对称（实测本集群
+              # github 间歇黑洞、gitee 秒级应答），只配一个地址时该主机不可达期间
+              # 既 seed 不出空卷、也刷不到新 release tag。
+              # http.connectTimeout/lowSpeed 给网络操作兜底，否则离线时 git 会
+              # 长时间挂在连接上拖慢 Init 与整 Pod 就绪。
+              mirrors="https://github.com/hcipengm/cogneva.git,https://gitee.com/hcipengm/cogneva.git"
               # git-remote 为 PVC（多节点）时首次挂载是空卷，从公开仓库 seed；
               # hostPath（单节点）时 bootstrap 已预 seed，本步自动跳过。
-              # __GIT_SEED_URL__ 由 bootstrap 按网络模式替换（CN 走 Gitee）
+              # 全部镜像失败不阻塞启动：离线集群用本地已有状态，下次重启 init 再试。
               if [ ! -f /host-git/HEAD ]; then
-                echo "git-remote is empty; seeding bare repo from __GIT_SEED_URL__ ..."
-                git clone --bare __GIT_SEED_URL__ /tmp/seed.git
-                cp -a /tmp/seed.git/. /host-git/
-                rm -rf /tmp/seed.git
+                for m in $(echo "$mirrors" | tr ',' ' '); do
+                  echo "git-remote is empty; seeding bare repo from $m ..."
+                  if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare "$m" /tmp/seed.git; then
+                    cp -a /tmp/seed.git/. /host-git/
+                    rm -rf /tmp/seed.git
+                    break
+                  fi
+                  rm -rf /tmp/seed.git
+                done
+                [ -f /host-git/HEAD ] || echo "WARN: git-remote seed failed on every mirror (offline?); starting without a seeded baseline"
               fi
-              # bare 保持指向上游的 upstream remote，启动时拉最新 release tag；
-              # 失败不阻塞（离线时用 seed 已带的 tag，当前版本 tag 在 seed 时已存在）。
-              git --git-dir=/host-git remote remove upstream 2>/dev/null || true
-              git --git-dir=/host-git remote add upstream __GIT_SEED_URL__
-              if ! git --git-dir=/host-git fetch upstream --tags --force; then
-                echo "WARN: fetch upstream tags failed (offline?); using tags present at seed"
+              if [ -f /host-git/HEAD ]; then
+                # bare 保持一个指向上游的 upstream remote，启动时拉最新 main 与
+                # release tag；首选不可达就换下一个，全部失败只告警——离线时用
+                # seed 已带的 tag（当前部署版本的 tag 在 seed 时就存在）。
+                for m in $(echo "$mirrors" | tr ',' ' '); do
+                  git --git-dir=/host-git remote remove upstream 2>/dev/null || true
+                  git --git-dir=/host-git remote add upstream "$m"
+                  if git --git-dir=/host-git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force; then
+                    break
+                  fi
+                  echo "WARN: fetch upstream tags from $m failed (offline?); trying the next mirror"
+                done
               fi
               # 工作树由分配器按需从裸仓库切出（零克隆、共享对象库），这里只清掉
               # 崩溃留下的孤儿登记，并备好工作树根目录（app 容器的 workingDir）。
