@@ -119,6 +119,16 @@ gateway:
 securityGateway:
   enabled: true
   replicas: 1
+  # 网关在全部调用链最前面（LLM 与 git 透传的唯一凭证出口）：没有 request 时
+  # 调度器按 BestEffort 处理，节点一有压力先驱逐它，而被驱逐的 Pod 正是调用方
+  # 的直接下游；request 按常驻实耗给，limit 留突发余量。
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
   # 观测通道端口：只挂 /health/* 与 /metrics，不含任何代理路由。与 8080/8081
   # 分列的原因是那两条通道会注入真实上游凭证，跨命名空间放行等于把凭证代持
   # 能力交给监控侧；观测通道没有代理面，可以只对它放行监控命名空间。

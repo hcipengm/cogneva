@@ -169,6 +169,30 @@ spec:
             # 观测通道监听端口；与容器端口同源 values，避免两处漂移。
             - name: COGNEVA_SG_METRICS_PORT
               value: {{ .Values.securityGateway.metricsPort | quote }}
+          # 探测挂在 8080：那是本进程唯一的常驻 HTTP 面（8081/8082 只在被调用时
+          # 有动静），/health/live 与 /health/ready 由网关自己答，不对上游发请求。
+          # 没有 liveness 时一个卡死的网关会一直被 Service 指向并持续吞掉全部
+          # LLM 与 git 出口调用；没有 readiness 时新 Pod 未就绪就先接流量。
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: egress-proxy
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: egress-proxy
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.securityGateway.resources | nindent 12 }}
+      # 网关是唯一持有真凭证的进程：以非 root 运行、卷组固定，避免凭证文件
+      # 落进 root 专属可读的目录。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
 ---
 apiVersion: v1
 kind: Service

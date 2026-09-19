@@ -56,10 +56,48 @@ def vol_key(v):
     if 'secret' in v: return 'secret:' + v['secret'].get('secretName', '?')
     return str([k for k in v if k != 'name'])
 
+UNIT = {'n': 1e-9, 'u': 1e-6, 'm': 1e-3, '': 1.0, 'k': 1e3, 'M': 1e6, 'G': 1e9,
+        'Ki': 2 ** 10, 'Mi': 2 ** 20, 'Gi': 2 ** 30, 'Ti': 2 ** 40}
+
+def norm_qty(v):
+    """Kubernetes resources: `1` and `1000m` are the same CPU amount. Comparing
+    the spelling instead of the amount would make the gate fail on a synonym and
+    pass on a real difference hidden behind a different unit."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    for suf in ('Ki', 'Mi', 'Gi', 'Ti', 'k', 'M', 'G', 'm', 'n', 'u', ''):
+        if suf and not s.endswith(suf):
+            continue
+        try:
+            return float(s[: len(s) - len(suf)] or 0) * UNIT[suf]
+        except ValueError:
+            break
+    return s
+
+def norm_resources(r):
+    if not r:
+        return None
+    out = {}
+    for sec in ('requests', 'limits'):
+        out[sec] = sorted((k, norm_qty(v)) for k, v in (r.get(sec) or {}).items())
+    return json.dumps(out, default=str, sort_keys=True)
+
+def norm_probes(c):
+    return json.dumps({k: c[k] for k in ('startupProbe', 'livenessProbe', 'readinessProbe') if k in c},
+                      sort_keys=True)
+
 def workload(doc):
     ps = pod_spec(doc)
     out = {'sa': ps.get('serviceAccountName', '(default)'),
            'automount': ps.get('automountServiceAccountToken', '(default)'),
+           # 探针 / 资源声明 / securityContext 也是能力面：少了 liveness 的进程
+           # 卡死不会被重启，少了 request 的 Pod 是 BestEffort（节点有压力先被
+           # 驱逐），少了 securityContext 的进程以镜像默认用户跑。它们不在
+           # env/卷/挂载里，只比那三类会让"渲染路径少一整套探针"无声通过。
+           'securityContext': json.dumps(ps.get('securityContext'), sort_keys=True),
            'volumes': sorted(f"{v['name']}={vol_key(v)}" for v in ps.get('volumes', []))}
     conts = {}
     for c in ps.get('containers', []) + ps.get('initContainers', []):
@@ -71,6 +109,10 @@ def workload(doc):
                               for e in c.get('envFrom', [])),
             'env': sorted(e['name'] for e in c.get('env', [])),
             'mounts': sorted(f"{m['name']}->{m['mountPath']}" for m in c.get('volumeMounts', [])),
+            'resources': norm_resources(c.get('resources')),
+            'probes': norm_probes(c),
+            'securityContext': json.dumps(c.get('securityContext'), sort_keys=True),
+            'workingDir': c.get('workingDir', ''),
         }
     out['containers'] = conts
     return out
@@ -137,7 +179,7 @@ for name in sorted(set(k) & set(h)):
     kind = name[0]
     if kind in ('Deployment', 'StatefulSet', 'DaemonSet'):
         ka, ha = workload(k[name]), workload(h[name])
-        for key in ('sa', 'automount'):
+        for key in ('sa', 'automount', 'securityContext'):
             if ka[key] != ha[key]:
                 errors.append(f"{kind}/{name[1]} {key}: k3s={ka[key]} helm={ha[key]}")
         for v in sorted(set(ka['volumes']) - set(ha['volumes'])):
@@ -155,6 +197,9 @@ for name in sorted(set(k) & set(h)):
                     errors.append(f"{kind}/{name[1]} [{cn}] {f} k3s-only: {x}")
                 for x in sorted(set(hc[f]) - set(kc[f])):
                     errors.append(f"{kind}/{name[1]} [{cn}] {f} helm-only: {x}")
+            for f in ('resources', 'probes', 'securityContext', 'workingDir'):
+                if kc[f] != hc[f]:
+                    errors.append(f"{kind}/{name[1]} [{cn}] {f}: k3s={kc[f]} helm={hc[f]}")
     elif kind == 'Service':
         ka, ha = svc(k[name]), svc(h[name])
         for x in sorted(set(ka['ports']) - set(ha['ports'])):

@@ -38,16 +38,23 @@ spec:
                   key: pg-password
             - name: POSTGRES_DB
               value: "cogneva"
+          # timeoutSeconds 必须显式给：Kubernetes 默认 1 秒，而 pg_isready 在
+          # checkpoint 或复制压力下会超过 1 秒——默认值下探针连续失败会判活失败
+          # 并重启数据库，重启期间全部写入方（进化、triage、告警落盘）一起断。
           livenessProbe:
             exec:
               command: ["pg_isready", "-U", "cog_user", "-d", "cogneva"]
             initialDelaySeconds: 30
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "cog_user", "-d", "cogneva"]
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             requests:
               cpu: 250m
