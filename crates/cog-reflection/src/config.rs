@@ -390,9 +390,38 @@ pub struct RolloutTargetConfig {
     pub manifest: Option<String>,
 }
 
+/// 上游跟踪的代码平台。取值决定网关 git 透传面的路径段（`/git/{slug}/`）；
+/// 凭证由网关在出口注入，本进程不持有任何 token。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodePlatform {
+    Github,
+    Gitee,
+}
+
+impl CodePlatform {
+    pub fn slug(self) -> &'static str {
+        match self {
+            CodePlatform::Github => "github",
+            CodePlatform::Gitee => "gitee",
+        }
+    }
+}
+
+/// 一个被跟踪的上游：平台 + `owner/repo`。同一仓库在两端镜像时配两项，
+/// 集群内按祖先关系择新；两端真分叉则不动主线并响亮告警——猜一个方向
+/// 等于用一次分叉决定集群跑谁的代码。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamTrackConfig {
+    pub platform: CodePlatform,
+    pub repo: String,
+}
+
 /// 主线跟踪自动部署器配置：进化 Pod 内常驻循环，检测集群内 bare 仓库
 /// （/host-git）公版 main 前进后，沙盒内增量构建 → buildah 叠层推集群内
 /// registry → 派独立 Job 门禁滚动四个 deployment，失败自动回滚。
+/// bare 的 main 由本部署器自己从各上游平台拉取推进（upstreams），
+/// 不再依赖宿主机上的定时器喂仓。
 /// 默认关闭：依赖 RBAC/NetworkPolicy/registry 就位，缺失时不空转报错。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -404,6 +433,16 @@ pub struct MainlineDeployerConfig {
     pub bare_repo: String,
     /// 跟踪的上游分支。
     pub branch: String,
+    /// 上游跟踪源。空 = 不跟踪上游（只跟随 bare，需外部喂仓）。留空时从
+    /// `github_integration` / `gitee_integration` 的 `repo` 推导——仓库身份
+    /// 只有一个家，部署器只消费它，不另写一份。
+    pub upstreams: Vec<UpstreamTrackConfig>,
+    /// 网关 git 透传根：上游 URL = `{base}/{platform}/{owner}/{repo}.git`，
+    /// 凭证由网关在出口注入。空 = 不跟踪上游。
+    pub git_proxy_base: String,
+    /// 单次上游 fetch 的超时（秒）。取的是网络往返的上界：网关到平台
+    /// 断了要能在一轮轮询内翻篇，不能把主循环挂在这里。
+    pub upstream_fetch_timeout_secs: u64,
     /// buildah 在进化 Pod 内 push/from 的 registry 端点（集群 DNS，http）：
     /// Pod 内可解析 svc 名，配合 --tls-verify=false。
     pub registry: String,
@@ -474,6 +513,9 @@ impl Default for MainlineDeployerConfig {
             poll_interval_secs: 600,
             bare_repo: "/host-git".into(),
             branch: "main".into(),
+            upstreams: Vec::new(),
+            git_proxy_base: String::new(),
+            upstream_fetch_timeout_secs: 300,
             registry: "cogneva-registry.cogneva.svc.cluster.local:5000".into(),
             local_registry: "localhost:30500".into(),
             namespace: "cogneva".into(),
@@ -530,6 +572,38 @@ impl Default for MainlineDeployerConfig {
     }
 }
 
+/// 跟踪源留空时，从 `github_integration` / `gitee_integration` 的 `repo`
+/// 推导：同一仓库在两端镜像，两端都跟。两个平台都关或都没有 repo 时返回
+/// 空列表——那表示"这台部署不跟踪上游"，不是错误，但部署器会据此在心跳里
+/// 明说（只跟随 bare 的部署必须能从日志看出来，否则它和"跟踪坏了"长得一样）。
+fn upstreams_from_integrations(root: &serde_json::Value) -> Vec<UpstreamTrackConfig> {
+    let mut out = Vec::new();
+    for (platform, pointer) in [
+        (CodePlatform::Github, "/github_integration"),
+        (CodePlatform::Gitee, "/gitee_integration"),
+    ] {
+        let Some(section) = root.pointer(pointer) else {
+            continue;
+        };
+        if section.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+            continue;
+        }
+        let repo = section
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if repo.is_empty() {
+            continue;
+        }
+        out.push(UpstreamTrackConfig {
+            platform,
+            repo: repo.to_string(),
+        });
+    }
+    out
+}
+
 impl MainlineDeployerConfig {
     /// 从 cogneva.json 的 `self_evolution.mainline_deployer` 段加载，再叠加
     /// env 覆盖。文件或段缺失时返回 Default（enabled=false，安全侧）；
@@ -541,11 +615,11 @@ impl MainlineDeployerConfig {
     }
 
     pub fn load_from(path: &Path) -> SFResult<Self> {
-        let mut cfg = match std::fs::read_to_string(path) {
+        let (mut cfg, root) = match std::fs::read_to_string(path) {
             Ok(text) => {
                 let root: serde_json::Value = serde_json::from_str(&text)
                     .map_err(|e| SFError::Config(format!("{}: {e}", path.display())))?;
-                match root.pointer("/self_evolution/mainline_deployer") {
+                let cfg = match root.pointer("/self_evolution/mainline_deployer") {
                     Some(section) => serde_json::from_value(section.clone()).map_err(|e| {
                         SFError::Config(format!(
                             "{} self_evolution.mainline_deployer: {e}",
@@ -553,12 +627,18 @@ impl MainlineDeployerConfig {
                         ))
                     })?,
                     None => Self::default(),
-                }
+                };
+                (cfg, Some(root))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
             Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
         };
         cfg.apply_env_with(|k| std::env::var(k).ok())?;
+        if cfg.upstreams.is_empty() {
+            if let Some(root) = root.as_ref() {
+                cfg.upstreams = upstreams_from_integrations(root);
+            }
+        }
         Ok(cfg)
     }
 
@@ -579,6 +659,13 @@ impl MainlineDeployerConfig {
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BRANCH") {
             self.branch = v;
+        }
+        if let Some(v) = get("COGNEVA_GIT_PROXY_BASE") {
+            self.git_proxy_base = v;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_UPSTREAM_FETCH_TIMEOUT_SECS") {
+            self.upstream_fetch_timeout_secs =
+                parse("COGNEVA_MAINLINE_DEPLOYER_UPSTREAM_FETCH_TIMEOUT_SECS", &v)?;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY") {
             self.registry = v;
@@ -703,6 +790,57 @@ mod tests {
         assert!(cfg
             .apply_env_with(|k| bad.get(k).map(|s| s.to_string()))
             .is_err());
+    }
+
+    /// 仓库身份只有一个家：部署器的上游跟踪源留空时从既有的集成段推导，
+    /// 两端镜像都跟——只跟一端会让另一个平台上的提交永远进不了集群。
+    #[test]
+    fn mainline_upstreams_default_to_both_integration_repos() {
+        let dir = std::env::temp_dir().join(format!("cog-reflection-ml-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "self_evolution": {"enabled": true},
+              "github_integration": {"enabled": true, "repo": "o/r"},
+              "gitee_integration": {"enabled": true, "repo": "o/r"}
+            }"#,
+        )
+        .unwrap();
+        let cfg = MainlineDeployerConfig::load_from(&path).unwrap();
+        let platforms: Vec<&str> = cfg.upstreams.iter().map(|u| u.platform.slug()).collect();
+        assert_eq!(platforms, vec!["github", "gitee"]);
+        assert!(cfg.upstreams.iter().all(|u| u.repo == "o/r"));
+
+        // 显式写了跟踪源就以显式为准，不再推导。
+        std::fs::write(
+            &path,
+            r#"{
+              "self_evolution": {"mainline_deployer": {"upstreams": [{"platform": "gitee", "repo": "x/y"}]}},
+              "github_integration": {"enabled": true, "repo": "o/r"},
+              "gitee_integration": {"enabled": true, "repo": "o/r"}
+            }"#,
+        )
+        .unwrap();
+        let cfg = MainlineDeployerConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.upstreams.len(), 1);
+        assert_eq!(cfg.upstreams[0].repo, "x/y");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 关掉或没配 repo 的平台不进跟踪列表：那表示这台部署不跟这一端，
+    /// 不是"跟一个空仓库"。
+    #[test]
+    fn disabled_platforms_are_not_tracked() {
+        let root: serde_json::Value = serde_json::from_str(
+            r#"{
+              "github_integration": {"enabled": false, "repo": "o/r"},
+              "gitee_integration": {"enabled": true, "repo": "  "}
+            }"#,
+        )
+        .unwrap();
+        assert!(upstreams_from_integrations(&root).is_empty());
     }
 
     #[test]

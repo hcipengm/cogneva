@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 # 公版 GitHub main → 宿主工作仓库 → K3s git-remote bare 仓库的源头拉取。
 #
-# 为什么需要：集群内主线跟踪部署器只看 bare 仓库（/host-git）的 main 前进；
-# 此前 bare 只由 sync-git-remote.sh 从宿主工作树推送，而宿主工作树不会自己
-# 从 GitHub 拉取——公版 main 前进后没有任何环节把它带进集群（2026-09-08
-# 20 个修复在 main 躺一天、集群仍跑旧镜像的事故根因）。本脚本补上源头：
-# 从 GitHub ff-only 拉公版 main，工作树干净就快进合并本地 main 再走既有
-# 同步脚本；工作树忙（有人在改/停在别的分支）也不动用户现场，直接把上游
-# 提交经祖先校验快进推给 bare。
+# 【已被取代】集群内的主线跟踪部署器现在自己从各平台拉 main（配置
+# self_evolution.mainline_deployer.upstreams，两端镜像都跟，经安全网关的
+# git 透传面取，凭证只存在于网关）。这条链不再需要宿主机参与，正常部署
+# 不要启用下面的 timer：两个写者同时推 bare 的 main 会互相打脸。
+# 本脚本保留作无网/救援时的手动通道（宿主机是唯一能直连 GitHub SSH 的地方）。
 #
-# 安装（systemd timer，每 10 分钟，停机错过补跑）：
-#   cp deploy/k3s/cogneva-upstream-pull.{service,timer} /etc/systemd/system/
-#   systemctl daemon-reload
-#   systemctl enable --now cogneva-upstream-pull.timer
-# 备用 cron 一行：
-#   */10 * * * * root /root/omc_workspace/cogneva/deploy/k3s/pull-upstream-main.sh
+# 历史：2026-09-08 的"20 个修复在 main 躺一天、集群仍跑旧镜像"事故，根因
+# 就是当时 bare 只由 sync-git-remote.sh 从宿主工作树推送，而宿主工作树
+# 不会自己从 GitHub 拉取——公版 main 前进后没有任何环节把它带进集群。
+# 当时的补法是在宿主补一个定时器；现在这条源头搬进了集群内。
+#
+# 手动用法（仅在集群内跟踪不可用时）：
+#   /root/omc_workspace/cogneva/deploy/k3s/pull-upstream-main.sh
+# 若曾经装过 timer，拆除：
+#   systemctl disable --now cogneva-upstream-pull.timer
 #
 # 安全约束：只快进，永不强推/reset；GitHub 走 SSH deploy key（本机 HTTPS
-# 被墙、SSH 通）；任何失败只记日志不致命，timer 下轮重试。
+# 被墙、SSH 通）；任何失败只记日志不致命。
 set -euo pipefail
 
 SRC_REPO="${1:-/root/omc_workspace/cogneva}"

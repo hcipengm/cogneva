@@ -40,7 +40,7 @@ use cog_core::{SFError, SFResult, ShutdownSignal};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::config::{MainlineDeployerConfig, RolloutTargetConfig};
+use crate::config::{CodePlatform, MainlineDeployerConfig, RolloutTargetConfig};
 
 /// buildah 存储库放 sandbox PVC：与金丝雀 publisher 共享基镜像层缓存，
 /// Pod 重启不丢。
@@ -1000,6 +1000,9 @@ pub struct MainlineDeployer {
     /// 部署器独占一棵稳定路径的工作树。与进化任务的工作树互不干涉：这里是
     /// 唯一能自由 `reset --hard` 的检出，任何第三方检出停在哪里都不影响它。
     workspaces: std::sync::Arc<crate::workspace::WorkspaceManager>,
+    /// 最近一次上游跟踪的结论，心跳里明说。上游这条链最容易长成"看着在跟、
+    /// 其实没跟"：没有它，只跟随 bare 的部署与跟踪坏掉的部署日志一模一样。
+    upstream_note: std::sync::Mutex<String>,
 }
 
 impl MainlineDeployer {
@@ -1007,7 +1010,11 @@ impl MainlineDeployer {
         cfg: MainlineDeployerConfig,
         workspaces: std::sync::Arc<crate::workspace::WorkspaceManager>,
     ) -> Self {
-        Self { cfg, workspaces }
+        Self {
+            cfg,
+            workspaces,
+            upstream_note: std::sync::Mutex::new("pending".to_string()),
+        }
     }
 
     /// 部署器工作树路径（稳定）。
@@ -1045,7 +1052,12 @@ impl MainlineDeployer {
             .bare_main_rev()
             .await
             .unwrap_or_else(|e| format!("unreadable({e})"));
-        let summary = heartbeat_message(&self.load_state(), &bare, chrono::Utc::now().timestamp());
+        let summary = heartbeat_message(
+            &self.load_state(),
+            &bare,
+            &self.upstream_note(),
+            chrono::Utc::now().timestamp(),
+        );
         info!(heartbeat = %summary, "mainline deployer heartbeat");
     }
 
@@ -1175,6 +1187,169 @@ impl MainlineDeployer {
             .await
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    fn set_upstream_note(&self, note: &str) {
+        if let Ok(mut slot) = self.upstream_note.lock() {
+            *slot = note.to_string();
+        }
+    }
+
+    fn upstream_note(&self) -> String {
+        self.upstream_note
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| "unknown".into())
+    }
+
+    /// 上游跟踪：把各平台的 main 拉进 bare，再把 bare 的本地分支按祖先关系
+    /// 推进到最新的那个 head，返回推进后的 rev（没推进返回 None）。
+    ///
+    /// 只写 refs 与对象、不碰任何工作树，因此可以和构建并行跑。多个平台之间
+    /// 取"是所有其他候选的祖先"的那一个；两个 head 互不为祖先（真分叉）时
+    /// 一个都不取，只告警——替分叉猜一个方向，等于用一次分叉决定集群跑谁的
+    /// 代码。
+    async fn refresh_upstream(&self, current: &str) -> Option<String> {
+        if self.cfg.upstreams.is_empty() || self.cfg.git_proxy_base.trim().is_empty() {
+            self.set_upstream_note("off");
+            return None;
+        }
+        let base = self.cfg.git_proxy_base.trim_end_matches('/');
+
+        let mut heads: Vec<(CodePlatform, String)> = Vec::new();
+        let mut unreachable: Vec<String> = Vec::new();
+        for up in &self.cfg.upstreams {
+            let repo = up.repo.trim().trim_end_matches(".git");
+            let url = format!("{base}/{}/{repo}.git", up.platform.slug());
+            let local = format!("refs/cogneva/upstream/{}", up.platform.slug());
+            let refspec = format!("+refs/heads/{}:{local}", self.cfg.branch);
+            match self
+                .run_cmd(
+                    "git",
+                    &[
+                        "--git-dir",
+                        &self.cfg.bare_repo,
+                        "fetch",
+                        "--no-tags",
+                        "--force",
+                        &url,
+                        &refspec,
+                    ],
+                    None,
+                    self.cfg.upstream_fetch_timeout_secs,
+                )
+                .await
+            {
+                Ok(_) => {
+                    match self
+                        .run_cmd(
+                            "git",
+                            &["--git-dir", &self.cfg.bare_repo, "rev-parse", &local],
+                            None,
+                            30,
+                        )
+                        .await
+                    {
+                        Ok(rev) => heads.push((up.platform, rev.trim().to_string())),
+                        Err(e) => unreachable.push(format!("{}: {e}", up.platform.slug())),
+                    }
+                }
+                Err(e) => unreachable.push(format!("{}: {e}", up.platform.slug())),
+            }
+        }
+        if !unreachable.is_empty() {
+            warn!(
+                upstreams = %unreachable.join("; "),
+                "upstream fetch failed; leaving the bare main where it is"
+            );
+        }
+        if heads.is_empty() {
+            self.set_upstream_note(&format!("unreachable({})", unreachable.len()));
+            return None;
+        }
+
+        // 候选 = bare 当前 main 的后代；等于 main 的不算推进，不是后代的不动。
+        let mut ahead: Vec<(CodePlatform, String)> = Vec::new();
+        for (platform, rev) in heads {
+            if rev == current {
+                continue;
+            }
+            if self.is_ancestor(current, &rev).await {
+                ahead.push((platform, rev));
+            } else {
+                warn!(
+                    platform = platform.slug(),
+                    rev = %rev12(&rev),
+                    "upstream main is not a descendant of the bare main; ignoring it"
+                );
+            }
+        }
+
+        let mut best: Option<(CodePlatform, String)> = None;
+        let mut diverged = false;
+        for (platform, rev) in ahead {
+            let Some((bp, brev)) = best.take() else {
+                best = Some((platform, rev));
+                continue;
+            };
+            if self.is_ancestor(&brev, &rev).await {
+                best = Some((platform, rev));
+            } else if self.is_ancestor(&rev, &brev).await {
+                best = Some((bp, brev));
+            } else {
+                diverged = true;
+                warn!(
+                    a = %format!("{}={}", bp.slug(), rev12(&brev)),
+                    b = %format!("{}={}", platform.slug(), rev12(&rev)),
+                    "upstream mains diverged; refusing to advance the bare main"
+                );
+                best = Some((bp, brev));
+            }
+        }
+        if diverged {
+            self.set_upstream_note("diverged");
+            return None;
+        }
+        let Some((platform, rev)) = best else {
+            self.set_upstream_note(&format!("up-to-date({})", rev12(current)));
+            return None;
+        };
+
+        // compare-and-swap：期间有别的写者动过 main 就让这次失败，下轮重来，
+        // 不去覆盖别人的结果。
+        let branch_ref = format!("refs/heads/{}", self.cfg.branch);
+        match self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "update-ref",
+                    &branch_ref,
+                    &rev,
+                    current,
+                ],
+                None,
+                30,
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    platform = platform.slug(),
+                    rev = %rev12(&rev),
+                    from = %rev12(current),
+                    "upstream main advanced the bare main"
+                );
+                self.set_upstream_note(&format!("advanced({}={})", platform.slug(), rev12(&rev)));
+                Some(rev)
+            }
+            Err(e) => {
+                warn!(error = %e, rev = %rev12(&rev), "could not advance the bare main; retrying next poll");
+                self.set_upstream_note("advance-failed");
+                None
+            }
+        }
     }
 
     /// buildah 在 Pod 内 push/from 的端点（集群 DNS，http）。
@@ -1348,7 +1523,12 @@ impl MainlineDeployer {
     pub async fn poll_once(&self) -> SFResult<()> {
         let mut state = self.load_state();
 
-        let bare = self.bare_main_rev().await?;
+        let mut bare = self.bare_main_rev().await?;
+        // 先把上游拉进来再判推进：bare 的 main 由本循环自己从各平台取，
+        // 宿主机不再是这条链上的一环。
+        if let Some(advanced) = self.refresh_upstream(&bare).await {
+            bare = advanced;
+        }
         let images = self.deployed_images().await?;
         let deployed = classify_deployed(&images);
 
@@ -2123,15 +2303,21 @@ impl Drop for BuildLock {
 
 /// 心跳摘要（纯函数便于测试）：一行覆盖空闲态全部关键状态。SameRev 收敛
 /// 路径静默返回，没有这条摘要时部署器存活无法从日志证明。
-fn heartbeat_message(state: &MainlineState, bare_rev: &str, now_unix: i64) -> String {
+fn heartbeat_message(
+    state: &MainlineState,
+    bare_rev: &str,
+    upstream: &str,
+    now_unix: i64,
+) -> String {
     let in_flight = state
         .in_flight
         .as_ref()
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
     format!(
-        "bare={} last_good={} in_flight={} failed_rev={} failed_class={} failed_attempts={} cooldown_remaining_secs={}",
+        "bare={} upstream={} last_good={} in_flight={} failed_rev={} failed_class={} failed_attempts={} cooldown_remaining_secs={}",
         rev12(bare_rev),
+        upstream,
         state.last_good_rev.as_deref().map(rev12).unwrap_or("none"),
         in_flight,
         state.failed_rev.as_deref().map(rev12).unwrap_or("none"),
@@ -4102,8 +4288,9 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_attempts: 0,
             failed_class: FailureClass::Version,
         };
-        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", 100);
+        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", 100);
         assert!(msg.contains("bare=4dfd51ff1209"), "{msg}");
+        assert!(msg.contains("upstream=off"), "{msg}");
         assert!(msg.contains("last_good=4dfd51ff1209"), "{msg}");
         assert!(msg.contains("in_flight=none"), "{msg}");
         assert!(msg.contains("failed_rev=none"), "{msg}");
@@ -4126,8 +4313,9 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_attempts: 2,
             failed_class: FailureClass::Version,
         };
-        let msg = heartbeat_message(&state, "aabbccddeeff0011", 1000);
+        let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date(aabbccddeeff)", 1000);
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
+        assert!(msg.contains("upstream=up-to-date(aabbccddeeff)"), "{msg}");
         assert!(msg.contains("failed_rev=112233445566"), "{msg}");
         assert!(msg.contains("failed_class=version"), "{msg}");
         assert!(msg.contains("failed_attempts=2"), "{msg}");
@@ -4145,7 +4333,8 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_class: FailureClass::Environment,
             ..Default::default()
         };
-        let msg = heartbeat_message(&state, "112233445566aabb", 1000);
+        let msg = heartbeat_message(&state, "112233445566aabb", "diverged", 1000);
+        assert!(msg.contains("upstream=diverged"), "{msg}");
         assert!(msg.contains("failed_rev=112233445566"), "{msg}");
         assert!(msg.contains("failed_class=environment"), "{msg}");
         assert!(msg.contains("failed_attempts=0"), "{msg}");
@@ -4154,8 +4343,14 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
     #[test]
     fn heartbeat_message_survives_unreadable_bare_rev() {
         // 心跳本身绝不能成为故障源：bare 读取失败时降级为占位文本。
-        let msg = heartbeat_message(&MainlineState::default(), "unreadable(git failed)", 0);
+        let msg = heartbeat_message(
+            &MainlineState::default(),
+            "unreadable(git failed)",
+            "unreachable(2)",
+            0,
+        );
         assert!(msg.contains("bare=unreadable("), "{msg}");
+        assert!(msg.contains("upstream=unreachable(2)"), "{msg}");
         assert!(msg.contains("last_good=none"), "{msg}");
     }
 
@@ -4579,6 +4774,12 @@ exit 0
             job_memory_limit: "199Mi".into(),
             heartbeat_log_secs: 3600,
             manifest_dir: "deploy/k3s".into(),
+            // 上游跟踪在用例里默认关：多数用例只关心 bare 前进后的收敛路径；
+            // 跟踪本身的用例自己配 upstreams + git_proxy_base（本地路径当作
+            // 透传根，走真实 git fetch，不改这些用例的网络面）。
+            upstreams: Vec::new(),
+            git_proxy_base: String::new(),
+            upstream_fetch_timeout_secs: 30,
             // 测试夹具仓库没有 deploy/k3s 清单树；这些用例走 set image 旧路径。
             deliver_manifests: false,
             targets: MainlineDeployerConfig::default().targets,
@@ -4595,6 +4796,185 @@ exit 0
             root.join("workspaces"),
             root.join("target"),
         ))
+    }
+
+    /// 在 `proxy/{platform}/owner/repo.git` 造一个上游镜像仓，main 指向给定 rev。
+    /// 透传根在用例里就是本地路径，git fetch 走文件传输——测的是真实
+    /// refspec/update-ref 路径，不引入网络。
+    async fn make_upstream_mirror(root: &Path, platform: &str, repo: &str, src: &Path, rev: &str) {
+        let dir = root.join("proxy").join(platform).join(repo);
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+        real_git(root, &["init", "--bare", &dir]).await;
+        real_git(
+            root,
+            &["--git-dir", &dir, "symbolic-ref", "HEAD", "refs/heads/main"],
+        )
+        .await;
+        real_git(src, &["push", &dir, &format!("{rev}:refs/heads/main")]).await;
+    }
+
+    fn upstream_config(root: &Path, bare: &Path) -> MainlineDeployerConfig {
+        MainlineDeployerConfig {
+            upstreams: vec![
+                crate::config::UpstreamTrackConfig {
+                    platform: crate::config::CodePlatform::Github,
+                    repo: "owner/repo".into(),
+                },
+                crate::config::UpstreamTrackConfig {
+                    platform: crate::config::CodePlatform::Gitee,
+                    repo: "owner/repo".into(),
+                },
+            ],
+            git_proxy_base: root.join("proxy").to_string_lossy().into_owned(),
+            ..test_config(root, bare, "buildah", "kubectl")
+        }
+    }
+
+    /// 上游 main 前进后由集群内自己拉进 bare 并推进本地 main：这条链上不该
+    /// 再有宿主机定时器。两端镜像同一提交时取同一个 rev，谁先到都一样。
+    #[tokio::test]
+    async fn upstream_main_advances_the_bare_without_a_host_timer() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+        // bare 还停在 A，平台两端都已前进到 B。
+        real_git(
+            root,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/main",
+                &rev_a,
+            ],
+        )
+        .await;
+        make_upstream_mirror(root, "github", "owner/repo.git", &work, &rev_b).await;
+        make_upstream_mirror(root, "gitee", "owner/repo.git", &work, &rev_b).await;
+
+        let deployer =
+            MainlineDeployer::new(upstream_config(root, &bare), test_workspaces(root, &bare));
+        let advanced = deployer.refresh_upstream(&rev_a).await;
+
+        assert_eq!(advanced.as_deref(), Some(rev_b.as_str()));
+        assert_eq!(deployer.bare_main_rev().await.unwrap(), rev_b);
+        assert!(
+            deployer.upstream_note().contains("advanced"),
+            "{}",
+            deployer.upstream_note()
+        );
+    }
+
+    /// 只有一端前进（另一端还停在旧位置）时同样推进：新 head 是旧 head 的
+    /// 后代，这正是一个人只推了 gitee 或只推了 github 的形态。
+    #[tokio::test]
+    async fn a_single_sided_advance_still_advances_the_bare() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+        real_git(
+            root,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/main",
+                &rev_a,
+            ],
+        )
+        .await;
+        make_upstream_mirror(root, "github", "owner/repo.git", &work, &rev_a).await;
+        make_upstream_mirror(root, "gitee", "owner/repo.git", &work, &rev_b).await;
+
+        let deployer =
+            MainlineDeployer::new(upstream_config(root, &bare), test_workspaces(root, &bare));
+        assert_eq!(
+            deployer.refresh_upstream(&rev_a).await.as_deref(),
+            Some(rev_b.as_str())
+        );
+    }
+
+    /// 两端真的分叉（互不为祖先）时不推进：替分叉猜一个方向，等于用一次
+    /// 分叉决定集群跑谁的代码。主线停在原处并留下可查的结论。
+    #[tokio::test]
+    async fn divergent_upstream_mains_leave_the_bare_alone() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+        real_git(
+            root,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/main",
+                &rev_a,
+            ],
+        )
+        .await;
+        make_upstream_mirror(root, "github", "owner/repo.git", &work, &rev_b).await;
+
+        // gitee 从 A 分叉出一条自己的提交。
+        let fork = root.join("fork");
+        real_git(
+            root,
+            &[
+                "clone",
+                "-b",
+                "main",
+                bare.to_str().unwrap(),
+                fork.to_str().unwrap(),
+            ],
+        )
+        .await;
+        real_git(&fork, &["config", "user.email", "t@t.com"]).await;
+        real_git(&fork, &["config", "user.name", "T"]).await;
+        std::fs::write(fork.join("fork.txt"), "fork\n").unwrap();
+        real_git(&fork, &["add", "."]).await;
+        real_git(&fork, &["commit", "-m", "fork"]).await;
+        let rev_c = real_git_stdout(&fork, &["rev-parse", "HEAD"]).await;
+        make_upstream_mirror(root, "gitee", "owner/repo.git", &fork, &rev_c).await;
+
+        let deployer =
+            MainlineDeployer::new(upstream_config(root, &bare), test_workspaces(root, &bare));
+        assert_eq!(deployer.refresh_upstream(&rev_a).await, None);
+        assert_eq!(deployer.bare_main_rev().await.unwrap(), rev_a);
+        assert_eq!(deployer.upstream_note(), "diverged");
+    }
+
+    /// 没有透传根就没有集群内的上游入口：不推进，但结论要落在心跳里——
+    /// 只跟随 bare 的部署必须和"跟踪坏了"能从日志上分开。
+    #[tokio::test]
+    async fn without_a_proxy_base_tracking_is_off() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+        real_git(
+            root,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/main",
+                &rev_a,
+            ],
+        )
+        .await;
+        make_upstream_mirror(root, "github", "owner/repo.git", &work, &rev_b).await;
+
+        let cfg = MainlineDeployerConfig {
+            git_proxy_base: String::new(),
+            ..upstream_config(root, &bare)
+        };
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+        assert_eq!(deployer.refresh_upstream(&rev_a).await, None);
+        assert_eq!(deployer.bare_main_rev().await.unwrap(), rev_a);
+        assert_eq!(deployer.upstream_note(), "off");
     }
 
     /// fake cargo：build_binary 靠 PATH 查找 "cargo"，假二进制必须叫这个名。

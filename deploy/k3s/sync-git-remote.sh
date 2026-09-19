@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # 宿主主线 → K3s git-remote bare 仓库同步。
 #
-# 为什么需要：GitOps 晋级通道以 /var/lib/cogneva-data/git-remote 为中央仓库
-# （沙盒推送端写 evolution-release，各集群拉取端 poll）。沙盒源码树基于
-# bare 的 main——bare 陈旧会让拉取端应用晋级产物时连带回退无关文件
-# （2026-08-06 设计评审结论）。本脚本把宿主开发仓库 main 快进推送到 bare，
-# 配合 cron 每 5 分钟跑一次，保持通道新鲜：
-#   */5 * * * * root /root/omc_workspace/cogneva/deploy/k3s/sync-git-remote.sh
+# 【已被取代，除救援外不要启用】集群内的主线跟踪部署器现在自己从各平台取
+# 上游 main 并 CAS 推进 bare（配置 self_evolution.mainline_deployer.upstreams）。
+# 本脚本连同 /etc/crontab 里那行 `*/5` 以及 pull-upstream-main.sh 的 timer
+# 都属旧的宿主写者链：两个写者同时推 bare 的 main 会互相打脸，正常部署
+# 应全部停用。本脚本保留作无网/救援时的手动通道（宿主能直连 GitHub）。
 #
-# 安全约束：只快进（--no-force）；bare 的 main 只由本脚本写（沙盒推送端
-# 只写 evolution-release 分支），出现分叉即报错留人工处置，绝不强推覆盖。
+# 停用宿主写者：
+#   systemctl disable --now cogneva-upstream-pull.timer
+#   sed -i '/sync-git-remote.sh/d' /etc/crontab
+#
+# 安全约束：只快进（--no-force）；分叉即报错留人工处置，绝不强推覆盖。
 set -euo pipefail
 
 SRC_REPO="${1:-/root/omc_workspace/cogneva}"
