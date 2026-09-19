@@ -42,6 +42,36 @@ pub struct RawSource {
     pub archived_at: DateTime<Utc>,
 }
 
+/// Why `id` cannot be used as a raw key, or `None` when it can.
+///
+/// A raw id is not free text: every [`MemoryBackend`] turns it into an object
+/// key, and the composite backend's file store maps each separator in that key
+/// onto a directory. An id carrying a separator therefore does not fail — it
+/// becomes a subtree. What the store then reports back is a different key than
+/// the caller supplied, and where the separator lands exactly where a file was
+/// expected the write leaves an empty directory and no object at all. Nothing
+/// reports that: `list_raw` walks the subtree and returns files only, so the
+/// raw disappears from every listing that would have counted it.
+///
+/// Only the silently-corrupting shapes are rejected here. An over-long id still
+/// fails loudly at the store, which is a reportable error rather than a
+/// vanished key.
+pub fn raw_id_key_error(id: &str) -> Option<&'static str> {
+    if id.is_empty() {
+        return Some("must not be empty");
+    }
+    if id.contains('/') || id.contains('\\') {
+        return Some("must not contain a path separator");
+    }
+    if id.contains('\0') {
+        return Some("must not contain a NUL byte");
+    }
+    if id == "." || id == ".." {
+        return Some("must not be a dot path segment");
+    }
+    None
+}
+
 impl RawSource {
     pub fn new(
         id: impl Into<String>,
@@ -488,4 +518,61 @@ pub trait SummaryBackend: Send + Sync {
 
     /// Update a summary entry, overwriting if the id already exists.
     async fn update_summary(&self, namespace: &str, entry: &SummaryEntry) -> SFResult<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_ids_are_valid_raw_keys() {
+        for id in [
+            "e2e-conv-1",
+            "agent-squad_self-signal-alert-134eb9f3ab",
+            "agent-agent-squad_decompose-Fix_github_issue__9-1789375717930-089b53ac",
+            " 摘要\n\n`",
+            "任务：修复登录",
+        ] {
+            assert_eq!(raw_id_key_error(id), None, "rejected {id:?}");
+        }
+    }
+
+    #[test]
+    fn separators_are_rejected_because_they_fork_the_key() {
+        for id in [
+            "http://example.com/x",
+            "a/b",
+            "report/2026-09-13",
+            "back\\slash",
+        ] {
+            assert_eq!(
+                raw_id_key_error(id),
+                Some("must not contain a path separator"),
+                "accepted {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_dot_and_nul_ids_are_rejected() {
+        assert_eq!(raw_id_key_error(""), Some("must not be empty"));
+        assert_eq!(
+            raw_id_key_error("."),
+            Some("must not be a dot path segment")
+        );
+        assert_eq!(
+            raw_id_key_error(".."),
+            Some("must not be a dot path segment")
+        );
+        assert_eq!(
+            raw_id_key_error("a\0b"),
+            Some("must not contain a NUL byte")
+        );
+    }
+
+    #[test]
+    fn a_long_id_is_left_to_the_store_to_reject_loudly() {
+        let long = "x".repeat(400);
+        assert_eq!(raw_id_key_error(&long), None);
+    }
 }

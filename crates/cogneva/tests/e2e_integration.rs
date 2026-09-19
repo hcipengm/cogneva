@@ -790,6 +790,64 @@ async fn e2e_memory_batch_ingest_and_list() {
     app.shutdown.trigger();
 }
 
+// ─── Test 11b: Ingest rejects ids that would fork the object key ─────
+
+#[tokio::test]
+async fn e2e_memory_ingest_rejects_ids_that_would_fork_the_key() {
+    let app = spawn_app(false, None).await;
+    let token = app.bearer_token().await;
+    let client = reqwest::Client::new();
+
+    // A separator in the id turns the object key into a subtree. Where the
+    // separator lands where a file was expected, the write leaves an empty
+    // directory and no object — invisible to every listing, reported by nothing.
+    for id in ["https://example.com/report", "nested/id", "back\\slash"] {
+        let res = client
+            .post(format!("http://{}/api/v1/memory/ingest", app.addr))
+            .header("Authorization", &token)
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"id": id, "text": "body"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "accepted {id:?}");
+    }
+
+    // The batch endpoint reports the reject per item instead of failing the batch.
+    let res = client
+        .post(format!("http://{}/api/v1/memory/ingest/batch", app.addr))
+        .header("Authorization", &token)
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::json!({
+                "items": [
+                    {"id": "ok-1", "text": "@entity:Alice"},
+                    {"id": "bad/1", "text": "@entity:Bob"},
+                ]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["processed"], 1);
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["id"], "bad/1");
+    assert!(
+        errors[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid raw id"),
+        "unexpected error body: {}",
+        errors[0]
+    );
+
+    app.shutdown.trigger();
+}
+
 // ─── Test 12: Memory unified search across schema + summary ──────────
 
 #[tokio::test]

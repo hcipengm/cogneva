@@ -160,6 +160,14 @@ pub async fn ingest_handler(
     claims: Option<axum::Extension<cog_core::Claims>>,
     Json(req): Json<IngestRequest>,
 ) -> Response {
+    if let Some(reason) = cog_core::raw_id_key_error(&req.id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid raw id {:?}: {reason}", req.id)})),
+        )
+            .into_response();
+    }
+
     let ns = effective_ns(claims_ref(&claims));
     let backend = match state.memory_backend.as_ref() {
         Some(b) => b.clone(),
@@ -264,6 +272,14 @@ pub async fn batch_ingest_handler(
     let mut errors = Vec::new();
 
     for item in req.items {
+        if let Some(reason) = cog_core::raw_id_key_error(&item.id) {
+            errors.push(BatchIngestError {
+                id: item.id,
+                error: format!("invalid raw id: {reason}"),
+            });
+            continue;
+        }
+
         let content_type = if item.content_type.is_empty() {
             "text/plain"
         } else {
