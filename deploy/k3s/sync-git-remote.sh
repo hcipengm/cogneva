@@ -7,9 +7,9 @@
 # 都属旧的宿主写者链：两个写者同时推 bare 的 main 会互相打脸，正常部署
 # 应全部停用。本脚本保留作无网/救援时的手动通道（宿主能直连 GitHub）。
 #
-# 停用宿主写者：
+# 停用宿主写者（2026-09-19 已做）：
 #   systemctl disable --now cogneva-upstream-pull.timer
-#   sed -i '/sync-git-remote.sh/d' /etc/crontab
+#   /etc/crontab 里本脚本那行改注释（原文件备份 /etc/crontab.bak-20260919）
 #
 # 安全约束：只快进（--no-force）；分叉即报错留人工处置，绝不强推覆盖。
 set -euo pipefail

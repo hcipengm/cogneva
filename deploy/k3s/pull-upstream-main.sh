@@ -14,8 +14,8 @@
 #
 # 手动用法（仅在集群内跟踪不可用时）：
 #   /root/omc_workspace/cogneva/deploy/k3s/pull-upstream-main.sh
-# 若曾经装过 timer，拆除：
-#   systemctl disable --now cogneva-upstream-pull.timer
+# 配套 timer 已于 2026-09-19 停用（systemctl disable --now
+# cogneva-upstream-pull.timer）；本脚本只是手动通道，别再把 timer 装回去。
 #
 # 安全约束：只快进，永不强推/reset；GitHub 走 SSH deploy key（本机 HTTPS
 # 被墙、SSH 通）；任何失败只记日志不致命。
