@@ -360,14 +360,37 @@ async fn e2e_task_create_then_list() {
 async fn e2e_raw_logger_records_http_requests() {
     let app = spawn_app(false, None).await;
 
-    // Trigger some HTTP traffic.
-    let _ = req_oneshot(app.state.clone(), "GET", "/health", Body::empty(), None).await;
+    // Trigger some business HTTP traffic. Health probes are excluded from the
+    // request log at the middleware, so /health would produce nothing here.
+    let _ = req_oneshot(
+        app.state.clone(),
+        "GET",
+        "/api/v1/tasks/list",
+        Body::empty(),
+        Some(app.bearer_token().await),
+    )
+    .await;
+    // A probe alongside it, to pin what the exclusion must not do: the request
+    // still gets served, it just does not become a logged request.
+    let (probe_status, _) =
+        req_oneshot(app.state.clone(), "GET", "/health", Body::empty(), None).await;
+    assert_eq!(probe_status, StatusCode::OK);
 
     // The RawLogger is MemoryRawLogger; inspect its records.
     let records = app.raw_logger.all_records().unwrap();
     assert!(
         !records.is_empty(),
         "expected at least one raw record from the http middleware"
+    );
+    assert!(
+        !records.iter().any(|r| {
+            r.payload
+                .raw
+                .get("uri")
+                .and_then(|u| u.as_str())
+                .is_some_and(|u| u.starts_with("/health"))
+        }),
+        "health probes must not be written to the request log"
     );
     let http_records: Vec<_> = records
         .into_iter()
@@ -663,10 +686,13 @@ async fn e2e_raw_logs_503_when_store_unconfigured() {
 async fn e2e_metrics_endpoint_surfaces_http_and_memory_counters() {
     let app = spawn_app(false, None).await;
 
-    // Generate a request so the http counter increments.
+    // Generate a business request so the http counter increments. Probes are
+    // kept out of this counter on purpose, so hitting /health would leave it
+    // empty — and an empty body is what the endpoint reports as "no backend".
     let client = reqwest::Client::new();
     let _ = client
-        .get(format!("http://{}/health", app.addr))
+        .get(format!("http://{}/api/v1/tasks/list", app.addr))
+        .header("Authorization", app.bearer_token().await)
         .send()
         .await
         .unwrap();
@@ -866,9 +892,12 @@ async fn e2e_trace_context_propagation() {
     let injected_trace_id = "aabbccdd11223344";
     let injected_span_id = "eeff55667788";
 
-    // Call /health with injected trace headers.
+    // Call a business endpoint with injected trace headers. Probes are
+    // excluded from the request log, so /health would echo the headers but
+    // leave nothing behind to inspect.
     let res = client
-        .get(format!("http://{}/health", app.addr))
+        .get(format!("http://{}/api/v1/tasks/list", app.addr))
+        .header("Authorization", app.bearer_token().await)
         .header("x-trace-id", injected_trace_id)
         .header("x-span-id", injected_span_id)
         .send()
