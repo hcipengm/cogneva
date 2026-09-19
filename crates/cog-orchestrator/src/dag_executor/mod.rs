@@ -410,9 +410,15 @@ impl DagExecutorRuntime {
 
     /// Consume goal messages from the `goals:{workspace_id}` stream and inject
     /// them into the DAG.
-    /// Each [`cog_core::GoalMessage`] is deserialized, deduplicated by
-    /// `message_id`, and submitted via [`Self::submit_goal`].  After submission,
-    /// newly-ready tasks are automatically published to the ready stream.
+    /// Each [`cog_core::GoalMessage`] is deserialized and submitted via
+    /// [`Self::submit_goal`]. After submission, newly-ready tasks are
+    /// automatically published to the ready stream.
+    ///
+    /// Replay safety here comes from task identity, not from the message:
+    /// every injection on this path is a duplicate-tolerant batch add, so a
+    /// redelivered message carrying task ids already in the DAG adds nothing.
+    /// There is no record of processed `message_id`s, and none is needed
+    /// while the injections stay idempotent.
     pub async fn run_goal_consumer(&self, shutdown: ShutdownSignal) -> SFResult<()> {
         let goal_stream = format!("goals:{}", self.config.workspace_id);
         let group = format!("dag-executor-{}", self.config.workspace_id);
@@ -496,9 +502,10 @@ impl DagExecutorRuntime {
                                 "Goal processed via ActionPlanner"
                             );
                         }
-                        // Planner failure can be transient (LLM/collaboration):
-                        // leave pending so redelivery retries; dedup by message_id
-                        // prevents double submission.
+                        // Planner failure can be transient (LLM/collaboration),
+                        // so the message is left pending rather than acked. A
+                        // retry replays it through the same idempotent injection
+                        // path; it does not re-submit anything already added.
                         Err(e) => {
                             tracing::warn!(
                                 goal_id = %goal.message_id,

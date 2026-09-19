@@ -5,8 +5,13 @@ use std::collections::HashMap;
 
 // ─── Goal Message ──────────────────────────────────────────────────────────
 
-/// 外部目标提交消息，由 Gateway 发布到 `goals:{workspace_id}` stream，
-/// 由 DagExecutorRuntime 消费并驱动后续编排。
+/// 目标提交的线上形态，由 DagExecutorRuntime 从 `goals:{workspace_id}`
+/// stream 消费并驱动后续编排。
+///
+/// 目前没有生产者：Gateway、GitHub discovery、reflection 等入口都在进程内
+/// 直接调 `OrchestratorControl::submit_goal_auto`，这条流自部署以来没有收到
+/// 过消息。保留它是为跨进程投递留的通道，但任何依赖"消息会被重投"的假设
+/// 在这条流上没有依据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalMessage {
     pub message_id: String,

@@ -608,6 +608,7 @@ impl ActionPlanOrchestrator {
             let now = Utc::now();
             let mut task_ids = Vec::new();
             if let Some(ref dag) = self.dag_executor {
+                let mut batch = Vec::with_capacity(tasks.len());
                 for mut task in tasks {
                     task.goal_id = Some(goal_id.clone());
                     task.is_executable = true;
@@ -623,8 +624,15 @@ impl ActionPlanOrchestrator {
                         timestamp: Some(now),
                     });
                     task_ids.push(task.id.clone());
-                    dag.add_task(task).await?;
+                    batch.push(task);
                 }
+                // Idempotent, like every other injection here: a caller that
+                // re-submits the same intent (a retry after a transient
+                // failure, a re-drive) carries the same stable task id, and
+                // adding one at a time would reject it as a duplicate and
+                // fail the whole submission instead of recognizing that the
+                // work is already in the DAG.
+                dag.add_tasks_batch(batch).await?;
             } else {
                 tracing::warn!("self_evolution tasks present but no DagExecutor attached");
             }
@@ -1973,6 +1981,45 @@ mod tests {
             stored.input["evolution_mode"],
             serde_json::json!("generate_change")
         );
+    }
+
+    /// The same intent can arrive twice — a retry after a transient failure, a
+    /// re-drive, a redelivered message — and carries the same stable task id
+    /// each time. Submitting the second copy used to fail the whole call with
+    /// "Task already exists", which on a message-driven path means the intent
+    /// is never acknowledged, so it is retried forever without ever landing.
+    #[tokio::test]
+    async fn resubmitting_a_self_evolution_intent_is_idempotent() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-evolution-replay".to_string()));
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![atomic_task("child-should-not-exist")]]),
+            }))
+            .with_dag_executor(dag.clone());
+        let registry = SkillRegistry::new();
+        let marked = || {
+            Task::new(
+                "github-issue-11",
+                TaskType::Custom("platform_issue_fix".into()),
+                serde_json::json!({"goal": "fix it", "evolution_mode": "generate_change"}),
+            )
+        };
+
+        let first = planner
+            .process_goal_impl("fix it", vec![marked()], &registry)
+            .await
+            .unwrap();
+        let replay = planner
+            .process_goal_impl("fix it", vec![marked()], &registry)
+            .await
+            .expect("a resent intent must be recognized, not rejected as a duplicate");
+
+        assert_eq!(first, replay);
+        let stored = dag.get_task("github-issue-11").await.unwrap();
+        assert!(stored.is_executable);
+        assert_eq!(stored.timeout_seconds, 3600);
+        assert_eq!(dag.get_all_tasks().await.len(), 1);
     }
 
     #[tokio::test]
