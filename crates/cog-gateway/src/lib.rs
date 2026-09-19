@@ -125,6 +125,12 @@ pub struct GatewayState {
     pub collaboration_graph: Option<Arc<collaboration::CollaborationGraph>>,
     pub supervisor: Option<Arc<dyn cog_core::Supervisor>>,
     pub alert_store: Option<Arc<dyn cog_core::AlertStore>>,
+    /// Durable alert state machine (firing/resolved rows in PostgreSQL),
+    /// published by the observability plugin when a database is configured.
+    /// The in-memory [`cog_core::AlertStore`] beside it holds only the
+    /// supervisor's process-local health events, so reading one of the two
+    /// reports a different alert set than the other.
+    pub active_alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
     pub backend_health_probe: Option<Arc<backend_health::BackendHealthProbe>>,
     pub snapshot_store: Option<Arc<dyn cog_core::CheckpointStore>>,
     pub heartbeat_history: Option<Arc<dyn cog_core::HeartbeatRegistry>>,
@@ -1957,10 +1963,59 @@ async fn agent_heartbeats_handler(
 
 // ─── Alerts Active Handler ───
 
+/// Fold the durable alert rows into the process-local list so that one
+/// question — what is firing right now — is answered by one predicate.
+///
+/// The two sources barely overlap: the in-memory store carries the
+/// supervisor's own health events (agents unhealthy, resource alerts, dead
+/// letters), while durable rows carry what production code persisted about
+/// itself (orphaned decompositions, OOM-killed pods, over-declared volumes).
+/// Serving only one of them hides the other's alerts from whoever asks.
+///
+/// Alerts the in-memory store already carries keep their richer record — it
+/// knows the agent/task/crew the condition belongs to — so a durable row for
+/// the same rule contributes nothing. Identity across the two is the rule
+/// name, which both sides derive from the same string.
+fn merge_active_alerts(
+    in_memory: Vec<alert_store::AlertEntry>,
+    durable: Vec<cog_core::PersistedAlert>,
+) -> Vec<alert_store::AlertEntry> {
+    let mut merged = in_memory;
+    let mut known: std::collections::HashSet<String> =
+        merged.iter().map(|a| a.event_type.clone()).collect();
+    for alert in durable {
+        if !known.insert(alert.rule.clone()) {
+            continue;
+        }
+        merged.push(alert_store::AlertEntry {
+            id: alert.dedup_key,
+            severity: alert.severity,
+            event_type: alert.rule,
+            message: alert.message,
+            agent_id: None,
+            task_id: None,
+            crew_id: None,
+            timestamp: alert.fired_at.to_rfc3339(),
+            resolved: false,
+        });
+    }
+    merged
+}
+
 async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Response {
-    match state.alert_store {
-        Some(ref store) => {
-            let alerts: Vec<alert_store::AlertEntry> = store
+    if state.alert_store.is_none() && state.active_alert_source.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "alert store not configured"})),
+        )
+            .into_response();
+    }
+
+    let mut alerts: Vec<alert_store::AlertEntry> = state
+        .alert_store
+        .as_ref()
+        .map(|store| {
+            store
                 .list_active(100)
                 .into_iter()
                 .map(|alert| alert_store::AlertEntry {
@@ -1978,22 +2033,27 @@ async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Respon
                     timestamp: alert.timestamp.to_rfc3339(),
                     resolved: alert.resolved,
                 })
-                .collect();
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "alerts": alerts,
-                    "count": alerts.len(),
-                })),
-            )
-                .into_response()
-        }
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "alert store not configured"})),
-        )
-            .into_response(),
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // The store above is process-local: it holds the supervisor's health
+    // events for this process and starts empty after a restart. Durable
+    // faults — orphaned decompositions, killed pods, over-declared volumes —
+    // are persisted by their producers instead, and would never reach a
+    // human asking this endpoint what is currently firing.
+    if let Some(ref source) = state.active_alert_source {
+        alerts = merge_active_alerts(alerts, source.list_active_alerts(100).await);
     }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "alerts": alerts,
+            "count": alerts.len(),
+        })),
+    )
+        .into_response()
 }
 
 // ─── Snapshots List Handler ───
@@ -2812,5 +2872,77 @@ mod http_metric_label_tests {
             *captured.lock().unwrap(),
             vec!["/api/v1/tasks/{id}".to_string(); 2]
         );
+    }
+}
+
+#[cfg(test)]
+mod active_alert_merge_tests {
+    use super::*;
+
+    fn durable(rule: &str) -> cog_core::PersistedAlert {
+        cog_core::PersistedAlert {
+            rule: rule.to_string(),
+            dedup_key: rule.to_string(),
+            severity: "critical".to_string(),
+            state: "firing".to_string(),
+            message: format!("{rule} is firing"),
+            labels: serde_json::json!({}),
+            fired_at: chrono::Utc::now(),
+        }
+    }
+
+    fn in_memory(event_type: &str) -> alert_store::AlertEntry {
+        alert_store::AlertEntry {
+            id: "mem-1".to_string(),
+            severity: "warning".to_string(),
+            event_type: event_type.to_string(),
+            message: "from the supervisor".to_string(),
+            agent_id: Some("agent-1".to_string()),
+            task_id: None,
+            crew_id: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            resolved: false,
+        }
+    }
+
+    /// A durable row whose rule the process-local store never saw must reach
+    /// the listing. Before the merge, an endpoint reading only the in-memory
+    /// store answered "nothing firing" while this row sat in the database.
+    #[test]
+    fn durable_alerts_the_in_memory_store_does_not_know_are_listed() {
+        let merged = merge_active_alerts(vec![], vec![durable("pod_oom_killed")]);
+        let ids: Vec<&str> = merged.iter().map(|a| a.event_type.as_str()).collect();
+        assert_eq!(ids, vec!["pod_oom_killed"]);
+        assert_eq!(merged[0].id, "pod_oom_killed");
+        assert!(!merged[0].resolved);
+    }
+
+    /// When both surfaces carry the same rule they describe one condition, so
+    /// it must appear once — and the in-memory record wins, because it knows
+    /// the agent/task the condition belongs to and the durable row does not.
+    #[test]
+    fn a_rule_both_surfaces_carry_is_listed_once_with_the_richer_record() {
+        let merged = merge_active_alerts(
+            vec![in_memory("llm_upstream_pool_down")],
+            vec![durable("llm_upstream_pool_down")],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "mem-1");
+        assert_eq!(merged[0].agent_id.as_deref(), Some("agent-1"));
+    }
+
+    /// Two durable rules are distinct alerts; neither may shadow the other.
+    #[test]
+    fn distinct_durable_rules_are_both_listed() {
+        let merged = merge_active_alerts(
+            vec![],
+            vec![
+                durable("decomposition_orphaned"),
+                durable("pod_restarting_fast"),
+            ],
+        );
+        let mut ids: Vec<&str> = merged.iter().map(|a| a.event_type.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["decomposition_orphaned", "pod_restarting_fast"]);
     }
 }

@@ -161,6 +161,7 @@ async fn build_test_state() -> AutonomousTestState {
         notification_store: None,
         supervisor: None,
         alert_store: None,
+        active_alert_source: None,
         backend_health_probe: None,
         trace_store: None,
         replay_engine: None,

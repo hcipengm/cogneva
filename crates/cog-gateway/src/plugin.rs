@@ -102,6 +102,10 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             .consume_service::<dyn cog_core::AlertStore>()
             .expect("alert store")
             .clone();
+        // Optional: absent when no database is configured, in which case
+        // alerts stay notification-only and the durable half is simply empty.
+        let active_alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>> =
+            ctx.consume_service::<dyn cog_core::ActiveAlertSource>();
         let supervisor_registry: Arc<dyn cog_core::HeartbeatRegistry> = ctx
             .consume_service::<dyn cog_core::HeartbeatRegistry>()
             .expect("supervisor registry")
@@ -222,6 +226,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &wiki_adapter,
             &supervisor,
             &alert_store,
+            &active_alert_source,
             &backend_health_probe,
             &supervisor_registry,
             &snapshot_store,
@@ -438,6 +443,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         cog_core::ConsumeSpec {
             type_name: "AlertStore",
             required: true,
+        },
+        cog_core::ConsumeSpec {
+            type_name: "ActiveAlertSource",
+            required: false,
         },
         cog_core::ConsumeSpec {
             type_name: "HeartbeatRegistry",
