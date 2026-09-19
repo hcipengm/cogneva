@@ -89,6 +89,20 @@ def norm_probes(c):
     return json.dumps({k: c[k] for k in ('startupProbe', 'livenessProbe', 'readinessProbe') if k in c},
                       sort_keys=True)
 
+def norm_command(c):
+    """Shell bodies (init container scripts) exist twice: once in the chart
+    template, once in the static manifest the GitOps consumer applies verbatim.
+    A real divergence means the two install paths run different code, so compare
+    them — but only full-line `#` comments are dropped, because the two sides
+    word their comments differently on purpose. Inline comments are kept: a
+    false positive here costs one line of noise, a missed body difference costs
+    two divergent provisioning paths."""
+    parts = []
+    for x in c.get('command') or []:
+        body = '\n'.join(l for l in x.splitlines() if not l.lstrip().startswith('#'))
+        parts.append(body.strip())
+    return '\n'.join(parts)
+
 def workload(doc):
     ps = pod_spec(doc)
     out = {'sa': ps.get('serviceAccountName', '(default)'),
@@ -111,6 +125,7 @@ def workload(doc):
             'mounts': sorted(f"{m['name']}->{m['mountPath']}" for m in c.get('volumeMounts', [])),
             'resources': norm_resources(c.get('resources')),
             'probes': norm_probes(c),
+            'command': norm_command(c),
             'securityContext': json.dumps(c.get('securityContext'), sort_keys=True),
             'workingDir': c.get('workingDir', ''),
         }
@@ -197,7 +212,7 @@ for name in sorted(set(k) & set(h)):
                     errors.append(f"{kind}/{name[1]} [{cn}] {f} k3s-only: {x}")
                 for x in sorted(set(hc[f]) - set(kc[f])):
                     errors.append(f"{kind}/{name[1]} [{cn}] {f} helm-only: {x}")
-            for f in ('resources', 'probes', 'securityContext', 'workingDir'):
+            for f in ('resources', 'probes', 'securityContext', 'workingDir', 'command'):
                 if kc[f] != hc[f]:
                     errors.append(f"{kind}/{name[1]} [{cn}] {f}: k3s={kc[f]} helm={hc[f]}")
     elif kind == 'Service':
