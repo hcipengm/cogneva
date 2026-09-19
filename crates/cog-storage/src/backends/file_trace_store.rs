@@ -117,10 +117,30 @@ impl FileTraceStore {
         serde_json::from_str(&json).map_err(SFError::Serialization)
     }
 
-    /// Remove a trace from a specific tier (best effort).
-    async fn remove_from_tier(&self, tier: StorageTier, trace_id: &str) {
-        let _ = tokio::fs::remove_file(self.trace_path(tier, trace_id)).await;
-        let _ = tokio::fs::remove_file(self.meta_path(tier, trace_id)).await;
+    /// Remove a trace from a specific tier.
+    ///
+    /// An already-absent file is the goal rather than a failure. Anything else
+    /// is reported: a copy that survives in a tier searched before the trace's
+    /// new one keeps answering `load` with the pre-move trace, which reads as
+    /// stale data rather than as a failed move.
+    async fn remove_from_tier(&self, tier: StorageTier, trace_id: &str) -> SFResult<()> {
+        for path in [
+            self.trace_path(tier, trace_id),
+            self.meta_path(tier, trace_id),
+        ] {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(SFError::IO(format!(
+                        "removing {} failed: {}",
+                        path.display(),
+                        e
+                    )))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read every parseable metadata file in one tier directory.
@@ -166,34 +186,48 @@ impl FileTraceStore {
 #[async_trait]
 impl TraceStore for FileTraceStore {
     async fn save(&self, trace: &AgentTrace) -> SFResult<String> {
+        // Serialized before anything on disk is touched: a serialization
+        // failure must not be preceded by the removal of the copy that is
+        // still the only one.
+        let trace_bytes = self.serialize_trace(trace)?;
+        let meta_json = serde_json::to_string_pretty(&TraceMeta::from_trace(trace))?;
+
+        // Which tier holds the copy this write replaces, read before the
+        // destination exists: the search returns the first tier holding
+        // metadata, so asked afterwards it would answer with the new one and
+        // the old copy would be left behind to shadow it.
+        let previous_tier = self.find_trace_tier(&trace.trace_id).await;
+
         // Ensure destination tier directory exists
         let tier_dir = self.tier_dir(trace.tier);
         tokio::fs::create_dir_all(&tier_dir)
             .await
             .map_err(|e| SFError::IO(e.to_string()))?;
 
-        // Check if trace exists in another tier and needs migration
-        if let Some(current_tier) = self.find_trace_tier(&trace.trace_id).await {
-            if current_tier != trace.tier {
-                // Remove from old tier
-                self.remove_from_tier(current_tier, &trace.trace_id).await;
-            }
-        }
-
-        // Serialize and write trace data
-        let trace_bytes = self.serialize_trace(trace)?;
+        // Destination first, metadata included. `load` reads a tier's metadata
+        // to learn the compression level, so data without it is unreadable
+        // while still looking like a trace that is present.
         let trace_path = self.trace_path(trace.tier, &trace.trace_id);
         tokio::fs::write(&trace_path, trace_bytes)
             .await
             .map_err(|e| SFError::IO(e.to_string()))?;
 
-        // Write metadata
-        let meta = TraceMeta::from_trace(trace);
         let meta_path = self.meta_path(trace.tier, &trace.trace_id);
-        let meta_json = serde_json::to_string_pretty(&meta)?;
         tokio::fs::write(&meta_path, meta_json)
             .await
             .map_err(|e| SFError::IO(e.to_string()))?;
+
+        // Only now is the old copy redundant. Removing it is what makes the
+        // move atomic in the direction that matters: a move that fails above
+        // leaves the trace exactly where it was, rather than in neither tier.
+        // A crash in between leaves it in both, which the next pass settles:
+        // the source tier still lists it as overdue, so the move runs again.
+        if let Some(previous_tier) = previous_tier {
+            if previous_tier != trace.tier {
+                self.remove_from_tier(previous_tier, &trace.trace_id)
+                    .await?;
+            }
+        }
 
         Ok(trace.trace_id.clone())
     }
@@ -225,11 +259,19 @@ impl TraceStore for FileTraceStore {
     }
 
     async fn delete(&self, trace_id: &str) -> SFResult<()> {
-        // Remove from all tiers (best effort)
+        // Every tier is attempted even when one fails: stopping at the first
+        // error would leave behind copies of the trace a delete was asked to
+        // remove. The first failure is what is reported.
+        let mut first_error = None;
         for &tier in &[StorageTier::Hot, StorageTier::Warm, StorageTier::Cold] {
-            self.remove_from_tier(tier, trace_id).await;
+            if let Err(e) = self.remove_from_tier(tier, trace_id).await {
+                first_error.get_or_insert(e);
+            }
         }
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     async fn list(&self, limit: usize) -> SFResult<Vec<AgentTrace>> {
@@ -375,6 +417,80 @@ mod tests {
         store.save(&test_trace(&long_id)).await.unwrap();
         let loaded = store.load(&long_id).await.unwrap();
         assert_eq!(loaded.unwrap().trace_id, long_id);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A tier move writes the destination before it removes the source, so a
+    /// write that cannot land leaves the trace exactly where it was. Removing
+    /// the source first loses it outright: no tier holds those events, and the
+    /// migrator that counted the failing move has nothing left to retry from.
+    #[tokio::test]
+    async fn a_failed_tier_move_leaves_the_trace_where_it_was() {
+        let dir = std::env::temp_dir().join(format!("fts-{}", uuid::Uuid::new_v4()));
+        let store = FileTraceStore::new(&dir);
+        let hot = aged_trace("t-fail", StorageTier::Hot, 40);
+        store.save(&hot).await.unwrap();
+
+        // The destination path is occupied by a directory, which fails the
+        // write whatever the process's privileges — a full or unwritable disk
+        // takes the same branch. Warm files carry the compression suffix.
+        tokio::fs::create_dir_all(dir.join("warm/t-fail.trace.zst"))
+            .await
+            .unwrap();
+
+        let mut demoted = hot.clone();
+        demoted.tier = StorageTier::Warm;
+        demoted.compression = 3;
+        assert!(
+            store.save(&demoted).await.is_err(),
+            "a destination write that failed must be reported"
+        );
+
+        let survived = store
+            .load("t-fail")
+            .await
+            .unwrap()
+            .expect("a failed move must not destroy the only copy");
+        assert_eq!(survived.tier, StorageTier::Hot);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The tier search answers with the first tier holding metadata. Asked
+    /// after the destination has been written, a move upwards would report the
+    /// destination as the previous tier and skip the removal, leaving the
+    /// source copy behind to shadow the new one for every later `load`.
+    #[tokio::test]
+    async fn a_move_upwards_leaves_no_copy_behind() {
+        let dir = std::env::temp_dir().join(format!("fts-{}", uuid::Uuid::new_v4()));
+        let store = FileTraceStore::new(&dir);
+        let warm = aged_trace("t-up", StorageTier::Warm, 40);
+        store.save(&warm).await.unwrap();
+
+        let mut promoted = warm.clone();
+        promoted.tier = StorageTier::Hot;
+        promoted.compression = 0;
+        promoted.event_count = 7;
+        store.save(&promoted).await.unwrap();
+
+        assert!(
+            !dir.join("warm/t-up.trace.zst").exists(),
+            "the warm copy must be gone rather than left to shadow the hot one"
+        );
+        assert!(!dir.join("warm/t-up.meta.json").exists());
+        assert_eq!(
+            store.list_meta(10).await.unwrap().len(),
+            1,
+            "one trace, whichever tier it moved between"
+        );
+
+        let loaded = store.load("t-up").await.unwrap().unwrap();
+        assert_eq!(loaded.tier, StorageTier::Hot);
+        assert_eq!(
+            loaded.event_count, 7,
+            "the hot copy is the one that answers"
+        );
+
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
