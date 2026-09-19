@@ -238,10 +238,11 @@ impl MemoryBackend for MetricsInstrumentedMemoryBackend {
     }
 
     async fn health_check(&self) -> SFResult<()> {
-        let start = Instant::now();
-        let result = self.inner.health_check().await;
-        self.record("health_check", start, result.is_err()).await;
-        result
+        // 探活不计成一次记忆操作：它由就绪探针按固定周期驱动，不是业务请求，
+        // 计进来之后 `memory_operations_total` 会几乎只剩它——真实读写被稀释到
+        // 读不出速率。探活本身的观测面仍完整：探针失败让 `/health/ready` 返回
+        // 503，Pod 转为 NotReady，由 k8s 的就绪状态与重启计数承载。
+        self.inner.health_check().await
     }
 
     async fn search_all(
