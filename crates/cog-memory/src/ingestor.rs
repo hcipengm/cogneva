@@ -61,6 +61,26 @@ fn raw_id_timestamp(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::from_timestamp_millis(millis)
 }
 
+/// 从 summary 的 `source_ref.raw_uri`（`memory://<raw id>`）取回它覆盖的 raw
+/// id。取不回就当作"没覆盖"——多报一条积压比漏报一条好。
+fn raw_id_from_uri(uri: &str) -> Option<String> {
+    uri.strip_prefix("memory://").map(str::to_string)
+}
+
+/// 一次对账扫描的结果。分成两段是因为它们对应两个不同的决定：`actionable`
+/// 会被重新入队（受上游闸门约束），`aged_out` 只能被报出来——对应的 raw 已经
+/// 老过重驱动窗，没有任何一条路径会再碰它们。
+struct UnextractedScan {
+    actionable: Vec<RawSource>,
+    aged_out: usize,
+}
+
+impl UnextractedScan {
+    fn total(&self) -> usize {
+        self.actionable.len() + self.aged_out
+    }
+}
+
 /// Runtime knobs for [`MemoryIngestor`]. Values come from the `memory.ingest`
 /// section of the config file; the [`Default`] impl is only a fallback.
 #[derive(Debug, Clone)]
@@ -79,10 +99,13 @@ pub struct MemoryIngestorConfig {
     /// 启动时是否对账扫描：把已归档但没有 summary 的 raw 重新入队。覆盖
     /// 崩溃/重启丢掉的在途抽取，以及任何"归档成功但抽取缺席"的残留。
     pub startup_reconcile: bool,
-    /// 对账扫描只回看最近这么多个小时的 raw。
+    /// 重驱动窗：只把最近这么多小时内归档的未抽取 raw 重新入队，更老的放弃。
+    /// 放弃是为了不无限重试内容本身抽不出来的 raw——它们写完死信仍然是"未
+    /// 抽取"，没有这个界就会每拍重驱动一次、死信按对账频率增长。放弃的代价
+    /// 是那部分不可自愈，所以扫描照报（`memory_unextracted_raw_aged_out`）。
     pub reconcile_lookback_hours: u64,
-    /// 周期对账间隔（秒）；0 = 只在启动时对账。启动对账覆盖不了"断供比对账
-    /// 窗口更长"的情形，周期重扫才让"归档必有抽取"不依赖重启时机。
+    /// 周期对账间隔（秒）；0 = 只在启动时对账。周期重扫让窗口内的欠账在上游
+    /// 恢复后的下一拍就被补驱动，不依赖进程重启时机。
     pub reconcile_interval_secs: u64,
     /// 连续多少次环境类抽取失败后暂停拉取。
     pub pull_pause_after_failures: u32,
@@ -798,10 +821,13 @@ impl MemoryIngestor {
         Ok(())
     }
 
-    /// 周期对账：启动对账只覆盖"进程崩溃到重启"这一小段，一次上游断供比对账
-    /// 回看窗更长时，断供早期已归档未抽取的 raw 会掉出窗口、再也不会被补驱动。
-    /// 按间隔重扫让"归档必有抽取"不依赖重启时机；闸门关着时跳过，上游恢复后
-    /// 的下一拍再补。间隔为 0 表示只在启动时对账。
+    /// 周期对账：启动对账只覆盖"进程崩溃到重启"这一小段。按间隔重扫让窗口内
+    /// 的欠账在上游恢复后的下一拍就被补驱动，不依赖重启时机；闸门关着时跳过。
+    /// 间隔为 0 表示只在启动时对账。
+    ///
+    /// 这个窗不是重启时机问题，而是自愈能力的边界：一次断供一旦长过重驱动窗，
+    /// 断供早期归档的 raw 就永久掉出补驱动范围。那部分不会再被这条路径碰到，
+    /// 只能靠积压观测（`memory_unextracted_raw_aged_out`）报出来。
     fn start_reconcile_ticker(
         self: &Arc<Self>,
         job_tx: &mpsc::UnboundedSender<QueuedRaw>,
@@ -844,27 +870,27 @@ impl MemoryIngestor {
         upstream_available: bool,
     ) {
         match self.collect_unextracted().await {
-            Ok(raws) => {
+            Ok(scan) => {
                 // 无论能不能入队都先把积压量报出去：这是「记忆静默丢失」唯一
                 // 的观测面，它必须在最坏的时候也在。没有 summary 的 raw 不会
                 // 自己报出来——判定「做完了没」就是一条 summary 存在性查询，
                 // 缺席查不出缺席。
-                self.report_unextracted(raws.len()).await;
-                if raws.is_empty() {
+                self.report_unextracted(&scan).await;
+                if scan.actionable.is_empty() {
                     return;
                 }
                 if !upstream_available {
                     info!(
                         "Memory ingest reconcile found {} unextracted raw sources; holding them until the LLM upstream returns",
-                        raws.len()
+                        scan.actionable.len()
                     );
                     return;
                 }
                 info!(
                     "Memory ingest reconcile re-driving {} unextracted raw sources",
-                    raws.len()
+                    scan.actionable.len()
                 );
-                for raw in raws {
+                for raw in scan.actionable {
                     enqueue(
                         job_tx,
                         backlog,
@@ -877,48 +903,80 @@ impl MemoryIngestor {
         }
     }
 
-    /// 把「扫到的未抽取 raw 数」发布成 gauge。没有指标面时只记日志：
-    /// 观测缺席不该让对账这一步失败。
-    async fn report_unextracted(&self, count: usize) {
+    /// 发布积压观测。两个 gauge 是两件事、两个决定，不合并成一个标量：
+    /// `memory_unextracted_raw` 是全部未抽取 raw（无时间窗，与它的名字和 HELP
+    /// 一致），`memory_unextracted_raw_aged_out` 是其中已经老过重驱动窗、系统
+    /// 自己再也补不回来的那部分。合并会掩盖后者——它永远小于全量，而全量随
+    /// 断供时长一起涨，一个"总量"读数分不出"正在排空"与"永远排不空"。
+    /// 没有指标面时只记日志：观测缺席不该让对账这一步失败。
+    async fn report_unextracted(&self, scan: &UnextractedScan) {
         let Some(metrics) = self.metrics.as_ref() else {
-            debug!("Memory ingest reconcile: {} unextracted raw sources", count);
+            debug!(
+                "Memory ingest reconcile: {} unextracted raw sources ({} beyond the re-drive window)",
+                scan.total(),
+                scan.aged_out
+            );
             return;
         };
-        if let Err(e) = metrics
-            .record_gauge("memory_unextracted_raw", count as f64, HashMap::new())
-            .await
-        {
-            warn!("Failed to record memory_unextracted_raw gauge: {}", e);
+        for (name, value) in [
+            ("memory_unextracted_raw", scan.total()),
+            ("memory_unextracted_raw_aged_out", scan.aged_out),
+        ] {
+            if let Err(e) = metrics
+                .record_gauge(name, value as f64, HashMap::new())
+                .await
+            {
+                warn!("Failed to record {name} gauge: {}", e);
+            }
         }
     }
 
-    async fn collect_unextracted(&self) -> SFResult<Vec<RawSource>> {
+    /// 扫出「已归档但没有 summary」的 raw。判据取差集，不取逐条存在性查询：
+    /// 一次 `list_raw` 拿全部归档 id，一次 `list_summary` 拿已被 summary 覆盖
+    /// 的 id，相减即积压——同样结果下逐条 `summary_for_raw` 要多花每个 raw
+    /// 一次查询。
+    ///
+    /// 时间窗只把结果切成"还能自愈"与"已经放弃"两段，不参与决定要不要看。
+    /// 用窗口筛掉不看的，恰恰是积压里最老、最不可能自己恢复的那一段，等于让
+    /// 「记忆静默丢失」随年龄增长自动消失。
+    ///
+    /// 重驱动一侧保留窗口是有意的，不是遗漏：内容本身抽不出来的 raw 走死信
+    /// 后仍是"未抽取"，没有窗口就会每拍重驱动一次、死信按对账频率无限增长。
+    /// 代价是这些 raw 超出窗口后不可自愈——所以它必须报出来（`aged_out`），
+    /// 让人知道欠了多少、需要一次带预算的回填。
+    async fn collect_unextracted(&self) -> SFResult<UnextractedScan> {
         let ids = self
             .backend
             .list_raw("default", Some("conversation/transcript"))
             .await?;
+        let summarized: std::collections::HashSet<String> = self
+            .backend
+            .list_summary("default")
+            .await?
+            .into_iter()
+            .filter_map(|e| raw_id_from_uri(&e.source_ref.raw_uri))
+            .collect();
         let cutoff = chrono::Utc::now()
             - chrono::Duration::hours(self.config.reconcile_lookback_hours as i64);
-        let mut out = Vec::new();
+        let mut actionable = Vec::new();
+        let mut aged_out = 0usize;
         for id in ids {
-            // 无时间信息的 id 不跳过：宁可多查一次 summary。
-            if let Some(ts) = raw_id_timestamp(&id) {
-                if ts < cutoff {
-                    continue;
-                }
+            if summarized.contains(&id) {
+                continue;
             }
-            if self
-                .backend
-                .summary_for_raw("default", &id)
-                .await?
-                .is_empty()
-            {
-                if let Some(raw) = self.backend.get_raw("default", &id).await? {
-                    out.push(raw);
-                }
+            // 无时间信息的 id 不算放弃：宁可多查一次 summary。
+            if raw_id_timestamp(&id).is_some_and(|ts| ts < cutoff) {
+                aged_out += 1;
+                continue;
+            }
+            if let Some(raw) = self.backend.get_raw("default", &id).await? {
+                actionable.push(raw);
             }
         }
-        Ok(out)
+        Ok(UnextractedScan {
+            actionable,
+            aged_out,
+        })
     }
 
     async fn retry_with_backoff<F, Fut>(&self, label: &str, mut op: F) -> SFResult<()>
@@ -1590,8 +1648,12 @@ mod tests {
     }
 
     fn transcript_raw(agent_id: &str) -> RawSource {
+        transcript_raw_at(agent_id, Utc::now())
+    }
+
+    fn transcript_raw_at(agent_id: &str, ts: chrono::DateTime<Utc>) -> RawSource {
         RawSource::new(
-            bounded_raw_id("agent", agent_id, Utc::now()),
+            bounded_raw_id("agent", agent_id, ts),
             "default",
             "conversation/transcript",
             b"[]".to_vec(),
@@ -1959,8 +2021,9 @@ mod tests {
         );
     }
 
-    /// C 面：断供比对账回看窗更长时，启动对账补不回断供早期归档的 raw。
-    /// 周期重扫让"归档必有抽取"不再依赖重启时机。
+    /// 周期重扫让"归档必有抽取"不再依赖重启时机：窗口内的欠账在上游恢复后的
+    /// 下一拍就被补驱动，不用等到进程重启。窗口外的欠账是另一个契约，见
+    /// [`Self::reconcile_reports_aged_out_backlog_beyond_the_redrive_window`]。
     #[tokio::test]
     async fn periodic_reconcile_redrives_without_a_restart() {
         let backend = Arc::new(MemoryMemoryBackend::new());
@@ -2144,6 +2207,94 @@ mod tests {
         assert!(
             job_rx.try_recv().is_ok(),
             "an open gate must re-drive the scanned raw sources"
+        );
+    }
+
+    /// 观测面必须覆盖整个病因面：老过重驱动窗的未抽取 raw 系统再也补不回来，
+    /// 但它仍然必须被报出来。按窗口筛掉不看的那些，恰恰是积压里最老、最不
+    /// 可能自己恢复的一段，等于让「记忆静默丢失」随年龄增长自动消失。
+    #[tokio::test]
+    async fn reconcile_reports_aged_out_backlog_beyond_the_redrive_window() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let now = Utc::now();
+        backend
+            .archive_raw(&transcript_raw_at("fresh", now))
+            .await
+            .unwrap();
+        backend
+            .archive_raw(&transcript_raw_at(
+                "stale",
+                now - chrono::Duration::hours(48),
+            ))
+            .await
+            .unwrap();
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone());
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        assert_eq!(
+            metrics.latest("memory_unextracted_raw"),
+            Some(2.0),
+            "the backlog gauge must count every unextracted raw, not only the re-drivable ones"
+        );
+        assert_eq!(
+            metrics.latest("memory_unextracted_raw_aged_out"),
+            Some(1.0),
+            "the part past the re-drive window must be reported as its own number"
+        );
+        assert!(
+            job_rx.try_recv().is_ok(),
+            "the in-window raw must still be re-driven"
+        );
+        assert!(
+            job_rx.try_recv().is_err(),
+            "a raw past the re-drive window is not re-driven"
+        );
+    }
+
+    /// 差集判据不能把"已有 summary 的 raw"算进积压：它按 raw id 相减，而不是
+    /// 只看 summary 是否存在过。
+    #[tokio::test]
+    async fn reconcile_excludes_raws_that_already_have_a_summary() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let raw = transcript_raw("already-summarized");
+        backend.archive_raw(&raw).await.unwrap();
+        backend
+            .store_summary(
+                "default",
+                &SummaryEntry::new(
+                    format!("summary-{}", raw.id),
+                    "default",
+                    "text",
+                    vec![0.0f32; 4],
+                    "rule_based/v1",
+                    cog_core::SourceRef::new(format!("memory://{}", raw.id), "rule_based/v1"),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone());
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        assert_eq!(
+            metrics.latest("memory_unextracted_raw"),
+            Some(0.0),
+            "a raw whose summary exists is not backlog"
+        );
+        assert!(
+            job_rx.try_recv().is_err(),
+            "a summarized raw must not be re-driven"
         );
     }
 }
