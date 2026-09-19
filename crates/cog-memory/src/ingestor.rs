@@ -960,8 +960,11 @@ impl MemoryIngestor {
             "dlq_timestamp": chrono::Utc::now().to_rfc3339(),
         });
 
+        // 键只由 raw 身份决定：带时间戳的键让同一条消息每失败一次就多一个文件，
+        // 死信目录于是用文件数冒充失败条数（实测 22,139 个文件来自 3,006 条 raw）。
+        // 内容缺陷是终止性的，重驱动只会得到同一条诊断，落同一个键即为最新诊断。
         let dlq_raw = RawSource::new(
-            format!("dlq-{}-{}", raw.id, chrono::Utc::now().timestamp_millis()),
+            format!("dlq-{}", raw.id),
             &self.config.dlq_namespace,
             "ingestion/failed",
             serde_json::to_vec(&dlq_payload).unwrap_or_default(),
@@ -1756,6 +1759,26 @@ mod tests {
         assert!(
             ingestor.pull_gate.blocked_for().await.is_none(),
             "a content failure says nothing about the upstream pool"
+        );
+    }
+
+    /// 死信目录的基数必须等于失败条数，不随重试次数增长：同一 raw 处理两次
+    /// 只留一份诊断，最新的一次覆盖旧的。
+    #[tokio::test]
+    async fn dead_letter_key_is_stable_across_retries() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(ContentBrokenExtractor))
+            .with_config(quick_retry_config());
+        let raw = transcript_raw("broken-twice");
+
+        assert!(ingestor.process(raw.clone()).await);
+        assert!(ingestor.process(raw).await);
+
+        let entries = backend.list_raw("dlq", None).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "retrying a poisoned message must overwrite its diagnosis, not add one"
         );
     }
 
