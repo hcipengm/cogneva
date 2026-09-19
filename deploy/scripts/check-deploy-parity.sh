@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # 部署拓扑 parity 校验：Helm chart 是应用拓扑的唯一权威源，deploy/k3s/ 静态清单
-# （bootstrap 消费）必须与 chart 的 k3s profile 渲染结果能力对齐——工作负载一个
-# 不少、env/卷/挂载/端口/SA 字段不弱、配置文档一段不缺。任何一侧改动后跑本
-# 脚本，差异即失败。
+# （bootstrap 消费）必须与 chart 的 k3s profile 渲染结果能力对齐。任何一侧改动后
+# 跑本脚本，差异即失败。
+#
+# 比什么：资源集合一个不少不多；每工作负载的 sa/automount/pod securityContext/
+# 整份卷声明；每容器的 args/端口(含协议)/挂载(含只读)/env(含取值来源)/
+# envFrom(含 optional 与 prefix)/命令正文/探针/资源声明/securityContext/workingDir；
+# Service 端口；治理对象与 PVC 的整份 spec；ConfigMap 的键与键值内的配置文档。
+# 判据面按「凡两侧都可能不同、且不同就改变运行时行为」取，不按「历史上错过什么」取
+# —— 只比错过的那几类，下一类漂移照样无声通过。
 #
 # ConfigMap 里真正的配置面常常不是 ConfigMap 的键，而是被嵌进某个值里的整份
 # 文档（cogneva.json 挂进来时键只有一个，少掉的字段藏在值里），所以值是 JSON
@@ -55,6 +61,48 @@ def vol_key(v):
     if 'emptyDir' in v: return 'emptyDir'
     if 'secret' in v: return 'secret:' + v['secret'].get('secretName', '?')
     return str([k for k in v if k != 'name'])
+
+def vol_sig(v):
+    """A volume's runtime behaviour is the whole block, not its type and target.
+    `hostPath.type` decides whether a missing directory is a mount error or gets
+    created (the difference between a working rollout and a pod stuck in
+    ContainerCreating); `configMap.items`/`defaultMode` decide which files appear
+    and with which permissions; `emptyDir.medium` decides whether it is disk or
+    memory. Keying only on path/name lets all of those drift unnoticed, so the
+    readable key stays as a prefix and the exact spec is compared after it."""
+    return f"{v['name']}={vol_key(v)} " + json.dumps(
+        {k: x for k, x in v.items() if k != 'name'}, sort_keys=True, default=str)
+
+def port_sig(p):
+    """`protocol` defaults to TCP, so an absent key and an explicit `TCP` are the
+    same port and must not read as a difference. A UDP flip on the same name and
+    number is a different wire protocol, and nothing else in the spec reveals it."""
+    return f"{p.get('name','')}:{p['containerPort']}/{p.get('protocol') or 'TCP'}"
+
+def mount_sig(m):
+    """`readOnly` absent and `false` are the same mount (Kubernetes defaults it to
+    false), so normalize to presence. `true` is not the same thing: a mount a
+    process needs to write turned read-only is a runtime failure the API server
+    accepts, and mountPath alone cannot see it."""
+    return f"{m['name']}->{m['mountPath']}" + (':ro' if m.get('readOnly') else '')
+
+def env_sig(e):
+    """The variable's name does not decide behaviour — its source does. The same
+    name pointed at a different ConfigMap key, a different literal, or a different
+    Secret field is a different configuration, and the two install paths (chart
+    render vs the static manifest the in-cluster consumer applies verbatim) feed
+    different processes. Comparing names only would call a swapped value aligned."""
+    return f"{e['name']}=" + json.dumps({k: x for k, x in e.items() if k != 'name'},
+                                        sort_keys=True, default=str)
+
+def envfrom_sig(e):
+    """Same reasoning one level up: `prefix` renames every variable that source
+    contributes, and `optional` decides whether a missing Secret blocks startup
+    or degrades. Both are contract, not decoration."""
+    kind = 'configMapRef' if 'configMapRef' in e else 'secretRef'
+    ref = e.get(kind) or {}
+    sig = f"{kind}:{ref.get('name','?')} optional={bool(ref.get('optional'))}"
+    return sig + (f" prefix={e['prefix']}" if e.get('prefix') else '')
 
 UNIT = {'n': 1e-9, 'u': 1e-6, 'm': 1e-3, '': 1.0, 'k': 1e3, 'M': 1e6, 'G': 1e9,
         'Ki': 2 ** 10, 'Mi': 2 ** 20, 'Gi': 2 ** 30, 'Ti': 2 ** 40}
@@ -112,17 +160,15 @@ def workload(doc):
            # 驱逐），少了 securityContext 的进程以镜像默认用户跑。它们不在
            # env/卷/挂载里，只比那三类会让"渲染路径少一整套探针"无声通过。
            'securityContext': json.dumps(ps.get('securityContext'), sort_keys=True),
-           'volumes': sorted(f"{v['name']}={vol_key(v)}" for v in ps.get('volumes', []))}
+           'volumes': sorted(vol_sig(v) for v in ps.get('volumes', []))}
     conts = {}
     for c in ps.get('containers', []) + ps.get('initContainers', []):
         conts[c['name']] = {
             'args': ' '.join(c.get('args', [])),
-            'ports': sorted(f"{p.get('name','')}:{p['containerPort']}" for p in c.get('ports', [])),
-            'envFrom': sorted((e.get('configMapRef') or {}).get('name')
-                              or (e.get('secretRef') or {}).get('name', '?')
-                              for e in c.get('envFrom', [])),
-            'env': sorted(e['name'] for e in c.get('env', [])),
-            'mounts': sorted(f"{m['name']}->{m['mountPath']}" for m in c.get('volumeMounts', [])),
+            'ports': sorted(port_sig(p) for p in c.get('ports', [])),
+            'envFrom': sorted(envfrom_sig(e) for e in c.get('envFrom', [])),
+            'env': sorted(env_sig(e) for e in c.get('env', [])),
+            'mounts': sorted(mount_sig(m) for m in c.get('volumeMounts', [])),
             'resources': norm_resources(c.get('resources')),
             'probes': norm_probes(c),
             'command': norm_command(c),
