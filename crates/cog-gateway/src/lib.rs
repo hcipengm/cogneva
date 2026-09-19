@@ -1092,7 +1092,9 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     ),
     (
         "llm_upstream_healthy",
-        "Whether each LLM upstream is considered usable, 1 or 0",
+        "Whether each LLM upstream has no outstanding failure, 1 or 0. \
+         A backoff window expiring is not evidence of recovery, so only a call \
+         that actually succeeded clears it — the same rule the pool verdict uses",
     ),
     (
         "llm_pool_available",

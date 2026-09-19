@@ -538,18 +538,19 @@ impl LlmHealthTable {
 
     /// 逐上游健康快照：`(身份, 是否健康, 连续失败数, 配额恢复时刻)`。
     /// 供指标与时序事件使用。
+    ///
+    /// 健康与池级判定用**同一条规则**：有未平账的失败就是不可用，只有一次真实
+    /// 成功（表项被移除）才算恢复。退避窗到期只说明"值得再试一次"，不是恢复的
+    /// 证据——若按"窗口未到期"报健康，同一个上游会在窗口到时的那一刻报 1，而池
+    /// 因为锁存仍报 0，读图的人从两个面上得到相反的结论。
     fn snapshot(&self, upstreams: &[LlmUpstream]) -> Vec<(String, bool, u32, Option<i64>)> {
-        let now = std::time::Instant::now();
         let states = self.states.lock().unwrap();
         upstreams
             .iter()
             .map(|u| {
                 let key = Self::key(u);
                 match states.get(&key) {
-                    Some(h) => {
-                        let suspect = h.suspect_until.is_some_and(|t| now < t);
-                        (key, !suspect, h.consecutive_failures, h.quota_reset_unix)
-                    }
+                    Some(h) => (key, false, h.consecutive_failures, h.quota_reset_unix),
                     None => (key, true, 0, None),
                 }
             })
@@ -3551,6 +3552,45 @@ mod tests {
         assert!(
             state.pool_down.load(Ordering::SeqCst),
             "没有实证成功就不解除锁存"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_backoff_window_is_not_reported_as_healthy() {
+        let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let u = stub_upstream("https://a.example.com", "m1");
+        let key = LlmHealthTable::key(&u);
+        state.llm_health.note_failure(&u, 300, None);
+        refresh_pool_state(&state).await;
+
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(text.contains("llm_pool_available 0"), "{text}");
+
+        // 窗到期只说明"值得再试一次"，不是恢复的证据。把窗拨到已到期，模拟探测器
+        // 还没轮到它、而窗已经过的状态：逐上游面与池面必须仍然给出同一个结论。
+        {
+            let mut states = state.llm_health.states.lock().unwrap();
+            states.get_mut(&key).unwrap().suspect_until =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        }
+        assert!(!state.llm_health.is_suspect(&u), "窗到期后路由不再降级");
+
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(text.contains("llm_pool_available 0"), "{text}");
+        assert!(
+            text.contains(&format!("llm_upstream_healthy{{upstream=\"{key}\"}} 0")),
+            "没有实证成功之前不得报健康，否则与池面结论相反: {text}"
+        );
+
+        // 实证成功才翻，两个面同时翻。
+        state.note_upstream_success(&u);
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(text.contains("llm_pool_available 1"), "{text}");
+        assert!(
+            text.contains(&format!("llm_upstream_healthy{{upstream=\"{key}\"}} 1")),
+            "{text}"
         );
     }
 
