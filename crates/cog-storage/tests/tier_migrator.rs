@@ -20,7 +20,12 @@ fn policy() -> TierPolicy {
 
 /// Write `name` under `base_dir/<stream>/` and backdate it so it has aged out
 /// of whatever tier the test is exercising.
-fn aged_file(base_dir: &std::path::Path, stream: &str, name: &str, age: Duration) -> std::path::PathBuf {
+fn aged_file(
+    base_dir: &std::path::Path,
+    stream: &str,
+    name: &str,
+    age: Duration,
+) -> std::path::PathBuf {
     let stream_dir = base_dir.join(stream);
     std::fs::create_dir_all(&stream_dir).unwrap();
     let path = stream_dir.join(name);
@@ -53,14 +58,22 @@ fn migrator(
 #[tokio::test]
 async fn an_aged_rotation_is_compressed_in_place_and_indexed() {
     let dir = tempfile::tempdir().unwrap();
-    let path = aged_file(dir.path(), "transport_raw", "2026-09-14.jsonl", Duration::from_secs(172_800));
+    let path = aged_file(
+        dir.path(),
+        "transport_raw",
+        "2026-09-14.jsonl",
+        Duration::from_secs(172_800),
+    );
     let (migrator, _objects, index) = migrator(dir.path());
 
     let stats = migrator.run_once().await.unwrap();
 
     assert_eq!(stats.warm_promotions, 1);
     assert!(!path.exists(), "the uncompressed source should be gone");
-    assert!(dir.path().join("transport_raw/2026-09-14.jsonl.zst").exists());
+    assert!(dir
+        .path()
+        .join("transport_raw/2026-09-14.jsonl.zst")
+        .exists());
 
     let rows = index.query(&RawLogQuery::default()).await.unwrap();
     assert_eq!(rows.len(), 1);
@@ -75,15 +88,31 @@ async fn an_aged_rotation_is_compressed_in_place_and_indexed() {
 #[tokio::test]
 async fn an_unrotated_file_is_left_alone_however_old() {
     let dir = tempfile::tempdir().unwrap();
-    let path = aged_file(dir.path(), "audit", "audit.jsonl", Duration::from_secs(2_592_000));
+    let path = aged_file(
+        dir.path(),
+        "audit",
+        "audit.jsonl",
+        Duration::from_secs(2_592_000),
+    );
     let (migrator, objects, index) = migrator(dir.path());
 
     let stats = migrator.run_once().await.unwrap();
 
     assert_eq!(stats.warm_promotions, 0);
-    assert!(path.exists(), "a live append stream must stay where its writer put it");
+    assert!(
+        path.exists(),
+        "a live append stream must stay where its writer put it"
+    );
     assert!(!dir.path().join("audit/audit.jsonl.zst").exists());
     assert_eq!(stats.skipped, 1);
-    assert!(index.query(&RawLogQuery::default()).await.unwrap().is_empty());
-    assert!(objects.get("raw/audit/date=2026-08-21/audit.jsonl.zst").await.unwrap().is_none());
+    assert!(index
+        .query(&RawLogQuery::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(objects
+        .get("raw/audit/date=2026-08-21/audit.jsonl.zst")
+        .await
+        .unwrap()
+        .is_none());
 }
