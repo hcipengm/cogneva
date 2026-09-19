@@ -984,6 +984,15 @@ pub struct SelfEvolutionConfig {
     pub workspaces: SelfEvolutionWorkspaceConfig,
 }
 
+/// Where synthesized hooks live inside the change directory. The writer (hook
+/// synthesis) and the reader (hook loading at agent startup) run in different
+/// processes, so a path assembled independently on either side can point the
+/// reader at a directory nothing writes to — a load that yields zero hooks and
+/// reports no error. Both sides take the subpath from here instead.
+pub fn self_evolution_hook_dir(change_dir: impl AsRef<std::path::Path>) -> std::path::PathBuf {
+    change_dir.as_ref().join("hooks")
+}
+
 impl Default for SelfEvolutionConfig {
     fn default() -> Self {
         Self {
@@ -1134,5 +1143,21 @@ mod tests {
 
         let cfg: TierMigratorConfig = serde_json::from_str(r#"{"trace_scan_batch": 123}"#).unwrap();
         assert_eq!(cfg.trace_scan_batch, 123);
+    }
+
+    /// The synthesizer and the startup loader must agree on where hooks live,
+    /// including when `change_dir` carries the trailing separator a config file
+    /// may well contain — a doubled separator would make the two sides address
+    /// different directories and the load would report zero hooks.
+    #[test]
+    fn hook_dir_is_the_change_dir_plus_one_segment() {
+        assert_eq!(
+            self_evolution_hook_dir("/opt/cogneva/sandbox/changes"),
+            std::path::Path::new("/opt/cogneva/sandbox/changes/hooks")
+        );
+        assert_eq!(
+            self_evolution_hook_dir("/opt/cogneva/sandbox/changes/"),
+            std::path::Path::new("/opt/cogneva/sandbox/changes/hooks")
+        );
     }
 }

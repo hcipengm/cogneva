@@ -406,7 +406,7 @@ impl EvolutionEngine {
         let artifact_id = id_str.to_string();
 
         // Write to hooks directory.
-        let hook_dir = self.change_dir.join("hooks");
+        let hook_dir = cog_core::config::self_evolution_hook_dir(&self.change_dir);
         let filename = hook_dir.join(format!("{}.json", artifact_id));
         if let Some(parent) = filename.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;

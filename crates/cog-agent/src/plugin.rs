@@ -47,7 +47,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
 
         // Snapshot config values to drop immutable borrow before publishing.
         let (
-            data_dir,
+            hook_change_dir,
             tool_timeout_secs,
             nats_config,
             hook_engine_config,
@@ -57,7 +57,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         ) = {
             let config = ctx.config();
             (
-                config.app.data_dir.clone(),
+                cog_core::config::self_evolution_hook_dir(&config.self_evolution.change_dir),
                 config.system.tool_timeout_secs,
                 config.dag_executor.nats.clone(),
                 config.hook_engine.clone(),
@@ -126,10 +126,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
             hook_engine_config.into(),
         ));
 
-        // Load persisted hooks from evolution-changes/hooks/ on startup.
+        // Load persisted hooks from the change dir's hooks/ on startup. The path
+        // comes from the same helper the synthesizer writes through: the two run
+        // in different processes, and a locally-built path here silently loads
+        // nothing.
         {
-            let hook_change_dir =
-                std::path::PathBuf::from(format!("{}/evolution-changes/hooks", data_dir));
             match hook_engine.load_from_dir(&hook_change_dir).await {
                 Ok(n) if n > 0 => info!(
                     "Loaded {} persisted hook(s) from {}",
