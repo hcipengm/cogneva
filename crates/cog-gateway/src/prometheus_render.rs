@@ -85,6 +85,63 @@ pub fn render_histograms(name: &str, help: &str, samples: &[MetricSample]) -> St
     out
 }
 
+/// Render a set of gauge samples in Prometheus text format.
+///
+/// A gauge is a point-in-time value, so unlike a counter or a summary there is
+/// nothing to aggregate: the newest sample per label set wins. Each value is
+/// accompanied by the timestamp of the sample it came from, because the pass
+/// that produces a gauge runs on a cadence of its own — minutes, for the ones
+/// that come from a periodic scan — while this exposition is scraped far more
+/// often. Without the timestamp a value left over from an earlier pass is
+/// indistinguishable from one just refreshed, and "the producer stalled" reads
+/// the same as "nothing to report".
+pub fn render_gauges(name: &str, help: &str, samples: &[MetricSample]) -> String {
+    if samples.is_empty() {
+        return String::new();
+    }
+
+    let mut latest: HashMap<String, &MetricSample> = HashMap::new();
+    for s in samples {
+        let key = format_labels(&s.labels);
+        match latest.get(&key) {
+            Some(prev) if prev.timestamp >= s.timestamp => {}
+            _ => {
+                latest.insert(key, s);
+            }
+        }
+    }
+
+    let mut keys: Vec<String> = latest.keys().cloned().collect();
+    keys.sort_unstable();
+
+    let mut out = format!("# HELP {name} {help}\n# TYPE {name} gauge\n");
+    for key in &keys {
+        let s = latest[key];
+        if key.is_empty() {
+            out.push_str(&format!("{name} {}\n", s.value));
+        } else {
+            out.push_str(&format!("{name}{{{key}}} {}\n", s.value));
+        }
+    }
+
+    out.push_str(&format!(
+        "# HELP {name}_observed_timestamp_seconds Unix seconds the {name} value above was produced at\n\
+         # TYPE {name}_observed_timestamp_seconds gauge\n"
+    ));
+    for key in &keys {
+        let ts = latest[key].timestamp.timestamp();
+        if key.is_empty() {
+            out.push_str(&format!("{name}_observed_timestamp_seconds {ts}\n"));
+        } else {
+            out.push_str(&format!(
+                "{name}_observed_timestamp_seconds{{{key}}} {ts}\n"
+            ));
+        }
+    }
+
+    out
+}
+
 /// Linear-interpolated quantile over ascending observations, matching the
 /// interpolation PostgreSQL's `percentile_cont` uses so in-process and
 /// in-database answers agree.
@@ -241,6 +298,51 @@ mod tests {
         assert!((value - 99.01).abs() < 1e-9, "{p99_line}");
         assert!(out.contains("http_request_duration_ms_count{endpoint=\"/api/v1/tasks\"} 100"));
         assert!(out.contains("# TYPE http_request_duration_ms summary\n"));
+    }
+
+    /// 一个 gauge 是一个时点值，不是一段窗口的和：同一序列在回看窗里有多个样本
+    /// 时只渲染最新的那个，求和或求平均都会把「当前积压」变成另一个数。
+    #[test]
+    fn gauge_renders_the_newest_sample_not_a_sum() {
+        let mut old = sample(7.0, &[]);
+        old.timestamp = chrono::Utc::now() - chrono::Duration::minutes(30);
+        let mut older = sample(5.0, &[]);
+        older.timestamp = chrono::Utc::now() - chrono::Duration::minutes(50);
+        let mut newest = sample(3.0, &[]);
+        newest.timestamp = chrono::Utc::now() - chrono::Duration::minutes(1);
+
+        let out = render_gauges("memory_unextracted_raw", "help", &[old, older, newest]);
+        assert!(
+            out.contains("\nmemory_unextracted_raw 3\n"),
+            "newest sample must win: {out}"
+        );
+        assert!(!out.contains("memory_unextracted_raw 15"), "{out}");
+        assert!(out.contains("# TYPE memory_unextracted_raw gauge\n"));
+    }
+
+    /// gauge 的产出节拍与抓取节拍不同，所以要连样本时间一起发出去：
+    /// 少了它，一个停了很久的生产者与一个刚跑过的生产者读起来一模一样。
+    #[test]
+    fn gauge_carries_the_sample_timestamp() {
+        let mut s = sample(4.0, &[]);
+        let ts = chrono::Utc::now() - chrono::Duration::minutes(12);
+        s.timestamp = ts;
+
+        let out = render_gauges("memory_unextracted_raw", "help", &[s]);
+        assert!(
+            out.contains(&format!(
+                "memory_unextracted_raw_observed_timestamp_seconds {}\n",
+                ts.timestamp()
+            )),
+            "{out}"
+        );
+    }
+
+    /// 没有样本就不渲染：一条只有 HELP 的 gauge 会让下游把「读不到」当成
+    /// 「值为空」，而正文里出现空序列比序列缺席更难分辨。
+    #[test]
+    fn empty_gauge_renders_nothing() {
+        assert!(render_gauges("memory_unextracted_raw", "help", &[]).is_empty());
     }
 
     #[test]

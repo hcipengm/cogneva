@@ -1010,6 +1010,13 @@ fn metric_endpoint_label(matched: Option<&MatchedPath>) -> String {
 /// Label value for requests that matched no route.
 const UNMATCHED_ENDPOINT_LABEL: &str = "unmatched";
 
+/// How far back the metrics endpoint looks for a gauge's newest sample.
+/// Gauges come from periodic passes rather than from the request path, so this
+/// has to stay comfortably above any producer's publish cadence — the memory
+/// ingest backlog is republished every ten minutes by default. A window
+/// narrower than the cadence would blank the series between passes.
+const GAUGE_LOOKBACK_SECS: i64 = 3600;
+
 /// Prometheus metrics endpoint — serves memory operation counters,
 /// latency histograms, and task operation counters from the MetricsBackend
 /// in text format, plus prometheus registry metrics from MetricsExporter.
@@ -1107,6 +1114,32 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
             }
             Err(e) => {
                 tracing::warn!("Failed to query tier migration counters: {}", e);
+            }
+        }
+
+        // Gauges get a lookback wider than the scrape window: the pass that
+        // produces this one runs on a minutes-scale cadence, and a window sized
+        // for a scrape would drop the series between two passes — the reader
+        // would see "no data" where the truth is "nothing is pending". The
+        // sample's own timestamp travels with the value so a value that stopped
+        // being refreshed is still readable as stale rather than as fresh.
+        match mb
+            .query_gauge_range(
+                "memory_unextracted_raw",
+                end - chrono::Duration::seconds(GAUGE_LOOKBACK_SECS),
+                end,
+            )
+            .await
+        {
+            Ok(samples) => {
+                body.push_str(&prometheus_render::render_gauges(
+                    "memory_unextracted_raw",
+                    "Archived raw sources still missing a summary, as last scanned",
+                    &samples,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query memory ingest backlog gauge: {}", e);
             }
         }
 
