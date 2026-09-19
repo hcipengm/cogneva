@@ -1,18 +1,14 @@
-//! Alertmanager — alerting rules, state machine, and notification routing.
-/// - Alert rules defined as ConfigMap-managed YAML (Phase 1: code config)
-/// - Rule evaluation against Prometheus metrics
-/// - Notification routing: webhook / email / Slack
-/// - State machine: Pending → Firing → Resolved
-///   **Phase 1**: in-memory evaluation + async webhook / SMTP / Slack dispatch.
-///   **Phase 2**: persistent alert history, alert grouping, silences.
-use chrono::Utc;
+//! Alert notification routing: webhook / email / Slack.
+//!
+//! Where alerts come from is not decided here. The infra watcher polls
+//! Prometheus rules and drives each series into the persistent `alerts` table,
+//! and the supervisor event bridge maps events; both hand the resulting
+//! `AlertEvent`s to `notify`. The rules this type holds are carried only so a
+//! webhook payload can resolve a rule's summary text — nothing evaluates them
+//! here.
 use cog_core::alerts::*;
-use std::collections::HashMap;
-use std::sync::Arc;
 
-/// Lightweight in-memory alert manager.
-/// Evaluates rules synchronously (fast path) and dispatches
-/// notifications asynchronously (background task).
+/// Formats alert events and dispatches them to the configured channels.
 use lettre::message::Message;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
@@ -20,7 +16,6 @@ use lettre::{AsyncSmtpTransport, Tokio1Executor};
 
 pub struct AlertManager {
     rules: Vec<AlertRule>,
-    active: std::sync::Mutex<Vec<AlertInstance>>,
     channels: Vec<AlertChannel>,
     timeout_secs: u64,
     client: Option<std::sync::Arc<dyn cog_core::HttpClient>>,
@@ -30,7 +25,6 @@ impl AlertManager {
     pub fn new(rules: Vec<AlertRule>, channels: Vec<AlertChannel>) -> Self {
         Self {
             rules,
-            active: std::sync::Mutex::new(Vec::new()),
             channels,
             timeout_secs: 10,
             client: None,
@@ -45,129 +39,6 @@ impl AlertManager {
     pub fn with_client(mut self, client: std::sync::Arc<dyn cog_core::HttpClient>) -> Self {
         self.client = Some(client);
         self
-    }
-
-    /// Evaluate a single metric sample against all rules.
-    ///
-    /// Push path: the caller supplies the sample. Sampling is not done here,
-    /// so a rule fires only for samples some caller hands to this method —
-    /// building a manager with rules is not the same as evaluating them.
-    pub fn evaluate(
-        &self,
-        metric_name: &str,
-        labels: &HashMap<String, String>,
-        value: f64,
-    ) -> Vec<AlertEvent> {
-        let mut events = Vec::new();
-        let now = Utc::now();
-
-        for rule in &self.rules {
-            if rule.metric_name != metric_name {
-                continue;
-            }
-            if !Self::labels_match(&rule.label_matchers, labels) {
-                continue;
-            }
-
-            let condition_met = rule.condition.evaluate(value);
-            let mut active = self.active.lock().unwrap();
-
-            let existing = active
-                .iter_mut()
-                .find(|a| a.rule_name == rule.name && Self::labels_match(&a.labels, labels));
-
-            if condition_met {
-                if let Some(inst) = existing {
-                    inst.value = value;
-                    inst.updated_at = now;
-                    // Transition Pending → Firing if duration exceeded
-                    if inst.state == AlertState::Pending {
-                        let elapsed = (now - inst.starts_at).num_seconds() as u64;
-                        if elapsed >= rule.duration_sec {
-                            inst.state = AlertState::Firing;
-                            events.push(AlertEvent::Firing(inst.clone()));
-                        }
-                    }
-                } else {
-                    let inst = AlertInstance {
-                        rule_name: rule.name.clone(),
-                        labels: labels.clone(),
-                        state: AlertState::Pending,
-                        severity: rule.severity,
-                        value,
-                        starts_at: now,
-                        ends_at: None,
-                        updated_at: now,
-                    };
-                    // If duration is 0, fire immediately
-                    if rule.duration_sec == 0 {
-                        let mut firing = inst.clone();
-                        firing.state = AlertState::Firing;
-                        active.push(firing.clone());
-                        events.push(AlertEvent::Firing(firing));
-                    } else {
-                        active.push(inst);
-                    }
-                }
-            } else if let Some(inst) = existing {
-                // Condition no longer met → resolve
-                inst.state = AlertState::Resolved;
-                inst.ends_at = Some(now);
-                inst.updated_at = now;
-                let resolved = inst.clone();
-                // Remove from active list
-                active.retain(|a| {
-                    !(a.rule_name == rule.name && Self::labels_match(&a.labels, labels))
-                });
-                events.push(AlertEvent::Resolved(resolved));
-            }
-        }
-
-        events
-    }
-
-    /// Scan the active alert list and auto-resolve any alerts whose
-    /// underlying metric has not been seen recently.
-    pub fn resolve_stale(&self, max_age_sec: u64) -> Vec<AlertEvent> {
-        let now = Utc::now();
-        let mut active = self.active.lock().unwrap();
-        let mut resolved = Vec::new();
-
-        active.retain(|a| {
-            let age = (now - a.updated_at).num_seconds() as u64;
-            if age > max_age_sec && a.state != AlertState::Resolved {
-                let mut r = a.clone();
-                r.state = AlertState::Resolved;
-                r.ends_at = Some(now);
-                r.updated_at = now;
-                resolved.push(AlertEvent::Resolved(r));
-                false
-            } else {
-                true
-            }
-        });
-
-        resolved
-    }
-
-    /// List currently active (Pending or Firing) alerts.
-    pub fn active_alerts(&self) -> Vec<AlertInstance> {
-        let active = self.active.lock().unwrap();
-        active
-            .iter()
-            .filter(|a| a.state != AlertState::Resolved)
-            .cloned()
-            .collect()
-    }
-
-    /// List only firing alerts.
-    pub fn firing_alerts(&self) -> Vec<AlertInstance> {
-        let active = self.active.lock().unwrap();
-        active
-            .iter()
-            .filter(|a| a.state == AlertState::Firing)
-            .cloned()
-            .collect()
     }
 
     /// Dispatch notifications for a batch of alert events.
@@ -347,36 +218,11 @@ impl AlertManager {
         }
     }
 
-    fn labels_match(matchers: &HashMap<String, String>, labels: &HashMap<String, String>) -> bool {
-        matchers
-            .iter()
-            .all(|(k, v)| labels.get(k).map(|s| s == v).unwrap_or(false))
-    }
-
     fn rule_summary(&self, rule_name: &str) -> String {
         self.rules
             .iter()
             .find(|r| r.name == rule_name)
             .map(|r| r.summary.clone())
             .unwrap_or_default()
-    }
-}
-
-/// Background evaluation loop for the alert manager.
-/// When using `PrometheusMetricsBackend`, metrics are push-based into
-/// the Registry.  The evaluation loop auto-resolves stale alerts.
-pub async fn alert_manager_loop(
-    manager: Arc<AlertManager>,
-    stale_check_interval_sec: u64,
-    stale_threshold_sec: u64,
-) {
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_secs(stale_check_interval_sec));
-    loop {
-        interval.tick().await;
-        let events = manager.resolve_stale(stale_threshold_sec);
-        if !events.is_empty() {
-            manager.notify(&events).await;
-        }
     }
 }
