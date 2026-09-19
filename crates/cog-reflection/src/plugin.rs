@@ -212,6 +212,41 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             ));
         }
 
+        // 反思条目与它的派生层是两次独立写，第二次失败或中途重启会留下「raw
+        // 落了盘、schema 缺席」的孤儿，而检索走 schema，于是这条学习静默消失。
+        // 补齐是确定性的（raw 里存的就是条目本身），不吃 LLM 配额，所以放在
+        // init：它既不依赖自进化管线是否武装，也不受沙盒边界门禁影响——缺口
+        // 在管线的哪一侧出现与门禁无关。
+        {
+            let repair_interval = ctx.config().self_evolution.schema_repair_interval_secs;
+            if let Some(mb) = memory_backend.clone() {
+                if repair_interval == 0 {
+                    info!("memory schema repair disabled by config");
+                } else {
+                    let recorder =
+                        crate::MemoryBackendRecorder::new(mb, crate::REFLECTION_NAMESPACE);
+                    let shutdown = cog_core::ShutdownSignal::new();
+                    if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                        let shutdown = shutdown.clone();
+                        let mut rx = broadcast_tx.0.subscribe();
+                        tokio::spawn(async move {
+                            let _ = rx.recv().await;
+                            shutdown.trigger();
+                        });
+                    }
+                    info!(
+                        interval_secs = repair_interval,
+                        "memory schema repair loop started"
+                    );
+                    tokio::spawn(crate::recorder::run_schema_repair_loop(
+                        recorder,
+                        std::time::Duration::from_secs(repair_interval),
+                        shutdown,
+                    ));
+                }
+            }
+        }
+
         let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
             crate::ReflectionEngine::new_self_evolution(

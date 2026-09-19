@@ -924,6 +924,11 @@ pub struct SelfEvolutionConfig {
     pub test_timeout_secs: u64,
     pub build_timeout_secs: u64,
     pub poll_interval_secs: u64,
+    /// 反思条目的归档与它的派生层（schema）是两次独立写，第二次失败或中途
+    /// 重启会留下「归档在、按 schema 检索不到」的孤儿。这个间隔决定多久重扫
+    /// 一次并补上缺口，0 表示关闭重扫。补齐只读本地归档、不调 LLM，所以上游
+    /// 断供时也该照跑。
+    pub schema_repair_interval_secs: u64,
     pub notify_on_success: bool,
     pub notify_on_failure: bool,
     /// Image-based 滚动更新；enabled=false 时忽略整块配置。
@@ -954,6 +959,7 @@ impl Default for SelfEvolutionConfig {
             test_timeout_secs: 600,
             build_timeout_secs: 1800,
             poll_interval_secs: 60,
+            schema_repair_interval_secs: 600,
             notify_on_success: false,
             notify_on_failure: true,
             image_rollout: ImageRolloutConfig::default(),

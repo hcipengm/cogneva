@@ -255,6 +255,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "self_evolution.poll_interval_secs".into(),
     );
     m.insert(
+        "COGNEVA_SELF_EVOLUTION_SCHEMA_REPAIR_INTERVAL_SECS".into(),
+        "self_evolution.schema_repair_interval_secs".into(),
+    );
+    m.insert(
         "COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS".into(),
         "self_evolution.test_timeout_secs".into(),
     );

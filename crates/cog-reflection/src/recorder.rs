@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cog_core::SFResult;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::types::{FeatureRequest, LearningFilter};
 use cog_core::{ErrorEntry, Learning, LearningStatus, Resolution};
@@ -188,6 +188,126 @@ fn matches_learning_filter(learning: &Learning, filter: Option<&LearningFilter>)
         && f.until.is_none_or(|until| learning.last_seen <= until)
 }
 
+/// 条目到派生层的映射。抽成一套共用函数是因为写入与补齐两条路径都要用它：
+/// 各写一份迟早分叉，而分叉的表现是「补齐出来的条目和正常写入的条目不同」，
+/// 比不补齐更难查。
+fn reflection_source_ref(namespace: &str, id: &str) -> SourceRef {
+    SourceRef::new(
+        format!("memory://{}/{}", namespace, id),
+        "cog-reflection/1.0",
+    )
+}
+
+fn importance_for(priority: cog_core::Priority) -> f32 {
+    match priority {
+        cog_core::Priority::Critical => 1.0,
+        cog_core::Priority::High => 0.8,
+        cog_core::Priority::Medium => 0.5,
+        cog_core::Priority::Low => 0.3,
+    }
+}
+
+fn schema_for_learning(namespace: &str, learning: &Learning) -> SFResult<cog_core::SchemaEntry> {
+    Ok(cog_core::SchemaEntry::new(
+        learning.id.clone(),
+        namespace,
+        cog_core::SchemaKind::Learning,
+        &learning.summary,
+        &learning.id,
+        reflection_source_ref(namespace, &learning.id),
+    )
+    .with_properties(serde_json::to_value(learning).map_err(cog_core::SFError::Serialization)?)
+    .with_importance(importance_for(learning.priority)))
+}
+
+fn schema_for_error(namespace: &str, error: &ErrorEntry) -> SFResult<cog_core::SchemaEntry> {
+    Ok(cog_core::SchemaEntry::new(
+        error.id.clone(),
+        namespace,
+        cog_core::SchemaKind::ErrorPattern,
+        &error.error_message,
+        &error.id,
+        reflection_source_ref(namespace, &error.id),
+    )
+    .with_properties(serde_json::to_value(error).map_err(cog_core::SFError::Serialization)?)
+    .with_importance(importance_for(error.priority)))
+}
+
+fn schema_for_feature_request(
+    namespace: &str,
+    request: &FeatureRequest,
+) -> SFResult<cog_core::SchemaEntry> {
+    Ok(cog_core::SchemaEntry::new(
+        request.id.clone(),
+        namespace,
+        cog_core::SchemaKind::Custom,
+        &request.capability,
+        &request.id,
+        reflection_source_ref(namespace, &request.id),
+    )
+    .with_properties(serde_json::to_value(request).map_err(cog_core::SFError::Serialization)?))
+}
+
+/// 从归档的条目内容重建它的派生层。类型按 id 前缀认——前缀由各类型的
+/// `generate_id` 生成，是这个存储里唯一的类型标记；条目自报的 id 与文件名
+/// 不一致说明这份归档对不上号，宁可跳过也不拿它给别人盖章。
+fn schema_from_payload(namespace: &str, id: &str, payload: &[u8]) -> Option<cog_core::SchemaEntry> {
+    if let Some(rest) = id.strip_prefix("LRN-") {
+        if rest.is_empty() {
+            return None;
+        }
+        let learning: Learning = serde_json::from_slice(payload).ok()?;
+        return (learning.id == id)
+            .then(|| schema_for_learning(namespace, &learning).ok())
+            .flatten();
+    }
+    if let Some(rest) = id.strip_prefix("ERR-") {
+        if rest.is_empty() {
+            return None;
+        }
+        let error: ErrorEntry = serde_json::from_slice(payload).ok()?;
+        return (error.id == id)
+            .then(|| schema_for_error(namespace, &error).ok())
+            .flatten();
+    }
+    if let Some(rest) = id.strip_prefix("FEAT-") {
+        if rest.is_empty() {
+            return None;
+        }
+        let request: FeatureRequest = serde_json::from_slice(payload).ok()?;
+        return (request.id == id)
+            .then(|| schema_for_feature_request(namespace, &request).ok())
+            .flatten();
+    }
+    None
+}
+
+/// 从 schema 的 `source_ref.raw_uri`（`memory://<namespace>/<条目 id>`）取回它
+/// 覆盖的 raw id。取不回就当作「没覆盖」——多补一条比漏补一条好。
+fn schema_raw_id(uri: &str, namespace: &str) -> Option<String> {
+    uri.strip_prefix(&format!("memory://{}/", namespace))
+        .filter(|rest| !rest.is_empty())
+        .map(str::to_string)
+}
+
+/// 一次补齐扫描的结果。两个数分开报是因为它们对应两个决定：补齐的是这一轮
+/// 自己救回来的，认不出的是需要人看一眼的。合并成一个数会让后者随前者一起
+/// 变化而看不见。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaRepair {
+    /// 这轮从 raw 内容重建出派生层的条目数。
+    pub repaired: usize,
+    /// 已归档、缺派生层、且无法从内容认出类型的条目数。
+    pub unrepairable: usize,
+}
+
+impl SchemaRepair {
+    /// 这轮发现的缺派生层的条目总数。
+    pub fn found(&self) -> usize {
+        self.repaired + self.unrepairable
+    }
+}
+
 /// Recorder backed by [`cog_core::MemoryBackend`].
 /// Stores learnings as schema entries so they participate in the
 /// three-layer memory pipeline (raw → schema → summary).
@@ -222,6 +342,77 @@ impl MemoryBackendRecorder {
             namespace: namespace.into(),
         }
     }
+
+    /// 补齐「已归档、但没有派生层」的条目。归档与派生层是两次独立写：第二次
+    /// 失败或进程在此重启，就留下只有一个 raw 的孤儿。而条目是按 schema 检索
+    /// 的，孤儿虽然落了盘却再也查不到——它不会自己报出来，因为「做完了没」的
+    /// 判据正是「派生层在不在」，缺席查不出缺席。
+    ///
+    /// 补齐不需要 LLM：raw 里存的就是条目本身，按 id 前缀还原成对应类型即可
+    /// 重建派生层，所以这条路径在上游断供时照样能跑。认不出类型的只计数，
+    /// 不猜也不丢：宁可不补，也不凭空造一条派生层去冒充原始记录。
+    pub async fn repair_missing_schemas(&self) -> SFResult<SchemaRepair> {
+        let ids = self.backend.list_raw(&self.namespace, None).await?;
+        let covered: std::collections::HashSet<String> = self
+            .backend
+            .list_schema(&self.namespace)
+            .await?
+            .into_iter()
+            .filter_map(|s| schema_raw_id(&s.source_ref.raw_uri, &self.namespace))
+            .collect();
+
+        let mut repair = SchemaRepair::default();
+        for id in ids {
+            if covered.contains(&id) {
+                continue;
+            }
+            let Some(raw) = self.backend.get_raw(&self.namespace, &id).await? else {
+                // 归档列表里有、读不到：既不能确认它缺派生层，也不能重建。
+                // 算作需要人看一眼的那种，不静默略过。
+                repair.unrepairable += 1;
+                continue;
+            };
+            match schema_from_payload(&self.namespace, &id, &raw.payload) {
+                Some(schema) => {
+                    self.backend.store_schema(&self.namespace, &schema).await?;
+                    repair.repaired += 1;
+                }
+                None => repair.unrepairable += 1,
+            }
+        }
+        Ok(repair)
+    }
+}
+
+/// 按间隔补齐缺失的派生层，直到收到停机信号。间隔为 0 表示不重扫。
+///
+/// 属主不用配置判定，用结构性证据：谁手里有这批 raw 才能补谁。反思条目的
+/// 归档落在各部署自己的数据卷上，而删掉派生层的缺口只可能出现在有归档的那
+/// 一侧，所以每个部署都跑一遍并不会互相重复劳动——没有归档的那份扫出来是空
+/// 的，有的是 upsert，重复执行也不会写坏。反过来用一个配置开关去指定属主会
+/// 指定错：拿执行器职责当开关，就会让握着归档的控制面跳过、让空手的执行器
+/// 白跑。
+pub async fn run_schema_repair_loop(
+    recorder: MemoryBackendRecorder,
+    interval: std::time::Duration,
+    shutdown: cog_core::ShutdownSignal,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.wait() => return,
+        }
+        match recorder.repair_missing_schemas().await {
+            Ok(repair) if repair.found() > 0 => info!(
+                repaired = repair.repaired,
+                unrepairable = repair.unrepairable,
+                "rebuilt missing memory schemas from archived entries"
+            ),
+            Ok(_) => debug!("memory schema repair: no orphaned entries"),
+            Err(e) => warn!("memory schema repair failed: {}", e),
+        }
+    }
 }
 
 #[async_trait]
@@ -236,27 +427,7 @@ impl LearningRecorder for MemoryBackendRecorder {
 
         self.backend.archive_raw(&raw).await?;
 
-        let source_ref = SourceRef::new(
-            format!("memory://{}/{}", self.namespace, learning.id),
-            "cog-reflection/1.0",
-        );
-
-        let schema = cog_core::SchemaEntry::new(
-            learning.id.clone(),
-            &self.namespace,
-            cog_core::SchemaKind::Learning,
-            &learning.summary,
-            &learning.id,
-            source_ref,
-        )
-        .with_properties(serde_json::to_value(&learning).map_err(cog_core::SFError::Serialization)?)
-        .with_importance(match learning.priority {
-            cog_core::Priority::Critical => 1.0,
-            cog_core::Priority::High => 0.8,
-            cog_core::Priority::Medium => 0.5,
-            cog_core::Priority::Low => 0.3,
-        });
-
+        let schema = schema_for_learning(&self.namespace, &learning)?;
         self.backend.store_schema(&self.namespace, &schema).await?;
         info!("persisted learning {} to memory backend", learning.id);
         Ok(())
@@ -271,27 +442,7 @@ impl LearningRecorder for MemoryBackendRecorder {
         );
         self.backend.archive_raw(&raw).await?;
 
-        let source_ref = SourceRef::new(
-            format!("memory://{}/{}", self.namespace, error.id),
-            "cog-reflection/1.0",
-        );
-
-        let schema = cog_core::SchemaEntry::new(
-            error.id.clone(),
-            &self.namespace,
-            cog_core::SchemaKind::ErrorPattern,
-            &error.error_message,
-            &error.id,
-            source_ref,
-        )
-        .with_properties(serde_json::to_value(&error).map_err(cog_core::SFError::Serialization)?)
-        .with_importance(match error.priority {
-            cog_core::Priority::Critical => 1.0,
-            cog_core::Priority::High => 0.8,
-            cog_core::Priority::Medium => 0.5,
-            cog_core::Priority::Low => 0.3,
-        });
-
+        let schema = schema_for_error(&self.namespace, &error)?;
         self.backend.store_schema(&self.namespace, &schema).await?;
         info!("persisted error {} to memory backend", error.id);
         Ok(())
@@ -306,21 +457,7 @@ impl LearningRecorder for MemoryBackendRecorder {
         );
         self.backend.archive_raw(&raw).await?;
 
-        let source_ref = SourceRef::new(
-            format!("memory://{}/{}", self.namespace, request.id),
-            "cog-reflection/1.0",
-        );
-
-        let schema = cog_core::SchemaEntry::new(
-            request.id.clone(),
-            &self.namespace,
-            cog_core::SchemaKind::Custom,
-            &request.capability,
-            &request.id,
-            source_ref,
-        )
-        .with_properties(serde_json::to_value(&request).map_err(cog_core::SFError::Serialization)?);
-
+        let schema = schema_for_feature_request(&self.namespace, &request)?;
         self.backend.store_schema(&self.namespace, &schema).await?;
         info!("persisted feature request {} to memory backend", request.id);
         Ok(())
@@ -363,8 +500,8 @@ impl LearningRecorder for MemoryBackendRecorder {
 mod tests {
     use super::*;
     use cog_core::contract::memory::{
-        MemoryMetrics, RelationDirection, SchemaSearchResult, SummaryEntry, SummarySearchResult,
-        UnifiedSearchResult,
+        MemoryBackend, MemoryMetrics, RelationDirection, SchemaSearchResult, SummaryEntry,
+        SummarySearchResult, UnifiedSearchResult,
     };
     use cog_core::{Area, LearningCategory, LearningSource, Priority};
     use std::sync::Mutex;
@@ -429,6 +566,165 @@ mod tests {
             _raw_id: &str,
         ) -> SFResult<Vec<cog_core::SchemaEntry>> {
             unsupported()
+        }
+        async fn list_schema(&self, _ns: &str) -> SFResult<Vec<cog_core::SchemaEntry>> {
+            Ok(self.schemas.lock().unwrap().clone())
+        }
+        async fn delete_schema(&self, _ns: &str, _id: &str) -> SFResult<()> {
+            unsupported()
+        }
+        async fn query_relations(
+            &self,
+            _ns: &str,
+            _entity: &str,
+            _direction: RelationDirection,
+            _relation_type: Option<&str>,
+        ) -> SFResult<Vec<cog_core::SchemaEntry>> {
+            unsupported()
+        }
+        async fn update_schema(&self, _ns: &str, _entry: &cog_core::SchemaEntry) -> SFResult<()> {
+            unsupported()
+        }
+        async fn store_summary(&self, _ns: &str, _entry: &SummaryEntry) -> SFResult<()> {
+            unsupported()
+        }
+        async fn get_summary(&self, _ns: &str, _id: &str) -> SFResult<Option<SummaryEntry>> {
+            unsupported()
+        }
+        async fn search_summary(
+            &self,
+            _ns: &str,
+            _query: &[f32],
+            _top_k: usize,
+            _range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+        ) -> SFResult<Vec<SummarySearchResult>> {
+            unsupported()
+        }
+        async fn summary_for_raw(&self, _ns: &str, _raw_id: &str) -> SFResult<Vec<SummaryEntry>> {
+            unsupported()
+        }
+        async fn list_summary(&self, _ns: &str) -> SFResult<Vec<SummaryEntry>> {
+            unsupported()
+        }
+        async fn delete_summary(&self, _ns: &str, _id: &str) -> SFResult<()> {
+            unsupported()
+        }
+        async fn update_summary(&self, _ns: &str, _entry: &SummaryEntry) -> SFResult<()> {
+            unsupported()
+        }
+        fn metrics(&self) -> MemoryMetrics {
+            MemoryMetrics::default()
+        }
+        async fn health_check(&self) -> SFResult<()> {
+            Ok(())
+        }
+        async fn search_all(
+            &self,
+            _ns: &str,
+            _query: &str,
+            _embedding: Option<&[f32]>,
+            _top_k: usize,
+            _range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+        ) -> SFResult<Vec<UnifiedSearchResult>> {
+            unsupported()
+        }
+        async fn ingest_explicit(
+            &self,
+            _ns: &str,
+            _text: &str,
+            _importance: f32,
+            _tags: Vec<String>,
+        ) -> SFResult<()> {
+            unsupported()
+        }
+        async fn forget(&self, _ns: &str, _id: &str) -> SFResult<()> {
+            unsupported()
+        }
+        async fn decay(
+            &self,
+            _ns: &str,
+            _age: u64,
+            _importance: f32,
+        ) -> SFResult<cog_core::DecayReport> {
+            unsupported()
+        }
+    }
+
+    /// A `MemoryBackend` that serves the raw and schema layers in memory.
+    /// The repair path reads one and writes the other, so it needs both; the
+    /// remaining layers exist only so the trait can be implemented.
+    #[derive(Default)]
+    struct RawAndSchemaBackend {
+        raws: Mutex<Vec<RawSource>>,
+        schemas: Mutex<Vec<cog_core::SchemaEntry>>,
+    }
+
+    #[async_trait]
+    impl cog_core::MemoryBackend for RawAndSchemaBackend {
+        async fn archive_raw(&self, source: &RawSource) -> SFResult<String> {
+            let mut raws = self.raws.lock().unwrap();
+            raws.retain(|r| r.id != source.id);
+            raws.push(source.clone());
+            Ok(format!("memory://{}/{}", source.namespace, source.id))
+        }
+        async fn get_raw(&self, _ns: &str, id: &str) -> SFResult<Option<RawSource>> {
+            Ok(self
+                .raws
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == id)
+                .cloned())
+        }
+        async fn list_raw(&self, _ns: &str, prefix: Option<&str>) -> SFResult<Vec<String>> {
+            Ok(self
+                .raws
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| prefix.is_none_or(|p| r.content_type.starts_with(p)))
+                .map(|r| r.id.clone())
+                .collect())
+        }
+        async fn delete_raw(&self, _ns: &str, _id: &str) -> SFResult<()> {
+            unsupported()
+        }
+        async fn store_schema(&self, _ns: &str, entry: &cog_core::SchemaEntry) -> SFResult<()> {
+            let mut schemas = self.schemas.lock().unwrap();
+            schemas.retain(|s| s.id != entry.id);
+            schemas.push(entry.clone());
+            Ok(())
+        }
+        async fn get_schema(&self, _ns: &str, id: &str) -> SFResult<Option<cog_core::SchemaEntry>> {
+            Ok(self
+                .schemas
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|s| s.id == id)
+                .cloned())
+        }
+        async fn search_schema(
+            &self,
+            _ns: &str,
+            _query: &str,
+            _limit: usize,
+        ) -> SFResult<Vec<SchemaSearchResult>> {
+            unsupported()
+        }
+        async fn schema_for_raw(
+            &self,
+            _ns: &str,
+            raw_id: &str,
+        ) -> SFResult<Vec<cog_core::SchemaEntry>> {
+            Ok(self
+                .schemas
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.source_ref.raw_uri.ends_with(raw_id))
+                .cloned()
+                .collect())
         }
         async fn list_schema(&self, _ns: &str) -> SFResult<Vec<cog_core::SchemaEntry>> {
             Ok(self.schemas.lock().unwrap().clone())
@@ -663,5 +959,110 @@ mod tests {
                 "filter matched but should not have: {mismatched:?}"
             );
         }
+    }
+
+    /// 归档与派生层是两次独立写，第二次失败就留下一个「在盘上、但按 schema
+    /// 检索不到」的孤儿。它不会自己报出来——判定「做完了没」的判据正是「派生层
+    /// 在不在」，缺席查不出缺席——所以只能靠一次主动重扫把它补回来。
+    #[tokio::test]
+    async fn repair_rebuilds_the_schema_of_an_orphaned_entry() {
+        let backend = Arc::new(RawAndSchemaBackend::default());
+        let recorder = MemoryBackendRecorder::new(backend.clone(), "reflection");
+        let orphan = learning(Priority::High, LearningStatus::Pending, &["a"]);
+        recorder.record_learning(orphan.clone()).await.unwrap();
+        // 抹掉派生层，复现「归档在、schema 缺席」的现场。
+        backend.schemas.lock().unwrap().clear();
+        assert!(recorder.list_learnings(None).await.unwrap().is_empty());
+
+        let repair = recorder.repair_missing_schemas().await.unwrap();
+        assert_eq!(repair.repaired, 1);
+        assert_eq!(repair.unrepairable, 0);
+
+        let schema = backend
+            .get_schema("reflection", &orphan.id)
+            .await
+            .unwrap()
+            .expect("the rebuilt schema must be retrievable");
+        assert_eq!(schema.kind, cog_core::SchemaKind::Learning);
+        assert_eq!(
+            schema.source_ref.raw_uri,
+            format!("memory://reflection/{}", orphan.id)
+        );
+        assert_eq!(
+            serde_json::from_value::<Learning>(schema.properties)
+                .unwrap()
+                .id,
+            orphan.id,
+            "the rebuilt entry must carry the archived record, not a summary of it"
+        );
+        let recovered = recorder.list_learnings(None).await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, orphan.id);
+    }
+
+    #[tokio::test]
+    async fn repair_leaves_entries_that_still_have_a_schema_alone() {
+        let backend = Arc::new(RawAndSchemaBackend::default());
+        let recorder = MemoryBackendRecorder::new(backend.clone(), "reflection");
+        recorder
+            .record_learning(learning(Priority::High, LearningStatus::Pending, &[]))
+            .await
+            .unwrap();
+
+        let repair = recorder.repair_missing_schemas().await.unwrap();
+        assert_eq!(repair.found(), 0);
+        assert_eq!(
+            backend.schemas.lock().unwrap().len(),
+            1,
+            "an entry that already has a schema must not be written twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_counts_entries_it_cannot_type_instead_of_guessing() {
+        let backend = Arc::new(RawAndSchemaBackend::default());
+        let recorder = MemoryBackendRecorder::new(backend.clone(), "reflection");
+        backend
+            .archive_raw(&RawSource::new(
+                "WRENCH-20260919-00000001",
+                "reflection",
+                "application/json",
+                br#"{"kind":"something else"}"#.to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        let repair = recorder.repair_missing_schemas().await.unwrap();
+        assert_eq!(repair.repaired, 0);
+        assert_eq!(
+            repair.unrepairable, 1,
+            "an entry the repair cannot type must be counted, not silently skipped"
+        );
+        assert!(
+            backend.schemas.lock().unwrap().is_empty(),
+            "a made-up schema would make the entry look recovered when it is not"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_skips_payloads_whose_id_disagrees_with_the_archive() {
+        let backend = Arc::new(RawAndSchemaBackend::default());
+        let recorder = MemoryBackendRecorder::new(backend.clone(), "reflection");
+        let mut recorded_elsewhere = learning(Priority::High, LearningStatus::Pending, &[]);
+        recorded_elsewhere.id = "LRN-20260916-00000001".into();
+        backend
+            .archive_raw(&RawSource::new(
+                "LRN-20260916-00000002",
+                "reflection",
+                "application/json",
+                serde_json::to_vec(&recorded_elsewhere).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let repair = recorder.repair_missing_schemas().await.unwrap();
+        assert_eq!(repair.repaired, 0);
+        assert_eq!(repair.unrepairable, 1);
+        assert!(backend.schemas.lock().unwrap().is_empty());
     }
 }

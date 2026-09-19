@@ -22,6 +22,11 @@
 //! - **`cog-llm`** — `SkillExtractor` uses an `LLMProvider` to generate `SkillConfig` from mature patterns.
 //! - **`cog-core`** — `SkillRegistry` receives promoted `SkillConfig` entries.
 
+/// 反思条目在记忆后端里的命名空间。写入与补齐扫的是同一份归档，两处各写一个
+/// 字面量迟早会分叉，而分叉的表现是补齐循环扫到空集合、报「没有孤儿」——正是
+/// 它要防的那种静默假阴性。
+pub const REFLECTION_NAMESPACE: &str = "reflection";
+
 pub mod auto_promoter;
 pub mod baseline_port;
 pub mod change_pipeline;
@@ -220,7 +225,7 @@ impl ReflectionEngine {
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
             memory_backend.clone(),
-            "reflection",
+            REFLECTION_NAMESPACE,
         ));
         let detector: Arc<dyn LearningDetector> = Arc::new(DefaultLearningDetector::new());
         let matcher: Arc<dyn LearningMatcher> =
@@ -287,8 +292,10 @@ impl ReflectionEngine {
         memory_backend: Arc<dyn cog_core::MemoryBackend>,
         prompt_manager: Option<Arc<dyn cog_core::PromptProvider>>,
     ) -> Self {
-        let recorder: Arc<dyn LearningRecorder> =
-            Arc::new(MemoryBackendRecorder::new(memory_backend, "reflection"));
+        let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
+            memory_backend,
+            REFLECTION_NAMESPACE,
+        ));
         let detector: Arc<dyn LearningDetector> = Arc::new(DefaultLearningDetector::new());
         let matcher: Arc<dyn LearningMatcher> =
             Arc::new(DefaultLearningMatcher::new(recorder.clone(), None));

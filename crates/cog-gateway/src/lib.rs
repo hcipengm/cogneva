@@ -1123,23 +1123,35 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
         // would see "no data" where the truth is "nothing is pending". The
         // sample's own timestamp travels with the value so a value that stopped
         // being refreshed is still readable as stale rather than as fresh.
-        match mb
-            .query_gauge_range(
+        for (name, help) in [
+            (
                 "memory_unextracted_raw",
-                end - chrono::Duration::seconds(GAUGE_LOOKBACK_SECS),
-                end,
-            )
-            .await
-        {
-            Ok(samples) => {
-                body.push_str(&prometheus_render::render_gauges(
-                    "memory_unextracted_raw",
-                    "Archived raw sources still missing a summary, as last scanned",
-                    &samples,
-                ));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to query memory ingest backlog gauge: {}", e);
+                "Archived raw sources still missing a summary, as last scanned",
+            ),
+            (
+                "memory_unextracted_raw_aged_out",
+                "Subset of the above that aged past the re-drive window; the system \
+                 will not pick these up again without a budgeted backfill",
+            ),
+        ] {
+            match mb
+                .query_gauge_range(
+                    name,
+                    end - chrono::Duration::seconds(GAUGE_LOOKBACK_SECS),
+                    end,
+                )
+                .await
+            {
+                Ok(samples) => {
+                    body.push_str(&prometheus_render::render_gauges(name, help, &samples));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to query memory ingest backlog gauge {}: {}",
+                        name,
+                        e
+                    );
+                }
             }
         }
 

@@ -117,6 +117,7 @@ data:
         "COGNEVA_SELF_EVOLUTION_BINARY_DIR": "self_evolution.binary_dir",
         "COGNEVA_SELF_EVOLUTION_BACKUP_DIR": "self_evolution.backup_dir",
         "COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS": "self_evolution.poll_interval_secs",
+        "COGNEVA_SELF_EVOLUTION_SCHEMA_REPAIR_INTERVAL_SECS": "self_evolution.schema_repair_interval_secs",
         "COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS": "self_evolution.test_timeout_secs",
         "COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS": "self_evolution.build_timeout_secs",
         "COGNEVA_TOOL_TIMEOUT_SECS": "system.tool_timeout_secs",
@@ -608,6 +609,7 @@ data:
         "test_timeout_secs": 600,
         "build_timeout_secs": 1800,
         "poll_interval_secs": 60,
+        "schema_repair_interval_secs": 600,
         "notify_on_success": true,
         "notify_on_failure": true
       },
