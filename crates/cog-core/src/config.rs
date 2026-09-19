@@ -507,6 +507,18 @@ pub struct MetricsConfig {
     /// republishes the log's size, so this has to stay well under the scrape's
     /// gauge lookback or the size series blanks between sweeps.
     pub sample_retention_sweep_interval_secs: u64,
+    /// Which observable dimensions the `/metrics` scrape asks for.
+    ///
+    /// An observable only answers the dimensions it branches on, so a
+    /// dimension no consumer asks is a metric nothing can ever read — it
+    /// counts, it is exported by nobody, and nothing fails. The set is
+    /// config instead of a literal so admitting a dimension is a reviewable
+    /// deployment decision rather than an edit buried in the handler.
+    ///
+    /// Admit a dimension only when the series it yields are bounded. The
+    /// agent's D1/D2/D3 branch records per-step series keyed by `task_id`,
+    /// which grows without bound, so those stay out.
+    pub scrape_dimensions: Vec<String>,
 }
 
 impl Default for MetricsConfig {
@@ -517,6 +529,13 @@ impl Default for MetricsConfig {
             interval_secs: 15,
             sample_retention_secs: 86_400,
             sample_retention_sweep_interval_secs: 600,
+            scrape_dimensions: vec![
+                "D4".into(),
+                "D5".into(),
+                "D6".into(),
+                "D8".into(),
+                "D9".into(),
+            ],
         }
     }
 }

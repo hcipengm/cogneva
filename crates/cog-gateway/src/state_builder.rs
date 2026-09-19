@@ -123,6 +123,7 @@ pub async fn build_gateway_state(
         guardrail: Some(guardrail.clone()),
         eval_service: eval_service.clone(),
         observables,
+        metrics_dimensions: config.metrics.scrape_dimensions.clone(),
         mcp_client: mcp_client.clone(),
         object_backend: None,
         notification_store: notification_store.clone(),

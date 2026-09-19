@@ -147,6 +147,8 @@ pub struct GatewayState {
     pub audit_stream: Option<Arc<dyn cog_core::AuditStream>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
     pub observables: Vec<Arc<dyn cog_core::Observable>>,
+    /// 抓取端点向 observable 询取的维度集合（配置面，非字面量）。
+    pub metrics_dimensions: Vec<String>,
     /// MCP client — discover and call external MCP tools.
     pub mcp_client: Option<Arc<dyn cog_core::McpClient>>,
     /// Object storage backend for file uploads/downloads.
@@ -1288,14 +1290,21 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
         }
     }
 
-    // Pull D8 collaboration metrics (ralph terminations, squad outcomes) from
-    // registered observables so they reach Prometheus alongside backend counters.
-    let d8_metrics = cog_core::collect_all_metrics(&state.observables, "D8").await;
-    if !d8_metrics.is_empty() {
+    // Pull each configured dimension from the registered observables so their
+    // rollups reach Prometheus alongside backend counters. The set is config,
+    // not a literal: an observable answers only the dimensions it branches on,
+    // so a dimension left out here is a metric that is counted and exported by
+    // nobody, with nothing failing to say so.
+    let mut observable_metrics = Vec::new();
+    for dimension in &state.metrics_dimensions {
+        observable_metrics
+            .extend(cog_core::collect_all_metrics(&state.observables, dimension).await);
+    }
+    if !observable_metrics.is_empty() {
         if !body.is_empty() {
             body.push('\n');
         }
-        body.push_str(&prometheus_render::render_raw_metrics(&d8_metrics));
+        body.push_str(&prometheus_render::render_raw_metrics(&observable_metrics));
     }
 
     // Self-observation: registry 按静态 TypeId 登记服务，某个 observable 若

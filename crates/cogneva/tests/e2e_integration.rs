@@ -154,6 +154,7 @@ async fn spawn_app_full(
         guardrail: None,
         eval_service: None,
         observables: Vec::new(),
+        metrics_dimensions: Vec::new(),
         mcp_client: None,
         workspace_store: None,
         external_skill_registry: None,

@@ -295,7 +295,9 @@ data:
         "_comment_sample_retention_secs": "cog_metrics_samples 是只追加的观测样本日志，这条是它的保留窗（秒），0=永不清理。读侧全是短窗——抓取读直方图 300 秒、仪表 3600 秒，admin 接口默认 60 秒，而计数器本来就不读这张表（走 cog_metric_counter_totals），所以超出最宽读窗的行任何代码路径都取不回来，只占磁盘。默认一整天：比最宽读窗大一个数量级以上，又与摄取对账的回看窗同长，读指标窗和读摄取窗看的是同一段。属主是主应用：两个 Pod 共用同一个库，进化 Pod 的部署环境里置 COGNEVA_METRICS_SAMPLE_RETENTION_SECS=0，本进程就不参与清理。",
         "sample_retention_secs": 86400,
         "_comment_sample_retention_sweep_interval_secs": "清理扫描间隔（秒）。每轮扫描同时重报这张表的大小，所以它必须显著小于抓取侧的仪表回看窗，",
-        "sample_retention_sweep_interval_secs": 600
+        "sample_retention_sweep_interval_secs": 600,
+        "_comment_scrape_dimensions": "抓取端点向各 observable 询取的维度集合。observable 只回答它按维度分支的那几个维度，所以这里的集合少一个维度，就有一批指标被计数、被谁都不导出——不报错、不打日志，只是没有任何端点能读到。写死成字面量时它是一处不可评审的常量，故改为配置面。准入原则：只收声明了有界序列的维度。D4（memory）、D5（observability）、D6（guardrail）、D9（llm）四家的指标都不带标签，基数固定；D8（collab/orchestrator）已在采集内。D1/D2/D3（agent）在那个分支里逐 step record，身份键取自 task_id，序列基数无界，故不纳入。",
+        "scrape_dimensions": ["D4", "D5", "D6", "D8", "D9"]
       },
       "raw_logger": {
         "_comment": "这里写的已是部署的生效值，不再由 cogneva-config 的同名 env 覆盖：同一个设置在两个地方各写一份，读配置文件的人就推不出 runtime 用的是哪份，而 base_dir 还兼着 trace 存储的根（<base_dir>/traces），改错了不报错，只把 trace 写到另一个目录去。env 映射仍留在本文件的 env 段，要按环境改动时走那里。",
