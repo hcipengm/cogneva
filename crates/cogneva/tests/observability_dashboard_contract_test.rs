@@ -14,6 +14,11 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+#[path = "common/promql.rs"]
+mod promql;
+
+use promql::metric_names_in;
+
 const DASHBOARD: &str = "deploy/k3s/observability/manifests/06-grafana-dashboard-configmap.yaml";
 
 /// Series this workspace produces, with the labels each one carries.
@@ -52,38 +57,13 @@ fn dashboard_text() -> String {
         .unwrap_or_else(|e| panic!("dashboard manifest unreadable at {}: {e}", path.display()))
 }
 
-/// Metric names a PromQL expression reads. A name is taken as the token
-/// immediately before `{`, `[`, or whitespace in a position that is not a
-/// label value or a function name — close enough for the handful of flat
-/// expressions this dashboard holds, and it errs toward reporting a name
-/// rather than skipping one.
-fn metric_names_in(expr: &str) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let bytes = expr.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c.is_ascii_alphabetic() || c == '_' {
-            let start = i;
-            while i < bytes.len()
-                && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
-                i += 1;
-            }
-            let token = &expr[start..i];
-            // A name is the token that a `{`, `[`, or the end of the expression
-            // follows. That excludes function names (`rate`, `sum`,
-            // `histogram_quantile`), label names inside braces, and comparison
-            // keywords — all of which are followed by `(` or `=` instead.
-            let next = expr[i..].chars().next();
-            if matches!(next, Some('{') | Some('[') | None) {
-                names.insert(token.to_string());
-            }
-            continue;
-        }
-        i += 1;
-    }
-    names
+/// Whether an `expr` filters a datasource other than the metric store, i.e. a
+/// log query. Those select by label and name no series, so running the PromQL
+/// extractor over one invents names — a `$variable` reference reads as an
+/// identifier. Only this dashboard holds such panels; the alert rules are all
+/// metric queries.
+fn is_log_query(expr: &str) -> bool {
+    expr.trim_start().starts_with('{')
 }
 
 /// Label names a legend template asks for: every `{{...}}` in the format.
@@ -110,7 +90,9 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
             continue;
         };
         let expr = rest.trim().trim_matches(|c| c == '"' || c == ',').trim();
-        if expr.is_empty() {
+        // A log query selects by label, not by series name; the extractor would
+        // read its `$variable` references as metrics.
+        if expr.is_empty() || is_log_query(expr) {
             continue;
         }
         for name in metric_names_in(expr) {
@@ -158,7 +140,11 @@ fn every_label_a_legend_names_is_on_the_series_it_describes() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("\"expr\":") {
             let expr = rest.trim().trim_matches(|c| c == '"' || c == ',').trim();
-            current = metric_names_in(expr).into_iter().next();
+            current = if is_log_query(expr) {
+                None
+            } else {
+                metric_names_in(expr).into_iter().next()
+            };
         } else if let Some(rest) = trimmed.strip_prefix("\"legendFormat\":") {
             let legend = rest.trim().trim_matches(|c| c == '"' || c == ',').trim();
             let (Some(metric), Some(expected)) = (
