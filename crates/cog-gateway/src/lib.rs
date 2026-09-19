@@ -1997,6 +1997,7 @@ fn merge_active_alerts(
             crew_id: None,
             timestamp: alert.fired_at.to_rfc3339(),
             resolved: false,
+            source: "durable",
         });
     }
     merged
@@ -2032,6 +2033,7 @@ async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Respon
                     crew_id: alert.crew_id,
                     timestamp: alert.timestamp.to_rfc3339(),
                     resolved: alert.resolved,
+                    source: "supervisor",
                 })
                 .collect::<Vec<_>>()
         })
@@ -2902,6 +2904,7 @@ mod active_alert_merge_tests {
             crew_id: None,
             timestamp: chrono::Utc::now().to_rfc3339(),
             resolved: false,
+            source: "supervisor",
         }
     }
 
@@ -2915,6 +2918,26 @@ mod active_alert_merge_tests {
         assert_eq!(ids, vec!["pod_oom_killed"]);
         assert_eq!(merged[0].id, "pod_oom_killed");
         assert!(!merged[0].resolved);
+    }
+
+    /// A durable entry is labelled as such. Without the label a reader cannot
+    /// tell which half an alert came from — and the halves disagree about
+    /// whether a restart clears them.
+    #[test]
+    fn a_durable_entry_carries_the_durable_source_label() {
+        let merged = merge_active_alerts(vec![], vec![durable("pod_oom_killed")]);
+        assert_eq!(merged[0].source, "durable");
+    }
+
+    /// The source label survives the merge on the half that stays: the record
+    /// kept for a rule both surfaces know is still the process-local one.
+    #[test]
+    fn a_supervisor_entry_keeps_its_source_label_through_the_merge() {
+        let merged = merge_active_alerts(
+            vec![in_memory("llm_upstream_pool_down")],
+            vec![durable("llm_upstream_pool_down")],
+        );
+        assert_eq!(merged[0].source, "supervisor");
     }
 
     /// When both surfaces carry the same rule they describe one condition, so

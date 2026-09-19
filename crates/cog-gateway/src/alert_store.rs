@@ -12,4 +12,10 @@ pub struct AlertEntry {
     pub crew_id: Option<String>,
     pub timestamp: String,
     pub resolved: bool,
+    /// Which half of the alert surface this came from. The two halves differ in
+    /// ways a reader has to know about: `supervisor` entries are the
+    /// process-local health events (emptied by a restart), `durable` entries are
+    /// rows in the persistent state machine. One list without this field would
+    /// make the two kinds of evidence indistinguishable.
+    pub source: &'static str,
 }
