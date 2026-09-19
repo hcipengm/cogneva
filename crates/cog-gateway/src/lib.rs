@@ -1143,6 +1143,37 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
             }
         }
 
+        // How much the metrics sample log holds and how far back it reaches.
+        // The retention sweeper keeps the table bounded, but a bound nobody can
+        // see is no different from no bound at all: the last time this table
+        // grew without limit it was found by hand, five days and 830 MiB later.
+        for (name, help) in [
+            (
+                "metrics_samples_rows",
+                "Rows currently held in the metrics sample log",
+            ),
+            (
+                "metrics_samples_retention_seconds",
+                "How far back the metrics sample log is kept",
+            ),
+        ] {
+            match mb
+                .query_gauge_range(
+                    name,
+                    end - chrono::Duration::seconds(GAUGE_LOOKBACK_SECS),
+                    end,
+                )
+                .await
+            {
+                Ok(samples) => {
+                    body.push_str(&prometheus_render::render_gauges(name, help, &samples));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to query {}: {}", name, e);
+                }
+            }
+        }
+
         // Declare what the `_total` series above mean. The scrape side versions
         // independently of this binary, so the declaration has to travel in the
         // body; without it a scraper has to assume the older windowed reading and

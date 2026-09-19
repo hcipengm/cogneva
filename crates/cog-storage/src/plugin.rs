@@ -792,6 +792,37 @@ impl cog_core::SystemPlugin for StoragePlugin {
             info!("PartitionMaintainer disabled (no PostgreSQL pool)");
         }
 
+        // ── Metrics sample log retention ──
+        // Only the PostgreSQL sample log grows without bound; the in-memory
+        // backend dies with the process. A retention of 0 disables pruning,
+        // which is also how a deployment opts out — the sweep is idempotent
+        // across processes, but only the deployment that means to age the log
+        // out should be the one doing it.
+        let retention_secs = ctx.config().metrics.sample_retention_secs;
+        if retention_secs == 0 {
+            info!("Metrics sample retention disabled (retention_secs=0)");
+        } else if let Some(pool) = self.pg_pool.clone() {
+            let interval_secs = ctx.config().metrics.sample_retention_sweep_interval_secs;
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+            let mut retention =
+                crate::SampleRetention::new(pool, std::time::Duration::from_secs(retention_secs));
+            if let Some(mb) = metrics {
+                retention = retention.with_metrics(mb);
+            }
+            tokio::spawn(async move { retention.run(interval_secs, shutdown).await });
+            info!(
+                retention_secs,
+                sweep_interval_secs = interval_secs,
+                "Metrics sample retention started"
+            );
+        } else {
+            info!("Metrics sample retention disabled (no PostgreSQL pool)");
+        }
+
         Ok(())
     }
 

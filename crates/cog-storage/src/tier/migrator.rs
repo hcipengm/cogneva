@@ -60,10 +60,14 @@ impl TierMigrator {
     /// shared [`ShutdownSignal`].
     pub fn spawn(self: Arc<Self>, shutdown: ShutdownSignal) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            // The first pass runs at once rather than after one interval. The
+            // loop only makes progress while the process lives, and a
+            // deployment that ships often replaces it well inside an interval
+            // — waiting a full one would mean the pass never runs at all.
+            // Scanning the same state twice costs one listing; missing every
+            // pass costs the feature.
             let mut interval = tokio::time::interval(self.policy.scan_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Skip the initial immediate tick.
-            interval.tick().await;
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -86,7 +90,12 @@ impl TierMigrator {
 
     async fn emit_metrics(&self, stats: &MigrationStats) {
         let Some(ref mb) = self.metrics else { return };
+        // A pass that moves nothing still has to say so. The outcome counters
+        // below are all zero on a quiet pass, so without this the loop is
+        // indistinguishable from a loop that never ran — which is exactly the
+        // state it was in before. Counting passes makes the cadence visible.
         for (tier, count) in [
+            ("pass", 1),
             ("warm", stats.warm_promotions),
             ("cold", stats.cold_promotions),
             ("skipped", stats.skipped),

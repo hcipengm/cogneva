@@ -39,6 +39,7 @@ pub mod media;
 pub mod meilisearch;
 #[cfg(feature = "mem")]
 pub mod mem;
+pub mod metrics_retention;
 pub mod migrate;
 pub mod partition_maintainer;
 
@@ -88,6 +89,7 @@ pub use migrate::{
 };
 
 pub use dlq::MemoryDeadLetterQueue;
+pub use metrics_retention::SampleRetention;
 pub use partition_maintainer::PartitionMaintainer;
 
 pub mod plugin;

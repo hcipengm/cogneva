@@ -155,6 +155,15 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_RAW_LOGGER_FLUSH_INTERVAL_SECS".into(),
         "raw_logger.flush_interval_secs".into(),
     );
+    // metrics
+    m.insert(
+        "COGNEVA_METRICS_SAMPLE_RETENTION_SECS".into(),
+        "metrics.sample_retention_secs".into(),
+    );
+    m.insert(
+        "COGNEVA_METRICS_SAMPLE_RETENTION_SWEEP_INTERVAL_SECS".into(),
+        "metrics.sample_retention_sweep_interval_secs".into(),
+    );
     // memory
     // tier_migrator
     m.insert(

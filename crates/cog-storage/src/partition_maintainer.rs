@@ -337,7 +337,7 @@ fn month_start(year: i32, month_of_year: u32) -> NaiveDate {
 /// Quote an identifier for splicing into generated DDL. Identifiers here come
 /// from the constants above and from integer month arithmetic, never from
 /// input, but quoting keeps the generated SQL honest.
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 

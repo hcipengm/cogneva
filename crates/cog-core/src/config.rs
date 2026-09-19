@@ -464,6 +464,23 @@ pub struct MetricsConfig {
     pub enabled: bool,
     pub endpoint: String,
     pub interval_secs: u64,
+    /// How long a row stays in the metrics sample log, in seconds. `0` keeps
+    /// every row forever.
+    ///
+    /// The sample log is append-only: one row per observation. Its readers are
+    /// all short-window — the scrape reads histograms over the last 300s and
+    /// gauges over 3600s, the admin endpoint defaults to 60s — and counters are
+    /// answered from the cumulative totals table rather than from the log, so a
+    /// row past the widest of those windows is not readable by anything. The
+    /// default is a full day: wider than every reader by more than an order of
+    /// magnitude, and the same span the ingest reconciliation looks back over,
+    /// so an operator reading the metrics window and the ingest window is
+    /// looking at the same period.
+    pub sample_retention_secs: u64,
+    /// How often the sample log is pruned, in seconds. Each sweep also
+    /// republishes the log's size, so this has to stay well under the scrape's
+    /// gauge lookback or the size series blanks between sweeps.
+    pub sample_retention_sweep_interval_secs: u64,
 }
 
 impl Default for MetricsConfig {
@@ -472,6 +489,8 @@ impl Default for MetricsConfig {
             enabled: true,
             endpoint: "/metrics".into(),
             interval_secs: 15,
+            sample_retention_secs: 86_400,
+            sample_retention_sweep_interval_secs: 600,
         }
     }
 }

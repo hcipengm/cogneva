@@ -4,8 +4,13 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use cog_core::{ObjectBackend, RawLogIndexStore, RawLogQuery, StorageTier, TierPolicy};
-use cog_storage::{MemoryObjectBackend, MemoryRawLogIndexStore, TierMigrator};
+use cog_core::{
+    MetricsBackend, ObjectBackend, RawLogIndexStore, RawLogQuery, ShutdownSignal, StorageTier,
+    TierPolicy,
+};
+use cog_storage::{
+    MemoryMetricsBackend, MemoryObjectBackend, MemoryRawLogIndexStore, TierMigrator,
+};
 
 fn policy() -> TierPolicy {
     TierPolicy {
@@ -115,4 +120,60 @@ async fn an_unrotated_file_is_left_alone_however_old() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// The spawned loop has to make progress within the process's lifetime, and a
+/// process that is replaced every few tens of minutes never reaches the far end
+/// of a one-hour interval. A first pass that waits for one would therefore
+/// never run at all on a deployment that ships often — so it runs at once, and
+/// a pass that moves nothing still counts itself so the cadence is observable.
+#[tokio::test]
+async fn the_spawned_loop_passes_without_waiting_a_full_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    aged_file(
+        dir.path(),
+        "transport_raw",
+        "2026-09-14.jsonl",
+        Duration::from_secs(172_800),
+    );
+    let (migrator, _objects, _index) = migrator(dir.path());
+    let metrics = Arc::new(MemoryMetricsBackend::new());
+    let migrator = Arc::new(migrator.with_metrics(metrics.clone() as Arc<dyn MetricsBackend>));
+
+    let shutdown = ShutdownSignal::new();
+    // Far longer than the test will run: only an immediate first pass can
+    // produce anything before this deadline.
+    let handle = migrator.spawn(shutdown.clone());
+
+    let mut pass = 0.0;
+    for _ in 0..200 {
+        let totals = metrics
+            .query_counter_totals("tier_migration_total")
+            .await
+            .unwrap();
+        pass = totals
+            .iter()
+            .filter(|s| s.labels.get("tier").map(String::as_str) == Some("pass"))
+            .map(|s| s.value)
+            .sum();
+        if pass > 0.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(pass > 0.0, "the loop produced no pass within its interval");
+
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let totals = metrics
+        .query_counter_totals("tier_migration_total")
+        .await
+        .unwrap();
+    let warm: f64 = totals
+        .iter()
+        .filter(|s| s.labels.get("tier").map(String::as_str) == Some("warm"))
+        .map(|s| s.value)
+        .sum();
+    assert_eq!(warm, 1.0, "the pass should have reported its promotion");
 }
