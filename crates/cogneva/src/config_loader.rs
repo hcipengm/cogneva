@@ -129,6 +129,22 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_DECOMPOSITION_ORPHAN_ALERT_DWELL_SECS".into(),
         "dag_executor.decomposition_orphan_alert_dwell_secs".into(),
     );
+    m.insert(
+        "COGNEVA_RESULT_CLAIM_IDLE_SECS".into(),
+        "dag_executor.result_claim_idle_secs".into(),
+    );
+    m.insert(
+        "COGNEVA_RESULT_CLAIM_INTERVAL_SECS".into(),
+        "dag_executor.result_claim_interval_secs".into(),
+    );
+    m.insert(
+        "COGNEVA_RESULT_CLAIM_BATCH".into(),
+        "dag_executor.result_claim_batch".into(),
+    );
+    m.insert(
+        "COGNEVA_DAG_SELF_EVOLUTION_TIMEOUT_SECS".into(),
+        "dag_executor.self_evolution_timeout_secs".into(),
+    );
     m.insert("COGNEVA_HTTP_PORT".into(), "gateway.http_port".into());
     m.insert("COGNEVA_WS_PORT".into(), "gateway.ws_port".into());
     m.insert("COGNEVA_METRICS_PORT".into(), "gateway.metrics_port".into());
@@ -882,36 +898,200 @@ mod tests {
     fn every_env_mapping_targets_a_path_the_config_can_hold() {
         let value =
             serde_json::to_value(AppConfig::default()).expect("AppConfig serializes to JSON");
-        let mut broken = Vec::new();
-        for (env_key, path) in default_env_mappings() {
-            let segments: Vec<&str> = path.split('.').collect();
-            let (leaf, parents) = segments
-                .split_last()
-                .expect("path has at least one segment");
-            let mut cursor = Some(&value);
-            for segment in parents {
-                cursor = cursor.and_then(|c| match c {
-                    serde_json::Value::Object(map) => map.get(*segment),
-                    serde_json::Value::Array(arr) => {
-                        segment.parse::<usize>().ok().and_then(|i| arr.get(i))
-                    }
-                    _ => None,
-                });
-            }
-            match cursor {
-                // A leaf may be missing only from a container the default tree
-                // cannot populate: an Option that is None, or a list the file
-                // layer fills in.
-                Some(serde_json::Value::Null) => {}
-                Some(serde_json::Value::Array(arr)) if arr.is_empty() => {}
-                Some(serde_json::Value::Object(map)) if map.contains_key(*leaf) => {}
-                _ => broken.push(format!("{env_key} -> {path}")),
-            }
-        }
+        let table = default_env_mappings();
+        let broken = unholdable_mappings(
+            &value,
+            table
+                .iter()
+                .map(|(env, path)| (env.as_str(), path.as_str())),
+        );
         assert!(
             broken.is_empty(),
             "env mappings the config schema cannot hold: {broken:?}"
         );
+    }
+
+    /// A loaded config file supplies the whole override map — `apply_env_overrides`
+    /// prefers `config.env` over the built-in fallback — so the shipped deploy
+    /// config's own map is the live one in every deployment. Nothing else
+    /// checks it: a mistyped path there is a knob the deployment believes it
+    /// turned.
+    ///
+    /// A path qualifies if the binary's schema can hold it, or if the shipped
+    /// file itself can. Sections owned by one crate are read from this same
+    /// file by that crate, so they are absent from the binary's schema while
+    /// still being real — a path neither can resolve exists nowhere.
+    #[test]
+    fn every_deploy_env_mapping_names_a_real_path() {
+        let path = deploy_file("helm/cogneva/files/cogneva.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let doc: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
+        let env = doc["env"]
+            .as_object()
+            .expect("deploy config carries an `env` map");
+        let schema =
+            serde_json::to_value(AppConfig::default()).expect("AppConfig serializes to JSON");
+
+        let mut broken = Vec::new();
+        for (key, target) in env {
+            if !key.starts_with("COGNEVA_") {
+                continue;
+            }
+            let target = target
+                .as_str()
+                .unwrap_or_else(|| panic!("{key} maps to a non-string target: {target}"));
+            if !holds_path(&schema, target) && !holds_path(&doc, target) {
+                broken.push(format!("{key} -> {target}"));
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "deploy env mappings that resolve to no path at all: {broken:?}"
+        );
+    }
+
+    /// The file layer really is what drives overrides, not just the built-in
+    /// table. A variable that exists only in the loaded file's map must reach
+    /// its field; if it does not, the deploy map is decoration and the schema
+    /// check above is checking the wrong table.
+    #[test]
+    fn env_mappings_are_taken_from_the_loaded_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cogneva.json");
+        std::fs::write(
+            &path,
+            r#"{"env": {"COGNEVA_SENTINEL_ONLY_IN_FILE": "system.strict_persistence"}}"#,
+        )
+        .unwrap();
+        let _sentinel = EnvGuard::set("COGNEVA_SENTINEL_ONLY_IN_FILE", "true");
+        let _config_path = EnvGuard::set("COGNEVA_CONFIG_PATH", &path.to_string_lossy());
+        assert!(
+            !default_env_mappings().contains_key("COGNEVA_SENTINEL_ONLY_IN_FILE"),
+            "the sentinel must not be in the built-in table for this test to mean anything"
+        );
+
+        let loaded = try_load().expect("the config file is present and valid");
+        assert!(
+            loaded.system.strict_persistence,
+            "the file's own env map did not apply"
+        );
+    }
+
+    /// The deploy config is hand-edited JSON shipped in two forms: the chart's
+    /// copy and the ConfigMap blob the in-cluster consumer applies. Nothing
+    /// else in the pipeline parses them until a pod reads the file at startup,
+    /// where a stray comma is a crash-loop rather than a build failure. Both
+    /// are parsed here so the syntax has a gate that runs before deploy.
+    #[test]
+    fn shipped_deploy_configs_parse_as_json() {
+        let chart_path = deploy_file("helm/cogneva/files/cogneva.json");
+        let chart_raw = std::fs::read_to_string(&chart_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", chart_path.display()));
+        serde_json::from_str::<serde_json::Value>(&chart_raw)
+            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", chart_path.display()));
+
+        let baseline_path = deploy_file("k3s/cogneva-json-configmap.yaml");
+        let baseline_raw = std::fs::read_to_string(&baseline_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", baseline_path.display()));
+        let embedded = configmap_block_scalar(&baseline_raw, "cogneva.json").unwrap_or_else(|| {
+            panic!(
+                "{} carries no `cogneva.json: |` block",
+                baseline_path.display()
+            )
+        });
+        serde_json::from_str::<serde_json::Value>(&embedded).unwrap_or_else(|e| {
+            panic!(
+                "the JSON block in {} is not valid: {e}",
+                baseline_path.display()
+            )
+        });
+    }
+
+    /// Env mappings whose JSON path the serialized config cannot hold. The
+    /// loader writes through `set_json_path`, which creates intermediate
+    /// objects on demand — so a mistyped segment does not fail, it writes into
+    /// a parallel tree nothing reads, and the variable silently does nothing.
+    /// Comparing the mapping against the schema is the only place that typo can
+    /// be caught.
+    ///
+    /// An absent leaf is tolerated only when its container cannot hold one in
+    /// the default tree: an optional sub-object serialized as `null`, or a list
+    /// that starts empty and is seeded by the config file.
+    fn unholdable_mappings<'a>(
+        schema: &serde_json::Value,
+        mappings: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> Vec<String> {
+        let mut broken = Vec::new();
+        for (env_key, path) in mappings {
+            if !holds_path(schema, path) {
+                broken.push(format!("{env_key} -> {path}"));
+            }
+        }
+        broken
+    }
+
+    /// Does this JSON tree have the given dot-path? Absent leaves are tolerated
+    /// where the container cannot carry one: a sub-object serialized as `null`,
+    /// or a list the config file seeds.
+    fn holds_path(value: &serde_json::Value, path: &str) -> bool {
+        let segments: Vec<&str> = path.split('.').collect();
+        let (leaf, parents) = match segments.split_last() {
+            Some(pair) => pair,
+            None => return false,
+        };
+        let mut cursor = Some(value);
+        for segment in parents {
+            cursor = cursor.and_then(|c| match c {
+                serde_json::Value::Object(map) => map.get(*segment),
+                serde_json::Value::Array(arr) => {
+                    segment.parse::<usize>().ok().and_then(|i| arr.get(i))
+                }
+                _ => None,
+            });
+        }
+        match cursor {
+            Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Array(arr)) if arr.is_empty() => true,
+            Some(serde_json::Value::Object(map)) => map.contains_key(*leaf),
+            _ => false,
+        }
+    }
+
+    fn deploy_file(relative: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("deploy")
+            .join(relative)
+    }
+
+    /// Content of a literal YAML block scalar, keyed by its `data` entry name.
+    /// The block's indentation is syntax, not content, so it is stripped at the
+    /// header's depth rather than guessed at.
+    fn configmap_block_scalar(manifest: &str, key: &str) -> Option<String> {
+        let header = format!("{key}: |");
+        let mut lines = manifest.lines();
+        let depth = loop {
+            let line = lines.next()?;
+            if line.trim() == header {
+                break line.len() - line.trim_start().len();
+            }
+        };
+        let mut block = String::new();
+        for line in lines {
+            if line.trim().is_empty() {
+                block.push('\n');
+                continue;
+            }
+            if line.len() - line.trim_start().len() <= depth {
+                break;
+            }
+            block.push_str(&line[depth..]);
+            block.push('\n');
+        }
+        Some(block)
     }
 
     #[test]

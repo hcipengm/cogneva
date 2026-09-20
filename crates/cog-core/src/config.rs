@@ -251,6 +251,14 @@ pub struct DagExecutorConfig {
     /// Maximum result messages reclaimed per sweep.
     #[serde(default = "default_result_claim_batch")]
     pub result_claim_batch: usize,
+    /// How long a self-evolution task may run before the timeout checker
+    /// reclaims it (seconds). These tasks drive multi-agent LLM collaboration,
+    /// which outlasts an ordinary atomic task by a wide margin — but every
+    /// second here is also how long a task orphaned by a restart stays
+    /// invisible, so the value belongs to the deployment rather than to the
+    /// code that creates the task.
+    #[serde(default = "default_self_evolution_timeout_secs")]
+    pub self_evolution_timeout_secs: u64,
 }
 
 impl Default for DagExecutorConfig {
@@ -279,6 +287,7 @@ impl Default for DagExecutorConfig {
             result_claim_idle_secs: default_result_claim_idle_secs(),
             result_claim_interval_secs: default_result_claim_interval_secs(),
             result_claim_batch: default_result_claim_batch(),
+            self_evolution_timeout_secs: default_self_evolution_timeout_secs(),
         }
     }
 }
@@ -457,6 +466,9 @@ fn default_result_claim_interval_secs() -> u64 {
 }
 fn default_result_claim_batch() -> usize {
     16
+}
+fn default_self_evolution_timeout_secs() -> u64 {
+    3600
 }
 
 /// Configuration for the Hot/Warm/Cold tier migrator.

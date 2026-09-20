@@ -61,6 +61,8 @@ pub struct ActionPlanOrchestrator {
     /// Decomposition attempts per goal delivery before an empty result is
     /// treated as a hard failure (clamped to >= 1).
     decomposition_max_attempts: u32,
+    /// DAG timeout granted to a directly-injected self-evolution task.
+    self_evolution_timeout_secs: u64,
     /// Optional persistent alert port for decomposition failures. Attached
     /// after plugin init (the store is published by another plugin).
     alert_sink: tokio::sync::RwLock<Option<Arc<dyn cog_core::PersistentAlertSink>>>,
@@ -108,6 +110,7 @@ impl ActionPlanOrchestrator {
             vector_collection: "patterns".into(),
             embedder: None,
             decomposition_max_attempts: 2,
+            self_evolution_timeout_secs: 3600,
             alert_sink: tokio::sync::RwLock::new(None),
         }
     }
@@ -185,6 +188,14 @@ impl ActionPlanOrchestrator {
     /// delivery when it returns zero atomic tasks.
     pub fn with_decomposition_max_attempts(mut self, attempts: u32) -> Self {
         self.decomposition_max_attempts = attempts.max(1);
+        self
+    }
+
+    /// DAG timeout for a directly-injected self-evolution task. Deployment
+    /// policy: the same value decides how long a task orphaned by a restart
+    /// stays held before the timeout checker reclaims it.
+    pub fn with_self_evolution_timeout_secs(mut self, secs: u64) -> Self {
+        self.self_evolution_timeout_secs = secs.max(1);
         self
     }
 
@@ -614,7 +625,7 @@ impl ActionPlanOrchestrator {
                 for mut task in tasks {
                     task.goal_id = Some(goal_id.clone());
                     task.is_executable = true;
-                    task.timeout_seconds = 3600; // self-evolution involves multi-agent LLM collaboration; allow more time
+                    task.timeout_seconds = self.self_evolution_timeout_secs;
                     task.action_planner_meta = Some(cog_core::ActionPlannerMeta {
                         verified: true,
                         version: Some("1.0.0".into()),

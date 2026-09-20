@@ -778,11 +778,25 @@ async fn redrive(
             log
         }
     );
+    let task_id = format!(
+        "redrive-{}",
+        crate::pending_changes::slug(&record.change.change_id)
+    );
+    // The id is stable per change, so a resubmission for a change that already
+    // produced a re-drive is dropped by the idempotent insert. Read the row
+    // first: without it the submission reports success and the change is left
+    // with no attempt running and no record of why.
+    if let Some(existing) = orchestrator.get_task(&task_id).await {
+        tracing::warn!(
+            change_id = %record.change.change_id,
+            task_id = %task_id,
+            status = ?existing.status,
+            "a re-drive for this change is already in the graph; nothing queued"
+        );
+        return;
+    }
     let task = cog_core::Task::new(
-        format!(
-            "redrive-{}",
-            crate::pending_changes::slug(&record.change.change_id)
-        ),
+        task_id,
         cog_core::TaskType::Custom("platform_ci_fix".into()),
         serde_json::json!({
             "goal": goal,

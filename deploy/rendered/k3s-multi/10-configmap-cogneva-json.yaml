@@ -78,6 +78,7 @@ data:
         "COGNEVA_RESULT_CLAIM_IDLE_SECS": "dag_executor.result_claim_idle_secs",
         "COGNEVA_RESULT_CLAIM_INTERVAL_SECS": "dag_executor.result_claim_interval_secs",
         "COGNEVA_RESULT_CLAIM_BATCH": "dag_executor.result_claim_batch",
+        "COGNEVA_DAG_SELF_EVOLUTION_TIMEOUT_SECS": "dag_executor.self_evolution_timeout_secs",
         "COGNEVA_HTTP_PORT": "gateway.http_port",
         "COGNEVA_WS_PORT": "gateway.ws_port",
         "COGNEVA_METRICS_PORT": "gateway.metrics_port",
@@ -276,7 +277,8 @@ data:
         "archive_poll_interval_secs": 300,
         "result_claim_idle_secs": 600,
         "result_claim_interval_secs": 60,
-        "result_claim_batch": 16
+        "result_claim_batch": 16,
+        "self_evolution_timeout_secs": 3600
       },
       "gateway": {
         "http_port": 8080,
