@@ -1218,6 +1218,7 @@ impl MainlineDeployer {
 
         let mut heads: Vec<(CodePlatform, String)> = Vec::new();
         let mut unreachable: Vec<String> = Vec::new();
+        let mut unreachable_platforms: Vec<&'static str> = Vec::new();
         for up in &self.cfg.upstreams {
             let repo = up.repo.trim().trim_end_matches(".git");
             let url = format!("{base}/{}/{repo}.git", up.platform.slug());
@@ -1251,10 +1252,16 @@ impl MainlineDeployer {
                         .await
                     {
                         Ok(rev) => heads.push((up.platform, rev.trim().to_string())),
-                        Err(e) => unreachable.push(format!("{}: {e}", up.platform.slug())),
+                        Err(e) => {
+                            unreachable.push(format!("{}: {e}", up.platform.slug()));
+                            unreachable_platforms.push(up.platform.slug());
+                        }
                     }
                 }
-                Err(e) => unreachable.push(format!("{}: {e}", up.platform.slug())),
+                Err(e) => {
+                    unreachable.push(format!("{}: {e}", up.platform.slug()));
+                    unreachable_platforms.push(up.platform.slug());
+                }
             }
         }
         if !unreachable.is_empty() {
@@ -1307,11 +1314,14 @@ impl MainlineDeployer {
             }
         }
         if diverged {
-            self.set_upstream_note("diverged");
+            self.set_upstream_note(&upstream_note_with("diverged", &unreachable_platforms));
             return None;
         }
         let Some((platform, rev)) = best else {
-            self.set_upstream_note(&format!("up-to-date({})", rev12(current)));
+            self.set_upstream_note(&upstream_note_with(
+                &format!("up-to-date({})", rev12(current)),
+                &unreachable_platforms,
+            ));
             return None;
         };
 
@@ -1341,12 +1351,18 @@ impl MainlineDeployer {
                     from = %rev12(current),
                     "upstream main advanced the bare main"
                 );
-                self.set_upstream_note(&format!("advanced({}={})", platform.slug(), rev12(&rev)));
+                self.set_upstream_note(&upstream_note_with(
+                    &format!("advanced({}={})", platform.slug(), rev12(&rev)),
+                    &unreachable_platforms,
+                ));
                 Some(rev)
             }
             Err(e) => {
                 warn!(error = %e, rev = %rev12(&rev), "could not advance the bare main; retrying next poll");
-                self.set_upstream_note("advance-failed");
+                self.set_upstream_note(&upstream_note_with(
+                    "advance-failed",
+                    &unreachable_platforms,
+                ));
                 None
             }
         }
@@ -2298,6 +2314,19 @@ struct BuildLock {
 impl Drop for BuildLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 上游状态标量（纯函数便于测试）：把"这次比较到底带上了哪些平台"并进结论。
+///
+/// 一个平台拉不动、另一个照常时，"上游没有更新"与"这次比较根本没算上那个
+/// 平台"是两件事。心跳是运维唯一会读的那一行，只报 `up-to-date` 等于替一个
+/// 失联的上游作证。全平台都失联时结论本身就是 `unreachable(N)`，不再重复。
+fn upstream_note_with(note: &str, unreachable: &[&'static str]) -> String {
+    if unreachable.is_empty() {
+        note.to_string()
+    } else {
+        format!("{note}; unreachable={}", unreachable.join(","))
     }
 }
 
@@ -4338,6 +4367,25 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(msg.contains("failed_rev=112233445566"), "{msg}");
         assert!(msg.contains("failed_class=environment"), "{msg}");
         assert!(msg.contains("failed_attempts=0"), "{msg}");
+    }
+
+    #[test]
+    fn a_partly_unreachable_upstream_set_is_not_reported_as_clean() {
+        // 全平台可达：结论原样出现，不拖一个空后缀。
+        assert_eq!(
+            upstream_note_with("up-to-date(aabbccddeeff)", &[]),
+            "up-to-date(aabbccddeeff)"
+        );
+        // 只有一个平台拉得动时，结论必须带着失联平台的名字——否则这一行读起来
+        // 就是"两个上游都说没有更新"，而实际上另一个根本没被问到。
+        let note = upstream_note_with("up-to-date(aabbccddeeff)", &["github"]);
+        assert_eq!(note, "up-to-date(aabbccddeeff); unreachable=github");
+        assert!(note.contains("unreachable=github"));
+        // 推进路径同样不能吞掉它。
+        assert_eq!(
+            upstream_note_with("advanced(gitee=aabbccddeeff)", &["github"]),
+            "advanced(gitee=aabbccddeeff); unreachable=github"
+        );
     }
 
     #[test]
