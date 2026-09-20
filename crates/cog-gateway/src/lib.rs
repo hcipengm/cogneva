@@ -1037,6 +1037,26 @@ const GAUGE_LOOKBACK_SECS: i64 = 3600;
 /// one wording.
 const COUNTER_HELP: &[(&str, &str)] = &[
     (
+        "evolution_generated_change_hunks_total",
+        "Hunks carried by generated change artifacts, summed over rounds; \
+         the ratio against the faithful count in the same window is generation \
+         fidelity, and the unfaithful remainder is what the apply gate throws away",
+    ),
+    (
+        "evolution_generated_change_hunks_faithful",
+        "Subset of the above whose context was found in the target tree",
+    ),
+    (
+        "evolution_generated_change_files_total",
+        "Files touched by generated change artifacts, summed over rounds; a \
+         low faithful ratio here with a high hunk ratio means artifacts aimed \
+         at the wrong revision, not artifacts written wrong",
+    ),
+    (
+        "evolution_generated_change_files_faithful",
+        "Subset of the above whose whole file patch applied",
+    ),
+    (
         "memory_operations_total",
         "Total number of memory backend operations",
     ),

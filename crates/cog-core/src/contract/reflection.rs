@@ -304,6 +304,243 @@ pub fn diff_structural_defect(content: &str) -> Option<String> {
     None
 }
 
+/// One file section of a unified diff, decomposed so that a single hunk can be
+/// put to the apply gate on its own.
+///
+/// A change is accepted or rejected whole, so the verdict on a rejected artifact
+/// names one hunk and says nothing about the others: an artifact carrying one
+/// bad hunk out of three and one carrying three bad hunks out of three look
+/// identical, and neither can be trended against the other. Separating the hunks
+/// is what makes the finer reading possible, and separating them is diff
+/// grammar — the grammar `diff_structural_defect` walks, read here through the
+/// same header parser and the same line classifier so the two cannot disagree
+/// about where a hunk ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffFileEntry {
+    /// Target path with the `a/`/`b/` prefix removed.
+    pub path: String,
+    /// Every line from the section's start up to the line before its first
+    /// hunk, verbatim: the `diff --git`/`---`/`+++` lines and git's extended
+    /// headers. A patch cut down to one hunk has to carry the same metadata as
+    /// the artifact it was cut from, or the gate rejects it for a reason that
+    /// artifact never had.
+    pub header: String,
+    /// One `@@ ... @@` line plus the body lines that follow it, verbatim. Empty
+    /// for a section that only renames a file or changes its mode.
+    pub hunks: Vec<String>,
+}
+
+impl DiffFileEntry {
+    /// Rebuild this section carrying only the chosen hunks, so that one of them
+    /// can be put to the same oracle as the whole diff.
+    pub fn narrow(&self, hunks: &[usize]) -> String {
+        let mut out = self.header.clone();
+        for &i in hunks {
+            if let Some(hunk) = self.hunks.get(i) {
+                out.push('\n');
+                out.push_str(hunk);
+            }
+        }
+        out.push('\n');
+        out
+    }
+}
+
+/// Split a unified diff into its file sections and hunks.
+///
+/// Hunk bodies are delimited by the counts their headers declare, which is the
+/// arithmetic `git apply` uses and the only rule that works here: a removed line
+/// whose content starts with `-- ` renders exactly like a `--- ` section header,
+/// so scanning for the next `--- ` would cut a body in half.
+pub fn diff_file_entries(content: &str) -> Vec<DiffFileEntry> {
+    let mut entries: Vec<DiffFileEntry> = Vec::new();
+    let mut current: Option<Section> = None;
+    // Lines the open hunk still owes, per its header. `None` means no hunk is
+    // open.
+    let mut owed: Option<(u64, u64)> = None;
+
+    for line in content.lines() {
+        if let Some((old, new)) = owed {
+            // A line owed to the body is consumed whatever it looks like. A bare
+            // `@@` cannot be a body line — added, removed, context and marker
+            // lines all carry a leading `+`, `-`, space or `\` — so seeing one
+            // means the open header declared fewer lines than its body holds,
+            // and the body closes there instead of swallowing the rest of the
+            // diff.
+            let body_line = (old > 0 || new > 0) && !line.starts_with("@@")
+                // A `\ No newline at end of file` marker arrives after the
+                // counts are already met and still belongs to the hunk it
+                // annotates.
+                || (old == 0 && new == 0 && line.starts_with('\\'));
+            if body_line {
+                let (o, n) = classify_hunk_line(line).tally();
+                owed = Some((old.saturating_sub(o), new.saturating_sub(n)));
+                push_hunk_line(&mut current, line);
+                continue;
+            }
+            owed = None;
+        }
+
+        if line.starts_with("diff --git ") {
+            if let Some(section) = current.take() {
+                entries.push(section.finish());
+            }
+            let mut section = Section::new(path_from_git_line(line));
+            section.header.push(line.to_string());
+            current = Some(section);
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            owed = Some(match parse_hunk_header_parts(line) {
+                Some(header) => (header.old_count, header.new_count),
+                // An unparsable header still names a hunk the artifact claims to
+                // carry, so it is counted; it owes no lines, which keeps the
+                // text after it out of its body.
+                None => (0, 0),
+            });
+            if let Some(section) = current.as_mut() {
+                section.hunks.push(line.to_string());
+            }
+            continue;
+        }
+
+        if line.starts_with("--- ") {
+            // Outside a body a `--- ` line is a section header. It starts the
+            // next file of a diff that omits `diff --git` lines, or opens the
+            // first section of one; after a `diff --git` line it is that
+            // section's own header, so the section is only closed when it
+            // already carries hunks.
+            let starts_section = current.as_ref().is_none_or(|s| !s.hunks.is_empty());
+            if starts_section {
+                if let Some(section) = current.take() {
+                    entries.push(section.finish());
+                }
+                current = Some(Section::new(String::new()));
+            }
+        }
+
+        push_header_line(&mut current, line);
+    }
+
+    if let Some(section) = current.take() {
+        entries.push(section.finish());
+    }
+    entries
+}
+
+/// A file section while it is being read. Header lines are accumulated rather
+/// than joined in place so that a blank line inside a section's metadata
+/// survives the round trip.
+struct Section {
+    path: String,
+    header: Vec<String>,
+    hunks: Vec<String>,
+}
+
+impl Section {
+    fn new(path: String) -> Self {
+        Self {
+            path,
+            header: Vec::new(),
+            hunks: Vec::new(),
+        }
+    }
+
+    /// The path comes from the section's first line when that line carries one,
+    /// and from its `---`/`+++` pair otherwise.
+    fn finish(self) -> DiffFileEntry {
+        let header = self.header.join("\n");
+        let path = if self.path.is_empty() || self.path == "/dev/null" {
+            section_path(&header)
+        } else {
+            self.path
+        };
+        DiffFileEntry {
+            path,
+            header,
+            hunks: self.hunks,
+        }
+    }
+}
+
+fn push_header_line(current: &mut Option<Section>, line: &str) {
+    if let Some(section) = current.as_mut() {
+        section.header.push(line.to_string());
+    }
+}
+
+fn push_hunk_line(current: &mut Option<Section>, line: &str) {
+    if let Some(section) = current.as_mut() {
+        if let Some(last) = section.hunks.last_mut() {
+            last.push('\n');
+            last.push_str(line);
+        }
+    }
+}
+
+fn path_from_git_line(line: &str) -> String {
+    let Some(rest) = line.strip_prefix("diff --git ") else {
+        return String::new();
+    };
+    // `a/<path> b/<path>`; the second half is the target and wins because a
+    // rename's two halves differ.
+    match split_two_paths(rest) {
+        Some((_, target)) => strip_diff_side_prefix(target),
+        None => String::new(),
+    }
+}
+
+/// The file a section targets when its first line does not name one: the `+++`
+/// side, or the `---` side when the target side is `/dev/null` (a deletion).
+fn section_path(header: &str) -> String {
+    let mut old_side = String::new();
+    for line in header.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            old_side = diff_path_field(rest);
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            let target = diff_path_field(rest);
+            if target != "/dev/null" {
+                return target;
+            }
+        }
+    }
+    if old_side == "/dev/null" {
+        String::new()
+    } else {
+        old_side
+    }
+}
+
+/// One path field of a `---`/`+++` line. `git diff` appends a tab and a
+/// timestamp to lines it emits for files on disk, and the path is everything
+/// before the first whitespace.
+fn diff_path_field(rest: &str) -> String {
+    strip_diff_side_prefix(rest.split_whitespace().next().unwrap_or(""))
+}
+
+/// An `a/` or `b/` prefix names the side rather than the file. `/dev/null` is
+/// the absence of a side and is kept as written, so a caller can tell "this side
+/// does not exist" from an empty parse.
+fn strip_diff_side_prefix(path: &str) -> String {
+    let path = path.trim();
+    if path == "/dev/null" {
+        return path.to_string();
+    }
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// Split `a/x b/y` on the space that separates the two paths. Paths containing
+/// spaces make this ambiguous; the first space is taken, which is correct for
+/// every path without one and never worse than refusing to parse.
+fn split_two_paths(rest: &str) -> Option<(&str, &str)> {
+    let idx = rest.find(' ')?;
+    Some((&rest[..idx], rest[idx + 1..].trim()))
+}
+
 /// A parsed `@@ -old_start,old_count +new_start,new_count @@ tail` header. The
 /// start lines and the section heading are carried through verbatim: a hunk
 /// body says how many lines it holds but never where it belongs, so a repair
@@ -1100,5 +1337,155 @@ mod tests {
                 assert_eq!(diff_structural_defect(&repaired), None, "{repaired}");
             }
         }
+    }
+
+    const TWO_FILES: &str = "diff --git a/one.txt b/one.txt\n\
+                             index 1111111..2222222 100644\n\
+                             --- a/one.txt\n\
+                             +++ b/one.txt\n\
+                             @@ -1,3 +1,3 @@\n\
+                             \x20alpha\n\
+                             -beta\n\
+                             +BETA\n\
+                             \x20gamma\n\
+                             @@ -10,3 +10,3 @@\n\
+                             \x20delta\n\
+                             -epsilon\n\
+                             +EPSILON\n\
+                             \x20zeta\n\
+                             diff --git a/two.txt b/two.txt\n\
+                             new file mode 100644\n\
+                             index 0000000..3333333\n\
+                             --- /dev/null\n\
+                             +++ b/two.txt\n\
+                             @@ -0,0 +1,2 @@\n\
+                             +first\n\
+                             +second\n";
+
+    #[test]
+    fn entries_carry_headers_verbatim_and_hunks_whole() {
+        let entries = diff_file_entries(TWO_FILES);
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0].path, "one.txt");
+        assert_eq!(entries[0].hunks.len(), 2);
+        assert!(entries[0]
+            .header
+            .starts_with("diff --git a/one.txt b/one.txt"));
+        // The header stops at the first hunk, so the narrowed patch rebuilt from
+        // it carries the same mode and index lines as the artifact.
+        assert!(entries[0].header.ends_with("+++ b/one.txt"));
+        assert!(entries[0].hunks[0].starts_with("@@ -1,3 +1,3 @@"));
+        // Both sides of the change survive, so a narrowed patch can be replayed
+        // against the tree rather than merely parsed.
+        assert!(entries[0].hunks[0].contains("\n-beta\n+BETA\n"));
+        assert!(entries[0].hunks[1].starts_with("@@ -10,3 +10,3 @@"));
+
+        // A new file's target side is `/dev/null` in `---`, so the path has to
+        // come from the `+++` side, and its mode line survives in the header.
+        assert_eq!(entries[1].path, "two.txt");
+        assert_eq!(entries[1].hunks.len(), 1);
+        assert!(entries[1].header.contains("new file mode 100644"));
+        assert!(entries[1].header.contains("+++ b/two.txt"));
+    }
+
+    #[test]
+    fn a_removed_line_that_looks_like_a_section_header_stays_in_its_body() {
+        // `-` followed by a line whose content starts with `-- ` renders as
+        // `--- `, indistinguishable from the line that opens a file section.
+        // Only the declared counts tell the two apart, which is why the walk
+        // reads them instead of scanning for the next section.
+        let diff = "diff --git a/x.txt b/x.txt\n\
+                    --- a/x.txt\n\
+                    +++ b/x.txt\n\
+                    @@ -1,3 +1,3 @@\n\
+                    \x20keep\n\
+                    --- removed heading\n\
+                    +---- kept heading\n\
+                    \x20tail\n";
+        let entries = diff_file_entries(diff);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hunks.len(), 1);
+        assert!(entries[0].hunks[0].contains("--- removed heading"));
+        assert!(entries[0].hunks[0].contains("+---- kept heading"));
+    }
+
+    #[test]
+    fn a_deletion_takes_its_path_from_the_old_side() {
+        let with_git_header = "diff --git a/gone.txt b/gone.txt\n\
+                               deleted file mode 100644\n\
+                               --- a/gone.txt\n\
+                               +++ /dev/null\n\
+                               @@ -1,2 +0,0 @@\n\
+                               -first\n\
+                               -second\n";
+        let entries = diff_file_entries(with_git_header);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "gone.txt");
+        assert_eq!(entries[0].hunks.len(), 1);
+
+        // Without a `diff --git` line the only name either side carries is the
+        // old one, since the new side does not exist.
+        let bare = "--- a/gone.txt\n\
+                    +++ /dev/null\n\
+                    @@ -1,2 +0,0 @@\n\
+                    -first\n\
+                    -second\n";
+        let entries = diff_file_entries(bare);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "gone.txt");
+    }
+
+    #[test]
+    fn a_section_without_git_headers_is_still_one_entry() {
+        let bare = "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n";
+        let entries = diff_file_entries(bare);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "x.txt");
+        assert_eq!(entries[0].hunks.len(), 1);
+    }
+
+    #[test]
+    fn a_diff_without_git_headers_splits_on_its_own_sections() {
+        let bare = "--- a/x.txt\n\
+                    +++ b/x.txt\n\
+                    @@ -1 +1 @@\n\
+                    -a\n\
+                    +b\n\
+                    --- a/y.txt\n\
+                    +++ b/y.txt\n\
+                    @@ -1 +1 @@\n\
+                    -c\n\
+                    +d\n";
+        let entries = diff_file_entries(bare);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "x.txt");
+        assert_eq!(entries[1].path, "y.txt");
+    }
+
+    #[test]
+    fn narrowing_keeps_the_header_and_only_the_chosen_hunk() {
+        let entries = diff_file_entries(TWO_FILES);
+        let patch = entries[0].narrow(&[1]);
+        assert!(patch.contains("diff --git a/one.txt b/one.txt"));
+        assert!(patch.contains("@@ -10,3 +10,3 @@"));
+        assert!(!patch.contains("@@ -1,3 +1,3 @@"));
+    }
+
+    #[test]
+    fn a_section_that_only_renames_has_a_header_and_no_hunks() {
+        let diff = "diff --git a/old.txt b/new.txt\n\
+                    similarity index 100%\n\
+                    rename from old.txt\n\
+                    rename to new.txt\n";
+        let entries = diff_file_entries(diff);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "new.txt");
+        assert!(entries[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn an_empty_diff_has_no_entries() {
+        assert!(diff_file_entries("").is_empty());
     }
 }

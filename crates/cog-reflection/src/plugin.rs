@@ -189,11 +189,19 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             }
         }
 
-        // Build the evolution engine up-front. It is required both as a
-        // ChangeSink for collaboration-generated changes and for the
-        // self-evolution auto-deploy pipeline. It does not depend on a
-        // persistent memory backend, so it is created whenever an LLM is
-        // available.
+        // The metrics backend storage published. Consumed here rather than
+        // passed down from wherever the reader sits: the reading belongs to the
+        // engine that runs the generation, and both engines below are built in
+        // this function.
+        let metrics_backend = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+
+        // Build an evolution engine up-front for the in-memory fallback below,
+        // which has no persistent memory backend to build one from. In
+        // production the engine comes from `new_self_evolution`, which builds
+        // its own — with the hook and tool sinks this one does not carry — so
+        // this instance is not the one that runs the self-evolution pipeline.
+        // It does not depend on a persistent memory backend, so it is created
+        // whenever an LLM is available.
         let evolution_engine: Option<Arc<crate::EvolutionEngine>> =
             if let Some(ref llm) = llm_provider {
                 let mut evolution = crate::EvolutionEngine::new(
@@ -204,6 +212,9 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 .with_change_dir(change_dir.clone());
                 if let Some(ref root) = engine_root {
                     evolution = evolution.with_project_root(root.clone());
+                }
+                if let Some(metrics) = metrics_backend.clone() {
+                    evolution = evolution.with_metrics(metrics);
                 }
                 Some(Arc::new(evolution))
             } else {
@@ -266,6 +277,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 Some(tool_tx),
                 engine_root.clone(),
                 change_dir.clone(),
+                metrics_backend,
             )
         } else {
             warn!("ReflectionEngine falling back to in-memory mode (memory_backend or llm_provider unavailable)");
@@ -1929,6 +1941,12 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         },
         cog_core::ConsumeSpec {
             type_name: "EvolutionMetrics",
+            required: false,
+        },
+        // 变更忠实度读数落在这条通道上：metrics 后端把名字枚举给 /metrics，
+        // 缺它只是少一条读数，不该拦住生成。
+        cog_core::ConsumeSpec {
+            type_name: "MetricsBackend",
             required: false,
         },
         cog_core::ConsumeSpec {

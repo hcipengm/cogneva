@@ -33,6 +33,7 @@ pub mod change_pipeline;
 pub mod config;
 pub mod crew;
 pub mod detector;
+pub mod diff_fidelity;
 pub mod discovery;
 pub mod effectiveness;
 pub mod eval_harness;
@@ -231,6 +232,9 @@ impl ReflectionEngine {
         tool_sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
         project_root: Option<std::path::PathBuf>,
         change_dir: impl Into<std::path::PathBuf>,
+        // 变更忠实度读数只能挂在真正跑生成的那个引擎上；这个构造函数自己
+        // 建引擎，所以凭据得从这里传进来，不能建完再从外面挂。
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
             memory_backend.clone(),
@@ -264,6 +268,9 @@ impl ReflectionEngine {
         }
         if let Some(root) = project_root {
             evolution = evolution.with_project_root(root);
+        }
+        if let Some(metrics) = metrics {
+            evolution = evolution.with_metrics(metrics);
         }
         let evolution = Arc::new(evolution);
         let discovery = Arc::new(DiscoveryEngine::new(recorder.clone()));

@@ -40,6 +40,9 @@ pub struct EvolutionEngine {
     /// In-memory log of all evolution attempts and their current status.
     /// Production systems may additionally persist this to a backend.
     results: Arc<tokio::sync::Mutex<std::collections::HashMap<String, EvolutionResult>>>,
+    /// Where per-artifact fidelity readings go. Absent means the reading is
+    /// kept in the log only; losing the aggregate must not fail generation.
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl std::fmt::Debug for EvolutionEngine {
@@ -70,7 +73,14 @@ impl EvolutionEngine {
             tool_sink: std::sync::Mutex::new(None),
             project_root: None,
             results: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            metrics: None,
         }
+    }
+
+    /// Report per-artifact fidelity readings to the metrics backend.
+    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Set the directory where code changes are written (default:
@@ -928,11 +938,64 @@ impl EvolutionEngine {
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
                 );
-                (out.status.success(), combined)
+                let ok = out.status.success();
+                self.report_fidelity(root, diff, ok).await;
+                (ok, combined)
             }
             Err(e) => {
                 warn!(error = %e, "git apply --check unavailable; structural validation only");
                 (true, format!("structural validation passed (git: {})", e))
+            }
+        }
+    }
+
+    /// Report how much of a generated artifact actually matched the tree it was
+    /// generated for.
+    ///
+    /// The gate above answers yes or no; this answers how much, which is the
+    /// only form of the answer that can be looked at across rounds. Both
+    /// granularities are reported because they diagnose different things: a
+    /// file that does not apply at all says the artifact is aimed at the wrong
+    /// revision, while a file that applies with half its hunks matching says
+    /// the artifact is aimed right and written wrong.
+    async fn report_fidelity(&self, root: &std::path::Path, diff: &str, whole_patch_ok: bool) {
+        let fidelity = crate::diff_fidelity::measure(root, diff, whole_patch_ok).await;
+        if fidelity.is_empty() {
+            return;
+        }
+        info!(
+            files_total = fidelity.files_total,
+            files_faithful = fidelity.files_faithful,
+            hunks_total = fidelity.hunks_total,
+            hunks_faithful = fidelity.hunks_faithful,
+            "generated change fidelity"
+        );
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        for (name, value) in [
+            (
+                "evolution_generated_change_files_total",
+                fidelity.files_total as f64,
+            ),
+            (
+                "evolution_generated_change_files_faithful",
+                fidelity.files_faithful as f64,
+            ),
+            (
+                "evolution_generated_change_hunks_total",
+                fidelity.hunks_total as f64,
+            ),
+            (
+                "evolution_generated_change_hunks_faithful",
+                fidelity.hunks_faithful as f64,
+            ),
+        ] {
+            if let Err(e) = metrics
+                .record_counter(name, value, std::collections::HashMap::new())
+                .await
+            {
+                warn!(error = %e, metric = name, "failed to record change fidelity");
             }
         }
     }
