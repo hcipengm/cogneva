@@ -1877,15 +1877,28 @@ pub fn spawn_gitee_token_refresher(
     refresh_threshold_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if !gitee_oauth_available().await {
+        // 属主判定放在最前，且每条退出路径都带原因。只报「起来了」是不够的：
+        // 属主拿 OAuth App 配置当门时，App 被撤掉那一支会静默返回，于是
+        // 「属主、有轮换材料、但不再刷新」与「属主、没东西可刷」在日志上同形，
+        // 只有 24h 后 egress 开始 401 才区分得开。先问属主，再逐支报原因，
+        // 全部署就恰好只有一台进程说话，且它每次都说清自己为什么跑或不跑。
+        //
+        // 不做属主判定就起循环是不行的：非属主每小时都会以 403 失败一次，
+        // 永远不成功；更糟的是一旦有人给它补上权限，两个进程就会拿同一个单次
+        // 有效的 refresh token 互相抢（token 每次使用都轮换）。
+        if !is_contribution_secret_owner().await {
+            // 非属主只在真的有事可做时才出声。没配 Gitee OAuth App 的安装里
+            // 它本就不该参与，再报一行「没起来」只会把「谁在说话」搅浑。
+            if gitee_oauth_available().await {
+                tracing::info!(
+                    "gitee token refresher not started: this process cannot read the contribution secret"
+                );
+            }
             return;
         }
-        // 不做属主判定，非属主进程每小时都会以 403 失败一次，永远不成功；更糟的
-        // 是一旦有人给它补上权限，两个进程就会拿同一个单次有效的 refresh token
-        // 互相抢（token 每次使用都轮换）。
-        if !is_contribution_secret_owner().await {
+        if !gitee_oauth_available().await {
             tracing::info!(
-                "gitee token refresher not started: this process cannot read the contribution secret"
+                "gitee token refresher not started: no Gitee OAuth app is configured for the security gateway"
             );
             return;
         }
