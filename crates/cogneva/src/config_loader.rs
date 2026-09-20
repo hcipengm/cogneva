@@ -1054,6 +1054,9 @@ mod tests {
             agent_id: "agent-42".into(),
             role: "generator".into(),
             max_iterations: 7,
+            // 评估器预算只服务 cog-agent 自己的 eval runtime，没有 RuntimeConfig 对应字段，
+            // 所以下面只断言 max_iterations。
+            eval_max_iterations: 5,
             context_window_size: 8192,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
