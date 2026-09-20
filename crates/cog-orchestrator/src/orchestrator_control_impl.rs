@@ -52,9 +52,12 @@ impl OrchestratorControl for OrchestratorControlImpl {
             let ids = planner.process_goal(goal, tasks, &registry).await?;
             return Ok(ids);
         }
-        let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
-        self.dag_executor.submit_goal(goal, tasks).await?;
-        Ok(task_ids)
+        // No planner: still answer with what the graph took, not with what was
+        // asked of it. `submit_goal` returns nothing and drops the ids the
+        // batch insert skipped, so a held id would read back as queued.
+        let added = self.dag_executor.add_tasks_batch(tasks).await?;
+        tracing::info!(%goal, added_tasks = %added.len(), "submitted goal directly to the DAG");
+        Ok(added)
     }
 
     async fn assign_task(&self, task_id: &str, agent_id: &str) -> SFResult<()> {

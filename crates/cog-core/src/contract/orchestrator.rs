@@ -16,7 +16,13 @@ pub trait OrchestratorControl: Send + Sync {
 
     /// Submit a goal with optional tasks. If `tasks` is empty, the orchestrator
     /// will automatically decompose the goal into atomic tasks via ActionPlanner.
-    /// Returns the list of task IDs that were added to the graph.
+    ///
+    /// Returns the ids this call actually added to the graph. A submission
+    /// whose id the graph already holds is an idempotent no-op — the intent is
+    /// in hand — so it is not among them. Callers that need to distinguish
+    /// "queued just now" from "already held" must read this back rather than
+    /// assume their input ids were accepted: a held id may name a finished
+    /// task, in which case nothing is running and the returned set is empty.
     async fn submit_goal_auto(&self, goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>>;
 
     /// Assign a pending/scheduled task to a specific agent.

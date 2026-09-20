@@ -580,7 +580,8 @@ impl ActionPlanOrchestrator {
     /// 3. If `tasks` exist but lack the verified marker, evaluate them and either
     ///    mark+inject or re-decompose.
     ///
-    /// Returns the list of task IDs that end up in the DagExecutor.
+    /// Returns the ids this call actually added to the DagExecutor; an id the
+    /// graph already held is an idempotent no-op and is not among them.
     pub async fn process_goal_impl(
         &self,
         goal: &str,
@@ -606,7 +607,8 @@ impl ActionPlanOrchestrator {
                 .and_then(|t| t.goal_id.clone())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let now = Utc::now();
-            let mut task_ids = Vec::new();
+            let mut requested = Vec::new();
+            let mut queued = Vec::new();
             if let Some(ref dag) = self.dag_executor {
                 let mut batch = Vec::with_capacity(tasks.len());
                 for mut task in tasks {
@@ -623,7 +625,7 @@ impl ActionPlanOrchestrator {
                         confidence: None,
                         timestamp: Some(now),
                     });
-                    task_ids.push(task.id.clone());
+                    requested.push(task.id.clone());
                     batch.push(task);
                 }
                 // Idempotent, like every other injection here: a caller that
@@ -632,11 +634,26 @@ impl ActionPlanOrchestrator {
                 // adding one at a time would reject it as a duplicate and
                 // fail the whole submission instead of recognizing that the
                 // work is already in the DAG.
-                dag.add_tasks_batch(batch).await?;
+                queued = dag.add_tasks_batch(batch).await?;
+                // Answer with what landed, not with what was asked for. A
+                // caller that gets its own input ids back cannot tell a
+                // submission it just queued from one the DAG already held and
+                // dropped — and the dropped one keeps reading as success right
+                // up until the work is expected and never arrives. Name the
+                // held ids and their state so the drop is at least attributable
+                // when it is noticed downstream.
+                for held in requested.iter().filter(|id| !queued.contains(id)) {
+                    let status = dag.get_task(held).await.map(|t| t.status);
+                    tracing::warn!(
+                        task_id = %held,
+                        ?status,
+                        "self-evolution submission held by an existing task; nothing was queued"
+                    );
+                }
             } else {
                 tracing::warn!("self_evolution tasks present but no DagExecutor attached");
             }
-            return Ok(task_ids);
+            return Ok(queued);
         }
 
         let all_verified = !tasks.is_empty()
@@ -659,13 +676,23 @@ impl ActionPlanOrchestrator {
                 task_count = %tasks.len(),
                 "All tasks verified by ActionPlanner; injecting directly into DagExecutor"
             );
-            let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
-            if let Some(ref dag) = self.dag_executor {
-                dag.add_tasks_batch(tasks).await?;
+            let requested: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+            let queued = if let Some(ref dag) = self.dag_executor {
+                let queued = dag.add_tasks_batch(tasks).await?;
+                for held in requested.iter().filter(|id| !queued.contains(id)) {
+                    let status = dag.get_task(held).await.map(|t| t.status);
+                    tracing::warn!(
+                        task_id = %held,
+                        ?status,
+                        "verified submission held by an existing task; nothing was queued"
+                    );
+                }
+                queued
             } else {
                 tracing::warn!("process_goal_impl: verified tasks but no DagExecutor attached");
-            }
-            return Ok(task_ids);
+                Vec::new()
+            };
+            return Ok(queued);
         }
 
         // Unverified tasks: route everything through the Collaboration main flow.
@@ -747,9 +774,20 @@ impl ActionPlanOrchestrator {
                 }
                 // Batch injection is idempotent: redelivery after a partial
                 // write skips rows that already landed instead of erroring.
-                dag.add_tasks_batch(failed_rows).await?;
+                let queued = dag.add_tasks_batch(failed_rows).await?;
+                for held in failed_ids.iter().filter(|id| !queued.contains(id)) {
+                    let status = dag.get_task(held).await.map(|t| t.status);
+                    tracing::warn!(
+                        task_id = %held,
+                        ?status,
+                        "failed-outcome row held by an existing task; the verdict was not recorded"
+                    );
+                }
+                return Ok(queued);
             }
-            return Ok(failed_ids);
+            // No DagExecutor: the verdict was logged and alerted but recorded
+            // nowhere, so there is no id to report as recorded.
+            return Ok(Vec::new());
         };
 
         // Inject placeholders + children as ONE idempotent batch so a
@@ -796,15 +834,25 @@ impl ActionPlanOrchestrator {
                 all_injected_ids.push(task.id.clone());
                 batch.push(task);
             }
-            dag.add_tasks_batch(batch).await?;
+            let queued = dag.add_tasks_batch(batch).await?;
+            for held in all_injected_ids.iter().filter(|id| !queued.contains(id)) {
+                let status = dag.get_task(held).await.map(|t| t.status);
+                tracing::warn!(
+                    task_id = %held,
+                    ?status,
+                    "decomposed submission held by an existing task; nothing was queued"
+                );
+            }
+            tracing::info!(
+                goal = %goal,
+                requested = %all_injected_ids.len(),
+                queued = %queued.len(),
+                "Goal decomposed and injected into DagExecutor"
+            );
+            return Ok(queued);
         }
 
-        tracing::info!(
-            goal = %goal,
-            task_count = %all_injected_ids.len(),
-            "Goal decomposed and injected into DagExecutor"
-        );
-        Ok(all_injected_ids)
+        Ok(Vec::new())
     }
 
     /// Drive a decomposition alert through the persistent alert port when
@@ -2015,7 +2063,14 @@ mod tests {
             .await
             .expect("a resent intent must be recognized, not rejected as a duplicate");
 
-        assert_eq!(first, replay);
+        // The resend queues nothing, and says so. Echoing the input back would
+        // read as "queued just now" for a call that changed nothing — the same
+        // reading that let an abandoned intent report success.
+        assert_eq!(first, vec!["github-issue-11".to_string()]);
+        assert!(
+            replay.is_empty(),
+            "the held id is not among the queued ones"
+        );
         let stored = dag.get_task("github-issue-11").await.unwrap();
         assert!(stored.is_executable);
         assert_eq!(stored.timeout_seconds, 3600);

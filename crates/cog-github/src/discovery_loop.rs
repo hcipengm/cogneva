@@ -72,6 +72,52 @@ fn is_terminal_failure(err: &CogGitHubError) -> bool {
         .contains(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX)
 }
 
+/// What a submission for an intent should do about the task that already
+/// carries its id.
+///
+/// The intent's task id is stable, so the row it names is the entire attempt
+/// history of that intent. Submitting again is not a way to run it a second
+/// time: the batch insert is idempotent and drops an id the graph already
+/// holds, so a re-submission of a finished attempt queues nothing while the
+/// caller reads its own ids back and logs success. Deciding from the row
+/// instead is what keeps "already submitted" from meaning "abandoned".
+#[derive(Debug, PartialEq, Eq)]
+enum IntentTaskAction {
+    /// No row carries the id; a submission is the only way to start.
+    Submit,
+    /// A previous attempt ended without a declared deterministic cause. It
+    /// spent its budget on an environment that is not necessarily the one
+    /// running now, so the attempt is worth refilling.
+    Redrive,
+    /// A previous attempt ended on a cause that declares itself deterministic.
+    /// Re-running reproduces it — the same rule the retry loop applies inside
+    /// the pipeline, applied one level up so the intake cannot re-buy what the
+    /// retry layer refuses to.
+    Blocked(String),
+    /// The attempt is live: pending, scheduled or running.
+    InHand,
+    /// The attempt finished successfully. The intent is answered.
+    Done,
+}
+
+fn intent_task_action(existing: Option<&Task>) -> IntentTaskAction {
+    let Some(task) = existing else {
+        return IntentTaskAction::Submit;
+    };
+    match task.status {
+        TaskStatus::Failed => {
+            let reason = task.error.as_deref().unwrap_or("");
+            if cog_core::contract::outcome::is_deterministic_failure(reason) {
+                IntentTaskAction::Blocked(reason.to_string())
+            } else {
+                IntentTaskAction::Redrive
+            }
+        }
+        TaskStatus::Completed => IntentTaskAction::Done,
+        _ => IntentTaskAction::InHand,
+    }
+}
+
 /// Exponential backoff for consecutive terminal failures: first failure
 /// backs off one poll interval, then doubles, capped at
 /// [`TERMINAL_BACKOFF_CAP_SECS`]. Self-adjusting — the schedule derives from
@@ -142,6 +188,18 @@ pub struct GitHubDiscoveryLoop {
     /// LLM attempt chain every round. Keyed by `"<kind>:<number>"`, the same
     /// convention as [`Self::conversations`].
     terminal_backoff: HashMap<String, TerminalBackoff>,
+    /// Intents already reported as blocked by a declared deterministic cause.
+    /// Blocked intents stay outside [`Self::submitted`] — they are not in hand
+    /// — so every round re-reads their row; this keeps the warning to the
+    /// transition into blocked instead of repeating it once per poll.
+    blocked_reported: HashMap<String, String>,
+    /// How long to leave a re-driven intent alone before refilling it again.
+    /// A task that keeps failing without ever declaring a cause has no
+    /// self-limiting shape — nothing in it says "this cannot work" — so
+    /// without this ledger the intake would refill it once per poll forever.
+    /// Same self-adjusting schedule as [`Self::terminal_backoff`], kept in a
+    /// separate ledger because that one is cleared by any successful round.
+    redrive_backoff: HashMap<String, TerminalBackoff>,
     /// Optional scheduler gate. When the LLM upstream pool is down the
     /// supervisor pauses the [`TaskClass::LlmDependent`] class; every round
     /// that would call an LLM (triage assessment, fix submission) is skipped
@@ -408,6 +466,8 @@ impl GitHubDiscoveryLoop {
             guards_loaded: false,
             verdicts: tokio::sync::Mutex::new(AssessVerdicts::default()),
             terminal_backoff: HashMap::new(),
+            blocked_reported: HashMap::new(),
+            redrive_backoff: HashMap::new(),
             gate: None,
         }
     }
@@ -523,6 +583,135 @@ impl GitHubDiscoveryLoop {
     /// Register a PR created for a change so its outcome is recorded.
     pub fn track_pr(&mut self, pr_number: u64, change_id: impl Into<String>) {
         self.recorder.track(pr_number, change_id);
+    }
+
+    /// The task id an intent's submission uses. One function so the id the
+    /// submission writes and the id the decision reads back cannot drift: a
+    /// lookup under a spelling that never existed would read as "no attempt
+    /// yet" and queue a second task for the same intent.
+    fn intent_task_id(&self, kind: IntentKind, number: u64) -> String {
+        format!(
+            "{}-{}-{}",
+            self.provider.platform_kind(),
+            kind.as_str(),
+            number
+        )
+    }
+
+    /// Decide what to do about an intent from the row its stable id names.
+    async fn intent_decision(&self, kind: IntentKind, number: u64) -> IntentTaskAction {
+        let Some(ref orchestrator) = self.orchestrator else {
+            return IntentTaskAction::Submit;
+        };
+        let existing = orchestrator
+            .get_task(&self.intent_task_id(kind, number))
+            .await;
+        intent_task_action(existing.as_ref())
+    }
+
+    /// Report an intent whose attempt cannot clear by re-running, once per
+    /// process. Repeated per-poll warnings for a condition that is by
+    /// definition unchanged would bury the first one.
+    fn note_blocked(&mut self, key: &str, label: &str, number: u64, reason: &str) {
+        if self.blocked_reported.get(key).map(String::as_str) == Some(reason) {
+            return;
+        }
+        self.blocked_reported
+            .insert(key.to_string(), reason.to_string());
+        tracing::warn!(
+            label,
+            number,
+            reason = %reason,
+            "intent blocked: its previous attempt declared a deterministic cause, so re-running it reproduces the failure; not re-driving"
+        );
+    }
+
+    /// Record that a re-drive was issued for this intent and open its backoff
+    /// window. Consecutive re-drives of the same intent lengthen the window,
+    /// so an intent that can never succeed is retried on a doubling schedule
+    /// instead of once per poll.
+    fn note_redrive(&mut self, key: &str) {
+        let consecutive = self
+            .redrive_backoff
+            .get(key)
+            .map(|b| b.consecutive + 1)
+            .unwrap_or(1);
+        let delay = terminal_backoff_delay(consecutive, self.config.poll_interval_secs);
+        self.redrive_backoff.insert(
+            key.to_string(),
+            TerminalBackoff {
+                consecutive,
+                skip_until: std::time::Instant::now() + delay,
+            },
+        );
+        tracing::info!(
+            intent = %key,
+            consecutive,
+            "re-driving a failed intent whose attempt declared no deterministic cause"
+        );
+    }
+
+    /// Whether this intent is still inside its re-drive backoff window.
+    fn in_redrive_backoff(&self, key: &str) -> bool {
+        self.redrive_backoff
+            .get(key)
+            .is_some_and(|b| std::time::Instant::now() < b.skip_until)
+    }
+
+    /// Decide what this round should do about a fix intent and act on the
+    /// decision. Returns `true` when the caller should submit a fresh task;
+    /// `false` when the attempt is already in hand, was refilled in place, or
+    /// is blocked. Every `false` return leaves the caller's submitted-guard
+    /// untouched, so the intent is re-examined next round rather than being
+    /// recorded as answered.
+    ///
+    /// A re-drive re-runs the stored attempt, so its payload is the one the
+    /// intent had when it was first submitted; a reply that arrives while the
+    /// attempt is failing is seen by the judgement, not by the refilled task.
+    /// Refreshing the payload means replacing the row, which the idempotent
+    /// insert cannot do — the attempt is recycled instead of silently dropped.
+    async fn apply_fix_decision(&mut self, key: &str, kind: IntentKind, number: u64) -> bool {
+        match self.intent_decision(kind, number).await {
+            IntentTaskAction::Submit => true,
+            IntentTaskAction::Done => {
+                // Answered: the streak is about an unresolved intent, so it
+                // ends with the intent. Keeping it would make a later, genuine
+                // failure of this intent wait out the old window.
+                self.redrive_backoff.remove(key);
+                false
+            }
+            IntentTaskAction::InHand => false,
+            IntentTaskAction::Redrive => {
+                if self.in_redrive_backoff(key) {
+                    return false;
+                }
+                let Some(ref orchestrator) = self.orchestrator else {
+                    return false;
+                };
+                let task_id = self.intent_task_id(kind, number);
+                match orchestrator.retry_task(&task_id).await {
+                    Ok(()) => {
+                        self.note_redrive(key);
+                        // The refill is the submission: the id is already in
+                        // the graph, so queueing it again would be dropped by
+                        // the idempotent insert and logged as a drop.
+                        false
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %err,
+                            "re-drive of a failed intent did not take; leaving it for the next round"
+                        );
+                        false
+                    }
+                }
+            }
+            IntentTaskAction::Blocked(reason) => {
+                self.note_blocked(key, kind.as_str(), number, &reason);
+                false
+            }
+        }
     }
 
     /// Whether this intent is still inside its terminal-failure backoff
@@ -990,8 +1179,14 @@ impl GitHubDiscoveryLoop {
             .act_on_decision(kind, issue.number, &key, decision, &mut conversation)
             .await?;
         if is_fix && self.config.auto_submit_fixes {
-            self.submit_fix_task(issue, &conversation).await?;
-            self.submitted.insert(key.clone());
+            // Read what the intent's row already holds before submitting. A
+            // stable id means a submission for an intent the graph already
+            // carries is dropped by the idempotent insert, so submitting
+            // blindly reports success for an intent that was abandoned.
+            if self.apply_fix_decision(&key, kind, issue.number).await {
+                self.submit_fix_task(issue, &conversation).await?;
+                self.submitted.insert(key.clone());
+            }
         }
 
         self.conversations.insert(key, conversation);
@@ -1048,8 +1243,18 @@ impl GitHubDiscoveryLoop {
         }
 
         // Already acted on this intent and the reporter only replied afterwards:
-        // don't re-submit.
-        if conversation.state == ConversationState::UserReplied && self.submitted.contains(&key) {
+        // don't re-submit. The guard records that the intent produced a task,
+        // not that the task is still alive — so it yields to an attempt that
+        // ended without declaring a deterministic cause. That round then
+        // refills the existing attempt through the decision below instead of
+        // queueing a duplicate under the same id.
+        if conversation.state == ConversationState::UserReplied
+            && self.submitted.contains(&key)
+            && !matches!(
+                self.intent_decision(kind, number).await,
+                IntentTaskAction::Redrive
+            )
+        {
             self.conversations.insert(key, conversation);
             return Ok(None);
         }
@@ -1457,7 +1662,7 @@ impl GitHubDiscoveryLoop {
         );
 
         let task = Task::new(
-            format!("{}-issue-{}", self.provider.platform_kind(), issue.number),
+            self.intent_task_id(IntentKind::Issue, issue.number),
             TaskType::Custom("platform_issue_fix".into()),
             serde_json::json!({
                 "goal": goal,
@@ -1528,8 +1733,12 @@ impl GitHubDiscoveryLoop {
             .act_on_decision(kind, pr.number, &key, decision, &mut conversation)
             .await?;
         if is_fix && self.config.auto_submit_fixes {
-            self.submit_pr_intent_task(pr).await?;
-            self.submitted.insert(key.clone());
+            // Same stable id as issues: read the row before submitting, or a
+            // re-submission for an abandoned attempt reads back as success.
+            if self.apply_fix_decision(&key, kind, pr.number).await {
+                self.submit_pr_intent_task(pr).await?;
+                self.submitted.insert(key.clone());
+            }
         }
 
         self.conversations.insert(key, conversation);
@@ -1553,7 +1762,7 @@ impl GitHubDiscoveryLoop {
         );
 
         let task = Task::new(
-            format!("{}-pr-{}", self.provider.platform_kind(), pr.number),
+            self.intent_task_id(IntentKind::Pr, pr.number),
             TaskType::Custom("platform_pr_intent".into()),
             serde_json::json!({
                 "goal": goal,
@@ -1847,6 +2056,79 @@ mod tests {
         assert!(
             !CogGitHubError::Upstream(SFError::LLM("weekly usage limit reached".into()))
                 .is_terminal_upstream_failure()
+        );
+    }
+
+    fn intent_task(status: TaskStatus, error: Option<&str>) -> Task {
+        let mut task = Task::new(
+            String::from("github-issue-7"),
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({}),
+        );
+        task.status = status;
+        task.error = error.map(str::to_string);
+        task
+    }
+
+    /// A submission is only correct when no row carries the id. Everything
+    /// else has to be read off the row, because the idempotent insert drops a
+    /// held id and reports the caller's own input back as success.
+    #[test]
+    fn intent_action_reads_the_row_the_stable_id_names() {
+        assert_eq!(intent_task_action(None), IntentTaskAction::Submit);
+
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Scheduled,
+            TaskStatus::Running,
+        ] {
+            assert_eq!(
+                intent_task_action(Some(&intent_task(status.clone(), None))),
+                IntentTaskAction::InHand,
+                "{status:?} is a live attempt"
+            );
+        }
+        assert_eq!(
+            intent_task_action(Some(&intent_task(TaskStatus::Completed, None))),
+            IntentTaskAction::Done
+        );
+        assert_eq!(
+            intent_task_action(Some(&intent_task(TaskStatus::Cancelled, None))),
+            IntentTaskAction::InHand,
+            "a cancelled attempt is not a verdict on the intent"
+        );
+    }
+
+    /// The split inside `Failed` is the whole point: an attempt that declared
+    /// a deterministic cause reproduces it, an attempt that did not is worth
+    /// one more run in whatever environment is current.
+    #[test]
+    fn failed_attempts_are_split_by_whether_they_declared_a_cause() {
+        let declared = intent_task(
+            TaskStatus::Failed,
+            Some(&format!(
+                "Agent execution error: {TERMINAL_ENV_FAILURE_PREFIX}: cargo not on PATH"
+            )),
+        );
+        assert!(matches!(
+            intent_task_action(Some(&declared)),
+            IntentTaskAction::Blocked(_)
+        ));
+
+        let transient = intent_task(
+            TaskStatus::Failed,
+            Some("Agent execution error: LLM stream error: connection reset"),
+        );
+        assert_eq!(
+            intent_task_action(Some(&transient)),
+            IntentTaskAction::Redrive
+        );
+
+        // A row that records no reason at all tells us nothing deterministic,
+        // so the attempt gets refilled rather than written off.
+        assert_eq!(
+            intent_task_action(Some(&intent_task(TaskStatus::Failed, None))),
+            IntentTaskAction::Redrive
         );
     }
 
