@@ -107,6 +107,24 @@ pub struct Artifact {
     pub artifact_type: String,
 }
 
+/// True when an artifact is the self-evolution deliverable: a unified diff that
+/// a later apply gate consumes verbatim.
+///
+/// Both the declared type and the file name are honoured because generators
+/// emit both shapes. Every consumer of a change artifact asks through this one
+/// function: an inline copy at each call site drifts, and a site that drifts
+/// silently stops recognising artifacts (or starts recognising non-diffs) while
+/// still compiling.
+pub fn is_change_artifact(artifact_type: &str, name: &str) -> bool {
+    artifact_type == "change" || name.to_lowercase().ends_with(".diff")
+}
+
+impl Artifact {
+    pub fn is_change(&self) -> bool {
+        is_change_artifact(&self.artifact_type, &self.name)
+    }
+}
+
 /// Output produced by a Generator agent.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct GeneratorOutput {
@@ -145,9 +163,7 @@ impl GeneratorOutput {
             return None;
         }
         self.artifacts.iter().find_map(|artifact| {
-            let is_change = artifact.artifact_type == "change"
-                || artifact.name.to_lowercase().ends_with(".diff");
-            if !is_change {
+            if !artifact.is_change() {
                 return None;
             }
             cog_core::diff_structural_defect(&artifact.content).map(|defect| {

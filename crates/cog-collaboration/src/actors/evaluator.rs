@@ -245,17 +245,12 @@ impl EvaluatorActor {
         let change_artifacts: Vec<&serde_json::Value> = artifacts
             .iter()
             .filter(|a| {
-                let is_change_type = a
-                    .get("artifact_type")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s == "change")
-                    .unwrap_or(false);
-                let is_change_name = a
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_lowercase().ends_with(".diff"))
-                    .unwrap_or(false);
-                is_change_type || is_change_name
+                crate::squad::pge::types::is_change_artifact(
+                    a.get("artifact_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    a.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                )
             })
             .collect();
 

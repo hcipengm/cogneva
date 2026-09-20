@@ -249,38 +249,14 @@ pub fn diff_structural_defect(content: &str) -> Option<String> {
         let lineno = idx + 1;
 
         if let Some((hunk_line, old_declared, new_declared, old_seen, new_seen)) = hunk {
-            match line.chars().next() {
-                Some('+') => {
-                    hunk = Some((
-                        hunk_line,
-                        old_declared,
-                        new_declared,
-                        old_seen,
-                        new_seen + 1,
-                    ))
-                }
-                Some('-') => {
-                    hunk = Some((
-                        hunk_line,
-                        old_declared,
-                        new_declared,
-                        old_seen + 1,
-                        new_seen,
-                    ))
-                }
-                Some('\\') => {}
-                // Context line. A blank line loses its leading space in some
-                // emitters; git reads it as context, so this does too.
-                _ => {
-                    hunk = Some((
-                        hunk_line,
-                        old_declared,
-                        new_declared,
-                        old_seen + 1,
-                        new_seen + 1,
-                    ))
-                }
-            }
+            let (old, new) = classify_hunk_line(line).tally();
+            hunk = Some((
+                hunk_line,
+                old_declared,
+                new_declared,
+                old_seen + old,
+                new_seen + new,
+            ));
             if let Some((_, od, nd, os, ns)) = hunk {
                 if os >= od && ns >= nd {
                     hunk = None;
@@ -298,9 +274,9 @@ pub fn diff_structural_defect(content: &str) -> Option<String> {
             continue;
         }
         if line.starts_with("@@") {
-            match parse_hunk_header(line) {
-                Some((old_declared, new_declared)) => {
-                    hunk = Some((lineno, old_declared, new_declared, 0, 0))
+            match parse_hunk_header_parts(line) {
+                Some(header) => {
+                    hunk = Some((lineno, header.old_count, header.new_count, 0, 0))
                 }
                 None => {
                     return Some(format!(
@@ -328,21 +304,190 @@ pub fn diff_structural_defect(content: &str) -> Option<String> {
     None
 }
 
+/// A parsed `@@ -old_start,old_count +new_start,new_count @@ tail` header. The
+/// start lines and the section heading are carried through verbatim: a hunk
+/// body says how many lines it holds but never where it belongs, so a repair
+/// that recomputes the counts has to preserve everything else.
+struct HunkHeader {
+    old_start: u64,
+    old_count: u64,
+    new_start: u64,
+    new_count: u64,
+    /// Everything after the closing `@@`, including the `fn foo()` heading.
+    tail: String,
+}
+
 /// Parse the `-old,count +new,count` fields of a hunk header. A missing count
 /// means one line, matching the unified-diff grammar.
-fn parse_hunk_header(line: &str) -> Option<(u64, u64)> {
+fn parse_hunk_header_parts(line: &str) -> Option<HunkHeader> {
     let inner = line.strip_prefix("@@")?;
     let end = inner.find("@@")?;
     let mut fields = inner[..end].split_whitespace();
     let old = fields.next()?.strip_prefix('-')?;
     let new = fields.next()?.strip_prefix('+')?;
-    let count = |spec: &str| -> Option<u64> {
+    let bounds = |spec: &str| -> Option<(u64, u64)> {
         match spec.split_once(',') {
-            Some((_, c)) => c.parse().ok(),
-            None => Some(1),
+            Some((s, c)) => Some((s.parse().ok()?, c.parse().ok()?)),
+            None => Some((spec.parse().ok()?, 1)),
         }
     };
-    Some((count(old)?, count(new)?))
+    let (old_start, old_count) = bounds(old)?;
+    let (new_start, new_count) = bounds(new)?;
+    Some(HunkHeader {
+        old_start,
+        old_count,
+        new_start,
+        new_count,
+        tail: inner[end + 2..].to_string(),
+    })
+}
+
+/// How one line of a hunk body contributes to the two line counts.
+///
+/// The counts and the body are two views of the same thing, so both the
+/// validator and the repair read them through this one classifier; a second
+/// copy of the `+`/`-`/other split would let the two disagree about what a diff
+/// means while each stayed self-consistent.
+#[derive(Clone, Copy)]
+enum HunkLine {
+    Added,
+    Removed,
+    /// `\ No newline at end of file` belongs to neither side.
+    Marker,
+    /// Context. A blank line loses its leading space in some emitters; git
+    /// reads it as context, so this does too.
+    Context,
+}
+
+impl HunkLine {
+    /// `(old, new)` lines this one line accounts for.
+    fn tally(self) -> (u64, u64) {
+        match self {
+            HunkLine::Added => (0, 1),
+            HunkLine::Removed => (1, 0),
+            HunkLine::Marker => (0, 0),
+            HunkLine::Context => (1, 1),
+        }
+    }
+}
+
+fn classify_hunk_line(line: &str) -> HunkLine {
+    match line.chars().next() {
+        Some('+') => HunkLine::Added,
+        Some('-') => HunkLine::Removed,
+        Some('\\') => HunkLine::Marker,
+        _ => HunkLine::Context,
+    }
+}
+
+/// Recompute every hunk header's declared line counts from the hunk body that
+/// follows it, returning the repaired diff only when a header disagreed.
+///
+/// A generator that writes a correct patch body but a wrong `@@` header — an
+/// off-by-N count, or a body longer than its header admits — produces a diff
+/// that every apply gate rejects as "corrupt patch". That verdict names a line
+/// number rather than the mistake, so re-prompting the generator tends to
+/// reproduce it. The body is the expensive part and the counts are pure
+/// arithmetic over it, so the counts are derived here instead. Whether the body
+/// actually applies at the declared start line is a content question and stays
+/// with the apply/compile gate.
+///
+/// `None` means "keep the original bytes": the diff was already structurally
+/// sound, no header disagreed, or the rewrite would still be unsound. A repair
+/// that cannot be shown to be an improvement is never returned.
+pub fn normalize_diff_hunk_headers(content: &str) -> Option<String> {
+    // Only a diff the validator already rejects is a repair candidate. A diff
+    // git would have accepted comes back untouched byte for byte, so this can
+    // never turn a working patch into a broken one.
+    if diff_structural_defect(content).is_some() {
+        return recompute_hunk_counts(content);
+    }
+    None
+}
+
+/// Recompute every hunk header's counts in a diff already known to have a
+/// structural defect.
+fn recompute_hunk_counts(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if !line.starts_with("@@") {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        let Some(header) = parse_hunk_header_parts(line) else {
+            // An unparsable header is not a count error; leave it for the gate.
+            return None;
+        };
+
+        // The body runs to the next hunk or file section. `@@` and
+        // `diff --git ` can never occur inside a body. A `--- ` line can — a
+        // removed line whose content starts with `-- ` renders identically — so
+        // it counts as a section boundary only when a `+++ ` line immediately
+        // follows, which is how git starts the next file and how a body's
+        // adjacent context/removed lines do not line up.
+        let body_start = i + 1;
+        let mut body_end = body_start;
+        while body_end < lines.len() {
+            let candidate = lines[body_end];
+            if candidate.starts_with("@@") || candidate.starts_with("diff --git ") {
+                break;
+            }
+            if candidate.starts_with("--- ")
+                && lines
+                    .get(body_end + 1)
+                    .is_some_and(|next| next.starts_with("+++ "))
+            {
+                break;
+            }
+            body_end += 1;
+        }
+        // Blank lines trailing a body separate it from what follows rather than
+        // being context lines of it; the validator skips a standalone blank line
+        // for the same reason.
+        while body_end > body_start && lines[body_end - 1].is_empty() {
+            body_end -= 1;
+        }
+
+        let mut old_seen = 0u64;
+        let mut new_seen = 0u64;
+        for body_line in &lines[body_start..body_end] {
+            let (old, new) = classify_hunk_line(body_line).tally();
+            old_seen += old;
+            new_seen += new;
+        }
+
+        if old_seen == header.old_count && new_seen == header.new_count {
+            out.push(line.to_string());
+        } else {
+            changed = true;
+            out.push(format!(
+                "@@ -{},{} +{},{} @@{}",
+                header.old_start, old_seen, header.new_start, new_seen, header.tail
+            ));
+        }
+        for body_line in &lines[body_start..body_end] {
+            out.push((*body_line).to_string());
+        }
+        i = body_end;
+    }
+
+    if !changed {
+        return None;
+    }
+    let mut repaired = out.join("\n");
+    if content.ends_with('\n') {
+        repaired.push('\n');
+    }
+    if diff_structural_defect(&repaired).is_some() {
+        return None;
+    }
+    Some(repaired)
 }
 
 /// Git's per-file extended headers, which sit between `diff --git` and the
@@ -812,5 +957,148 @@ mod tests {
                     \x20one\n";
         let defect = diff_structural_defect(diff).unwrap();
         assert!(defect.contains("src/deep/nested.rs:3"), "{defect}");
+    }
+
+    #[test]
+    fn a_sound_diff_is_never_rewritten() {
+        // The repair is allowed to fire only where the validator already
+        // objects. Anything git would have accepted must come back untouched,
+        // byte for byte, so a repair can never turn a working patch into a
+        // broken one.
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n\
+                    index 1111111..2222222 100644\n\
+                    --- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,3 +1,4 @@\n\
+                    \x20fn a() {}\n\
+                    \x20fn b() {}\n\
+                    -fn c() {}\n\
+                    +fn c() { /* changed */ }\n\
+                    +fn d() {}\n";
+        assert_eq!(normalize_diff_hunk_headers(diff), None);
+    }
+
+    #[test]
+    fn a_header_that_understates_its_body_is_recomputed() {
+        // The header closes the hunk after one line, so the lines that follow
+        // are what the validator reports as "outside any hunk".
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,1 +1,1 @@\n\
+                    \x20fn a() {}\n\
+                    +fn b() {}\n\
+                    \x20fn c() {}\n";
+        assert!(diff_structural_defect(diff).is_some());
+        let repaired = normalize_diff_hunk_headers(diff).expect("count mismatch is repairable");
+        assert!(repaired.contains("@@ -1,2 +1,3 @@"), "{repaired}");
+        assert_eq!(diff_structural_defect(&repaired), None);
+    }
+
+    #[test]
+    fn a_header_that_overstates_its_body_is_recomputed() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n\
+                    --- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,15 +1,49 @@\n\
+                    \x20fn a() {}\n\
+                    +fn b() {}\n";
+        let repaired = normalize_diff_hunk_headers(diff).expect("count mismatch is repairable");
+        assert!(repaired.contains("@@ -1,1 +1,2 @@"), "{repaired}");
+        assert_eq!(diff_structural_defect(&repaired), None);
+    }
+
+    #[test]
+    fn a_truncated_body_shrinks_the_header() {
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,5 +1,5 @@\n\
+                    \x20fn a() {}\n";
+        let repaired = normalize_diff_hunk_headers(diff).expect("declared counts exceed the body");
+        assert!(repaired.contains("@@ -1,1 +1,1 @@"), "{repaired}");
+        assert_eq!(diff_structural_defect(&repaired), None);
+    }
+
+    #[test]
+    fn the_repair_keeps_the_start_lines_and_the_section_heading() {
+        // A body says how many lines it holds but never where it belongs, so
+        // only the counts may move.
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -7,1 +9,1 @@ fn foo()\n\
+                    \x20old\n\
+                    \x20also\n";
+        let repaired = normalize_diff_hunk_headers(diff).expect("count mismatch is repairable");
+        assert!(repaired.contains("@@ -7,2 +9,2 @@ fn foo()"), "{repaired}");
+    }
+
+    #[test]
+    fn a_blank_line_between_hunks_separates_rather_than_counts() {
+        // An unindented blank line between hunks is a separator; reading it as
+        // context would inflate the preceding hunk by one line on each side.
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,1 +1,1 @@\n\
+                    \x20one\n\
+                    \x20two\n\
+                    \n\
+                    @@ -10,1 +10,1 @@\n\
+                    \x20x\n";
+        let repaired = normalize_diff_hunk_headers(diff).expect("count mismatch is repairable");
+        assert!(
+            repaired.contains("@@ -1,2 +1,2 @@\n\x20one\n\x20two\n\n@@ -10,1 +10,1 @@"),
+            "{repaired}"
+        );
+        assert_eq!(diff_structural_defect(&repaired), None);
+    }
+
+    #[test]
+    fn the_body_stops_at_the_next_file_section() {
+        // Without `diff --git`, the next file starts at `--- `/`+++ `. Swallowing
+        // those into the previous hunk would corrupt the following file.
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,1 +1,1 @@\n\
+                    \x20a1\n\
+                    -a2\n\
+                    --- a/src/b.rs\n\
+                    +++ b/src/b.rs\n\
+                    @@ -1,1 +1,1 @@\n\
+                    \x20b1\n";
+        let repaired = normalize_diff_hunk_headers(diff).expect("count mismatch is repairable");
+        assert!(repaired.contains("@@ -1,2 +1,1 @@"), "{repaired}");
+        let second = repaired.split("--- a/src/b.rs").nth(1).unwrap();
+        assert!(second.contains("@@ -1,1 +1,1 @@"), "{repaired}");
+        assert_eq!(diff_structural_defect(&repaired), None);
+    }
+
+    #[test]
+    fn an_unparsable_header_is_left_alone() {
+        // A header that cannot be read is not a count error, and the counts
+        // cannot be rebuilt from a header that is missing a side. Failing
+        // closed leaves the original for the apply gate to reject.
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,1 @@\n\
+                    \x20a\n";
+        assert!(diff_structural_defect(diff).is_some());
+        assert_eq!(normalize_diff_hunk_headers(diff), None);
+    }
+
+    #[test]
+    fn every_repair_leaves_a_diff_the_validator_accepts() {
+        // The repair's own precondition, asserted over the shapes a generator
+        // produces: whatever comes back must be structurally sound, and a
+        // repair that cannot achieve that must not come back at all.
+        let diffs = [
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,1 @@\n\x20a\n\x20b\n",
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,4 +1,4 @@\n\x20a\n",
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -9 @@\n-x\n+y\n-z\n",
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n\x20a\n\n\x20b\n",
+        ];
+        for diff in diffs {
+            if let Some(repaired) = normalize_diff_hunk_headers(diff) {
+                assert_eq!(diff_structural_defect(&repaired), None, "{repaired}");
+            }
+        }
     }
 }

@@ -10,6 +10,7 @@ use crate::squad::pge::types::{
     PgeBranchResult, PgeRoundtableIteration, PlannerOutput, Verdict,
 };
 use std::sync::Arc;
+use tracing::info;
 
 pub struct PgeRoundtableConfig {
     pub max_iterations: u32,
@@ -853,6 +854,11 @@ pub fn parse_planner_output(value: &serde_json::Value, goal: &str) -> PlannerOut
 }
 
 pub fn parse_generator_output(value: &serde_json::Value) -> GeneratorOutput {
+    repair_change_artifacts(parse_generator_output_as_written(value))
+}
+
+/// Read the generator's result exactly as it was written.
+fn parse_generator_output_as_written(value: &serde_json::Value) -> GeneratorOutput {
     // A spent iteration budget is checked before the shape parses: the sentinel
     // is a valid JSON object that simply has none of this role's fields, so
     // every later branch would read it as a generator that returned nothing.
@@ -874,6 +880,37 @@ pub fn parse_generator_output(value: &serde_json::Value) -> GeneratorOutput {
             artifacts: Vec::new(),
         }
     })
+}
+
+/// Re-derive the hunk header counts of every change artifact from its body.
+///
+/// The body is the part of a diff that carries the change; the `@@` counts are
+/// arithmetic over it. A generator that writes the right body under a wrong
+/// count produces a diff that only the apply gate can reject, and it rejects it
+/// with a line number — a verdict the generator cannot act on, so the same
+/// mistake recurs on every retry. Deriving the counts here, at the one place
+/// model output becomes an artifact, costs no tokens and changes nothing about
+/// what the diff says; whether the body applies to the file at the declared
+/// start line remains the apply/compile gate's call.
+///
+/// Only change artifacts are touched: an artifact that merely contains `@@`
+/// lines is not a diff and must survive verbatim.
+fn repair_change_artifacts(mut output: GeneratorOutput) -> GeneratorOutput {
+    for artifact in &mut output.artifacts {
+        if !artifact.is_change() {
+            continue;
+        }
+        let defect = cog_core::diff_structural_defect(&artifact.content);
+        if let Some(repaired) = cog_core::normalize_diff_hunk_headers(&artifact.content) {
+            info!(
+                artifact = %artifact.name,
+                defect = ?defect,
+                "recomputed diff hunk header counts from the body"
+            );
+            artifact.content = repaired;
+        }
+    }
+    output
 }
 
 /// Best-effort extraction of a change artifact from a raw fallback result.

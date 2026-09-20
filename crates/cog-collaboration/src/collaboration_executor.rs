@@ -846,9 +846,7 @@ impl CollaborationExecutor {
         };
 
         for artifact in artifacts {
-            let is_change = artifact.artifact_type == "change"
-                || artifact.name.to_lowercase().ends_with(".diff");
-            if !is_change {
+            if !artifact.is_change() {
                 continue;
             }
 
