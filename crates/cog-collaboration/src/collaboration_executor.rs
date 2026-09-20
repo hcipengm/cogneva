@@ -9,6 +9,17 @@ use crate::{
     squad::{SquadConfig, SquadExecutor},
 };
 
+/// Identity carried on the actionability verdict's outbound request. Without it
+/// the gateway records the call against its `unknown` default and the verdict's
+/// token spend cannot be attributed to any component.
+const INTENT_ASSESS_ACTOR: &str = "intent_assess";
+
+/// Chat options for the actionability verdict. Split out from the call site so
+/// the attribution is pinned by a test rather than by reading the line.
+fn intent_assess_options() -> cog_core::ChatOptions {
+    cog_core::ChatOptions::default().with_actor(INTENT_ASSESS_ACTOR)
+}
+
 /// [`cog_core::TaskExecutor`] implementation that routes tasks through
 /// `SquadExecutor` + `ModeSelectorActor` for Agent-based collaboration.
 pub struct CollaborationExecutor {
@@ -335,7 +346,7 @@ impl CollaborationExecutor {
         ];
 
         let stream = agent
-            .chat_stream(&messages, &cog_core::ChatOptions::default())
+            .chat_stream(&messages, &intent_assess_options())
             .await?;
         use futures::StreamExt;
         let mut stream = stream;
@@ -977,6 +988,21 @@ impl CollaborationExecutor {
 #[cfg(test)]
 mod tests {
     use super::CollaborationExecutor;
+
+    #[test]
+    fn the_actionability_verdict_carries_an_actor() {
+        // The gateway falls back to "unknown" when the header is absent, which
+        // is indistinguishable from a component genuinely named unknown. The
+        // verdict path must therefore never send default options.
+        let options = super::intent_assess_options();
+        assert_eq!(
+            options
+                .headers
+                .get(cog_core::LLM_ACTOR_HEADER)
+                .map(String::as_str),
+            Some(super::INTENT_ASSESS_ACTOR)
+        );
+    }
 
     #[test]
     fn distinct_content_from_distinct_tasks_gets_distinct_ids() {
