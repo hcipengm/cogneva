@@ -291,7 +291,7 @@
     "flush_interval_secs": 1
   },
   "memory": {
-    "_comment": "Memory backend — composite puts Raw on the shared ObjectBackend, Schema and the Summary entry store on PostgreSQL, and the summary vectors on the shared VectorBackend, so both pods read one dataset and it survives a restart.",
+    "_comment": "Memory backend — composite puts Raw on the shared ObjectBackend, Schema and the Summary entry store on PostgreSQL, and the summary vectors on the shared VectorBackend, so the dataset survives a restart. This applies to the processes that enable it: the evolution worker overrides COGNEVA_MEMORY_ENABLED to false, so it holds no memory dataset at all and any state it must keep across a restart lives in its own app.data_dir instead.",
     "_comment_models": "load_*_model gates the ONNX weights loaded at startup. Both are false on the shipped profile: the single node has ~1.8GiB free against ~2.2GiB of resident weights per session (dense and sparse each open their own session over the same BGE-M3 weights, plus the reranker), so loading either one evicts the rest of the workload. Weights are deliberately kept out of the image and out of the release archive (4.6GiB total, and gzip cannot shrink fp32 weights); they are to arrive as one authoritative copy in the object store, seeded into each node's local cache. Until a host has the RAM, the vector layer stays absent and search falls back to the schema/text path.",
     "enabled": true,
     "backend_type": "composite",
