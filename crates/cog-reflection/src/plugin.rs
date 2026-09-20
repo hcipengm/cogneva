@@ -293,16 +293,19 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // active 版本读取；ArtifactEvolution 供评估侧在统计显著时升级策略。
         let policy_dir = format!("{}/policies", ctx.config().app.data_dir);
         let policy_store = crate::PolicyStore::new(&policy_dir);
-        if engine.meta_learning.is_some() {
-            engine.meta_learning = Some(Arc::new(
-                crate::MetaLearningEngine::new(engine.recorder.clone())
-                    .with_policy_store(policy_store.clone(), "meta_learning.mode"),
-            ));
-        }
+        // 一个进程只造一个引擎，写侧和读侧共用同一个对象：squad 把决策结果
+        // 记进它，推荐路径从它的 active 版本读参数，调参驱动也从它读已记录
+        // 的结果。任何一侧拿到的是另一个实例，两边就都活着却谁也看不见谁
+        // ——记录写进无人读的引擎，驱动对着空分组报证据不足。所以这里不按
+        // 「原来有没有引擎」分叉：没有就造一个，造完一律挂上策略库。
+        let meta_learning_engine = Arc::new(
+            crate::MetaLearningEngine::new(engine.recorder.clone())
+                .with_policy_store(policy_store.clone(), "meta_learning.mode"),
+        );
+        engine.meta_learning = Some(meta_learning_engine.clone());
         let artifact_evolution = Arc::new(crate::ArtifactEvolution::new(policy_store));
-        // 循环在 start() 挂载；这里先把两侧拿在手上。写侧与读侧必须在同一个
-        // 进程、同一块数据卷上，否则写出去的版本没人读。
-        self.meta_learning = engine.meta_learning.clone();
+        // 循环在 start() 挂载；这里先把两侧拿在手上。
+        self.meta_learning = Some(meta_learning_engine.clone());
         self.artifact_evolution = Some(artifact_evolution.clone());
         let engine = Arc::new(engine);
         ctx.publish(artifact_evolution.clone());
@@ -328,10 +331,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             ));
         ctx.publish_service(squad_reflection);
 
-        let meta_learning: Arc<dyn cog_core::MetaLearning> = engine
-            .meta_learning
-            .clone()
-            .unwrap_or_else(|| Arc::new(crate::MetaLearningEngine::new(engine.recorder.clone())));
+        // 下游拿到的必须就是上面那个挂了库的引擎。此前这里在引擎缺席时另造
+        // 一个无库实例发布出去，于是执行面记录到的结果落进一个没有策略库、
+        // 也没有驱动在读的引擎里。
+        let meta_learning: Arc<dyn cog_core::MetaLearning> = meta_learning_engine.clone();
         ctx.publish_service(meta_learning);
 
         let fault_classifier: Arc<dyn cog_core::FaultClassifier> =

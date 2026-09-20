@@ -624,33 +624,6 @@ impl ReflectionEngine {
         Ok(())
     }
 
-    /// Recommend a PGE mode using meta-learning.
-    pub async fn recommend_mode(
-        &self,
-        features: &cog_core::TaskFeatures,
-    ) -> cog_core::ModeRecommendation {
-        match self.meta_learning {
-            Some(ref meta) => meta.recommend_mode(features).await,
-            None => cog_core::ModeRecommendation::UseDefault,
-        }
-    }
-
-    /// Record the actual outcome of a mode decision so meta-learning can improve.
-    pub async fn record_mode_outcome(
-        &self,
-        features: &cog_core::TaskFeatures,
-        selected_mode: &str,
-        success: bool,
-        score: f32,
-        latency_ms: u64,
-    ) -> cog_core::SFResult<()> {
-        if let Some(ref meta) = self.meta_learning {
-            meta.record_outcome(features, selected_mode, success, score, latency_ms)
-                .await?;
-        }
-        Ok(())
-    }
-
     /// Generate a batch of discovery tasks.
     pub async fn generate_discovery_tasks(
         &self,
