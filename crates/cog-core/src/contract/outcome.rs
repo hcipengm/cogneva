@@ -53,7 +53,40 @@ pub const ITERATION_BUDGET_EXHAUSTED_MARKER: &str = "iteration_budget_exhausted"
 /// only in whether the cause was known before the first attempt or discovered
 /// during it.
 pub fn is_deterministic_failure(reason: &str) -> bool {
-    reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX) || reason.starts_with(DEGENERATE_LOOP_PREFIX)
+    [TERMINAL_ENV_FAILURE_PREFIX, DEGENERATE_LOOP_PREFIX]
+        .into_iter()
+        .any(|prefix| declares(reason, prefix))
+}
+
+/// Whether `reason` carries `prefix` as a declared label.
+///
+/// The producer writes the marker first, but the reason then travels through
+/// layers that prepend their own context, and this crate's own error type does
+/// exactly that when it renders: every wrapping variant of `SFError` joins the
+/// inner text as `"<context>: <inner>"`. A bare `starts_with` therefore reads
+/// only the outermost wrapper's prose and misses the declaration underneath it —
+/// which looks identical to "no cause was declared", so the retry loop buys
+/// another attempt for a failure that cannot clear, and the classification
+/// counter records the run as unclassified while the corresponding events keep
+/// happening.
+///
+/// The marker is recognised in the two shapes a declaration can take: leading
+/// the reason, or opening a clause after a wrapper boundary (`": "`). Requiring
+/// the trailing `:` in the wrapped shape keeps a sentence that merely mentions
+/// the words — prose, not a classification — from counting as one.
+///
+/// Every reader of these markers asks here rather than re-implementing the
+/// match: a second copy keeps compiling when the shapes drift apart and then
+/// silently answers "nothing was declared" for reasons that were.
+pub fn declares(reason: &str, prefix: &str) -> bool {
+    if reason.starts_with(prefix) {
+        return true;
+    }
+    let mut needle = String::with_capacity(prefix.len() + 3);
+    needle.push_str(": ");
+    needle.push_str(prefix);
+    needle.push(':');
+    reason.contains(&needle)
 }
 
 #[cfg(test)]
@@ -81,5 +114,35 @@ mod tests {
             "the request failed; terminal_env_failure is not the cause"
         ));
         assert!(!is_deterministic_failure(""));
+    }
+
+    /// A declaration survives the wrapping that the error type applies on its
+    /// way out. `SFError::Agent` renders as `"Agent execution error: {inner}"`,
+    /// so a reason that arrives through it begins with the wrapper's prose and
+    /// only then carries the marker. Reading position zero alone made this the
+    /// common case, not an edge case: the failure that motivated the predicate
+    /// reached the retry decision in exactly this shape.
+    #[test]
+    fn a_wrapper_does_not_hide_the_declaration() {
+        assert!(is_deterministic_failure(
+            "Agent execution error: terminal_env_failure: generator produced no artifacts (environment/protocol failure)"
+        ));
+        assert!(is_deterministic_failure(
+            "Dag-executor error: degenerate_loop: same failure 3 times"
+        ));
+        // Nesting the wrappers must not defeat it either.
+        assert!(is_deterministic_failure(
+            "LLM provider error: Agent execution error: terminal_env_failure: generator prompt failed: HTTP 503"
+        ));
+    }
+
+    /// Widening the match to "the words appear somewhere" would end retries for
+    /// ordinary failures whose text happens to discuss the marker. Only a label —
+    /// the marker opening a clause and terminated by its colon — counts.
+    #[test]
+    fn a_mention_inside_prose_is_still_not_a_declaration() {
+        assert!(!is_deterministic_failure(
+            "warning: terminal_env_failure is the name of the marker we look for"
+        ));
     }
 }

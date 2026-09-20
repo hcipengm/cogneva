@@ -32,11 +32,16 @@ pub const DECLARED_CLASSES: &[(&str, &str)] = &[
     (DEGENERATE_LOOP_PREFIX, DEGENERATE_LOOP_CLASS),
 ];
 
-/// 文本声明了哪一个已声明的分类（前缀匹配），没有声明则 `None`。
+/// 文本声明了哪一个已声明的分类，没有声明则 `None`。
+///
+/// 判定交给前缀自身的归属层：reason 在到达记录端前会被各层错误类型加上
+/// `"<上下文>: <内层>"` 的前缀，只认首字节会把带包装的声明读成"没有声明"，
+/// 于是分类序列结构性恒为 0、事件却一直在发生——正是本模块要防的那种自相
+/// 矛盾。各有各的匹配实现就等于各有各的盲区。
 pub fn declared_in(text: &str) -> Option<&'static str> {
     DECLARED_CLASSES
         .iter()
-        .find(|(prefix, _)| text.starts_with(prefix))
+        .find(|(prefix, _)| cog_core::contract::outcome::declares(text, prefix))
         .map(|(_, class)| *class)
 }
 
@@ -107,6 +112,19 @@ mod tests {
         );
         assert_eq!(declared_in("degenerate debate loop detected"), None);
         assert_eq!(declared_in(""), None);
+    }
+
+    /// 声明在到达这里之前已经被上层错误类型包了一层上下文。只认首字节的
+    /// 实现会把这种 reason 记成"未分类"，而分类序列恒为 0 恰恰会被自查读成
+    /// "这个分类从没发生过"，掩盖事件一直在发生的事实。
+    #[test]
+    fn a_wrapped_reason_is_still_classified() {
+        assert_eq!(
+            classify(&format!(
+                "Agent execution error: {TERMINAL_ENV_FAILURE_PREFIX}: generator produced no artifacts"
+            )),
+            TERMINAL_ENV_FAILURE_CLASS
+        );
     }
 
     fn counts(pairs: &[(&str, u64)]) -> HashMap<String, u64> {

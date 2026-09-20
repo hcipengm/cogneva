@@ -2584,6 +2584,38 @@ mod tests {
         assert!(view.retry_not_before.is_none());
     }
 
+    /// 判定要认的是声明本身，不是它在字符串里的字节位置：reason 被上层错误
+    /// 类型包装后才到达这里是常态，那时声明前缀前面多出一段上下文。只认首字节
+    /// 会把这种失败读成"没有声明原因"，确定性失败照样花掉整份重试预算——每一轮
+    /// 都要重跑一遍完整流水线，而条件一次都没变过。
+    #[tokio::test]
+    async fn a_wrapped_deterministic_failure_is_not_retried() {
+        let dag = DagExecutor::new("ws-wrapped".into());
+        let task = Task::new("t-wrapped", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+
+        let (retried, cancelled, _) = dag
+            .fail_task(
+                &task_id,
+                "Agent execution error: terminal_env_failure: generator produced no artifacts (environment/protocol failure)"
+                    .into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !retried,
+            "a wrapper must not hide the declared cause from the retry decision"
+        );
+        assert!(cancelled.is_empty());
+        let view = dag.get_task(&task_id).await.unwrap();
+        assert_eq!(view.status, TaskStatus::Failed);
+        assert_eq!(view.retry_count, 0, "the budget was never spent");
+    }
+
     /// 类型通道与文本通道各自独立成立。传输层看到的配额耗尽（402/401）在
     /// 文本里不出现任何前缀，只凭文本判断就会把它当可重试；这条钉住类型
     /// 通道没有被文本判据吞掉。
