@@ -82,6 +82,11 @@ pub struct LandingRecord {
     /// failure. One attempt only.
     #[serde(default)]
     pub redriven: bool,
+    /// Whether it has already been reported that this record never reached the
+    /// land step. The report is a latch rather than a level so a change that is
+    /// simply old does not re-announce itself every pass.
+    #[serde(default)]
+    pub unlanded_reported: bool,
     /// When the change first entered the channel.
     pub created_at: DateTime<Utc>,
     /// Last time this record changed; the CI watch window is measured from it.
@@ -285,6 +290,7 @@ impl MainChannel {
             state: LandingState::Landed,
             failure_recorded: false,
             redriven: false,
+            unlanded_reported: false,
             created_at: created,
             updated_at: now,
         })
@@ -585,6 +591,7 @@ impl cog_core::ChangeLanding for MainChannel {
             state: LandingState::Unverified,
             failure_recorded: false,
             redriven: false,
+            unlanded_reported: false,
             created_at: created,
             updated_at: now,
         })
@@ -613,6 +620,30 @@ pub async fn watch_landed(
     let now = Utc::now();
     for mut record in load_records().await {
         if record.state != LandingState::Landed || record.landed_rev.is_empty() {
+            // A change that was submitted and then never reached the land step
+            // leaves this record behind with nothing to move it. The record is
+            // the only trace of that change, so a silent skip makes "submitted
+            // and abandoned" indistinguishable from "never submitted" on every
+            // surface we have. The window is the same one a landed commit is
+            // watched for: either way it is "an outcome was expected by now".
+            let age = (now - record.updated_at).num_seconds().max(0) as u64;
+            if !record.unlanded_reported && age > policy.ci_watch_timeout_secs {
+                tracing::warn!(
+                    change_id = %record.change.change_id,
+                    age_secs = age,
+                    state = ?record.state,
+                    "a submitted change never reached the land step; without a land or an \
+                     explicit approval it stays here forever"
+                );
+                record.unlanded_reported = true;
+                // `updated_at` is deliberately not refreshed: it is the clock
+                // this age is measured from, so touching it would reset the
+                // staleness the report exists to surface.
+                if let Err(e) = save_record(&record).await {
+                    tracing::warn!(change_id = %record.change.change_id, error = %e,
+                        "could not latch the unlanded report; it will repeat next pass");
+                }
+            }
             continue;
         }
         let age = (now - record.updated_at).num_seconds().max(0) as u64;
@@ -1272,6 +1303,77 @@ mod tests {
         remove_record("chg-1").await;
         assert!(load_records().await.is_empty());
 
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn a_change_that_never_landed_is_reported_once() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let policy = crate::config::LandingPolicy {
+            ci_watch_timeout_secs: 1800,
+            ..Default::default()
+        };
+        let chan = channel(policy.clone());
+        let now = Utc::now();
+
+        // One record past the window and one inside it: only the first is news.
+        for (id, age_secs) in [("chg-old", 7200i64), ("chg-fresh", 60i64)] {
+            save_record(&LandingRecord {
+                change: change(id, &diff_touching(&["crates/cog-github/src/lib.rs"])),
+                base: "main".into(),
+                landed_rev: String::new(),
+                state: LandingState::Unverified,
+                failure_recorded: false,
+                redriven: false,
+                unlanded_reported: false,
+                created_at: now - chrono::Duration::seconds(age_secs),
+                updated_at: now - chrono::Duration::seconds(age_secs),
+            })
+            .await
+            .unwrap();
+        }
+
+        watch_landed(&chan, None, None).await;
+
+        let records = load_records().await;
+        let old = records
+            .iter()
+            .find(|r| r.change.change_id == "chg-old")
+            .expect("old record survives the pass");
+        assert!(
+            old.unlanded_reported,
+            "a change stale past the window is news"
+        );
+        // The age clock must survive the report, or the next pass would read a
+        // freshly-touched record and never say anything again.
+        assert_eq!(old.updated_at, now - chrono::Duration::seconds(7200));
+        let fresh = records
+            .iter()
+            .find(|r| r.change.change_id == "chg-fresh")
+            .expect("fresh record survives the pass");
+        assert!(
+            !fresh.unlanded_reported,
+            "a change still inside the window is not news"
+        );
+
+        // Idempotent: the latch is what keeps a stuck record from re-announcing
+        // itself every pass for as long as it stays stuck.
+        watch_landed(&chan, None, None).await;
+        let records = load_records().await;
+        assert_eq!(records.len(), 2, "neither record is reaped by reporting");
+        assert!(
+            records
+                .iter()
+                .find(|r| r.change.change_id == "chg-old")
+                .unwrap()
+                .unlanded_reported
+        );
+
+        remove_record("chg-old").await;
+        remove_record("chg-fresh").await;
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
