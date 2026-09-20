@@ -127,6 +127,10 @@ ensure_random pg-password
 ensure_random redis-password
 ensure_random webhook-internal
 ensure_random jwt-secret
+# 进化 Pod 的签名密钥：与主应用刻意不同源（它持有部署器，不能并入用户会话
+# 的鉴权域），但也必须跨重启稳定——它每推进一个 rev 就被重建一次，缺这条
+# 就等于鉴权域每轮换签。
+ensure_random evolution-jwt-secret
 ensure_random meili-master-key
 
 echo "==> 实例身份指纹（64 位十六进制，缺失才创建）"

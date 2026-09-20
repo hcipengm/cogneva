@@ -318,6 +318,11 @@ secrets:
   redisPassword: ""
   webhookInternal: ""
   jwtSecret: ""
+  # 进化 Pod 自己的 JWT 签名密钥：与主应用刻意不同。进化 Pod 持有主线部署器
+  # （能推 registry、能滚四部署），把它的管理面并进用户会话的鉴权域，等于让
+  # 一枚 WebUI token 够到部署器；而每次重启换签，又让它的管理面谁也进不去。
+  # 一份独立且跨重启稳定的密钥同时避开这两头。
+  evolutionJwtSecret: ""
   # 实例身份指纹（64 位十六进制）：安装时生成一次、之后幂等保留。身份不再由
   # 容器内的机器标识推导（容器里只有 Pod 主机名与 veth MAC，两者每轮重启都变），
   # 因此重装带同一个 Secret、换机器带同一个 Secret 都是同一个实例，也可显式钉住。

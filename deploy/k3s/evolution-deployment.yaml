@@ -124,6 +124,16 @@ spec:
             # 要分开量：两个进程写同一个路径，但各自的卷互不相干。
             - name: COGNEVA_DATA_VOLUME_CLAIM
               value: "cogneva-evolution-data-pvc"
+            # 本 Pod 自己的 JWT 签名密钥，与主应用那份**不同源**：本 Pod 持有
+            # 主线部署器（推 registry、滚四部署），并入用户会话的鉴权域等于让
+            # 一枚 WebUI token 够到部署器。取不到时进程退化为一次性随机密钥，
+            # 而本 Pod 每推进一个 rev 就被重建一次——那等于鉴权域每轮换签。
+            - name: COGNEVA_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: evolution-jwt-secret
+                  optional: true
             # 沙盒零凭证（设计 §2.6.1）：LLM 调用经安全网关 8081 OpenAI 兼容
             # 透传端点，真实 key 只存在于安全网关 Pod；cogneva.json 的
             # llm_routing 只有网关透传一个后端，api_key 为写死的非敏感占位，
