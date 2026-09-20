@@ -21,6 +21,9 @@ pub struct ToolRegistry {
     guardrail: Option<Arc<dyn cog_core::Guardrail>>,
     plugin_registry: Option<Arc<dyn cog_core::PluginRegistry>>,
     wasm_timeout: Duration,
+    /// Budget for shell commands. Kept apart from `wasm_timeout`: a snippet is
+    /// bounded work, a command may be a compiler run.
+    shell_timeout: Duration,
     /// When true, shell-class tools reject calls without a [`ToolScope`].
     /// Evolution pods turn this on so no command can reach the executor under
     /// a synthetic identity; default off keeps embedded/main-app behavior.
@@ -35,6 +38,7 @@ impl ToolRegistry {
             guardrail: None,
             plugin_registry: None,
             wasm_timeout: Duration::from_secs(30),
+            shell_timeout: Duration::from_secs(600),
             require_identity: false,
         }
     }
@@ -50,6 +54,11 @@ impl ToolRegistry {
 
     pub fn with_wasm_timeout(mut self, secs: u64) -> Self {
         self.wasm_timeout = Duration::from_secs(secs);
+        self
+    }
+
+    pub fn with_shell_timeout(mut self, secs: u64) -> Self {
+        self.shell_timeout = Duration::from_secs(secs);
         self
     }
 
@@ -245,7 +254,7 @@ impl ToolRegistry {
                         .unwrap_or_else(|| format!("unscoped-tool-{}", name)),
                     payload,
                     input: arguments,
-                    timeout: self.wasm_timeout,
+                    timeout: self.shell_timeout,
                     limits: Default::default(),
                 };
                 let mut stream = backend.execute_stream(&req).await?;
@@ -471,11 +480,11 @@ mod tests {
         assert!(err.to_string().contains("SandboxBackend not configured"));
     }
 
-    /// Records the identity stamped on every request so tests can assert what
-    /// the sandbox plane actually sees.
+    /// Records the identity and budget stamped on every request so tests can
+    /// assert what the sandbox plane actually sees.
     #[derive(Default)]
     struct RecordingBackend {
-        seen: tokio::sync::Mutex<Vec<(String, String)>>,
+        seen: tokio::sync::Mutex<Vec<(String, String, Duration)>>,
     }
 
     #[async_trait::async_trait]
@@ -484,7 +493,7 @@ mod tests {
             self.seen
                 .lock()
                 .await
-                .push((req.task_id.clone(), req.agent_id.clone()));
+                .push((req.task_id.clone(), req.agent_id.clone(), req.timeout));
             Ok(cog_core::SandboxResult {
                 exit_code: 0,
                 ..Default::default()
@@ -545,7 +554,34 @@ mod tests {
             .unwrap();
 
         let seen = backend.seen.lock().await.clone();
-        assert_eq!(seen, vec![("dag-task-7".into(), "worker-3".into())]);
+        assert_eq!(
+            seen,
+            vec![(
+                "dag-task-7".into(),
+                "worker-3".into(),
+                Duration::from_secs(600)
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_commands_get_their_own_budget_not_the_wasm_one() {
+        let backend = Arc::new(RecordingBackend::default());
+        let registry = ToolRegistry::new()
+            .with_wasm_timeout(30)
+            .with_shell_timeout(600)
+            .with_sandbox_backend(backend.clone() as Arc<dyn SandboxBackend>);
+        cog_core::ToolRegistry::register(&registry, builtins::run_command());
+
+        registry
+            .execute("run_command", serde_json::json!({"command": "cargo check"}))
+            .await
+            .unwrap();
+
+        let seen = backend.seen.lock().await.clone();
+        assert_eq!(seen.len(), 1);
+        // A command may be a compiler run; the WASM snippet budget cannot serve it.
+        assert_eq!(seen[0].2, Duration::from_secs(600));
     }
 
     #[tokio::test]
@@ -590,7 +626,14 @@ mod tests {
             .await
             .unwrap();
         let seen = backend.seen.lock().await.clone();
-        assert_eq!(seen, vec![("dag-task-9".into(), "worker-1".into())]);
+        assert_eq!(
+            seen,
+            vec![(
+                "dag-task-9".into(),
+                "worker-1".into(),
+                Duration::from_secs(600)
+            )]
+        );
     }
 
     #[tokio::test]
@@ -615,8 +658,8 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ("dag-a".into(), "w-1".into()),
-                ("dag-b".into(), "w-2".into())
+                ("dag-a".into(), "w-1".into(), Duration::from_secs(600)),
+                ("dag-b".into(), "w-2".into(), Duration::from_secs(600))
             ]
         );
     }
@@ -647,9 +690,14 @@ mod tests {
             .unwrap();
 
         let seen = backend.seen.lock().await.clone();
+        // A WASM snippet keeps the tight snippet budget.
         assert_eq!(
             seen,
-            vec![("unscoped-tool-wasm_echo".into(), "plugin-42".into())]
+            vec![(
+                "unscoped-tool-wasm_echo".into(),
+                "plugin-42".into(),
+                Duration::from_secs(30)
+            )]
         );
     }
 }

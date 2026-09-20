@@ -292,6 +292,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "system.tool_timeout_secs".into(),
     );
     m.insert(
+        "COGNEVA_SHELL_TIMEOUT_SECS".into(),
+        "system.shell_timeout_secs".into(),
+    );
+    m.insert(
         "COGNEVA_GRPC_RECONNECT_INTERVAL_SECS".into(),
         "system.grpc_reconnect_interval_secs".into(),
     );

@@ -49,6 +49,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         let (
             hook_change_dir,
             tool_timeout_secs,
+            shell_timeout_secs,
             nats_config,
             hook_engine_config,
             _agent_config,
@@ -59,6 +60,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             (
                 cog_core::config::self_evolution_hook_dir(&config.self_evolution.change_dir),
                 config.system.tool_timeout_secs,
+                config.system.shell_timeout_secs,
                 config.dag_executor.nats.clone(),
                 config.hook_engine.clone(),
                 config.agent.clone(),
@@ -165,6 +167,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         let tool_registry = Arc::new(
             crate::ToolRegistry::new()
                 .with_wasm_timeout(tool_timeout_secs)
+                .with_shell_timeout(shell_timeout_secs)
                 .with_sandbox_backend(sandbox_backend)
                 .with_guardrail(guardrail)
                 .with_plugin_registry(plugin_registry)

@@ -708,6 +708,11 @@ pub struct SystemConfig {
     pub partition_maintenance_interval_secs: u64,
     /// WASM tool execution timeout (seconds).
     pub tool_timeout_secs: u64,
+    /// Shell command timeout (seconds). Separate from `tool_timeout_secs`: a
+    /// WASM snippet is bounded work, while a command may legitimately run a
+    /// compiler — one budget cannot serve both. Must not exceed the executor's
+    /// own ceiling, which silently clamps anything larger.
+    pub shell_timeout_secs: u64,
     /// URL of the remote sandbox executor (e.g.
     /// `http://cogneva-sandbox-executor.cogneva.svc:9090`). When set, shell
     /// command tools execute in the isolated executor pod; when absent,
@@ -773,6 +778,7 @@ impl Default for SystemConfig {
             stale_task_detector_poll_secs: 15,
             partition_maintenance_interval_secs: 3600,
             tool_timeout_secs: 30,
+            shell_timeout_secs: 600,
             sandbox_executor_url: None,
             require_tool_identity: false,
             grpc_reconnect_interval_secs: 5,
