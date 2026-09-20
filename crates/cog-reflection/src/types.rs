@@ -231,15 +231,6 @@ pub struct ModeDecisionRecord {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Aggregated statistics for a task category.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ModeStatistics {
-    pub pipeline_attempts: u32,
-    pub pipeline_successes: u32,
-    pub roundtable_attempts: u32,
-    pub roundtable_successes: u32,
-}
-
 // ============================================================================
 // Discovery Types
 // ============================================================================

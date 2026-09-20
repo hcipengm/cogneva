@@ -96,7 +96,7 @@ pub use mainline_deployer::{
     RolloutFailure, RolloutPlan, RolloutTarget,
 };
 pub use matcher::{DefaultLearningMatcher, LearningMatcher};
-pub use meta_learning::MetaLearningEngine;
+pub use meta_learning::{DecisionStatsSnapshot, MetaLearningEngine};
 pub use policy_evolution::{
     run_policy_evolution_loop, PolicyEvolutionConfig, PolicyEvolutionDriver, PolicyEvolutionOutcome,
 };

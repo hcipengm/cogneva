@@ -293,6 +293,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // active 版本读取；ArtifactEvolution 供评估侧在统计显著时升级策略。
         let policy_dir = format!("{}/policies", ctx.config().app.data_dir);
         let policy_store = crate::PolicyStore::new(&policy_dir);
+        // 决策聚合是进程内的，重启即空；而调参驱动与推荐路径都读它，所以它
+        // 必须落在本进程自己的数据卷上——否则「攒够证据才调参」会被每次换版
+        // 清零，参数搜索在频繁重建 Pod 的部署上永远到不了 min_trials。快照
+        // 只被本进程读写，不碰共享库表，也不依赖 memory 后端。
+        let stats_path = format!(
+            "{}/meta_learning/decision_stats.json",
+            ctx.config().app.data_dir
+        );
         // 一个进程只造一个引擎，写侧和读侧共用同一个对象：squad 把决策结果
         // 记进它，推荐路径从它的 active 版本读参数，调参驱动也从它读已记录
         // 的结果。任何一侧拿到的是另一个实例，两边就都活着却谁也看不见谁
@@ -300,8 +308,26 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // 「原来有没有引擎」分叉：没有就造一个，造完一律挂上策略库。
         let meta_learning_engine = Arc::new(
             crate::MetaLearningEngine::new(engine.recorder.clone())
-                .with_policy_store(policy_store.clone(), "meta_learning.mode"),
+                .with_policy_store(policy_store.clone(), "meta_learning.mode")
+                .with_state_snapshot(crate::DecisionStatsSnapshot::new(&stats_path)),
         );
+        match meta_learning_engine.hydrate().await {
+            Ok((0, _)) => info!(
+                path = %stats_path,
+                "meta-learning state: nothing to restore (first start, or no decision recorded yet)"
+            ),
+            Ok((groups, trials)) => info!(
+                path = %stats_path,
+                groups,
+                trials,
+                "meta-learning state restored from the durable snapshot"
+            ),
+            Err(e) => warn!(
+                path = %stats_path,
+                error = %e,
+                "meta-learning state snapshot unreadable; starting from empty"
+            ),
+        }
         engine.meta_learning = Some(meta_learning_engine.clone());
         let artifact_evolution = Arc::new(crate::ArtifactEvolution::new(policy_store));
         // 循环在 start() 挂载；这里先把两侧拿在手上。
