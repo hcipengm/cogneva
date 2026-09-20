@@ -625,6 +625,8 @@ struct AppState {
     /// No total timeout — SSE streams from reasoning models can run for
     /// minutes; only connection establishment is bounded.
     stream_client: reqwest::Client,
+    /// 出站请求自我标识（`cogneva/<版本>`，有构建版本时带进去）。
+    outbound_identity: Arc<str>,
     egress_stats: std::sync::Arc<LatencyStats>,
     llm_stats: std::sync::Arc<LatencyStats>,
     code_stats: std::sync::Arc<LatencyStats>,
@@ -2268,7 +2270,7 @@ async fn code_platform_forward(
             builder = builder.header(key, v);
         }
     }
-    builder = builder.header("User-Agent", "cogneva-security-gateway");
+    // User-Agent 由客户端默认头给（GitHub API 也要求请求带 UA）。
     if matches!(platform, CodePlatform::GitHub) {
         builder = builder.bearer_auth(token);
     }
@@ -2407,7 +2409,7 @@ async fn attach_proxy(
 
     let mut builder = client
         .get(url.clone())
-        .header("User-Agent", "cogneva-security-gateway");
+        .header("User-Agent", &*state.outbound_identity);
     if matches!(platform, CodePlatform::GitHub)
         && matches!(host.as_str(), "github.com" | "api.github.com")
     {
@@ -3037,8 +3039,40 @@ fn seed_pool_down(raw: Option<&str>) -> bool {
         .is_some_and(|s| s.unavailable)
 }
 
+/// 出站请求的自我标识。
+///
+/// 上游后台按调用方归属用量，而网关此前连 User-Agent 都不带（reqwest 默认不
+/// 发），那个看板上这些 token 就没有主人：跨上游对账时对不出是谁在烧配额，
+/// 出事后也追不回是哪一次构建。标识的是我们自己，不含任何上游信息。
+fn outbound_identity(build_revision: Option<&str>) -> String {
+    match build_revision {
+        Some(rev) if !rev.is_empty() => format!("cogneva/{} ({rev})", env!("CARGO_PKG_VERSION")),
+        _ => format!("cogneva/{}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+/// 把自我标识做成客户端默认头：调用方自己带的 User-Agent 仍按其请求头走
+/// （逐请求头优先于默认头），所以这个默认只补上"没写身份"的那些请求。
+fn identity_default_headers(identity: &str) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(ua) = reqwest::header::HeaderValue::from_str(identity) {
+        headers.insert(reqwest::header::USER_AGENT, ua);
+    }
+    headers.insert(
+        reqwest::header::HeaderName::from_static("x-app"),
+        reqwest::header::HeaderValue::from_static("cogneva"),
+    );
+    headers
+}
+
 /// 启动安全网关（三个通道各自监听）。
-pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `build_revision` 是二进制内嵌的构建版本，由调用方交进来：库 crate 看不到
+/// 二进制包的构建变量（那个 rustc-env 只作用于声明了 build script 的包）。
+pub async fn run(
+    config: SecurityGatewayConfig,
+    build_revision: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let http_client: Arc<dyn cog_core::HttpClient> =
         Arc::new(cog_net::ReqwestHttpClient::new(reqwest::Client::new()));
     init_gateway_logging(&config.observability, &http_client);
@@ -3062,13 +3096,19 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
         }
         None => false,
     };
+    let identity: Arc<str> = Arc::from(outbound_identity(build_revision).as_str());
+    let identity_headers = identity_default_headers(&identity);
+    tracing::info!(identity = %identity, "安全网关出站请求自我标识");
     let state = AppState {
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
+            .default_headers(identity_headers.clone())
             .build()?,
         stream_client: reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            .default_headers(identity_headers.clone())
             .build()?,
+        outbound_identity: identity,
         egress_stats: std::sync::Arc::new(LatencyStats::default()),
         llm_stats: std::sync::Arc::new(LatencyStats::default()),
         code_stats: std::sync::Arc::new(LatencyStats::default()),
@@ -3120,8 +3160,8 @@ pub async fn run(config: SecurityGatewayConfig) -> Result<(), Box<dyn std::error
 }
 
 /// 从环境变量启动（`cogneva security-gateway` 子命令入口）。
-pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    run(SecurityGatewayConfig::from_env()).await
+pub async fn run_from_env(build_revision: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    run(SecurityGatewayConfig::from_env(), build_revision).await
 }
 
 #[cfg(test)]
@@ -3869,9 +3909,18 @@ mod tests {
     }
 
     fn test_state(upstreams: Vec<LlmUpstream>) -> AppState {
+        let identity = "cogneva/test";
+        let headers = identity_default_headers(identity);
         AppState {
-            client: reqwest::Client::new(),
-            stream_client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .default_headers(headers.clone())
+                .build()
+                .unwrap(),
+            stream_client: reqwest::Client::builder()
+                .default_headers(headers)
+                .build()
+                .unwrap(),
+            outbound_identity: Arc::from(identity),
             egress_stats: std::sync::Arc::new(LatencyStats::default()),
             llm_stats: std::sync::Arc::new(LatencyStats::default()),
             code_stats: std::sync::Arc::new(LatencyStats::default()),
@@ -4111,5 +4160,102 @@ mod tests {
 
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(logged.is_empty(), "4xx 不该留痕：{logged}");
+    }
+
+    /// 桩上游：记录收到的请求头，供"标识有没有真的发出去"这类断言使用。
+    type SeenHeaders = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    async fn spawn_header_recording_upstream() -> (String, SeenHeaders) {
+        let seen: SeenHeaders = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/chat/completions",
+            post({
+                let seen = seen.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let seen = seen.clone();
+                    async move {
+                        let mut out = seen.lock().unwrap();
+                        for (k, v) in headers.iter() {
+                            out.push((
+                                k.as_str().to_string(),
+                                v.to_str().unwrap_or_default().to_string(),
+                            ));
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                        }))
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn recorded(seen: &SeenHeaders, name: &str) -> Option<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    /// 上游后台按调用方归属用量，所以出站请求必须自己报出是谁在调用。这条测试
+    /// 不看代码怎么写的，而是拿桩上游**收到**的请求头断言——两条 LLM 出口各走各
+    /// 的客户端（透传走 stream_client、意图封装走 client），任一条漏带标识都要
+    /// 在这条测试上红。
+    #[tokio::test]
+    async fn llm_upstreams_see_who_is_calling() {
+        let (base, seen) = spawn_header_recording_upstream().await;
+        let state = test_state(vec![stub_upstream(&base, "m1")]);
+
+        // 出口一：/v1/chat/completions 透传（stream_client）。
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = chat_completions_passthrough(State(state.clone()), req)
+            .await
+            .expect("上游可达时返回 Response");
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ua = recorded(&seen, "user-agent").expect("透传请求必须带 User-Agent");
+        assert!(ua.starts_with("cogneva/"), "User-Agent 要自报身份：{ua}");
+        assert_eq!(recorded(&seen, "x-app").as_deref(), Some("cogneva"));
+
+        // 出口二：/v1/intent 的 LLM 调用（client，另一条连接池）。
+        seen.lock().unwrap().clear();
+        let _ = intent_inner(
+            &state,
+            IntentRequest {
+                intent: "ping".into(),
+                context: None,
+                schema: None,
+            },
+        )
+        .await
+        .expect("上游可达时返回结果");
+        let ua = recorded(&seen, "user-agent").expect("意图请求必须带 User-Agent");
+        assert!(ua.starts_with("cogneva/"), "User-Agent 要自报身份：{ua}");
+        assert_eq!(recorded(&seen, "x-app").as_deref(), Some("cogneva"));
+    }
+
+    #[test]
+    fn outbound_identity_carries_the_build_revision_when_there_is_one() {
+        let bare = outbound_identity(None);
+        assert!(bare.starts_with("cogneva/"), "{bare}");
+        assert_eq!(outbound_identity(Some("")), bare, "空 rev 不留下空括号");
+
+        let revved = outbound_identity(Some("abc1234"));
+        assert!(revved.starts_with(&bare), "{revved}");
+        assert!(revved.contains("abc1234"), "{revved}");
     }
 }

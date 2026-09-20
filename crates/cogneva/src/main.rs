@@ -22,7 +22,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // 独立安全网关模式（deploy/k3s/gateway-deployment.yaml 的启动命令）。
     if std::env::args().nth(1).as_deref() == Some("security-gateway") {
-        return cog_gateway::security_gateway::run_from_env().await;
+        return cog_gateway::security_gateway::run_from_env(Some(env!("COGNEVA_GIT_REVISION")))
+            .await;
     }
     // 独立沙箱执行器模式（deploy/k3s/sandbox-executor-deployment.yaml 的启动命令）。
     if std::env::args().nth(1).as_deref() == Some("sandbox-executor") {
