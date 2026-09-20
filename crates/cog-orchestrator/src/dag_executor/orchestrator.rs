@@ -763,7 +763,15 @@ impl DagExecutor {
             },
         )
         .await?;
-        let max_retries = self.retry_matrix.max_retries(&task.task_type);
+        // 与内存路径同一个判据：不能靠重跑清除的失败不给重试预算。
+        let max_retries = if Self::is_retryable_failure(&error, cause) {
+            self.retry_matrix.max_retries(&task.task_type)
+        } else {
+            0
+        };
+        // 退避随任务一起落库，不留在调度循环的内存里：判定重试的进程与之后
+        // 重新投递它的进程可能不是同一个。
+        let retry_delay = self.retry_matrix.delay(&task.task_type, task.retry_count);
         let (retried, cancelled) = be
             .dag_fail_task(
                 &self.workspace_id,
@@ -771,6 +779,7 @@ impl DagExecutor {
                 error.clone(),
                 cause,
                 max_retries,
+                retry_delay,
             )
             .await?;
         for dep_id in &cancelled {
@@ -912,10 +921,14 @@ impl DagExecutor {
         let tasks = self.all_tasks_unified().await;
         let by_id: std::collections::HashMap<&str, &Task> =
             tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        let now = chrono::Utc::now();
         let mut ready: Vec<Task> = tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Pending)
             .filter(|t| t.is_executable)
+            // 退避未到期的重试不是"就绪"，重投它等于取消退避。周期性发布者每次
+            // 都会扫到这里，所以这个过滤同时也是退避到点后的重新投递者。
+            .filter(|t| t.retry_not_before.is_none_or(|due| due <= now))
             .filter(|t| {
                 t.blocked_by.iter().all(|dep_id| {
                     by_id
@@ -1329,6 +1342,24 @@ impl DagExecutor {
         result
     }
 
+    /// Whether re-running this task could succeed.
+    ///
+    /// Two independent channels can say a failure is deterministic, and either
+    /// one is enough. [`UpstreamFailure::is_terminal`] is the typed channel,
+    /// filled when the transport saw an HTTP status. The reason prefix is the
+    /// in-band channel, and it is what carries the verdict when the failure is
+    /// discovered one or more crates deeper than the transport — a generator
+    /// that produced nothing because its prompt never reached the upstream
+    /// reports it as text, and no status code survives that far.
+    ///
+    /// Both are consulted because they answer the same question from different
+    /// distances, and a retry that only reads the near one pays again for every
+    /// failure whose cause was found far away.
+    fn is_retryable_failure(error: &str, cause: Option<UpstreamFailure>) -> bool {
+        !cause.is_some_and(UpstreamFailure::is_terminal)
+            && !cog_core::contract::outcome::is_deterministic_failure(error)
+    }
+
     /// Fail a task with the given error.
     /// Returns `(retried, cancelled, dlq_pushed)` where:
     /// - `retried` = `true` if the task was sent back to Pending for retry
@@ -1373,7 +1404,15 @@ impl DagExecutor {
                 timestamp: chrono::Utc::now(),
             });
 
-        let max_retries = self.retry_matrix.max_retries(&task_type);
+        // 确定性失败不受重试预算约束：同样的输入在同一环境里再来一次必然同样
+        // 失败，多付的只是那一轮烧掉的 token 和上游调用。预算清零比"重试三次
+        // 都白跑"更省，也让失败原因在第一轮就浮出来而不是被三次重试盖住。
+        let retryable = Self::is_retryable_failure(&error, cause);
+        let max_retries = if retryable {
+            self.retry_matrix.max_retries(&task_type)
+        } else {
+            0
+        };
 
         let task = inner.tasks.get_mut(task_id).expect("task exists");
         if retry_count < max_retries {
@@ -1382,6 +1421,8 @@ impl DagExecutor {
             task.error = Some(error.clone());
             task.error_cause = cause;
             task.updated_at = chrono::Utc::now();
+            task.retry_not_before =
+                Some(chrono::Utc::now() + self.retry_matrix.delay(&task_type, retry_count));
 
             drop(inner);
             self.emit_event(cog_core::TaskEvent::TaskFailed {
@@ -1407,6 +1448,9 @@ impl DagExecutor {
             task.error = Some(error.clone());
             task.error_cause = cause;
             task.updated_at = chrono::Utc::now();
+            // 终态任务若留下一个未来的时间戳，人工重投它时会先被退避挡掉——
+            // 那个时间戳只在"回到 Pending 等下一次"这条路上有意义。
+            task.retry_not_before = None;
 
             // Mark that DLQ push is needed; callers should call `push_to_dlq` async.
             let dlq_pushed = self.dlq.is_some();
@@ -2507,5 +2551,139 @@ mod tests {
         let view = dag.get_task("sig-alert-store").await.unwrap();
         assert_eq!(view.status, TaskStatus::Failed);
         assert!(view.error.as_deref().unwrap().contains("empty plan"));
+    }
+
+    /// 重试预算按失败原因发放，不按任务类型固定发。生成链在配额耗尽时报
+    /// `terminal_env_failure`：同一环境里再来一次必然是同一个结果，重试只是
+    /// 把整条 Squad→PGE 流水线连同它的 LLM 调用再买一遍。这条测试钉住的是
+    /// "预算没被发出去"——只钉 `retried=false` 的话，一个把状态留在 Pending 的
+    /// 实现也能过。
+    #[tokio::test]
+    async fn a_deterministic_failure_is_not_retried() {
+        let dag = DagExecutor::new("ws-terminal".into());
+        let task = Task::new("t-terminal", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+
+        let (retried, cancelled, _) = dag
+            .fail_task(
+                &task_id,
+                "terminal_env_failure: generator produced no artifacts (environment/protocol failure)"
+                    .into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!retried, "a deterministic failure must not be retried");
+        assert!(cancelled.is_empty());
+        let view = dag.get_task(&task_id).await.unwrap();
+        assert_eq!(view.status, TaskStatus::Failed);
+        assert_eq!(view.retry_count, 0, "the budget was never spent");
+        assert!(view.retry_not_before.is_none());
+    }
+
+    /// 类型通道与文本通道各自独立成立。传输层看到的配额耗尽（402/401）在
+    /// 文本里不出现任何前缀，只凭文本判断就会把它当可重试；这条钉住类型
+    /// 通道没有被文本判据吞掉。
+    #[tokio::test]
+    async fn a_terminal_upstream_cause_is_not_retried() {
+        let dag = DagExecutor::new("ws-cause".into());
+        let task = Task::new("t-cause", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+
+        let (retried, _, _) = dag
+            .fail_task(
+                &task_id,
+                "upstream refused".into(),
+                Some(UpstreamFailure::QuotaExhausted),
+            )
+            .await
+            .unwrap();
+
+        assert!(!retried);
+        assert_eq!(
+            dag.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Failed
+        );
+    }
+
+    /// 可重试的失败回到 Pending，但要等够该任务类型的退避才重新就绪。
+    /// 没有这一步，重试就是零延迟重投——`RetryMatrix::delay` 配了也等于没有。
+    #[tokio::test]
+    async fn a_transient_failure_waits_out_its_backoff() {
+        let dag = DagExecutor::new("ws-backoff".into());
+        let task = Task::new("t-backoff", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+
+        let (retried, _, _) = dag
+            .fail_task(&task_id, "upstream is unreachable".into(), None)
+            .await
+            .unwrap();
+
+        assert!(retried, "a transient failure keeps its retry");
+        let view = dag.get_task(&task_id).await.unwrap();
+        assert_eq!(view.status, TaskStatus::Pending);
+        assert_eq!(view.retry_count, 1);
+        // DagNode 的第一次退避是 5s；判据取"明显晚于现在"而不是具体秒数，
+        // 免得把策略里的数值复制进测试后两边各自漂移。
+        let due = view.retry_not_before.expect("a backoff deadline");
+        assert!(
+            due > chrono::Utc::now() + chrono::Duration::seconds(3),
+            "retry deadline {due} is not held off"
+        );
+
+        // 未到期的重试不是就绪任务：发布者扫到它也不能重投。
+        assert!(
+            !dag.find_ready_tasks().await.iter().any(|t| t.id == task_id),
+            "a task inside its backoff window was offered as ready"
+        );
+    }
+
+    /// 存续模式走的是另一条路径（判定在 `dag_fail_task` 里，退避要随 JSONB
+    /// 一起落库）。双 pod 下判定与重新投递不是同一个进程，只测内存路径会漏掉
+    /// 退避在过界时丢掉的那种实现。
+    #[tokio::test]
+    async fn store_mode_holds_off_a_transient_retry_too() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-backoff-fg".into()).with_state_backend(backend);
+        let task = Task::new("t-backoff-fg", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+
+        let (retried, _, _) = dag
+            .fail_task(&task_id, "upstream is unreachable".into(), None)
+            .await
+            .unwrap();
+        assert!(retried);
+
+        let view = dag.get_task(&task_id).await.unwrap();
+        assert_eq!(view.retry_count, 1);
+        let due = view
+            .retry_not_before
+            .expect("a backoff deadline survived the store");
+        assert!(due > chrono::Utc::now() + chrono::Duration::seconds(3));
+        assert!(!dag.find_ready_tasks().await.iter().any(|t| t.id == task_id));
+
+        // 存续模式下终止性失败同样不重试。
+        let other = Task::new("t-terminal-fg", TaskType::DagNode, serde_json::json!({}));
+        let other_id = other.id.clone();
+        dag.add_task(other).await.unwrap();
+        dag.schedule_task(&other_id).await.unwrap();
+        let (retried, _, _) = dag
+            .fail_task(&other_id, "terminal_env_failure: no artifacts".into(), None)
+            .await
+            .unwrap();
+        assert!(!retried);
+        assert_eq!(
+            dag.get_task(&other_id).await.unwrap().status,
+            TaskStatus::Failed
+        );
     }
 }

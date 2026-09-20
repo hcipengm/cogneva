@@ -815,6 +815,7 @@ impl StateBackend for PostgresStateBackend {
         error: String,
         cause: Option<UpstreamFailure>,
         max_retries: u32,
+        retry_delay: std::time::Duration,
     ) -> SFResult<(bool, Vec<String>)> {
         let mut tx = self
             .pool
@@ -850,8 +851,12 @@ impl StateBackend for PostgresStateBackend {
         if should_retry {
             task.retry_count += 1;
             task.status = cog_core::TaskStatus::Pending;
+            task.retry_not_before = chrono::Duration::from_std(retry_delay)
+                .ok()
+                .map(|d| Utc::now() + d);
         } else {
             task.status = cog_core::TaskStatus::Failed;
+            task.retry_not_before = None;
             // 递归级联取消全部非终态下游
             let mut stack = vec![task_id.to_string()];
             let mut visited = std::collections::HashSet::new();

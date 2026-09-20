@@ -21,6 +21,7 @@ fn make_test_task(id: &str) -> Task {
         workspace_id: None,
         retry_count: 0,
         max_retries: 3,
+        retry_not_before: None,
         started_at: None,
         timeout_seconds: 300,
         action_planner_meta: None,

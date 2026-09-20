@@ -95,6 +95,14 @@ pub struct Task {
     pub workspace_id: Option<String>,
     pub retry_count: u32,
     pub max_retries: u32,
+    /// 重新允许本任务被执行的最早时刻，由失败路径按重试策略的退避算出。
+    ///
+    /// 退避必须落在任务自身而不是调度循环的内存里：判定重试的进程与最终把它
+    /// 重新投递出去的进程可能不是同一个，值只留在内存里就会随重启或换 pod 丢
+    /// 失，退避静默退化成零延迟重试——配置上的退避策略看着还在，实际一次都没
+    /// 生效。`None` 表示随时可执行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_not_before: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     pub timeout_seconds: u64,
@@ -228,6 +236,7 @@ impl Task {
             workspace_id: None,
             retry_count: 0,
             max_retries: 3,
+            retry_not_before: None,
             started_at: None,
             timeout_seconds: 300,
             action_planner_meta: None,

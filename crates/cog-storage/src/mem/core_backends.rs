@@ -409,6 +409,7 @@ impl StateBackend for MemoryStateBackend {
         error: String,
         cause: Option<UpstreamFailure>,
         max_retries: u32,
+        retry_delay: std::time::Duration,
     ) -> SFResult<(bool, Vec<String>)> {
         let mut store = self
             .store
@@ -427,10 +428,14 @@ impl StateBackend for MemoryStateBackend {
         if task.retry_count < max_retries {
             task.retry_count += 1;
             task.status = cog_core::TaskStatus::Pending;
+            task.retry_not_before = chrono::Duration::from_std(retry_delay)
+                .ok()
+                .map(|d| chrono::Utc::now() + d);
             return Ok((true, Vec::new()));
         }
 
         task.status = cog_core::TaskStatus::Failed;
+        task.retry_not_before = None;
         let downstream = collect_downstream_derived(tasks, task_id);
         let mut cancelled = Vec::new();
         for dep_id in downstream {

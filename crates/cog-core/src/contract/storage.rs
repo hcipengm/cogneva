@@ -548,10 +548,16 @@ pub trait StateBackend: Send + Sync {
     }
 
     /// Atomically fail a task.
-    /// `retry_count < max_retries`: bump retry_count, back to `Pending`,
-    /// returns `(true, [])`. Otherwise `Failed` + recursive cascade-cancel
-    /// of all non-terminal downstream tasks, returns `(false, cancelled)`.
+    /// `retry_count < max_retries`: bump retry_count, back to `Pending` with
+    /// `retry_not_before = now + retry_delay`, returns `(true, [])`. Otherwise
+    /// `Failed` + recursive cascade-cancel of all non-terminal downstream
+    /// tasks, returns `(false, cancelled)`.
     /// `cause` 与 `error` 一起落到任务记录上：文本给人读，类型给判定读。
+    ///
+    /// `max_retries` 由调用方按失败原因算出，不是任务类型的固定配额：确定性
+    /// 失败传 0。退避同理由调用方按任务类型与已尝试次数算出后传进来，实现侧
+    /// 只负责让它随任务落库——判定重试的进程与之后重新投递它的进程可能不是
+    /// 同一个，退避留在内存里就会丢。
     async fn dag_fail_task(
         &self,
         workspace_id: &str,
@@ -559,6 +565,7 @@ pub trait StateBackend: Send + Sync {
         _error: String,
         _cause: Option<UpstreamFailure>,
         _max_retries: u32,
+        _retry_delay: std::time::Duration,
     ) -> SFResult<(bool, Vec<String>)> {
         let _ = workspace_id;
         let _ = task_id;

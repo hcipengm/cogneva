@@ -994,6 +994,7 @@ mod consumer_ack_tests {
             workspace_id: Some("ws-ack-test".into()),
             retry_count: 0,
             max_retries: 1,
+            retry_not_before: None,
             started_at: None,
             timeout_seconds: 30,
             action_planner_meta: None,

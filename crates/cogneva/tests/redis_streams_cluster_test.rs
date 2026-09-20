@@ -47,6 +47,7 @@ fn make_task(id: &str, task_type: TaskType, blocked_by: Vec<String>, workspace: 
         workspace_id: Some(workspace.into()),
         retry_count: 0,
         max_retries: 2,
+        retry_not_before: None,
         started_at: None,
         timeout_seconds: 30,
         action_planner_meta: None,
