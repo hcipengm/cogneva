@@ -44,6 +44,10 @@ pub struct LlmUpstream {
     /// 保持既有放行行为）；`Some(false)` = 探测证实不支持，携带 tools 的
     /// 请求不再路由到该上游（快速失败，而不是让调用方烧钱空转）。
     pub supports_tool_calls: Option<bool>,
+    /// 准入探测实证的「只接受 temperature=1」。`None` = 未知，原样透传；
+    /// `Some(true)` = 透传时把调用方的 temperature 钳到 1（否则上游直接 400，
+    /// 调用方那一次请求白烧，还要多走一轮池内故障转移）。
+    pub requires_temperature_one: Option<bool>,
 }
 
 impl std::fmt::Debug for LlmUpstream {
@@ -205,6 +209,9 @@ fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
                 model: get("model"),
                 api_key: get("api_key"),
                 supports_tool_calls: v.get("supports_tool_calls").and_then(|x| x.as_bool()),
+                requires_temperature_one: v
+                    .get("requires_temperature_one")
+                    .and_then(|x| x.as_bool()),
             };
             if upstream.base_url.is_empty()
                 || upstream.model.is_empty()
@@ -1593,6 +1600,7 @@ async fn stream_forward(
             "anthropic" => format!("{base}/v1/messages"),
             _ => format!("{base}/chat/completions"),
         };
+        let mut clamped_temperature = false;
         let body = match &parsed {
             Some(v) => {
                 let mut v = v.clone();
@@ -1611,11 +1619,32 @@ async fn stream_forward(
                             }
                         }
                     }
+                    // 有的推理模型只接受 temperature=1，别的值直接 400。调用
+                    // 方判定不了这件事：它连的是网关，base URL 里没有厂商身份，
+                    // 客户端侧按 vendor 域名做的兼容探测在部署形态下永远不命中。
+                    // 网关是唯一知道真实上游的地方，也是既有的协议适配点。
+                    if upstream.requires_temperature_one == Some(true) {
+                        if let Some(t) = obj.get_mut("temperature") {
+                            if t.as_f64() != Some(1.0) {
+                                *t = serde_json::json!(1.0);
+                                clamped_temperature = true;
+                            }
+                        }
+                    }
                 }
                 serde_json::to_vec(&v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
             }
             None => body.to_vec(),
         };
+        if clamped_temperature {
+            let upstream_key = LlmHealthTable::key(upstream);
+            record_counter(
+                &state,
+                "llm_request_param_clamped_total",
+                &[("field", "temperature"), ("upstream", &upstream_key)],
+            )
+            .await;
+        }
 
         let start = std::time::Instant::now();
         let builder = state
@@ -3402,6 +3431,21 @@ mod tests {
     }
 
     #[test]
+    fn upstreams_temperature_constraint_parsed() {
+        let list = parse_upstreams(
+            r#"[
+                {"api_style": "openai", "base_url": "https://a.example.com", "model": "m1", "api_key": "k1", "requires_temperature_one": true},
+                {"api_style": "openai", "base_url": "https://b.example.com", "model": "m2", "api_key": "k2", "requires_temperature_one": false},
+                {"api_style": "openai", "base_url": "https://c.example.com", "model": "m3", "api_key": "k3"}
+            ]"#,
+        );
+        assert_eq!(list[0].requires_temperature_one, Some(true));
+        assert_eq!(list[1].requires_temperature_one, Some(false));
+        // 老条目没有该字段：约束未知，调用方原样透传（不退化既有行为）。
+        assert_eq!(list[2].requires_temperature_one, None);
+    }
+
+    #[test]
     fn suspect_backoff_exponential_and_capped() {
         // 窗口 = 探测间隔 × 2^(n-1)，封顶 6h；间隔有 30s 下限防呆。
         assert_eq!(suspect_backoff_secs(1, 300), 300);
@@ -3420,6 +3464,7 @@ mod tests {
             model: "m1".into(),
             api_key: "k".into(),
             supports_tool_calls: None,
+            requires_temperature_one: None,
         };
         assert!(!table.is_suspect(&u));
         // 首次失败开新窗：返回计数供调用方打 WARN。
@@ -3481,6 +3526,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
             supports_tool_calls: None,
+            requires_temperature_one: None,
         };
         let a = mk("https://a");
         let b = mk("https://b");
@@ -3732,6 +3778,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
             supports_tool_calls: None,
+            requires_temperature_one: None,
         };
         let a = mk("https://a");
         let b = mk("https://b");
@@ -3806,6 +3853,65 @@ mod tests {
         assert_eq!(&bytes[..], healthy_body.as_bytes());
         assert!(state.llm_health.is_suspect(&stub_upstream(&dead, "m1")));
         assert!(!state.llm_health.is_suspect(&stub_upstream(&healthy, "m2")));
+    }
+
+    #[tokio::test]
+    async fn passthrough_clamps_temperature_only_where_the_upstream_demands_it() {
+        // 同一个请求体走两条路径：有该约束的上游必须收到温度 1，没有的必须原样
+        // 收到 0.2。只断言"改了"会漏掉"对所有上游都乱改"的另一侧。
+        let constrained_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let constrained_stub = spawn_capturing_upstream(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            constrained_seen.clone(),
+        )
+        .await;
+        let mut constrained = stub_upstream(&constrained_stub, "m1");
+        constrained.requires_temperature_one = Some(true);
+
+        let plain_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plain_stub = spawn_capturing_upstream(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            plain_seen.clone(),
+        )
+        .await;
+        let plain = stub_upstream(&plain_stub, "m2");
+
+        let req_body = r#"{"model":"placeholder","temperature":0.2,"messages":[{"role":"user","content":"hi"}]}"#;
+
+        let state = test_state(vec![constrained]);
+        let resp = chat_completions_passthrough(State(state.clone()), json_request(req_body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let got: serde_json::Value =
+            serde_json::from_str(&constrained_seen.lock().unwrap()[0]).unwrap();
+        assert_eq!(got["temperature"], serde_json::json!(1.0));
+        // 网关改写了调用方发的东西，这件事本身要有读数：静默改写等于调用方
+        // 以为自己在控温而实际没有。
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains("llm_request_param_clamped_total"),
+            "钳制必须留痕: {text}"
+        );
+
+        let plain_state = test_state(vec![plain]);
+        let resp = chat_completions_passthrough(State(plain_state.clone()), json_request(req_body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let got: serde_json::Value = serde_json::from_str(&plain_seen.lock().unwrap()[0]).unwrap();
+        assert_eq!(
+            got["temperature"],
+            serde_json::json!(0.2),
+            "没有该约束的上游温度必须原样透传"
+        );
+        let text = String::from_utf8(plain_state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            !text.contains("llm_request_param_clamped_total"),
+            "没钳过就不该有这个读数: {text}"
+        );
     }
 
     #[tokio::test]
@@ -3905,6 +4011,7 @@ mod tests {
             model: model.to_string(),
             api_key: "stub-key".into(),
             supports_tool_calls: None,
+            requires_temperature_one: None,
         }
     }
 
@@ -3962,6 +4069,44 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// 同上，外加把上游实际收到的请求体记下来——"网关到底改写了什么"只有看
+    /// 上游收到的那一份才算数。
+    async fn spawn_capturing_upstream(
+        status: u16,
+        body: &'static str,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
+        use axum::http::header;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |payload: String| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(payload);
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        [(header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// 透传端点的最小请求：非流式 chat 体，走真实路由。
+    fn json_request(body: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
     }
 
     #[test]

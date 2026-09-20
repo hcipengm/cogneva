@@ -280,9 +280,68 @@ async fn resolve_upstream(
                 );
             }
         }
+        // temperature 准入探测：有些推理模型只接受 temperature=1，调用方发的
+        // 别的值会被上游直接 400。调用方自己判断不了——它连的是网关，base URL
+        // 里没有厂商身份，客户端侧按域名做的兼容探测在部署形态下永远不命中，
+        // 该判据结构性不可达。网关是唯一知道真实上游的地方，探测结果存进池
+        // 条目，透传层据此钳制。探测不成（配额/鉴权/网络）不写字段，保持原样。
+        match detect_temperature_constraint(base_url, model, api_key).await {
+            Some(requires_one) => {
+                entry["requires_temperature_one"] = json!(requires_one);
+            }
+            None => {
+                tracing::warn!(
+                    base_url = %base_url,
+                    model = %model,
+                    "temperature constraint probe inconclusive; constraint left unknown"
+                );
+            }
+        }
     }
 
     Ok(entry)
+}
+
+/// 把一次最小 temperature 探测的响应归成能力判定：`Some(false)` = 上游接受了
+/// 非 1 的 temperature；`Some(true)` = 上游因 temperature 明确拒绝，只认 1；
+/// `None` = 说不清（配额/鉴权/网络/与温度无关的 400），不写字段。
+///
+/// 只有上游报文里点名 temperature 才算判定。配额与鉴权这类 4xx 也会带着各自
+/// 的措辞回来，把它们误读成"只认 1"会让所有调用方的温度被静默改写。
+fn classify_temperature_probe(status: u16, body: &str) -> Option<bool> {
+    if (200..300).contains(&status) {
+        return Some(false);
+    }
+    if body.to_lowercase().contains("temperature") {
+        return Some(true);
+    }
+    None
+}
+
+/// temperature 准入探测：发一个 temperature=0.2 的最小 chat 请求，看上游认不认。
+async fn detect_temperature_constraint(base_url: &str, model: &str, api_key: &str) -> Option<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+    let resp = client
+        .post(format!(
+            "{}/chat/completions",
+            base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": model,
+            "temperature": 0.2,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}]
+        }))
+        .send()
+        .await
+        .ok()?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    classify_temperature_probe(status, &body)
 }
 
 /// function-calling 实证探测：发一个带 tools 的最小 chat 请求，强制模型
@@ -562,7 +621,7 @@ impl KubeClient {
 
 #[cfg(test)]
 mod tests {
-    use super::apiserver_denies_ownership;
+    use super::{apiserver_denies_ownership, classify_temperature_probe};
 
     #[test]
     fn only_permission_verdicts_deny_ownership() {
@@ -577,5 +636,40 @@ mod tests {
                 "status {status} must not be read as a permission verdict"
             );
         }
+    }
+
+    #[test]
+    fn temperature_probe_reads_the_upstream_verdict() {
+        // 通了就是"任意温度都行"。
+        assert_eq!(classify_temperature_probe(200, "{}"), Some(false));
+        // 上游点名 temperature 拒绝：只认 1。
+        assert_eq!(
+            classify_temperature_probe(
+                400,
+                r#"{"error":{"message":"invalid temperature: only 1 is allowed for this model"}}"#
+            ),
+            Some(true)
+        );
+        // 配额/鉴权/服务端故障与温度无关：不能读成"只认 1"，否则所有调用方
+        // 的温度会被静默改写；也不能读成"任意值都行"，那会把约束漏掉。
+        assert_eq!(
+            classify_temperature_probe(
+                429,
+                r#"{"error":{"code":"AccountQuotaExceeded","message":"monthly quota"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            classify_temperature_probe(403, r#"{"error":{"type":"access_terminated_error"}}"#),
+            None
+        );
+        assert_eq!(
+            classify_temperature_probe(401, r#"{"error":{"message":"invalid api key"}}"#),
+            None
+        );
+        assert_eq!(
+            classify_temperature_probe(400, r#"{"error":{"message":"invalid request body"}}"#),
+            None
+        );
     }
 }
