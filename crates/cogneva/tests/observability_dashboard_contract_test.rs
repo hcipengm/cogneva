@@ -35,6 +35,10 @@ const PRODUCED: &[(&str, &[&str])] = &[
         "llm_call_latency_ms",
         &["upstream", "model", "result", "actor"],
     ),
+    // Agent run counters carry no labels: they are totals for the process, not
+    // per-task readings, so nothing distinguishes one sample from the next.
+    ("agent_success_count", &[]),
+    ("agent_budget_exhausted_count", &[]),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

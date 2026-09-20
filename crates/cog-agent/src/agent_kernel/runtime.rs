@@ -730,10 +730,13 @@ impl AgentRuntime {
                 })
                 .await?;
 
-                let success = self.state == RuntimeState::Complete;
                 let steps = self.steps.len();
                 let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
-                crate::observable::global_observable().record_run(success, steps, tool_calls);
+                crate::observable::global_observable().record_run(
+                    crate::observable::RunOutcome::Delivered,
+                    steps,
+                    tool_calls,
+                );
 
                 return Ok(result);
             }
@@ -788,10 +791,13 @@ impl AgentRuntime {
                 })
                 .await?;
 
-                let success = self.state == RuntimeState::Complete;
                 let steps = self.steps.len();
                 let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
-                crate::observable::global_observable().record_run(success, steps, tool_calls);
+                crate::observable::global_observable().record_run(
+                    crate::observable::RunOutcome::BudgetExhausted,
+                    steps,
+                    tool_calls,
+                );
 
                 return Ok(result);
             }
@@ -956,10 +962,13 @@ impl AgentRuntime {
         }
 
         // Record observable metrics for this run
-        let success = self.state == RuntimeState::Complete;
         let steps = self.steps.len();
         let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
-        crate::observable::global_observable().record_run(success, steps, tool_calls);
+        crate::observable::global_observable().record_run(
+            crate::observable::RunOutcome::BudgetExhausted,
+            steps,
+            tool_calls,
+        );
 
         Ok(result)
     }

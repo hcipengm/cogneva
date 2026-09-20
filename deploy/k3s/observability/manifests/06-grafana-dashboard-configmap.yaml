@@ -161,6 +161,31 @@ data:
             }
           },
           {
+            "id": 9,
+            "title": "Agent Run Outcomes (since process start)",
+            "description": "Every agent run ends either by delivering an answer or by spending its whole iteration budget without writing one. A rising exhausted count means tokens are being paid for runs that produce nothing. Both series reset when the pod restarts.",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+            "targets": [
+              {
+                "expr": "agent_success_count",
+                "legendFormat": "delivered",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              },
+              {
+                "expr": "agent_budget_exhausted_count",
+                "legendFormat": "budget exhausted",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "custom": {"drawStyle": "line", "lineWidth": 2}
+              }
+            }
+          },
+          {
             "id": 8,
             "title": "Recent Logs",
             "type": "logs",
