@@ -363,11 +363,43 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// 工作树是否已经停在 `base` 上、且没有跟踪文件的改动。只有拿到肯定证据
+    /// 才返回 true：解不出目标提交、读不到 HEAD、或 status 读不出来，都按"没停
+    /// 在"处理，让调用方走原来的 reset。
+    async fn sits_at_clean(&self, path: &Path, base: &BaseRef) -> bool {
+        let Ok(target) = self
+            .git_in(path, &["rev-parse", &format!("{}^{{commit}}", base.rev())])
+            .await
+        else {
+            return false;
+        };
+        let Ok(head) = self.git_in(path, &["rev-parse", "--verify", "HEAD"]).await else {
+            return false;
+        };
+        if head != target {
+            return false;
+        }
+        // 未跟踪文件不需要 reset（下面的 clean 会扫掉）、且清掉它们不写跟踪文件，
+        // 所以只看跟踪文件的改动。
+        matches!(
+            self.git_in(path, &["status", "--porcelain", "--untracked-files=no"])
+                .await,
+            Ok(out) if out.is_empty()
+        )
+    }
+
     /// 就地移动到 `base`：`reset --hard` + `clean -ffdx`。target 目录外置，
     /// 故 `-x` 不会误删编译缓存，工作树可以放心回到干净基线。
+    ///
+    /// 已经停在该提交、树又干净时跳过 reset：`reset --hard` 在索引的 stat 缓存
+    /// 与工作树对不上时（容器重启换了挂载，git 记的 inode/ctime 全部失效、判定
+    /// 依据只剩内容）会把整棵树重写一遍，每个文件 mtime 都刷新。本地 path crate
+    /// 的新鲜度按 mtime 判，这一下等于把增量缓存全量作废，而树的内容其实没变。
     pub async fn refresh(&self, ws: &Workspace, base: BaseRef) -> SFResult<()> {
-        self.git_in(&ws.path, &["reset", "--hard", base.rev()])
-            .await?;
+        if !self.sits_at_clean(&ws.path, &base).await {
+            self.git_in(&ws.path, &["reset", "--hard", base.rev()])
+                .await?;
+        }
         self.git_in(&ws.path, &["clean", "-ffdx"]).await?;
         Ok(())
     }
@@ -1001,6 +1033,54 @@ mod tests {
             "回到 rev_a 后 b.txt 应消失"
         );
         assert!(mgr.target_dir().join("marker").exists(), "编译缓存要保住");
+    }
+
+    /// 已经停在目标提交上、树又干净时，refresh 不该再 reset：这一次写既没有
+    /// 必要，又会在索引的 stat 缓存与工作树对不上时把整棵树重写一遍。用种在
+    /// GIT_DIR 里、不会过期的 index.lock 当探针——只有 reset 需要它（status 与
+    /// clean 都不写索引锁），所以这里还能成功就说明 reset 确实被跳过了。
+    #[tokio::test]
+    async fn refresh_skips_the_reset_when_already_at_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, rev_a, _rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare);
+        let ws = mgr
+            .acquire_ephemeral("cycle", BaseRef::Commit(rev_a.clone()))
+            .await
+            .unwrap();
+        let gitdir = PathBuf::from(git_out(&ws.path, &["rev-parse", "--absolute-git-dir"]));
+        let lock = gitdir.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        mgr.refresh(&ws, BaseRef::Commit(rev_a.clone()))
+            .await
+            .expect("目标就是当前 HEAD 时不该需要 reset，锁不该挡路");
+        assert!(lock.exists(), "探针锁不该被动");
+        assert_eq!(git_out(&ws.path, &["rev-parse", "HEAD"]), rev_a);
+    }
+
+    /// 跳过 reset 的判据是"没改动"，不是"HEAD 对上了就一律不动"：跟踪文件被
+    /// 改过、HEAD 又恰好停在目标上时，改动仍必须被丢弃。
+    #[tokio::test]
+    async fn refresh_still_discards_tracked_edits_at_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, rev_a, _rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare);
+        let ws = mgr
+            .acquire_ephemeral("cycle", BaseRef::Commit(rev_a.clone()))
+            .await
+            .unwrap();
+        std::fs::write(ws.path.join("a.txt"), "tampered\n").unwrap();
+
+        mgr.refresh(&ws, BaseRef::Commit(rev_a.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(ws.path.join("a.txt")).unwrap(),
+            "a\n",
+            "跟踪文件的改动要被丢回基线内容"
+        );
     }
 
     #[tokio::test]
