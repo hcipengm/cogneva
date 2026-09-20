@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use cog_core::{SFError, SFResult};
 
@@ -248,8 +248,12 @@ pub async fn run_policy_evolution_loop(
         tokio::select! {
             biased;
             _ = shutdown.wait() => break,
+            // 每轮结果必须落在默认可见级别。这一环的三种结论里两种都不动手，
+            // 若只在 debug 留痕，"没有更优候选"与"循环根本没跑"在运维面上就是
+            // 同一片空白；而 `baseline_trials` 正是"决策结果是否在积累"的唯一
+            // 带内证据，代价是每小时一行。
             _ = ticker.tick() => match driver.run_once().await {
-                Ok(outcome) => debug!(?outcome, "artifact-level evolution round"),
+                Ok(outcome) => info!(?outcome, "artifact-level evolution round"),
                 Err(e) => warn!(error = %e, "artifact-level evolution round failed"),
             },
         }
