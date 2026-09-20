@@ -281,6 +281,25 @@ impl PgeRoundtable {
                 break;
             }
 
+            // Same guard on the third role: a round whose judge spent its
+            // iteration budget did not judge, so another round hands the same
+            // judge the same budget. Named here rather than left to the
+            // degenerate-loop guard below, which would file the local cause as
+            // a debate that stopped making progress.
+            if let Some(reason) = evaluation.terminal_env_failure_reason() {
+                tracing::warn!(
+                    iteration,
+                    "Roundtable evaluator reported terminal environment failure; stopping debate"
+                );
+                if let Some(last) = history.last_mut() {
+                    last.evaluation.feedback = crate::squad::classify::declare(
+                        crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+                        reason,
+                    );
+                }
+                break;
+            }
+
             // Degenerate-loop guard: consecutive iterations the evaluator
             // judged no better mean more rounds only rephrase the same failure.
             // Mark the run and stop before spending more.
@@ -403,7 +422,17 @@ impl PgeRoundtable {
                 .await;
             review.enforce_criteria_evidence(!criteria.is_empty());
             let review_json = serde_json::to_value(&review).unwrap_or_default();
-            if !matches!(review.verdict, Verdict::Pass) {
+            if let Some(reason) = review.terminal_env_failure_reason() {
+                tracing::warn!(
+                    "Roundtable independent reviewer reported terminal environment failure"
+                );
+                consensus_reached = false;
+                last.evaluation.verdict = Verdict::Fail;
+                last.evaluation.feedback = crate::squad::classify::declare(
+                    crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+                    reason,
+                );
+            } else if !matches!(review.verdict, Verdict::Pass) {
                 consensus_reached = false;
                 last.evaluation.verdict = Verdict::Fail;
                 last.evaluation.feedback = format!(
@@ -1243,6 +1272,59 @@ mod tests {
             .and_then(|d| d.get("independent_review"))
             .expect("reviewer verdict must be recorded");
         assert_eq!(review["verdict"], "fail");
+    }
+
+    /// A debate round whose judge spent its iteration budget judged nothing.
+    /// Left unnamed it falls through to the degenerate-loop guard, so the run
+    /// is filed as a debate that stopped making progress and the local cause —
+    /// the judge's own budget — is lost.
+    #[tokio::test]
+    async fn a_debate_with_an_exhausted_judge_stops_naming_the_budget() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": {"code": "fn main() {}"}, "artifacts": []}),
+        )));
+        let evaluator =
+            EvaluatorActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+                "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
+                "iterations": 5,
+                "pending_tool_calls": 2
+            }))));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 5,
+                consensus_threshold: 0.5,
+                stall_threshold: 0,
+                independent_review: false,
+                ..Default::default()
+            },
+            planner,
+            generator,
+            evaluator,
+        );
+        let task = cog_core::Task::new(
+            "t-budget".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let result = rt.debate(&task, serde_json::json!({})).await;
+
+        assert_eq!(result.iterations, 1, "another round spends the same budget");
+        assert!(!result.consensus_reached);
+        let feedback = &result.final_evaluation.feedback;
+        assert!(
+            feedback.starts_with(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX),
+            "the outer loops match on the prefix, got: {feedback}"
+        );
+        assert!(
+            !feedback.contains("degenerate"),
+            "the local cause must not be filed as a stalled debate: {feedback}"
+        );
     }
 
     #[tokio::test]
