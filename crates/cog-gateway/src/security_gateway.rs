@@ -823,6 +823,52 @@ async fn record_llm_call(
             .property("actor", serde_json::json!(actor))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
+    if let Some(record) = failed_attempt_usage(upstream, result, latency_ms, actor) {
+        land_usage_record(state, record);
+    }
+}
+
+/// 失败尝试在台账里的落点。
+///
+/// 台账由 [`record_llm_tokens`] 落行，而它只在拿到真实用量时被调用，也就是只有
+/// 成功那次会落行——失败的尝试一条都不落，`gateway_llm_usage.result` 的取值域被
+/// 实现锁死成 `ok`，与 [`LlmUsageRecord::result`] 声称的 `ok | error` 不符。按
+/// `result` 切分只会得到一条"全成功"的读数，而池全灭时台账是安静的：那看起来像
+/// 没有流量，不像每一次尝试都被拒。
+///
+/// 失败的尝试零用量但可见（谁在什么时候试过哪个上游，被谁拒了），成功那条仍然由
+/// `record_llm_tokens` 带着真实用量落，所以这里对 `ok` 让位，避免同一次调用两行。
+fn failed_attempt_usage(
+    upstream: &LlmUpstream,
+    result: &str,
+    latency_ms: u64,
+    actor: &str,
+) -> Option<LlmUsageRecord> {
+    if result == "ok" {
+        return None;
+    }
+    Some(LlmUsageRecord {
+        upstream: LlmHealthTable::key(upstream),
+        api_style: upstream.api_style.clone(),
+        model: upstream.model.clone(),
+        result: result.to_string(),
+        actor: actor.to_string(),
+        tokens_input: 0,
+        tokens_output: 0,
+        latency_ms,
+    })
+}
+
+/// 台账写入异步化：流结束的调用方不该等一次 PG insert。
+fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
+    let Some(store) = state.pool_obs.usage.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(e) = store.record(&record).await {
+            tracing::warn!(error = %e, "LLM 计量明细落库失败");
+        }
+    });
 }
 
 /// 一次调用的 token 计量落点（三处同写）：Prometheus counter、ClickHouse 明细、
@@ -867,8 +913,9 @@ async fn record_llm_tokens(
             .property("tokens_out", serde_json::json!(tokens_output))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
-    if let Some(store) = &state.pool_obs.usage {
-        let record = LlmUsageRecord {
+    land_usage_record(
+        state,
+        LlmUsageRecord {
             upstream: key,
             api_style: upstream.api_style.clone(),
             model: upstream.model.clone(),
@@ -877,15 +924,8 @@ async fn record_llm_tokens(
             tokens_input,
             tokens_output,
             latency_ms,
-        };
-        let store = store.clone();
-        // 台账写入异步化：流结束的调用方不该等一次 PG insert。
-        tokio::spawn(async move {
-            if let Err(e) = store.record(&record).await {
-                tracing::warn!(error = %e, "LLM 计量明细落库失败");
-            }
-        });
-    }
+        },
+    );
 }
 
 /// 从一条 SSE `data:` 负载或非流式 JSON body 里提取 token usage。
@@ -3196,6 +3236,35 @@ pub async fn run_from_env(build_revision: Option<&str>) -> Result<(), Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_upstream() -> LlmUpstream {
+        LlmUpstream {
+            api_style: "openai".into(),
+            base_url: "https://upstream.example/v1".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            supports_tool_calls: None,
+            requires_temperature_one: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_attempt_lands_a_zero_token_row() {
+        // 失败尝试没有用量可带，于是曾经一条台账都不落，result 列只剩 ok。
+        let row = failed_attempt_usage(&test_upstream(), "error", 12, "agent:generator")
+            .expect("a failed attempt must be visible in the ledger");
+        assert_eq!(row.result, "error");
+        assert_eq!(row.tokens_input, 0);
+        assert_eq!(row.tokens_output, 0);
+        assert_eq!(row.actor, "agent:generator");
+        assert_eq!(row.model, "m");
+    }
+
+    #[test]
+    fn a_successful_call_is_not_landed_twice() {
+        // 成功那条由 record_llm_tokens 带着真实用量落，这里必须让位。
+        assert!(failed_attempt_usage(&test_upstream(), "ok", 12, "agent:generator").is_none());
+    }
 
     #[test]
     fn actor_header_normalized_to_bounded_labels() {
