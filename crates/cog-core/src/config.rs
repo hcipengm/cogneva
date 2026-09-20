@@ -336,6 +336,14 @@ pub struct GatewayConfig {
     pub sandbox_task_timeout_secs: u64,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// How often the contribution OAuth refresher wakes up. 0 = built-in
+    /// default ([`DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS`]).
+    #[serde(default)]
+    pub contribution_oauth_refresh_interval_secs: u64,
+    /// Renew the token once less than this much lifetime remains. 0 = built-in
+    /// default ([`DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS`]).
+    #[serde(default)]
+    pub contribution_oauth_refresh_threshold_secs: u64,
     /// Optional HTTP webhook URL for outbound notification delivery.
     #[serde(default)]
     pub notification_webhook_url: Option<String>,
@@ -359,7 +367,33 @@ impl GatewayConfig {
             self.access_token_ttl_minutes
         }
     }
+
+    /// Effective contribution OAuth refresher interval; never zero.
+    pub fn effective_contribution_oauth_refresh_interval_secs(&self) -> u64 {
+        if self.contribution_oauth_refresh_interval_secs == 0 {
+            DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS
+        } else {
+            self.contribution_oauth_refresh_interval_secs
+        }
+    }
+
+    /// Effective contribution OAuth renewal threshold; never zero. A threshold
+    /// of zero would renew only after the token had already expired.
+    pub fn effective_contribution_oauth_refresh_threshold_secs(&self) -> u64 {
+        if self.contribution_oauth_refresh_threshold_secs == 0 {
+            DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS
+        } else {
+            self.contribution_oauth_refresh_threshold_secs
+        }
+    }
 }
+
+/// Hourly wake-up. The access token lives 24h, so an hourly check leaves room
+/// for several failed attempts before the token actually lapses.
+pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS: u64 = 3600;
+/// Renew once under 4h of lifetime remain: enough for the token exchange, the
+/// Secret patch and the gateway roll to all land before expiry.
+pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS: u64 = 4 * 3600;
 
 fn default_websocket_timeout_secs() -> u64 {
     0
@@ -1143,6 +1177,34 @@ mod tests {
 
         let cfg: TierMigratorConfig = serde_json::from_str(r#"{"trace_scan_batch": 123}"#).unwrap();
         assert_eq!(cfg.trace_scan_batch, 123);
+    }
+
+    /// The refresher's two knobs default to zero, which means "use the built-in
+    /// default". A zero interval would busy-loop the token exchange and a zero
+    /// threshold would renew only once the token had already expired, so the
+    /// effective accessors must never return zero.
+    #[test]
+    fn contribution_oauth_refresh_defaults_are_never_zero() {
+        let cfg: GatewayConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            cfg.effective_contribution_oauth_refresh_interval_secs(),
+            DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS
+        );
+        assert_eq!(
+            cfg.effective_contribution_oauth_refresh_threshold_secs(),
+            DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS
+        );
+
+        let cfg: GatewayConfig = serde_json::from_str(
+            r#"{"contribution_oauth_refresh_interval_secs": 60,
+                "contribution_oauth_refresh_threshold_secs": 900}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_contribution_oauth_refresh_interval_secs(), 60);
+        assert_eq!(
+            cfg.effective_contribution_oauth_refresh_threshold_secs(),
+            900
+        );
     }
 
     /// The synthesizer and the startup loader must agree on where hooks live,

@@ -60,10 +60,6 @@ const GITHUB_DEVICE_SCOPE: &str = "repo write:public_key read:public_key";
 /// Gitee OAuth states are single-use and expire quickly: the user is mid-flow
 /// in another tab, anything older than this is abandoned.
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(15 * 60);
-/// Gitee access tokens expire in 24h; refresh when less than this remains so
-/// a failed refresh still has hours of runway to retry on the next tick.
-const GITEE_REFRESH_THRESHOLD_SECS: u64 = 4 * 3600;
-const GITEE_REFRESH_INTERVAL_SECS: u64 = 3600;
 
 /// A generated Ed25519 keypair in OpenSSH formats.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1863,16 +1859,22 @@ pub(crate) async fn is_contribution_secret_owner() -> bool {
     }
 }
 
-/// Hourly refresher for Gitee OAuth tokens: the access token expires in 24h,
-/// so when less than GITEE_REFRESH_THRESHOLD_SECS remains the loop exchanges
-/// the refresh token for a new pair, patches the Secret and rolls the gateway
-/// so egress picks the fresh token up. PAT-mode installs have no refresh
-/// material and are skipped.
+/// Periodic refresher for Gitee OAuth tokens: the access token expires in 24h,
+/// so when less than `refresh_threshold_secs` remains the loop exchanges the
+/// refresh token for a new pair, patches the Secret and rolls the gateway so
+/// egress picks the fresh token up. PAT-mode installs have no refresh material
+/// and are skipped.
+///
+/// Both the interval and the threshold come from the config surface; the
+/// caller passes the effective values so the loop and the line that reports it
+/// cannot disagree about what is running.
 ///
 /// Spawned from the gateway plugin, which every deployment of the binary loads:
 /// only the process that can read the contribution secret runs the loop.
 pub fn spawn_gitee_token_refresher(
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    interval_secs: u64,
+    refresh_threshold_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !gitee_oauth_available().await {
@@ -1887,13 +1889,22 @@ pub fn spawn_gitee_token_refresher(
             );
             return;
         }
-        let mut interval = tokio::time::interval(Duration::from_secs(GITEE_REFRESH_INTERVAL_SECS));
+        // 属主这一侧必须自报。只靠非属主的「not started」，部署里就没有任何一行
+        // 说得出「刷新循环正在跑」——属主消失时两侧都静默（非属主不再出现是因为
+        // 它本来就不该出现，属主不再出现是因为它没了），要等 24h 后 token 过期、
+        // egress 开始 401 才知道。周期与阈值一起报出来，读数才有决定面。
+        tracing::info!(
+            interval_secs,
+            refresh_threshold_secs,
+            "gitee token refresher started: this process owns the contribution secret"
+        );
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.tick().await; // first tick is immediate; skip it
         loop {
             tokio::select! {
                 _ = shutdown.recv() => break,
                 _ = interval.tick() => {
-                    if let Err(e) = gitee_refresh_tick().await {
+                    if let Err(e) = gitee_refresh_tick(refresh_threshold_secs).await {
                         tracing::warn!(error = %e, "gitee token refresh tick failed");
                     }
                 }
@@ -1902,7 +1913,7 @@ pub fn spawn_gitee_token_refresher(
     })
 }
 
-async fn gitee_refresh_tick() -> Result<(), String> {
+async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
     let kube = KubeClient::in_cluster()?;
     let secret = kube.get_json(&secret_api_path(kube.namespace())).await?;
     let decode = |key: &str| -> Option<String> {
@@ -1926,7 +1937,7 @@ async fn gitee_refresh_tick() -> Result<(), String> {
         .and_then(|v| v.as_u64())
         .unwrap_or(86400);
     let remaining = (obtained_at + expires_in).saturating_sub(unix_now());
-    if remaining > GITEE_REFRESH_THRESHOLD_SECS {
+    if remaining > refresh_threshold_secs {
         return Ok(());
     }
     let refresh = decode(SECRET_GITEE_REFRESH)

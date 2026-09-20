@@ -126,6 +126,8 @@
     "COGNEVA_NOTIFICATION_LIMIT": "gateway.notification_limit",
     "COGNEVA_SANDBOX_TASK_TIMEOUT_SECS": "gateway.sandbox_task_timeout_secs",
     "COGNEVA_REQUEST_TIMEOUT_SECS": "gateway.request_timeout_secs",
+    "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS": "gateway.contribution_oauth_refresh_interval_secs",
+    "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS": "gateway.contribution_oauth_refresh_threshold_secs",
     "COGNEVA_NOTIFICATION_WEBHOOK_URL": "gateway.notification_webhook_url",
     "COGNEVA_STREAM_CAPACITY": "tuning.stream_capacity",
     "COGNEVA_HIGH_WATERMARK": "tuning.high_watermark",
@@ -266,6 +268,8 @@
     "notification_limit": 50,
     "sandbox_task_timeout_secs": 30,
     "request_timeout_secs": 30,
+    "contribution_oauth_refresh_interval_secs": 3600,
+    "contribution_oauth_refresh_threshold_secs": 14400,
     "notification_webhook_url": null
   },
   "metrics": {

@@ -341,6 +341,14 @@ fn default_env_mappings() -> HashMap<String, String> {
         "gateway.request_timeout_secs".into(),
     );
     m.insert(
+        "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS".into(),
+        "gateway.contribution_oauth_refresh_interval_secs".into(),
+    );
+    m.insert(
+        "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS".into(),
+        "gateway.contribution_oauth_refresh_threshold_secs".into(),
+    );
+    m.insert(
         "COGNEVA_NOTIFICATION_WEBHOOK_URL".into(),
         "gateway.notification_webhook_url".into(),
     );
@@ -852,6 +860,54 @@ mod tests {
         assert_eq!(config.app.version, "");
         assert_eq!(config.supervisor.health_interval_secs, 20);
         assert_eq!(config.supervisor.quota_interval_secs, 60);
+    }
+
+    /// Every env override must name a path the config tree can hold. The
+    /// loader writes through `set_json_path`, which creates intermediate
+    /// objects on demand — so a mistyped segment does not fail, it writes into
+    /// a parallel tree nothing reads, and the variable silently does nothing.
+    /// Comparing the mapping against the serialized schema is the only place
+    /// that typo can be caught.
+    ///
+    /// An absent leaf is tolerated only when its container cannot hold one in
+    /// the default tree: an optional sub-object serialized as `null`, or a
+    /// list that starts empty and is seeded by the config file. Both of those
+    /// live in the shipped `cogneva.json`; the check is against the schema, so
+    /// it stays independent of any one deployment's values.
+    #[test]
+    fn every_env_mapping_targets_a_path_the_config_can_hold() {
+        let value =
+            serde_json::to_value(AppConfig::default()).expect("AppConfig serializes to JSON");
+        let mut broken = Vec::new();
+        for (env_key, path) in default_env_mappings() {
+            let segments: Vec<&str> = path.split('.').collect();
+            let (leaf, parents) = segments
+                .split_last()
+                .expect("path has at least one segment");
+            let mut cursor = Some(&value);
+            for segment in parents {
+                cursor = cursor.and_then(|c| match c {
+                    serde_json::Value::Object(map) => map.get(*segment),
+                    serde_json::Value::Array(arr) => {
+                        segment.parse::<usize>().ok().and_then(|i| arr.get(i))
+                    }
+                    _ => None,
+                });
+            }
+            match cursor {
+                // A leaf may be missing only from a container the default tree
+                // cannot populate: an Option that is None, or a list the file
+                // layer fills in.
+                Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Array(arr)) if arr.is_empty() => {}
+                Some(serde_json::Value::Object(map)) if map.contains_key(*leaf) => {}
+                _ => broken.push(format!("{env_key} -> {path}")),
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "env mappings the config schema cannot hold: {broken:?}"
+        );
     }
 
     #[test]

@@ -356,8 +356,12 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             );
             // Gitee OAuth token refresher: no-ops unless OAuth-mode material
             // is present in the Secret.
-            let _gitee_refresh =
-                crate::contribution_admin::spawn_gitee_token_refresher(broadcast_tx.0.subscribe());
+            let gateway_cfg = &ctx.config().gateway;
+            let _gitee_refresh = crate::contribution_admin::spawn_gitee_token_refresher(
+                broadcast_tx.0.subscribe(),
+                gateway_cfg.effective_contribution_oauth_refresh_interval_secs(),
+                gateway_cfg.effective_contribution_oauth_refresh_threshold_secs(),
+            );
         }
 
         Ok(())
