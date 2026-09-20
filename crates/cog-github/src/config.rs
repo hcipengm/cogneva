@@ -480,7 +480,7 @@ impl BotIdentityConfig {
 const GITHUB_ENV: &[(&str, &str)] = &[
     ("COGNEVA_GITHUB_REPO", "repo"),
     ("COGNEVA_GITHUB_BASE_BRANCH", "base_branch"),
-    ("COGNEVA_GITHUB_API_BASE", "api_base"),
+    (cog_core::contract::ci::GITHUB_API_BASE_ENV, "api_base"),
     ("COGNEVA_GITHUB_DISCOVERY_ENABLED", "discovery_enabled"),
     ("COGNEVA_GITHUB_APP_SLUG", "bot_identity.app_slug"),
     (
@@ -560,7 +560,7 @@ impl Default for GiteeIntegrationConfig {
 const GITEE_ENV: &[(&str, &str)] = &[
     ("COGNEVA_GITEE_REPO", "repo"),
     ("COGNEVA_GITEE_BASE_BRANCH", "base_branch"),
-    ("COGNEVA_GITEE_API_BASE", "api_base"),
+    (cog_core::contract::ci::GITEE_API_BASE_ENV, "api_base"),
 ];
 
 impl GiteeIntegrationConfig {

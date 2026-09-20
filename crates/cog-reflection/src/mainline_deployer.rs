@@ -97,6 +97,23 @@ fn endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
     Some((host, port.parse().ok()?))
 }
 
+/// 拆 `http://host:port[/prefix]` 成 (host, port, prefix)。平台 API 基址来自
+/// 配置/env（形如 `http://cogneva-security-gateway:8081/github`），与 registry
+/// 端点不同：它带一个路径前缀，请求行要带上前缀才落到透传分支上。
+fn split_http_base(base: &str) -> Option<(String, u16, String)> {
+    let rest = base.trim().strip_prefix("http://")?;
+    let (authority, prefix) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let (host, port) = endpoint_host_port(authority)?;
+    Some((
+        host.to_string(),
+        port,
+        prefix.trim_end_matches('/').to_string(),
+    ))
+}
+
 /// 单平台 manifest 的 config blob digest（多平台 index 没有这一层）。
 fn config_digest_of(manifest: &serde_json::Value) -> Option<String> {
     manifest
@@ -989,6 +1006,10 @@ struct MainlineState {
     /// 没有这一格，缺省按版本类（保守：宁可重建）。
     #[serde(default)]
     failed_class: FailureClass,
+    /// 上游 CI 已经报失败、因此被按住不滚的 rev。没有这一格，"被门禁按住"
+    /// 与"没有新 rev 可滚"在心跳上完全同形。
+    #[serde(default)]
+    ci_hold_rev: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,6 +1466,112 @@ impl MainlineDeployer {
         Ok(body)
     }
 
+    /// 平台 API 的只读 GET：明文 HTTP 打到安全网关的透传端点（凭证由网关在
+    /// 出口注入，本进程零 token），与 registry 客户端同形。非 200、不可达、
+    /// 响应不是 JSON 一律 Err——调用方按"没有证据"处理，不按失败处理。
+    async fn platform_get_json(&self, api_base: &str, path: &str) -> SFResult<serde_json::Value> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (host, port, prefix) = split_http_base(api_base).ok_or_else(|| {
+            SFError::Config(format!(
+                "platform api base {api_base:?} is not http://host:port[/prefix]"
+            ))
+        })?;
+        let req = format!(
+            "GET {prefix}{path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n\
+             User-Agent: cogneva-mainline-deployer\r\nConnection: close\r\n\r\n"
+        );
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| SFError::IO(format!("platform api {host}:{port} connect timed out")))?
+        .map_err(|e| SFError::IO(format!("platform api {host}:{port} connect failed: {e}")))?;
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .map_err(|e| SFError::IO(format!("platform api request write failed: {e}")))?;
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut raw))
+            .await
+            .map_err(|_| SFError::IO("platform api read timed out".into()))?
+            .map_err(|e| SFError::IO(format!("platform api read failed: {e}")))?;
+        let (status, body) = parse_http_response(&raw)
+            .ok_or_else(|| SFError::IO("platform api returned a malformed HTTP response".into()))?;
+        if status != 200 {
+            return Err(SFError::IO(format!("platform GET {path} -> {status}")));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|e| SFError::IO(format!("platform GET {path} returned non-JSON: {e}")))
+    }
+
+    /// 该 rev 在某平台上的 CI 结论：check runs 优先，提交状态兜底，折判据与
+    /// 落地通道共用同一份（取不到就是 `None`，两个消费面都不许猜）。
+    async fn platform_ci_verdict(&self, api_base: &str, repo: &str, rev: &str) -> Option<bool> {
+        let mut conclusions: Vec<String> = Vec::new();
+        let mut saw_signal = false;
+        let mut pending = false;
+        if let Ok(v) = self
+            .platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/check-runs"))
+            .await
+        {
+            if let Some(runs) = v.get("check_runs").and_then(|r| r.as_array()) {
+                for run in runs {
+                    saw_signal = true;
+                    match run.get("conclusion").and_then(|c| c.as_str()) {
+                        Some(c) => conclusions.push(c.to_string()),
+                        // 结论为 null = 这条检查还在跑。此刻下结论等于拿半个结果判死刑。
+                        None => pending = true,
+                    }
+                }
+            }
+        }
+        if let Some(verdict) =
+            cog_core::contract::ci::fold_ci_signals(saw_signal, pending, &conclusions)
+        {
+            return Some(verdict);
+        }
+        // 只用提交状态上报 CI 的仓库（没有 check runs），与落地通道同一条兜底。
+        let status = self
+            .platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/status"))
+            .await
+            .ok()?;
+        match status.get("state").and_then(|s| s.as_str()) {
+            Some("success") => Some(true),
+            Some("failure") | Some("error") => Some(false),
+            _ => None,
+        }
+    }
+
+    /// 要滚的这个 rev 在上游各平台的 CI 结论。`Some(false)` = 至少一个平台
+    /// 给出了明确的失败结论；`None` = 没有证据（没配基址、平台不可达、仓库
+    /// 不用 CI、检查还没跑完）。
+    async fn ci_verdict_for_rev(&self, rev: &str) -> Option<bool> {
+        let mut verdicts = Vec::new();
+        for up in &self.cfg.upstreams {
+            let Some(base) = up
+                .api_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let repo = up.repo.trim().trim_end_matches(".git");
+            if let Some(v) = self.platform_ci_verdict(base, repo, rev).await {
+                verdicts.push(v);
+            }
+        }
+        if verdicts.iter().any(|v| !*v) {
+            return Some(false);
+        }
+        if verdicts.is_empty() {
+            None
+        } else {
+            Some(true)
+        }
+    }
+
     /// registry 上某 tag 当前内容构建自哪个 rev：manifest → config blob →
     /// `org.opencontainers.image.revision` 标签。多平台 index 多一跳，先下
     /// 第一个子 manifest 取它的 config digest（各平台同 rev，标签一致）。
@@ -1687,6 +1814,30 @@ impl MainlineDeployer {
                 info!(decision = ?other, "mainline advance skipped");
                 return Ok(());
             }
+        }
+
+        // 滚动门禁：上游 CI 已经给出明确的失败结论就不滚这个 rev。bare 的
+        // main 在上面就推进过了（它只是一份镜像副本，推进无害），所以这里挡
+        // 的是"把红 CI 的代码送进集群"，不是"跟踪上游"——上游修好或下一个 rev
+        // 追上来，这条路径自己恢复。读不到结论一律放行：拿一次平台抖动停掉
+        // 整条主线跟踪，代价比偶尔滚一个恰好红的 rev 更大。
+        if self.ci_verdict_for_rev(&bare).await == Some(false) {
+            warn!(
+                rev = %rev12(&bare),
+                "upstream CI reports a failure for this rev; holding the rollout"
+            );
+            if state.ci_hold_rev.as_deref() != Some(bare.as_str()) {
+                state.ci_hold_rev = Some(bare.clone());
+                self.save_state(&state)?;
+            }
+            return Ok(());
+        }
+        if state.ci_hold_rev.take().is_some() {
+            info!(
+                rev = %rev12(&bare),
+                "upstream CI no longer reports a failure; resuming the rollout"
+            );
+            self.save_state(&state)?;
         }
 
         let _lock = match self.acquire_lock() {
@@ -2344,11 +2495,12 @@ fn heartbeat_message(
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
     format!(
-        "bare={} upstream={} last_good={} in_flight={} failed_rev={} failed_class={} failed_attempts={} cooldown_remaining_secs={}",
+        "bare={} upstream={} last_good={} in_flight={} ci_hold={} failed_rev={} failed_class={} failed_attempts={} cooldown_remaining_secs={}",
         rev12(bare_rev),
         upstream,
         state.last_good_rev.as_deref().map(rev12).unwrap_or("none"),
         in_flight,
+        state.ci_hold_rev.as_deref().map(rev12).unwrap_or("none"),
         state.failed_rev.as_deref().map(rev12).unwrap_or("none"),
         // 环境类失败不计尝试次数，`failed_rev` 与 `failed_attempts=0` 会同时出现；
         // 不说出类别，这一行读起来就像记账坏了。
@@ -4316,10 +4468,13 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_cooldown_until: 0,
             failed_attempts: 0,
             failed_class: FailureClass::Version,
+            ci_hold_rev: None,
         };
         let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", 100);
         assert!(msg.contains("bare=4dfd51ff1209"), "{msg}");
         assert!(msg.contains("upstream=off"), "{msg}");
+        // 门禁按住与"没有新 rev"必须在这行上分开：两者都不前进。
+        assert!(msg.contains("ci_hold=none"), "{msg}");
         assert!(msg.contains("last_good=4dfd51ff1209"), "{msg}");
         assert!(msg.contains("in_flight=none"), "{msg}");
         assert!(msg.contains("failed_rev=none"), "{msg}");
@@ -4341,6 +4496,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_cooldown_until: 1500,
             failed_attempts: 2,
             failed_class: FailureClass::Version,
+            ci_hold_rev: Some("deadbeef0011".into()),
         };
         let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date(aabbccddeeff)", 1000);
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
@@ -4349,6 +4505,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(msg.contains("failed_class=version"), "{msg}");
         assert!(msg.contains("failed_attempts=2"), "{msg}");
         assert!(msg.contains("cooldown_remaining_secs=500"), "{msg}");
+        assert!(msg.contains("ci_hold=deadbeef0011"), "{msg}");
     }
 
     /// 环境类失败不计尝试次数，`failed_rev` 与 `failed_attempts=0` 会同时出现：
@@ -4576,6 +4733,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_cooldown_until: 0,
             failed_attempts: 0,
             failed_class: FailureClass::Environment,
+            ci_hold_rev: None,
         };
         let text = serde_json::to_string(&state).unwrap();
         let back: MainlineState = serde_json::from_str(&text).unwrap();
@@ -4868,10 +5026,12 @@ exit 0
                 crate::config::UpstreamTrackConfig {
                     platform: crate::config::CodePlatform::Github,
                     repo: "owner/repo".into(),
+                    api_base: None,
                 },
                 crate::config::UpstreamTrackConfig {
                     platform: crate::config::CodePlatform::Gitee,
                     repo: "owner/repo".into(),
+                    api_base: None,
                 },
             ],
             git_proxy_base: root.join("proxy").to_string_lossy().into_owned(),
@@ -5337,6 +5497,94 @@ exit 0
     }
 
     const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+
+    #[test]
+    fn http_base_splits_scheme_host_port_and_prefix() {
+        // 平台 API 基址带一个透传前缀，请求行必须带上它才落到网关对应分支。
+        assert_eq!(
+            split_http_base("http://gw:8081/github"),
+            Some(("gw".into(), 8081, "/github".into()))
+        );
+        assert_eq!(
+            split_http_base("http://gw:8081/github/"),
+            Some(("gw".into(), 8081, "/github".into()))
+        );
+        assert_eq!(
+            split_http_base("http://gw:8081"),
+            Some(("gw".into(), 8081, String::new()))
+        );
+        // 集群内透传是明文 http；https 基址在这里无法解析，门禁按无证据放行。
+        assert_eq!(split_http_base("https://gw:443/github"), None);
+    }
+
+    /// 门禁只在拿到**明确的失败结论**时按住。一次检查还在跑、平台不可达、
+    /// 没配基址，全都算没有证据——那正是"一次上游抖动不该停掉整条主线跟踪"
+    /// 的实现，不是健壮性兜底。
+    #[tokio::test]
+    async fn ci_verdict_blocks_only_on_a_completed_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"conclusion":"success"},{"conclusion":"failure"}]}"#,
+        )])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        assert_eq!(deployer.ci_verdict_for_rev("abc123").await, Some(false));
+
+        let reqs = handle.await.unwrap();
+        assert!(
+            reqs[0].starts_with("GET /github/repos/owner/repo/commits/abc123/check-runs "),
+            "{:?}",
+            reqs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_verdict_stays_silent_while_a_check_is_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"conclusion":null}]}"#),
+            http_200(r#"{"state":"pending"}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        assert_eq!(deployer.ci_verdict_for_rev("abc123").await, None);
+
+        // 检查还在跑时问不出结论，于是退到提交状态兜底这条路径上。
+        let reqs = handle.await.unwrap();
+        assert!(
+            reqs[1].starts_with("GET /github/repos/owner/repo/commits/abc123/status "),
+            "{:?}",
+            reqs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_verdict_without_a_reachable_platform_is_no_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // 没配基址：不发请求，也不判失败。
+        let cfg = upstream_config(root, Path::new("/nonexistent"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+        assert_eq!(deployer.ci_verdict_for_rev("abc123").await, None);
+
+        // 配了但连不上：同样按没证据处理。
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+        assert_eq!(deployer.ci_verdict_for_rev("abc123").await, None);
+    }
 
     #[tokio::test]
     async fn registry_tag_revision_reads_label_from_manifest_and_blob() {

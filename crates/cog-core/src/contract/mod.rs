@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod alerts;
 pub mod auth;
+pub mod ci;
 pub mod codec;
 pub mod context_builder;
 pub mod dlq;

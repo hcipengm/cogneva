@@ -6,6 +6,8 @@
 use async_trait::async_trait;
 use octocrab::Octocrab;
 
+use cog_core::contract::ci::fold_ci_signals;
+
 use crate::config::GitHubAccount;
 
 use crate::error::{CogGitHubError, Result};
@@ -580,29 +582,6 @@ pub(crate) fn split_repo(repo: &str) -> Result<(String, String)> {
         )));
     }
     Ok((parts[0].to_string(), parts[1].to_string()))
-}
-
-/// Whether one completed run's conclusion counts as passing.
-///
-/// `neutral` and `skipped` pass: they are what a path-filtered or
-/// condition-gated job reports, and GitHub's own required-check evaluation
-/// treats them as satisfied. Anything unrecognised fails closed.
-fn ci_conclusion_passes(conclusion: &str) -> bool {
-    matches!(conclusion, "success" | "neutral" | "skipped")
-}
-
-/// Fold collected check-run signals into a verdict; `None` means no evidence.
-///
-/// Split out from the network path so the three-way outcome (`Some(true)` /
-/// `Some(false)` / `None`) can be tested without a live platform.
-fn fold_ci_signals(saw_signal: bool, pending: bool, conclusions: &[String]) -> Option<bool> {
-    if !saw_signal {
-        return None;
-    }
-    if pending {
-        return None;
-    }
-    Some(conclusions.iter().all(|c| ci_conclusion_passes(c)))
 }
 
 /// Keep the last `cap` bytes of `text`, starting on a char boundary.

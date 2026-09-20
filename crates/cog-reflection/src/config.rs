@@ -415,6 +415,11 @@ impl CodePlatform {
 pub struct UpstreamTrackConfig {
     pub platform: CodePlatform,
     pub repo: String,
+    /// 该平台的 API 基址（安全网关透传端点，凭证由网关出口注入）。空 =
+    /// 读不到该平台的 CI 结论，滚动照常推进——把"读不到"当成失败会让一次
+    /// 上游抖动停掉整条主线跟踪。留空时与 `repo` 同源推导。
+    #[serde(default)]
+    pub api_base: Option<String>,
 }
 
 /// 主线跟踪自动部署器配置：进化 Pod 内常驻循环，检测集群内 bare 仓库
@@ -576,11 +581,22 @@ impl Default for MainlineDeployerConfig {
 /// 推导：同一仓库在两端镜像，两端都跟。两个平台都关或都没有 repo 时返回
 /// 空列表——那表示"这台部署不跟踪上游"，不是错误，但部署器会据此在心跳里
 /// 明说（只跟随 bare 的部署必须能从日志看出来，否则它和"跟踪坏了"长得一样）。
-fn upstreams_from_integrations(root: &serde_json::Value) -> Vec<UpstreamTrackConfig> {
+fn upstreams_from_integrations(
+    root: &serde_json::Value,
+    get: impl Fn(&str) -> Option<String>,
+) -> Vec<UpstreamTrackConfig> {
     let mut out = Vec::new();
-    for (platform, pointer) in [
-        (CodePlatform::Github, "/github_integration"),
-        (CodePlatform::Gitee, "/gitee_integration"),
+    for (platform, pointer, api_env) in [
+        (
+            CodePlatform::Github,
+            "/github_integration",
+            cog_core::contract::ci::GITHUB_API_BASE_ENV,
+        ),
+        (
+            CodePlatform::Gitee,
+            "/gitee_integration",
+            cog_core::contract::ci::GITEE_API_BASE_ENV,
+        ),
     ] {
         let Some(section) = root.pointer(pointer) else {
             continue;
@@ -596,9 +612,20 @@ fn upstreams_from_integrations(root: &serde_json::Value) -> Vec<UpstreamTrackCon
         if repo.is_empty() {
             continue;
         }
+        // 基址与 repo 的来源顺序一致：先是集成段自己的字段，再是该平台的
+        // env 覆盖（部署里真正设的就是 env，段字段多为 null）。
+        let api_base = section
+            .get("api_base")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| get(api_env).map(|v| v.trim().to_string()))
+            .filter(|s| !s.is_empty());
         out.push(UpstreamTrackConfig {
             platform,
             repo: repo.to_string(),
+            api_base,
         });
     }
     out
@@ -636,7 +663,7 @@ impl MainlineDeployerConfig {
         cfg.apply_env_with(|k| std::env::var(k).ok())?;
         if cfg.upstreams.is_empty() {
             if let Some(root) = root.as_ref() {
-                cfg.upstreams = upstreams_from_integrations(root);
+                cfg.upstreams = upstreams_from_integrations(root, |k| std::env::var(k).ok());
             }
         }
         Ok(cfg)
@@ -840,7 +867,34 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(upstreams_from_integrations(&root).is_empty());
+        assert!(upstreams_from_integrations(&root, |_| None).is_empty());
+    }
+
+    /// 滚动门禁要读该 rev 的 CI 结论，所以跟踪项必须带上读得到的基址；
+    /// 段字段优先，其次该平台自己的 env 覆盖（部署里设的正是 env）。
+    #[test]
+    fn upstreams_carry_the_platform_api_base() {
+        let root: serde_json::Value = serde_json::from_str(
+            r#"{
+              "github_integration": {"enabled": true, "repo": "o/r",
+                                     "api_base": "http://gw:8081/github"},
+              "gitee_integration": {"enabled": true, "repo": "o/r", "api_base": null}
+            }"#,
+        )
+        .unwrap();
+        let ups = upstreams_from_integrations(&root, |k| {
+            (k == "COGNEVA_GITEE_API_BASE").then(|| "http://gw:8081/gitee".to_string())
+        });
+        assert_eq!(ups[0].api_base.as_deref(), Some("http://gw:8081/github"));
+        assert_eq!(ups[1].api_base.as_deref(), Some("http://gw:8081/gitee"));
+
+        // 两处都没有基址：跟踪照常，只是读不到 CI 结论（门禁按无证据放行）。
+        let bare: serde_json::Value =
+            serde_json::from_str(r#"{"github_integration": {"enabled": true, "repo": "o/r"}}"#)
+                .unwrap();
+        let ups = upstreams_from_integrations(&bare, |_| None);
+        assert!(ups[0].api_base.is_none());
+        assert_eq!(ups[0].repo, "o/r");
     }
 
     #[test]
