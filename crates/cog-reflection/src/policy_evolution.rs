@@ -214,8 +214,11 @@ impl PolicyEvolutionDriver {
             .evolve(&self.config.policy_name, &baseline, &candidate)
             .await?;
         if verdict != crate::EvalVerdict::Adopt {
-            // evolve 会自己复算一遍判定；这里不一致说明基线或候选在两次
-            // 调用之间变了，宁可不动手也要说出来。
+            // 门禁归 evolve 所有（管理端点走同一道门），所以判定以它为准。
+            // 同一组切片喂进去现在必然得出同一个判定，这一支不是靠"两次调用
+            // 之间基线变了"能触发的；它留着是为了 evolve 的判据将来加严时，
+            // 驱动与门禁之间还有一处对账——少了它，驱动会拿一个没被采纳的
+            // 候选去报 Adopted。
             warn!(
                 policy = %self.config.policy_name,
                 ?verdict,

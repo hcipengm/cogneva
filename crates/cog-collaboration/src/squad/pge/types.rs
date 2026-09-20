@@ -1,4 +1,6 @@
-use cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX;
+use cog_core::contract::outcome::{
+    ITERATION_BUDGET_EXHAUSTED_MARKER, MAX_ITERATIONS_STATUS, TERMINAL_ENV_FAILURE_PREFIX,
+};
 use serde::{Deserialize, Serialize};
 
 /// Specification of a single atomic task produced by the Planner.
@@ -28,6 +30,45 @@ pub struct PlannerOutput {
     pub acceptance_criteria: Vec<String>,
 }
 
+/// Whether an in-band cause names a deterministic failure: the transport never
+/// reached the upstream, or the loop spent its budget before producing anything.
+/// One predicate for every role output so the planner and the generator cannot
+/// drift apart on what counts as terminal.
+fn names_a_deterministic_cause(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("environment_error")
+        || t.contains("tool_pipeline_broken")
+        || t.contains(ITERATION_BUDGET_EXHAUSTED_MARKER)
+}
+
+/// The agent runtime's sentinel for a ReAct loop that spent its whole iteration
+/// budget while tool calls were still pending, rendered as the in-band cause the
+/// rest of the chain reads. `None` when the value is a normal role result.
+///
+/// The sentinel has no `content`, no `artifacts` and no `plan`, so a parser that
+/// does not name it hands downstream an empty output that reads exactly like a
+/// role which finished and had nothing to say. The real cause is local — the
+/// budget ran out mid-exploration — and both the operator and the discovery
+/// loop's backoff decision are reading that text, so it has to say so.
+pub fn iteration_budget_exhausted_reason(value: &serde_json::Value) -> Option<String> {
+    if value.get("status").and_then(|v| v.as_str()) != Some(MAX_ITERATIONS_STATUS) {
+        return None;
+    }
+    let iterations = value
+        .get("iterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let pending = value
+        .get("pending_tool_calls")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Some(format!(
+        "{ITERATION_BUDGET_EXHAUSTED_MARKER}: the agent loop used its whole iteration budget \
+         while tool calls were still pending (max_iterations={iterations}, \
+         pending_tool_calls={pending}); it stopped mid-exploration and wrote no deliverable"
+    ))
+}
+
 impl PlannerOutput {
     /// True when the planner's prompt never reached its upstream, so the empty
     /// plan it reports is the transport failing rather than the planner
@@ -36,10 +77,7 @@ impl PlannerOutput {
     /// in-band.
     pub fn is_terminal_env_failure(&self) -> bool {
         match &self.plan {
-            serde_json::Value::String(s) => {
-                let t = s.to_ascii_lowercase();
-                t.contains("environment_error") || t.contains("tool_pipeline_broken")
-            }
+            serde_json::Value::String(s) => names_a_deterministic_cause(s),
             _ => false,
         }
     }
@@ -136,8 +174,7 @@ impl GeneratorOutput {
             serde_json::Value::Null => return true,
             other => return other.to_string().is_empty(),
         };
-        let t = text.to_ascii_lowercase();
-        t.contains("environment_error") || t.contains("tool_pipeline_broken")
+        names_a_deterministic_cause(text)
     }
 
     /// Failure reason in the wire format outer loops match on, carrying the
@@ -537,6 +574,62 @@ mod tests {
         assert_eq!(
             output.terminal_env_failure_reason(),
             Some(no_artifacts_reason())
+        );
+    }
+
+    /// The ReAct runtime returns this sentinel when the loop runs out of
+    /// iterations with tool calls still pending — the model was still reading
+    /// and testing when the budget ended, so no artifact ever got a chance to
+    /// be written. The cause is the budget, not the environment, and the
+    /// reason has to say so: the generic wording sends the operator to look
+    /// at the upstream while the run was failing locally.
+    #[test]
+    fn an_exhausted_iteration_budget_names_the_budget_not_the_environment() {
+        let output = crate::squad::pge::roundtable::parse_generator_output(&serde_json::json!({
+            "status": "max_iterations_reached",
+            "iterations": 10,
+            "pending_tool_calls": 2
+        }));
+        let reason = output
+            .terminal_env_failure_reason()
+            .expect("retrying with the same budget exhausts it the same way: not retryable");
+        assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
+        assert!(
+            reason.contains("iteration budget"),
+            "the reason must name the budget, got: {reason}"
+        );
+        assert!(
+            reason.contains("max_iterations_reached") || reason.contains("10"),
+            "the reason must carry the observed numbers, got: {reason}"
+        );
+        assert_ne!(
+            reason,
+            no_artifacts_reason(),
+            "a budget exhaustion is not a generator that chose to produce nothing"
+        );
+    }
+
+    /// An empty plan is a valid plan, so a planner that ran out of iterations
+    /// is the same trap on the plan side: unnamed, it reads as a planner that
+    /// considered the goal and had nothing to propose, and the generator is
+    /// then asked to implement that nothing.
+    #[test]
+    fn a_planner_that_ran_out_of_iterations_is_not_read_as_an_empty_plan() {
+        let output = crate::squad::pge::roundtable::parse_planner_output(
+            &serde_json::json!({
+                "status": MAX_ITERATIONS_STATUS,
+                "iterations": 10,
+                "pending_tool_calls": 4
+            }),
+            "edit the workspace",
+        );
+        let reason = output
+            .terminal_env_failure_reason()
+            .expect("the same budget fails the same way on a retry: not retryable");
+        assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
+        assert!(
+            reason.contains("iteration budget") && reason.contains("max_iterations=10"),
+            "the reason must name the budget and the observed numbers, got: {reason}"
         );
     }
 

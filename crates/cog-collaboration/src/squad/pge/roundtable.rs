@@ -804,6 +804,17 @@ impl PgeRoundtable {
 }
 
 pub fn parse_planner_output(value: &serde_json::Value, goal: &str) -> PlannerOutput {
+    // Same guard as the generator: an empty plan is a valid plan, so a spent
+    // iteration budget that is not named here travels downstream as a planner
+    // that looked at the goal and found nothing to do.
+    if let Some(reason) = crate::squad::pge::types::iteration_budget_exhausted_reason(value) {
+        return PlannerOutput {
+            summary: format!("Plan for: {goal}"),
+            plan: serde_json::Value::String(reason),
+            sub_tasks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+        };
+    }
     serde_json::from_value(value.clone()).unwrap_or_else(|_| PlannerOutput {
         summary: format!("Plan for: {}", goal),
         plan: value.clone(),
@@ -813,6 +824,15 @@ pub fn parse_planner_output(value: &serde_json::Value, goal: &str) -> PlannerOut
 }
 
 pub fn parse_generator_output(value: &serde_json::Value) -> GeneratorOutput {
+    // A spent iteration budget is checked before the shape parses: the sentinel
+    // is a valid JSON object that simply has none of this role's fields, so
+    // every later branch would read it as a generator that returned nothing.
+    if let Some(reason) = crate::squad::pge::types::iteration_budget_exhausted_reason(value) {
+        return GeneratorOutput {
+            content: serde_json::Value::String(reason),
+            artifacts: Vec::new(),
+        };
+    }
     serde_json::from_value(value.clone()).unwrap_or_else(|_| {
         if let Some(artifact) = try_extract_change_artifact(value) {
             return GeneratorOutput {

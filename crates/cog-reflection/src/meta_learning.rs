@@ -142,8 +142,8 @@ pub struct MetaLearningEngine {
     /// 产物级进化策略源（§14.3 热替换）：配置后推荐参数以策略产物 active
     /// 版本为准，self.min_samples/self.margin 仅作兜底。
     policy: Option<(crate::PolicyStore, String)>,
-    /// 决策聚合的耐久快照：每次记录落盘、构造时读回。None 只出现在
-    /// [`Self::new_ephemeral`] 造的引擎上（测试、没有数据卷的进程）。
+    /// 决策聚合的耐久快照：每次记录落盘、构造时读回。None 只出现在测试构造
+    /// 的引擎上——非测试构建里没有构造无快照引擎的入口。
     snapshot: Option<DecisionStatsSnapshot>,
 }
 
@@ -157,11 +157,7 @@ impl std::fmt::Debug for MetaLearningEngine {
 }
 
 impl MetaLearningEngine {
-    /// Engine without durable state: everything it learns is gone when the
-    /// process is. Only for tests and for processes that have no data volume —
-    /// a deployment builds its engine through [`Self::with_durable_state`],
-    /// which attaches the snapshot and reads it back in the same step.
-    pub fn new_ephemeral(recorder: Arc<dyn LearningRecorder>) -> Self {
+    fn base(recorder: Arc<dyn LearningRecorder>) -> Self {
         Self {
             decision_stats: Arc::new(RwLock::new(HashMap::new())),
             recorder,
@@ -170,6 +166,15 @@ impl MetaLearningEngine {
             policy: None,
             snapshot: None,
         }
+    }
+
+    /// Engine without durable state: everything it learns is gone when the
+    /// process is. Test-only on purpose — a deployment's engine carries a
+    /// snapshot, and keeping this out of non-test builds means "built an engine
+    /// that nothing can restore into" is not something the code can express.
+    #[cfg(test)]
+    pub(crate) fn new_ephemeral(recorder: Arc<dyn LearningRecorder>) -> Self {
+        Self::base(recorder)
     }
 
     /// The single construction path for a deployment: attach the durable
@@ -184,7 +189,7 @@ impl MetaLearningEngine {
         recorder: Arc<dyn LearningRecorder>,
         snapshot: DecisionStatsSnapshot,
     ) -> Self {
-        let mut engine = Self::new_ephemeral(recorder);
+        let mut engine = Self::base(recorder);
         engine.snapshot = Some(snapshot);
         engine.hydrate().await;
         engine

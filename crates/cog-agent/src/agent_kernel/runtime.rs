@@ -741,8 +741,20 @@ impl AgentRuntime {
             // Last iteration but still has tool calls: max iterations reached
             if iteration == self.config.max_iterations - 1 {
                 self.state = RuntimeState::Complete;
+                // The run stops here having bought nothing: the model was still
+                // reading and testing when the budget ended, so no answer was
+                // ever written. Without this line the exhaustion is invisible —
+                // the sentinel below is the only trace, and every reader of the
+                // result sees an empty output, not a spent budget.
+                tracing::warn!(
+                    agent_id = %self.config.agent_id,
+                    max_iterations = self.config.max_iterations,
+                    pending_tool_calls = tool_calls.len(),
+                    "agent loop exhausted its iteration budget with tool calls still pending; \
+                     the run stops mid-exploration and returns no deliverable"
+                );
                 let result = serde_json::json!({
-                    "status": "max_iterations_reached",
+                    "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
                     "iterations": self.config.max_iterations,
                     "pending_tool_calls": tool_calls.len(),
                 });
@@ -916,8 +928,14 @@ impl AgentRuntime {
 
         // Max iterations reached
         self.state = RuntimeState::Complete;
+        tracing::warn!(
+            agent_id = %self.config.agent_id,
+            max_iterations = self.config.max_iterations,
+            "agent loop exhausted its iteration budget; \
+             the run stops mid-exploration and returns no deliverable"
+        );
         let result = serde_json::json!({
-            "status": "max_iterations_reached",
+            "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
             "iterations": self.config.max_iterations
         });
 

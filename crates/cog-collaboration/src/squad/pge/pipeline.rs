@@ -1256,4 +1256,69 @@ mod tests {
         );
         assert_eq!(result.attempts, 1, "环境类失败不该被重试");
     }
+
+    /// A generator whose ReAct loop spends its whole iteration budget still
+    /// exploring comes back as the runtime's `max_iterations_reached` sentinel.
+    /// Read as an ordinary empty output it buys an evaluator call, a full round
+    /// of local repairs and every configured retry — all of them paid, none of
+    /// them able to produce the artifact the budget never left room for.
+    #[tokio::test]
+    async fn a_generator_that_ran_out_of_iterations_ends_the_run_before_the_evaluator() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 3,
+            timeout_ms: 5_000,
+            local_repair_max: 2,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "summary": "s",
+                "plan": {"steps": ["edit"]},
+                "sub_tasks": [],
+                "acceptance_criteria": []
+            }),
+        }));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
+                "iterations": 10,
+                "pending_tool_calls": 2
+            }),
+        }));
+        // The evaluator would pass anything it is handed; its verdict must never
+        // be asked for, because asking is what a spent budget must not pay for.
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "verdict": "pass", "score": 100, "feedback": "", "criteria": []
+            }),
+        }));
+
+        let task = test_task("edit the workspace");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        let feedback = &result.final_evaluation.feedback;
+        assert!(
+            feedback.starts_with(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX),
+            "the outer loops match on the prefix, got: {feedback}"
+        );
+        assert!(
+            feedback.contains("iteration budget"),
+            "the feedback must name the budget as the real cause, got: {feedback}"
+        );
+        assert!(
+            feedback.contains("max_iterations=10"),
+            "the feedback must carry the observed numbers, got: {feedback}"
+        );
+        assert!(!result.passed, "an exhausted budget is not a pass");
+        assert_eq!(result.attempts, 1, "an exhausted budget is not retryable");
+    }
 }
