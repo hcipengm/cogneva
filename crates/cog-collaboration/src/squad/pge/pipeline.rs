@@ -87,6 +87,15 @@ pub struct PgePipelineResult {
     pub final_evaluation: EvaluationResult,
     /// Full attempt history, ordered oldest → newest.
     pub history: Vec<PgePipelineAttempt>,
+    /// The composed cause when this run ended on a deterministic
+    /// environment/protocol failure, `None` when it ended any other way.
+    /// It names the role that actually failed, which is not always the
+    /// generator: a planner that spent its own iteration budget ends the run
+    /// before any generation happens, and a reader that re-derives the cause
+    /// from `final_generation` alone blames the generator for a run it never
+    /// took part in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
 }
 
 /// Linear Planner → Generator → Evaluator orchestrator with optional
@@ -109,6 +118,13 @@ impl PgePipeline {
     /// failure: a synthesized zero-score evaluation marks the attempt, and
     /// the feedback prefix lets outer loops (Ralph, squad escalation)
     /// recognize the failure as terminal without re-parsing the generation.
+    ///
+    /// The cause travels in [`PgePipelineResult::terminal_reason`] and in the
+    /// evaluation's feedback — never in `final_generation`. That field may
+    /// hold a placeholder written here for a role that never ran, so it is
+    /// structurally identical to a real empty output and cannot be told apart
+    /// by inspection: a reader that re-derives the cause from it reports the
+    /// wrong role.
     fn terminal_result(
         attempt: u32,
         plan: PlannerOutput,
@@ -129,7 +145,7 @@ impl PgePipeline {
             // 由分类可达性自查比对（声明过却从未被记录 = 分类被丢了）。
             feedback: crate::squad::classify::declare(
                 crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                declared,
+                declared.clone(),
             ),
             score: Some(0),
             criteria: Vec::new(),
@@ -149,6 +165,7 @@ impl PgePipeline {
             final_generation: generation,
             final_evaluation: evaluation,
             history,
+            terminal_reason: Some(declared),
         }
     }
 
@@ -189,6 +206,8 @@ impl PgePipeline {
                     attempt,
                     "Planner reported terminal environment failure; aborting pipeline without generation"
                 );
+                // 生成器没被调用，这里是占位而非产出：真因由 plan 侧合成进
+                // terminal_reason，读侧不能拿这个空生成反推是谁失败。
                 let generation = GeneratorOutput {
                     content: serde_json::Value::Null,
                     artifacts: Vec::new(),
@@ -480,6 +499,7 @@ impl PgePipeline {
             final_generation: last.generation,
             final_evaluation: last.evaluation,
             history,
+            terminal_reason: None,
         }
     }
 }

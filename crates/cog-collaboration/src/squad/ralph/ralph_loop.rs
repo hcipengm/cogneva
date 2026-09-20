@@ -7,7 +7,7 @@
 //!   不是被消耗掉的额度。
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
-use crate::squad::classify::{classify, declare, TERMINAL_ENV_FAILURE_CLASS};
+use crate::squad::classify::classify;
 use crate::squad::pge::pipeline::PgePipeline;
 use crate::squad::pge::roundtable::{PgeRoundtable, PgeRoundtableResult};
 use crate::squad::pge::stall::{made_progress, ProgressSignals};
@@ -463,16 +463,14 @@ impl RalphLoop {
 
             let analysis = if passed {
                 FailureAnalysis::Recoverable(ResetStrategy::Identical)
-            } else if pge_result.final_generation.is_terminal_env_failure() {
+            } else if let Some(reason) = pge_result.terminal_reason.clone() {
                 // Deterministic environment/protocol failure: no reset
                 // strategy can fix it, stop before another paid iteration.
-                FailureAnalysis::Unrecoverable(declare(
-                    TERMINAL_ENV_FAILURE_CLASS,
-                    pge_result
-                        .final_generation
-                        .terminal_env_failure_reason()
-                        .unwrap_or_else(crate::squad::pge::types::no_artifacts_reason),
-                ))
+                // The cause comes from the pipeline, which is the side that
+                // made the decision and knows which role failed; re-deriving
+                // it here from the generation alone puts a planner's spent
+                // budget on a generator that never ran.
+                FailureAnalysis::Unrecoverable(reason)
             } else {
                 self.analyze_failure(&pge_result.final_evaluation, &self.history)
                     .await
@@ -568,14 +566,10 @@ impl RalphLoop {
 
             let analysis = if passed {
                 FailureAnalysis::Recoverable(ResetStrategy::Identical)
-            } else if rt_result.final_generation.is_terminal_env_failure() {
-                FailureAnalysis::Unrecoverable(declare(
-                    TERMINAL_ENV_FAILURE_CLASS,
-                    rt_result
-                        .final_generation
-                        .terminal_env_failure_reason()
-                        .unwrap_or_else(crate::squad::pge::types::no_artifacts_reason),
-                ))
+            } else if let Some(reason) = rt_result.terminal_reason.clone() {
+                // Same as the pipeline branch: the debate already composed the
+                // cause and named the role that failed.
+                FailureAnalysis::Unrecoverable(reason)
             } else {
                 Self::analyze_roundtable_failure(&rt_result, &self.history)
             };
@@ -1431,6 +1425,7 @@ mod tests {
             },
             history: Vec::new(),
             context_board: None,
+            terminal_reason: None,
         }
     }
 
@@ -2176,6 +2171,118 @@ mod tests {
                 assert!(
                     reason.contains("HTTP 503 upstream unavailable"),
                     "the reason must carry the generator's own cause: {reason}"
+                );
+            }
+            other => panic!("expected Unrecoverable, got {other:?}"),
+        }
+    }
+
+    /// 计划侧耗尽迭代预算时，终止因必须指向计划器的预算，而不是某个生成器缺陷。
+    /// 计划侧一坏 pipeline 就收口，生成器根本没被调用——它留下的那个空生成是
+    /// 合成出来的证据，不是证据。外层若改从 final_generation 重新推导，就会把
+    /// 责任记在一个从未运行的角色头上：实证里 github-issue-62 报的正是
+    /// "generator produced no artifacts"，而日志里一次生成器调用都没有。
+    #[tokio::test]
+    async fn a_planner_that_spent_its_budget_is_not_reported_as_a_generator_defect() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 0,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(Arc::new(MockAgent {
+            response: serde_json::json!({
+                "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
+                "iterations": 10,
+                "pending_tool_calls": 1,
+            }),
+        }));
+        // 若生成器真被调用会回一个可辨认的内容，用它证明这一轮没走到生成。
+        let generator = GeneratorActor::new(Arc::new(MockAgent {
+            response: serde_json::json!({"content": "SHOULD_NOT_RUN", "artifacts": []}),
+        }));
+
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 3,
+            stagnation_window: 1,
+        });
+        let verdict = ralph
+            .run_pipeline(
+                "goal",
+                serde_json::json!({}),
+                &pipeline,
+                &planner,
+                &generator,
+                &EvaluatorActor::new(Arc::new(pass_evaluator())),
+            )
+            .await;
+
+        match verdict {
+            RalphVerdict::Unrecoverable { reason, .. } => {
+                assert_eq!(
+                    classify(&reason),
+                    crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+                    "外层按分类前缀跳过策略升级，实到: {reason}"
+                );
+                assert!(
+                    reason.contains(cog_core::contract::outcome::ITERATION_BUDGET_EXHAUSTED_MARKER),
+                    "真因是计划器的预算耗尽，实到: {reason}"
+                );
+                assert!(
+                    reason.contains("max_iterations=10"),
+                    "原因必须带上实测数字，实到: {reason}"
+                );
+                assert!(
+                    !reason.contains("generator produced no artifacts"),
+                    "生成器从未运行，不能被报成生成器缺陷: {reason}"
+                );
+            }
+            other => panic!("expected Unrecoverable, got {other:?}"),
+        }
+    }
+
+    /// 同一件事在 Roundtable 上的镜像：评审器耗尽预算的那一轮，真因是评审器，
+    /// 而它的生成是正常交付的。从 final_generation 推导在这里会得出相反的结论。
+    #[tokio::test]
+    async fn a_roundtable_judge_that_spent_its_budget_keeps_its_own_reason() {
+        let roundtable = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 3,
+                consensus_threshold: 0.8,
+                stall_threshold: 0,
+                independent_review: false,
+                ..Default::default()
+            },
+            PlannerActor::new(Arc::new(pass_planner())),
+            GeneratorActor::new(Arc::new(pass_generator())),
+            EvaluatorActor::new(Arc::new(MockAgent {
+                response: serde_json::json!({
+                    "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
+                    "iterations": 5,
+                    "pending_tool_calls": 3,
+                }),
+            })),
+        );
+
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 2,
+            stagnation_window: 1,
+        });
+        let verdict = ralph
+            .run_roundtable("goal", serde_json::json!({}), &roundtable)
+            .await;
+
+        match verdict {
+            RalphVerdict::Unrecoverable { reason, .. } => {
+                assert_eq!(
+                    classify(&reason),
+                    crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+                    "实到: {reason}"
+                );
+                assert!(
+                    reason.contains("evaluator") && reason.contains("iteration budget"),
+                    "真因是评审器的预算耗尽，实到: {reason}"
                 );
             }
             other => panic!("expected Unrecoverable, got {other:?}"),

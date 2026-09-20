@@ -110,6 +110,13 @@ pub struct PgeRoundtableResult {
     /// Final state of the shared context board after all debate rounds.
     /// `None` if no context board was configured.
     pub context_board: Option<serde_json::Value>,
+    /// The composed cause when the debate ended on a deterministic
+    /// environment/protocol failure, `None` when it ended any other way.
+    /// It names the role that actually failed; a reader that re-derives the
+    /// cause from `final_generation` alone reports a generator failure for a
+    /// debate that stopped because the judge or the reviewer spent its budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
 }
 
 /// Multi-agent roundtable debate orchestrator.
@@ -193,6 +200,7 @@ impl PgeRoundtable {
         let mut final_evaluation: Option<EvaluationResult> = None;
         let mut prev_verdict: Option<Verdict> = None;
         let mut board = self.init_board().await;
+        let mut terminal_reason: Option<String> = None;
 
         for iteration in 1..=self.config.max_iterations {
             crate::observable::global_observable().record_round();
@@ -272,6 +280,24 @@ impl PgeRoundtable {
                 merge_summary,
             });
 
+            // 计划侧的终止性失败：生成与评估都没有发生，真因在 plan 自己身上。
+            // 这条闸必须在生成闸之前——占位的空生成与真的空产出同形，先读生成
+            // 就会把一个从未被调用的角色报成责任人。
+            if let Some(reason) = plan.terminal_env_failure_reason() {
+                tracing::warn!(
+                    iteration,
+                    "Roundtable planner reported terminal environment failure; stopping debate"
+                );
+                if let Some(last) = history.last_mut() {
+                    last.evaluation.feedback = crate::squad::classify::declare(
+                        crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+                        reason.clone(),
+                    );
+                }
+                terminal_reason = Some(reason);
+                break;
+            }
+
             // Deterministic environment/protocol failure: further debate
             // rounds must fail identically — stop before paying for them.
             if generation.is_terminal_env_failure() {
@@ -279,6 +305,16 @@ impl PgeRoundtable {
                     iteration,
                     "Roundtable generation reported terminal environment failure; stopping debate"
                 );
+                let reason = generation
+                    .terminal_env_failure_reason()
+                    .unwrap_or_else(crate::squad::pge::types::no_artifacts_reason);
+                if let Some(last) = history.last_mut() {
+                    last.evaluation.feedback = crate::squad::classify::declare(
+                        crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+                        reason.clone(),
+                    );
+                }
+                terminal_reason = Some(reason);
                 break;
             }
 
@@ -295,9 +331,10 @@ impl PgeRoundtable {
                 if let Some(last) = history.last_mut() {
                     last.evaluation.feedback = crate::squad::classify::declare(
                         crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                        reason,
+                        reason.clone(),
                     );
                 }
+                terminal_reason = Some(reason);
                 break;
             }
 
@@ -431,8 +468,9 @@ impl PgeRoundtable {
                 last.evaluation.verdict = Verdict::Fail;
                 last.evaluation.feedback = crate::squad::classify::declare(
                     crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                    reason,
+                    reason.clone(),
                 );
+                terminal_reason = Some(reason);
             } else if !matches!(review.verdict, Verdict::Pass) {
                 consensus_reached = false;
                 last.evaluation.verdict = Verdict::Fail;
@@ -458,7 +496,29 @@ impl PgeRoundtable {
             final_evaluation: last.evaluation,
             history,
             context_board: Some(board),
+            terminal_reason,
         }
+    }
+
+    /// 计划侧终止时的占位三元组：生成与评估都没有发生，所以这两个对象不带
+    /// 任何证据。原因由 `plan` 自己携带，读侧按 plan 判，不按这两个占位判。
+    fn terminal_placeholders(
+        plan: PlannerOutput,
+    ) -> (PlannerOutput, GeneratorOutput, EvaluationResult) {
+        (
+            plan,
+            GeneratorOutput {
+                content: serde_json::Value::Null,
+                artifacts: Vec::new(),
+            },
+            EvaluationResult {
+                verdict: Verdict::Fail,
+                feedback: String::new(),
+                score: None,
+                criteria: Vec::new(),
+                details: None,
+            },
+        )
     }
 
     /// Run a single sequential PGE iteration using the primary actors.
@@ -487,6 +547,12 @@ impl PgeRoundtable {
                 Some(board),
             )
             .await;
+
+        // 计划侧已经终止：这一轮不该再买生成与评估。占位只是让返回类型成立，
+        // 读侧看的是 plan 自己带的原因。
+        if plan.is_terminal_env_failure() {
+            return Self::terminal_placeholders(plan);
+        }
 
         let plan_json = serde_json::to_value(&plan).unwrap_or_default();
         let generation = self
@@ -583,6 +649,17 @@ impl PgeRoundtable {
                         Some(&board),
                     )
                     .await;
+
+                // 与顺序路径同一条闸：计划侧已终止的分支不再买生成与评估。
+                if plan.is_terminal_env_failure() {
+                    let (plan, generation, evaluation) = Self::terminal_placeholders(plan);
+                    return PgeBranchResult {
+                        branch_id,
+                        plan,
+                        generation,
+                        evaluation,
+                    };
+                }
 
                 let plan_json = serde_json::to_value(&plan).unwrap_or_default();
                 let generation = generator
@@ -1361,6 +1438,76 @@ mod tests {
         assert!(
             !feedback.contains("degenerate"),
             "the local cause must not be filed as a stalled debate: {feedback}"
+        );
+    }
+
+    /// 计划侧耗尽预算的那一轮，生成与评估都不该被买。计划已经明确说了这次
+    /// 运行不会有产出，拿一个空计划去生成、再拿空产出评判，两次都是付费的空转；
+    /// 而且占位的空生成与真的空产出同形，谁先读它谁就会把责任推给生成器。
+    /// 两个观测面各证一件事：生成器的答卷没出现在结果里（生成没买），
+    /// 评估器的 pass 没有变成共识（评估没买）。
+    #[tokio::test]
+    async fn a_debate_with_an_exhausted_planner_stops_before_paying_anyone() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
+            "iterations": 10,
+            "pending_tool_calls": 1
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": {"code": "SHOULD_NOT_RUN"}, "artifacts": []}),
+        )));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"verdict": "pass", "score": 90, "feedback": "ok", "criteria": []}),
+        )));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 5,
+                consensus_threshold: 0.5,
+                stall_threshold: 0,
+                independent_review: false,
+                ..Default::default()
+            },
+            planner,
+            generator,
+            evaluator,
+        );
+        let task = cog_core::Task::new(
+            "t-planner-budget".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let result = rt.debate(&task, serde_json::json!({})).await;
+
+        assert_eq!(result.iterations, 1, "another round spends the same budget");
+        assert!(
+            !result.consensus_reached,
+            "the judge's pass was never asked for, so it cannot carry the debate"
+        );
+        let reason = result
+            .terminal_reason
+            .as_deref()
+            .expect("the debate must report a composed terminal reason");
+        assert!(
+            reason.contains(cog_core::contract::outcome::ITERATION_BUDGET_EXHAUSTED_MARKER),
+            "the planner's spent budget is the cause, got: {reason}"
+        );
+        assert!(
+            reason.contains("max_iterations=10"),
+            "the reason must carry the observed numbers, got: {reason}"
+        );
+        assert!(
+            !reason.contains("no artifacts"),
+            "the generator never ran, so it cannot be the blamed role: {reason}"
+        );
+        assert_eq!(
+            result.final_generation.content,
+            serde_json::Value::Null,
+            "the generator's answer must not appear: it was never asked"
+        );
+        assert!(
+            result.final_generation.artifacts.is_empty(),
+            "a generation that never happened produced nothing"
         );
     }
 
