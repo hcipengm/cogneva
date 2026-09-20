@@ -94,12 +94,19 @@ impl PolicyEvolutionConfig {
 /// 一轮的结论。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolicyEvolutionOutcome {
-    /// 当前参数能落到的已观测结果太少，比较没有意义。
-    InsufficientEvidence { trials: usize },
+    /// 当前参数能落到的可比较结果太少，比较没有意义。
+    InsufficientEvidence {
+        /// 重放出来的规模：每组只放**被选中的那一个决策**的尝试。
+        replayed_trials: usize,
+        /// 耐久快照里记下的全部尝试数。与 `replayed_trials` 分开报，否则
+        /// 运维面上分不出「压根没数据」和「有数据但当前参数几乎选不中」。
+        recorded_trials: usize,
+    },
     /// 比较过了，没有任何候选显著更优。
     NoImprovement {
         considered: usize,
         baseline_trials: usize,
+        recorded_trials: usize,
     },
     /// 已保存为新版本并热替换。
     Adopted {
@@ -134,12 +141,18 @@ impl PolicyEvolutionDriver {
     /// 跑一轮。没有可执行的升级时也返回结论，调用方据此留痕。
     pub async fn run_once(&self) -> SFResult<PolicyEvolutionOutcome> {
         let groups = self.engine.decision_groups().await;
+        let recorded_trials: usize = groups
+            .iter()
+            .flat_map(|g| g.values())
+            .map(|(attempts, _)| *attempts as usize)
+            .sum();
         // 基线就是推荐路径此刻实际会用的参数——同一份推导，不另推一遍。
         let (base_min_samples, base_margin) = self.engine.tuned_params().await;
         let baseline = replay_outcomes(&groups, base_min_samples, base_margin);
         if baseline.len() < self.config.min_trials {
             return Ok(PolicyEvolutionOutcome::InsufficientEvidence {
-                trials: baseline.len(),
+                replayed_trials: baseline.len(),
+                recorded_trials,
             });
         }
         let s_base = baseline.iter().filter(|&&o| o).count();
@@ -177,6 +190,7 @@ impl PolicyEvolutionDriver {
             return Ok(PolicyEvolutionOutcome::NoImprovement {
                 considered,
                 baseline_trials: baseline.len(),
+                recorded_trials,
             });
         };
 
@@ -210,6 +224,7 @@ impl PolicyEvolutionDriver {
             return Ok(PolicyEvolutionOutcome::NoImprovement {
                 considered,
                 baseline_trials: baseline.len(),
+                recorded_trials,
             });
         }
         info!(
@@ -324,7 +339,10 @@ mod tests {
         );
         assert_eq!(
             d.run_once().await.unwrap(),
-            PolicyEvolutionOutcome::InsufficientEvidence { trials: 0 }
+            PolicyEvolutionOutcome::InsufficientEvidence {
+                replayed_trials: 0,
+                recorded_trials: 0,
+            }
         );
         assert!(
             evolution
@@ -335,6 +353,34 @@ mod tests {
                 .is_empty(),
             "证据不足时不得写出任何版本"
         );
+    }
+
+    #[tokio::test]
+    async fn insufficient_evidence_separates_recorded_from_replayed() {
+        // 同一份计数：记下 40 次尝试，但重放每组只放被选中的那一个决策，
+        // 本轮选中的 roundtable 只有 30 次。两个数都必须报出来——只报一个
+        // 的话，「压根没数据」与「有数据但当前参数几乎选不中」在运维面上
+        // 长得一模一样，而两者的处置完全不同。
+        let tmp = tempfile::tempdir().unwrap();
+        let evolution = Arc::new(ArtifactEvolution::new(crate::PolicyStore::new(tmp.path())));
+        let d = PolicyEvolutionDriver::new(
+            PolicyEvolutionConfig {
+                min_trials: 100,
+                ..PolicyEvolutionConfig::default()
+            },
+            engine_with(&[("pipeline", 10, 0), ("roundtable", 30, 30)]).await,
+            evolution,
+        );
+        match d.run_once().await.unwrap() {
+            PolicyEvolutionOutcome::InsufficientEvidence {
+                replayed_trials,
+                recorded_trials,
+            } => {
+                assert_eq!(replayed_trials, 30, "重放规模只含被选中的那个决策");
+                assert_eq!(recorded_trials, 40, "耐久计数含全部决策");
+            }
+            other => panic!("expected InsufficientEvidence, got {other:?}"),
+        }
     }
 
     #[tokio::test]
