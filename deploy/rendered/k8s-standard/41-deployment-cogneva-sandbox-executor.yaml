@@ -54,7 +54,12 @@ spec:
             - |
               set -e
               root=/opt/cogneva/sandbox
-              mkdir -p "$root/workspaces" "$root/src/target" "$root/repo.git"
+              mkdir -p "$root/workspaces" "$root/src/target" "$root/repo.git" "$root/cargo-home"
+              # CARGO_HOME 换到卷上之后，镜像里那份 sparse 镜像配置不会自动跟过来，
+              # 缺了它 cargo 直连 crates.io；一次性把镜像内配置带到卷上。
+              if [ ! -f "$root/cargo-home/config.toml" ] && [ -f /usr/local/cargo/config.toml ]; then
+                cp /usr/local/cargo/config.toml "$root/cargo-home/config.toml"
+              fi
               # 镜像按序尝试，第一个可达的胜出：可达性按主机不对称（实测本集群
               # github 间歇黑洞、gitee 秒级应答），只配一个地址时该主机不可达期间
               # 空卷种子会失败、工作树会静默停在旧 main。
@@ -114,6 +119,13 @@ spec:
               value: /opt/cogneva/sandbox/repo.git
             - name: CARGO_TARGET_DIR
               value: /opt/cogneva/sandbox/src/target
+            # 镜像里的 /usr/local/cargo 归 root，本 Pod 以非 root 跑，cargo 连
+            # registry 缓存目录都建不出来——每条 cargo 命令第一步就失败，工具
+            # 调用只剩反复试错。指向自有卷上的目录：可写，且已拉取的 registry
+            # 跨重启保留，第二个任务起不必重新下载全量依赖。config.toml 由
+            # init 容器从镜像带入。
+            - name: CARGO_HOME
+              value: /opt/cogneva/sandbox/cargo-home
             # 有序镜像列表（逗号分隔）：第一个首选，其余按序回退。
             - name: SANDBOX_REPO_SEED_URLS
               value: "https://github.com/hcipengm/cogneva.git,https://gitee.com/hcipengm/cogneva.git"
