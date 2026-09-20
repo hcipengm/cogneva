@@ -138,10 +138,19 @@ async fn consumer_loop_retries_on_task_failed_result() {
     runtime.run_consumer(shutdown).await.unwrap();
 
     let t = runtime.orchestrator().get_task("task-fail").await.unwrap();
-    // Task is retried (retry_count incremented) and then re-published by
-    // publish_ready_tasks, so its final status is Scheduled.
-    assert_eq!(t.status, TaskStatus::Scheduled);
+    // A transient failure stays retryable, so the retry budget is spent on it —
+    // but the retry is held behind the task type's backoff rather than pushed
+    // straight back onto the ready stream: the task is Pending again and carries
+    // the deadline the publisher filters on. Going back to Scheduled here would
+    // mean the retry ignored its own backoff.
+    assert_eq!(t.status, TaskStatus::Pending);
     assert_eq!(t.retry_count, 1);
+    assert!(
+        t.retry_not_before
+            .is_some_and(|due| due > chrono::Utc::now()),
+        "a retried task must carry a future backoff deadline, got {:?}",
+        t.retry_not_before
+    );
 }
 
 #[tokio::test]
