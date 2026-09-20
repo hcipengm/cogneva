@@ -37,13 +37,10 @@ fn main() {
     cog_deps.sort();
 
     let mut lines = vec![
-        "/// Build a [`cog_core::PluginRunner`] from the static descriptor list.".to_string(),
-        "///".to_string(),
-        "/// Descriptors are topologically sorted by [`cog_core::PluginRunner::from_descriptors`]"
-            .to_string(),
-        "/// before the runner is returned.".to_string(),
-        "pub fn register_all() -> cog_core::SFResult<cog_core::PluginRunner> {".to_string(),
-        "    let descriptors: &[cog_core::PluginDescriptor] = &[".to_string(),
+        "/// Every first-party plugin descriptor this binary registers, derived from".to_string(),
+        "/// `[dependencies]` so that adding a crate cannot leave this list stale.".to_string(),
+        "pub fn all_descriptors() -> &'static [cog_core::PluginDescriptor] {".to_string(),
+        "    &[".to_string(),
     ];
 
     // cog-* plugins (alphabetical, including cog-eval)
@@ -52,8 +49,20 @@ fn main() {
         lines.push(format!("        {}::plugin::DESCRIPTOR,", mod_name));
     }
 
-    lines.push("    ];".to_string());
-    lines.push("    cog_core::PluginRunner::from_descriptors(descriptors)".to_string());
+    lines.push("    ]".to_string());
+    lines.push("}".to_string());
+    lines.push(String::new());
+    lines.push(
+        "/// Build a [`cog_core::PluginRunner`] from the static descriptor list.".to_string(),
+    );
+    lines.push("///".to_string());
+    lines.push(
+        "/// Descriptors are topologically sorted by [`cog_core::PluginRunner::from_descriptors`]"
+            .to_string(),
+    );
+    lines.push("/// before the runner is returned.".to_string());
+    lines.push("pub fn register_all() -> cog_core::SFResult<cog_core::PluginRunner> {".to_string());
+    lines.push("    cog_core::PluginRunner::from_descriptors(all_descriptors())".to_string());
     lines.push("}".to_string());
 
     let out_dir = std::env::var("OUT_DIR").unwrap();

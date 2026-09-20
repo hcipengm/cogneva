@@ -921,6 +921,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         "MediaBackend",
         "UserStore",
         "PlatformIdentityStore",
+        "ExplainPool",
     ],
     consumes: &[cog_core::ConsumeSpec {
         type_name: "HttpClient",

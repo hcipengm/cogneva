@@ -466,7 +466,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     optional_requires: &["llm", "stream", "collaboration", "extension"],
     provides: &[
         "OrchestratorControl",
-        "TaskExecutor",
+        // The router that aggregates the task executors is published under its
+        // concrete type, so nothing can reach it through the `TaskExecutor`
+        // pin. Declaring it here would let a `required` consume of that pin
+        // validate at startup and then panic when no executor is published.
         "ActionPlanner",
         "DagExecutorRuntime",
         "Observable",

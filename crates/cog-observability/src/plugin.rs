@@ -860,7 +860,9 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     optional_requires: &[],
     provides: &[
         "MetricsExporter",
-        "RawLogger",
+        // RawLogger is consumed here (storage publishes it), never published:
+        // declaring it would let the connectivity check pass while the
+        // `expect("raw logger")` below panics at startup instead.
         "TraceCollector",
         "ReplayEngine",
         "TraceTierMigrator",
@@ -868,6 +870,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         "Observable",
         "LogFilterHandle",
         "EvolutionMetrics",
+        "ActiveAlertSource",
     ],
     consumes: &[
         cog_core::ConsumeSpec {
