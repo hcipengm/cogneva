@@ -2768,6 +2768,81 @@ async fn metrics_json_handler(State(state): State<AppState>) -> Json<serde_json:
     }))
 }
 
+/// 凡以 5xx 结束的请求留一行痕。
+///
+/// 网关上每一条把请求转给上游的路径，失败时都是"错误回给调用方、网关自己
+/// 一行不留"：沙盒那边只看到 502/503，运维看网关日志却是空白，而空白读起来
+/// 像"根本没有请求进来"——上游连不通、凭证没配这类事于是只能靠人碰巧去查。
+/// 这一层放在所有转发路由共用的位置上，新加的转发路径自动被覆盖，不需要谁
+/// 记得补日志。
+///
+/// 只记方法、路径、状态码：query 不进来（有些上游把 access_token 拼在 query
+/// 上，且值域无界），路径本身是路由模板或 owner/repo，基数有界。
+///
+/// 只挂在"会出去"的路由上，健康与指标路径不在其中：就绪探针在没配 LLM Key
+/// 时**本来就该**回 503，那是它如实自报状态，kubelet 每几秒问一次，按 5xx 记
+/// 一笔只会把日志刷成噪声。
+///
+/// LLM 通道同样挂在这一层之外——那里有自己的失败记账（按嫌疑窗去重，只在开
+/// 新窗时留一行），逐请求再记一遍会把那份设计抵消掉。
+async fn trace_server_failures(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let resp = next.run(req).await;
+    if resp.status().is_server_error() {
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            status = resp.status().as_u16(),
+            "安全网关：请求以 5xx 结束（上游转发失败或网关内部错误）"
+        );
+    }
+    resp
+}
+
+/// 代码平台通道：API 透传、git 转发、附件、OAuth 兑换。这些路径没有自己的
+/// 失败记账，统一挂 [`trace_server_failures`]。
+fn code_channel_router() -> Router<AppState> {
+    Router::new()
+        .route("/github/{*path}", axum::routing::any(github_passthrough))
+        .route("/gitee/{*path}", axum::routing::any(gitee_passthrough))
+        .route("/v1/oauth/gitee/app", get(gitee_oauth_app_handler))
+        .route(
+            "/v1/oauth/gitee/exchange",
+            post(gitee_oauth_exchange_handler),
+        )
+        .route("/v1/oauth/gitee/refresh", post(gitee_oauth_refresh_handler))
+        .route(
+            "/git/github/{*path}",
+            axum::routing::any(git_github_passthrough),
+        )
+        .route(
+            "/git/gitee/{*path}",
+            axum::routing::any(git_gitee_passthrough),
+        )
+        .route("/attach", get(attach_proxy))
+        .layer(axum::middleware::from_fn(trace_server_failures))
+}
+
+/// LLM 通道：池健康有自己的嫌疑窗记账，失败留痕不走统一层。
+fn llm_channel_router() -> Router<AppState> {
+    Router::new()
+        .route("/v1/intent", post(intent_handler))
+        .route("/v1/chat", post(chat_handler))
+        .route("/v1/chat/completions", post(chat_completions_passthrough))
+        .route("/v1/messages", post(anthropic_messages_passthrough))
+}
+
+/// 外网代理通道：`/proxy` 转发沙盒出站请求，是转发路径，挂统一留痕层。
+fn proxy_channel_router() -> Router<AppState> {
+    Router::new()
+        .route("/proxy", post(proxy_handler))
+        .layer(axum::middleware::from_fn(trace_server_failures))
+}
+
 fn router(state: AppState, llm_channel: bool) -> Router {
     let r = Router::new()
         .route("/health/live", get(health_live))
@@ -2775,39 +2850,23 @@ fn router(state: AppState, llm_channel: bool) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/metrics/json", get(metrics_json_handler));
     let r = if llm_channel {
-        r.route("/v1/intent", post(intent_handler))
-            .route("/v1/chat", post(chat_handler))
-            .route("/v1/chat/completions", post(chat_completions_passthrough))
-            .route("/v1/messages", post(anthropic_messages_passthrough))
-            .route("/github/{*path}", axum::routing::any(github_passthrough))
-            .route("/gitee/{*path}", axum::routing::any(gitee_passthrough))
-            .route("/v1/oauth/gitee/app", get(gitee_oauth_app_handler))
-            .route(
-                "/v1/oauth/gitee/exchange",
-                post(gitee_oauth_exchange_handler),
-            )
-            .route("/v1/oauth/gitee/refresh", post(gitee_oauth_refresh_handler))
-            .route(
-                "/git/github/{*path}",
-                axum::routing::any(git_github_passthrough),
-            )
-            .route(
-                "/git/gitee/{*path}",
-                axum::routing::any(git_gitee_passthrough),
-            )
-            .route("/attach", get(attach_proxy))
+        r.merge(llm_channel_router()).merge(code_channel_router())
     } else {
-        r.route("/proxy", post(proxy_handler))
+        r.merge(proxy_channel_router())
     };
     r.with_state(state)
 }
 
 /// webhook 入口通道路由（面向集群外平台回调，验签后转发主应用）。
 fn webhook_router(state: AppState) -> Router {
-    Router::new()
-        .route("/health/live", get(health_live))
+    // 转发主应用失败的 502/503 此前只回给平台、网关自己不留痕。
+    let hooks = Router::new()
         .route("/webhooks/github", post(github_webhook_handler))
         .route("/webhooks/gitee", post(gitee_webhook_handler))
+        .layer(axum::middleware::from_fn(trace_server_failures));
+    Router::new()
+        .route("/health/live", get(health_live))
+        .merge(hooks)
         .with_state(state)
 }
 
@@ -3969,5 +4028,88 @@ mod tests {
                 "{uri} 不应出现在观测通道上"
             );
         }
+    }
+
+    /// 把 tracing 事件收进内存缓冲，供"这行日志有没有出现"这类断言使用。
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = {
+            let buf = buf.clone();
+            move || CaptureWriter(buf.clone())
+        };
+        // 只留 WARN 及以上：这正是「网关把失败吞掉」时缺的那一档。
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        (buf, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// 网关把失败回给调用方、自己却一行不留，是这套代码反复出的一类形状：
+    /// 调用方只看到 502/503，运维看网关日志却是空白，而空白读起来像"没有请求
+    /// 进来"。这条测试把"转发路径凡 5xx 必有痕"钉在真实路由上——在没有平台
+    /// token 的状态下走一次 git 转发，断言网关自己记了一行，行里有方法、路径、
+    /// 状态码，且 query 不进日志。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_forward_leaves_a_line_in_the_gateway_log() {
+        use tower::ServiceExt;
+        let (buf, _guard) = capture_logs();
+
+        let app = router(test_state(Vec::new()), true);
+        let req = axum::extract::Request::builder()
+            .uri("/git/github/owner/repo.git/info/refs?service=git-upload-pack")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("WARN"), "应有 WARN 行：{logged}");
+        assert!(
+            logged.contains("/git/github/owner/repo.git/info/refs"),
+            "行里要有路径：{logged}"
+        );
+        assert!(logged.contains("503"), "行里要有状态码：{logged}");
+        assert!(
+            !logged.contains("service=git-upload-pack"),
+            "query 不进日志：{logged}"
+        );
+    }
+
+    /// 反向一档：同一层挂着的路由回了 4xx（这里是参数缺失），不该被记成失败。
+    /// 少了这一条，"每请求都记一行"也能让上面那条测试变绿。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_error_through_a_traced_route_is_not_logged() {
+        use tower::ServiceExt;
+        let (buf, _guard) = capture_logs();
+
+        let app = router(test_state(Vec::new()), true);
+        let req = axum::extract::Request::builder()
+            .uri("/attach")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logged.is_empty(), "4xx 不该留痕：{logged}");
     }
 }

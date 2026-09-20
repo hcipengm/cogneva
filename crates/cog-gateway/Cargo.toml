@@ -44,6 +44,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand_core = "0.6"
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 tokio-test = "0.4"
 redis = { workspace = true }
 uuid = { workspace = true }
