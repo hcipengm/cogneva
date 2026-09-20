@@ -40,6 +40,10 @@ fn load_section_from<T: serde::de::DeserializeOwned + Default>(
 const AGENT_LOOP_ENV: &[(&str, &str)] = &[
     ("COGNEVA_AGENT_LOOP_MAX_ITERATIONS", "max_iterations"),
     (
+        "COGNEVA_AGENT_LOOP_EVAL_MAX_ITERATIONS",
+        "eval_max_iterations",
+    ),
+    (
         "COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE",
         "context_window_size",
     ),
@@ -67,6 +71,11 @@ pub struct AgentLoopConfig {
     pub agent_id: String,
     pub role: String,
     pub max_iterations: u32,
+    /// Iteration budget of the dedicated evaluator runtime. It differs from
+    /// [`Self::max_iterations`] on purpose: judging a delivered result needs
+    /// fewer turns than producing one. Kept here rather than as a literal at
+    /// the construction site so raising it does not require a new image.
+    pub eval_max_iterations: u32,
     pub context_window_size: usize,
     /// TTL for the available_skills cache in AgentRuntime (seconds).
     pub skill_cache_ttl_secs: u64,
@@ -81,6 +90,7 @@ impl Default for AgentLoopConfig {
             agent_id: "agent-001".into(),
             role: "planner".into(),
             max_iterations: 10,
+            eval_max_iterations: 5,
             context_window_size: 32000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
@@ -153,6 +163,9 @@ mod tests {
         assert_eq!(l.agent_id, "agent-001");
         assert_eq!(l.role, "planner");
         assert_eq!(l.max_iterations, 10);
+        // The evaluator budget defaults to the value the runtime used to carry
+        // as a literal; moving it here must not change it on its own.
+        assert_eq!(l.eval_max_iterations, 5);
         let p = AgentManagerConfig::default();
         assert!(p.enabled);
         assert_eq!(p.worker_count, 3);
@@ -169,13 +182,15 @@ mod tests {
         let path = dir.join("cogneva.json");
         std::fs::write(
             &path,
-            r#"{"agent_loop": {"role": "evaluator", "max_iterations": 3},
+            r#"{"agent_loop": {"role": "evaluator", "max_iterations": 3,
+                    "eval_max_iterations": 7},
                 "agent_pool": {"worker_count": 8}}"#,
         )
         .unwrap();
         let l = AgentLoopConfig::load_from(&path).unwrap();
         assert_eq!(l.role, "evaluator");
         assert_eq!(l.max_iterations, 3);
+        assert_eq!(l.eval_max_iterations, 7);
         assert_eq!(
             AgentManagerConfig::load_from(&path).unwrap().worker_count,
             8

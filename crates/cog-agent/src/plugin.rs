@@ -195,12 +195,16 @@ impl cog_core::SystemPlugin for AgentPlugin {
         info!("AgentPlugin tool registry published");
 
         // ── Eval AgentRuntime ──
+        // agent_loop 是 cog-agent 自有配置段，这里连同 evaluator 的迭代预算一起
+        // 读一次：预算走配置面，改值不用重新打镜像（其余字段仍是评估器自有默认值，
+        // 与生成侧不是一个量级，不能直接继承）。
+        let agent_loop_config = crate::AgentLoopConfig::load()?;
         let (eval_event_tx, eval_event_rx) =
             tokio::sync::mpsc::channel::<cog_core::AgentEvent>(128);
         let eval_config = cog_core::RuntimeConfig {
             agent_id: "eval-agent".into(),
             role: "evaluator".into(),
-            max_iterations: 5,
+            max_iterations: agent_loop_config.eval_max_iterations,
             context_window_size: 32000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
@@ -233,7 +237,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             }
         };
         // agent_loop / agent_pool 是 cog-agent 自有配置段，自读 cogneva.json。
-        let agent_loop_config: cog_core::RuntimeConfig = crate::AgentLoopConfig::load()?.into();
+        let agent_loop_config: cog_core::RuntimeConfig = agent_loop_config.into();
         let mut pool_builder = crate::GlobalAgentManager::new(
             agent_registry.clone(),
             pool_backend,
