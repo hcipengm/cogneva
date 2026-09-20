@@ -113,12 +113,14 @@ impl PgePipeline {
         attempt: u32,
         plan: PlannerOutput,
         generation: GeneratorOutput,
+        explicit_reason: Option<String>,
         mut history: Vec<PgePipelineAttempt>,
     ) -> PgePipelineResult {
-        // 计划侧的原因优先：本轮 planner 都没到上游时，拿生成侧兜底文案会把
+        // 谁先坏谁的原因优先，调用方知道得最清楚，其次才按链路顺序回落。
+        // 计划侧优先于生成侧：本轮 planner 都没到上游时，拿生成侧兜底文案会把
         // 责任记在一个从未被调用过的生成器头上。
-        let declared = plan
-            .terminal_env_failure_reason()
+        let declared = explicit_reason
+            .or_else(|| plan.terminal_env_failure_reason())
             .or_else(|| generation.terminal_env_failure_reason())
             .unwrap_or_else(crate::squad::pge::types::no_artifacts_reason);
         let evaluation = EvaluationResult {
@@ -191,7 +193,7 @@ impl PgePipeline {
                     content: serde_json::Value::Null,
                     artifacts: Vec::new(),
                 };
-                return Self::terminal_result(attempt, plan, generation, history);
+                return Self::terminal_result(attempt, plan, generation, None, history);
             }
 
             // Stage 2: Generator (initial attempt).
@@ -225,7 +227,7 @@ impl PgePipeline {
                     attempt,
                     "Generator reported terminal environment failure; aborting pipeline without evaluation"
                 );
-                return Self::terminal_result(attempt, plan, generation, history);
+                return Self::terminal_result(attempt, plan, generation, None, history);
             }
 
             // Stage 3: Evaluator.
@@ -268,6 +270,24 @@ impl PgePipeline {
             evaluation.enforce_criteria_evidence(!criteria.is_empty());
             evaluation.enforce_change_artifact_integrity(generation.change_artifact_defect(task));
 
+            // Same guard as the two above, on the third role: an evaluator that
+            // ran out of iterations judged nothing, so repairing towards its
+            // empty feedback and re-judging with the same budget both spend
+            // without being able to conclude.
+            if let Some(reason) = evaluation.terminal_env_failure_reason() {
+                tracing::warn!(
+                    attempt,
+                    "Evaluator reported terminal environment failure; aborting pipeline without repair or retry"
+                );
+                return Self::terminal_result(
+                    attempt,
+                    plan.clone(),
+                    generation,
+                    Some(reason),
+                    history,
+                );
+            }
+
             let mut local_repairs: Vec<LocalRepairAttempt> = Vec::new();
             let mut repair_stall = StallDetector::new(self.config.stall_threshold);
 
@@ -304,7 +324,7 @@ impl PgePipeline {
                         repair_iteration,
                         "Generator repair reported terminal environment failure; aborting pipeline"
                     );
-                    return Self::terminal_result(attempt, plan.clone(), generation, history);
+                    return Self::terminal_result(attempt, plan.clone(), generation, None, history);
                 }
 
                 evaluation = evaluator
@@ -320,6 +340,21 @@ impl PgePipeline {
                 evaluation.enforce_criteria_evidence(!criteria.is_empty());
                 evaluation
                     .enforce_change_artifact_integrity(generation.change_artifact_defect(task));
+
+                if let Some(reason) = evaluation.terminal_env_failure_reason() {
+                    tracing::warn!(
+                        attempt,
+                        repair_iteration,
+                        "Evaluator reported terminal environment failure during repair; aborting pipeline"
+                    );
+                    return Self::terminal_result(
+                        attempt,
+                        plan.clone(),
+                        generation,
+                        Some(reason),
+                        history,
+                    );
+                }
 
                 local_repairs.push(LocalRepairAttempt {
                     repair_iteration,
@@ -361,6 +396,23 @@ impl PgePipeline {
                     )
                     .await;
                 review.enforce_criteria_evidence(!criteria.is_empty());
+                // The reviewer ran out of budget too, so it did not reject the
+                // pass — it never looked. Wrapping that as "independent reviewer
+                // rejected" would put the second role's failure on a verdict the
+                // reviewer never reached.
+                if let Some(reason) = review.terminal_env_failure_reason() {
+                    tracing::warn!(
+                        attempt,
+                        "Independent reviewer reported terminal environment failure; aborting pipeline"
+                    );
+                    return Self::terminal_result(
+                        attempt,
+                        plan.clone(),
+                        generation,
+                        Some(reason),
+                        history,
+                    );
+                }
                 let review_json = serde_json::to_value(&review).unwrap_or_default();
                 if !matches!(review.verdict, Verdict::Pass) {
                     evaluation.verdict = Verdict::Fail;
@@ -1320,5 +1372,74 @@ mod tests {
         );
         assert!(!result.passed, "an exhausted budget is not a pass");
         assert_eq!(result.attempts, 1, "an exhausted budget is not retryable");
+    }
+
+    /// The third role's version of the same trap. The evaluator's budget is
+    /// smaller, so it is reached differently, but the cost is identical: an
+    /// empty `Fail` sends the generator back to repair towards feedback nobody
+    /// wrote, and the re-judge spends the same budget to reach the same place.
+    #[tokio::test]
+    async fn an_evaluator_that_ran_out_of_iterations_ends_the_run_before_repairs() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 3,
+            timeout_ms: 5_000,
+            local_repair_max: 2,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "summary": "s",
+                "plan": {"steps": ["edit"]},
+                "sub_tasks": [],
+                "acceptance_criteria": []
+            }),
+        }));
+        // A generator that did deliver: the run must stop because the judge
+        // spent its budget, not because there was nothing to judge.
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "content": {"code": "fn main() {}"},
+                "artifacts": []
+            }),
+        }));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
+                "iterations": 5,
+                "pending_tool_calls": 3
+            }),
+        }));
+
+        let task = test_task("edit the workspace");
+        let result = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        let feedback = &result.final_evaluation.feedback;
+        assert!(
+            feedback.starts_with(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX),
+            "the outer loops match on the prefix, got: {feedback}"
+        );
+        assert!(
+            feedback.contains("evaluator") && feedback.contains("iteration budget"),
+            "the feedback must put the spend on the evaluator, got: {feedback}"
+        );
+        assert!(
+            !feedback.contains("rejected"),
+            "the judge never reached a verdict, so it rejected nothing: {feedback}"
+        );
+        assert!(!result.passed, "an exhausted budget is not a pass");
+        assert_eq!(result.attempts, 1, "an exhausted budget is not retryable");
+        assert!(
+            result.history[0].local_repairs.is_empty(),
+            "no repair can be aimed at feedback that was never written"
+        );
     }
 }

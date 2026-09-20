@@ -270,6 +270,25 @@ pub struct EvaluationResult {
 }
 
 impl EvaluationResult {
+    /// Whether the evaluator never judged anything because its own ReAct loop
+    /// spent its whole iteration budget. The raw payload is read structurally
+    /// rather than by scanning the feedback: that feedback is prose about
+    /// somebody else's work, so a deterministic-sounding failure named inside
+    /// it is a judgement the evaluator made, not a cause the evaluator suffered.
+    ///
+    /// Without this the exhausted run comes back as a bare `Fail` with empty
+    /// feedback — indistinguishable from an evaluator that read the attempt and
+    /// found it wanting — and buys a full round of local repairs plus every
+    /// configured retry, none of which can judge anything either.
+    pub fn terminal_env_failure_reason(&self) -> Option<String> {
+        let cause = iteration_budget_exhausted_reason(self.details.as_ref()?)?;
+        Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: evaluator {cause}"))
+    }
+
+    pub fn is_terminal_env_failure(&self) -> bool {
+        self.terminal_env_failure_reason().is_some()
+    }
+
     /// Deterministic gate: when the plan declared acceptance criteria, a Pass
     /// verdict is only credible if the evaluator actually reported a
     /// per-criterion judgement. A Pass without any criterion evidence means
@@ -481,6 +500,54 @@ mod tests {
         assert_eq!(evaluation.verdict, Verdict::Fail);
         assert!(evaluation.feedback.contains("hunk header miscounts"));
         assert!(evaluation.feedback.contains("looks correct"));
+    }
+
+    /// The same spent budget on the third role. Read as an ordinary payload it
+    /// is a `Fail` with empty feedback — indistinguishable from an evaluator
+    /// that read the attempt and rejected it — so the run repairs towards
+    /// nothing and re-judges with the same budget.
+    #[test]
+    fn an_exhausted_evaluator_is_not_read_as_a_bare_fail() {
+        let parsed = crate::squad::pge::roundtable::parse_evaluation_result(&serde_json::json!({
+            "status": MAX_ITERATIONS_STATUS,
+            "iterations": 5,
+            "pending_tool_calls": 1
+        }));
+        // The shape-level fallback is what makes this reachable at all: the
+        // sentinel has no `feedback`, so it lands in `details` intact.
+        assert_eq!(
+            parsed.details,
+            Some(serde_json::json!({
+                "status": MAX_ITERATIONS_STATUS,
+                "iterations": 5,
+                "pending_tool_calls": 1
+            }))
+        );
+        let reason = parsed
+            .terminal_env_failure_reason()
+            .expect("an evaluator that judged nothing did not reject anything");
+        assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
+        assert!(
+            reason.contains("evaluator") && reason.contains("iteration budget"),
+            "the reason must say which role spent what, got: {reason}"
+        );
+    }
+
+    /// The evaluator's feedback is prose about somebody else's work. An
+    /// evaluator complaining that a change mishandles an environment error is
+    /// making a judgement — reading that as the evaluator's own cause would
+    /// turn a substantive review into a non-retryable environment failure.
+    #[test]
+    fn an_evaluator_judging_an_environment_error_is_still_judging() {
+        let parsed = crate::squad::pge::roundtable::parse_evaluation_result(&serde_json::json!({
+            "verdict": "fail",
+            "feedback": "the change mishandles environment_error and tool_pipeline_broken cases",
+            "score": 10
+        }));
+        assert!(
+            parsed.terminal_env_failure_reason().is_none(),
+            "a judgement about the environment is not the evaluator failing on the environment"
+        );
     }
 
     #[test]
