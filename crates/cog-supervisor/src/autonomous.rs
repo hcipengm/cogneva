@@ -387,15 +387,14 @@ impl AutonomousCollaborator {
     async fn task_features_for(&self, task_id: &str) -> Option<cog_core::TaskFeatures> {
         let tasks = self.orchestrator.get_all_tasks().await;
         let task = tasks.into_iter().find(|t| t.id == task_id)?;
-        let goal = task
-            .input
-            .get("goal")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&task.id)
-            .to_string();
+        // The engine groups observations by task type plus the first domain
+        // tag, so the tag has to be something many tasks share. A goal string
+        // is unique per task: every group would hold a single observation,
+        // never reach the sample floor, and the retry decision would stay
+        // unlearnable no matter how many tasks run.
         Some(cog_core::TaskFeatures {
             task_type: format!("{:?}", task.task_type),
-            domain_tags: vec![goal],
+            domain_tags: Vec::new(),
             estimated_complexity: 5.0,
             has_external_dependencies: !task.blocked_by.is_empty(),
             historical_success_rate: 0.5,

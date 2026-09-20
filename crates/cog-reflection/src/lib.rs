@@ -49,6 +49,7 @@ pub mod image_rollout;
 pub mod mainline_deployer;
 pub mod matcher;
 pub mod meta_learning;
+pub mod policy_evolution;
 pub mod policy_store;
 pub mod promoter;
 pub mod promotion_gate;
@@ -96,6 +97,9 @@ pub use mainline_deployer::{
 };
 pub use matcher::{DefaultLearningMatcher, LearningMatcher};
 pub use meta_learning::MetaLearningEngine;
+pub use policy_evolution::{
+    run_policy_evolution_loop, PolicyEvolutionConfig, PolicyEvolutionDriver, PolicyEvolutionOutcome,
+};
 pub use policy_store::{
     ArtifactEvolution, PolicyArtifact, PolicyCandidate, PolicyProposal, PolicyStore,
 };

@@ -7,6 +7,7 @@ pub mod collaboration_executor;
 pub mod config;
 pub mod hierarchy;
 pub mod ipc;
+pub mod meta_features;
 pub mod observable;
 pub mod profile;
 pub mod squad;

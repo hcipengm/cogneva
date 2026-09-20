@@ -75,7 +75,9 @@ impl MetaLearningEngine {
     }
 
     /// 有效调参：策略产物 active 版本优先，缺失字段回退到构造参数。
-    async fn tuned_params(&self) -> (u32, f64) {
+    /// 公开：参数搜索要拿它当基线，自己另推一份就会与推荐路径实际用的
+    /// 参数悄悄分叉。
+    pub async fn tuned_params(&self) -> (u32, f64) {
         if let Some((store, name)) = &self.policy {
             if let Ok(Some(artifact)) = store.load_active(name).await {
                 let min_samples = artifact
@@ -93,6 +95,18 @@ impl MetaLearningEngine {
             }
         }
         (self.min_samples, self.margin)
+    }
+
+    /// Snapshot of every observed decision group, for offline parameter
+    /// search. Grouping is dropped: the tuning parameters apply to the rule
+    /// itself, so the search pools the groups the rule is applied to.
+    pub async fn decision_groups(&self) -> Vec<HashMap<String, (u32, u32)>> {
+        self.decision_stats
+            .read()
+            .await
+            .values()
+            .map(|s| s.counts.clone())
+            .collect()
     }
 
     /// Build a lookup key from task features.
@@ -180,21 +194,17 @@ impl MetaLearningEngine {
         }
 
         let (min_samples, margin) = self.tuned_params().await;
-        let mut best: Option<(String, f64)> = None;
-        for (decision, (attempts, successes)) in &stats.counts {
-            if *attempts < min_samples {
-                continue;
-            }
-            let rate = *successes as f64 / *attempts as f64;
-            match best {
-                Some((_, best_rate)) if rate <= best_rate + margin => {
-                    // Within margin — no strong preference.
-                }
-                _ => best = Some((decision.clone(), rate)),
-            }
+        let decision = select_decision(&stats.counts, min_samples, margin);
+        if decision.is_none() {
+            debug!(
+                category = ?category,
+                key = %key,
+                min_samples,
+                margin,
+                "Meta-learning: no decision clears the configured margin"
+            );
         }
-
-        best.map(|(d, _)| d)
+        decision
     }
 
     // ========================================================================
@@ -388,5 +398,132 @@ impl cog_core::MetaLearning for MetaLearningEngine {
         outcome: DecisionOutcome,
     ) -> SFResult<()> {
         MetaLearningEngine::record(self, category, features, decision, outcome).await
+    }
+}
+
+/// The decision-selection rule, as a pure function of the observations.
+///
+/// Shared by the live recommendation path and the offline replay that scores
+/// candidate tuning parameters: a replay that models the rule differently from
+/// the way the rule actually runs would compare parameter sets against a
+/// system that does not exist. Iteration order is fixed (best rate first,
+/// ties by decision name) so the outcome does not depend on hash ordering.
+///
+/// Returns `None` while no decision has been observed `min_samples` times, and
+/// when the best of them does not lead the runner-up by more than `margin` —
+/// a margin that never suppressed anything would make the parameter nothing
+/// but a number in a file.
+pub fn select_decision(
+    counts: &HashMap<String, (u32, u32)>,
+    min_samples: u32,
+    margin: f64,
+) -> Option<String> {
+    let floor = min_samples.max(1);
+    let mut eligible: Vec<(&String, f64, u32)> = counts
+        .iter()
+        .filter(|(_, (attempts, _))| *attempts >= floor)
+        .map(|(decision, (attempts, successes))| {
+            (decision, *successes as f64 / *attempts as f64, *attempts)
+        })
+        .collect();
+    eligible.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+
+    let (best, best_rate, _) = eligible.first()?;
+    if let Some((_, runner_up_rate, _)) = eligible.get(1) {
+        if *best_rate <= runner_up_rate + margin {
+            return None;
+        }
+    }
+    Some(best.to_string())
+}
+
+/// Replay the recommendation path over a set of observed decision groups.
+///
+/// For every group the rule would have decided on, the resulting arm holds
+/// that decision's observed trials. Groups the rule leaves undecided
+/// contribute nothing: the live path falls back to its own default profile
+/// there, and a replay has no trials for the decision it never took.
+///
+/// Both arms resample the same recorded trials, so they are not independent
+/// while the two-proportion test assumes they are. That makes the test
+/// conservative — the gate only lets a candidate through when it clears
+/// significance, so a conservative test errs toward the current version.
+pub fn replay_outcomes(
+    groups: &[HashMap<String, (u32, u32)>],
+    min_samples: u32,
+    margin: f64,
+) -> Vec<bool> {
+    let mut outcomes = Vec::new();
+    for counts in groups {
+        let Some(decision) = select_decision(counts, min_samples, margin) else {
+            continue;
+        };
+        let Some(&(attempts, successes)) = counts.get(&decision) else {
+            continue;
+        };
+        outcomes.extend(std::iter::repeat_n(true, successes as usize));
+        outcomes.extend(std::iter::repeat_n(false, (attempts - successes) as usize));
+    }
+    outcomes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counts(spec: &[(&str, u32, u32)]) -> HashMap<String, (u32, u32)> {
+        spec.iter()
+            .map(|(d, a, s)| (d.to_string(), (*a, *s)))
+            .collect()
+    }
+
+    #[test]
+    fn selection_is_independent_of_iteration_order() {
+        // The rates differ by more than the margin, so exactly one decision
+        // qualifies — which one must not depend on hash order.
+        let c = counts(&[("pipeline", 10, 9), ("roundtable", 10, 1)]);
+        assert_eq!(select_decision(&c, 3, 0.15).as_deref(), Some("pipeline"));
+        let c = counts(&[("roundtable", 10, 9), ("pipeline", 10, 1)]);
+        assert_eq!(select_decision(&c, 3, 0.15).as_deref(), Some("roundtable"));
+    }
+
+    #[test]
+    fn margin_suppresses_a_close_lead() {
+        let c = counts(&[("pipeline", 10, 6), ("roundtable", 10, 5)]);
+        assert_eq!(select_decision(&c, 3, 0.15), None);
+        assert_eq!(select_decision(&c, 3, 0.05).as_deref(), Some("pipeline"));
+    }
+
+    #[test]
+    fn thin_decisions_are_ineligible() {
+        let c = counts(&[("pipeline", 10, 5), ("roundtable", 2, 2)]);
+        // roundtable is perfect but has not been observed min_samples times.
+        assert_eq!(select_decision(&c, 3, 0.15).as_deref(), Some("pipeline"));
+        // Lowering the floor alone still leaves a single eligible decision.
+        assert_eq!(select_decision(&c, 2, 0.15).as_deref(), Some("roundtable"));
+    }
+
+    #[test]
+    fn no_eligible_decision_yields_none() {
+        let c = counts(&[("pipeline", 1, 1)]);
+        assert_eq!(select_decision(&c, 3, 0.15), None);
+        assert_eq!(select_decision(&HashMap::new(), 3, 0.15), None);
+    }
+
+    #[test]
+    fn replay_returns_the_trials_of_the_selected_decision() {
+        let groups = vec![
+            counts(&[("pipeline", 4, 4), ("roundtable", 4, 0)]),
+            counts(&[("pipeline", 4, 0), ("roundtable", 4, 4)]),
+        ];
+        let outcomes = replay_outcomes(&groups, 3, 0.15);
+        assert_eq!(outcomes.len(), 8);
+        assert!(outcomes.iter().all(|&o| o));
+        // A margin that exceeds the lead leaves both groups undecided.
+        assert!(replay_outcomes(&groups, 3, 1.5).is_empty());
     }
 }

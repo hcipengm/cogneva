@@ -626,7 +626,16 @@
     "poll_interval_secs": 60,
     "schema_repair_interval_secs": 600,
     "notify_on_success": true,
-    "notify_on_failure": true
+    "notify_on_failure": true,
+    "artifact_evolution": {
+      "_comment": "Autonomous search over the meta-learning policy's tuning parameters (min_samples, margin). Each round replays the recorded decision outcomes under every candidate parameter set and adopts one only when a two-proportion z-test says it beats what the recommendation path is currently using; the winner is saved as a new version and hot-swapped. The input is this process's own recorded results, so it runs without LLM or network access. min_trials is the floor — below it the test cannot be significant and the round writes nothing. Ownership: the policy artifact lives under this process's own data dir, so this loop needs no per-deployment owner switch.",
+      "enabled": true,
+      "interval_secs": 3600,
+      "policy_name": "meta_learning.mode",
+      "min_trials": 40,
+      "min_samples_grid": [2, 3, 5, 8],
+      "margin_grid": [0.0, 0.05, 0.1, 0.15, 0.2, 0.3]
+    }
   },
   "multi_backend_consumer": {
     "_comment": "events_on_bus=true: AgentEnd is published only to the persistent event plane (dedicated NATS JetStream at nats_urls, decoupled from the task-queue backend); the supervisor re-injects it into the broadcast exactly once and memory-ingestor consumes from the bus with ack-after-processing. Publish-side knobs bound the in-memory buffer that covers NATS outage windows.",

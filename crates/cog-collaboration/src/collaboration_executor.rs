@@ -26,6 +26,9 @@ pub struct CollaborationExecutor {
     pge_schemas: Option<std::collections::HashMap<String, serde_json::Value>>,
     skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// 决策结果的写侧：每个任务现建的 SquadExecutor 都要拿到它，否则
+    /// 引擎只读不写，表永远空。
+    meta_learning: Option<Arc<dyn cog_core::MetaLearning>>,
     /// Ralph Loop 预算与停滞窗口（配置面 `ralph` 段；None = 默认）。
     ralph: Option<crate::squad::ralph::RalphLoopConfig>,
 }
@@ -48,6 +51,7 @@ impl CollaborationExecutor {
             pge_schemas: None,
             skill_registry: None,
             state_backend: None,
+            meta_learning: None,
             ralph: None,
         }
     }
@@ -65,8 +69,14 @@ impl CollaborationExecutor {
     }
 
     /// Attach a meta-learning engine for predictive PGE mode selection.
+    ///
+    /// Held on the executor as well as handed to the mode selector: the
+    /// selector only reads a recommendation, while the squad executors built
+    /// per task are what write the outcome back. Wiring one without the other
+    /// leaves the engine reading a table nothing ever fills.
     pub fn with_meta_learning(mut self, engine: Arc<dyn cog_core::MetaLearning>) -> Self {
-        self.mode_selector = self.mode_selector.with_meta_learning(engine);
+        self.mode_selector = self.mode_selector.with_meta_learning(engine.clone());
+        self.meta_learning = Some(engine);
         self
     }
 
@@ -467,6 +477,9 @@ impl CollaborationExecutor {
         if let Some(ref backend) = self.state_backend {
             squad_executor = squad_executor.with_state_backend(backend.clone());
         }
+        if let Some(ref meta) = self.meta_learning {
+            squad_executor = squad_executor.with_meta_learning(meta.clone());
+        }
         if let Some(ralph) = self.ralph {
             squad_executor = squad_executor.with_ralph_config(ralph);
         }
@@ -586,6 +599,9 @@ impl CollaborationExecutor {
         }
         if let Some(ref backend) = self.state_backend {
             squad_executor = squad_executor.with_state_backend(backend.clone());
+        }
+        if let Some(ref meta) = self.meta_learning {
+            squad_executor = squad_executor.with_meta_learning(meta.clone());
         }
         if let Some(ralph) = self.ralph {
             squad_executor = squad_executor.with_ralph_config(ralph);

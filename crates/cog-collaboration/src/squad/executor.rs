@@ -293,14 +293,7 @@ impl SquadExecutor {
 
         // Meta-learning: record the actual outcome so the model improves.
         if let Some(ref engine) = self.meta_learning {
-            let features = cog_core::TaskFeatures {
-                task_type: "squad".into(),
-                domain_tags: vec![result.squad_id.clone()],
-                estimated_complexity: 0.5,
-                has_external_dependencies: false,
-                historical_success_rate: if result.success { 1.0 } else { 0.0 },
-                required_skills: vec![],
-            };
+            let features = crate::meta_features::squad_decision_features();
             let mode_str = match result.pge_mode {
                 PgeMode::Pipeline => "pipeline",
                 PgeMode::Roundtable => "roundtable",

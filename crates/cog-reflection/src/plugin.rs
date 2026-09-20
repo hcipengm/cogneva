@@ -42,6 +42,11 @@ pub struct ReflectionPlugin {
     pool_gate: Arc<PoolGate>,
     /// 全插件唯一的分配器：部署器、各进化消费者都从这里取工作树。
     workspaces: Option<Arc<crate::workspace::WorkspaceManager>>,
+    /// 产物级进化的读侧：既提供已记录的决策结果，也提供推荐路径此刻真正
+    /// 在用的参数。参数搜索拿它当基线，不自己另推一份。
+    meta_learning: Option<Arc<crate::MetaLearningEngine>>,
+    /// 产物级进化的写侧：保存新版本并热替换 active 指针。
+    artifact_evolution: Option<Arc<crate::ArtifactEvolution>>,
 }
 
 impl ReflectionPlugin {
@@ -52,6 +57,8 @@ impl ReflectionPlugin {
             porter_armed: false,
             pool_gate: Arc::new(PoolGate::default()),
             workspaces: None,
+            meta_learning: None,
+            artifact_evolution: None,
         }
     }
 }
@@ -293,6 +300,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             ));
         }
         let artifact_evolution = Arc::new(crate::ArtifactEvolution::new(policy_store));
+        // 循环在 start() 挂载；这里先把两侧拿在手上。写侧与读侧必须在同一个
+        // 进程、同一块数据卷上，否则写出去的版本没人读。
+        self.meta_learning = engine.meta_learning.clone();
+        self.artifact_evolution = Some(artifact_evolution.clone());
         let engine = Arc::new(engine);
         ctx.publish(artifact_evolution.clone());
         info!(dir = %policy_dir, "artifact-level evolution policy store enabled");
@@ -835,6 +846,36 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             ));
         } else {
             info!("signal watcher: no orchestrator; self-discovery intents disabled");
+        }
+
+        // 产物级进化的自主触发者：拿本进程已记录的决策结果重放候选参数，
+        // 显著更优才写新版本并热替换。与自发现信号 watcher 不同，它的副
+        // 作用只落在本进程自己的策略目录里（`app.data_dir` 下的 PV），既
+        // 不碰共享上游也不碰共享库表，所以不需要按部署指定属主——每个进程
+        // 调的本来就是自己那套参数。配置解析失败要响亮失败，所以先读配置。
+        let pe_config = crate::PolicyEvolutionConfig::load()?;
+        if !pe_config.enabled {
+            info!("artifact-level evolution driver disabled by config");
+        } else if let (Some(engine), Some(evolution)) =
+            (self.meta_learning.clone(), self.artifact_evolution.clone())
+        {
+            let shutdown = cog_core::ShutdownSignal::new();
+            if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                let shutdown = shutdown.clone();
+                let mut rx = broadcast_tx.0.subscribe();
+                tokio::spawn(async move {
+                    let _ = rx.recv().await;
+                    shutdown.trigger();
+                });
+            }
+            tokio::spawn(crate::run_policy_evolution_loop(
+                Arc::new(crate::PolicyEvolutionDriver::new(
+                    pe_config, engine, evolution,
+                )),
+                shutdown,
+            ));
+        } else {
+            info!("artifact-level evolution driver: no meta-learning engine; skipping");
         }
 
         if !self.porter_armed {

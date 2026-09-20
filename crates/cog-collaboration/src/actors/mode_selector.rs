@@ -200,20 +200,17 @@ impl ModeSelectorActor {
 
     async fn meta_learning_context(
         &self,
-        goal: &str,
+        _goal: &str,
         profile: Option<&TaskProfile>,
     ) -> Option<String> {
         let engine = self.meta_learning.as_ref()?;
-        let profile = profile?;
+        // Still require a profile: without one the caller has nothing to
+        // classify the task by and the recommendation would be noise.
+        profile?;
 
-        let features = cog_core::TaskFeatures {
-            task_type: "squad".into(),
-            domain_tags: vec![goal.into()],
-            estimated_complexity: complexity_score(profile) as f32,
-            has_external_dependencies: profile.dependency_count > 0.0,
-            historical_success_rate: profile.historical_success as f32,
-            required_skills: vec![],
-        };
+        // Same features the writing side uses — the recommendation has to be
+        // looked up under the key the outcomes were recorded with.
+        let features = crate::meta_features::squad_decision_features();
 
         let rec = engine.recommend_mode(&features).await;
         let text = match rec {
