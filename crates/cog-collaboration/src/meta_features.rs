@@ -1,29 +1,36 @@
-//! Task features for the meta-learning decision about the PGE mode.
+//! What the meta-learning engine is told about a PGE-mode decision.
 //!
-//! The engine groups observations by task type plus the first domain tag, and
-//! the two halves of the loop run at different moments: mode selection reads a
-//! recommendation before the squad exists, squad completion writes the outcome
-//! after it finished. Only the task kind is knowable on both sides, so it is
-//! the whole discriminator — a squad id or a goal string would make every group
-//! a single observation, and the engine needs `min_samples` observations in a
-//! group before it can recommend anything at all. Two sides that build the key
-//! from different fields never share a group either.
+//! One decision, two moments: mode selection reads a recommendation before the
+//! squad exists, squad completion writes the outcome after it finished. The
+//! group the engine learns from is a task *kind* — a squad id or a goal string
+//! would make every group a single observation, and the engine's sample floor
+//! would then be unreachable no matter how many squads run. Two sides that
+//! group an observation differently never see each other's trials either.
 //!
-//! Both sides take their features from here so the read key and the write key
-//! cannot drift apart.
+//! Both sides take the group and the recorded context from here, in one value,
+//! so neither half of the loop can drift from the other.
 
-use cog_core::TaskFeatures;
+use cog_core::{DecisionGroupKey, TaskFeatures};
 
-/// Features for the PGE-mode decision. Only `task_type` and `domain_tags`
-/// participate in the grouping key; the remaining fields are placeholders for
-/// a richer model that is not wired yet.
-pub fn squad_decision_features() -> TaskFeatures {
-    TaskFeatures {
-        task_type: "squad".into(),
-        domain_tags: Vec::new(),
-        estimated_complexity: 0.5,
-        has_external_dependencies: false,
-        historical_success_rate: 0.5,
-        required_skills: Vec::new(),
+/// The group and recorded context of a squad's PGE-mode decision.
+pub struct SquadDecision {
+    pub group: DecisionGroupKey,
+    /// Recorded context for the decision log. Carries no grouping: the engine
+    /// groups by [`DecisionGroupKey`] alone.
+    pub features: TaskFeatures,
+}
+
+/// The one definition of which group a squad's PGE-mode decision belongs to.
+pub fn squad_decision() -> SquadDecision {
+    SquadDecision {
+        group: DecisionGroupKey::by_task_type("squad"),
+        features: TaskFeatures {
+            task_type: "squad".into(),
+            domain_tags: Vec::new(),
+            estimated_complexity: 0.5,
+            has_external_dependencies: false,
+            historical_success_rate: 0.5,
+            required_skills: Vec::new(),
+        },
     }
 }

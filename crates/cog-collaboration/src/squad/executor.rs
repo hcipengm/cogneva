@@ -293,14 +293,15 @@ impl SquadExecutor {
 
         // Meta-learning: record the actual outcome so the model improves.
         if let Some(ref engine) = self.meta_learning {
-            let features = crate::meta_features::squad_decision_features();
+            let decision = crate::meta_features::squad_decision();
             let mode_str = match result.pge_mode {
                 PgeMode::Pipeline => "pipeline",
                 PgeMode::Roundtable => "roundtable",
             };
             let _ = engine
                 .record_outcome(
-                    &features,
+                    &decision.group,
+                    &decision.features,
                     mode_str,
                     result.success,
                     if result.success { 1.0 } else { 0.0 },

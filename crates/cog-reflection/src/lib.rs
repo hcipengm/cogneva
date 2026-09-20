@@ -210,11 +210,16 @@ impl ReflectionEngine {
         }
     }
 
-    /// Build a **deep self-evolution** engine with all components including
-    /// effectiveness tracking, meta-learning, controlled evolution, and
-    /// autonomous discovery.
+    /// Build a **deep self-evolution** engine with effectiveness tracking,
+    /// controlled evolution, and autonomous discovery.
     /// This is the highest-tier constructor for systems that need to improve
     /// themselves across sessions.
+    ///
+    /// The meta-learning engine is *not* built here: it needs the durable state
+    /// path, which belongs to the deployment's data volume rather than to this
+    /// constructor, and a second engine built anywhere else would be a second
+    /// object that records decisions nobody reads. The deployment installs the
+    /// one engine through [`MetaLearningEngine::with_durable_state`].
     #[allow(clippy::too_many_arguments)]
     pub fn new_self_evolution(
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
@@ -248,7 +253,6 @@ impl ReflectionEngine {
             prompt_manager.clone(),
         ));
         let effectiveness_tracker = Arc::new(SkillEffectivenessTracker::new(recorder.clone()));
-        let meta_learning = Arc::new(MetaLearningEngine::new(recorder.clone()));
         let mut evolution =
             EvolutionEngine::new(llm.clone(), skill_registry.clone(), prompt_manager.clone())
                 .with_change_dir(change_dir);
@@ -272,7 +276,7 @@ impl ReflectionEngine {
             reviewer: Some(reviewer),
             extractor: Some(extractor),
             effectiveness_tracker: Some(effectiveness_tracker),
-            meta_learning: Some(meta_learning),
+            meta_learning: None,
             evolution: Some(evolution),
             discovery: Some(discovery),
             evolution_cooldowns: Arc::new(

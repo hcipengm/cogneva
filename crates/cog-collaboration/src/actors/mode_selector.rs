@@ -208,11 +208,11 @@ impl ModeSelectorActor {
         // classify the task by and the recommendation would be noise.
         profile?;
 
-        // Same features the writing side uses — the recommendation has to be
-        // looked up under the key the outcomes were recorded with.
-        let features = crate::meta_features::squad_decision_features();
+        // The same group the writing side records under — the recommendation
+        // has to be looked up in the group the outcomes were recorded in.
+        let group = crate::meta_features::squad_decision().group;
 
-        let rec = engine.recommend_mode(&features).await;
+        let rec = engine.recommend_mode(&group).await;
         let text = match rec {
             cog_core::ModeRecommendation::Pipeline => {
                 "Historical data strongly suggests Pipeline (fastest, sufficient for this task category)."

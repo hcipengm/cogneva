@@ -419,6 +419,11 @@ pub trait SquadReflection: Send + Sync {
 // ============================================================================
 
 /// Features extracted from a task that serve as input to the mode selector.
+///
+/// These are recorded context, not a grouping key: which observations the
+/// engine learns from together is decided by [`DecisionGroupKey`], so a field
+/// that happens to vary per task (a goal, a tag) cannot silently become the
+/// grouping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskFeatures {
     pub task_type: String,
@@ -427,6 +432,38 @@ pub struct TaskFeatures {
     pub has_external_dependencies: bool,
     pub historical_success_rate: f32,
     pub required_skills: Vec<String>,
+}
+
+/// The observation group a decision's outcome belongs to.
+///
+/// Two properties have to hold, and neither is expressible while the grouping
+/// is "whatever string the caller formatted": the read side and the write side
+/// of one decision must hand over the *same* key, and the key's value domain
+/// must be bounded. A discriminator taken from a field that varies per object —
+/// a goal string, a squad id — gives every group a single observation, so the
+/// engine's sample floor becomes unreachable by construction no matter how many
+/// tasks run. Both sides therefore name the grouping through this type, and the
+/// constructors are where "what counts as one group" is written down.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DecisionGroupKey(String);
+
+impl DecisionGroupKey {
+    /// Group by task kind: every task of the same kind shares one group. The
+    /// argument has to be a kind, not an instance.
+    pub fn by_task_type(task_type: impl Into<String>) -> Self {
+        Self(task_type.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DecisionGroupKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Recommendation returned by the meta-learning engine.
@@ -654,12 +691,15 @@ impl ErrorEntry {
 /// Lightweight trait abstracting the meta-learning mode selector.
 #[async_trait::async_trait]
 pub trait MetaLearning: Send + Sync + std::fmt::Debug {
-    /// Recommend a mode based on historical data for this task category.
-    async fn recommend_mode(&self, features: &TaskFeatures) -> ModeRecommendation;
+    /// Recommend a mode for the given decision group.
+    async fn recommend_mode(&self, group: &DecisionGroupKey) -> ModeRecommendation;
 
     /// Record the actual outcome of a mode decision so the model can learn.
+    /// `features` is the recorded context; the group is passed separately so
+    /// the two sides of the decision cannot group the observation differently.
     async fn record_outcome(
         &self,
+        group: &DecisionGroupKey,
         features: &TaskFeatures,
         selected_mode: &str,
         success: bool,
@@ -671,14 +711,14 @@ pub trait MetaLearning: Send + Sync + std::fmt::Debug {
     async fn recommend(
         &self,
         category: DecisionCategory,
-        features: &TaskFeatures,
+        group: &DecisionGroupKey,
     ) -> Option<String>;
 
     /// Record the outcome of a decision so the model can learn.
     async fn record(
         &self,
         category: DecisionCategory,
-        features: &TaskFeatures,
+        group: &DecisionGroupKey,
         decision: &str,
         outcome: DecisionOutcome,
     ) -> crate::SFResult<()>;

@@ -264,25 +264,18 @@ pub async fn run_policy_evolution_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::{DecisionCategory, DecisionOutcome, TaskFeatures};
+    use cog_core::{DecisionCategory, DecisionOutcome};
 
     /// Record outcomes through the same entry point the live system uses, so
     /// the driver is exercised against the grouping the engine really builds.
     async fn record_counts(engine: &MetaLearningEngine, counts: &[(&str, u32, u32)]) {
-        let features = TaskFeatures {
-            task_type: "squad".into(),
-            domain_tags: Vec::new(),
-            estimated_complexity: 0.5,
-            has_external_dependencies: false,
-            historical_success_rate: 0.5,
-            required_skills: Vec::new(),
-        };
+        let group = cog_core::DecisionGroupKey::by_task_type("squad");
         for (decision, attempts, successes) in counts {
             for i in 0..*attempts {
                 engine
                     .record(
                         DecisionCategory::PgeMode,
-                        &features,
+                        &group,
                         decision,
                         if i < *successes {
                             DecisionOutcome::Success
@@ -297,7 +290,7 @@ mod tests {
     }
 
     async fn engine_with(counts: &[(&str, u32, u32)]) -> Arc<MetaLearningEngine> {
-        let engine = Arc::new(MetaLearningEngine::new(Arc::new(
+        let engine = Arc::new(MetaLearningEngine::new_ephemeral(Arc::new(
             crate::InMemoryRecorder::new(),
         )));
         record_counts(&engine, counts).await;
@@ -313,7 +306,7 @@ mod tests {
         policy_name: &str,
     ) -> Arc<MetaLearningEngine> {
         let engine = Arc::new(
-            MetaLearningEngine::new(Arc::new(crate::InMemoryRecorder::new()))
+            MetaLearningEngine::new_ephemeral(Arc::new(crate::InMemoryRecorder::new()))
                 .with_policy_store(store, policy_name),
         );
         record_counts(&engine, counts).await;

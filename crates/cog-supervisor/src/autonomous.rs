@@ -189,11 +189,11 @@ impl AutonomousCollaborator {
         };
         if had_retries {
             if let Some(ref meta) = self.meta_learning {
-                if let Some(features) = self.task_features_for(task_id).await {
+                if let Some(group) = self.decision_group_for(task_id).await {
                     let _ = meta
                         .record(
                             cog_core::DecisionCategory::RetryPolicy,
-                            &features,
+                            &group,
                             "identical_retry",
                             cog_core::DecisionOutcome::Success,
                         )
@@ -214,9 +214,9 @@ impl AutonomousCollaborator {
 
         // Build task features and query meta-learning for retry strategy.
         let ml_recommendation = if let Some(ref meta) = self.meta_learning {
-            if let Some(features) = self.task_features_for(task_id).await {
+            if let Some(group) = self.decision_group_for(task_id).await {
                 let decision = meta
-                    .recommend(cog_core::DecisionCategory::RetryPolicy, &features)
+                    .recommend(cog_core::DecisionCategory::RetryPolicy, &group)
                     .await;
                 if let Some(ref d) = decision {
                     info!(
@@ -266,11 +266,11 @@ impl AutonomousCollaborator {
 
             // Record failed outcome to meta-learning.
             if let Some(ref meta) = self.meta_learning {
-                if let Some(features) = self.task_features_for(task_id).await {
+                if let Some(group) = self.decision_group_for(task_id).await {
                     let _ = meta
                         .record(
                             cog_core::DecisionCategory::RetryPolicy,
-                            &features,
+                            &group,
                             strategy,
                             cog_core::DecisionOutcome::Failed,
                         )
@@ -302,11 +302,11 @@ impl AutonomousCollaborator {
 
             // Record retry decision to meta-learning.
             if let Some(ref meta) = self.meta_learning {
-                if let Some(features) = self.task_features_for(task_id).await {
+                if let Some(group) = self.decision_group_for(task_id).await {
                     let _ = meta
                         .record(
                             cog_core::DecisionCategory::RetryPolicy,
-                            &features,
+                            &group,
                             strategy,
                             cog_core::DecisionOutcome::Escalated,
                         )
@@ -382,23 +382,19 @@ impl AutonomousCollaborator {
         }
     }
 
-    /// Look up a task in the orchestrator and build simplified [`TaskFeatures`]
-    /// for the meta-learning engine.
-    async fn task_features_for(&self, task_id: &str) -> Option<cog_core::TaskFeatures> {
+    /// Look up a task in the orchestrator and name the group its retry
+    /// decision belongs to.
+    ///
+    /// The group is the task *kind*: a goal string or a task id is unique per
+    /// task, so every group would hold a single observation, never reach the
+    /// sample floor, and the retry decision would stay unlearnable no matter
+    /// how many tasks run.
+    async fn decision_group_for(&self, task_id: &str) -> Option<cog_core::DecisionGroupKey> {
         let tasks = self.orchestrator.get_all_tasks().await;
         let task = tasks.into_iter().find(|t| t.id == task_id)?;
-        // The engine groups observations by task type plus the first domain
-        // tag, so the tag has to be something many tasks share. A goal string
-        // is unique per task: every group would hold a single observation,
-        // never reach the sample floor, and the retry decision would stay
-        // unlearnable no matter how many tasks run.
-        Some(cog_core::TaskFeatures {
-            task_type: format!("{:?}", task.task_type),
-            domain_tags: Vec::new(),
-            estimated_complexity: 5.0,
-            has_external_dependencies: !task.blocked_by.is_empty(),
-            historical_success_rate: 0.5,
-            required_skills: Vec::new(),
-        })
+        Some(cog_core::DecisionGroupKey::by_task_type(format!(
+            "{:?}",
+            task.task_type
+        )))
     }
 }

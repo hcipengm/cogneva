@@ -307,27 +307,13 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // ——记录写进无人读的引擎，驱动对着空分组报证据不足。所以这里不按
         // 「原来有没有引擎」分叉：没有就造一个，造完一律挂上策略库。
         let meta_learning_engine = Arc::new(
-            crate::MetaLearningEngine::new(engine.recorder.clone())
-                .with_policy_store(policy_store.clone(), "meta_learning.mode")
-                .with_state_snapshot(crate::DecisionStatsSnapshot::new(&stats_path)),
+            crate::MetaLearningEngine::with_durable_state(
+                engine.recorder.clone(),
+                crate::DecisionStatsSnapshot::new(&stats_path),
+            )
+            .await
+            .with_policy_store(policy_store.clone(), "meta_learning.mode"),
         );
-        match meta_learning_engine.hydrate().await {
-            Ok((0, _)) => info!(
-                path = %stats_path,
-                "meta-learning state: nothing to restore (first start, or no decision recorded yet)"
-            ),
-            Ok((groups, trials)) => info!(
-                path = %stats_path,
-                groups,
-                trials,
-                "meta-learning state restored from the durable snapshot"
-            ),
-            Err(e) => warn!(
-                path = %stats_path,
-                error = %e,
-                "meta-learning state snapshot unreadable; starting from empty"
-            ),
-        }
         engine.meta_learning = Some(meta_learning_engine.clone());
         let artifact_evolution = Arc::new(crate::ArtifactEvolution::new(policy_store));
         // 循环在 start() 挂载；这里先把两侧拿在手上。
