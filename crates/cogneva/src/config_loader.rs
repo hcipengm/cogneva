@@ -173,12 +173,8 @@ fn default_env_mappings() -> HashMap<String, String> {
     );
     // metrics
     m.insert(
-        "COGNEVA_METRICS_SAMPLE_RETENTION_SECS".into(),
-        "metrics.sample_retention_secs".into(),
-    );
-    m.insert(
-        "COGNEVA_METRICS_SAMPLE_RETENTION_SWEEP_INTERVAL_SECS".into(),
-        "metrics.sample_retention_sweep_interval_secs".into(),
+        "COGNEVA_METRICS_SAMPLE_MAX_ROWS".into(),
+        "metrics.sample_max_rows".into(),
     );
     // memory
     // tier_migrator
@@ -1169,7 +1165,7 @@ mod tests {
     fn test_business_config_from_json() {
         let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
         let json = r#"{
-            "metrics": { "enabled": false, "interval_secs": 30 },
+            "metrics": { "enabled": false, "sample_max_rows": 12345 },
             "supervisor": {
                 "health_interval_secs": 5,
                 "health_checker": { "suspect_after_secs": 10 }
@@ -1180,7 +1176,7 @@ mod tests {
 
         let config = from_json_file(tmpfile.path()).unwrap();
         assert!(!config.metrics.enabled);
-        assert_eq!(config.metrics.interval_secs, 30);
+        assert_eq!(config.metrics.sample_max_rows, 12345);
         assert_eq!(config.supervisor.health_interval_secs, 5);
         assert_eq!(config.supervisor.health_checker.suspect_after_secs, 10);
         assert_eq!(config.hook_engine.dedup_window_secs, 2);

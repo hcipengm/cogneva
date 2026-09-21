@@ -58,9 +58,9 @@ data:
   # 对象，先归档的那份找不回且不报错。属主给主应用，本 Pod 只保留热层落盘。
   COGNEVA_TIER_MIGRATOR_ENABLED: "false"
   # 指标样本日志的清理同理只给主应用：两个 Pod 共用同一个库，都开着清理就是两
-  # 个进程各自按自己的窗删同一张表。删除本身幂等，但只有一个属主时，「这张表有
-  # 多大」与「谁把它删到这个大小」才是同一件事。置 0 = 本 Pod 永不清理。
-  COGNEVA_METRICS_SAMPLE_RETENTION_SECS: "0"
+  # 个进程各自按自己的容量删同一张表。删除本身幂等，但只有一个属主时，「这张表
+  # 有多大」与「谁把它删到这个大小」才是同一件事。置 0 = 本 Pod 永不清理。
+  COGNEVA_METRICS_SAMPLE_MAX_ROWS: "0"
   # 本 Pod 完全不启用 memory 后端：自进化循环必须在 PostgreSQL/Redis 通不通
   # 的情况下都能起来，而它也不对外提供 memory 读。embedding/reranker 权重另有
   # memory.load_embedding_model / load_reranker_model 两道开关管着，所以「不下载

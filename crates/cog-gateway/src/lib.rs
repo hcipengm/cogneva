@@ -1108,8 +1108,20 @@ const GAUGE_HELP: &[(&str, &str)] = &[
         "Rows currently held in the metrics sample log",
     ),
     (
-        "metrics_samples_retention_seconds",
-        "How far back the metrics sample log is kept",
+        "metrics_samples_budget_rows",
+        "Rows the metrics sample log is allowed to hold; the sweep deletes \
+         oldest-first past this, stopping at each series' newest row",
+    ),
+    (
+        "metrics_samples_over_capacity",
+        "1 when the sample log is over its row budget and cannot be pruned \
+         further without deleting a series' current value, 0 otherwise",
+    ),
+    (
+        "metrics_samples_bytes",
+        "On-disk bytes the metrics sample log occupies, including indexes. \
+         Lags the row count, since PostgreSQL frees deleted space only when it \
+         vacuums, so it is a reading and never the pruning criterion",
     ),
     (
         "llm_upstream_healthy",
@@ -2787,7 +2799,9 @@ mod metrics_exposition_tests {
             "memory_unextracted_raw",
             "memory_unextracted_raw_aged_out",
             "metrics_samples_rows",
-            "metrics_samples_retention_seconds",
+            "metrics_samples_budget_rows",
+            "metrics_samples_over_capacity",
+            "metrics_samples_bytes",
             "llm_upstream_healthy",
             "llm_pool_available",
             "llm_pool_evidenced_recovery_unix",

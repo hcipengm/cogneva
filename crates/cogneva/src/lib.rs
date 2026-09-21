@@ -249,8 +249,8 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 // 5. metrics
                 need_restart.push(format!(
-                    "metrics_enabled={}, interval={}s (requires restart)",
-                    new_config.metrics.enabled, new_config.metrics.interval_secs
+                    "metrics_enabled={}, sample_max_rows={} (requires restart)",
+                    new_config.metrics.enabled, new_config.metrics.sample_max_rows
                 ));
 
                 if !applied.is_empty() {
