@@ -186,6 +186,26 @@ data:
             }
           },
           {
+            "id": 10,
+            "title": "Iteration Budget Cut-offs by Role",
+            "description": "Runs of a role that were cut off at its iteration ceiling, split by role. The ceiling is derived from that role's own delivered runs, so a series that keeps rising says the derivation is not keeping up with the work this role is being handed. A cut-off run is total: nothing delivered, everything spent. Reset when the pod restarts.",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+            "targets": [
+              {
+                "expr": "agent_iteration_budget_exhausted",
+                "legendFormat": "{{role}}",
+                "datasource": {"type": "prometheus", "uid": "${datasource}"}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "custom": {"drawStyle": "line", "lineWidth": 2}
+              }
+            }
+          },
+          {
             "id": 8,
             "title": "Recent Logs",
             "type": "logs",

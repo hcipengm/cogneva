@@ -6,6 +6,36 @@ use cog_core::{
     AgentRegistration, AgentRegistry, InboxMessage, MessageBackend, SFResult, StateBackend,
 };
 
+/// Build the runtime config a new agent of `role` starts from.
+///
+/// Installing the role's skill here is the single point where the skill's
+/// declared parameters reach the runtime: `AgentRuntime::new` applies the
+/// skill's iteration budget on top of the config value, and the per-role
+/// calibration in the observable moves it from there. Without this hop the
+/// skill file is written, validated, and evolved while nothing reads it.
+///
+/// A role with no registered skill keeps the config value: the mapping is
+/// absent for that role, which is not the same statement as "this role wants
+/// the default" — it is simply no evidence, and inventing one would change
+/// behaviour for roles nobody has described yet.
+async fn runtime_config_for(
+    default_config: &cog_core::RuntimeConfig,
+    skill_registry: Option<&RwLock<cog_core::SkillRegistry>>,
+    agent_id: &str,
+    role: &str,
+) -> cog_core::RuntimeConfig {
+    let mut config = default_config.clone();
+    config.agent_id = agent_id.into();
+    config.role = role.into();
+    if let Some(registry) = skill_registry {
+        let registry = registry.read().await;
+        if let Some(skill) = registry.skill_for_role(role) {
+            config.skill_config = Some(skill.clone());
+        }
+    }
+    config
+}
+
 /// Handle to a spawned worker agent.
 #[derive(Clone)]
 pub struct WorkerHandle {
@@ -30,6 +60,12 @@ pub struct GlobalAgentManager {
     default_runtime_config: cog_core::RuntimeConfig,
     default_tools: Option<Arc<crate::ToolRegistry>>,
     external_skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
+    /// The shared agent-skill registry (`skills/*.json`). Handing each new
+    /// agent the skill its role declares is what makes the skill's runtime
+    /// parameters — the iteration budget above all — actually take effect:
+    /// otherwise the file is written, validated, and evolved by the reflection
+    /// loop while nothing at runtime ever reads it.
+    skill_registry: Option<Arc<RwLock<cog_core::SkillRegistry>>>,
     event_bus: Option<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>,
     event_bus_sink: Option<crate::EventBusSink>,
 }
@@ -59,9 +95,22 @@ impl GlobalAgentManager {
             },
             default_tools: None,
             external_skill_registry: None,
+            skill_registry: None,
             event_bus: None,
             event_bus_sink: None,
         }
+    }
+
+    /// The runtime config a newly spawned agent of `role` starts from: the
+    /// manager's default, plus that role's own skill when one is registered.
+    async fn runtime_config_for(&self, agent_id: &str, role: &str) -> cog_core::RuntimeConfig {
+        runtime_config_for(
+            &self.default_runtime_config,
+            self.skill_registry.as_deref(),
+            agent_id,
+            role,
+        )
+        .await
     }
 
     /// Route AgentEnd events from every spawned worker onto the persistent
@@ -106,6 +155,13 @@ impl GlobalAgentManager {
         self
     }
 
+    /// Set the shared agent-skill registry newly spawned agents take their
+    /// role's skill from.
+    pub fn with_skill_registry(mut self, registry: Arc<RwLock<cog_core::SkillRegistry>>) -> Self {
+        self.skill_registry = Some(registry);
+        self
+    }
+
     /// Spawn a new worker agent, register it globally, and start its inbox consumer.
     /// # Arguments
     /// * `agent_id` — unique worker identifier
@@ -126,9 +182,7 @@ impl GlobalAgentManager {
         Fut: std::future::Future<Output = SFResult<()>> + Send,
     {
         let agent_id = agent_id.into();
-        let mut config = self.default_runtime_config.clone();
-        config.agent_id = agent_id.clone();
-        config.role = role.clone();
+        let config = self.runtime_config_for(&agent_id, &role).await;
 
         let capabilities = registration.capabilities.clone();
 
@@ -223,9 +277,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
         role: &str,
         llm: std::sync::Arc<dyn cog_core::LlmClient>,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
-        let mut config = self.default_runtime_config.clone();
-        config.agent_id = agent_id.into();
-        config.role = role.into();
+        let config = self.runtime_config_for(agent_id, role).await;
 
         let capabilities = vec![role.to_string()];
         let registration = cog_core::AgentRegistration::new(
@@ -316,5 +368,96 @@ impl cog_core::AgentManager for GlobalAgentManager {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::SkillConfig;
+
+    fn registry_with(skills: &str) -> Arc<RwLock<cog_core::SkillRegistry>> {
+        let mut registry = cog_core::SkillRegistry::new();
+        registry.load_skills_from_json(skills).expect("skills load");
+        Arc::new(RwLock::new(registry))
+    }
+
+    fn skill_json(role: &str, max_iterations: u32) -> String {
+        format!(
+            r#"[{{"skill_id":"{role}","name":"{role}","tools":[],"max_iterations":{max_iterations},"role_type":"{role}"}}]"#
+        )
+    }
+
+    /// 技能面的预算要真的走到运行时头上。这条链路曾经只差最后一跳——技能
+    /// 被装上、被校验、被改写，运行时却没有任何读点，于是"自进化能调预算"
+    /// 看起来是真的而实际是死的。这里量的是那一跳。
+    #[tokio::test]
+    async fn the_roles_skill_reaches_the_runtime_config() {
+        let registry = registry_with(&skill_json("generator", 17));
+        let config = runtime_config_for(
+            &cog_core::RuntimeConfig::default(),
+            Some(registry.as_ref()),
+            "squad-a-generator",
+            "generator",
+        )
+        .await;
+
+        let skill: &SkillConfig = config.skill_config.as_ref().expect("skill installed");
+        assert_eq!(skill.skill_id, "generator");
+        assert_eq!(skill.max_iterations, 17);
+        assert_eq!(config.role, "generator");
+        assert_eq!(config.agent_id, "squad-a-generator");
+    }
+
+    /// 技能是**按角色**取的：别的角色的技能不能顺手落到这个角色头上。
+    #[tokio::test]
+    async fn another_roles_skill_is_not_installed() {
+        let registry = registry_with(&skill_json("generator", 17));
+        let config = runtime_config_for(
+            &cog_core::RuntimeConfig::default(),
+            Some(registry.as_ref()),
+            "squad-a-evaluator",
+            "evaluator",
+        )
+        .await;
+
+        assert!(
+            config.skill_config.is_none(),
+            "an evaluator must not run under the generator's skill"
+        );
+    }
+
+    /// 没有技能注册表时保持配置面现值：这条路径上的角色没有人描述过，
+    /// 凭空给它安一个技能就是拿"没人写过"当成"要这个值"。
+    #[tokio::test]
+    async fn without_a_registry_the_configured_value_stands() {
+        let default_config = cog_core::RuntimeConfig {
+            max_iterations: 23,
+            ..Default::default()
+        };
+        let config = runtime_config_for(&default_config, None, "worker-0", "planner").await;
+
+        assert!(config.skill_config.is_none());
+        assert_eq!(config.max_iterations, 23);
+    }
+
+    /// 那一跳的另一半：装上的技能预算真的成为运行时的预算。角色名只有本用例
+    /// 用——预算还跟着该角色自己跑出来的读数走，借用别的用例写过的角色名会把
+    /// 断言变成对执行顺序的断言。
+    #[tokio::test]
+    async fn the_installed_skill_sets_the_runtime_budget() {
+        let role = "skill-chain-budget-test";
+        let registry = registry_with(&skill_json(role, 17));
+        let config = runtime_config_for(
+            &cog_core::RuntimeConfig::default(),
+            Some(registry.as_ref()),
+            "skill-chain-budget-test-agent",
+            role,
+        )
+        .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let runtime = crate::AgentRuntime::new(config, tx);
+        assert_eq!(runtime.config().max_iterations, 17);
     }
 }

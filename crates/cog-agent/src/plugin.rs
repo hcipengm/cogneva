@@ -287,6 +287,20 @@ impl cog_core::SystemPlugin for AgentPlugin {
         if let Some(ref esr) = external_skill_registry {
             pool_builder = pool_builder.with_external_skill_registry(esr.clone());
         }
+        // 角色 → 技能：技能面里那个 max_iterations 在此之前是个死值——被装进
+        // 注册表、被 extractor 校验、被 promoter 改写，运行时却没有任何读点。
+        // 这里把它交到建 agent 的那一跳，技能预算才真的生效。
+        match ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>() {
+            Some(registry) => {
+                pool_builder = pool_builder.with_skill_registry(registry);
+                info!("AgentPlugin agent pool attached to the shared skill registry");
+            }
+            None => {
+                warn!(
+                    "shared skill registry unavailable; agents keep their configured iteration budget"
+                );
+            }
+        }
         let pool = Arc::new(pool_builder);
         self.pool = Some(pool.clone());
         let pool_dyn: Arc<dyn cog_core::AgentManager> = pool;
@@ -504,8 +518,15 @@ async fn event_upload_task(
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "agent",
-    requires: &["storage", "extension", "guardrail"],
-    optional_requires: &["stream", "skill", "net"],
+    // `skill` is a strong edge, not an optional one: the pool binds each role's
+    // skill (its iteration budget above all) at construction time, inside this
+    // plugin's `init`. Only `requires` orders `init` in this framework, so a
+    // soft edge would leave the bind racing the skill plugin's publish — and
+    // losing that race is silent, every role quietly reverting to its
+    // configured seed. Declaring it also turns "skill disabled" into a startup
+    // diagnostic instead of a budget regression nobody can see.
+    requires: &["storage", "extension", "guardrail", "skill"],
+    optional_requires: &["stream", "net"],
     provides: &[
         "HookEngine",
         "ToolRegistry",
@@ -545,6 +566,12 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         cog_core::ConsumeSpec {
             type_name: "ExternalSkillRegistry",
             required: false,
+        },
+        // Read during init to bind each role's skill; see the `skill` edge in
+        // `requires` for why it is declared required rather than best-effort.
+        cog_core::ConsumeSpec {
+            type_name: "SkillRegistry",
+            required: true,
         },
         cog_core::ConsumeSpec {
             type_name: "LlmClient",

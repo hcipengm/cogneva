@@ -23,6 +23,11 @@ const INIT_CONSUMES: &[(&str, &str, &[&str])] = &[
     ("storage", "net", &["HttpClient"]),
     ("gateway", "storage", &["ExplainPool"]),
     ("gateway", "observability", &["ActiveAlertSource"]),
+    // The agent pool binds each role's skill — its iteration budget above all —
+    // when it is built inside init. Losing this edge to a soft dependency would
+    // not fail: every role would quietly run on its configured seed, which is
+    // the "wired but ineffective" state the binding exists to end.
+    ("agent", "skill", &["SkillRegistry"]),
 ];
 
 fn provided_by(producer: &str) -> &'static [&'static str] {
@@ -30,6 +35,7 @@ fn provided_by(producer: &str) -> &'static [&'static str] {
         "storage" => cog_storage::plugin::DESCRIPTOR.provides,
         "net" => cog_net::plugin::DESCRIPTOR.provides,
         "observability" => cog_observability::plugin::DESCRIPTOR.provides,
+        "skill" => cog_skill::plugin::DESCRIPTOR.provides,
         other => panic!("{other} has no descriptor in this test"),
     }
 }
@@ -42,6 +48,7 @@ fn init_consumes_are_declared_and_ordered() {
             "wiki" => cog_wiki::plugin::DESCRIPTOR.requires,
             "storage" => cog_storage::plugin::DESCRIPTOR.requires,
             "gateway" => cog_gateway::plugin::DESCRIPTOR.requires,
+            "agent" => cog_agent::plugin::DESCRIPTOR.requires,
             other => panic!("{other} has no descriptor in this test"),
         };
 

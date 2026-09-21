@@ -293,6 +293,11 @@ impl AgentRuntime {
         if let Some(ref skill) = config.skill_config {
             config.max_iterations = skill.max_iterations;
         }
+        // 预算由这个角色自己跑出来的读数推：种子（配置面或技能面）只在还没有
+        // 观测时生效。写死一个数在这里就是把它交给一个永远不知道工作量的常量，
+        // 而它要裁的恰恰是"这一轮还要不要接着干"。
+        config.max_iterations = crate::observable::global_observable()
+            .iteration_budget_for(&config.role, config.max_iterations);
 
         let context = ContextWindow::new(config.context_window_size);
 
@@ -733,7 +738,9 @@ impl AgentRuntime {
                 let steps = self.steps.len();
                 let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
                 crate::observable::global_observable().record_run(
+                    &self.config.role,
                     crate::observable::RunOutcome::Delivered,
+                    iteration + 1,
                     steps,
                     tool_calls,
                 );
@@ -794,7 +801,9 @@ impl AgentRuntime {
                 let steps = self.steps.len();
                 let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
                 crate::observable::global_observable().record_run(
+                    &self.config.role,
                     crate::observable::RunOutcome::BudgetExhausted,
+                    iteration + 1,
                     steps,
                     tool_calls,
                 );
@@ -965,7 +974,9 @@ impl AgentRuntime {
         let steps = self.steps.len();
         let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
         crate::observable::global_observable().record_run(
+            &self.config.role,
             crate::observable::RunOutcome::BudgetExhausted,
+            self.config.max_iterations,
             steps,
             tool_calls,
         );
@@ -1420,7 +1431,10 @@ mod tests {
             role_type: "planner".into(),
         };
 
+        // 角色取一个只有本用例用的名字：预算现在还跟着"这个角色跑出来的读数"走，
+        // 借用别的用例会写进去的角色名，断言就变成了对执行顺序的断言。
         let config = RuntimeConfig {
+            role: "skill-prompt-test".into(),
             skill_config: Some(skill.clone()),
             ..Default::default()
         };
@@ -1451,6 +1465,7 @@ mod tests {
         };
 
         let config = RuntimeConfig {
+            role: "skill-budget-test".into(),
             max_iterations: 100,
             skill_config: Some(skill),
             ..Default::default()
@@ -1460,6 +1475,54 @@ mod tests {
         let agent_loop = AgentRuntime::new(config, tx);
         // max_iterations should be overridden by skill config
         assert_eq!(agent_loop.config.max_iterations, 3);
+    }
+
+    /// 这个角色自己跑出来的读数决定上限：种子（配置面 / 技能面）只在还没有
+    /// 观测时生效，有了观测就不再是那个数。写死一个常量的坏处正在这里——它
+    /// 永远不知道这一轮的工作量，而它要裁的恰恰是"还要不要接着干"。
+    #[test]
+    fn the_iteration_budget_follows_this_roles_own_runs() {
+        let role = "budget-calibrated-test";
+        for iterations in [6u32, 8] {
+            crate::observable::global_observable().record_run(
+                role,
+                crate::observable::RunOutcome::Delivered,
+                iterations,
+                20,
+                5,
+            );
+        }
+
+        let config = RuntimeConfig {
+            role: role.into(),
+            max_iterations: 10,
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let agent_loop = AgentRuntime::new(config, tx);
+
+        assert!(
+            agent_loop.config.max_iterations > 10,
+            "the seed was binding for this role's own runs, so it must not stay the ceiling: {}",
+            agent_loop.config.max_iterations
+        );
+        assert!(
+            agent_loop.config.max_iterations > 8,
+            "the ceiling must admit the longest run this role has delivered"
+        );
+    }
+
+    /// 没有观测就原样用种子：凭一个没看见过的事实改数字，只是把猜数换了个地方。
+    #[test]
+    fn a_role_without_observations_keeps_its_seed_budget() {
+        let config = RuntimeConfig {
+            role: "budget-unobserved-test".into(),
+            max_iterations: 7,
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let agent_loop = AgentRuntime::new(config, tx);
+        assert_eq!(agent_loop.config.max_iterations, 7);
     }
 
     // ─── Mock WAL backend for testing ───

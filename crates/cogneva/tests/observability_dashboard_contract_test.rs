@@ -39,6 +39,9 @@ const PRODUCED: &[(&str, &[&str])] = &[
     // per-task readings, so nothing distinguishes one sample from the next.
     ("agent_success_count", &[]),
     ("agent_budget_exhausted_count", &[]),
+    // The iteration ceiling is derived per role, so which role is being cut off
+    // is the question; a single unlabelled total could not answer it.
+    ("agent_iteration_budget_exhausted", &["role"]),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

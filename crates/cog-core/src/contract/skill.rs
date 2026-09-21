@@ -179,6 +179,27 @@ impl SkillRegistry {
         self.agent_skills.get(skill_id)
     }
 
+    /// The agent skill registered for a role, if any.
+    ///
+    /// The role → skill mapping is read out of the skill data (`role_type`)
+    /// rather than spelled as a table in code: the skill files are the one
+    /// place the mapping can change — the operator writes them, and the
+    /// evolution loop rewrites them — so a second copy in a `match` arm would
+    /// be a copy that silently goes stale the first time someone edits a skill.
+    ///
+    /// Several skills may claim one role. The highest priority wins, and ties
+    /// break on the skill id so the choice does not depend on hash order.
+    pub fn skill_for_role(&self, role: &str) -> Option<&SkillConfig> {
+        self.agent_skills
+            .values()
+            .filter(|skill| skill.role_type == role)
+            .max_by(|a, b| {
+                self.get_priority(&a.skill_id)
+                    .cmp(&self.get_priority(&b.skill_id))
+                    .then_with(|| b.skill_id.cmp(&a.skill_id))
+            })
+    }
+
     /// Insert an agent skill configuration.
     ///
     /// Also mirrors the config into the planner-facing `skills` map so that
@@ -760,6 +781,57 @@ mod tests {
         registry.load_skills_from_dir(path).unwrap();
         assert!(registry.get_skill("planner").is_some());
         assert!(registry.get_skill("evaluator").is_some());
+    }
+
+    /// 角色 → 技能从技能数据里读，不从代码里读：清单里写死的那份会在别人
+    /// 改技能文件的那天悄悄过期，而运行时照旧按过期的映射取预算。
+    #[test]
+    fn skill_for_role_reads_the_mapping_out_of_the_skill_data() {
+        let mut registry = SkillRegistry::new();
+        registry
+            .load_skills_from_json(
+                r#"[
+                    {"skill_id":"generator","name":"Generator","tools":["code"],"max_iterations":10,"role_type":"generator"},
+                    {"skill_id":"planner","name":"Planner","tools":["md"],"max_iterations":10,"role_type":"planner"}
+                ]"#,
+            )
+            .unwrap();
+
+        let generator = registry
+            .skill_for_role("generator")
+            .expect("generator skill");
+        assert_eq!(generator.skill_id, "generator");
+        assert_eq!(generator.max_iterations, 10);
+        assert!(
+            registry.skill_for_role("moderator").is_none(),
+            "a role with no skill must resolve to nothing, not to some other role's skill"
+        );
+    }
+
+    /// 一个角色有多份技能时取优先级最高的；同优先级按 id 定序，否则选择会
+    /// 跟着哈希顺序变——同一个部署重启两次拿到两份不同的预算。
+    #[test]
+    fn skill_for_role_prefers_priority_and_breaks_ties_deterministically() {
+        let mut registry = SkillRegistry::new();
+        registry
+            .load_skills_from_json(
+                r#"[
+                    {"skill_id":"a-generator","name":"A","tools":[],"max_iterations":5,"role_type":"generator"},
+                    {"skill_id":"b-generator","name":"B","tools":[],"max_iterations":20,"role_type":"generator"}
+                ]"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.skill_for_role("generator").unwrap().skill_id,
+            "a-generator",
+            "with equal priority the choice must be fixed, not hash-ordered"
+        );
+        registry.set_priority("b-generator", 1);
+        assert_eq!(
+            registry.skill_for_role("generator").unwrap().skill_id,
+            "b-generator"
+        );
     }
 
     #[test]
