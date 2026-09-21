@@ -310,6 +310,11 @@ pub const ALERT_RULE_DECOMPOSITION_EMPTY: &str = "decomposition_empty";
 /// Rule name for alerts raised by the stalled-orphan reconciler: a
 /// non-executable parent placeholder with no children stuck pending.
 pub const ALERT_RULE_DECOMPOSITION_ORPHANED: &str = "decomposition_orphaned";
+/// Rule name for alerts raised when the promotion ledger has gone whole weeks
+/// without a single promotion. Distinct from the trend rule: a flat zero has no
+/// decided samples, so every success-rate comparison skips it and the loudest
+/// possible failure reads as an idle system.
+pub const ALERT_RULE_PROMOTION_STALL: &str = "promotion_stall";
 
 /// A persistent alert condition a plugin wants driven into the alert state
 /// machine. Mirrors the storage crate's `NewAlert` without coupling callers

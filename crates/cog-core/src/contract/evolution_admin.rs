@@ -114,6 +114,14 @@ pub struct PromotionTrendReport {
     pub weeks: Vec<PromotionTrendWeek>,
     /// 趋势向下告警：连续多周成功率下降且样本足够时非空。
     pub alert: Option<String>,
+    /// 停摆告警：连续多个**已完成**周零晋级时非空。
+    ///
+    /// 与 `alert` 分开而不是并成一个字段：成功率下降的前提是「有对决胜出」，
+    /// 而零晋级时每周的样本数都是 0、成功率是空值，趋势判定会把它们整周跳过，
+    /// 于是「什么都没产出」和「系统空闲」在报告里长得一模一样。两条判据的
+    /// 证据来源不同，合并成一个标量后消费侧就分不出是哪种。
+    #[serde(default)]
+    pub stall_alert: Option<String>,
 }
 
 /// 单周晋级聚合。

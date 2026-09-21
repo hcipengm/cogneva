@@ -709,6 +709,7 @@ impl EvolutionAdmin for EvolutionAdminService {
                 generated_at: chrono::Utc::now(),
                 weeks: Vec::new(),
                 alert: None,
+                stall_alert: None,
             }))
     }
 }

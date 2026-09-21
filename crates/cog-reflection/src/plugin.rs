@@ -631,6 +631,13 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let mut trend_reporter = None;
                 if promotion.trend_report_enabled {
                     if let Some(ref ledger) = promotion_ledger {
+                        // 停摆（连续整周零晋级）没有告警就只是一份没人看的报告：
+                        // 成功率为空的周会被趋势判定整周跳过，最响的失败读起来像
+                        // 系统空闲。周报要有能力把它推进持久化告警面。
+                        let alert_sink = ctx.consume_service::<dyn cog_core::PersistentAlertSink>();
+                        if alert_sink.is_none() {
+                            warn!("PersistentAlertSink not published; promotion stall alerts stay report-only");
+                        }
                         let reporter = crate::PromotionTrendReporter::new(
                             ledger.clone(),
                             std::path::PathBuf::from(format!(
@@ -639,6 +646,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             )),
                             std::time::Duration::from_secs(promotion.trend_report_interval_secs),
                             audit_stream.clone(),
+                            alert_sink,
                         );
                         admin = admin.with_trend_latest(reporter.latest());
                         trend_reporter = Some(reporter);
