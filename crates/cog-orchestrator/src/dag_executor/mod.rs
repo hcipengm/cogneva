@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cog_core::{DagMessage, MessageBackend, SFError, SFResult, ShutdownSignal, Task};
@@ -116,17 +117,19 @@ impl DagExecutorRuntime {
     }
 
     /// Scan the DAG for ready tasks and publish them to the message backend.
-    /// Each ready task is transitioned to `Scheduled` and then all tasks are
-    /// published in a single batch via [`MessageBackend::publish_batch`] for
-    /// lower latency and higher throughput.
+    /// Each ready task is transitioned to `Scheduled` and then the tasks are
+    /// published in one batch per queue via [`MessageBackend::publish_batch`]
+    /// for lower latency and higher throughput.
+    ///
+    /// A task whose artifact is only readable by its producer does not go on
+    /// the queue every worker competes for; see [`crate::ready_queue`].
     pub async fn publish_ready_tasks(&self) -> SFResult<()> {
         let ready_tasks: Vec<Task> = self.orchestrator.find_ready_tasks().await;
         if ready_tasks.is_empty() {
             return Ok(());
         }
 
-        let ready_stream = format!("orchestrator:ready:{}", self.config.workspace_id);
-        let mut payloads = Vec::with_capacity(ready_tasks.len());
+        let mut by_stream: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
 
         for task in ready_tasks {
             if let Err(e) = self.orchestrator.schedule_task(&task.id).await {
@@ -134,11 +137,17 @@ impl DagExecutorRuntime {
                 continue;
             }
             let payload = serde_json::to_vec(&task).map_err(SFError::Serialization)?;
-            payloads.push(payload);
+            by_stream
+                .entry(crate::ready_queue::ready_stream_for(
+                    &task,
+                    &self.config.workspace_id,
+                ))
+                .or_default()
+                .push(payload);
         }
 
-        if !payloads.is_empty() {
-            self.backend.publish_batch(&ready_stream, &payloads).await?;
+        for (stream, payloads) in by_stream {
+            self.backend.publish_batch(&stream, &payloads).await?;
         }
         Ok(())
     }

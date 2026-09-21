@@ -223,3 +223,61 @@ async fn publisher_publishes_ready_tasks() {
     let t = runtime.orchestrator().get_task("task-4").await.unwrap();
     assert_eq!(t.status, TaskStatus::Scheduled);
 }
+
+/// 变更生成的产物只有产出它的进程读得到（写进本进程的 change_dir，扫它的
+/// 循环也在同一个进程里），所以它不能走所有 worker 竞争的共享队列：谁先读到
+/// 谁执行，跑到别的进程里就产出一份没有读者存在的东西，且账单照付。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn change_generation_goes_to_the_process_local_queue() {
+    let backend = MemoryMessageBackend::new();
+    let runtime = DagExecutorRuntime::new_with_backend(
+        DagExecutorConfig {
+            redis_url: "redis://localhost".into(),
+            workspace_id: "ws-local".into(),
+            consumer_group: "cg-local".into(),
+            max_retries: 3,
+            ..DagExecutorConfig::default()
+        },
+        backend.clone(),
+    );
+
+    let mut ordinary = make_test_task("task-ordinary");
+    ordinary.task_type = cog_core::TaskType::Custom("unit_of_work".into());
+
+    let mut generation = make_test_task("task-generate");
+    generation.task_type = cog_core::TaskType::Custom("platform_issue_fix".into());
+    generation.input = serde_json::json!({"goal": "fix it", "evolution_mode": "generate_change"});
+
+    runtime
+        .submit_goal("mixed-goal", vec![ordinary, generation])
+        .await
+        .unwrap();
+    runtime.publish_ready_tasks().await.unwrap();
+
+    async fn drain(stream: &str, group: &str, backend: &MemoryMessageBackend) -> Vec<String> {
+        let mut sub = backend.subscribe(stream, group).await.unwrap();
+        let mut ids = Vec::new();
+        while let Ok(Some(Ok((_, bytes)))) =
+            tokio::time::timeout(tokio::time::Duration::from_millis(200), sub.next()).await
+        {
+            if let Ok(t) = serde_json::from_slice::<Task>(&bytes) {
+                ids.push(t.id);
+            }
+        }
+        ids
+    }
+
+    let shared = drain("orchestrator:ready:ws-local", "grp-shared", &backend).await;
+    let local = drain("orchestrator:ready:ws-local:local", "grp-local", &backend).await;
+
+    assert_eq!(
+        shared,
+        vec!["task-ordinary".to_string()],
+        "a task whose result travels over the bus stays on the shared queue"
+    );
+    assert_eq!(
+        local,
+        vec!["task-generate".to_string()],
+        "change generation belongs on the queue only the executor role reads"
+    );
+}

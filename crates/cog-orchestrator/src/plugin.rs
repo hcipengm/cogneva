@@ -313,6 +313,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let workspace_id = ctx.config().dag_executor.workspace_id.clone();
                         let ready_task_poll_interval_secs =
                             ctx.config().dag_executor.ready_task_poll_interval_secs;
+                        // 变更生成的产物写进本进程的 change_dir，而扫它的循环只在
+                        // 执行器部署里跑：谁执行生成，谁就得是扫得动那份产物的进程。
+                        // 这个开关和执行器循环、基线移植、自我发现用的是同一个。
+                        let owns_executor_role = ctx.config().self_evolution.executor_enabled;
 
                         let dag_shutdown = cog_core::ShutdownSignal::new();
                         let dag_shutdown_clone = dag_shutdown.clone();
@@ -396,6 +400,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                     backend.clone(),
                                     backend,
                                     &workspace_id,
+                                    owns_executor_role,
                                     exec_shutdown,
                                 )
                                 .await

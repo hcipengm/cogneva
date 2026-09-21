@@ -3,6 +3,7 @@ pub mod dag_executor;
 pub mod observable;
 pub mod orchestrator_control_impl;
 pub mod plugin;
+pub mod ready_queue;
 pub mod task_executor_router;
 
 pub use action_planner::ActionPlanOrchestrator;

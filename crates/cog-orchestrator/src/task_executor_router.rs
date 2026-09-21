@@ -8,6 +8,24 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
+// Pending 恢复：pod 在执行途中死掉时，消息在组内永 pending，
+// `subscribe`（XREADGROUP ">"）只读新消息，永远不会重投——旧消息会
+// 堵住依赖它的下游任务。后台清扫器周期性 XAUTOCLAIM 认领 idle 超
+// 阈值的 pending 消息并重走完整执行管线。
+// 阈值必须大于最长任务执行时长，否则正在执行的长任务会被误判死亡
+// 而并发重投（at-least-once：下游 complete_task 需容忍重复）。
+const PENDING_IDLE_MS: u64 = 10 * 60 * 1000;
+const CLAIM_INTERVAL: Duration = Duration::from_secs(60);
+const CLAIM_BATCH: usize = 16;
+/// 认领消息的执行并发上限。tick 只负责认领和派发，不能在某条认领
+/// 消息的执行上 await：agent 任务可能跑几十分钟，串行处理会让整个
+/// pending 恢复循环停摆（实测一条任务执行 90+ 分钟，期间零
+/// XAUTOCLAIM，恢复网形同虚设）。
+///
+/// 进程级上限：本进程读的每条 ready 队列共用同一份许可，多读一条队列
+/// 不该把在途执行翻倍。
+const CLAIM_CONCURRENCY: usize = 4;
+
 /// Dispatcher that routes ready tasks to the first [`TaskExecutor`] whose
 /// [`TaskExecutor::supports`] returns `true`.
 /// Decouples the orchestrator from concrete execution crates
@@ -63,14 +81,53 @@ impl TaskExecutorRouter {
 
     /// Consume ready tasks from the message backend, execute them, and publish
     /// results back to the results stream.
+    ///
+    /// Reads every queue [`crate::ready_queue::consumed_ready_streams`] names
+    /// for this deployment. The queues share one in-flight budget: the
+    /// concurrency ceiling is per process, so reading a second queue must not
+    /// double the number of tasks this process runs at once.
     pub async fn run_consumer(
         &self,
         task_backend: Arc<dyn MessageBackend>,
         result_backend: Arc<dyn MessageBackend>,
         workspace_id: &str,
+        owns_executor_role: bool,
         shutdown: ShutdownSignal,
     ) -> SFResult<()> {
-        let ready_stream = format!("orchestrator:ready:{workspace_id}");
+        // 主订阅循环与清扫器共用的执行许可：新鲜投递与 idle 认领合计最多
+        // CLAIM_CONCURRENCY 条在途执行。
+        let claim_slots = Arc::new(tokio::sync::Semaphore::new(CLAIM_CONCURRENCY));
+
+        let loops = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role)
+            .into_iter()
+            .map(|ready_stream| {
+                self.run_one_ready_stream(
+                    task_backend.clone(),
+                    result_backend.clone(),
+                    ready_stream,
+                    workspace_id.to_string(),
+                    claim_slots.clone(),
+                    shutdown.clone(),
+                )
+            });
+
+        for outcome in futures::future::join_all(loops).await {
+            if let Err(e) = outcome {
+                tracing::warn!("ready stream consumer exited: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_one_ready_stream(
+        &self,
+        task_backend: Arc<dyn MessageBackend>,
+        result_backend: Arc<dyn MessageBackend>,
+        ready_stream: String,
+        workspace_id: String,
+        claim_slots: Arc<tokio::sync::Semaphore>,
+        shutdown: ShutdownSignal,
+    ) -> SFResult<()> {
         // Use a stable group name per workspace so that pod restacks do not
         // leak an unbounded number of consumer groups and so messages are not
         // lost when a new pod takes over. The group name intentionally omits
@@ -82,32 +139,13 @@ impl TaskExecutorRouter {
             .create_consumer_group(&ready_stream, &group)
             .await?;
 
-        // Pending 恢复：pod 在执行途中死掉时，消息在组内永 pending，
-        // `subscribe`（XREADGROUP ">"）只读新消息，永远不会重投——旧消息会
-        // 堵住依赖它的下游任务。后台清扫器周期性 XAUTOCLAIM 认领 idle 超
-        // 阈值的 pending 消息并重走完整执行管线。
-        // 阈值必须大于最长任务执行时长，否则正在执行的长任务会被误判死亡
-        // 而并发重投（at-least-once：下游 complete_task 需容忍重复）。
-        const PENDING_IDLE_MS: u64 = 10 * 60 * 1000;
-        const CLAIM_INTERVAL: Duration = Duration::from_secs(60);
-        const CLAIM_BATCH: usize = 16;
-        // 认领消息的执行并发上限。tick 只负责认领和派发，不能在某条认领
-        // 消息的执行上 await：agent 任务可能跑几十分钟，串行处理会让整个
-        // pending 恢复循环停摆（实测一条任务执行 90+ 分钟，期间零
-        // XAUTOCLAIM，恢复网形同虚设）。
-        const CLAIM_CONCURRENCY: usize = 4;
-
         let pipe = Arc::new(ReadyPipeline {
             task_backend: task_backend.clone(),
             result_backend: result_backend.clone(),
             ready_stream: ready_stream.clone(),
             group: group.clone(),
-            workspace_id: workspace_id.to_string(),
+            workspace_id,
         });
-
-        // 主订阅循环与清扫器共用的执行许可：新鲜投递与 idle 认领合计最多
-        // CLAIM_CONCURRENCY 条在途执行。
-        let claim_slots = Arc::new(tokio::sync::Semaphore::new(CLAIM_CONCURRENCY));
 
         {
             let sweeper = self.clone();
@@ -855,7 +893,7 @@ mod ready_pipeline_tests {
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
                 router
-                    .run_consumer(backend.clone(), backend, "ws", shutdown)
+                    .run_consumer(backend.clone(), backend, "ws", false, shutdown)
                     .await
             })
         };
@@ -911,5 +949,221 @@ mod ready_pipeline_tests {
             backend.acks.lock().await.is_empty(),
             "panicked message must stay unacked for redelivery"
         );
+    }
+}
+
+/// 队列归属：变更生成的产物只有产出它的进程读得到，所以承载这类任务的
+/// ready 队列只能由执行器角色的部署来读。非属主读到了就是白跑一轮——
+/// 变更写进一个没有任何读者存在的目录，且账单照付。
+#[cfg(test)]
+mod ready_queue_placement_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use cog_core::{MessageStream, TaskResultMetadata};
+    use std::collections::{HashMap, VecDeque};
+
+    /// 一条队列上的预置消息：(msg_id, payload)。
+    type Messages = VecDeque<(String, Vec<u8>)>;
+
+    /// 按 subject 分队列投递的后端，并记录"谁订阅了哪条队列"。
+    #[derive(Default)]
+    struct PerStreamBackend {
+        queues: tokio::sync::Mutex<HashMap<String, Messages>>,
+        subscribed: tokio::sync::Mutex<Vec<String>>,
+        acks: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl PerStreamBackend {
+        async fn queue(&self, stream: &str, id: &str, payload: Vec<u8>) {
+            self.queues
+                .lock()
+                .await
+                .entry(stream.to_string())
+                .or_default()
+                .push_back((id.to_string(), payload));
+        }
+    }
+
+    #[async_trait]
+    impl MessageBackend for PerStreamBackend {
+        async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
+            Ok(())
+        }
+        async fn subscribe(&self, subject: &str, _group: &str) -> SFResult<MessageStream> {
+            self.subscribed.lock().await.push(subject.to_string());
+            let items: Vec<(String, Vec<u8>)> = self
+                .queues
+                .lock()
+                .await
+                .entry(subject.to_string())
+                .or_default()
+                .drain(..)
+                .collect();
+            Ok(Box::pin(
+                futures::stream::iter(items.into_iter().map(Ok)).chain(futures::stream::pending()),
+            ))
+        }
+        async fn subscribe_from(
+            &self,
+            _subject: &str,
+            _group: &str,
+            _start_id: &str,
+        ) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn create_consumer_group(&self, _stream: &str, _group: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn ack(&self, _stream: &str, _group: &str, ids: &[String]) -> SFResult<()> {
+            self.acks.lock().await.extend(ids.iter().cloned());
+            Ok(())
+        }
+        async fn claim_pending(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _min_idle_ms: u64,
+            _count: usize,
+        ) -> SFResult<Vec<(String, Vec<u8>)>> {
+            Ok(Vec::new())
+        }
+        async fn pending_stats(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _idle_threshold_ms: u64,
+        ) -> SFResult<Option<cog_core::PendingStats>> {
+            Ok(None)
+        }
+        async fn dlq(&self, _stream: &str, _msg_id: &str, _reason: &str) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    struct AcceptEverything;
+
+    #[async_trait]
+    impl TaskExecutor for AcceptEverything {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+        async fn execute(&self, _task: &Task) -> SFResult<TaskResult> {
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({"done": true}),
+                metadata: TaskResultMetadata::new("accept"),
+            })
+        }
+    }
+
+    fn ordinary_task() -> Vec<u8> {
+        serde_json::to_vec(&Task::new(
+            "t-ordinary",
+            TaskType::Custom("unit_of_work".into()),
+            serde_json::json!({"goal": "ordinary"}),
+        ))
+        .unwrap()
+    }
+
+    fn generation_task() -> Vec<u8> {
+        serde_json::to_vec(&Task::new(
+            "t-generate",
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({"goal": "fix it", "evolution_mode": "generate_change"}),
+        ))
+        .unwrap()
+    }
+
+    /// 跑到两条消息都处理完，或超时。
+    async fn settle(backend: &PerStreamBackend, want_acks: usize) {
+        let started = std::time::Instant::now();
+        while backend.acks.lock().await.len() < want_acks {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "consumer did not process the expected messages: {:?}",
+                backend.acks.lock().await
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn run_as(owns_executor_role: bool) -> (Arc<PerStreamBackend>, ShutdownSignal) {
+        let shared = crate::ready_queue::ready_stream("ws");
+        let local = crate::ready_queue::process_local_ready_stream("ws");
+        let backend = Arc::new(PerStreamBackend::default());
+        backend.queue(&shared, "m-ordinary", ordinary_task()).await;
+        backend.queue(&local, "m-generate", generation_task()).await;
+
+        let router = Arc::new(
+            TaskExecutorRouter::new()
+                .with_executor(Arc::new(AcceptEverything))
+                .await,
+        );
+        let shutdown = ShutdownSignal::new();
+        let runner = {
+            let router = router.clone();
+            let backend = backend.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                router
+                    .run_consumer(backend.clone(), backend, "ws", owns_executor_role, shutdown)
+                    .await
+            })
+        };
+        tokio::pin!(runner);
+        // 非属主只会收到一条消息；属主会收到两条。由调用方用 settle 等待，
+        // 这里只确认订阅已建立。
+        let started = std::time::Instant::now();
+        while backend.subscribed.lock().await.is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "no subscription"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (backend, shutdown)
+    }
+
+    #[tokio::test]
+    async fn a_deployment_without_the_executor_role_leaves_change_generation_alone() {
+        let (backend, shutdown) = run_as(false).await;
+        settle(&backend, 1).await;
+
+        let acks = backend.acks.lock().await.clone();
+        assert_eq!(
+            acks,
+            vec!["m-ordinary".to_string()],
+            "a worker without the executor role must run only the shared queue"
+        );
+        let subscribed = backend.subscribed.lock().await.clone();
+        assert!(
+            !subscribed.contains(&crate::ready_queue::process_local_ready_stream("ws")),
+            "a worker without the executor role must not subscribe to the \
+             process-local queue at all: reading it would execute a change \
+             generation where nothing scans the change dir, and the redelivery \
+             sweeper would keep re-reading it. subscribed: {subscribed:?}"
+        );
+        drop(acks);
+        shutdown.trigger();
+    }
+
+    #[tokio::test]
+    async fn the_executor_role_runs_both_queues() {
+        let (backend, shutdown) = run_as(true).await;
+        settle(&backend, 2).await;
+
+        let mut acks = backend.acks.lock().await.clone();
+        acks.sort();
+        assert_eq!(
+            acks,
+            vec!["m-generate".to_string(), "m-ordinary".to_string()],
+            "the executor role owns change generation and must read its queue"
+        );
+        let subscribed = backend.subscribed.lock().await.clone();
+        assert!(
+            subscribed.contains(&crate::ready_queue::process_local_ready_stream("ws")),
+            "subscribed: {subscribed:?}"
+        );
+        shutdown.trigger();
     }
 }
