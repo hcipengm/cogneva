@@ -32,15 +32,40 @@ pub struct ObservabilityExportersConfig {
 /// claim-backed here, and the watcher stays off. There is deliberately no
 /// separate enable flag, so the watcher cannot be turned on without naming
 /// what it measures.
+///
+/// `claim` covers the application data directory alone, which is all a
+/// single-volume workload has. `volumes` adds further claim-backed mounts;
+/// a workload whose largest volume is not the data directory would otherwise
+/// have no reading for the volume most likely to overrun.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DataVolumeWatchConfig {
     /// Name of the persistent volume claim backing the application data
     /// directory. Empty disables the watcher.
     pub claim: String,
-    /// How often the directory is re-measured. Clamped up to
+    /// How often every watched directory is re-measured. Clamped up to
     /// [`crate::data_volume::MIN_SCAN_INTERVAL_SECS`].
     pub interval_secs: u64,
+    /// Additional claim-backed mounts to measure, each independently joined
+    /// against its own declaration. Normally supplied by the deployment
+    /// through `COGNEVA_DATA_VOLUME_MOUNTS`, because the pairing is a fact
+    /// about that workload's own pods.
+    pub volumes: Vec<WatchedVolumeConfig>,
+}
+
+/// One claim-backed mount to measure beyond the application data directory.
+///
+/// Nested mounts are deliberately absent: the process derives from its own
+/// mount table which directories below `path` are separate volumes, so a
+/// deployment states only the pairing it alone knows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WatchedVolumeConfig {
+    /// Claim backing `path`; the label the reading carries and the key the
+    /// declaration is joined on.
+    pub claim: String,
+    /// Mount point to walk.
+    pub path: String,
 }
 
 /// Trace collector in-memory buffering policy. Squad agents can run for
@@ -317,9 +342,39 @@ impl ObservabilityExportersConfig {
             Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
         };
         cog_core::config::apply_env_paths(&mut section, OBS_ENV);
+        // 挂载清单是一个列表，而上面的标量映射会把每个 env 值都变成字符串，
+        // 所以它单走一条路：解析失败响亮报错，不能让 Pod 起来却什么都不量。
+        if let Ok(raw) = std::env::var("COGNEVA_DATA_VOLUME_MOUNTS") {
+            apply_mount_list(&mut section, &raw)?;
+        }
         serde_json::from_value(section)
             .map_err(|e| SFError::Config(format!("{} observability: {e}", path.display())))
     }
+}
+
+/// Overwrite the watched-mount list from the `claim=path` env value.
+fn apply_mount_list(section: &mut serde_json::Value, raw: &str) -> SFResult<()> {
+    let volumes = crate::data_volume::parse_mounts(raw)
+        .map_err(|e| SFError::Config(format!("COGNEVA_DATA_VOLUME_MOUNTS: {e}")))?;
+    if volumes.is_empty() {
+        return Ok(());
+    }
+    let watch = section
+        .as_object_mut()
+        .map(|root| {
+            root.entry("data_volume_watch")
+                .or_insert_with(|| serde_json::json!({}))
+        })
+        .ok_or_else(|| SFError::Config("observability section is not an object".into()))?;
+    let watch = watch
+        .as_object_mut()
+        .ok_or_else(|| SFError::Config("data_volume_watch is not an object".into()))?;
+    watch.insert(
+        "volumes".into(),
+        serde_json::to_value(volumes)
+            .map_err(|e| SFError::Config(format!("watched mounts: {e}")))?,
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -359,6 +414,7 @@ mod tests {
         let cfg = ObservabilityExportersConfig::default();
         assert!(cfg.data_volume_watch.claim.is_empty());
         assert_eq!(cfg.data_volume_watch.interval_secs, 0);
+        assert!(cfg.data_volume_watch.volumes.is_empty());
 
         let dir = std::env::temp_dir().join(format!("cog-obs-vol-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -372,5 +428,67 @@ mod tests {
         assert_eq!(cfg.data_volume_watch.claim, "cogneva-data-pvc");
         assert_eq!(cfg.data_volume_watch.interval_secs, 300);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A workload's largest volume need not be its data directory. Listing
+    /// further mounts is how the deployments whose overrun risk lives elsewhere
+    /// get a reading at all.
+    #[test]
+    fn reads_additional_watched_volumes() {
+        let dir = std::env::temp_dir().join(format!("cog-obs-vols-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        std::fs::write(
+            &path,
+            r#"{"observability": {"data_volume_watch": {
+                "claim": "",
+                "interval_secs": 600,
+                "volumes": [
+                    {"claim": "sandbox-data", "path": "/opt/cogneva/sandbox"},
+                    {"claim": "sandbox-src", "path": "/opt/cogneva/sandbox/src"}
+                ]}}}"#,
+        )
+        .unwrap();
+        let cfg = ObservabilityExportersConfig::load_from(&path).unwrap();
+        let volumes = &cfg.data_volume_watch.volumes;
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0].claim, "sandbox-data");
+        assert_eq!(volumes[0].path, "/opt/cogneva/sandbox");
+        assert_eq!(volumes[1].path, "/opt/cogneva/sandbox/src");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The list cannot go through the scalar env mapping, so it has its own
+    /// path. It has to land in a section the file may not even have declared,
+    /// and a malformed value must fail the load rather than start a pod that
+    /// quietly measures nothing.
+    #[test]
+    fn mount_list_lands_in_the_section_and_malformed_input_is_loud() {
+        let mut section = serde_json::json!({"loki": {"enabled": false}});
+        apply_mount_list(
+            &mut section,
+            "cogneva-evolution-pvc=/opt/cogneva/sandbox\n\
+             cogneva-evolution-source-pvc=/opt/cogneva/sandbox/src",
+        )
+        .unwrap();
+        let cfg: ObservabilityExportersConfig = serde_json::from_value(section).unwrap();
+        assert!(!cfg.loki.enabled);
+        assert_eq!(cfg.data_volume_watch.volumes.len(), 2);
+        assert_eq!(
+            cfg.data_volume_watch.volumes[1].claim,
+            "cogneva-evolution-source-pvc"
+        );
+
+        let mut section = serde_json::json!({});
+        assert!(apply_mount_list(&mut section, "not-a-pair").is_err());
+
+        // 空值等于没配，不能让一个空 env 把文件里写的清单清掉。
+        let mut section = serde_json::json!({
+            "data_volume_watch": {"volumes": [{"claim": "from-file", "path": "/x"}]}
+        });
+        apply_mount_list(&mut section, "   \n  ").unwrap();
+        let cfg: ObservabilityExportersConfig = serde_json::from_value(section).unwrap();
+        assert_eq!(cfg.data_volume_watch.volumes.len(), 1);
+        assert_eq!(cfg.data_volume_watch.volumes[0].claim, "from-file");
     }
 }

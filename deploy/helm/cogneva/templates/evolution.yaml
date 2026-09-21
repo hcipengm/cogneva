@@ -242,6 +242,15 @@ spec:
             # 分开量：两个进程写同一个路径，但各自的卷互不相干。
             - name: COGNEVA_DATA_VOLUME_CLAIM
               value: "cogneva-evolution-data-pvc"
+            # 本 Pod 在数据目录之外还挂了两张卷，占用都远大于上面那张：沙箱工作树
+            # 与构建缓存。不列出来它们就没有观测面——唯一能发现"声明 10Gi、实际
+            # 101G"的规则看不见它们，只会在节点盘整体告急时才被间接发现。
+            # 子挂载由进程读自己的挂载表排除，不在这里重复声明，免得挂载一变就
+            # 静默量错。
+            - name: COGNEVA_DATA_VOLUME_MOUNTS
+              value: |
+                cogneva-evolution-pvc=/opt/cogneva/sandbox
+                cogneva-evolution-source-pvc=/opt/cogneva/sandbox/src
             # 本 Pod 自己的 JWT 签名密钥，与主应用那份**不同源**：本 Pod 持有
             # 主线部署器（推 registry、滚四部署），并入用户会话的鉴权域等于让
             # 一枚 WebUI token 够到部署器。取不到时进程退化为一次性随机密钥，

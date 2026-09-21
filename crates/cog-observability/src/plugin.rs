@@ -21,9 +21,12 @@ pub struct ObservabilityPlugin {
     /// Per-agent trace buffer budget, read in `init` from config and applied
     /// to the collection task in `start`.
     trace_buffer_max_bytes: usize,
-    /// Data-directory footprint gauge, created in `init` when the deployment
-    /// names a backing claim and scanned by a task spawned in `start`.
-    data_volume: Option<Arc<crate::data_volume::DataVolumeObservable>>,
+    /// Footprint gauge per claim-backed directory, created in `init` and
+    /// scanned by one task each in `start`.
+    data_volume: Vec<(
+        crate::data_volume::WatchedTarget,
+        Arc<crate::data_volume::DataVolumeObservable>,
+    )>,
 }
 
 impl ObservabilityPlugin {
@@ -35,7 +38,7 @@ impl ObservabilityPlugin {
             trace_tier_migrator: None,
             alert_store: None,
             trace_buffer_max_bytes: crate::config::TraceCollectorConfig::default().buffer_max_bytes,
-            data_volume: None,
+            data_volume: Vec::new(),
         }
     }
 }
@@ -264,17 +267,28 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // ── Data directory footprint ──
         // The volume's declared size is compared against this gauge; nothing
         // else measures what a directory-backed volume actually holds, so
-        // without it an overrun has no observation face at all.
-        if !observability.data_volume_watch.claim.is_empty() {
+        // without it an overrun has no observation face at all. One gauge per
+        // claim: a reading attributed to the wrong claim invents an overrun on
+        // one volume and hides the one on another.
+        let (targets, rejected) = crate::data_volume::resolve_targets(
+            &observability.data_volume_watch,
+            std::path::Path::new(&ctx.config().app.data_dir),
+        );
+        for reason in &rejected {
+            warn!(reason = %reason, "watched volume not measured");
+        }
+        for target in targets {
             let volume = Arc::new(crate::data_volume::DataVolumeObservable::new(
-                observability.data_volume_watch.claim.clone(),
+                target.claim.clone(),
             ));
             ctx.publish_observable(volume.clone());
-            self.data_volume = Some(volume);
             info!(
-                claim = %observability.data_volume_watch.claim,
+                claim = %target.claim,
+                dir = %target.dir.display(),
+                excluded = target.exclude.len(),
                 "ObservabilityPlugin data volume footprint published"
             );
+            self.data_volume.push((target, volume));
         }
 
         // ── Persistent alert state machine ──
@@ -354,14 +368,13 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
 
         // ── Data directory footprint ──
         let obs_cfg = crate::ObservabilityExportersConfig::load()?;
-        if let Some(ref volume) = self.data_volume {
-            let data_dir = std::path::PathBuf::from(&ctx.config().app.data_dir);
+        for (target, volume) in &self.data_volume {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
             tokio::spawn(crate::data_volume::run_data_volume_watch(
-                data_dir,
+                target.clone(),
                 volume.clone(),
                 obs_cfg.data_volume_watch.interval_secs,
                 shutdown,
