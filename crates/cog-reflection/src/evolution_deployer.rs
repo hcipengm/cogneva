@@ -7,7 +7,7 @@
 //! - Stage the new binary for the supervisor's binary switcher.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cog_core::{SFError, SFResult};
 use tracing::{info, warn};
@@ -46,7 +46,7 @@ impl EvolutionDeployer {
             binary_dir: binary_dir.into(),
             backup_dir: backup_dir.into(),
             binary_name: "cogneva".to_string(),
-            build_timeout_secs: 1800,
+            build_timeout_secs: 3600,
             git_name: "Cogneva Self-Evolution".to_string(),
             git_email: "self-evolution@cogneva.ai".to_string(),
             target_dir: None,
@@ -211,10 +211,23 @@ impl EvolutionDeployer {
         if let Some(target) = &self.target_dir {
             cmd.env("CARGO_TARGET_DIR", target);
         }
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| SFError::IO(format!("Failed to run cargo build: {}", e)))?;
+        let output =
+            match tokio::time::timeout(Duration::from_secs(self.build_timeout_secs), cmd.output())
+                .await
+            {
+                Ok(result) => {
+                    result.map_err(|e| SFError::IO(format!("Failed to run cargo build: {}", e)))?
+                }
+                Err(_) => {
+                    // An unbounded release build outlives the pod's own
+                    // resources long before it is useful; give up and let the
+                    // caller roll the commit back.
+                    return Err(SFError::IO(format!(
+                        "cargo build --release exceeded the {}s deployment budget and was killed",
+                        self.build_timeout_secs
+                    )));
+                }
+            };
 
         if !output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);

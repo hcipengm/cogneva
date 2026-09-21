@@ -823,7 +823,7 @@ mod tests {
     /// 两端镜像都跟——只跟一端会让另一个平台上的提交永远进不了集群。
     #[test]
     fn mainline_upstreams_default_to_both_integration_repos() {
-        let dir = std::env::temp_dir().join(format!("cog-reflection-ml-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cog-reflection-ml-up-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cogneva.json");
         std::fs::write(
@@ -1027,7 +1027,8 @@ mod tests {
 
     #[test]
     fn mainline_section_load_and_env_overrides() {
-        let dir = std::env::temp_dir().join(format!("cog-reflection-ml-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cog-reflection-ml-env-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cogneva.json");
         std::fs::write(

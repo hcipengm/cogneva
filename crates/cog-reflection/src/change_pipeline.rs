@@ -10,12 +10,69 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cog_core::{SFError, SFResult};
 use tracing::{info, warn};
 
 use crate::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
 use crate::EvolutionEngine;
+
+/// Environment the verification test process is allowed to inherit.
+///
+/// The verdict has to be a function of the change alone. An inherited
+/// environment lets the deployment's own configuration reach the assertions
+/// (its endpoints, claim names, feature flags), so the same change is accepted
+/// on one deployment and rejected on another. Everything listed here is what
+/// it takes to launch the toolchain and find its caches; nothing that
+/// describes a deployment.
+const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+    "TMPDIR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTC_WRAPPER",
+    "RUSTFLAGS",
+    "SCCACHE_DIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
+
+/// Resolve the environment for the verification test process: the passthrough
+/// set as reported by `get`, plus an explicit target directory.
+///
+/// Split out from the command so the rule can be checked without spawning
+/// anything: a variable that describes the deployment must never reach an
+/// assertion.
+fn verification_env(
+    get: impl Fn(&str) -> Option<String>,
+    target_dir: Option<&Path>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = VERIFICATION_ENV_PASSTHROUGH
+        .iter()
+        .filter_map(|key| get(key).map(|value| (key.to_string(), value)))
+        .collect();
+    if let Some(dir) = target_dir {
+        env.push(("CARGO_TARGET_DIR".to_string(), dir.display().to_string()));
+    }
+    env
+}
 
 /// Result of applying and testing a single change.
 #[derive(Debug, Clone)]
@@ -33,6 +90,10 @@ pub struct ChangePipeline {
     project_root: PathBuf,
     change_dir: PathBuf,
     auto_apply: bool,
+    /// Wall-clock budget for the verification test run. A cold verification
+    /// compiles the whole workspace on the deployment's own hardware before it
+    /// runs a single test, so this bounds a build-plus-test, not just a test;
+    /// a budget shorter than one real run turns every verdict into a timeout.
     test_timeout_secs: u64,
     promotion_policy: Option<crate::PromotionGateConfig>,
     /// 共享 CARGO_TARGET_DIR：把编译产物留在工作树之外，临时工作树用完即弃
@@ -50,7 +111,7 @@ impl ChangePipeline {
             project_root: project_root.into(),
             change_dir: change_dir.into(),
             auto_apply,
-            test_timeout_secs: 600,
+            test_timeout_secs: 3600,
             promotion_policy: None,
             target_dir: None,
         }
@@ -667,19 +728,37 @@ impl ChangePipeline {
     }
 
     /// Run `cargo test --workspace` and return (success, combined_output).
+    ///
+    /// `--no-fail-fast` because the verdict is read by whoever investigates a
+    /// rejection: stopping at the first failing crate hides the rest of the
+    /// failure surface and makes an environmental problem look like the only
+    /// problem.
     async fn run_cargo_test(&self, workdir: &Path) -> SFResult<(bool, String)> {
         info!("Running cargo test --workspace");
         let mut cmd = tokio::process::Command::new("cargo");
-        cmd.args(["test", "--workspace"])
+        cmd.args(["test", "--workspace", "--no-fail-fast"])
             .current_dir(workdir)
             .kill_on_drop(true);
-        if let Some(target) = &self.target_dir {
-            cmd.env("CARGO_TARGET_DIR", target);
+        cmd.env_clear();
+        for (key, value) in verification_env(|k| std::env::var(k).ok(), self.target_dir.as_deref())
+        {
+            cmd.env(key, value);
         }
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| SFError::IO(format!("Failed to run cargo test: {}", e)))?;
+
+        let output =
+            match tokio::time::timeout(Duration::from_secs(self.test_timeout_secs), cmd.output())
+                .await
+            {
+                Ok(result) => {
+                    result.map_err(|e| SFError::IO(format!("Failed to run cargo test: {}", e)))?
+                }
+                Err(_) => {
+                    return Err(SFError::IO(format!(
+                        "cargo test exceeded the {}s verification budget and was killed",
+                        self.test_timeout_secs
+                    )));
+                }
+            };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1148,5 +1227,48 @@ index 1111111..2222222 100644
             .unwrap();
 
         assert!(!change_dir.join("retired").exists());
+    }
+
+    /// 部署自己的配置一旦渗进验证进程，同一个变更在不同部署上就会得到不同判定：
+    /// 某部署的 `COGNEVA_GITEE_API_BASE` / `COGNEVA_DATA_VOLUME_CLAIM` 会盖掉测试
+    /// 临时文件里的期望值，于是门禁变成"部署像不像 CI"而不是"变更对不对"。
+    /// 这条不变式同时挡住将来有人把产品命名空间的变量加进白名单。
+    #[test]
+    fn verification_env_carries_no_deployment_configuration() {
+        let polluted = |key: &str| match key {
+            "PATH" => Some("/usr/local/bin:/usr/bin".to_string()),
+            "HOME" => Some("/root".to_string()),
+            "CARGO_HOME" => Some("/usr/local/cargo".to_string()),
+            "COGNEVA_GITEE_API_BASE" => Some("http://gw:8081/gitee".to_string()),
+            "COGNEVA_DATA_VOLUME_CLAIM" => Some("cogneva-evolution-data-pvc".to_string()),
+            "COGNEVA_SELF_EVOLUTION_PROMOTION_ENABLED" => Some("true".to_string()),
+            "PG_PASSWORD" => Some("not-a-real-password".to_string()),
+            _ => None,
+        };
+
+        let env = verification_env(polluted, None);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(keys.contains(&"PATH"), "工具链需要 PATH 才能启动");
+        assert!(keys.contains(&"CARGO_HOME"), "cargo 需要它的缓存目录");
+        assert!(
+            !keys.iter().any(|k| k.starts_with("COGNEVA_")),
+            "产品命名空间的变量不得进入判据进程，实测进了：{keys:?}"
+        );
+        assert!(!keys.contains(&"PG_PASSWORD"), "部署侧凭证不得进入判据进程");
+    }
+
+    /// 共享 target 目录必须在清空环境后显式补回，否则验证会退回工作树内的
+    /// target，每轮都全量重编。
+    #[test]
+    fn verification_env_keeps_the_shared_target_dir() {
+        let env = verification_env(|_| None, Some(Path::new("/var/cache/cogneva-target")));
+        assert_eq!(
+            env,
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                "/var/cache/cogneva-target".to_string()
+            )]
+        );
     }
 }
