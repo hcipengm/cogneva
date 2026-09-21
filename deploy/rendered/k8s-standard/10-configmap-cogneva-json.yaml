@@ -299,7 +299,7 @@ data:
       "metrics": {
         "enabled": true,
         "endpoint": "/metrics",
-        "_comment_sample_max_rows": "cog_metrics_samples 是只追加的观测样本日志，这条是它的容量上限（行数），0=不清理。清理的判据是容量不是时间：时间窗两个问题都答不了——流量可以在任何窗内塞进任意多行，而清理仍然会删掉正在读的行、留着没人要的行。清理按最早的先删，直到回到上限为止，但每个 series 的最新一行永不删——所有读路径都是经 series 的当前值读到这张表的（抓取取每标签组最新一条，计数器与直方图读各自的累计表），删掉某个 series 的最新行等于这个 series 从 /metrics 上消失，读起来是"从来没存在过"而不是"被裁掉了"。若光是这些最新行就超过上限，清理停在最新行上并通过 metrics_samples_over_capacity=1 说出来。默认值按开发集群实测的观测速率（约每天 2.2 万行）取约十天，比稳态高一个数量级，正常运转够不着，而失控的探测循环会在几小时内撞上而不是先把卷写满。属主是主应用：两个 Pod 共用同一个库，进化 Pod 的部署环境里置 COGNEVA_METRICS_SAMPLE_MAX_ROWS=0，本进程就不参与清理。",
+        "_comment_sample_max_rows": "cog_metrics_samples 是只追加的观测样本日志，这条是它的容量上限（行数），0=不清理。清理的判据是容量不是时间：时间窗两个问题都答不了——流量可以在任何窗内塞进任意多行，而清理仍然会删掉正在读的行、留着没人要的行。清理按最早的先删，直到回到上限为止，但每个 series 的最新一行永不删——所有读路径都是经 series 的当前值读到这张表的（抓取取每标签组最新一条，计数器与直方图读各自的累计表），删掉某个 series 的最新行等于这个 series 从 /metrics 上消失，读起来是「从来没存在过」而不是「被裁掉了」。若光是这些最新行就超过上限，清理停在最新行上并通过 metrics_samples_over_capacity=1 说出来。默认值按开发集群实测的观测速率（约每天 2.2 万行）取约十天，比稳态高一个数量级，正常运转够不着，而失控的探测循环会在几小时内撞上而不是先把卷写满。属主是主应用：两个 Pod 共用同一个库，进化 Pod 的部署环境里置 COGNEVA_METRICS_SAMPLE_MAX_ROWS=0，本进程就不参与清理。",
         "sample_max_rows": 200000,
         "_comment_scrape_dimensions": "抓取端点向各 observable 询取的维度集合。observable 只回答它按维度分支的那几个维度，所以这里的集合少一个维度，就有一批指标被计数、被谁都不导出——不报错、不打日志，只是没有任何端点能读到。写死成字面量时它是一处不可评审的常量，故改为配置面。准入原则：只收声明了有界序列的维度。D4（memory）、D5（observability）、D6（guardrail）、D9（llm）四家的指标都不带标签，基数固定；D8（collab/orchestrator）已在采集内。D1/D2/D3（agent）在那个分支里逐 step record，身份键取自 task_id，序列基数无界，故不纳入。",
         "scrape_dimensions": ["D4", "D5", "D6", "D8", "D9"]
