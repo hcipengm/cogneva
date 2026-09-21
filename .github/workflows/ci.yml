@@ -56,6 +56,15 @@ jobs:
         run: cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The sample-log sweep is expressed almost entirely as one DELETE, so its
+      # correctness cannot be checked without a server; the DB-free tests beside
+      # it only cover the sweep period. Leaving these out of the gate is how a
+      # sweep that kept every row sharing the newest instant passed both the
+      # local gate and CI.
+      - name: Live-DB metrics sample capacity sweep
+        run: cargo test -p cog-storage --test metrics_sample_cap -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - name: Live-DB backup/restore round trip
         run: cargo test -p cogneva --test backup_pg -- --ignored
         env:

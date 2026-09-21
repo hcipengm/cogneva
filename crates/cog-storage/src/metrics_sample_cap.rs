@@ -25,7 +25,9 @@
 //! cumulations live in their own tables — so a series whose newest row was
 //! deleted is a series that vanished from `/metrics`, which reads as "this
 //! never existed" rather than as "this was trimmed". That floor is what the
-//! capacity may never buy. If the floor alone holds more rows than the
+//! capacity may never buy, and it is one row per series rather than everything
+//! at the newest instant: a row is exempt for being a series' newest, not for
+//! being as recent as its newest. If the floor alone holds more rows than the
 //! capacity allows, the sweep stops at the floor and says so: refusing to
 //! delete more is the correct outcome, and a silent refusal would look exactly
 //! like the capacity being met.
@@ -33,7 +35,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
@@ -178,15 +179,9 @@ impl SampleLogCap {
             return Ok(outcome);
         }
 
-        let Some(floor) = self.newest_per_series_floor().await? else {
-            // An empty table cannot be over capacity; treat a missing floor as
-            // nothing to delete rather than as licence to delete everything.
-            return Ok(outcome);
-        };
-
         let mut remaining = held - budget;
         while remaining > 0 {
-            let batch = self.delete_older_than(&floor, remaining).await?;
+            let batch = self.delete_surplus(remaining).await?;
             outcome.removed += batch;
             remaining -= batch as i64;
             if batch == 0 {
@@ -199,42 +194,40 @@ impl SampleLogCap {
         Ok(outcome)
     }
 
-    /// The instant below which no row can be a series' newest.
+    /// Delete up to `limit` rows, oldest first, keeping each series' newest
+    /// row. Returns how many went.
     ///
-    /// The smallest of the per-series maxima: every series holds a row at or
-    /// after it, so anything strictly older belongs to a series that already
-    /// has something newer and is safe to drop. One grouped pass, rather than
-    /// a per-row "is this the newest" test that would have to be repeated for
-    /// every batch.
-    async fn newest_per_series_floor(&self) -> SFResult<Option<DateTime<Utc>>> {
-        let sql = format!(
-            "SELECT min(newest) FROM (
-                 SELECT max(timestamp) AS newest FROM {table}
-                 GROUP BY metric_type, name, labels
-             ) newest_per_series",
-            table = crate::partition_maintainer::quote_ident(&self.table),
-        );
-        sqlx::query_scalar(&sql)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))
-    }
-
-    /// Delete up to `limit` rows older than `floor`, oldest first. Returns how
-    /// many went.
+    /// The exemption is by rank, not by a timestamp cutoff. A cutoff at
+    /// `min(per-series max timestamp)` reads well and is cheap, but it keeps
+    /// every row that happens to share that instant, so a series written as one
+    /// burst under a single timestamp could not be pruned at all — the sweep
+    /// would report itself over capacity while fifty deletable rows sat there.
+    /// Ranking asks the question actually meant — "is this the newest row of
+    /// its series" — and answers it with one row per series, ties broken by
+    /// id so the answer does not depend on which of two equal rows the planner
+    /// happens to visit first.
     ///
     /// The statement takes exactly as much work as the overshoot it is
     /// correcting: the cap it is enforcing is the batch size, so there is no
     /// second number deciding how much a single statement may hold locks over.
-    async fn delete_older_than(&self, floor: &DateTime<Utc>, limit: i64) -> SFResult<u64> {
+    async fn delete_surplus(&self, limit: i64) -> SFResult<u64> {
         let sql = format!(
             "DELETE FROM {table} WHERE id IN (
-                 SELECT id FROM {table} WHERE timestamp < $1 ORDER BY timestamp LIMIT $2
+                 SELECT id FROM (
+                     SELECT id, timestamp,
+                            row_number() OVER (
+                                PARTITION BY metric_type, name, labels
+                                ORDER BY timestamp DESC, id DESC
+                            ) AS newest_rank
+                     FROM {table}
+                 ) ranked
+                 WHERE newest_rank > 1
+                 ORDER BY timestamp, id
+                 LIMIT $1
              )",
             table = crate::partition_maintainer::quote_ident(&self.table),
         );
         Ok(sqlx::query(&sql)
-            .bind(floor)
             .bind(limit.max(1))
             .execute(&self.pool)
             .await
