@@ -64,6 +64,7 @@ mod tests {
                 stop_reason: StopReason::Stop,
                 error_message: None,
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -87,6 +88,7 @@ mod tests {
                 stop_reason: StopReason::Stop,
                 error_message: None,
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             };
             let (stream, mut producer) = AssistantMessageEventStream::with_capacity(10);
@@ -125,6 +127,7 @@ mod tests {
                 stop_reason: StopReason::Stop,
                 error_message: None,
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             };
             let (stream, mut producer) = AssistantMessageEventStream::with_capacity(10);
@@ -211,6 +214,7 @@ mod tests {
                 stop_reason: StopReason::Error,
                 error_message: Some(self.reason.clone()),
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             })
         }

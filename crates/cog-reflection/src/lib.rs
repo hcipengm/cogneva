@@ -1004,6 +1004,7 @@ mod tests {
             stop_reason: cog_core::StopReason::Stop,
             error_message: None,
             upstream_failure: None,
+            retry_after_secs: None,
             timestamp: chrono::Utc::now(),
         };
         let event = cog_core::AssistantMessageEvent::TextEnd {
@@ -1044,6 +1045,7 @@ mod tests {
                 stop_reason: cog_core::StopReason::Stop,
                 error_message: None,
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -1200,6 +1202,7 @@ mod tests {
                 stop_reason: cog_core::StopReason::Stop,
                 error_message: None,
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -1248,6 +1251,7 @@ mod tests {
                 stop_reason: cog_core::StopReason::Error,
                 error_message: Some(self.reason.clone()),
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             })
         }

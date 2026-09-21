@@ -143,6 +143,7 @@ impl cog_core::TaskExecutionCallback for GatewayTaskRunner {
             Err(e) => {
                 let error = e.to_string();
                 let cause = e.upstream_failure();
+                let retry_after_secs = e.retry_after_secs();
                 warn!("Task {} failed: {}", task_id, error);
                 if let Some(ref engine) = self.state.hook_engine {
                     engine.emit_detached(
@@ -154,7 +155,7 @@ impl cog_core::TaskExecutionCallback for GatewayTaskRunner {
                 let (_retried, _cancelled, _dlq) = match self
                     .state
                     .orchestrator
-                    .fail_task(&task_id, error, cause)
+                    .fail_task_after(&task_id, error, cause, retry_after_secs)
                     .await
                 {
                     Ok(r) => r,

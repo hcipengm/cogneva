@@ -2079,6 +2079,15 @@ mod tests {
         ) -> SFResult<(bool, Vec<String>, bool)> {
             unimplemented!()
         }
+        async fn fail_task_after(
+            &self,
+            _t: &str,
+            _e: String,
+            _c: Option<cog_core::UpstreamFailure>,
+            _w: Option<u64>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!()
+        }
         async fn cancel_task(&self, _t: &str) -> SFResult<Vec<String>> {
             unimplemented!()
         }

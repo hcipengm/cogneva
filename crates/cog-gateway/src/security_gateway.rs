@@ -281,21 +281,13 @@ fn suspect_backoff_secs(consecutive_failures: u32, probe_interval_secs: u64) -> 
 /// `max_tokens=1` 的探测去撞一堵已知要到某时刻才开的门。
 /// `Retry-After` 优先（协议标准，语义明确），其次错误体里的 `reset at ...`。
 fn parse_quota_reset(body: &str, retry_after: Option<&str>) -> Option<i64> {
-    if let Some(secs) = retry_after.and_then(parse_retry_after_secs) {
-        return Some(Utc::now().timestamp().saturating_add(secs));
+    // 形态解析只有一份实现，放在契约层：这个头上下游都要读——网关读它定嫌疑
+    // 窗，业务侧读它定重试时刻。两份实现各自演化时，同一句话会被两边读出不同
+    // 的长度，而任何一边单独看都是对的。
+    if let Some(secs) = retry_after.and_then(cog_core::parse_retry_after_secs) {
+        return Some(Utc::now().timestamp().saturating_add(secs as i64));
     }
     parse_reset_at(body)
-}
-
-/// `Retry-After`：秒数或 HTTP-date 两种合法形态。
-fn parse_retry_after_secs(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    if let Ok(secs) = raw.parse::<i64>() {
-        return Some(secs.max(0));
-    }
-    DateTime::parse_from_rfc2822(raw)
-        .ok()
-        .map(|t| (t.timestamp() - Utc::now().timestamp()).max(0))
 }
 
 /// 错误体里的 `reset at <时间>`：取该短语后的时间戳，按几种已知形态解析。
@@ -1631,9 +1623,10 @@ async fn stream_forward(
     let candidates = order_by_health(candidates, &state.llm_health);
 
     let mut last_err = String::new();
-    // 最后一个真实上游错误响应（状态码、content-type、原始 body）：
-    // 池耗尽时优先透传它，而不是合成 502 文本。
-    let mut last_failure: Option<(reqwest::StatusCode, String, String)> = None;
+    // 最后一个真实上游错误响应（状态码、content-type、原始 body、上游自己说的
+    // 重试等待）：池耗尽时优先透传它，而不是合成 502 文本。等待时长要一起透传：
+    // 调用侧据此决定何时重试，头丢在这里，它就只能拿状态码去猜。
+    let mut last_failure: Option<(reqwest::StatusCode, String, String, Option<String>)> = None;
     for upstream in candidates {
         let base = upstream.base_url.trim_end_matches('/');
         let url = match style {
@@ -1767,7 +1760,7 @@ async fn stream_forward(
                 mark_upstream_failure(&state, upstream, base, quota_reset).await;
             }
             last_err = format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text));
-            last_failure = Some((status, ctype, text));
+            last_failure = Some((status, ctype, text, retry_after));
             continue;
         }
         if state.note_upstream_success(upstream) {
@@ -1800,11 +1793,15 @@ async fn stream_forward(
     }
     // 池耗尽：有真实上游错误响应就透传状态码与原始 body（保留厂商
     // 错误标记，调用侧终止性退避据此分类），连真实响应都没有才合成 502。
-    if let Some((status, ctype, body)) = last_failure {
+    if let Some((status, ctype, body, retry_after)) = last_failure {
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return Ok(axum::response::Response::builder()
+        let mut builder = axum::response::Response::builder()
             .status(status)
-            .header("content-type", ctype)
+            .header("content-type", ctype);
+        if let Some(wait) = retry_after {
+            builder = builder.header(cog_core::RETRY_AFTER_HEADER, wait);
+        }
+        return Ok(builder
             .body(axum::body::Body::from(body))
             .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
     }
@@ -3893,6 +3890,39 @@ mod tests {
         assert!(state.llm_health.is_suspect(&stub_upstream(&dead2, "m2")));
     }
 
+    /// 池耗尽时透传最后一个上游的真实响应，上游自己说的重试等待要一起透传。
+    /// 头丢在这一跳，调用侧就只剩状态码可猜——而"何时再试"的权威答案本来
+    /// 就在这个头上，不在状态码里。
+    #[tokio::test]
+    async fn an_exhausted_pool_passes_the_stated_wait_through() {
+        let upstream = spawn_stub_upstream_stating_wait(
+            429,
+            r#"{"error":{"type":"rate_limit_exceeded"}}"#,
+            "90",
+        )
+        .await;
+        let state = test_state(vec![stub_upstream(&upstream, "m1")]);
+
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = chat_completions_passthrough(State(state.clone()), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 429);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("90"),
+            "上游明说的等待没能穿过网关"
+        );
+    }
+
     #[tokio::test]
     async fn stream_forward_falls_through_to_healthy_upstream() {
         // 池内第一个上游配额终止（403），第二个健康：调用方应拿到第二个
@@ -4130,6 +4160,34 @@ mod tests {
                 (
                     StatusCode::from_u16(status).unwrap(),
                     [(header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// 本地桩上游，额外带上 `Retry-After`。
+    async fn spawn_stub_upstream_stating_wait(
+        status: u16,
+        body: &'static str,
+        wait: &'static str,
+    ) -> String {
+        use axum::http::header;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [
+                        (header::CONTENT_TYPE, "application/json"),
+                        (header::RETRY_AFTER, wait),
+                    ],
                     body,
                 )
             }),

@@ -117,6 +117,18 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.fail_task(task_id, error, cause).await
     }
 
+    async fn fail_task_after(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+        retry_after_secs: Option<u64>,
+    ) -> SFResult<(bool, Vec<String>, bool)> {
+        self.dag_executor
+            .fail_task_after(task_id, error, cause, retry_after_secs)
+            .await
+    }
+
     async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
         self.dag_executor.cancel_task(task_id).await
     }

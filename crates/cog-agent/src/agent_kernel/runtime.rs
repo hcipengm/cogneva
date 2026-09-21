@@ -1774,6 +1774,7 @@ mod tests {
                     stop_reason: cog_core::StopReason::Stop,
                     error_message: None,
                     upstream_failure: None,
+                    retry_after_secs: None,
                     timestamp: chrono::Utc::now(),
                 });
             });
@@ -1806,6 +1807,7 @@ mod tests {
                 stop_reason: cog_core::StopReason::Stop,
                 error_message: None,
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             })
         }

@@ -59,6 +59,7 @@ impl cog_core::LlmClient for DummyProvider {
             stop_reason: StopReason::Stop,
             error_message: None,
             upstream_failure: None,
+            retry_after_secs: None,
             timestamp: chrono::Utc::now(),
         })
     }
@@ -82,6 +83,7 @@ impl cog_core::LlmClient for DummyProvider {
                 stop_reason: StopReason::Stop,
                 error_message: None,
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             };
 
@@ -287,6 +289,7 @@ impl cog_core::LlmClient for SilentProvider {
             },
             error_message: self.error_message.clone(),
             upstream_failure: None,
+            retry_after_secs: None,
             timestamp: chrono::Utc::now(),
         })
     }

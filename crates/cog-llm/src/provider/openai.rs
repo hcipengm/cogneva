@@ -506,6 +506,7 @@ impl LLMProvider for OpenAIProvider {
                 stop_reason: StopReason::Stop,
                 error_message: None,
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             };
             let start = std::time::Instant::now();
@@ -572,6 +573,9 @@ impl LLMProvider for OpenAIProvider {
 
             if !http_response.is_success() {
                 let status = http_response.status;
+                // 上游明说的等待时长要在读掉响应体之前取出来：头与体一起被
+                // 消费，先取则留着，后取就只剩空表。
+                response.retry_after_secs = cog_core::retry_after_hint(&http_response.headers);
                 let text = http_response.drain_text().await;
                 response.stop_reason = StopReason::Error;
                 // 状态码是这次失败的**类型**，文本只是它的措辞。留在这里，
@@ -1446,6 +1450,63 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 stream,
             })
+        }
+    }
+
+    /// 非 2xx 的桩：上游拒绝时状态码与响应头一起到。
+    #[derive(Debug)]
+    struct RefusingSseClient {
+        status: u16,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for RefusingSseClient {
+        async fn execute(&self, _req: cog_core::HttpRequest) -> SFResult<cog_core::HttpResponse> {
+            unreachable!("stream path only")
+        }
+        async fn execute_stream(
+            &self,
+            _req: cog_core::HttpRequest,
+        ) -> SFResult<cog_core::HttpStreamResponse> {
+            let chunk: Result<bytes::Bytes, SFError> = Ok(bytes::Bytes::from(self.body.clone()));
+            let stream: cog_core::HttpBodyStream = Box::pin(futures::stream::iter(vec![chunk]));
+            Ok(cog_core::HttpStreamResponse {
+                status: self.status,
+                headers: self.headers.clone(),
+                stream,
+            })
+        }
+    }
+
+    /// 上游拒绝时明说的等待要落到响应上：读这个头的就是具体客户端，丢了它，
+    /// 调度器只能拿状态码去猜一个上游从没说过的时刻。两种大小写都要认——
+    /// HTTP 头名不区分大小写，各家客户端保留的原始大小写不同。
+    #[tokio::test]
+    async fn a_refused_stream_carries_the_stated_wait() {
+        for name in ["Retry-After", "retry-after"] {
+            let provider = OpenAIProvider::new(test_model(), "key").with_client(
+                std::sync::Arc::new(RefusingSseClient {
+                    status: 429,
+                    headers: HashMap::from([(name.to_string(), "90".to_string())]),
+                    body: br#"{"error":{"type":"rate_limit_exceeded"}}"#.to_vec(),
+                }),
+            );
+
+            let mut stream = provider
+                .chat_stream(&[Message::user("hi")], &ChatOptions::default())
+                .await
+                .expect("stream starts");
+            while stream.next().await.is_some() {}
+            let response = stream.result().await;
+
+            assert_eq!(
+                response.upstream_failure,
+                Some(UpstreamFailure::RateLimited),
+                "{name}"
+            );
+            assert_eq!(response.retry_after_secs, Some(90), "{name}");
         }
     }
 

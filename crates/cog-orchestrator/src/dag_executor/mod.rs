@@ -360,11 +360,12 @@ impl DagExecutorRuntime {
                 task_id,
                 error,
                 error_cause,
+                retry_after_secs,
                 ..
             } => {
                 match self
                     .orchestrator
-                    .fail_task(&task_id, error.clone(), error_cause)
+                    .fail_task_after(&task_id, error.clone(), error_cause, retry_after_secs)
                     .await
                 {
                     Ok((retried, cancelled, _dlq_pushed)) => {

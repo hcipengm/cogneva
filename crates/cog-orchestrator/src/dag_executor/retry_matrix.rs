@@ -239,6 +239,28 @@ impl RetryMatrix {
         self.lookup(task_type).backoff.delay(attempt)
     }
 
+    /// The wait before the next attempt, raised to the wait the upstream named
+    /// when it named a longer one.
+    ///
+    /// The policy delay is derived from our own guess at how long a refusal
+    /// lasts; a stated wait is the upstream measuring its own recovery. When
+    /// the measurement is longer, retrying at the guessed moment just buys
+    /// another refusal, so the measurement governs. When it is shorter — or
+    /// absent — the policy stays in charge: an upstream asking for less than
+    /// our policy does not license us to retry harder than we otherwise would.
+    pub fn delay_with_hint(
+        &self,
+        task_type: &TaskType,
+        attempt: u32,
+        upstream_hint: Option<u64>,
+    ) -> Duration {
+        let policy = self.delay(task_type, attempt);
+        match upstream_hint {
+            Some(secs) => policy.max(Duration::from_secs(secs)),
+            None => policy,
+        }
+    }
+
     /// Get the max retries for a given task type.
     pub fn max_retries(&self, task_type: &TaskType) -> u32 {
         self.lookup(task_type).max_retries
@@ -321,5 +343,51 @@ mod tests {
         let matrix = RetryMatrix::defaults();
         assert_eq!(matrix.delay(&TaskType::LlmCall, 1).as_secs(), 2);
         assert_eq!(matrix.max_retries(&TaskType::ToolCall), 2);
+    }
+
+    /// 上游明说的等待只在**比策略更长**时接管；更短或没说都由策略说了算。
+    /// 让它接管更短的一档，等于上游要求放慢而我们加速。
+    #[test]
+    fn a_stated_wait_governs_only_when_it_outlasts_the_policy() {
+        let matrix = RetryMatrix::defaults();
+
+        // LlmCall 第 1 次退避是 2s。
+        assert_eq!(
+            matrix
+                .delay_with_hint(&TaskType::LlmCall, 1, None)
+                .as_secs(),
+            2
+        );
+        assert_eq!(
+            matrix
+                .delay_with_hint(&TaskType::LlmCall, 1, Some(1))
+                .as_secs(),
+            2,
+            "上游要的更短，不缩短我们的退避"
+        );
+        assert_eq!(
+            matrix
+                .delay_with_hint(&TaskType::LlmCall, 1, Some(2))
+                .as_secs(),
+            2
+        );
+        assert_eq!(
+            matrix
+                .delay_with_hint(&TaskType::LlmCall, 1, Some(90))
+                .as_secs(),
+            90,
+            "上游要的更久，等满它说的时长"
+        );
+
+        // 策略退避有封顶，明说的等待不受封顶约束：封顶是我们的猜测，明说的
+        // 是上游的测量。
+        let capped = matrix.delay(&TaskType::DagNode, 10);
+        assert_eq!(capped.as_secs(), 20);
+        assert_eq!(
+            matrix
+                .delay_with_hint(&TaskType::DagNode, 10, Some(120))
+                .as_secs(),
+            120
+        );
     }
 }

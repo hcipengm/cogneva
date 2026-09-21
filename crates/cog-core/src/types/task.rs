@@ -194,6 +194,11 @@ pub enum DagMessage {
         /// 老版本发布者不带它，反序列化按 `None` 处理。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_cause: Option<UpstreamFailure>,
+        /// 上游这次拒绝时自己说的等待时长（秒）。与同一变体的 `error_cause` 并行
+        /// 传递，理由相同：它是判定重试时刻的输入，而判定发生在消费这条消息的
+        /// 进程里，不是产生它的进程里。老版本发布者不带它，按 `None` 处理。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_secs: Option<u64>,
         sender: String,
         recipient: String,
     },
@@ -296,18 +301,25 @@ mod tests {
             task_id: "t1".into(),
             error: "boom".into(),
             error_cause: Some(UpstreamFailure::Auth),
+            retry_after_secs: Some(90),
             sender: "executor-loop".into(),
             recipient: "dag-executor".into(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         match serde_json::from_str::<DagMessage>(&json).unwrap() {
-            DagMessage::TaskFailed { error_cause, .. } => {
-                assert_eq!(error_cause, Some(UpstreamFailure::Auth))
+            DagMessage::TaskFailed {
+                error_cause,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(error_cause, Some(UpstreamFailure::Auth));
+                assert_eq!(retry_after_secs, Some(90));
             }
             other => panic!("expected TaskFailed, got {other:?}"),
         }
 
-        // 老发布者的消息里没有这个字段：只能读成"没有类型可依"，不能猜。
+        // 老发布者的消息里没有这两个字段：只能读成"没有类型、没有明说的等待
+        // 可依"，不能猜。
         let older = serde_json::json!({
             "type": "task_failed",
             "message_id": "m2",
@@ -318,7 +330,14 @@ mod tests {
             "recipient": "dag-executor",
         });
         match serde_json::from_value::<DagMessage>(older).unwrap() {
-            DagMessage::TaskFailed { error_cause, .. } => assert_eq!(error_cause, None),
+            DagMessage::TaskFailed {
+                error_cause,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(error_cause, None);
+                assert_eq!(retry_after_secs, None);
+            }
             other => panic!("expected TaskFailed, got {other:?}"),
         }
     }

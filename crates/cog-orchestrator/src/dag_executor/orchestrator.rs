@@ -747,6 +747,7 @@ impl DagExecutor {
         task_id: &str,
         error: String,
         cause: Option<UpstreamFailure>,
+        retry_after_secs: Option<u64>,
     ) -> SFResult<(bool, Vec<String>, bool)> {
         let be = self.fg().expect("store mode");
         let task = self.store_task(task_id).await?;
@@ -771,7 +772,9 @@ impl DagExecutor {
         };
         // 退避随任务一起落库，不留在调度循环的内存里：判定重试的进程与之后
         // 重新投递它的进程可能不是同一个。
-        let retry_delay = self.retry_matrix.delay(&task.task_type, task.retry_count);
+        let retry_delay =
+            self.retry_matrix
+                .delay_with_hint(&task.task_type, task.retry_count, retry_after_secs);
         let (retried, cancelled) = be
             .dag_fail_task(
                 &self.workspace_id,
@@ -1371,8 +1374,23 @@ impl DagExecutor {
         error: String,
         cause: Option<UpstreamFailure>,
     ) -> SFResult<(bool, Vec<String>, bool)> {
+        self.fail_task_after(task_id, error, cause, None).await
+    }
+
+    /// [`Self::fail_task`] for a failure whose upstream named the wait it wants
+    /// before the next attempt. See [`RetryMatrix::delay_with_hint`] for how the
+    /// stated wait and the policy delay are combined.
+    pub async fn fail_task_after(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+        retry_after_secs: Option<u64>,
+    ) -> SFResult<(bool, Vec<String>, bool)> {
         if self.fg().is_some() {
-            return self.fail_task_store(task_id, error, cause).await;
+            return self
+                .fail_task_store(task_id, error, cause, retry_after_secs)
+                .await;
         }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
@@ -1421,8 +1439,12 @@ impl DagExecutor {
             task.error = Some(error.clone());
             task.error_cause = cause;
             task.updated_at = chrono::Utc::now();
-            task.retry_not_before =
-                Some(chrono::Utc::now() + self.retry_matrix.delay(&task_type, retry_count));
+            task.retry_not_before = Some(
+                chrono::Utc::now()
+                    + self
+                        .retry_matrix
+                        .delay_with_hint(&task_type, retry_count, retry_after_secs),
+            );
 
             drop(inner);
             self.emit_event(cog_core::TaskEvent::TaskFailed {
@@ -2048,6 +2070,18 @@ impl cog_core::DagExecutor for DagExecutor {
         cause: Option<UpstreamFailure>,
     ) -> SFResult<(bool, Vec<String>, bool)> {
         self.fail_task(task_id, error, cause).await
+    }
+
+    async fn fail_task_after(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+        retry_after_secs: Option<u64>,
+    ) -> SFResult<(bool, Vec<String>, bool)> {
+        // 写全类型名指向固有方法：同名 trait 方法就在这里，靠方法解析的优先级
+        // 去区分两者，读的人看不出走的是哪一条。
+        DagExecutor::fail_task_after(self, task_id, error, cause, retry_after_secs).await
     }
 
     async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
@@ -2716,6 +2750,71 @@ mod tests {
         assert_eq!(
             dag.get_task(&other_id).await.unwrap().status,
             TaskStatus::Failed
+        );
+    }
+
+    /// 上游说了要等多久时，重试时刻由它说了算——只要它说的比策略更久。
+    /// 两条路径都要看：内存路径与存续路径各算各的退避，只测一条会漏掉另一条
+    /// 把明说的时长丢掉。
+    #[tokio::test]
+    async fn a_stated_wait_outlasts_the_policy_delay_on_both_paths() {
+        const STATED: u64 = 300;
+
+        let dag = DagExecutor::new("ws-stated".into());
+        let task = Task::new("t-stated", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+
+        let (retried, _, _) = dag
+            .fail_task_after(
+                &task_id,
+                "upstream refused".into(),
+                Some(UpstreamFailure::RateLimited),
+                Some(STATED),
+            )
+            .await
+            .unwrap();
+        assert!(retried, "一次限流仍可重试，只是要等上游说的时长");
+        let due = dag
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .retry_not_before
+            .expect("a backoff deadline");
+        // DagNode 的第一次退避是 5s。取比它高一个数量级的判据，免得把策略里
+        // 的数值抄进测试，两边各自漂移。
+        assert!(
+            due > chrono::Utc::now() + chrono::Duration::seconds(240),
+            "上游说的 300s 没有盖过 5s 的策略退避: {due}"
+        );
+
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let stored = DagExecutor::new("ws-stated-fg".into()).with_state_backend(backend);
+        let task = Task::new("t-stated-fg", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        stored.add_task(task).await.unwrap();
+        stored.schedule_task(&task_id).await.unwrap();
+
+        let (retried, _, _) = stored
+            .fail_task_after(
+                &task_id,
+                "upstream refused".into(),
+                Some(UpstreamFailure::RateLimited),
+                Some(STATED),
+            )
+            .await
+            .unwrap();
+        assert!(retried);
+        let due = stored
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .retry_not_before
+            .expect("a backoff deadline survived the store");
+        assert!(
+            due > chrono::Utc::now() + chrono::Duration::seconds(240),
+            "落库路径把明说的时长丢了: {due}"
         );
     }
 }

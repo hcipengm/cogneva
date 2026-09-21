@@ -120,6 +120,7 @@ async fn consumer_loop_retries_on_task_failed_result() {
         task_id: "task-fail".into(),
         error: "simulated failure".into(),
         error_cause: None,
+        retry_after_secs: None,
         sender: "executor".into(),
         recipient: "orchestrator".into(),
     };

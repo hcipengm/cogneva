@@ -374,6 +374,9 @@ impl TaskExecutorRouter {
                     // 就地取出，不让下游回头去解析那句 Display。
                     error: e.to_string(),
                     error_cause: e.upstream_failure(),
+                    // 上游明说的等待同样要过桥：算出重试时刻的是消费这条
+                    // 消息的进程，明说的时长必须在消息里跟着走。
+                    retry_after_secs: e.retry_after_secs(),
                     sender: "executor-loop".into(),
                     recipient: "dag-executor".into(),
                 };
@@ -452,7 +455,7 @@ impl Default for TaskExecutorRouter {
 mod ready_pipeline_tests {
     use super::*;
     use async_trait::async_trait;
-    use cog_core::{MessageStream, TaskResultMetadata};
+    use cog_core::{MessageStream, TaskResultMetadata, UpstreamFailure};
 
     #[derive(Default)]
     struct ScriptedBackend {
@@ -509,6 +512,23 @@ mod ready_pipeline_tests {
         }
         async fn dlq(&self, _stream: &str, _msg_id: &str, _reason: &str) -> SFResult<()> {
             Ok(())
+        }
+    }
+
+    /// 上游拒绝并明说等待时长的执行器，用来验证类型与时长都过了总线。
+    struct RefusingExecutor;
+
+    #[async_trait]
+    impl TaskExecutor for RefusingExecutor {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+        async fn execute(&self, _task: &Task) -> SFResult<TaskResult> {
+            Err(SFError::upstream_refused_after(
+                UpstreamFailure::RateLimited,
+                "API error (HTTP 429): slow down",
+                Some(90),
+            ))
         }
     }
 
@@ -606,6 +626,39 @@ mod ready_pipeline_tests {
         let acks = backend.acks.lock().await;
         assert_eq!(acks.len(), 1);
         assert_eq!(acks[0].2, vec!["m1".to_string()]);
+    }
+
+    /// 上游的失败类型与它明说的等待都要过总线：算出重试时刻的是消费这条消息
+    /// 的进程，两个信号留在产生它们的进程里，消费侧就只能拿文本去猜。
+    #[tokio::test]
+    async fn a_refusal_publishes_its_cause_and_stated_wait() {
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(RefusingExecutor))
+            .await;
+
+        router
+            .process_ready_message(
+                &pipe,
+                "m1".into(),
+                &serde_json::to_vec(&test_task(30)).unwrap(),
+            )
+            .await;
+
+        let published = backend.published.lock().await;
+        assert_eq!(published.len(), 1);
+        match serde_json::from_slice::<DagMessage>(&published[0].1).unwrap() {
+            DagMessage::TaskFailed {
+                error_cause,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(error_cause, Some(UpstreamFailure::RateLimited));
+                assert_eq!(retry_after_secs, Some(90));
+            }
+            other => panic!("expected TaskFailed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -136,6 +136,7 @@ impl LLMProvider for OllamaProvider {
                 stop_reason: StopReason::Stop,
                 error_message: None,
                 upstream_failure: None,
+                retry_after_secs: None,
                 timestamp: chrono::Utc::now(),
             };
 
@@ -181,6 +182,9 @@ impl LLMProvider for OllamaProvider {
 
             if !http_response.is_success() {
                 let status = http_response.status;
+                // 上游明说的等待时长要在读掉响应体之前取出来：头与体一起被
+                // 消费，先取则留着，后取就只剩空表。
+                response.retry_after_secs = cog_core::retry_after_hint(&http_response.headers);
                 let text = http_response.drain_text().await;
                 response.stop_reason = StopReason::Error;
                 // 状态码是这次失败的**类型**，文本只是它的措辞。留在这里，

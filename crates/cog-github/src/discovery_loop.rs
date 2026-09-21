@@ -1466,7 +1466,7 @@ impl GitHubDiscoveryLoop {
                         // 把判定权交给上游当天的措辞。没有类型可依才退回文本。
                         return Err(match t.error_cause {
                             Some(cause) => {
-                                CogGitHubError::Upstream(SFError::Upstream { cause, reason })
+                                CogGitHubError::Upstream(SFError::upstream_refused(cause, reason))
                             }
                             None => CogGitHubError::Provider(format!(
                                 "assess task {id} failed: {reason}"
@@ -2035,10 +2035,7 @@ mod tests {
     #[test]
     fn terminal_follows_the_type_not_the_provider_wording() {
         let refused = |cause| {
-            CogGitHubError::Upstream(SFError::Upstream {
-                cause,
-                reason: "prose the provider chose".into(),
-            })
+            CogGitHubError::Upstream(SFError::upstream_refused(cause, "prose the provider chose"))
         };
 
         assert!(refused(UpstreamFailure::QuotaExhausted).is_terminal_upstream_failure());
@@ -2206,7 +2203,7 @@ mod tests {
             .expect_err("a failed assess task yields no verdict");
         assert!(is_terminal_failure(&err), "{err}");
         match err {
-            CogGitHubError::Upstream(SFError::Upstream { cause, reason }) => {
+            CogGitHubError::Upstream(SFError::Upstream { cause, reason, .. }) => {
                 assert_eq!(cause, UpstreamFailure::QuotaExhausted);
                 assert_eq!(reason, "mock assess failure");
             }
@@ -2261,10 +2258,10 @@ mod tests {
             "pr:54",
             "pull request",
             54,
-            &CogGitHubError::Upstream(SFError::Upstream {
-                cause: UpstreamFailure::QuotaExhausted,
-                reason: "weekly usage limit reached".into(),
-            }),
+            &CogGitHubError::Upstream(SFError::upstream_refused(
+                UpstreamFailure::QuotaExhausted,
+                "weekly usage limit reached",
+            )),
         );
         assert!(loop_.in_terminal_backoff("pr:54"));
         assert!(!loop_.in_terminal_backoff("pr:55"));
@@ -2275,10 +2272,10 @@ mod tests {
             "pr:54",
             "pull request",
             54,
-            &CogGitHubError::Upstream(SFError::Upstream {
-                cause: UpstreamFailure::Auth,
-                reason: "invalid api key".into(),
-            }),
+            &CogGitHubError::Upstream(SFError::upstream_refused(
+                UpstreamFailure::Auth,
+                "invalid api key",
+            )),
         );
         assert_eq!(loop_.terminal_backoff["pr:54"].consecutive, 2);
 
@@ -2475,6 +2472,15 @@ mod tests {
             _t: &str,
             _e: String,
             _c: Option<cog_core::UpstreamFailure>,
+        ) -> cog_core::SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!()
+        }
+        async fn fail_task_after(
+            &self,
+            _t: &str,
+            _e: String,
+            _c: Option<cog_core::UpstreamFailure>,
+            _w: Option<u64>,
         ) -> cog_core::SFResult<(bool, Vec<String>, bool)> {
             unimplemented!()
         }

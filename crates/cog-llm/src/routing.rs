@@ -316,10 +316,17 @@ impl LLMProvider for RoutingProvider {
                 // 笼统的话。下游据此区分该等窗口复位还是该重试，丢在这里就
                 // 只能再猜一遍文本。
                 return Err(match response.upstream_failure {
-                    Some(cause) => SFError::Upstream {
-                        cause,
-                        reason: response.error_message.unwrap_or_default(),
-                    },
+                    // 上游若一并说了要等多久，就把它原样带出去：那是上游自己
+                    // 报的复位时刻，比我们这边的策略退避更贴近事实。没说就
+                    // 是 `None`，由下游的策略兜底，不再猜一遍。
+                    Some(cause) => {
+                        let wait = response.retry_after_secs;
+                        SFError::upstream_refused_after(
+                            cause,
+                            response.error_message.unwrap_or_default(),
+                            wait,
+                        )
+                    }
                     None => SFError::LLM(
                         response
                             .error_message
@@ -358,6 +365,10 @@ mod tests {
         /// When true, emit a TextDelta before the Error event (post-content
         /// failure — must NOT trigger failover).
         mid_stream_error: bool,
+        /// 传输层信号给出的失败类型，与真实 provider 一样与文本并行传递。
+        upstream_failure: Option<UpstreamFailure>,
+        /// 上游自己说的重试等待，与真实 provider 一样来自响应头。
+        retry_after_secs: Option<u64>,
     }
 
     #[async_trait]
@@ -380,7 +391,8 @@ mod tests {
                     StopReason::Stop
                 },
                 error_message: self.error_msg.clone(),
-                upstream_failure: None,
+                upstream_failure: self.upstream_failure,
+                retry_after_secs: self.retry_after_secs,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -407,7 +419,8 @@ mod tests {
                     StopReason::Stop
                 },
                 error_message: self.error_msg.clone(),
-                upstream_failure: None,
+                upstream_failure: self.upstream_failure,
+                retry_after_secs: self.retry_after_secs,
                 timestamp: chrono::Utc::now(),
             };
             let (stream, mut producer) = AssistantMessageEventStream::with_capacity(10);
@@ -472,11 +485,15 @@ mod tests {
             response_text: "".into(),
             error_msg: Some("API error: 429 rate limit exceeded".into()),
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -498,11 +515,15 @@ mod tests {
             response_text: "".into(),
             error_msg: Some("API error: 402 payment required".into()),
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -524,11 +545,15 @@ mod tests {
             response_text: "".into(),
             error_msg: Some("API error: 429 rate limit exceeded".into()),
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, false, false);
@@ -545,11 +570,15 @@ mod tests {
             response_text: "".into(),
             error_msg: Some("API error: 429".into()),
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "".into(),
             error_msg: Some("API error: 402".into()),
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -559,17 +588,45 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// 换无可换时带出去的是这次失败的原始原因与上游明说的等待，不是另造一句
+    /// 笼统的话：重试时刻由消费这个错误的人算，明说的时长丢在这里，它就只剩
+    /// 状态码可猜。
+    #[tokio::test]
+    async fn an_exhausted_router_carries_the_stated_wait_out() {
+        let only = Arc::new(MockProvider {
+            response_text: "".into(),
+            error_msg: Some("API error (HTTP 429): slow down".into()),
+            mid_stream_error: false,
+            upstream_failure: Some(UpstreamFailure::RateLimited),
+            retry_after_secs: Some(90),
+        });
+
+        let router = RoutingProvider::new(vec![only], 3, true, true);
+        let err = router
+            .chat(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .expect_err("换无可换时必须是 Err");
+
+        assert_eq!(err.upstream_failure(), Some(UpstreamFailure::RateLimited));
+        assert_eq!(err.retry_after_secs(), Some(90));
+        assert!(!err.is_terminal_upstream_failure(), "限流是瞬时信号");
+    }
+
     #[tokio::test]
     async fn test_primary_success_no_failover() {
         let primary = Arc::new(MockProvider {
             response_text: "hello from primary".into(),
             error_msg: None,
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -653,11 +710,15 @@ mod tests {
             response_text: "".into(),
             error_msg: Some("API error: 429 rate limit exceeded".into()),
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -688,11 +749,15 @@ mod tests {
             response_text: "".into(),
             error_msg: Some("API error: 429 rate limit exceeded".into()),
             mid_stream_error: true,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
         let secondary = Arc::new(MockProvider {
             response_text: "hello from secondary".into(),
             error_msg: None,
             mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
         });
 
         let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
@@ -775,6 +840,7 @@ mod tests {
                     stop_reason: StopReason::Stop,
                     error_message: None,
                     upstream_failure: None,
+                    retry_after_secs: None,
                     timestamp: chrono::Utc::now(),
                 };
                 producer.end(response);

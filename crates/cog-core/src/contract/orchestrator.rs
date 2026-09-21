@@ -74,6 +74,20 @@ pub trait OrchestratorControl: Send + Sync {
         cause: Option<UpstreamFailure>,
     ) -> SFResult<(bool, Vec<String>, bool)>;
 
+    /// [`Self::fail_task`] for a failure whose upstream named the wait it wants
+    /// before the next attempt.
+    ///
+    /// 单独一个名字而不是多一个 `None` 参数：能说出这个时长的调用点很少，把
+    /// 它写在名字上，"这次重试有上游给的时刻"就在调用处看得见，而不是淹没在
+    /// 一串同样传 `None` 的调用里。
+    async fn fail_task_after(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+        retry_after_secs: Option<u64>,
+    ) -> SFResult<(bool, Vec<String>, bool)>;
+
     /// Cancel a task and return cascaded cancellations.
     async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>>;
 
@@ -147,6 +161,16 @@ pub trait DagExecutor: Send + Sync {
         task_id: &str,
         error: String,
         cause: Option<UpstreamFailure>,
+    ) -> SFResult<(bool, Vec<String>, bool)>;
+
+    /// [`Self::fail_task`] for a failure whose upstream named the wait it wants
+    /// before the next attempt.
+    async fn fail_task_after(
+        &self,
+        task_id: &str,
+        error: String,
+        cause: Option<UpstreamFailure>,
+        retry_after_secs: Option<u64>,
     ) -> SFResult<(bool, Vec<String>, bool)>;
 
     /// Cancel a task and cascade-cancel all downstream dependents.

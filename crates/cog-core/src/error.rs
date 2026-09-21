@@ -19,6 +19,12 @@ pub enum SFError {
     Upstream {
         cause: UpstreamFailure,
         reason: String,
+        /// The wait the upstream itself named, when it named one. Kept beside
+        /// the cause rather than inside it: the cause is a closed enum every
+        /// consumer matches exhaustively, and a stated wait is an optional
+        /// measurement, not a seventh kind of refusal. `None` means the
+        /// upstream said nothing, and the caller's own policy governs.
+        retry_after_secs: Option<u64>,
     },
 
     #[error("Agent execution error: {0}")]
@@ -109,6 +115,45 @@ impl SFError {
             _ => None,
         }
     }
+
+    /// The wait the upstream named on this refusal, if it named one and if this
+    /// error carries a typed refusal at all.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            SFError::Upstream {
+                retry_after_secs, ..
+            } => *retry_after_secs,
+            _ => None,
+        }
+    }
+}
+
+impl SFError {
+    /// Build a typed upstream refusal with no stated wait.
+    ///
+    /// The common case, and the one every caller that has only a status code
+    /// wants; spelling it out keeps the stated-wait case visibly different at
+    /// the construction site instead of one more `None` in a field list.
+    pub fn upstream_refused(cause: UpstreamFailure, reason: impl Into<String>) -> Self {
+        Self::Upstream {
+            cause,
+            reason: reason.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    /// Build a typed upstream refusal that carries the wait the upstream named.
+    pub fn upstream_refused_after(
+        cause: UpstreamFailure,
+        reason: impl Into<String>,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
+        Self::Upstream {
+            cause,
+            reason: reason.into(),
+            retry_after_secs,
+        }
+    }
 }
 
 impl From<std::io::Error> for SFError {
@@ -144,10 +189,7 @@ mod tests {
     /// message 里写满 quota 也只是措辞，类别由 status 翻出来的取值决定。
     #[test]
     fn upstream_refusal_is_environment_unless_our_request_was_malformed() {
-        let refused = |cause| SFError::Upstream {
-            cause,
-            reason: "quota exceeded".into(),
-        };
+        let refused = |cause| SFError::upstream_refused(cause, "quota exceeded");
 
         assert!(refused(UpstreamFailure::RateLimited).is_environment_failure());
         assert!(refused(UpstreamFailure::QuotaExhausted).is_environment_failure());
@@ -162,10 +204,7 @@ mod tests {
     /// 瞬时信号，按终止处理会让恢复侧睡死。
     #[test]
     fn terminal_covers_only_quota_and_credentials() {
-        let refused = |cause| SFError::Upstream {
-            cause,
-            reason: String::new(),
-        };
+        let refused = |cause| SFError::upstream_refused(cause, String::new());
 
         assert!(refused(UpstreamFailure::QuotaExhausted).is_terminal_upstream_failure());
         assert!(refused(UpstreamFailure::Auth).is_terminal_upstream_failure());
@@ -177,6 +216,26 @@ mod tests {
 
         // 没有状态码可依的失败不猜：LLM(_) 只说明上游没服务这次调用。
         assert!(!SFError::LLM("quota exceeded".into()).is_terminal_upstream_failure());
+    }
+
+    /// 上游明说的等待时长与原因并行传递，不是原因的第七种取值：没有说就是
+    /// `None`，由调用方自己的策略兜底；说了就原样带出去，别再猜一遍。
+    #[test]
+    fn a_stated_wait_travels_beside_the_cause() {
+        let stated =
+            SFError::upstream_refused_after(UpstreamFailure::RateLimited, "slow down", Some(42));
+        assert_eq!(stated.retry_after_secs(), Some(42));
+        assert_eq!(
+            stated.upstream_failure(),
+            Some(UpstreamFailure::RateLimited)
+        );
+
+        assert_eq!(
+            SFError::upstream_refused(UpstreamFailure::RateLimited, "slow down").retry_after_secs(),
+            None
+        );
+        // A failure with no typed cause cannot have named a wait either.
+        assert_eq!(SFError::Timeout.retry_after_secs(), None);
     }
 
     /// 状态码到原因的翻译是纯函数，边界的取值要落在预期的档位上。
