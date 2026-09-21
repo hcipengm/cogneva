@@ -7,6 +7,20 @@ use cog_core::{RawSource, SchemaEntry, SchemaKind, SourceRef, SummaryEntry, NO_E
 
 use cog_core::MemoryExtractor;
 
+/// Fold one more mention of a fact into the pass's entries.
+///
+/// A pass that finds the same fact twice — two lines naming one event, an LLM
+/// listing an entity it already listed — would otherwise hand the store two
+/// entries carrying one identity, and the store would keep one of them. What
+/// the store cannot recover on its own is how many times the pass saw it, so
+/// the repeats are counted here, where they are still visible.
+fn record(entries: &mut Vec<SchemaEntry>, entry: SchemaEntry) {
+    match entries.iter_mut().find(|e| e.id == entry.id) {
+        Some(existing) => existing.occurrences = existing.occurrences.saturating_add(1),
+        None => entries.push(entry),
+    }
+}
+
 /// A rule-based extractor for testing and baseline behaviour.
 /// - Schema extraction looks for simple `@entity:Name` and
 ///   `@relation:Name->Target` patterns in text payloads.
@@ -70,15 +84,10 @@ impl MemoryExtractor for RuleBasedExtractor {
 
         let mut entries = Vec::new();
 
-        // Ids are scoped to the source. `store_schema` upserts on `id`, so a
-        // position-only id (`schema-entity-0`) is the same primary key for
-        // every source: the second source ingested overwrites the first
-        // source's rows and rewrites their `raw_uri`, so the loss leaves no
-        // trace to notice it by.
-        for (idx, (name, key)) in Self::parse_entities(&text).into_iter().enumerate() {
-            entries.push(
-                SchemaEntry::new(
-                    format!("schema-entity-{}-{}", source.id, idx),
+        for (name, key) in Self::parse_entities(&text) {
+            record(
+                &mut entries,
+                SchemaEntry::identified(
                     &source.namespace,
                     SchemaKind::Entity,
                     name,
@@ -89,10 +98,10 @@ impl MemoryExtractor for RuleBasedExtractor {
             );
         }
 
-        for (idx, (from, to, key)) in Self::parse_relations(&text).into_iter().enumerate() {
-            entries.push(
-                SchemaEntry::new(
-                    format!("schema-relation-{}-{}", source.id, idx),
+        for (from, to, key) in Self::parse_relations(&text) {
+            record(
+                &mut entries,
+                SchemaEntry::identified(
                     &source.namespace,
                     SchemaKind::Relation,
                     format!("{} -> {}", from, to),
@@ -107,10 +116,10 @@ impl MemoryExtractor for RuleBasedExtractor {
             );
         }
 
-        for (idx, (name, key)) in Self::parse_events(&text).into_iter().enumerate() {
-            entries.push(
-                SchemaEntry::new(
-                    format!("schema-event-{}-{}", source.id, idx),
+        for (name, key) in Self::parse_events(&text) {
+            record(
+                &mut entries,
+                SchemaEntry::identified(
                     &source.namespace,
                     SchemaKind::Event,
                     name,
@@ -307,12 +316,12 @@ impl MemoryExtractor for LlmMemoryExtractor {
 
         let mut entries = Vec::new();
 
-        for (idx, entity) in extraction.entities.into_iter().enumerate() {
+        for entity in extraction.entities {
             let key = entity.name.to_lowercase().replace(' ', "_");
             let importance = (entity.importance as f32).clamp(1.0, 10.0) / 10.0;
-            entries.push(
-                SchemaEntry::new(
-                    format!("schema-entity-{}-{}", source.id, idx),
+            record(
+                &mut entries,
+                SchemaEntry::identified(
                     &source.namespace,
                     SchemaKind::Entity,
                     entity.name,
@@ -324,16 +333,16 @@ impl MemoryExtractor for LlmMemoryExtractor {
             );
         }
 
-        for (idx, relation) in extraction.relations.into_iter().enumerate() {
+        for relation in extraction.relations {
             let key = format!(
                 "{}_to_{}",
                 relation.source.to_lowercase().replace(' ', "_"),
                 relation.target.to_lowercase().replace(' ', "_")
             );
             let importance = (relation.importance as f32).clamp(1.0, 10.0) / 10.0;
-            entries.push(
-                SchemaEntry::new(
-                    format!("schema-relation-{}-{}", source.id, idx),
+            record(
+                &mut entries,
+                SchemaEntry::identified(
                     &source.namespace,
                     SchemaKind::Relation,
                     format!("{} -> {}", relation.source, relation.target),
@@ -349,7 +358,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
             );
         }
 
-        for (idx, event) in extraction.events.into_iter().enumerate() {
+        for event in extraction.events {
             let key = event.name.to_lowercase().replace(' ', "_");
             let mut props = serde_json::json!({
                 "participants": event.participants,
@@ -358,9 +367,9 @@ impl MemoryExtractor for LlmMemoryExtractor {
                 props["timestamp"] = serde_json::Value::String(ts);
             }
             let importance = (event.importance as f32).clamp(1.0, 10.0) / 10.0;
-            entries.push(
-                SchemaEntry::new(
-                    format!("schema-event-{}-{}", source.id, idx),
+            record(
+                &mut entries,
+                SchemaEntry::identified(
                     &source.namespace,
                     SchemaKind::Event,
                     event.name,
@@ -428,13 +437,12 @@ mod tests {
         RawSource::new(id, "default", "text/plain", body.as_bytes().to_vec())
     }
 
-    /// Two raws carrying the same `@entity:` line are two entities observed
-    /// twice, not one entity. Ids are the store's primary key, so a
-    /// position-only id would make the second raw's rows overwrite the first
-    /// raw's rows — and rewrite their `raw_uri` — leaving nothing behind that
-    /// says a row went missing.
+    /// Two raws carrying the same `@entity:` line are one entity observed
+    /// twice. An id scoped to the raw that produced it would make them two
+    /// rows holding one fact, and the row count would then measure ingestion
+    /// volume instead of knowledge.
     #[tokio::test]
-    async fn rule_based_schema_ids_are_scoped_to_their_source() {
+    async fn one_entity_reported_by_two_sources_is_one_row() {
         let extractor = RuleBasedExtractor::new();
         let first = extractor
             .extract_schema(&raw("raw-a", "@entity: security gateway\n"))
@@ -447,9 +455,9 @@ mod tests {
 
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
-        assert_ne!(
+        assert_eq!(
             first[0].id, second[0].id,
-            "the same name from two sources must not share a primary key"
+            "the same fact from two sources must be one identity"
         );
 
         let backend = crate::MemoryMemoryBackend::new();
@@ -457,10 +465,88 @@ mod tests {
         backend.store_schema("default", &second[0]).await.unwrap();
 
         let rows = backend.list_schema("default").await.unwrap();
-        assert_eq!(rows.len(), 2, "both sources' rows must survive the store");
-        let uris: std::collections::HashSet<&str> =
-            rows.iter().map(|r| r.source_ref.raw_uri.as_str()).collect();
-        assert_eq!(uris.len(), 2, "each row must keep its own source");
+        assert_eq!(rows.len(), 1, "one fact, one row");
+        assert_eq!(rows[0].occurrences, 2, "both observations must be counted");
+        assert!(
+            rows[0].observed_from("memory://raw-a") && rows[0].observed_from("memory://raw-b"),
+            "both sources must stay readable as origins: {:?}",
+            rows[0].observed_by
+        );
+
+        // Each source's own query still finds the shared row, which is what
+        // keeps the reconciliation pass from re-extracting it forever.
+        assert_eq!(
+            backend
+                .schema_for_raw("default", "raw-a")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            backend
+                .schema_for_raw("default", "raw-b")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Forgetting one origin must not erase the other's fact.
+        backend.forget("default", "raw-a").await.unwrap();
+        let rows = backend.list_schema("default").await.unwrap();
+        assert_eq!(rows.len(), 1, "the fact outlives the source it came from");
+        assert_eq!(rows[0].observed_by, vec!["memory://raw-b".to_string()]);
+        assert_eq!(
+            backend
+                .schema_for_raw("default", "raw-a")
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // The last origin gone leaves nothing behind.
+        backend.forget("default", "raw-b").await.unwrap();
+        assert!(backend.list_schema("default").await.unwrap().is_empty());
+    }
+
+    /// Repeated mentions inside one raw are counts, not rows: the store would
+    /// collapse them onto one identity anyway, and the count is the part the
+    /// store cannot recover once the pass is over.
+    #[tokio::test]
+    async fn repeated_mentions_in_one_raw_become_an_occurrence_count() {
+        let extractor = RuleBasedExtractor::new();
+        let entries = extractor
+            .extract_schema(&raw(
+                "raw-a",
+                "@event: deploy\n@event: deploy\n@event: rollback\n",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(entries.len(), 2, "two facts, not three rows: {entries:?}");
+        let deploy = entries
+            .iter()
+            .find(|e| e.key == "deploy")
+            .expect("deploy event");
+        assert_eq!(deploy.occurrences, 2);
+
+        // Re-extracting the same raw is the same observation seen again, so
+        // the count must not inflate.
+        let backend = crate::MemoryMemoryBackend::new();
+        for entry in &entries {
+            backend.store_schema("default", entry).await.unwrap();
+        }
+        for entry in &entries {
+            backend.store_schema("default", entry).await.unwrap();
+        }
+        let rows = backend.list_schema("default").await.unwrap();
+        let deploy = rows.iter().find(|e| e.key == "deploy").expect("deploy row");
+        assert_eq!(
+            deploy.occurrences, 2,
+            "a re-extraction is not a new sighting"
+        );
     }
 
     /// Without an embedder there is no vector to store. A run of zeros would

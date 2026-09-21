@@ -4,8 +4,8 @@ use std::sync::RwLock;
 
 use chrono::{DateTime, Utc};
 use cog_core::{
-    DecayReport, MemoryMetrics, RawSource, SchemaEntry, SchemaSearchResult, SummaryEntry,
-    SummarySearchResult, UnifiedSearchResult,
+    merge_schema_observation, DecayReport, MemoryMetrics, RawSource, SchemaEntry,
+    SchemaSearchResult, SummaryEntry, SummarySearchResult, UnifiedSearchResult,
 };
 use cog_core::{SFError, SFResult};
 
@@ -122,7 +122,14 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             .metrics
             .write()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        store.schema.insert(entry.id.clone(), entry.clone());
+        // One identity can be reached from several sources, so a store is a
+        // merge against whatever is already held rather than an overwrite by
+        // the last writer.
+        let merged = match store.schema.get(&entry.id) {
+            Some(stored) => merge_schema_observation(stored, entry),
+            None => entry.clone(),
+        };
+        store.schema.insert(entry.id.clone(), merged);
         metrics.schema_stored += 1;
         Ok(())
     }
@@ -178,10 +185,13 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             .read()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         let raw_uri = format!("memory://{}", raw_id);
+        // Membership, not provenance: an entry merged from several sources
+        // still belongs to each of them, and asking by the one that happened
+        // to write last would answer "nothing here" for the others.
         Ok(store
             .schema
             .values()
-            .filter(|e| e.namespace == namespace && e.source_ref.raw_uri == raw_uri)
+            .filter(|e| e.namespace == namespace && e.observed_from(&raw_uri))
             .cloned()
             .collect())
     }
@@ -259,10 +269,13 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             .metrics
             .write()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        // Keyed by the entry's own identity, not by its `key`: the id carries
+        // the kind as well, and two entries of different kinds can share a key
+        // without being the same thing.
         let existing = store
             .schema
-            .values()
-            .find(|e| e.namespace == namespace && e.key == entry.key)
+            .get(&entry.id)
+            .filter(|e| e.namespace == namespace)
             .cloned();
         if let Some(mut existing) = existing {
             if let (Some(existing_map), Some(new_map)) = (
@@ -557,16 +570,23 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             }
         }
 
-        // Delete schema entries whose source_ref.raw_uri matches memory://{id}
+        // Withdraw the forgotten raw as an origin. An entry another source
+        // still reports is that source's fact too, so it survives with its
+        // provenance moved; only the entry left with nothing behind it goes.
         let raw_uri = format!("memory://{}", id);
-        let schema_ids_to_remove: Vec<String> = store
+        let schema_ids: Vec<String> = store
             .schema
             .values()
-            .filter(|e| e.namespace == namespace && e.source_ref.raw_uri == raw_uri)
+            .filter(|e| e.namespace == namespace && e.observed_from(&raw_uri))
             .map(|e| e.id.clone())
             .collect();
-        for sid in schema_ids_to_remove {
-            store.schema.remove(&sid);
+        for sid in schema_ids {
+            let Some(entry) = store.schema.remove(&sid) else {
+                continue;
+            };
+            if let Some(entry) = entry.without_observer(&raw_uri) {
+                store.schema.insert(sid, entry);
+            }
         }
 
         // Delete summaries whose source_ref.raw_uri matches memory://{id}

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use cog_core::{SFError, SFResult, SchemaBackend};
+use cog_core::{merge_schema_observation, SFError, SFResult, SchemaBackend};
 use cog_core::{SchemaEntry, SchemaSearchResult};
 
 /// In-memory schema backend with optional JSON persistence.
@@ -115,7 +115,13 @@ impl SchemaBackend for MemorySchemaBackend {
                 .store
                 .write()
                 .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-            store.insert(entry.id.clone(), entry.clone());
+            // An identity can be reached from several sources, so a store
+            // merges with what is held instead of replacing it.
+            let merged = match store.get(&entry.id) {
+                Some(stored) => merge_schema_observation(stored, entry),
+                None => entry.clone(),
+            };
+            store.insert(entry.id.clone(), merged);
         }
         self.persist().await?;
         Ok(())
@@ -164,9 +170,31 @@ impl SchemaBackend for MemorySchemaBackend {
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         Ok(store
             .values()
-            .filter(|e| e.namespace == namespace && e.source_ref.raw_uri == raw_uri)
+            .filter(|e| e.namespace == namespace && e.observed_from(&raw_uri))
             .cloned()
             .collect())
+    }
+
+    async fn forget_schema_source(
+        &self,
+        _namespace: &str,
+        id: &str,
+        raw_uri: &str,
+    ) -> SFResult<()> {
+        {
+            let mut store = self
+                .store
+                .write()
+                .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+            let Some(entry) = store.remove(id) else {
+                return Ok(());
+            };
+            if let Some(entry) = entry.without_observer(raw_uri) {
+                store.insert(id.to_string(), entry);
+            }
+        }
+        self.persist().await?;
+        Ok(())
     }
 
     async fn list_schema(&self, namespace: &str) -> SFResult<Vec<SchemaEntry>> {
@@ -237,9 +265,12 @@ impl SchemaBackend for MemorySchemaBackend {
                 .store
                 .write()
                 .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+            // Keyed by the entry's own identity, not by its `key`: the id
+            // carries the kind as well, and two entries of different kinds can
+            // share a key without being the same thing.
             let existing = store
-                .values()
-                .find(|e| e.namespace == namespace && e.key == entry.key)
+                .get(&entry.id)
+                .filter(|e| e.namespace == namespace)
                 .cloned();
             if let Some(mut existing) = existing {
                 // Merge properties: new properties overwrite old ones at the top level.

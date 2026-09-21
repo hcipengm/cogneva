@@ -1388,7 +1388,8 @@ mod tests {
         );
         backend.archive_raw(&raw).await.unwrap();
         // 模拟"schema 抽完、summary 还没生成进程就死了"的半成品现场：
-        // schema_for_raw 以 source_ref.raw_uri 匹配，挂上同一 raw id。
+        // SchemaEntry::new 把 source_ref 的 raw 记进观察者清单，
+        // schema_for_raw 按该清单做归属查询，因此这条能被认出来。
         let entry = SchemaEntry::new(
             "schema-entity-0",
             "default",

@@ -504,9 +504,15 @@ impl MemoryBackend for CompositeMemoryBackend {
         let key = Self::raw_key(namespace, id);
         self.raw.delete(&key).await?;
 
+        // A schema entry is identified by its content, so forgetting this raw
+        // withdraws one origin rather than deleting the fact: an entity other
+        // raws still mention has to outlive the one being forgotten.
         let schemas = self.schema.schema_for_raw(namespace, id).await?;
+        let raw_uri = format!("memory://{}", id);
         for s in schemas {
-            self.schema.delete_schema(namespace, &s.id).await?;
+            self.schema
+                .forget_schema_source(namespace, &s.id, &raw_uri)
+                .await?;
         }
 
         let summaries = self.summary.summary_for_raw(namespace, id).await?;
