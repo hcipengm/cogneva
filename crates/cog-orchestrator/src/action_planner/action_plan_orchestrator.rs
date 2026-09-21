@@ -455,9 +455,11 @@ impl ActionPlanOrchestrator {
 
         // Step 1.3: Collaboration-based decomposition via injected TaskExecutor.
         let tasks = if let Some(ref executor) = self.task_executor {
+            // 这里不放 mode 之类的字符串暗号：路由由 Task.is_executable 决定，
+            // 提示里再写一遍既没有读方，又会让模型把"只做分解"读成一个需要它
+            // 拒绝的模式，于是模型拒答而链路把拒答当成生成器没产出。
             let mut task_input = serde_json::json!({
                 "goal": goal,
-                "mode": "decompose_only",
                 "skills": skills.iter().map(|s| serde_json::json!({
                     "id": s.id,
                     "name": s.name,

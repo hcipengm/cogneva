@@ -22,6 +22,18 @@ pub const TERMINAL_ENV_FAILURE_PREFIX: &str = "terminal_env_failure";
 /// repeating, or cost rising with nothing to show for it.
 pub const DEGENERATE_LOOP_PREFIX: &str = "degenerate_loop";
 
+/// Cause carried in-band by a generator that returned an envelope with neither
+/// content nor artifacts, and named no cause of its own.
+///
+/// Deliberately not [`TERMINAL_ENV_FAILURE_PREFIX`]: the prompt demonstrably
+/// reached the upstream and the model answered with a well-formed envelope, so
+/// nothing observed here rules out the next attempt. Filing it as an environment
+/// failure ends retries on the strength of a fact that was never seen, and
+/// points the reader at the transport while the defect is in what the generator
+/// produced. It is the generator's own name for "I produced nothing", which the
+/// repair loop is the thing that exists to act on.
+pub const EMPTY_GENERATION_PREFIX: &str = "empty_generation";
+
 /// Status the agent runtime reports when its ReAct loop used up its whole
 /// iteration budget while tool calls were still pending. The loop stops
 /// mid-work, so the result carries neither content nor artifacts.
@@ -96,11 +108,26 @@ mod tests {
     #[test]
     fn a_declared_cause_is_recognised_in_both_wire_forms() {
         assert!(is_deterministic_failure(
-            "terminal_env_failure: generator produced no artifacts (environment/protocol failure)"
+            "terminal_env_failure: generator prompt failed: HTTP 503"
         ));
         assert!(is_deterministic_failure(
             "degenerate_loop: same failure 3 times"
         ));
+    }
+
+    /// An empty envelope is a defect in what the generator produced, not a
+    /// statement about the transport, so it must keep its retries: the next
+    /// attempt may well answer. Reading it as deterministic would end them on
+    /// evidence nobody observed and file it under the wrong role.
+    #[test]
+    fn an_empty_envelope_keeps_its_retries() {
+        assert!(!is_deterministic_failure(&format!(
+            "{EMPTY_GENERATION_PREFIX}: the generator returned an envelope with no content and no artifacts"
+        )));
+        // ...including when it arrives wrapped by the error type.
+        assert!(!is_deterministic_failure(&format!(
+            "Agent execution error: {EMPTY_GENERATION_PREFIX}: nothing produced"
+        )));
     }
 
     /// The predicate reads a declaration, not a mood. A reason that merely talks
@@ -125,7 +152,7 @@ mod tests {
     #[test]
     fn a_wrapper_does_not_hide_the_declaration() {
         assert!(is_deterministic_failure(
-            "Agent execution error: terminal_env_failure: generator produced no artifacts (environment/protocol failure)"
+            "Agent execution error: terminal_env_failure: generator prompt failed: HTTP 503"
         ));
         assert!(is_deterministic_failure(
             "Dag-executor error: degenerate_loop: same failure 3 times"

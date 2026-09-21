@@ -138,7 +138,7 @@ impl PgePipeline {
         let declared = explicit_reason
             .or_else(|| plan.terminal_env_failure_reason())
             .or_else(|| generation.terminal_env_failure_reason())
-            .unwrap_or_else(crate::squad::pge::types::no_artifacts_reason);
+            .unwrap_or_else(crate::squad::pge::types::unnamed_terminal_reason);
         let evaluation = EvaluationResult {
             verdict: Verdict::Fail,
             // 声明这次运行按终止性环境故障处置；边界会不会把它记成同一分类，
@@ -249,7 +249,6 @@ impl PgePipeline {
                 return Self::terminal_result(attempt, plan, generation, None, history);
             }
 
-            // Stage 3: Evaluator.
             let eval_history: Vec<serde_json::Value> = history
                 .iter()
                 .map(|h| {
@@ -276,18 +275,35 @@ impl PgePipeline {
                     .map(|s| s.as_str())
                     .collect()
             };
-            let mut evaluation = evaluator
-                .evaluate(
-                    task,
-                    &plan_json,
-                    &serde_json::to_value(&generation).unwrap_or_default(),
-                    &eval_history,
-                    &criteria,
-                    None,
-                )
-                .await;
-            evaluation.enforce_criteria_evidence(!criteria.is_empty());
-            evaluation.enforce_change_artifact_integrity(generation.change_artifact_defect(task));
+
+            // An empty envelope is not a terminal failure, and it is nothing to
+            // spend an inference call on either: there is no artifact to judge,
+            // so the evaluator's only possible answer is "there is nothing
+            // here". Judge it deterministically under its own cause instead, and
+            // hand the repair loop a name it can act on.
+            let mut evaluation = if generation.is_empty_envelope() {
+                tracing::warn!(
+                    attempt,
+                    "Generator returned an empty envelope; failing the attempt under its own cause instead of evaluating nothing"
+                );
+                crate::squad::pge::types::empty_envelope_evaluation()
+            } else {
+                // Stage 3: Evaluator.
+                let mut evaluation = evaluator
+                    .evaluate(
+                        task,
+                        &plan_json,
+                        &serde_json::to_value(&generation).unwrap_or_default(),
+                        &eval_history,
+                        &criteria,
+                        None,
+                    )
+                    .await;
+                evaluation.enforce_criteria_evidence(!criteria.is_empty());
+                evaluation
+                    .enforce_change_artifact_integrity(generation.change_artifact_defect(task));
+                evaluation
+            };
 
             // Same guard as the two above, on the third role: an evaluator that
             // ran out of iterations judged nothing, so repairing towards its
@@ -346,19 +362,32 @@ impl PgePipeline {
                     return Self::terminal_result(attempt, plan.clone(), generation, None, history);
                 }
 
-                evaluation = evaluator
-                    .evaluate(
-                        task,
-                        &plan_json,
-                        &serde_json::to_value(&generation).unwrap_or_default(),
-                        &eval_history,
-                        &criteria,
-                        None,
-                    )
-                    .await;
-                evaluation.enforce_criteria_evidence(!criteria.is_empty());
-                evaluation
-                    .enforce_change_artifact_integrity(generation.change_artifact_defect(task));
+                // Same rule as the initial generation: a repair that delivered
+                // nothing is judged under its own cause, not spent on an
+                // inference call that can only answer "there is nothing here".
+                evaluation = if generation.is_empty_envelope() {
+                    tracing::warn!(
+                        attempt,
+                        repair_iteration,
+                        "Generator repair returned an empty envelope; failing the repair under its own cause"
+                    );
+                    crate::squad::pge::types::empty_envelope_evaluation()
+                } else {
+                    let mut evaluation = evaluator
+                        .evaluate(
+                            task,
+                            &plan_json,
+                            &serde_json::to_value(&generation).unwrap_or_default(),
+                            &eval_history,
+                            &criteria,
+                            None,
+                        )
+                        .await;
+                    evaluation.enforce_criteria_evidence(!criteria.is_empty());
+                    evaluation
+                        .enforce_change_artifact_integrity(generation.change_artifact_defect(task));
+                    evaluation
+                };
 
                 if let Some(reason) = evaluation.terminal_env_failure_reason() {
                     tracing::warn!(
@@ -507,7 +536,9 @@ impl PgePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX;
+    use cog_core::contract::outcome::{
+        is_deterministic_failure, DEGENERATE_LOOP_PREFIX, EMPTY_GENERATION_PREFIX,
+    };
 
     /// Test-only mock implementing the object-level [`cog_core::Agent`] trait.
     /// All methods except [`prompt`] are no-op stubs.
@@ -684,7 +715,7 @@ mod tests {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
         }));
         let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"content": "", "artifacts": []}),
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
         }));
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "", "criteria": []}),
@@ -713,7 +744,7 @@ mod tests {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
         }));
         let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"content": "", "artifacts": []}),
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
         }));
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "", "criteria": []}),
@@ -747,7 +778,7 @@ mod tests {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
         }));
         let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"content": "", "artifacts": []}),
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
         }));
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "", "criteria": []}),
@@ -780,7 +811,7 @@ mod tests {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
         }));
         let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"content": "", "artifacts": []}),
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
         }));
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "", "criteria": []}),
@@ -965,7 +996,7 @@ mod tests {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
         }));
         let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"content": "", "artifacts": []}),
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
         }));
         // Evaluator always fails.
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
@@ -1008,7 +1039,7 @@ mod tests {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
         }));
         let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"content": "", "artifacts": []}),
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
         }));
         // Evaluator fails identically every attempt: flat score, flat error
         // class, no artifacts — the definition of a degenerate loop.
@@ -1055,7 +1086,7 @@ mod tests {
             response: serde_json::json!({"summary": "fallback", "plan": {}, "sub_tasks": []}),
         }));
         let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({"content": "", "artifacts": []}),
+            response: serde_json::json!({"content": {"draft": "attempt output"}, "artifacts": []}),
         }));
         // Score improves every attempt: spend is buying progress, so the
         // pipeline must run to the retry ceiling even though it never passes.
@@ -1085,6 +1116,141 @@ mod tests {
             .final_evaluation
             .feedback
             .starts_with(DEGENERATE_LOOP_PREFIX));
+    }
+
+    /// 空信封是失败，但**不是**终止性失败：模型答了、交付物是空的，没有任何
+    /// 观测到的证据排除下一轮成功，把它记成环境故障等于按一个从没看见过的事实
+    /// 结账。而且这里连评估器都不该被叫起来——没有东西可评，它唯一可能的答复
+    /// 就是"没东西可评"，那一次调用只会把这一轮记在噪声底下而不是事实底下。
+    #[tokio::test]
+    async fn an_empty_envelope_fails_under_its_own_cause_without_evaluating() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let planner = pass_planner();
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"content": null, "artifacts": []}),
+        }));
+        // 评估器一旦被叫到就会给通过：运行若通过，就证明它被叫过。
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "good", "criteria": []}),
+        }));
+
+        let result = pipeline
+            .execute_task(
+                &test_task("produce something"),
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        assert!(!result.passed, "an empty envelope cannot pass");
+        assert_eq!(
+            result.final_evaluation.criteria[0].name,
+            "generation_is_non_empty"
+        );
+        assert!(
+            result
+                .final_evaluation
+                .feedback
+                .contains(EMPTY_GENERATION_PREFIX),
+            "{}",
+            result.final_evaluation.feedback
+        );
+        assert!(
+            !is_deterministic_failure(&result.final_evaluation.feedback),
+            "an empty deliverable names no observed cause, so retries must stay open"
+        );
+        assert!(result.terminal_reason.is_none());
+    }
+
+    /// 空串与 null 是同一个观测：信封到了、里面是空的。分开读会让一个用空串
+    /// 作答的生成器逃掉另一个会得到的病因名。
+    #[tokio::test]
+    async fn a_blank_string_content_is_the_same_empty_envelope() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"content": "   \n", "artifacts": []}),
+        }));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({"verdict": "pass", "score": 92, "feedback": "good", "criteria": []}),
+        }));
+
+        let result = pipeline
+            .execute_task(
+                &test_task("produce something"),
+                serde_json::json!({}),
+                &pass_planner(),
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        assert!(!result.passed);
+        assert!(result
+            .final_evaluation
+            .feedback
+            .contains(EMPTY_GENERATION_PREFIX));
+    }
+
+    /// 修复轮产出的空信封与首轮同罪：判据的理由（没有东西可评）不区分它来自
+    /// 哪一轮，少修一条就等于留了一条花掉评估调用却什么也判不出的路径。
+    #[tokio::test]
+    async fn an_empty_repair_is_judged_under_its_own_cause_too() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 1,
+            stall_threshold: 2,
+            independent_review: false,
+        });
+        // 首轮交了东西（走评估器），修复轮交了空信封。
+        let generator = GeneratorActor::new(std::sync::Arc::new(SequenceMockAgent {
+            responses: std::sync::Mutex::new(vec![
+                serde_json::json!({"content": {"draft": "first"}, "artifacts": []}),
+                serde_json::json!({"content": null, "artifacts": []}),
+            ]),
+        }));
+        // 第一次评审判失败触发修复；第二次若被叫到会给通过，从而暴露"修复轮被送去评估"。
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
+            responses: std::sync::Mutex::new(vec![
+                serde_json::json!({"verdict": "fail", "score": 30, "feedback": "bad", "criteria": []}),
+                serde_json::json!({"verdict": "pass", "score": 92, "feedback": "good", "criteria": []}),
+            ]),
+        }));
+
+        let result = pipeline
+            .execute_task(
+                &test_task("produce something"),
+                serde_json::json!({}),
+                &pass_planner(),
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        assert!(!result.passed);
+        assert_eq!(result.history[0].local_repairs.len(), 1);
+        assert!(
+            result.history[0].local_repairs[0]
+                .evaluation
+                .feedback
+                .contains(EMPTY_GENERATION_PREFIX),
+            "{}",
+            result.history[0].local_repairs[0].evaluation.feedback
+        );
     }
 
     fn pass_planner() -> PlannerActor {

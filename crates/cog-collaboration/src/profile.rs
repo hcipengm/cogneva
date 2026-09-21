@@ -40,6 +40,39 @@ pub enum PgeMode {
     Pipeline,
     /// Iterative debate loop with retries and consensus checking.
     Roundtable,
+    /// 只跑 Planner：交付物是它产出的原子任务列表，所以这条路径没有生成器也
+    /// 没有评估器，没有 PGE 拓扑可言。
+    ///
+    /// 只有分解任务走这条路径，而它的判据是结构性的（有没有拿到任务列表），
+    /// 不是"某份产物好不好"——这正是不能借用另外两种模式的原因：它们最后都
+    /// 拿一份产物的分数决定成败，而分解的产物是任务列表之外的东西（曾经是
+    /// 生成器写的一份没人读的产物）。选择器不会返回这个值：它不参与"哪种
+    /// 拓扑更适合"的取舍，也就不该出现在那张候选表里。
+    PlanOnly,
+}
+
+impl PgeMode {
+    /// 这个模式在台账与学习数据里的名字。
+    ///
+    /// `None` = 它不是一次模式选择，别记账：分解路径从来没有"选哪种拓扑更好"
+    /// 这一步，把它写成一条模式试验记录，模式选择的样本里就会混进一批从未
+    /// 发生过的试验，而污染的表现是模型对真实模式越来越有把握。
+    pub fn as_learnt_mode(&self) -> Option<&'static str> {
+        match self {
+            PgeMode::Pipeline => Some("pipeline"),
+            PgeMode::Roundtable => Some("roundtable"),
+            PgeMode::PlanOnly => None,
+        }
+    }
+
+    /// 这个模式的名字，用于记录与日志。所有模式都有名字，`None` 只影响学习面。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PgeMode::Pipeline => "pipeline",
+            PgeMode::Roundtable => "roundtable",
+            PgeMode::PlanOnly => "plan_only",
+        }
+    }
 }
 
 /// Threshold below which the [`PgeMode::Pipeline`] is preferred.

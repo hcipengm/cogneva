@@ -1,5 +1,6 @@
 use cog_core::contract::outcome::{
-    ITERATION_BUDGET_EXHAUSTED_MARKER, MAX_ITERATIONS_STATUS, TERMINAL_ENV_FAILURE_PREFIX,
+    EMPTY_GENERATION_PREFIX, ITERATION_BUDGET_EXHAUSTED_MARKER, MAX_ITERATIONS_STATUS,
+    TERMINAL_ENV_FAILURE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,18 @@ fn names_a_deterministic_cause(text: &str) -> bool {
     t.contains("environment_error")
         || t.contains("tool_pipeline_broken")
         || t.contains(ITERATION_BUDGET_EXHAUSTED_MARKER)
+}
+
+/// Whether a role output's `content` holds nothing at all: absent, or a string
+/// of whitespace. Both are one observation — the envelope arrived and was empty
+/// — and both must read the same way, or a generator that answers with a blank
+/// string escapes the naming its null twin gets.
+fn content_is_blank(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    }
 }
 
 /// The agent runtime's sentinel for a ReAct loop that spent its whole iteration
@@ -134,17 +147,50 @@ pub struct GeneratorOutput {
     pub artifacts: Vec<Artifact>,
 }
 
-/// Failure reason for a run that produced nothing and carried no cause of its
-/// own. One definition, so every producer of this feedback — pipeline, Ralph,
-/// roundtable escalation — reports the identical string.
+/// Cause of a generator that answered with an envelope carrying neither content
+/// nor artifacts, and named no cause of its own. One definition, so every
+/// producer of this feedback — pipeline attempt, local repair, roundtable round
+/// — reports the identical string.
 ///
-/// Composed from the shared prefix rather than spelled out: a literal copy
-/// would keep compiling after the prefix changes and quietly stop being
-/// classified, which reads downstream as "the environment stopped failing"
-/// while the failures keep happening.
-pub fn no_artifacts_reason() -> String {
+/// It is a generation defect, not a transport one: the prompt reached the
+/// upstream and the model replied with a well-formed empty envelope. Naming it
+/// under the terminal prefix instead sent the learning chain after the
+/// environment while the defect sat in what the generator wrote.
+pub fn empty_envelope_reason() -> String {
     format!(
-        "{TERMINAL_ENV_FAILURE_PREFIX}: generator produced no artifacts (environment/protocol failure)"
+        "{EMPTY_GENERATION_PREFIX}: the generator returned an envelope with no content and no artifacts"
+    )
+}
+
+/// Deterministic judgement of an empty envelope: one failed criterion that
+/// states the observed fact, and a zero score so the stall detector reads the
+/// flat reading it actually is.
+///
+/// There is nothing here for an evaluator to judge, so asking one buys an
+/// inference call whose only possible content is "there is nothing to assess",
+/// and files the attempt under that noise instead of under the fact.
+pub fn empty_envelope_evaluation() -> EvaluationResult {
+    let reason = empty_envelope_reason();
+    EvaluationResult {
+        verdict: Verdict::Fail,
+        score: Some(0),
+        criteria: vec![Criterion {
+            name: "generation_is_non_empty".into(),
+            score: 0,
+            comment: reason.clone(),
+        }],
+        feedback: reason,
+        details: None,
+    }
+}
+
+/// Last-resort label for a run that ended through a terminal guard without any
+/// role naming the cause. It does not point at an observed defect, and it must
+/// not be spelled as one: naming a role here blames a role that may never have
+/// been called for a cause that was simply lost in transit.
+pub fn unnamed_terminal_reason() -> String {
+    format!(
+        "{TERMINAL_ENV_FAILURE_PREFIX}: the run ended on a deterministic failure but no role named the cause"
     )
 }
 
@@ -175,40 +221,40 @@ impl GeneratorOutput {
         })
     }
 
-    /// True when the generator produced nothing for a deterministic reason:
-    /// it reported an environment/protocol failure (tools never executed,
-    /// explicit `environment_error`), or it returned no artifacts and no
-    /// content at all. Retrying with the same environment cannot succeed, so
-    /// callers must treat the run as terminal rather than paying for more
-    /// attempts.
+    /// True when the generator returned an envelope with nothing in it: no
+    /// content and no artifacts. The prompt was answered, so this is the
+    /// generator failing to produce, never the transport failing to deliver.
+    pub fn is_empty_envelope(&self) -> bool {
+        self.artifacts.is_empty() && content_is_blank(&self.content)
+    }
+
+    /// True when the run failed for a deterministic environment/protocol
+    /// reason, which only an in-band cause of its own can declare — tools that
+    /// never executed, an explicit `environment_error`, a spent iteration
+    /// budget. An empty envelope is not one of these: it names no cause, and
+    /// nothing about it rules out the next attempt.
     pub fn is_terminal_env_failure(&self) -> bool {
-        if !self.artifacts.is_empty() {
-            return false;
-        }
-        let text = match &self.content {
-            serde_json::Value::String(s) => s.as_str(),
-            serde_json::Value::Null => return true,
-            other => return other.to_string().is_empty(),
-        };
-        names_a_deterministic_cause(text)
+        self.terminal_env_failure_reason().is_some()
     }
 
     /// Failure reason in the wire format outer loops match on, carrying the
     /// generator's own error when it has one. A prompt that never reached the
-    /// upstream reports that failure; only a run that produced nothing without
-    /// a cause of its own falls back to [`no_artifacts_reason`]. Reporting the
-    /// generic label for an upstream outage blames a generator defect that does
-    /// not exist and sends the learning chain after it. `None` when this is not
-    /// a terminal environment failure.
+    /// upstream reports that failure. `None` for every other outcome — a run
+    /// that produced something is not a failure, and a run that produced
+    /// nothing without a cause of its own is named by
+    /// [`empty_envelope_reason`], which is the repair loop's business and not a
+    /// reason to stop.
     pub fn terminal_env_failure_reason(&self) -> Option<String> {
-        if !self.is_terminal_env_failure() {
+        if !self.artifacts.is_empty() {
             return None;
         }
-        let detail = match &self.content {
-            serde_json::Value::String(s) if !s.trim().is_empty() => s.trim(),
-            _ => return Some(no_artifacts_reason()),
+        let serde_json::Value::String(detail) = &self.content else {
+            return None;
         };
-        Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: {detail}"))
+        if !names_a_deterministic_cause(detail) {
+            return None;
+        }
+        Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: {}", detail.trim()))
     }
 }
 
@@ -645,19 +691,36 @@ mod tests {
             reason.contains("upstream unavailable"),
             "the real cause must survive into the reason, got: {reason}"
         );
-        assert_ne!(reason, no_artifacts_reason());
+        assert_ne!(reason, empty_envelope_reason());
     }
 
+    /// An envelope with nothing in it and no cause of its own is the
+    /// generator's own defect, not the transport's: the prompt was answered.
+    /// It names no observed cause, so it must not be filed as a terminal
+    /// environment failure — that reading ends the retries on the strength of
+    /// a fact nobody saw, and points the reader at the upstream while the
+    /// defect is in what the generator wrote.
     #[test]
-    fn bare_empty_output_reports_the_generic_reason() {
+    fn a_bare_empty_output_is_a_generation_defect_not_a_transport_one() {
         let output = GeneratorOutput {
             content: serde_json::Value::Null,
             artifacts: Vec::new(),
         };
-        assert_eq!(
-            output.terminal_env_failure_reason(),
-            Some(no_artifacts_reason())
-        );
+        assert!(output.is_empty_envelope());
+        assert!(!output.is_terminal_env_failure());
+        assert_eq!(output.terminal_env_failure_reason(), None);
+    }
+
+    /// The same empty envelope with whitespace instead of `null` — the other
+    /// shape a model writes when it means "nothing".
+    #[test]
+    fn a_whitespace_only_output_is_the_same_empty_envelope() {
+        let output = GeneratorOutput {
+            content: serde_json::Value::String("   \n".into()),
+            artifacts: Vec::new(),
+        };
+        assert!(output.is_empty_envelope());
+        assert!(!output.is_terminal_env_failure());
     }
 
     /// The ReAct runtime returns this sentinel when the loop runs out of
@@ -687,7 +750,7 @@ mod tests {
         );
         assert_ne!(
             reason,
-            no_artifacts_reason(),
+            empty_envelope_reason(),
             "a budget exhaustion is not a generator that chose to produce nothing"
         );
     }

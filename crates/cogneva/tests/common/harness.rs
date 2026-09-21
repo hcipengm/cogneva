@@ -368,7 +368,6 @@ impl TestHarness {
             profile: None,
             context_window_size: None,
             boundary_config: None,
-            execution_mode: false,
             is_self_evolution: false,
             planner_skill_id: None,
             generator_skill_id: None,

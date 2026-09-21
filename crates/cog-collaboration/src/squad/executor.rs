@@ -20,6 +20,9 @@ use cog_core::{HookEngine, HookEvent, HookTrigger};
 pub struct SquadConfig {
     pub goal: String,
     pub context: serde_json::Value,
+    /// 这次运行实际会用的拓扑。它是"跑到哪几个角色"的唯一来源：PlanOnly 表示
+    /// 只跑 Planner（分解任务的交付物就是它产出的任务列表），另外两个值表示
+    /// Planner → Generator → Evaluator 的两种拓扑。
     pub pge_mode: PgeMode,
     /// Squad 被 Ralph Loop 判定不可修复后的最大策略升级次数。
     /// 0 = 只做一次尝试（不升级），1 = 允许一次 Pipeline → Roundtable 升级。
@@ -30,8 +33,6 @@ pub struct SquadConfig {
     pub profile: Option<crate::profile::TaskProfile>,
     /// 可选的 BoundaryConfig，注入到 Evaluator Agent 用于动态边界维度评估。
     pub boundary_config: Option<crate::BoundaryConfig>,
-    /// true = 原子任务执行模式（Planner 制定执行方案而非分解任务）。
-    pub execution_mode: bool,
     /// true = 这是一个 self_evolution 任务；使用更激进的短路径以控制延迟。
     pub is_self_evolution: bool,
     /// 通过 Skill ID 指定 Planner 角色的 prompt/schema 来源（None = 内置默认）。
@@ -52,7 +53,6 @@ impl Default for SquadConfig {
             context_window_size: None,
             profile: None,
             boundary_config: None,
-            execution_mode: false,
             is_self_evolution: false,
             planner_skill_id: None,
             generator_skill_id: None,
@@ -292,22 +292,25 @@ impl SquadExecutor {
         crate::observable::global_observable().record_message();
 
         // Meta-learning: record the actual outcome so the model improves.
+        //
+        // 只记真的跑过 PGE 拓扑的那些运行。分解路径没有拓扑可言，把它记成一次
+        // 模式试验就是往学习数据里写一条"这个模式跑过、结果如此"的假记录——
+        // 模式选择的样本会被一批从未发生过的试验污染，而污染的表现是模型对
+        // 真实模式越来越有把握。
         if let Some(ref engine) = self.meta_learning {
             let decision = crate::meta_features::squad_decision();
-            let mode_str = match result.pge_mode {
-                PgeMode::Pipeline => "pipeline",
-                PgeMode::Roundtable => "roundtable",
-            };
-            let _ = engine
-                .record_outcome(
-                    &decision.group,
-                    &decision.features,
-                    mode_str,
-                    result.success,
-                    if result.success { 1.0 } else { 0.0 },
-                    0,
-                )
-                .await;
+            if let Some(mode_str) = result.pge_mode.as_learnt_mode() {
+                let _ = engine
+                    .record_outcome(
+                        &decision.group,
+                        &decision.features,
+                        mode_str,
+                        result.success,
+                        if result.success { 1.0 } else { 0.0 },
+                        0,
+                    )
+                    .await;
+            }
         }
 
         // Broadcast squad completion via hierarchical communication layer.
@@ -364,6 +367,52 @@ impl SquadExecutor {
             "evaluator",
         )
         .await;
+        // 分解路径只跑 Planner：这条路上没有生成器也没有评估器，凭空创建两个
+        // 不会被调用的 agent 是白花，还会让"谁参与了这次运行"变得不可读。
+        if matches!(squad.config.pge_mode, PgeMode::PlanOnly) {
+            let (Some(manager), Some(llm)) = (agent_manager.as_ref(), llm_provider.as_ref()) else {
+                return RalphVerdict::Unrecoverable {
+                    reason: "AgentManager not available to create the Planner agent".into(),
+                    iterations: 0,
+                    history: Vec::new(),
+                };
+            };
+            let planner = match manager
+                .create_agent(&format!("{}-planner", squad.id), "planner", llm.clone())
+                .await
+            {
+                Ok(agent) => agent,
+                Err(e) => {
+                    tracing::warn!("Failed to create the decomposition planner agent: {}", e);
+                    return RalphVerdict::Unrecoverable {
+                        reason: format!("Failed to create the Planner agent: {e}"),
+                        iterations: 0,
+                        history: Vec::new(),
+                    };
+                }
+            };
+            let mut planner_actor = PlannerActor::new(planner);
+            if let Some(ref kb) = knowledge_backend {
+                planner_actor = planner_actor.with_knowledge(kb.clone());
+            }
+            if let Some(ref cfg) = self_review {
+                planner_actor = planner_actor.with_self_review(cfg.clone());
+            }
+            if let Some(s) = schema_for("planner") {
+                planner_actor = planner_actor.with_output_schema(s);
+            }
+            if let Some(ref sk) = planner_skill {
+                planner_actor = planner_actor.with_prompt_skill(sk.clone());
+            }
+            return ralph
+                .run_plan(
+                    &squad.config.goal,
+                    squad.config.context.clone(),
+                    &planner_actor,
+                )
+                .await;
+        }
+
         let (planner, generator, evaluator, moderator) = match (agent_manager, llm_provider) {
             (Some(manager), Some(llm)) => {
                 let planner_id = format!("{}-planner", squad.id);
@@ -398,6 +447,12 @@ impl SquadExecutor {
         };
 
         match squad.config.pge_mode {
+            // 分解在上面的早返回里处理掉了：走到这里必然是有拓扑的模式。
+            PgeMode::PlanOnly => RalphVerdict::Unrecoverable {
+                reason: "PlanOnly squads run before the PGE dispatch".into(),
+                iterations: 0,
+                history: Vec::new(),
+            },
             PgeMode::Pipeline => {
                 let mut pipeline_config = PgePipelineConfig::default();
                 if squad.config.is_self_evolution {
@@ -637,6 +692,9 @@ impl SquadExecutor {
         // === 尝试 1 失败：运行 Reflection，决定是否升级策略 ===
         let reflection = run_squad_reflection(squad_reflection, &verdict, &squad).await;
 
+        // 只有 Pipeline 有升级目标，所以这条判据同时排除两件事：Roundtable
+        // 失败后没有下一个拓扑，分解（PlanOnly）更没有——它跑的不是拓扑，
+        // 升级只会把生成器重新请回一条不需要它的路径上。
         let is_pipeline = matches!(squad.config.pge_mode, PgeMode::Pipeline);
         // Deterministic environment/protocol failures and stall-detected
         // degenerate loops cannot be fixed by a strategy upgrade — Roundtable

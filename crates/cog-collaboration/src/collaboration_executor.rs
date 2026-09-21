@@ -204,7 +204,8 @@ impl cog_core::TaskExecutor for CollaborationExecutor {
         // is_executable == false means this is an original overall task
         // (placeholder injected by ActionPlanner) that needs decomposition.
         // is_executable == true means this is an atomic/executable task that
-        // should be executed directly via Squad in execution_mode.
+        // should be executed directly via Squad, where the Planner produces an
+        // execution plan for the Generator.
         if !task.is_executable {
             self.execute_decomposition(task).await
         } else {
@@ -429,8 +430,10 @@ impl CollaborationExecutor {
         Ok(v)
     }
 
-    /// Decomposition path: run the full Squad → PGE → SelfReview pipeline
-    /// to break a goal into atomic tasks.
+    /// Decomposition path: run the Planner and take its atomic task list as the
+    /// deliverable. No mode selection, no generator, no evaluator — the
+    /// deliverable's contract is structural, so the gate on it is structural too
+    /// and there is nothing for the other two roles to do.
     async fn execute_decomposition(&self, task: &Task) -> SFResult<TaskResult> {
         // Global retry budget: if DagExecutor has already retried this task
         // up to max_retries, fail fast to prevent cross-layer retry storms.
@@ -450,12 +453,10 @@ impl CollaborationExecutor {
             .unwrap_or(&task.id)
             .to_string();
 
-        let mode_selector = self.mode_selector_with_agent().await;
-        let (pge_mode, reason) = mode_selector
-            .select_mode(&goal, Some(&profile), Some(&task.id))
-            .await;
-
-        info!(task_id=%task.id, ?pge_mode, %reason, "ModeSelectorActor decision");
+        // 这里不问模式选择器：它选的是"哪种 PGE 拓扑更适合这个目标"，而分解
+        // 根本不跑拓扑。问一次只会拿到一个不会被执行的选择，再把它记进台账，
+        // 于是日志与学习数据里出现一条从没发生过的试验。
+        info!(task_id=%task.id, "Decomposition run: planner only, no PGE topology");
 
         let mut squad_executor = SquadExecutor::new();
         if let Some(ref llm) = self.llm_provider {
@@ -501,12 +502,11 @@ impl CollaborationExecutor {
                 SquadConfig {
                     goal,
                     context: task.input.clone(),
-                    pge_mode,
+                    pge_mode: crate::profile::PgeMode::PlanOnly,
                     max_retries: task.max_retries,
                     profile: Some(profile),
                     context_window_size: None,
                     boundary_config: self.boundary_config.clone(),
-                    execution_mode: false,
                     is_self_evolution: false,
                     planner_skill_id: None,
                     generator_skill_id: None,
@@ -545,7 +545,7 @@ impl CollaborationExecutor {
     }
 
     /// Atomic execution path: run the full Squad → PGE → SelfReview pipeline,
-    /// but in execution_mode where the Planner produces an execution plan
+    /// but with the Planner producing an execution plan
     /// (steps, approach, boundaries) rather than decomposing into sub-tasks.
     /// Generator executes the plan, Evaluator assesses quality.
     async fn execute_atomic_via_squad(&self, task: &Task) -> SFResult<TaskResult> {
@@ -635,7 +635,6 @@ impl CollaborationExecutor {
                     profile: Some(profile),
                     context_window_size: None,
                     boundary_config: self.boundary_config.clone(),
-                    execution_mode: true,
                     is_self_evolution,
                     planner_skill_id: None,
                     generator_skill_id: None,
@@ -658,10 +657,7 @@ impl CollaborationExecutor {
 
         // Record the Squad outcome for reflection learning regardless of success.
         if let Some(ref engine) = self.reflection_engine {
-            let pge_mode_str = match result.pge_mode {
-                crate::profile::PgeMode::Pipeline => "pipeline",
-                crate::profile::PgeMode::Roundtable => "roundtable",
-            };
+            let pge_mode_str = result.pge_mode.as_str();
             let score = Self::extract_score(&result).map(|s| s as f32);
             if let Err(e) = engine
                 .record_squad_result(
@@ -783,10 +779,7 @@ impl CollaborationExecutor {
     }
 
     fn pge_mode_str(mode: &crate::profile::PgeMode) -> String {
-        match mode {
-            crate::profile::PgeMode::Pipeline => "pipeline".into(),
-            crate::profile::PgeMode::Roundtable => "roundtable".into(),
-        }
+        mode.as_str().to_string()
     }
 
     fn build_self_evolution_context(mut base: serde_json::Value, goal: &str) -> serde_json::Value {
@@ -880,6 +873,13 @@ impl CollaborationExecutor {
 
     fn extract_score(squad_result: &crate::squad::SquadResult) -> Option<f64> {
         if let Some(ref result_val) = squad_result.result {
+            // 分解路径的判定是结构性的二值（拿到任务列表 / 没拿到），这里是
+            // 把它翻成下游门槛吃的 0..1 分数，不是给产出质量打分。
+            if let Ok(plan_run) =
+                serde_json::from_value::<crate::squad::PlanRunResult>(result_val.clone())
+            {
+                return plan_run.evaluation.score.map(|s| s as f64 / 100.0);
+            }
             if let Ok(pipeline) =
                 serde_json::from_value::<crate::PgePipelineResult>(result_val.clone())
             {
@@ -896,6 +896,15 @@ impl CollaborationExecutor {
 
     fn extract_execution_result(squad_result: &crate::squad::SquadResult) -> serde_json::Value {
         if let Some(ref result_val) = squad_result.result {
+            // 分解路径：计划是交付物，没有生成物可言。
+            if let Ok(plan_run) =
+                serde_json::from_value::<crate::squad::PlanRunResult>(result_val.clone())
+            {
+                return serde_json::json!({
+                    "plan": plan_run.plan,
+                    "evaluation": plan_run.evaluation,
+                });
+            }
             // Try PgePipelineResult first.
             if let Ok(pipeline) =
                 serde_json::from_value::<crate::PgePipelineResult>(result_val.clone())
@@ -923,6 +932,15 @@ impl CollaborationExecutor {
     fn extract_atomic_tasks(squad_result: &crate::squad::SquadResult) -> Vec<AtomicTask> {
         let mut tasks = Vec::new();
         if let Some(ref result_val) = squad_result.result {
+            // 分解路径的产物形状：计划本身就是交付物。
+            if let Ok(plan_run) =
+                serde_json::from_value::<crate::squad::PlanRunResult>(result_val.clone())
+            {
+                for spec in &plan_run.plan.sub_tasks {
+                    tasks.push(Self::task_spec_to_atomic(spec));
+                }
+                return tasks;
+            }
             // Try to parse as PgePipelineResult first.
             if let Ok(pipeline) =
                 serde_json::from_value::<crate::PgePipelineResult>(result_val.clone())

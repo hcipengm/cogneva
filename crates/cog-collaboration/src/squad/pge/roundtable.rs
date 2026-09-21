@@ -300,14 +300,11 @@ impl PgeRoundtable {
 
             // Deterministic environment/protocol failure: further debate
             // rounds must fail identically — stop before paying for them.
-            if generation.is_terminal_env_failure() {
+            if let Some(reason) = generation.terminal_env_failure_reason() {
                 tracing::warn!(
                     iteration,
                     "Roundtable generation reported terminal environment failure; stopping debate"
                 );
-                let reason = generation
-                    .terminal_env_failure_reason()
-                    .unwrap_or_else(crate::squad::pge::types::no_artifacts_reason);
                 if let Some(last) = history.last_mut() {
                     last.evaluation.feedback = crate::squad::classify::declare(
                         crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
@@ -569,6 +566,20 @@ impl PgeRoundtable {
             )
             .await;
 
+        // 空信封与线性路径同一条闸：没有产出可判，法官能给的唯一答案就是
+        // "这里什么都没有"。按它自己的名字确定性地判失败，别为一次空推理付费。
+        if generation.is_empty_envelope() {
+            tracing::warn!(
+                iteration,
+                "Roundtable generator returned an empty envelope; failing the round under its own cause"
+            );
+            return (
+                plan,
+                generation,
+                crate::squad::pge::types::empty_envelope_evaluation(),
+            );
+        }
+
         let generation_json = serde_json::to_value(&generation).unwrap_or_default();
         let criteria: Vec<&str> = plan
             .acceptance_criteria
@@ -674,6 +685,21 @@ impl PgeRoundtable {
                         Some(&board),
                     )
                     .await;
+
+                // 与顺序路径同一条闸，也与线性路径同语义。
+                if generation.is_empty_envelope() {
+                    tracing::warn!(
+                        iteration,
+                        branch_id,
+                        "Roundtable branch generator returned an empty envelope; failing the branch under its own cause"
+                    );
+                    return PgeBranchResult {
+                        branch_id,
+                        plan,
+                        generation,
+                        evaluation: crate::squad::pge::types::empty_envelope_evaluation(),
+                    };
+                }
 
                 let generation_json = serde_json::to_value(&generation).unwrap_or_default();
                 let criteria: Vec<&str> = plan

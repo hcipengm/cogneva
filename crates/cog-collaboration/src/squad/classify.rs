@@ -80,13 +80,17 @@ pub fn unreachable_classes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::squad::pge::types::no_artifacts_reason;
+    use crate::squad::pge::types::empty_envelope_reason;
 
     #[test]
     fn classify_follows_the_shared_wire_prefixes() {
         // The exact reason the pipeline and Ralph both produce, and the exact
         // reason the squad executor keys off to stop upgrading strategies.
-        assert_eq!(classify(&no_artifacts_reason()), TERMINAL_ENV_FAILURE_CLASS);
+        assert_eq!(
+            classify(&empty_envelope_reason()),
+            UNCLASSIFIED_CLASS,
+            "an empty envelope names no declared cause: it is a generation defect the repair loop acts on, not a termination"
+        );
         assert_eq!(
             classify(&format!(
                 "{TERMINAL_ENV_FAILURE_PREFIX}: generator prompt failed: HTTP 503"

@@ -422,6 +422,116 @@ impl RalphLoop {
         }
     }
 
+    /// 以分解模式运行 Ralph Loop：只跑 Planner，交付物是原子任务列表。
+    ///
+    /// 与另外两条路径共用同一套预算、停滞判据与历史复用，区别只在"这一轮的
+    /// 产物怎么判"：判据是纯结构的（[`crate::squad::plan::judge_plan`]），所以
+    /// 这里不调评估器——没有产出可判，评估器能给的唯一答案就是"这里什么都没有"。
+    /// 也不调失败语义分析：分解只有两种失败（没拿到任务列表，或计划侧的终止性
+    /// 环境失败），两者的重试输入都是那段原因本身，一次 LLM 判读买不到新信息。
+    pub async fn run_plan(
+        &mut self,
+        goal: &str,
+        mut context: serde_json::Value,
+        planner: &PlannerActor,
+    ) -> RalphVerdict {
+        self.load_history().await;
+
+        // 与 Pipeline/Roundtable 同构：预算属于本次执行，历史只提供反馈与停滞证据。
+        for iteration in 1..=self.config.max_iterations {
+            crate::observable::global_observable().record_round();
+            if iteration > 1 {
+                context["ralph_iteration"] = serde_json::json!(iteration);
+                if let Some(prev) = self.history.last() {
+                    context["ralph_feedback"] = serde_json::json!(&prev.feedback);
+                }
+            }
+
+            let mut input = context.clone();
+            input["goal"] = serde_json::json!(goal);
+            let task = Task::new(
+                format!("ralph-plan-{}", uuid::Uuid::new_v4()),
+                TaskType::Custom("ralph_plan_goal".into()),
+                input,
+            );
+
+            // 上一轮的失败原因直接喂回 Planner：重试的全部价值就在这段反馈里，
+            // 丢掉它等于把同一轮原样重放一次。
+            let previous_feedback = self.history.last().map(|h| h.feedback.clone());
+            let plan = planner
+                .plan(
+                    &task,
+                    iteration,
+                    previous_feedback.as_deref(),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+
+            // 计划侧的终止性失败与另外两条路径同一条闸：prompt 没到上游，重试
+            // 必然同样失败。
+            if let Some(reason) = plan.terminal_env_failure_reason() {
+                tracing::warn!(
+                    iteration,
+                    "Ralph plan loop: planner reported terminal environment failure; stopping"
+                );
+                self.record_iteration(RalphIteration {
+                    iteration,
+                    reset_strategy: ResetStrategy::Identical,
+                    pge_passed: false,
+                    feedback: reason.clone(),
+                    snapshot: serde_json::json!({ "plan": &plan, "reason": &reason }),
+                    progress: None,
+                })
+                .await;
+                return self.unrecoverable_verdict(reason);
+            }
+
+            let evaluation = crate::squad::plan::judge_plan(&plan);
+            let passed = matches!(evaluation.verdict, Verdict::Pass);
+            let feedback = evaluation.feedback.clone();
+            let progress = Some(ProgressSignals::from_evaluation(&evaluation));
+
+            let run = crate::squad::plan::PlanRunResult { plan, evaluation };
+            let snapshot = match serde_json::to_value(&run) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    // 交付物在手上却序列化不出来，是这一环的内部缺陷：当成
+                    // "没有产出"会把它读成一次普通的空交付物，然后照着重试。
+                    return self.unrecoverable_verdict(format!(
+                        "Ralph plan loop could not serialize its own deliverable: {e}"
+                    ));
+                }
+            };
+
+            self.record_iteration(RalphIteration {
+                iteration,
+                reset_strategy: ResetStrategy::Identical,
+                pge_passed: passed,
+                feedback: feedback.clone(),
+                snapshot: snapshot.clone(),
+                progress,
+            })
+            .await;
+
+            if passed {
+                let total_iterations = self.history.len() as u32;
+                return RalphVerdict::Passed {
+                    result: snapshot,
+                    iterations: total_iterations,
+                    history: self.history.clone(),
+                };
+            }
+
+            if self.is_stagnated() {
+                return self.stagnated_verdict();
+            }
+        }
+
+        self.budget_exhausted_verdict()
+    }
+
     /// 以 Pipeline 模式运行 Ralph Loop。
     pub async fn run_pipeline(
         &mut self,
@@ -1031,6 +1141,76 @@ mod tests {
                 assert_eq!(iterations, 1);
             }
             other => panic!("Expected Passed, got {:?}", other),
+        }
+    }
+
+    /// 分解拿到任务列表就是通过：这条路径上没有生成器也没有评估器，判据是结构性的。
+    #[tokio::test]
+    async fn ralph_plan_passes_when_the_planner_returns_tasks() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 10,
+            ..Default::default()
+        });
+        let planner = PlannerActor::new(Arc::new(pass_planner()));
+
+        let verdict = ralph
+            .run_plan("decompose the goal", serde_json::json!({}), &planner)
+            .await;
+
+        match verdict {
+            RalphVerdict::Passed {
+                iterations, result, ..
+            } => {
+                assert_eq!(iterations, 1);
+                assert_eq!(
+                    result["plan"]["sub_tasks"].as_array().map(Vec::len),
+                    Some(1),
+                    "the deliverable must be the task list itself: {result}"
+                );
+            }
+            other => panic!("Expected Passed, got {:?}", other),
+        }
+    }
+
+    /// 空分解不是终止性失败：没有任何观测到的证据排除下一轮成功，第一轮就收摊
+    /// 等于按一个从没看见过的事实结账。这里量的是"它到底有没有接着试"。
+    #[tokio::test]
+    async fn an_empty_decomposition_retries_instead_of_terminating() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 3,
+            // 关掉停滞检测，这条用例只量"空交付物会不会被当成终止性失败"。
+            stagnation_window: 0,
+        });
+        let planner = PlannerActor::new(Arc::new(MockAgent {
+            response: serde_json::json!({"summary": "n/a", "plan": {}, "sub_tasks": []}),
+        }));
+
+        let verdict = ralph
+            .run_plan("decompose the goal", serde_json::json!({}), &planner)
+            .await;
+
+        match verdict {
+            RalphVerdict::Unrecoverable {
+                reason,
+                iterations,
+                history,
+            } => {
+                assert_eq!(
+                    iterations, 3,
+                    "an empty deliverable must be retried, not terminated on the first attempt"
+                );
+                assert!(
+                    !cog_core::contract::outcome::is_deterministic_failure(&reason),
+                    "{reason}"
+                );
+                assert!(
+                    history.iter().all(|it| it
+                        .feedback
+                        .contains(crate::squad::plan::EMPTY_DECOMPOSITION_PREFIX)),
+                    "every retry must carry the cause it is retrying on: {history:?}"
+                );
+            }
+            other => panic!("Expected Unrecoverable budget exhaustion, got {:?}", other),
         }
     }
 
