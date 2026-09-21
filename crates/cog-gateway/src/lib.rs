@@ -1312,11 +1312,9 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
     // not a literal: an observable answers only the dimensions it branches on,
     // so a dimension left out here is a metric that is counted and exported by
     // nobody, with nothing failing to say so.
-    let mut observable_metrics = Vec::new();
-    for dimension in &state.metrics_dimensions {
-        observable_metrics
-            .extend(cog_core::collect_all_metrics(&state.observables, dimension).await);
-    }
+    let observable_metrics =
+        cog_core::collect_metrics_for_dimensions(&state.observables, &state.metrics_dimensions)
+            .await;
     if !observable_metrics.is_empty() {
         if !body.is_empty() {
             body.push('\n');

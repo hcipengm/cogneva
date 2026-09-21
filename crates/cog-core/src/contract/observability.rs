@@ -300,6 +300,38 @@ pub async fn collect_all_metrics(
     all
 }
 
+/// 按每个 observable 实际分维度的情况采集：声明了维度的按每个维度采一次，
+/// `available_dimensions()` 为空的只采一次。
+///
+/// 空声明是"这个量不随维度变"的意思——卷占用、trace 分层积压这类 gauge 对每个
+/// 维度都是同一个数。按维度逐个采它，会让同一组序列在一个抓取体里重复出现；
+/// 值一样时 Prometheus 当作重复样本丢掉，值在两采之间变一次就会变成同一时间戳
+/// 冲突的样本而被拒，那一条序列在该次抓取里就没有读数。
+pub async fn collect_metrics_for_dimensions(
+    observables: &[Arc<dyn Observable>],
+    dimensions: &[String],
+) -> Vec<RawMetric> {
+    let mut all = Vec::new();
+    for observable in observables {
+        if observable.available_dimensions().is_empty() {
+            match observable.collect_metrics("").await {
+                Ok(mut metrics) => all.append(&mut metrics),
+                Err(e) => tracing::warn!(error = %e, "Observable::collect_metrics failed"),
+            }
+            continue;
+        }
+        for dimension in dimensions {
+            match observable.collect_metrics(dimension).await {
+                Ok(mut metrics) => all.append(&mut metrics),
+                Err(e) => {
+                    tracing::warn!(dimension = %dimension, error = %e, "Observable::collect_metrics failed")
+                }
+            }
+        }
+    }
+    all
+}
+
 /// 从多个 Observable 聚合指定任务的轨迹片段（便捷函数）。
 pub async fn collect_all_traces(
     observables: &[Arc<dyn Observable>],
@@ -395,7 +427,11 @@ pub fn series_endpoint(line: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod infra_endpoint_tests {
-    use super::{is_infra_endpoint, series_endpoint};
+    use super::{
+        collect_metrics_for_dimensions, is_infra_endpoint, series_endpoint, Observable, RawMetric,
+        SFResult, TraceFragment,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn classified_as_infra() {
@@ -439,5 +475,59 @@ mod infra_endpoint_tests {
         let line = "http_requests_total{method=\"GET\",status=\"200\"} 42";
         assert_eq!(series_endpoint(line), None);
         assert!(!series_endpoint(line).is_some_and(is_infra_endpoint));
+    }
+
+    /// Counts how many times the endpoint asked it, per dimension.
+    struct CountingObservable {
+        dimensions: Vec<String>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Observable for CountingObservable {
+        async fn collect_metrics(&self, dimension: &str) -> SFResult<Vec<RawMetric>> {
+            self.asked.lock().unwrap().push(dimension.to_string());
+            Ok(vec![RawMetric::new("a_gauge", 1.0)])
+        }
+        async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
+            Ok(Vec::new())
+        }
+        fn available_dimensions(&self) -> Vec<String> {
+            self.dimensions.clone()
+        }
+    }
+
+    /// An observable that ignores the dimension is pulled once, not once per
+    /// configured dimension. Pulling it per dimension repeats every series in
+    /// the scrape body: identical copies collapse, but a value that moves
+    /// between two pulls lands as a second sample for the same timestamp and
+    /// the series loses its reading for that scrape.
+    #[tokio::test]
+    async fn a_dimensionless_observable_is_pulled_once() {
+        let dimensions = vec!["D4".to_string(), "D5".to_string(), "D8".to_string()];
+
+        let flat = Arc::new(CountingObservable {
+            dimensions: Vec::new(),
+            asked: Default::default(),
+        });
+        let flat_dyn: Arc<dyn Observable> = flat.clone();
+        let metrics = collect_metrics_for_dimensions(&[flat_dyn], &dimensions).await;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(flat.asked.lock().unwrap().len(), 1);
+
+        // And the other direction: an observable that does branch still gets
+        // every configured dimension, so narrowing this cannot silently drop
+        // a dimension's metrics.
+        let branched = Arc::new(CountingObservable {
+            dimensions: vec!["D4".into(), "D5".into()],
+            asked: Default::default(),
+        });
+        let branched_dyn: Arc<dyn Observable> = branched.clone();
+        let metrics = collect_metrics_for_dimensions(&[branched_dyn], &dimensions).await;
+        assert_eq!(metrics.len(), 3);
+        assert_eq!(
+            *branched.asked.lock().unwrap(),
+            vec!["D4".to_string(), "D5".to_string(), "D8".to_string()]
+        );
     }
 }
