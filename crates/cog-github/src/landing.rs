@@ -61,6 +61,10 @@ pub enum LandingState {
     Unverified,
     /// Committed to the base branch; CI on that commit is being watched.
     Landed,
+    /// Verification rejected it, so it will never land. Terminal: the record
+    /// stays as the audit trail, but it is out of the verification queue and
+    /// out of the owner's approval list.
+    Retired,
 }
 
 /// One change's landing record, persisted so an intent survives a restart.
@@ -87,6 +91,11 @@ pub struct LandingRecord {
     /// simply old does not re-announce itself every pass.
     #[serde(default)]
     pub unlanded_reported: bool,
+    /// Why verification settled this change as one that must not land. Set
+    /// together with `Retired`, and the only record of a verdict that leaves
+    /// no commit behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_reason: Option<String>,
     /// When the change first entered the channel.
     pub created_at: DateTime<Utc>,
     /// Last time this record changed; the CI watch window is measured from it.
@@ -291,6 +300,7 @@ impl MainChannel {
             failure_recorded: false,
             redriven: false,
             unlanded_reported: false,
+            retired_reason: None,
             created_at: created,
             updated_at: now,
         })
@@ -592,10 +602,37 @@ impl cog_core::ChangeLanding for MainChannel {
             failure_recorded: false,
             redriven: false,
             unlanded_reported: false,
+            retired_reason: None,
             created_at: created,
             updated_at: now,
         })
         .await
+    }
+
+    async fn unverified_changes(&self) -> SFResult<Vec<GeneratedChange>> {
+        Ok(load_records()
+            .await
+            .into_iter()
+            .filter(|r| r.state == LandingState::Unverified)
+            .map(|r| r.change)
+            .collect())
+    }
+
+    async fn retire_unverified(&self, change_id: &str, reason: &str) -> SFResult<()> {
+        let Some(mut record) = load_record(change_id).await else {
+            // Nothing of this channel's to settle: the change reached the
+            // verify loop through the local queue instead.
+            return Ok(());
+        };
+        if record.state != LandingState::Unverified {
+            // Already settled — a landing that raced this verdict wins, since
+            // the change is on the branch either way.
+            return Ok(());
+        }
+        record.state = LandingState::Retired;
+        record.retired_reason = Some(reason.to_string());
+        record.updated_at = Utc::now();
+        save_record(&record).await
     }
 }
 
@@ -619,6 +656,12 @@ pub async fn watch_landed(
     let policy = &channel.config.landing_policy;
     let now = Utc::now();
     for mut record in load_records().await {
+        if record.state == LandingState::Retired {
+            // Verification settled this one: it never lands, and that is a
+            // verdict rather than a stall, so there is nothing to watch and
+            // nothing to report.
+            continue;
+        }
         if record.state != LandingState::Landed || record.landed_rev.is_empty() {
             // A change that was submitted and then never reached the land step
             // leaves this record behind with nothing to move it. The record is
@@ -1320,6 +1363,175 @@ mod tests {
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
+    /// 只存在于记录里的变更必须能被验证循环读到：交接的持久面就是这条记录，
+    /// 换一个部署生成、或者进程重启丢掉内存里的描述之后，它是唯一还剩的东西。
+    #[tokio::test]
+    async fn unverified_changes_reports_what_the_verify_loop_must_pick_up() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let chan = channel(Default::default());
+        let mut ch = change("chg-1", &diff_touching(&["crates/cog-github/src/lib.rs"]));
+        ch.issue_number = Some(4);
+        ch.self_review_score = Some(0.85);
+        cog_core::ChangeLanding::record_unverified(&chan, &ch)
+            .await
+            .unwrap();
+
+        let pending = cog_core::ChangeLanding::unverified_changes(&chan)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        // 记录那份变更原样带出来：落地要落它，不是落一份从产物重建的副本。
+        assert_eq!(pending[0].change_id, "chg-1");
+        assert_eq!(pending[0].goal, ch.goal);
+        assert_eq!(pending[0].issue_number, Some(4));
+        assert_eq!(pending[0].self_review_score, Some(0.85));
+
+        // 已经落地的记录不再是待验证输入。
+        remove_record("chg-1").await;
+        assert!(cog_core::ChangeLanding::unverified_changes(&chan)
+            .await
+            .unwrap()
+            .is_empty());
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 验证判定必须终局，且理由要留下：不留理由，"被判定打不上"和"从没提交过"
+    /// 在读侧就分不出来，而记录正是这两者之间唯一的区别。
+    #[tokio::test]
+    async fn retiring_an_unverified_record_settles_it_with_the_reason() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let chan = channel(Default::default());
+        let ch = change("chg-1", &diff_touching(&["crates/cog-github/src/lib.rs"]));
+        cog_core::ChangeLanding::record_unverified(&chan, &ch)
+            .await
+            .unwrap();
+
+        cog_core::ChangeLanding::retire_unverified(&chan, "chg-1", "patch does not apply")
+            .await
+            .unwrap();
+
+        assert!(
+            cog_core::ChangeLanding::unverified_changes(&chan)
+                .await
+                .unwrap()
+                .is_empty(),
+            "判定打不上的变更不得再进验证队列，否则每轮重验一次，永不终局"
+        );
+        let rec = load_record("chg-1").await.expect("记录留下作审计线索");
+        assert_eq!(rec.state, LandingState::Retired);
+        assert_eq!(rec.retired_reason.as_deref(), Some("patch does not apply"));
+        assert_ne!(
+            rec.updated_at, rec.created_at,
+            "终局要体现在记录的变化上，不是留在原地无人问"
+        );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 已经落到主分支的记录不能被一个迟到的判定改写成退休。
+    #[tokio::test]
+    async fn a_landed_record_is_not_overwritten_by_a_late_verdict() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let chan = channel(Default::default());
+        let ch = change("chg-1", &diff_touching(&["crates/cog-github/src/lib.rs"]));
+        let now = Utc::now();
+        save_record(&LandingRecord {
+            change: ch,
+            base: "main".into(),
+            landed_rev: "abc1234".into(),
+            state: LandingState::Landed,
+            failure_recorded: false,
+            redriven: false,
+            unlanded_reported: false,
+            retired_reason: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+        cog_core::ChangeLanding::retire_unverified(&chan, "chg-1", "stale verdict")
+            .await
+            .unwrap();
+
+        let rec = load_record("chg-1").await.unwrap();
+        assert_eq!(rec.state, LandingState::Landed);
+        assert_eq!(rec.landed_rev, "abc1234");
+        assert_eq!(rec.retired_reason, None);
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 变更也可能来自本地队列，这条通道上没有它的记录：收口是空操作，不得凭空
+    /// 造一条记录出来。
+    #[tokio::test]
+    async fn settling_a_change_this_channel_never_saw_creates_nothing() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        cog_core::ChangeLanding::retire_unverified(&channel(Default::default()), "chg-nope", "why")
+            .await
+            .unwrap();
+
+        assert!(load_records().await.is_empty());
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 退休是判定，不是卡住：巡检不得把它报成"提交之后再没走到落地"。
+    #[tokio::test]
+    async fn a_retired_record_is_not_reported_as_never_landing() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let policy = crate::config::LandingPolicy {
+            ci_watch_timeout_secs: 1800,
+            ..Default::default()
+        };
+        let chan = channel(policy);
+        let now = Utc::now();
+        save_record(&LandingRecord {
+            change: change(
+                "chg-retired",
+                &diff_touching(&["crates/cog-github/src/lib.rs"]),
+            ),
+            base: "main".into(),
+            landed_rev: String::new(),
+            state: LandingState::Retired,
+            failure_recorded: false,
+            redriven: false,
+            unlanded_reported: false,
+            retired_reason: Some("patch does not apply".into()),
+            created_at: now - chrono::Duration::seconds(7200),
+            updated_at: now - chrono::Duration::seconds(7200),
+        })
+        .await
+        .unwrap();
+
+        watch_landed(&chan, None, None).await;
+
+        let records = load_records().await;
+        let rec = records
+            .iter()
+            .find(|r| r.change.change_id == "chg-retired")
+            .expect("退休记录不会被巡检清掉");
+        assert!(!rec.unlanded_reported, "退休是判定过的终局，不是没人管它");
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
     #[tokio::test]
     async fn a_change_that_never_landed_is_reported_once() {
         let _guard = crate::identity::ENV_LOCK.lock().await;
@@ -1343,6 +1555,7 @@ mod tests {
                 failure_recorded: false,
                 redriven: false,
                 unlanded_reported: false,
+                retired_reason: None,
                 created_at: now - chrono::Duration::seconds(age_secs),
                 updated_at: now - chrono::Duration::seconds(age_secs),
             })

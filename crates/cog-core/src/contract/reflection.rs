@@ -138,6 +138,23 @@ pub trait ChangeLanding: Send + Sync + std::fmt::Debug {
     /// landed only when a mainline later verifies it (or the owner approves
     /// it explicitly).
     async fn record_unverified(&self, change: &GeneratedChange) -> crate::SFResult<()>;
+
+    /// The recorded changes still awaiting verification.
+    ///
+    /// "A mainline later verifies it" is a promise about work someone does,
+    /// so the verify loop has to be able to read the set it applies to. The
+    /// record is the durable side of that handoff: a change generated in one
+    /// deployment is verified by whichever deployment owns the sandbox, and
+    /// the record is all the two share.
+    async fn unverified_changes(&self) -> crate::SFResult<Vec<GeneratedChange>>;
+
+    /// Settle a change that verification proved must not land.
+    ///
+    /// Terminal, and the reason is kept: an unverified record that can never
+    /// be applied would otherwise be re-verified on every pass and re-offered
+    /// to the owner forever, and "rejected for this reason" would be
+    /// indistinguishable from "never submitted".
+    async fn retire_unverified(&self, change_id: &str, reason: &str) -> crate::SFResult<()>;
 }
 
 /// Owner policy for flowing evolved changes back upstream as PRs.

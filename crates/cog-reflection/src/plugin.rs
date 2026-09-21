@@ -1505,6 +1505,60 @@ struct CycleDeps<'a> {
     landing: Option<&'a Arc<dyn cog_core::ChangeLanding>>,
 }
 
+/// 把两条输入通道汇合成本轮要验证的变更集合。
+///
+/// 本地队列是"生成与验证必须同一个进程"留下的临时口；落地记录是这份交接的持久
+/// 面——换一个部署生成、或者进程重启丢掉内存里的描述，记录仍然在。只认本地队列，
+/// "某条主线后来验证它"这一支就不存在：记录会永远停在 unverified，既没人验也没人
+/// 问。两条通道用同一个 id 指同一份变更，所以只按 id 去重、只验一次。
+///
+/// 返回的映射里是记录那份变更本身。落地要落它，而不是落一份从产物重建的副本——
+/// 重建只剩描述与正文，记录里比产物多出来的字段（问题号、评审分）会被覆盖掉。
+/// 队列里已有的变更也放进去：它同样有记录，只是这份记录还没被验过。
+async fn merge_verification_inputs(
+    queued: Vec<crate::types::EvolutionResult>,
+    landing: Option<&dyn cog_core::ChangeLanding>,
+) -> (
+    Vec<crate::types::EvolutionResult>,
+    std::collections::HashMap<String, cog_core::GeneratedChange>,
+) {
+    let mut recorded: std::collections::HashMap<String, cog_core::GeneratedChange> =
+        std::collections::HashMap::new();
+    let Some(landing) = landing else {
+        return (queued, recorded);
+    };
+    let list = match landing.unverified_changes().await {
+        Ok(list) => list,
+        Err(e) => {
+            // 读不到记录不是"没有记录"：这一轮只验本地队列，但要把这件事说出来，
+            // 否则"记录不可读"和"没有待验证记录"在日志里长得一模一样。
+            warn!(
+                error = %e,
+                "Unverified landing records could not be read; verifying the local queue only"
+            );
+            return (queued, recorded);
+        }
+    };
+
+    let mut changes = queued;
+    for change in list {
+        let already_queued = changes.iter().any(|c| c.artifact_id == change.change_id);
+        if !already_queued {
+            changes.push(crate::types::EvolutionResult {
+                kind: crate::types::EvolutionKind::CodeChange,
+                artifact_id: change.change_id.clone(),
+                description: change.goal.clone(),
+                content: change.content.clone(),
+                status: crate::types::EvolutionStatus::CompileChecked,
+                created_at: chrono::Utc::now(),
+                eval_summary: None,
+            });
+        }
+        recorded.insert(change.change_id.clone(), change);
+    }
+    (changes, recorded)
+}
+
 /// 记录一次终局失败，并把变更移出待处理队列。
 ///
 /// 两件事必须一起做：登记结论是审计线索，移出队列才让"拒绝"成为终局。队列本身
@@ -1517,9 +1571,15 @@ struct CycleDeps<'a> {
 /// （校验管线报错、构建、落地、部署）不移除：那些是环境的问题，环境修好后同一个
 /// 变更还该能落地。判据与环境的边界由 `apply_and_test_in` 的返回类型划开——判定走
 /// `Ok(test_passed = false)`，环境走 `Err`。
+///
+/// 同一个变更可能来自两条输入通道之一——本地队列（`.diff` 文件）或落地记录——
+/// 所以两处都要收口，各自只认自己那一份，缺席的一方是空操作。只收口一边，另一边
+/// 的输入会在下一轮原样回来：目录里的 `.diff` 被读成全新变更，记录被重新送进验证
+/// 队列，于是同一个"打不上"的变更每轮重跑一次，永远不终局。
 async fn fail_and_retire_change(
     engine: &crate::ReflectionEngine,
     pipeline: &crate::ChangePipeline,
+    landing: Option<&dyn cog_core::ChangeLanding>,
     change_id: &str,
     reason: &str,
 ) {
@@ -1530,6 +1590,15 @@ async fn fail_and_retire_change(
             error = %e,
             "Change could not be retired; it stays in the pending queue"
         );
+    }
+    if let Some(landing) = landing {
+        if let Err(e) = landing.retire_unverified(change_id, reason).await {
+            warn!(
+                change_id = %change_id,
+                error = %e,
+                "Change could not be settled on the landing channel; it stays unverified"
+            );
+        }
     }
 }
 
@@ -1661,7 +1730,9 @@ async fn run_evolution_cycle_in(
     // 解析出的版本 tag 上就是两个提交。
     align_engine_baseline(workspaces, workdir).await;
 
-    let changes = pipeline.pending_changes(Some(evo_engine)).await?;
+    let queued = pipeline.pending_changes(Some(evo_engine)).await?;
+    let (changes, recorded) = merge_verification_inputs(queued, landing.map(|l| l.as_ref())).await;
+
     if changes.is_empty() {
         return Ok(());
     }
@@ -1711,7 +1782,14 @@ async fn run_evolution_cycle_in(
                 reason = %reason,
                 "Change rejected; skipping deploy"
             );
-            fail_and_retire_change(engine, pipeline, &result.change_id, &result.test_output).await;
+            fail_and_retire_change(
+                engine,
+                pipeline,
+                landing.map(|l| l.as_ref()),
+                &result.change_id,
+                &result.test_output,
+            )
+            .await;
             change_failed = true;
         } else if !config.auto_apply || config.manual_approve {
             info!(change_id = %result.change_id, "Change awaiting manual approval");
@@ -1750,14 +1828,20 @@ async fn run_evolution_cycle_in(
             // 落地失败不放行部署：镜像里跑着主分支没有的代码，是最难排查的
             // 那种分叉。
             if let Some(landing) = landing {
-                let landed = cog_core::GeneratedChange {
-                    change_id: artifact.change_id.clone(),
-                    goal: change.description.clone(),
-                    content: change.content.clone(),
-                    affected_files: cog_core::parse_diff_affected_files(&change.content)
-                        .unwrap_or_default(),
-                    ..Default::default()
-                };
+                // 变更本来是记录里的那份就落它那份：从产物重建出来的副本只剩
+                // 描述与正文，记录里比产物多出来的字段（问题号、评审分）会被
+                // 落地的写回覆盖成默认值。
+                let landed = recorded
+                    .get(&artifact.change_id)
+                    .cloned()
+                    .unwrap_or_else(|| cog_core::GeneratedChange {
+                        change_id: artifact.change_id.clone(),
+                        goal: change.description.clone(),
+                        content: change.content.clone(),
+                        affected_files: cog_core::parse_diff_affected_files(&change.content)
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    });
                 let source = cog_core::LandedSource {
                     repo: workspaces.bare_repo().to_path_buf(),
                     rev: artifact.commit_hash.clone(),
@@ -1968,6 +2052,148 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 落地通道替身：验证循环从它只读"待验证的记录"。其余方法一律炸掉——输入
+    /// 汇合这一步不该落地、不该记录、也不该退休。
+    #[derive(Debug)]
+    struct FakeLanding {
+        unverified: Vec<cog_core::GeneratedChange>,
+        readable: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::ChangeLanding for FakeLanding {
+        async fn land(
+            &self,
+            _change: &cog_core::GeneratedChange,
+            _source: Option<&cog_core::LandedSource>,
+        ) -> cog_core::SFResult<String> {
+            unreachable!("input merging never lands a change")
+        }
+
+        async fn record_unverified(
+            &self,
+            _change: &cog_core::GeneratedChange,
+        ) -> cog_core::SFResult<()> {
+            unreachable!("input merging never records a change")
+        }
+
+        async fn unverified_changes(&self) -> cog_core::SFResult<Vec<cog_core::GeneratedChange>> {
+            if !self.readable {
+                return Err(cog_core::SFError::IO("landing dir unreadable".into()));
+            }
+            Ok(self.unverified.clone())
+        }
+
+        async fn retire_unverified(&self, _id: &str, _reason: &str) -> cog_core::SFResult<()> {
+            unreachable!("input merging never retires a change")
+        }
+    }
+
+    fn generated(id: &str, goal: &str) -> cog_core::GeneratedChange {
+        cog_core::GeneratedChange {
+            change_id: id.into(),
+            goal: goal.into(),
+            content: "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            affected_files: vec!["crates/x/src/lib.rs".into()],
+            rationale: Some("because".into()),
+            pge_mode: "squad".into(),
+            self_review_score: Some(0.85),
+            issue_number: Some(4),
+        }
+    }
+
+    fn queued(id: &str, description: &str) -> crate::types::EvolutionResult {
+        crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::CodeChange,
+            artifact_id: id.into(),
+            description: description.into(),
+            content: "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            status: crate::types::EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        }
+    }
+
+    /// 契约承诺 unverified 的变更"等某条主线后来验证它"才落地。这条支线要真的
+    /// 存在，验证循环就必须把记录当成一份输入——只有本地队列时，一条只留在记录里
+    /// 的变更永远进不了验证，那句承诺就是空的。
+    #[tokio::test]
+    async fn a_record_without_a_local_diff_enters_verification() {
+        let landing = FakeLanding {
+            unverified: vec![generated("github-issue-4-abc", "Fix issue 4")],
+            readable: true,
+        };
+
+        let (changes, recorded) = merge_verification_inputs(Vec::new(), Some(&landing)).await;
+
+        assert_eq!(changes.len(), 1, "记录必须成为本轮要验证的变更");
+        assert_eq!(changes[0].artifact_id, "github-issue-4-abc");
+        assert_eq!(
+            changes[0].description, "Fix issue 4",
+            "描述取记录里的目标，不是从临时文件路径猜出来的"
+        );
+        let kept = recorded
+            .get("github-issue-4-abc")
+            .expect("记录那份变更要留着");
+        assert_eq!(
+            kept.issue_number,
+            Some(4),
+            "落地要落记录那份：从产物重建的副本会把这个字段抹成默认值"
+        );
+    }
+
+    /// 两条通道用同一个 id 指同一份变更：生成它的进程写本地队列，提交时又留下
+    /// 一条记录。汇合后只能剩一条，否则同一份变更被 apply 两次。
+    #[tokio::test]
+    async fn a_change_present_in_both_channels_is_verified_once() {
+        let landing = FakeLanding {
+            unverified: vec![generated("chg-1", "goal from the record")],
+            readable: true,
+        };
+
+        let (changes, recorded) =
+            merge_verification_inputs(vec![queued("chg-1", "goal from the queue")], Some(&landing))
+                .await;
+
+        assert_eq!(changes.len(), 1, "同一份变更只能被验一次");
+        assert_eq!(
+            changes[0].description, "goal from the queue",
+            "队列里已有的那份保留原样，记录只补队列没有的"
+        );
+        assert!(
+            recorded.contains_key("chg-1"),
+            "变更就算来自队列，它的记录也要留给落地用"
+        );
+    }
+
+    /// 读不到记录不是"没有记录"：读失败时本轮只验本地队列，但不能连本地队列也
+    /// 丢掉，否则一次读抖动就让待验证的变更集体消失。
+    #[tokio::test]
+    async fn an_unreadable_record_set_leaves_the_local_queue_intact() {
+        let landing = FakeLanding {
+            unverified: Vec::new(),
+            readable: false,
+        };
+
+        let (changes, recorded) =
+            merge_verification_inputs(vec![queued("chg-1", "goal")], Some(&landing)).await;
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].artifact_id, "chg-1");
+        assert!(recorded.is_empty());
+    }
+
+    /// 未连平台账号时没有落地通道，行为要与从前一致：只验本地队列。
+    #[tokio::test]
+    async fn without_a_landing_channel_the_local_queue_is_unchanged() {
+        let (changes, recorded) =
+            merge_verification_inputs(vec![queued("chg-1", "goal")], None).await;
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].artifact_id, "chg-1");
+        assert!(recorded.is_empty());
+    }
 
     #[tokio::test]
     async fn ensure_env_passes_for_current_repo() {
