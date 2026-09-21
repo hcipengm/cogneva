@@ -375,8 +375,12 @@ async fn test_rule_based_extractor_summary() {
         summary.text,
         "This is a long conversation about architecture."
     );
-    assert_eq!(summary.embedding.len(), 128);
-    assert!(summary.embedding.iter().all(|v| *v == 0.0));
+    // The rule-based extractor has no embedder, so the summary must carry no
+    // vector at all. A zero vector would be a well-formed vector that scores
+    // 0.0 against every query, which reads as a ranked result rather than as
+    // an absent capability.
+    assert!(summary.embedding.is_empty());
+    assert_eq!(summary.embedding_model, cog_core::NO_EMBEDDING_MODEL);
 }
 
 #[tokio::test]

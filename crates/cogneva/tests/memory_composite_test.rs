@@ -1002,10 +1002,12 @@ async fn test_ingest_explicit_embeds_with_provider() {
     );
 }
 
-/// Without an embedder the vector is zero, but it still has to match the
-/// configured dimension so the collection shape stays consistent.
+/// Without an embedder there is no vector to store. The configured dimension
+/// describes the shape a real embedder would produce, not a filler for the
+/// entries that never had one: a run of that many zeros scores 0.0 against
+/// every query, so a search would return arbitrary ties instead of nothing.
 #[tokio::test]
-async fn test_ingest_explicit_without_embedder_uses_configured_dimension() {
+async fn test_ingest_explicit_without_embedder_stores_no_vector() {
     let tmp = tempfile::tempdir().unwrap();
     let object = Arc::new(FileObjectBackend::new(tmp.path()));
     let backend = CompositeMemoryBackend::new(
@@ -1020,6 +1022,10 @@ async fn test_ingest_explicit_without_embedder_uses_configured_dimension() {
         .unwrap();
 
     let entries = backend.list_summary("default").await.unwrap();
-    assert_eq!(entries[0].embedding.len(), 1024);
-    assert!(entries[0].embedding.iter().all(|v| *v == 0.0));
+    assert!(entries[0].embedding.is_empty());
+    assert_eq!(
+        entries[0].embedding_model,
+        cog_core::NO_EMBEDDING_MODEL,
+        "an entry with no vector must not name an embedding model"
+    );
 }
