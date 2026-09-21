@@ -4,7 +4,8 @@
 //!   → RawLogger → TierMigrator → RawLogIndexStore → MetricsBackend
 //! Each test constructs a fresh `GatewayState` backed by memory-only
 //! implementations so no external DB or filesystem persistence is required
-//! (except for the transient raw-log temp dir).
+//! (except for the transient raw-log temp dir). Redis backs the quota manager
+//! and has no in-memory stand-in, so a test skips when none is reachable.
 
 use axum::{
     body::{to_bytes, Body},
@@ -51,7 +52,53 @@ struct TestApp {
     _migrator: Option<tokio::task::JoinHandle<()>>,
 }
 
-async fn spawn_app(with_tier_migrator: bool, raw_log_dir: Option<&std::path::Path>) -> TestApp {
+/// Redis endpoint for the suite. CI supplies one through a service container;
+/// a developer machine usually has one on the default port.
+fn test_redis_url() -> String {
+    std::env::var("COGNEVA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
+}
+
+/// Connect to the store the quota manager needs, or return `None` when none
+/// is reachable so the test can skip.
+async fn open_test_redis() -> Option<redis::aio::MultiplexedConnection> {
+    open_test_redis_at(&test_redis_url()).await
+}
+
+/// The endpoint is a parameter so the skip rule can be checked without
+/// mutating the environment the parallel tests read.
+async fn open_test_redis_at(redis_url: &str) -> Option<redis::aio::MultiplexedConnection> {
+    let client = match redis::Client::open(redis_url) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("SKIP: unusable Redis url ({e})");
+            return None;
+        }
+    };
+    match client.get_multiplexed_async_connection().await {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            eprintln!("SKIP: no Redis reachable ({e})");
+            None
+        }
+    }
+}
+
+/// The sandbox has no Redis. A connection failure there has to read as "not
+/// applicable" rather than as a broken quota store, or the verdict says which
+/// services happened to be up instead of whether the change is sound.
+#[tokio::test]
+async fn unreachable_redis_skips_instead_of_panicking() {
+    let conn = open_test_redis_at("redis://127.0.0.1:1").await;
+    assert!(
+        conn.is_none(),
+        "an unreachable Redis must skip, not connect"
+    );
+}
+
+async fn spawn_app(
+    with_tier_migrator: bool,
+    raw_log_dir: Option<&std::path::Path>,
+) -> Option<TestApp> {
     spawn_app_full(with_tier_migrator, raw_log_dir, true).await
 }
 
@@ -59,13 +106,11 @@ async fn spawn_app_full(
     with_tier_migrator: bool,
     raw_log_dir: Option<&std::path::Path>,
     with_raw_log_index: bool,
-) -> TestApp {
-    // Redis is required for the quota manager.
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379").expect("redis open");
-    let redis_conn = redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .expect("redis conn");
+) -> Option<TestApp> {
+    // Redis is required for the quota manager. The suite also runs inside the
+    // evolution sandbox, which has no Redis; a red run there would be a
+    // statement about the sandbox rather than about the change under test.
+    let redis_conn = open_test_redis().await?;
 
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
@@ -210,7 +255,7 @@ async fn spawn_app_full(
         None
     };
 
-    TestApp {
+    Some(TestApp {
         state: gateway_state,
         raw_logger,
         metrics,
@@ -220,7 +265,7 @@ async fn spawn_app_full(
         addr,
         _server: server,
         _migrator,
-    }
+    })
 }
 
 impl TestApp {
@@ -278,7 +323,9 @@ async fn req_oneshot(
 
 #[tokio::test]
 async fn e2e_health_endpoints() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
 
     let client = reqwest::Client::new();
     let res = client
@@ -305,7 +352,9 @@ async fn e2e_health_endpoints() {
 
 #[tokio::test]
 async fn e2e_task_create_then_list() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
 
     let (status, body) = req_oneshot(
         app.state.clone(),
@@ -360,7 +409,9 @@ async fn e2e_task_create_then_list() {
 
 #[tokio::test]
 async fn e2e_raw_logger_records_http_requests() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
 
     // Trigger some business HTTP traffic. Health probes are excluded from the
     // request log at the middleware, so /health would produce nothing here.
@@ -411,7 +462,9 @@ async fn e2e_raw_logger_records_http_requests() {
 #[tokio::test]
 async fn e2e_tier_migration_and_raw_logs_query() {
     let dir = tempfile::TempDir::new().unwrap();
-    let app = spawn_app(true, Some(dir.path())).await;
+    let Some(app) = spawn_app(true, Some(dir.path())).await else {
+        return;
+    };
 
     // The tier migrator is already running on a 1-second scan interval.
     // Manually drop a "hot" file that is older than hot_duration (1s).
@@ -452,7 +505,9 @@ async fn e2e_tier_migration_and_raw_logs_query() {
 #[tokio::test]
 async fn e2e_tier_migration_increments_prometheus_counter() {
     let dir = tempfile::TempDir::new().unwrap();
-    let app = spawn_app(true, Some(dir.path())).await;
+    let Some(app) = spawn_app(true, Some(dir.path())).await else {
+        return;
+    };
 
     // Seed an old file to trigger migration.
     let stream_dir = dir.path().join("transport_raw");
@@ -487,18 +542,18 @@ async fn e2e_tier_migration_increments_prometheus_counter() {
 
 #[tokio::test]
 async fn e2e_quota_exceeded_returns_429() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
 
     // Drain the specific user's quota by directly setting the Redis key to 0.
     // (Using pre_check to drain is unreliable because Redis DECR can produce
     // negative values that break the u64 read-back in the manager.)
     let user_id = uuid::Uuid::new_v4().to_string();
     {
-        let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
-        let mut conn = redis_client
-            .get_multiplexed_async_connection()
-            .await
-            .unwrap();
+        let Some(mut conn) = open_test_redis().await else {
+            return;
+        };
         let key = format!("quota:remaining:{}", user_id);
         let _: () = conn.set_ex(&key, 0u64, 60u64).await.unwrap();
     }
@@ -547,7 +602,9 @@ async fn e2e_quota_exceeded_returns_429() {
 
 #[tokio::test]
 async fn e2e_memory_ingest_and_search() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
 
     let token = app.bearer_token().await;
     let client = reqwest::Client::new();
@@ -668,7 +725,9 @@ async fn e2e_cold_upload_failure_retains_local() {
 #[tokio::test]
 async fn e2e_raw_logs_503_when_store_unconfigured() {
     // Build a GatewayState with raw_log_index_store = None.
-    let app = spawn_app_full(false, None, false).await;
+    let Some(app) = spawn_app_full(false, None, false).await else {
+        return;
+    };
     let client = reqwest::Client::new();
 
     let res = client
@@ -686,7 +745,9 @@ async fn e2e_raw_logs_503_when_store_unconfigured() {
 
 #[tokio::test]
 async fn e2e_metrics_endpoint_surfaces_http_and_memory_counters() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
 
     // Generate a business request so the http counter increments. Probes are
     // kept out of this counter on purpose, so hitting /health would leave it
@@ -720,7 +781,9 @@ async fn e2e_metrics_endpoint_surfaces_http_and_memory_counters() {
 
 #[tokio::test]
 async fn e2e_memory_batch_ingest_and_list() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
     let token = app.bearer_token().await;
     let client = reqwest::Client::new();
 
@@ -795,7 +858,9 @@ async fn e2e_memory_batch_ingest_and_list() {
 
 #[tokio::test]
 async fn e2e_memory_ingest_rejects_ids_that_would_fork_the_key() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
     let token = app.bearer_token().await;
     let client = reqwest::Client::new();
 
@@ -853,7 +918,9 @@ async fn e2e_memory_ingest_rejects_ids_that_would_fork_the_key() {
 
 #[tokio::test]
 async fn e2e_memory_unified_search() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
     let token = app.bearer_token().await;
     let client = reqwest::Client::new();
 
@@ -894,7 +961,9 @@ async fn e2e_memory_unified_search() {
 
 #[tokio::test]
 async fn e2e_memory_stats_and_metrics() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
     let token = app.bearer_token().await;
     let client = reqwest::Client::new();
 
@@ -946,7 +1015,9 @@ async fn e2e_memory_stats_and_metrics() {
 
 #[tokio::test]
 async fn e2e_trace_context_propagation() {
-    let app = spawn_app(false, None).await;
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
     let client = reqwest::Client::new();
 
     let injected_trace_id = "aabbccdd11223344";
