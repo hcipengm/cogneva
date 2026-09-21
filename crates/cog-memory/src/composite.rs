@@ -27,9 +27,10 @@ pub struct CompositeMemoryBackend {
     schema: Arc<dyn SchemaBackend>,
     summary: Arc<dyn SummaryBackend>,
     metrics: std::sync::RwLock<MemoryMetrics>,
-    embedding_dim: usize,
-    /// Dense embedder used when a caller stores an explicit memory. Without
-    /// one the entry gets a zero vector, which is honest but unsearchable.
+    /// Dense embedder used when a caller stores an explicit memory. Without one
+    /// the entry is stored with no vector at all, so it stays reachable through
+    /// the text path and is not indexed as a point that ties with every other
+    /// vector-less entry.
     embedder: Option<Arc<dyn cog_core::EmbeddingProvider>>,
     /// Concrete handle to the default schema backend, retained while the
     /// caller has not replaced it.  Used by [`set_persist_dir`](Self::set_persist_dir)
@@ -54,7 +55,6 @@ impl CompositeMemoryBackend {
             schema: schema.clone(),
             summary: summary.clone(),
             metrics: std::sync::RwLock::new(MemoryMetrics::default()),
-            embedding_dim,
             embedder: None,
             default_schema: Some(schema),
             default_summary: Some(summary),
@@ -62,7 +62,7 @@ impl CompositeMemoryBackend {
     }
 
     /// Attach a dense embedder. Explicit ingests then store a real embedding
-    /// instead of a zero vector.
+    /// instead of none.
     pub fn with_embedder(mut self, embedder: Arc<dyn cog_core::EmbeddingProvider>) -> Self {
         self.embedder = Some(embedder);
         self
@@ -457,9 +457,11 @@ impl MemoryBackend for CompositeMemoryBackend {
             metrics.raw_archived += 1;
         }
 
-        // A zero vector is unsearchable, so embed the text when an embedder is
-        // available. Falling back to the configured dimension keeps the vector
-        // shape consistent with the collection either way.
+        // With no embedder this host has no vector layer, so the entry carries
+        // no vector and the text path is the only way back to it. Writing a
+        // zero vector instead would put a well-formed but information-free
+        // point in the collection, where it ties at score 0.0 with every other
+        // such point and answers searches with an arbitrary ranking.
         let embedding = match self.embedder.as_ref() {
             Some(embedder) => embedder
                 .embed(vec![text.to_string()])
@@ -467,7 +469,12 @@ impl MemoryBackend for CompositeMemoryBackend {
                 .into_iter()
                 .next()
                 .ok_or_else(|| SFError::Agent("embedder returned no vector".into()))?,
-            None => vec![0.0f32; self.embedding_dim],
+            None => Vec::new(),
+        };
+        let embedding_model = if embedding.is_empty() {
+            cog_core::NO_EMBEDDING_MODEL
+        } else {
+            "explicit/v1"
         };
 
         let summary = SummaryEntry::new(
@@ -475,7 +482,7 @@ impl MemoryBackend for CompositeMemoryBackend {
             namespace,
             text,
             embedding,
-            "explicit",
+            embedding_model,
             cog_core::SourceRef::new(format!("memory://{}", id), "explicit/v1"),
         )
         .with_importance(importance);

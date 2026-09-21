@@ -389,6 +389,21 @@ pub async fn summary_search_handler(
     claims: Option<axum::Extension<cog_core::Claims>>,
     Json(req): Json<SummarySearchRequest>,
 ) -> Response {
+    // This endpoint ranks by vector similarity and has no text query to fall
+    // back to, so an empty embedding leaves it nothing to rank with. Accepting
+    // it would return the collection's first points at score 0.0, which reads
+    // like a result set that lost the query rather than like a caller error.
+    if req.embedding.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "embedding must not be empty: this endpoint ranks by vector similarity; \
+                          use /api/v1/memory/search for text queries"
+            })),
+        )
+            .into_response();
+    }
+
     let ns = effective_ns(claims_ref(&claims));
     let backend = match state.memory_backend.as_ref() {
         Some(b) => b,

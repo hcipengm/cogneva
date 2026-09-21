@@ -3,16 +3,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cog_core::{EmbeddingProvider, SFResult};
-use cog_core::{RawSource, SchemaEntry, SchemaKind, SourceRef, SummaryEntry};
+use cog_core::{RawSource, SchemaEntry, SchemaKind, SourceRef, SummaryEntry, NO_EMBEDDING_MODEL};
 
 use cog_core::MemoryExtractor;
 
 /// A rule-based extractor for testing and baseline behaviour.
 /// - Schema extraction looks for simple `@entity:Name` and
 ///   `@relation:Name->Target` patterns in text payloads.
-/// - Summary generation returns a truncated text preview and a dummy
-///   embedding (all zeros) so that the pipeline can be exercised
-///   without an LLM.
+/// - Summary generation returns a truncated text preview and no embedding,
+///   so that the pipeline can be exercised without an LLM.
 #[derive(Debug, Clone, Default)]
 pub struct RuleBasedExtractor;
 
@@ -130,14 +129,12 @@ impl MemoryExtractor for RuleBasedExtractor {
         let preview: String = text.chars().take(200).collect();
         let source_ref = SourceRef::new(format!("memory://{}", source.id), "rule_based/v1");
 
-        let embedding = vec![0.0f32; 128]; // dummy 128-dim embedding
-
         Ok(SummaryEntry::new(
             format!("summary-{}", source.id),
             &source.namespace,
             preview,
-            embedding,
-            "dummy/v1",
+            Vec::new(),
+            NO_EMBEDDING_MODEL,
             source_ref,
         )
         .with_importance(0.5))
@@ -238,7 +235,6 @@ struct SummaryExtraction {
 pub struct LlmMemoryExtractor {
     provider: Arc<dyn LlmClient>,
     options: ChatOptions,
-    embedding_dim: usize,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
 }
 
@@ -246,18 +242,16 @@ impl std::fmt::Debug for LlmMemoryExtractor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmMemoryExtractor")
             .field("options", &self.options)
-            .field("embedding_dim", &self.embedding_dim)
             .field("embedder", &self.embedder.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl LlmMemoryExtractor {
-    pub fn new(provider: Arc<dyn LlmClient>, embedding_dim: usize) -> Self {
+    pub fn new(provider: Arc<dyn LlmClient>) -> Self {
         Self {
             provider,
             options: ChatOptions::default().with_actor("memory"),
-            embedding_dim,
             embedder: None,
         }
     }
@@ -390,14 +384,24 @@ impl MemoryExtractor for LlmMemoryExtractor {
         )
         .await?;
 
-        let embedding = if let Some(ref embedder) = self.embedder {
-            let embeddings = embedder.embed(vec![extraction.text.clone()]).await?;
-            embeddings
+        // An embedder that answers with nothing is a fault, not an absence: only
+        // a missing embedder means "this host has no vector layer". Collapsing
+        // the two would hide a broken embedder behind the same silent state.
+        let embedding = match self.embedder.as_ref() {
+            Some(embedder) => embedder
+                .embed(vec![extraction.text.clone()])
+                .await?
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| vec![0.0f32; self.embedding_dim])
+                .ok_or_else(|| {
+                    cog_core::SFError::Validation("embedder returned no vector".into())
+                })?,
+            None => Vec::new(),
+        };
+        let embedding_model = if embedding.is_empty() {
+            NO_EMBEDDING_MODEL
         } else {
-            vec![0.0f32; self.embedding_dim]
+            "llm/v1"
         };
 
         let source_ref = SourceRef::new(format!("memory://{}", source.id), "llm/v1");
@@ -408,7 +412,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
             &source.namespace,
             extraction.text,
             embedding,
-            "llm/v1",
+            embedding_model,
             source_ref,
         )
         .with_importance(importance))
@@ -457,6 +461,25 @@ mod tests {
         let uris: std::collections::HashSet<&str> =
             rows.iter().map(|r| r.source_ref.raw_uri.as_str()).collect();
         assert_eq!(uris.len(), 2, "each row must keep its own source");
+    }
+
+    /// Without an embedder there is no vector to store. A run of zeros would
+    /// claim otherwise: every summary would carry a well-formed vector that
+    /// scores 0.0 against every query, and the index would answer searches with
+    /// arbitrary ties instead of with an empty set.
+    #[tokio::test]
+    async fn rule_based_summaries_carry_no_embedding() {
+        let extractor = RuleBasedExtractor::new();
+        let summary = extractor
+            .generate_summary(&raw("raw-a", "some text"))
+            .await
+            .unwrap();
+
+        assert!(
+            summary.embedding.is_empty(),
+            "a summary with no vector must store no vector, not zeros"
+        );
+        assert_eq!(summary.embedding_model, NO_EMBEDDING_MODEL);
     }
 
     /// Re-extracting the same raw must produce the same ids, so the store's

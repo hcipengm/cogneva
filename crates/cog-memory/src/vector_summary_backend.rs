@@ -178,16 +178,22 @@ impl VectorSummaryBackend {
             "text": entry.text,
             "raw_uri": entry.source_ref.raw_uri,
         });
-        let vec_id = self
-            .vector
-            .insert(
-                &self.collection,
-                vec![entry.embedding.clone()],
-                vec![meta.clone()],
-            )
-            .await
-            .ok()
-            .and_then(|mut ids| ids.pop());
+        // An entry with no embedding has nothing to index. Passing the empty
+        // run through would either be rejected for its dimension or, worse, be
+        // stored as a point that ties with every other unembedded entry.
+        let vec_id = if entry.embedding.is_empty() {
+            None
+        } else {
+            self.vector
+                .insert(
+                    &self.collection,
+                    vec![entry.embedding.clone()],
+                    vec![meta.clone()],
+                )
+                .await
+                .ok()
+                .and_then(|mut ids| ids.pop())
+        };
         if let Some(ref sparse) = entry.sparse_embedding {
             let _ = self
                 .vector
@@ -234,17 +240,22 @@ impl SummaryBackend for VectorSummaryBackend {
             "raw_uri": entry.source_ref.raw_uri,
         });
 
-        let mut returned_ids = self
-            .vector
-            .insert(
-                &self.collection,
-                vec![entry.embedding.clone()],
-                vec![meta.clone()],
-            )
-            .await?;
-        let vec_id = returned_ids
-            .pop()
-            .ok_or_else(|| SFError::Agent("vector backend returned no id on insert".into()))?;
+        let vec_id =
+            if entry.embedding.is_empty() {
+                None
+            } else {
+                let mut returned_ids = self
+                    .vector
+                    .insert(
+                        &self.collection,
+                        vec![entry.embedding.clone()],
+                        vec![meta.clone()],
+                    )
+                    .await?;
+                Some(returned_ids.pop().ok_or_else(|| {
+                    SFError::Agent("vector backend returned no id on insert".into())
+                })?)
+            };
 
         if let Some(ref sparse) = entry.sparse_embedding {
             let _ = self
@@ -255,12 +266,18 @@ impl SummaryBackend for VectorSummaryBackend {
 
         self.store.upsert(entry).await?;
 
+        // An entry that lost its embedding must not keep the point it had: the
+        // vector index is the store's derived copy, so a stale point would keep
+        // answering searches for text the store no longer holds a vector for.
         let stale_vec_id = {
             let mut vec_ids = self
                 .vec_ids
                 .write()
                 .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-            vec_ids.insert(entry.id.clone(), vec_id)
+            match vec_id {
+                Some(id) => vec_ids.insert(entry.id.clone(), id),
+                None => vec_ids.remove(&entry.id),
+            }
         };
         if let Some(prev) = stale_vec_id {
             let _ = self.vector.delete(&self.collection, &[prev]).await;
@@ -280,6 +297,12 @@ impl SummaryBackend for VectorSummaryBackend {
         top_k: usize,
         time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> SFResult<Vec<SummarySearchResult>> {
+        // No query vector means there is no similarity to rank by. Searching
+        // anyway would rank against the collection's dimension, not the query,
+        // and hand back whichever points the backend happened to order first.
+        if query_embedding.is_empty() {
+            return Ok(Vec::new());
+        }
         if !self.vector.collection_exists(&self.collection).await? {
             return Ok(Vec::new());
         }
@@ -355,6 +378,11 @@ impl SummaryBackend for VectorSummaryBackend {
         top_k: usize,
         time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> SFResult<Vec<SummarySearchResult>> {
+        // Same reason as `search_summary`: the dense half is what the collection
+        // is indexed by, and an empty one carries no similarity to rank with.
+        if query_dense.is_empty() {
+            return Ok(Vec::new());
+        }
         if !self.vector.collection_exists(&self.collection).await? {
             return Ok(Vec::new());
         }
@@ -583,5 +611,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    /// No embedder means no vector, and an entry with no vector must not reach
+    /// the index at all. Indexing a run of zeros instead would put a point in
+    /// the collection that ties at score 0.0 with every other such point, so
+    /// every search would answer with an arbitrary subset of them.
+    #[tokio::test]
+    async fn an_entry_without_an_embedding_is_stored_but_not_indexed() {
+        let store = Arc::new(DurableStubStore::new());
+        let mut no_vector = entry("s1");
+        no_vector.embedding = Vec::new();
+        no_vector.embedding_model = cog_core::NO_EMBEDDING_MODEL.to_string();
+        store.upsert(&no_vector).await.unwrap();
+
+        let backend =
+            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+                .with_store(store);
+
+        backend.load().await.unwrap();
+        backend.store_summary("default", &no_vector).await.unwrap();
+
+        let hits = backend
+            .search_summary("default", &[1.0, 0.0, 0.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "an entry with no vector must not be reachable through vector search"
+        );
+
+        let found = backend.get_summary("default", "s1").await.unwrap();
+        assert!(
+            found.is_some(),
+            "the entry itself stays stored and reachable by id"
+        );
+    }
+
+    /// The index is a derived copy of the store, so an entry that loses its
+    /// embedding must lose the point it used to have. Leaving it would let the
+    /// store answer with a vector it no longer holds.
+    #[tokio::test]
+    async fn an_entry_that_loses_its_embedding_drops_its_index_point() {
+        let store = Arc::new(DurableStubStore::new());
+        let backend =
+            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+                .with_store(store);
+
+        backend
+            .store_summary("default", &entry("s1"))
+            .await
+            .unwrap();
+        let hits = backend
+            .search_summary("default", &[1.0, 0.0, 0.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+
+        let mut stripped = entry("s1");
+        stripped.embedding = Vec::new();
+        backend.store_summary("default", &stripped).await.unwrap();
+
+        let hits = backend
+            .search_summary("default", &[1.0, 0.0, 0.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "the stale point must be deleted, not merely left unindexed"
+        );
+    }
+
+    /// A search with no query vector has no similarity to rank by, so it must
+    /// return nothing rather than the collection's first points.
+    #[tokio::test]
+    async fn a_search_without_a_query_vector_returns_nothing() {
+        let store = Arc::new(DurableStubStore::new());
+        let backend =
+            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+                .with_store(store);
+
+        backend
+            .store_summary("default", &entry("s1"))
+            .await
+            .unwrap();
+
+        let hits = backend
+            .search_summary("default", &[], 10, None)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
     }
 }

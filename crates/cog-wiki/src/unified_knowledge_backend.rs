@@ -296,12 +296,17 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             Vec::new()
         };
 
+        let embedding_model = if embedding.is_empty() {
+            cog_core::NO_EMBEDDING_MODEL
+        } else {
+            "unified_knowledge_backend"
+        };
         let summary_entry = SummaryEntry::new(
             &record_id,
             NS_EXECUTION,
             &summary_text,
             embedding,
-            String::from("unified_knowledge_backend"),
+            embedding_model,
             SourceRef::new(&record_id, "unified_knowledge_backend::archive_execution"),
         )
         .with_related_schema_ids(vec![schema_entry.id.clone()]);

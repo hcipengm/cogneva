@@ -14,6 +14,15 @@ use cog_core::{SFError, SFResult};
 use cog_core::{SourceRef, SummaryEntry};
 
 /// SQL DDL applied by [`PostgresEntryStore::init_table`].
+///
+/// The final statement is a one-time correction, not a schema change. Rows
+/// written before absence had a representation carry a run of zeros in
+/// `embedding` and a real model name in `embedding_model`, which reads as a
+/// vector that matched nothing rather than as no vector at all; the index then
+/// rebuilt from them and every search returned an arbitrary tie at score 0.0.
+/// The predicate makes it idempotent and non-destructive: it only rewrites a
+/// vector that carries no information by construction, and matches nothing
+/// once every such row has been converted.
 pub const SUMMARY_ENTRIES_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS summary_entries (
     id                TEXT        PRIMARY KEY,
@@ -31,6 +40,10 @@ CREATE TABLE IF NOT EXISTS summary_entries (
     related_schema_ids JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_summary_entries_ns_raw_uri ON summary_entries(namespace, raw_uri);
+UPDATE summary_entries
+   SET embedding = '{}', embedding_model = ''
+ WHERE cardinality(embedding) > 0
+   AND embedding = array_fill(0.0::real, ARRAY[cardinality(embedding)]);
 "#;
 
 /// PostgreSQL-backed entry store for the Summary layer.

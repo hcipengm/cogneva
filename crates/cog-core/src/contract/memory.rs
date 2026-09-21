@@ -181,12 +181,22 @@ impl SchemaEntry {
     }
 }
 
+/// `embedding_model` carried by a summary whose vector is absent.
+///
+/// An absent vector is stored as an empty `Vec`, never as a run of zeros: a
+/// zero vector is a well-formed vector that scores 0.0 against every query, so
+/// a collection full of them answers every search with an arbitrary tie at
+/// score 0.0 — a ranked-looking result set that carries no ranking. Absence has
+/// to be representable, or the store ends up asserting something it cannot know.
+pub const NO_EMBEDDING_MODEL: &str = "";
+
 /// Layer 2 — Summary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SummaryEntry {
     pub id: String,
     pub namespace: String,
     pub text: String,
+    /// Empty when no embedder could produce a vector; see [`NO_EMBEDDING_MODEL`].
     pub embedding: Vec<f32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sparse_embedding: Option<SparseEmbedding>,

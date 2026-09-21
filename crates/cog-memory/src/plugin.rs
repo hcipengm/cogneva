@@ -103,7 +103,7 @@ impl cog_core::SystemPlugin for MemoryPlugin {
 
         // ── Embedding provider ──
         // Built before the memory backend so an explicit ingest can embed with
-        // the real model instead of storing a zero vector.
+        // the real model. Absent, entries are stored with no vector at all.
         let embed_provider: Option<Arc<dyn cog_core::EmbeddingProvider>> = if load_embedding_model {
             match crate::FastEmbedProvider::try_new() {
                 Ok(p) => {
@@ -318,18 +318,16 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             .map(|h| (*h).clone());
 
         if let Some(backend) = memory_backend {
-            let extractor: Arc<dyn cog_core::MemoryExtractor> = if let Some(ref provider) =
-                llm_provider
-            {
-                let mut extractor =
-                    crate::LlmMemoryExtractor::new(provider.clone(), memory.embedding_dimension);
-                if let Some(ref embedder) = embed_provider {
-                    extractor = extractor.with_embedder(embedder.clone());
-                }
-                Arc::new(extractor)
-            } else {
-                Arc::new(crate::RuleBasedExtractor::new())
-            };
+            let extractor: Arc<dyn cog_core::MemoryExtractor> =
+                if let Some(ref provider) = llm_provider {
+                    let mut extractor = crate::LlmMemoryExtractor::new(provider.clone());
+                    if let Some(ref embedder) = embed_provider {
+                        extractor = extractor.with_embedder(embedder.clone());
+                    }
+                    Arc::new(extractor)
+                } else {
+                    Arc::new(crate::RuleBasedExtractor::new())
+                };
             let mut ingestor =
                 crate::MemoryIngestor::new(backend, extractor).with_config((&memory.ingest).into());
             if let Some(ref metrics) = metrics_backend {

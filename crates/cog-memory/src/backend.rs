@@ -526,12 +526,14 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
         store.raw.insert(id.clone(), raw.clone());
         metrics.raw_archived += 1;
 
+        // No embedder is reachable from this backend, so the entry carries no
+        // vector and is found by the text path. See `NO_EMBEDDING_MODEL`.
         let summary = SummaryEntry::new(
             &id,
             namespace,
             text,
-            vec![0.0f32; 128],
-            "explicit",
+            Vec::new(),
+            cog_core::NO_EMBEDDING_MODEL,
             cog_core::SourceRef::new(format!("memory://{}", id), "explicit/v1"),
         )
         .with_importance(importance);
