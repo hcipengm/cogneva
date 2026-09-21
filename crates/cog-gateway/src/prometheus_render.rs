@@ -1,12 +1,6 @@
 use std::collections::HashMap;
 
-use cog_core::MetricSample;
-
-/// Quantiles published for every summary. A summary's quantile set is part of
-/// its definition rather than a tunable: consumers read specific members of
-/// this set, so the set itself is the contract. p99 is the latency-regression
-/// signal the canary gate watches.
-const SUMMARY_QUANTILES: [f64; 3] = [0.5, 0.9, 0.99];
+use cog_core::{HistogramTotals, MetricSample};
 
 /// Render a set of counter samples in Prometheus text format.
 /// Samples are aggregated by their label set and summed.
@@ -34,55 +28,60 @@ pub fn render_counters(name: &str, help: &str, samples: &[MetricSample]) -> Stri
     out
 }
 
-/// Render a set of histogram samples in Prometheus text format as a summary.
-/// Produces one series per quantile plus `_count` and `_sum` per label set.
-/// A summary without its quantile series is unreadable as a latency signal:
-/// consumers can only derive a mean from `_sum`/`_count`, so a tail-latency
-/// regression disappears into it.
-pub fn render_histograms(name: &str, help: &str, samples: &[MetricSample]) -> String {
-    if samples.is_empty() {
+/// Render cumulative histogram buckets in Prometheus text format.
+///
+/// Emits `_bucket{le=...}`, `_sum` and `_count` per label set, all cumulative
+/// since recording began. Cumulative is what makes the series readable at all:
+/// quantiles and rates come from differencing two scrapes, so a bucket count
+/// that can fall — which is what a window over aging observations produces —
+/// reads downstream as negative traffic, and `histogram_quantile` has no
+/// monotonic series to interpolate.
+///
+/// The boundaries come from the backend that accumulated the counts, so it is
+/// the accumulation that decides what a bucket means, not this renderer. Two
+/// backends could in principle report different boundaries for one name; what
+/// keeps them in step is that the scheme is a pure function of the name, not a
+/// per-backend choice.
+pub fn render_histograms(name: &str, help: &str, series: &[HistogramTotals]) -> String {
+    if series.is_empty() {
         return String::new();
     }
 
-    let mut out = format!("# HELP {name} {help}\n# TYPE {name} summary\n");
+    let mut out = format!("# HELP {name} {help}\n# TYPE {name} histogram\n");
 
-    // Aggregate by label set. Observations are kept so quantiles can be
-    // computed; the caller only ever passes one scrape window, so this is
-    // bounded by the window rather than by the metric's lifetime.
-    let mut groups: HashMap<String, (HashMap<String, String>, Vec<f64>)> = HashMap::new();
-    for s in samples {
-        let key = format_labels(&s.labels);
-        groups
-            .entry(key)
-            .or_insert_with(|| (s.labels.clone(), Vec::new()))
-            .1
-            .push(s.value);
-    }
+    let mut ordered: Vec<&HistogramTotals> = series.iter().collect();
+    ordered.sort_by_key(|s| format_labels(&s.labels));
 
-    let mut keys: Vec<String> = groups.keys().cloned().collect();
-    keys.sort_unstable();
-
-    for key in keys {
-        let (labels, mut observations) = groups.remove(&key).expect("key came from groups");
-        observations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        for q in SUMMARY_QUANTILES {
-            let mut with_quantile = labels.clone();
-            with_quantile.insert("quantile".into(), format!("{q}"));
+    for totals in ordered {
+        let key = format_labels(&totals.labels);
+        for (bound, count) in totals.cumulative_buckets() {
+            let mut with_bound = totals.labels.clone();
+            with_bound.insert("le".into(), format_bound(bound));
             out.push_str(&format!(
-                "{name}{{{}}} {}\n",
-                format_labels(&with_quantile),
-                quantile(&observations, q)
+                "{name}_bucket{{{}}} {count}\n",
+                format_labels(&with_bound)
             ));
         }
-
-        let count = observations.len();
-        let sum: f64 = observations.iter().sum();
-        out.push_str(&format!("{name}_count{{{key}}} {count}\n"));
-        out.push_str(&format!("{name}_sum{{{key}}} {sum}\n"));
+        out.push_str(&format!("{name}_sum{{{key}}} {}\n", totals.sum));
+        out.push_str(&format!("{name}_count{{{key}}} {}\n", totals.count));
     }
 
     out
+}
+
+/// The `le` label's value, in the form Prometheus parses.
+///
+/// `+Inf` has to be spelled exactly that way — it is the label every histogram
+/// carries and the one `histogram_quantile` reads to know where the
+/// observations end. Rust would render the bound as `inf`, which Prometheus
+/// accepts as a float but which no query written against a standard histogram
+/// matches.
+fn format_bound(bound: f64) -> String {
+    if bound.is_infinite() {
+        "+Inf".to_string()
+    } else {
+        format!("{bound}")
+    }
 }
 
 /// Render a set of gauge samples in Prometheus text format.
@@ -140,27 +139,6 @@ pub fn render_gauges(name: &str, help: &str, samples: &[MetricSample]) -> String
     }
 
     out
-}
-
-/// Linear-interpolated quantile over ascending observations, matching the
-/// interpolation PostgreSQL's `percentile_cont` uses so in-process and
-/// in-database answers agree.
-fn quantile(sorted: &[f64], q: f64) -> f64 {
-    match sorted.len() {
-        0 => 0.0,
-        1 => sorted[0],
-        n => {
-            let position = q * (n as f64 - 1.0);
-            let lower = position.floor() as usize;
-            let upper = position.ceil() as usize;
-            if lower == upper {
-                sorted[lower]
-            } else {
-                let weight = position - lower as f64;
-                sorted[lower] * (1.0 - weight) + sorted[upper] * weight
-            }
-        }
-    }
 }
 
 /// Render raw observable metrics (D5/D8 pulls) in Prometheus text format.
@@ -277,27 +255,48 @@ mod tests {
         );
     }
 
-    /// summary 必须发布分位线：只有 `_count`/`_sum` 的 summary 读不出尾部延迟，
-    /// 金丝雀的 p99 回归判据会永远读到 0 而静默失效。
+    /// 延迟必须以**累积直方图**发布：分位数由下游用 `histogram_quantile` 从
+    /// `le` 桶插值而来，只有 `_count`/`_sum` 的序列读不出尾部延迟。
+    ///
+    /// 桶是累积的，`+Inf` 桶要写成 Prometheus 认的那个字面量：它既是
+    /// `histogram_quantile` 用来定位观测总数的桶，写错名字就等于没有它。
     #[test]
-    fn summary_publishes_p99_quantile() {
-        let samples: Vec<MetricSample> = (1..=100)
-            .map(|i| sample(i as f64, &[("endpoint", "/api/v1/tasks")]))
-            .collect();
+    fn histogram_publishes_cumulative_buckets_with_an_inf_bound() {
+        let series = vec![HistogramTotals {
+            labels: [("endpoint".to_string(), "/api/v1/tasks".to_string())]
+                .into_iter()
+                .collect(),
+            // 每条桶自带的是**桶内**观测数，不是累积数：10 + 20 + 15 + 溢出 5 = 50。
+            buckets: vec![(1.0, 10), (2.0, 20), (4.0, 15)],
+            overflow: 5,
+            count: 50,
+            sum: 123.0,
+        }];
 
-        let out = render_histograms("http_request_duration_ms", "help", &samples);
-        let p99_line = out
-            .lines()
-            .find(|l| l.starts_with("http_request_duration_ms{") && l.contains("quantile=\"0.99\""))
-            .expect("p99 quantile series");
-        let value: f64 = p99_line
-            .split_whitespace()
-            .last()
-            .and_then(|v| v.parse().ok())
-            .expect("series carries a value");
-        assert!((value - 99.01).abs() < 1e-9, "{p99_line}");
-        assert!(out.contains("http_request_duration_ms_count{endpoint=\"/api/v1/tasks\"} 100"));
-        assert!(out.contains("# TYPE http_request_duration_ms summary\n"));
+        let out = render_histograms("http_request_duration_ms", "help", &series);
+        assert!(
+            out.contains("# TYPE http_request_duration_ms histogram\n"),
+            "{out}"
+        );
+        // 桶累积：le=2 的计数含 le=1 的那 10 个。
+        assert!(
+            out.contains("_bucket{endpoint=\"/api/v1/tasks\",le=\"2\"} 30\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("_bucket{endpoint=\"/api/v1/tasks\",le=\"+Inf\"} 50\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("_sum{endpoint=\"/api/v1/tasks\"} 123\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("_count{endpoint=\"/api/v1/tasks\"} 50\n"),
+            "{out}"
+        );
+        // 只有 HELP/TYPE 头没有正文，读起来像「系统空闲」而不是「读不到」。
+        assert!(render_histograms("http_request_duration_ms", "help", &[]).is_empty());
     }
 
     /// 一个 gauge 是一个时点值，不是一段窗口的和：同一序列在回看窗里有多个样本

@@ -1018,13 +1018,6 @@ fn metric_endpoint_label(matched: Option<&MatchedPath>) -> String {
 /// Label value for requests that matched no route.
 const UNMATCHED_ENDPOINT_LABEL: &str = "unmatched";
 
-/// How far back the metrics endpoint looks for a gauge's newest sample.
-/// Gauges come from periodic passes rather than from the request path, so this
-/// has to stay comfortably above any producer's publish cadence — the memory
-/// ingest backlog is republished every ten minutes by default. A window
-/// narrower than the cadence would blank the series between passes.
-const GAUGE_LOOKBACK_SECS: i64 = 3600;
-
 /// Descriptions for the counter series. Not a list of what to serve — that
 /// comes from the backend, see [`listed_metric_names`]. What lives here is only
 /// what a name cannot say about itself.
@@ -1202,14 +1195,13 @@ async fn listed_metric_names(
 async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     let mut body = String::new();
 
-    // Only the histograms are read over a window; that is what a summary's
-    // quantiles describe. Counters are read from their cumulative totals
-    // instead, because a `_total` series has to be monotonic for
-    // `rate()`/`increase()` to mean anything, and a window sum shrinks as
-    // samples age out.
-    let end = chrono::Utc::now();
-    let start = end - chrono::Duration::seconds(300);
-
+    // Nothing here is read over a window. Each kind is read as the observation
+    // state a scrape needs: counters and histograms as their cumulations, so
+    // `rate()` and `histogram_quantile()` have a monotonic series to
+    // difference, and gauges as their newest sample per label set. How far back
+    // a reader looks is the reader's decision — Prometheus holds one in its own
+    // scrape interval — and a window chosen here would be this exporter making
+    // that decision for every reader at once.
     for name in listed_metric_names(mb, cog_core::MetricType::Counter, COUNTER_HELP).await {
         match mb.query_counter_totals(&name).await {
             Ok(samples) => {
@@ -1226,7 +1218,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     }
 
     for name in listed_metric_names(mb, cog_core::MetricType::Histogram, HISTOGRAM_HELP).await {
-        match mb.query_histogram_range(&name, start, end).await {
+        match mb.query_histogram_totals(&name).await {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_histograms(
                     &name,
@@ -1240,21 +1232,8 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
         }
     }
 
-    // Gauges get a lookback wider than the scrape window: the pass that
-    // produces them runs on a minutes-scale cadence, and a window sized for a
-    // scrape would drop the series between two passes — the reader would see
-    // "no data" where the truth is "nothing is pending". Each sample carries
-    // its own timestamp, so a value that stopped being refreshed is still
-    // readable as stale rather than as fresh.
     for name in listed_metric_names(mb, cog_core::MetricType::Gauge, GAUGE_HELP).await {
-        match mb
-            .query_gauge_range(
-                &name,
-                end - chrono::Duration::seconds(GAUGE_LOOKBACK_SECS),
-                end,
-            )
-            .await
-        {
+        match mb.query_gauge_latest(&name).await {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_gauges(
                     &name,

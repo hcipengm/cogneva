@@ -48,7 +48,7 @@ data:
             "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
             "targets": [
               {
-                "expr": "http_request_duration_ms{quantile=\"0.99\"}",
+                "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_ms_bucket[5m])))",
                 "legendFormat": "P99",
                 "datasource": {"type": "prometheus", "uid": "${datasource}"}
               }

@@ -58,6 +58,10 @@ impl MetricsBackend for NoopMetricsBackend {
         Ok(Vec::new())
     }
 
+    async fn query_gauge_latest(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+        Ok(Vec::new())
+    }
+
     async fn query_counter_range(
         &self,
         _name: &str,
@@ -77,6 +81,13 @@ impl MetricsBackend for NoopMetricsBackend {
         _start: chrono::DateTime<chrono::Utc>,
         _end: chrono::DateTime<chrono::Utc>,
     ) -> SFResult<Vec<cog_core::MetricSample>> {
+        Ok(Vec::new())
+    }
+
+    async fn query_histogram_totals(
+        &self,
+        _name: &str,
+    ) -> SFResult<Vec<cog_core::HistogramTotals>> {
         Ok(Vec::new())
     }
 

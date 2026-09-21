@@ -1717,6 +1717,24 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn query_gauge_latest(
+            &self,
+            name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            // The double keeps only (name, value) pairs, so the newest value for
+            // the name is the whole of what it can honestly report.
+            Ok(self
+                .latest(name)
+                .map(|value| {
+                    vec![cog_core::MetricSample {
+                        timestamp: Utc::now(),
+                        value,
+                        labels: HashMap::new(),
+                    }]
+                })
+                .unwrap_or_default())
+        }
+
         async fn query_counter_range(
             &self,
             _name: &str,
@@ -1739,6 +1757,13 @@ mod tests {
             _start: chrono::DateTime<Utc>,
             _end: chrono::DateTime<Utc>,
         ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_histogram_totals(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::HistogramTotals>> {
             Ok(Vec::new())
         }
 

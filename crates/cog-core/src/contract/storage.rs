@@ -28,6 +28,70 @@ pub struct MetricSample {
     pub labels: HashMap<String, String>,
 }
 
+/// Upper bounds of the buckets a histogram series is recorded into.
+///
+/// The unit has to match the observations. A seconds-scale scheme fed
+/// millisecond values puts every observation into the top bucket, and
+/// `histogram_quantile` then reports that boundary as if it were the measured
+/// latency — a plausible-looking number that is not a measurement. The `_ms`
+/// suffix is the series' own unit declaration, so it selects the scheme; a name
+/// declaring no unit keeps the seconds-scale default.
+///
+/// Lives here rather than beside either backend because the accumulated bucket
+/// counts and the exposition have to describe the same boundaries. Two copies
+/// of this scheme would drift into two answers for one metric name, and the
+/// reader has no way to tell which one a given number came from.
+pub fn histogram_bucket_bounds(name: &str) -> Vec<f64> {
+    // 1 ms doubling to ~65 s: covers a fast local call and a slow model turn
+    // without spending buckets below a millisecond. The seconds-scale default
+    // starts three decades lower, at 1 ms, for the same span.
+    let (first, count) = if name.ends_with("_ms") {
+        (1.0_f64, 17)
+    } else {
+        (0.001_f64, 15)
+    };
+    (0..count).map(|i| first * 2f64.powi(i)).collect()
+}
+
+/// The cumulative state of one histogram series, as a scrape reads it.
+///
+/// Cumulative, not per-bucket: Prometheus derives rates and quantiles by
+/// differencing successive scrapes, so a bucket whose value can decrease is
+/// unreadable. The bounds travel with the counts because a reader must be able
+/// to see which boundary each number belongs to without re-deriving the scheme.
+#[derive(Debug, Clone)]
+pub struct HistogramTotals {
+    pub labels: HashMap<String, String>,
+    /// Finite upper bound and the number of observations that fell in that
+    /// bucket alone. Ascending by bound. Kept per-bucket because that is what a
+    /// backend accumulates; [`Self::cumulative_buckets`] is what a scrape
+    /// reads.
+    pub buckets: Vec<(f64, u64)>,
+    /// Observations above the top finite bound. Reported as the `+Inf` bucket.
+    pub overflow: u64,
+    /// Every observation, including those in [`Self::overflow`].
+    pub count: u64,
+    pub sum: f64,
+}
+
+impl HistogramTotals {
+    /// Cumulative bucket counts, with the `+Inf` bucket appended.
+    ///
+    /// The `+Inf` line is not stored: by definition it equals the observation
+    /// count, and a stored copy could disagree with the count it claims to
+    /// mirror.
+    pub fn cumulative_buckets(&self) -> Vec<(f64, u64)> {
+        let mut out = Vec::with_capacity(self.buckets.len() + 1);
+        let mut running = 0u64;
+        for (bound, observations) in &self.buckets {
+            running += observations;
+            out.push((*bound, running));
+        }
+        out.push((f64::INFINITY, self.count));
+        out
+    }
+}
+
 /// Comment prefix in a Prometheus exposition body that declares how its
 /// `_total` series are meant to be read.
 ///
@@ -85,6 +149,18 @@ pub trait MetricsBackend: Send + Sync {
         end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>>;
 
+    /// The newest sample of every label set of a gauge, with no time window.
+    ///
+    /// A gauge's reader wants the current value of each series, and how far
+    /// back to look is the reader's question — Prometheus already answers it
+    /// with its own scrape interval. A window here would be the exporter
+    /// deciding it on every reader's behalf, and a window narrower than the
+    /// producer's own publish cadence blanks a series that is alive and merely
+    /// slow, showing "no data" where the truth is "nothing is pending". Each
+    /// sample carries its own timestamp, so a value that stopped being
+    /// refreshed still reads as stale rather than as fresh.
+    async fn query_gauge_latest(&self, name: &str) -> SFResult<Vec<MetricSample>>;
+
     /// Query counter samples for a metric over a time range.
     async fn query_counter_range(
         &self,
@@ -102,6 +178,21 @@ pub trait MetricsBackend: Send + Sync {
     /// meaningless. Backends that cannot answer this return an empty set
     /// rather than a windowed approximation.
     async fn query_counter_totals(&self, name: &str) -> SFResult<Vec<MetricSample>>;
+
+    /// The cumulative bucket state of every label set of a histogram.
+    ///
+    /// This is the histogram's counterpart to [`Self::query_counter_totals`],
+    /// and it exists for the same reason: a scrape has to see buckets that only
+    /// ever grow, or `rate()` and `histogram_quantile()` have nothing stable to
+    /// difference. A windowed read cannot provide that — the bucket counts
+    /// shrink as observations age out, which reads downstream as negative
+    /// traffic. Which window a reader cares about is the reader's decision, so
+    /// the backend answers with the whole accumulation and lets the query side
+    /// narrow it.
+    ///
+    /// Backends that cannot answer this return an empty set rather than a
+    /// windowed approximation.
+    async fn query_histogram_totals(&self, name: &str) -> SFResult<Vec<HistogramTotals>>;
 
     /// Query histogram samples for a metric over a time range.
     async fn query_histogram_range(

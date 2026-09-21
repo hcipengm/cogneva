@@ -4,7 +4,10 @@ use serde_json;
 use sqlx::PgPool;
 use std::collections::HashMap;
 
-use cog_core::{MetricSample, MetricType, MetricsBackend, SFError, SFResult};
+use cog_core::{
+    histogram_bucket_bounds, HistogramTotals, MetricSample, MetricType, MetricsBackend, SFError,
+    SFResult,
+};
 
 /// PostgreSQL-backed metrics backend.
 pub struct PostgresMetricsBackend {
@@ -73,12 +76,103 @@ impl PostgresMetricsBackend {
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
 
+        // Histogram buckets are accumulations for the same reason counters are,
+        // and live one row per (series, bucket) rather than as an array column:
+        // an array would have to be grown in place when an observation lands
+        // above the top bound, and Postgres array element assignment is not
+        // available in the upsert form this path needs. A row per bucket makes
+        // the increment uniform and leaves no separate overflow column to keep
+        // in step with the count it belongs to.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cog_metric_histogram_buckets (
+                name TEXT NOT NULL,
+                labels JSONB NOT NULL DEFAULT '{}',
+                bucket INTEGER NOT NULL,
+                observations BIGINT NOT NULL,
+                PRIMARY KEY (name, labels, bucket)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        // The sum of observations has no bucket to live in — it is not a count
+        // and cannot be recovered from the bucket counts without the raw values.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cog_metric_histogram_sums (
+                name TEXT NOT NULL,
+                labels JSONB NOT NULL DEFAULT '{}',
+                sum DOUBLE PRECISION NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (name, labels)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
         // The table starts empty on purpose. Seeding it from the counter samples
         // already logged would restore every series ever recorded, and the ones
         // keyed on an object id never recur — the exposition would carry
         // thousands of series that stopped moving long ago. A counter that
         // restarts at zero is an event Prometheus reads natively; resurrecting
         // dead series is not.
+        Ok(())
+    }
+
+    /// Add one observation to the bucket it falls in.
+    ///
+    /// A value above the top finite bound lands in bucket index `bounds.len()`,
+    /// which is the `+Inf` bucket — the same index the read side treats as the
+    /// overflow, so the two ends agree without a separate overflow column.
+    async fn increment_histogram_bucket(
+        &self,
+        name: &str,
+        value: f64,
+        labels: &HashMap<String, String>,
+    ) -> SFResult<()> {
+        let bounds = histogram_bucket_bounds(name);
+        let bucket = bounds
+            .iter()
+            .position(|bound| value <= *bound)
+            .unwrap_or(bounds.len()) as i32;
+        let labels_json = serde_json::to_value(labels).map_err(SFError::Serialization)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO cog_metric_histogram_buckets (name, labels, bucket, observations)
+            VALUES ($1, $2, $3, 1)
+            ON CONFLICT (name, labels, bucket)
+            DO UPDATE SET observations = cog_metric_histogram_buckets.observations + 1
+            "#,
+        )
+        .bind(name)
+        .bind(labels_json.clone())
+        .bind(bucket)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO cog_metric_histogram_sums (name, labels, sum)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (name, labels)
+            DO UPDATE SET sum = cog_metric_histogram_sums.sum + EXCLUDED.sum,
+                          updated_at = NOW()
+            "#,
+        )
+        .bind(name)
+        .bind(labels_json)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
         Ok(())
     }
 
@@ -202,7 +296,39 @@ impl MetricsBackend for PostgresMetricsBackend {
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
-        self.record("histogram", name, value, labels).await
+        self.record("histogram", name, value, labels.clone())
+            .await?;
+        self.increment_histogram_bucket(name, value, &labels).await
+    }
+
+    async fn query_gauge_latest(&self, name: &str) -> SFResult<Vec<MetricSample>> {
+        // `DISTINCT ON` with a matching leading sort key gives the newest row
+        // per label set in one pass; ordering timestamps descending inside the
+        // group is what makes the first row the current value.
+        let rows: Vec<(f64, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT ON (labels) value, labels, timestamp
+            FROM cog_metrics_samples
+            WHERE metric_type = 'gauge' AND name = $1
+            ORDER BY labels, timestamp DESC
+            "#,
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        let mut samples = Vec::with_capacity(rows.len());
+        for (value, labels_json, timestamp) in rows {
+            let labels: HashMap<String, String> =
+                serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
+            samples.push(MetricSample {
+                timestamp,
+                value,
+                labels,
+            });
+        }
+        Ok(samples)
     }
 
     async fn query_gauge_range(
@@ -247,6 +373,79 @@ impl MetricsBackend for PostgresMetricsBackend {
             });
         }
         Ok(samples)
+    }
+
+    async fn query_histogram_totals(&self, name: &str) -> SFResult<Vec<HistogramTotals>> {
+        let bounds = histogram_bucket_bounds(name);
+
+        let bucket_rows: Vec<(serde_json::Value, i32, i64)> = sqlx::query_as(
+            r#"
+            SELECT labels, bucket, observations
+            FROM cog_metric_histogram_buckets
+            WHERE name = $1
+            "#,
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        let sum_rows: Vec<(serde_json::Value, f64)> = sqlx::query_as(
+            r#"
+            SELECT labels, sum
+            FROM cog_metric_histogram_sums
+            WHERE name = $1
+            "#,
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        // Keyed on the serialized labels rather than on a `HashMap` of them:
+        // the JSONB text is what the primary key compares, so grouping on it
+        // keeps two rows in one series exactly when the database considers them
+        // one series.
+        let mut series: HashMap<String, HistogramTotals> = HashMap::new();
+
+        for (labels_json, sum) in sum_rows {
+            let labels: HashMap<String, String> =
+                serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
+            let key = serde_json::to_string(&labels).map_err(SFError::Serialization)?;
+            series.insert(
+                key,
+                HistogramTotals {
+                    labels,
+                    buckets: bounds.iter().map(|b| (*b, 0)).collect(),
+                    overflow: 0,
+                    count: 0,
+                    sum,
+                },
+            );
+        }
+
+        for (labels_json, bucket, observations) in bucket_rows {
+            let labels: HashMap<String, String> =
+                serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
+            let key = serde_json::to_string(&labels).map_err(SFError::Serialization)?;
+            let observations = observations.max(0) as u64;
+            let totals = series.entry(key).or_insert_with(|| HistogramTotals {
+                labels,
+                buckets: bounds.iter().map(|b| (*b, 0)).collect(),
+                overflow: 0,
+                count: 0,
+                sum: 0.0,
+            });
+
+            if let Some(slot) = totals.buckets.get_mut(bucket.max(0) as usize) {
+                slot.1 = observations;
+            } else {
+                totals.overflow = observations;
+            }
+            totals.count += observations;
+        }
+
+        Ok(series.into_values().collect())
     }
 
     async fn query_histogram_range(

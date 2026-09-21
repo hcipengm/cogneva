@@ -887,7 +887,12 @@ impl GitOpsPuller {
         // 成功抓取并保留整段看护期，样本量随时间增长，不必靠单次间隔凑够。
         // 连同被观测的副本集合一起记住：副本被换掉时那两点就不再是一段连续
         // 历史，必须重新起一个参考点。
-        let mut canary_reference: Option<(String, CanarySignals, CounterSemantics)> = None;
+        let mut canary_reference: Option<(
+            String,
+            CanarySignals,
+            CounterSemantics,
+            HistogramSnapshot,
+        )> = None;
 
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -898,20 +903,24 @@ impl GitOpsPuller {
             let Ok((_, new_ips)) = self.canary_pod_groups(pre).await else {
                 continue;
             };
-            let Some((current, semantics)) = self.scrape_group(&new_ips).await else {
+            let Some((current, semantics, current_hist)) = self.scrape_group(&new_ips).await else {
                 // 新副本还没起来（拉镜像中）或抓不到：没有候选的证据就不判。
                 continue;
             };
             let observed = new_ips.join(",");
-            let reference = match &canary_reference {
-                Some((seen, signals, s)) if *seen == observed && *s == semantics => *signals,
-                // 首次观测，或观测对象/语义变过：以这一读为新参考点。
+            let (reference, reference_hist) = match &canary_reference {
+                Some((seen, signals, s, hist)) if *seen == observed && *s == semantics => {
+                    (*signals, hist.clone())
+                }
+                // 首次观测，或观测对象/语义变过：以这一读为新参考点。两点相同即
+                // 增量为零，p99 读作「还没有证据」，不会编出一个数。
                 _ => {
-                    canary_reference = Some((observed, current, semantics));
-                    current
+                    canary_reference = Some((observed, current, semantics, current_hist.clone()));
+                    (current, current_hist.clone())
                 }
             };
-            self.compare_metrics(base, reference, &current, semantics)?;
+            let candidate_p99 = p99_between(&reference_hist, &current_hist).unwrap_or(0.0);
+            self.compare_metrics(base, reference, candidate_p99, &current, semantics)?;
         }
         Ok(())
     }
@@ -932,16 +941,18 @@ impl GitOpsPuller {
     ) -> Option<CanaryBaseline> {
         let (old_ips, _) = self.canary_pod_groups(pre_rollout).await.ok()?;
         // 旧副本一个都抓不到就当没有基线：拿候选自己当基线等于自比自。
-        let (first, semantics) = self.scrape_group(&old_ips).await?;
+        let (first, semantics, first_hist) = self.scrape_group(&old_ips).await?;
         tokio::time::sleep(Duration::from_secs(sample_secs.max(1))).await;
-        let (second, second_semantics) = match self.scrape_group(&old_ips).await {
+        let (second, second_semantics, second_hist) = match self.scrape_group(&old_ips).await {
             Some(v) => v,
             // 第二次抓不到就退回单点：窗口求和语义下单点仍给出速率，累积语义下
-            // 由 error_rate 自己判「没有证据」，不会伪造一个数。
-            None => (first, semantics),
+            // 由 error_rate 自己判「没有证据」，不会伪造一个数。直方图沿用第一份，
+            // 两点相同即增量为零，p99 读作「没有证据」。
+            None => (first, semantics, first_hist.clone()),
         };
         // 两次之间语义变过，相减就不是一段连续历史：不给速率，闸门照 skipped 走。
-        let rate = (second_semantics == semantics).then(|| {
+        let same_semantics = second_semantics == semantics;
+        let rate = same_semantics.then(|| {
             error_rate(
                 first,
                 second,
@@ -949,10 +960,17 @@ impl GitOpsPuller {
                 self.config.canary_min_requests_for_rate,
             )
         });
+        // p99 同样取旧版本自己的两点之差：累积桶描述的是进程一生，旧副本的一生
+        // 比候选长得多，直接比累积量等于拿两个不同的时间尺度在比。
+        let p99_ms = if same_semantics {
+            p99_between(&first_hist, &second_hist).unwrap_or(0.0)
+        } else {
+            0.0
+        };
         Some(CanaryBaseline {
             semantics,
             rate: rate.flatten(),
-            p99_ms: second.p99_ms,
+            p99_ms,
         })
     }
 
@@ -1022,11 +1040,12 @@ impl GitOpsPuller {
         Ok(())
     }
 
-    /// 抓取一个 metrics 地址（可选）。返回正文里的原始计数与它声明的语义。
+    /// 抓取一个 metrics 地址（可选）。返回正文里的原始计数、它声明的语义，
+    /// 以及延迟直方图的累积桶。
     async fn scrape_metrics_at(
         &self,
         url: &str,
-    ) -> SFResult<Option<(CanarySignals, CounterSemantics)>> {
+    ) -> SFResult<Option<(CanarySignals, CounterSemantics, HistogramSnapshot)>> {
         let body = self
             .run("curl", &["-sf", "--max-time", "10", url], None, 15)
             .await?;
@@ -1041,7 +1060,10 @@ impl GitOpsPuller {
     ///
     /// 组内任一副本抓不到就返回 `None`——半个组的读数不是这一版的读数，
     /// 拿它下结论等于拿不完整的证据判版本好坏。
-    async fn scrape_group(&self, ips: &[String]) -> Option<(CanarySignals, CounterSemantics)> {
+    async fn scrape_group(
+        &self,
+        ips: &[String],
+    ) -> Option<(CanarySignals, CounterSemantics, HistogramSnapshot)> {
         let base = self.metrics_url.as_deref()?;
         if ips.is_empty() {
             return None;
@@ -1049,12 +1071,12 @@ impl GitOpsPuller {
         let mut total = CanarySignals {
             errors: 0.0,
             requests: 0.0,
-            p99_ms: 0.0,
         };
+        let mut histograms = HistogramSnapshot::default();
         let mut semantics: Option<CounterSemantics> = None;
         for ip in ips {
             let url = metrics_url_for_pod(base, ip)?;
-            let Ok(Some((signals, s))) = self.scrape_metrics_at(&url).await else {
+            let Ok(Some((signals, s, hist))) = self.scrape_metrics_at(&url).await else {
                 warn!(pod_ip = %ip, "canary metrics scrape failed; skipping this group");
                 return None;
             };
@@ -1071,9 +1093,9 @@ impl GitOpsPuller {
             }
             total.errors += signals.errors;
             total.requests += signals.requests;
-            total.p99_ms = total.p99_ms.max(signals.p99_ms);
+            histograms.merge(&hist);
         }
-        semantics.map(|s| (total, s))
+        semantics.map(|s| (total, s, histograms))
     }
 
     /// 看护范围内本部署的副本，返回 (名字, podIP)。还没有 IP 的副本
@@ -1145,31 +1167,35 @@ impl GitOpsPuller {
     /// `reference`→`current` 是候选自己的），不能拿一侧的参考点去减另一侧的
     /// 计数——那是两个进程各自的计数器，相减没有意义。
     ///
-    /// p99 与计数器语义无关，任何一轮都先看。错误率两边必须用同一种语义解读：
-    /// 语义在换版那一轮会从窗口求和切成累积，跨语义相除得到的不是任何一版的
-    /// 错误率。这种情况下显式记日志并跳过错误率这一项，而不是硬算出一个数
-    /// 把好版本回滚掉。
+    /// p99 与计数器语义无关，任何一轮都先看。两侧的 p99 各自由本侧的两个抓取点
+    /// 相减得出，调用方算好传进来（`candidate_p99`）——累积桶的差值只有对着
+    /// 同一侧的两个点才有意义，而参考点与当前读数才是同侧的两个计数点。
+    ///
+    /// 错误率两边必须用同一种语义解读：语义在换版那一轮会从窗口求和切成累积，
+    /// 跨语义相除得到的不是任何一版的错误率。这种情况下显式记日志并跳过错误率
+    /// 这一项，而不是硬算出一个数把好版本回滚掉。
     fn compare_metrics(
         &self,
         baseline: &CanaryBaseline,
         reference: CanarySignals,
+        candidate_p99: f64,
         current: &CanarySignals,
         semantics: CounterSemantics,
     ) -> SFResult<()> {
-        // 分位数只在抓取窗口内有请求时才存在：窗口内没请求，正文里就没有这条
-        // 序列，读出来是 0。用 0 当基线去比会把任何一次观测都判成回归，所以两种
+        // 分位数只在这段两点窗口内到达过请求时才存在：窗口内没请求，两次抓取的
+        // 桶差为零，读出来是 0。用 0 当基线去比会把任何一次观测都判成回归，所以两种
         // 缺证据都跳过——但必须各自记日志。这条闸门是回滚好版本的依据，静默跳过
         // 会让"没测到"和"测了没回归"在日志上长得一样，一条长期无效的判据就此消失
         // 得无声无息。
         let base_p99 = baseline.p99_ms;
-        let p99 = current.p99_ms;
+        let p99 = candidate_p99;
         if base_p99 <= 0.0 {
             warn!(
-                "canary p99 gate skipped: baseline recorded no observation inside the scrape window"
+                "canary p99 gate skipped: baseline recorded no observation between its two scrapes"
             );
         } else if p99 <= 0.0 {
             warn!(
-                "canary p99 gate skipped: candidate recorded no observation inside the scrape window"
+                "canary p99 gate skipped: candidate recorded no observation between its two scrapes"
             );
         } else if p99 > base_p99 * self.config.canary_p99_multiplier {
             return Err(SFError::Agent(format!(
@@ -1316,13 +1342,22 @@ fn metrics_url_for_pod(base: &str, ip: &str) -> Option<String> {
     Some(format!("{scheme}://{host}{port}{path}"))
 }
 
-/// 一次抓取到的原始计数。错误率不在这里算：怎么算取决于正文声明的计数器
-/// 语义，而那只有拿到两次抓取的对比方才知道。
+/// 一次抓取到的原始计数。错误率与 p99 都不在这里算：怎么算取决于正文声明的
+/// 计数器语义与两次抓取的对比，那只有拿到第二个观测点方才知道。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CanarySignals {
     errors: f64,
     requests: f64,
-    p99_ms: f64,
+}
+
+/// 一次抓取到的延迟直方图累积桶，按序列（标签集去掉 `le`）分组。
+///
+/// 桶是累积量，单点只说明「进程启动以来」；要给出一段窗口内的分位数，必须留
+/// 两个点做差。所以抓取的产物里要带上这一份原始桶，而不只是一个算好的数。
+#[derive(Debug, Clone, Default, PartialEq)]
+struct HistogramSnapshot {
+    /// 标签集（去掉 `le`）→ 每个上界及其累积计数，按上界升序。
+    series: std::collections::BTreeMap<String, Vec<(f64, u64)>>,
 }
 
 /// 正文声明的计数器取值含义。
@@ -1345,7 +1380,7 @@ struct CanaryBaseline {
     semantics: CounterSemantics,
     /// 旧版本自身的错误率；正文证据不足以算出它时是 `None`。
     rate: Option<f64>,
-    /// 旧版本的 p99 延迟（毫秒）。
+    /// 旧版本自身两点之间的 p99 延迟（毫秒）；没有观测证据时是 0。
     p99_ms: f64,
 }
 
@@ -1383,13 +1418,17 @@ fn error_rate(
     }
 }
 
-/// 从 Prometheus 文本面读出原始计数与它声明的计数器语义。
+/// 延迟直方图的桶序列名。网关把请求延迟以毫秒记在 `http_request_duration_ms`
+/// 下，正文里从不存在以秒记的同名序列。
+const LATENCY_BUCKET_SERIES: &str = "http_request_duration_ms_bucket{";
+
+/// 从 Prometheus 文本面读出原始计数、声明的计数器语义，以及延迟直方图的累积桶。
 /// 纯函数：输入是抓取到的正文，输出只由正文决定，便于对着真实输出形态做断言。
-fn parse_prometheus_signals(body: &str) -> (CanarySignals, CounterSemantics) {
+fn parse_prometheus_signals(body: &str) -> (CanarySignals, CounterSemantics, HistogramSnapshot) {
     let mut error_total = 0.0f64;
     let mut request_total = 0.0f64;
-    let mut p99 = 0.0f64;
     let mut semantics = CounterSemantics::Windowed;
+    let mut histograms = HistogramSnapshot::default();
     for line in body.lines() {
         // 探针与抓取器的序列不进判据：它们不可能失败，留在分母里会让一个只影响
         // 业务端点的回归读不出来。过滤必须落在读侧——抓到的正文可能来自还在跑
@@ -1410,24 +1449,99 @@ fn parse_prometheus_signals(body: &str) -> (CanarySignals, CounterSemantics) {
             if line.contains("status=\"5") {
                 error_total += value;
             }
-        } else if line.starts_with("http_request_duration_ms") && line.contains("quantile=\"0.99\"")
-        {
-            // 网关把请求延迟以毫秒记在 `http_request_duration_ms` 下；正文里
-            // 从不存在以秒记的同名序列，按那个名字读会让 p99 恒为 0，
-            // 延迟回归闸门永远不响。
-            // 每个端点各有一条 p99，取最差的那条：闸门要盯的是最先越界的端点，
-            // 「最后一行赢」会让结论取决于正文行序。
-            p99 = p99.max(parse_series_value(line));
+        } else if line.starts_with(LATENCY_BUCKET_SERIES) {
+            histograms.push(line);
         }
     }
     (
         CanarySignals {
             errors: error_total,
             requests: request_total,
-            p99_ms: p99,
         },
         semantics,
+        histograms,
     )
+}
+
+impl HistogramSnapshot {
+    /// 记下一条 `_bucket` 行，按它所属序列的标签集分组。
+    fn push(&mut self, line: &str) {
+        let (Some(open), Some(close)) = (line.find('{'), line.rfind('}')) else {
+            return;
+        };
+        let labels = &line[open + 1..close];
+        let Some((bound, count)) = label_value(labels, "le")
+            .and_then(parse_bound)
+            .zip(Some(parse_series_value(line)))
+        else {
+            return;
+        };
+        let count = if count < 0.0 { 0 } else { count as u64 };
+        let series = self.series.entry(without_le_label(labels)).or_default();
+        // 正文不一定按上界升序；分位数依赖顺序，读取时先排好。
+        series.push((bound, count));
+        series.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    /// 并入同一版本另一个副本的桶。同一版本的副本是同一个进程模型，桶界相同，
+    /// 逐序列逐上界相加即得这一版的整体画像；合成只发生在同版本副本之间，
+    /// 新旧版本合成正是判据要分开比的东西。
+    fn merge(&mut self, other: &HistogramSnapshot) {
+        for (key, buckets) in &other.series {
+            let series = self.series.entry(key.clone()).or_default();
+            for (bound, count) in buckets {
+                match series.iter_mut().find(|(b, _)| b == bound) {
+                    Some(entry) => entry.1 += count,
+                    None => series.push((*bound, *count)),
+                }
+            }
+            series.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+}
+
+/// 一次抓取里某个标签值。只在标签边界上匹配，避免 `slot="1"` 被当成 `le`。
+fn label_value<'a>(labels: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=\"");
+    let mut search = 0usize;
+    while let Some(found) = labels[search..].find(&needle) {
+        let start = search + found;
+        let value_start = start + needle.len();
+        let value_end = value_start + labels[value_start..].find('"')?;
+        if start == 0 || labels.as_bytes()[start - 1] == b',' {
+            return Some(&labels[value_start..value_end]);
+        }
+        search = value_end + 1;
+    }
+    None
+}
+
+/// 标签集去掉 `le`：`le` 是被读的那一维，不属于标识一条序列的东西。
+fn without_le_label(labels: &str) -> String {
+    let Some(start) = labels.find("le=\"") else {
+        return labels.to_string();
+    };
+    let Some(offset) = labels[start + 4..].find('"') else {
+        return labels.to_string();
+    };
+    let end = start + 4 + offset + 1;
+    let mut out = labels[..start].trim_end_matches(',').to_string();
+    let tail = labels[end..].trim_start_matches(',');
+    if !tail.is_empty() {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(tail);
+    }
+    out
+}
+
+/// 桶上界。Prometheus 把无穷桶写成 `+Inf`，`f64` 认的是 `inf`，两者要搭上。
+fn parse_bound(raw: &str) -> Option<f64> {
+    match raw {
+        "+Inf" | "Inf" | "inf" | "+inf" => Some(f64::INFINITY),
+        other => other.parse().ok(),
+    }
 }
 
 fn parse_series_value(line: &str) -> f64 {
@@ -1435,6 +1549,88 @@ fn parse_series_value(line: &str) -> f64 {
         .last()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.0)
+}
+
+/// 两次抓取之间到达的观测的 99 分位，取最差的一条序列。
+///
+/// 累积桶描述的是进程一生，而金丝雀两侧的「一生」长短差得很远：旧副本从上一次
+/// 滚动起就一直活着，候选才起来几分钟。直接比两者的累积量，等于拿旧组一整周的
+/// 长尾去比候选的几分钟，偏向「别动」。两点做差才能让两侧落在同一个窗口里。
+///
+/// 取最差的那条序列：闸门要盯的是最先越界的那一条，「最后一行赢」会让结论随
+/// 正文行序变化。
+fn p99_between(earlier: &HistogramSnapshot, later: &HistogramSnapshot) -> Option<f64> {
+    let mut worst: Option<f64> = None;
+    for (key, buckets) in &later.series {
+        let delta = match earlier.series.get(key) {
+            Some(previous) => match delta_buckets(previous, buckets) {
+                Some(delta) => delta,
+                // 序列在两点之间重启过，差值不是一个计数，这条不提供证据。
+                None => continue,
+            },
+            // 这段窗口之前没有观测点，整份累积量都落在窗口内。
+            None => buckets.clone(),
+        };
+        let Some(q) = quantile_from_buckets(&delta, 0.99) else {
+            continue;
+        };
+        worst = Some(worst.map_or(q, |w: f64| w.max(q)));
+    }
+    worst
+}
+
+/// 同一条序列两个累积读数之间的增量。
+///
+/// 计数下降只可能是进程被换掉、序列从头开始，这时的差值不是观测数；返回 `None`
+/// 让调用方跳过这条，而不是把负增量夹成 0 —— 夹零会破坏桶的单调性，分位数插值
+/// 依赖的正是它。
+fn delta_buckets(earlier: &[(f64, u64)], later: &[(f64, u64)]) -> Option<Vec<(f64, u64)>> {
+    let mut out = Vec::with_capacity(later.len());
+    for (bound, count) in later {
+        let previous = earlier
+            .iter()
+            .find(|(b, _)| b == bound)
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        if *count < previous {
+            return None;
+        }
+        out.push((*bound, count - previous));
+    }
+    Some(out)
+}
+
+/// 一条序列累积桶上的分位数，与 Prometheus 的 `histogram_quantile` 同法插值。
+///
+/// 与仪表盘用同一个算法，是为了让人在面板上看到的数与闸门据以判定的数是同一个
+/// ——两个答案对同一个问题，迟早会有一个是错的。
+fn quantile_from_buckets(buckets: &[(f64, u64)], q: f64) -> Option<f64> {
+    let (top_bound, total) = *buckets.last()?;
+    // 没有 `+Inf` 桶就不是一组能读的直方图；没有观测就没有可排的名次。
+    if !top_bound.is_infinite() || total == 0 {
+        return None;
+    }
+    let rank = q * total as f64;
+
+    let mut lower_bound = 0.0f64;
+    let mut lower_count = 0u64;
+    for (bound, count) in buckets {
+        if (*count as f64) >= rank {
+            if !bound.is_finite() {
+                // 名次落在 `+Inf` 桶里，只能说答案不低于最后一个有限上界。
+                return Some(lower_bound);
+            }
+            let in_bucket = count - lower_count;
+            if in_bucket == 0 {
+                return Some(*bound);
+            }
+            let fraction = (rank - lower_count as f64) / in_bucket as f64;
+            return Some(lower_bound + (*bound - lower_bound) * fraction);
+        }
+        lower_bound = *bound;
+        lower_count = *count;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1447,27 +1643,29 @@ mod tests {
     }
 
     /// 正文取自网关 `/metrics` 的真实输出形态：延迟以毫秒记在
-    /// `http_request_duration_ms` 下，没有以秒命名的同名序列。
+    /// `http_request_duration_ms` 下，且是累积桶而非预先算好的分位线。
     #[test]
     fn parses_error_rate_and_p99_from_gateway_body() {
-        let body = "\
+        let first = "\
+# TYPE http_requests_total counter
+http_requests_total{endpoint=\"/api/v1/tasks\",method=\"POST\",status=\"201\"} 0
+";
+        let second = "\
 # TYPE http_requests_total counter
 http_requests_total{endpoint=\"/api/v1/tasks\",method=\"POST\",status=\"201\"} 90
 http_requests_total{endpoint=\"/api/v1/tasks\",method=\"POST\",status=\"500\"} 10
-# TYPE http_request_duration_ms summary
-http_request_duration_ms{endpoint=\"/api/v1/tasks\",method=\"POST\",quantile=\"0.5\"} 12.5
-http_request_duration_ms{endpoint=\"/api/v1/tasks\",method=\"POST\",quantile=\"0.99\"} 840.25
-http_request_duration_ms_count{endpoint=\"/api/v1/tasks\",method=\"POST\"} 100
+# TYPE http_request_duration_ms histogram
+http_request_duration_ms_bucket{endpoint=\"/api/v1/tasks\",method=\"POST\",le=\"100\"} 99
+http_request_duration_ms_bucket{endpoint=\"/api/v1/tasks\",method=\"POST\",le=\"+Inf\"} 100
 http_request_duration_ms_sum{endpoint=\"/api/v1/tasks\",method=\"POST\"} 12345.6
+http_request_duration_ms_count{endpoint=\"/api/v1/tasks\",method=\"POST\"} 100
 ";
-        let (signals, _) = parse_prometheus_signals(body);
+        let (_, _, earlier) = parse_prometheus_signals(first);
+        let (signals, _, later) = parse_prometheus_signals(second);
         let rate = windowed_rate(signals).expect("有请求就有速率");
         assert!((rate - 0.1).abs() < 1e-9, "error_rate={rate}");
-        assert!(
-            (signals.p99_ms - 840.25).abs() < 1e-9,
-            "p99={}",
-            signals.p99_ms
-        );
+        // 99 分位落在 le=100 这条桶的上界上：这一段的观测都 ≤100ms。
+        assert_eq!(p99_between(&earlier, &later), Some(100.0));
     }
 
     /// 分母是全部请求：5xx 既算错误也算请求。把它剔出分母会让错误率虚高，
@@ -1478,14 +1676,14 @@ http_request_duration_ms_sum{endpoint=\"/api/v1/tasks\",method=\"POST\"} 12345.6
 http_requests_total{endpoint=\"/a\",method=\"GET\",status=\"200\"} 100
 http_requests_total{endpoint=\"/a\",method=\"GET\",status=\"503\"} 100
 ";
-        let (signals, _) = parse_prometheus_signals(body);
+        let (signals, _, _) = parse_prometheus_signals(body);
         let rate = windowed_rate(signals).expect("有请求就有速率");
         assert!((rate - 0.5).abs() < 1e-9, "error_rate={rate}");
     }
 
-    /// 探针与抓取器的序列不进分母。它们的量级压过业务流量，留在里面会把错误率
-    /// 稀释到接近 0，闸门 `err > base_err * multiplier && err > 0.01` 就永远不成立
-    /// ——判据结构性失效，而不是判成通过。
+    /// 探针与抓取器的序列不进分母，也不进 p99。它们的量级压过业务流量，留在
+    /// 分母里会把错误率稀释到接近 0，闸门 `err > base_err * multiplier && err > 0.01`
+    /// 就永远不成立——判据结构性失效，而不是判成通过。
     #[test]
     fn infra_series_stay_out_of_the_error_rate() {
         let body = "\
@@ -1494,43 +1692,87 @@ http_requests_total{endpoint=\"/health/ready\",method=\"GET\",status=\"200\"} 10
 http_requests_total{endpoint=\"/metrics\",method=\"GET\",status=\"200\"} 100000
 http_requests_total{endpoint=\"/api/v1/tasks\",method=\"POST\",status=\"201\"} 90
 http_requests_total{endpoint=\"/api/v1/tasks\",method=\"POST\",status=\"500\"} 10
-http_request_duration_ms{endpoint=\"/health/live\",method=\"GET\",quantile=\"0.99\"} 1
-http_request_duration_ms{endpoint=\"/api/v1/tasks\",method=\"POST\",quantile=\"0.99\"} 840.25
+http_request_duration_ms_bucket{endpoint=\"/health/live\",method=\"GET\",le=\"1\"} 100
+http_request_duration_ms_bucket{endpoint=\"/health/live\",method=\"GET\",le=\"+Inf\"} 100
+http_request_duration_ms_bucket{endpoint=\"/api/v1/tasks\",method=\"POST\",le=\"100\"} 99
+http_request_duration_ms_bucket{endpoint=\"/api/v1/tasks\",method=\"POST\",le=\"+Inf\"} 100
 ";
-        let (signals, _) = parse_prometheus_signals(body);
+        let (signals, _, hist) = parse_prometheus_signals(body);
         let rate = windowed_rate(signals).expect("有请求就有速率");
         assert!((rate - 0.1).abs() < 1e-9, "error_rate={rate}");
-        assert!(
-            (signals.p99_ms - 840.25).abs() < 1e-9,
-            "p99={}",
-            signals.p99_ms
+        // 探针的 1ms 系列被滤掉，剩下的最差一条是业务端点的 100ms。
+        assert_eq!(
+            p99_between(&HistogramSnapshot::default(), &hist),
+            Some(100.0)
         );
     }
 
-    /// 多端点各有一条 p99 时取最差的那条，结论不随正文行序变化。
+    /// 多序列各有一条 p99 时取最差的那条，结论不随正文行序变化。
     #[test]
     fn p99_is_the_worst_endpoint_regardless_of_line_order() {
         let body = "\
-http_request_duration_ms{endpoint=\"/a\",quantile=\"0.99\"} 50
-http_request_duration_ms{endpoint=\"/b\",quantile=\"0.99\"} 900
-http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
+http_request_duration_ms_bucket{endpoint=\"/c\",le=\"+Inf\"} 100
+http_request_duration_ms_bucket{endpoint=\"/b\",le=\"900\"} 99
+http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
+http_request_duration_ms_bucket{endpoint=\"/b\",le=\"+Inf\"} 100
+http_request_duration_ms_bucket{endpoint=\"/a\",le=\"1\"} 99
+http_request_duration_ms_bucket{endpoint=\"/c\",le=\"120\"} 99
 ";
-        let (signals, _) = parse_prometheus_signals(body);
-        assert!(
-            (signals.p99_ms - 900.0).abs() < 1e-9,
-            "p99={}",
-            signals.p99_ms
+        let (_, _, hist) = parse_prometheus_signals(body);
+        assert_eq!(
+            p99_between(&HistogramSnapshot::default(), &hist),
+            Some(900.0)
         );
     }
 
-    /// p99 缺失或窗口内没有请求时读作 0：没有证据就不判回归，
-    /// 但也不能把「读不到」当成「延迟很好」写进任何结论。
+    /// 两点之间没有新观测就没有 p99：累积量相同即增量为零，读作「没有证据」。
+    /// 拿一份整段进程历史的累积量当窗口读数，会让金丝雀整轮看不到任何变化。
     #[test]
-    fn missing_p99_reads_zero() {
+    fn unchanged_snapshots_carry_no_p99_evidence() {
+        let body = "\
+http_request_duration_ms_bucket{endpoint=\"/a\",le=\"100\"} 99
+http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
+";
+        let (_, _, hist) = parse_prometheus_signals(body);
+        assert_eq!(p99_between(&hist, &hist), None);
+    }
+
+    /// p99 缺失时读作没有证据，而不是读作 0——把「读不到」当成「延迟很好」
+    /// 写进结论，闸门就会对一次真正的回归放行。
+    #[test]
+    fn missing_p99_reads_no_evidence() {
         let body = "# TYPE http_requests_total counter\nhttp_requests_total{status=\"200\"} 5\n";
-        let (signals, _) = parse_prometheus_signals(body);
+        let (signals, _, hist) = parse_prometheus_signals(body);
         assert_eq!(windowed_rate(signals), Some(0.0));
-        assert_eq!(signals.p99_ms, 0.0);
+        assert_eq!(p99_between(&hist, &HistogramSnapshot::default()), None);
+    }
+
+    /// 序列在两个观测点之间重启过（计数下降）时，差值不是这一段窗口的观测数：
+    /// 跳过这条序列，不把负增量夹成 0 —— 夹零会破坏桶的单调性，而分位数插值
+    /// 依赖的正是它。
+    #[test]
+    fn a_restarted_series_yields_no_delta() {
+        let earlier = vec![(100.0, 10u64), (f64::INFINITY, 10u64)];
+        let later = vec![(100.0, 3u64), (f64::INFINITY, 3u64)];
+        assert_eq!(delta_buckets(&earlier, &later), None);
+    }
+
+    /// 分位数在桶内插值，与 Prometheus 的 `histogram_quantile` 同法：名次落在
+    /// 相邻两条桶界之间时，按落在桶内的比例线性取值。
+    #[test]
+    fn quantile_interpolates_within_the_bucket() {
+        let buckets = vec![(256.0, 90u64), (512.0, 100u64), (f64::INFINITY, 100u64)];
+        // 名次 99 落在 (256, 512] 这条桶内，桶里 10 个观测，第 9 个：0.9。
+        let q = quantile_from_buckets(&buckets, 0.99).expect("有 +Inf 桶就能插值");
+        assert!((q - (256.0 + (512.0 - 256.0) * 0.9)).abs() < 1e-9, "q={q}");
+    }
+
+    /// 名次落在 `+Inf` 桶里时只能说「不低于最后一个有限上界」，不能编出一个
+    /// 具体的毫秒数。
+    #[test]
+    fn quantile_landing_in_the_overflow_bucket_reports_the_last_finite_bound() {
+        let buckets = vec![(100.0, 50u64), (f64::INFINITY, 100u64)];
+        assert_eq!(quantile_from_buckets(&buckets, 0.99), Some(100.0));
     }
 
     #[test]
@@ -1713,12 +1955,8 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
         )
     }
 
-    fn signals(errors: f64, requests: f64, p99_ms: f64) -> CanarySignals {
-        CanarySignals {
-            errors,
-            requests,
-            p99_ms,
-        }
+    fn signals(errors: f64, requests: f64) -> CanarySignals {
+        CanarySignals { errors, requests }
     }
 
     fn baseline(semantics: CounterSemantics, rate: Option<f64>, p99_ms: f64) -> CanaryBaseline {
@@ -1839,22 +2077,23 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
         let puller = test_puller();
         let base = baseline(CounterSemantics::Windowed, Some(0.02), 100.0);
         let windowed = CounterSemantics::Windowed;
-        let read = signals(2.0, 100.0, 120.0);
+        // 窗口语义下错误率只看当前读数，参考点不参与计算。
+        let read = signals(2.0, 100.0);
         // 基线错误率 2%，现 2.5%（1.25x，未超 1.5x）→ 通过。
         assert!(puller
-            .compare_metrics(&base, read, &signals(2.5, 100.0, 120.0), windowed)
+            .compare_metrics(&base, read, 120.0, &signals(2.5, 100.0), windowed)
             .is_ok());
         // 现 4%（2x）→ 回归。
         assert!(puller
-            .compare_metrics(&base, read, &signals(4.0, 100.0, 120.0), windowed)
+            .compare_metrics(&base, read, 120.0, &signals(4.0, 100.0), windowed)
             .is_err());
         // p99 100ms → 140ms（1.4x > 1.3x）→ 回归。
         assert!(puller
-            .compare_metrics(&base, read, &signals(2.0, 100.0, 140.0), windowed)
+            .compare_metrics(&base, read, 140.0, &signals(2.0, 100.0), windowed)
             .is_err());
         // p99 125ms（1.25x）→ 通过。
         assert!(puller
-            .compare_metrics(&base, read, &signals(2.0, 100.0, 125.0), windowed)
+            .compare_metrics(&base, read, 125.0, &signals(2.0, 100.0), windowed)
             .is_ok());
     }
 
@@ -1865,14 +2104,14 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
     fn cumulative_semantics_judges_the_delta_not_the_lifetime_ratio() {
         let puller = test_puller();
         let base = baseline(CounterSemantics::Cumulative, Some(0.01), 100.0);
-        let at = signals(50.0, 1_000.0, 100.0);
+        let at = signals(50.0, 1_000.0);
         let cumulative = CounterSemantics::Cumulative;
         assert!(puller
-            .compare_metrics(&base, at, &signals(50.0, 1_200.0, 100.0), cumulative)
+            .compare_metrics(&base, at, 100.0, &signals(50.0, 1_200.0), cumulative)
             .is_ok());
         // 增量里真的变坏了：200 个新请求错 20 个（10%）。
         assert!(puller
-            .compare_metrics(&base, at, &signals(70.0, 1_200.0, 100.0), cumulative)
+            .compare_metrics(&base, at, 100.0, &signals(70.0, 1_200.0), cumulative)
             .is_err());
     }
 
@@ -1883,16 +2122,16 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
         let puller = test_puller();
         let base = baseline(CounterSemantics::Cumulative, Some(0.01), 100.0);
         // 新副本刚起来：计数器归零。
-        let at = signals(0.0, 0.0, 100.0);
+        let at = signals(0.0, 0.0);
         let cumulative = CounterSemantics::Cumulative;
         // 500 个请求错 1 个（0.2%），好于基线 → 通过。
         assert!(puller
-            .compare_metrics(&base, at, &signals(1.0, 500.0, 100.0), cumulative)
+            .compare_metrics(&base, at, 100.0, &signals(1.0, 500.0), cumulative)
             .is_ok());
         // 同一段窗口内错 20 个（4%）→ 回归。基线取的是旧版本的累积量，
         // 若误用它当参考点，这里会算出负增量而静默放过。
         assert!(puller
-            .compare_metrics(&base, at, &signals(20.0, 500.0, 100.0), cumulative)
+            .compare_metrics(&base, at, 100.0, &signals(20.0, 500.0), cumulative)
             .is_err());
     }
 
@@ -1903,15 +2142,15 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
     fn cumulative_semantics_refuses_to_judge_on_too_few_new_requests() {
         let puller = test_puller();
         let base = baseline(CounterSemantics::Cumulative, Some(0.01), 100.0);
-        let at = signals(10.0, 1_000.0, 100.0);
+        let at = signals(10.0, 1_000.0);
         let cumulative = CounterSemantics::Cumulative;
         assert!(puller
-            .compare_metrics(&base, at, &signals(11.0, 1_020.0, 100.0), cumulative)
+            .compare_metrics(&base, at, 100.0, &signals(11.0, 1_020.0), cumulative)
             .is_ok());
         // 增量够大且确实变坏，同一个基线就该判回归——上面那次通过的原因
         // 只能是样本不足，不能是判据根本不看错误率。
         assert!(puller
-            .compare_metrics(&base, at, &signals(60.0, 1_200.0, 100.0), cumulative)
+            .compare_metrics(&base, at, 100.0, &signals(60.0, 1_200.0), cumulative)
             .is_err());
     }
 
@@ -1924,8 +2163,9 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
         assert!(puller
             .compare_metrics(
                 &base,
-                signals(10.0, 1_000.0, 100.0),
-                &signals(50.0, 1_200.0, 100.0),
+                signals(10.0, 1_000.0),
+                100.0,
+                &signals(50.0, 1_200.0),
                 CounterSemantics::Cumulative
             )
             .is_ok());
@@ -1937,12 +2177,13 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
     fn semantics_change_mid_canary_skips_the_error_rate_gate() {
         let puller = test_puller();
         let base = baseline(CounterSemantics::Windowed, Some(0.02), 100.0);
-        let at = signals(2.0, 100.0, 100.0);
+        let at = signals(2.0, 100.0);
         assert!(puller
             .compare_metrics(
                 &base,
                 at,
-                &signals(9.0, 100.0, 100.0),
+                100.0,
+                &signals(9.0, 100.0),
                 CounterSemantics::Cumulative
             )
             .is_ok());
@@ -1950,7 +2191,8 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
             .compare_metrics(
                 &base,
                 at,
-                &signals(2.0, 100.0, 140.0),
+                140.0,
+                &signals(2.0, 100.0),
                 CounterSemantics::Cumulative
             )
             .is_err());
@@ -1963,12 +2205,16 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
         let body = "# TYPE http_requests_total counter\n\
                     http_requests_total{status=\"200\"} 40\n\
                     http_requests_total{status=\"500\"} 10\n\
-                    http_request_duration_ms{quantile=\"0.99\"} 88\n";
-        let (signals, semantics) = parse_prometheus_signals(body);
+                    http_request_duration_ms_bucket{le=\"88\"} 99\n\
+                    http_request_duration_ms_bucket{le=\"+Inf\"} 100\n";
+        let (signals, semantics, hist) = parse_prometheus_signals(body);
         assert_eq!(semantics, CounterSemantics::Windowed);
         assert_eq!(signals.requests, 50.0);
         assert_eq!(signals.errors, 10.0);
-        assert_eq!(signals.p99_ms, 88.0);
+        assert_eq!(
+            p99_between(&HistogramSnapshot::default(), &hist),
+            Some(88.0)
+        );
         // 5xx 也在分母里：排除它会系统性放大错误率。
         assert_eq!(windowed_rate(signals), Some(0.2));
     }
@@ -1981,13 +2227,13 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
             "{}\nhttp_requests_total{{status=\"200\"}} 40\nhttp_requests_total{{status=\"500\"}} 10\n",
             cog_core::cumulative_semantics_declaration()
         );
-        let (_, semantics) = parse_prometheus_signals(&body);
+        let (_, semantics, _) = parse_prometheus_signals(&body);
         assert_eq!(semantics, CounterSemantics::Cumulative);
         // 增量下限用请求增量比对，不受错误数影响。
         assert_eq!(
             error_rate(
-                signals(5.0, 100.0, 0.0),
-                signals(15.0, 300.0, 0.0),
+                signals(5.0, 100.0),
+                signals(15.0, 300.0),
                 CounterSemantics::Cumulative,
                 100.0
             ),
@@ -1996,8 +2242,8 @@ http_request_duration_ms{endpoint=\"/c\",quantile=\"0.99\"} 120
         // 计数器下降说明自称的语义与取值不符，不能拿负增量算速率。
         assert_eq!(
             error_rate(
-                signals(5.0, 300.0, 0.0),
-                signals(6.0, 100.0, 0.0),
+                signals(5.0, 300.0),
+                signals(6.0, 100.0),
                 CounterSemantics::Cumulative,
                 10.0
             ),

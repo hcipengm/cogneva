@@ -72,6 +72,19 @@ impl Default for MockMetricsBackend {
     }
 }
 
+/// Group key for a label set, derived from label names so that two samples
+/// carrying the same labels never land in different groups just because their
+/// maps happen to iterate differently.
+fn label_key(labels: &HashMap<String, String>) -> String {
+    let mut pairs: Vec<(&String, &String)> = labels.iter().collect();
+    pairs.sort_unstable();
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[async_trait]
 impl MetricsBackend for MockMetricsBackend {
     async fn record_gauge(
@@ -128,6 +141,31 @@ impl MetricsBackend for MockMetricsBackend {
         Ok(samples)
     }
 
+    async fn query_gauge_latest(&self, name: &str) -> SFResult<Vec<MetricSample>> {
+        let records = self.records.lock().unwrap();
+        let mut latest: HashMap<String, MetricSample> = HashMap::new();
+        for r in records
+            .iter()
+            .filter(|r| r.kind == MetricKind::Gauge && r.name == name)
+        {
+            let key = label_key(&r.labels);
+            match latest.get(&key) {
+                Some(existing) if existing.timestamp >= r.timestamp => {}
+                _ => {
+                    latest.insert(
+                        key,
+                        MetricSample {
+                            timestamp: r.timestamp,
+                            value: r.value,
+                            labels: r.labels.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(latest.into_values().collect())
+    }
+
     async fn query_counter_range(
         &self,
         name: &str,
@@ -160,13 +198,7 @@ impl MetricsBackend for MockMetricsBackend {
             .iter()
             .filter(|r| r.kind == MetricKind::Counter && r.name == name)
         {
-            let mut pairs: Vec<(&String, &String)> = r.labels.iter().collect();
-            pairs.sort_unstable();
-            let key = pairs
-                .into_iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let key = label_key(&r.labels);
             match totals.get_mut(&key) {
                 Some(existing) => existing.value += r.value,
                 None => {
@@ -182,6 +214,34 @@ impl MetricsBackend for MockMetricsBackend {
             }
         }
         Ok(totals.into_values().collect())
+    }
+
+    async fn query_histogram_totals(&self, name: &str) -> SFResult<Vec<cog_core::HistogramTotals>> {
+        let bounds = cog_core::histogram_bucket_bounds(name);
+        let records = self.records.lock().unwrap();
+        let mut series: HashMap<String, cog_core::HistogramTotals> = HashMap::new();
+        for r in records
+            .iter()
+            .filter(|r| r.kind == MetricKind::Histogram && r.name == name)
+        {
+            let key = label_key(&r.labels);
+            let totals = series
+                .entry(key)
+                .or_insert_with(|| cog_core::HistogramTotals {
+                    labels: r.labels.clone(),
+                    buckets: bounds.iter().map(|b| (*b, 0)).collect(),
+                    overflow: 0,
+                    count: 0,
+                    sum: 0.0,
+                });
+            match bounds.iter().position(|bound| r.value <= *bound) {
+                Some(index) => totals.buckets[index].1 += 1,
+                None => totals.overflow += 1,
+            }
+            totals.count += 1;
+            totals.sum += r.value;
+        }
+        Ok(series.into_values().collect())
     }
 
     async fn query_histogram_range(

@@ -1,12 +1,29 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cog_core::{MetricSample, MetricsBackend, SFError, SFResult};
+use cog_core::{HistogramTotals, MetricSample, MetricsBackend, SFError, SFResult};
 use prometheus::core::Collector;
 use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Registry,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Turn a registry's cumulative bucket counts into the per-bucket counts
+/// [`HistogramTotals`] carries.
+///
+/// The registry reports each bucket as everything at or below its bound,
+/// because that is what an exposition needs. The shared type stores buckets as
+/// they are accumulated, one observation in exactly one bucket, so the
+/// cumulative series has to be differenced back.
+fn differential_buckets(cumulative: Vec<(f64, u64)>) -> Vec<(f64, u64)> {
+    let mut out = Vec::with_capacity(cumulative.len());
+    let mut previous = 0u64;
+    for (bound, count) in cumulative {
+        out.push((bound, count.saturating_sub(previous)));
+        previous = count;
+    }
+    out
+}
 
 /// Prometheus metrics exporter.
 /// Wraps a `prometheus::Registry` and provides encoding for the
@@ -159,20 +176,10 @@ impl PrometheusMetricsBackend {
     }
 
     fn histogram_buckets(name: &str) -> Vec<f64> {
-        // The unit has to match the observations. A seconds-scale scheme fed
-        // millisecond values puts every observation in the top bucket, and
-        // `histogram_quantile` then reports that bucket's boundary as if it
-        // were the measured latency — a plausible-looking number that is not a
-        // measurement. The `_ms` suffix is the series' own unit declaration, so
-        // it selects the scheme; a name that declares no unit keeps the
-        // seconds-scale default.
-        if name.ends_with("_ms") {
-            // 1 ms doubling up to ~65 s: covers a fast local call and a slow
-            // model turn without spending buckets below a millisecond.
-            prometheus::exponential_buckets(1.0, 2.0, 17).unwrap_or_default()
-        } else {
-            prometheus::exponential_buckets(0.001, 2.0, 15).unwrap_or_default()
-        }
+        // The scheme is shared with the backends that accumulate bucket counts
+        // by hand, so that a metric name describes the same boundaries
+        // whichever backend is behind it.
+        cog_core::histogram_bucket_bounds(name)
     }
 
     fn get_or_create_histogram(
@@ -302,6 +309,89 @@ impl MetricsBackend for PrometheusMetricsBackend {
         _end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>> {
         Ok(Vec::new())
+    }
+
+    async fn query_gauge_latest(&self, name: &str) -> SFResult<Vec<MetricSample>> {
+        // A registry gauge holds one value per label set, already the newest by
+        // construction: `set` replaces rather than appends.
+        let full = self.full_name(name);
+        let store = self
+            .gauges
+            .lock()
+            .map_err(|_| SFError::Agent("gauge lock poisoned".into()))?;
+        let mut samples = Vec::new();
+        for vec in store.values() {
+            for family in vec.collect() {
+                if family.get_name() != full {
+                    continue;
+                }
+                for metric in family.get_metric() {
+                    let labels: HashMap<String, String> = metric
+                        .get_label()
+                        .iter()
+                        .map(|l| (l.get_name().to_string(), l.get_value().to_string()))
+                        .collect();
+                    samples.push(MetricSample {
+                        timestamp: Utc::now(),
+                        value: metric.get_gauge().get_value(),
+                        labels,
+                    });
+                }
+            }
+        }
+        Ok(samples)
+    }
+
+    /// The registry's histograms already carry cumulative buckets, so they are
+    /// readable directly rather than re-derived from the observations.
+    async fn query_histogram_totals(&self, name: &str) -> SFResult<Vec<HistogramTotals>> {
+        let full = self.full_name(name);
+        let store = self
+            .histograms
+            .lock()
+            .map_err(|_| SFError::Agent("histogram lock poisoned".into()))?;
+        let mut totals = Vec::new();
+        for vec in store.values() {
+            for family in vec.collect() {
+                if family.get_name() != full {
+                    continue;
+                }
+                for metric in family.get_metric() {
+                    let labels: HashMap<String, String> = metric
+                        .get_label()
+                        .iter()
+                        .map(|l| (l.get_name().to_string(), l.get_value().to_string()))
+                        .collect();
+
+                    // The boundaries come from the registry rather than from
+                    // the shared scheme: a histogram created before the scheme
+                    // last changed still reports the buckets it was actually
+                    // observed into.
+                    let histogram = metric.get_histogram();
+                    let mut cumulative: Vec<(f64, u64)> = Vec::new();
+                    let mut overflow = 0u64;
+                    for bucket in histogram.get_bucket() {
+                        let bound = bucket.get_upper_bound();
+                        if bound.is_finite() {
+                            cumulative.push((bound, bucket.get_cumulative_count()));
+                        } else {
+                            overflow = bucket.get_cumulative_count();
+                        }
+                    }
+                    cumulative
+                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+                    totals.push(HistogramTotals {
+                        labels,
+                        buckets: differential_buckets(cumulative),
+                        overflow,
+                        count: histogram.get_sample_count(),
+                        sum: histogram.get_sample_sum(),
+                    });
+                }
+            }
+        }
+        Ok(totals)
     }
 
     async fn list_metric_names(&self, metric_type: cog_core::MetricType) -> SFResult<Vec<String>> {

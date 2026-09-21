@@ -5,10 +5,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use cog_core::{
-    AgentEvent, AgentState, ClusterOverview, ContextBoard, Event, EventFilter, LogEntry,
-    MetricSample, MetricType, MetricsBackend, ObservabilityGateway, RawLogIndex, RawLogIndexEntry,
-    RawLogIndexStore, RawLogQuery, SFError, SFResult, SquadState, SquadStatus, StateBackend,
-    TaskCheckpoint, TaskMetrics, UpstreamFailure, VectorBackend, VectorSearchResult,
+    AgentEvent, AgentState, ClusterOverview, ContextBoard, Event, EventFilter, HistogramTotals,
+    LogEntry, MetricSample, MetricType, MetricsBackend, ObservabilityGateway, RawLogIndex,
+    RawLogIndexEntry, RawLogIndexStore, RawLogQuery, SFError, SFResult, SquadState, SquadStatus,
+    StateBackend, TaskCheckpoint, TaskMetrics, UpstreamFailure, VectorBackend, VectorSearchResult,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -787,6 +787,21 @@ impl MemoryMetricsBackend {
             .join(",")
     }
 
+    /// The newest sample of each label set, in no particular order.
+    fn latest_per_label_set(samples: &[MetricSample]) -> Vec<MetricSample> {
+        let mut latest: HashMap<String, MetricSample> = HashMap::new();
+        for sample in samples {
+            let key = Self::label_key(&sample.labels);
+            match latest.get(&key) {
+                Some(existing) if existing.timestamp >= sample.timestamp => {}
+                _ => {
+                    latest.insert(key, sample.clone());
+                }
+            }
+        }
+        latest.into_values().collect()
+    }
+
     fn query_range(
         store: &HashMap<String, Vec<MetricSample>>,
         name: &str,
@@ -905,6 +920,45 @@ impl MetricsBackend for MemoryMetricsBackend {
             .read()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         Ok(Self::query_range(&store, name, start, end))
+    }
+
+    async fn query_gauge_latest(&self, name: &str) -> SFResult<Vec<MetricSample>> {
+        let store = self
+            .gauges
+            .read()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        Ok(Self::latest_per_label_set(
+            store.get(name).map(Vec::as_slice).unwrap_or_default(),
+        ))
+    }
+
+    async fn query_histogram_totals(&self, name: &str) -> SFResult<Vec<HistogramTotals>> {
+        let store = self
+            .histograms
+            .read()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        let bounds = cog_core::histogram_bucket_bounds(name);
+
+        let mut series: HashMap<String, HistogramTotals> = HashMap::new();
+        for sample in store.get(name).map(Vec::as_slice).unwrap_or_default() {
+            let key = Self::label_key(&sample.labels);
+            let totals = series.entry(key).or_insert_with(|| HistogramTotals {
+                labels: sample.labels.clone(),
+                buckets: bounds.iter().map(|b| (*b, 0)).collect(),
+                overflow: 0,
+                count: 0,
+                sum: 0.0,
+            });
+
+            match bounds.iter().position(|bound| sample.value <= *bound) {
+                Some(index) => totals.buckets[index].1 += 1,
+                None => totals.overflow += 1,
+            }
+            totals.count += 1;
+            totals.sum += sample.value;
+        }
+
+        Ok(series.into_values().collect())
     }
 
     async fn list_metric_names(&self, metric_type: MetricType) -> SFResult<Vec<String>> {
