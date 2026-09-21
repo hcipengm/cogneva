@@ -527,6 +527,23 @@ impl cog_core::MetaLearning for MetaLearningEngine {
 /// when the best of them does not lead the runner-up by more than `margin` —
 /// a margin that never suppressed anything would make the parameter nothing
 /// but a number in a file.
+///
+/// When two arms both clear the floor and neither leads by the margin, the
+/// rule does not abstain: it spends the decision on the arm with the fewest
+/// observations. Abstaining hands the choice back to the caller's default, and
+/// the default is what produced the counts in the first place — so a mode that
+/// the evidence favours but that has only been tried a handful of times can
+/// never be tried enough to become the leader, and the comparison stays
+/// undecided forever, whatever the threshold. Feeding the thin arm is what
+/// lets the margin test reach a verdict at all, and it costs nothing while a
+/// leader is decisive: an arm that leads by the margin is still the one chosen.
+/// A tie on observations means no arm is thin, so there is nothing to feed and
+/// the answer stays `None`.
+///
+/// The arm fed is the thinnest, not the best-rated among the thin ones: the
+/// floor above already says a rate computed from too few trials is not worth
+/// acting on, and trusting that rate here would contradict it at exactly the
+/// moment it is least reliable.
 pub fn select_decision(
     counts: &HashMap<String, (u32, u32)>,
     min_samples: u32,
@@ -546,13 +563,35 @@ pub fn select_decision(
             .then_with(|| a.0.cmp(b.0))
     });
 
+    // Nothing has cleared the floor, so there is no comparison to explore
+    // from — the caller's default stands.
     let (best, best_rate, _) = eligible.first()?;
-    if let Some((_, runner_up_rate, _)) = eligible.get(1) {
-        if *best_rate <= runner_up_rate + margin {
-            return None;
-        }
+    let leads = match eligible.get(1) {
+        Some((_, runner_up_rate, _)) => *best_rate > runner_up_rate + margin,
+        // A sole eligible arm has no competitor to be measured against.
+        None => true,
+    };
+    if leads {
+        return Some(best.to_string());
     }
-    Some(best.to_string())
+    least_observed(counts)
+}
+
+/// The decision observed the fewest times, or `None` when the counts tie.
+///
+/// Ties are broken by name so the choice never depends on hash order, the same
+/// way the margin comparison does not.
+fn least_observed(counts: &HashMap<String, (u32, u32)>) -> Option<String> {
+    let min = counts.values().map(|(attempts, _)| *attempts).min()?;
+    let max = counts.values().map(|(attempts, _)| *attempts).max()?;
+    if min == max {
+        return None;
+    }
+    counts
+        .iter()
+        .filter(|(_, (attempts, _))| *attempts == min)
+        .map(|(decision, _)| decision.clone())
+        .min()
 }
 
 /// Replay the recommendation path over a set of observed decision groups.
@@ -626,6 +665,44 @@ mod tests {
         let c = counts(&[("pipeline", 1, 1)]);
         assert_eq!(select_decision(&c, 3, 0.15), None);
         assert_eq!(select_decision(&HashMap::new(), 3, 0.15), None);
+    }
+
+    /// 两个模式都没跑出差距时，规则必须去喂样本少的那一个。若在这里弃权，
+    /// 选择权落回调用方的默认模式——而计数正是默认模式跑出来的，于是"证据
+    /// 偏向但很少被试"的模式永远攒不够样本翻盘，比较永远停在未决。
+    #[test]
+    fn an_undecided_rule_explores_the_least_observed_arm() {
+        // 实测分布：默认模式被跑了 91 次、挑战者只有 3 次，两者都是 0 成功。
+        let c = counts(&[("pipeline", 91, 0), ("roundtable", 3, 0)]);
+        assert_eq!(
+            select_decision(&c, 3, 0.15).as_deref(),
+            Some("roundtable"),
+            "the arm starving for trials is the one the decision must feed"
+        );
+    }
+
+    /// 探索是有界的：两边样本齐平就没有"薄"的一边可喂，答案回到弃权，默认
+    /// 模式接管。否则这条规则会一直摆动而不是收敛。
+    #[test]
+    fn exploration_stops_once_the_arms_are_equally_observed() {
+        let c = counts(&[("pipeline", 91, 0), ("roundtable", 91, 0)]);
+        assert_eq!(select_decision(&c, 3, 0.15), None);
+    }
+
+    /// 探索只在未决时发生：一边已经按 margin 领先，就不该为了凑样本把决策
+    /// 让给明显更差的那一边。
+    #[test]
+    fn a_clear_leader_is_never_traded_away_for_samples() {
+        let c = counts(&[("pipeline", 91, 50), ("roundtable", 3, 0)]);
+        assert_eq!(select_decision(&c, 3, 0.15).as_deref(), Some("pipeline"));
+    }
+
+    /// 探索的取值也不依赖哈希序：样本数最少的若不止一个，按名字定，像
+    /// margin 比较那样给出唯一答案。
+    #[test]
+    fn exploration_picks_deterministically_among_equally_thin_arms() {
+        let c = counts(&[("pipeline", 20, 0), ("hybrid", 4, 0), ("roundtable", 4, 0)]);
+        assert_eq!(select_decision(&c, 3, 0.15).as_deref(), Some("hybrid"));
     }
 
     #[test]
