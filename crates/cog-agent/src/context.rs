@@ -19,6 +19,12 @@ impl ContextWindow {
     }
 
     pub fn add_message(&mut self, message: Message) {
+        // 工具结果是上下文里唯一由进程外决定大小的内容：一条超大结果可以
+        // 独自超过整个窗口，而裁剪只能整条丢弃——它恰恰是最新的那条，丢不掉，
+        // 于是窗口预算失效，之后每一轮都带着它，同一份字节还会被当作记忆
+        // 原文再发给抽取器两次。边界卡在「进入上下文」这一步，且只作用于
+        // 工具结果：user 是任务输入、assistant 是模型自己的话，都不该在这里被改写。
+        let message = bound_tool_result(message, self.max_tokens);
         let tokens = estimate_tokens(&message.content());
         self.current_tokens += tokens;
         self.messages.push(message);
@@ -40,6 +46,9 @@ impl ContextWindow {
         self.messages.clear();
         self.current_tokens = 0;
         for msg in messages {
+            // 快照可能是旧版本写下的：进入上下文的这一步在恢复路径上也要重做，
+            // 否则一份更早的、没有这条界的进程存下的快照会把巨块带回来。
+            let msg = bound_tool_result(msg, self.max_tokens);
             let tokens = estimate_tokens(&msg.content());
             self.current_tokens += tokens;
             self.messages.push(msg);
@@ -113,6 +122,69 @@ impl ContextWindow {
                 .sum();
         }
     }
+}
+
+/// 单条工具结果允许占用的窗口份额的分母：窗口的一半。
+///
+/// 留一半给任务输入、system 与后续轮次，超出的部分不是"内容多"而是
+/// 这条结果根本挤不进这段对话。与窗口同源而不是另立一个绝对值：
+/// 窗口配大了，允许的单条结果跟着变大，两者不会各自漂移。
+const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
+
+/// 估算口径里一个 token 折算的字符数，与 `estimate_tokens` 的英文分支同源。
+const CHARS_PER_ESTIMATED_TOKEN: usize = 4;
+
+/// 把超出窗口份额的单条工具结果截断到预算内，其余消息原样返回。
+///
+/// 界按字符数而不是估算 token 数：估算把任何不含空白的整块都算成一个词
+/// （4 token），于是一条没有空格的巨块——二进制倾倒、单行大 JSON——
+/// 在窗口账面上永远是 4 token，预算根本不会触发。按字符数卡，这条例外
+/// 就不存在了。
+fn bound_tool_result(message: Message, max_tokens: usize) -> Message {
+    let Message::ToolResult {
+        tool_call_id,
+        tool_name,
+        content,
+        is_error,
+        timestamp,
+    } = &message
+    else {
+        return message;
+    };
+    let budget_chars = (max_tokens / TOOL_RESULT_WINDOW_SHARE_DIVISOR)
+        .max(1)
+        .saturating_mul(CHARS_PER_ESTIMATED_TOKEN);
+    let text: String = content.iter().filter_map(|b| b.as_text()).collect();
+    if text.chars().count() <= budget_chars {
+        return message;
+    }
+    Message::ToolResult {
+        tool_call_id: tool_call_id.clone(),
+        tool_name: tool_name.clone(),
+        content: vec![cog_core::ContentBlock::text(truncate_to_chars(
+            &text,
+            budget_chars,
+        ))],
+        is_error: *is_error,
+        timestamp: *timestamp,
+    }
+}
+
+/// 从头部保留到预算为止，并在尾部说明被丢掉了多少。
+///
+/// 静默的截断读起来像完整输出：读者必须能从文本本身看出"还有没看到的"，
+/// 否则一份被砍过的日志会被当成跑完了的日志。标记里带上原长度，是为了
+/// 让重跑命令时有据可依（收窄输出，而不是原样再来一次）。
+pub fn truncate_to_chars(text: &str, budget_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= budget_chars {
+        return text.to_string();
+    }
+    let kept: String = chars[..budget_chars].iter().collect();
+    format!(
+        "{kept}\n[tool output truncated: showing {budget_chars} of {} characters]",
+        chars.len()
+    )
 }
 
 /// 简化的 token 估算。
@@ -286,5 +358,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn one_oversized_tool_result_cannot_outgrow_the_window() {
+        let mut ctx = ContextWindow::new(400);
+        ctx.add_message(Message::user("原始任务输入"));
+        ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+            "call_bin",
+            "run_command",
+            serde_json::json!({"command": "cat /opt/cogneva/cogneva"}),
+        )]));
+        // 一条命令把二进制倾倒进上下文：由进程外决定大小，比整个窗口还大，
+        // 而且整块没有空白——估算把它记成 4 token，窗口因此看不见它。
+        ctx.add_message(Message::tool_result_text(
+            "call_bin",
+            "run_command",
+            "ELF\u{2}\u{1}\u{0}".repeat(2000),
+        ));
+
+        let kept = ctx
+            .messages()
+            .last()
+            .expect("结果还在，只是被截短")
+            .content();
+        assert!(
+            kept.contains("tool output truncated"),
+            "被砍过的输出必须自己说自己被砍过，否则读起来像跑完了的日志"
+        );
+        assert!(
+            kept.starts_with(&"ELF\u{2}\u{1}\u{0}".repeat(100)),
+            "保留的是头部内容"
+        );
+        assert!(
+            kept.chars().count() < 1000,
+            "8000 字符的结果被压到窗口份额换算出的字符预算 400/2*4 = 800 附近: {}",
+            kept.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_tool_result_that_fits_is_untouched() {
+        let mut ctx = ContextWindow::new(400);
+        ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+            "call_ok",
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+        )]));
+        let text = "编译通过，3 个测试用例全部通过";
+        ctx.add_message(Message::tool_result_text("call_ok", "run_command", text));
+        assert_eq!(ctx.messages().last().unwrap().content(), text);
+    }
+
+    #[test]
+    fn the_task_input_is_never_truncated_by_the_tool_result_bound() {
+        // 首条 user 是任务输入，由调用方决定内容；这里的界只针对外部输出。
+        let mut ctx = ContextWindow::new(200);
+        let input = "目标 ".repeat(200);
+        ctx.add_message(Message::user(input.clone()));
+        assert_eq!(ctx.messages()[0].content(), input);
     }
 }
