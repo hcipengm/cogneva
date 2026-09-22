@@ -28,6 +28,54 @@ pub fn stream_pending_observable() -> Arc<StreamPendingObservable> {
         .clone()
 }
 
+/// Measure one consumed stream's pending state on its own cadence, in its own
+/// task, alongside whatever sweeper reads the same stream.
+///
+/// Sweeping and measuring want the same fact but answer different questions:
+/// the sweeper acts on its own rhythm, the measurement reports on its own, and
+/// sharing one tick makes "is anything stuck?" depend on "is the sweeper
+/// getting through?" — which is exactly the reading that must not be lost. A
+/// sweep that blocks its loop (permits exhausted, or a whole reclaimed message
+/// awaited in place) freezes the series, and a frozen series is
+/// indistinguishable at the scrape from a stream with nothing pending: the
+/// stall hides itself precisely when it is largest. Both callers had this
+/// shape, so the cadence lives here once.
+///
+/// Measured once before the loop, so the series exists before the first tick.
+/// The interval's first tick is immediately ready and is consumed, or it would
+/// measure a second time right after that first measurement; one measurement
+/// per tick after.
+pub fn spawn_pending_observer(
+    backend: Arc<dyn cog_core::MessageBackend>,
+    stream: String,
+    group: String,
+    claim_idle_ms: u64,
+    interval: std::time::Duration,
+    shutdown: cog_core::ShutdownSignal,
+) -> tokio::task::JoinHandle<()> {
+    let observer = stream_pending_observable();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            observer
+                .measure(
+                    &*backend,
+                    &stream,
+                    &group,
+                    claim_idle_ms,
+                    interval.as_secs(),
+                )
+                .await;
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => break,
+                _ = ticker.tick() => {}
+            }
+        }
+    })
+}
+
 /// Entries pending right now on one consumed stream.
 pub const STREAM_PENDING_COUNT_METRIC: &str = "cogneva_stream_pending_count";
 /// Entries pending longer than the reclaim threshold — work a reclaim pass

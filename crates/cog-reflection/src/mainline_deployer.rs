@@ -4005,27 +4005,76 @@ mod tests {
         assert_eq!(rev12("short"), "short");
     }
 
-    /// 最终镜像阶段每条 COPY 的落点（去引号去方括号，shell 与 JSON 两种写法
-    /// 都能读）。只看最后一个 `FROM` 之后的指令：前面那些阶段往镜像里放的
-    /// 东西不经过 run 阶段的文件系统。
+    /// 最终镜像阶段每条 `COPY`/`ADD` 的落点（shell 与 JSON 两种写法都能读）。
+    ///
+    /// 只看最后一个 `FROM` 之后的指令：前面那些阶段往镜像里放的东西不经过 run
+    /// 阶段的文件系统。反斜杠续行先并成一条逻辑指令，`ADD` 与 `COPY` 同等看待
+    /// ——往镜像里烤资产的两条指令里，漏读任何一条，这道门禁就看不见新资产，
+    /// 而它失效的方向正是「该红不红」：烘焙了、没人知道、overlay 也刷不到。
     fn image_baked_destinations(dockerfile: &str) -> Vec<String> {
+        let mut logical: Vec<String> = Vec::new();
+        let mut pending = String::new();
+        for raw in dockerfile.lines() {
+            let line = raw.trim();
+            let continued = line.ends_with('\\');
+            let body = line.strip_suffix('\\').unwrap_or(line).trim();
+            if !pending.is_empty() {
+                pending.push(' ');
+            }
+            pending.push_str(body);
+            if !continued {
+                logical.push(std::mem::take(&mut pending));
+            }
+        }
+        if !pending.is_empty() {
+            logical.push(pending);
+        }
+
         let mut last_stage: Vec<&str> = Vec::new();
-        for line in dockerfile.lines() {
-            let line = line.trim();
+        for line in &logical {
             if line.starts_with("FROM ") {
                 last_stage.clear();
             }
-            last_stage.push(line);
+            last_stage.push(line.as_str());
         }
+
         last_stage
             .iter()
-            .filter_map(|line| line.strip_prefix("COPY "))
-            .filter_map(|rest| rest.split_whitespace().next_back())
-            .map(|dest| {
-                dest.trim_matches(|c| c == '"' || c == '[' || c == ']' || c == ',')
-                    .to_string()
+            .filter_map(|line| {
+                line.strip_prefix("COPY ")
+                    .or_else(|| line.strip_prefix("ADD "))
+                    .and_then(copy_destination)
             })
             .collect()
+    }
+
+    /// 一条 `COPY`/`ADD` 去掉指令名之后的落点：shell 形态取最后那个非 flag 的
+    /// token，JSON 形态取数组最后一个元素。
+    fn copy_destination(rest: &str) -> Option<String> {
+        // 先摘掉 `--from=` / `--chmod=` 这类 flag，剩下的第一个字符才能告诉
+        // 我们这是 shell 形态还是 JSON 形态。
+        let mut rest = rest.trim();
+        while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
+            if !head.starts_with("--") {
+                break;
+            }
+            rest = tail.trim();
+        }
+
+        // JSON 形态交给 JSON 解析，不按逗号切：路径里的逗号是合法字符，切错了
+        // 会把落点读成半截路径——门禁比对不到就红，方向是 "该绿不绿"，还不算
+        // 最坏；真正要防的是读出一个对得上的错落点。
+        if rest.starts_with('[') {
+            if let Ok(items) = serde_json::from_str::<Vec<String>>(rest) {
+                return items.last().cloned().filter(|dest| !dest.is_empty());
+            }
+            return None;
+        }
+
+        rest.split_whitespace()
+            .next_back()
+            .map(|dest| dest.trim_matches(|c| c == '"').to_string())
+            .filter(|dest| !dest.is_empty())
     }
 
     /// 镜像烤进去的运行时资产集，必须与 overlay 刷新的资产集对齐。
@@ -4042,13 +4091,16 @@ mod tests {
                 .expect("read workspace Dockerfile");
 
         let baked = image_baked_destinations(&dockerfile);
-        // 解析器自身得先站得住：skills 是当前唯一从构建上下文拷进 run 阶段的
-        // 资产，读不到它说明 COPY 行的写法变了、这道门禁已经看不见东西了。
-        assert!(
-            baked.iter().any(|d| d == "/opt/cogneva/skills"),
-            "Dockerfile's run stage no longer copies /opt/cogneva/skills; \
-             this gate is reading nothing: {baked:?}"
-        );
+        // 解析器自身得先站得住：run 阶段既拷二进制（来自构建产物）又拷 skills
+        // （来自构建上下文），两条形态不同的 COPY 都得读到。只断言其中一条时，
+        // 另一条的写法一变就是静默漏读——门禁看着全绿，其实已经瞎了。
+        for expected in [OVERLAY_BINARY_DEST, "/opt/cogneva/skills"] {
+            assert!(
+                baked.iter().any(|d| d == expected),
+                "the Dockerfile's run stage no longer copies {expected} in a form this gate \
+                 can read, so the gate is reading nothing: {baked:?}"
+            );
+        }
 
         let refreshed: HashSet<&str> = OVERLAY_ASSETS.iter().map(|(_, to)| *to).collect();
         let unreachable: HashSet<&str> = OVERLAY_UNREFRESHABLE.iter().map(|(to, _)| *to).collect();
@@ -4083,6 +4135,34 @@ mod tests {
                 "overlay copies {from} out of the checkout, but {src:?} does not exist"
             );
         }
+    }
+
+    /// 门禁的解析器要认得往镜像里烤资产的每一种写法，否则新资产用另一种写法
+    /// 烤进去就是静默漏判（该红不红）。
+    #[test]
+    fn the_baked_destination_reader_understands_every_copy_form() {
+        let dockerfile = r#"
+FROM ubuntu:24.04 AS builder
+COPY --from=builder /x /opt/never-looked-at
+FROM ubuntu:24.04
+COPY --from=builder /out/cogneva /opt/cogneva/cogneva
+COPY --chmod=755 \
+     --from=webbuilder \
+     /src/web/dist \
+     /opt/cogneva/web
+ADD skills /opt/cogneva/skills
+COPY ["prompts", "/opt/cogneva/prompts"]
+"#;
+        let baked = image_baked_destinations(dockerfile);
+        assert_eq!(
+            baked,
+            vec![
+                "/opt/cogneva/cogneva",
+                "/opt/cogneva/web",
+                "/opt/cogneva/skills",
+                "/opt/cogneva/prompts",
+            ]
+        );
     }
 
     #[test]

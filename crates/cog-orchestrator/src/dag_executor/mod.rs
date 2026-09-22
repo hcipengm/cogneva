@@ -183,42 +183,18 @@ impl DagExecutorRuntime {
         // at-least-once，已终态任务会被上面的拒绝分支 ack 丢弃，不会重复迁移。
         let claim_idle_ms = self.config.result_claim_idle_secs.saturating_mul(1000);
         let interval_secs = self.config.result_claim_interval_secs.max(1);
-        {
-            // 观测面单独成任务，不搭清扫器的节拍。清扫器认得这条流和它的阈值，
-            // 观测从它那里取这两个事实，但两者的节奏必须各自独立：这个循环会
-            // 在 tick 里就地 await 一条重投消息的完整处理（可能几十分钟），把
-            // 测量挂在同一根节拍上，就等于"处理得越久，指标越静止"，而抓取面
-            // 上一条静止的序列和一条干净流量的序列是同一个样子——恰好把最该
-            // 被看见的停滞藏了起来。先量一次再进循环，让系列在首个节拍前就存在。
-            let observer = crate::observable::stream_pending_observable();
-            let observe_backend = self.backend.clone();
-            let observe_stream = result_stream.clone();
-            let observe_group = group_name.clone();
-            let observe_shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                // interval 的首次 tick 立即就绪，先吃掉它，否则会在首次量完之后
-                // 紧接着重复量一次；此后一拍一量。
-                let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                ticker.tick().await;
-                loop {
-                    observer
-                        .measure(
-                            &*observe_backend,
-                            &observe_stream,
-                            &observe_group,
-                            claim_idle_ms,
-                            interval_secs,
-                        )
-                        .await;
-                    tokio::select! {
-                        biased;
-                        _ = observe_shutdown.wait() => break,
-                        _ = ticker.tick() => {}
-                    }
-                }
-            });
-        }
+        // 观测面单独成任务，不搭清扫器的节拍：这个循环会在 tick 里就地 await
+        // 一条重投消息的完整处理（可能几十分钟），测量挂在同一根节拍上就等于
+        // "处理得越久，指标越静止"，而抓取面上一条静止的序列和一条干净流量的
+        // 序列是同一个样子——恰好把最该被看见的停滞藏了起来。
+        crate::observable::spawn_pending_observer(
+            self.backend.clone(),
+            result_stream.clone(),
+            group_name.clone(),
+            claim_idle_ms,
+            std::time::Duration::from_secs(interval_secs),
+            shutdown.clone(),
+        );
 
         {
             let sweeper = self.clone();

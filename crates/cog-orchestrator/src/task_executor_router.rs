@@ -147,41 +147,17 @@ impl TaskExecutorRouter {
             workspace_id,
         });
 
-        {
-            // 观测面单独成任务，不搭清扫器的节拍。两者要的是同一个事实，但判据
-            // 不同：清扫按自己的节奏动，观测按自己的节奏量，共用一根节拍就等于
-            // 让"量到没有"取决于"扫得快不快"。清扫一轮耗时长或卡在认领上，指标
-            // 序列就跟着静止，而抓取面上一条静止的序列和一条干净流量的序列是同
-            // 一个样子——刚好把最该被看见的停滞藏了起来。先量一次再进循环，让系
-            // 列在首个节拍前就存在。
-            let observer = crate::observable::stream_pending_observable();
-            let observe_backend = task_backend.clone();
-            let observe_shutdown = shutdown.clone();
-            let observe_stream = ready_stream.clone();
-            let observe_group = group.clone();
-            tokio::spawn(async move {
-                // interval 的首次 tick 立即就绪，先吃掉它，否则会在首次量完之后
-                // 紧接着重复量一次；此后一拍一量。
-                let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
-                ticker.tick().await;
-                loop {
-                    observer
-                        .measure(
-                            &*observe_backend,
-                            &observe_stream,
-                            &observe_group,
-                            PENDING_IDLE_MS,
-                            CLAIM_INTERVAL.as_secs(),
-                        )
-                        .await;
-                    tokio::select! {
-                        biased;
-                        _ = observe_shutdown.wait() => break,
-                        _ = ticker.tick() => {}
-                    }
-                }
-            });
-        }
+        // 观测面单独成任务，不搭清扫器的节拍：清扫卡在认领上时指标序列会跟着
+        // 静止，而抓取面上一条静止的序列和一条干净流量的序列是同一个样子——
+        // 刚好把最该被看见的停滞藏了起来。
+        crate::observable::spawn_pending_observer(
+            task_backend.clone(),
+            ready_stream.clone(),
+            group.clone(),
+            PENDING_IDLE_MS,
+            CLAIM_INTERVAL,
+            shutdown.clone(),
+        );
 
         {
             let sweeper = self.clone();

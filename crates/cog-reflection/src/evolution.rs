@@ -874,7 +874,12 @@ impl EvolutionEngine {
         }
 
         let diff = lines[start..end].join("\n");
-        cog_core::parse_diff_affected_files(&diff).ok()?;
+        // A deletion names its file only on the side that goes away, so a patch
+        // that only deletes offers no `+++` path. It is still a change, and
+        // discarding it here would drop it as though it were prose.
+        if cog_core::parse_diff_targets(&diff).is_empty() {
+            return None;
+        }
         Some(diff)
     }
 
@@ -888,6 +893,8 @@ impl EvolutionEngine {
     /// Returns `(success, details)`; `details` feeds the retry loop on
     /// failure. When `git` is unavailable the structural checks alone decide.
     async fn validate_change(&self, diff: &str) -> (bool, String) {
+        // Judge every file the diff names, deletions included: deleting a
+        // protected file is the same offence as rewriting it.
         let files: Vec<std::path::PathBuf> = match cog_core::parse_diff_affected_files(diff) {
             Ok(f) => f.into_iter().map(std::path::PathBuf::from).collect(),
             Err(e) => return (false, format!("Change structure invalid: {}", e)),
@@ -1046,65 +1053,13 @@ impl EvolutionEngine {
         files: &[std::path::PathBuf],
         project_root: Option<&std::path::Path>,
     ) -> cog_core::SFResult<()> {
-        use std::collections::HashSet;
-
-        let forbidden_names: HashSet<&str> = [
-            "Cargo.toml",
-            "Cargo.lock",
-            "cogneva.json",
-            ".env",
-            ".envrc",
-            "Dockerfile",
-            "Containerfile",
-            "docker-compose.yml",
-            "setup.sh",
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let forbidden_extensions: HashSet<&str> =
-            ["pem", "key", "crt", "p12"].iter().cloned().collect();
-
         let canonical_root = project_root.and_then(|r| r.canonicalize().ok());
 
         for file in files {
             let path = std::path::Path::new(file);
 
-            // Reject path traversal.
-            if path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Err(cog_core::SFError::Validation(format!(
-                    "Change path contains parent directory traversal: {}",
-                    file.display()
-                )));
-            }
-
-            if path.is_absolute() {
-                return Err(cog_core::SFError::Validation(format!(
-                    "Change path must be relative: {}",
-                    file.display()
-                )));
-            }
-
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if forbidden_names.contains(name) {
-                    return Err(cog_core::SFError::Validation(format!(
-                        "Modifying protected file {} is not allowed",
-                        name
-                    )));
-                }
-            }
-
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if forbidden_extensions.contains(ext) {
-                    return Err(cog_core::SFError::Validation(format!(
-                        "Modifying .{} files is not allowed",
-                        ext
-                    )));
-                }
+            if let Some(reason) = cog_core::forbidden_target_reason(&file.to_string_lossy()) {
+                return Err(cog_core::SFError::Validation(reason));
             }
 
             // When a project root is known, verify the target resolves inside it.
@@ -1269,18 +1224,23 @@ mod tests {
     #[test]
     fn extract_unified_diff_none_for_prose() {
         assert!(EvolutionEngine::extract_unified_diff("# Just a header\nNo code here.").is_none());
-        // A block naming no file comes back empty-handed. A deletion names its
-        // file only on the side that goes away, so there is nothing to write
-        // and nothing to extract.
-        assert!(EvolutionEngine::extract_unified_diff(
-            "diff --git a/x b/x\n\
-                 deleted file mode 100644\n\
-                 --- a/x\n\
-                 +++ /dev/null\n\
-                 @@ -1 +0,0 @@\n\
-                 -a\n"
-        )
-        .is_none());
+        assert!(EvolutionEngine::extract_unified_diff("@@ -1 +1 @@\n-a\n+b\n").is_none());
+    }
+
+    #[test]
+    fn extract_unified_diff_keeps_a_deletion() {
+        // A deletion names its file only on the side that goes away. Reading
+        // paths off the `+++` line alone finds nothing there and discards the
+        // change as though the model had written prose; the file it removes is
+        // one the change affects as much as any it rewrites.
+        let text = "diff --git a/x b/x\n\
+                    deleted file mode 100644\n\
+                    --- a/x\n\
+                    +++ /dev/null\n\
+                    @@ -1 +0,0 @@\n\
+                    -a\n";
+        let diff = EvolutionEngine::extract_unified_diff(text).expect("a deletion is a change");
+        assert!(diff.starts_with("diff --git a/x b/x"));
     }
 
     #[test]

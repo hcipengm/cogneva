@@ -271,24 +271,82 @@ fn target_kind(header: &str) -> DiffTargetKind {
 
 /// Parse a unified diff change and return the list of files it touches.
 ///
-/// Extracts the targets of [`parse_diff_targets`], dropping deletions: a
-/// deletion has no file to write, and a caller asking what the change produces
-/// is not asking about a path that goes away. This is a pure function shared by
-/// collaboration (static validation) and reflection (change pipeline).
+/// Extracts the paths of every target in [`parse_diff_targets`], deletions
+/// included: a deletion names its file only on the side that goes away, so a
+/// caller reading paths off the `+++` line alone cannot see it, and a file the
+/// change removes is one the change affects as much as one it rewrites. This is
+/// a pure function shared by collaboration (static validation) and reflection
+/// (change pipeline, which applies the same rules to deletions).
 pub fn parse_diff_affected_files(content: &str) -> crate::SFResult<Vec<String>> {
     let files: Vec<String> = parse_diff_targets(content)
         .into_iter()
-        .filter(|target| target.kind != DiffTargetKind::Delete)
         .map(|target| target.path)
         .collect();
 
     if files.is_empty() {
         return Err(crate::SFError::Validation(
-            "No file paths found in change (expected '+++ b/<path>' lines)".into(),
+            "No file paths found in change (expected '--- a/<path>' or '+++ b/<path>' lines)"
+                .into(),
         ));
     }
 
     Ok(files)
+}
+
+/// Names a change may not rewrite: the build, deployment and configuration
+/// manifests.
+///
+/// Rewriting one of these changes what the project is built into or how it is
+/// deployed rather than what it does, and the pipeline that would apply the
+/// change has nothing to test that against.
+pub const PROTECTED_FILE_NAMES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "cogneva.json",
+    ".env",
+    ".envrc",
+    "Dockerfile",
+    "Containerfile",
+    "docker-compose.yml",
+    "setup.sh",
+];
+
+/// Extensions a change may not rewrite: a diff must not be able to replace a
+/// credential file that no reviewer ever saw.
+pub const PROTECTED_FILE_EXTENSIONS: &[&str] = &["pem", "key", "crt", "p12"];
+
+/// Why a change may not name `path`, or `None` when it may.
+///
+/// Answers only what is a property of the path itself — its shape and whether
+/// it is protected — and never whether it exists. That split is what lets
+/// every gate reach the same verdict here: the evaluator vets a change before
+/// there is a checkout to resolve against, while the apply gate has one, so
+/// existence is the one question the two cannot share and is left to the gate.
+pub fn forbidden_target_reason(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let path = std::path::Path::new(&normalized);
+
+    if path.is_absolute() {
+        return Some(format!("absolute path not allowed: {normalized}"));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Some(format!("path escapes project root: {normalized}"));
+    }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if PROTECTED_FILE_NAMES.contains(&name) {
+            return Some(format!("protected file: {name}"));
+        }
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if PROTECTED_FILE_EXTENSIONS.contains(&ext) {
+            return Some(format!("protected file extension: .{ext}"));
+        }
+    }
+
+    None
 }
 
 /// Structural check of a unified diff: every hunk must carry exactly the

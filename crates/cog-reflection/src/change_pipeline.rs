@@ -8,7 +8,6 @@
 //!   and roll back on failure.
 //! - Report results by updating the evolution status.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -449,26 +448,13 @@ impl ChangePipeline {
             ))
         })?;
 
-        let forbidden_names: HashSet<&str> = [
-            "Cargo.toml",
-            "Cargo.lock",
-            "cogneva.json",
-            ".env",
-            ".envrc",
-            "Dockerfile",
-            "Containerfile",
-            "docker-compose.yml",
-            "setup.sh",
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let forbidden_extensions: HashSet<&str> =
-            ["pem", "key", "crt", "p12"].iter().cloned().collect();
-
         for target in targets {
             let file = Path::new(&target.path);
+
+            if let Some(reason) = cog_core::forbidden_target_reason(&target.path) {
+                return Err(SFError::Validation(reason));
+            }
+
             let absolute = canonical_root.join(file);
 
             let resolved = match target.kind {
@@ -501,22 +487,18 @@ impl ChangePipeline {
                 }
             };
 
-            if let Some(name) = resolved.file_name().and_then(|n| n.to_str()) {
-                if forbidden_names.contains(name) {
-                    return Err(SFError::Validation(format!(
-                        "Modifying protected file {} is not allowed",
-                        name
-                    )));
-                }
-            }
-
-            if let Some(ext) = resolved.extension().and_then(|e| e.to_str()) {
-                if forbidden_extensions.contains(ext) {
-                    return Err(SFError::Validation(format!(
-                        "Modifying .{} files is not allowed",
-                        ext
-                    )));
-                }
+            // The raw path was judged above. Judge the resolved path too: a
+            // symlink's own name says nothing about the file the diff ends up
+            // rewriting, so the leaf that survives `canonicalize` is the one
+            // worth asking about. Same policy function, two inputs.
+            let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
+                SFError::Validation(format!(
+                    "Resolved target path escapes project root: {}",
+                    resolved.display()
+                ))
+            })?;
+            if let Some(reason) = cog_core::forbidden_target_reason(&relative.to_string_lossy()) {
+                return Err(SFError::Validation(reason));
             }
 
             if !resolved
@@ -801,25 +783,24 @@ impl ChangePipeline {
 /// There is no file for `canonicalize` to speak for — the patch is what brings
 /// it into being — and its parent directories need not exist either, since a
 /// patch creates them on the way (verified against `git apply`). What can
-/// still be checked is the path itself: `..` is resolved lexically so it cannot
-/// walk out of the root, and the deepest ancestor that does exist is
-/// canonicalized so a symlinked directory pointing out of the tree cannot be
-/// followed on the way to the new file.
+/// still be checked is the deepest ancestor that does exist: canonicalizing it
+/// stops a symlinked directory pointing out of the tree from being followed on
+/// the way to the new file.
+///
+/// `..` never reaches here. It is refused before the kind is even consulted,
+/// because `git apply` refuses it too ("invalid path") — resolving it lexically
+/// instead would let a path the apply gate is about to reject pass this
+/// judgement, which is the same kind of unactionable defect this whole path
+/// exists to name early.
 fn resolve_created_path(
     absolute: &Path,
     canonical_root: &Path,
     reported: &Path,
 ) -> SFResult<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
+    let normalized: PathBuf = absolute
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect();
 
     if !normalized.starts_with(canonical_root) {
         return Err(SFError::Validation(format!(

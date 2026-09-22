@@ -412,12 +412,17 @@ impl AgentRuntime {
             Some(skill) if !skill.tools.is_empty() => {
                 let missing = tools.missing_tools(&skill.tools);
                 if !missing.is_empty() {
-                    let kept = skill.tools.len() - missing.len();
+                    // Both sides of the count are deduplicated: `missing` already
+                    // is, and a declared list that repeats a name would otherwise
+                    // subtract a shorter missing list from a longer declared one
+                    // and report a role as better off than it is.
+                    let declared: std::collections::HashSet<&String> = skill.tools.iter().collect();
+                    let kept = declared.len() - missing.len();
                     tracing::warn!(
                         skill = %skill.skill_id,
                         missing = ?missing,
                         kept,
-                        declared = skill.tools.len(),
+                        declared = declared.len(),
                         "skill declares tools the registry does not hold; the role runs without them"
                     );
                 }

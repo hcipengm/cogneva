@@ -283,8 +283,49 @@ mod tests {
             ),
             ("creating a file has its own shape", "--- /dev/null"),
             (
+                "the creation shape names the mode line",
+                "new file mode 100644",
+            ),
+            (
+                "the creation shape names its hunk header",
+                "@@ -0,0 +1,<n> @@",
+            ),
+            (
+                "an existing file may not be recreated",
+                "Creating a file that already exists fails",
+            ),
+            (
+                "an absent file may not be rewritten silently",
+                "rewriting a file that does not exist without declaring it as a creation",
+            ),
+            (
                 "the protected-file set is named",
                 "configuration or credential files",
+            ),
+            (
+                "the build manifests are named",
+                "build and deployment manifests",
+            ),
+            (
+                "the deploy manifests are named",
+                "Dockerfile, Containerfile",
+            ),
+            ("the deploy manifests are named", "setup.sh"),
+            (
+                "line numbers must be the file's real ones",
+                "must be the real line numbers in the file you read",
+            ),
+            (
+                "hunks must be narrow and uniquely anchored",
+                "narrow and anchor them on context that is unique in the file",
+            ),
+            (
+                "deletions are judged as edits are",
+                "deletions are judged by the same rules as edits",
+            ),
+            (
+                "the directories must be listed before reading",
+                "list the directories you intend to touch",
             ),
         ] {
             assert!(

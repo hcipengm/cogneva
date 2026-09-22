@@ -97,11 +97,11 @@ impl EvaluatorActor {
         );
 
         // Self-evolution change validation: ensure generated artifacts are valid
-        // unified diffs targeting safe source paths.
+        // unified diffs naming paths the apply gate will also accept.
         let is_self_evolution = task.is_self_evolution();
 
         // For self-evolution tasks the only thing that matters is whether the
-        // generated change artifact is a valid unified diff targeting safe paths.
+        // generated change artifact is a valid unified diff over safe paths.
         // Reasoning-only models often fail to return structured JSON, and the
         // LLM reformat step can hang for minutes. Use deterministic validation
         // and skip the semantic LLM evaluation entirely for this mode.
@@ -263,30 +263,159 @@ impl EvaluatorActor {
                 return "change_validation: change artifact has no string content".into();
             };
 
-            let files = match cog_core::parse_diff_affected_files(content) {
-                Ok(f) => f,
-                Err(e) => {
-                    return format!("change_validation: failed to parse unified diff: {}", e);
-                }
-            };
+            // Judge every target the apply gate will judge, deletions included:
+            // a deletion names its file on the side that disappears, and
+            // deleting a protected file is the same offence as rewriting it.
+            let targets = cog_core::parse_diff_targets(content);
+            if targets.is_empty() {
+                return "change_validation: failed to parse unified diff: no file paths found"
+                    .into();
+            }
 
-            for file in &files {
-                let path = std::path::Path::new(file);
-                if path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    return format!("change_validation: path escapes project root: {}", file);
-                }
-                if path.is_absolute() {
-                    return format!("change_validation: absolute path not allowed: {}", file);
-                }
-                if !path.to_string_lossy().replace('\\', "/").contains("/src/") {
-                    return format!("change_validation: target must be under src/: {}", file);
+            for target in &targets {
+                // The same question the apply gate asks, from the same place,
+                // so a change this evaluator passes is not one the gate refuses
+                // for a reason the generator was never told about.
+                if let Some(reason) = cog_core::forbidden_target_reason(&target.path) {
+                    return format!("change_validation: {}", reason);
                 }
             }
         }
 
-        "change_validation: change artifact(s) are valid unified diffs targeting src/".into()
+        "change_validation: change artifact(s) are valid unified diffs".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generation_with_diff(diff: &str) -> serde_json::Value {
+        serde_json::json!({
+            "artifacts": [{
+                "artifact_type": "change",
+                "name": "changes.diff",
+                "content": diff,
+            }]
+        })
+    }
+
+    fn modify_diff(path: &str) -> String {
+        format!(
+            "diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1 +1 @@\n-a\n+b\n",
+            p = path
+        )
+    }
+
+    fn create_diff(path: &str) -> String {
+        format!(
+            "diff --git a/{p} b/{p}\nnew file mode 100644\n--- /dev/null\n+++ b/{p}\n\
+             @@ -0,0 +1,1 @@\n+new\n",
+            p = path
+        )
+    }
+
+    fn delete_diff(path: &str) -> String {
+        format!(
+            "diff --git a/{p} b/{p}\ndeleted file mode 100644\n--- a/{p}\n+++ /dev/null\n\
+             @@ -1 +0,0 @@\n-gone\n",
+            p = path
+        )
+    }
+
+    fn verdict_for(diff: &str) -> String {
+        EvaluatorActor::validate_change_artifacts(&generation_with_diff(diff))
+    }
+
+    #[test]
+    fn a_change_outside_src_is_accepted() {
+        // The apply gate warns about these and allows them. An evaluator that
+        // refused them would reject a change the contract told the generator it
+        // could write, and hand back a reason the contract never mentioned.
+        for path in [
+            "prompts/system.md",
+            "deploy/k3s/notes.md",
+            "skills/generator.json",
+        ] {
+            let verdict = verdict_for(&modify_diff(path));
+            assert!(
+                verdict.contains("are valid unified diffs"),
+                "{path} was refused: {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_created_file_outside_src_is_accepted() {
+        let verdict = verdict_for(&create_diff("crates/cogneva/src/new_module.rs"));
+        assert!(
+            verdict.contains("are valid unified diffs"),
+            "a creation was refused: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_protected_file_is_refused_however_it_is_touched() {
+        for diff in [
+            modify_diff("Cargo.toml"),
+            create_diff("Cargo.toml"),
+            delete_diff("Cargo.toml"),
+        ] {
+            let verdict = verdict_for(&diff);
+            assert!(
+                verdict.contains("protected file: Cargo.toml"),
+                "a protected file slipped through: {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_credential_is_refused_however_it_is_touched() {
+        for diff in [
+            modify_diff("certs/server.pem"),
+            delete_diff("certs/server.pem"),
+        ] {
+            let verdict = verdict_for(&diff);
+            assert!(
+                verdict.contains("protected file extension: .pem"),
+                "a credential slipped through: {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_that_escapes_the_root_is_refused() {
+        for diff in [
+            modify_diff("../../etc/passwd"),
+            create_diff("../outside.rs"),
+        ] {
+            let verdict = verdict_for(&diff);
+            assert!(
+                verdict.contains("escapes project root"),
+                "an escape slipped through: {verdict}"
+            );
+        }
+        assert!(verdict_for(&modify_diff("/etc/passwd")).contains("absolute path"));
+    }
+
+    #[test]
+    fn a_diff_naming_no_file_is_refused() {
+        let verdict = verdict_for("not a diff at all\n");
+        assert!(verdict.contains("no file paths found"), "{verdict}");
+    }
+
+    #[test]
+    fn the_src_only_wording_the_contract_no_longer_promises_is_gone() {
+        // The generator's contract says only the protected lists are refused.
+        // A refusal naming a rule that is nowhere in the contract leaves the
+        // generator nothing to correct, which is the failure this replaced.
+        let all = format!(
+            "{}{}{}{}",
+            verdict_for(&modify_diff("docs/a.md")),
+            verdict_for(&create_diff("docs/b.md")),
+            verdict_for(&delete_diff("docs/c.md")),
+            verdict_for(&modify_diff("src/lib.rs"))
+        );
+        assert!(!all.contains("must be under src"), "{all}");
     }
 }
