@@ -43,6 +43,12 @@ data:
   COGNEVA_WS_PORT: "8081"
   COGNEVA_METRICS_PORT: "9090"
 
+  # 告警通知出口地址。出口机制四类 dispatcher 都在代码里，缺的只是地址；空值
+  # 不建出口（与 cogneva.json 的 null 等价）。地址只由集群侧 values / --set 给，
+  # 所以这里渲染成空串而不是省略——省略会让"这份清单里没有这个键"与"运维没配"
+  # 变成同一件事。主应用与进化 Pod 都经 envFrom 取这一份。
+  COGNEVA_NOTIFICATION_WEBHOOK_URL: ""
+
   # raw_logger 段不在这里覆盖：与下面的 memory 段同理，同一件事在文件里写一份、
   # 在 env 里再写一份，读文件的人推不出 runtime 用的是哪份——文件里曾写着
   # enabled=false 与一个打不开的目录，实跑却是 true 与 raw-logs。要改改文件。

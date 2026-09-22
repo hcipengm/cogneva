@@ -374,6 +374,22 @@ gitops:
 webhook:
   nodePort: 30991
 
+# 告警通知出口。出口机制（通用 webhook / 钉钉 / 飞书 / 企业微信四类 dispatcher）
+# 已在代码里，缺的一直只是地址——所以这里给的就是地址本身，不给第二份开关。
+# 默认空 = 不建出口，与 cogneva.json 的 gateway.notification_webhook_url: null
+# 等价（WebhookDispatcher 只在 url 非空时挂上）。地址是本集群的事，不是代码或
+# 清单的一部分：它只经 --set / 集群自己的 values 覆盖注入，仓库里永远为空。
+# 主应用（告警判定）与进化 Pod（沙盒降级）都会发通知，两者都从 cogneva-config
+# 取这一份，改一处即可。
+notification:
+  webhookUrl: ""
+  # 进化 Pod 的 egress 是白名单（主应用没有 egress 限制，地址在哪儿都发得出去）。
+  # 地址落在集群外时，不加这条放行，进化 Pod 那类通知会被策略拦掉、且只有一行
+  # warn——看起来像"没有告警"而不是"告警发不出去"。两键都非空才渲染这条规则，
+  # 默认不加任何放行。留空只影响进化 Pod 的通知，主应用侧照发。
+  egressCidr: ""
+  egressPort: 443
+
 ingress:
   enabled: true
   # nginx 为默认（k3s 现网入口统一 ingress-nginx）；traefik 时自动附带
