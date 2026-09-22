@@ -16,12 +16,22 @@
 //! （如运维手工触发的 admin 部署）才用带 uuid 的 [`WorkspaceManager::acquire_ephemeral`]，
 //! 以路径唯一换取并发安全，代价是那一次冷编。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cog_core::{SFError, SFResult};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+/// 一棵常驻工作树的下一次 `reset --hard` 会重写多少个已跟踪文件——索引没记住的
+/// 都算在内，健康时为 0。
+pub const WORKTREE_INDEX_MISSING_FILES_METRIC: &str = "cogneva_worktree_index_missing_files";
+
+/// 这棵工作树的索引文件是否在。0 与「在、但一个条目都没有」会让上一条都等于全树
+/// 大小，这一条把两者分开：前者是文件被删或没挂上，后者是写到一半被截断。
+pub const WORKTREE_INDEX_PRESENT_METRIC: &str = "cogneva_worktree_index_present";
 
 /// 工作树默认根目录（沙盒 PVC 内，与 bin/backups/changes/mainline 同级）。
 pub const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
@@ -193,6 +203,9 @@ pub struct WorkspaceManager {
     meta_dir: PathBuf,
     ephemeral_ttl: Duration,
     stale_lock_age: Duration,
+    /// 索引健康度采样的去处。缺席则只记日志、不上报——丢一个聚合读数不该让
+    /// 刷新本身失败。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl WorkspaceManager {
@@ -210,7 +223,14 @@ impl WorkspaceManager {
             meta_dir,
             ephemeral_ttl: DEFAULT_EPHEMERAL_TTL,
             stale_lock_age: STALE_GIT_LOCK_AGE,
+            metrics: None,
         }
+    }
+
+    /// 上报索引健康度采样的去处。
+    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// 覆盖临时工作树存活上限（回收策略随分配器走，各子系统用同一个值）。
@@ -366,10 +386,91 @@ impl WorkspaceManager {
     /// 就地移动到 `base`：`reset --hard` + `clean -ffdx`。target 目录外置，
     /// 故 `-x` 不会误删编译缓存，工作树可以放心回到干净基线。
     pub async fn refresh(&self, ws: &Workspace, base: BaseRef) -> SFResult<()> {
+        self.sample_index_health(ws).await;
         self.git_in(&ws.path, &["reset", "--hard", base.rev()])
             .await?;
         self.git_in(&ws.path, &["clean", "-ffdx"]).await?;
         Ok(())
+    }
+
+    /// 采样这棵工作树的索引健康度。调用方要在 `reset --hard` **之前**调：它量的是
+    /// "这一次 reset 会重写多少文件"，而不是事后剩下什么。
+    ///
+    /// 索引和 HEAD 对不上时，`reset --hard` 会把整棵树按 HEAD 重写一遍——上千个
+    /// 文件的 mtime 全刷新，共享 target 里本地 crate 的增量因此整轮作废（cargo 按
+    /// 本地 path crate 的源码 mtime 判新鲜度）。索引为什么会丢至今没定因，也不是
+    /// 每次重启都丢，所以先把它变成随时可读的数，等它自己再出现一次，而不是照着
+    /// 一个未验证的假设再写一个守卫。
+    ///
+    /// 两个量都只读索引文件与 HEAD 的树对象，不 stat 工作树。用
+    /// `git status --porcelain` 数 `D` 行能得到同一个数（索引空了时所有跟踪文件
+    /// 都报 `D`），但那要扫一遍工作树，是每轮白付的钱。
+    ///
+    /// 只在常驻工作树上采。它们的 id 取自闭集——部署器、引擎基线、每实例的
+    /// `cycle-*` 与 `porter-*`，旧实例的树由 [`Self::gc_orphan_instances`] 回收，
+    /// 所以序列基数有界；临时树的 id 带 uuid，采了就是无界基数，而它本来就是一次性
+    /// 检出、路径不参与增量，索引丢没丢不影响任何人。
+    pub async fn sample_index_health(&self, ws: &Workspace) {
+        let Some(metrics) = self.metrics.clone() else {
+            return;
+        };
+        if !ws.is_persistent() {
+            return;
+        }
+        let Ok(gitdir) = self
+            .git_in(&ws.path, &["rev-parse", "--absolute-git-dir"])
+            .await
+        else {
+            // 解析不出 gitdir 就采不到，而那本身也是"这棵树的 git 元数据已经不对了"
+            // 的一种；留一行日志，不编一个数。
+            warn!(worktree = %ws.id, "index sample: cannot resolve the git dir");
+            return;
+        };
+        let labels = HashMap::from([("worktree".to_string(), ws.id.clone())]);
+        // 存在性先报：它只要一次 stat，后面两条 git 读数都失败时这一条仍然前进，
+        // 采样停摆因此不会被读成"一切正常"。
+        let present = tokio::fs::metadata(PathBuf::from(gitdir).join("index"))
+            .await
+            .is_ok();
+        report(
+            metrics.as_ref(),
+            WORKTREE_INDEX_PRESENT_METRIC,
+            if present { 1.0 } else { 0.0 },
+            &labels,
+        )
+        .await;
+
+        let tracked = match self
+            .count_git_lines(&ws.path, &["ls-tree", "-r", "--name-only", "HEAD"])
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(worktree = %ws.id, "index sample: cannot list the files at HEAD: {e}");
+                return;
+            }
+        };
+        let entries = match self.count_git_lines(&ws.path, &["ls-files"]).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(worktree = %ws.id, "index sample: cannot list the index: {e}");
+                return;
+            }
+        };
+        // 索引里比 HEAD 多的条目（暂存过又没提交的）不算"缺"，故只取正的差额。
+        report(
+            metrics.as_ref(),
+            WORKTREE_INDEX_MISSING_FILES_METRIC,
+            tracked.saturating_sub(entries) as f64,
+            &labels,
+        )
+        .await;
+    }
+
+    /// 数一条 git 命令输出的行数。空输出是 0 行，不是一个空行。
+    async fn count_git_lines(&self, path: &Path, args: &[&str]) -> SFResult<u64> {
+        let out = self.git_in(path, args).await?;
+        Ok(out.lines().filter(|line| !line.is_empty()).count() as u64)
     }
 
     /// 某棵工作树当前的 HEAD。读不到返回 `None`——调用方据此保持原状，而不是
@@ -742,6 +843,19 @@ impl WorkspaceManager {
     }
 }
 
+/// 上报一个采样值。采样不该因为上报失败而中断——工作树该刷新的还是要刷新——
+/// 所以错误只留一行日志。
+async fn report(
+    metrics: &dyn cog_core::MetricsBackend,
+    name: &str,
+    value: f64,
+    labels: &HashMap<String, String>,
+) {
+    if let Err(e) = metrics.record_gauge(name, value, labels.clone()).await {
+        warn!(metric = name, "index sample: cannot report: {e}");
+    }
+}
+
 /// 工作树 id 只保留文件系统安全字符；空结果回退占位符。
 fn sanitize_id(id: &str) -> String {
     let cleaned: String = id
@@ -807,6 +921,7 @@ fn parse_worktree_list(text: &str) -> Vec<WorktreeEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_core::MetricsBackend as _;
 
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
@@ -909,6 +1024,97 @@ mod tests {
         let rebuilt = mgr.ensure_persistent(spec).await.unwrap();
         assert!(rebuilt.path.join("a.txt").exists());
         assert_eq!(git_out(&rebuilt.path, &["rev-parse", "HEAD"]), rev_b);
+    }
+
+    async fn gauge_of(mb: &cog_storage::MemoryMetricsBackend, name: &str, worktree: &str) -> f64 {
+        let samples = mb.query_gauge_latest(name).await.unwrap();
+        samples
+            .into_iter()
+            .find(|s| s.labels.get("worktree").map(String::as_str) == Some(worktree))
+            .unwrap_or_else(|| panic!("no {name} sample for worktree {worktree}"))
+            .value
+    }
+
+    #[tokio::test]
+    async fn index_health_reads_clean_on_a_healthy_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
+
+        let spec = WorkspaceSpec::persistent(
+            "mainline",
+            WorkspaceKind::Deployer,
+            BaseRef::Commit(rev_b.clone()),
+        );
+        let ws = mgr.ensure_persistent(spec).await.unwrap();
+        mgr.sample_index_health(&ws).await;
+
+        assert_eq!(
+            gauge_of(&mb, WORKTREE_INDEX_PRESENT_METRIC, "mainline").await,
+            1.0
+        );
+        assert_eq!(
+            gauge_of(&mb, WORKTREE_INDEX_MISSING_FILES_METRIC, "mainline").await,
+            0.0
+        );
+    }
+
+    /// 复现实验 ④ 的状态：索引文件被删。这正是「下一次 reset 会重写整棵树」的条件，
+    /// 采样必须在 reset **之前**给出非零读数。
+    #[tokio::test]
+    async fn index_health_reports_every_tracked_file_when_the_index_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
+
+        let spec = WorkspaceSpec::persistent(
+            "mainline",
+            WorkspaceKind::Deployer,
+            BaseRef::Commit(rev_b.clone()),
+        );
+        let ws = mgr.ensure_persistent(spec).await.unwrap();
+        let tracked = git_out(&ws.path, &["ls-tree", "-r", "--name-only", "HEAD"])
+            .lines()
+            .count() as f64;
+        assert!(tracked > 0.0);
+
+        let gitdir = git_out(&ws.path, &["rev-parse", "--absolute-git-dir"]);
+        std::fs::remove_file(Path::new(&gitdir).join("index")).unwrap();
+        mgr.sample_index_health(&ws).await;
+
+        assert_eq!(
+            gauge_of(&mb, WORKTREE_INDEX_PRESENT_METRIC, "mainline").await,
+            0.0
+        );
+        assert_eq!(
+            gauge_of(&mb, WORKTREE_INDEX_MISSING_FILES_METRIC, "mainline").await,
+            tracked
+        );
+    }
+
+    /// 临时树的 id 带 uuid，采了就是无界基数；它们本来就一次性检出。
+    #[tokio::test]
+    async fn index_health_skips_ephemeral_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
+
+        let ws = mgr
+            .acquire_ephemeral("cycle", BaseRef::Commit(rev_b.clone()))
+            .await
+            .unwrap();
+        mgr.sample_index_health(&ws).await;
+
+        assert!(
+            mb.query_gauge_latest(WORKTREE_INDEX_PRESENT_METRIC)
+                .await
+                .unwrap()
+                .is_empty(),
+            "临时树不该被采样"
+        );
     }
 
     #[tokio::test]

@@ -1923,7 +1923,10 @@ impl MainlineDeployer {
             crate::workspace::WorkspaceKind::Deployer,
             crate::workspace::BaseRef::Commit(rev.to_string()),
         );
-        self.workspaces.ensure_persistent(spec).await?;
+        let ws = self.workspaces.ensure_persistent(spec).await?;
+        // 与 `refresh` 同一处采样：这棵树也是共享 target 的常驻编译树，索引丢了
+        // 一样会把整棵树重写一遍。采样必须在 reset 之前。
+        self.workspaces.sample_index_health(&ws).await;
         self.git_src(&["reset", "--hard", rev]).await?;
         // target 目录在工作树之外，clean 只清源码，不丢增量编译缓存。
         self.git_src(&["clean", "-ffdx"]).await?;

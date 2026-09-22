@@ -103,10 +103,16 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // 部署器配置（默认 /host-git，与 GitOps 推送端同源）。
         let bare_repo = crate::MainlineDeployerConfig::load()?.bare_repo;
         let ws_cfg = &ctx.config().self_evolution.workspaces;
-        let workspaces = Arc::new(
+        // 索引健康度的采样去处。在这里取一次而不是各消费者各取一次：分配器是
+        // 单例，采样点在它内部，调用方不该为了上报再去问一遍服务表。
+        let metrics_backend = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+        let mut workspaces =
             crate::workspace::WorkspaceManager::new(&bare_repo, &ws_cfg.root, &ws_cfg.target_dir)
-                .with_ephemeral_ttl(std::time::Duration::from_secs(ws_cfg.ephemeral_ttl_secs)),
-        );
+                .with_ephemeral_ttl(std::time::Duration::from_secs(ws_cfg.ephemeral_ttl_secs));
+        if let Some(metrics) = metrics_backend.clone() {
+            workspaces = workspaces.with_metrics(metrics);
+        }
+        let workspaces = Arc::new(workspaces);
         info!(
             bare = %bare_repo,
             root = %ws_cfg.root,
@@ -193,8 +199,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // passed down from wherever the reader sits: the reading belongs to the
         // engine that runs the generation, and both engines below are built in
         // this function.
-        let metrics_backend = ctx.consume_service::<dyn cog_core::MetricsBackend>();
-
         // Build an evolution engine up-front for the in-memory fallback below,
         // which has no persistent memory backend to build one from. In
         // production the engine comes from `new_self_evolution`, which builds
