@@ -186,9 +186,7 @@ impl<E: MemoryExtractor> IngestionPipeline<E> {
 
     /// Run the extractor against a raw source and return both layers.
     pub async fn ingest(&self, source: &RawSource) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
-        let schema = self.extractor.extract_schema(source).await?;
-        let summary = self.extractor.generate_summary(source).await?;
-        Ok((schema, summary))
+        self.extractor.extract_all(source).await
     }
 }
 
@@ -254,6 +252,33 @@ struct SummaryExtraction {
     importance: u8, // 1-10
 }
 
+/// The shape one call answers both layers in. The schema half is the same three
+/// lists [`SchemaExtraction`] declares, so [`Self::split`] hands each half to
+/// the same builder the single-layer paths use.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+struct CombinedExtraction {
+    #[serde(default)]
+    entities: Vec<ExtractedEntity>,
+    #[serde(default)]
+    relations: Vec<ExtractedRelation>,
+    #[serde(default)]
+    events: Vec<ExtractedEvent>,
+    summary: SummaryExtraction,
+}
+
+impl CombinedExtraction {
+    fn split(self) -> (SchemaExtraction, SummaryExtraction) {
+        (
+            SchemaExtraction {
+                entities: self.entities,
+                relations: self.relations,
+                events: self.events,
+            },
+            self.summary,
+        )
+    }
+}
+
 /// LLM-driven [`MemoryExtractor`] implementation.
 /// Uses a configured [`LlmClient`] to perform:
 /// - Named-entity recognition (NER) + relation extraction + event extraction
@@ -297,43 +322,62 @@ impl LlmMemoryExtractor {
         self
     }
 
+    /// What the model is asked to do for the schema layer.
+    const SCHEMA_TASK: &'static str = "Extract structured information from the following \
+         conversation or text. Identify entities, relations between them, and any events \
+         mentioned.";
+
+    /// What the model is asked to do for the summary layer.
+    const SUMMARY_TASK: &'static str = "Summarize the following conversation or text, \
+         focusing on key decisions, lessons learned, user preferences, and actionable \
+         insights. Keep the summary concise (1-3 sentences).";
+
+    /// Both layers are rated on the same 1-10 scale, so the scale is stated once
+    /// instead of being repeated per task and drifting apart.
+    const IMPORTANCE_TASK: &'static str = "Rate the importance of each extracted item on a \
+         scale of 1-10, where 10 is critical information that will be valuable in future \
+         conversations, and 1 is trivial.";
+
+    /// The source is appended to the instructions exactly here, so every prompt
+    /// path pays for the payload the same number of times — once.
+    fn prompt(tasks: &str, source: &RawSource) -> String {
+        format!("{tasks}\n\n{}", String::from_utf8_lossy(&source.payload))
+    }
+
     fn build_schema_prompt(source: &RawSource) -> String {
-        let text = String::from_utf8_lossy(&source.payload);
-        format!(
-            "Extract structured information from the following conversation or text. \
-             Identify entities, relations between them, and any events mentioned. \
-             Rate the importance of each extracted item on a scale of 1-10, \
-             where 10 is critical information that will be valuable in future conversations, \
-             and 1 is trivial.\n\n{}",
-            text
+        Self::prompt(
+            &format!("{} {}", Self::SCHEMA_TASK, Self::IMPORTANCE_TASK),
+            source,
         )
     }
 
     fn build_summary_prompt(source: &RawSource) -> String {
-        let text = String::from_utf8_lossy(&source.payload);
-        format!(
-            "Summarize the following conversation or text, focusing on key decisions, \
-             lessons learned, user preferences, and actionable insights. \
-             Keep the summary concise (1-3 sentences). \
-             Rate the importance of the summary on a scale of 1-10, \
-             where 10 is critical information that will be valuable in future conversations, \
-             and 1 is trivial.\n\n{}",
-            text
+        Self::prompt(
+            &format!("{} {}", Self::SUMMARY_TASK, Self::IMPORTANCE_TASK),
+            source,
         )
     }
-}
 
-#[async_trait]
-impl MemoryExtractor for LlmMemoryExtractor {
-    async fn extract_schema(&self, source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
-        let prompt = Self::build_schema_prompt(source);
-        let extraction: SchemaExtraction = execute_structured(
-            &*self.provider,
-            &[cog_core::Message::user(prompt)],
-            &self.options,
+    /// One prompt carrying both tasks, so one call can answer both. The two
+    /// single-layer prompts are what a caller falls back to when only one layer
+    /// is still missing; this is what a caller with neither missing uses.
+    fn build_combined_prompt(source: &RawSource) -> String {
+        Self::prompt(
+            &format!(
+                "{} {}\n\n{} {}",
+                Self::SCHEMA_TASK,
+                Self::IMPORTANCE_TASK,
+                Self::SUMMARY_TASK,
+                Self::IMPORTANCE_TASK
+            ),
+            source,
         )
-        .await?;
+    }
 
+    /// Turn a schema extraction into store entries. The schema-only call and
+    /// the combined call both land here, so a merged call cannot produce
+    /// different ids or importance for the same model output.
+    fn schema_entries(source: &RawSource, extraction: SchemaExtraction) -> Vec<SchemaEntry> {
         let source_ref = SourceRef::new(format!("memory://{}", source.id), "llm/v1");
 
         let mut entries = Vec::new();
@@ -403,18 +447,17 @@ impl MemoryExtractor for LlmMemoryExtractor {
             );
         }
 
-        Ok(entries)
+        entries
     }
 
-    async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry> {
-        let prompt = Self::build_summary_prompt(source);
-        let extraction: SummaryExtraction = execute_structured(
-            &*self.provider,
-            &[cog_core::Message::user(prompt)],
-            &self.options,
-        )
-        .await?;
-
+    /// Turn a summary extraction into the store entry, embedding the text when
+    /// this host has an embedder. Shared by the summary-only call and the
+    /// combined call for the same reason as [`Self::schema_entries`].
+    async fn summary_entry(
+        &self,
+        source: &RawSource,
+        extraction: SummaryExtraction,
+    ) -> SFResult<SummaryEntry> {
         // An embedder that answers with nothing is a fault, not an absence: only
         // a missing embedder means "this host has no vector layer". Collapsing
         // the two would hide a broken embedder behind the same silent state.
@@ -450,6 +493,52 @@ impl MemoryExtractor for LlmMemoryExtractor {
     }
 }
 
+#[async_trait]
+impl MemoryExtractor for LlmMemoryExtractor {
+    async fn extract_schema(&self, source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
+        let prompt = Self::build_schema_prompt(source);
+        let extraction: SchemaExtraction = execute_structured(
+            &*self.provider,
+            &[cog_core::Message::user(prompt)],
+            &self.options,
+        )
+        .await?;
+
+        Ok(Self::schema_entries(source, extraction))
+    }
+
+    async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry> {
+        let prompt = Self::build_summary_prompt(source);
+        let extraction: SummaryExtraction = execute_structured(
+            &*self.provider,
+            &[cog_core::Message::user(prompt)],
+            &self.options,
+        )
+        .await?;
+
+        self.summary_entry(source, extraction).await
+    }
+
+    /// Both layers from one call. The source is a conversation transcript, so
+    /// it dominates the prompt: asking for the layers in two calls sends all of
+    /// it twice and pays for it twice. The two single-layer methods stay for
+    /// the case where only one layer is still missing.
+    async fn extract_all(&self, source: &RawSource) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
+        let prompt = Self::build_combined_prompt(source);
+        let extraction: CombinedExtraction = execute_structured(
+            &*self.provider,
+            &[cog_core::Message::user(prompt)],
+            &self.options,
+        )
+        .await?;
+
+        let (schema, summary) = extraction.split();
+        let entries = Self::schema_entries(source, schema);
+        let summary = self.summary_entry(source, summary).await?;
+        Ok((entries, summary))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +546,190 @@ mod tests {
 
     fn raw(id: &str, body: &str) -> RawSource {
         RawSource::new(id, "default", "text/plain", body.as_bytes().to_vec())
+    }
+
+    /// 抽取走的是 `execute_structured`，最终落在一次 `chat` 上，所以调用次数
+    /// 就是"这段 payload 被发了几遍"。它同时记下每次收到的正文，供断言
+    /// payload 出现次数用。
+    struct ScriptedLlm {
+        answer: String,
+        calls: std::sync::atomic::AtomicUsize,
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedLlm {
+        fn new(answer: &str) -> Self {
+            Self {
+                answer: answer.to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                prompts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ScriptedLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(1);
+            producer.end(cog_core::ChatResponse::default());
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            self.chat_stream(&[], &ChatOptions::default()).await
+        }
+
+        async fn chat(
+            &self,
+            messages: &[cog_core::Message],
+            _options: &ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.prompts.lock().unwrap().push(
+                messages
+                    .iter()
+                    .map(|m| m.content())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+
+            Ok(cog_core::ChatResponse {
+                content: vec![cog_core::ContentBlock::text(self.answer.clone())],
+                ..Default::default()
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// The schema half alone, as the schema-only call would answer it.
+    const SCHEMA_ANSWER: &str = r#"{
+        "entities": [
+            {"name": "gateway", "kind": "service", "properties": {"tier": "edge"}, "importance": 9}
+        ],
+        "relations": [
+            {"source": "gateway", "target": "cluster", "relation_type": "routes_to", "importance": 7}
+        ],
+        "events": [
+            {"name": "deploy finished", "participants": ["gateway"], "importance": 8}
+        ]
+    }"#;
+
+    /// Both halves in one answer, as the merged call asks for them.
+    const COMBINED_ANSWER: &str = r#"{
+        "entities": [
+            {"name": "gateway", "kind": "service", "properties": {"tier": "edge"}, "importance": 9}
+        ],
+        "relations": [
+            {"source": "gateway", "target": "cluster", "relation_type": "routes_to", "importance": 7}
+        ],
+        "events": [
+            {"name": "deploy finished", "participants": ["gateway"], "importance": 8}
+        ],
+        "summary": {
+            "text": "The gateway routed a deploy to the cluster.",
+            "importance": 6
+        }
+    }"#;
+
+    /// 一段对话就是抽取调用的 payload，token 大头在它上面。分层调用把同一段
+    /// payload 发两遍、按两遍计费；合并之后两层必须来自同一次请求。
+    #[tokio::test]
+    async fn both_layers_come_from_one_call() {
+        let provider = Arc::new(ScriptedLlm::new(COMBINED_ANSWER));
+        let extractor = LlmMemoryExtractor::new(provider.clone());
+
+        let (schema, summary) = extractor
+            .extract_all(&raw("raw-a", "gateway routed a deploy to the cluster"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provider.calls(),
+            1,
+            "the source must be sent once, not once per layer"
+        );
+        // 那一次请求必须是合并提示词，否则"省一半"就退化成只问了其中一层。
+        let sent = provider.prompts();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains(LlmMemoryExtractor::SCHEMA_TASK));
+        assert!(sent[0].contains(LlmMemoryExtractor::SUMMARY_TASK));
+        assert_eq!(
+            schema.len(),
+            3,
+            "all three schema kinds survived: {schema:?}"
+        );
+        assert_eq!(summary.text, "The gateway routed a deploy to the cluster.");
+        assert_eq!(summary.importance, cog_core::importance_from_rating(6));
+    }
+
+    /// 合并本身不许把 payload 塞两遍——那正是这次要消掉的那笔开销；也不许
+    /// 用"少发点"的名义丢掉一层。
+    #[tokio::test]
+    async fn the_merged_prompt_carries_the_payload_once() {
+        const SENTINEL: &str = "SENTINEL-4682f1";
+        let prompt = LlmMemoryExtractor::build_combined_prompt(&raw("raw-a", SENTINEL));
+
+        assert_eq!(
+            prompt.matches(SENTINEL).count(),
+            1,
+            "the payload must appear exactly once: {prompt}"
+        );
+        assert!(prompt.contains(LlmMemoryExtractor::SCHEMA_TASK));
+        assert!(prompt.contains(LlmMemoryExtractor::SUMMARY_TASK));
+    }
+
+    /// 合并只许省调用，不许改落库的内容：同一份模型输出，分层走与合并走
+    /// 必须产出同样的 id、kind 与 importance，否则"优化"会静默改掉记忆。
+    #[tokio::test]
+    async fn the_merged_call_stores_what_the_layered_call_stores() {
+        let layered = LlmMemoryExtractor::new(Arc::new(ScriptedLlm::new(SCHEMA_ANSWER)));
+        let merged = LlmMemoryExtractor::new(Arc::new(ScriptedLlm::new(COMBINED_ANSWER)));
+        let source = raw("raw-a", "gateway routed a deploy to the cluster");
+
+        let mut alone = layered.extract_schema(&source).await.unwrap();
+        let (mut together, _) = merged.extract_all(&source).await.unwrap();
+
+        let shape = |entries: &mut Vec<SchemaEntry>| {
+            entries.sort_by(|a, b| a.id.cmp(&b.id));
+            entries
+                .iter()
+                .map(|e| (e.id.clone(), e.kind, e.importance))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&mut alone), shape(&mut together));
+    }
+
+    /// 抽取器报错时两层一起失败（一次调用只有一个结局）。这不是缺陷，是合并
+    /// 的代价：调用失败后什么都没落库，重驱动会把两层一起补上。
+    #[tokio::test]
+    async fn a_failed_merged_call_stores_nothing() {
+        let provider = Arc::new(ScriptedLlm::new("{\"entities\": []}"));
+        let extractor = LlmMemoryExtractor::new(provider.clone());
+
+        assert!(extractor
+            .extract_all(&raw("raw-a", "gateway routed a deploy"))
+            .await
+            .is_err());
+        assert_eq!(provider.calls(), 1);
     }
 
     /// The rule path's importance is a rating on the shared scale, not a bare

@@ -636,6 +636,21 @@ pub trait MemoryExtractor: Send + Sync {
 
     /// Generate a semantic summary entry from a raw source.
     async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry>;
+
+    /// Extract both layers in one pass.
+    ///
+    /// A caller that needs both layers calls this instead of the two methods
+    /// above. The default runs them one after the other, which is correct but
+    /// reads the source twice: when the extraction is a model call, the source
+    /// — typically the bulk of the prompt — is paid for on every layer.
+    /// Implementations whose two layers can share one call must override this
+    /// so the source is sent once; the default keeps an extractor that has no
+    /// such call (a rule matcher, a test double) working unchanged.
+    async fn extract_all(&self, source: &RawSource) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
+        let schema = self.extract_schema(source).await?;
+        let summary = self.generate_summary(source).await?;
+        Ok((schema, summary))
+    }
 }
 
 // ─── SchemaBackend / SummaryBackend (migrated from cog-memory) ───────────

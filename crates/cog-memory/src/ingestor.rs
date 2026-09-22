@@ -793,29 +793,45 @@ impl MemoryIngestor {
 
     /// 补齐 raw 缺失的层：schema 或 summary 已存在就跳过对应抽取。对账重放
     /// 与正常路径共用这一段，靠层存在性保证幂等。
+    ///
+    /// 两层都缺（正常路径，也是绝大多数）时走一次合并调用：抽取器分层调用
+    /// 会把同一段 payload 各发一遍，而 payload 是输入 token 的大头。只有一层
+    /// 缺时才用单层方法，否则已落库的那层会被白抽一遍。
     async fn ingest_missing(&self, raw: &RawSource) -> SFResult<()> {
         let schema_done = !self
             .backend
             .schema_for_raw(&raw.namespace, &raw.id)
             .await?
             .is_empty();
-        if !schema_done {
-            let schema_entries = self.extractor.extract_schema(raw).await?;
-            for entry in &schema_entries {
-                self.backend.store_schema(&raw.namespace, entry).await?;
-            }
-            debug!("Stored {} schema entries", schema_entries.len());
-        }
-
         let summary_done = !self
             .backend
             .summary_for_raw(&raw.namespace, &raw.id)
             .await?
             .is_empty();
-        if !summary_done {
-            let summary = self.extractor.generate_summary(raw).await?;
-            self.backend.store_summary(&raw.namespace, &summary).await?;
-            debug!("Stored summary {}", summary.id);
+
+        match (schema_done, summary_done) {
+            (true, true) => {}
+            (false, false) => {
+                let (schema_entries, summary) = self.extractor.extract_all(raw).await?;
+                for entry in &schema_entries {
+                    self.backend.store_schema(&raw.namespace, entry).await?;
+                }
+                debug!("Stored {} schema entries", schema_entries.len());
+                self.backend.store_summary(&raw.namespace, &summary).await?;
+                debug!("Stored summary {}", summary.id);
+            }
+            (false, true) => {
+                let schema_entries = self.extractor.extract_schema(raw).await?;
+                for entry in &schema_entries {
+                    self.backend.store_schema(&raw.namespace, entry).await?;
+                }
+                debug!("Stored {} schema entries", schema_entries.len());
+            }
+            (true, false) => {
+                let summary = self.extractor.generate_summary(raw).await?;
+                self.backend.store_summary(&raw.namespace, &summary).await?;
+                debug!("Stored summary {}", summary.id);
+            }
         }
 
         Ok(())
@@ -1646,6 +1662,128 @@ mod tests {
                 unavailable_upstreams: vec!["a|m".into()],
             })
         }
+    }
+
+    /// 带可抽取实体的 raw：规则抽取器只认 `@entity:` 这类行，没有它 schema
+    /// 层是空的，"已落库/缺失"就分不出来。
+    fn entity_raw(id: &str) -> RawSource {
+        RawSource::new(
+            id,
+            "default",
+            "text/plain",
+            b"@entity: gateway\n@event: deploy finished\n".to_vec(),
+        )
+    }
+
+    /// 记下每个入口被调用几次的抽取器：分层调用与合并调用是两条不同的路径，
+    /// 走错一条只体现在调用次数上。
+    #[derive(Default)]
+    struct CountingExtractor {
+        inner: RuleBasedExtractor,
+        merged: std::sync::atomic::AtomicUsize,
+        schema_only: std::sync::atomic::AtomicUsize,
+        summary_only: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingExtractor {
+        fn calls(&self) -> (usize, usize, usize) {
+            (
+                self.merged.load(std::sync::atomic::Ordering::SeqCst),
+                self.schema_only.load(std::sync::atomic::Ordering::SeqCst),
+                self.summary_only.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryExtractor for CountingExtractor {
+        async fn extract_schema(&self, source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
+            self.schema_only
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.extract_schema(source).await
+        }
+
+        async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry> {
+            self.summary_only
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.generate_summary(source).await
+        }
+
+        async fn extract_all(
+            &self,
+            source: &RawSource,
+        ) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
+            self.merged
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let schema = self.inner.extract_schema(source).await?;
+            let summary = self.inner.generate_summary(source).await?;
+            Ok((schema, summary))
+        }
+    }
+
+    /// 正常路径两层都缺：只许发生一次合并抽取。分层调用会把同一段 payload
+    /// 各发一遍，而 payload 是输入 token 的大头。
+    #[tokio::test]
+    async fn both_missing_layers_take_the_merged_call() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let extractor = Arc::new(CountingExtractor::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), extractor.clone());
+        let raw = entity_raw("merged-call");
+
+        ingestor.ingest_missing(&raw).await.unwrap();
+
+        assert_eq!(
+            extractor.calls(),
+            (1, 0, 0),
+            "one merged call, no single-layer call"
+        );
+        assert!(
+            !backend
+                .schema_for_raw(&raw.namespace, &raw.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the schema half must still be stored"
+        );
+        assert_eq!(
+            backend
+                .summary_for_raw(&raw.namespace, &raw.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the summary half must still be stored"
+        );
+    }
+
+    /// 上一次跑到一半（schema 已落库、summary 还没写）是重驱动最常见的样子：
+    /// 这时只许补缺的那层，已落库的层不许被重抽一遍。
+    #[tokio::test]
+    async fn a_stored_layer_is_not_re_extracted() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let extractor = Arc::new(CountingExtractor::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), extractor.clone());
+        let raw = entity_raw("half-done");
+
+        let seeded = RuleBasedExtractor::new()
+            .extract_schema(&raw)
+            .await
+            .unwrap();
+        assert!(
+            !seeded.is_empty(),
+            "fixture must carry something the backend can find again"
+        );
+        for entry in &seeded {
+            backend.store_schema(&raw.namespace, entry).await.unwrap();
+        }
+
+        ingestor.ingest_missing(&raw).await.unwrap();
+
+        assert_eq!(
+            extractor.calls(),
+            (0, 0, 1),
+            "only the missing layer may be extracted"
+        );
     }
 
     fn transcript_raw(agent_id: &str) -> RawSource {
