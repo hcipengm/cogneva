@@ -969,18 +969,18 @@ impl PgeRoundtable {
             .map(|(v, _)| v)
             .unwrap_or(Verdict::Fail);
 
-        // 先在同判决的分支里按分挑，挑不到（不该发生，除非判决计数与判词不一致）
-        // 才退回第一条已判分支，而不是全场最高分——那会把判决不同的分支选上来，
-        // 与"按多数判决合并"这句话相反。
+        // 只在与多数判决一致的分支里按分挑。多数判决是从这批分支自己数出来的，所以
+        // 至少有一条分支持该判决，这里挑不空。刻意不设"挑空就退回某条分支"的兜底：
+        // 那等于把一条判决与合并所用判决相反的分支选上来，而 `reasoning` 里写的仍是
+        // 多数判决，读的人无从发现。
         let agreeing: Vec<&PgeBranchResult> = judged
             .iter()
             .copied()
             .filter(|b| b.outcome.judgement().map(|e| e.verdict) == Some(majority_verdict))
             .collect();
-        let best = best_scored(&agreeing)
-            .or_else(|| judged.first().copied())
-            .cloned()
-            .expect("the caller checked at least one branch reached a judgement");
+        let best = best_scored(&agreeing).cloned().expect(
+            "the majority verdict was counted over these same branches, so one of them holds it",
+        );
 
         MergeResult {
             reasoning: format!(
