@@ -80,6 +80,11 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: "120"
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: "3600"
   COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: "2"
+  # 从裸仓库的哪个目录读清单。默认与代码默认值同源（deploy/k3s），暴露它是为了
+  # 让"清单目录"成为可配置的部署面，而不是散在代码里的常量。换成
+  # deploy/rendered/<profile>/ 现在不成立：那里没有 kustomization.yaml，清单
+  # 文件名也不同，得先有消费渲染产物的路径。
+  COGNEVA_MAINLINE_DEPLOYER_MANIFEST_DIR: "deploy/k3s"
   # 启动阶段（Pod 的 init 容器未结束）的上界，与就绪预算分开计。
   COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS: "900"
   # 就绪阶段（init 全部结束后的滚动收敛）上界，与代码默认值同为 300s：

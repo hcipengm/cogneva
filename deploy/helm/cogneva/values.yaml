@@ -417,6 +417,13 @@ mainlineDeployer:
   soakSecs: 120
   failureCooldownSecs: 3600
   cargoBuildJobs: 2
+  # 部署器从裸仓库的哪个目录读清单（仓库内相对路径）。它的 `kustomization.yaml`
+  # 的 resources 列表是发布资源集的权威清单，滚动 Job 按它 apply 支撑资源。
+  # 默认 `deploy/k3s`：那是三份 profile 共用的静态基线，也是本集群在跑的那份。
+  # 换成 `deploy/rendered/<profile>/` 现在不成立——那里没有 kustomization.yaml，
+  # 清单文件名也不同（41-deployment-cogneva.yaml vs deployment.yaml），换目录
+  # 还不够，得先有消费渲染产物的路径。此处先把这个度暴露出来，不制造半截能力。
+  manifestDir: "deploy/k3s"
   # 滚动启动阶段的上界（秒）：Pod 的 init 容器（仓库种子/镜像拉取）未结束时
   # 不吃就绪预算、只吃这个上界。种子是网络克隆，耗时随集群到上游的链路变化，
   # 链路慢就调大这里，不要靠放宽就绪预算。

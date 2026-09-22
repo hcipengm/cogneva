@@ -106,6 +106,9 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: {{ .Values.mainlineDeployer.soakSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: {{ .Values.mainlineDeployer.failureCooldownSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: {{ .Values.mainlineDeployer.cargoBuildJobs | int | quote }}
+  # 从裸仓库的哪个目录读清单。默认与代码默认值同源（deploy/k3s），暴露它是为了
+  # 让"清单目录"成为可配置的部署面，而不是散在代码里的常量。
+  COGNEVA_MAINLINE_DEPLOYER_MANIFEST_DIR: {{ .Values.mainlineDeployer.manifestDir | quote }}
   # 启动阶段（Pod 的 init 容器未结束）的上界，与就绪预算分开计。
   COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS: {{ .Values.mainlineDeployer.startupTimeoutSecs | int | quote }}
   # 就绪阶段（init 全部结束后的滚动收敛）上界。默认与代码默认值同源，
