@@ -890,7 +890,10 @@ impl ActionPlanOrchestrator {
             "parent_task_id": task_id,
             "attempts": attempts,
             "source": "action_planner",
-            "original_input": original_input,
+            "task_goal": cog_core::bounded_task_goal(
+                original_input,
+                cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
+            ),
         });
         if let Some(sink) = self.alert_sink().await {
             let draft = cog_core::PersistentAlertDraft {
@@ -1911,6 +1914,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingAlertSink {
         calls: std::sync::Mutex<Vec<(bool, String, String)>>,
+        drafts: std::sync::Mutex<Vec<cog_core::PersistentAlertDraft>>,
     }
 
     #[async_trait::async_trait]
@@ -1925,6 +1929,7 @@ mod tests {
                 draft.rule.clone(),
                 draft.dedup_key.clone(),
             ));
+            self.drafts.lock().unwrap().push(draft.clone());
             Ok(())
         }
 
@@ -1970,6 +1975,51 @@ mod tests {
         assert!(calls[0].0);
         assert_eq!(calls[0].1, cog_core::ALERT_RULE_DECOMPOSITION_EMPTY);
         assert!(calls[0].2.ends_with(":sig-alert-1"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_decomposition_alert_bounds_the_input_it_quotes() {
+        // The label is what self-discovery inlines into the next goal, which
+        // becomes the next task's input — so it may only carry an excerpt the
+        // reader can see inline, never the whole input.
+        let dag: Arc<dyn cog_core::DagExecutor> = Arc::new(crate::DagExecutor::new(
+            "ws-empty-decomp-labels".to_string(),
+        ));
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let registry = SkillRegistry::new();
+        let mut original = hint_task("sig-alert-big");
+        original.input = serde_json::json!({ "goal": "刷新接口未区分访问令牌".repeat(5000) });
+        planner
+            .process_goal_impl("fix firing alert", vec![original], &registry)
+            .await
+            .expect("exhausted decomposition acks with failed originals");
+
+        let drafts = sink.drafts.lock().unwrap();
+        let labels = &drafts
+            .first()
+            .expect("the empty decomposition must alert")
+            .labels;
+        let carried = labels["task_goal"]
+            .as_str()
+            .expect("the excerpt is a string");
+        assert!(
+            carried.chars().count() <= cog_core::ALERT_LABEL_VALUE_MAX_CHARS + 1,
+            "the alert label is what the next task input embeds: {} chars",
+            carried.chars().count()
+        );
+        assert!(carried.ends_with('…'));
+        assert!(
+            labels.get("original_input").is_none(),
+            "the whole input must not survive as a label"
+        );
     }
 
     #[tokio::test]

@@ -67,6 +67,16 @@ pub struct SignalWatcherConfig {
     pub alert_channel_enabled: bool,
     /// Max alerts converted to intents per tick (flood guard).
     pub alert_channel_max_per_tick: usize,
+    /// Longest an alert label value may be where this channel inlines it into
+    /// a goal.
+    ///
+    /// The goal is submitted as a task input, and when that task stalls its
+    /// input comes back as the next alert's labels — so an unbounded label
+    /// value makes every generation cost more tokens than the one before it
+    /// for the same non-progress. The cap is here, and not only on the
+    /// producers, because the control plane that raised the alert can be an
+    /// older revision than this watcher.
+    pub alert_label_max_chars: usize,
 }
 
 impl Default for SignalWatcherConfig {
@@ -81,6 +91,7 @@ impl Default for SignalWatcherConfig {
             self_audit_interval_secs: 7 * 86_400,
             alert_channel_enabled: true,
             alert_channel_max_per_tick: 5,
+            alert_label_max_chars: cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
         }
     }
 }
@@ -196,6 +207,42 @@ fn select_alerts<'a>(
         .filter(|a| cooldown_elapsed(state, &format!("alert:{}", a.dedup_key), cooldown_secs, now))
         .take(max)
         .collect()
+}
+
+/// Turn one firing alert into the intent that will try to fix it.
+///
+/// The labels are clamped on the way in because this intent's task input is
+/// what the *next* alert about this work will carry as its labels: an alert
+/// that embedded its task's whole input, turned into a goal that inlines the
+/// labels, became a task whose input the following alert embedded again.
+/// Nothing in that chain makes progress until the upstream returns, so the
+/// payload was pure growth — eight generations took one alert's labels from
+/// 1.9 KB of JSON to 25 KB, all of it the same text re-nested.
+fn alert_intent(
+    alert: &cog_core::PersistedAlert,
+    max_label_chars: usize,
+) -> (String, serde_json::Value) {
+    let labels = cog_core::bound_alert_labels(&alert.labels, max_label_chars);
+    let goal = format!(
+        "Investigate and fix the root cause of firing alert \"{}\" \
+         (severity: {}): {}. Alert labels: {}. The alert fired at {} \
+         and is still active. Identify the underlying defect or \
+         resource condition, implement a durable fix, and explain \
+         how recurrence is prevented.",
+        alert.rule,
+        alert.severity,
+        alert.message,
+        labels,
+        alert.fired_at.to_rfc3339(),
+    );
+    let detail = serde_json::json!({
+        "kind": "persisted_alert",
+        "rule": alert.rule,
+        "dedup_key": alert.dedup_key,
+        "severity": alert.severity,
+        "labels": labels,
+    });
+    (goal, detail)
 }
 
 /// Normalize a task error into a recurrence signature: same root cause must
@@ -491,30 +538,13 @@ async fn tick(
                 let key = format!("alert:{}", alert.dedup_key);
                 dirty = true;
                 let hash = short_hash(&key);
-                let goal = format!(
-                    "Investigate and fix the root cause of firing alert \"{}\" \
-                     (severity: {}): {}. Alert labels: {}. The alert fired at {} \
-                     and is still active. Identify the underlying defect or \
-                     resource condition, implement a durable fix, and explain \
-                     how recurrence is prevented.",
-                    alert.rule,
-                    alert.severity,
-                    alert.message,
-                    alert.labels,
-                    alert.fired_at.to_rfc3339(),
-                );
+                let (goal, detail) = alert_intent(alert, config.alert_label_max_chars);
                 let outcome = submit_intent(
                     orch,
                     format!("self-signal-alert-{hash}"),
                     "self_signal",
                     goal,
-                    serde_json::json!({
-                        "kind": "persisted_alert",
-                        "rule": alert.rule,
-                        "dedup_key": alert.dedup_key,
-                        "severity": alert.severity,
-                        "labels": alert.labels,
-                    }),
+                    detail,
                 )
                 .await;
                 report_outcome(&mut state, &key, outcome, now);
@@ -706,5 +736,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
+    }
+
+    #[test]
+    fn an_alert_that_embeds_a_whole_input_yields_a_bounded_intent() {
+        // The amplification this guards against: an alert carries its task's
+        // whole input as a label, the watcher inlines the labels into a goal,
+        // and that goal becomes the next task's input — which the next alert
+        // then embeds, one nesting level deeper, for the same non-progress.
+        let mut alert = firing("amp");
+        alert.labels = serde_json::json!({
+            "goal_id": "g1",
+            "original_input": {
+                "goal": "刷新接口未区分访问令牌".repeat(2000),
+                "nested": { "original_input": { "goal": "g".repeat(50_000) } },
+            },
+        });
+
+        let (goal, detail) = alert_intent(&alert, 256);
+
+        assert!(
+            goal.chars().count() < 4_000,
+            "goal inlines the labels; unbounded labels make every re-drive bigger: {} chars",
+            goal.chars().count()
+        );
+        let forwarded = detail["labels"]["original_input"]
+            .as_str()
+            .expect("a nested object must be flattened, not carried as nesting");
+        assert!(
+            forwarded.chars().count() <= 257,
+            "the forwarded label is what the next alert embeds: {} chars",
+            forwarded.chars().count()
+        );
+        assert!(forwarded.ends_with('…'));
     }
 }

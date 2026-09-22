@@ -330,6 +330,73 @@ pub struct PersistentAlertDraft {
     pub labels: serde_json::Value,
 }
 
+/// Longest an alert label value may be before it is truncated.
+pub const ALERT_LABEL_VALUE_MAX_CHARS: usize = 1024;
+
+/// Truncate on a character boundary and mark that it happened.
+///
+/// A silent cut reads as the whole value; the marker is what keeps a
+/// truncated label from being mistaken for a complete one.
+pub fn clamp_label_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// Bounded, label-safe summary of a task input for an alert about that task.
+///
+/// The task id stays in the labels as the pointer to the full input; this is
+/// only the excerpt a reader gets inline. It must be bounded because labels do
+/// not stay in the alert: self-discovery inlines them into a new goal, that
+/// goal becomes the next task's input, and when that task stalls its input
+/// becomes labels again. Whatever a label carries therefore comes back one
+/// generation deeper, so a label that embeds a whole input makes every
+/// re-drive cost more than the last for the same non-progress.
+pub fn bounded_task_goal(input: Option<&serde_json::Value>, max_chars: usize) -> String {
+    let text = input
+        .and_then(|v| v.get("goal"))
+        .and_then(|g| g.as_str())
+        .unwrap_or_default();
+    clamp_label_text(text, max_chars)
+}
+
+/// Clamp every value of an alert label set to a bounded size.
+///
+/// The consumer applies this because the producer may predate the bound: an
+/// evolution deployment is ahead of the control plane that raised the alert,
+/// and only the consumer knows how much text it is about to embed in a prompt.
+/// Nested objects and arrays are flattened to a clamped string rather than
+/// descended into, because depth is exactly what the label chain grows by.
+pub fn bound_alert_labels(labels: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+    match labels {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        match v {
+                            serde_json::Value::String(s) => {
+                                serde_json::Value::String(clamp_label_text(s, max_chars))
+                            }
+                            serde_json::Value::Number(_)
+                            | serde_json::Value::Bool(_)
+                            | serde_json::Value::Null => v.clone(),
+                            nested => serde_json::Value::String(clamp_label_text(
+                                &nested.to_string(),
+                                max_chars,
+                            )),
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        other => serde_json::Value::String(clamp_label_text(&other.to_string(), max_chars)),
+    }
+}
+
 /// Write-side handle over persisted alerts, symmetric to
 /// [`ActiveAlertSource`]. Producers that detect durable fault conditions
 /// (stalled DAG tasks, exhausted retries) raise alerts through this port so
@@ -353,4 +420,78 @@ pub trait PersistentAlertSink: Send + Sync {
         rule_prefix: &str,
         limit: i64,
     ) -> Vec<PersistedAlert>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_label_text_leaves_short_text_untouched() {
+        assert_eq!(clamp_label_text("ok", 16), "ok");
+        // Exactly at the cap is not a truncation.
+        assert_eq!(clamp_label_text("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn clamp_label_text_truncates_on_a_char_boundary_and_says_so() {
+        let text = "刷新接口未区分访问令牌".repeat(10);
+        let clamped = clamp_label_text(&text, 5);
+        assert_eq!(clamped, "刷新接口未…");
+        assert!(
+            clamped.ends_with('…'),
+            "a silent cut reads as a whole value"
+        );
+    }
+
+    #[test]
+    fn bounded_task_goal_reads_the_goal_and_caps_it() {
+        let input = serde_json::json!({ "goal": "g".repeat(100), "other": "ignored" });
+        assert_eq!(
+            bounded_task_goal(Some(&input), 10),
+            format!("{}…", "g".repeat(10))
+        );
+    }
+
+    #[test]
+    fn bounded_task_goal_of_a_missing_or_shapeless_input_is_empty() {
+        assert_eq!(bounded_task_goal(None, 10), "");
+        // A task whose input has no string goal yields nothing rather than a
+        // serialized blob: the labels are not a place to smuggle the input in.
+        assert_eq!(
+            bounded_task_goal(Some(&serde_json::json!({"goal": 7})), 10),
+            ""
+        );
+    }
+
+    #[test]
+    fn bound_alert_labels_clamps_values_and_flattens_nesting() {
+        let nested = serde_json::json!({"original_input": {"goal": "x".repeat(500)}});
+        let bounded = bound_alert_labels(
+            &serde_json::json!({
+                "goal_id": "g1",
+                "attempts": 3,
+                "source": "orphan_reconciler",
+                "original_input": nested,
+            }),
+            64,
+        );
+        assert_eq!(bounded["goal_id"], "g1");
+        assert_eq!(bounded["attempts"], 3);
+        let flattened = bounded["original_input"]
+            .as_str()
+            .expect("a nested object must not survive as nesting");
+        assert!(flattened.chars().count() <= 65, "over the cap: {flattened}");
+        assert!(flattened.ends_with('…'));
+    }
+
+    #[test]
+    fn bound_alert_labels_caps_a_bare_string() {
+        let bounded = bound_alert_labels(&serde_json::json!("y".repeat(100)), 8);
+        // A non-object label set is flattened by serializing it, so the clamped
+        // text starts with the opening quote of that serialization.
+        let text = bounded.as_str().expect("a bare value flattens to a string");
+        assert!(text.ends_with('…'));
+        assert!(text.chars().count() <= 9, "over the cap: {text}");
+    }
 }

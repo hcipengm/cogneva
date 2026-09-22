@@ -671,7 +671,10 @@ async fn orphan_reconcile_tick(
             "goal_id": goal_id,
             "parent_task_id": task_id,
             "source": "orphan_reconciler",
-            "original_input": orphan.input,
+            "task_goal": cog_core::bounded_task_goal(
+                Some(&orphan.input),
+                cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
+            ),
         });
         if let Some(sink) = sink {
             let draft = cog_core::PersistentAlertDraft {
@@ -1189,6 +1192,7 @@ mod orphan_reconciler_tests {
     #[derive(Default)]
     struct RecordingAlertSink {
         calls: Mutex<Calls>,
+        drafts: Mutex<Vec<cog_core::PersistentAlertDraft>>,
         active: Mutex<Vec<cog_core::PersistedAlert>>,
     }
 
@@ -1204,6 +1208,7 @@ mod orphan_reconciler_tests {
                 draft.rule.clone(),
                 draft.dedup_key.clone(),
             ));
+            self.drafts.lock().unwrap().push(draft.clone());
             Ok(())
         }
 
@@ -1312,6 +1317,53 @@ mod orphan_reconciler_tests {
         assert_eq!(
             recording.calls.lock().unwrap()[1],
             (false, "decomposition_orphaned".into(), key.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_orphan_alert_carries_a_bounded_excerpt_not_the_whole_input() {
+        // Self-discovery turns a firing alert's labels into a new goal, which
+        // becomes the next task's input, which the next alert embeds again.
+        // A label that carries the whole input therefore grows one generation
+        // deeper for the same non-progress.
+        let dag = Arc::new(DagExecutor::new("ws-orphan-labels".into()));
+        let mut orphan = Task::new(
+            "orphan-big",
+            TaskType::Generator,
+            serde_json::json!({ "goal": "刷新接口未区分访问令牌".repeat(5000) }),
+        );
+        orphan.is_executable = false;
+        orphan.updated_at = chrono::Utc::now() - chrono::Duration::minutes(60);
+        dag.add_task(orphan).await.unwrap();
+
+        let recording = Arc::new(RecordingAlertSink::default());
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
+        let mut firing = std::collections::HashMap::new();
+        orphan_reconcile_tick(
+            &dag,
+            Some(&sink),
+            &chrono::Duration::minutes(30),
+            &chrono::Duration::zero(),
+            &mut firing,
+        )
+        .await;
+
+        let drafts = recording.drafts.lock().unwrap();
+        let draft = drafts
+            .first()
+            .expect("the orphan must have raised an alert");
+        let carried = draft.labels["task_goal"]
+            .as_str()
+            .expect("the excerpt is a string");
+        assert!(
+            carried.chars().count() <= cog_core::ALERT_LABEL_VALUE_MAX_CHARS + 1,
+            "the alert label is what the next task input embeds: {} chars",
+            carried.chars().count()
+        );
+        assert!(carried.ends_with('…'));
+        assert!(
+            draft.labels.get("original_input").is_none(),
+            "the whole input must not survive as a label"
         );
     }
 
