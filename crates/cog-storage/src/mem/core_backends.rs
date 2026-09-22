@@ -948,6 +948,7 @@ impl MetricsBackend for MemoryMetricsBackend {
                 overflow: 0,
                 count: 0,
                 sum: 0.0,
+                updated_at: sample.timestamp,
             });
 
             match bounds.iter().position(|bound| sample.value <= *bound) {
@@ -956,6 +957,7 @@ impl MetricsBackend for MemoryMetricsBackend {
             }
             totals.count += 1;
             totals.sum += sample.value;
+            totals.updated_at = totals.updated_at.max(sample.timestamp);
         }
 
         Ok(series.into_values().collect())

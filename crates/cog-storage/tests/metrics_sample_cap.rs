@@ -3,8 +3,8 @@
 //! What these tests check is the part the database decides: that a log over
 //! its row budget is brought back under it oldest-first, that a log under
 //! budget is left alone, that a log larger than one statement is drained all
-//! the way rather than partly, and that no series is left without the one row
-//! every reader reaches it through. None of that can be checked without a
+//! the way rather than partly, and that no gauge series is left without the one
+//! row every reader reaches it through. None of that can be checked without a
 //! server, so the tests are ignored by default and need
 //! `COGNEVA_TEST_DATABASE_URL` pointing at a throwaway database:
 //!
@@ -85,8 +85,33 @@ async fn insert_series(pool: &PgPool, table: &str, series: i64, rows: i64) {
     .unwrap();
 }
 
+/// Insert `rows` counter rows spread across `series` distinct label sets — the
+/// shape of a counter keyed on an object id, where no label set ever recurs.
+async fn insert_counter_series(pool: &PgPool, table: &str, series: i64, rows: i64) {
+    sqlx::query(&format!(
+        "INSERT INTO {table} (metric_type, name, value, labels, timestamp)
+         SELECT 'counter', 'probe_total', 1.0,
+                jsonb_build_object('object', g % $1),
+                NOW() - make_interval(secs => g)
+         FROM generate_series(0, $2 - 1) AS g"
+    ))
+    .bind(series)
+    .bind(rows)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn count(pool: &PgPool, table: &str) -> i64 {
     sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn count_named(pool: &PgPool, table: &str, name: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE name = $1"))
+        .bind(name)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -207,96 +232,58 @@ async fn every_series_keeps_its_newest_row_even_when_the_budget_is_below_that() 
     drop_probe(&pool, table).await;
 }
 
-/// A series nothing writes any more must not be exempt by construction. Its
-/// newest row is the newest it will ever have, so an unconditional floor holds
-/// it forever and `/metrics` keeps serving a value from before the rename —
-/// which reads as a live reading rather than as a leftover. Released at its
-/// ordinary rank, it ages out with the rest.
+/// The floor is about which kinds are read through the log, not about being a
+/// head. A gauge's value is its newest row, so that row stays; a counter's and a
+/// histogram's value is in their accumulation tables, so every row of theirs is
+/// history the sweep may take.
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
-async fn a_retired_series_row_is_not_held_by_the_floor() {
-    let table = "metrics_sample_cap_probe_retired";
+async fn only_a_gauge_series_keeps_a_row() {
+    let table = "metrics_sample_cap_probe_kinds";
     let pool = PgPool::connect(&database_url()).await.unwrap();
     fresh_probe(&pool, table).await;
-
-    // A retired series with a single, old row — the shape a rename leaves.
-    sqlx::query(&format!(
-        "INSERT INTO {table} (metric_type, name, value, timestamp)
-         VALUES ('gauge', 'retired_probe_gauge', 1.0, NOW() - INTERVAL '2 days')"
-    ))
-    .execute(&pool)
-    .await
-    .unwrap();
     insert_aged(&pool, table, 4, "1 day").await;
+    insert_series(&pool, table, 1, 4).await;
 
-    // A budget the floor alone would stop: the live series' newest row plus the
-    // retired row are five rows, so a budget of one is unreachable while the
-    // retired row stays exempt.
-    let outcome = SampleLogCap::new(pool.clone(), 1)
-        .with_table(table)
-        .with_retired_names(vec!["retired_probe_gauge"])
-        .sweep_once()
-        .await
-        .unwrap();
+    let outcome = cap(pool.clone(), table, 1).sweep_once().await.unwrap();
 
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT count(*) FROM {table} WHERE name = 'retired_probe_gauge'"
-        ))
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
+        count_named(&pool, table, "probe_total").await,
         0,
-        "the retired series' last row must be deletable"
+        "a counter's log rows are history and must all be deletable"
     );
-    // The live series' head survives; the retired row and the three rows below
-    // the head go, which is exactly the four rows over the budget of one.
-    assert_eq!(outcome.removed, 4);
+    assert_eq!(
+        count_named(&pool, table, "probe_gauge").await,
+        1,
+        "the gauge's newest row is the value the scrape reads"
+    );
+    assert_eq!(outcome.removed, 7);
     assert_eq!(outcome.held, 1);
-    assert!(
-        !outcome.floor_held,
-        "with the retired row released the floor is the live series' head alone"
-    );
+    assert!(!outcome.floor_held);
     drop_probe(&pool, table).await;
 }
 
-/// And the release is only for the names named: a series the sweep was not
-/// told about keeps its head, which is the behaviour the release must not
-/// widen by accident.
+/// A counter keyed on an object id mints a label set per object and never
+/// repeats one. Were the floor to cover counters, this log could never be
+/// brought under budget: every pass would report itself over capacity with no
+/// row it was allowed to take, which makes the capacity knob inoperative
+/// exactly where an unbounded series count lives.
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
-async fn a_series_not_named_as_retired_keeps_its_head() {
-    let table = "metrics_sample_cap_probe_not_retired";
+async fn a_counter_whose_series_do_not_repeat_can_be_brought_under_budget() {
+    let table = "metrics_sample_cap_probe_cardinality";
     let pool = PgPool::connect(&database_url()).await.unwrap();
     fresh_probe(&pool, table).await;
+    insert_counter_series(&pool, table, 30, 300).await;
 
-    sqlx::query(&format!(
-        "INSERT INTO {table} (metric_type, name, value, timestamp)
-         VALUES ('gauge', 'retired_probe_gauge', 1.0, NOW() - INTERVAL '2 days')"
-    ))
-    .execute(&pool)
-    .await
-    .unwrap();
-    insert_aged(&pool, table, 4, "1 day").await;
+    let outcome = cap(pool.clone(), table, 5).sweep_once().await.unwrap();
 
-    let outcome = SampleLogCap::new(pool.clone(), 1)
-        .with_table(table)
-        .with_retired_names(vec![])
-        .sweep_once()
-        .await
-        .unwrap();
-
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT count(*) FROM {table} WHERE name = 'retired_probe_gauge'"
-        ))
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        1,
-        "an unnamed series' head is what the floor exists for"
+    assert_eq!(outcome.held, 5);
+    assert_eq!(outcome.removed, 295);
+    assert!(
+        !outcome.floor_held,
+        "nothing in a counter's log is a value any reader reaches it through"
     );
-    assert!(outcome.floor_held);
     drop_probe(&pool, table).await;
 }
 

@@ -792,27 +792,43 @@ impl cog_core::SystemPlugin for StoragePlugin {
             info!("PartitionMaintainer disabled (no PostgreSQL pool)");
         }
 
-        // ── Metrics sample log capacity ──
+        // ── Metrics sample log capacity and retired-name release ──
         // Only the PostgreSQL sample log grows without bound; the in-memory
         // backend dies with the process. A budget of 0 disables pruning, which
         // is also how a deployment opts out — the sweep is idempotent across
         // processes, but only the deployment that means to hold the log down
-        // should be the one doing it.
+        // should be the one doing it. The release of retired names is attached
+        // to this loop for its cadence, not for its gate: it runs every cycle
+        // whether or not anything is being pruned, because whether a retired
+        // name is still served is not a capacity decision. Concurrent releases
+        // are harmless — every deployment ships the same list and a second one
+        // finds the rows already gone.
         let sample_max_rows = ctx.config().metrics.sample_max_rows;
-        if sample_max_rows == 0 {
-            info!("Metrics sample capacity disabled (sample_max_rows=0)");
-        } else if let Some(pool) = self.pg_pool.clone() {
+        if let Some(pool) = self.pg_pool.clone() {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
             let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
-            let mut cap = crate::SampleLogCap::new(pool, sample_max_rows);
+
+            let mut retirement = crate::RetirementPass::new(std::sync::Arc::new(
+                crate::MetricsRetirement::new(pool.clone()),
+            ));
+            if let Some(mb) = metrics.clone() {
+                retirement = retirement.with_metrics(mb);
+            }
+
+            let mut cap = crate::SampleLogCap::new(pool, sample_max_rows)
+                .with_retirement(std::sync::Arc::new(retirement));
             if let Some(mb) = metrics {
                 cap = cap.with_metrics(mb);
             }
             tokio::spawn(async move { cap.run(shutdown).await });
-            info!(sample_max_rows, "Metrics sample capacity started");
+            if sample_max_rows == 0 {
+                info!("Metrics sample capacity disabled (sample_max_rows=0)");
+            } else {
+                info!(sample_max_rows, "Metrics sample capacity started");
+            }
         } else {
             info!("Metrics sample capacity disabled (no PostgreSQL pool)");
         }

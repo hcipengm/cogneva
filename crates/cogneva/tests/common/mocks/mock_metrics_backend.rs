@@ -233,6 +233,7 @@ impl MetricsBackend for MockMetricsBackend {
                     overflow: 0,
                     count: 0,
                     sum: 0.0,
+                    updated_at: r.timestamp,
                 });
             match bounds.iter().position(|bound| r.value <= *bound) {
                 Some(index) => totals.buckets[index].1 += 1,
@@ -240,6 +241,7 @@ impl MetricsBackend for MockMetricsBackend {
             }
             totals.count += 1;
             totals.sum += r.value;
+            totals.updated_at = totals.updated_at.max(r.timestamp);
         }
         Ok(series.into_values().collect())
     }

@@ -4,6 +4,14 @@ use cog_core::{HistogramTotals, MetricSample};
 
 /// Render a set of counter samples in Prometheus text format.
 /// Samples are aggregated by their label set and summed.
+///
+/// Each series is accompanied by the time of the newest observation behind it,
+/// for the same reason a gauge carries its sample time: a cumulative counter
+/// that has stopped growing looks identical whether its producer is running and
+/// finding nothing to count, or has gone away. Recorded at whatever cadence the
+/// producer's call sites happen to fire, read at whatever cadence the scrape
+/// runs — the timestamp is what lets a reader tell a quiet counter from an
+/// abandoned one instead of inferring it from a flat line.
 pub fn render_counters(name: &str, help: &str, samples: &[MetricSample]) -> String {
     if samples.is_empty() {
         return String::new();
@@ -11,19 +19,31 @@ pub fn render_counters(name: &str, help: &str, samples: &[MetricSample]) -> Stri
 
     let mut out = format!("# HELP {name} {help}\n# TYPE {name} counter\n");
 
-    // Aggregate by label set
-    let mut aggregated: HashMap<String, f64> = HashMap::new();
+    // Aggregate by label set, keeping the newest observation time seen for it:
+    // a total is a sum, but "when was this last fed" is a maximum, and summing
+    // timestamps would answer a question nobody asked.
+    let mut aggregated: HashMap<String, (f64, i64)> = HashMap::new();
     for s in samples {
         let key = format_labels(&s.labels);
-        *aggregated.entry(key).or_insert(0.0) += s.value;
+        let entry = aggregated
+            .entry(key)
+            .or_insert((0.0, s.timestamp.timestamp()));
+        entry.0 += s.value;
+        entry.1 = entry.1.max(s.timestamp.timestamp());
     }
 
     let mut keys: Vec<String> = aggregated.keys().cloned().collect();
     keys.sort_unstable();
-    for labels in keys {
-        let value = aggregated[&labels];
+    for labels in &keys {
+        let (value, _) = aggregated[labels];
         out.push_str(&format!("{name}{{{labels}}} {value}\n"));
     }
+
+    let observed: Vec<(String, i64)> = keys
+        .iter()
+        .map(|labels| (labels.clone(), aggregated[labels].1))
+        .collect();
+    out.push_str(&render_observed_timestamps(name, &observed));
 
     out
 }
@@ -42,6 +62,12 @@ pub fn render_counters(name: &str, help: &str, samples: &[MetricSample]) -> Stri
 /// backends could in principle report different boundaries for one name; what
 /// keeps them in step is that the scheme is a pure function of the name, not a
 /// per-backend choice.
+///
+/// Each series carries the time of the last observation it accumulated, taken
+/// from the same row the counts come from. An accumulation can say that it is
+/// cumulative but never that it is current: a histogram whose producer went
+/// away and one whose producer is merely quiet render as the same plausible
+/// buckets, and only the timestamp separates them.
 pub fn render_histograms(name: &str, help: &str, series: &[HistogramTotals]) -> String {
     if series.is_empty() {
         return String::new();
@@ -52,6 +78,7 @@ pub fn render_histograms(name: &str, help: &str, series: &[HistogramTotals]) -> 
     let mut ordered: Vec<&HistogramTotals> = series.iter().collect();
     ordered.sort_by_key(|s| format_labels(&s.labels));
 
+    let mut observed: Vec<(String, i64)> = Vec::with_capacity(ordered.len());
     for totals in ordered {
         let key = format_labels(&totals.labels);
         for (bound, count) in totals.cumulative_buckets() {
@@ -64,7 +91,10 @@ pub fn render_histograms(name: &str, help: &str, series: &[HistogramTotals]) -> 
         }
         out.push_str(&format!("{name}_sum{{{key}}} {}\n", totals.sum));
         out.push_str(&format!("{name}_count{{{key}}} {}\n", totals.count));
+        observed.push((key, totals.updated_at.timestamp()));
     }
+
+    out.push_str(&render_observed_timestamps(name, &observed));
 
     out
 }
@@ -86,14 +116,14 @@ fn format_bound(bound: f64) -> String {
 
 /// Render a set of gauge samples in Prometheus text format.
 ///
-/// A gauge is a point-in-time value, so unlike a counter or a summary there is
-/// nothing to aggregate: the newest sample per label set wins. Each value is
-/// accompanied by the timestamp of the sample it came from, because the pass
-/// that produces a gauge runs on a cadence of its own — minutes, for the ones
-/// that come from a periodic scan — while this exposition is scraped far more
-/// often. Without the timestamp a value left over from an earlier pass is
-/// indistinguishable from one just refreshed, and "the producer stalled" reads
-/// the same as "nothing to report".
+/// A gauge is a point-in-time value, so unlike a counter there is nothing to
+/// aggregate: the newest sample per label set wins. Each value is accompanied by
+/// the timestamp of the sample it came from, because the pass that produces a
+/// gauge runs on a cadence of its own — minutes, for the ones that come from a
+/// periodic scan — while this exposition is scraped far more often. Without the
+/// timestamp a value left over from an earlier pass is indistinguishable from
+/// one just refreshed, and "the producer stalled" reads the same as "nothing to
+/// report".
 pub fn render_gauges(name: &str, help: &str, samples: &[MetricSample]) -> String {
     if samples.is_empty() {
         return String::new();
@@ -123,12 +153,33 @@ pub fn render_gauges(name: &str, help: &str, samples: &[MetricSample]) -> String
         }
     }
 
-    out.push_str(&format!(
-        "# HELP {name}_observed_timestamp_seconds Unix seconds the {name} value above was produced at\n\
+    let observed: Vec<(String, i64)> = keys
+        .iter()
+        .map(|key| (key.clone(), latest[key].timestamp.timestamp()))
+        .collect();
+    out.push_str(&render_observed_timestamps(name, &observed));
+
+    out
+}
+
+/// The `_observed_timestamp_seconds` family for a rendered series set.
+///
+/// One shape for all three kinds, because it answers one question: when did the
+/// newest thing behind this series happen. A scrape cannot tell an abandoned
+/// series from a quiet one without it — nothing in the value itself moves — and
+/// a reader that has to guess between the two will read a dead metric as a live
+/// one with nothing to report. The pairs arrive in the same order as the values
+/// they belong to, so a series is never paired with another series' time.
+fn render_observed_timestamps(name: &str, series: &[(String, i64)]) -> String {
+    if series.is_empty() {
+        return String::new();
+    }
+
+    let mut out = format!(
+        "# HELP {name}_observed_timestamp_seconds Unix seconds the newest observation behind {name} was recorded at\n\
          # TYPE {name}_observed_timestamp_seconds gauge\n"
-    ));
-    for key in &keys {
-        let ts = latest[key].timestamp.timestamp();
+    );
+    for (key, ts) in series {
         if key.is_empty() {
             out.push_str(&format!("{name}_observed_timestamp_seconds {ts}\n"));
         } else {
@@ -234,9 +285,41 @@ mod tests {
         let samples: Vec<MetricSample> = (0..16).map(|_| sample(1.0, &labels)).collect();
 
         let out = render_counters("http_requests_total", "help", &samples);
-        let series: Vec<&str> = out.lines().filter(|l| !l.starts_with('#')).collect();
+        let series: Vec<&str> = out
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.contains("_observed_timestamp_seconds"))
+            .collect();
         assert_eq!(series.len(), 1, "one series rendered as {series:?}");
         assert!(series[0].ends_with(" 16"), "values must sum: {}", series[0]);
+        // 值只有一条，时间戳也只能有一条：两边一起数才不会出现「值合并了、
+        // 时间戳还碎着」这种一半对一半错的形态。
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.contains("_observed_timestamp_seconds") && !l.starts_with('#'))
+                .count(),
+            1,
+            "{out}"
+        );
+    }
+
+    /// 一个计数器累加停了，可能是生产者还在跑但没什么可数的，也可能是生产者
+    /// 没了；两者的曲线一模一样，只有最近一次观测的时间能分开它们。
+    #[test]
+    fn counter_carries_the_newest_observation_time() {
+        let mut old = sample(3.0, &[("job", "a")]);
+        old.timestamp = chrono::Utc::now() - chrono::Duration::minutes(40);
+        let mut newer = sample(2.0, &[("job", "a")]);
+        newer.timestamp = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let newest_ts = newer.timestamp.timestamp();
+
+        let out = render_counters("http_requests_total", "help", &[old, newer]);
+        assert!(out.contains("http_requests_total{job=\"a\"} 5\n"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "http_requests_total_observed_timestamp_seconds{{job=\"a\"}} {newest_ts}\n"
+            )),
+            "累加是求和，时间是取最新，不能把时间也加起来: {out}"
+        );
     }
 
     #[test]
@@ -262,6 +345,7 @@ mod tests {
     /// `histogram_quantile` 用来定位观测总数的桶，写错名字就等于没有它。
     #[test]
     fn histogram_publishes_cumulative_buckets_with_an_inf_bound() {
+        let observed_at = chrono::Utc::now() - chrono::Duration::minutes(7);
         let series = vec![HistogramTotals {
             labels: [("endpoint".to_string(), "/api/v1/tasks".to_string())]
                 .into_iter()
@@ -271,6 +355,7 @@ mod tests {
             overflow: 5,
             count: 50,
             sum: 123.0,
+            updated_at: observed_at,
         }];
 
         let out = render_histograms("http_request_duration_ms", "help", &series);
@@ -293,6 +378,15 @@ mod tests {
         );
         assert!(
             out.contains("_count{endpoint=\"/api/v1/tasks\"} 50\n"),
+            "{out}"
+        );
+        // 累积量能说自己是累积的，却说不出自己是不是还活着：时间戳必须来自
+        // 同一行累积数据，才能把「生产者没了」和「生产者只是安静」分开。
+        assert!(
+            out.contains(&format!(
+                "http_request_duration_ms_observed_timestamp_seconds{{endpoint=\"/api/v1/tasks\"}} {}\n",
+                observed_at.timestamp()
+            )),
             "{out}"
         );
         // 只有 HELP/TYPE 头没有正文，读起来像「系统空闲」而不是「读不到」。

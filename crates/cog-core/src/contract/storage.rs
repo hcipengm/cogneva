@@ -72,6 +72,16 @@ pub struct HistogramTotals {
     /// Every observation, including those in [`Self::overflow`].
     pub count: u64,
     pub sum: f64,
+    /// When the most recent observation of this series arrived.
+    ///
+    /// An accumulation can report that it is cumulative but never that it is
+    /// current: a series whose producer went away and one whose producer is
+    /// merely quiet render as the same plausible value. The time of the last
+    /// observation is what separates them, and it has to come from the same row
+    /// the value does — taken from the sample log instead it would go blank
+    /// exactly when pruning removed that name's history, reporting a live
+    /// metric as a dead one.
+    pub updated_at: DateTime<Utc>,
 }
 
 impl HistogramTotals {

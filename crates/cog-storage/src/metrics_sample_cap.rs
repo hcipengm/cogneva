@@ -19,25 +19,32 @@
 //! do without dropping facts. The footprint in bytes is measured and published
 //! alongside, so the disk cost is visible, but it is a reading, not the knob.
 //!
-//! One row is exempt from eviction: the newest row of every series still being
-//! written. Every reader reaches the log through a series' current value — the
-//! scrape asks for the latest sample per label set, and the counter and
-//! histogram cumulations live in their own tables — so a series whose newest
-//! row was deleted is a series that vanished from `/metrics`, which reads as
-//! "this never existed" rather than as "this was trimmed". That floor is what
-//! the capacity may never buy, and it is one row per series rather than
-//! everything at the newest instant: a row is exempt for being a series'
-//! newest, not for being as recent as its newest. If the floor alone holds more
-//! rows than the capacity allows, the sweep stops at the floor and says so:
-//! refusing to delete more is the correct outcome, and a silent refusal would
-//! look exactly like the capacity being met.
+//! One row is exempt from eviction: the newest row of every gauge series. A
+//! gauge's value *is* its newest row — the scrape asks for the latest sample per
+//! label set — so a gauge series whose newest row went is a series that vanished
+//! from `/metrics`, which reads as "this never existed" rather than as "this was
+//! trimmed". That floor is what the capacity may never buy, and it is one row
+//! per series rather than everything at the newest instant: a row is exempt for
+//! being a series' newest, not for being as recent as its newest. If the floor
+//! alone holds more rows than the capacity allows, the sweep stops at the floor
+//! and says so: refusing to delete more is the correct outcome, and a silent
+//! refusal would look exactly like the capacity being met.
 //!
-//! "Still being written" is the part the log cannot answer for itself — a
-//! producer that has gone quiet and one that has gone away leave the same rows
-//! behind — so the names nothing writes any more are declared where the names
-//! are known, and their rows are released to the sweep at their ordinary rank.
-//! Without that, every rename leaves one series that is exempt by construction
-//! and never updated again.
+//! Counters and histograms are not floored, because the log is not where their
+//! value is. Their current value lives in their own accumulation tables, one row
+//! per label set, and the log holds the observations that fed it — history a
+//! reader may look back over, not a reading that has to be there. Flooring them
+//! would also make the capacity unbindable exactly where it matters most: a
+//! counter keyed on an object id mints a series per object and never repeats
+//! one, so the floor over those kinds grows without bound and the sweep would
+//! report itself over capacity on every pass while unable to reach it.
+//!
+//! A name nothing writes any more needs no exemption here at all, and the
+//! release is not a variant of this sweep — a retired name's rows have to go
+//! whether or not the log is over budget, so it is its own pass (see
+//! [`crate::MetricsRetirement`]) driven from this loop for its cadence. What the
+//! sweep must not do is inherit the retirement's reach or the retirement the
+//! sweep's capacity gate.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -85,7 +92,7 @@ pub struct SampleLogCap {
     table: String,
     budget: i64,
     metrics: Option<Arc<dyn MetricsBackend>>,
-    retired_names: Vec<&'static str>,
+    retirement: Option<Arc<crate::metrics_retirement::RetirementPass>>,
 }
 
 /// What the previous pass saw and when it ran. The next period is derived from
@@ -108,7 +115,7 @@ impl SampleLogCap {
             table: SAMPLES_TABLE.to_string(),
             budget: budget as i64,
             metrics: None,
-            retired_names: cog_core::RETIRED_METRIC_NAMES.to_vec(),
+            retirement: None,
         }
     }
 
@@ -119,11 +126,19 @@ impl SampleLogCap {
         self
     }
 
-    /// Replace the retired-name set the floor exempts. Exists so a test can
-    /// name a series of its own instead of depending on which names the
-    /// codebase happens to have retired.
-    pub fn with_retired_names(mut self, names: Vec<&'static str>) -> Self {
-        self.retired_names = names;
+    /// Run the retirement pass every cycle, whatever the budget says.
+    ///
+    /// The release is attached here rather than given a loop of its own because
+    /// this loop is the only thing that visits the metric store on a period, and
+    /// a second period would be a second constant to keep right. Being attached
+    /// does not make it conditional on pruning: a budget of 0 means this
+    /// deployment does not own the log, which is a statement about capacity and
+    /// not about whether a retired name should still be served.
+    pub fn with_retirement(
+        mut self,
+        retirement: Arc<crate::metrics_retirement::RetirementPass>,
+    ) -> Self {
+        self.retirement = Some(retirement);
         self
     }
 
@@ -141,6 +156,12 @@ impl SampleLogCap {
         let mut period = MIN_SWEEP_PERIOD;
         let mut previous: Option<PreviousPass> = None;
         loop {
+            // Before the sweep, so a retired name's rows are gone when the sweep
+            // ranks what is left rather than being counted as ordinary history
+            // for one more cycle.
+            if let Some(retirement) = self.retirement.clone() {
+                retirement.run_once().await;
+            }
             match self.sweep_once().await {
                 Ok(outcome) => {
                     if outcome.removed > 0 {
@@ -211,8 +232,8 @@ impl SampleLogCap {
         Ok(outcome)
     }
 
-    /// Delete up to `limit` rows, oldest first, keeping each series' newest
-    /// row. Returns how many went.
+    /// Delete up to `limit` rows, oldest first, keeping each gauge series'
+    /// newest row. Returns how many went.
     ///
     /// The exemption is by rank, not by a timestamp cutoff. A cutoff at
     /// `min(per-series max timestamp)` reads well and is cheap, but it keeps
@@ -224,41 +245,41 @@ impl SampleLogCap {
     /// id so the answer does not depend on which of two equal rows the planner
     /// happens to visit first.
     ///
-    /// The rank is the exemption, so it has to except the names nothing writes
-    /// any more: a retired series' newest row is the newest it will ever have,
-    /// and holding it forever is what turns a renamed metric into a series
-    /// `/metrics` keeps serving with a value from before the rename. Retired
-    /// names are passed in rather than read from a constant here so a test can
-    /// exercise the release against a name of its own.
+    /// The predicate names the kind because the exemption is not about rows at
+    /// all: it is about which kinds are read through the log. A gauge is, a
+    /// counter and a histogram are read from their accumulation tables, so their
+    /// log rows are history and fall to the sweep at their ordinary rank — the
+    /// rank comparison is computed for them anyway, and every row of theirs is
+    /// deletable.
     ///
     /// The statement takes exactly as much work as the overshoot it is
     /// correcting: the cap it is enforcing is the batch size, so there is no
     /// second number deciding how much a single statement may hold locks over.
+    ///
+    /// Every column the filter reads is projected by the ranking subquery, and
+    /// that is load-bearing rather than tidy: a column the subquery leaves out
+    /// does not fail to compile, it resolves against the delete's own table and
+    /// turns the subquery into a correlated one — a pass over the whole table for
+    /// each row of it.
     async fn delete_surplus(&self, limit: i64) -> SFResult<u64> {
         let sql = format!(
             "DELETE FROM {table} WHERE id IN (
                  SELECT id FROM (
-                     SELECT id, timestamp, name,
+                     SELECT id, metric_type, timestamp,
                             row_number() OVER (
                                 PARTITION BY metric_type, name, labels
                                 ORDER BY timestamp DESC, id DESC
                             ) AS newest_rank
                      FROM {table}
                  ) ranked
-                 WHERE newest_rank > 1 OR name = ANY($2)
+                 WHERE metric_type <> 'gauge' OR newest_rank > 1
                  ORDER BY timestamp, id
                  LIMIT $1
              )",
             table = crate::partition_maintainer::quote_ident(&self.table),
         );
-        let retired: Vec<String> = self
-            .retired_names
-            .iter()
-            .map(|n| (*n).to_string())
-            .collect();
         Ok(sqlx::query(&sql)
             .bind(limit.max(1))
-            .bind(&retired)
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(e.to_string()))?

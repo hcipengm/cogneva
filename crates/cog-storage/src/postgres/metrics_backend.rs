@@ -390,9 +390,9 @@ impl MetricsBackend for PostgresMetricsBackend {
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
 
-        let sum_rows: Vec<(serde_json::Value, f64)> = sqlx::query_as(
+        let sum_rows: Vec<(serde_json::Value, f64, DateTime<Utc>)> = sqlx::query_as(
             r#"
-            SELECT labels, sum
+            SELECT labels, sum, updated_at
             FROM cog_metric_histogram_sums
             WHERE name = $1
             "#,
@@ -408,7 +408,7 @@ impl MetricsBackend for PostgresMetricsBackend {
         // one series.
         let mut series: HashMap<String, HistogramTotals> = HashMap::new();
 
-        for (labels_json, sum) in sum_rows {
+        for (labels_json, sum, updated_at) in sum_rows {
             let labels: HashMap<String, String> =
                 serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
             let key = serde_json::to_string(&labels).map_err(SFError::Serialization)?;
@@ -420,6 +420,7 @@ impl MetricsBackend for PostgresMetricsBackend {
                     overflow: 0,
                     count: 0,
                     sum,
+                    updated_at,
                 },
             );
         }
@@ -435,6 +436,10 @@ impl MetricsBackend for PostgresMetricsBackend {
                 overflow: 0,
                 count: 0,
                 sum: 0.0,
+                // A bucket row without a sums row is not a series this backend
+                // can time; the sums row is written by the same call, so the
+                // only way to be here is a partially written observation.
+                updated_at: Utc::now(),
             });
 
             if let Some(slot) = totals.buckets.get_mut(bucket.max(0) as usize) {
@@ -458,13 +463,24 @@ impl MetricsBackend for PostgresMetricsBackend {
     }
 
     async fn list_metric_names(&self, metric_type: MetricType) -> SFResult<Vec<String>> {
-        // Counters are read from their own table, so a counter name is one that
-        // table holds -- listing them from the sample log instead would offer
-        // names whose totals row has not been written yet, and the read that
-        // follows would come back empty.
+        // A name is listed from wherever its value is read, so that listing and
+        // reading cannot disagree. Counters and histograms keep their current
+        // value in their own accumulation tables, and reading the name out of
+        // the sample log instead answers a different question: it offers names
+        // whose accumulation row does not exist yet (the read that follows comes
+        // back empty), and it drops a name whose log rows the capacity sweep
+        // pruned while its accumulation — the thing actually served — is still
+        // there. Only gauges are read through the log, because for a gauge the
+        // log is the value.
         let rows: Vec<(String,)> = match metric_type {
             MetricType::Counter => sqlx::query_as(
                 "SELECT DISTINCT name FROM cog_metric_counter_totals ORDER BY name",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?,
+            MetricType::Histogram => sqlx::query_as(
+                "SELECT DISTINCT name FROM cog_metric_histogram_sums ORDER BY name",
             )
             .fetch_all(&self.pool)
             .await

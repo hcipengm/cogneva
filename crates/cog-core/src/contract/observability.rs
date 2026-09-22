@@ -465,23 +465,40 @@ pub fn series_endpoint(line: &str) -> Option<&str> {
 /// Metric names this codebase used to publish and no longer does.
 ///
 /// A retired name is not a reading. Nothing will write it again, so its newest
-/// sample is the newest it will ever have — and the sample log's rule that each
-/// series keeps its newest row would hold that row forever, which is how a
-/// renamed metric becomes a series `/metrics` serves and nothing ever updates.
-/// Naming the retirement here is what lets the last row age out with the rest.
+/// sample is the newest it will ever have — and the rule that each series keeps
+/// its newest row would hold that row forever, which is how a renamed metric
+/// becomes a series `/metrics` serves and nothing ever updates.
 ///
-/// The list lives in core rather than beside the exporter because the sweep
-/// needs it too, and two copies would drift — the drift being silent, a name
-/// retired in one copy and not the other leaves exactly the zombie this list
-/// exists to prevent.
+/// It covers every place a series is stored, not just the sample log: a
+/// counter's and a histogram's current value live in their own accumulation
+/// tables, one row per label set, rewritten in place. Those rows have no rank
+/// to fall down and no age to reach, so without this list a retired counter is
+/// not merely held — it is never deleted at all, and a frozen total reads as
+/// "no traffic" rather than as "this metric is gone".
 ///
-/// Removing a name from the code that recorded it means adding it here. That is
-/// the one maintenance step, and forgetting it reproduces today's behaviour
-/// rather than deleting something a live series needed: the list only ever
-/// widens what the sweep may delete.
+/// The list lives in core rather than beside the exporter because the exporter
+/// and the retirement pass both need it, and copies would drift — the drift
+/// being silent, a name retired in one copy and not the other leaves exactly the
+/// zombie this list exists to prevent.
+///
+/// Removing a name from the code that recorded it means adding it here. The
+/// list only ever widens what may be deleted, never narrows the protection a
+/// live series has, so forgetting the step reproduces today's behaviour rather
+/// than deleting something a live series needed. The opposite error is the
+/// dangerous one — naming a metric that is still produced releases a live
+/// series' current value — and it is the one a gate holds down: the names here
+/// must appear nowhere else in the workspace outside this declaration, so a
+/// producer cannot come back without turning it red.
 pub const RETIRED_METRIC_NAMES: &[&str] = &["metrics_samples_retention_seconds"];
 
 /// Whether `name` is a retired metric. See [`RETIRED_METRIC_NAMES`].
+///
+/// Asked by the exposition as well as by the pass that deletes the rows. The
+/// pass runs on a cadence and only where a store is reachable, so between the
+/// deployment that retired the name and the pass that clears it there is a
+/// window in which the stored rows are still there — and refusing to serve them
+/// is what makes the retirement take effect at deploy time rather than at
+/// whatever moment the next pass lands.
 pub fn is_retired_metric(name: &str) -> bool {
     RETIRED_METRIC_NAMES.contains(&name)
 }
@@ -490,7 +507,7 @@ pub fn is_retired_metric(name: &str) -> bool {
 mod infra_endpoint_tests {
     use super::{
         collect_metrics_for_dimensions, is_infra_endpoint, is_retired_metric, series_endpoint,
-        DimensionSpec, Observable, RawMetric, SFResult, TraceFragment,
+        DimensionSpec, Observable, RawMetric, SFResult, TraceFragment, RETIRED_METRIC_NAMES,
     };
     use std::sync::Arc;
 
@@ -650,15 +667,21 @@ mod infra_endpoint_tests {
         assert_eq!(*declared.asked.lock().unwrap(), vec!["D4".to_string()]);
     }
 
-    /// The one name currently retired has to be one, because the sweep's
-    /// exemption is now keyed on this list: a list that matched nothing would
-    /// leave the zombie series in place while looking like it was handled.
+    /// The list has to name something, and every name in it has to be one the
+    /// lookup agrees with: a list that matched nothing would leave every zombie
+    /// series in place while looking like it was handled.
     #[test]
-    fn the_retired_name_is_matched_by_the_lookup() {
+    fn every_retired_name_is_matched_by_the_lookup() {
         assert!(
-            is_retired_metric("metrics_samples_retention_seconds"),
-            "the retired series the sweep has to release is not matched"
+            !RETIRED_METRIC_NAMES.is_empty(),
+            "a retirement list with no names releases nothing"
         );
+        for name in RETIRED_METRIC_NAMES {
+            assert!(
+                is_retired_metric(name),
+                "{name} is declared retired and the lookup does not match it"
+            );
+        }
     }
 
     /// And it has to match exactly one name — a predicate that matched

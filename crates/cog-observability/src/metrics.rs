@@ -387,6 +387,13 @@ impl MetricsBackend for PrometheusMetricsBackend {
                         overflow,
                         count: histogram.get_sample_count(),
                         sum: histogram.get_sample_sum(),
+                        // The registry is the live accumulator itself, read here
+                        // rather than a stored copy of it: everything recorded
+                        // before this instant is already in the counts, so now
+                        // is the only answer available and the right one. There
+                        // is no stale reading to warn about — a registry that
+                        // can be read is a producer that is still running.
+                        updated_at: Utc::now(),
                     });
                 }
             }

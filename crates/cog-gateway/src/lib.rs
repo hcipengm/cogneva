@@ -1110,18 +1110,24 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "metrics_samples_budget_rows",
         "Rows the metrics sample log is allowed to hold; the sweep deletes \
-         oldest-first past this, stopping at each series' newest row",
+         oldest-first past this, stopping at each gauge series' newest row",
     ),
     (
         "metrics_samples_over_capacity",
         "1 when the sample log is over its row budget and cannot be pruned \
-         further without deleting a series' current value, 0 otherwise",
+         further without deleting a gauge series' current value, 0 otherwise",
     ),
     (
         "metrics_samples_bytes",
         "On-disk bytes the metrics sample log occupies, including indexes. \
          Lags the row count, since PostgreSQL frees deleted space only when it \
          vacuums, so it is a reading and never the pruning criterion",
+    ),
+    (
+        "metrics_retired_rows_removed",
+        "Rows of retired metric names the last release pass deleted, labelled \
+         by the table they came from. Reported every pass, so a table whose \
+         reading stays non-zero is one the release is not draining",
     ),
     (
         "llm_upstream_healthy",
@@ -1176,6 +1182,13 @@ fn metric_help(help: &[(&str, &str)], name: &str) -> String {
 /// exactly what this endpoint served before enumeration existed, so an
 /// enumeration failure degrades to the old behaviour rather than to an empty
 /// exposition.
+///
+/// Retired names are dropped from whatever the backend answers. Their rows are
+/// deleted too, but that pass runs on a cadence and needs a reachable store,
+/// while this is the step that decides what a scrape sees: filtering here makes
+/// the retirement take effect at the moment the new binary serves, and keeps a
+/// retired series out of the exposition even where no deployment ever runs the
+/// release.
 async fn listed_metric_names(
     backend: &dyn cog_core::MetricsBackend,
     metric_type: cog_core::MetricType,
@@ -1183,6 +1196,7 @@ async fn listed_metric_names(
 ) -> Vec<String> {
     match backend.list_metric_names(metric_type).await {
         Ok(mut names) => {
+            names.retain(|name| !cog_core::is_retired_metric(name));
             names.sort_unstable();
             names.dedup();
             names
@@ -2814,6 +2828,9 @@ mod metrics_exposition_tests {
 
     /// 反向断言：产出面没有的名字不得出现在描述表里。上和下两条一起才把
     /// "表 == 产出面" 这个等式钉住——只断上面那条，多一个凭空写下的名字不会红。
+    ///
+    /// 退场的名字不写在这里：它由 `retired_names_are_not_described` 从名单
+    /// 逐条取，写死一个字面量就等于把名单又抄了一份。
     #[test]
     fn names_nothing_produces_are_not_described() {
         for name in [
@@ -2822,8 +2839,6 @@ mod metrics_exposition_tests {
             "tool_calls_total",
             "llm_call_latency_ms",
             "tool_call_latency_ms",
-            // 已退场的旋钮读数：产出方拆掉了，只剩样本表里最后一行。
-            "metrics_samples_retention_seconds",
         ] {
             assert!(
                 metric_help(COUNTER_HELP, name).starts_with("Undocumented")
@@ -2835,8 +2850,8 @@ mod metrics_exposition_tests {
     }
 
     /// 退场的名字与描述表互斥：描述一个已退场的名字，等于宣称一个再也不来的
-    /// 读数。清扫侧的地板按这份退场名单放开，描述表按产出面收紧，两边一旦同时
-    /// 收进一个名字，就是既在放行又在宣称。
+    /// 读数。释放侧按这份退场名单把四处存储都清掉，描述表按产出面收紧，两边一旦
+    /// 同时收进一个名字，就是既在删除又在宣称，读起来像一次正常的抓取。
     #[test]
     fn retired_names_are_not_described() {
         for name in cog_core::RETIRED_METRIC_NAMES {
