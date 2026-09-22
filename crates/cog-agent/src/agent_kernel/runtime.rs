@@ -283,6 +283,55 @@ fn try_extract_json(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&substr[..end]).ok()
 }
 
+/// The deliverable held in a finished turn's text: a JSON object or array,
+/// possibly inside a fence or surrounded by prose. `None` means the turn
+/// produced words but no product.
+///
+/// This is the same predicate `build_result` uses to decide it has something
+/// to hand over, and the two must stay one function: it is what separates
+/// "the run wrote a deliverable" from "the run wrote a sentence about one".
+fn deliverable_in(text: &str) -> Option<serde_json::Value> {
+    try_extract_json(text)
+        .filter(|v| !v.is_null() && *v != serde_json::Value::Object(Default::default()))
+}
+
+/// The text of an assistant turn, as the loop reads it.
+/// Text blocks win; reasoning-only models (e.g. kimi-k2.6) put the answer in
+/// thinking/reasoning blocks instead, so those are the fallback rather than a
+/// separate reading path.
+fn assistant_text(msg: &Message) -> String {
+    msg.content_blocks()
+        .map(|blocks| {
+            let text = blocks
+                .iter()
+                .filter_map(|b| b.as_text())
+                .collect::<Vec<_>>()
+                .join("");
+            if !text.is_empty() {
+                text
+            } else {
+                blocks
+                    .iter()
+                    .filter_map(|b| b.as_thinking())
+                    .collect::<Vec<_>>()
+                    .join("")
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// The ask put to the model when the iteration budget ends with tool calls
+/// still pending. It has to say that tools are gone — otherwise the model
+/// answers with another tool call and the turn buys nothing — and it has to
+/// say what shape the answer takes, because this is the only turn in the run
+/// that is not part of the ReAct loop.
+const FINAL_DRAFT_INSTRUCTION: &str = "Your iteration budget for this run is spent and no more tool calls are \
+     available: any call you just issued was not executed. Answer now, from what is already in this \
+     conversation. Write your final deliverable as a single compact JSON object matching the output \
+     shape your role instructions specify, and nothing else — no preamble, no explanation, no \
+     markdown fences. If something is missing, still deliver the object with the fields you have and \
+     name what is missing inside it.";
+
 impl AgentRuntime {
     /// Access the loop configuration.
     pub fn config(&self) -> &RuntimeConfig {
@@ -663,27 +712,7 @@ impl AgentRuntime {
             tracing::info!(agent_id = %self.config.agent_id, "AgentRuntime::run calling think_stream");
             let assistant_msg = self.think_stream(llm).await?;
 
-            let thought_text: String = assistant_msg
-                .content_blocks()
-                .map(|blocks| {
-                    let text: String = blocks
-                        .iter()
-                        .filter_map(|b| b.as_text())
-                        .collect::<Vec<_>>()
-                        .join("");
-                    if !text.is_empty() {
-                        text
-                    } else {
-                        // Reasoning-only models (e.g. kimi-k2.6) place the answer in
-                        // thinking/reasoning blocks instead of regular text.
-                        blocks
-                            .iter()
-                            .filter_map(|b| b.as_thinking())
-                            .collect::<Vec<_>>()
-                            .join("")
-                    }
-                })
-                .unwrap_or_default();
+            let thought_text = assistant_text(&assistant_msg);
 
             let tool_calls = assistant_msg.tool_calls();
 
@@ -700,88 +729,94 @@ impl AgentRuntime {
 
             // If no tool calls, complete normally
             if tool_calls.is_empty() {
-                self.state = RuntimeState::Complete;
-                let result_timeout = Duration::from_secs(180);
-                let result = match tokio::time::timeout(
-                    result_timeout,
-                    self.build_result(&thought_text, llm),
-                )
-                .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        let err = SFError::Agent(format!(
-                            "AgentRuntime::build_result timed out after {}s for agent {}",
-                            result_timeout.as_secs(),
-                            self.config.agent_id
-                        ));
-                        tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime build_result timeout");
-                        return Err(err);
-                    }
-                };
-
-                self.steps.push(RuntimeStep {
-                    state: RuntimeState::Complete,
-                    thought: Some(thought_text),
-                    tool_calls: Vec::new(),
-                    observations: Vec::new(),
-                    result: Some(result.clone()),
-                    error: None,
-                    timestamp: chrono::Utc::now(),
-                });
-
-                self.context.add_message(assistant_msg);
-
-                self.emit_event(AgentEvent::TurnEnd {
-                    agent_id: self.config.agent_id.clone(),
-                    message: Message::assistant_text(result.to_string()),
-                    tool_results: Vec::new(),
-                    timestamp: chrono::Utc::now(),
-                })
-                .await?;
-
-                self.emit_event(AgentEvent::AgentEnd {
-                    agent_id: self.config.agent_id.clone(),
-                    messages: self.context.messages().to_vec(),
-                    crew_id: None,
-                    squad_id: None,
-                    timestamp: chrono::Utc::now(),
-                })
-                .await?;
-
-                let steps = self.steps.len();
-                let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
-                crate::observable::global_observable().record_run(
-                    &self.config.role,
-                    crate::observable::RunOutcome::Delivered,
-                    iteration + 1,
-                    steps,
-                    tool_calls,
-                );
-
-                return Ok(result);
+                return self
+                    .deliver(llm, thought_text, assistant_msg, iteration + 1)
+                    .await;
             }
 
-            // Last iteration but still has tool calls: max iterations reached
+            // Last iteration but still has tool calls: the loop's iteration
+            // budget is spent. Before writing the run off, ask the model once
+            // more for its answer with no tools attached: every turn so far was
+            // reading and testing, and the model has never been asked to hand
+            // anything over. Writing it off here records a question that was
+            // never put as one that cannot be answered — and the budget it
+            // would have answered out of is already paid for.
             if iteration == self.config.max_iterations - 1 {
+                tracing::warn!(
+                    agent_id = %self.config.agent_id,
+                    max_iterations = self.config.max_iterations,
+                    pending_tool_calls = tool_calls.len(),
+                    "agent loop exhausted its iteration budget with tool calls still pending; \
+                     asking for a final draft without tools before writing the run off"
+                );
+                // The ask below is another request on this same transcript, and
+                // an assistant turn whose tool calls have no results is one no
+                // provider will accept. Close it first: the calls are recorded
+                // as never run (the truth — the budget ended before they did),
+                // then the plain-text ask goes in as the next user turn.
+                self.context.add_message(assistant_msg);
+                let not_run = serde_json::json!({
+                    "error": "not executed: the iteration budget ended before this tool call ran"
+                });
+                for tc in &tool_calls {
+                    self.context.add_message(Message::tool_result_text(
+                        &tc.id,
+                        &tc.name,
+                        not_run.to_string(),
+                    ));
+                }
+                self.context
+                    .add_message(Message::user(FINAL_DRAFT_INSTRUCTION));
+                let forced = match self.think_stream_final(llm).await {
+                    Ok(msg) => {
+                        let text = assistant_text(&msg);
+                        if text.trim().is_empty() {
+                            // 追问过了，模型还是不交东西：这件事必须跟着哨兵走。
+                            // 少了它，读的人分不出「还没被问过」与「被直接问过
+                            // 还是没答」，而这两种的处理方式不一样。
+                            (None, "empty")
+                        } else if deliverable_in(&text).is_none() {
+                            // 有字没产物。走正常路径的话，这段字会被包成
+                            // {"result": <text>} 交给评估——把「被截断」读成
+                            // 「交了东西」，还给了重试一个看上去合法的理由。
+                            // 被工具拿走后仍写不出交付物的，就是这一轮的实话。
+                            (None, "malformed")
+                        } else {
+                            (Some((text, msg)), "delivered")
+                        }
+                    }
+                    // 追问本身失败（上游抖动、流断）不改写这一轮的定性：预算确实
+                    // 用完了，照哨兵走终止性失败，比把一次追问的传输错误报成整轮
+                    // 失败更接近事实。
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = %self.config.agent_id,
+                            error = %e,
+                            "the final-draft call failed; the run still ends on its spent budget"
+                        );
+                        (None, "unavailable")
+                    }
+                };
+                if let Some((draft, msg)) = forced.0 {
+                    tracing::info!(
+                        agent_id = %self.config.agent_id,
+                        "the final draft recovered an answer the loop's budget had no room for"
+                    );
+                    return self
+                        .deliver(llm, draft, msg, self.config.max_iterations + 1)
+                        .await;
+                }
                 self.state = RuntimeState::Complete;
                 // The run stops here having bought nothing: the model was still
                 // reading and testing when the budget ended, so no answer was
                 // ever written. Without this line the exhaustion is invisible —
                 // the sentinel below is the only trace, and every reader of the
                 // result sees an empty output, not a spent budget.
-                tracing::warn!(
-                    agent_id = %self.config.agent_id,
-                    max_iterations = self.config.max_iterations,
-                    pending_tool_calls = tool_calls.len(),
-                    "agent loop exhausted its iteration budget with tool calls still pending; \
-                     the run stops mid-exploration and returns no deliverable"
-                );
                 let result = serde_json::json!({
                     "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
                     "iterations": self.config.max_iterations,
                     "pending_tool_calls": tool_calls.len(),
+                    "final_draft": forced.1,
                 });
 
                 self.steps.push(RuntimeStep {
@@ -793,8 +828,6 @@ impl AgentRuntime {
                     error: None,
                     timestamp: chrono::Utc::now(),
                 });
-
-                self.context.add_message(assistant_msg);
 
                 self.emit_event(AgentEvent::TurnEnd {
                     agent_id: self.config.agent_id.clone(),
@@ -999,8 +1032,96 @@ impl AgentRuntime {
         Ok(result)
     }
 
+    /// Close the run on an answer: extract the deliverable from `draft`, record
+    /// the turn, and report the run as delivered.
+    ///
+    /// Both the ordinary path (the loop stopped because the model had nothing
+    /// left to call) and the forced path (the budget ended and the model was
+    /// asked directly) end here, so the extraction, event emission and run
+    /// accounting cannot drift apart between them.
+    async fn deliver(
+        &mut self,
+        llm: &dyn cog_core::LlmClient,
+        draft: String,
+        turn_message: Message,
+        iterations: u32,
+    ) -> SFResult<serde_json::Value> {
+        self.state = RuntimeState::Complete;
+        let result_timeout = Duration::from_secs(180);
+        let result = match tokio::time::timeout(result_timeout, self.build_result(&draft, llm))
+            .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                let err = SFError::Agent(format!(
+                    "AgentRuntime::build_result timed out after {}s for agent {}",
+                    result_timeout.as_secs(),
+                    self.config.agent_id
+                ));
+                tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime build_result timeout");
+                return Err(err);
+            }
+        };
+
+        self.steps.push(RuntimeStep {
+            state: RuntimeState::Complete,
+            thought: Some(draft),
+            tool_calls: Vec::new(),
+            observations: Vec::new(),
+            result: Some(result.clone()),
+            error: None,
+            timestamp: chrono::Utc::now(),
+        });
+
+        self.context.add_message(turn_message);
+
+        self.emit_event(AgentEvent::TurnEnd {
+            agent_id: self.config.agent_id.clone(),
+            message: Message::assistant_text(result.to_string()),
+            tool_results: Vec::new(),
+            timestamp: chrono::Utc::now(),
+        })
+        .await?;
+
+        self.emit_event(AgentEvent::AgentEnd {
+            agent_id: self.config.agent_id.clone(),
+            messages: self.context.messages().to_vec(),
+            crew_id: None,
+            squad_id: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await?;
+
+        let steps = self.steps.len();
+        let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
+        crate::observable::global_observable().record_run(
+            &self.config.role,
+            crate::observable::RunOutcome::Delivered,
+            iterations,
+            steps,
+            tool_calls,
+        );
+
+        Ok(result)
+    }
+
     /// Stream LLM response and accumulate the assistant message.
     async fn think_stream(&mut self, llm: &dyn cog_core::LlmClient) -> SFResult<Message> {
+        self.think_stream_with(llm, false).await
+    }
+
+    /// The same call with no tools offered: the one ask that has to produce an
+    /// answer rather than another action.
+    async fn think_stream_final(&mut self, llm: &dyn cog_core::LlmClient) -> SFResult<Message> {
+        self.think_stream_with(llm, true).await
+    }
+
+    async fn think_stream_with(
+        &mut self,
+        llm: &dyn cog_core::LlmClient,
+        without_tools: bool,
+    ) -> SFResult<Message> {
         let mut messages: Vec<Message> = self.context.messages().to_vec();
 
         // OpenAI-compatible APIs (e.g. Kimi) reject assistant messages whose
@@ -1070,7 +1191,7 @@ impl AgentRuntime {
             messages = self.context.messages().to_vec();
         }
 
-        let tool_defs = if self.tools.is_empty() {
+        let tool_defs = if without_tools || self.tools.is_empty() {
             None
         } else {
             Some(
@@ -1219,14 +1340,12 @@ impl AgentRuntime {
             thought_prefix = %thought.chars().take(120).collect::<String>(),
             "AgentRuntime build_result examining thought"
         );
-        if let Some(parsed) = try_extract_json(thought) {
-            if !parsed.is_null() && parsed != serde_json::Value::Object(Default::default()) {
-                tracing::info!(
-                    agent_id = %self.config.agent_id,
-                    "AgentRuntime build_result extracted JSON from thought; skipping reformat"
-                );
-                return Ok(parsed);
-            }
+        if let Some(parsed) = deliverable_in(thought) {
+            tracing::info!(
+                agent_id = %self.config.agent_id,
+                "AgentRuntime build_result extracted JSON from thought; skipping reformat"
+            );
+            return Ok(parsed);
         }
 
         tracing::info!(
@@ -1269,11 +1388,8 @@ impl AgentRuntime {
                         .collect::<Vec<_>>()
                         .join("")
                 };
-                if let Some(parsed) = try_extract_json(&text) {
-                    if !parsed.is_null() && parsed != serde_json::Value::Object(Default::default())
-                    {
-                        return Ok(parsed);
-                    }
+                if let Some(parsed) = deliverable_in(&text) {
+                    return Ok(parsed);
                 }
                 Ok(serde_json::json!({ "result": text }))
             }

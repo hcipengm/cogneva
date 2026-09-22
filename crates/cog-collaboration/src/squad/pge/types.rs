@@ -75,10 +75,22 @@ pub fn iteration_budget_exhausted_reason(value: &serde_json::Value) -> Option<St
         .get("pending_tool_calls")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    // Whether the model was asked straight out for an answer, and what came of
+    // it. "Not asked" and "asked and still delivered nothing" are different
+    // states: the first is a budget we chose, the second is the model having
+    // nothing to hand over even with the tools taken away.
+    let asked = match value.get("final_draft").and_then(|v| v.as_str()) {
+        Some("empty") => "asked for a final draft without tools and produced nothing",
+        Some("malformed") => {
+            "asked for a final draft without tools and produced text with no deliverable in it"
+        }
+        Some("unavailable") => "the final-draft ask could not be made: the request itself failed",
+        _ => "not asked for a final draft",
+    };
     Some(format!(
         "{ITERATION_BUDGET_EXHAUSTED_MARKER}: the agent loop used its whole iteration budget \
          while tool calls were still pending (max_iterations={iterations}, \
-         pending_tool_calls={pending}); it stopped mid-exploration and wrote no deliverable"
+         pending_tool_calls={pending}); {asked}; it stopped mid-exploration and wrote no deliverable"
     ))
 }
 

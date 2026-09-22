@@ -396,3 +396,137 @@ async fn test_agent_runtime_discovers_dynamically_registered_tool() {
     assert!(result.is_ok());
     assert_eq!(result.unwrap()["output"], "hello");
 }
+
+/// A runtime whose one tool is registered, so a request either carries a tool
+/// definition or is provably the ask that carries none. The event receiver goes
+/// back to the caller: the runtime's event channel is bounded, and a dropped
+/// receiver turns every emission into backpressure.
+fn runtime_with_one_tool(
+    agent_id: &str,
+    role: &str,
+    max_iterations: u32,
+) -> (AgentRuntime, mpsc::Receiver<AgentEvent>) {
+    let (event_tx, event_rx) = mpsc::channel(128);
+    let registry = cog_agent::ToolRegistry::new();
+    registry.register(cog_core::Tool {
+        name: "read_file".into(),
+        description: "read a file".into(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+        implementation: cog_core::ToolImplementation::Native(Arc::new(|_args| {
+            Box::pin(async move { Ok(serde_json::json!({"content": "file body"})) })
+        })),
+    });
+    let runtime = AgentRuntime::new(
+        RuntimeConfig {
+            agent_id: agent_id.into(),
+            role: role.to_string(),
+            max_iterations,
+            context_window_size: 4000,
+            skill_cache_ttl_secs: 30,
+            think_stall_timeout_secs: 240,
+            skill_config: None,
+            crew_id: None,
+            squad_id: None,
+        },
+        event_tx,
+    )
+    .with_tools(registry);
+    (runtime, event_rx)
+}
+
+fn read_file_call() -> cog_core::ToolCall {
+    cog_core::ToolCall {
+        id: "tc-1".into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": "/tmp/x"}),
+    }
+}
+
+/// The budget runs out with a tool call pending, and the model — asked directly,
+/// with no tools on the table — hands over the deliverable it had been circling.
+/// That answer is the run's product; the exhaustion sentinel would erase it.
+///
+/// The last assertion is what separates the two asks: the loop's own turn
+/// carried a tool definition, the ask after the budget did not. Without that,
+/// "asked with tools taken away" is not observable and the test would pass on a
+/// runtime that simply asked again.
+#[tokio::test]
+async fn a_draft_asked_for_at_the_budget_edge_becomes_the_product() {
+    let (mut runtime, _events) = runtime_with_one_tool("final-draft", "final_draft_probe", 1);
+
+    let llm = Arc::new(
+        MockProvider::with_responses(vec![
+            "let me read the file first",
+            r#"{"plan": ["one"], "summary": "wrote it from what was already read"}"#,
+        ])
+        .with_tool_call(read_file_call())
+        .with_tool_call_turns(1),
+    );
+
+    let result = runtime
+        .run(serde_json::json!({"goal": "x"}), llm.as_ref())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result["plan"],
+        serde_json::json!(["one"]),
+        "the recovered draft is the product: {result}"
+    );
+    assert!(
+        result.get("status").is_none(),
+        "a recovered draft must not be reported as a spent budget: {result}"
+    );
+    assert_eq!(
+        *llm.offered_tools.lock().unwrap(),
+        vec![Some(1), None],
+        "the loop's turn offers the tool, the ask after the budget does not"
+    );
+}
+
+/// Same budget edge, but the model still will not write a deliverable even with
+/// the tools gone. The run has to end as the deterministic failure it is: the
+/// words it did produce are not a product, and letting them through as
+/// `{"result": <words>}` would hand the evaluator something that reads like one
+/// and buy the whole attempt another ride through the retry loop.
+#[tokio::test]
+async fn a_draft_that_is_still_not_a_product_ends_the_run_as_a_terminal_failure() {
+    let (mut runtime, _events) =
+        runtime_with_one_tool("final-draft-mute", "final_draft_mute_probe", 1);
+
+    let llm = Arc::new(
+        MockProvider::with_responses(vec![
+            "let me read the file first",
+            "I would need to read the file, but the tools are gone, so I cannot say.",
+        ])
+        .with_tool_call(read_file_call())
+        .with_tool_call_turns(1),
+    );
+
+    let result = runtime
+        .run(serde_json::json!({"goal": "x"}), llm.as_ref())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.get("status").and_then(|v| v.as_str()),
+        Some("max_iterations_reached"),
+        "words with no deliverable in them are not a deliverable: {result}"
+    );
+    assert_eq!(
+        result.get("final_draft").and_then(|v| v.as_str()),
+        Some("malformed"),
+        "the sentinel has to name what the ask produced: {result}"
+    );
+    assert_eq!(*llm.offered_tools.lock().unwrap(), vec![Some(1), None]);
+
+    // The pipeline reads that sentinel as a deterministic cause, which is what
+    // stops it from being retried; the words the model produced must never
+    // reach the evaluator as a result.
+    let reason = cog_collaboration::squad::pge::types::iteration_budget_exhausted_reason(&result)
+        .expect("the sentinel names its cause");
+    assert!(
+        reason.contains("iteration_budget_exhausted") && reason.contains("no deliverable"),
+        "the cause has to travel in-band: {reason}"
+    );
+}
