@@ -185,6 +185,10 @@ impl GitOpsPublisher {
     /// buildah 打最小 overlay 镜像（cogneva 基镜像 + 沙盒编译二进制）并推仓库。
     /// 基镜像必须是正式 cogneva 镜像（WebUI/skills/migrations/动态库齐全），
     /// overlay 只替换 /opt/cogneva/cogneva 一个层。
+    ///
+    /// 这条不变式意味着金丝雀带的运行时资产（skills / migrations / web）就是
+    /// 它基底镜像那一份，只会随 main 的部署器前移，不随本次晋级变化：金丝雀
+    /// 验的是二进制，资产面的改动经主线 overlay 到达集群。
     async fn publish_image(&self, change_id: &str) -> SFResult<()> {
         let binary = self.binary_dir.join("cogneva");
         if !binary.exists() {

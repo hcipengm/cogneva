@@ -51,6 +51,36 @@ const BUILDAH_RUNROOT: &str = "/opt/cogneva/sandbox/containers/run";
 /// 全丢，每次构建都要在家庭网络上重拉整个 crates.io 索引。
 const CARGO_HOME_PVC: &str = "/opt/cogneva/sandbox/cargo-home";
 
+/// 镜像里那个二进制的落点。overlay 单独替换它，与下面的资产表不同源：
+/// 它来自构建产物目录，不是 rev 检出里的文件。
+const OVERLAY_BINARY_DEST: &str = "/opt/cogneva/cogneva";
+
+/// overlay 必须从被部署 rev 的检出里重新拷进去的运行时资产，形如
+/// （检出内路径，镜像内落点）。
+///
+/// 镜像在构建它的那一刻就把这些资产烤进去了，而那一刻的检出不是现在这个
+/// rev：不重拷，新二进制就配着旧资产跑。资产失配里 skills 是最静默的一种
+/// ——角色注册表按 skill 声明的工具名收窄，名字一个都对不上就收窄成空表，
+/// 模型的请求里连 tools 字段都不发，角色于是没有工具可用，而日志里一个
+/// 字都没有。
+const OVERLAY_ASSETS: &[(&str, &str)] = &[
+    (
+        "crates/cog-storage/migrations",
+        "/opt/cogneva/crates/cog-storage/migrations",
+    ),
+    ("skills", "/opt/cogneva/skills"),
+];
+
+/// 最终镜像烤了、但 overlay 明确不刷新的资产，形如（镜像内落点，为什么刷不了）。
+///
+/// 这张表的用途是让「不刷新」成为一条要有人辩护的声明，而不是一次遗漏：
+/// 门禁读 Dockerfile 最终阶段的 COPY 行，凡不在 [`OVERLAY_ASSETS`] 里、又不
+/// 在 [`OVERLAY_BINARY_DEST`] 上的落点，必须在这里留下理由，否则测试红。
+const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[(
+    "/opt/cogneva/web",
+    "由镜像的 node 阶段从 web/src 构建，overlay 内没有 node 工具链，新 rev 的前端产物无法在 overlay 内生成",
+)];
+
 // ---------------------------------------------------------------------------
 // 纯函数（无 IO，单测覆盖）
 // ---------------------------------------------------------------------------
@@ -2004,23 +2034,26 @@ impl MainlineDeployer {
     }
 
     async fn buildah_steps(&self, ctr: &str, rev: &str, new_tag: &str) -> SFResult<()> {
+        // 说清楚这次滚动带不动哪些资产：不带，就意味着线上跑的是基底镜像里
+        // 那一份，而"哪一份"没有别的面能看出来。
+        for (dest, reason) in OVERLAY_UNREFRESHABLE {
+            warn!(
+                dest = %dest,
+                reason = %reason,
+                "overlay keeps the base image's copy of this asset"
+            );
+        }
         let bin = self.target_dir().join("release/cogneva");
-        let migrations = self.workdir().join("crates/cog-storage/migrations");
         self.buildah(
-            &["copy", ctr, bin.to_str().unwrap(), "/opt/cogneva/cogneva"],
+            &["copy", ctr, bin.to_str().unwrap(), OVERLAY_BINARY_DEST],
             300,
         )
         .await?;
-        self.buildah(
-            &[
-                "copy",
-                ctr,
-                migrations.to_str().unwrap(),
-                "/opt/cogneva/crates/cog-storage/migrations",
-            ],
-            300,
-        )
-        .await?;
+        for (from, to) in OVERLAY_ASSETS {
+            let src = self.workdir().join(from);
+            self.buildah(&["copy", ctr, src.to_str().unwrap(), to], 300)
+                .await?;
+        }
 
         // 换版即验证：新二进制必须能自报版本，且内嵌 rev 是目标 rev。
         let version = self
@@ -3970,6 +4003,86 @@ mod tests {
     fn rev12_truncates() {
         assert_eq!(rev12("abcdef0123456789"), "abcdef012345");
         assert_eq!(rev12("short"), "short");
+    }
+
+    /// 最终镜像阶段每条 COPY 的落点（去引号去方括号，shell 与 JSON 两种写法
+    /// 都能读）。只看最后一个 `FROM` 之后的指令：前面那些阶段往镜像里放的
+    /// 东西不经过 run 阶段的文件系统。
+    fn image_baked_destinations(dockerfile: &str) -> Vec<String> {
+        let mut last_stage: Vec<&str> = Vec::new();
+        for line in dockerfile.lines() {
+            let line = line.trim();
+            if line.starts_with("FROM ") {
+                last_stage.clear();
+            }
+            last_stage.push(line);
+        }
+        last_stage
+            .iter()
+            .filter_map(|line| line.strip_prefix("COPY "))
+            .filter_map(|rest| rest.split_whitespace().next_back())
+            .map(|dest| {
+                dest.trim_matches(|c| c == '"' || c == '[' || c == ']' || c == ',')
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// 镜像烤进去的运行时资产集，必须与 overlay 刷新的资产集对齐。
+    ///
+    /// 两个集合各自演进时，新二进制会配着旧资产跑，而失配是静默的：skill 里
+    /// 一个工具名对不上注册表，那个角色就收窄成空工具表，日志里没有任何一行
+    /// 提示。所以判据不写死资产名，而是读 Dockerfile 最终阶段的 COPY 行——
+    /// 谁往镜像里烤了东西，谁就得出现在 overlay 的资产表里，或者进那张要
+    /// 写明理由的「刷不了」表。
+    #[test]
+    fn every_asset_the_image_bakes_is_refreshed_by_the_overlay_or_declared_unreachable() {
+        let dockerfile =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dockerfile"))
+                .expect("read workspace Dockerfile");
+
+        let baked = image_baked_destinations(&dockerfile);
+        // 解析器自身得先站得住：skills 是当前唯一从构建上下文拷进 run 阶段的
+        // 资产，读不到它说明 COPY 行的写法变了、这道门禁已经看不见东西了。
+        assert!(
+            baked.iter().any(|d| d == "/opt/cogneva/skills"),
+            "Dockerfile's run stage no longer copies /opt/cogneva/skills; \
+             this gate is reading nothing: {baked:?}"
+        );
+
+        let refreshed: HashSet<&str> = OVERLAY_ASSETS.iter().map(|(_, to)| *to).collect();
+        let unreachable: HashSet<&str> = OVERLAY_UNREFRESHABLE.iter().map(|(to, _)| *to).collect();
+        let mut unaccounted: Vec<&str> = baked
+            .iter()
+            .map(String::as_str)
+            .filter(|dest| {
+                *dest != OVERLAY_BINARY_DEST
+                    && !refreshed.contains(dest)
+                    && !unreachable.contains(dest)
+            })
+            .collect();
+        unaccounted.sort_unstable();
+
+        assert!(
+            unaccounted.is_empty(),
+            "the image bakes runtime assets the overlay never refreshes, so the pod would \
+             run the new binary beside a stale copy of them: {unaccounted:?}. Add each to \
+             OVERLAY_ASSETS, or to OVERLAY_UNREFRESHABLE with the reason it cannot be \
+             refreshed from the checkout."
+        );
+    }
+
+    /// overlay 从检出拷进去的源路径，必须真的在检出了才有得拷。
+    #[test]
+    fn every_overlay_asset_source_exists_in_the_checkout() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (from, _) in OVERLAY_ASSETS {
+            let src = root.join(from);
+            assert!(
+                src.exists(),
+                "overlay copies {from} out of the checkout, but {src:?} does not exist"
+            );
+        }
     }
 
     #[test]
