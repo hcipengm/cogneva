@@ -3,7 +3,7 @@
 //! the live pending state of the streams this process consumes.
 
 use async_trait::async_trait;
-use cog_core::observability::{Observable, RawMetric, TraceFragment};
+use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::SFResult;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,9 +146,9 @@ impl StreamPendingObservable {
 #[async_trait]
 impl Observable for StreamPendingObservable {
     /// The dimension is ignored on purpose, exactly as for the trace tier
-    /// gauges: the metrics endpoint asks every observable for one dimension,
-    /// so an observable answering only its own would be absent from the scrape
-    /// — invisible rather than unlabelled.
+    /// gauges: none of this varies by dimension, so declaring none is what gets
+    /// this observable pulled once. Answering only one dimension would instead
+    /// have it absent from the scrape — invisible rather than unlabelled.
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
         let streams = self.streams.lock().await;
         let mut out = Vec::new();
@@ -216,7 +216,7 @@ impl Observable for StreamPendingObservable {
         Ok(Vec::new())
     }
 
-    fn available_dimensions(&self) -> Vec<String> {
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
         Vec::new()
     }
 }
@@ -293,8 +293,11 @@ impl Observable for OrchestratorObservable {
         Ok(Vec::new())
     }
 
-    fn available_dimensions(&self) -> Vec<String> {
-        vec!["D1".into(), "D8".into()]
+    /// 这里的 D1 与 agent 面的 D1 不是同一件事：本面记的是编排级累计计数
+    /// （任务数、成功数、比率），键固定、基数有界；agent 面在 D1 上是逐 step
+    /// 按 task_id 记的，同一个维度名在这两处有不同的有界性。
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
+        vec![DimensionSpec::bounded("D1"), DimensionSpec::bounded("D8")]
     }
 }
 

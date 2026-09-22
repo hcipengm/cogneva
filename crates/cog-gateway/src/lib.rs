@@ -153,7 +153,7 @@ pub struct GatewayState {
     pub audit_stream: Option<Arc<dyn cog_core::AuditStream>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
     pub observables: Vec<Arc<dyn cog_core::Observable>>,
-    /// 抓取端点向 observable 询取的维度集合（配置面，非字面量）。
+    /// 抓取维度集合的可选收窄项；空 = 不收窄，采每个 observable 自己声明的有界维度。
     pub metrics_dimensions: Vec<String>,
     /// MCP client — discover and call external MCP tools.
     pub mcp_client: Option<Arc<dyn cog_core::McpClient>>,

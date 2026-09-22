@@ -2,7 +2,7 @@
 //! Exposes D4 (Context & Memory) raw metrics.
 
 use async_trait::async_trait;
-use cog_core::observability::{Observable, RawMetric, TraceFragment};
+use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::SFResult;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -76,7 +76,8 @@ impl Observable for MemoryObservable {
         Ok(Vec::new())
     }
 
-    fn available_dimensions(&self) -> Vec<String> {
-        vec!["D4".into()]
+    /// D4 的三个量都是进程级累计值，键固定，序列基数有界，可以进周期抓取。
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
+        vec![DimensionSpec::bounded("D4")]
     }
 }

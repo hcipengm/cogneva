@@ -2,7 +2,7 @@
 //! Exposes D1 (Outcome), D2 (Planning), and D3 (Tool Use) raw metrics.
 
 use async_trait::async_trait;
-use cog_core::observability::{Observable, RawMetric, TraceFragment};
+use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::SFResult;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -314,8 +314,15 @@ impl Observable for AgentObservable {
         Ok(fragments)
     }
 
-    fn available_dimensions(&self) -> Vec<String> {
-        vec!["D1".into(), "D2".into(), "D3".into()]
+    /// D1/D2/D3 都是逐 step 记录、键取自 `task_id`，基数随运行时长增长：它们可以
+    /// 被明确知道自己在查哪个任务的消费者单采，但不能进周期抓取。上面那组不随维度
+    /// 变的累计计数器靠"没有可采维度时采一次"进入抓取。
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
+        vec![
+            DimensionSpec::unbounded("D1"),
+            DimensionSpec::unbounded("D2"),
+            DimensionSpec::unbounded("D3"),
+        ]
     }
 }
 

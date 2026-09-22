@@ -705,9 +705,10 @@ impl TraceTierMigrator {
 
 #[async_trait::async_trait]
 impl cog_core::Observable for TraceTierMigrator {
-    /// The dimension is ignored on purpose: the metrics endpoint asks every
-    /// observable for one dimension, so a gauge answering only its own would
-    /// be absent from the scrape — invisible rather than unlabelled.
+    /// The dimension is ignored on purpose: none of this varies by dimension,
+    /// so declaring none is what gets this observable pulled once. Answering
+    /// only one dimension would instead have it absent from the scrape —
+    /// invisible rather than unlabelled.
     async fn collect_metrics(
         &self,
         _dimension: &str,
@@ -756,7 +757,7 @@ impl cog_core::Observable for TraceTierMigrator {
         Ok(Vec::new())
     }
 
-    fn available_dimensions(&self) -> Vec<String> {
+    fn available_dimensions(&self) -> Vec<cog_core::observability::DimensionSpec> {
         Vec::new()
     }
 }

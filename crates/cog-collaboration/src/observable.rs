@@ -3,7 +3,7 @@
 
 use crate::squad::classify;
 use async_trait::async_trait;
-use cog_core::observability::{Observable, RawMetric, TraceFragment};
+use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::SFResult;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -167,8 +167,8 @@ impl Observable for CollaborationObservable {
         Ok(Vec::new())
     }
 
-    fn available_dimensions(&self) -> Vec<String> {
-        vec!["D8".into()]
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
+        vec![DimensionSpec::bounded("D8")]
     }
 }
 

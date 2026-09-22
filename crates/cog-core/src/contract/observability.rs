@@ -275,53 +275,90 @@ pub struct TraceFragment {
     pub error: Option<String>,
 }
 
+/// 一个 observable 会按它分支的维度，以及它在该维度上的序列基数是否有界。
+///
+/// `bounded` 是给**消费侧**看的：只有有界的维度才允许进周期抓取。逐对象取键的
+/// 维度（按 `task_id` 逐 step、按会话 id 逐消息……）在长跑里只会增长，抓它等于把
+/// 无界基数引进抓取体，时间一长既压垮抓取也压垮存储。
+///
+/// 有界性挂在**这个 observable 的这个维度**上，不是挂在维度名上：同一个 "D1" 在
+/// 编排面上是累计计数器（有界），在 agent 面上是逐 step 记录（无界），按名字一刀
+/// 切会把有界的那半也挡在外面。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DimensionSpec {
+    pub name: String,
+    pub bounded: bool,
+}
+
+impl DimensionSpec {
+    /// 该维度的序列基数有界，可以进周期抓取。
+    pub fn bounded(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            bounded: true,
+        }
+    }
+
+    /// 该维度逐对象取键，基数无界，不得进周期抓取；仍可由明确知道自己在干什么的
+    /// 消费者按需单采。
+    pub fn unbounded(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            bounded: false,
+        }
+    }
+}
+
 /// 可观测性 trait —— 各业务 crate 实现此 trait 暴露原始数据。
 #[async_trait::async_trait]
 pub trait Observable: Send + Sync {
     async fn collect_metrics(&self, dimension: &str) -> SFResult<Vec<RawMetric>>;
     async fn collect_trace(&self, task_id: &str) -> SFResult<Vec<TraceFragment>>;
-    fn available_dimensions(&self) -> Vec<String>;
+    /// 这个 observable 会按哪些维度分支，以及每个维度的基数是否有界。
+    ///
+    /// 返回空集是"读数不随维度变"的意思：卷占用、trace 分层积压这类 gauge 对每个
+    /// 维度都是同一个数，采集侧只采一次。
+    fn available_dimensions(&self) -> Vec<DimensionSpec>;
 }
 
-/// 从多个 Observable 聚合指定维度的指标（便捷函数）。
-pub async fn collect_all_metrics(
-    observables: &[Arc<dyn Observable>],
-    dimension: &str,
-) -> Vec<RawMetric> {
-    let mut all = Vec::new();
-    for observable in observables {
-        match observable.collect_metrics(dimension).await {
-            Ok(mut metrics) => all.append(&mut metrics),
-            Err(e) => {
-                tracing::warn!(dimension = %dimension, error = %e, "Observable::collect_metrics failed")
-            }
-        }
-    }
-    all
-}
-
-/// 按每个 observable 实际分维度的情况采集：声明了维度的按每个维度采一次，
-/// `available_dimensions()` 为空的只采一次。
+/// 按每个 observable 自己声明的维度采集：只问它声明过、且声明为有界、且没被
+/// `allow` 挡在外面的那些维度；一个可采的维度都没有的 observable 只采一次。
 ///
-/// 空声明是"这个量不随维度变"的意思——卷占用、trace 分层积压这类 gauge 对每个
-/// 维度都是同一个数。按维度逐个采它，会让同一组序列在一个抓取体里重复出现；
-/// 值一样时 Prometheus 当作重复样本丢掉，值在两采之间变一次就会变成同一时间戳
-/// 冲突的样本而被拒，那一条序列在该次抓取里就没有读数。
+/// 问谁、问哪些，判据都在产出侧——`available_dimensions()` 是产出侧对自己行为的
+/// 陈述，消费侧照它来。手写一张"抓哪些维度"的清单当权威，新声明的有界维度会静默
+/// 不进抓取（产出侧加了个维度，什么都不报错，就是读数永远不出现），而没声明过的
+/// 维度会被问一遍：那些返回空还好，返回"与维度无关的那部分读数"的就会在同一个抓取
+/// 体里重复出现——值一样时 Prometheus 当作重复样本丢掉，值在两采之间变一次就变成
+/// 同一时间戳冲突的样本而被拒，那一条序列在该次抓取里没有读数。
+///
+/// `allow` 是叠加在声明之上的**收窄**，不是替代：空 = 不限额，按声明的有界维度全采；
+/// 非空 = 只采其中被点名的。无界的维度无论在不在 `allow` 里都不采——它是否该进抓取
+/// 由产出侧的有界性声明决定，不由部署方的一个字符串决定。
 pub async fn collect_metrics_for_dimensions(
     observables: &[Arc<dyn Observable>],
-    dimensions: &[String],
+    allow: &[String],
 ) -> Vec<RawMetric> {
+    let unrestricted = allow.is_empty();
     let mut all = Vec::new();
     for observable in observables {
-        if observable.available_dimensions().is_empty() {
+        let wanted: Vec<String> = observable
+            .available_dimensions()
+            .into_iter()
+            .filter(|spec| {
+                spec.bounded && (unrestricted || allow.iter().any(|name| name == &spec.name))
+            })
+            .map(|spec| spec.name)
+            .collect();
+
+        if wanted.is_empty() {
             match observable.collect_metrics("").await {
                 Ok(mut metrics) => all.append(&mut metrics),
                 Err(e) => tracing::warn!(error = %e, "Observable::collect_metrics failed"),
             }
             continue;
         }
-        for dimension in dimensions {
-            match observable.collect_metrics(dimension).await {
+        for dimension in wanted {
+            match observable.collect_metrics(&dimension).await {
                 Ok(mut metrics) => all.append(&mut metrics),
                 Err(e) => {
                     tracing::warn!(dimension = %dimension, error = %e, "Observable::collect_metrics failed")
@@ -453,7 +490,7 @@ pub fn is_retired_metric(name: &str) -> bool {
 mod infra_endpoint_tests {
     use super::{
         collect_metrics_for_dimensions, is_infra_endpoint, is_retired_metric, series_endpoint,
-        Observable, RawMetric, SFResult, TraceFragment,
+        DimensionSpec, Observable, RawMetric, SFResult, TraceFragment,
     };
     use std::sync::Arc;
 
@@ -503,7 +540,7 @@ mod infra_endpoint_tests {
 
     /// Counts how many times the endpoint asked it, per dimension.
     struct CountingObservable {
-        dimensions: Vec<String>,
+        dimensions: Vec<DimensionSpec>,
         asked: std::sync::Mutex<Vec<String>>,
     }
 
@@ -516,7 +553,7 @@ mod infra_endpoint_tests {
         async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
             Ok(Vec::new())
         }
-        fn available_dimensions(&self) -> Vec<String> {
+        fn available_dimensions(&self) -> Vec<DimensionSpec> {
             self.dimensions.clone()
         }
     }
@@ -538,21 +575,79 @@ mod infra_endpoint_tests {
         let metrics = collect_metrics_for_dimensions(&[flat_dyn], &dimensions).await;
         assert_eq!(metrics.len(), 1);
         assert_eq!(flat.asked.lock().unwrap().len(), 1);
+    }
 
-        // And the other direction: an observable that does branch still gets
-        // every configured dimension, so narrowing this cannot silently drop
-        // a dimension's metrics.
+    /// An observable is asked for the dimensions it declares, and for nothing
+    /// else. Asking a branched observable for a dimension it does not answer
+    /// is not harmless: an implementation that also returns a
+    /// dimension-independent core emits that core again for every extra
+    /// question, and the second copy of a counter that moved between the two
+    /// calls is a duplicate sample for one timestamp, which loses the series
+    /// for that scrape.
+    #[tokio::test]
+    async fn a_branched_observable_is_asked_only_what_it_declares() {
+        let dimensions = vec!["D4".to_string(), "D5".to_string(), "D8".to_string()];
+
         let branched = Arc::new(CountingObservable {
-            dimensions: vec!["D4".into(), "D5".into()],
+            dimensions: vec![DimensionSpec::bounded("D4"), DimensionSpec::bounded("D5")],
             asked: Default::default(),
         });
         let branched_dyn: Arc<dyn Observable> = branched.clone();
-        let metrics = collect_metrics_for_dimensions(&[branched_dyn], &dimensions).await;
-        assert_eq!(metrics.len(), 3);
+        collect_metrics_for_dimensions(&[branched_dyn], &dimensions).await;
         assert_eq!(
             *branched.asked.lock().unwrap(),
-            vec!["D4".to_string(), "D5".to_string(), "D8".to_string()]
+            vec!["D4".to_string(), "D5".to_string()]
         );
+    }
+
+    /// A dimension declared unbounded stays out of the scrape even when the
+    /// allowance names it, and even when nothing else is left to ask — the
+    /// observable is then pulled once for whatever it has that does not vary
+    /// by dimension, which is exactly the readings that are safe to take.
+    #[tokio::test]
+    async fn an_unbounded_dimension_is_not_scraped_even_when_named() {
+        let unbounded_only = Arc::new(CountingObservable {
+            dimensions: vec![
+                DimensionSpec::unbounded("D1"),
+                DimensionSpec::unbounded("D2"),
+            ],
+            asked: Default::default(),
+        });
+        let unbounded_dyn: Arc<dyn Observable> = unbounded_only.clone();
+
+        // No allowance: the declaration is the whole rule.
+        collect_metrics_for_dimensions(std::slice::from_ref(&unbounded_dyn), &[]).await;
+        assert_eq!(*unbounded_only.asked.lock().unwrap(), vec!["".to_string()]);
+
+        // Naming it explicitly must not open it: whether it may be scraped is
+        // the producer's boundedness claim, not a deployment's string.
+        unbounded_only.asked.lock().unwrap().clear();
+        collect_metrics_for_dimensions(&[unbounded_dyn], &["D1".to_string()]).await;
+        assert_eq!(*unbounded_only.asked.lock().unwrap(), vec!["".to_string()]);
+    }
+
+    /// An allowance narrows what is declared; it does not replace it. A
+    /// dimension nobody declares is asked of nobody, so listing it changes
+    /// nothing — and an empty allowance means "no narrowing", not "ask
+    /// nothing", which would silently blank the whole endpoint.
+    #[tokio::test]
+    async fn the_allowance_only_narrows() {
+        let declared = Arc::new(CountingObservable {
+            dimensions: vec![DimensionSpec::bounded("D4"), DimensionSpec::bounded("D6")],
+            asked: Default::default(),
+        });
+        let declared_dyn: Arc<dyn Observable> = declared.clone();
+
+        collect_metrics_for_dimensions(std::slice::from_ref(&declared_dyn), &[]).await;
+        assert_eq!(
+            *declared.asked.lock().unwrap(),
+            vec!["D4".to_string(), "D6".to_string()]
+        );
+
+        declared.asked.lock().unwrap().clear();
+        collect_metrics_for_dimensions(&[declared_dyn], &["D4".to_string(), "D9".to_string()])
+            .await;
+        assert_eq!(*declared.asked.lock().unwrap(), vec!["D4".to_string()]);
     }
 
     /// The one name currently retired has to be one, because the sweep's

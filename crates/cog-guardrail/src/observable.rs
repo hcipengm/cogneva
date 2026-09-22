@@ -2,7 +2,7 @@
 //! Exposes D6 (Safety & Compliance) raw metrics.
 
 use async_trait::async_trait;
-use cog_core::observability::{Observable, RawMetric, TraceFragment};
+use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::SFResult;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -86,7 +86,7 @@ impl Observable for GuardrailObservable {
         Ok(Vec::new())
     }
 
-    fn available_dimensions(&self) -> Vec<String> {
-        vec!["D6".into()]
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
+        vec![DimensionSpec::bounded("D6")]
     }
 }

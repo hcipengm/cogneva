@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cog_core::observability::{Observable, RawMetric, TraceFragment};
+use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::{SFResult, ShutdownSignal};
 use tracing::{info, warn};
 
@@ -255,9 +255,9 @@ impl Observable for DataVolumeObservable {
     }
 
     /// The footprint is not a per-dimension metric: every dimension consumes
-    /// the same volume, and the metrics endpoint asks each observable for one
-    /// dimension, so answering only that one dimension would hide the gauge.
-    fn available_dimensions(&self) -> Vec<String> {
+    /// the same volume, so declaring no dimension is what tells the collector
+    /// to pull this observable once rather than once per question.
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
         Vec::new()
     }
 }

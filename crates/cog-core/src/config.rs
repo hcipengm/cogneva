@@ -555,17 +555,23 @@ pub struct MetricsConfig {
     /// exactly what should differ between them, and a duration would force
     /// them to trim at the same rate instead.
     pub sample_max_rows: u64,
-    /// Which observable dimensions the `/metrics` scrape asks for.
+    /// An optional narrowing of what the `/metrics` scrape asks for.
     ///
-    /// An observable only answers the dimensions it branches on, so a
-    /// dimension no consumer asks is a metric nothing can ever read — it
-    /// counts, it is exported by nobody, and nothing fails. The set is
-    /// config instead of a literal so admitting a dimension is a reviewable
-    /// deployment decision rather than an edit buried in the handler.
+    /// Empty — the default — means no narrowing: the scrape asks every
+    /// registered observable for every bounded dimension it declares, which is
+    /// the whole set of series that can be read without the scrape growing
+    /// with traffic. A non-empty list is an operator saying "only these",
+    /// and it can only ever ask for less than the producers declare; naming a
+    /// dimension nobody declares, or one that is declared unbounded, yields
+    /// nothing rather than an error.
     ///
-    /// Admit a dimension only when the series it yields are bounded. The
-    /// agent's D1/D2/D3 branch records per-step series keyed by `task_id`,
-    /// which grows without bound, so those stay out.
+    /// Whether a dimension's series are bounded is a property of the producer,
+    /// not of this list: the agent's D1/D2/D3 branch records per-step series
+    /// keyed by `task_id`, which grows without bound, so those stay out no
+    /// matter what this says. That keeps one process-wide knob from having to
+    /// be right about each of a dozen observables, and it is why a scrape body
+    /// is not duplicated when a name appears here that several producers
+    /// answer.
     pub scrape_dimensions: Vec<String>,
 }
 
@@ -575,13 +581,7 @@ impl Default for MetricsConfig {
             enabled: true,
             endpoint: "/metrics".into(),
             sample_max_rows: 200_000,
-            scrape_dimensions: vec![
-                "D4".into(),
-                "D5".into(),
-                "D6".into(),
-                "D8".into(),
-                "D9".into(),
-            ],
+            scrape_dimensions: Vec::new(),
         }
     }
 }
