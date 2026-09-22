@@ -131,20 +131,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     // the consume races with storage's init.
     requires: &["storage"],
     optional_requires: &[],
-    provides: &["WikiBackend", "KnowledgeBackend"],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "ObjectBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "MemoryBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "EmbeddingProvider",
-            required: false,
-        },
-    ],
     factory: || Box::new(WikiPlugin::new()),
 };

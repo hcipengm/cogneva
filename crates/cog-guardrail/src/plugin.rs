@@ -82,10 +82,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "guardrail",
     requires: &[],
     optional_requires: &[],
-    provides: &["Guardrail", "Observable"],
-    consumes: &[cog_core::ConsumeSpec {
-        type_name: "GuardAuditRecorder",
-        required: false,
-    }],
     factory: || Box::new(GuardrailPlugin::new()),
 };

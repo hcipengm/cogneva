@@ -85,12 +85,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         let llm_provider = ctx.consume_service::<dyn cog_core::LlmClient>();
         let memory_backend = ctx.consume_service::<dyn cog_core::MemoryBackend>();
         let skill_registry = ctx
-            .consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>()
-            .expect("skill registry")
+            .require::<tokio::sync::RwLock<cog_core::SkillRegistry>>()?
             .clone();
         let prompt_manager = ctx
-            .consume_service::<dyn cog_core::PromptProvider>()
-            .expect("prompt manager")
+            .require_service::<dyn cog_core::PromptProvider>()?
             .clone();
 
         let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
@@ -371,12 +369,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         info!("ReflectionPlugin reflection trait objects published");
 
         // Spawn evolution bridges.
-        let hook_engine = ctx
-            .consume_service::<dyn cog_core::HookEngine>()
-            .expect("hook engine");
-        let tool_registry = ctx
-            .consume_service::<dyn cog_core::ToolRegistry>()
-            .expect("tool registry");
+        let hook_engine = ctx.require_service::<dyn cog_core::HookEngine>()?;
+        let tool_registry = ctx.require_service::<dyn cog_core::ToolRegistry>()?;
 
         // Hook bridge.
         {
@@ -1994,62 +1988,6 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     // supervisor 可选：其 SchedulerGate 用于池全灭时暂停 LLM 依赖型循环；
     // 不能写成 requires（supervisor 反向可选依赖 reflection，会成环）。
     optional_requires: &["llm", "memory", "supervisor"],
-    provides: &[
-        "ReflectionEngine",
-        "SquadReflection",
-        "MetaLearning",
-        "EvolutionAdmin",
-        "FaultClassifier",
-    ],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "LlmClient",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "MemoryBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "SkillRegistry",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "PromptProvider",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "HookEngine",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "ToolRegistry",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "BinarySwitcher",
-            required: false,
-        },
-        // 平台集成缺席（未连平台账号）时进化照常跑，只是变更不回上游。
-        cog_core::ConsumeSpec {
-            type_name: "ChangeLanding",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "EvolutionMetrics",
-            required: false,
-        },
-        // 变更忠实度读数落在这条通道上：metrics 后端把名字枚举给 /metrics，
-        // 缺它只是少一条读数，不该拦住生成。
-        cog_core::ConsumeSpec {
-            type_name: "MetricsBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "SchedulerGate",
-            required: false,
-        },
-    ],
     factory: || Box::new(ReflectionPlugin::new()),
 };
 

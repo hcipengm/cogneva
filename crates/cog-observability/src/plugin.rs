@@ -75,10 +75,8 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         };
 
         // Consume HTTP client (published by NetPlugin).
-        let http_client: Arc<dyn cog_core::HttpClient> = ctx
-            .consume_service::<dyn cog_core::HttpClient>()
-            .expect("http client")
-            .clone();
+        let http_client: Arc<dyn cog_core::HttpClient> =
+            ctx.require_service::<dyn cog_core::HttpClient>()?.clone();
 
         self.trace_buffer_max_bytes = observability.trace_collector.buffer_max_bytes;
 
@@ -108,10 +106,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         }
 
         // ── Raw logger ──
-        let raw_logger = ctx
-            .consume_service::<dyn cog_core::RawLogger>()
-            .expect("raw logger")
-            .clone();
+        let raw_logger = ctx.require_service::<dyn cog_core::RawLogger>()?.clone();
         {
             let record = cog_core::RawRecord {
                 meta: cog_core::RawMeta {
@@ -224,10 +219,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         }
 
         // ── Trace store ──
-        let trace_store = ctx
-            .consume_service::<dyn cog_core::TraceStore>()
-            .expect("trace store")
-            .clone();
+        let trace_store = ctx.require_service::<dyn cog_core::TraceStore>()?.clone();
         info!("ObservabilityPlugin trace store consumed");
 
         // ── Trace collector & replay engine ──
@@ -871,38 +863,6 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "observability",
     requires: &["net", "storage"],
     optional_requires: &[],
-    provides: &[
-        "MetricsExporter",
-        // RawLogger is consumed here (storage publishes it), never published:
-        // declaring it would let the connectivity check pass while the
-        // `expect("raw logger")` below panics at startup instead.
-        "TraceCollector",
-        "ReplayEngine",
-        "TraceTierMigrator",
-        "SearchBackend",
-        "Observable",
-        "LogFilterHandle",
-        "EvolutionMetrics",
-        "ActiveAlertSource",
-    ],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "HttpClient",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "RawLogger",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "TraceStore",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "Supervisor",
-            required: false,
-        },
-    ],
     factory: || Box::new(ObservabilityPlugin::new()),
 };
 

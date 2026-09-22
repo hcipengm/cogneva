@@ -10,9 +10,10 @@
 //!
 //!No single composition root knows the wiring details of every component.
 
-use std::any::Any;
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::any::{Any, TypeId};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 // ---------------------------------------------------------------------------
 // Service<T> — universal trait-object wrapper for PluginContext
@@ -57,6 +58,93 @@ impl<T: ?Sized + Send + Sync + 'static> std::fmt::Debug for Service<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Pin — the one identifier shared by the publish and the read side
+// ---------------------------------------------------------------------------
+
+/// Identity of a service pin: a thing one plugin publishes and another reads.
+///
+/// The identity is derived from the Rust type itself — `TypeId` for lookup, the
+/// compiler's `type_name` for display.  Nothing is spelled by hand, so the two
+/// sides cannot drift: whoever publishes `dyn LlmClient` and whoever reads it
+/// necessarily name the same pin, because both derive it from that one type.
+///
+/// A pair of hand-maintained lists (`provides` next to a plugin's code,
+/// `consumes` next to another's) cannot make that guarantee.  They agree with
+/// each other and disagree with the runtime, and the disagreement is silent:
+/// either a read is reported as unpublished forever while the publisher exists,
+/// or a read is reported as satisfied and then panics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Pin {
+    id: TypeId,
+    name: &'static str,
+}
+
+impl Pin {
+    /// Pin of a value published through [`PluginContext::publish`].
+    pub fn of<T: Any + Send + Sync + 'static>() -> Self {
+        Self {
+            id: TypeId::of::<T>(),
+            name: std::any::type_name::<T>(),
+        }
+    }
+
+    /// Pin of a trait object published through [`PluginContext::publish_service`].
+    ///
+    /// Keyed on the [`Service`] wrapper that actually stores it, but named after
+    /// the inner type, so a report reads `dyn LlmClient` rather than the storage
+    /// wrapper around it.
+    pub fn of_service<T: ?Sized + Send + Sync + 'static>() -> Self {
+        Self {
+            id: TypeId::of::<Service<T>>(),
+            name: std::any::type_name::<T>(),
+        }
+    }
+
+    /// The compiler's name for the pinned type.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+impl std::fmt::Debug for Pin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name)
+    }
+}
+
+/// One party's read of a pin, as observed at runtime.
+#[derive(Clone, Copy, Debug)]
+pub struct PinConsumer {
+    /// The plugin that read it; `None` when the binary root did.
+    pub owner: Option<&'static str>,
+    /// The read could not proceed without the pin (it went through
+    /// [`PluginContext::require`]).  A missing publisher is then a wiring error
+    /// rather than a designed degradation.
+    pub required: bool,
+    /// The read happened while `init` was running.  Init runs a topological
+    /// layer at a time and its plugins concurrently, so an init-time read of a
+    /// pin published by a plugin the reader does not depend on can race the
+    /// publish; a read during `start` cannot.
+    pub during_init: bool,
+}
+
+/// Everything the runtime observed about one pin.
+#[derive(Clone, Debug)]
+pub struct PinWiring {
+    pub pin: Pin,
+    /// Parties that published it, in publish order; `None` = the binary root.
+    pub publishers: Vec<Option<&'static str>>,
+    /// Parties that read it, in read order.
+    pub consumers: Vec<PinConsumer>,
+}
+
+#[derive(Default)]
+struct WiringLedger {
+    published: HashMap<Pin, Vec<Option<&'static str>>>,
+    demanded: HashMap<Pin, Vec<PinConsumer>>,
+}
+
+// ---------------------------------------------------------------------------
 // PluginContext — shared dependency lookup
 // ---------------------------------------------------------------------------
 
@@ -66,49 +154,104 @@ impl<T: ?Sized + Send + Sync + 'static> std::fmt::Debug for Service<T> {
 /// This eliminates direct crate-to-crate dependencies; plugins only depend on
 /// `cog-core` traits.
 pub struct PluginContext {
-    services: std::sync::RwLock<HashMap<std::any::TypeId, Vec<Arc<dyn Any + Send + Sync>>>>,
+    inner: Arc<PluginContextInner>,
+    /// The plugin whose `init`/`start` is running against this view, or `None`
+    /// for the binary root.  Carried on the view rather than in the shared inner
+    /// state because a topological layer initialises its plugins concurrently:
+    /// a single shared "current plugin" slot would attribute every publish in
+    /// the layer to whichever plugin happened to be polled last.
+    owner: Option<&'static str>,
+}
+
+struct PluginContextInner {
+    services: RwLock<HashMap<TypeId, Vec<Arc<dyn Any + Send + Sync>>>>,
     config: crate::Config,
+    /// What was published and read, by whom.  Recorded on every access so the
+    /// wiring graph is an observation rather than a claim.
+    wiring: RwLock<WiringLedger>,
+    /// Set by the runner for the duration of the init phase.
+    during_init: AtomicBool,
+}
+
+impl Clone for PluginContext {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            owner: self.owner,
+        }
+    }
 }
 
 impl PluginContext {
     pub fn new(config: crate::Config) -> Self {
         Self {
-            services: std::sync::RwLock::new(HashMap::new()),
-            config,
+            inner: Arc::new(PluginContextInner {
+                services: RwLock::new(HashMap::new()),
+                config,
+                wiring: RwLock::new(WiringLedger::default()),
+                during_init: AtomicBool::new(false),
+            }),
+            owner: None,
         }
+    }
+
+    /// A view of this context that attributes everything recorded through it to
+    /// `owner`.  The runner hands one to each plugin's `init`/`start`, which is
+    /// what lets the wiring graph name the publisher and the reader instead of
+    /// reporting an anonymous pin.
+    pub fn as_owner(&self, owner: &'static str) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            owner: Some(owner),
+        }
+    }
+
+    /// Mark the point where the runner leaves `init` and enters `start`.  Reads
+    /// recorded while it is set are the ones a missing dependency edge can make
+    /// race their publisher.
+    pub(crate) fn set_during_init(&self, during_init: bool) {
+        self.inner.during_init.store(during_init, Ordering::Relaxed);
     }
 
     /// Publish a shared service so other plugins can look it up.
     /// Multiple plugins may publish the same type; all instances are retained.
     pub fn publish<T: Any + Send + Sync>(&self, service: Arc<T>) {
-        let mut guard = self.services.write().unwrap();
-        guard
-            .entry(std::any::TypeId::of::<T>())
+        let pin = Pin::of::<T>();
+        self.inner
+            .services
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(pin.id)
             .or_default()
             .push(service);
+        self.record_publish(pin);
     }
 
     /// Consume a shared service published by another plugin.
     /// Returns the *first* published instance (backward-compatible).
     pub fn consume<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
-        let guard = self.services.read().unwrap();
-        guard
-            .get(&std::any::TypeId::of::<T>())
-            .and_then(|vec| vec.first())
-            .and_then(|arc| arc.clone().downcast::<T>().ok())
+        let pin = Pin::of::<T>();
+        self.record_demand(pin, false);
+        self.lookup::<T>(pin)
+    }
+
+    /// Consume a shared service the caller cannot run without.
+    ///
+    /// The read is recorded as required, so a missing publisher is answered here
+    /// with a diagnostic that names the pin and the reader.  The alternative —
+    /// `consume(..).expect("...")` — leaves the same failure as an opaque panic
+    /// whose message is a local variable name.
+    pub fn require<T: Any + Send + Sync>(&self) -> crate::SFResult<Arc<T>> {
+        let pin = Pin::of::<T>();
+        self.record_demand(pin, true);
+        self.lookup::<T>(pin).ok_or_else(|| self.unpublished(pin))
     }
 
     /// Consume **all** shared services of a given type published by other plugins.
     pub fn consume_all<T: Any + Send + Sync>(&self) -> Vec<Arc<T>> {
-        let guard = self.services.read().unwrap();
-        guard
-            .get(&std::any::TypeId::of::<T>())
-            .map(|vec| {
-                vec.iter()
-                    .filter_map(|arc| arc.clone().downcast::<T>().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let pin = Pin::of::<T>();
+        self.record_demand(pin, false);
+        self.lookup_all::<T>(pin)
     }
 
     // ── Service<T> helpers (trait objects without per-crate Holders) ────────
@@ -116,7 +259,15 @@ impl PluginContext {
     /// Publish a trait object (or any `Arc<T>`) via the universal [`Service`]
     /// wrapper.  Prefer this over `publish` when `T` is a trait object.
     pub fn publish_service<T: ?Sized + Send + Sync + 'static>(&self, service: Arc<T>) {
-        self.publish(Arc::new(Service(service)));
+        let pin = Pin::of_service::<T>();
+        self.inner
+            .services
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(pin.id)
+            .or_default()
+            .push(Arc::new(Service(service)));
+        self.record_publish(pin);
     }
 
     /// Publish an [`crate::Observable`] for metrics collection.
@@ -132,13 +283,26 @@ impl PluginContext {
     /// Consume a trait object published via [`Self::publish_service`].
     /// Returns `Arc<T>` directly for ergonomic use.
     pub fn consume_service<T: ?Sized + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
-        self.consume::<Service<T>>().map(|s| s.0.clone())
+        let pin = Pin::of_service::<T>();
+        self.record_demand(pin, false);
+        self.lookup::<Service<T>>(pin).map(|s| s.0.clone())
+    }
+
+    /// Consume a trait object the caller cannot run without.  See [`Self::require`].
+    pub fn require_service<T: ?Sized + Send + Sync + 'static>(&self) -> crate::SFResult<Arc<T>> {
+        let pin = Pin::of_service::<T>();
+        self.record_demand(pin, true);
+        self.lookup::<Service<T>>(pin)
+            .map(|s| s.0.clone())
+            .ok_or_else(|| self.unpublished(pin))
     }
 
     /// Consume **all** trait objects of a given type published via
     /// [`Self::publish_service`].
     pub fn consume_all_services<T: ?Sized + Send + Sync + 'static>(&self) -> Vec<Arc<T>> {
-        self.consume_all::<Service<T>>()
+        let pin = Pin::of_service::<T>();
+        self.record_demand(pin, false);
+        self.lookup_all::<Service<T>>(pin)
             .into_iter()
             .map(|s| s.0.clone())
             .collect()
@@ -146,7 +310,92 @@ impl PluginContext {
 
     /// Access the global configuration.
     pub fn config(&self) -> &crate::Config {
-        &self.config
+        &self.inner.config
+    }
+
+    // ── wiring ledger ───────────────────────────────────────────────────────
+
+    fn lookup<T: Any + Send + Sync>(&self, pin: Pin) -> Option<Arc<T>> {
+        let guard = self
+            .inner
+            .services
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&pin.id)
+            .and_then(|vec| vec.first())
+            .and_then(|arc| arc.clone().downcast::<T>().ok())
+    }
+
+    fn lookup_all<T: Any + Send + Sync>(&self, pin: Pin) -> Vec<Arc<T>> {
+        let guard = self
+            .inner
+            .services
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&pin.id)
+            .map(|vec| {
+                vec.iter()
+                    .filter_map(|arc| arc.clone().downcast::<T>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn record_publish(&self, pin: Pin) {
+        self.inner
+            .wiring
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .published
+            .entry(pin)
+            .or_default()
+            .push(self.owner);
+    }
+
+    fn record_demand(&self, pin: Pin, required: bool) {
+        self.inner
+            .wiring
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .demanded
+            .entry(pin)
+            .or_default()
+            .push(PinConsumer {
+                owner: self.owner,
+                required,
+                during_init: self.inner.during_init.load(Ordering::Relaxed),
+            });
+    }
+
+    fn unpublished(&self, pin: Pin) -> crate::SFError {
+        crate::SFError::Config(format!(
+            "{} requires pin '{}' but nothing published it",
+            self.owner.unwrap_or("<binary root>"),
+            pin.name()
+        ))
+    }
+
+    /// Snapshot of the wiring observed so far, one entry per pin, ordered by pin
+    /// name so two runs of the same binary produce the same report.
+    pub fn pin_wiring(&self) -> Vec<PinWiring> {
+        let guard = self.inner.wiring.read().unwrap_or_else(|e| e.into_inner());
+        let mut pins: Vec<Pin> = guard
+            .published
+            .keys()
+            .chain(guard.demanded.keys())
+            .copied()
+            .collect();
+        pins.sort_by_key(|p| p.name());
+        pins.dedup();
+        pins.into_iter()
+            .map(|pin| PinWiring {
+                pin,
+                publishers: guard.published.get(&pin).cloned().unwrap_or_default(),
+                consumers: guard.demanded.get(&pin).cloned().unwrap_or_default(),
+            })
+            .collect()
     }
 }
 
@@ -184,13 +433,12 @@ pub trait SystemPlugin: Send + Sync {
 /// Static descriptor for a system plugin.
 /// Used by auto-discovery mechanisms (inventory push or build.rs pull)
 /// so that the binary root never hard-codes plugin names or init order.
-/// Specification of a consumed service type for static validation.
-#[derive(Clone, Copy, Debug)]
-pub struct ConsumeSpec {
-    pub type_name: &'static str,
-    pub required: bool,
-}
-
+///
+/// Which pins a plugin publishes and reads is deliberately **not** declared
+/// here.  Such a list would be a second, hand-maintained copy of what the
+/// plugin's code already says, and it can only ever be right by being kept
+/// right.  The runtime records the real graph instead — see [`PinWiring`] and
+/// [`PluginRunner::audit_pins`].
 #[derive(Clone, Copy)]
 pub struct PluginDescriptor {
     pub name: &'static str,
@@ -198,10 +446,6 @@ pub struct PluginDescriptor {
     pub requires: &'static [&'static str],
     /// Optional dependencies — if missing, the plugin degrades gracefully.
     pub optional_requires: &'static [&'static str],
-    /// Service types this plugin publishes (output pins).
-    pub provides: &'static [&'static str],
-    /// Service types this plugin consumes (input pins).
-    pub consumes: &'static [ConsumeSpec],
     pub factory: fn() -> Box<dyn SystemPlugin>,
 }
 
@@ -243,6 +487,174 @@ impl std::fmt::Display for AssemblyReport {
 }
 
 // ---------------------------------------------------------------------------
+// PinAudit — mechanical verdict on the observed wiring
+// ---------------------------------------------------------------------------
+
+/// A read during `init` of a pin whose publisher the reader does not depend on.
+#[derive(Clone, Debug)]
+pub struct UnorderedInitRead {
+    pub pin: Pin,
+    pub reader: &'static str,
+    pub publisher: &'static str,
+}
+
+/// Verdict on the pin wiring the runtime observed.
+#[derive(Debug, Default)]
+pub struct PinAudit {
+    /// Pins that were read and never published.
+    pub unsatisfied: Vec<(Pin, Vec<PinConsumer>)>,
+    /// Pins that were published and never read.
+    pub unconsumed: Vec<(Pin, Vec<Option<&'static str>>)>,
+    /// Pins with more than one publisher.  `consume` returns the first, so
+    /// which instance a reader gets depends on init order.
+    pub multi_published: Vec<(Pin, Vec<Option<&'static str>>)>,
+    /// Init-time reads that a missing `requires` edge left unordered.
+    pub unordered_init_reads: Vec<UnorderedInitRead>,
+    /// Distinct pins observed, and the totals behind them.
+    pub pins: usize,
+    pub publishes: usize,
+    pub reads: usize,
+}
+
+impl PinAudit {
+    /// Derive the verdict from an observed wiring snapshot and the dependency
+    /// graph.  Pure: no logging, so it can be asserted on directly.
+    pub fn evaluate(wiring: &[PinWiring], descriptors: &[PluginDescriptor]) -> Self {
+        let mut audit = PinAudit {
+            pins: wiring.len(),
+            publishes: wiring.iter().map(|w| w.publishers.len()).sum(),
+            reads: wiring.iter().map(|w| w.consumers.len()).sum(),
+            ..Default::default()
+        };
+
+        for w in wiring {
+            if w.publishers.is_empty() {
+                if !w.consumers.is_empty() {
+                    audit.unsatisfied.push((w.pin, w.consumers.clone()));
+                }
+                continue;
+            }
+            if w.publishers.len() > 1 {
+                audit.multi_published.push((w.pin, w.publishers.clone()));
+            }
+            if w.consumers.is_empty() {
+                audit.unconsumed.push((w.pin, w.publishers.clone()));
+            }
+            // Only a single, plugin-owned publisher can be ordered against: with
+            // several, the pin does not identify one producer, and the binary
+            // root publishes before any plugin runs.
+            if w.publishers.len() != 1 {
+                continue;
+            }
+            let Some(publisher) = w.publishers[0] else {
+                continue;
+            };
+            for consumer in &w.consumers {
+                let Some(reader) = consumer.owner else {
+                    continue;
+                };
+                if !consumer.during_init || reader == publisher {
+                    continue;
+                }
+                if !requires_closure(descriptors, reader).contains(publisher) {
+                    audit.unordered_init_reads.push(UnorderedInitRead {
+                        pin: w.pin,
+                        reader,
+                        publisher,
+                    });
+                }
+            }
+        }
+        audit
+    }
+
+    /// Log the verdict.  Anomalies go where an operator sees them at default
+    /// verbosity; the healthy part of the graph is only dumped at `debug`,
+    /// because a fact is not a finding.
+    pub fn report(&self) {
+        for (pin, publishers) in &self.multi_published {
+            tracing::warn!(
+                "pin '{}' has {} publishers {:?}; readers get the first one, which depends on init order",
+                pin.name(),
+                publishers.len(),
+                publishers
+            );
+        }
+        for read in &self.unordered_init_reads {
+            tracing::warn!(
+                "plugin '{}' reads pin '{}' during init but does not require '{}'; same-layer plugins init in parallel, so the read can race the publish",
+                read.reader,
+                read.pin.name(),
+                read.publisher
+            );
+        }
+        for (pin, consumers) in &self.unsatisfied {
+            let owners: Vec<&str> = consumers
+                .iter()
+                .map(|c| c.owner.unwrap_or("<binary root>"))
+                .collect();
+            tracing::info!(
+                "pin '{}' was read by {:?} but never published; optional reads degrade, required ones fail startup",
+                pin.name(),
+                owners
+            );
+        }
+        for (pin, publishers) in &self.unconsumed {
+            tracing::info!(
+                "pin '{}' was published by {:?} but never read in this process",
+                pin.name(),
+                publishers
+            );
+        }
+        tracing::debug!(
+            "pin wiring: {} pins, {} publishes, {} reads, {} anomalies",
+            self.pins,
+            self.publishes,
+            self.reads,
+            self.multi_published.len() + self.unordered_init_reads.len() + self.unsatisfied.len()
+        );
+    }
+
+    /// Fail startup when a read that said it could not proceed without the pin
+    /// found nothing to read.
+    pub fn enforce(&self) -> crate::SFResult<()> {
+        let mut errors = Vec::new();
+        for (pin, consumers) in &self.unsatisfied {
+            for consumer in consumers.iter().filter(|c| c.required) {
+                errors.push(format!(
+                    "{} requires pin '{}' but nothing published it",
+                    consumer.owner.unwrap_or("<binary root>"),
+                    pin.name()
+                ));
+            }
+        }
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(crate::SFError::Config(format!(
+            "Pin wiring validation failed:\n  - {}",
+            errors.join("\n  - ")
+        )))
+    }
+}
+
+/// Every plugin `reader` transitively depends on, by descriptor name.
+fn requires_closure(descriptors: &[PluginDescriptor], reader: &str) -> HashSet<&'static str> {
+    let edges: HashMap<&str, &[&'static str]> =
+        descriptors.iter().map(|d| (d.name, d.requires)).collect();
+    let mut seen: HashSet<&'static str> = HashSet::new();
+    let mut queue: Vec<&str> = vec![reader];
+    while let Some(name) = queue.pop() {
+        for &dep in edges.get(name).copied().unwrap_or(&[]) {
+            if seen.insert(dep) {
+                queue.push(dep);
+            }
+        }
+    }
+    seen
+}
+
+// ---------------------------------------------------------------------------
 // PluginRunner — thin orchestration layer
 // ---------------------------------------------------------------------------
 
@@ -272,7 +684,6 @@ impl PluginRunner {
     /// Also validates the dependency graph and generates an [`AssemblyReport`].
     pub fn from_descriptors(descriptors: &[PluginDescriptor]) -> crate::SFResult<Self> {
         Self::validate_dependency_graph(descriptors)?;
-        Self::validate_pin_connectivity(descriptors)?;
         let sorted = Self::topological_sort(descriptors)?;
         let report = Self::build_report(&sorted);
         let sorted_descriptors: Vec<_> = sorted.iter().map(|&d| *d).collect();
@@ -347,12 +758,13 @@ impl PluginRunner {
             .map(|(i, d)| (d.name, i))
             .collect();
 
+        ctx.set_during_init(true);
         for (layer_idx, layer) in plan.layers.iter().enumerate() {
             if layer.len() == 1 {
                 let idx = name_to_idx[layer[0]];
                 if let Some(ref mut plugin) = self.plugins[idx] {
                     tracing::info!("init plugin: {} (layer {})", plugin.name(), layer_idx);
-                    plugin.init(ctx).await?;
+                    plugin.init(&ctx.as_owner(plugin.name())).await?;
                 }
             } else {
                 let mut taken = Vec::new();
@@ -371,8 +783,9 @@ impl PluginRunner {
                             plugin.name(),
                             layer_idx
                         );
+                        let view = ctx.as_owner(plugin.name());
                         async move {
-                            let result = plugin.init(ctx).await;
+                            let result = plugin.init(&view).await;
                             (idx, plugin, result)
                         }
                     })
@@ -384,6 +797,7 @@ impl PluginRunner {
                 }
             }
         }
+        ctx.set_during_init(false);
 
         if let Some(ref report) = self.report {
             tracing::info!("\n{}", report);
@@ -391,16 +805,39 @@ impl PluginRunner {
         Ok(())
     }
 
-    /// Start every plugin in parallel.
+    /// Start every plugin in parallel, then run the pin-wiring audit.
+    ///
+    /// The audit belongs here rather than in the caller: it is the last point at
+    /// which the whole graph has been observed, and a composition root that
+    /// forgot to call it would silently lose the only mechanical check on the
+    /// wiring.
     pub async fn start_all(&self, ctx: &PluginContext) -> crate::SFResult<()> {
         let futures = self.plugins.iter().filter_map(|opt| {
             let plugin = opt.as_ref()?;
             Some(async move {
                 tracing::info!("start plugin: {}", plugin.name());
-                plugin.start(ctx).await
+                plugin.start(&ctx.as_owner(plugin.name())).await
             })
         });
-        futures::future::try_join_all(futures).await.map(|_| ())
+        futures::future::try_join_all(futures).await.map(|_| ())?;
+        self.audit_pins(ctx)?;
+        Ok(())
+    }
+
+    /// Compare the pin wiring the runtime observed against itself and report
+    /// every asymmetry: a read nothing published, a pin nobody read, one pin
+    /// with several publishers, an init-time read whose publisher the reader
+    /// does not depend on.
+    ///
+    /// Only the first of those can fail startup, and only when the reader said
+    /// it could not proceed without the pin.  A read that degrades, or a pin
+    /// published for a consumer outside this process, is a fact worth logging
+    /// and not a reason to refuse to run.
+    pub fn audit_pins(&self, ctx: &PluginContext) -> crate::SFResult<PinAudit> {
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &self.descriptors);
+        audit.report();
+        audit.enforce()?;
+        Ok(audit)
     }
 
     /// Shut down every plugin in *reverse* order.
@@ -445,50 +882,6 @@ impl PluginRunner {
         if !errors.is_empty() {
             return Err(crate::SFError::Config(format!(
                 "Plugin dependency graph validation failed:\n  - {}",
-                errors.join("\n  - ")
-            )));
-        }
-        Ok(())
-    }
-
-    /// Validate that every consumed type (pin) has at least one publisher.
-    fn validate_pin_connectivity(descriptors: &[PluginDescriptor]) -> crate::SFResult<()> {
-        let mut published_by: std::collections::HashMap<&str, Vec<&str>> =
-            std::collections::HashMap::new();
-        for desc in descriptors {
-            for &ty in desc.provides {
-                published_by.entry(ty).or_default().push(desc.name);
-            }
-        }
-
-        let mut errors = Vec::new();
-        let mut warnings = Vec::new();
-        for desc in descriptors {
-            for consume in desc.consumes {
-                match published_by.get(consume.type_name) {
-                    None if consume.required => errors.push(format!(
-                        "{} consumes '{}' but no plugin publishes it",
-                        desc.name, consume.type_name
-                    )),
-                    None => warnings.push(format!(
-                        "{} optionally consumes '{}' but no plugin publishes it",
-                        desc.name, consume.type_name
-                    )),
-                    Some(provs) if provs.len() > 1 => warnings.push(format!(
-                        "{} consumes '{}' published by multiple plugins: {:?}",
-                        desc.name, consume.type_name, provs
-                    )),
-                    _ => {}
-                }
-            }
-        }
-
-        for w in &warnings {
-            tracing::warn!("{}", w);
-        }
-        if !errors.is_empty() {
-            return Err(crate::SFError::Config(format!(
-                "Pin connectivity validation failed:\n  - {}",
                 errors.join("\n  - ")
             )));
         }
@@ -823,5 +1216,259 @@ mod dag_scheduler {
             // Both become layer 0 because "ext" is treated as satisfied
             assert_eq!(plan.layers, vec![vec!["a", "b"]]);
         }
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    trait Alpha: Send + Sync {}
+    struct AlphaImpl;
+    impl Alpha for AlphaImpl {}
+
+    /// What a fake plugin does during `init`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Step {
+        PublishAlpha,
+        ReadAlpha,
+    }
+
+    struct FakePlugin {
+        name: &'static str,
+        steps: &'static [Step],
+    }
+
+    #[async_trait::async_trait]
+    impl SystemPlugin for FakePlugin {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn init(&mut self, ctx: &PluginContext) -> crate::SFResult<()> {
+            for step in self.steps {
+                match step {
+                    Step::PublishAlpha => ctx.publish_service::<dyn Alpha>(Arc::new(AlphaImpl)),
+                    Step::ReadAlpha => {
+                        let _ = ctx.consume_service::<dyn Alpha>();
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn start(&self, _ctx: &PluginContext) -> crate::SFResult<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> crate::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    fn publisher_factory() -> Box<dyn SystemPlugin> {
+        Box::new(FakePlugin {
+            name: "publisher",
+            steps: &[Step::PublishAlpha],
+        })
+    }
+
+    fn reader_factory() -> Box<dyn SystemPlugin> {
+        Box::new(FakePlugin {
+            name: "reader",
+            steps: &[Step::ReadAlpha],
+        })
+    }
+
+    fn ctx() -> PluginContext {
+        PluginContext::new(crate::Config::default())
+    }
+
+    fn descriptor(name: &'static str, requires: &'static [&'static str]) -> PluginDescriptor {
+        PluginDescriptor {
+            name,
+            requires,
+            optional_requires: &[],
+            factory: if name == "publisher" {
+                publisher_factory
+            } else {
+                reader_factory
+            },
+        }
+    }
+
+    #[test]
+    fn a_pin_is_derived_from_the_type_so_both_sides_name_the_same_one() {
+        assert_eq!(
+            Pin::of_service::<dyn Alpha>(),
+            Pin::of_service::<dyn Alpha>()
+        );
+        assert_ne!(Pin::of_service::<dyn Alpha>(), Pin::of::<AlphaImpl>());
+        assert!(Pin::of_service::<dyn Alpha>().name().ends_with("Alpha"));
+        assert!(Pin::of_service::<AlphaImpl>().name().ends_with("AlphaImpl"));
+    }
+
+    #[test]
+    fn the_read_side_finds_what_the_write_side_published() {
+        let ctx = ctx();
+        assert!(ctx.consume_service::<dyn Alpha>().is_none());
+        ctx.publish_service::<dyn Alpha>(Arc::new(AlphaImpl));
+        assert!(ctx.consume_service::<dyn Alpha>().is_some());
+        assert!(ctx.require_service::<dyn Alpha>().is_ok());
+    }
+
+    #[test]
+    fn a_required_read_that_finds_nothing_names_the_pin_and_the_reader() {
+        let ctx = ctx();
+        let err = ctx
+            .as_owner("requirer")
+            .require_service::<dyn Alpha>()
+            .err()
+            .expect("an unpublished pin cannot be required");
+        let text = err.to_string();
+        assert!(text.contains("requirer"), "{text}");
+        assert!(text.contains("Alpha"), "{text}");
+    }
+
+    #[test]
+    fn an_unsatisfied_optional_read_is_reported_but_does_not_fail_startup() {
+        let ctx = ctx();
+        let _ = ctx.as_owner("reader").consume_service::<dyn Alpha>();
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &[]);
+        assert_eq!(audit.unsatisfied.len(), 1);
+        assert!(audit.enforce().is_ok());
+    }
+
+    #[test]
+    fn an_unsatisfied_required_read_fails_startup() {
+        let ctx = ctx();
+        let _ = ctx.as_owner("requirer").require_service::<dyn Alpha>();
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &[]);
+        let text = audit.enforce().unwrap_err().to_string();
+        assert!(text.contains("requirer"), "{text}");
+        assert!(text.contains("Alpha"), "{text}");
+    }
+
+    #[test]
+    fn a_pin_published_twice_and_read_nowhere_is_reported() {
+        let ctx = ctx();
+        ctx.as_owner("a")
+            .publish_service::<dyn Alpha>(Arc::new(AlphaImpl));
+        ctx.as_owner("b")
+            .publish_service::<dyn Alpha>(Arc::new(AlphaImpl));
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &[]);
+        assert_eq!(audit.unconsumed.len(), 1);
+        assert_eq!(audit.multi_published.len(), 1);
+        assert!(audit.enforce().is_ok());
+    }
+
+    #[test]
+    fn an_init_read_without_a_dependency_edge_is_reported() {
+        let descriptors = [descriptor("publisher", &[]), descriptor("reader", &[])];
+        let mut runner = PluginRunner::from_descriptors(&descriptors).expect("descriptors");
+        let ctx = ctx();
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(runner.init_all(&ctx))
+            .expect("init");
+
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &descriptors);
+        assert_eq!(audit.unordered_init_reads.len(), 1, "{audit:?}");
+        assert_eq!(audit.unordered_init_reads[0].reader, "reader");
+        assert_eq!(audit.unordered_init_reads[0].publisher, "publisher");
+        assert!(audit.enforce().is_ok());
+    }
+
+    #[test]
+    fn a_dependency_edge_on_the_publisher_settles_the_init_read() {
+        let descriptors = [
+            descriptor("publisher", &[]),
+            descriptor("reader", &["publisher"]),
+        ];
+        let mut runner = PluginRunner::from_descriptors(&descriptors).expect("descriptors");
+        let ctx = ctx();
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(runner.init_all(&ctx))
+            .expect("init");
+
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &descriptors);
+        assert!(audit.unordered_init_reads.is_empty(), "{audit:?}");
+        assert!(audit.enforce().is_ok());
+    }
+
+    #[test]
+    fn an_indirect_dependency_settles_the_init_read() {
+        let descriptors = [
+            descriptor("publisher", &[]),
+            descriptor("middle", &["publisher"]),
+            descriptor("reader", &["middle"]),
+        ];
+        let mut runner = PluginRunner::from_descriptors(&descriptors).expect("descriptors");
+        let ctx = ctx();
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(runner.init_all(&ctx))
+            .expect("init");
+
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &descriptors);
+        assert!(audit.unordered_init_reads.is_empty(), "{audit:?}");
+    }
+
+    #[test]
+    fn a_read_during_start_is_not_ordering_checked() {
+        let descriptors = [descriptor("publisher", &[]), descriptor("reader", &[])];
+        let mut runner = PluginRunner::from_descriptors(&descriptors).expect("descriptors");
+        let ctx = ctx();
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(runner.init_all(&ctx))
+            .expect("init");
+        // Same pin, same pair of plugins, but the read happens once init is over,
+        // so no ordering is required of it.
+        ctx.set_during_init(false);
+        let _ = ctx.as_owner("reader").consume_service::<dyn Alpha>();
+
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &descriptors);
+        assert_eq!(audit.unordered_init_reads.len(), 1, "{audit:?}");
+        assert_eq!(
+            audit.unordered_init_reads[0].reader, "reader",
+            "only the init-time read may be flagged"
+        );
+    }
+
+    #[test]
+    fn the_root_reading_during_init_is_not_ordering_checked() {
+        let ctx = ctx();
+        ctx.set_during_init(true);
+        ctx.as_owner("publisher")
+            .publish_service::<dyn Alpha>(Arc::new(AlphaImpl));
+        let _ = ctx.consume_service::<dyn Alpha>();
+
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &[]);
+        assert!(audit.unordered_init_reads.is_empty(), "{audit:?}");
+    }
+
+    #[test]
+    fn the_runner_audits_the_wiring_the_plugins_actually_produced() {
+        let descriptors = [
+            descriptor("publisher", &[]),
+            descriptor("reader", &["publisher"]),
+        ];
+        let mut runner = PluginRunner::from_descriptors(&descriptors).expect("descriptors");
+        let ctx = ctx();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime
+            .block_on(runner.init_all(&ctx))
+            .expect("init of a well-wired set");
+        runtime
+            .block_on(runner.start_all(&ctx))
+            .expect("start audits clean");
+
+        let wiring = ctx.pin_wiring();
+        assert_eq!(wiring.len(), 1, "{wiring:?}");
+        assert_eq!(wiring[0].publishers, vec![Some("publisher")]);
+        assert_eq!(wiring[0].consumers.len(), 1);
+        assert_eq!(wiring[0].consumers[0].owner, Some("reader"));
     }
 }

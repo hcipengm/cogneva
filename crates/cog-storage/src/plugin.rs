@@ -914,28 +914,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     // later layer than net so the client is published before it is consumed.
     requires: &["net"],
     optional_requires: &[],
-    provides: &[
-        "RawLogger",
-        "TraceStore",
-        "StateBackend",
-        "RedisClient",
-        "VectorBackend",
-        "AgentRegistry",
-        "ObjectBackend",
-        "CheckpointStore",
-        "RawLogIndexStore",
-        "GuardAuditRecorder",
-        "MetricsBackend",
-        "ObservabilityGateway",
-        "HookArchive",
-        "MediaBackend",
-        "UserStore",
-        "PlatformIdentityStore",
-        "ExplainPool",
-    ],
-    consumes: &[cog_core::ConsumeSpec {
-        type_name: "HttpClient",
-        required: false,
-    }],
     factory: || Box::new(StoragePlugin::new()),
 };

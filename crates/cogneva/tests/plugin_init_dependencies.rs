@@ -1,13 +1,17 @@
 //! Plugins in the same topological layer are initialised concurrently, so a
-//! plugin that consumes another plugin's service during its own `init` must
-//! declare that dependency in `requires`. Otherwise the consume races with the
-//! producer's init and silently degrades to a fallback — or, under
-//! strict_persistence, fails the process at random.
+//! plugin that reads another plugin's service during its own `init` must depend
+//! on that plugin in `requires`. Otherwise the read races the producer's init
+//! and silently degrades to a fallback — or, under strict_persistence, fails the
+//! process at random.
 //!
-//! These tests pin the declarations that make init-time consumes safe. The
-//! provided-service lists are read from the producers' real descriptors rather
-//! than copied here: a hand-written copy cannot fail when the descriptor it
-//! mirrors drifts, which is the very failure this test exists to catch.
+//! Whether a read pin exists at all is deliberately *not* asserted here. The
+//! only thing such an assertion could read is a hand-maintained `provides` list,
+//! which agrees with itself rather than with the runtime. That half lives in
+//! `PluginRunner::audit_pins`, which reports the pins the process really
+//! published and read, by whom. These tests keep the ordering half, because init
+//! order is not something the runtime can reconstruct after the fact.
+
+use std::collections::{HashMap, HashSet};
 
 /// (consumer plugin, producer plugin, services the consumer reads during init),
 /// read off each consumer's `plugin.rs`.
@@ -30,74 +34,64 @@ const INIT_CONSUMES: &[(&str, &str, &[&str])] = &[
     ("agent", "skill", &["SkillRegistry"]),
 ];
 
-fn provided_by(producer: &str) -> &'static [&'static str] {
-    match producer {
-        "storage" => cog_storage::plugin::DESCRIPTOR.provides,
-        "net" => cog_net::plugin::DESCRIPTOR.provides,
-        "observability" => cog_observability::plugin::DESCRIPTOR.provides,
-        "skill" => cog_skill::plugin::DESCRIPTOR.provides,
-        other => panic!("{other} has no descriptor in this test"),
-    }
-}
-
-#[test]
-fn init_consumes_are_declared_and_ordered() {
-    for (plugin, producer, consumed) in INIT_CONSUMES {
-        let requires = match *plugin {
-            "memory" => cog_memory::plugin::DESCRIPTOR.requires,
-            "wiki" => cog_wiki::plugin::DESCRIPTOR.requires,
-            "storage" => cog_storage::plugin::DESCRIPTOR.requires,
-            "gateway" => cog_gateway::plugin::DESCRIPTOR.requires,
-            "agent" => cog_agent::plugin::DESCRIPTOR.requires,
-            other => panic!("{other} has no descriptor in this test"),
-        };
-
-        for service in *consumed {
-            assert!(
-                provided_by(producer).contains(service),
-                "{service} is not listed as provided by {producer}; \
-                 {plugin} reads it during init, so the declaration has drifted"
-            );
-            assert!(
-                requires.contains(producer),
-                "{plugin} consumes {service} during init but does not require {producer}; \
-                 same-layer plugins init in parallel, so this is a race"
-            );
+/// Every plugin `name` transitively depends on.
+fn requires_closure(name: &str) -> HashSet<&'static str> {
+    let descriptors = cogneva::plugin_registry::all_descriptors();
+    let edges: HashMap<&str, &[&'static str]> =
+        descriptors.iter().map(|d| (d.name, d.requires)).collect();
+    let mut seen: HashSet<&'static str> = HashSet::new();
+    let mut queue: Vec<&str> = vec![name];
+    while let Some(current) = queue.pop() {
+        for &dep in edges.get(current).copied().unwrap_or(&[]) {
+            if seen.insert(dep) {
+                queue.push(dep);
+            }
         }
     }
+    seen
 }
 
-/// A `provides` entry is a promise that some consumer can look the pin up. A
-/// plugin that lists a pin it only ever consumes makes that promise to itself,
-/// so the connectivity check passes and the `expect(...)` at the consume site
-/// panics at startup instead. `all_descriptors()` comes from `build.rs`, so
-/// this covers every registered crate without a list to keep in sync.
 #[test]
-fn declared_pins_are_honest() {
+fn init_consumes_are_ordered() {
+    for (plugin, producer, consumed) in INIT_CONSUMES {
+        assert!(
+            requires_closure(plugin).contains(producer),
+            "{plugin} reads {consumed:?} from {producer} during init but does not depend on \
+             {producer}; same-layer plugins init in parallel, so the read can race the publisher"
+        );
+    }
+}
+
+/// A dependency name that matches no registered plugin is only ever noticed when
+/// the process fails to start. Catch it here instead.
+#[test]
+fn every_declared_dependency_exists() {
     let descriptors = cogneva::plugin_registry::all_descriptors();
     assert!(!descriptors.is_empty(), "no descriptors registered");
+    let names: HashSet<&str> = descriptors.iter().map(|d| d.name).collect();
 
     for desc in descriptors {
-        let consumed: Vec<&str> = desc.consumes.iter().map(|c| c.type_name).collect();
-        for provided in desc.provides {
+        for target in desc.requires.iter().chain(desc.optional_requires) {
             assert!(
-                !consumed.contains(provided),
-                "{} declares '{}' in both provides and consumes; it is a re-export \
-                 of a pin it also reads, so nothing guarantees a publisher exists",
-                desc.name,
-                provided
+                names.contains(target),
+                "{} depends on '{target}', which no registered plugin provides",
+                desc.name
             );
         }
+    }
+}
 
-        for consume in desc.consumes.iter().filter(|c| c.required) {
-            let foreign = descriptors
-                .iter()
-                .any(|d| d.name != desc.name && d.provides.contains(&consume.type_name));
-            assert!(
-                foreign,
-                "{} require-consumes '{}' but no other plugin publishes it",
-                desc.name, consume.type_name
-            );
-        }
+/// `all_descriptors()` is generated from `[dependencies]`, so a crate listed
+/// twice — or a name reused by another crate — would silently shadow one plugin.
+#[test]
+fn plugin_names_are_unique() {
+    let descriptors = cogneva::plugin_registry::all_descriptors();
+    let mut seen = HashSet::new();
+    for desc in descriptors {
+        assert!(
+            seen.insert(desc.name),
+            "plugin name '{}' is registered more than once",
+            desc.name
+        );
     }
 }

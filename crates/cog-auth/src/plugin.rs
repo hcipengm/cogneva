@@ -37,11 +37,7 @@ impl cog_core::SystemPlugin for AuthPlugin {
             return Ok(());
         }
 
-        let redis_client = ctx
-            .consume::<cog_storage::RedisClient>()
-            .expect("redis client")
-            .0
-            .clone();
+        let redis_client = ctx.require::<cog_storage::RedisClient>()?.0.clone();
 
         let jwt_manager: Arc<dyn cog_core::AuthProvider> =
             Arc::new(crate::JwtManager::new(resolve_jwt_config(ctx.config())?));
@@ -119,10 +115,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "auth",
     requires: &["storage"],
     optional_requires: &[],
-    provides: &["AuthProvider", "SessionManager"],
-    consumes: &[cog_core::ConsumeSpec {
-        type_name: "RedisClient",
-        required: true,
-    }],
     factory: || Box::new(AuthPlugin::new()),
 };

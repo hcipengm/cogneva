@@ -35,9 +35,7 @@ impl cog_core::SystemPlugin for NotificationPlugin {
         let mut dispatcher = crate::MultiDispatcher::new()
             .add(Arc::new(broadcast) as Arc<dyn cog_core::NotificationDispatcher>);
 
-        let http_client = ctx
-            .consume_service::<dyn cog_core::HttpClient>()
-            .expect("http client for webhook dispatchers");
+        let http_client = ctx.require_service::<dyn cog_core::HttpClient>()?;
 
         if let Some(ref url) = config.gateway.notification_webhook_url {
             if !url.is_empty() {
@@ -106,14 +104,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "notification",
     requires: &["net"],
     optional_requires: &[],
-    provides: &[
-        "NotificationDispatcher",
-        "NotificationStore",
-        "Sender<Notification>",
-    ],
-    consumes: &[cog_core::ConsumeSpec {
-        type_name: "HttpClient",
-        required: true,
-    }],
     factory: || Box::new(NotificationPlugin::new()),
 };

@@ -263,10 +263,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "llm",
     requires: &["net"],
     optional_requires: &[],
-    provides: &["HotSwappableLlmClient", "LlmClient", "Observable"],
-    consumes: &[cog_core::ConsumeSpec {
-        type_name: "HttpClient",
-        required: false,
-    }],
     factory: || Box::new(LlmPlugin::new()),
 };

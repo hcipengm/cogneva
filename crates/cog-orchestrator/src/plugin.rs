@@ -41,18 +41,12 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         }
 
         // ── Consume dependencies ──
-        let task_event_tx = (*ctx
-            .consume::<tokio::sync::broadcast::Sender<cog_core::TaskEvent>>()
-            .expect("task_event_tx"))
-        .clone();
+        let task_event_tx =
+            (*ctx.require::<tokio::sync::broadcast::Sender<cog_core::TaskEvent>>()?).clone();
 
-        let state_backend = ctx
-            .consume_service::<dyn cog_core::StateBackend>()
-            .expect("state_backend");
+        let state_backend = ctx.require_service::<dyn cog_core::StateBackend>()?;
 
-        let raw_logger = ctx
-            .consume_service::<dyn cog_core::RawLogger>()
-            .expect("raw logger");
+        let raw_logger = ctx.require_service::<dyn cog_core::RawLogger>()?;
 
         let message_backend = ctx.consume_service::<dyn cog_core::MessageBackend>();
 
@@ -506,57 +500,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "orchestrator",
     requires: &["storage"],
     optional_requires: &["llm", "stream", "collaboration", "extension"],
-    provides: &[
-        "OrchestratorControl",
-        // The router that aggregates the task executors is published under its
-        // concrete type, so nothing can reach it through the `TaskExecutor`
-        // pin. Declaring it here would let a `required` consume of that pin
-        // validate at startup and then panic when no executor is published.
-        "ActionPlanner",
-        "DagExecutorRuntime",
-        "Observable",
-    ],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "Sender<TaskEvent>",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "StateBackend",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "RawLogger",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "LlmClient",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "MessageBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "ObjectBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "VectorBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "AgentRegistry",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "CheckpointStore",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "TaskExecutor",
-            required: false,
-        },
-    ],
     factory: || Box::new(OrchestratorPlugin::new()),
 };

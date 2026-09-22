@@ -89,7 +89,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "net",
     requires: &[],
     optional_requires: &[],
-    provides: &["HttpClient", "WebSocketClient"],
-    consumes: &[],
     factory: || Box::new(NetPlugin::new()),
 };

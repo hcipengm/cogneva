@@ -71,24 +71,16 @@ impl cog_core::SystemPlugin for AgentPlugin {
 
         // Consume dependencies published by earlier plugins.
         let shared_message_backend = ctx.consume_service::<dyn cog_core::MessageBackend>();
-        let sandbox_backend = ctx
-            .consume_service::<dyn cog_core::SandboxBackend>()
-            .expect("sandbox backend");
-        let guardrail = ctx
-            .consume_service::<dyn cog_core::Guardrail>()
-            .expect("guardrail");
-        let plugin_registry = ctx
-            .consume_service::<dyn cog_core::PluginRegistry>()
-            .expect("plugin registry");
+        let sandbox_backend = ctx.require_service::<dyn cog_core::SandboxBackend>()?;
+        let guardrail = ctx.require_service::<dyn cog_core::Guardrail>()?;
+        let plugin_registry = ctx.require_service::<dyn cog_core::PluginRegistry>()?;
 
         // Clone before moving into tool_registry so eval runtime can reuse them.
         let sandbox_backend_for_eval = sandbox_backend.clone();
         let _guardrail_for_eval = guardrail.clone();
         let plugin_registry_for_eval = plugin_registry.clone();
         let hook_archive = ctx.consume_service::<dyn cog_core::HookArchive>();
-        let agent_registry = ctx
-            .consume_service::<dyn cog_core::AgentRegistry>()
-            .expect("agent registry");
+        let agent_registry = ctx.require_service::<dyn cog_core::AgentRegistry>()?;
 
         // ── HookEngine ──
         let redis_backend: Arc<dyn cog_core::MessageBackend> = match shared_message_backend.clone()
@@ -226,9 +218,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         *self.eval_event_rx.lock().await = Some(eval_event_rx);
 
         // ── GlobalAgentManager ──
-        let supervisor_state_backend = ctx
-            .consume_service::<dyn cog_core::StateBackend>()
-            .expect("state backend");
+        let supervisor_state_backend = ctx.require_service::<dyn cog_core::StateBackend>()?;
         let external_skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
 
         let pool_backend: Arc<dyn cog_core::MessageBackend> = match shared_message_backend.clone() {
@@ -527,72 +517,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     // diagnostic instead of a budget regression nobody can see.
     requires: &["storage", "extension", "guardrail", "skill"],
     optional_requires: &["stream", "net"],
-    provides: &[
-        "HookEngine",
-        "ToolRegistry",
-        "AgentManager",
-        "AgentRuntime",
-        "Observable",
-    ],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "MessageBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "SandboxBackend",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "Guardrail",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "PluginRegistry",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "HookArchive",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "AgentRegistry",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "StateBackend",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "ExternalSkillRegistry",
-            required: false,
-        },
-        // Read during init to bind each role's skill; see the `skill` edge in
-        // `requires` for why it is declared required rather than best-effort.
-        cog_core::ConsumeSpec {
-            type_name: "SkillRegistry",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "LlmClient",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "TaskExecutionCallback",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "HttpClient",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "Sender<AgentEvent>",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "EventPlanePublisher",
-            required: false,
-        },
-    ],
     factory: || Box::new(AgentPlugin::new()),
 };

@@ -32,11 +32,7 @@ impl cog_core::SystemPlugin for QuotaPlugin {
             return Ok(());
         }
 
-        let redis_client = ctx
-            .consume::<cog_storage::RedisClient>()
-            .expect("redis client")
-            .0
-            .clone();
+        let redis_client = ctx.require::<cog_storage::RedisClient>()?.0.clone();
 
         let quota_manager = {
             let conn = redis_client
@@ -88,10 +84,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "quota",
     requires: &["storage"],
     optional_requires: &[],
-    provides: &["QuotaManager", "HierarchyManager", "WorkspaceQuotaSource"],
-    consumes: &[cog_core::ConsumeSpec {
-        type_name: "RedisClient",
-        required: true,
-    }],
     factory: || Box::new(QuotaPlugin::new()),
 };

@@ -119,26 +119,17 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         };
 
         // ── Consume dependencies ──
-        let quota_manager = ctx
-            .consume_service::<dyn cog_core::WorkspaceQuotaSource>()
-            .expect("quota manager");
-        let state_backend = ctx
-            .consume_service::<dyn cog_core::StateBackend>()
-            .expect("state_backend");
-        let supervisor_orchestrator = ctx
-            .consume_service::<dyn cog_core::OrchestratorControl>()
-            .expect("orchestrator control");
-        let event_tx = ctx
-            .consume::<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>()
-            .expect("event sender");
+        let quota_manager = ctx.require_service::<dyn cog_core::WorkspaceQuotaSource>()?;
+        let state_backend = ctx.require_service::<dyn cog_core::StateBackend>()?;
+        let supervisor_orchestrator = ctx.require_service::<dyn cog_core::OrchestratorControl>()?;
+        let event_tx = ctx.require::<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>()?;
         let event_tx = (*event_tx).clone();
         let meta_learning = ctx.consume_service::<dyn cog_core::MetaLearning>();
         let fault_classifier = ctx.consume_service::<dyn cog_core::FaultClassifier>();
 
         // ── Consume observability gateway ──
         let gateway = ctx
-            .consume_service::<dyn cog_core::ObservabilityGateway>()
-            .expect("observability gateway")
+            .require_service::<dyn cog_core::ObservabilityGateway>()?
             .clone();
 
         // ── Build supervisor registry ──
@@ -310,53 +301,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         "observability",
     ],
     optional_requires: &["reflection"],
-    provides: &[
-        "Supervisor",
-        "AlertStore",
-        "HeartbeatRegistry",
-        "SchedulerGate",
-        "LlmPoolStatusSource",
-        "SupervisorConfigTx",
-        "Sender<SupervisorEvent>",
-        "BinarySwitcher",
-    ],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "WorkspaceQuotaSource",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "StateBackend",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "OrchestratorControl",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "Sender<AgentEvent>",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "ObservabilityGateway",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "MetaLearning",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "FaultClassifier",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "MessageBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "EventPlaneBackend",
-            required: false,
-        },
-    ],
     factory: || Box::new(SupervisorPlugin::new()),
 };

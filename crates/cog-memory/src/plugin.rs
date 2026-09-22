@@ -423,38 +423,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     // edge cannot form a cycle.
     requires: &["storage"],
     optional_requires: &[],
-    provides: &[
-        "MemoryBackend",
-        "MemoryIngestor",
-        "EmbeddingProvider",
-        "RerankerProvider",
-        "Observable",
-    ],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "ExplainPool",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "MetricsBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "VectorBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "ObjectBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "EventPlaneBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "LlmPoolStatusSource",
-            required: false,
-        },
-    ],
     factory: || Box::new(MemoryPlugin::new()),
 };

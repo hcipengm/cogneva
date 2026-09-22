@@ -121,48 +121,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "collaboration",
     requires: &["llm", "reflection", "agent"],
     optional_requires: &[],
-    provides: &["TaskExecutor", "Observable"],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "LlmClient",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "AgentManager",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "HookEngine",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "SquadReflection",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "MetaLearning",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "ChangeSink",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "ReflectionEngine",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "KnowledgeBackend",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "ExternalSkillRegistry",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "StateBackend",
-            required: false,
-        },
-    ],
     factory,
 };

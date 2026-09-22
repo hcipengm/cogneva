@@ -97,7 +97,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "extension",
     requires: &[],
     optional_requires: &[],
-    provides: &["SandboxBackend", "PluginRegistry", "TaskExecutor"],
-    consumes: &[],
     factory: || Box::new(ExtensionPlugin::new()),
 };

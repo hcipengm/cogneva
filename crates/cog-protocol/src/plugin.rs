@@ -159,16 +159,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "protocol",
     requires: &[],
     optional_requires: &[],
-    provides: &["McpClient", "AgentLifecycleServer", "AgentLifecycleClient"],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "AgentRegistry",
-            required: false,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "Sender<SupervisorEvent>",
-            required: false,
-        },
-    ],
     factory: || Box::new(ProtocolPlugin::new()),
 };

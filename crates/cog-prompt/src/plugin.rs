@@ -90,7 +90,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "prompt",
     requires: &[],
     optional_requires: &[],
-    provides: &["PromptProvider"],
-    consumes: &[],
     factory: || Box::new(PromptPlugin::new()),
 };

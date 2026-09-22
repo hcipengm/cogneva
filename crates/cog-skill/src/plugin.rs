@@ -114,7 +114,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "skill",
     requires: &[],
     optional_requires: &[],
-    provides: &["SkillRegistry", "ExternalSkillRegistry"],
-    consumes: &[],
     factory: || Box::new(SkillPlugin::new()),
 };

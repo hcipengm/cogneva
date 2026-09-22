@@ -176,14 +176,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "stream",
     requires: &[],
     optional_requires: &[],
-    provides: &[
-        "MessageBackend",
-        "EventPublisher",
-        "EventPlaneBackend",
-        "EventPlanePublisher",
-        "Sender<AgentEvent>",
-        "Sender<TaskEvent>",
-    ],
-    consumes: &[],
     factory: || Box::new(StreamPlugin::new()),
 };

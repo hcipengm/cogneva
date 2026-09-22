@@ -85,20 +85,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "eval",
     requires: &["agent", "llm"],
     optional_requires: &[],
-    provides: &["EvalService"],
-    consumes: &[
-        cog_core::ConsumeSpec {
-            type_name: "AgentRuntime",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "LlmClient",
-            required: true,
-        },
-        cog_core::ConsumeSpec {
-            type_name: "Observable",
-            required: false,
-        },
-    ],
     factory: || Box::new(EvalPlugin::new()),
 };

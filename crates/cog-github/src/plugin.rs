@@ -506,15 +506,5 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     requires: &[],
     // 池全灭时按 SchedulerGate 跳过 LLM 依赖轮次；supervisor 缺席也能跑。
     optional_requires: &["supervisor"],
-    provides: &[
-        "CodePlatformProvider",
-        "ContributionControl",
-        "ChangeSink",
-        "ChangeLanding",
-    ],
-    consumes: &[cog_core::ConsumeSpec {
-        type_name: "SchedulerGate",
-        required: false,
-    }],
     factory: || Box::new(GitHubPlugin::new()),
 };
