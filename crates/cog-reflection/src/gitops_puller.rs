@@ -30,7 +30,7 @@ use cog_core::{
     PromotionLedger, PromotionRecord, PromotionStatus, SFError, SFResult,
     COUNTER_SEMANTICS_CUMULATIVE, COUNTER_SEMANTICS_MARKER,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -728,7 +728,7 @@ impl GitOpsPuller {
 
         let watch = self.watch_canary(pre_rollout.as_ref()).await;
         match watch {
-            Ok(()) => {
+            Ok(coverage) => {
                 if let Err(e) = self
                     .run(
                         &k,
@@ -788,7 +788,10 @@ impl GitOpsPuller {
                 // 镜像换了但 prompts configmap 不重建的话，挂载的旧
                 // prompts 会遮蔽新镜像里的更新——本提交触及 prompts/
                 // 时随金丝雀成功一并重建。
-                let mut note = format!("canary passed; rolled out {image}");
+                // 放行的话里必须带上这轮判据的覆盖情况：只写「canary passed」，
+                // 读台账的人会把它读成「延迟与错误率都验过了」，而取不到数时
+                // 那条闸门整轮都在放行，结论长得一模一样。
+                let mut note = format!("canary passed; {}; rolled out {image}", coverage.summary());
                 if self.commit_touches("prompts/").await? {
                     note.push_str(&format!("; {}", self.rebuild_prompts_configmap().await?));
                 }
@@ -867,110 +870,90 @@ impl GitOpsPuller {
 
     /// 金丝雀看护：watch 期内周期性检查新副本 readiness 与 restart
     /// count；配置了 metrics_url 时另做阈值比对。任何异常立即返回 Err。
-    async fn watch_canary(&self, pre_rollout: Option<&HashSet<String>>) -> SFResult<()> {
+    ///
+    /// 返回值是这一轮**实际拿到了什么**。取不到数不是通过：整轮什么都没测到的
+    /// 放行必须和「测了、没回归」在结论上分得开，否则一条长期失效的判据会无声
+    /// 无息地一直放行。
+    async fn watch_canary(&self, pre_rollout: Option<&HashSet<String>>) -> SFResult<GateCoverage> {
         let watch_secs = self.config.canary_watch_secs;
         let interval = std::cmp::max(watch_secs / 20, 5);
-        let baseline = match pre_rollout {
-            Some(pre) => self.baseline_signals(interval, pre).await,
-            None => None,
-        };
-        if pre_rollout.is_some() && baseline.is_none() {
-            warn!("canary metrics baseline unavailable; error-rate and p99 gates stay idle");
+        let mut coverage = GateCoverage::default();
+        if self.metrics_url.is_none() {
+            coverage.metrics_off = Some("no metrics endpoint configured");
+        } else if pre_rollout.is_none() {
+            coverage.metrics_off = Some("pre-rollout pod list unavailable");
         }
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_secs(watch_secs);
         // 宽限期：金丝雀刚 set image 时新副本还在 ContainerCreating，
         // not-ready 属正常；宽限过后仍不 ready 才算异常。
         let grace = Duration::from_secs(std::cmp::max(90, watch_secs / 4));
-        // 金丝雀侧的速率也必须是它自己的两个点：累积语义下新副本的计数器从零
-        // 起步，拿旧版本的累积量当参考点相减只会得到负增量。参考点取第一次
-        // 成功抓取并保留整段看护期，样本量随时间增长，不必靠单次间隔凑够。
-        // 连同被观测的副本集合一起记住：副本被换掉时那两点就不再是一段连续
-        // 历史，必须重新起一个参考点。
-        let mut canary_reference: Option<(
-            String,
-            CanarySignals,
-            CounterSemantics,
-            HistogramSnapshot,
-        )> = None;
+        // 参考点两侧同拍取，且装在同一个值里：只重取一侧就会让两侧的起算点分开，
+        // 两个分位数描述的时间长度随即差一个数量级（旧副本已跑一整天、候选才几分
+        // 钟），而这个差会静默地把闸门推宽或推窄。
+        let mut window: Option<CanaryWindow> = None;
 
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(interval)).await;
             self.check_pods_healthy(started.elapsed() < grace).await?;
-            let (Some(pre), Some(base)) = (pre_rollout, &baseline) else {
+            coverage.pod_checks += 1;
+            let Some(pre) = pre_rollout else {
                 continue;
             };
-            let Ok((_, new_ips)) = self.canary_pod_groups(pre).await else {
+            let Ok((old_ips, new_ips)) = self.canary_pod_groups(pre).await else {
                 continue;
             };
-            let Some((current, semantics, current_hist)) = self.scrape_group(&new_ips).await else {
-                // 新副本还没起来（拉镜像中）或抓不到：没有候选的证据就不判。
+            // 两侧都要抓得到才是同一拍的两个参考点。新副本还在拉镜像时新组为空，
+            // 旧副本被换掉时旧组为空——任一侧缺席这一拍就不起算，也绝不拿旧读数
+            // 顶替，否则两侧的起算点会错开。
+            let (Some(old_now), Some(new_now)) = (
+                self.scrape_side(&old_ips).await,
+                self.scrape_side(&new_ips).await,
+            ) else {
                 continue;
             };
-            let observed = new_ips.join(",");
-            let (reference, reference_hist) = match &canary_reference {
-                Some((seen, signals, s, hist)) if *seen == observed && *s == semantics => {
-                    (*signals, hist.clone())
+            match &window {
+                Some(w) if w.holds(&old_now, &new_now) => {
+                    self.compare_metrics(w, &old_now, &new_now, &mut coverage)?;
                 }
-                // 首次观测，或观测对象/语义变过：以这一读为新参考点。两点相同即
-                // 增量为零，p99 读作「还没有证据」，不会编出一个数。
-                _ => {
-                    canary_reference = Some((observed, current, semantics, current_hist.clone()));
-                    (current, current_hist.clone())
+                Some(_) => {
+                    // 观测对象或正文语义变过：两点不再是一段连续历史，整窗重取。
+                    coverage.window_resets += 1;
+                    window = Some(CanaryWindow {
+                        old: old_now,
+                        new: new_now,
+                    });
                 }
-            };
-            let candidate_p99 = p99_between(&reference_hist, &current_hist).unwrap_or(0.0);
-            self.compare_metrics(base, reference, candidate_p99, &current, semantics)?;
+                None => {
+                    window = Some(CanaryWindow {
+                        old: old_now,
+                        new: new_now,
+                    });
+                }
+            }
         }
-        Ok(())
+        coverage.no_window = coverage.metrics_off.is_none() && window.is_none();
+        let summary = coverage.summary();
+        // 有判据整轮没拿到读数时按 warn 记：这是需要有人看一眼的形态，不是常态。
+        if coverage.measured("latency") && coverage.measured("error-rate") {
+            info!(cluster = %self.cluster, "{summary}");
+        } else {
+            warn!(cluster = %self.cluster, "{summary}");
+        }
+        Ok(coverage)
     }
 
-    /// 看护开始时的两次抓取，间隔 `sample_secs`，用来看**旧版本自己**的错误率。
+    /// 抓取一组副本，连同「刮的是谁、正文声明什么语义」一起记下。
     ///
-    /// 一次抓取只是一个点：正文若按累积计数器解释，单点只是「进程启动以来的
-    /// 总量」，读不出任何速率，用它当基线等于拿整段进程历史的平均错误率去比，
-    /// 金丝雀自己回归时这个数几乎不动。所以取两个点做差。
-    ///
-    /// 两次都在 `set image` 之后，但都取自**旧副本**——金丝雀暂停期间旧副本
-    /// 不缩容，它仍在跑旧版本，两点相减得到的是旧版本的速率。参考点因此不能
-    /// 跨到金丝雀那一侧去用：那是另一个进程的计数器。
-    async fn baseline_signals(
-        &self,
-        sample_secs: u64,
-        pre_rollout: &HashSet<String>,
-    ) -> Option<CanaryBaseline> {
-        let (old_ips, _) = self.canary_pod_groups(pre_rollout).await.ok()?;
-        // 旧副本一个都抓不到就当没有基线：拿候选自己当基线等于自比自。
-        let (first, semantics, first_hist) = self.scrape_group(&old_ips).await?;
-        tokio::time::sleep(Duration::from_secs(sample_secs.max(1))).await;
-        let (second, second_semantics, second_hist) = match self.scrape_group(&old_ips).await {
-            Some(v) => v,
-            // 第二次抓不到就退回单点：窗口求和语义下单点仍给出速率，累积语义下
-            // 由 error_rate 自己判「没有证据」，不会伪造一个数。直方图沿用第一份，
-            // 两点相同即增量为零，p99 读作「没有证据」。
-            None => (first, semantics, first_hist.clone()),
-        };
-        // 两次之间语义变过，相减就不是一段连续历史：不给速率，闸门照 skipped 走。
-        let same_semantics = second_semantics == semantics;
-        let rate = same_semantics.then(|| {
-            error_rate(
-                first,
-                second,
-                semantics,
-                self.config.canary_min_requests_for_rate,
-            )
-        });
-        // p99 同样取旧版本自己的两点之差：累积桶描述的是进程一生，旧副本的一生
-        // 比候选长得多，直接比累积量等于拿两个不同的时间尺度在比。
-        let p99_ms = if same_semantics {
-            p99_between(&first_hist, &second_hist).unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        Some(CanaryBaseline {
+    /// 单有一份读数不够：要判断两次读数是不是同一段连续历史，就必须知道各自
+    /// 观测的是哪一组副本、正文声明的又是哪一套语义。
+    async fn scrape_side(&self, ips: &[String]) -> Option<SideRead> {
+        let (signals, semantics, hist) = self.scrape_group(ips).await?;
+        Some(SideRead {
+            pods: ips.join(","),
             semantics,
-            rate: rate.flatten(),
-            p99_ms,
+            signals,
+            hist,
         })
     }
 
@@ -1161,75 +1144,55 @@ impl GitOpsPuller {
         Some(pods.into_iter().map(|(name, _)| name).collect())
     }
 
-    /// 金丝雀看护的阈值比对。
+    /// 金丝雀看护的阈值比对，一拍一次。
     ///
-    /// 两侧的速率各自由本侧的两个点得出（`baseline.rate` 是旧版本自己的，
-    /// `reference`→`current` 是候选自己的），不能拿一侧的参考点去减另一侧的
-    /// 计数——那是两个进程各自的计数器，相减没有意义。
+    /// `window` 是两侧同拍的参考点，`old`/`new` 是此刻的读数：两侧的速率与 p99
+    /// 各自由**本侧的两个点**得出，不能拿一侧的参考点去减另一侧的计数——那是两个
+    /// 进程各自的计数器，相减没有意义。
     ///
-    /// p99 与计数器语义无关，任何一轮都先看。两侧的 p99 各自由本侧的两个抓取点
-    /// 相减得出，调用方算好传进来（`candidate_p99`）——累积桶的差值只有对着
-    /// 同一侧的两个点才有意义，而参考点与当前读数才是同侧的两个计数点。
-    ///
-    /// 错误率两边必须用同一种语义解读：语义在换版那一轮会从窗口求和切成累积，
-    /// 跨语义相除得到的不是任何一版的错误率。这种情况下显式记日志并跳过错误率
-    /// 这一项，而不是硬算出一个数把好版本回滚掉。
+    /// 每拍把两条判据的结局写进 `coverage`：读数还是缺证据、缺在哪一侧、什么原因。
+    /// 只判回归而不留这件事，会让「整轮没测到」在台账上长得和「测了没回归」一样。
     fn compare_metrics(
         &self,
-        baseline: &CanaryBaseline,
-        reference: CanarySignals,
-        candidate_p99: f64,
-        current: &CanarySignals,
-        semantics: CounterSemantics,
+        window: &CanaryWindow,
+        old: &SideRead,
+        new: &SideRead,
+        coverage: &mut GateCoverage,
     ) -> SFResult<()> {
-        // 分位数只在这段两点窗口内到达过请求时才存在：窗口内没请求，两次抓取的
-        // 桶差为零，读出来是 0。用 0 当基线去比会把任何一次观测都判成回归，所以两种
-        // 缺证据都跳过——但必须各自记日志。这条闸门是回滚好版本的依据，静默跳过
-        // 会让"没测到"和"测了没回归"在日志上长得一样，一条长期无效的判据就此消失
-        // 得无声无息。
-        let base_p99 = baseline.p99_ms;
-        let p99 = candidate_p99;
-        if base_p99 <= 0.0 {
-            warn!(
-                "canary p99 gate skipped: baseline recorded no observation between its two scrapes"
-            );
-        } else if p99 <= 0.0 {
-            warn!(
-                "canary p99 gate skipped: candidate recorded no observation between its two scrapes"
-            );
-        } else if p99 > base_p99 * self.config.canary_p99_multiplier {
-            return Err(SFError::Agent(format!(
-                "canary p99 regressed: {p99:.0}ms > baseline {base_p99:.0}ms x {}",
-                self.config.canary_p99_multiplier
-            )));
+        // 分位数只在这段两点窗口内到达过请求时才存在。读不出来不是 0——用 0 当
+        // 基线去比会把任何一次观测都判成回归，也会把「没测到」写成「延迟很好」。
+        let baseline_p99 = p99_between(&window.old.hist, &old.hist);
+        let candidate_p99 = p99_between(&window.new.hist, &new.hist);
+        let outcome = latency_outcome(baseline_p99, candidate_p99);
+        debug!("canary latency gate: {outcome}");
+        coverage.record("latency", outcome);
+        if let (LatencyRead::Measured(b), LatencyRead::Measured(c)) = (baseline_p99, candidate_p99)
+        {
+            if b > 0.0 && c > b * self.config.canary_p99_multiplier {
+                return Err(SFError::Agent(format!(
+                    "canary p99 regressed: {c:.0}ms > baseline {b:.0}ms x {}",
+                    self.config.canary_p99_multiplier
+                )));
+            }
         }
-        if baseline.semantics != semantics {
-            warn!(
-                baseline = ?baseline.semantics,
-                current = ?semantics,
-                "counter semantics changed mid-canary; error-rate gate skipped for this tick"
-            );
-            return Ok(());
-        }
-        let min_requests = self.config.canary_min_requests_for_rate;
-        let Some(err) = error_rate(reference, *current, semantics, min_requests) else {
-            warn!(
-                requests_added = current.requests - reference.requests,
-                min_requests, "canary error rate has no evidence yet; gate skipped for this tick"
-            );
-            return Ok(());
-        };
-        // 基线速率取不到时不能拿 0 去比：那等于「任何超过 1% 的错误率都判回归」，
-        // 会无差别回滚好版本。没有基线的相对判据就没有这条判据——跳过并记日志。
-        let Some(base_err) = baseline.rate else {
-            warn!("canary baseline error rate has no evidence; gate skipped");
-            return Ok(());
-        };
-        if err > base_err * self.config.canary_error_rate_multiplier && err > 0.01 {
-            return Err(SFError::Agent(format!(
-                "canary error rate regressed: {err:.4} > baseline {base_err:.4} x {}",
-                self.config.canary_error_rate_multiplier
-            )));
+        // 语义由 `CanaryWindow::holds` 保证两侧一致；变过就整窗重取了，不会走到这里。
+        let read = error_rate_gate(window, old, new, self.config.canary_min_requests_for_rate);
+        debug!(
+            cluster = %self.cluster,
+            "canary error-rate gate: {}", read.label()
+        );
+        coverage.record("error-rate", read.label());
+        if let RateRead::Measured {
+            candidate,
+            baseline,
+        } = read
+        {
+            if candidate > baseline * self.config.canary_error_rate_multiplier && candidate > 0.01 {
+                return Err(SFError::Agent(format!(
+                    "canary error rate regressed: {candidate:.4} > baseline {baseline:.4} x {}",
+                    self.config.canary_error_rate_multiplier
+                )));
+            }
         }
         Ok(())
     }
@@ -1371,17 +1334,192 @@ enum CounterSemantics {
     Windowed,
 }
 
-/// 旧版本自己的观测：两次抓取算出的速率，加上用于比对的 p99。
+/// 一侧（旧版本或候选）在一次抓取里的观测。
 ///
-/// 这里只留「旧版本是什么样」，不留任何供金丝雀侧相减的计数点——两侧是不同
-/// 进程的计数器，差要各算各的。
-#[derive(Debug, Clone, Copy)]
-struct CanaryBaseline {
+/// 带上「刮的是哪一组副本」与「正文声明什么语义」：这两样一变，这一读与之前那读
+/// 就不再是同一段连续历史，参考点必须重取。
+#[derive(Debug, Clone)]
+struct SideRead {
+    /// 被观测的副本 IP 集合，拼成一个串。
+    pods: String,
     semantics: CounterSemantics,
-    /// 旧版本自身的错误率；正文证据不足以算出它时是 `None`。
-    rate: Option<f64>,
-    /// 旧版本自身两点之间的 p99 延迟（毫秒）；没有观测证据时是 0。
-    p99_ms: f64,
+    signals: CanarySignals,
+    hist: HistogramSnapshot,
+}
+
+/// 一段判据窗：旧版本与候选各自在这一拍上的参考读数。
+///
+/// 两侧必须**同拍**取参考点。一边从进程启动起算、另一边从被观测起算，两个分位数
+/// 描述的时间长度就差着一个数量级——旧副本已经跑了一整天、候选才几分钟——比它们
+/// 等于拿两个时间尺度在比，而这个差会静默地把闸门推宽或推窄。把两侧参考点放进
+/// 同一个值里，就没法只重取其中一侧。
+#[derive(Debug, Clone)]
+struct CanaryWindow {
+    old: SideRead,
+    new: SideRead,
+}
+
+impl CanaryWindow {
+    /// 两侧都还在观测同一组副本、同一套语义，这个窗才接着用。任一侧变了就整窗
+    /// 重取——只重取一侧会让两侧的起算点分开，那正是这个值要杜绝的事。
+    fn holds(&self, old: &SideRead, new: &SideRead) -> bool {
+        self.old.same_observation(old) && self.new.same_observation(new)
+    }
+}
+
+impl SideRead {
+    /// 两次抓取观测的是同一组副本、同一套计数器语义。
+    fn same_observation(&self, other: &SideRead) -> bool {
+        self.pods == other.pods && self.semantics == other.semantics
+    }
+}
+
+/// 一段观测窗里读延迟分位数的结果。
+///
+/// 四种「读不到」是四个不同的事实：正文里根本没有这条序列（这一版一生没服务过
+/// 计时请求），序列在但窗口内没有新观测（没有流量到达被观测的副本），序列在两个
+/// 观测点之间重启过（两个计数不是一段连续历史），序列读不出分位数（正文不是一份
+/// 能读的直方图）。合成一句话会让它们互相冒充，而「候选根本不接流量」正是最该被
+/// 看见的那一种。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LatencyRead {
+    /// 窗口内的 p99（毫秒）。
+    Measured(f64),
+    NoSeries,
+    NoObservations,
+    Restarted,
+    Malformed,
+}
+
+impl LatencyRead {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Measured(_) => "measured",
+            Self::NoSeries => "no-series",
+            Self::NoObservations => "no-observations",
+            Self::Restarted => "restarted",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+/// 一拍错误率判据的读数。两种「读不到」是两个不同的事实，都不是「通过」。
+///
+/// 两侧语义不同不在这里：那是「这一读与之前那读不是一段连续历史」，整窗都要
+/// 重取，落到 `CanaryWindow::holds` 上去判，而不是留着旧参考点逐轮跳过。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RateRead {
+    Measured {
+        candidate: f64,
+        baseline: f64,
+    },
+    /// 候选侧窗口内新增请求不到下限：一条 5xx 就能把小增量抬到任意高。
+    NoDelta,
+    /// 基线一侧没有读数：没有基线的相对量就没有相对判据。
+    NoBaseline,
+}
+
+impl RateRead {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Measured { .. } => "measured",
+            Self::NoDelta => "no-delta",
+            Self::NoBaseline => "no-baseline",
+        }
+    }
+}
+
+/// 一轮看护里每条判据实际拿到了什么。
+///
+/// 取不到数不是「通过」。整轮滚动的结论若不带这件事，读读数的人会把一次什么都没
+/// 测到的放行读成「延迟与错误率都验过了」——而在这个部署上，那正是常态。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct GateCoverage {
+    /// 整轮没做指标比对的确定性原因。没配 metrics 地址、或滚动前拿不到副本名单，
+    /// 两者都不是缺陷，但也不能长得像「比过了没回归」。
+    metrics_off: Option<&'static str>,
+    /// 配了地址、名单也拿到了，却整轮没起算过参考点：候选或旧组始终抓不到。
+    no_window: bool,
+    /// 参考点被整窗重取的次数：副本名单换过、或正文声明的语义变过。
+    window_resets: u32,
+    /// 每一拍都跑了的 Pod 健康检查次数（跑过即通过，否则看护已中止）。
+    pod_checks: u32,
+    /// (判据, 结局) → 拍数。结局名带得出病因而非只说「跳过了」。
+    outcomes: std::collections::BTreeMap<(String, String), u32>,
+}
+
+impl GateCoverage {
+    fn record(&mut self, gate: &str, outcome: impl Into<String>) {
+        *self
+            .outcomes
+            .entry((gate.to_string(), outcome.into()))
+            .or_default() += 1;
+    }
+
+    fn outcomes_of(&self, gate: &str) -> Vec<String> {
+        let mut counts: Vec<String> = self
+            .outcomes
+            .iter()
+            .filter(|((g, _), _)| g == gate)
+            .map(|((_, label), n)| format!("{label} x{n}"))
+            .collect();
+        counts.sort();
+        counts
+    }
+
+    /// 这条判据整轮有没有拿到过可比读数。
+    fn measured(&self, gate: &str) -> bool {
+        self.outcomes
+            .get(&(gate.to_string(), "measured".to_string()))
+            .copied()
+            .unwrap_or(0)
+            > 0
+    }
+
+    fn one_gate(&self, gate: &str) -> String {
+        let counts = self.outcomes_of(gate);
+        // 一次都没跑也是一条事实，显式写出来：漏掉它，读者分不清「这条判据整轮
+        // 没执行」和「执行了且在结论里没被提到」。
+        let counts = if counts.is_empty() {
+            "not-run".to_string()
+        } else {
+            counts.join(" ")
+        };
+        let tag = if self.measured(gate) {
+            "measured"
+        } else {
+            "NO-EVIDENCE"
+        };
+        format!("{gate}={tag}[{counts}]")
+    }
+
+    /// 一条能进台账的话：哪几条判据真的给了读数、哪几条整轮没有证据、各是什么原因。
+    fn summary(&self) -> String {
+        if let Some(reason) = self.metrics_off {
+            return format!(
+                "gates: metrics off ({reason}); pods=ok x{}",
+                self.pod_checks
+            );
+        }
+        if self.no_window {
+            return format!(
+                "gates: NO-EVIDENCE (the candidate and the old group were never both \
+                 scrapeable); pods=ok x{}",
+                self.pod_checks
+            );
+        }
+        let resets = if self.window_resets > 0 {
+            format!(" window-resets={}", self.window_resets)
+        } else {
+            String::new()
+        };
+        format!(
+            "gates: pods=ok x{}{resets} {} {}",
+            self.pod_checks,
+            self.one_gate("latency"),
+            self.one_gate("error-rate"),
+        )
+    }
 }
 
 /// 两次抓取之间的错误率，按正文声明的计数器语义解释。
@@ -1551,6 +1689,49 @@ fn parse_series_value(line: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// 一拍延迟闸门的结局。这条判据只有在两侧都有正读数时才给出结论。
+///
+/// 两侧各是一段连续历史里的两个计数点，任何一侧读不出数，这一拍就没有相对判据。
+/// 两类病因都写进这一条标签里：候选那一侧读不出，恰恰是「候选根本没接流量」最该
+/// 被看见的形态，不能被旧组的原因盖掉。
+fn latency_outcome(baseline: LatencyRead, candidate: LatencyRead) -> String {
+    match (baseline, candidate) {
+        // 基线读作 0 时比值判据不存在：任何一次观测都大于 0，比下去等于把好版本
+        // 判成回归。这与「基线读不出数」是同一类缺口，落同一个名字。
+        (LatencyRead::Measured(b), LatencyRead::Measured(_)) if b <= 0.0 => {
+            "no-baseline:non-positive".to_string()
+        }
+        (LatencyRead::Measured(_), LatencyRead::Measured(_)) => "measured".to_string(),
+        (LatencyRead::Measured(_), c) => format!("no-candidate:{}", c.label()),
+        (b, LatencyRead::Measured(_)) => format!("no-baseline:{}", b.label()),
+        (b, c) => format!("no-baseline:{} no-candidate:{}", b.label(), c.label()),
+    }
+}
+
+/// 一拍错误率闸门的读数：两侧各按本侧的两点算出速率，再相除比。
+///
+/// 读不出候选侧的速率，与读不出基线侧的速率，是两个不同的缺口；两者都返回
+/// 「没有证据」而不是 0——拿 0 当基线等于「任何超过 1% 的错误率都判回归」，
+/// 会无差别回滚好版本。
+fn error_rate_gate(
+    window: &CanaryWindow,
+    old: &SideRead,
+    new: &SideRead,
+    min_requests: f64,
+) -> RateRead {
+    let semantics = new.semantics;
+    let candidate = error_rate(window.new.signals, new.signals, semantics, min_requests);
+    let baseline = error_rate(window.old.signals, old.signals, semantics, min_requests);
+    match (candidate, baseline) {
+        (Some(candidate), Some(baseline)) => RateRead::Measured {
+            candidate,
+            baseline,
+        },
+        (None, _) => RateRead::NoDelta,
+        (Some(_), None) => RateRead::NoBaseline,
+    }
+}
+
 /// 两次抓取之间到达的观测的 99 分位，取最差的一条序列。
 ///
 /// 累积桶描述的是进程一生，而金丝雀两侧的「一生」长短差得很远：旧副本从上一次
@@ -1559,24 +1740,45 @@ fn parse_series_value(line: &str) -> f64 {
 ///
 /// 取最差的那条序列：闸门要盯的是最先越界的那一条，「最后一行赢」会让结论随
 /// 正文行序变化。
-fn p99_between(earlier: &HistogramSnapshot, later: &HistogramSnapshot) -> Option<f64> {
+fn p99_between(earlier: &HistogramSnapshot, later: &HistogramSnapshot) -> LatencyRead {
+    // 正文里一条延迟序列都没有：这一版一生没服务过被计时的请求。
+    if later.series.is_empty() {
+        return LatencyRead::NoSeries;
+    }
     let mut worst: Option<f64> = None;
+    let mut restarted = false;
+    let mut malformed = false;
     for (key, buckets) in &later.series {
         let delta = match earlier.series.get(key) {
             Some(previous) => match delta_buckets(previous, buckets) {
                 Some(delta) => delta,
                 // 序列在两点之间重启过，差值不是一个计数，这条不提供证据。
-                None => continue,
+                None => {
+                    restarted = true;
+                    continue;
+                }
             },
             // 这段窗口之前没有观测点，整份累积量都落在窗口内。
             None => buckets.clone(),
         };
-        let Some(q) = quantile_from_buckets(&delta, 0.99) else {
+        // 桶差里一个观测都没有：这条序列在窗口内是安静的。这与「读不出分位数」
+        // 是两件事，先分开——分位数函数对二者都返回 `None`。
+        if delta.last().map(|(_, count)| *count).unwrap_or(0) == 0 {
             continue;
-        };
-        worst = Some(worst.map_or(q, |w: f64| w.max(q)));
+        }
+        match quantile_from_buckets(&delta, 0.99) {
+            Some(q) => worst = Some(worst.map_or(q, |w: f64| w.max(q))),
+            None => malformed = true,
+        }
     }
-    worst
+    match worst {
+        Some(q) => LatencyRead::Measured(q),
+        // 一个数都没读出来时先报更具体的病因：正文本身读不出分位数，比「这段
+        // 时间没观测」更能说明问题。
+        None if malformed => LatencyRead::Malformed,
+        None if restarted => LatencyRead::Restarted,
+        None => LatencyRead::NoObservations,
+    }
 }
 
 /// 同一条序列两个累积读数之间的增量。
@@ -1665,7 +1867,7 @@ http_request_duration_ms_count{endpoint=\"/api/v1/tasks\",method=\"POST\"} 100
         let rate = windowed_rate(signals).expect("有请求就有速率");
         assert!((rate - 0.1).abs() < 1e-9, "error_rate={rate}");
         // 99 分位落在 le=100 这条桶的上界上：这一段的观测都 ≤100ms。
-        assert_eq!(p99_between(&earlier, &later), Some(100.0));
+        assert_eq!(p99_between(&earlier, &later), LatencyRead::Measured(100.0));
     }
 
     /// 分母是全部请求：5xx 既算错误也算请求。把它剔出分母会让错误率虚高，
@@ -1703,7 +1905,7 @@ http_request_duration_ms_bucket{endpoint=\"/api/v1/tasks\",method=\"POST\",le=\"
         // 探针的 1ms 系列被滤掉，剩下的最差一条是业务端点的 100ms。
         assert_eq!(
             p99_between(&HistogramSnapshot::default(), &hist),
-            Some(100.0)
+            LatencyRead::Measured(100.0)
         );
     }
 
@@ -1721,11 +1923,11 @@ http_request_duration_ms_bucket{endpoint=\"/c\",le=\"120\"} 99
         let (_, _, hist) = parse_prometheus_signals(body);
         assert_eq!(
             p99_between(&HistogramSnapshot::default(), &hist),
-            Some(900.0)
+            LatencyRead::Measured(900.0)
         );
     }
 
-    /// 两点之间没有新观测就没有 p99：累积量相同即增量为零，读作「没有证据」。
+    /// 两点之间没有新观测就没有 p99：累积量相同即增量为零，读作「窗口内没有观测」。
     /// 拿一份整段进程历史的累积量当窗口读数，会让金丝雀整轮看不到任何变化。
     #[test]
     fn unchanged_snapshots_carry_no_p99_evidence() {
@@ -1734,17 +1936,82 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"100\"} 99
 http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
 ";
         let (_, _, hist) = parse_prometheus_signals(body);
-        assert_eq!(p99_between(&hist, &hist), None);
+        assert_eq!(p99_between(&hist, &hist), LatencyRead::NoObservations);
     }
 
-    /// p99 缺失时读作没有证据，而不是读作 0——把「读不到」当成「延迟很好」
+    /// p99 缺失时读作「没有证据」，而不是读作 0——把「读不到」当成「延迟很好」
     /// 写进结论，闸门就会对一次真正的回归放行。
     #[test]
     fn missing_p99_reads_no_evidence() {
         let body = "# TYPE http_requests_total counter\nhttp_requests_total{status=\"200\"} 5\n";
         let (signals, _, hist) = parse_prometheus_signals(body);
         assert_eq!(windowed_rate(signals), Some(0.0));
-        assert_eq!(p99_between(&hist, &HistogramSnapshot::default()), None);
+        assert_eq!(
+            p99_between(&hist, &HistogramSnapshot::default()),
+            LatencyRead::NoSeries
+        );
+    }
+
+    /// 三种「读不到」是三个不同的事实，各自要有自己的词。
+    ///
+    /// 合成一句话会让它们互相冒充：正文里根本没有这条序列（这一版一生没服务过被
+    /// 计时的请求）、序列在但这段窗口没有观测（没有流量到达被观测的副本）、正文
+    /// 不是一份能读的直方图。「候选根本不接流量」正是最该被看见的那一种，不能被
+    /// 另外两种盖成同一句话。
+    #[test]
+    fn the_three_ways_of_having_no_p99_read_differently() {
+        // 这一版从来没有过这条序列。
+        let no_series = p99_between(&HistogramSnapshot::default(), &HistogramSnapshot::default());
+        // 序列在，但这段窗口里一个观测都没有。
+        let mut quiet = HistogramSnapshot::default();
+        quiet.series.insert(
+            "endpoint=\"/a\"".to_string(),
+            vec![(100.0, 99), (f64::INFINITY, 100)],
+        );
+        let no_observations = p99_between(&quiet, &quiet);
+        // 正文里有桶，但收尾的不是 `+Inf` 桶，读不出分位数。
+        let mut unfinishable = HistogramSnapshot::default();
+        unfinishable
+            .series
+            .insert("endpoint=\"/a\"".to_string(), vec![(100.0, 99)]);
+        let malformed = p99_between(&HistogramSnapshot::default(), &unfinishable);
+
+        assert_eq!(no_series, LatencyRead::NoSeries);
+        assert_eq!(no_observations, LatencyRead::NoObservations);
+        assert_eq!(malformed, LatencyRead::Malformed);
+        let labels = [
+            no_series.label(),
+            no_observations.label(),
+            malformed.label(),
+        ];
+        for (i, a) in labels.iter().enumerate() {
+            assert!(!matches!(a, &"measured"), "读不到不能读成通过：{a:?}");
+            for b in labels.iter().skip(i + 1) {
+                assert_ne!(a, b, "三种缺口不能用同一个词");
+            }
+        }
+    }
+
+    /// 序列在两个观测点之间重启过（计数下降）时，差值不是这一段窗口的观测数：
+    /// 跳过这条序列。这与「窗口内没有观测」是两件事——前者说明这一读不是一段
+    /// 连续历史，后者说明这段时间没有流量。
+    #[test]
+    fn a_restarted_series_reads_as_restarted_not_quiet() {
+        let mut earlier = HistogramSnapshot::default();
+        earlier.series.insert(
+            "endpoint=\"/a\"".to_string(),
+            vec![(100.0, 10), (f64::INFINITY, 10)],
+        );
+        let mut later = HistogramSnapshot::default();
+        later.series.insert(
+            "endpoint=\"/a\"".to_string(),
+            vec![(100.0, 3), (f64::INFINITY, 3)],
+        );
+        assert_eq!(p99_between(&earlier, &later), LatencyRead::Restarted);
+        assert_ne!(
+            LatencyRead::Restarted.label(),
+            LatencyRead::NoObservations.label()
+        );
     }
 
     /// 序列在两个观测点之间重启过（计数下降）时，差值不是这一段窗口的观测数：
@@ -1959,12 +2226,57 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
         CanarySignals { errors, requests }
     }
 
-    fn baseline(semantics: CounterSemantics, rate: Option<f64>, p99_ms: f64) -> CanaryBaseline {
-        CanaryBaseline {
+    /// 一侧的一读。桶给空：本侧窗口内的分位数就由当前读数的桶单独决定，
+    /// 便于把某一条判据单独拎出来看。
+    fn side(semantics: CounterSemantics, signals: CanarySignals) -> SideRead {
+        SideRead {
+            pods: "10.0.0.1".to_string(),
             semantics,
-            rate,
-            p99_ms,
+            signals,
+            hist: HistogramSnapshot::default(),
         }
+    }
+
+    /// 两侧同拍的一对参考点。
+    fn window_of(
+        semantics: CounterSemantics,
+        old: CanarySignals,
+        new: CanarySignals,
+    ) -> CanaryWindow {
+        CanaryWindow {
+            old: side(semantics, old),
+            new: side(semantics, new),
+        }
+    }
+
+    /// 一段窗口里的桶差：一条序列，`buckets` 按上界升序给出。
+    fn histogram(series: &str, buckets: &[(f64, u64)]) -> HistogramSnapshot {
+        let mut hist = HistogramSnapshot::default();
+        hist.series.insert(series.to_string(), buckets.to_vec());
+        hist
+    }
+
+    /// 窗口内恰好 100 个观测、99 分位精确落在 `bound` 上的两个计数点。
+    ///
+    /// 参考点这一序列还没有观测，此刻 99 个 ≤ `bound`、共 100 个：桶差里名次 99
+    /// 落在 `bound` 这条桶的最右端，插值系数正好是 1，读出来就是 `bound` 本身。
+    fn p99_points(bound: f64) -> (HistogramSnapshot, HistogramSnapshot) {
+        (
+            histogram("endpoint=\"/a\"", &[(bound, 0), (f64::INFINITY, 0)]),
+            histogram("endpoint=\"/a\"", &[(bound, 99), (f64::INFINITY, 100)]),
+        )
+    }
+
+    /// 跑一拍阈值比对，返回结局与这一拍记下的判据覆盖。
+    fn one_tick(
+        puller: &GitOpsPuller,
+        window: &CanaryWindow,
+        old: &SideRead,
+        new: &SideRead,
+    ) -> (SFResult<()>, GateCoverage) {
+        let mut coverage = GateCoverage::default();
+        let result = puller.compare_metrics(window, old, new, &mut coverage);
+        (result, coverage)
     }
 
     /// 配置里的 `localhost` 读作「每个 Pod 自己的端点」，套到被观测的副本上
@@ -2075,44 +2387,56 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
     #[test]
     fn windowed_semantics_keeps_the_existing_thresholds() {
         let puller = test_puller();
-        let base = baseline(CounterSemantics::Windowed, Some(0.02), 100.0);
         let windowed = CounterSemantics::Windowed;
+        let (base_before, base_now) = p99_points(100.0);
+        let (_, at_120) = p99_points(120.0);
+        let (_, at_125) = p99_points(125.0);
+        let (_, at_140) = p99_points(140.0);
+        // 旧版本这一侧：这段窗口内的 99 分位是 100ms。
+        let mut w = window_of(windowed, signals(2.0, 100.0), signals(2.0, 100.0));
+        w.old.hist = base_before;
+        let mut old = side(windowed, signals(2.0, 100.0));
+        old.hist = base_now;
         // 窗口语义下错误率只看当前读数，参考点不参与计算。
-        let read = signals(2.0, 100.0);
         // 基线错误率 2%，现 2.5%（1.25x，未超 1.5x）→ 通过。
-        assert!(puller
-            .compare_metrics(&base, read, 120.0, &signals(2.5, 100.0), windowed)
-            .is_ok());
+        let mut new = side(windowed, signals(2.5, 100.0));
+        new.hist = at_120.clone();
+        assert!(one_tick(&puller, &w, &old, &new).0.is_ok());
         // 现 4%（2x）→ 回归。
-        assert!(puller
-            .compare_metrics(&base, read, 120.0, &signals(4.0, 100.0), windowed)
-            .is_err());
-        // p99 100ms → 140ms（1.4x > 1.3x）→ 回归。
-        assert!(puller
-            .compare_metrics(&base, read, 140.0, &signals(2.0, 100.0), windowed)
-            .is_err());
-        // p99 125ms（1.25x）→ 通过。
-        assert!(puller
-            .compare_metrics(&base, read, 125.0, &signals(2.0, 100.0), windowed)
-            .is_ok());
+        let mut new = side(windowed, signals(4.0, 100.0));
+        new.hist = at_120;
+        assert!(one_tick(&puller, &w, &old, &new).0.is_err());
+        // 候选 p99 140ms（1.4x > 1.3x）→ 回归。
+        let mut new = side(windowed, signals(2.0, 100.0));
+        new.hist = at_140;
+        assert!(one_tick(&puller, &w, &old, &new).0.is_err());
+        // 候选 p99 125ms（1.25x）→ 通过。
+        let mut new = side(windowed, signals(2.0, 100.0));
+        new.hist = at_125;
+        let (result, coverage) = one_tick(&puller, &w, &old, &new);
+        assert!(result.is_ok());
+        // 两侧都读了数，两条判据都在这一拍给出了结论——覆盖里必须留下这件事。
+        assert!(coverage.measured("latency"));
+        assert!(coverage.measured("error-rate"));
     }
 
-    /// 累积语义下要比的是**增量**错误率。生命周期比值在这里是 5%，远超基线，
-    /// 但这一段窗口内新发生的 200 个请求一个都没错——判成回归就是在回滚一个
-    /// 好版本，而闸门本来要盯的正是「这段时间有没有变坏」。
+    /// 累积语义下要比的是**增量**错误率。候选的生命周期比值在这里是 4%，
+    /// 远超基线，但这一段窗口内新发生的 200 个请求一个都没错——判成回归就是在
+    /// 回滚一个好版本，而闸门本来要盯的正是「这段时间有没有变坏」。
     #[test]
     fn cumulative_semantics_judges_the_delta_not_the_lifetime_ratio() {
         let puller = test_puller();
-        let base = baseline(CounterSemantics::Cumulative, Some(0.01), 100.0);
-        let at = signals(50.0, 1_000.0);
         let cumulative = CounterSemantics::Cumulative;
-        assert!(puller
-            .compare_metrics(&base, at, 100.0, &signals(50.0, 1_200.0), cumulative)
-            .is_ok());
+        // 旧版本在同一段窗口内的增量：1000 个请求错 10 个（1%）。
+        let w = window_of(cumulative, signals(5.0, 1_000.0), signals(50.0, 1_000.0));
+        let old = side(cumulative, signals(15.0, 2_000.0));
+        // 候选这段窗口 200 个新请求零错误。生命周期比值 50/1200 = 4% 高于基线，
+        // 但窗口内一个都没错。
+        let good = side(cumulative, signals(50.0, 1_200.0));
+        assert!(one_tick(&puller, &w, &old, &good).0.is_ok());
         // 增量里真的变坏了：200 个新请求错 20 个（10%）。
-        assert!(puller
-            .compare_metrics(&base, at, 100.0, &signals(70.0, 1_200.0), cumulative)
-            .is_err());
+        let bad = side(cumulative, signals(70.0, 1_200.0));
+        assert!(one_tick(&puller, &w, &old, &bad).0.is_err());
     }
 
     /// 候选侧速率必须由候选自己的两个点得出。新副本的累积计数器从零起步，
@@ -2120,19 +2444,28 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
     #[test]
     fn cumulative_semantics_differences_the_candidates_own_counters() {
         let puller = test_puller();
-        let base = baseline(CounterSemantics::Cumulative, Some(0.01), 100.0);
-        // 新副本刚起来：计数器归零。
-        let at = signals(0.0, 0.0);
         let cumulative = CounterSemantics::Cumulative;
+        // 旧版本这一段窗口 1000 个请求错 10 个（1%）。
+        let w = window_of(
+            cumulative,
+            signals(5.0, 1_000.0),
+            // 新副本刚起来：计数器归零。
+            signals(0.0, 0.0),
+        );
+        let old = side(cumulative, signals(15.0, 2_000.0));
         // 500 个请求错 1 个（0.2%），好于基线 → 通过。
-        assert!(puller
-            .compare_metrics(&base, at, 100.0, &signals(1.0, 500.0), cumulative)
-            .is_ok());
+        assert!(
+            one_tick(&puller, &w, &old, &side(cumulative, signals(1.0, 500.0)))
+                .0
+                .is_ok()
+        );
         // 同一段窗口内错 20 个（4%）→ 回归。基线取的是旧版本的累积量，
         // 若误用它当参考点，这里会算出负增量而静默放过。
-        assert!(puller
-            .compare_metrics(&base, at, 100.0, &signals(20.0, 500.0), cumulative)
-            .is_err());
+        assert!(
+            one_tick(&puller, &w, &old, &side(cumulative, signals(20.0, 500.0)))
+                .0
+                .is_err()
+        );
     }
 
     /// 增量太小时一条 5xx 就能把比值抬到任意高：20 个新请求错 1 个是 5%，
@@ -2141,17 +2474,19 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
     #[test]
     fn cumulative_semantics_refuses_to_judge_on_too_few_new_requests() {
         let puller = test_puller();
-        let base = baseline(CounterSemantics::Cumulative, Some(0.01), 100.0);
-        let at = signals(10.0, 1_000.0);
         let cumulative = CounterSemantics::Cumulative;
-        assert!(puller
-            .compare_metrics(&base, at, 100.0, &signals(11.0, 1_020.0), cumulative)
-            .is_ok());
+        let w = window_of(cumulative, signals(10.0, 1_000.0), signals(10.0, 1_000.0));
+        let old = side(cumulative, signals(11.0, 2_000.0));
+        // 20 个新请求，不足下限（100）：不判，且覆盖里要写清是样本不够，
+        // 而不是「测了没回归」。
+        let (result, coverage) =
+            one_tick(&puller, &w, &old, &side(cumulative, signals(11.0, 1_020.0)));
+        assert!(result.is_ok());
+        assert_eq!(coverage.outcomes_of("error-rate"), vec!["no-delta x1"]);
         // 增量够大且确实变坏，同一个基线就该判回归——上面那次通过的原因
         // 只能是样本不足，不能是判据根本不看错误率。
-        assert!(puller
-            .compare_metrics(&base, at, 100.0, &signals(60.0, 1_200.0), cumulative)
-            .is_err());
+        let bad = side(cumulative, signals(60.0, 1_200.0));
+        assert!(one_tick(&puller, &w, &old, &bad).0.is_err());
     }
 
     /// 基线速率取不到时不能拿 0 当基线：那等于「任何超过 1% 的错误率都判回归」，
@@ -2159,43 +2494,170 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
     #[test]
     fn missing_baseline_rate_does_not_roll_back_a_good_version() {
         let puller = test_puller();
-        let base = baseline(CounterSemantics::Cumulative, None, 100.0);
-        assert!(puller
-            .compare_metrics(
-                &base,
-                signals(10.0, 1_000.0),
-                100.0,
-                &signals(50.0, 1_200.0),
-                CounterSemantics::Cumulative
-            )
-            .is_ok());
+        let cumulative = CounterSemantics::Cumulative;
+        // 旧版本这一段窗口只多了 10 个请求，不足下限 → 基线速率读不出来。
+        let w = window_of(cumulative, signals(10.0, 1_000.0), signals(0.0, 0.0));
+        let old = side(cumulative, signals(10.0, 1_010.0));
+        let new = side(cumulative, signals(50.0, 1_200.0));
+        let (result, coverage) = one_tick(&puller, &w, &old, &new);
+        assert!(result.is_ok());
+        assert_eq!(coverage.outcomes_of("error-rate"), vec!["no-baseline x1"]);
     }
 
     /// 换版那一轮正文的语义会从窗口求和切成累积。跨语义相除得到的不是任何
-    /// 一版的错误率，只能拒绝比较；p99 仍要照常判。
+    /// 一版的错误率，所以这次观测不能接着用旧的参考点：整窗作废重取。
     #[test]
-    fn semantics_change_mid_canary_skips_the_error_rate_gate() {
-        let puller = test_puller();
-        let base = baseline(CounterSemantics::Windowed, Some(0.02), 100.0);
-        let at = signals(2.0, 100.0);
-        assert!(puller
-            .compare_metrics(
-                &base,
-                at,
-                100.0,
-                &signals(9.0, 100.0),
-                CounterSemantics::Cumulative
-            )
-            .is_ok());
-        assert!(puller
-            .compare_metrics(
-                &base,
-                at,
-                140.0,
-                &signals(2.0, 100.0),
-                CounterSemantics::Cumulative
-            )
-            .is_err());
+    fn a_semantics_change_invalidates_the_whole_window() {
+        let windowed = CounterSemantics::Windowed;
+        let cumulative = CounterSemantics::Cumulative;
+        let w = window_of(windowed, signals(2.0, 100.0), signals(0.0, 0.0));
+        // 两侧都还观测着同一组副本、同一套语义 → 窗继续用。
+        assert!(w.holds(
+            &side(windowed, signals(2.0, 100.0)),
+            &side(windowed, signals(9.0, 100.0))
+        ));
+        // 候选一侧的正文换了语义：这一读与参考点不再是同一段连续历史。
+        assert!(!w.holds(
+            &side(windowed, signals(2.0, 100.0)),
+            &side(cumulative, signals(9.0, 100.0))
+        ));
+        // 旧版本一侧换了语义同样作废——只重取候选一侧会让两侧的起算点分开。
+        assert!(!w.holds(
+            &side(cumulative, signals(2.0, 100.0)),
+            &side(windowed, signals(9.0, 100.0))
+        ));
+    }
+
+    /// 窗的「继续用」要求**两侧都**还观测着原样的东西。只重取一侧会让两侧的
+    /// 起算点分开，两个分位数随即描述不同长度的时间段。
+    #[test]
+    fn a_changed_pod_set_invalidates_the_whole_window() {
+        let cumulative = CounterSemantics::Cumulative;
+        let mut reference = window_of(cumulative, signals(1.0, 100.0), signals(1.0, 100.0));
+        reference.old.pods = "10.0.0.1".to_string();
+        reference.new.pods = "10.0.0.2".to_string();
+        let mut old_same = side(cumulative, signals(1.0, 100.0));
+        old_same.pods = "10.0.0.1".to_string();
+        let mut new_same = side(cumulative, signals(1.0, 100.0));
+        new_same.pods = "10.0.0.2".to_string();
+        assert!(reference.holds(&old_same, &new_same));
+        let mut moved = side(cumulative, signals(1.0, 100.0));
+        moved.pods = "10.0.0.9".to_string();
+        assert!(!reference.holds(&moved, &new_same));
+        assert!(!reference.holds(&old_same, &moved));
+    }
+
+    /// 一拍延迟闸门的结局要说清缺在哪一侧：候选侧读不出数（候选根本没接流量）
+    /// 与旧组侧读不出数，是两条不同的结论，都不能长得像通过。
+    #[test]
+    fn latency_outcome_names_the_side_that_is_missing() {
+        let measured = LatencyRead::Measured(100.0);
+        let quiet = LatencyRead::NoObservations;
+        assert_eq!(latency_outcome(measured, measured), "measured");
+        assert_eq!(
+            latency_outcome(measured, quiet),
+            "no-candidate:no-observations"
+        );
+        assert_eq!(
+            latency_outcome(quiet, measured),
+            "no-baseline:no-observations"
+        );
+        assert_eq!(
+            latency_outcome(quiet, quiet),
+            "no-baseline:no-observations no-candidate:no-observations"
+        );
+        // 基线读作 0 时比值判据不存在：任何一次观测都大于 0，比下去等于把
+        // 好版本判成回归。这与「基线读不出数」落同一个名字。
+        assert_eq!(
+            latency_outcome(LatencyRead::Measured(0.0), measured),
+            "no-baseline:non-positive"
+        );
+        for outcome in [
+            latency_outcome(measured, quiet),
+            latency_outcome(quiet, measured),
+            latency_outcome(quiet, quiet),
+        ] {
+            assert_ne!(outcome, "measured");
+        }
+    }
+
+    /// 整轮没做指标比对有两种确定性原因（没配地址、滚动前拿不到副本名单），
+    /// 都不会产生指标读数。它们既不能长得像「比过了没回归」，也要各自说得出是哪种。
+    #[test]
+    fn a_roll_without_the_metrics_gates_says_so_in_its_conclusion() {
+        let off = GateCoverage {
+            pod_checks: 3,
+            metrics_off: Some("no metrics endpoint configured"),
+            ..Default::default()
+        };
+        assert!(off.summary().contains("metrics off"));
+        assert!(off.summary().contains("no metrics endpoint configured"));
+        assert!(!off.summary().contains("latency=measured"));
+
+        let unlisted = GateCoverage {
+            metrics_off: Some("pre-rollout pod list unavailable"),
+            ..Default::default()
+        };
+        assert!(unlisted
+            .summary()
+            .contains("pre-rollout pod list unavailable"));
+        assert_ne!(off.summary(), unlisted.summary());
+
+        // 配了地址、名单也有，却整轮没起算过参考点：同样是没证据，但成因不同。
+        let no_window = GateCoverage {
+            pod_checks: 3,
+            no_window: true,
+            ..Default::default()
+        };
+        assert!(no_window.summary().contains("NO-EVIDENCE"));
+        assert_ne!(no_window.summary(), off.summary());
+    }
+
+    /// 一轮看护的结论必须区分「判据给了读数」与「判据整轮没有证据」，
+    /// 并且没有证据时要写清是什么缺口。少了这件事，一次什么都没测到的放行
+    /// 会和「延迟与错误率都验过了」在台账上长得一模一样。
+    #[test]
+    fn gate_coverage_separates_measured_from_no_evidence() {
+        let mut measured = GateCoverage {
+            pod_checks: 20,
+            ..Default::default()
+        };
+        measured.record("latency", "measured");
+        measured.record("error-rate", "measured");
+        assert!(measured.measured("latency"));
+        assert!(measured.summary().contains("latency=measured"));
+        assert!(measured.summary().contains("error-rate=measured"));
+
+        let mut idle = GateCoverage {
+            pod_checks: 20,
+            ..Default::default()
+        };
+        idle.record("latency", "no-candidate:no-series");
+        idle.record("error-rate", "no-delta");
+        assert!(!idle.measured("latency"));
+        assert!(idle.summary().contains("latency=NO-EVIDENCE"));
+        assert!(idle.summary().contains("no-candidate:no-series x1"));
+        assert!(idle.summary().contains("error-rate=NO-EVIDENCE"));
+        assert_ne!(measured.summary(), idle.summary());
+
+        // 判据一次都没跑与跑过但没读数，也不是同一件事。
+        let not_run = GateCoverage {
+            pod_checks: 20,
+            ..Default::default()
+        };
+        assert!(not_run.summary().contains("latency=NO-EVIDENCE[not-run]"));
+        assert_ne!(not_run.summary(), idle.summary());
+
+        // 参考点被反复重取也要出现在结论里：那是「一直在换观测对象」。
+        let mut flapping = GateCoverage {
+            pod_checks: 20,
+            window_resets: 7,
+            ..Default::default()
+        };
+        flapping.record("latency", "measured");
+        flapping.record("error-rate", "measured");
+        assert!(flapping.summary().contains("window-resets=7"));
+        assert_ne!(flapping.summary(), measured.summary());
     }
 
     /// 正文没有语义标记时按窗口求和处理：旧版正文的行为不能因为这次改造
@@ -2213,7 +2675,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
         assert_eq!(signals.errors, 10.0);
         assert_eq!(
             p99_between(&HistogramSnapshot::default(), &hist),
-            Some(88.0)
+            LatencyRead::Measured(88.0)
         );
         // 5xx 也在分母里：排除它会系统性放大错误率。
         assert_eq!(windowed_rate(signals), Some(0.2));
