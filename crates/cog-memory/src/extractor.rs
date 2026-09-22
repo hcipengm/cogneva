@@ -26,8 +26,30 @@ fn record(entries: &mut Vec<SchemaEntry>, entry: SchemaEntry) {
 ///   `@relation:Name->Target` patterns in text payloads.
 /// - Summary generation returns a truncated text preview and no embedding,
 ///   so that the pipeline can be exercised without an LLM.
+///
+/// Importance here is a fixed prior per kind, not a measurement: a pattern
+/// match says that something was written down, never how much it matters. The
+/// prior is stated as a rating on the shared importance scale (see
+/// [`cog_core::IMPORTANCE_RATING_MAX`]) so these entries sort against ones a
+/// model rated, and it is deliberately undiscriminating — four kinds placed at
+/// four adjacent ratings, nothing near the top. A rule extractor that claimed
+/// a high rating would be asserting evidence it does not have, and a fallback
+/// extractor runs precisely when no producer with better evidence is available.
 #[derive(Debug, Clone, Default)]
 pub struct RuleBasedExtractor;
+
+/// Rating this extractor places a kind at, before conversion to the entry's
+/// `importance`. See [`RuleBasedExtractor`] for why the numbers are a prior.
+mod rating {
+    /// An entity is named and nothing more is said about it.
+    pub const ENTITY: u8 = 6;
+    /// A relation carries the two ends it connects, so it says slightly more.
+    pub const RELATION: u8 = 7;
+    /// An event is a thing that happened, at a point in time.
+    pub const EVENT: u8 = 8;
+    /// A preview is a slice of the payload, not a claim about the payload.
+    pub const SUMMARY: u8 = 5;
+}
 
 impl RuleBasedExtractor {
     pub fn new() -> Self {
@@ -94,7 +116,7 @@ impl MemoryExtractor for RuleBasedExtractor {
                     key,
                     source_ref.clone(),
                 )
-                .with_importance(0.6),
+                .with_importance(cog_core::importance_from_rating(rating::ENTITY)),
             );
         }
 
@@ -112,7 +134,7 @@ impl MemoryExtractor for RuleBasedExtractor {
                     "from": from,
                     "to": to,
                 }))
-                .with_importance(0.7),
+                .with_importance(cog_core::importance_from_rating(rating::RELATION)),
             );
         }
 
@@ -126,7 +148,7 @@ impl MemoryExtractor for RuleBasedExtractor {
                     key,
                     source_ref.clone(),
                 )
-                .with_importance(0.8),
+                .with_importance(cog_core::importance_from_rating(rating::EVENT)),
             );
         }
 
@@ -146,7 +168,7 @@ impl MemoryExtractor for RuleBasedExtractor {
             NO_EMBEDDING_MODEL,
             source_ref,
         )
-        .with_importance(0.5))
+        .with_importance(cog_core::importance_from_rating(rating::SUMMARY)))
     }
 }
 
@@ -318,7 +340,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
 
         for entity in extraction.entities {
             let key = entity.name.to_lowercase().replace(' ', "_");
-            let importance = (entity.importance as f32).clamp(1.0, 10.0) / 10.0;
+            let importance = cog_core::importance_from_rating(entity.importance);
             record(
                 &mut entries,
                 SchemaEntry::identified(
@@ -339,7 +361,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
                 relation.source.to_lowercase().replace(' ', "_"),
                 relation.target.to_lowercase().replace(' ', "_")
             );
-            let importance = (relation.importance as f32).clamp(1.0, 10.0) / 10.0;
+            let importance = cog_core::importance_from_rating(relation.importance);
             record(
                 &mut entries,
                 SchemaEntry::identified(
@@ -366,7 +388,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
             if let Some(ts) = event.timestamp {
                 props["timestamp"] = serde_json::Value::String(ts);
             }
-            let importance = (event.importance as f32).clamp(1.0, 10.0) / 10.0;
+            let importance = cog_core::importance_from_rating(event.importance);
             record(
                 &mut entries,
                 SchemaEntry::identified(
@@ -415,7 +437,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
 
         let source_ref = SourceRef::new(format!("memory://{}", source.id), "llm/v1");
 
-        let importance = (extraction.importance as f32).clamp(1.0, 10.0) / 10.0;
+        let importance = cog_core::importance_from_rating(extraction.importance);
         Ok(SummaryEntry::new(
             format!("summary-{}", source.id),
             &source.namespace,
@@ -435,6 +457,54 @@ mod tests {
 
     fn raw(id: &str, body: &str) -> RawSource {
         RawSource::new(id, "default", "text/plain", body.as_bytes().to_vec())
+    }
+
+    /// The rule path's importance is a rating on the shared scale, not a bare
+    /// float. Asserting the arithmetic (`importance * max` is a whole rating)
+    /// rather than the four numbers themselves pins the property that matters:
+    /// these entries sort against entries a model rated, and a later edit that
+    /// reached for a hand-picked float would have to leave the scale to do it.
+    #[tokio::test]
+    async fn the_rule_path_places_importance_on_the_shared_scale() {
+        let extractor = RuleBasedExtractor::new();
+        let entries = extractor
+            .extract_schema(&raw(
+                "raw-scale",
+                "@entity: gateway\n@relation: gateway -> cluster\n@event: deploy finished\n",
+            ))
+            .await
+            .unwrap();
+
+        let max = cog_core::IMPORTANCE_RATING_MAX as f32;
+        for entry in &entries {
+            let rating = entry.importance * max;
+            assert!(
+                (rating - rating.round()).abs() < f32::EPSILON,
+                "{:?} importance {} is not on the rating scale",
+                entry.kind,
+                entry.importance
+            );
+        }
+
+        // The prior only has to be a prior; asserting the relative order keeps
+        // it from silently flattening, which is what a hand-edit to `0.5` for
+        // every kind would do.
+        let importance_of = |kind: SchemaKind| {
+            entries
+                .iter()
+                .find(|e| e.kind == kind)
+                .map(|e| e.importance)
+                .expect("kind present in the fixture")
+        };
+        assert!(
+            importance_of(SchemaKind::Event) > importance_of(SchemaKind::Relation)
+                && importance_of(SchemaKind::Relation) > importance_of(SchemaKind::Entity),
+            "the prior must keep its order: {:?}",
+            entries
+                .iter()
+                .map(|e| (e.kind, e.importance))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Two raws carrying the same `@entity:` line are one entity observed

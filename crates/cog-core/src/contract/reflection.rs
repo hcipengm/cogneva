@@ -929,6 +929,32 @@ pub enum Priority {
     Critical,
 }
 
+impl Priority {
+    /// This priority as a rating on the shared importance scale.
+    ///
+    /// Priority is a four-level ordinal and importance is a one-to-ten one, so
+    /// the mapping has to pick where each level lands. It spreads them over the
+    /// scale rather than clustering them: two levels a reader would call
+    /// different should not sort as equal just because a five-point gap was
+    /// rounded away. `Critical` sits at the top because it is the level an
+    /// operator acts on first, and an importance ranking that put it below
+    /// anything else would order the queue backwards.
+    pub fn importance_rating(self) -> u8 {
+        match self {
+            Priority::Critical => 10,
+            Priority::High => 8,
+            Priority::Medium => 5,
+            Priority::Low => 3,
+        }
+    }
+
+    /// This priority on the shared importance scale, for an entry's
+    /// `importance` field.
+    pub fn importance(self) -> f32 {
+        crate::contract::memory::importance_from_rating(self.importance_rating())
+    }
+}
+
 /// Functional area affected by the learning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1504,5 +1530,46 @@ mod tests {
     #[test]
     fn an_empty_diff_has_no_entries() {
         assert!(diff_file_entries("").is_empty());
+    }
+
+    /// The four levels must stay distinguishable on the ten-point scale. A
+    /// mapping that collapsed two of them would make importance ordering depend
+    /// on which level happened to round where.
+    #[test]
+    fn every_priority_level_lands_on_its_own_rating() {
+        let ratings: Vec<u8> = [
+            Priority::Low,
+            Priority::Medium,
+            Priority::High,
+            Priority::Critical,
+        ]
+        .iter()
+        .map(|p| p.importance_rating())
+        .collect();
+        let mut sorted = ratings.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ratings.len(), "two levels share a rating");
+    }
+
+    /// Importance sorts a queue, so the level an operator acts on first has to
+    /// sort above the rest — a mapping that inverted the order would send the
+    /// queue out backwards.
+    #[test]
+    fn priority_order_survives_the_mapping() {
+        let ordered = [
+            Priority::Critical,
+            Priority::High,
+            Priority::Medium,
+            Priority::Low,
+        ];
+        for pair in ordered.windows(2) {
+            assert!(
+                pair[0].importance() > pair[1].importance(),
+                "{:?} must outrank {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

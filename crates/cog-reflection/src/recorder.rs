@@ -198,13 +198,13 @@ fn reflection_source_ref(namespace: &str, id: &str) -> SourceRef {
     )
 }
 
+/// A reflection's importance is its priority placed on the system's one
+/// importance scale — the same scale the model rates an extracted item on, so a
+/// reflection and a fact rank against each other instead of each being
+/// comparable only within its own producer. The placement belongs to the level,
+/// not to this recorder, so it lives on [`cog_core::Priority`].
 fn importance_for(priority: cog_core::Priority) -> f32 {
-    match priority {
-        cog_core::Priority::Critical => 1.0,
-        cog_core::Priority::High => 0.8,
-        cog_core::Priority::Medium => 0.5,
-        cog_core::Priority::Low => 0.3,
-    }
+    priority.importance()
 }
 
 fn schema_for_learning(namespace: &str, learning: &Learning) -> SFResult<cog_core::SchemaEntry> {

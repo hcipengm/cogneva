@@ -5,6 +5,30 @@ use serde::{Deserialize, Serialize};
 
 // ─── Types ───────────────────────────────────────────────────────────
 
+/// The one scale importance is expressed on, system-wide: a rating in
+/// `1..=IMPORTANCE_RATING_MAX`, divided by the maximum.
+///
+/// Two kinds of producer write this field. One measures it — the model rates an
+/// item 1..=10 and that rating is the evidence. The other can only assert a
+/// prior, because a rule match says nothing about how much an item matters. Both
+/// land on this scale so their entries rank against each other; without a shared
+/// scale each producer's numbers would be comparable only to its own, and a
+/// reader comparing two entries could not tell which producer was speaking.
+///
+/// The `importance` field on each entry type stays a plain `f32` in
+/// `0.0..=1.0`, because that is what consumers sort on, and a bounded float
+/// needs no conversion at the point of use.
+pub const IMPORTANCE_RATING_MAX: u8 = 10;
+
+/// Place a rating on the shared importance scale, clamping it into range.
+///
+/// Clamping rather than rejecting: the ratings that arrive from a model are
+/// frequently out of the advertised range, and the alternative to clamping is
+/// losing the item over a number that is only ever used for ordering.
+pub fn importance_from_rating(rating: u8) -> f32 {
+    rating.clamp(1, IMPORTANCE_RATING_MAX) as f32 / IMPORTANCE_RATING_MAX as f32
+}
+
 /// A pointer back to the raw source that produced a schema or summary entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceRef {
@@ -734,6 +758,25 @@ pub trait SummaryBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scale has to be usable at both ends and in the middle, because a
+    /// model rating an item 1 and a producer asserting a low prior both go
+    /// through here.
+    #[test]
+    fn a_rating_maps_onto_the_shared_importance_scale() {
+        assert_eq!(importance_from_rating(1), 0.1);
+        assert_eq!(importance_from_rating(10), 1.0);
+        assert_eq!(importance_from_rating(5), 0.5);
+    }
+
+    /// Out-of-range ratings are clamped rather than dropped: the number is only
+    /// ever used to order entries, so losing an entry over it would cost more
+    /// than the ordering is worth.
+    #[test]
+    fn an_out_of_range_rating_is_clamped_into_the_scale() {
+        assert_eq!(importance_from_rating(0), 0.1);
+        assert_eq!(importance_from_rating(200), 1.0);
+    }
 
     #[test]
     fn slug_ids_are_valid_raw_keys() {
