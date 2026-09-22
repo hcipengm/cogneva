@@ -342,4 +342,43 @@ mod tests {
             "the contract is back to forbidding everything the gate allows"
         );
     }
+
+    /// The contract names every file the gate refuses, derived from the policy
+    /// rather than restated here.
+    ///
+    /// The test above pins the wording the model reads; this one pins the list
+    /// against the gate it is a promise about. They fail in different
+    /// directions and neither replaces the other: a name added to the policy
+    /// without a word in the contract is a change the generator is invited to
+    /// write and the gate then refuses — a round paid for nothing, and the
+    /// exact divergence that let a contract-legal change die at evaluation.
+    #[test]
+    fn the_change_contract_names_every_file_the_policy_refuses() {
+        let text = change_generation_contract().to_string();
+
+        // A needle that is a prefix of another entry (`.env` inside `.envrc`)
+        // must be followed by something other than a name character, or `.envrc`
+        // alone would satisfy the check for `.env` and hide the omission.
+        let names = |needle: &str| {
+            text.match_indices(needle).any(|(start, _)| {
+                match text[start + needle.len()..].chars().next() {
+                    Some(c) => !c.is_ascii_alphanumeric(),
+                    None => true,
+                }
+            })
+        };
+
+        for name in cog_core::PROTECTED_FILE_NAMES {
+            assert!(
+                names(name),
+                "the contract never names protected file {name}"
+            );
+        }
+        for ext in cog_core::PROTECTED_FILE_EXTENSIONS {
+            assert!(
+                names(ext),
+                "the contract never names protected extension .{ext}"
+            );
+        }
+    }
 }
