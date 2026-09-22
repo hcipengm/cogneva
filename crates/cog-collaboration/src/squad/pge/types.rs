@@ -395,6 +395,123 @@ impl EvaluationResult {
     }
 }
 
+/// Why a round stopped without anyone judging anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StopCause {
+    /// A role named a cause of its own: the prompt never reached its upstream,
+    /// a tool pipeline broke, or a loop spent its budget before producing
+    /// anything. Another round must fail identically, so the run stops instead
+    /// of paying for it.
+    Deterministic { reason: String },
+    /// The generator answered the prompt with an envelope carrying neither
+    /// content nor artifacts. It names no cause and rules out no retry: the
+    /// round stops, the debate need not.
+    EmptyEnvelope,
+    /// Nothing ran at all: the debate was configured for zero iterations, or a
+    /// round was configured for parallel branches and none of them started.
+    /// Nothing failed and nothing was observed — a cause invented here would
+    /// send a reader after a role that was never called.
+    NotAttempted,
+}
+
+impl StopCause {
+    /// The composed cause in the wire format the outer loops match on.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Deterministic { reason } => reason.clone(),
+            Self::EmptyEnvelope => empty_envelope_reason(),
+            Self::NotAttempted => {
+                "nothing was attempted, so nothing was produced and no role failed".to_string()
+            }
+        }
+    }
+
+    /// Whether this cause rules out the next attempt. An empty envelope does
+    /// not: it is a generation defect a repair can act on.
+    pub fn is_deterministic(&self) -> bool {
+        matches!(self, Self::Deterministic { .. } | Self::NotAttempted)
+    }
+}
+
+/// Whether a round that stopped without a judgement had anything to judge.
+///
+/// Kept apart from [`StopCause`] rather than folded into it, because "why it
+/// stopped" and "was there a product" are two observations and either one
+/// re-derived from the other misreads a caller that acts on it: a round whose
+/// judge spent its budget *did* produce something, and a round that stopped
+/// before the generator wrote a word did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoppedProduct {
+    /// Nothing to judge: the generator never ran, or what it wrote was the
+    /// failure itself.
+    None,
+    /// A product exists and no judge ever saw it, because the judge is what
+    /// failed.
+    Unjudged,
+}
+
+/// What one round or one branch produced: either a judgement of a product, or
+/// the reason it stopped and whether a product existed.
+///
+/// A round with no product has no judgement to carry, and inventing one is not
+/// a bookkeeping detail. That verdict enters the debate history the next planner
+/// and judge read, the merge that picks a winning branch, and the contributions
+/// the reflection chain learns from — teaching all three a conclusion nobody
+/// reached.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RoundOutcome {
+    /// A judge read a product and ruled on it.
+    Judged { evaluation: EvaluationResult },
+    /// The round ended without a judgement.
+    Stopped {
+        cause: StopCause,
+        product: StoppedProduct,
+    },
+}
+
+impl RoundOutcome {
+    /// The judgement, when this round reached one.
+    pub fn judgement(&self) -> Option<&EvaluationResult> {
+        match self {
+            Self::Judged { evaluation } => Some(evaluation),
+            Self::Stopped { .. } => None,
+        }
+    }
+
+    /// The composed cause when the round stopped on something no further round
+    /// can change. `None` for a judged round and for an empty envelope, which
+    /// rules out no retry. Reads through [`StopCause::is_deterministic`] so the
+    /// two can never disagree about which causes those are.
+    pub fn deterministic_stop(&self) -> Option<String> {
+        match self {
+            Self::Stopped { cause, .. } if cause.is_deterministic() => Some(cause.reason()),
+            _ => None,
+        }
+    }
+
+    /// The composed cause of any stop, deterministic or not. `None` when the
+    /// round was judged.
+    pub fn stop_reason(&self) -> Option<String> {
+        match self {
+            Self::Stopped { cause, .. } => Some(cause.reason()),
+            Self::Judged { .. } => None,
+        }
+    }
+
+    /// A round that stopped because the generator answered with an empty
+    /// envelope. The cause is the round's own business; the debate decides for
+    /// itself whether that is worth another round.
+    pub fn empty_envelope() -> Self {
+        Self::Stopped {
+            cause: StopCause::EmptyEnvelope,
+            product: StoppedProduct::None,
+        }
+    }
+}
+
 /// A single local repair cycle inside a pipeline attempt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocalRepairAttempt {
@@ -410,7 +527,7 @@ pub struct PgeBranchResult {
     pub branch_id: u32,
     pub plan: PlannerOutput,
     pub generation: GeneratorOutput,
-    pub evaluation: EvaluationResult,
+    pub outcome: RoundOutcome,
 }
 
 /// Strategy for merging parallel branch results.
@@ -432,7 +549,11 @@ pub enum BranchMergeStrategy {
 /// Summary of how parallel branches were merged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MergeSummary {
-    pub selected_branch_id: u32,
+    /// The branch that was carried out. `None` when no branch reached a
+    /// judgement and the round stopped: there was no selection to make, and a
+    /// sentinel id would read as one.
+    #[serde(default)]
+    pub selected_branch_id: Option<u32>,
     pub strategy: BranchMergeStrategy,
     pub reasoning: String,
 }
@@ -443,7 +564,7 @@ pub struct PgeRoundtableIteration {
     pub iteration: u32,
     pub plan: PlannerOutput,
     pub generation: GeneratorOutput,
-    pub evaluation: EvaluationResult,
+    pub outcome: RoundOutcome,
     /// Parallel branch results that produced this iteration, if any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<PgeBranchResult>,
@@ -605,6 +726,40 @@ mod tests {
             reason.contains("evaluator") && reason.contains("iteration budget"),
             "the reason must say which role spent what, got: {reason}"
         );
+    }
+
+    /// What came of asking the model straight out for an answer is part of the
+    /// cause. "Never asked", "asked and silent", "asked and answered with words
+    /// that hold no deliverable" and "the ask itself failed" are four states,
+    /// and one string for all four cannot tell a budget we chose to end from a
+    /// model that had nothing to hand over with the tools taken away.
+    #[test]
+    fn the_ways_a_spent_budget_can_end_each_read_differently() {
+        let of = |final_draft: Option<&str>| {
+            let mut value = serde_json::json!({
+                "status": MAX_ITERATIONS_STATUS,
+                "iterations": 1,
+                "pending_tool_calls": 2
+            });
+            if let Some(v) = final_draft {
+                value["final_draft"] = serde_json::Value::String(v.into());
+            }
+            value
+        };
+        let all: Vec<String> = [None, Some("empty"), Some("malformed"), Some("unavailable")]
+            .into_iter()
+            .map(|state| iteration_budget_exhausted_reason(&of(state)).unwrap())
+            .collect();
+
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two different end states read the same: {a}");
+            }
+            assert!(
+                names_a_deterministic_cause(a),
+                "a spent budget is terminal however the ask went: {a}"
+            );
+        }
     }
 
     /// The evaluator's feedback is prose about somebody else's work. An

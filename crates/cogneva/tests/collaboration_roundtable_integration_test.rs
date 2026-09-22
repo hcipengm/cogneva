@@ -184,7 +184,12 @@ async fn test_roundtable_debate_reaches_consensus() {
         "Should produce a plan with tasks"
     );
     assert!(
-        result.final_evaluation.score.unwrap_or(0) > 0,
+        result
+            .final_outcome
+            .judgement()
+            .and_then(|e| e.score)
+            .unwrap_or(0)
+            > 0,
         "Should produce a non-zero score"
     );
 }
@@ -250,8 +255,12 @@ async fn test_roundtable_evaluator_criteria_present() {
         .debate(&test_task("any goal"), serde_json::json!({}))
         .await;
 
+    let judgement = result
+        .final_outcome
+        .judgement()
+        .expect("the round reached a judgement");
     assert!(
-        !result.final_evaluation.feedback.is_empty(),
+        !judgement.feedback.is_empty(),
         "Evaluator should produce feedback"
     );
 }
@@ -283,8 +292,8 @@ async fn test_roundtable_context_board_populated() {
         "Board should contain generator output"
     );
     assert!(
-        board.get("latest_evaluation").is_some(),
-        "Board should contain evaluator output"
+        board.get("latest_outcome").is_some(),
+        "Board should contain what the round reached"
     );
     assert!(
         board.get("round").is_some(),

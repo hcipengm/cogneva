@@ -904,7 +904,11 @@ impl CollaborationExecutor {
             if let Ok(roundtable) =
                 serde_json::from_value::<crate::PgeRoundtableResult>(result_val.clone())
             {
-                return roundtable.final_evaluation.score.map(|s| s as f64 / 100.0);
+                return roundtable
+                    .final_outcome
+                    .judgement()
+                    .and_then(|e| e.score)
+                    .map(|s| s as f64 / 100.0);
             }
         }
         None
@@ -938,7 +942,7 @@ impl CollaborationExecutor {
                 return serde_json::json!({
                     "plan": roundtable.final_plan,
                     "generation": roundtable.final_generation,
-                    "evaluation": roundtable.final_evaluation,
+                    "outcome": roundtable.final_outcome,
                 });
             }
         }

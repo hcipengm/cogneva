@@ -7,7 +7,8 @@ use crate::squad::pge::stall::{
 };
 use crate::squad::pge::types::{
     Artifact, BranchMergeStrategy, Criterion, EvaluationResult, GeneratorOutput, MergeSummary,
-    PgeBranchResult, PgeRoundtableIteration, PlannerOutput, Verdict,
+    PgeBranchResult, PgeRoundtableIteration, PlannerOutput, RoundOutcome, StopCause,
+    StoppedProduct, Verdict,
 };
 use std::sync::Arc;
 use tracing::info;
@@ -105,13 +106,18 @@ pub struct PgeRoundtableResult {
     pub consensus_reached: bool,
     pub final_plan: PlannerOutput,
     pub final_generation: GeneratorOutput,
-    pub final_evaluation: EvaluationResult,
+    /// What the last round produced: a judgement, or the reason it stopped and
+    /// whether there was anything to judge. Read this instead of assuming a
+    /// verdict exists — a debate that stopped with no product has none, and a
+    /// fabricated one would be indistinguishable from a judgement.
+    pub final_outcome: RoundOutcome,
     pub history: Vec<PgeRoundtableIteration>,
     /// Final state of the shared context board after all debate rounds.
     /// `None` if no context board was configured.
     pub context_board: Option<serde_json::Value>,
-    /// The composed cause when the debate ended on a deterministic
-    /// environment/protocol failure, `None` when it ended any other way.
+    /// The composed cause when the debate ended on something no further round
+    /// can change — a deterministic environment/protocol failure, or a loop
+    /// whose rounds bought no progress. `None` when it ended any other way.
     /// It names the role that actually failed; a reader that re-derives the
     /// cause from `final_generation` alone reports a generator failure for a
     /// debate that stopped because the judge or the reviewer spent its budget.
@@ -197,7 +203,7 @@ impl PgeRoundtable {
         let mut consensus_reached = false;
         let mut stall = StallDetector::new(self.config.stall_threshold);
 
-        let mut final_evaluation: Option<EvaluationResult> = None;
+        let mut last_judgement: Option<EvaluationResult> = None;
         let mut prev_verdict: Option<Verdict> = None;
         let mut board = self.init_board().await;
         let mut terminal_reason: Option<String> = None;
@@ -215,7 +221,7 @@ impl PgeRoundtable {
                 .last()
                 .map(|h| serde_json::to_value(&h.generation).unwrap_or_default());
             let prev_gen_ref = prev_gen_json.as_ref();
-            let prev_eval_ref = final_evaluation
+            let prev_eval_ref = last_judgement
                 .as_ref()
                 .map(|e| serde_json::to_value(e).unwrap_or_default());
             let prev_eval_ref2 = prev_eval_ref.as_ref();
@@ -227,12 +233,12 @@ impl PgeRoundtable {
                         "iteration": h.iteration,
                         "plan": &h.plan,
                         "generation": &h.generation,
-                        "evaluation": &h.evaluation,
+                        "outcome": &h.outcome,
                     })
                 })
                 .collect();
 
-            let (plan, generation, evaluation, branches, merge_summary) =
+            let (plan, generation, outcome, branches, merge_summary) =
                 if self.config.parallel_branches > 1 {
                     self.run_parallel_iteration(
                         task,
@@ -244,7 +250,7 @@ impl PgeRoundtable {
                     )
                     .await
                 } else {
-                    let (p, g, e) = self
+                    let (p, g, o) = self
                         .run_sequential_iteration(
                             task,
                             iteration,
@@ -254,19 +260,19 @@ impl PgeRoundtable {
                             &board,
                         )
                         .await;
-                    (p, g, e, Vec::new(), None)
+                    (p, g, o, Vec::new(), None)
                 };
 
             let plan_json = serde_json::to_value(&plan).unwrap_or_default();
             let generation_json = serde_json::to_value(&generation).unwrap_or_default();
-            let eval_json = serde_json::to_value(&evaluation).unwrap_or_default();
+            let outcome_json = serde_json::to_value(&outcome).unwrap_or_default();
             board["latest_plan"] = plan_json.clone();
             self.persist_field("latest_plan", &plan_json).await;
             board["latest_generation"] = generation_json.clone();
             self.persist_field("latest_generation", &generation_json)
                 .await;
-            board["latest_evaluation"] = eval_json.clone();
-            self.persist_field("latest_evaluation", &eval_json).await;
+            board["latest_outcome"] = outcome_json.clone();
+            self.persist_field("latest_outcome", &outcome_json).await;
             board["round"] = serde_json::json!(iteration);
             self.persist_field("round", &serde_json::json!(iteration))
                 .await;
@@ -275,99 +281,71 @@ impl PgeRoundtable {
                 iteration,
                 plan: plan.clone(),
                 generation: generation.clone(),
-                evaluation: evaluation.clone(),
+                outcome: outcome.clone(),
                 branches,
                 merge_summary,
             });
 
-            // 计划侧的终止性失败：生成与评估都没有发生，真因在 plan 自己身上。
-            // 这条闸必须在生成闸之前——占位的空生成与真的空产出同形，先读生成
+            // 这一轮的终止判定由产出它的那条路径做出（顺序路径 / 并行分支），
+            // 这里只读结论。三个角色各自的闸放在那里，是因为只有那一层知道
+            // 谁被真正调用了：占位的空生成与真的空产出同形，在这里按对象反推
             // 就会把一个从未被调用的角色报成责任人。
-            if let Some(reason) = plan.terminal_env_failure_reason() {
+            if let Some(reason) = outcome.deterministic_stop() {
                 tracing::warn!(
                     iteration,
-                    "Roundtable planner reported terminal environment failure; stopping debate"
+                    "Roundtable round stopped on a deterministic failure; stopping debate"
                 );
-                if let Some(last) = history.last_mut() {
-                    last.evaluation.feedback = crate::squad::classify::declare(
-                        crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                        reason.clone(),
-                    );
-                }
-                terminal_reason = Some(reason);
+                terminal_reason = Some(crate::squad::classify::declare(
+                    crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+                    reason,
+                ));
                 break;
             }
 
-            // Deterministic environment/protocol failure: further debate
-            // rounds must fail identically — stop before paying for them.
-            if let Some(reason) = generation.terminal_env_failure_reason() {
-                tracing::warn!(
-                    iteration,
-                    "Roundtable generation reported terminal environment failure; stopping debate"
-                );
-                if let Some(last) = history.last_mut() {
-                    last.evaluation.feedback = crate::squad::classify::declare(
-                        crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                        reason.clone(),
-                    );
-                }
-                terminal_reason = Some(reason);
-                break;
-            }
-
-            // Same guard on the third role: a round whose judge spent its
-            // iteration budget did not judge, so another round hands the same
-            // judge the same budget. Named here rather than left to the
-            // degenerate-loop guard below, which would file the local cause as
-            // a debate that stopped making progress.
-            if let Some(reason) = evaluation.terminal_env_failure_reason() {
-                tracing::warn!(
-                    iteration,
-                    "Roundtable evaluator reported terminal environment failure; stopping debate"
-                );
-                if let Some(last) = history.last_mut() {
-                    last.evaluation.feedback = crate::squad::classify::declare(
-                        crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                        reason.clone(),
-                    );
-                }
-                terminal_reason = Some(reason);
-                break;
-            }
+            // 没有判定的一轮没有进展可言：读数记成"没有分数、没有判据"，
+            // 不借来一个分数。真产物存在但法官失败了的那种（Unjudged）也一样
+            // ——评委这一环空转，贡献不了任何进展证据。
+            let signals = ProgressSignals::from_outcome(&outcome);
 
             // Degenerate-loop guard: consecutive iterations the evaluator
             // judged no better mean more rounds only rephrase the same failure.
             // Mark the run and stop before spending more.
-            if !matches!(evaluation.verdict, Verdict::Pass)
-                && matches!(
-                    stall.observe(ProgressSignals::from_evaluation(&evaluation),),
-                    StallVerdict::Stalled
-                )
-            {
+            let judged_pass = matches!(outcome.judgement().map(|e| e.verdict), Some(Verdict::Pass));
+            if !judged_pass && matches!(stall.observe(signals), StallVerdict::Stalled) {
                 tracing::warn!(
                     iteration,
                     "degenerate debate loop detected; stopping roundtable early"
                 );
-                if let Some(last) = history.last_mut() {
-                    last.evaluation.feedback = degenerate_loop_feedback(format!(
-                        "{} consecutive iterations bought no progress \
-                         (evaluation score and criteria both flat); stopped early: {}",
-                        self.config.stall_threshold, last.evaluation.feedback
-                    ));
-                }
+                // 有判词就把它的原文带上：判据说的是"没进展"，而"哪一步
+                // 没进展"只有这一轮的判词说得清。
+                let detail = match outcome.judgement() {
+                    Some(evaluation) => format!("; stopped early: {}", evaluation.feedback),
+                    None => " and no round reached a judgement".to_string(),
+                };
+                terminal_reason = Some(degenerate_loop_feedback(format!(
+                    "{} consecutive iterations bought no progress \
+                     (evaluation score and criteria both flat); stopped early{detail}",
+                    self.config.stall_threshold
+                )));
                 break;
             }
 
-            // Consensus: require Verdict::Pass for at least 2 consecutive iterations.
-            let verdict_stable = if let Some(ref prev) = prev_verdict {
-                matches!(evaluation.verdict, Verdict::Pass) && matches!(prev, Verdict::Pass)
-            } else {
-                false
-            };
+            // Consensus needs a judgement to be about: a round that reached none
+            // carries none, and cannot carry the debate. The moderator below
+            // still sees it — a generator that keeps answering with nothing is
+            // exactly the moment its ChangeStrategy / Escalate call matters.
+            if let Some(judgement) = outcome.judgement() {
+                // Consensus: require Verdict::Pass for at least 2 consecutive iterations.
+                let verdict_stable = if let Some(ref prev) = prev_verdict {
+                    matches!(judgement.verdict, Verdict::Pass) && matches!(prev, Verdict::Pass)
+                } else {
+                    false
+                };
 
-            if matches!(evaluation.verdict, Verdict::Pass) && verdict_stable {
-                consensus_reached = true;
-                break;
+                if matches!(judgement.verdict, Verdict::Pass) && verdict_stable {
+                    consensus_reached = true;
+                    break;
+                }
             }
 
             // --- Moderator intervention ---
@@ -400,8 +378,12 @@ impl PgeRoundtable {
                 }
             }
 
-            prev_verdict = Some(evaluation.verdict);
-            final_evaluation = Some(evaluation);
+            if let Some(judgement) = outcome.judgement() {
+                prev_verdict = Some(judgement.verdict);
+                // 一轮没有判定不该抹掉上一轮的判词：下一轮的计划者要看的
+                // 是最后一次真实的评价，不是"这一轮什么都没说"。
+                last_judgement = Some(judgement.clone());
+            }
         }
 
         let mut last = history
@@ -419,12 +401,9 @@ impl PgeRoundtable {
                     content: serde_json::Value::Null,
                     artifacts: Vec::new(),
                 },
-                evaluation: EvaluationResult {
-                    verdict: Verdict::Fail,
-                    feedback: String::new(),
-                    score: None,
-                    criteria: Vec::new(),
-                    details: None,
+                outcome: RoundOutcome::Stopped {
+                    cause: StopCause::NotAttempted,
+                    product: StoppedProduct::None,
                 },
                 branches: Vec::new(),
                 merge_summary: None,
@@ -434,55 +413,57 @@ impl PgeRoundtable {
         // history, so consensus is self-assessment. Re-judge the final output
         // in a fresh context (no history) before accepting; on conflict the
         // reviewer wins. Both verdicts stay on the record.
-        if consensus_reached
-            && self.config.independent_review
-            && matches!(last.evaluation.verdict, Verdict::Pass)
-        {
-            let criteria: Vec<&str> = last
-                .plan
-                .acceptance_criteria
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let mut review = self
-                .evaluator
-                .evaluate(
-                    task,
-                    &serde_json::to_value(&last.plan).unwrap_or_default(),
-                    &serde_json::to_value(&last.generation).unwrap_or_default(),
-                    &[],
-                    &criteria,
-                    Some(&board),
-                )
-                .await;
-            review.enforce_criteria_evidence(!criteria.is_empty());
-            let review_json = serde_json::to_value(&review).unwrap_or_default();
-            if let Some(reason) = review.terminal_env_failure_reason() {
-                tracing::warn!(
-                    "Roundtable independent reviewer reported terminal environment failure"
-                );
-                consensus_reached = false;
-                last.evaluation.verdict = Verdict::Fail;
-                last.evaluation.feedback = crate::squad::classify::declare(
-                    crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                    reason.clone(),
-                );
-                terminal_reason = Some(reason);
-            } else if !matches!(review.verdict, Verdict::Pass) {
-                consensus_reached = false;
-                last.evaluation.verdict = Verdict::Fail;
-                last.evaluation.feedback = format!(
-                    "independent reviewer rejected the consensus: {}",
-                    review.feedback
-                );
+        //
+        // The review exists to confirm a consensus *Pass*. A round the moderator
+        // accepted as a partial is not a Pass, and a round nobody judged has no
+        // claim to re-check: in both cases there is nothing to confirm and the
+        // fresh-context judge is not paid for.
+        if consensus_reached && self.config.independent_review {
+            if let RoundOutcome::Judged { evaluation } = &mut last.outcome {
+                if matches!(evaluation.verdict, Verdict::Pass) {
+                    let criteria: Vec<&str> = last
+                        .plan
+                        .acceptance_criteria
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect();
+                    let mut review = self
+                        .evaluator
+                        .evaluate(
+                            task,
+                            &serde_json::to_value(&last.plan).unwrap_or_default(),
+                            &serde_json::to_value(&last.generation).unwrap_or_default(),
+                            &[],
+                            &criteria,
+                            Some(&board),
+                        )
+                        .await;
+                    review.enforce_criteria_evidence(!criteria.is_empty());
+                    let review_json = serde_json::to_value(&review).unwrap_or_default();
+                    if let Some(reason) = review.terminal_env_failure_reason() {
+                        tracing::warn!(
+                            "Roundtable independent reviewer reported terminal environment failure"
+                        );
+                        consensus_reached = false;
+                        evaluation.verdict = Verdict::Fail;
+                        evaluation.feedback = crate::squad::classify::declare(
+                            crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+                            reason.clone(),
+                        );
+                        terminal_reason = Some(reason);
+                    } else if !matches!(review.verdict, Verdict::Pass) {
+                        consensus_reached = false;
+                        evaluation.verdict = Verdict::Fail;
+                        evaluation.feedback = format!(
+                            "independent reviewer rejected the consensus: {}",
+                            review.feedback
+                        );
+                    }
+                    let mut details = evaluation.details.take().unwrap_or(serde_json::json!({}));
+                    details["independent_review"] = review_json;
+                    evaluation.details = Some(details);
+                }
             }
-            let mut details = last
-                .evaluation
-                .details
-                .take()
-                .unwrap_or(serde_json::json!({}));
-            details["independent_review"] = review_json;
-            last.evaluation.details = Some(details);
         }
 
         PgeRoundtableResult {
@@ -490,32 +471,46 @@ impl PgeRoundtable {
             consensus_reached,
             final_plan: last.plan,
             final_generation: last.generation,
-            final_evaluation: last.evaluation,
+            final_outcome: last.outcome,
             history,
             context_board: Some(board),
             terminal_reason,
         }
     }
 
-    /// 计划侧终止时的占位三元组：生成与评估都没有发生，所以这两个对象不带
-    /// 任何证据。原因由 `plan` 自己携带，读侧按 plan 判，不按这两个占位判。
-    fn terminal_placeholders(
-        plan: PlannerOutput,
-    ) -> (PlannerOutput, GeneratorOutput, EvaluationResult) {
-        (
-            plan,
-            GeneratorOutput {
-                content: serde_json::Value::Null,
-                artifacts: Vec::new(),
+    /// The stop a round reaches after generating and before evaluating, if any.
+    ///
+    /// A round whose generator already named a deterministic cause, or answered
+    /// with an empty envelope, has nothing for a judge to read. Asking one buys
+    /// an inference whose only possible content is "there is nothing here", and
+    /// files it — as a verdict — against the attempt. Both the sequential loop
+    /// and every parallel branch come through here, so neither can grow the
+    /// gate the other is missing.
+    fn stop_before_evaluation(generation: &GeneratorOutput) -> Option<RoundOutcome> {
+        if let Some(reason) = generation.terminal_env_failure_reason() {
+            return Some(RoundOutcome::Stopped {
+                cause: StopCause::Deterministic { reason },
+                product: StoppedProduct::None,
+            });
+        }
+        if generation.is_empty_envelope() {
+            return Some(RoundOutcome::empty_envelope());
+        }
+        None
+    }
+
+    /// The outcome of an evaluation: a judgement, unless the judge itself
+    /// failed. A judge that spent its own iteration budget judged nothing —
+    /// recording that as a verdict on the attempt blames the product for the
+    /// judge's problem. The product is real either way, hence `Unjudged`.
+    fn outcome_from_evaluation(evaluation: EvaluationResult) -> RoundOutcome {
+        match evaluation.terminal_env_failure_reason() {
+            Some(reason) => RoundOutcome::Stopped {
+                cause: StopCause::Deterministic { reason },
+                product: StoppedProduct::Unjudged,
             },
-            EvaluationResult {
-                verdict: Verdict::Fail,
-                feedback: String::new(),
-                score: None,
-                criteria: Vec::new(),
-                details: None,
-            },
-        )
+            None => RoundOutcome::Judged { evaluation },
+        }
     }
 
     /// Run a single sequential PGE iteration using the primary actors.
@@ -527,7 +522,7 @@ impl PgeRoundtable {
         prev_gen_ref: Option<&serde_json::Value>,
         eval_history: &[serde_json::Value],
         board: &serde_json::Value,
-    ) -> (PlannerOutput, GeneratorOutput, EvaluationResult) {
+    ) -> (PlannerOutput, GeneratorOutput, RoundOutcome) {
         let plan = self
             .planner
             .plan(
@@ -545,10 +540,20 @@ impl PgeRoundtable {
             )
             .await;
 
-        // 计划侧已经终止：这一轮不该再买生成与评估。占位只是让返回类型成立，
-        // 读侧看的是 plan 自己带的原因。
-        if plan.is_terminal_env_failure() {
-            return Self::terminal_placeholders(plan);
+        // 计划侧已经终止：生成与评估都不该买。占位生成只是让返回类型成立，
+        // 真因由 outcome 自己带着，读侧不看那个空对象。
+        if let Some(reason) = plan.terminal_env_failure_reason() {
+            return (
+                plan,
+                GeneratorOutput {
+                    content: serde_json::Value::Null,
+                    artifacts: Vec::new(),
+                },
+                RoundOutcome::Stopped {
+                    cause: StopCause::Deterministic { reason },
+                    product: StoppedProduct::None,
+                },
+            );
         }
 
         let plan_json = serde_json::to_value(&plan).unwrap_or_default();
@@ -566,18 +571,12 @@ impl PgeRoundtable {
             )
             .await;
 
-        // 空信封与线性路径同一条闸：没有产出可判，法官能给的唯一答案就是
-        // "这里什么都没有"。按它自己的名字确定性地判失败，别为一次空推理付费。
-        if generation.is_empty_envelope() {
+        if let Some(outcome) = Self::stop_before_evaluation(&generation) {
             tracing::warn!(
                 iteration,
-                "Roundtable generator returned an empty envelope; failing the round under its own cause"
+                "Roundtable round produced nothing to judge; not paying for an evaluation"
             );
-            return (
-                plan,
-                generation,
-                crate::squad::pge::types::empty_envelope_evaluation(),
-            );
+            return (plan, generation, outcome);
         }
 
         let generation_json = serde_json::to_value(&generation).unwrap_or_default();
@@ -600,7 +599,7 @@ impl PgeRoundtable {
         evaluation.enforce_criteria_evidence(!criteria.is_empty());
         evaluation.enforce_change_artifact_integrity(generation.change_artifact_defect(task));
 
-        (plan, generation, evaluation)
+        (plan, generation, Self::outcome_from_evaluation(evaluation))
     }
 
     /// Run multiple independent PGE branches in parallel and merge the results.
@@ -615,7 +614,7 @@ impl PgeRoundtable {
     ) -> (
         PlannerOutput,
         GeneratorOutput,
-        EvaluationResult,
+        RoundOutcome,
         Vec<PgeBranchResult>,
         Option<MergeSummary>,
     ) {
@@ -662,13 +661,18 @@ impl PgeRoundtable {
                     .await;
 
                 // 与顺序路径同一条闸：计划侧已终止的分支不再买生成与评估。
-                if plan.is_terminal_env_failure() {
-                    let (plan, generation, evaluation) = Self::terminal_placeholders(plan);
+                if let Some(reason) = plan.terminal_env_failure_reason() {
                     return PgeBranchResult {
                         branch_id,
                         plan,
-                        generation,
-                        evaluation,
+                        generation: GeneratorOutput {
+                            content: serde_json::Value::Null,
+                            artifacts: Vec::new(),
+                        },
+                        outcome: RoundOutcome::Stopped {
+                            cause: StopCause::Deterministic { reason },
+                            product: StoppedProduct::None,
+                        },
                     };
                 }
 
@@ -686,18 +690,17 @@ impl PgeRoundtable {
                     )
                     .await;
 
-                // 与顺序路径同一条闸，也与线性路径同语义。
-                if generation.is_empty_envelope() {
+                if let Some(outcome) = Self::stop_before_evaluation(&generation) {
                     tracing::warn!(
                         iteration,
                         branch_id,
-                        "Roundtable branch generator returned an empty envelope; failing the branch under its own cause"
+                        "Roundtable branch produced nothing to judge; not paying for an evaluation"
                     );
                     return PgeBranchResult {
                         branch_id,
                         plan,
                         generation,
-                        evaluation: crate::squad::pge::types::empty_envelope_evaluation(),
+                        outcome,
                     };
                 }
 
@@ -725,7 +728,7 @@ impl PgeRoundtable {
                     branch_id,
                     plan,
                     generation,
-                    evaluation,
+                    outcome: Self::outcome_from_evaluation(evaluation),
                 }
             });
             handles.push(handle);
@@ -733,7 +736,7 @@ impl PgeRoundtable {
 
         // Await all branches. If every branch spawn failed, fall back to sequential.
         if handles.is_empty() {
-            let (p, g, e) = self
+            let (p, g, o) = self
                 .run_sequential_iteration(
                     task,
                     iteration,
@@ -743,7 +746,7 @@ impl PgeRoundtable {
                     board,
                 )
                 .await;
-            return (p, g, e, Vec::new(), None);
+            return (p, g, o, Vec::new(), None);
         }
 
         let branches: Vec<PgeBranchResult> = futures::future::join_all(handles)
@@ -760,7 +763,7 @@ impl PgeRoundtable {
 
         let merge_result = self.merge_branches(task, &branches, board).await;
         let merge_summary = Some(MergeSummary {
-            selected_branch_id: branches.first().map(|b| b.branch_id).unwrap_or(0),
+            selected_branch_id: merge_result.selected_branch_id,
             strategy: self.config.branch_merge_strategy,
             reasoning: merge_result.reasoning.clone(),
         });
@@ -768,7 +771,7 @@ impl PgeRoundtable {
         (
             merge_result.plan,
             merge_result.generation,
-            merge_result.evaluation,
+            merge_result.outcome,
             branches,
             merge_summary,
         )
@@ -810,6 +813,17 @@ impl PgeRoundtable {
         Some((planner_actor, generator_actor, evaluator_actor))
     }
 
+    /// The branches that reached a judgement: the only ones a merge can rank.
+    /// A branch with no product has no score and no verdict, so letting it into
+    /// "pick the highest score" reads its emptiness as a real bad review and
+    /// can hand back a branch nobody ever judged.
+    fn judged_branches(branches: &[PgeBranchResult]) -> Vec<&PgeBranchResult> {
+        branches
+            .iter()
+            .filter(|b| b.outcome.judgement().is_some())
+            .collect()
+    }
+
     /// Merge parallel branch results into a single result according to the
     /// configured [`BranchMergeStrategy`].
     async fn merge_branches(
@@ -830,15 +844,17 @@ impl PgeRoundtable {
                     content: serde_json::Value::Null,
                     artifacts: Vec::new(),
                 },
-                evaluation: EvaluationResult {
-                    verdict: Verdict::Fail,
-                    feedback: "No branches produced results".into(),
-                    score: None,
-                    criteria: Vec::new(),
-                    details: None,
+                outcome: RoundOutcome::Stopped {
+                    cause: StopCause::NotAttempted,
+                    product: StoppedProduct::None,
                 },
+                selected_branch_id: None,
                 reasoning: "No branches".into(),
             };
+        }
+
+        if Self::judged_branches(branches).is_empty() {
+            return Self::merge_without_judgement(branches);
         }
 
         match self.config.branch_merge_strategy {
@@ -856,25 +872,105 @@ impl PgeRoundtable {
         }
     }
 
-    fn merge_best_score(&self, branches: &[PgeBranchResult]) -> MergeResult {
-        let best = branches
+    /// The round's result when no branch reached a judgement: the cause is the
+    /// branches' own, and the product carried out is the one that actually
+    /// exists, so "was there anything to judge" follows the product rather than
+    /// being counted separately.
+    fn merge_without_judgement(branches: &[PgeBranchResult]) -> MergeResult {
+        // A branch that produced something but whose judge failed is the one
+        // worth carrying out; failing that, any branch at all — the plan and
+        // generation of a stopped round are the round's record of what it got
+        // to, not a deliverable.
+        let carried = branches
             .iter()
-            .max_by_key(|b| b.evaluation.score.unwrap_or(0))
+            .find(|b| {
+                matches!(
+                    &b.outcome,
+                    RoundOutcome::Stopped {
+                        product: StoppedProduct::Unjudged,
+                        ..
+                    }
+                )
+            })
+            .or_else(|| branches.first());
+        // 确定性原因优先带出去：它自带"重试无用"的语义，比生成器交了个空
+        // 信封更该被上层看到。
+        let cause = branches
+            .iter()
+            .find_map(|b| match &b.outcome {
+                RoundOutcome::Stopped { cause, .. } if cause.is_deterministic() => {
+                    Some(cause.clone())
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                branches.iter().find_map(|b| match &b.outcome {
+                    RoundOutcome::Stopped { cause, .. } => Some(cause.clone()),
+                    RoundOutcome::Judged { .. } => None,
+                })
+            })
+            .unwrap_or(StopCause::NotAttempted);
+        let product = match carried.map(|b| &b.outcome) {
+            Some(RoundOutcome::Stopped { product, .. }) => *product,
+            _ => StoppedProduct::None,
+        };
+        let selected_branch_id = carried.map(|b| b.branch_id);
+
+        match carried {
+            Some(branch) => MergeResult {
+                reasoning: format!(
+                    "No branch reached a judgement; carried branch {}",
+                    branch.branch_id
+                ),
+                plan: branch.plan.clone(),
+                generation: branch.generation.clone(),
+                outcome: RoundOutcome::Stopped { cause, product },
+                selected_branch_id,
+            },
+            None => MergeResult {
+                plan: PlannerOutput {
+                    summary: String::new(),
+                    plan: serde_json::json!({}),
+                    sub_tasks: Vec::new(),
+                    acceptance_criteria: Vec::new(),
+                },
+                generation: GeneratorOutput {
+                    content: serde_json::Value::Null,
+                    artifacts: Vec::new(),
+                },
+                outcome: RoundOutcome::Stopped {
+                    cause,
+                    product: StoppedProduct::None,
+                },
+                selected_branch_id: None,
+                reasoning: "No branches".into(),
+            },
+        }
+    }
+
+    fn merge_best_score(&self, branches: &[PgeBranchResult]) -> MergeResult {
+        let best = Self::judged_branches(branches)
+            .into_iter()
+            .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0))
             .cloned()
-            .expect("branches is non-empty");
+            .expect("the caller checked at least one branch reached a judgement");
 
         MergeResult {
             reasoning: format!("Selected branch {} by best score", best.branch_id),
             plan: best.plan,
             generation: best.generation,
-            evaluation: best.evaluation,
+            outcome: best.outcome,
+            selected_branch_id: Some(best.branch_id),
         }
     }
 
     fn merge_majority_vote(&self, branches: &[PgeBranchResult]) -> MergeResult {
+        let judged = Self::judged_branches(branches);
         let mut counts = std::collections::HashMap::new();
-        for b in branches {
-            *counts.entry(b.evaluation.verdict).or_insert(0) += 1;
+        for b in &judged {
+            if let Some(verdict) = b.outcome.judgement().map(|e| e.verdict) {
+                *counts.entry(verdict).or_insert(0) += 1;
+            }
         }
         let majority_verdict = counts
             .into_iter()
@@ -882,13 +978,14 @@ impl PgeRoundtable {
             .map(|(v, _)| v)
             .unwrap_or(Verdict::Fail);
 
-        let best = branches
+        let best = judged
             .iter()
-            .filter(|b| b.evaluation.verdict == majority_verdict)
-            .max_by_key(|b| b.evaluation.score.unwrap_or(0))
+            .filter(|b| b.outcome.judgement().map(|e| e.verdict) == Some(majority_verdict))
+            .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0))
+            .copied()
+            .or_else(|| judged.first().copied())
             .cloned()
-            .or_else(|| branches.first().cloned())
-            .expect("branches is non-empty");
+            .expect("the caller checked at least one branch reached a judgement");
 
         MergeResult {
             reasoning: format!(
@@ -897,16 +994,17 @@ impl PgeRoundtable {
             ),
             plan: best.plan,
             generation: best.generation,
-            evaluation: best.evaluation,
+            outcome: best.outcome,
+            selected_branch_id: Some(best.branch_id),
         }
     }
 
     fn merge_union_artifacts(&self, branches: &[PgeBranchResult]) -> MergeResult {
-        let best = branches
-            .iter()
-            .max_by_key(|b| b.evaluation.score.unwrap_or(0))
+        let best = Self::judged_branches(branches)
+            .into_iter()
+            .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0))
             .cloned()
-            .expect("branches is non-empty");
+            .expect("the caller checked at least one branch reached a judgement");
 
         let mut all_artifacts = best.generation.artifacts.clone();
         let mut seen_names = std::collections::HashSet::new();
@@ -931,7 +1029,8 @@ impl PgeRoundtable {
             ),
             plan: best.plan,
             generation,
-            evaluation: best.evaluation,
+            outcome: best.outcome,
+            selected_branch_id: Some(best.branch_id),
         }
     }
 }
@@ -1142,6 +1241,9 @@ mod tests {
 
     struct MockAgent {
         responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+        /// How many times this actor was asked for anything. The only way to
+        /// observe "this role was never paid for" from outside.
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockAgent {
@@ -1149,6 +1251,7 @@ mod tests {
         fn fixed(value: serde_json::Value) -> Self {
             Self {
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([value])),
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
@@ -1156,10 +1259,16 @@ mod tests {
         fn sequence(values: Vec<serde_json::Value>) -> Self {
             Self {
                 responses: std::sync::Mutex::new(values.into()),
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         fn next_response(&self) -> serde_json::Value {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut responses = self.responses.lock().unwrap();
             match responses.len() {
                 0 => serde_json::Value::Null,
@@ -1294,14 +1403,47 @@ mod tests {
                 content: serde_json::Value::Null,
                 artifacts,
             },
-            evaluation: eval_result(
-                if score >= 80 {
-                    Verdict::Pass
-                } else {
-                    Verdict::Fail
-                },
-                score,
-            ),
+            outcome: RoundOutcome::Judged {
+                evaluation: eval_result(
+                    if score >= 80 {
+                        Verdict::Pass
+                    } else {
+                        Verdict::Fail
+                    },
+                    score,
+                ),
+            },
+        }
+    }
+
+    /// A branch that was never judged, so it carries no verdict for a merge to
+    /// rank. Whether there was anything to judge follows the artifacts it did
+    /// produce rather than being asserted separately.
+    fn unjudged_branch(branch_id: u32, artifact_name: &str) -> PgeBranchResult {
+        let mut artifacts = Vec::new();
+        if !artifact_name.is_empty() {
+            artifacts.push(crate::squad::pge::types::Artifact {
+                name: artifact_name.into(),
+                content: String::new(),
+                artifact_type: "code".into(),
+            });
+        }
+        let product = if artifacts.is_empty() {
+            StoppedProduct::None
+        } else {
+            StoppedProduct::Unjudged
+        };
+        PgeBranchResult {
+            branch_id,
+            plan: empty_planner_output(),
+            generation: GeneratorOutput {
+                content: serde_json::Value::Null,
+                artifacts,
+            },
+            outcome: RoundOutcome::Stopped {
+                cause: StopCause::EmptyEnvelope,
+                product,
+            },
         }
     }
 
@@ -1329,7 +1471,8 @@ mod tests {
         let rt = roundtable_for_merge(BranchMergeStrategy::BestScore);
         let branches = vec![branch(0, 40, ""), branch(1, 90, ""), branch(2, 60, "")];
         let merged = rt.merge_best_score(&branches);
-        assert_eq!(merged.evaluation.score, Some(90));
+        assert_eq!(merged.outcome.judgement().and_then(|e| e.score), Some(90));
+        assert_eq!(merged.selected_branch_id, Some(1));
     }
 
     #[test]
@@ -1337,8 +1480,9 @@ mod tests {
         let rt = roundtable_for_merge(BranchMergeStrategy::MajorityVote);
         let branches = vec![branch(0, 40, ""), branch(1, 85, ""), branch(2, 90, "")];
         let merged = rt.merge_majority_vote(&branches);
-        assert!(matches!(merged.evaluation.verdict, Verdict::Pass));
-        assert_eq!(merged.evaluation.score, Some(90));
+        let judgement = merged.outcome.judgement().expect("a judged branch");
+        assert!(matches!(judgement.verdict, Verdict::Pass));
+        assert_eq!(judgement.score, Some(90));
     }
 
     #[test]
@@ -1350,7 +1494,7 @@ mod tests {
             branch(2, 60, "a.rs"),
         ];
         let merged = rt.merge_union_artifacts(&branches);
-        assert_eq!(merged.evaluation.score, Some(90));
+        assert_eq!(merged.outcome.judgement().and_then(|e| e.score), Some(90));
         let names: Vec<&str> = merged
             .generation
             .artifacts
@@ -1360,6 +1504,30 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"a.rs"));
         assert!(names.contains(&"b.rs"));
+    }
+
+    /// A merge whose branches were never judged has no verdict to hand back.
+    /// Reading their emptiness as a bad review picks a "winner" nobody judged
+    /// and files that invented review in the debate history.
+    #[test]
+    fn a_merge_of_unjudged_branches_invents_no_verdict() {
+        let branches = vec![
+            unjudged_branch(0, ""),
+            unjudged_branch(1, "b.rs"),
+            unjudged_branch(2, ""),
+        ];
+
+        let merged = PgeRoundtable::merge_without_judgement(&branches);
+
+        assert!(
+            merged.outcome.judgement().is_none(),
+            "no branch was judged, so there is no judgement to carry"
+        );
+        assert!(merged.outcome.stop_reason().is_some());
+        // The branch that has something to carry is the one that travels — its
+        // emptiness is the round's record, not a score.
+        assert_eq!(merged.selected_branch_id, Some(1));
+        assert_eq!(merged.generation.artifacts.len(), 1);
     }
 
     #[tokio::test]
@@ -1401,12 +1569,12 @@ mod tests {
             !result.consensus_reached,
             "reviewer rejection must break consensus"
         );
-        assert!(result
-            .final_evaluation
-            .feedback
-            .contains("independent reviewer rejected"));
-        let review = result
-            .final_evaluation
+        let judgement = result
+            .final_outcome
+            .judgement()
+            .expect("the reviewer's rejection is a judgement");
+        assert!(judgement.feedback.contains("independent reviewer rejected"));
+        let review = judgement
             .details
             .as_ref()
             .and_then(|d| d.get("independent_review"))
@@ -1456,14 +1624,30 @@ mod tests {
 
         assert_eq!(result.iterations, 1, "another round spends the same budget");
         assert!(!result.consensus_reached);
-        let feedback = &result.final_evaluation.feedback;
+        let reason = result
+            .terminal_reason
+            .as_deref()
+            .expect("the debate must report a composed terminal reason");
         assert!(
-            feedback.starts_with(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX),
-            "the outer loops match on the prefix, got: {feedback}"
+            reason.starts_with(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX),
+            "the outer loops match on the prefix, got: {reason}"
         );
         assert!(
-            !feedback.contains("degenerate"),
-            "the local cause must not be filed as a stalled debate: {feedback}"
+            !reason.contains("degenerate"),
+            "the local cause must not be filed as a stalled debate: {reason}"
+        );
+        // The generator did write something; the judge is what failed. Those
+        // are two different observations and the outcome keeps them apart.
+        assert!(
+            matches!(
+                &result.final_outcome,
+                RoundOutcome::Stopped {
+                    cause: StopCause::Deterministic { .. },
+                    product: StoppedProduct::Unjudged,
+                }
+            ),
+            "a round whose judge spent its budget still produced something: {:?}",
+            result.final_outcome
         );
     }
 
@@ -1570,10 +1754,189 @@ mod tests {
         let result = rt.debate(&task, serde_json::json!({})).await;
         assert!(result.consensus_reached);
         assert!(result
-            .final_evaluation
-            .details
-            .as_ref()
+            .final_outcome
+            .judgement()
+            .and_then(|e| e.details.as_ref())
             .and_then(|d| d.get("independent_review"))
             .is_some());
+    }
+
+    /// A partial the moderator accepted is a consensus, but it is not a Pass,
+    /// so there is no consensus claim for the fresh-context judge to confirm.
+    /// Running the review anyway would judge a claim nobody made — and a code
+    /// path that assumes every consensus is a Pass reads it as one here.
+    #[tokio::test]
+    async fn an_accepted_partial_is_not_re_reviewed_by_the_fresh_context_judge() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": {"code": "partial"}, "artifacts": []}),
+        )));
+        let evaluator_agent = std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "verdict": "fail", "score": 10, "feedback": "not good enough", "criteria": []
+        })));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 5,
+                consensus_threshold: 1.0,
+                stall_threshold: 0,
+                independent_review: true,
+                moderator: Some(ModeratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+                    serde_json::json!({"decision": "accept_partial"}),
+                )))),
+                ..Default::default()
+            },
+            planner,
+            generator,
+            EvaluatorActor::new(evaluator_agent.clone()),
+        );
+        let task = cog_core::Task::new(
+            "t-partial".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let result = rt.debate(&task, serde_json::json!({})).await;
+
+        assert!(
+            result.consensus_reached,
+            "the moderator accepted the partial"
+        );
+        assert_eq!(
+            evaluator_agent.calls(),
+            1,
+            "the round's own judge ran once; the fresh-context review had no Pass to confirm"
+        );
+        let judgement = result
+            .final_outcome
+            .judgement()
+            .expect("the round was judged");
+        assert!(matches!(judgement.verdict, Verdict::Fail));
+    }
+
+    /// A round that produced nothing has nothing to judge, so the judge is not
+    /// paid for. The evaluator here would return a Pass if it were ever asked,
+    /// which is exactly the fabrication that used to travel downstream as a
+    /// real review of an empty envelope.
+    #[tokio::test]
+    async fn a_round_that_produces_nothing_pays_no_evaluator() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": null, "artifacts": []}),
+        )));
+        let evaluator_agent = std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "verdict": "pass", "score": 90, "feedback": "ok", "criteria": []
+        })));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 3,
+                consensus_threshold: 0.5,
+                stall_threshold: 0,
+                independent_review: false,
+                context_board: Some(serde_json::json!({})),
+                ..Default::default()
+            },
+            planner,
+            generator,
+            EvaluatorActor::new(evaluator_agent.clone()),
+        );
+        let task = cog_core::Task::new(
+            "t-empty".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let result = rt.debate(&task, serde_json::json!({})).await;
+
+        assert_eq!(
+            evaluator_agent.calls(),
+            0,
+            "an envelope with no content and no artifacts has nothing to judge"
+        );
+        assert!(
+            !result.consensus_reached,
+            "the judge's pass was never asked for, so it cannot carry the debate"
+        );
+        assert!(
+            result.final_outcome.judgement().is_none(),
+            "no verdict may be invented for a round nobody judged"
+        );
+        assert!(result
+            .final_outcome
+            .stop_reason()
+            .is_some_and(|r| r.contains("no content and no artifacts")));
+
+        // Neither the debate history nor the shared board may carry a review of
+        // an empty envelope: the next planner and judge read both.
+        for iteration in &result.history {
+            assert!(
+                iteration.outcome.judgement().is_none(),
+                "iteration {} wrote a verdict for a round that was never judged",
+                iteration.iteration
+            );
+        }
+        let board = result.context_board.expect("the board was configured");
+        assert!(
+            board.get("latest_outcome").is_some(),
+            "the board records what the round reached"
+        );
+        assert!(
+            board.get("latest_evaluation").is_none(),
+            "an evaluation-shaped key would describe a review that never happened"
+        );
+    }
+
+    /// The other half of the same rule: a round that did produce something is
+    /// judged as before, so the guard cannot pass by never paying anyone.
+    #[tokio::test]
+    async fn a_round_that_produces_something_pays_the_evaluator() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": {"answer": 42}, "artifacts": []}),
+        )));
+        let evaluator_agent = std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "verdict": "pass", "score": 90, "feedback": "ok", "criteria": []
+        })));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 3,
+                consensus_threshold: 0.5,
+                stall_threshold: 0,
+                independent_review: false,
+                ..Default::default()
+            },
+            planner,
+            generator,
+            EvaluatorActor::new(evaluator_agent.clone()),
+        );
+        let task = cog_core::Task::new(
+            "t-product".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let result = rt.debate(&task, serde_json::json!({})).await;
+
+        assert!(
+            evaluator_agent.calls() >= 1,
+            "a round with a product is judged"
+        );
+        let judgement = result
+            .final_outcome
+            .judgement()
+            .expect("the round reached a judgement");
+        assert_eq!(judgement.score, Some(90));
+        assert!(result.consensus_reached);
     }
 }

@@ -11,7 +11,7 @@ use crate::squad::classify::classify;
 use crate::squad::pge::pipeline::PgePipeline;
 use crate::squad::pge::roundtable::{PgeRoundtable, PgeRoundtableResult};
 use crate::squad::pge::stall::{made_progress, ProgressSignals};
-use crate::squad::pge::types::{EvaluationResult, Verdict};
+use crate::squad::pge::types::{EvaluationResult, RoundOutcome, Verdict};
 use cog_core::{Task, TaskType};
 use std::sync::Arc;
 
@@ -689,9 +689,7 @@ impl RalphLoop {
                 FailureAnalysis::Unrecoverable(_) => ResetStrategy::Identical,
             };
 
-            let progress = Some(ProgressSignals::from_evaluation(
-                &rt_result.final_evaluation,
-            ));
+            let progress = Some(ProgressSignals::from_outcome(&rt_result.final_outcome));
             let snapshot = serde_json::json!({ "roundtable": rt_result });
 
             self.record_iteration(RalphIteration {
@@ -924,18 +922,19 @@ Respond with **only** a JSON object matching this schema:\n\
         result: &PgeRoundtableResult,
         history: &[RalphIteration],
     ) -> FailureAnalysis {
-        let feedback = &result.final_evaluation.feedback;
-
-        // 退化辩论环在 feedback 上留了标记，和 Pipeline 侧同一条判据。
-        // 若这里只看 verdict 再回一个常量 reason，标记就被丢掉：真因（停滞）
-        // 会被归成兜底的 unrecoverable，下游按前缀做的不可重试判定也失配。
-        if feedback.starts_with(cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX) {
-            return FailureAnalysis::Unrecoverable(feedback.clone());
-        }
+        // 没有终判的一轮只有它自己说出的停止原因，没有 verdict 可读。从产物
+        // 反推一个 verdict 会把这个原因丢掉，还会把账算到没跑过的角色头上。
+        let evaluation = match &result.final_outcome {
+            RoundOutcome::Judged { evaluation } => evaluation,
+            RoundOutcome::Stopped { cause, .. } => {
+                return FailureAnalysis::Unrecoverable(cause.reason());
+            }
+        };
+        let feedback = &evaluation.feedback;
 
         // 若最终 verdict 为 Fail，视为无有效输出（verdict 是核心信号，score 仅作参考）。
         // reason 取真实 feedback，落盘与指标才带得动定位信息；feedback 为空时才回退常量。
-        if matches!(result.final_evaluation.verdict, Verdict::Fail) {
+        if matches!(evaluation.verdict, Verdict::Fail) {
             return FailureAnalysis::Unrecoverable(if feedback.trim().is_empty() {
                 "Roundtable produced no viable output".into()
             } else {
@@ -944,7 +943,7 @@ Respond with **only** a JSON object matching this schema:\n\
         }
 
         // 检测 Roundtable 是否卡住（连续相同 verdict）
-        let current_verdict_str = match result.final_evaluation.verdict {
+        let current_verdict_str = match evaluation.verdict {
             Verdict::Pass => "Pass",
             Verdict::Fail => "Fail",
             Verdict::Partial => "Partial",
@@ -954,7 +953,8 @@ Respond with **only** a JSON object matching this schema:\n\
         let recent_same = history.iter().rev().take(2).all(|h| {
             h.snapshot
                 .get("roundtable")
-                .and_then(|r| r.get("final_evaluation"))
+                .and_then(|r| r.get("final_outcome"))
+                .and_then(|o| o.get("evaluation"))
                 .and_then(|e| e.get("verdict"))
                 .and_then(|s| s.as_str())
                 == Some(current_verdict_str)
@@ -972,6 +972,7 @@ Respond with **only** a JSON object matching this schema:\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::squad::pge::types::{StopCause, StoppedProduct};
     use crate::squad::pge::{PgePipeline, PgePipelineConfig, PgeRoundtable, PgeRoundtableConfig};
     use std::sync::Arc;
 
@@ -1596,12 +1597,14 @@ mod tests {
                 content: serde_json::json!({}),
                 artifacts: Vec::new(),
             },
-            final_evaluation: EvaluationResult {
-                verdict,
-                feedback: feedback.to_string(),
-                score: None,
-                criteria: Vec::new(),
-                details: None,
+            final_outcome: RoundOutcome::Judged {
+                evaluation: EvaluationResult {
+                    verdict,
+                    feedback: feedback.to_string(),
+                    score: None,
+                    criteria: Vec::new(),
+                    details: None,
+                },
             },
             history: Vec::new(),
             context_board: None,
@@ -1609,18 +1612,83 @@ mod tests {
         }
     }
 
+    /// A debate that ended without anyone judging anything, carrying the cause
+    /// the round itself composed.
+    fn stopped_roundtable_result(reason: &str) -> PgeRoundtableResult {
+        use crate::squad::pge::types::{GeneratorOutput, PlannerOutput};
+
+        let mut result = roundtable_result(Verdict::Fail, "");
+        result.final_plan = PlannerOutput {
+            summary: String::new(),
+            plan: serde_json::json!({}),
+            sub_tasks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+        };
+        result.final_generation = GeneratorOutput {
+            content: serde_json::Value::Null,
+            artifacts: Vec::new(),
+        };
+        result.final_outcome = RoundOutcome::Stopped {
+            cause: StopCause::Deterministic {
+                reason: reason.to_string(),
+            },
+            product: StoppedProduct::None,
+        };
+        result.terminal_reason = Some(reason.to_string());
+        result
+    }
+
     #[test]
     fn a_degenerate_roundtable_keeps_its_class_instead_of_falling_back() {
+        use crate::squad::pge::stall::degenerate_loop_feedback;
         use cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX;
 
-        let result = roundtable_result(
-            Verdict::Fail,
-            &format!("{DEGENERATE_LOOP_PREFIX}: 3 consecutive iterations bought no progress"),
-        );
+        let degenerate =
+            degenerate_loop_feedback("3 consecutive iterations bought no progress".into());
+        let result = stopped_roundtable_result(&degenerate);
         match RalphLoop::analyze_roundtable_failure(&result, &[]) {
             FailureAnalysis::Unrecoverable(reason) => {
                 assert!(reason.starts_with(DEGENERATE_LOOP_PREFIX));
                 assert_eq!(classify(&reason), "degenerate_loop");
+            }
+            other => panic!("expected Unrecoverable, got {other:?}"),
+        }
+    }
+
+    /// A round nobody judged reports the cause the round composed, not the
+    /// verdict of a judge that never ran.
+    #[test]
+    fn a_round_nobody_judged_reports_its_own_cause() {
+        let mut empty_envelope = roundtable_result(Verdict::Pass, "looks good");
+        empty_envelope.final_outcome = RoundOutcome::Stopped {
+            cause: StopCause::EmptyEnvelope,
+            product: StoppedProduct::None,
+        };
+        match RalphLoop::analyze_roundtable_failure(&empty_envelope, &[]) {
+            FailureAnalysis::Unrecoverable(reason) => assert!(
+                reason.contains("no content and no artifacts"),
+                "the cause must be the round's own, not the verdict that was never given: \
+                 {reason}"
+            ),
+            other => panic!("expected Unrecoverable, got {other:?}"),
+        }
+
+        // A round that produced something whose judge is what failed names the
+        // judge's own cause, and the reason survives the boundary intact.
+        let mut unjudged_product = roundtable_result(Verdict::Pass, "looks good");
+        unjudged_product.final_outcome = RoundOutcome::Stopped {
+            cause: StopCause::Deterministic {
+                reason: format!(
+                    "{}: evaluator prompt failed: HTTP 503",
+                    cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX
+                ),
+            },
+            product: StoppedProduct::Unjudged,
+        };
+        match RalphLoop::analyze_roundtable_failure(&unjudged_product, &[]) {
+            FailureAnalysis::Unrecoverable(reason) => {
+                assert!(reason.contains("evaluator prompt failed: HTTP 503"));
+                assert_eq!(classify(&reason), "terminal_env_failure");
             }
             other => panic!("expected Unrecoverable, got {other:?}"),
         }

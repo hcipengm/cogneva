@@ -2,14 +2,22 @@ use std::sync::Arc;
 
 use cog_core::Agent;
 
-use crate::squad::pge::types::{EvaluationResult, GeneratorOutput, PgeBranchResult, PlannerOutput};
+use crate::squad::pge::types::{
+    GeneratorOutput, PgeBranchResult, PlannerOutput, RoundOutcome, StopCause, StoppedProduct,
+};
 
 /// Result of merging parallel PGE branches.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MergeResult {
     pub plan: PlannerOutput,
     pub generation: GeneratorOutput,
-    pub evaluation: EvaluationResult,
+    /// What the merged round reached: a judgement, or the reason it stopped.
+    /// A merge that could not judge anything must say so rather than hand back
+    /// a verdict-shaped placeholder.
+    pub outcome: RoundOutcome,
+    /// The branch carried out; `None` when there was no selection to make.
+    #[serde(default)]
+    pub selected_branch_id: Option<u32>,
     pub reasoning: String,
 }
 
@@ -79,7 +87,7 @@ impl MergerActor {
                 if let Some(ref schema) = self.output_schema {
                     crate::actors::validate_against_schema(schema, &result.to_string(), "merger");
                 }
-                parse_merge_result(&result)
+                parse_merge_result(&result, branches)
             }
             Err(e) => {
                 tracing::warn!("Merger prompt failed: {}", e);
@@ -96,7 +104,7 @@ impl MergerActor {
         .await
         {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&revised) {
-                output = parse_merge_result(&value);
+                output = parse_merge_result(&value, branches);
             }
         }
         output
@@ -104,52 +112,40 @@ impl MergerActor {
 }
 
 /// Parse a raw JSON value into a [`MergeResult`].
-/// Falls back to selecting the best branch if parsing fails.
-pub fn parse_merge_result(value: &serde_json::Value) -> MergeResult {
-    serde_json::from_value(value.clone()).unwrap_or_else(|_| {
-        // If the LLM did not return a valid MergeResult, try to interpret it as
-        // a selected branch_id.
-        if let Some(branch_id) = value
-            .get("selected_branch_id")
-            .and_then(|v| v.as_u64())
-            .map(|id| id as u32)
-        {
-            // This branch is unreachable in practice because the `from_value`
-            // above would have succeeded for a valid MergeResult; kept for
-            // documentation of the expected alternative shape.
-            let _ = branch_id;
-        }
-        MergeResult {
-            plan: PlannerOutput {
-                summary: String::new(),
-                plan: serde_json::json!({}),
-                sub_tasks: Vec::new(),
-                acceptance_criteria: Vec::new(),
-            },
-            generation: GeneratorOutput {
-                content: serde_json::Value::Null,
-                artifacts: Vec::new(),
-            },
-            evaluation: EvaluationResult {
-                verdict: crate::squad::pge::types::Verdict::Fail,
-                feedback: String::new(),
-                score: None,
-                criteria: Vec::new(),
-                details: Some(value.clone()),
-            },
-            reasoning: String::new(),
-        }
+///
+/// A response that does not match the merge contract leaves the branches as the
+/// only thing known to exist, so the deterministic best-branch pick applies
+/// instead. That pick carries a judgement a judge actually reached; a
+/// verdict-shaped placeholder built from the unparsed text would invent one and
+/// send it into the debate history as a real review.
+pub fn parse_merge_result(value: &serde_json::Value, branches: &[PgeBranchResult]) -> MergeResult {
+    serde_json::from_value(value.clone()).unwrap_or_else(|e| {
+        tracing::warn!(
+            "Merger output did not match the merge contract ({}); falling back to best branch: {}",
+            e,
+            value
+        );
+        fallback_best_branch(branches)
     })
 }
 
 /// Fallback merge strategy: pick the branch with the highest evaluation score.
+/// Only judged branches carry a score, so only they can be ranked.
 pub fn fallback_best_branch(branches: &[PgeBranchResult]) -> MergeResult {
     let best = branches
         .iter()
-        .max_by_key(|b| b.evaluation.score.unwrap_or(0))
-        .cloned()
-        .unwrap_or_else(|| PgeBranchResult {
-            branch_id: 0,
+        .filter(|b| b.outcome.judgement().is_some())
+        .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0));
+
+    match best {
+        Some(best) => MergeResult {
+            reasoning: format!("Fallback: selected branch {} by best score", best.branch_id),
+            plan: best.plan.clone(),
+            generation: best.generation.clone(),
+            outcome: best.outcome.clone(),
+            selected_branch_id: Some(best.branch_id),
+        },
+        None => MergeResult {
             plan: PlannerOutput {
                 summary: String::new(),
                 plan: serde_json::json!({}),
@@ -160,19 +156,12 @@ pub fn fallback_best_branch(branches: &[PgeBranchResult]) -> MergeResult {
                 content: serde_json::Value::Null,
                 artifacts: Vec::new(),
             },
-            evaluation: EvaluationResult {
-                verdict: crate::squad::pge::types::Verdict::Fail,
-                feedback: String::new(),
-                score: None,
-                criteria: Vec::new(),
-                details: None,
+            outcome: RoundOutcome::Stopped {
+                cause: StopCause::NotAttempted,
+                product: StoppedProduct::None,
             },
-        });
-
-    MergeResult {
-        reasoning: format!("Fallback: selected branch {} by best score", best.branch_id),
-        plan: best.plan,
-        generation: best.generation,
-        evaluation: best.evaluation,
+            selected_branch_id: None,
+            reasoning: "No branch reached a judgement to fall back to".into(),
+        },
     }
 }

@@ -20,7 +20,7 @@
 //! non-retryable and the failure record becomes reflection fuel instead of
 //! being retried silently.
 
-use super::types::EvaluationResult;
+use super::types::{EvaluationResult, RoundOutcome};
 use cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX;
 
 /// 声明本次运行是退化环：带前缀的 feedback 只在构造一次，同时记一次
@@ -56,6 +56,20 @@ impl ProgressSignals {
                 .iter()
                 .map(|c| (c.name.clone(), c.score))
                 .collect(),
+        }
+    }
+
+    /// Reading of a round, judged or not. A round that reached no judgement has
+    /// no score and no criteria to compare, which is the flat reading it is: the
+    /// stall detector counts it as an attempt that bought nothing rather than
+    /// reading an invented zero as a real bad review.
+    pub fn from_outcome(outcome: &RoundOutcome) -> Self {
+        match outcome.judgement() {
+            Some(evaluation) => Self::from_evaluation(evaluation),
+            None => Self {
+                score: None,
+                criteria: Vec::new(),
+            },
         }
     }
 }
