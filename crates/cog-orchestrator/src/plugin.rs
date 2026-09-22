@@ -80,6 +80,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             consumer_group,
             max_retries,
             strict_persistence,
+            task_lease_secs,
         ) = {
             let config = ctx.config();
             (
@@ -97,6 +98,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 config.dag_executor.consumer_group.clone(),
                 config.dag_executor.max_retries,
                 config.system.strict_persistence,
+                config.dag_executor.task_lease_secs,
             )
         };
 
@@ -114,7 +116,8 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 archive_enabled,
                 archive_after_secs,
                 archive_poll_interval_secs,
-            );
+            )
+            .with_task_lease_secs(task_lease_secs);
         if let Err(e) = dag_executor.load_from_backend().await {
             warn!("DagExecutor failed to load state from backend: {}", e);
         }
@@ -362,6 +365,37 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                         }
                                     }
                                     _ = pub_shutdown.wait() => break,
+                                }
+                            }
+                        });
+
+                        // Lease renewer: every worker deployment claims tasks off
+                        // the shared ready queue, so every one of them has to keep
+                        // the leases of its own claims fresh — a deployment that
+                        // claimed a task and stopped renewing it would have that
+                        // task taken away by whoever sweeps next. The renewal is
+                        // scoped to this process's run id, so a deployment holding
+                        // no task renews nothing and the loop is a no-op query.
+                        let renew_shutdown = dag_shutdown.clone();
+                        let renew_orchestrator = self
+                            .shared_orchestrator
+                            .clone()
+                            .expect("shared orchestrator");
+                        let renew_lease_secs = ctx.config().dag_executor.task_lease_secs;
+                        tokio::spawn(async move {
+                            let cadence =
+                                std::time::Duration::from_secs((renew_lease_secs / 3).max(1));
+                            let mut interval = tokio::time::interval(cadence);
+                            interval
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            loop {
+                                tokio::select! {
+                                    _ = interval.tick() => {
+                                        if let Err(e) = renew_orchestrator.renew_leases().await {
+                                            tracing::warn!("task lease renewal failed: {e}");
+                                        }
+                                    }
+                                    _ = renew_shutdown.wait() => break,
                                 }
                             }
                         });

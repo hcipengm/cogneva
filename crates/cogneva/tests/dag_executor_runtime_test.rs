@@ -24,6 +24,8 @@ fn make_test_task(id: &str) -> Task {
         retry_not_before: None,
         started_at: None,
         timeout_seconds: 300,
+        lease_owner: None,
+        lease_expires_at: None,
         action_planner_meta: None,
         goal_id: None,
         parent_task_id: None,

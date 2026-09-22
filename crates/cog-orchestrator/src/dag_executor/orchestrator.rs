@@ -34,6 +34,11 @@ struct Inner {
 
 pub struct DagExecutor {
     workspace_id: String,
+    /// 本进程的运行身份，任务租约的持有者。每次构造新产生一个值，所以它随进程
+    /// 消亡而失效——这正是「上一任持有者已经不在了」可以被读出来的依据。
+    run_id: String,
+    /// 任务租约时长；持有者按它的三分之一续期。
+    task_lease: chrono::Duration,
     inner: RwLock<Inner>,
     retry_matrix: RetryMatrix,
     dlq: Option<Box<dyn DeadLetterQueue>>,
@@ -49,10 +54,81 @@ pub struct DagExecutor {
     archive_poll_interval_secs: u64,
 }
 
+/// 为什么一个 Running 任务需要被回收。
+///
+/// 两个原因对下游是相反的判定：一个说「换个进程重来」，另一个说「重来也白来」。
+/// 它们所以是两种类型而不是同一句话里的两种措辞，是因为读到它们的是重试判定，
+/// 而那个判定只认类型与带内标记，不认散文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReclaimCause {
+    /// 持有者的心跳停了：原进程被换掉了，这一轮没有产出。接手它是对的——环境
+    /// 确实换了人，同一份输入在下一个进程里未必重蹈覆辙。所以这个原因**不**
+    /// 声明自己是终止性的。
+    LeaseExpired {
+        owner: Option<String>,
+        expired_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// 持有者还在，但这一轮把预算跑满了还没产出：花费涨了、进展为零。同一份
+    /// 输入重跑买不到不同的结果，所以这个原因声明自己是终止性的，省下的是
+    /// 下一整轮预算。
+    OverBudget { timeout_seconds: u64 },
+}
+
+impl ReclaimCause {
+    /// 失败原因文本。带内标记由 `cog_core::contract::outcome` 定义，判定读的是
+    /// 那个常量而不是这里的字面量——两边各写一份，改一处就会静默失配。
+    fn error(&self) -> String {
+        match self {
+            Self::LeaseExpired { owner, .. } => format!(
+                "run lease expired: the process that held this task ({}) stopped renewing it, so the run never produced a result",
+                owner.as_deref().unwrap_or("unknown")
+            ),
+            Self::OverBudget { timeout_seconds } => format!(
+                "{}: task ran its whole {}s budget without producing a result",
+                cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX,
+                timeout_seconds
+            ),
+        }
+    }
+}
+
+/// 回收判据。只有 Running 的任务需要被回收，且必须有一条证据：持有者的租约过期
+/// （原进程不在了），或这一轮用光了预算。两条证据都没有就不动它——「没看到续期」
+/// 与「看到过期」是两回事，前者在租约还新的时候就是常态。
+fn reclaim_cause(
+    task: &Task,
+    lease: chrono::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ReclaimCause> {
+    if task.status != TaskStatus::Running {
+        return None;
+    }
+    if let Some(expired_at) = task.lease_expiry(lease) {
+        if expired_at < now {
+            return Some(ReclaimCause::LeaseExpired {
+                owner: task.lease_owner.clone(),
+                expired_at,
+            });
+        }
+    }
+    let over_budget = task
+        .started_at
+        .map(|s| (now - s).num_seconds() > task.timeout_seconds as i64)
+        .unwrap_or(false);
+    if over_budget {
+        return Some(ReclaimCause::OverBudget {
+            timeout_seconds: task.timeout_seconds,
+        });
+    }
+    None
+}
+
 impl DagExecutor {
     pub fn new(workspace_id: String) -> Self {
         Self {
             workspace_id,
+            run_id: Uuid::new_v4().to_string(),
+            task_lease: chrono::Duration::seconds(cog_core::config::DEFAULT_TASK_LEASE_SECS as i64),
             inner: RwLock::new(Inner {
                 tasks: HashMap::new(),
                 dependencies: HashMap::new(),
@@ -79,6 +155,26 @@ impl DagExecutor {
 
     pub fn workspace_id(&self) -> &str {
         &self.workspace_id
+    }
+
+    /// 本进程的运行身份。它是租约的持有者标记，也是心跳续期的作用域：续期只
+    /// 碰自己起的任务，所以一个不执行任何任务的进程跑这条循环是无操作。
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// 任务租约时长（秒）。
+    pub fn task_lease_secs(&self) -> u64 {
+        self.task_lease.num_seconds().max(1) as u64
+    }
+
+    /// 租约时长取配置面；0 视为未配置，退回默认值，免得一个笔误让所有任务
+    /// 一到手就被判为过期。
+    pub fn with_task_lease_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.task_lease = chrono::Duration::seconds(secs as i64);
+        }
+        self
     }
 
     pub fn with_state_backend(mut self, backend: Arc<dyn cog_core::StateBackend>) -> Self {
@@ -837,37 +933,23 @@ impl DagExecutor {
             .dag_get_all_tasks(&self.workspace_id)
             .await
             .unwrap_or_default();
-        let timed_out: Vec<Task> = all
+        let reclaimable: Vec<(Task, ReclaimCause)> = all
             .into_iter()
-            .filter(|t| t.status == TaskStatus::Running)
-            .filter(|t| {
-                t.started_at
-                    .map(|s| (now - s).num_seconds() > t.timeout_seconds as i64)
-                    .unwrap_or(false)
-            })
+            .filter_map(|t| reclaim_cause(&t, self.task_lease, now).map(|c| (t, c)))
             .collect();
 
         let mut results = Vec::new();
-        for t in timed_out {
+        for (t, cause) in reclaimable {
             // 再确认仍 Running：扫描到此间可能已被执行器完成
             match be.dag_get_task(&self.workspace_id, &t.id).await {
                 Ok(Some(cur)) if cur.status == TaskStatus::Running => {}
                 _ => continue,
             }
-            self.emit_event(cog_core::TaskEvent::TaskTimeout {
-                task_id: t.id.clone(),
-                timeout_seconds: t.timeout_seconds,
-                timestamp: chrono::Utc::now(),
-            });
-            // 超时是编排层观测到的事实，不是传输层给的信号：没有状态码可依，
+            self.emit_reclaim(&t, &cause);
+            // 回收是编排层观测到的事实，不是传输层给的信号：没有状态码可依，
             // 类型留空，让下游知道这次失败只有文本。
-            if let Ok((retried, cancelled, dlq_pushed)) = self
-                .fail_task(
-                    &t.id,
-                    format!("Task timed out after {} seconds", t.timeout_seconds),
-                    None,
-                )
-                .await
+            if let Ok((retried, cancelled, dlq_pushed)) =
+                self.fail_task(&t.id, cause.error(), None).await
             {
                 if retried {
                     let _ = self
@@ -875,7 +957,7 @@ impl DagExecutor {
                             &t.id,
                             &[TaskStatus::Pending],
                             "Cannot transition task in {} state",
-                            |task| task.started_at = None,
+                            |task| task.clear_run(),
                             None,
                         )
                         .await;
@@ -1186,15 +1268,13 @@ impl DagExecutor {
 
     pub async fn start_task(&self, task_id: &str) -> SFResult<()> {
         if self.fg().is_some() {
+            let (owner, lease) = (self.run_id.clone(), self.task_lease);
             return self
                 .store_transition(
                     task_id,
                     &[TaskStatus::Scheduled],
                     "Cannot start task in {} state",
-                    |t| {
-                        t.status = TaskStatus::Running;
-                        t.started_at = Some(chrono::Utc::now());
-                    },
+                    |t| t.begin_run(&owner, lease, chrono::Utc::now()),
                     Some(cog_core::TaskEvent::TaskStarted {
                         task_id: task_id.into(),
                         timestamp: chrono::Utc::now(),
@@ -1219,8 +1299,7 @@ impl DagExecutor {
             });
         }
 
-        task.status = TaskStatus::Running;
-        task.started_at = Some(chrono::Utc::now());
+        task.begin_run(&self.run_id, self.task_lease, chrono::Utc::now());
         let task_snapshot = task.clone();
         drop(inner);
         self.emit_event(cog_core::TaskEvent::TaskStarted {
@@ -1670,7 +1749,7 @@ impl DagExecutor {
                         t.retry_count = 0;
                         t.error = None;
                         t.error_cause = None;
-                        t.started_at = None;
+                        t.clear_run();
                     },
                     Some(cog_core::TaskEvent::TaskRetried {
                         task_id: task_id.into(),
@@ -1708,7 +1787,7 @@ impl DagExecutor {
         task.retry_count = 0;
         task.error = None;
         task.error_cause = None;
-        task.started_at = None;
+        task.clear_run();
         task.updated_at = chrono::Utc::now();
         let task_snapshot = task.clone();
 
@@ -1733,31 +1812,18 @@ impl DagExecutor {
             return self.check_timeouts_store().await;
         }
         let now = chrono::Utc::now();
-        let task_ids: Vec<String> = {
+        let reclaimable: Vec<(Task, ReclaimCause)> = {
             let inner = self.inner.read().await;
             inner
                 .tasks
                 .values()
-                .filter(|t| t.status == TaskStatus::Running)
-                .filter(|t| {
-                    t.started_at
-                        .map(|s| (now - s).num_seconds() > t.timeout_seconds as i64)
-                        .unwrap_or(false)
-                })
-                .map(|t| t.id.clone())
+                .filter_map(|t| reclaim_cause(t, self.task_lease, now).map(|c| (t.clone(), c)))
                 .collect()
         };
 
         let mut results = Vec::new();
-        for task_id in task_ids {
-            let timeout_seconds = {
-                let inner = self.inner.read().await;
-                inner
-                    .tasks
-                    .get(&task_id)
-                    .map(|t| t.timeout_seconds)
-                    .unwrap_or(0)
-            };
+        for (task, cause) in reclaimable {
+            let task_id = task.id.clone();
 
             // Re-verify under read lock before failing: the task may have been
             // completed by the executor between the scan above and now.
@@ -1770,28 +1836,19 @@ impl DagExecutor {
                     .unwrap_or(false)
             };
             if !still_running {
-                tracing::info!(task_id = %task_id, "Task no longer Running, skipping timeout");
+                tracing::info!(task_id = %task_id, "Task no longer Running, skipping reclaim");
                 continue;
             }
 
-            self.emit_event(cog_core::TaskEvent::TaskTimeout {
-                task_id: task_id.clone(),
-                timeout_seconds,
-                timestamp: chrono::Utc::now(),
-            });
+            self.emit_reclaim(&task, &cause);
 
-            if let Ok((retried, cancelled, dlq_pushed)) = self
-                .fail_task(
-                    &task_id,
-                    format!("Task timed out after {} seconds", timeout_seconds),
-                    None,
-                )
-                .await
+            if let Ok((retried, cancelled, dlq_pushed)) =
+                self.fail_task(&task_id, cause.error(), None).await
             {
                 if retried {
                     let mut inner = self.inner.write().await;
                     if let Some(t) = inner.tasks.get_mut(&task_id) {
-                        t.started_at = None;
+                        t.clear_run();
                     }
                 }
                 results.push((task_id, retried, cancelled, dlq_pushed));
@@ -1799,6 +1856,69 @@ impl DagExecutor {
         }
 
         results
+    }
+
+    /// 心跳：把本进程持有的活跃任务租约整体推后一次。只碰自己起的任务，所以
+    /// 一个不执行任何任务的进程跑它等于空转查询。
+    pub async fn renew_leases(&self) -> SFResult<usize> {
+        let now = chrono::Utc::now();
+        let lease = self.task_lease;
+        let owner = self.run_id.clone();
+
+        if let Some(be) = self.fg() {
+            let all = be.dag_get_all_tasks(&self.workspace_id).await?;
+            let mut renewed = 0usize;
+            for mut task in all {
+                if !task.renew_lease(&owner, lease, now) {
+                    continue;
+                }
+                task.updated_at = now;
+                // CAS 在 Running 上：本进程读与写之间任务可能已经结束，那时这次
+                // 续期就该落空而不是把它写回 Running。
+                if be
+                    .dag_transition_task(
+                        &self.workspace_id,
+                        &task.id,
+                        &[TaskStatus::Running],
+                        &task,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    renewed += 1;
+                }
+            }
+            return Ok(renewed);
+        }
+
+        let mut inner = self.inner.write().await;
+        let mut renewed = 0usize;
+        for task in inner.tasks.values_mut() {
+            if task.renew_lease(&owner, lease, now) {
+                task.updated_at = now;
+                renewed += 1;
+            }
+        }
+        Ok(renewed)
+    }
+
+    fn emit_reclaim(&self, task: &Task, cause: &ReclaimCause) {
+        let event = match cause {
+            ReclaimCause::LeaseExpired { owner, expired_at } => {
+                cog_core::TaskEvent::TaskLeaseExpired {
+                    task_id: task.id.clone(),
+                    owner: owner.clone(),
+                    expired_at: *expired_at,
+                    timestamp: chrono::Utc::now(),
+                }
+            }
+            ReclaimCause::OverBudget { timeout_seconds } => cog_core::TaskEvent::TaskTimeout {
+                task_id: task.id.clone(),
+                timeout_seconds: *timeout_seconds,
+                timestamp: chrono::Utc::now(),
+            },
+        };
+        self.emit_event(event);
     }
 
     pub async fn get_task(&self, task_id: &str) -> Option<Task> {
@@ -2815,6 +2935,305 @@ mod tests {
         assert!(
             due > chrono::Utc::now() + chrono::Duration::seconds(240),
             "落库路径把明说的时长丢了: {due}"
+        );
+    }
+
+    /// 走唯一入口拿到执行权的任务必然带租约。没有租约的 Running 行没有"到期
+    /// 时刻"这条证据，也就没有任何东西会去回收它——它到不了任何终态。
+    #[tokio::test]
+    async fn starting_a_task_grants_it_a_lease() {
+        let dag = DagExecutor::new("ws-lease-start".into()).with_task_lease_secs(60);
+        let task = Task::new("t-start", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+
+        let view = dag.get_task(&task_id).await.unwrap();
+        assert_eq!(view.status, TaskStatus::Running);
+        assert_eq!(view.lease_owner.as_deref(), Some(dag.run_id()));
+        let expires = view.lease_expires_at.expect("a lease expiry");
+        assert!(
+            expires > chrono::Utc::now(),
+            "到期时刻必须在将来: {expires}"
+        );
+        assert!(
+            expires <= chrono::Utc::now() + chrono::Duration::seconds(61),
+            "到期时刻不能超过租约时长: {expires}"
+        );
+    }
+
+    /// 心跳只续自己持有的、还在跑的任务。续别人的会让一个旁观者把另一个进程的
+    /// 死线不断推后，那个进程死了也永远判不到过期，回收就再也不会发生。
+    #[tokio::test]
+    async fn renewal_touches_only_own_live_claims() {
+        let dag = DagExecutor::new("ws-renew".into()).with_task_lease_secs(60);
+
+        let mine = Task::new("t-mine", TaskType::DagNode, serde_json::json!({}));
+        dag.add_task(mine).await.unwrap();
+        dag.schedule_task("t-mine").await.unwrap();
+        dag.start_task("t-mine").await.unwrap();
+
+        let mut theirs = Task::new("t-theirs", TaskType::DagNode, serde_json::json!({}));
+        theirs.begin_run(
+            "some-other-process",
+            chrono::Duration::seconds(60),
+            chrono::Utc::now(),
+        );
+        dag.add_task(theirs).await.unwrap();
+
+        let pending = Task::new("t-pending", TaskType::DagNode, serde_json::json!({}));
+        dag.add_task(pending).await.unwrap();
+
+        let mine_before = dag
+            .get_task("t-mine")
+            .await
+            .unwrap()
+            .lease_expires_at
+            .unwrap();
+        let theirs_before = dag
+            .get_task("t-theirs")
+            .await
+            .unwrap()
+            .lease_expires_at
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert_eq!(
+            dag.renew_leases().await.unwrap(),
+            1,
+            "只有自己持有的 running 任务该被续期"
+        );
+        assert!(
+            dag.get_task("t-mine")
+                .await
+                .unwrap()
+                .lease_expires_at
+                .unwrap()
+                > mine_before,
+            "自己的租约要被推后"
+        );
+        assert_eq!(
+            dag.get_task("t-theirs")
+                .await
+                .unwrap()
+                .lease_expires_at
+                .unwrap(),
+            theirs_before,
+            "别人持有的租约一个字节都不能碰"
+        );
+        assert!(dag
+            .get_task("t-pending")
+            .await
+            .unwrap()
+            .lease_expires_at
+            .is_none());
+    }
+
+    /// 换版把原进程连根拔掉时，它手里的任务停在 Running，而 Running 到不了任何
+    /// 终态——没有回收就永久卡住。租约到期是"原进程不在了"的证据，接手它是对的，
+    /// 所以这个原因不能被读成终止性失败，否则一次部署就会把这条链永久封死。
+    #[tokio::test]
+    async fn a_lease_expired_task_is_reclaimed_and_stays_retryable() {
+        let dag = DagExecutor::new("ws-expired".into()).with_task_lease_secs(60);
+        let task = Task::new("t-expired", TaskType::DagNode, serde_json::json!({}));
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task("t-expired").await.unwrap();
+        dag.start_task("t-expired").await.unwrap();
+
+        // 心跳停了：租约到期时刻被推回过去，而这一轮离预算耗尽还远。
+        {
+            let mut inner = dag.inner.write().await;
+            let t = inner.tasks.get_mut("t-expired").unwrap();
+            t.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+            t.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+            t.timeout_seconds = 3600;
+        }
+
+        let results = dag.check_timeouts().await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1, "租约过期必须回到重试预算里，不是被判死");
+
+        let view = dag.get_task("t-expired").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Pending);
+        let reason = view.error.expect("a failure reason");
+        assert!(reason.contains("run lease expired"), "{reason}");
+        assert!(
+            !cog_core::contract::outcome::is_deterministic_failure(&reason),
+            "部署换人不是确定性失败；标成确定性会让 discovery 把这条意图永久 Blocked 掉"
+        );
+        assert!(view.lease_owner.is_none(), "回收后租约要清干净");
+        assert!(
+            view.retry_not_before
+                .is_some_and(|due| due > chrono::Utc::now()),
+            "回 Pending 的任务带着退避死线"
+        );
+    }
+
+    /// 持有者还活着却把整段预算跑满，是"花了钱没产出"。同一份输入重跑买不到不同
+    /// 的结果，所以这个原因声明自己是终止性的——否则每一轮都要重新买一遍完整预算。
+    #[tokio::test]
+    async fn an_over_budget_task_is_reclaimed_as_a_deterministic_failure() {
+        let dag = DagExecutor::new("ws-budget".into()).with_task_lease_secs(60);
+        let task = Task::new("t-budget", TaskType::DagNode, serde_json::json!({}));
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task("t-budget").await.unwrap();
+        dag.start_task("t-budget").await.unwrap();
+
+        {
+            let mut inner = dag.inner.write().await;
+            let t = inner.tasks.get_mut("t-budget").unwrap();
+            // 租约刚续过（持有者还活着），但 started_at 已经超出预算。
+            t.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
+            t.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3601));
+            t.timeout_seconds = 3600;
+        }
+
+        let results = dag.check_timeouts().await;
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].1, "预算耗尽不能重投，那等于重买一轮");
+
+        let view = dag.get_task("t-budget").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Failed);
+        assert_eq!(view.retry_count, 0, "确定性失败不花预算");
+        let reason = view.error.expect("a failure reason");
+        assert!(
+            cog_core::contract::outcome::declares(
+                &reason,
+                cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX
+            ),
+            "{reason}"
+        );
+        assert!(cog_core::contract::outcome::is_deterministic_failure(
+            &reason
+        ));
+    }
+
+    /// 部署前起的任务行里没有租约字段。没有租约就没有"到期时刻"，但 started_at
+    /// 加上租约仍然是它该被回收的时刻——否则这些存量行要么永远 Running，要么
+    /// 得白等满整个 timeout。
+    #[tokio::test]
+    async fn a_legacy_claim_without_a_lease_expires_from_its_start_time() {
+        let dag = DagExecutor::new("ws-legacy".into()).with_task_lease_secs(60);
+        let mut task = Task::new("t-legacy", TaskType::DagNode, serde_json::json!({}));
+        task.status = TaskStatus::Running;
+        task.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        task.timeout_seconds = 3600;
+        dag.add_task(task).await.unwrap();
+
+        assert_eq!(
+            dag.check_timeouts().await.len(),
+            1,
+            "存量 Running 行必须按 started_at 判过期"
+        );
+        assert!(dag
+            .get_task("t-legacy")
+            .await
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("run lease expired"));
+    }
+
+    /// 没在跑的任务不是回收对象：等退避或被依赖挡住是 Pending 的常态，把它们
+    /// 当僵尸清扫会直接吃掉整条 DAG。
+    #[tokio::test]
+    async fn a_pending_task_is_never_reclaimed() {
+        let dag = DagExecutor::new("ws-pending".into()).with_task_lease_secs(60);
+        let mut task = Task::new("t-pending", TaskType::DagNode, serde_json::json!({}));
+        task.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3600));
+        task.timeout_seconds = 1;
+        dag.add_task(task).await.unwrap();
+
+        assert!(dag.check_timeouts().await.is_empty());
+        assert_eq!(
+            dag.get_task("t-pending").await.unwrap().status,
+            TaskStatus::Pending
+        );
+    }
+
+    /// 落库模式下回收同样成立：这是两个部署实际走的路径，租约的权威在存储行上，
+    /// 不在任何一个进程的内存里。
+    #[tokio::test]
+    async fn a_lease_expired_store_claim_is_reclaimed() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-lease-fg".into())
+            .with_state_backend(backend.clone())
+            .with_task_lease_secs(60);
+        let task = Task::new("t-fg", TaskType::DagNode, serde_json::json!({}));
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task("t-fg").await.unwrap();
+        dag.start_task("t-fg").await.unwrap();
+
+        // 直接改存储行：持有者心跳停了，而这一轮离预算耗尽还远。
+        let mut row = backend
+            .dag_get_task("ws-lease-fg", "t-fg")
+            .await
+            .unwrap()
+            .expect("the row was persisted");
+        row.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        row.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+        row.timeout_seconds = 3600;
+        backend
+            .dag_set_task("ws-lease-fg", "t-fg", &row)
+            .await
+            .unwrap();
+
+        assert_eq!(dag.check_timeouts().await.len(), 1);
+        let view = dag.get_task("t-fg").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Pending);
+        assert!(!cog_core::contract::outcome::is_deterministic_failure(
+            view.error.as_deref().unwrap()
+        ));
+    }
+
+    /// 心跳续期在存储行上做 CAS 校验身份：另一个进程即使扫到我的任务也不能替它
+    /// 续期，否则我的进程死了，它手里的租约被旁观者一直续着，永远不会被回收。
+    #[tokio::test]
+    async fn a_peer_process_cannot_renew_my_store_claim() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let pod_a = DagExecutor::new("ws-lease-renew-fg".into())
+            .with_state_backend(backend.clone())
+            .with_task_lease_secs(60);
+        let pod_b = DagExecutor::new("ws-lease-renew-fg".into()).with_state_backend(backend);
+
+        let task = Task::new("t-fg-renew", TaskType::DagNode, serde_json::json!({}));
+        pod_a.add_task(task).await.unwrap();
+        pod_a.schedule_task("t-fg-renew").await.unwrap();
+        pod_a.start_task("t-fg-renew").await.unwrap();
+
+        let before = pod_a
+            .get_task("t-fg-renew")
+            .await
+            .unwrap()
+            .lease_expires_at
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert_eq!(
+            pod_b.renew_leases().await.unwrap(),
+            0,
+            "旁观者续不了别人的租约"
+        );
+        assert_eq!(
+            pod_b
+                .get_task("t-fg-renew")
+                .await
+                .unwrap()
+                .lease_expires_at
+                .unwrap(),
+            before
+        );
+
+        assert_eq!(pod_a.renew_leases().await.unwrap(), 1);
+        assert!(
+            pod_a
+                .get_task("t-fg-renew")
+                .await
+                .unwrap()
+                .lease_expires_at
+                .unwrap()
+                > before
         );
     }
 }

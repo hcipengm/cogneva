@@ -389,6 +389,9 @@ pub fn task_event_as_status_change(event: &cog_core::TaskEvent) -> cog_core::Age
         TE::TaskTimeout {
             task_id, timestamp, ..
         } => (task_id, "timeout", timestamp),
+        TE::TaskLeaseExpired {
+            task_id, timestamp, ..
+        } => (task_id, "lease_expired", timestamp),
     };
     cog_core::AgentEvent::TaskStatusChange {
         task_id: task_id.clone(),

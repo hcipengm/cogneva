@@ -106,6 +106,22 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     pub timeout_seconds: u64,
+    /// 持有本任务执行权的进程身份，随进程消亡而失效。
+    ///
+    /// 它不是实例身份：同一台机器上换一个进程，持有者就换了一个值，而这正是
+    /// 「原来那个进程已经不在了」能被读出来的唯一依据。放在任务行里而不是进程
+    /// 内存里，是因为要发现孤儿的是**后来那个进程**——它的内存里从来没有过这条
+    /// 记录，只有落盘的持有者能让它知道该不该接手。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_owner: Option<String>,
+    /// 租约到期时刻，由持有者心跳续期。没有续期证据即视为过期：判断发生在持有者
+    /// 之外的进程里，它看不到持有者是否还在跑，只能看到这个时刻有没有被推后。
+    ///
+    /// 读到 `None` 而状态是 Running，说明这一行由不认识租约的旧版本写入；回收
+    /// 判据按「开始时刻 + 租约时长」兜底，所以它仍会在一个租约时长内被接走，
+    /// 不会退回「等满一个超时窗」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<DateTime<Utc>>,
     /// ActionPlanner 验证标记。存在且 verified=true 时可直接进入 DagExecutor。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_planner_meta: Option<ActionPlannerMeta>,
@@ -244,11 +260,56 @@ impl Task {
             retry_not_before: None,
             started_at: None,
             timeout_seconds: 300,
+            lease_owner: None,
+            lease_expires_at: None,
             action_planner_meta: None,
             goal_id: None,
             parent_task_id: None,
             is_executable: true,
         }
+    }
+
+    /// 进入 Running 的唯一入口：开始时刻与租约一起落定。
+    ///
+    /// 两者必须同时写，因为回收判据读的是租约而状态机给的是 Running，任何一处
+    /// 只设状态不设租约的写法都会造出一行「看起来有人持有、其实谁也接不走」的
+    /// 任务。收在一个方法里，这个不变式就有了唯一的写点。
+    pub fn begin_run(&mut self, owner: &str, lease: chrono::Duration, now: DateTime<Utc>) {
+        self.status = TaskStatus::Running;
+        self.started_at = Some(now);
+        self.lease_owner = Some(owner.to_string());
+        self.lease_expires_at = Some(now + lease);
+    }
+
+    /// 结束一次运行，与 [`Self::begin_run`] 对称：开始时刻与租约一起清掉，回到
+    /// 「没有人在跑它」。回到 Pending 的行若留着一位持有者，读起来就是一件还有
+    /// 人在做的任务，而它其实正等着被重新派发。
+    pub fn clear_run(&mut self) {
+        self.started_at = None;
+        self.lease_owner = None;
+        self.lease_expires_at = None;
+    }
+
+    /// 持有者心跳：把到期时刻推后。只有仍在 Running 的任务需要续期——其它状态
+    /// 已经不由任何人持有，续它等于伪造一个持有者。返回是否真的续上了。
+    pub fn renew_lease(
+        &mut self,
+        owner: &str,
+        lease: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.status != TaskStatus::Running || self.lease_owner.as_deref() != Some(owner) {
+            return false;
+        }
+        self.lease_expires_at = Some(now + lease);
+        true
+    }
+
+    /// 回收判据读的到期时刻：显式租约优先，没有租约时按「开始时刻 + 租约时长」
+    /// 兜底。`None` 表示既没有租约也没有开始时刻——两种证据都没有，不构成过期。
+    pub fn lease_expiry(&self, lease: chrono::Duration) -> Option<DateTime<Utc>> {
+        self.lease_expires_at
+            .or_else(|| self.started_at.map(|s| s + lease))
     }
 
     /// Whether this task opts into the self-evolution change-generation flow.

@@ -69,6 +69,7 @@ data:
         "COGNEVA_RESULT_CLAIM_INTERVAL_SECS": "dag_executor.result_claim_interval_secs",
         "COGNEVA_RESULT_CLAIM_BATCH": "dag_executor.result_claim_batch",
         "COGNEVA_DAG_SELF_EVOLUTION_TIMEOUT_SECS": "dag_executor.self_evolution_timeout_secs",
+        "COGNEVA_DAG_TASK_LEASE_SECS": "dag_executor.task_lease_secs",
         "COGNEVA_HTTP_PORT": "gateway.http_port",
         "COGNEVA_WS_PORT": "gateway.ws_port",
         "COGNEVA_METRICS_PORT": "gateway.metrics_port",
@@ -264,7 +265,9 @@ data:
         "result_claim_idle_secs": 600,
         "result_claim_interval_secs": 60,
         "result_claim_batch": 16,
-        "self_evolution_timeout_secs": 3600
+        "_comment_task_lease_secs": "任务租约时长（秒）：执行者拿到任务时写下「我持有它到此刻」，之后按这一时长的三分之一心跳续期。持有者的进程被换掉后心跳就停，租约到期即判为可回收，任务回到重试而不是卡在 Running 到不了任何终态。取值要大于 system.timeout_checker_interval_secs，否则一次扫描还没到就已被判过期；也不宜太短，比单次任务正常时长还短会误伤正在跑的活。",
+        "self_evolution_timeout_secs": 3600,
+        "task_lease_secs": 120
       },
       "gateway": {
         "http_port": 8080,

@@ -494,6 +494,22 @@ pub enum TaskEvent {
         timeout_seconds: u64,
         timestamp: DateTime<Utc>,
     },
+    /// A running task stopped being renewed by whoever held it. Distinct from
+    /// [`Self::TaskTimeout`] because the two say opposite things to a reader:
+    /// a timeout is a run that spent its whole budget, while this is a run
+    /// nobody is holding any more, reclaimed long before its budget elapsed.
+    /// Folding the two into `TaskTimeout` would make a restart read as a run
+    /// that used everything it was given.
+    TaskLeaseExpired {
+        task_id: String,
+        /// The process whose renewal stopped. Absent only for a row written
+        /// before leases existed, which is the one way a running task can have
+        /// no holder.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        expired_at: DateTime<Utc>,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 /// Legacy StreamEvent — retained for backward compatibility during migration.

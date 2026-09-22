@@ -259,6 +259,29 @@ pub struct DagExecutorConfig {
     /// code that creates the task.
     #[serde(default = "default_self_evolution_timeout_secs")]
     pub self_evolution_timeout_secs: u64,
+    /// How long a running task's lease stays valid without a heartbeat
+    /// (seconds). A process holds the lease of every task it started and
+    /// pushes the expiry forward while it works; when it is replaced, the
+    /// expiry stops moving and whoever observes the lapse takes the task over.
+    /// This is what bounds how long work orphaned by a restart stays
+    /// invisible — the timeout above is the budget a *live* run gets, not a
+    /// restart detector. Keep it above the timeout-checker cadence
+    /// (`system.timeout_checker_interval_secs`) so a reclaim lands on the next
+    /// sweep rather than on a stale read, and low enough that a task killed by
+    /// a rolling replacement is picked up long before the next one.
+    #[serde(default = "default_task_lease_secs")]
+    pub task_lease_secs: u64,
+}
+
+/// Two minutes: the renewal cadence is a third of this, so a process may miss
+/// two renewals — a paused container, a loaded node — before another process
+/// judges it gone. Shorter values make a live process lose its own tasks to a
+/// slow tick; much longer ones put the orphan window back within reach of the
+/// replacement cadence this exists to stay ahead of.
+pub const DEFAULT_TASK_LEASE_SECS: u64 = 120;
+
+fn default_task_lease_secs() -> u64 {
+    DEFAULT_TASK_LEASE_SECS
 }
 
 impl Default for DagExecutorConfig {
@@ -288,6 +311,7 @@ impl Default for DagExecutorConfig {
             result_claim_interval_secs: default_result_claim_interval_secs(),
             result_claim_batch: default_result_claim_batch(),
             self_evolution_timeout_secs: default_self_evolution_timeout_secs(),
+            task_lease_secs: default_task_lease_secs(),
         }
     }
 }

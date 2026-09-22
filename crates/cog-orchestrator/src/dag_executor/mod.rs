@@ -1010,6 +1010,8 @@ mod consumer_ack_tests {
             retry_not_before: None,
             started_at: None,
             timeout_seconds: 30,
+            lease_owner: None,
+            lease_expires_at: None,
             action_planner_meta: None,
             goal_id: Some("goal-reclaimed".into()),
             parent_task_id: None,
