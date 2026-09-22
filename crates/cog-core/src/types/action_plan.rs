@@ -28,6 +28,15 @@ pub struct SkillConfig {
     pub name: String,
     #[serde(default)]
     pub system_prompt: String,
+    /// The registry tools this role may call, by the name the registry knows
+    /// them by. A role's skill is where its boundary is declared, next to the
+    /// iteration budget it already carries, so the two halves of "how much may
+    /// this role do" are read from one place.
+    ///
+    /// An empty list means the boundary is not declared, and a run under this
+    /// skill gets the whole registry. An entry that matches no registered tool
+    /// is dropped, so a typo here narrows a role silently — which is why the
+    /// shipped lists are gated against the registry rather than trusted.
     pub tools: Vec<String>,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,

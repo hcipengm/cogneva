@@ -296,6 +296,41 @@ impl ToolRegistry {
     pub fn is_empty(&self) -> bool {
         self.tools.read().unwrap().is_empty()
     }
+
+    /// A registry holding only the named tools, over the same execution
+    /// machinery — sandbox backend, guardrail, plugin registry, timeouts — so
+    /// a narrowed registry runs a tool exactly as the full one would.
+    ///
+    /// This is how a role's tool boundary is enforced, and it is enforced in
+    /// both directions: the model is offered only these definitions, and a call
+    /// it invents for anything else has nothing behind it to reach. A boundary
+    /// that only hid the definitions would be a suggestion.
+    ///
+    /// A name with no tool behind it is dropped rather than refused. The list
+    /// states what the role is allowed to do; a name that matches nothing is a
+    /// stale entry in that statement, and failing to build the registry over it
+    /// would turn a tidying omission into an outage. What keeps the statement
+    /// honest is a gate over the shipped lists, not a runtime panic.
+    pub fn restricted_to(&self, allowed: &[String]) -> Self {
+        let mut kept = HashMap::new();
+        {
+            let source = self.tools.read().unwrap();
+            for name in allowed {
+                if let Some(tool) = source.get(name) {
+                    kept.insert(name.clone(), tool.clone());
+                }
+            }
+        }
+        Self {
+            tools: Arc::new(std::sync::RwLock::new(kept)),
+            sandbox_backend: self.sandbox_backend.clone(),
+            guardrail: self.guardrail.clone(),
+            plugin_registry: self.plugin_registry.clone(),
+            wasm_timeout: self.wasm_timeout,
+            shell_timeout: self.shell_timeout,
+            require_identity: self.require_identity,
+        }
+    }
 }
 
 #[async_trait::async_trait]

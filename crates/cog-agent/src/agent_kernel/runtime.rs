@@ -339,8 +339,23 @@ impl AgentRuntime {
         self
     }
 
+    /// Give this run its tools, narrowed to the role's declared set.
+    ///
+    /// The registry handed in is the whole fleet's; which of it this role may
+    /// reach is a property of the role, and the role's skill is where it is
+    /// declared — the same file that already carries the role's iteration
+    /// budget. Restricting here rather than at the registry means the shared
+    /// registry keeps every tool and each run gets a view of it, so one role's
+    /// boundary cannot become another's.
+    ///
+    /// A role with no skill, or a skill that declares no tools, gets the whole
+    /// registry: an absent list is no evidence about what the role needs, and
+    /// inventing a boundary from it would restrict a role nobody has described.
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
-        self.tools = tools;
+        self.tools = match self.config.skill_config.as_ref() {
+            Some(skill) if !skill.tools.is_empty() => tools.restricted_to(&skill.tools),
+            _ => tools,
+        };
         self
     }
 
@@ -1510,6 +1525,99 @@ mod tests {
             agent_loop.config.max_iterations > 8,
             "the ceiling must admit the longest run this role has delivered"
         );
+    }
+
+    fn registry_of(names: &[&str]) -> ToolRegistry {
+        let registry = ToolRegistry::new();
+        for name in names {
+            cog_core::ToolRegistry::register(
+                &registry,
+                cog_core::Tool {
+                    name: (*name).into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                    implementation: cog_core::ToolImplementation::Shell(cog_core::ShellOp::Command),
+                },
+            );
+        }
+        registry
+    }
+
+    fn runtime_with(skill: Option<SkillConfig>, role: &str) -> AgentRuntime {
+        let config = RuntimeConfig {
+            role: role.into(),
+            skill_config: skill,
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        AgentRuntime::new(config, tx)
+    }
+
+    fn skill_naming(role: &str, tools: &[&str]) -> SkillConfig {
+        SkillConfig {
+            skill_id: format!("{role}-boundary-test"),
+            name: role.into(),
+            system_prompt: String::new(),
+            tools: tools.iter().map(|t| (*t).into()).collect(),
+            max_iterations: 5,
+            role_type: role.into(),
+        }
+    }
+
+    /// 角色说自己能用什么，跑起来就只能用什么：边界落在运行时持有的那份工具上，
+    /// 而不是只落在给模型看的定义列表上——后者是一句建议。
+    #[test]
+    fn a_run_holds_the_tools_its_skill_declares() {
+        let whole = registry_of(&["read_file", "write_file", "run_command"]);
+        let runtime = runtime_with(
+            Some(skill_naming("boundary-narrow-test", &["read_file"])),
+            "boundary-narrow-test",
+        )
+        .with_tools(whole.clone());
+
+        let mut held = runtime.tools.names();
+        held.sort();
+        assert_eq!(held, vec!["read_file".to_string()]);
+
+        // 收窄的是这一轮手上的那份，共享的那份不动：否则一个角色的边界会变成别人的。
+        assert_eq!(
+            whole.names().len(),
+            3,
+            "narrowing one run must not shrink the registry it was handed"
+        );
+    }
+
+    /// 没声明边界就没有边界。空名单不是"什么都不许"，它是一个没人描述过这个角色
+    /// 需要什么的证据；凭它把角色清空，是把缺失当成了限制。
+    #[test]
+    fn an_undeclared_boundary_leaves_the_run_the_whole_registry() {
+        let whole = registry_of(&["read_file", "write_file", "run_command"]);
+
+        for skill in [None, Some(skill_naming("boundary-absent-test", &[]))] {
+            let runtime = runtime_with(skill, "boundary-absent-test").with_tools(whole.clone());
+            assert_eq!(
+                runtime.tools.names().len(),
+                3,
+                "an absent tool list is not a boundary"
+            );
+        }
+    }
+
+    /// 名单里写错一个名字，只该少那一个；剩下的照常收窄，构建不出错。
+    /// 让一处笔误把整轮跑挂掉，是把整理遗漏变成了一次事故。
+    #[test]
+    fn a_name_with_no_tool_behind_it_narrows_without_failing() {
+        let whole = registry_of(&["read_file", "run_command"]);
+        let runtime = runtime_with(
+            Some(skill_naming(
+                "boundary-typo-test",
+                &["read_file", "reed_file"],
+            )),
+            "boundary-typo-test",
+        )
+        .with_tools(whole);
+
+        assert_eq!(runtime.tools.names(), vec!["read_file".to_string()]);
     }
 
     /// 没有观测就原样用种子：凭一个没看见过的事实改数字，只是把猜数换了个地方。
