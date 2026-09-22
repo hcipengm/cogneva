@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use cog_core::{SFError, SFResult};
 
-const MEMORY_ENV: &[(&str, &str)] = &[
+/// The env-var names this section answers to. Published so the deploy-config
+/// gate can tell "honored, but not by the core schema" from "honored by
+/// nobody".
+pub const MEMORY_ENV: &[(&str, &str)] = &[
     ("COGNEVA_MEMORY_ENABLED", "enabled"),
     ("COGNEVA_MEMORY_BACKEND_TYPE", "backend_type"),
     ("COGNEVA_MEMORY_EMBEDDING_DIMENSION", "embedding_dimension"),

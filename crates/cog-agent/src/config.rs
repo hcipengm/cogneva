@@ -37,7 +37,10 @@ fn load_section_from<T: serde::de::DeserializeOwned + Default>(
         .map_err(|e| SFError::Config(format!("{} {pointer}: {e}", path.display())))
 }
 
-const AGENT_LOOP_ENV: &[(&str, &str)] = &[
+/// The env-var names this section answers to. Published so the deploy-config
+/// gate can tell "honored, but not by the core schema" from "honored by
+/// nobody".
+pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
     ("COGNEVA_AGENT_LOOP_MAX_ITERATIONS", "max_iterations"),
     (
         "COGNEVA_AGENT_LOOP_EVAL_MAX_ITERATIONS",

@@ -907,18 +907,79 @@ mod tests {
         );
     }
 
+    /// Sections outside the core schema, with the env names their owning crate
+    /// actually reads. `apply_env_overrides` writes a deploy-map entry into a
+    /// value it then deserializes back into `AppConfig`; a section that type
+    /// has no field for is dropped on the way in, so the write is lost without
+    /// a word. The only thing that can make such an entry real is the crate
+    /// that loads that section applying the same name — so that is what the
+    /// gate below asks for.
+    ///
+    /// The list is hand-written on purpose: a deploy entry for a section that
+    /// is missing here fails the test instead of passing silently, so the
+    /// failure points at the one line that has to be added.
+    fn crate_owned_env_tables() -> [(&'static str, &'static [(&'static str, &'static str)]); 3] {
+        [
+            ("memory", cog_memory::config::MEMORY_ENV),
+            ("tuning", cog_llm::config::TUNING_ENV),
+            ("agent_loop", cog_agent::config::AGENT_LOOP_ENV),
+        ]
+    }
+
+    /// A value the deployed file holds for `raw`, written through the loader's
+    /// own setter and then read back out of the deserialized config. A path the
+    /// type has no field for is created in the intermediate tree and dropped on
+    /// the way in, so a write that does not come back is a knob the deployment
+    /// believes it turned.
+    fn write_reaches_the_config(target: &str, raw: &str) -> bool {
+        let mut value =
+            serde_json::to_value(AppConfig::default()).expect("AppConfig serializes to JSON");
+        cog_core::config::set_json_path(&mut value, target, raw);
+        serde_json::from_value::<AppConfig>(value)
+            .ok()
+            .and_then(|config| serde_json::to_value(config).ok())
+            .map(|back| holds_path(&back, target))
+            .unwrap_or(false)
+    }
+
+    /// The value a document holds at a dot-path, if any.
+    fn value_at<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+        let segments: Vec<&str> = path.split('.').collect();
+        let (leaf, parents) = segments.split_last()?;
+        let mut cursor = Some(value);
+        for segment in parents {
+            cursor = cursor.and_then(|c| match c {
+                serde_json::Value::Object(map) => map.get(*segment),
+                serde_json::Value::Array(arr) => {
+                    segment.parse::<usize>().ok().and_then(|i| arr.get(i))
+                }
+                _ => None,
+            });
+        }
+        cursor.and_then(|c| match c {
+            serde_json::Value::Object(map) => map.get(*leaf),
+            _ => None,
+        })
+    }
+
     /// A loaded config file supplies the whole override map — `apply_env_overrides`
     /// prefers `config.env` over the built-in fallback — so the shipped deploy
     /// config's own map is the live one in every deployment. Nothing else
     /// checks it: a mistyped path there is a knob the deployment believes it
     /// turned.
     ///
-    /// A path qualifies if the binary's schema can hold it, or if the shipped
-    /// file itself can. Sections owned by one crate are read from this same
-    /// file by that crate, so they are absent from the binary's schema while
-    /// still being real — a path neither can resolve exists nowhere.
+    /// An entry qualifies if the write reaches a field of the core config, or
+    /// if the crate that owns its section applies that same name to that same
+    /// field. Either way the name is honored somewhere; a path nothing reads is
+    /// a variable no deployment can turn, however plausible it looks in the
+    /// file.
+    ///
+    /// The probe goes through `set_json_path` rather than comparing against the
+    /// serialized schema alone: an optional field the type skips while unset is
+    /// absent from the default tree yet still a field, and only the write shows
+    /// the difference between that and a section the type does not have at all.
     #[test]
-    fn every_deploy_env_mapping_names_a_real_path() {
+    fn every_deploy_env_mapping_is_honored_somewhere() {
         let path = deploy_file("helm/cogneva/files/cogneva.json");
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -929,6 +990,7 @@ mod tests {
             .expect("deploy config carries an `env` map");
         let schema =
             serde_json::to_value(AppConfig::default()).expect("AppConfig serializes to JSON");
+        let owned = crate_owned_env_tables();
 
         let mut broken = Vec::new();
         for (key, target) in env {
@@ -938,13 +1000,33 @@ mod tests {
             let target = target
                 .as_str()
                 .unwrap_or_else(|| panic!("{key} maps to a non-string target: {target}"));
-            if !holds_path(&schema, target) && !holds_path(&doc, target) {
+            let honored_by_owner = target
+                .split_once('.')
+                .map(|(section, field)| {
+                    owned.iter().any(|(owner, table)| {
+                        *owner == section
+                            && table.iter().any(|(name, p)| name == key && *p == field)
+                    })
+                })
+                .unwrap_or(false);
+            let probed = value_at(&doc, target).and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            });
+            let reaches_core = holds_path(&schema, target)
+                || probed
+                    .map(|raw| write_reaches_the_config(target, &raw))
+                    .unwrap_or(false);
+            if !reaches_core && !honored_by_owner {
                 broken.push(format!("{key} -> {target}"));
             }
         }
         assert!(
             broken.is_empty(),
-            "deploy env mappings that resolve to no path at all: {broken:?}"
+            "deploy env mappings nothing reads — the core loader drops the write \
+             and no crate applies the name: {broken:?}"
         );
     }
 

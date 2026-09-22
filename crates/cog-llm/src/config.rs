@@ -36,7 +36,10 @@ fn load_section_from<T: serde::de::DeserializeOwned + Default>(
         .map_err(|e| SFError::Config(format!("{} {pointer}: {e}", path.display())))
 }
 
-const TUNING_ENV: &[(&str, &str)] = &[
+/// The env-var names this section answers to. Published so the deploy-config
+/// gate can tell "honored, but not by the core schema" from "honored by
+/// nobody".
+pub const TUNING_ENV: &[(&str, &str)] = &[
     ("COGNEVA_STREAM_CAPACITY", "stream_capacity"),
     ("COGNEVA_HIGH_WATERMARK", "high_watermark"),
     ("COGNEVA_LOW_WATERMARK", "low_watermark"),
