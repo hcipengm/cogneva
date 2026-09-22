@@ -28,14 +28,14 @@ fn main() {
 
     // 3. 自愈 change 的安全校验：路径必须在 workspace 内且不触碰受保护文件
     let change = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
-    let files = ChangePipeline::parse_diff(change).expect("valid unified diff");
-    println!("change affects: {files:?}");
+    let targets = ChangePipeline::parse_diff(change).expect("valid unified diff");
+    println!("change affects: {targets:?}");
 
     let evil = "diff --git a/../../etc/passwd b/../../etc/passwd\n--- a/../../etc/passwd\n+++ b/../../etc/passwd\n@@ -1 +1 @@\n-a\n+b\n";
     match ChangePipeline::parse_diff(evil) {
-        Ok(files) => {
+        Ok(targets) => {
             let root = std::env::temp_dir();
-            match ChangePipeline::validate_change_files(&files, &root) {
+            match ChangePipeline::validate_change_files(&targets, &root) {
                 Ok(()) => println!("unexpected: escape change accepted"),
                 Err(e) => println!("escape change rejected: {e}"),
             }

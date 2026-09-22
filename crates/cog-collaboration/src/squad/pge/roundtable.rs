@@ -1077,16 +1077,17 @@ fn parse_generator_output_as_written(value: &serde_json::Value) -> GeneratorOutp
     })
 }
 
-/// Re-derive the hunk header counts of every change artifact from its body.
+/// Repair the structure of every change artifact from its body.
 ///
 /// The body is the part of a diff that carries the change; the `@@` counts are
-/// arithmetic over it. A generator that writes the right body under a wrong
-/// count produces a diff that only the apply gate can reject, and it rejects it
-/// with a line number — a verdict the generator cannot act on, so the same
-/// mistake recurs on every retry. Deriving the counts here, at the one place
-/// model output becomes an artifact, costs no tokens and changes nothing about
-/// what the diff says; whether the body applies to the file at the declared
-/// start line remains the apply/compile gate's call.
+/// arithmetic over it and the final newline is punctuation the parser requires.
+/// A generator that writes the right body under a wrong count, or closes it
+/// without a terminating newline, produces a diff that only the apply gate can
+/// reject, and it rejects it with a line number — a verdict the generator
+/// cannot act on, so the same mistake recurs on every retry. Repairing here, at
+/// the one place model output becomes an artifact, costs no tokens and changes
+/// nothing about what the diff says; whether the body applies to the file at the
+/// declared start line remains the apply/compile gate's call.
 ///
 /// Only change artifacts are touched: an artifact that merely contains `@@`
 /// lines is not a diff and must survive verbatim.
@@ -1100,7 +1101,7 @@ fn repair_change_artifacts(mut output: GeneratorOutput) -> GeneratorOutput {
             info!(
                 artifact = %artifact.name,
                 defect = ?defect,
-                "recomputed diff hunk header counts from the body"
+                "repaired diff structure from the body"
             );
             artifact.content = repaired;
         }

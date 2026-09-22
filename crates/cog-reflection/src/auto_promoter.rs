@@ -167,7 +167,7 @@ impl AutoPromoter {
 
         let files: Vec<String> = crate::ChangePipeline::parse_diff(&change.content)?
             .iter()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .map(|t| t.path.replace('\\', "/"))
             .collect();
         let diff_lines = count_diff_lines(&change.content);
         let verdict = classify(&files, diff_lines, &self.policy);
@@ -307,7 +307,7 @@ impl AutoPromoter {
         };
         let files: Vec<String> = crate::ChangePipeline::parse_diff(&change.content)?
             .iter()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .map(|t| t.path.replace('\\', "/"))
             .collect();
         let level = if files.iter().all(|f| {
             self.policy

@@ -296,8 +296,8 @@ impl ChangePipeline {
         // 校验的失败塞进 `Err` 会让这条界线失效——分不清"这个变更不行"和"现在这个
         // 环境不行"，一个有效变更可能因一次 git 抖动被永久退休。
         // `SFError::Validation` 是"对变更本身的断言"，其余变体是环境。
-        let files_changed = match Self::parse_diff(&change.content) {
-            Ok(files) => files,
+        let targets = match Self::parse_diff(&change.content) {
+            Ok(targets) => targets,
             Err(SFError::Validation(e)) => {
                 warn!(change_id = %change.artifact_id, error = %e, "Change is not a usable diff");
                 return Ok(ApplyResult {
@@ -310,14 +310,18 @@ impl ChangePipeline {
             }
             Err(e) => return Err(e),
         };
+        // 报告面记的是这次变更写了哪些文件；删除没有可写文件，不入此列。
+        let files_changed: Vec<PathBuf> = targets
+            .iter()
+            .filter(|t| t.kind != cog_core::DiffTargetKind::Delete)
+            .map(|t| PathBuf::from(&t.path))
+            .collect();
 
         // 晋级门入口：黑名单命中（依赖清单/密钥材料）直接拒收，
-        // 不做 apply、不跑测试，状态落 Rejected 留审计痕迹。
+        // 不做 apply、不跑测试，状态落 Rejected 留审计痕迹。判据面取全部目标
+        // 含删除：删掉一份受保护文件与改写它同样要拦。
         if let Some(policy) = &self.promotion_policy {
-            let files: Vec<String> = files_changed
-                .iter()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .collect();
+            let files: Vec<String> = targets.iter().map(|t| t.path.replace('\\', "/")).collect();
             let diff_lines = crate::promotion_gate::count_diff_lines(&change.content);
             if let crate::GateVerdict::Reject { reason, .. } =
                 crate::promotion_gate::classify(&files, diff_lines, policy)
@@ -333,7 +337,7 @@ impl ChangePipeline {
             }
         }
 
-        match Self::validate_change_files(&files_changed, workdir) {
+        match Self::validate_change_files(&targets, workdir) {
             Ok(()) => {}
             Err(SFError::Validation(e)) => {
                 warn!(change_id = %change.artifact_id, error = %e, "Change touches a file it may not");
@@ -408,20 +412,35 @@ impl ChangePipeline {
         })
     }
 
-    /// Parse a unified diff change and return the list of files it touches.
+    /// Parse a unified diff change and return the files it touches, each with
+    /// the way the diff treats it.
     ///
-    /// Extracts paths from `+++ b/<path>` lines. New files appear as
-    /// `+++ b/<path>` with `--- /dev/null`, so this also handles additions.
-    pub fn parse_diff(content: &str) -> SFResult<Vec<PathBuf>> {
-        let files = cog_core::parse_diff_affected_files(content)?;
-        Ok(files.into_iter().map(PathBuf::from).collect())
+    /// A patch that creates a file is the one shape whose target does not exist
+    /// yet, and the diff says so itself: its old side is `/dev/null`. Carrying
+    /// that distinction here is what keeps the path checks below from rejecting
+    /// a legitimate creation and from accepting an invented path.
+    pub fn parse_diff(content: &str) -> SFResult<Vec<cog_core::DiffTarget>> {
+        let targets = cog_core::parse_diff_targets(content);
+        if targets.is_empty() {
+            return Err(SFError::Validation(
+                "No file paths found in change (expected '+++ b/<path>' lines)".into(),
+            ));
+        }
+        Ok(targets)
     }
 
-    /// Validate that every affected path is safe to modify.
-    /// - Must resolve to a real file inside the project root.
-    /// - Must not escape the project root.
-    /// - Must not be a build/config/deployment/secret file.
-    pub fn validate_change_files(files: &[PathBuf], project_root: &Path) -> SFResult<()> {
+    /// Validate that every target is safe to touch.
+    /// - A file the diff rewrites or deletes must resolve to a real file inside
+    ///   the project root.
+    /// - A file the diff creates must stay inside the project root by
+    ///   construction, since there is no file yet for `canonicalize` to speak
+    ///   for.
+    /// - Nothing may escape the project root.
+    /// - Nothing may be a build/config/deployment/secret file.
+    pub fn validate_change_files(
+        targets: &[cog_core::DiffTarget],
+        project_root: &Path,
+    ) -> SFResult<()> {
         let canonical_root = project_root.canonicalize().map_err(|e| {
             SFError::IO(format!(
                 "Failed to canonicalize project root {}: {}",
@@ -448,31 +467,41 @@ impl ChangePipeline {
         let forbidden_extensions: HashSet<&str> =
             ["pem", "key", "crt", "p12"].iter().cloned().collect();
 
-        for file in files {
+        for target in targets {
+            let file = Path::new(&target.path);
             let absolute = canonical_root.join(file);
-            let canonical = absolute.canonicalize().map_err(|e| {
-                SFError::Validation(format!(
-                    "Target path does not exist or is not accessible: {} ({})",
-                    file.display(),
-                    e
-                ))
-            })?;
 
-            if !canonical.starts_with(&canonical_root) {
-                return Err(SFError::Validation(format!(
-                    "Target path escapes project root: {}",
-                    file.display()
-                )));
-            }
+            let resolved = match target.kind {
+                cog_core::DiffTargetKind::Create => {
+                    resolve_created_path(&absolute, &canonical_root, file)?
+                }
+                _ => {
+                    let canonical = absolute.canonicalize().map_err(|e| {
+                        SFError::Validation(format!(
+                            "Target path does not exist or is not accessible: {} ({})",
+                            file.display(),
+                            e
+                        ))
+                    })?;
 
-            if !canonical.is_file() {
-                return Err(SFError::Validation(format!(
-                    "Target path is not a file: {}",
-                    file.display()
-                )));
-            }
+                    if !canonical.starts_with(&canonical_root) {
+                        return Err(SFError::Validation(format!(
+                            "Target path escapes project root: {}",
+                            file.display()
+                        )));
+                    }
 
-            if let Some(name) = canonical.file_name().and_then(|n| n.to_str()) {
+                    if !canonical.is_file() {
+                        return Err(SFError::Validation(format!(
+                            "Target path is not a file: {}",
+                            file.display()
+                        )));
+                    }
+                    canonical
+                }
+            };
+
+            if let Some(name) = resolved.file_name().and_then(|n| n.to_str()) {
                 if forbidden_names.contains(name) {
                     return Err(SFError::Validation(format!(
                         "Modifying protected file {} is not allowed",
@@ -481,7 +510,7 @@ impl ChangePipeline {
                 }
             }
 
-            if let Some(ext) = canonical.extension().and_then(|e| e.to_str()) {
+            if let Some(ext) = resolved.extension().and_then(|e| e.to_str()) {
                 if forbidden_extensions.contains(ext) {
                     return Err(SFError::Validation(format!(
                         "Modifying .{} files is not allowed",
@@ -490,7 +519,7 @@ impl ChangePipeline {
                 }
             }
 
-            if !canonical
+            if !resolved
                 .to_string_lossy()
                 .replace('\\', "/")
                 .contains("/src/")
@@ -767,6 +796,63 @@ impl ChangePipeline {
     }
 }
 
+/// Resolve the path of a file a patch is about to create.
+///
+/// There is no file for `canonicalize` to speak for — the patch is what brings
+/// it into being — and its parent directories need not exist either, since a
+/// patch creates them on the way (verified against `git apply`). What can
+/// still be checked is the path itself: `..` is resolved lexically so it cannot
+/// walk out of the root, and the deepest ancestor that does exist is
+/// canonicalized so a symlinked directory pointing out of the tree cannot be
+/// followed on the way to the new file.
+fn resolve_created_path(
+    absolute: &Path,
+    canonical_root: &Path,
+    reported: &Path,
+) -> SFResult<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    if !normalized.starts_with(canonical_root) {
+        return Err(SFError::Validation(format!(
+            "Target path escapes project root: {}",
+            reported.display()
+        )));
+    }
+
+    let mut existing = normalized.as_path();
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => break,
+        }
+    }
+    let canonical_existing = existing.canonicalize().map_err(|e| {
+        SFError::IO(format!(
+            "Failed to canonicalize {} while resolving {}: {}",
+            existing.display(),
+            reported.display(),
+            e
+        ))
+    })?;
+    if !canonical_existing.starts_with(canonical_root) {
+        return Err(SFError::Validation(format!(
+            "Target path escapes project root: {}",
+            reported.display()
+        )));
+    }
+
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,9 +867,10 @@ index 1234567..abcdefg 100644
  fn old() {}
 +fn new() {}
 "#;
-        let files = ChangePipeline::parse_diff(change).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0], PathBuf::from("crates/foo/src/bar.rs"));
+        let targets = ChangePipeline::parse_diff(change).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].path, "crates/foo/src/bar.rs");
+        assert_eq!(targets[0].kind, cog_core::DiffTargetKind::Modify);
     }
 
     #[test]
@@ -796,9 +883,91 @@ index 0000000..1234567
 @@ -0,0 +1 @@
 +fn new() {}
 "#;
-        let files = ChangePipeline::parse_diff(change).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0], PathBuf::from("crates/foo/src/new.rs"));
+        let targets = ChangePipeline::parse_diff(change).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].path, "crates/foo/src/new.rs");
+        assert_eq!(targets[0].kind, cog_core::DiffTargetKind::Create);
+    }
+
+    #[test]
+    fn a_created_file_may_be_absent_and_still_be_valid() {
+        // A patch that creates a file names a path that does not exist yet.
+        // Requiring the file to be there rejects exactly the change the patch
+        // is; requiring nothing lets an invented path through to a gate whose
+        // verdict is a line number. The diff's own `/dev/null` side is what
+        // separates the two.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("crates/foo/src")).unwrap();
+        let change = "diff --git a/crates/foo/src/new.rs b/crates/foo/src/new.rs\n\
+                      new file mode 100644\n\
+                      --- /dev/null\n\
+                      +++ b/crates/foo/src/new.rs\n\
+                      @@ -0,0 +1 @@\n\
+                      +fn new() {}\n";
+        let targets = ChangePipeline::parse_diff(change).unwrap();
+        assert!(!root.path().join("crates/foo/src/new.rs").exists());
+        ChangePipeline::validate_change_files(&targets, root.path())
+            .expect("a declared creation must validate");
+    }
+
+    #[test]
+    fn a_rewrite_of_a_missing_file_is_still_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let change = "diff --git a/crates/foo/src/ghost.rs b/crates/foo/src/ghost.rs\n\
+                      --- a/crates/foo/src/ghost.rs\n\
+                      +++ b/crates/foo/src/ghost.rs\n\
+                      @@ -1 +1 @@\n\
+                      -old\n\
+                      +new\n";
+        let targets = ChangePipeline::parse_diff(change).unwrap();
+        assert!(ChangePipeline::validate_change_files(&targets, root.path()).is_err());
+    }
+
+    #[test]
+    fn a_created_file_may_not_escape_through_dot_dot_or_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("crates")).unwrap();
+
+        let escaping = "diff --git a/crates/../../etc/passwd b/crates/../../etc/passwd\n\
+                        new file mode 100644\n\
+                        --- /dev/null\n\
+                        +++ b/crates/../../etc/passwd\n\
+                        @@ -0,0 +1 @@\n\
+                        +root\n";
+        let targets = ChangePipeline::parse_diff(escaping).unwrap();
+        assert!(
+            ChangePipeline::validate_change_files(&targets, root.path()).is_err(),
+            "a creation that walks out of the root must be rejected"
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("crates/link")).unwrap();
+        let through_link = "diff --git a/crates/link/passwd b/crates/link/passwd\n\
+                            new file mode 100644\n\
+                            --- /dev/null\n\
+                            +++ b/crates/link/passwd\n\
+                            @@ -0,0 +1 @@\n\
+                            +root\n";
+        let targets = ChangePipeline::parse_diff(through_link).unwrap();
+        assert!(
+            ChangePipeline::validate_change_files(&targets, root.path()).is_err(),
+            "a creation whose ancestor links out of the root must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_created_protected_file_is_still_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("crates/foo")).unwrap();
+        let change = "diff --git a/crates/foo/Cargo.toml b/crates/foo/Cargo.toml\n\
+                      new file mode 100644\n\
+                      --- /dev/null\n\
+                      +++ b/crates/foo/Cargo.toml\n\
+                      @@ -0,0 +1,2 @@\n\
+                      +[package]\n\
+                      +name = \"foo\"\n";
+        let targets = ChangePipeline::parse_diff(change).unwrap();
+        assert!(ChangePipeline::validate_change_files(&targets, root.path()).is_err());
     }
 
     #[tokio::test]
@@ -873,8 +1042,11 @@ index 1111111..2222222 100644
     #[test]
     fn validate_change_files_rejects_escape() {
         let root = PathBuf::from("/tmp/should-not-exist-for-test");
-        let files = vec![PathBuf::from("../etc/passwd")];
-        assert!(ChangePipeline::validate_change_files(&files, &root).is_err());
+        let targets = vec![cog_core::DiffTarget {
+            path: "../etc/passwd".into(),
+            kind: cog_core::DiffTargetKind::Modify,
+        }];
+        assert!(ChangePipeline::validate_change_files(&targets, &root).is_err());
     }
 
     /// git 集成测试脚手架：造 upstream bare + 沙盒 work（remote local→bare）。

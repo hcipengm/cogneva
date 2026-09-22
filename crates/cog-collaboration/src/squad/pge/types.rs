@@ -226,10 +226,11 @@ impl GeneratorOutput {
     /// A self-evolution run's deliverable is a unified diff that a later apply
     /// gate consumes verbatim. The evaluator is an LLM: it can judge whether
     /// the change looks right, but it cannot see that a hunk header's declared
-    /// line counts disagree with the hunk body, so it passes artifacts that
-    /// `git apply` will reject. Naming the defect here lets the repair loop
-    /// hand the exact arithmetic back to the generator instead of the artifact
-    /// travelling downstream to die as an opaque "corrupt patch".
+    /// line counts disagree with the hunk body or that the diff's last line is
+    /// unterminated, so it passes artifacts that `git apply` will reject.
+    /// Naming the defect here lets the repair loop hand the exact structural
+    /// mistake back to the generator instead of the artifact travelling
+    /// downstream to die as an opaque "corrupt patch".
     pub fn change_artifact_defect(&self, task: &cog_core::Task) -> Option<String> {
         if !task.is_self_evolution() {
             return None;

@@ -1269,10 +1269,28 @@ mod tests {
     #[test]
     fn extract_unified_diff_none_for_prose() {
         assert!(EvolutionEngine::extract_unified_diff("# Just a header\nNo code here.").is_none());
-        // A diff-like block with no +++ file header is also rejected.
-        assert!(
-            EvolutionEngine::extract_unified_diff("diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n")
-                .is_none()
-        );
+        // A block naming no file comes back empty-handed. A deletion names its
+        // file only on the side that goes away, so there is nothing to write
+        // and nothing to extract.
+        assert!(EvolutionEngine::extract_unified_diff(
+            "diff --git a/x b/x\n\
+                 deleted file mode 100644\n\
+                 --- a/x\n\
+                 +++ /dev/null\n\
+                 @@ -1 +0,0 @@\n\
+                 -a\n"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn extract_unified_diff_accepts_a_hunk_block_naming_its_file_once() {
+        // `git apply` reads the path off the `diff --git` line and does not
+        // need the redundant `---`/`+++` pair at all, so a block carrying only
+        // the former is a diff a gate would have applied. Rejecting it here
+        // discards a usable change as if the model had written prose.
+        let text = "diff --git a/x.rs b/x.rs\n@@ -1 +1,2 @@\n a\n+b\n";
+        let diff = EvolutionEngine::extract_unified_diff(text).expect("git accepts this shape");
+        assert!(diff.starts_with("diff --git a/x.rs b/x.rs"));
     }
 }

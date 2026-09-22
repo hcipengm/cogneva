@@ -209,32 +209,78 @@ pub trait ContributionControl: Send + Sync {
     async fn flush_pending(&self, change_id: Option<&str>) -> crate::SFResult<usize>;
 }
 
-/// Parse a unified diff change and return the list of files it touches.
+/// How a diff treats the file it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffTargetKind {
+    /// The diff rewrites a file that already exists.
+    Modify,
+    /// The diff creates a file that does not exist yet. A patch that creates a
+    /// file is the only kind whose target may be absent, and git marks it as
+    /// such: the old side is `/dev/null`.
+    Create,
+    /// The diff deletes the file it names.
+    Delete,
+}
+
+/// One file a diff touches, with the way it touches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffTarget {
+    pub path: String,
+    pub kind: DiffTargetKind,
+}
+
+/// Which files a diff touches, and how, in the order it introduces them.
 ///
-/// Extracts paths from `+++ b/<path>` lines. New files appear as
-/// `+++ b/<path>` with `--- /dev/null`, so this also handles additions.
-/// This is a pure function shared by collaboration (static validation) and
-/// reflection (change pipeline).
-pub fn parse_diff_affected_files(content: &str) -> crate::SFResult<Vec<String>> {
-    let mut files = Vec::new();
+/// Read through the same section grammar as [`diff_file_entries`], so a body
+/// line that merely looks like a header cannot invent a target. Whether the
+/// target is expected to exist is a property of the diff, not of the tree it
+/// will be applied to, and deriving it here is what lets a caller tell a file
+/// the patch creates from a path the generator made up.
+pub fn parse_diff_targets(content: &str) -> Vec<DiffTarget> {
+    diff_file_entries(content)
+        .into_iter()
+        .filter(|entry| !entry.path.is_empty() && entry.path != "/dev/null")
+        .map(|entry| DiffTarget {
+            kind: target_kind(&entry.header),
+            path: entry.path,
+        })
+        .collect()
+}
 
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("+++") {
-            let rest = rest.trim();
-            // Unified diff produced by git uses "+++ b/<path>".
-            // Strip the "b/" prefix when present.
-            let path_str = rest.strip_prefix("b/").unwrap_or(rest);
-
-            // Skip the timestamp header that `git diff` sometimes emits.
-            let path_str = path_str.split_whitespace().next().unwrap_or(path_str);
-
-            if path_str == "/dev/null" {
-                continue;
-            }
-
-            files.push(path_str.to_string());
+/// A section's side markers say whether the file exists before the patch.
+///
+/// A section claiming both sides are absent is not a shape git produces, so it
+/// keeps the strictest reading — an existing file — and lets the apply gate
+/// reject the patch on its own terms.
+fn target_kind(header: &str) -> DiffTargetKind {
+    let mut creates = false;
+    let mut deletes = false;
+    for line in header.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            creates = diff_path_field(rest) == "/dev/null";
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            deletes = diff_path_field(rest) == "/dev/null";
         }
     }
+    match (creates, deletes) {
+        (true, false) => DiffTargetKind::Create,
+        (false, true) => DiffTargetKind::Delete,
+        _ => DiffTargetKind::Modify,
+    }
+}
+
+/// Parse a unified diff change and return the list of files it touches.
+///
+/// Extracts the targets of [`parse_diff_targets`], dropping deletions: a
+/// deletion has no file to write, and a caller asking what the change produces
+/// is not asking about a path that goes away. This is a pure function shared by
+/// collaboration (static validation) and reflection (change pipeline).
+pub fn parse_diff_affected_files(content: &str) -> crate::SFResult<Vec<String>> {
+    let files: Vec<String> = parse_diff_targets(content)
+        .into_iter()
+        .filter(|target| target.kind != DiffTargetKind::Delete)
+        .map(|target| target.path)
+        .collect();
 
     if files.is_empty() {
         return Err(crate::SFError::Validation(
@@ -246,7 +292,7 @@ pub fn parse_diff_affected_files(content: &str) -> crate::SFResult<Vec<String>> 
 }
 
 /// Structural check of a unified diff: every hunk must carry exactly the
-/// number of lines its header declares.
+/// number of lines its header declares, and the last line must be terminated.
 ///
 /// `git apply` rejects a mismatch with "corrupt patch at line N", but only
 /// after the artifact has travelled to the apply gate, where the reason is a
@@ -318,7 +364,28 @@ pub fn diff_structural_defect(content: &str) -> Option<String> {
         ));
     }
 
+    if has_unterminated_last_line(content) {
+        return Some(format!(
+            "{file}: the diff's last line is not terminated by a newline, git apply will reject the \
+             patch as corrupt"
+        ));
+    }
+
     None
+}
+
+/// Whether the diff's final line reaches the parser unterminated.
+///
+/// `git apply` reads a patch as a stream of newline-terminated lines, and its
+/// reader rejects an unterminated final line as "corrupt patch at line N" —
+/// naming the line it stopped on rather than the missing terminator. A
+/// generator that emits the diff body and closes the string without a final
+/// newline produces exactly that, and the hunk arithmetic cannot see it: the
+/// last line is present, so every count still agrees. The rule therefore
+/// belongs in the same walk as the counts, so the detector's grammar stays as
+/// wide as the parser it stands in for.
+fn has_unterminated_last_line(content: &str) -> bool {
+    !content.is_empty() && !content.ends_with('\n')
 }
 
 /// One file section of a unified diff, decomposed so that a single hunk can be
@@ -634,34 +701,35 @@ fn classify_hunk_line(line: &str) -> HunkLine {
     }
 }
 
-/// Recompute every hunk header's declared line counts from the hunk body that
-/// follows it, returning the repaired diff only when a header disagreed.
+/// Repair a diff the validator rejects: recompute every hunk header's declared
+/// line counts from the hunk body that follows it and terminate the final line.
 ///
 /// A generator that writes a correct patch body but a wrong `@@` header — an
 /// off-by-N count, or a body longer than its header admits — produces a diff
-/// that every apply gate rejects as "corrupt patch". That verdict names a line
-/// number rather than the mistake, so re-prompting the generator tends to
-/// reproduce it. The body is the expensive part and the counts are pure
-/// arithmetic over it, so the counts are derived here instead. Whether the body
-/// actually applies at the declared start line is a content question and stays
-/// with the apply/compile gate.
+/// that every apply gate rejects as "corrupt patch". So does a body the model
+/// closed without a final newline. Both verdicts name a line number rather than
+/// the mistake, so re-prompting the generator tends to reproduce them. The body
+/// is the expensive part, the counts are pure arithmetic over it, and the
+/// missing terminator is a single byte the parser requires, so both are derived
+/// here instead. Whether the body actually applies at the declared start line is
+/// a content question and stays with the apply/compile gate.
 ///
 /// `None` means "keep the original bytes": the diff was already structurally
-/// sound, no header disagreed, or the rewrite would still be unsound. A repair
-/// that cannot be shown to be an improvement is never returned.
+/// sound, nothing the repair can reach disagreed, or the rewrite would still be
+/// unsound. A repair that cannot be shown to be an improvement is never
+/// returned.
 pub fn normalize_diff_hunk_headers(content: &str) -> Option<String> {
     // Only a diff the validator already rejects is a repair candidate. A diff
     // git would have accepted comes back untouched byte for byte, so this can
     // never turn a working patch into a broken one.
     if diff_structural_defect(content).is_some() {
-        return recompute_hunk_counts(content);
+        return repair_structural_defect(content);
     }
     None
 }
 
-/// Recompute every hunk header's counts in a diff already known to have a
-/// structural defect.
-fn recompute_hunk_counts(content: &str) -> Option<String> {
+/// Repair a diff already known to have a structural defect.
+fn repair_structural_defect(content: &str) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
@@ -731,13 +799,16 @@ fn recompute_hunk_counts(content: &str) -> Option<String> {
         i = body_end;
     }
 
-    if !changed {
+    // `lines()` drops the terminator, so an unterminated input and a
+    // count-disagreeing input are the same rewrite from here on: join the lines
+    // and close the last one. The terminator is itself the repair when no count
+    // disagreed, and re-adding it when one did keeps the bytes git would have
+    // accepted identical.
+    if !changed && content.ends_with('\n') {
         return None;
     }
     let mut repaired = out.join("\n");
-    if content.ends_with('\n') {
-        repaired.push('\n');
-    }
+    repaired.push('\n');
     if diff_structural_defect(&repaired).is_some() {
         return None;
     }
@@ -1240,6 +1311,49 @@ mod tests {
     }
 
     #[test]
+    fn a_diff_whose_last_line_is_unterminated_is_a_defect() {
+        // The hunk arithmetic agrees with the body — every line is present and
+        // counted — so only git's requirement that the patch end in a newline
+        // stands between this diff and the apply gate.
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,1 +1,2 @@\n\
+                    \x20fn a() {}\n\
+                    +fn b() {}";
+        let defect = diff_structural_defect(diff).expect("unterminated last line must be reported");
+        assert!(defect.contains("newline"), "{defect}");
+    }
+
+    #[test]
+    fn the_repair_terminates_the_last_line_and_changes_nothing_else() {
+        let diff = "--- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,2 +1,2 @@\n\
+                    \x20old\n\
+                    -gone\n\
+                    +added";
+        assert!(diff_structural_defect(diff).is_some());
+        let repaired =
+            normalize_diff_hunk_headers(diff).expect("a missing terminator is repairable");
+        assert_eq!(repaired, format!("{diff}\n"));
+        assert_eq!(diff_structural_defect(&repaired), None);
+    }
+
+    #[test]
+    fn a_missing_terminator_and_a_wrong_count_are_repaired_together() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n\
+                    --- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,15 +1,49 @@\n\
+                    \x20fn a() {}\n\
+                    +fn b() {}";
+        let repaired = normalize_diff_hunk_headers(diff).expect("both defects are repairable");
+        assert!(repaired.contains("@@ -1,1 +1,2 @@"), "{repaired}");
+        assert!(repaired.ends_with("+fn b() {}\n"), "{repaired}");
+        assert_eq!(diff_structural_defect(&repaired), None);
+    }
+
+    #[test]
     fn a_sound_diff_is_never_rewritten() {
         // The repair is allowed to fire only where the validator already
         // objects. Anything git would have accepted must come back untouched,
@@ -1374,6 +1488,8 @@ mod tests {
             "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,4 +1,4 @@\n\x20a\n",
             "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -9 @@\n-x\n+y\n-z\n",
             "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n\x20a\n\n\x20b\n",
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,1 @@\n\x20a\n\x20b",
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,9 +1,9 @@\n\x20a\n\x20b",
         ];
         for diff in diffs {
             if let Some(repaired) = normalize_diff_hunk_headers(diff) {
