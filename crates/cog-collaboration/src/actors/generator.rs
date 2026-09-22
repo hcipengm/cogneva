@@ -112,21 +112,7 @@ impl GeneratorActor {
         let is_self_evolution = task.is_self_evolution();
 
         if is_self_evolution {
-            ctx["change_generation"] = serde_json::json!({
-                "output_format": "unified_diff",
-                "response_format": "json",
-                "schema": {
-                    "content": "string: concise summary of the change",
-                    "artifacts": [
-                        {
-                            "artifact_type": "change",
-                            "name": "changes.diff",
-                            "content": "valid git unified diff starting with 'diff --git'"
-                        }
-                    ]
-                },
-                "artifact_instructions": "Output the code change as a single artifact with artifact_type='change', name='changes.diff', content being a valid git unified diff starting with 'diff --git'. Do not wrap in markdown fences. This is a Rust workspace; include only source file modifications under src/ directories within crates/**/*.rs."
-            });
+            ctx["change_generation"] = change_generation_contract();
         } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
             // Built-in contract for standard execution. Lowest precedence:
             // operator schema > prompt skill > built-in.
@@ -229,5 +215,90 @@ impl GeneratorActor {
             }
         }
         output
+    }
+}
+
+/// The prompt contract the Generator gets for a self-evolution task.
+///
+/// The change this asks for is judged deterministically: the diff runs against a
+/// checkout of the repository through `git apply --check` and then compiles. So
+/// the contract has to state the things the gate will check, in the terms the
+/// gate checks them — read before writing, hunk counts equal to the body, the
+/// diff terminated, context matching the file byte for byte. A diff written from
+/// memory is the most expensive failure on this path: the whole generation and
+/// evaluation round is paid for and nothing is produced.
+fn change_generation_contract() -> serde_json::Value {
+    serde_json::json!({
+        "output_format": "unified_diff",
+        "response_format": "json",
+        "schema": {
+            "content": "string: concise summary of the change",
+            "artifacts": [
+                {
+                    "artifact_type": "change",
+                    "name": "changes.diff",
+                    "content": "valid git unified diff starting with 'diff --git'"
+                }
+            ]
+        },
+        "artifact_instructions": "Output exactly one artifact: artifact_type='change', name='changes.diff', content being the raw unified diff whose first line is 'diff --git a/<path> b/<path>'. No markdown fences, no commentary inside content.",
+        "grounding": "Your diff is validated with `git apply --check` against a checkout of this repository, then applied to it and compiled. It must therefore describe the files as they actually are, not as you remember them. You have file tools in this run — use them before writing: list the directories you intend to touch, then read every file you change in full (read_file, or a shell command such as `sed -n '1,400p' <path>`). Address files by repository-relative path (for example crates/cog-core/src/lib.rs) — the same path that appears in the '+++ b/' line — and those paths resolve against the checkout. Never guess a path: a path that is not in the checkout is rejected unless the diff itself declares it as created.",
+        "diff_grammar": "Every hunk header '@@ -<start>,<count> +<start>,<count> @@' must declare exactly the number of lines its body carries, and the diff must end with a newline. Every context line and every removed line has to match the file byte for byte, including indentation and trailing whitespace, and the start line numbers must be the real line numbers in the file you read. Keep hunks narrow and anchor them on context that is unique in the file: one hunk whose context cannot be located fails the entire change.",
+        "creating_a_file": "To add a file, declare it as a creation: 'diff --git a/<path> b/<path>', then 'new file mode 100644', '--- /dev/null', '+++ b/<path>', and a hunk header '@@ -0,0 +1,<n> @@' whose body is n '+' lines. Creating a file that already exists fails, and so does rewriting a file that does not exist without declaring it as a creation.",
+        "scope": "Stay inside the checkout, and prefer paths under crates/*/src/. The gate rejects changes to build and deployment manifests (Cargo.toml, Cargo.lock, Dockerfile, Containerfile, docker-compose.yml, setup.sh) and to configuration or credential files (cogneva.json, .env, .envrc, *.pem, *.key, *.crt, *.p12); deletions are judged by the same rules as edits. The applied change is compiled and tested, so it must be complete and self-consistent — no placeholder or unimplemented bodies."
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every rule here is one the gate enforces, so dropping any of them costs a
+    /// whole paid round for nothing. The prose is free to change; these claims
+    /// are not.
+    #[test]
+    fn the_change_contract_states_the_rules_the_gate_judges() {
+        let contract = change_generation_contract();
+        let text = contract.to_string();
+
+        for (claim, needle) in [
+            (
+                "the diff is checked against a checkout",
+                "git apply --check",
+            ),
+            (
+                "the model must read before writing",
+                "read every file you change in full",
+            ),
+            ("paths are repository-relative", "repository-relative path"),
+            ("a guessed path is rejected", "Never guess a path"),
+            (
+                "hunk counts must equal the body",
+                "number of lines its body carries",
+            ),
+            ("the diff must be terminated", "must end with a newline"),
+            (
+                "context must match byte for byte",
+                "match the file byte for byte",
+            ),
+            ("creating a file has its own shape", "--- /dev/null"),
+            (
+                "the protected-file set is named",
+                "configuration or credential files",
+            ),
+        ] {
+            assert!(
+                text.contains(needle),
+                "contract no longer says {claim}: {needle}"
+            );
+        }
+
+        // The old wording told the model to only ever edit existing sources
+        // under src/, which is narrower than the gate: creations are allowed and
+        // so is anything else inside the checkout.
+        assert!(
+            !text.contains("include only source file modifications"),
+            "the contract is back to forbidding everything the gate allows"
+        );
     }
 }
