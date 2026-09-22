@@ -12,11 +12,13 @@
 //! is what answers a red CI run with a revert, minutes later, in a different
 //! process than the one that landed the commit.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use cog_core::{GeneratedChange, LandedSource, SFError, SFResult};
 
@@ -31,6 +33,97 @@ use crate::provider::CodePlatformProvider;
 /// the change is already on the branch, and a push that races another landing
 /// can be retried without producing a duplicate.
 const CHANGE_ID_TRAILER: &str = "Change-Id";
+
+/// Landings that failed, one increment per failed call, labeled with the
+/// category.
+///
+/// A landing failure is otherwise one log line inside a loop that then moves
+/// on, so "the channel is empty" and "the channel is being refused" look the
+/// same from outside. The category is the only part of the failure that
+/// aggregates: the message names a file and a hunk, the category says whether
+/// the branch moved under the change or the change itself is the problem.
+pub const LANDING_FAILURES_METRIC: &str = "cogneva_landing_failures_total";
+
+/// Why a landing call failed, as a closed set the metric labels.
+///
+/// Decided where the failure happens — which step failed names the category —
+/// and never recovered from the error text afterwards. The categories ask for
+/// different answers: a conflict is the base branch having moved under the
+/// change, which re-driving generation can address; a path or size refusal is
+/// a property of the change that re-driving would only repeat; an environment
+/// failure says nothing about the change at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandingCategory {
+    /// The verified delta no longer replays onto the base tip. The ordinary
+    /// cause is another commit reaching the branch first and moving the code
+    /// the change was generated against.
+    Conflict,
+    /// Every attempt lost the push race for the branch.
+    Raced,
+    /// The push was refused for a reason re-applying cannot fix.
+    Rejected,
+    /// The path policy refuses the change: it touches paths outside the
+    /// contribution whitelist, a forbidden path, or cannot be read as a diff
+    /// far enough to say which paths it touches.
+    Path,
+    /// The change exceeds the landing policy's size cap.
+    Oversized,
+    /// The landing machinery could not run: git, fetch, worktree, commit.
+    Environment,
+}
+
+impl LandingCategory {
+    /// The metric label. Stable: alert rules and dashboards read these.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::Raced => "raced",
+            Self::Rejected => "rejected",
+            Self::Path => "path",
+            Self::Oversized => "oversized",
+            Self::Environment => "environment",
+        }
+    }
+}
+
+/// A landing failure carrying its category up to whoever records it.
+///
+/// Anything raised by the crate's own error type converts to `Environment` by
+/// construction, so an unclassified failure is never silently labeled as one
+/// of the named ones; the steps that do know their category override that
+/// default at their own call site.
+#[derive(Debug)]
+struct LandingError {
+    category: LandingCategory,
+    error: CogGitHubError,
+}
+
+impl LandingError {
+    fn of(category: LandingCategory, error: CogGitHubError) -> Self {
+        Self { category, error }
+    }
+}
+
+impl std::fmt::Display for LandingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl From<CogGitHubError> for LandingError {
+    fn from(error: CogGitHubError) -> Self {
+        Self {
+            category: LandingCategory::Environment,
+            error,
+        }
+    }
+}
+
+impl From<std::io::Error> for LandingError {
+    fn from(error: std::io::Error) -> Self {
+        Self::from(CogGitHubError::from(error))
+    }
+}
 
 /// Directory holding one `<change_id>.json` file per landing.
 pub fn landing_dir() -> PathBuf {
@@ -170,6 +263,11 @@ pub struct MainChannel {
     /// Serializes landings: each one rebuilds a scratch worktree, so two
     /// concurrent landings (mainline + owner flush) would clobber each other.
     gate: tokio::sync::Mutex<()>,
+    /// Where landing failures are counted. Set once, from `start`, because the
+    /// storage plugin that publishes the backend inits in a later layer than
+    /// this plugin and the channel is built during `init`; none until then, in
+    /// which case a failure stays a log line.
+    metrics: OnceLock<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl std::fmt::Debug for MainChannel {
@@ -195,7 +293,14 @@ impl MainChannel {
             provider,
             controller,
             gate: tokio::sync::Mutex::new(()),
+            metrics: OnceLock::new(),
         }
+    }
+
+    /// Count landing failures into `metrics`. Called once, from the plugin's
+    /// `start`, after every plugin has initialised and the backend exists.
+    pub fn attach_metrics(&self, metrics: Arc<dyn cog_core::MetricsBackend>) {
+        let _ = self.metrics.set(metrics);
     }
 
     /// The base branch this channel commits to.
@@ -239,6 +344,22 @@ impl MainChannel {
         source: Option<&LandedSource>,
         owner_approved: bool,
     ) -> Result<String> {
+        match self.land_attempt(change, source, owner_approved).await {
+            Ok(rev) => Ok(rev),
+            Err(failure) => {
+                self.note_landing_failure(failure.category).await;
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// One landing call, with the category of a failure kept alongside it.
+    async fn land_attempt(
+        &self,
+        change: &GeneratedChange,
+        source: Option<&LandedSource>,
+        owner_approved: bool,
+    ) -> std::result::Result<String, LandingError> {
         self.check_policy(change, owner_approved)?;
         let base = self.config.base_branch.clone();
         let attempts = self.config.landing_policy.max_land_attempts.max(1);
@@ -278,12 +399,34 @@ impl MainChannel {
                 }
             }
         }
-        Err(last_race.unwrap_or_else(|| {
-            CogGitHubError::Provider(format!(
-                "landing {} lost the race for {base} {attempts} times",
-                change.change_id
-            ))
-        }))
+        Err(LandingError::of(
+            LandingCategory::Raced,
+            last_race.unwrap_or_else(|| {
+                CogGitHubError::Provider(format!(
+                    "landing {} lost the race for {base} {attempts} times",
+                    change.change_id
+                ))
+            }),
+        ))
+    }
+
+    /// Count one failed landing under its category. A failure to record is
+    /// logged and dropped: losing the reading must not turn a failed landing
+    /// into a different failure.
+    async fn note_landing_failure(&self, category: LandingCategory) {
+        let Some(metrics) = self.metrics.get().cloned() else {
+            return;
+        };
+        let labels = HashMap::from([("category".to_string(), category.as_str().to_string())]);
+        if let Err(e) = metrics
+            .record_counter(LANDING_FAILURES_METRIC, 1.0, labels)
+            .await
+        {
+            warn!(
+                category = category.as_str(),
+                "cannot record landing failure: {e}"
+            );
+        }
     }
 
     async fn record_landed(&self, change: &GeneratedChange, base: &str, rev: &str) -> Result<()> {
@@ -315,31 +458,43 @@ impl MainChannel {
     /// Reject a change that must not reach the public branch, before any git
     /// operation runs. Fail closed: an unparseable diff or an unmeasured
     /// change is held back rather than trusted.
-    fn check_policy(&self, change: &GeneratedChange, owner_approved: bool) -> Result<()> {
+    fn check_policy(
+        &self,
+        change: &GeneratedChange,
+        owner_approved: bool,
+    ) -> std::result::Result<(), LandingError> {
         let policy = &self.config.landing_policy;
-        ensure_contribution_allowed(&change.content)?;
+        ensure_contribution_allowed(&change.content)
+            .map_err(|e| LandingError::of(LandingCategory::Path, e))?;
 
         if !owner_approved {
             let changed_lines = count_changed_lines(&change.content);
             if changed_lines > policy.max_changed_lines {
-                return Err(CogGitHubError::PrivacyRejected(format!(
-                    "change {} touches {changed_lines} lines, over the {}-line cap",
-                    change.change_id, policy.max_changed_lines
-                )));
+                return Err(LandingError::of(
+                    LandingCategory::Oversized,
+                    CogGitHubError::PrivacyRejected(format!(
+                        "change {} touches {changed_lines} lines, over the {}-line cap",
+                        change.change_id, policy.max_changed_lines
+                    )),
+                ));
             }
         }
 
-        let files = affected_files(&change.content)?;
+        let files = affected_files(&change.content)
+            .map_err(|e| LandingError::of(LandingCategory::Path, e))?;
         for file in &files {
             if let Some(pattern) = policy
                 .forbidden_paths
                 .iter()
                 .find(|p| path_forbidden(file, p))
             {
-                return Err(CogGitHubError::PrivacyRejected(format!(
-                    "change {} touches forbidden path {file} (pattern {pattern})",
-                    change.change_id
-                )));
+                return Err(LandingError::of(
+                    LandingCategory::Path,
+                    CogGitHubError::PrivacyRejected(format!(
+                        "change {} touches forbidden path {file} (pattern {pattern})",
+                        change.change_id
+                    )),
+                ));
             }
         }
         Ok(())
@@ -351,7 +506,7 @@ impl MainChannel {
         change: &GeneratedChange,
         source: Option<&LandedSource>,
         base: &str,
-    ) -> Result<LandOutcome> {
+    ) -> std::result::Result<LandOutcome, LandingError> {
         if let Some(rev) = self.landed_rev_on(base, &change.change_id).await? {
             return Ok(LandOutcome::AlreadyLanded(rev));
         }
@@ -381,7 +536,12 @@ impl MainChannel {
                 );
                 run_git(&src.repo, &["update-ref", &pinned, &rev]).await?;
                 run_git(&wt, &["fetch", "--no-tags", &repo, &pinned]).await?;
-                run_git(&wt, &["cherry-pick", "--no-commit", "FETCH_HEAD"]).await?;
+                // This is the step the base branch moving under the change
+                // breaks: a delta generated against an older tip no longer
+                // applies to the new one.
+                run_git(&wt, &["cherry-pick", "--no-commit", "FETCH_HEAD"])
+                    .await
+                    .map_err(|e| LandingError::of(LandingCategory::Conflict, e))?;
             }
             None => {
                 // Owner-approved change applied as a patch. Only its own
@@ -397,7 +557,8 @@ impl MainChannel {
                         &patch.path().to_string_lossy(),
                     ],
                 )
-                .await?;
+                .await
+                .map_err(|e| LandingError::of(LandingCategory::Conflict, e))?;
             }
         }
         run_git(&wt, &["add", "-A"]).await?;
@@ -412,7 +573,10 @@ impl MainChannel {
             Err(PushFailure::Raced(msg)) => {
                 Ok(LandOutcome::Superseded(CogGitHubError::Provider(msg)))
             }
-            Err(PushFailure::Rejected(msg)) => Err(CogGitHubError::Provider(msg)),
+            Err(PushFailure::Rejected(msg)) => Err(LandingError::of(
+                LandingCategory::Rejected,
+                CogGitHubError::Provider(msg),
+            )),
         }
     }
 
@@ -1141,6 +1305,7 @@ async fn run_git_status(dir: &Path, args: &[&str]) -> Result<(bool, String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_core::MetricsBackend as _;
 
     fn diff_touching(paths: &[&str]) -> String {
         paths
@@ -1313,6 +1478,93 @@ mod tests {
         channel(Default::default())
             .check_policy(&ch, false)
             .unwrap();
+    }
+
+    /// A channel wired to an in-memory backend, plus that backend, so a test
+    /// can read back what a landing counted.
+    fn measured_channel(
+        policy: crate::config::LandingPolicy,
+    ) -> (MainChannel, Arc<cog_storage::MemoryMetricsBackend>) {
+        let chan = channel(policy);
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        chan.attach_metrics(metrics.clone());
+        (chan, metrics)
+    }
+
+    /// Recorded count for one failure category, zero when it has no series.
+    async fn failure_count(metrics: &cog_storage::MemoryMetricsBackend, category: &str) -> f64 {
+        metrics
+            .query_counter_totals(LANDING_FAILURES_METRIC)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.labels.get("category").map(String::as_str) == Some(category))
+            .map(|s| s.value)
+            .unwrap_or(0.0)
+    }
+
+    async fn series_count(metrics: &cog_storage::MemoryMetricsBackend) -> usize {
+        metrics
+            .query_counter_totals(LANDING_FAILURES_METRIC)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn an_oversized_change_is_counted_under_its_own_category() {
+        let policy = crate::config::LandingPolicy {
+            max_changed_lines: 1,
+            ..Default::default()
+        };
+        let (chan, metrics) = measured_channel(policy);
+        let ch = change("c1", &diff_touching(&["crates/cog-github/src/lib.rs"]));
+
+        chan.land(&ch, None).await.unwrap_err();
+
+        assert_eq!(failure_count(&metrics, "oversized").await, 1.0);
+        // 只有这一类被记账：类别取自失败的那一步，不是事后从错误文本里猜的。
+        assert_eq!(series_count(&metrics).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_path_is_counted_under_path() {
+        let policy = crate::config::LandingPolicy {
+            forbidden_paths: vec!["crates/".into()],
+            ..Default::default()
+        };
+        let (chan, metrics) = measured_channel(policy);
+        let ch = change("c1", &diff_touching(&["crates/cog-github/src/lib.rs"]));
+
+        chan.land(&ch, None).await.unwrap_err();
+
+        assert_eq!(failure_count(&metrics, "path").await, 1.0);
+        assert_eq!(series_count(&metrics).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_whitelist_violation_is_counted_under_path() {
+        let (chan, metrics) = measured_channel(Default::default());
+        let ch = change("c1", &diff_touching(&["deploy/helm/cogneva/values.yaml"]));
+
+        chan.land(&ch, None).await.unwrap_err();
+
+        assert_eq!(failure_count(&metrics, "path").await, 1.0);
+        assert_eq!(series_count(&metrics).await, 1);
+    }
+
+    /// 没接后端时落地行为一字不变：计数是旁路，不是前置条件。
+    #[tokio::test]
+    async fn a_landing_without_a_backend_fails_the_same_way() {
+        let policy = crate::config::LandingPolicy {
+            max_changed_lines: 1,
+            ..Default::default()
+        };
+        let ch = change("c1", &diff_touching(&["crates/cog-github/src/lib.rs"]));
+
+        let err = channel(policy).land(&ch, None).await.unwrap_err();
+
+        assert!(err.to_string().contains("over the 1-line cap"), "{err}");
     }
 
     #[test]

@@ -1574,6 +1574,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cog-core",
+ "cog-storage",
  "hex",
  "hmac 0.12.1",
  "jsonwebtoken 9.3.1",

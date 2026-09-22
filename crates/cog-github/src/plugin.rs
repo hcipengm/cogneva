@@ -306,6 +306,15 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         if orchestrator.is_none() {
             info!("GitHubPlugin: no orchestrator; intent assessment falls back to local rules heuristic");
         }
+        // 落地失败的计数去处。在这里取而不是 init 时：storage 插件的层在 github
+        // 之后（github 不 require 任何插件），init 阶段服务表里还没有它。取不到就
+        // 只有日志，不改变落地行为。
+        if let (Some(channel), Some(metrics)) = (
+            self.channel.as_ref(),
+            ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+        ) {
+            channel.attach_metrics(metrics);
+        }
 
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
