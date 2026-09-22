@@ -19,18 +19,25 @@
 //! do without dropping facts. The footprint in bytes is measured and published
 //! alongside, so the disk cost is visible, but it is a reading, not the knob.
 //!
-//! One row is exempt from eviction: the newest row of every series. Every
-//! reader reaches the log through a series' current value — the scrape asks
-//! for the latest sample per label set, and the counter and histogram
-//! cumulations live in their own tables — so a series whose newest row was
-//! deleted is a series that vanished from `/metrics`, which reads as "this
-//! never existed" rather than as "this was trimmed". That floor is what the
-//! capacity may never buy, and it is one row per series rather than everything
-//! at the newest instant: a row is exempt for being a series' newest, not for
-//! being as recent as its newest. If the floor alone holds more rows than the
-//! capacity allows, the sweep stops at the floor and says so: refusing to
-//! delete more is the correct outcome, and a silent refusal would look exactly
-//! like the capacity being met.
+//! One row is exempt from eviction: the newest row of every series still being
+//! written. Every reader reaches the log through a series' current value — the
+//! scrape asks for the latest sample per label set, and the counter and
+//! histogram cumulations live in their own tables — so a series whose newest
+//! row was deleted is a series that vanished from `/metrics`, which reads as
+//! "this never existed" rather than as "this was trimmed". That floor is what
+//! the capacity may never buy, and it is one row per series rather than
+//! everything at the newest instant: a row is exempt for being a series'
+//! newest, not for being as recent as its newest. If the floor alone holds more
+//! rows than the capacity allows, the sweep stops at the floor and says so:
+//! refusing to delete more is the correct outcome, and a silent refusal would
+//! look exactly like the capacity being met.
+//!
+//! "Still being written" is the part the log cannot answer for itself — a
+//! producer that has gone quiet and one that has gone away leave the same rows
+//! behind — so the names nothing writes any more are declared where the names
+//! are known, and their rows are released to the sweep at their ordinary rank.
+//! Without that, every rename leaves one series that is exempt by construction
+//! and never updated again.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -78,6 +85,7 @@ pub struct SampleLogCap {
     table: String,
     budget: i64,
     metrics: Option<Arc<dyn MetricsBackend>>,
+    retired_names: Vec<&'static str>,
 }
 
 /// What the previous pass saw and when it ran. The next period is derived from
@@ -100,6 +108,7 @@ impl SampleLogCap {
             table: SAMPLES_TABLE.to_string(),
             budget: budget as i64,
             metrics: None,
+            retired_names: cog_core::RETIRED_METRIC_NAMES.to_vec(),
         }
     }
 
@@ -107,6 +116,14 @@ impl SampleLogCap {
     /// sweeper at a throwaway table.
     pub fn with_table(mut self, table: impl Into<String>) -> Self {
         self.table = table.into();
+        self
+    }
+
+    /// Replace the retired-name set the floor exempts. Exists so a test can
+    /// name a series of its own instead of depending on which names the
+    /// codebase happens to have retired.
+    pub fn with_retired_names(mut self, names: Vec<&'static str>) -> Self {
+        self.retired_names = names;
         self
     }
 
@@ -207,6 +224,13 @@ impl SampleLogCap {
     /// id so the answer does not depend on which of two equal rows the planner
     /// happens to visit first.
     ///
+    /// The rank is the exemption, so it has to except the names nothing writes
+    /// any more: a retired series' newest row is the newest it will ever have,
+    /// and holding it forever is what turns a renamed metric into a series
+    /// `/metrics` keeps serving with a value from before the rename. Retired
+    /// names are passed in rather than read from a constant here so a test can
+    /// exercise the release against a name of its own.
+    ///
     /// The statement takes exactly as much work as the overshoot it is
     /// correcting: the cap it is enforcing is the batch size, so there is no
     /// second number deciding how much a single statement may hold locks over.
@@ -214,21 +238,27 @@ impl SampleLogCap {
         let sql = format!(
             "DELETE FROM {table} WHERE id IN (
                  SELECT id FROM (
-                     SELECT id, timestamp,
+                     SELECT id, timestamp, name,
                             row_number() OVER (
                                 PARTITION BY metric_type, name, labels
                                 ORDER BY timestamp DESC, id DESC
                             ) AS newest_rank
                      FROM {table}
                  ) ranked
-                 WHERE newest_rank > 1
+                 WHERE newest_rank > 1 OR name = ANY($2)
                  ORDER BY timestamp, id
                  LIMIT $1
              )",
             table = crate::partition_maintainer::quote_ident(&self.table),
         );
+        let retired: Vec<String> = self
+            .retired_names
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect();
         Ok(sqlx::query(&sql)
             .bind(limit.max(1))
+            .bind(&retired)
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(e.to_string()))?

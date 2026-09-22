@@ -2822,12 +2822,29 @@ mod metrics_exposition_tests {
             "tool_calls_total",
             "llm_call_latency_ms",
             "tool_call_latency_ms",
+            // 已退场的旋钮读数：产出方拆掉了，只剩样本表里最后一行。
+            "metrics_samples_retention_seconds",
         ] {
             assert!(
                 metric_help(COUNTER_HELP, name).starts_with("Undocumented")
                     && metric_help(HISTOGRAM_HELP, name).starts_with("Undocumented")
                     && metric_help(GAUGE_HELP, name).starts_with("Undocumented"),
                 "{name} 没有任何产出落点，不该被描述"
+            );
+        }
+    }
+
+    /// 退场的名字与描述表互斥：描述一个已退场的名字，等于宣称一个再也不来的
+    /// 读数。清扫侧的地板按这份退场名单放开，描述表按产出面收紧，两边一旦同时
+    /// 收进一个名字，就是既在放行又在宣称。
+    #[test]
+    fn retired_names_are_not_described() {
+        for name in cog_core::RETIRED_METRIC_NAMES {
+            assert!(
+                metric_help(COUNTER_HELP, name).starts_with("Undocumented")
+                    && metric_help(HISTOGRAM_HELP, name).starts_with("Undocumented")
+                    && metric_help(GAUGE_HELP, name).starts_with("Undocumented"),
+                "{name} 已退场，不该再被描述"
             );
         }
     }

@@ -425,11 +425,35 @@ pub fn series_endpoint(line: &str) -> Option<&str> {
     rest.split_once('"').map(|(value, _)| value)
 }
 
+/// Metric names this codebase used to publish and no longer does.
+///
+/// A retired name is not a reading. Nothing will write it again, so its newest
+/// sample is the newest it will ever have — and the sample log's rule that each
+/// series keeps its newest row would hold that row forever, which is how a
+/// renamed metric becomes a series `/metrics` serves and nothing ever updates.
+/// Naming the retirement here is what lets the last row age out with the rest.
+///
+/// The list lives in core rather than beside the exporter because the sweep
+/// needs it too, and two copies would drift — the drift being silent, a name
+/// retired in one copy and not the other leaves exactly the zombie this list
+/// exists to prevent.
+///
+/// Removing a name from the code that recorded it means adding it here. That is
+/// the one maintenance step, and forgetting it reproduces today's behaviour
+/// rather than deleting something a live series needed: the list only ever
+/// widens what the sweep may delete.
+pub const RETIRED_METRIC_NAMES: &[&str] = &["metrics_samples_retention_seconds"];
+
+/// Whether `name` is a retired metric. See [`RETIRED_METRIC_NAMES`].
+pub fn is_retired_metric(name: &str) -> bool {
+    RETIRED_METRIC_NAMES.contains(&name)
+}
+
 #[cfg(test)]
 mod infra_endpoint_tests {
     use super::{
-        collect_metrics_for_dimensions, is_infra_endpoint, series_endpoint, Observable, RawMetric,
-        SFResult, TraceFragment,
+        collect_metrics_for_dimensions, is_infra_endpoint, is_retired_metric, series_endpoint,
+        Observable, RawMetric, SFResult, TraceFragment,
     };
     use std::sync::Arc;
 
@@ -529,5 +553,29 @@ mod infra_endpoint_tests {
             *branched.asked.lock().unwrap(),
             vec!["D4".to_string(), "D5".to_string(), "D8".to_string()]
         );
+    }
+
+    /// The one name currently retired has to be one, because the sweep's
+    /// exemption is now keyed on this list: a list that matched nothing would
+    /// leave the zombie series in place while looking like it was handled.
+    #[test]
+    fn the_retired_name_is_matched_by_the_lookup() {
+        assert!(
+            is_retired_metric("metrics_samples_retention_seconds"),
+            "the retired series the sweep has to release is not matched"
+        );
+    }
+
+    /// And it has to match exactly one name — a predicate that matched
+    /// everything would strip the newest-row floor from every live series.
+    #[test]
+    fn the_lookup_matches_nothing_else() {
+        for name in [
+            "metrics_samples_rows",
+            "memory_operations_total",
+            "memory_unextracted_raw",
+        ] {
+            assert!(!is_retired_metric(name), "{name} is a live series");
+        }
     }
 }

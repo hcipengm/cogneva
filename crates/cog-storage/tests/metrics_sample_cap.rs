@@ -207,6 +207,99 @@ async fn every_series_keeps_its_newest_row_even_when_the_budget_is_below_that() 
     drop_probe(&pool, table).await;
 }
 
+/// A series nothing writes any more must not be exempt by construction. Its
+/// newest row is the newest it will ever have, so an unconditional floor holds
+/// it forever and `/metrics` keeps serving a value from before the rename —
+/// which reads as a live reading rather than as a leftover. Released at its
+/// ordinary rank, it ages out with the rest.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_retired_series_row_is_not_held_by_the_floor() {
+    let table = "metrics_sample_cap_probe_retired";
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    fresh_probe(&pool, table).await;
+
+    // A retired series with a single, old row — the shape a rename leaves.
+    sqlx::query(&format!(
+        "INSERT INTO {table} (metric_type, name, value, timestamp)
+         VALUES ('gauge', 'retired_probe_gauge', 1.0, NOW() - INTERVAL '2 days')"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    insert_aged(&pool, table, 4, "1 day").await;
+
+    // A budget the floor alone would stop: the live series' newest row plus the
+    // retired row are five rows, so a budget of one is unreachable while the
+    // retired row stays exempt.
+    let outcome = SampleLogCap::new(pool.clone(), 1)
+        .with_table(table)
+        .with_retired_names(vec!["retired_probe_gauge"])
+        .sweep_once()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT count(*) FROM {table} WHERE name = 'retired_probe_gauge'"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0,
+        "the retired series' last row must be deletable"
+    );
+    // The live series' head survives; the retired row and the three rows below
+    // the head go, which is exactly the four rows over the budget of one.
+    assert_eq!(outcome.removed, 4);
+    assert_eq!(outcome.held, 1);
+    assert!(
+        !outcome.floor_held,
+        "with the retired row released the floor is the live series' head alone"
+    );
+    drop_probe(&pool, table).await;
+}
+
+/// And the release is only for the names named: a series the sweep was not
+/// told about keeps its head, which is the behaviour the release must not
+/// widen by accident.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_series_not_named_as_retired_keeps_its_head() {
+    let table = "metrics_sample_cap_probe_not_retired";
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    fresh_probe(&pool, table).await;
+
+    sqlx::query(&format!(
+        "INSERT INTO {table} (metric_type, name, value, timestamp)
+         VALUES ('gauge', 'retired_probe_gauge', 1.0, NOW() - INTERVAL '2 days')"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    insert_aged(&pool, table, 4, "1 day").await;
+
+    let outcome = SampleLogCap::new(pool.clone(), 1)
+        .with_table(table)
+        .with_retired_names(vec![])
+        .sweep_once()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT count(*) FROM {table} WHERE name = 'retired_probe_gauge'"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1,
+        "an unnamed series' head is what the floor exists for"
+    );
+    assert!(outcome.floor_held);
+    drop_probe(&pool, table).await;
+}
+
 /// The same floor must not block a sweep that the budget can actually meet.
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
