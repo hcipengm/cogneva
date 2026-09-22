@@ -182,28 +182,51 @@ impl DagExecutorRuntime {
         // 阈值必须大于最长处理时长，否则正在处理的消息会被并发重投；重投是
         // at-least-once，已终态任务会被上面的拒绝分支 ack 丢弃，不会重复迁移。
         let claim_idle_ms = self.config.result_claim_idle_secs.saturating_mul(1000);
+        let interval_secs = self.config.result_claim_interval_secs.max(1);
+        {
+            // 观测面单独成任务，不搭清扫器的节拍。清扫器认得这条流和它的阈值，
+            // 观测从它那里取这两个事实，但两者的节奏必须各自独立：这个循环会
+            // 在 tick 里就地 await 一条重投消息的完整处理（可能几十分钟），把
+            // 测量挂在同一根节拍上，就等于"处理得越久，指标越静止"，而抓取面
+            // 上一条静止的序列和一条干净流量的序列是同一个样子——恰好把最该
+            // 被看见的停滞藏了起来。先量一次再进循环，让系列在首个节拍前就存在。
+            let observer = crate::observable::stream_pending_observable();
+            let observe_backend = self.backend.clone();
+            let observe_stream = result_stream.clone();
+            let observe_group = group_name.clone();
+            let observe_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                // interval 的首次 tick 立即就绪，先吃掉它，否则会在首次量完之后
+                // 紧接着重复量一次；此后一拍一量。
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                ticker.tick().await;
+                loop {
+                    observer
+                        .measure(
+                            &*observe_backend,
+                            &observe_stream,
+                            &observe_group,
+                            claim_idle_ms,
+                            interval_secs,
+                        )
+                        .await;
+                    tokio::select! {
+                        biased;
+                        _ = observe_shutdown.wait() => break,
+                        _ = ticker.tick() => {}
+                    }
+                }
+            });
+        }
+
         {
             let sweeper = self.clone();
             let stream = result_stream.clone();
             let group = group_name.clone();
             let sweep_shutdown = shutdown.clone();
-            let interval_secs = self.config.result_claim_interval_secs.max(1);
             let batch = self.config.result_claim_batch;
             tokio::spawn(async move {
-                // 观测面：清扫器是唯一同时知道"扫哪条流"和"按什么阈值扫"的地方，
-                // 由它把 pending 状态报给指标面。先量一次再进循环，让系列在首个
-                // 节拍前就存在——否则一个从没量过的流和一个量过发现干净的流
-                // 在抓取面上都是"没有证据"。
-                let observer = crate::observable::stream_pending_observable();
-                observer
-                    .measure(
-                        &*sweeper.backend,
-                        &stream,
-                        &group,
-                        claim_idle_ms,
-                        interval_secs,
-                    )
-                    .await;
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 loop {
@@ -234,18 +257,6 @@ impl DagExecutorRuntime {
                                     );
                                 }
                             }
-                            // 每轮必量，包括认领失败那一轮：报出去的是这一轮扫完仍然
-                            // 超龄的那部分，也就是清扫器没能收回的工作。认领失败时这
-                            // 个数最该被看见，走到 continue 就会把它漏掉。
-                            observer
-                                .measure(
-                                    &*sweeper.backend,
-                                    &stream,
-                                    &group,
-                                    claim_idle_ms,
-                                    interval_secs,
-                                )
-                                .await;
                         }
                     }
                 }
@@ -784,6 +795,13 @@ mod consumer_ack_tests {
         /// Refuse to hand entries back, the way a reclaim pass that is broken
         /// or unreachable would, so a test can look at what is left behind.
         hold_claims: Arc<std::sync::atomic::AtomicBool>,
+        /// A reclaim round that never comes back — the shape a slow or wedged
+        /// round has from the loop's point of view.
+        stall_claims: Arc<std::sync::atomic::AtomicBool>,
+        /// How many times the pending state was asked for, so a test can tell
+        /// "the measurement kept running" apart from "the last reading is still
+        /// on screen".
+        pending_stats_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl ScriptedBackend {
@@ -810,6 +828,16 @@ mod consumer_ack_tests {
         fn hold_claims(&self) {
             self.hold_claims
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn stall_claims(&self) {
+            self.stall_claims
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn pending_stats_calls(&self) -> usize {
+            self.pending_stats_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
 
         fn acked_ids(&self) -> Vec<String> {
@@ -863,6 +891,9 @@ mod consumer_ack_tests {
             _min_idle_ms: u64,
             _count: usize,
         ) -> SFResult<Vec<(String, Vec<u8>)>> {
+            if self.stall_claims.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
             if self.hold_claims.load(std::sync::atomic::Ordering::Relaxed) {
                 return Ok(Vec::new());
             }
@@ -876,6 +907,8 @@ mod consumer_ack_tests {
             _group: &str,
             idle_threshold_ms: u64,
         ) -> SFResult<Option<cog_core::PendingStats>> {
+            self.pending_stats_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let count = self.pending.lock().unwrap().len() as u64;
             let idle = *self.pending_idle_ms.lock().unwrap();
             let unreclaimed = if count > 0 && idle > idle_threshold_ms {
@@ -1151,6 +1184,67 @@ mod consumer_ack_tests {
         assert!(
             of(crate::observable::STREAM_PENDING_MEASURE_LAST_METRIC) > 0.0,
             "a measured stream must carry the timestamp its staleness is judged against"
+        );
+    }
+
+    /// The measurement keeps its own cadence. It used to run inside the reclaim
+    /// pass's tick, so a round that took a long time — or never came back —
+    /// froze the series along with it, and a frozen series is the same picture
+    /// at the scrape as a clean stream. Here the reclaim round never returns,
+    /// and the measurement still has to keep running behind it.
+    #[tokio::test]
+    async fn a_reclaim_round_that_never_returns_does_not_freeze_the_measurement() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-measure-cadence".into(),
+            consumer_group: "grp-measure-cadence".into(),
+            max_retries: 1,
+            result_claim_idle_secs: 600,
+            result_claim_interval_secs: 1,
+            result_claim_batch: 16,
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+        let msg = DagMessage::TaskComplete {
+            message_id: "m-stalled".into(),
+            timestamp: chrono::Utc::now(),
+            task_id: "task-stalled".into(),
+            result: serde_json::json!({"ok": true}),
+            sender: "exec".into(),
+            recipient: "dag".into(),
+        };
+        backend.abandon("rid-stalled", serde_json::to_vec(&msg).unwrap());
+        backend.set_pending_idle_ms(601_000);
+        backend.stall_claims();
+
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
+
+        // A wedged tick could have produced exactly the one reading taken before
+        // the loop started; several readings at a 1s cadence can only come from a
+        // measurement that is not waiting on the reclaim round.
+        for _ in 0..200 {
+            if backend.pending_stats_calls() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let calls = backend.pending_stats_calls();
+        shutdown.trigger();
+        let _ = handle.await;
+
+        // The round really is stuck, so those readings cannot have come from it:
+        // a round that had returned would have taken the message back and acked
+        // it. Without this, a `stall_claims` that silently did nothing would let
+        // the measurement look independent while it was still on the tick.
+        assert!(
+            backend.acked_ids().is_empty(),
+            "the reclaim round completed, so this test proves nothing about a stalled one"
+        );
+        assert!(
+            calls >= 3,
+            "the measurement stopped with the reclaim round: {calls} reading(s) in ~10s at a 1s cadence"
         );
     }
 

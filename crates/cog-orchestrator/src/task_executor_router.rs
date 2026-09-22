@@ -148,26 +148,48 @@ impl TaskExecutorRouter {
         });
 
         {
+            // 观测面单独成任务，不搭清扫器的节拍。两者要的是同一个事实，但判据
+            // 不同：清扫按自己的节奏动，观测按自己的节奏量，共用一根节拍就等于
+            // 让"量到没有"取决于"扫得快不快"。清扫一轮耗时长或卡在认领上，指标
+            // 序列就跟着静止，而抓取面上一条静止的序列和一条干净流量的序列是同
+            // 一个样子——刚好把最该被看见的停滞藏了起来。先量一次再进循环，让系
+            // 列在首个节拍前就存在。
+            let observer = crate::observable::stream_pending_observable();
+            let observe_backend = task_backend.clone();
+            let observe_shutdown = shutdown.clone();
+            let observe_stream = ready_stream.clone();
+            let observe_group = group.clone();
+            tokio::spawn(async move {
+                // interval 的首次 tick 立即就绪，先吃掉它，否则会在首次量完之后
+                // 紧接着重复量一次；此后一拍一量。
+                let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
+                ticker.tick().await;
+                loop {
+                    observer
+                        .measure(
+                            &*observe_backend,
+                            &observe_stream,
+                            &observe_group,
+                            PENDING_IDLE_MS,
+                            CLAIM_INTERVAL.as_secs(),
+                        )
+                        .await;
+                    tokio::select! {
+                        biased;
+                        _ = observe_shutdown.wait() => break,
+                        _ = ticker.tick() => {}
+                    }
+                }
+            });
+        }
+
+        {
             let sweeper = self.clone();
             let sweep_task_backend = task_backend.clone();
             let sweep_shutdown = shutdown.clone();
             let sweep_pipe = pipe.clone();
             let sweep_slots = claim_slots.clone();
             tokio::spawn(async move {
-                // 观测面：清扫器是唯一同时知道"扫哪条流"和"按什么阈值扫"的地方，
-                // 由它把 pending 状态报给指标面。先量一次再进循环，让系列在首个
-                // 节拍前就存在——否则一个从没量过的流和一个量过发现干净的流
-                // 在抓取面上都是"没有证据"。
-                let observer = crate::observable::stream_pending_observable();
-                observer
-                    .measure(
-                        &*sweep_task_backend,
-                        &sweep_pipe.ready_stream,
-                        &sweep_pipe.group,
-                        PENDING_IDLE_MS,
-                        CLAIM_INTERVAL.as_secs(),
-                    )
-                    .await;
                 let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
                 loop {
                     tokio::select! {
@@ -216,18 +238,6 @@ impl TaskExecutorRouter {
                                     );
                                 }
                             }
-                            // 每轮必量，包括认领失败那一轮：报出去的是这一轮扫完仍然
-                            // 超龄的那部分，也就是清扫器没能收回的工作。认领失败时这
-                            // 个数最该被看见，走到 continue 就会把它漏掉。
-                            observer
-                                .measure(
-                                    &*sweep_task_backend,
-                                    &sweep_pipe.ready_stream,
-                                    &sweep_pipe.group,
-                                    PENDING_IDLE_MS,
-                                    CLAIM_INTERVAL.as_secs(),
-                                )
-                                .await;
                         }
                     }
                 }

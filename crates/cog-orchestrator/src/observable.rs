@@ -100,6 +100,12 @@ impl StreamPendingObservable {
     /// A failed measurement keeps the previous figures and does not advance
     /// `last_measure_seconds`: the numbers stay readable as "the last thing we
     /// knew", while the staleness and failure series say how old that is.
+    ///
+    /// The lock is never held across the backend call. Scraping takes the same
+    /// lock, so holding it through a slow Redis round trip would turn a slow
+    /// backend into a process-wide scrape stall — every series this process
+    /// exports would go missing, which reads exactly like the process being
+    /// gone. Each phase therefore takes the lock, does one thing, and lets go.
     pub async fn measure(
         &self,
         backend: &dyn cog_core::MessageBackend,
@@ -108,22 +114,34 @@ impl StreamPendingObservable {
         claim_idle_ms: u64,
         measure_interval_secs: u64,
     ) {
-        let mut streams = self.streams.lock().await;
-        let entry = streams
-            .entry(stream.to_string())
-            .or_insert(StreamPendingState {
-                count: 0,
-                unreclaimed_count: 0,
-                unreclaimed_oldest_idle_ms: 0,
-                claim_idle_ms,
-                measure_interval_secs,
-                last_measure_seconds: 0,
-                measure_failures: 0,
-            });
-        entry.claim_idle_ms = claim_idle_ms;
-        entry.measure_interval_secs = measure_interval_secs;
+        {
+            let mut streams = self.streams.lock().await;
+            let entry = streams
+                .entry(stream.to_string())
+                .or_insert(StreamPendingState {
+                    count: 0,
+                    unreclaimed_count: 0,
+                    unreclaimed_oldest_idle_ms: 0,
+                    claim_idle_ms,
+                    measure_interval_secs,
+                    last_measure_seconds: 0,
+                    measure_failures: 0,
+                });
+            entry.claim_idle_ms = claim_idle_ms;
+            entry.measure_interval_secs = measure_interval_secs;
+        }
 
-        match backend.pending_stats(stream, group, claim_idle_ms).await {
+        let measured = backend.pending_stats(stream, group, claim_idle_ms).await;
+
+        let mut streams = self.streams.lock().await;
+        let Some(entry) = streams.get_mut(stream) else {
+            // The entry is created above and nothing removes entries, so this is
+            // unreachable; falling back to a fresh insert would be worse than
+            // saying so.
+            tracing::warn!(stream = %stream, "pending measurement found no entry");
+            return;
+        };
+        match measured {
             Ok(Some(stats)) => {
                 entry.count = stats.count;
                 entry.unreclaimed_count = stats.unreclaimed_count;
