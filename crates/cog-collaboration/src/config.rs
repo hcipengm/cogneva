@@ -82,7 +82,7 @@ impl SelfReviewSettings {
 }
 
 /// PGE pipeline configuration: optional JSON Schemas constraining actor
-/// outputs. Empty by default so existing behavior is unchanged.
+/// outputs, plus the local-repair budget.
 ///
 /// When a schema is configured for an actor (keyed by actor name:
 /// "planner", "generator", "evaluator", "moderator", "merger"), the actor
@@ -90,10 +90,39 @@ impl SelfReviewSettings {
 /// raw LLM output against it. Validation failures are logged and the legacy
 /// lenient parsing still applies, so a bad schema can never break the
 /// pipeline.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PgeSettings {
     pub schemas: HashMap<String, serde_json::Value>,
+    /// Local-repair budget: how many times, after the evaluator judges a
+    /// generation a failure, its feedback is handed back to the generator
+    /// with the plan held fixed. Only when this runs out does the run
+    /// escalate to a global reset, which re-runs the planner. Zero turns the
+    /// path off, and then every failure pays for a fresh plan even when the
+    /// failure lies in a generation the plan already described.
+    pub local_repair_max: u32,
+}
+
+/// The repair budget a run gets when nothing sets one. Two, not one and not
+/// unbounded: the first repair is what lets feedback be acted on at all, and
+/// the second absorbs a first rewrite that is itself rejected. Past that the
+/// feedback is unchanged between iterations, so repeating it cannot buy a
+/// different outcome — either the plan is the real defect, which is the global
+/// reset's job, or nothing in the feedback is actionable.
+pub const DEFAULT_LOCAL_REPAIR_MAX: u32 = 2;
+
+/// A zero here would close the repair loop for every deployment that does not
+/// set one, which is the state this constant exists to leave behind, so it is
+/// refused where it is written rather than in a test.
+const _: () = assert!(DEFAULT_LOCAL_REPAIR_MAX > 0);
+
+impl Default for PgeSettings {
+    fn default() -> Self {
+        Self {
+            schemas: HashMap::new(),
+            local_repair_max: DEFAULT_LOCAL_REPAIR_MAX,
+        }
+    }
 }
 
 impl PgeSettings {
@@ -186,6 +215,73 @@ mod tests {
         assert!(!SelfReviewSettings::load_from(p).unwrap().enabled);
         assert!(PgeSettings::load_from(p).unwrap().schemas.is_empty());
         assert!(BoundaryConfig::load_from(p).unwrap().rules.is_empty());
+    }
+
+    #[test]
+    fn a_pge_section_without_the_repair_budget_gets_the_policy_default() {
+        let dir = std::env::temp_dir().join(format!("cog-collab-pge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        // The shipped deployments write the `pge` section for its schemas, so a
+        // budget that is absent there must still leave the repair loop open:
+        // reading a missing key as 0 is what made the loop unreachable.
+        std::fs::write(&path, r#"{"pge": {"schemas": {}}}"#).unwrap();
+        assert_eq!(
+            PgeSettings::load_from(&path).unwrap().local_repair_max,
+            DEFAULT_LOCAL_REPAIR_MAX
+        );
+        // An explicit 0 still means off — the default fills absences, it does
+        // not overrule the deployment.
+        std::fs::write(&path, r#"{"pge": {"local_repair_max": 0}}"#).unwrap();
+        assert_eq!(PgeSettings::load_from(&path).unwrap().local_repair_max, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A shipped template is a claim about this section's type: serde passes
+    /// over a key with no field behind it without a word, so an entry nothing
+    /// reads looks exactly like one that was applied. The comparison is an
+    /// equality because the other direction matters too — a field read but
+    /// never written ships a value the operator can neither see nor change,
+    /// which is how the repair budget stayed unreachable from every
+    /// deployment while the code that read it was already there.
+    fn assert_pge_surface_matches(file: &Path) {
+        let raw = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let doc: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", file.display()));
+        let section = doc
+            .get("pge")
+            .unwrap_or_else(|| panic!("{} has no pge section", file.display()));
+
+        let mut expected: Vec<String> = serde_json::to_value(PgeSettings::default())
+            .expect("PgeSettings serializes")
+            .as_object()
+            .expect("PgeSettings serializes to an object")
+            .keys()
+            .cloned()
+            .collect();
+        let mut actual: Vec<String> = section
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| !k.starts_with('_'))
+            .cloned()
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            expected,
+            actual,
+            "{} pge section drifted from PgeSettings",
+            file.display()
+        );
+    }
+
+    #[test]
+    fn shipped_config_templates_track_the_pge_field_surface() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_pge_surface_matches(&root.join("cogneva.example.json"));
+        assert_pge_surface_matches(&root.join("deploy/helm/cogneva/files/cogneva.json"));
     }
 
     #[test]

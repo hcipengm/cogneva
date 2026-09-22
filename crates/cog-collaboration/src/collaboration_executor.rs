@@ -42,6 +42,8 @@ pub struct CollaborationExecutor {
     meta_learning: Option<Arc<dyn cog_core::MetaLearning>>,
     /// Ralph Loop 预算与停滞窗口（配置面 `ralph` 段；None = 默认）。
     ralph: Option<crate::squad::ralph::RalphLoopConfig>,
+    /// 局部修复预算（配置面 `pge` 段；None = [`crate::DEFAULT_LOCAL_REPAIR_MAX`]）。
+    local_repair_max: Option<u32>,
 }
 
 impl CollaborationExecutor {
@@ -64,6 +66,7 @@ impl CollaborationExecutor {
             state_backend: None,
             meta_learning: None,
             ralph: None,
+            local_repair_max: None,
         }
     }
 
@@ -174,6 +177,13 @@ impl CollaborationExecutor {
     /// (from the `ralph` config section).
     pub fn with_ralph_config(mut self, config: crate::squad::ralph::RalphLoopConfig) -> Self {
         self.ralph = Some(config);
+        self
+    }
+
+    /// Override the local-repair budget for all squads
+    /// (from the `pge` config section).
+    pub fn with_local_repair_max(mut self, max: u32) -> Self {
+        self.local_repair_max = Some(max);
         self
     }
 }
@@ -495,6 +505,9 @@ impl CollaborationExecutor {
         if let Some(ralph) = self.ralph {
             squad_executor = squad_executor.with_ralph_config(ralph);
         }
+        if let Some(max) = self.local_repair_max {
+            squad_executor = squad_executor.with_local_repair_max(max);
+        }
 
         let result = squad_executor
             .execute_squad(
@@ -616,6 +629,9 @@ impl CollaborationExecutor {
         }
         if let Some(ralph) = self.ralph {
             squad_executor = squad_executor.with_ralph_config(ralph);
+        }
+        if let Some(max) = self.local_repair_max {
+            squad_executor = squad_executor.with_local_repair_max(max);
         }
 
         let mut context = task.input.clone();

@@ -60,6 +60,7 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             if !pge.schemas.is_empty() {
                 collab = collab.with_pge_schemas(pge.schemas.clone());
             }
+            collab = collab.with_local_repair_max(pge.local_repair_max);
 
             collab = collab.with_ralph_config(crate::RalphSettings::load()?.to_loop_config());
 

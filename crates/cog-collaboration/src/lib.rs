@@ -14,7 +14,9 @@ pub mod squad;
 
 pub use actors::{ModeratorDecision, ModeratorOutput};
 pub use collaboration_executor::CollaborationExecutor;
-pub use config::{BoundaryConfig, PgeSettings, RalphSettings, SelfReviewSettings};
+pub use config::{
+    BoundaryConfig, PgeSettings, RalphSettings, SelfReviewSettings, DEFAULT_LOCAL_REPAIR_MAX,
+};
 pub use hierarchy::{
     cross_squad_notify, AgentIdent, BroadcastRouter, HierarchicalCommunication,
     HierarchicalMessage, InterSquadMessage, RoutingStrategy, SquadId, TopicName,

@@ -458,7 +458,9 @@
   },
   "pge": {
     "_comment": "PGE actor 输出契约。schemas 按 actor 名（planner/generator/evaluator/moderator/merger）配置 JSON Schema；配置后 schema 会注入 prompt 上下文并对 LLM 原始输出做校验，校验失败仅告警并回退宽松解析，不会中断流水线。默认为空 = 使用内置契约。",
-    "schemas": {}
+    "_comment_local_repair_max": "局部修复预算：Evaluator 判失败后保持当前 Plan 不变、把 feedback 回传给 Generator 再生成的次数，耗尽才做全局重置（重跑 Planner）。0 = 关闭这条路径，于是每次失败都从新 Plan 重来。写在这里是因为 schemas 一旦配置就很难注意到这条键缺了，而缺了的读法是 0。",
+    "schemas": {},
+    "local_repair_max": 2
   },
   "lifecycle": {
     "heartbeat_interval_secs": 5,

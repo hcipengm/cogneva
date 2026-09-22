@@ -117,6 +117,9 @@ pub struct SquadExecutor {
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
     /// Ralph Loop 预算与停滞窗口（来自配置面 `ralph` 段，默认见 RalphLoopConfig）。
     ralph: RalphLoopConfig,
+    /// 局部修复预算（来自配置面 `pge` 段）。None = 由
+    /// [`crate::DEFAULT_LOCAL_REPAIR_MAX`] 兜底。
+    local_repair_max: Option<u32>,
 }
 
 /// Optional service dependencies shared by squad execution stages.
@@ -133,6 +136,8 @@ pub(crate) struct SquadDeps {
     pub skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     pub state_backend: Option<Arc<dyn cog_core::StateBackend>>,
     pub ralph: RalphLoopConfig,
+    /// 局部修复预算（配置面 `pge` 段）。None = [`crate::DEFAULT_LOCAL_REPAIR_MAX`]。
+    pub local_repair_max: Option<u32>,
 }
 
 impl SquadExecutor {
@@ -228,6 +233,13 @@ impl SquadExecutor {
         self
     }
 
+    /// Override the local-repair budget (from the `pge` config section).
+    /// Unset = [`crate::DEFAULT_LOCAL_REPAIR_MAX`].
+    pub fn with_local_repair_max(mut self, max: u32) -> Self {
+        self.local_repair_max = Some(max);
+        self
+    }
+
     /// 直接执行一个 Squad，返回执行结果。
     pub async fn execute_squad(&self, task_id: String, config: SquadConfig) -> SquadResult {
         let squad_id = format!("squad:{}", task_id);
@@ -283,6 +295,7 @@ impl SquadExecutor {
             skill_registry: self.skill_registry.clone(),
             state_backend: self.state_backend.clone(),
             ralph: self.ralph,
+            local_repair_max: self.local_repair_max,
         };
         let result = Self::run_squad_with_retries(squad, deps).await;
         let squad_latency_ms = squad_start.elapsed().as_millis() as u64;
@@ -460,6 +473,14 @@ impl SquadExecutor {
                     // Ralph iteration is enough; rely on Ralph for global reset.
                     pipeline_config.max_retries = 1;
                 }
+                // The repair loop is what lets the evaluator's feedback reach the
+                // generator without paying for a new plan, so it is set for every
+                // mode rather than only the non-self-evolution ones: the run that
+                // matters most here is the one whose artifact failed a structural
+                // gate that already named what to change.
+                pipeline_config.local_repair_max = deps
+                    .local_repair_max
+                    .unwrap_or(crate::DEFAULT_LOCAL_REPAIR_MAX);
                 let pipeline = PgePipeline::new(pipeline_config);
                 match (planner.as_ref(), generator.as_ref(), evaluator.as_ref()) {
                     (Some(p), Some(g), Some(e)) => {
