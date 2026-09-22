@@ -52,11 +52,20 @@ pub fn classify(reason: &str) -> &'static str {
     declared_in(reason).unwrap_or(UNCLASSIFIED_CLASS)
 }
 
-/// 声明「本次运行的失败属于 `class`」：记一次声明计数，文本原样返回。
-/// 产生端在写出带前缀的 reason/feedback 时调用它；记录端在落指标时计数，
-/// 两边一旦分叉，可达性自查就能说出"这个分类声明过却从没被记录"。
-pub fn declare(class: &'static str, text: String) -> String {
-    crate::observable::global_observable().announce_class(class);
+/// 声明「这段文本自己声明的分类」：按文本读出的分类记一次声明计数，文本原样返回。
+///
+/// 产生端**不该另立一个分类名**——它手里只有文本，而文本声明什么分类由
+/// [`declared_in`] 从同一份表导出。让产生端再写一遍分类，就是第二份定义：
+/// 一处写 `terminal_env_failure`、文本却没带该前缀时，声明计数照记、记录端却把
+/// 它读成 `unrecoverable`，于是自查报出一个"声明过却从未被记录"的分类，而真因是
+/// 那句话根本没声明过。声明与记录必须由同一个判据给出。
+///
+/// 文本没声明任何分类时**不记数**：没有声明就谈不上声明丢失，替文本安一个类别
+/// 等于让它说了没说过的话。
+pub fn declare_for(text: String) -> String {
+    if let Some(class) = declared_in(&text) {
+        crate::observable::global_observable().announce_class(class);
+    }
     text
 }
 
@@ -129,6 +138,27 @@ mod tests {
             )),
             TERMINAL_ENV_FAILURE_CLASS
         );
+    }
+
+    /// 声明的分类取自文本本身，不在调用点另写一遍。反过来说，一段没带前缀的
+    /// reason 不该被记成任何已声明的分类——记了就会让自查报一个"声明过却从未被
+    /// 记录"的分类，而那句话其实什么都没声明。
+    #[test]
+    fn the_announced_class_comes_from_the_text_not_the_call_site() {
+        use crate::squad::pge::types::StopCause;
+
+        let announced = declared_in(&declare_for(format!(
+            "{DEGENERATE_LOOP_PREFIX}: flat across the window"
+        )));
+        assert_eq!(announced, Some(DEGENERATE_LOOP_CLASS));
+
+        // 「什么都没跑」是终止的，但它没声明任何 wire 分类：不该替它认领一个。
+        let not_attempted = StopCause::NotAttempted.reason();
+        assert!(
+            declared_in(&not_attempted).is_none(),
+            "nothing was attempted declares no wire class, got: {not_attempted}"
+        );
+        assert_eq!(classify(&declare_for(not_attempted)), UNCLASSIFIED_CLASS);
     }
 
     fn counts(pairs: &[(&str, u64)]) -> HashMap<String, u64> {

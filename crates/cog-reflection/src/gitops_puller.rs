@@ -949,8 +949,13 @@ impl GitOpsPuller {
     /// 观测的是哪一组副本、正文声明的又是哪一套语义。
     async fn scrape_side(&self, ips: &[String]) -> Option<SideRead> {
         let (signals, semantics, hist) = self.scrape_group(ips).await?;
+        // 排序后拼接：这里问的是「还是同一组副本吗」，与 kubectl 两次返回它们的
+        // 先后无关。不排序的话，名单顺序抖一下就是一个假的 window_resets，读的人
+        // 会去追一次并不存在的副本更替。
+        let mut pods: Vec<&str> = ips.iter().map(String::as_str).collect();
+        pods.sort_unstable();
         Some(SideRead {
-            pods: ips.join(","),
+            pods: pods.join(","),
             semantics,
             signals,
             hist,
@@ -1175,7 +1180,8 @@ impl GitOpsPuller {
                 )));
             }
         }
-        // 语义由 `CanaryWindow::holds` 保证两侧一致；变过就整窗重取了，不会走到这里。
+        // 两侧语义不同时 `error_rate_gate` 自己报 `semantics-mismatch`：那两段历史
+        // 各自连续但不可比，重取参考点治不了它，只有说出来。
         let read = error_rate_gate(window, old, new, self.config.canary_min_requests_for_rate);
         debug!(
             cluster = %self.cluster,
@@ -1403,10 +1409,13 @@ impl LatencyRead {
     }
 }
 
-/// 一拍错误率判据的读数。两种「读不到」是两个不同的事实，都不是「通过」。
+/// 一拍错误率判据的读数。三种「读不到」是三个不同的事实，都不是「通过」。
 ///
-/// 两侧语义不同不在这里：那是「这一读与之前那读不是一段连续历史」，整窗都要
-/// 重取，落到 `CanaryWindow::holds` 上去判，而不是留着旧参考点逐轮跳过。
+/// 两侧语义不同是「两段各自连续的历史不可比」，不是「某一读与之前那读不连续」：
+/// 旧组两点都出自旧二进制、候选两点都出自新二进制，各自的历史都是连续的，缺的是
+/// 一条能同时解释两侧的读法。所以它属于这条判据，不属于 `CanaryWindow::holds`——
+/// 落进整窗重取只会让它每拍重取一次、永远比不了，而台账上只剩一个越滚越大的
+/// `window_resets` 计数，读的人分不出病因。
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RateRead {
     Measured {
@@ -1417,6 +1426,8 @@ enum RateRead {
     NoDelta,
     /// 基线一侧没有读数：没有基线的相对量就没有相对判据。
     NoBaseline,
+    /// 两侧正文声明的计数器语义不同，没有任何单一读法能同时解释两侧。
+    SemanticsMismatch,
 }
 
 impl RateRead {
@@ -1425,6 +1436,7 @@ impl RateRead {
             Self::Measured { .. } => "measured",
             Self::NoDelta => "no-delta",
             Self::NoBaseline => "no-baseline",
+            Self::SemanticsMismatch => "semantics-mismatch",
         }
     }
 }
@@ -1719,6 +1731,12 @@ fn error_rate_gate(
     new: &SideRead,
     min_requests: f64,
 ) -> RateRead {
+    // 两侧语义不同的那一拍在这里就出结论，不往下算：下面两个 `error_rate` 共用
+    // 同一个 semantics，而语义不同的两侧没有一个共用读法——挑一侧的语义去解释
+    // 另一侧，得到的是一条看着像读数、实则是错的基线速率。
+    if old.semantics != new.semantics {
+        return RateRead::SemanticsMismatch;
+    }
     let semantics = new.semantics;
     let candidate = error_rate(window.new.signals, new.signals, semantics, min_requests);
     let baseline = error_rate(window.old.signals, old.signals, semantics, min_requests);
@@ -2526,6 +2544,49 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
             &side(cumulative, signals(2.0, 100.0)),
             &side(windowed, signals(9.0, 100.0))
         ));
+    }
+
+    /// 两侧语义不同不是「这一读与之前那读不连续」：各自的历史都连续，缺的是一条
+    /// 能同时解释两侧的读法。整窗重取治不了它（下一拍还是不同，只会一直重取），
+    /// 挑一侧的语义去解释另一侧则得到一条错的基线速率。只出口径唯一的结论：
+    /// `semantics-mismatch`，且必须有别于其余三种读不到。
+    #[test]
+    fn two_sides_that_disagree_on_counter_semantics_have_no_shared_reading() {
+        let puller = test_puller();
+        let windowed = CounterSemantics::Windowed;
+        let cumulative = CounterSemantics::Cumulative;
+        // 旧组跑旧二进制（窗口求和），候选跑新二进制（累积）。两侧本侧的历史都
+        // 是连续的：旧组两点同语义、候选两点也同语义。
+        let w = CanaryWindow {
+            old: side(windowed, signals(2.0, 100.0)),
+            new: side(cumulative, signals(0.0, 0.0)),
+        };
+        let old = side(windowed, signals(5.0, 200.0));
+        let new = side(cumulative, signals(50.0, 1_200.0));
+        let (result, coverage) = one_tick(&puller, &w, &old, &new);
+        assert!(result.is_ok(), "口径不明不能回滚：{result:?}");
+        assert_eq!(
+            coverage.outcomes_of("error-rate"),
+            vec!["semantics-mismatch x1"]
+        );
+        // 三种「读不到」加上「读到了」四个词必须互不相同，否则读者分不出是没数据、
+        // 缺基线还是口径不明。
+        let labels = [
+            RateRead::Measured {
+                candidate: 0.0,
+                baseline: 0.0,
+            }
+            .label(),
+            RateRead::NoDelta.label(),
+            RateRead::NoBaseline.label(),
+            RateRead::SemanticsMismatch.label(),
+        ];
+        let unique: std::collections::BTreeSet<_> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "labels must not collide: {labels:?}"
+        );
     }
 
     /// 窗的「继续用」要求**两侧都**还观测着原样的东西。只重取一侧会让两侧的

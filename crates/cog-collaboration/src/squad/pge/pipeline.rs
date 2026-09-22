@@ -142,11 +142,9 @@ impl PgePipeline {
         let evaluation = EvaluationResult {
             verdict: Verdict::Fail,
             // 声明这次运行按终止性环境故障处置；边界会不会把它记成同一分类，
-            // 由分类可达性自查比对（声明过却从未被记录 = 分类被丢了）。
-            feedback: crate::squad::classify::declare(
-                crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                declared.clone(),
-            ),
+            // 由分类可达性自查比对（声明过却从未被记录 = 分类被丢了）。声明的
+            // 分类由这段文本自己给出，不在调用点再写一遍。
+            feedback: crate::squad::classify::declare_for(declared.clone()),
             score: Some(0),
             criteria: Vec::new(),
             details: None,

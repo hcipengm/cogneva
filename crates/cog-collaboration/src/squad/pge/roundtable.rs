@@ -295,10 +295,7 @@ impl PgeRoundtable {
                     iteration,
                     "Roundtable round stopped on a deterministic failure; stopping debate"
                 );
-                terminal_reason = Some(crate::squad::classify::declare(
-                    crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                    reason,
-                ));
+                terminal_reason = Some(crate::squad::classify::declare_for(reason));
                 break;
             }
 
@@ -446,10 +443,7 @@ impl PgeRoundtable {
                         );
                         consensus_reached = false;
                         evaluation.verdict = Verdict::Fail;
-                        evaluation.feedback = crate::squad::classify::declare(
-                            crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
-                            reason.clone(),
-                        );
+                        evaluation.feedback = crate::squad::classify::declare_for(reason.clone());
                         terminal_reason = Some(reason);
                     } else if !matches!(review.verdict, Verdict::Pass) {
                         consensus_reached = false;
@@ -895,21 +889,29 @@ impl PgeRoundtable {
             .or_else(|| branches.first());
         // 确定性原因优先带出去：它自带"重试无用"的语义，比生成器交了个空
         // 信封更该被上层看到。
+        //
+        // 原因与产物取自不同的分支，这是有意的：这是**整轮**的结论，不是某一支的
+        // ——产物是那一支留下的东西，而"这一轮里出现了确定性失败"是另一支也能
+        // 贡献的事实，把它藏起来会让整轮看起来还能重试。所以原因要带上它是谁说的，
+        // 否则推理串里只写 carried 分支，读的人会以为原因也出自它。
         let cause = branches
             .iter()
             .find_map(|b| match &b.outcome {
                 RoundOutcome::Stopped { cause, .. } if cause.is_deterministic() => {
-                    Some(cause.clone())
+                    Some((b.branch_id, cause.clone()))
                 }
                 _ => None,
             })
             .or_else(|| {
                 branches.iter().find_map(|b| match &b.outcome {
-                    RoundOutcome::Stopped { cause, .. } => Some(cause.clone()),
+                    RoundOutcome::Stopped { cause, .. } => Some((b.branch_id, cause.clone())),
                     RoundOutcome::Judged { .. } => None,
                 })
-            })
-            .unwrap_or(StopCause::NotAttempted);
+            });
+        let (cause_from, cause) = match cause {
+            Some((id, cause)) => (Some(id), cause),
+            None => (None, StopCause::NotAttempted),
+        };
         let product = match carried.map(|b| &b.outcome) {
             Some(RoundOutcome::Stopped { product, .. }) => *product,
             _ => StoppedProduct::None,
@@ -918,10 +920,16 @@ impl PgeRoundtable {
 
         match carried {
             Some(branch) => MergeResult {
-                reasoning: format!(
-                    "No branch reached a judgement; carried branch {}",
-                    branch.branch_id
-                ),
+                reasoning: match cause_from {
+                    Some(id) if id != branch.branch_id => format!(
+                        "No branch reached a judgement; carried branch {}, stop cause from branch {}",
+                        branch.branch_id, id
+                    ),
+                    _ => format!(
+                        "No branch reached a judgement; carried branch {}",
+                        branch.branch_id
+                    ),
+                },
                 plan: branch.plan.clone(),
                 generation: branch.generation.clone(),
                 outcome: RoundOutcome::Stopped { cause, product },

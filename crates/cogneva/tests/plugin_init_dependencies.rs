@@ -13,25 +13,33 @@
 
 use std::collections::{HashMap, HashSet};
 
-/// (consumer plugin, producer plugin, services the consumer reads during init),
-/// read off each consumer's `plugin.rs`.
-const INIT_CONSUMES: &[(&str, &str, &[&str])] = &[
-    (
-        "memory",
-        "storage",
-        &["ExplainPool", "VectorBackend", "ObjectBackend"],
-    ),
-    ("wiki", "storage", &["ObjectBackend"]),
+/// (consumer plugin, producer plugin) for every edge a plugin's own `init`
+/// depends on, read off each consumer's `plugin.rs`.
+///
+/// Only the two plugin names are data: they are what the assertion compares.
+/// Which pins are read is a note for whoever reads a failure, kept as a comment
+/// so it cannot be mistaken for a second vocabulary the runtime would have to
+/// agree with — a name written here that drifted would change nothing but the
+/// wording of a message.
+const INIT_CONSUMES: &[(&str, &str)] = &[
+    // ExplainPool, VectorBackend, ObjectBackend
+    ("memory", "storage"),
+    // ObjectBackend
+    ("wiki", "storage"),
     // The object backend is chosen from `providers.storage.provider` at init;
     // the S3 path needs an HttpClient then, not on first request.
-    ("storage", "net", &["HttpClient"]),
-    ("gateway", "storage", &["ExplainPool"]),
-    ("gateway", "observability", &["ActiveAlertSource"]),
+    // HttpClient
+    ("storage", "net"),
+    // ExplainPool
+    ("gateway", "storage"),
+    // ActiveAlertSource
+    ("gateway", "observability"),
     // The agent pool binds each role's skill — its iteration budget above all —
     // when it is built inside init. Losing this edge to a soft dependency would
     // not fail: every role would quietly run on its configured seed, which is
     // the "wired but ineffective" state the binding exists to end.
-    ("agent", "skill", &["SkillRegistry"]),
+    // SkillRegistry
+    ("agent", "skill"),
 ];
 
 /// Every plugin `name` transitively depends on.
@@ -53,11 +61,11 @@ fn requires_closure(name: &str) -> HashSet<&'static str> {
 
 #[test]
 fn init_consumes_are_ordered() {
-    for (plugin, producer, consumed) in INIT_CONSUMES {
+    for (plugin, producer) in INIT_CONSUMES {
         assert!(
             requires_closure(plugin).contains(producer),
-            "{plugin} reads {consumed:?} from {producer} during init but does not depend on \
-             {producer}; same-layer plugins init in parallel, so the read can race the publisher"
+            "{plugin} reads from {producer} during init but does not depend on {producer}; \
+             same-layer plugins init in parallel, so the read can race the publisher"
         );
     }
 }

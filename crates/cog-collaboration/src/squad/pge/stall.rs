@@ -27,10 +27,7 @@ use cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX;
 /// 「已声明」。边界若把这段文本翻成别的 reason，这个分类的序列就会结构性
 /// 恒 0，可达性自查靠这次计数把分叉自己报出来。
 pub fn degenerate_loop_feedback(detail: String) -> String {
-    crate::squad::classify::declare(
-        crate::squad::classify::DEGENERATE_LOOP_CLASS,
-        format!("{DEGENERATE_LOOP_PREFIX}: {detail}"),
-    )
+    crate::squad::classify::declare_for(format!("{DEGENERATE_LOOP_PREFIX}: {detail}"))
 }
 
 /// The evaluator's judgement of one attempt, reduced to what progress can be
