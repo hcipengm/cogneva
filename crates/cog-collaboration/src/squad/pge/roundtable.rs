@@ -6,8 +6,8 @@ use crate::squad::pge::stall::{
     degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict,
 };
 use crate::squad::pge::types::{
-    Artifact, BranchMergeStrategy, Criterion, EvaluationResult, GeneratorOutput, MergeSummary,
-    PgeBranchResult, PgeRoundtableIteration, PlannerOutput, RoundOutcome, StopCause,
+    best_scored, Artifact, BranchMergeStrategy, Criterion, EvaluationResult, GeneratorOutput,
+    MergeSummary, PgeBranchResult, PgeRoundtableIteration, PlannerOutput, RoundOutcome, StopCause,
     StoppedProduct, Verdict,
 };
 use std::sync::Arc;
@@ -394,10 +394,7 @@ impl PgeRoundtable {
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
                 },
-                generation: GeneratorOutput {
-                    content: serde_json::Value::Null,
-                    artifacts: Vec::new(),
-                },
+                generation: GeneratorOutput::none(),
                 outcome: RoundOutcome::Stopped {
                     cause: StopCause::NotAttempted,
                     product: StoppedProduct::None,
@@ -539,10 +536,7 @@ impl PgeRoundtable {
         if let Some(reason) = plan.terminal_env_failure_reason() {
             return (
                 plan,
-                GeneratorOutput {
-                    content: serde_json::Value::Null,
-                    artifacts: Vec::new(),
-                },
+                GeneratorOutput::none(),
                 RoundOutcome::Stopped {
                     cause: StopCause::Deterministic { reason },
                     product: StoppedProduct::None,
@@ -659,10 +653,7 @@ impl PgeRoundtable {
                     return PgeBranchResult {
                         branch_id,
                         plan,
-                        generation: GeneratorOutput {
-                            content: serde_json::Value::Null,
-                            artifacts: Vec::new(),
-                        },
+                        generation: GeneratorOutput::none(),
                         outcome: RoundOutcome::Stopped {
                             cause: StopCause::Deterministic { reason },
                             product: StoppedProduct::None,
@@ -834,10 +825,7 @@ impl PgeRoundtable {
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
                 },
-                generation: GeneratorOutput {
-                    content: serde_json::Value::Null,
-                    artifacts: Vec::new(),
-                },
+                generation: GeneratorOutput::none(),
                 outcome: RoundOutcome::Stopped {
                     cause: StopCause::NotAttempted,
                     product: StoppedProduct::None,
@@ -942,10 +930,7 @@ impl PgeRoundtable {
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
                 },
-                generation: GeneratorOutput {
-                    content: serde_json::Value::Null,
-                    artifacts: Vec::new(),
-                },
+                generation: GeneratorOutput::none(),
                 outcome: RoundOutcome::Stopped {
                     cause,
                     product: StoppedProduct::None,
@@ -957,9 +942,7 @@ impl PgeRoundtable {
     }
 
     fn merge_best_score(&self, branches: &[PgeBranchResult]) -> MergeResult {
-        let best = Self::judged_branches(branches)
-            .into_iter()
-            .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0))
+        let best = best_scored(&Self::judged_branches(branches))
             .cloned()
             .expect("the caller checked at least one branch reached a judgement");
 
@@ -986,11 +969,15 @@ impl PgeRoundtable {
             .map(|(v, _)| v)
             .unwrap_or(Verdict::Fail);
 
-        let best = judged
+        // 先在同判决的分支里按分挑，挑不到（不该发生，除非判决计数与判词不一致）
+        // 才退回第一条已判分支，而不是全场最高分——那会把判决不同的分支选上来，
+        // 与"按多数判决合并"这句话相反。
+        let agreeing: Vec<&PgeBranchResult> = judged
             .iter()
-            .filter(|b| b.outcome.judgement().map(|e| e.verdict) == Some(majority_verdict))
-            .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0))
             .copied()
+            .filter(|b| b.outcome.judgement().map(|e| e.verdict) == Some(majority_verdict))
+            .collect();
+        let best = best_scored(&agreeing)
             .or_else(|| judged.first().copied())
             .cloned()
             .expect("the caller checked at least one branch reached a judgement");
@@ -1008,9 +995,7 @@ impl PgeRoundtable {
     }
 
     fn merge_union_artifacts(&self, branches: &[PgeBranchResult]) -> MergeResult {
-        let best = Self::judged_branches(branches)
-            .into_iter()
-            .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0))
+        let best = best_scored(&Self::judged_branches(branches))
             .cloned()
             .expect("the caller checked at least one branch reached a judgement");
 

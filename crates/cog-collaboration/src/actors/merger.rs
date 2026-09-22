@@ -132,12 +132,12 @@ pub fn parse_merge_result(value: &serde_json::Value, branches: &[PgeBranchResult
 /// Fallback merge strategy: pick the branch with the highest evaluation score.
 /// Only judged branches carry a score, so only they can be ranked.
 pub fn fallback_best_branch(branches: &[PgeBranchResult]) -> MergeResult {
-    let best = branches
+    let judged: Vec<&PgeBranchResult> = branches
         .iter()
         .filter(|b| b.outcome.judgement().is_some())
-        .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0));
+        .collect();
 
-    match best {
+    match crate::squad::pge::types::best_scored(&judged) {
         Some(best) => MergeResult {
             reasoning: format!("Fallback: selected branch {} by best score", best.branch_id),
             plan: best.plan.clone(),
@@ -152,10 +152,7 @@ pub fn fallback_best_branch(branches: &[PgeBranchResult]) -> MergeResult {
                 sub_tasks: Vec::new(),
                 acceptance_criteria: Vec::new(),
             },
-            generation: GeneratorOutput {
-                content: serde_json::Value::Null,
-                artifacts: Vec::new(),
-            },
+            generation: GeneratorOutput::none(),
             outcome: RoundOutcome::Stopped {
                 cause: StopCause::NotAttempted,
                 product: StoppedProduct::None,

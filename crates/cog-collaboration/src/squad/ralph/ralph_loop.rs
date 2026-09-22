@@ -1624,10 +1624,7 @@ mod tests {
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
         };
-        result.final_generation = GeneratorOutput {
-            content: serde_json::Value::Null,
-            artifacts: Vec::new(),
-        };
+        result.final_generation = GeneratorOutput::none();
         result.final_outcome = RoundOutcome::Stopped {
             cause: StopCause::Deterministic {
                 reason: reason.to_string(),

@@ -206,10 +206,7 @@ impl PgePipeline {
                 );
                 // 生成器没被调用，这里是占位而非产出：真因由 plan 侧合成进
                 // terminal_reason，读侧不能拿这个空生成反推是谁失败。
-                let generation = GeneratorOutput {
-                    content: serde_json::Value::Null,
-                    artifacts: Vec::new(),
-                };
+                let generation = GeneratorOutput::none();
                 return Self::terminal_result(attempt, plan, generation, None, history);
             }
 

@@ -159,6 +159,20 @@ pub struct GeneratorOutput {
     pub artifacts: Vec<Artifact>,
 }
 
+impl GeneratorOutput {
+    /// The output of a round that never reached the generator, or reached it and
+    /// got nothing. Whoever returns this must also say why in its outcome: an
+    /// empty output on its own is indistinguishable from a generator that ran
+    /// and wrote nothing, which is the reading this constructor exists to not
+    /// invite.
+    pub fn none() -> Self {
+        Self {
+            content: serde_json::Value::Null,
+            artifacts: Vec::new(),
+        }
+    }
+}
+
 /// Cause of a generator that answered with an envelope carrying neither content
 /// nor artifacts, and named no cause of its own. One definition, so every
 /// producer of this feedback — pipeline attempt, local repair, roundtable round
@@ -528,6 +542,20 @@ pub struct PgeBranchResult {
     pub plan: PlannerOutput,
     pub generation: GeneratorOutput,
     pub outcome: RoundOutcome,
+}
+
+/// The highest-scoring branch among the ones a judge actually ruled on.
+///
+/// Only a judgement carries a score, so only judged branches can be ranked:
+/// ranking the rest would read "nobody judged this" as a score of zero and let
+/// an unjudged branch win a contest it never entered. Callers pass the judged
+/// subset, which is also the set they had to find non-empty before ranking
+/// anything at all.
+pub fn best_scored<'a>(judged: &[&'a PgeBranchResult]) -> Option<&'a PgeBranchResult> {
+    judged
+        .iter()
+        .copied()
+        .max_by_key(|b| b.outcome.judgement().and_then(|e| e.score).unwrap_or(0))
 }
 
 /// Strategy for merging parallel branch results.
