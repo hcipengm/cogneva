@@ -270,3 +270,47 @@ async fn a_tool_outside_the_boundary_has_nothing_behind_it() {
         "the narrowed registry lost the execution machinery, not just the tool list: {out}"
     );
 }
+
+/// Narrowing drops what it cannot resolve, so the drop has to be reportable:
+/// this is the runtime half of the check above. The gate here reads the lists
+/// as shipped in the repository, which says nothing about the lists a running
+/// deployment loaded — a deployment carrying older skill files narrows every
+/// role down and nothing in the repository can see it.
+#[test]
+fn the_names_narrowing_dropped_are_named_back() {
+    let registry = production_registry();
+
+    assert!(
+        registry
+            .missing_tools(&["read_file".to_string(), "run_command".to_string()])
+            .is_empty(),
+        "every name here resolves, so nothing was dropped"
+    );
+
+    assert_eq!(
+        registry.missing_tools(&[
+            "read_file".to_string(),
+            "code".to_string(),
+            "test".to_string(),
+        ]),
+        vec!["code".to_string(), "test".to_string()],
+        "the report names the drops, in the order declared"
+    );
+
+    // The shape a deployment with stale skill files actually produces: a list
+    // where every entry is unknown. The role ends up with no tools, and the
+    // report has to say so rather than come back empty.
+    let stale = vec!["code".to_string(), "test".to_string()];
+    assert_eq!(registry.missing_tools(&stale).len(), stale.len());
+    assert_eq!(
+        registry.restricted_to(&stale).names(),
+        Vec::<String>::new(),
+        "an entirely unknown list leaves the role with nothing to call"
+    );
+
+    // A name repeated in the declaration is one drop, not two.
+    assert_eq!(
+        registry.missing_tools(&["code".to_string(), "code".to_string()]),
+        vec!["code".to_string()]
+    );
+}

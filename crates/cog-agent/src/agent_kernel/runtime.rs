@@ -400,9 +400,29 @@ impl AgentRuntime {
     /// A role with no skill, or a skill that declares no tools, gets the whole
     /// registry: an absent list is no evidence about what the role needs, and
     /// inventing a boundary from it would restrict a role nobody has described.
+    ///
+    /// A name the registry does not hold is reported here. Narrowing is silent
+    /// by design — a stale entry must not take the role down — but a list that
+    /// resolves to nothing at all leaves the role with no tools, and that reads
+    /// at the model as a role that never had any. The report is the only thing
+    /// standing between the two, so it names the tools and the count that
+    /// survived.
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = match self.config.skill_config.as_ref() {
-            Some(skill) if !skill.tools.is_empty() => tools.restricted_to(&skill.tools),
+            Some(skill) if !skill.tools.is_empty() => {
+                let missing = tools.missing_tools(&skill.tools);
+                if !missing.is_empty() {
+                    let kept = skill.tools.len() - missing.len();
+                    tracing::warn!(
+                        skill = %skill.skill_id,
+                        missing = ?missing,
+                        kept,
+                        declared = skill.tools.len(),
+                        "skill declares tools the registry does not hold; the role runs without them"
+                    );
+                }
+                tools.restricted_to(&skill.tools)
+            }
             _ => tools,
         };
         self

@@ -297,6 +297,22 @@ impl ToolRegistry {
         self.tools.read().unwrap().is_empty()
     }
 
+    /// The names in `allowed` this registry has no tool behind, in the order
+    /// they were given, each once.
+    ///
+    /// Narrowing drops these without a word; naming them is what turns "this
+    /// role has fewer tools than its skill says" from an absence into a reading.
+    pub fn missing_tools(&self, allowed: &[String]) -> Vec<String> {
+        let source = self.tools.read().unwrap();
+        let mut missing: Vec<String> = Vec::new();
+        for name in allowed {
+            if !source.contains_key(name) && !missing.contains(name) {
+                missing.push(name.clone());
+            }
+        }
+        missing
+    }
+
     /// A registry holding only the named tools, over the same execution
     /// machinery — sandbox backend, guardrail, plugin registry, timeouts — so
     /// a narrowed registry runs a tool exactly as the full one would.
@@ -311,6 +327,10 @@ impl ToolRegistry {
     /// stale entry in that statement, and failing to build the registry over it
     /// would turn a tidying omission into an outage. What keeps the statement
     /// honest is a gate over the shipped lists, not a runtime panic.
+    ///
+    /// Which is exactly why the drops have to be reportable: a gate over the
+    /// lists in the repository says nothing about which lists a running
+    /// deployment loaded. [`Self::missing_tools`] is that report.
     pub fn restricted_to(&self, allowed: &[String]) -> Self {
         let mut kept = HashMap::new();
         {
