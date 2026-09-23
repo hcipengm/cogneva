@@ -575,6 +575,24 @@ data:
               },
               "severity": "warning",
               "summary": "Pending state for {stream} failed to be measured {value} time(s) in the last hour. The reclaim loop is running but cannot read the queue, so its last published figures are not evidence about the present"
+            },
+            {
+              "name": "runtime_asset_not_refreshed",
+              "promql": "cogneva_runtime_asset_state{state=\"not_refreshed\"} > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The overlay that built this image never recorded refreshing {asset}, so what is live there is the base image's copy, not this revision's. The overlay is built by the deployer binary that was running at the time, which is one revision behind the one it deploys: a revision that adds an asset to deploy/overlay-assets.json is copied by the next rollout and silently left out by every rollout before it. Reading this per asset rather than as a bare count is the point — which asset is stale is what says whether the revision now arriving is the one carrying the fix"
+            },
+            {
+              "name": "runtime_asset_content_drift",
+              "promql": "cogneva_runtime_asset_state{state=\"content_drift\"} > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The live copy of {asset} is not the copy the overlay recorded writing into this image. The overlay digests the checkout tree it copies and the application digests the same path at startup; the two differ, so either the copy did not land, or the destination still carries files the source no longer ships — a copy onto a pre-existing directory merges, and does not delete what it no longer contains"
             }
           ]
         },

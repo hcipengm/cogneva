@@ -64,6 +64,22 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = cog_core::PluginContext::new(config.core.clone());
     ctx.publish(Arc::new(config.core.clone()));
 
+    // 镜像里的运行时资产（skills、migrations）由主线 overlay 从被部署 rev 的
+    // 检出里重拷，而构建 overlay 的部署器永远是上一代二进制：它按上一代的资产
+    // 表拷，本 rev 新增的资产就漏在镜像基底里那份旧副本上，且没有任何一面说得
+    // 出现在跑的是哪一份。这一判在这里做——本进程是唯一跑最新代码的一侧——判据
+    // 是 overlay 记在镜像里的那份拷贝记录，对本 rev 声明的每个落点逐个比。
+    let declared_assets = cog_reflection::runtime_assets::embedded_asset_list();
+    let asset_report = cog_reflection::runtime_assets::verify(
+        std::path::Path::new(cog_reflection::runtime_assets::RUNTIME_ASSET_MANIFEST_DEST),
+        &declared_assets,
+    )
+    .await;
+    asset_report.log();
+    let asset_observable = Arc::new(cog_reflection::runtime_assets::AssetIdentityObservable::new());
+    asset_observable.record(asset_report).await;
+    ctx.publish_observable(asset_observable);
+
     let (daemon, _pid_file) = assembly::infra::init_daemon_and_pidfile();
 
     let task_event_tx = tokio::sync::broadcast::channel::<cog_core::TaskEvent>(

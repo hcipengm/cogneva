@@ -56,6 +56,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-orchestrator/src/observable.rs",
     ),
     (
+        "cogneva_runtime_asset_state",
+        "crates/cog-reflection/src/runtime_assets.rs",
+    ),
+    (
         "cogneva_trace_tier_last_pass_seconds",
         "crates/cog-observability/src/snapshot.rs",
     ),

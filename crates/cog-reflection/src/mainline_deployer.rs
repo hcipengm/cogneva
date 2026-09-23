@@ -51,31 +51,20 @@ const BUILDAH_RUNROOT: &str = "/opt/cogneva/sandbox/containers/run";
 /// 全丢，每次构建都要在家庭网络上重拉整个 crates.io 索引。
 const CARGO_HOME_PVC: &str = "/opt/cogneva/sandbox/cargo-home";
 
-/// 镜像里那个二进制的落点。overlay 单独替换它，与下面的资产表不同源：
+/// 镜像里那个二进制的落点。overlay 单独替换它，与资产表不同源：
 /// 它来自构建产物目录，不是 rev 检出里的文件。
 const OVERLAY_BINARY_DEST: &str = "/opt/cogneva/cogneva";
 
-/// overlay 必须从被部署 rev 的检出里重新拷进去的运行时资产，形如
-/// （检出内路径，镜像内落点）。
-///
-/// 镜像在构建它的那一刻就把这些资产烤进去了，而那一刻的检出不是现在这个
-/// rev：不重拷，新二进制就配着旧资产跑。资产失配里 skills 是最静默的一种
-/// ——角色注册表按 skill 声明的工具名收窄，名字一个都对不上就收窄成空表，
-/// 模型的请求里连 tools 字段都不发，角色于是没有工具可用，而日志里一个
-/// 字都没有。
-const OVERLAY_ASSETS: &[(&str, &str)] = &[
-    (
-        "crates/cog-storage/migrations",
-        "/opt/cogneva/crates/cog-storage/migrations",
-    ),
-    ("skills", "/opt/cogneva/skills"),
-];
+/// 运行时资产表在检出的位置。真正的表是仓库里的这个文件，见
+/// [`MainlineDeployer::asset_list`]：部署器永远比它正在部署的 rev 旧一代，
+/// 表若编在它里面，就描述的是上一代的资产。
+const OVERLAY_ASSET_LIST_PATH: &str = "deploy/overlay-assets.json";
 
 /// 最终镜像烤了、但 overlay 明确不刷新的资产，形如（镜像内落点，为什么刷不了）。
 ///
 /// 这张表的用途是让「不刷新」成为一条要有人辩护的声明，而不是一次遗漏：
-/// 门禁读 Dockerfile 最终阶段的 COPY 行，凡不在 [`OVERLAY_ASSETS`] 里、又不
-/// 在 [`OVERLAY_BINARY_DEST`] 上的落点，必须在这里留下理由，否则测试红。
+/// 门禁读 Dockerfile 最终阶段的 COPY 行，凡不在资产表里、又不在
+/// [`OVERLAY_BINARY_DEST`] 上的落点，必须在这里留下理由，否则测试红。
 const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[(
     "/opt/cogneva/web",
     "由镜像的 node 阶段从 web/src 构建，overlay 内没有 node 工具链，新 rev 的前端产物无法在 overlay 内生成",
@@ -2033,6 +2022,40 @@ impl MainlineDeployer {
         Ok(())
     }
 
+    /// 这次滚动要重拷的资产表。
+    ///
+    /// 优先进被部署 rev 的检出：本进程是上一代二进制，编在它里面的表描述的
+    /// 是上一代的资产，rev 若新增了一项，交由此表构建的 overlay 就会漏掉它，
+    /// 而且不会再有下一次滚动来补——这正是资产陈旧能被拖成永久的那条路。
+    /// 检出里没有这个文件（早于该文件的 rev）时才回落到编译进来的那一份。
+    ///
+    /// 镜像是构建它的那一刻把资产烤进去的，而那一刻的检出不是现在这个 rev，
+    /// 不重拷就是新二进制配旧资产跑。失配里 skills 最静默：角色注册表按 skill
+    /// 声明的工具名收窄，名字一个都对不上就收窄成空表，请求里连 tools 字段
+    /// 都不发，角色于是没有工具可用，而日志里一个字都没有。
+    async fn asset_list(&self) -> Vec<crate::runtime_assets::AssetEntry> {
+        let path = self.workdir().join(OVERLAY_ASSET_LIST_PATH);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(text) => match crate::runtime_assets::parse_asset_list(&text) {
+                Ok(list) => {
+                    info!(path = %path.display(), assets = list.len(), "overlay asset list read from the checkout");
+                    return list;
+                }
+                Err(e) => warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "overlay asset list in the checkout is unusable; falling back to the list compiled into this binary, which describes the previous revision's assets"
+                ),
+            },
+            Err(e) => warn!(
+                path = %path.display(),
+                error = %e,
+                "checkout carries no overlay asset list; falling back to the list compiled into this binary, which describes the previous revision's assets"
+            ),
+        }
+        crate::runtime_assets::embedded_asset_list()
+    }
+
     async fn buildah_steps(&self, ctr: &str, rev: &str, new_tag: &str) -> SFResult<()> {
         // 说清楚这次滚动带不动哪些资产：不带，就意味着线上跑的是基底镜像里
         // 那一份，而"哪一份"没有别的面能看出来。
@@ -2043,17 +2066,48 @@ impl MainlineDeployer {
                 "overlay keeps the base image's copy of this asset"
             );
         }
+        let assets = self.asset_list().await;
         let bin = self.target_dir().join("release/cogneva");
         self.buildah(
             &["copy", ctr, bin.to_str().unwrap(), OVERLAY_BINARY_DEST],
             300,
         )
         .await?;
-        for (from, to) in OVERLAY_ASSETS {
-            let src = self.workdir().join(from);
-            self.buildah(&["copy", ctr, src.to_str().unwrap(), to], 300)
+        for entry in &assets {
+            let src = self.workdir().join(&entry.from);
+            self.buildah(&["copy", ctr, src.to_str().unwrap(), &entry.to], 300)
                 .await?;
         }
+
+        // 把这次拷进去的是什么记进镜像本身，好让**跑最新代码的那一侧**——应用
+        // 进程——自己判它的资产对不对得上本 rev。部署器判不了这件事：它永远是
+        // 旧一代，只能回答上一代的问题。
+        let mut digests = std::collections::BTreeMap::new();
+        for entry in &assets {
+            let src = self.workdir().join(&entry.from);
+            let tree = crate::runtime_assets::digest_tree(&src)
+                .await
+                .map_err(|e| SFError::IO(format!("digest overlay asset {}: {e}", src.display())))?;
+            info!(asset = %entry.to, files = tree.files, "overlay refreshed runtime asset");
+            digests.insert(entry.to.clone(), tree.digest);
+        }
+        let manifest =
+            crate::runtime_assets::manifest_json(rev, &digests).map_err(SFError::Validation)?;
+        std::fs::create_dir_all(&self.cfg.state_dir)
+            .map_err(|e| SFError::IO(format!("create state dir {}: {e}", self.cfg.state_dir)))?;
+        let manifest_path = Path::new(&self.cfg.state_dir).join("runtime-assets.json");
+        std::fs::write(&manifest_path, manifest)
+            .map_err(|e| SFError::IO(format!("write {}: {e}", manifest_path.display())))?;
+        self.buildah(
+            &[
+                "copy",
+                ctr,
+                manifest_path.to_str().unwrap(),
+                crate::runtime_assets::RUNTIME_ASSET_MANIFEST_DEST,
+            ],
+            60,
+        )
+        .await?;
 
         // 换版即验证：新二进制必须能自报版本，且内嵌 rev 是目标 rev。
         let version = self
@@ -4102,7 +4156,8 @@ mod tests {
             );
         }
 
-        let refreshed: HashSet<&str> = OVERLAY_ASSETS.iter().map(|(_, to)| *to).collect();
+        let list = crate::runtime_assets::embedded_asset_list();
+        let refreshed: HashSet<&str> = list.iter().map(|e| e.to.as_str()).collect();
         let unreachable: HashSet<&str> = OVERLAY_UNREFRESHABLE.iter().map(|(to, _)| *to).collect();
         let mut unaccounted: Vec<&str> = baked
             .iter()
@@ -4119,20 +4174,24 @@ mod tests {
             unaccounted.is_empty(),
             "the image bakes runtime assets the overlay never refreshes, so the pod would \
              run the new binary beside a stale copy of them: {unaccounted:?}. Add each to \
-             OVERLAY_ASSETS, or to OVERLAY_UNREFRESHABLE with the reason it cannot be \
-             refreshed from the checkout."
+             deploy/overlay-assets.json, or to OVERLAY_UNREFRESHABLE with the reason it \
+             cannot be refreshed from the checkout."
         );
     }
 
-    /// overlay 从检出拷进去的源路径，必须真的在检出了才有得拷。
+    /// 资产表的源路径必须真的在检出了才有得拷。
+    ///
+    /// 表读的是被部署 rev 的检出，所以这里断言的也是「表里每一项的来源在本仓库
+    /// 存在」——表是仓库的一部分，仓库里没有就永远拷不到。
     #[test]
     fn every_overlay_asset_source_exists_in_the_checkout() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for (from, _) in OVERLAY_ASSETS {
-            let src = root.join(from);
+        for entry in crate::runtime_assets::embedded_asset_list() {
+            let src = root.join(&entry.from);
             assert!(
                 src.exists(),
-                "overlay copies {from} out of the checkout, but {src:?} does not exist"
+                "overlay copies {} out of the checkout, but {src:?} does not exist",
+                entry.from
             );
         }
     }
@@ -4982,6 +5041,22 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         std::fs::write(work.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::create_dir_all(work.join("crates/cog-storage/migrations")).unwrap();
         std::fs::write(work.join("crates/cog-storage/migrations/001.sql"), "").unwrap();
+        // 检出自带一份资产表，且比编在二进制里的那份多一项：rev 新增的资产必须
+        // 由承载它的那次滚动带上，而不是等下一次。
+        std::fs::create_dir_all(work.join("skills")).unwrap();
+        std::fs::write(work.join("skills/generator.json"), "[]").unwrap();
+        std::fs::create_dir_all(work.join("prompts")).unwrap();
+        std::fs::write(work.join("prompts/system.md"), "system\n").unwrap();
+        std::fs::create_dir_all(work.join("deploy")).unwrap();
+        std::fs::write(
+            work.join("deploy/overlay-assets.json"),
+            r#"{"assets":[
+  {"from": "crates/cog-storage/migrations", "to": "/opt/cogneva/crates/cog-storage/migrations"},
+  {"from": "skills", "to": "/opt/cogneva/skills"},
+  {"from": "prompts", "to": "/opt/cogneva/prompts"}
+]}"#,
+        )
+        .unwrap();
         real_git(&work, &["add", "."]).await;
         real_git(&work, &["commit", "-m", "a"]).await;
         // clone 后默认分支名随 git 配置（master/main），统一推到 bare 的 main。
@@ -5506,6 +5581,78 @@ exit 0
             serde_json::from_str(&std::fs::read_to_string(root.join("state/state.json")).unwrap())
                 .unwrap();
         assert_eq!(state.in_flight.unwrap().phase, Phase::Dispatched);
+    }
+
+    /// 本轮滚动要重拷的资产表取自**被部署 rev 的检出**，不是编在部署器里的那份。
+    ///
+    /// 部署器永远是上一代二进制，编在它里面的表描述的是上一代的资产。夹具的检出
+    /// 比二进制多一项 `/opt/cogneva/prompts`——`rev 新增的资产必须由承载它的那次
+    /// 滚动带上`这件事，只有这样断言得到：若回头去用回退表，这次拷贝会消失，
+    /// 而线上没有任何一面说得出来。
+    #[tokio::test]
+    async fn the_overlay_asset_list_comes_from_the_checkout_not_the_binary() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        let kubectl = fake_kubectl(&bin_dir, "reg.local:5000/cogneva:local");
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, ws);
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        // 这条断言让用例有区分力：回退表里没有这个落点，拷贝只可能来自检出。
+        assert!(
+            !crate::runtime_assets::embedded_asset_list()
+                .iter()
+                .any(|e| e.to == "/opt/cogneva/prompts"),
+            "回退表不该含 /opt/cogneva/prompts，否则本用例证明不了表来自检出"
+        );
+
+        let calls = std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap();
+        // 源路径在部署器的检出里、落点是检出那一项独占的：这条拷贝只可能是
+        // "读了检出里的表"的结果。
+        assert!(
+            calls.contains(&format!(
+                "copy ctr-test-123 {}/prompts /opt/cogneva/prompts",
+                deployer.workdir().display()
+            )),
+            "检出里那一项没被拷进镜像：{calls}"
+        );
+
+        // overlay 把这次拷的是什么记进镜像，供跑最新代码的应用侧自己核对。
+        assert!(
+            calls.contains(crate::runtime_assets::RUNTIME_ASSET_MANIFEST_DEST),
+            "镜像里没有留下拷贝记录，应用侧就无从判断跑的是哪一份：{calls}"
+        );
+        let manifest = std::fs::read_to_string(root.join("state/runtime-assets.json")).unwrap();
+        let parsed = crate::runtime_assets::parse_manifest(&manifest).unwrap();
+        assert_eq!(parsed.rev, rev_b);
+        assert_eq!(
+            parsed.assets.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "/opt/cogneva/crates/cog-storage/migrations",
+                "/opt/cogneva/prompts",
+                "/opt/cogneva/skills",
+            ],
+            "拷贝记录必须覆盖本次真正拷进去的每个落点：{manifest}"
+        );
+        for (dest, digest) in &parsed.assets {
+            assert!(
+                !digest.is_empty() && digest.len() == 64,
+                "{dest} 的摘要不像一份 blake3 十六进制：{digest}"
+            );
+        }
     }
 
     /// 本次死结的回归：第三方工作树停在无关提交（一条与 main 无共同祖先的

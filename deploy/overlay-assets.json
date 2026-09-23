@@ -1,0 +1,13 @@
+{
+  "_comment": "Runtime assets the mainline overlay re-copies into the image from the deployed rev's checkout, as (checkout path, image path). This file is read from the rev being deployed, not from the running deployer, because the running deployer is always one revision behind the rev it is deploying — a list compiled into it would describe the previous revision's assets. Every destination the Dockerfile bakes must appear here or in the deployer's unreachable table; a test enforces that.",
+  "assets": [
+    {
+      "from": "crates/cog-storage/migrations",
+      "to": "/opt/cogneva/crates/cog-storage/migrations"
+    },
+    {
+      "from": "skills",
+      "to": "/opt/cogneva/skills"
+    }
+  ]
+}

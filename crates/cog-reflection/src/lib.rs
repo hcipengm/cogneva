@@ -58,6 +58,7 @@ pub mod promotion_switch;
 pub mod promotion_trend;
 pub mod recorder;
 pub mod reviewer;
+pub mod runtime_assets;
 pub mod sandbox;
 pub mod signal_watcher;
 pub mod squad;
