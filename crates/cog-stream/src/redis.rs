@@ -241,12 +241,25 @@ impl MessageBackend for RedisMessageBackend {
         // follow — which list entries — are only issued against a non-empty
         // PEL, and so a total that exceeds what one page can list is still
         // reported truthfully.
-        let summary: redis::Value = redis::cmd("XPENDING")
+        //
+        // XPENDING against a consumer group that does not exist yet answers
+        // NOGROUP. That is a benign state, not a backend fault: nothing has
+        // been delivered to the group, so nothing can be pending for it.
+        // Answering it as Err made the pending observer count a measurement
+        // failure every time this read raced ahead of group creation — the
+        // false positive behind stream_pending_measure_failing. subscribe()
+        // and spawn_pending_observer both create the group idempotently; this
+        // arm keeps the read honest regardless of which of them ran first.
+        let summary: redis::Value = match redis::cmd("XPENDING")
             .arg(stream)
             .arg(group)
             .query_async(&mut conn)
             .await
-            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        {
+            Ok(value) => value,
+            Err(e) if e.code() == Some("NOGROUP") => return Ok(None),
+            Err(e) => return Err(SFError::Redis(e.to_string())),
+        };
         let count = match &summary {
             redis::Value::Array(items) => match items.first() {
                 Some(redis::Value::Int(n)) => (*n).max(0) as u64,
@@ -641,5 +654,57 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_pending_stats_missing_group_is_not_a_failure() {
+        // Regression: pending_stats answered XPENDING's NOGROUP with Err, and
+        // the pending observer counted every such read as a measurement
+        // failure — stream_pending_measure_failing fired on a healthy queue
+        // whose consumer group simply had not been created yet. A group that
+        // does not exist holds nothing pending; that is Ok(None), not a
+        // backend fault.
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("cog-test:nogroup-{suffix}");
+        let group = format!("nogroup-{suffix}");
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+        backend.publish(&stream, b"one").await.unwrap();
+
+        // The stream exists but no consumer group has been created on it: the
+        // read must say "no pending state" instead of failing.
+        let stats = backend
+            .pending_stats(&stream, &group, 0)
+            .await
+            .expect("pending_stats must not fail when the consumer group is absent");
+        assert!(
+            stats.is_none(),
+            "a missing consumer group has no pending state to report, got {stats:?}"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
     }
 }

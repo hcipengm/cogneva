@@ -55,6 +55,22 @@ pub fn spawn_pending_observer(
 ) -> tokio::task::JoinHandle<()> {
     let observer = stream_pending_observable();
     tokio::spawn(async move {
+        // The measurement reads what the group holds unacked, so the group
+        // must exist before the first read. A pending_stats that answers
+        // NOGROUP now reports "nothing pending" instead of failing, but the
+        // reclaim pass this series reports on still cannot run without the
+        // group, and leaving its existence to whichever consumer subscribes
+        // first is exactly the race that fired stream_pending_measure_failing
+        // on a healthy queue. Creating it here is idempotent (BUSYGROUP is
+        // tolerated by the backend), mirroring the guarantee subscribe()
+        // already gives the read loops.
+        if let Err(e) = backend.create_consumer_group(&stream, &group).await {
+            tracing::warn!(
+                stream = %stream,
+                group = %group,
+                "pending observer: consumer group creation failed, measuring anyway: {e}"
+            );
+        }
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
         loop {
@@ -550,6 +566,48 @@ mod tests {
                 .unwrap()
                 .value,
             2.0
+        );
+    }
+
+    /// A backend that answers "no pending state to report" — the Redis answer
+    /// for a consumer group that does not exist yet — is not a failed
+    /// measurement. The failure counter feeds stream_pending_measure_failing,
+    /// which must reflect only genuine backend read faults; and a
+    /// nothing-to-report answer must not move the last-successful timestamp,
+    /// or the staleness rule would read the absence of a fault as the absence
+    /// of evidence.
+    #[tokio::test]
+    async fn a_backend_with_nothing_to_report_is_not_a_failure() {
+        let observer = StreamPendingObservable::new();
+        let ok = StubBackend(Reply::Stats(PendingStats {
+            count: 1,
+            unreclaimed_count: 0,
+            unreclaimed_oldest_idle_ms: 0,
+        }));
+        observer
+            .measure(&ok, STREAM, GROUP, CLAIM_IDLE_MS, 60)
+            .await;
+        let after_ok = observer.collect_metrics("D8").await.unwrap();
+        let last_ok = metric(&after_ok, STREAM_PENDING_MEASURE_LAST_METRIC)
+            .unwrap()
+            .value;
+
+        let none = StubBackend(Reply::Unobservable);
+        observer
+            .measure(&none, STREAM, GROUP, CLAIM_IDLE_MS, 60)
+            .await;
+        let after = observer.collect_metrics("D8").await.unwrap();
+
+        assert_eq!(
+            metric(&after, STREAM_PENDING_MEASURE_LAST_METRIC)
+                .unwrap()
+                .value,
+            last_ok,
+            "a nothing-to-report answer must not move the last-successful timestamp"
+        );
+        assert!(
+            metric(&after, STREAM_PENDING_MEASURE_FAILURES_METRIC).is_none(),
+            "a nothing-to-report answer must not increment the failure counter"
         );
     }
 
