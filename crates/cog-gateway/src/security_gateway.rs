@@ -2658,8 +2658,7 @@ async fn git_forward(
 
     if adaptive {
         if let Some(why) = channel_failure {
-            let (failures, window_secs) =
-                state.git_transport.health().note_https_failure();
+            let (failures, window_secs) = state.git_transport.health().note_https_failure();
             if window_secs > 0 {
                 tracing::warn!(
                     failures,

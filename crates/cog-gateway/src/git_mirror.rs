@@ -126,7 +126,12 @@ impl GitTransportHealth {
     /// HTTPS 当前是否可用：有未到期的嫌疑窗就是不可用。
     pub fn https_available(&self) -> bool {
         let now = std::time::Instant::now();
-        !self.https.lock().unwrap().suspect_until.is_some_and(|t| now < t)
+        !self
+            .https
+            .lock()
+            .unwrap()
+            .suspect_until
+            .is_some_and(|t| now < t)
     }
 
     /// 记一次 HTTPS 失败：开/加窗。返回 `(连续失败数, 窗口秒)`；窗口内的并发
@@ -205,7 +210,11 @@ impl GitTransport {
 
     /// HTTPS 快路径的等待上限：GET 短、POST 长（见常量注释）。
     pub fn https_timeout(is_get: bool) -> std::time::Duration {
-        if is_get { HTTPS_GET_TIMEOUT } else { HTTPS_POST_TIMEOUT }
+        if is_get {
+            HTTPS_GET_TIMEOUT
+        } else {
+            HTTPS_POST_TIMEOUT
+        }
     }
 
     /// 应答一个 git smart HTTP 请求（从 SSH 镜像出）。失败一律是
@@ -245,10 +254,7 @@ impl GitTransport {
         } else if suffix == "/git-receive-pack" {
             ("git-receive-pack".to_string(), false)
         } else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("镜像不提供该路径: {suffix}"),
-            ));
+            return Err((StatusCode::NOT_FOUND, format!("镜像不提供该路径: {suffix}")));
         };
 
         // GET 只能取 refs 广告，POST 只能打 RPC 端点——对不上就是客户端行为异常。
@@ -273,9 +279,11 @@ impl GitTransport {
         // GitHub 的东西。快照必须在 receive-pack 之前——之后的镜像已经被 Pod
         // 改过了，没有基线可比。
         let before = if service == "git-receive-pack" && !advertise {
-            Some(self.snapshot_refs(&dir).await.map_err(|e| {
-                (StatusCode::BAD_GATEWAY, format!("读取镜像 refs 失败: {e}"))
-            })?)
+            Some(
+                self.snapshot_refs(&dir)
+                    .await
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, format!("读取镜像 refs 失败: {e}")))?,
+            )
         } else {
             None
         };
@@ -507,9 +515,12 @@ impl GitTransport {
             cmd.env("GIT_PROTOCOL", p);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("启动 git {subcommand} 失败: {e}")))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("启动 git {subcommand} 失败: {e}"),
+            )
+        })?;
         // stdin 必须**并发**写：pack 数据可能远大于管道缓冲，边写边等 stdout
         // 会在双方都写满时互锁。
         if let Some(mut stdin) = child.stdin.take() {
@@ -543,11 +554,7 @@ impl GitTransport {
         Ok(out.stdout)
     }
 
-    async fn run_git(
-        &self,
-        args: &[&str],
-        ssh: Option<&str>,
-    ) -> Result<Vec<u8>, String> {
+    async fn run_git(&self, args: &[&str], ssh: Option<&str>) -> Result<Vec<u8>, String> {
         let out = self.run_git_status(args, ssh).await?;
         if !out.status.success() {
             return Err(format!(
@@ -769,7 +776,11 @@ mod tests {
         std::fs::create_dir_all(upstream.parent().unwrap()).unwrap();
 
         // 造"上游"裸仓（= GitHub 在这一测里的替身）与一个初始提交
-        git(tmp.path(), &["init", "--bare", "-b", "main", upstream.to_str().unwrap()]).await;
+        git(
+            tmp.path(),
+            &["init", "--bare", "-b", "main", upstream.to_str().unwrap()],
+        )
+        .await;
         git(tmp.path(), &["init", "-b", "main", work.to_str().unwrap()]).await;
         std::fs::write(work.join("a.txt"), "hello\n").unwrap();
         git(&work, &["add", "."]).await;
