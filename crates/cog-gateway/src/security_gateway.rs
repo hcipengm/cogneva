@@ -267,7 +267,11 @@ fn error_excerpt(text: &str) -> String {
 const SUSPECT_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 
 /// 嫌疑窗时长：探测间隔 × 2^(n-1)，封顶 6h。n 为连续失败次数。
-fn suspect_backoff_secs(consecutive_failures: u32, probe_interval_secs: u64) -> u64 {
+///
+/// git 传输熔断（[`crate::git_mirror`]）复用同一条退避曲线：两类通道的失败
+/// 形态是同一回事（对端不响应），退避节拍也该同形，否则同一个网络事件会在
+/// LLM 面和 git 面表现出两种不同的恢复时间。
+pub(crate) fn suspect_backoff_secs(consecutive_failures: u32, probe_interval_secs: u64) -> u64 {
     let base = probe_interval_secs.max(30);
     let exp = consecutive_failures.saturating_sub(1).min(20);
     base.saturating_mul(1u64 << exp)
@@ -636,6 +640,10 @@ struct AppState {
     /// LLM 上游池健康表：请求路径失败/成功实时写入，探测器周期复测，
     /// 候选排序据此热切换（进程内状态，零重启）。
     llm_health: std::sync::Arc<LlmHealthTable>,
+    /// git 传输的 HTTPS/SSH 自适应兜底：HTTPS 优先，连续失败即熔断降级到网关
+    /// 自持的 SSH 镜像，窗口到期自动回切。未挂私钥时兜底不可用，行为与加这个
+    /// 模块之前完全一致（纯 HTTPS 透传）。
+    git_transport: std::sync::Arc<crate::git_mirror::GitTransport>,
     /// 池健康的落盘出口（指标/时序/告警）。
     pool_obs: Arc<PoolObservability>,
     /// 跨进程池状态信号连接（调度侧读同一个键决定是否暂停 LLM 依赖型任务）。
@@ -2549,6 +2557,15 @@ async fn attach_proxy(
 /// `/git/{platform}/owner/repo.git`，凭证以 Basic auth 出口注入
 /// （GitHub: x-access-token:<token>；Gitee: oauth2:<token>）。
 /// 请求体带缓冲上限（pack 数据），响应体流式回传。
+///
+/// **GitHub 面是自适应的**：优先走 HTTPS（实测比 SSH 快约三倍），连接类失败
+/// 连续出现即熔断、降级到网关自持的 SSH 镜像（见 [`crate::git_mirror`]），
+/// 嫌疑窗到期后由真实请求实证回切。Gitee 面没有兜底，行为与从前一致——
+/// 镜像只维护 GitHub 这一条基线，因为**GitHub 的 main 才是基线**，其余同步点
+/// 都对齐它。
+///
+/// 选路完全发生在这里：`landing.rs` / `mainline_deployer.rs` 仍然只是在跟
+/// `{GIT_PROXY_BASE}/github/x.git` 说 smart HTTP，Pod 侧零改动。
 async fn git_forward(
     state: AppState,
     req: axum::extract::Request,
@@ -2558,35 +2575,138 @@ async fn git_forward(
         CodePlatform::GitHub => "github",
         CodePlatform::Gitee => "gitee",
     };
-    // installation token 同样可作 git HTTPS 密码（x-access-token），App 与 PAT 双通道通用。
-    let token = match platform {
-        CodePlatform::GitHub => state.github_bearer().await,
-        CodePlatform::Gitee => state.config.gitee_token.clone(),
-    };
-    let Some(token) = token.as_deref() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("网关未配置 {name} token"),
-        ));
-    };
-
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let prefix = format!("/git/{name}");
     let upstream_path = path.strip_prefix(&prefix).unwrap_or(&path).to_string();
     let query = req.uri().query().map(|q| q.to_string());
     let headers = req.headers().clone();
+    let is_get = method == axum::http::Method::GET;
+    let git_protocol = headers
+        .get("git-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     // pack 数据带 256MB 上限缓冲：cogneva 仓库量级下远低于此，
     // 缓冲换取 Content-Length 完整（git 服务器对 chunked 支持不一）。
     let body = axum::body::to_bytes(req.into_body(), 256 * 1024 * 1024)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
+    // 只有 GitHub 面 + 私钥已挂载才谈"自适应"：兜底镜像维护的是 GitHub 基线，
+    // 且健康表的读写必须限定在同一条通道上，否则 Gitee 的失败会把 GitHub 的
+    // 熔断窗一起推开。
+    let adaptive =
+        matches!(platform, CodePlatform::GitHub) && state.git_transport.fallback_available();
+    let mirror = adaptive.then(|| crate::git_mirror::MirrorRequest {
+        path: &upstream_path,
+        query: query.as_deref(),
+        git_protocol: git_protocol.as_deref(),
+        is_get,
+        body: &body,
+    });
+
+    // installation token 同样可作 git HTTPS 密码（x-access-token），App 与 PAT 双通道通用。
+    let token = match platform {
+        CodePlatform::GitHub => state.github_bearer().await,
+        CodePlatform::Gitee => state.config.gitee_token.clone(),
+    };
+    let token = match token {
+        Some(t) => t,
+        None => {
+            // **没 token 不等于没通道**：SSH 兜底用的是网关自己的部署密钥，与
+            // 平台 token 无关。先看兜底能不能接，能接就不报"未配置凭证"——那会把
+            // 一台只配了 SSH 的机器上本来通的链路说成断的。
+            if let Some(m) = mirror {
+                tracing::warn!("{name} 未配置平台 token，本次 git 请求改走 SSH 兜底镜像");
+                return state.git_transport.serve(m).await;
+            }
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("网关未配置 {name} token"),
+            ));
+        }
+    };
+
+    // 嫌疑窗内不必再试一次已知会挂的通道：直接交给兜底，省掉一次注定超时的等待。
+    if adaptive && !state.git_transport.health().https_available() {
+        if let Some(m) = mirror {
+            return state.git_transport.serve(m).await;
+        }
+    }
+
+    let https = git_https_forward(
+        &state,
+        platform,
+        &method,
+        &upstream_path,
+        &query,
+        &headers,
+        &token,
+        &body,
+        is_get,
+    )
+    .await;
+
+    // 通道级失败有两种：连不上/超时（Err），以及上游 5xx。上游 5xx 也算——
+    // 它是"这条通道此刻给不出应答"，而不是"这个请求被拒绝了"；把它原样吐回
+    // Pod 只会让调用侧重试到同一条坏通道上。
+    let channel_failure = match &https {
+        Err((_, msg)) => Some(msg.clone()),
+        Ok(r) if r.status().is_server_error() => Some(format!("HTTPS 上游返回 {}", r.status())),
+        Ok(_) => None,
+    };
+
+    if adaptive {
+        if let Some(why) = channel_failure {
+            let (failures, window_secs) =
+                state.git_transport.health().note_https_failure();
+            if window_secs > 0 {
+                tracing::warn!(
+                    failures,
+                    window_secs,
+                    reason = %why,
+                    "git HTTPS 通道连续失败，进入熔断窗"
+                );
+            }
+            if let Some(m) = mirror {
+                tracing::warn!(reason = %why, "本次 git 请求改走 SSH 兜底镜像");
+                return state.git_transport.serve(m).await;
+            }
+            // 没有兜底就如实报失败：换一个错误码去掩饰"通道坏了"，会让调用侧
+            // 按错误类型做出错误的处置。
+            return https;
+        }
+        if state.git_transport.health().note_https_success() {
+            tracing::info!("git HTTPS 通道恢复（此前处于熔断窗内）");
+        }
+    }
+    https
+}
+
+/// HTTPS 透传本体。抽出来是为了让选路能在**不动请求提取逻辑**的前提下，
+/// 把同一个请求交给两条通道——两条通道拿到的必须是逐字节相同的输入，
+/// 否则"降级后行为等价"就不成立。
+#[allow(clippy::too_many_arguments)]
+async fn git_https_forward(
+    state: &AppState,
+    platform: CodePlatform,
+    method: &axum::http::Method,
+    upstream_path: &str,
+    query: &Option<String>,
+    headers: &axum::http::HeaderMap,
+    token: &str,
+    body: &[u8],
+    is_get: bool,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let name = match platform {
+        CodePlatform::GitHub => "github",
+        CodePlatform::Gitee => "gitee",
+    };
     let base = match platform {
         CodePlatform::GitHub => "https://github.com",
         CodePlatform::Gitee => "https://gitee.com",
     };
-    let url = match &query {
+    let url = match query {
         Some(q) if !q.is_empty() => format!("{base}{upstream_path}?{q}"),
         _ => format!("{base}{upstream_path}"),
     };
@@ -2600,7 +2720,7 @@ async fn git_forward(
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{token}"));
 
     let start = std::time::Instant::now();
-    let mut builder = state.stream_client.request(method, &url);
+    let mut builder = state.stream_client.request(method.clone(), &url);
     // git 协议头原样透传（含 Git-Protocol: version=2），认证头一律丢弃。
     for key in ["content-type", "accept", "git-protocol", "user-agent"] {
         if let Some(v) = headers.get(key) {
@@ -2611,12 +2731,24 @@ async fn git_forward(
     if !body.is_empty() {
         builder = builder.body(body.to_vec());
     }
-    let resp = builder.send().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("连接 {name} git 上游失败: {e}"),
-        )
-    })?;
+    // 透传路径原本没有任何总超时（`stream_client` 只约束建连）。加这个上限不是
+    // 给正常请求设预算，而是让"进了黑洞"这件事**可判定**——没有它，一个挂死的
+    // 请求会一直占着，兜底永远不会被触发。
+    let timeout = crate::git_mirror::GitTransport::https_timeout(is_get);
+    let resp = tokio::time::timeout(timeout, builder.send())
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("连接 {name} git 上游超时（{}s）", timeout.as_secs()),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("连接 {name} git 上游失败: {e}"),
+            )
+        })?;
     state.code_stats.record(start.elapsed().as_millis() as u64);
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -3181,6 +3313,7 @@ pub async fn run(
         github_app: GitHubAppCreds::from_env(),
         app_token_cache: std::sync::Arc::new(AppTokenCache::default()),
         llm_health: std::sync::Arc::new(LlmHealthTable::default()),
+        git_transport: std::sync::Arc::new(crate::git_mirror::GitTransport::from_env()),
         pool_obs,
         redis,
         pool_down: Arc::new(AtomicBool::new(pool_down)),
@@ -4133,6 +4266,15 @@ mod tests {
             github_app: None,
             app_token_cache: std::sync::Arc::new(AppTokenCache::default()),
             llm_health: std::sync::Arc::new(LlmHealthTable::default()),
+            // 测试里兜底恒不可用（没有私钥）：走的就是纯 HTTPS 透传那条路，
+            // 与加这个模块之前被测的行为完全一致。
+            git_transport: std::sync::Arc::new(crate::git_mirror::GitTransport::new(
+                crate::git_mirror::GitMirrorConfig {
+                    root: std::path::PathBuf::from("/tmp/cogneva-mirror-test"),
+                    ssh_key: None,
+                    ssh_base: crate::git_mirror::DEFAULT_SSH_BASE.into(),
+                },
+            )),
             pool_obs: std::sync::Arc::new(PoolObservability {
                 metrics: std::sync::Arc::new(PrometheusMetricsBackend::new("")),
                 analytics: None,

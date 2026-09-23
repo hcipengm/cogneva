@@ -1,0 +1,24 @@
+# SSH 兜底镜像的存储（见 cog-gateway 的 git_mirror 模块）：HTTPS 快路径连续失败
+# 熔断后，网关用这份裸镜像继续给业务 Pod 讲 smart HTTP，SSH 只发生在网关到 GitHub
+# 之间——Pod 零凭证这条约束在兜底通道上不变。
+#
+# 刻意**不带** helm.sh/resource-policy: keep，与这里其余每个卷都不同：这是唯一一个
+# 内容可以整个从外部真相源（GitHub）重建的卷，标了 keep 只会在反复重装时堆出无主
+# 的陈旧镜像。它也不与 cogneva-git-remote-pvc 合并——裸仓是全部进化分支与晋级产物
+# 的规范来源，镜像只是网关的一层传输缓存，二者可丢性不同。
+#
+# 不写 storageClassName，跟随集群默认 SC（与 pg/redis/qdrant 同策略）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-git-mirror-pvc
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: security-gateway
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

@@ -135,6 +135,21 @@ securityGateway:
   metricsPort: 9090
   metricsAllowedNamespaces:
     - monitoring
+  # git 传输的 SSH 兜底（HTTPS 快路径 + SSH 兜底，实现在 cog-gateway 的
+  # git_mirror 模块）。GitHub 的 HTTPS 通道实测是高方差 + 偶发黑洞：好时 0.5s、
+  # 坏时直冲超时，而黑洞期一来主线 deployer 拉不到基线、landing 推不上去，整条
+  # 自进化链路停摆。开这个开关后网关自持一份裸镜像，连续失败即熔断降级到 SSH。
+  #
+  # 私钥来自 cogneva-secrets/git-ssh-private-key（真实部署用 SSH 公钥上传到
+  # GitHub 账号，私钥只注入网关）；**缺私钥时兜底自动保持关闭**，网关退回纯
+  # HTTPS 透传、行为与从前一致——所以可以先开开关、后补凭证。
+  gitMirror:
+    enabled: true
+    # 镜像卷：<root>/github/<owner>/<repo>.git。它是本 chart 里唯一**不需要**
+    # resource-policy: keep 的卷——内容全部可从一个外部真相源（GitHub）重建，
+    # 标了 keep 只会在反复重装时堆出无主的陈旧镜像。5Gi 对 cogneva 仓库
+    # （含历史与 LFS 外的全部对象）绰绰有余。
+    storage: 5Gi
   # 上游池可观测导出端点。四种体裁各落各的后端：日志→Loki、时序明细
   # →ClickHouse、告警状态机→PostgreSQL（复用 cogneva 自身 PG，无需配置）、
   # 指标→Prometheus（ServiceMonitor 已抓取）。默认开启：观测栈的安装脚本

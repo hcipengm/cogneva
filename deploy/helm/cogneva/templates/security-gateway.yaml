@@ -95,6 +95,16 @@ spec:
                   name: cogneva-secrets
                   key: gitee-token
                   optional: true
+            # git 传输的 SSH 兜底镜像（见 cog-gateway 的 git_mirror 模块）。
+            # 私钥只注入本进程，是"业务 Pod 零凭证"在兜底通道上的延续：Pod 依然
+            # 只会说 smart HTTP，SSH 只发生在网关到 GitHub 之间。
+            # 路径写死在这里而不是 values：它同时是卷的挂载点，两处分开配就会漂移。
+            - name: COGNEVA_GATEWAY_GIT_MIRROR_ROOT
+              value: /var/lib/cogneva-git-mirror
+            - name: COGNEVA_GATEWAY_GIT_MIRROR_ENABLED
+              value: {{ .Values.securityGateway.gitMirror.enabled | quote }}
+            - name: COGNEVA_GATEWAY_GIT_SSH_KEY
+              value: /etc/cogneva/git-ssh/id_ed25519
             # 贡献通道 Gitee OAuth 应用凭证：授权码兑换与 token 续期的唯一起点，
             # 只注入本进程，业务 Pod 零持有；缺失即授权码通道 fail-closed
             # （手动令牌/PAT 通道不受影响）。值是项目方 OAuth App 的公开应用
@@ -187,6 +197,35 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.securityGateway.resources | nindent 12 }}
+          {{- if .Values.securityGateway.gitMirror.enabled }}
+          volumeMounts:
+            - name: git-mirror
+              mountPath: /var/lib/cogneva-git-mirror
+            # 私钥挂成固定文件名：git 读的是路径，不是 Secret 的键名。
+            - name: git-ssh-key
+              mountPath: /etc/cogneva/git-ssh
+              readOnly: true
+          {{- end }}
+      {{- if .Values.securityGateway.gitMirror.enabled }}
+      volumes:
+        - name: git-mirror
+          persistentVolumeClaim:
+            claimName: cogneva-git-mirror-pvc
+        # 整个卷 optional：没有私钥时 Pod 照常起来，网关自己检测到文件不存在
+        # 就保持兜底关闭。若这里不 optional，一次"先部署后补凭证"会让网关
+        # 卡在 ContainerCreating——而网关是全部出站调用的唯一出口。
+        - name: git-ssh-key
+          secret:
+            secretName: cogneva-secrets
+            optional: true
+            # 0400：OpenSSH 只在**属主是自己**时才检查权限位。容器以 1001 运行、
+            # 而 Secret 卷文件属主是 root（fsGroup 只加组读），所以这条检查会被
+            # 跳过；但把权限收窄到最小仍然是对的——这个文件是账号级的写权限。
+            defaultMode: 0400
+            items:
+              - key: git-ssh-private-key
+                path: id_ed25519
+      {{- end }}
       # 网关是唯一持有真凭证的进程：以非 root 运行、卷组固定，避免凭证文件
       # 落进 root 专属可读的目录。
       securityContext:
@@ -220,4 +259,25 @@ spec:
       port: {{ .Values.securityGateway.metricsPort }}
       targetPort: metrics
       protocol: TCP
+{{- if .Values.securityGateway.gitMirror.enabled }}
+---
+# SSH 兜底镜像的存储。刻意**不带** `helm.sh/resource-policy: keep`：这是本 chart
+# 里唯一一个内容可以整个从外部真相源（GitHub）重建的卷，标了 keep 只会在反复
+# 重装时堆出无主的陈旧镜像。它也不与 cogneva-git-remote-pvc 合并——裸仓是全部
+# 进化分支与晋级产物的规范来源，镜像只是网关的一层传输缓存，二者可丢性不同。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cogneva-git-mirror-pvc
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security-gateway
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.securityGateway.gitMirror.storage }}
+{{- end }}
 {{- end }}

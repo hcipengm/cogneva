@@ -35,6 +35,7 @@ pub mod error;
 pub mod evolution;
 pub mod executor;
 pub mod files;
+pub mod git_mirror;
 pub mod github_app;
 pub mod heartbeat_history;
 pub mod hook_forwarder;
