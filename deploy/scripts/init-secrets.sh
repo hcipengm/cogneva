@@ -43,8 +43,11 @@ ensure_random() {
   local val b64
   val="$(gen)"
   b64="$(printf '%s' "$val" | base64 | tr -d '\n')"
-  kubectl -n "$NS" patch secret "$SECRET" --type=json \
-    -p="[{\"op\":\"add\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]" >/dev/null
+  # 用 merge patch 而非 JSON patch：全新的 Secret 没有 data 字段，
+  # RFC 6902 的 add 因父路径 /data 不存在而被 API server 拒绝
+  # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
+  kubectl -n "$NS" patch secret "$SECRET" --type=merge \
+    -p="{\"data\":{\"${key}\":\"${b64}\"}}" >/dev/null
   echo "  ${key}: 已生成随机强密钥"
 }
 
@@ -65,8 +68,11 @@ ensure_fingerprint() {
     val="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   fi
   b64="$(printf '%s' "$val" | base64 | tr -d '\n')"
-  kubectl -n "$NS" patch secret "$SECRET" --type=json \
-    -p="[{\"op\":\"add\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]" >/dev/null
+  # 用 merge patch 而非 JSON patch：全新的 Secret 没有 data 字段，
+  # RFC 6902 的 add 因父路径 /data 不存在而被 API server 拒绝
+  # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
+  kubectl -n "$NS" patch secret "$SECRET" --type=merge \
+    -p="{\"data\":{\"${key}\":\"${b64}\"}}" >/dev/null
   echo "  ${key}: 已生成随机指纹"
 }
 
@@ -106,8 +112,11 @@ ensure_s3_identity() {
 JSON
 )"
   b64="$(printf '%s' "$json" | base64 | tr -d '\n')"
-  kubectl -n "$NS" patch secret "$SECRET" --type=json \
-    -p="[{\"op\":\"add\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]" >/dev/null
+  # 用 merge patch 而非 JSON patch：全新的 Secret 没有 data 字段，
+  # RFC 6902 的 add 因父路径 /data 不存在而被 API server 拒绝
+  # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
+  kubectl -n "$NS" patch secret "$SECRET" --type=merge \
+    -p="{\"data\":{\"${key}\":\"${b64}\"}}" >/dev/null
   echo "  ${key}: 已生成（凭证取自 s3-access-key / s3-secret-key）"
 }
 
@@ -117,8 +126,8 @@ ensure_blank() {
   local cur
   cur="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null || true)"
   if [ -z "$cur" ]; then
-    kubectl -n "$NS" patch secret "$SECRET" --type=json \
-      -p="[{\"op\":\"add\",\"path\":\"/data/${key}\",\"value\":\"\"}]" >/dev/null 2>&1 || true
+    kubectl -n "$NS" patch secret "$SECRET" --type=merge \
+      -p="{\"data\":{\"${key}\":\"\"}}" >/dev/null 2>&1 || true
   fi
 }
 
