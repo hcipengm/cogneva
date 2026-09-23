@@ -48,8 +48,13 @@ tests
 # Scripts (not needed in image)
 scripts
 
-# Deploy configs (not needed in image)
-deploy
+# Deploy configs (not needed in image) —— 但 cog-reflection 在编译期
+# include_str! 了 deploy/overlay-assets.json（overlay 资产表的兜底副本，
+# 见 crates/cog-reflection/src/runtime_assets.rs），整目录排除会让 release
+# 构建直接编译失败。必须写成 deploy/* + 取反：Docker 的忽略规则不允许在
+# **父目录被排除**的情况下重新包含其子文件，排除子项则可以。
+deploy/*
+!deploy/overlay-assets.json
 
 # Local data
 /var/lib/sf-data

@@ -142,6 +142,12 @@ RUN ok=0; for i in $(seq 1 10); do cargo fetch --locked && { ok=1; break; }; \
 # Copy actual source code
 COPY crates/ ./crates/
 
+# 编译期被 include_str! 嵌入的那一份 overlay 资产表。cog-reflection 用它作为
+# 「被部署 rev 的检出里读不到这张表」时的兜底（见 runtime_assets.rs 模块头），
+# 所以它必须在 cargo build 之前就位。不放进依赖预热层：那一层用的是占位
+# lib.rs，碰不到这条 include_str!，放进去只会白废一层缓存。
+COPY deploy/overlay-assets.json ./deploy/
+
 # Touch source files to invalidate cached object files only
 RUN touch crates/*/src/lib.rs crates/*/src/main.rs 2>/dev/null || true
 
