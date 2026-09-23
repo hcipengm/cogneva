@@ -5,6 +5,14 @@ use uuid::Uuid;
 use crate::error::{AuthError, AuthResult};
 use cog_core::{Claims, Permission, Role, User, UserType};
 
+/// Well-known placeholder signing secret from pre-hardening defaults. Refused
+/// at startup outside explicitly-opted-in demo mode: HS256 with a public
+/// secret lets anyone forge an admin token offline.
+pub const KNOWN_WEAK_SECRET: &str = "change-me-in-production";
+
+/// Minimum acceptable length (bytes) for an HMAC signing secret.
+pub const MIN_HMAC_SECRET_LEN: usize = 32;
+
 /// JWT configuration.
 #[derive(Debug, Clone)]
 pub struct JwtConfig {
@@ -17,18 +25,23 @@ pub struct JwtConfig {
     pub private_key_pem: Option<String>,
     /// RSA public key in PEM format (for RS256 verification).
     pub public_key_pem: Option<String>,
+    /// Explicitly allow the well-known placeholder / short HMAC secret.
+    /// Must stay `false` outside throwaway demo deployments: with `true`,
+    /// [`JwtManager::new`] skips the weak-secret rejection.
+    pub allow_weak_secret: bool,
 }
 
 impl Default for JwtConfig {
     fn default() -> Self {
         Self {
-            secret: "change-me-in-production".into(),
+            secret: KNOWN_WEAK_SECRET.into(),
             issuer: "cogneva".into(),
             audience: "cogneva-api".into(),
             access_token_ttl_minutes: 15,
             refresh_token_ttl_days: 7,
             private_key_pem: None,
             public_key_pem: None,
+            allow_weak_secret: false,
         }
     }
 }
@@ -52,6 +65,19 @@ impl JwtManager {
                 DecodingKey::from_rsa_pem(public.as_bytes()).expect("invalid RSA public key PEM");
             (enc, dec, Algorithm::RS256)
         } else {
+            if !config.allow_weak_secret
+                && (config.secret.len() < MIN_HMAC_SECRET_LEN
+                    || config.secret == KNOWN_WEAK_SECRET)
+            {
+                panic!(
+                    "refusing to start JwtManager with an insecure HMAC secret \
+                     ({} byte(s); min {MIN_HMAC_SECRET_LEN}, and must not equal the public \
+                     placeholder '{KNOWN_WEAK_SECRET}'); set COGNEVA_JWT_SECRET to a random \
+                     value of at least {MIN_HMAC_SECRET_LEN} bytes (installers generate one) \
+                     or opt into demo mode with allow_weak_secret",
+                    config.secret.len()
+                );
+            }
             let enc = EncodingKey::from_secret(config.secret.as_bytes());
             let dec = DecodingKey::from_secret(config.secret.as_bytes());
             (enc, dec, Algorithm::HS256)
@@ -226,6 +252,17 @@ pub fn generate_test_rsa_keypair() -> (String, String) {
 mod tests {
     use super::*;
 
+    /// Strong-enough HMAC secret for unit tests (>= [`MIN_HMAC_SECRET_LEN`]
+    /// bytes and distinct from [`KNOWN_WEAK_SECRET`]).
+    const TEST_HMAC_SECRET: &str = "test-hmac-secret-0123456789abcdef0123456789abcdef";
+
+    fn test_config() -> JwtConfig {
+        JwtConfig {
+            secret: TEST_HMAC_SECRET.into(),
+            ..Default::default()
+        }
+    }
+
     fn test_user() -> User {
         User {
             id: Uuid::new_v4(),
@@ -243,7 +280,7 @@ mod tests {
 
     #[test]
     fn generate_and_verify_token() {
-        let mgr = JwtManager::new(JwtConfig::default());
+        let mgr = JwtManager::new(test_config());
         let user = test_user();
         let (access, refresh) = mgr
             .generate_token(&user, vec!["ws-001".into()], vec![Permission::AgentRead])
@@ -260,7 +297,7 @@ mod tests {
 
     #[test]
     fn refresh_access_token_ok() {
-        let mgr = JwtManager::new(JwtConfig::default());
+        let mgr = JwtManager::new(test_config());
         let user = test_user();
         let (access, refresh) = mgr.generate_token(&user, vec![], vec![]).unwrap();
 
@@ -274,10 +311,8 @@ mod tests {
 
     #[test]
     fn expired_token_fails() {
-        let config = JwtConfig {
-            access_token_ttl_minutes: -5,
-            ..Default::default()
-        };
+        let mut config = test_config();
+        config.access_token_ttl_minutes = -5;
         let mgr = JwtManager::new(config);
         let user = test_user();
         let (access, _) = mgr.generate_token(&user, vec![], vec![]).unwrap();
@@ -346,5 +381,35 @@ mod tests {
 
         let err = mgr.verify_token(&access).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "insecure HMAC secret")]
+    fn known_weak_secret_is_rejected() {
+        // `JwtConfig::default()` still carries the public placeholder; the
+        // manager must refuse to boot on it unless explicitly opted in.
+        let _ = JwtManager::new(JwtConfig::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "insecure HMAC secret")]
+    fn short_secret_is_rejected() {
+        let config = JwtConfig {
+            secret: "too-short".into(),
+            ..Default::default()
+        };
+        let _ = JwtManager::new(config);
+    }
+
+    #[test]
+    fn weak_secret_allowed_when_explicitly_opted_in() {
+        let config = JwtConfig {
+            allow_weak_secret: true,
+            ..Default::default()
+        };
+        let mgr = JwtManager::new(config);
+        let user = test_user();
+        let (access, _) = mgr.generate_token(&user, vec![], vec![]).unwrap();
+        assert!(!access.is_empty());
     }
 }

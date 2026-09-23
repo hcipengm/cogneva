@@ -112,8 +112,12 @@ async fn spawn_app_full(
     // statement about the sandbox rather than about the change under test.
     let redis_conn = open_test_redis().await?;
 
-    let jwt_manager: Arc<dyn cog_core::AuthProvider> =
-        Arc::new(JwtManager::new(JwtConfig::default()));
+    let jwt_manager: Arc<dyn cog_core::AuthProvider> = Arc::new(JwtManager::new(JwtConfig {
+        // `JwtConfig::default()` carries the public placeholder and is
+        // rejected by `JwtManager::new`; tests use a strong fixed secret.
+        secret: "test-hmac-secret-0123456789abcdef0123456789abcdef".into(),
+        ..Default::default()
+    }));
     // Generous default so a single request doesn't exhaust quota during E2E.
     let quota_manager = Arc::new(QuotaManager::new(redis_conn, 1_000_000_000));
 
