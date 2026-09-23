@@ -350,6 +350,24 @@ impl ChangePipeline {
             }
             Err(e) => return Err(e),
         }
+
+        // `description` is the field a change carries its goal in: the engine
+        // sets it from the module it was asked to improve, and a landed change
+        // from the goal the author submitted. Judging the artifact against it
+        // is the only check here that can tell "this is not the file you meant"
+        // from "this file is wrong", which no gate downstream of the diff can.
+        if let Some(reason) = Self::intent_alignment_reason(&change.description, &targets, workdir)
+        {
+            warn!(change_id = %change.artifact_id, reason = %reason, "Change does not address the goal it was generated for");
+            return Ok(ApplyResult {
+                change_id: change.artifact_id.clone(),
+                files_changed,
+                test_passed: false,
+                test_output: format!("Change does not answer its goal: {reason}"),
+                new_status: EvolutionStatus::ValidationFailed,
+            });
+        }
+
         self.ensure_clean_workspace(workdir).await?;
 
         if let Err(e) = self.git_apply_check(workdir, &change.content).await {
@@ -514,6 +532,60 @@ impl ChangePipeline {
         }
 
         Ok(())
+    }
+
+    /// Whether a change delivered what the goal that asked for it named, or
+    /// `None` when there is nothing to hold it to.
+    ///
+    /// A goal to extend `README.md` comes back as a brand-new
+    /// `crates/cogneva/src/windows_quickstart.rs`: a well-formed diff of a
+    /// well-formed file that compiles, so format, lint and test gates all pass
+    /// while the file somebody asked about is untouched and a file nobody asked
+    /// for appears. Nothing in the artifact says which of the two was wanted —
+    /// the goal text is the only place the intent was ever written down, and
+    /// the checkout is the only place that can say whether the file it names
+    /// exists. This puts the two side by side.
+    ///
+    /// Everything runs on names and existence, so the verdict is a function of
+    /// the goal, the diff's own `/dev/null` sides, and the tree — no model
+    /// reads the goal and no threshold is guessed.
+    ///
+    /// It fails open, and deliberately so on two counts. A goal that names
+    /// nothing the checkout can confirm yields no anchor, because a name that
+    /// resolves to nothing cannot be contradicted by an artifact. And a change
+    /// that rewrites or deletes a real file is left alone even when it adds an
+    /// unrelated one, because "the goal mentioned another file too" is not
+    /// evidence that this file was the wrong one to touch. What is left is the
+    /// one shape with no reading in which it is right: a goal that names a file
+    /// which exists, answered by a change that only creates files somewhere
+    /// else.
+    pub fn intent_alignment_reason(
+        goal: &str,
+        targets: &[cog_core::DiffTarget],
+        project_root: &Path,
+    ) -> Option<String> {
+        let anchors = goal_anchors(goal, project_root);
+        if anchors.is_empty() {
+            return None;
+        }
+        if !targets
+            .iter()
+            .all(|t| t.kind == cog_core::DiffTargetKind::Create)
+        {
+            return None;
+        }
+        let touched: Vec<String> = targets.iter().map(|t| t.path.replace('\\', "/")).collect();
+        if touched
+            .iter()
+            .any(|t| anchors.iter().any(|a| names_same_or_nested(t, a)))
+        {
+            return None;
+        }
+        Some(format!(
+            "the goal names {}, which exists, but the change only creates {} — none of them is that file or lives under it, so the file the goal is about was left untouched",
+            anchors.join(", "),
+            touched.join(", ")
+        ))
     }
 
     /// Refuse to apply if the git working tree already has uncommitted changes.
@@ -834,9 +906,264 @@ fn resolve_created_path(
     Ok(normalized)
 }
 
+/// The files a goal names that this checkout can confirm are real.
+///
+/// Two ways a goal names a file, and each needs a different side to be right.
+/// A path it spells out (`crates/x/y.rs`) is checked where it points. A bare
+/// word (`README`) is not a name at all until something says so — so the
+/// checkout supplies the candidates and the goal is asked which of them it
+/// means. Running the question that way is what keeps `improve` and `module`
+/// out of the answer without a stopword list to maintain.
+///
+/// Only the checkout root is offered as candidates. A goal naming `README` is
+/// taken to mean the one the project shows at its top, and widening the search
+/// would make the same goal resolve differently as the tree grows.
+fn goal_anchors(goal: &str, project_root: &Path) -> Vec<String> {
+    let mut anchors: Vec<String> = Vec::new();
+    let mut push = |name: String| {
+        if !anchors.iter().any(|seen| seen == &name) {
+            anchors.push(name);
+        }
+    };
+
+    for named in cog_core::paths_named_in_goal(goal) {
+        if project_root.join(&named).exists() {
+            push(named);
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return anchors;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let stem = Path::new(file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file_name);
+        if cog_core::mentions_name(goal, file_name) || cog_core::mentions_name(goal, stem) {
+            push(file_name.to_string());
+        }
+    }
+
+    anchors
+}
+
+/// Whether `target` is `anchor` or sits inside it. Written bare, `README` and
+/// `README` are the same name; written with a trailing slash, a goal naming a
+/// directory still covers the files under it.
+fn names_same_or_nested(target: &str, anchor: &str) -> bool {
+    let target = target.trim_matches('/');
+    let anchor = anchor.trim_matches('/');
+    target == anchor
+        || target.starts_with(&format!("{anchor}/"))
+        || anchor.starts_with(&format!("{target}/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A diff that introduces one brand-new file, the shape the generator
+    /// produces when it answers a request about an existing file by writing a
+    /// different one.
+    fn creates(path: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\n\
+             new file mode 100644\n\
+             --- /dev/null\n\
+             +++ b/{path}\n\
+             @@ -0,0 +1 @@\n\
+             +fn generated() {{}}\n"
+        )
+    }
+
+    /// A diff that rewrites an existing file in place.
+    fn rewrites(path: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\n\
+             --- a/{path}\n\
+             +++ b/{path}\n\
+             @@ -1 +1 @@\n\
+             -old\n\
+             +new\n"
+        )
+    }
+
+    fn targets_of(diff: &str) -> Vec<cog_core::DiffTarget> {
+        ChangePipeline::parse_diff(diff).expect("test diff must parse")
+    }
+
+    /// The shape G3 is: a goal about a file that is right there, answered by a
+    /// creation somewhere else. Every gate downstream of the diff passes it —
+    /// the diff is well formed, the new file compiles — so this is the only
+    /// place the two can be compared.
+    #[test]
+    fn a_goal_about_a_file_the_change_never_touches_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# project\n").unwrap();
+        let targets = targets_of(&creates("crates/cogneva/src/windows_quickstart.rs"));
+
+        let reason = ChangePipeline::intent_alignment_reason(
+            "建议在 README.md 中补充 Windows 快速开始",
+            &targets,
+            root.path(),
+        )
+        .expect("a creation elsewhere must not answer a goal about README.md");
+
+        assert!(reason.contains("README.md"), "{reason}");
+        assert!(reason.contains("windows_quickstart.rs"), "{reason}");
+    }
+
+    /// The same goal written the way a person writes it in prose: the file
+    /// named without its extension. Only the checkout can say `README` means
+    /// `README.md`, so it is asked.
+    #[test]
+    fn a_bare_name_the_checkout_confirms_still_anchors_the_goal() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# project\n").unwrap();
+        let targets = targets_of(&creates("crates/cogneva/src/windows_quickstart.rs"));
+
+        assert!(
+            ChangePipeline::intent_alignment_reason(
+                "改 README 里的快速开始",
+                &targets,
+                root.path()
+            )
+            .is_some(),
+            "`README` beside a real README.md names that file"
+        );
+    }
+
+    #[test]
+    fn a_goal_the_change_actually_carries_out_is_allowed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# project\n").unwrap();
+
+        assert!(
+            ChangePipeline::intent_alignment_reason(
+                "补充 README.md 的 Windows 快速开始",
+                &targets_of(&rewrites("README.md")),
+                root.path(),
+            )
+            .is_none(),
+            "rewriting the file the goal named is the answer to the goal"
+        );
+    }
+
+    /// Naming a directory covers what is put inside it, so a goal about a
+    /// module is satisfied by creating a file in that module rather than by
+    /// creating the directory itself.
+    #[test]
+    fn a_creation_inside_a_named_directory_is_allowed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("crates/cog-core/src")).unwrap();
+        std::fs::write(root.path().join("crates/cog-core/src/lib.rs"), "//\n").unwrap();
+
+        assert!(ChangePipeline::intent_alignment_reason(
+            "add a helper to crates/cog-core/src",
+            &targets_of(&creates("crates/cog-core/src/helper.rs")),
+            root.path(),
+        )
+        .is_none());
+    }
+
+    /// A goal naming a file that does not exist yet is a request to create it,
+    /// and a creation is exactly the right answer — the `/dev/null` side of the
+    /// diff is where that is written down.
+    #[test]
+    fn creating_the_file_the_goal_names_is_the_answer() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!root.path().join("CHANGELOG.md").exists());
+
+        assert!(ChangePipeline::intent_alignment_reason(
+            "add a CHANGELOG.md",
+            &targets_of(&creates("CHANGELOG.md")),
+            root.path(),
+        )
+        .is_none());
+    }
+
+    /// A goal that names nothing the checkout can confirm says nothing about
+    /// which file was meant, and a name that resolves to nothing cannot be
+    /// contradicted by an artifact.
+    #[test]
+    fn a_goal_without_a_confirmable_name_is_not_judged() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# project\n").unwrap();
+
+        assert!(ChangePipeline::intent_alignment_reason(
+            "make the frontend module faster",
+            &targets_of(&creates("crates/cogneva/src/windows_quickstart.rs")),
+            root.path(),
+        )
+        .is_none());
+        assert!(
+            ChangePipeline::intent_alignment_reason(
+                "补充 docs/NOTES.md 的内容",
+                &targets_of(&creates("crates/cogneva/src/windows_quickstart.rs")),
+                root.path(),
+            )
+            .is_none(),
+            "a named path that does not exist is not a claim this can check"
+        );
+    }
+
+    /// A goal often names context as well as the target. A change that rewrites
+    /// a real file did the work it was asked to do somewhere, and "you also
+    /// mentioned another file" is not evidence that this was the wrong one.
+    #[test]
+    fn a_change_that_rewrites_a_real_file_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("crates/x/src")).unwrap();
+        std::fs::write(root.path().join("README.md"), "# project\n").unwrap();
+        std::fs::write(root.path().join("crates/x/src/lib.rs"), "//\n").unwrap();
+
+        assert!(ChangePipeline::intent_alignment_reason(
+            "see README.md, fix the parser in crates/x/src/lib.rs",
+            &targets_of(&rewrites("crates/x/src/lib.rs")),
+            root.path(),
+        )
+        .is_none());
+    }
+
+    /// The verdict has to be reachable from the flow that applies changes, not
+    /// only from the function: a rejected change must land as a judgement about
+    /// the change, never as an environment error the caller would retry.
+    #[tokio::test]
+    async fn the_apply_flow_refuses_a_change_that_misses_its_goal() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# project\n").unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "change-GOAL".into(),
+            description: "补充 README.md 的 Windows 快速开始".into(),
+            content: creates("crates/cogneva/src/windows_quickstart.rs"),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert!(!result.test_passed);
+        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
+        assert!(
+            result.test_output.contains("README.md"),
+            "{}",
+            result.test_output
+        );
+    }
 
     #[test]
     fn parse_diff_extracts_files_from_unified_diff() {

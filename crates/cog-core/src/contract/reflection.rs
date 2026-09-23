@@ -349,6 +349,129 @@ pub fn forbidden_target_reason(path: &str) -> Option<String> {
     None
 }
 
+/// Longest an extension may be before a trailing `.foo` reads as a sentence
+/// fragment rather than a file type.
+const GOAL_PATH_EXT_MAX: usize = 6;
+
+/// Shortest extension worth reading as a file type. One letter is the shape of
+/// an abbreviation (`e.g`, `i.e`), not of an extension anybody ships.
+const GOAL_PATH_EXT_MIN: usize = 2;
+
+/// Characters that separate one candidate token from the next. A goal is prose,
+/// so a path arrives wrapped in whatever punctuation the sentence needed; these
+/// are cut apart before anything is judged, and none of them can appear inside
+/// a path.
+const GOAL_TOKEN_BREAKS: &str = ",;()[]{}\"'`<>";
+
+/// Punctuation that may trail a token because the sentence ended, not because
+/// the path did. `README.md.` and `` `crates/x/y.rs`, `` both name a file.
+const GOAL_TOKEN_TRAILING: &str = ".:!?*#";
+
+/// Characters that cannot appear in a path this system would ever act on. A
+/// token carrying one is prose that happens to look path-like — a glob, a URL
+/// with a scheme, an assignment — and is dropped rather than guessed at.
+const GOAL_PATH_ILLEGAL: &str = "*?|=:!<>\"'`";
+
+/// The file names a goal holds itself to, in the order it names them.
+///
+/// A goal that says which file it is about is making a claim the change it
+/// produces can be held to, but only if the claim can be read off the text
+/// without asking a model. This reads it: a token counts as a path when it has
+/// a directory separator or a trailing extension, which is what separates
+/// `README.md` and `crates/x/y.rs` from the ordinary words around them.
+///
+/// Nothing here touches the filesystem. Whether a named path is real is the
+/// caller's question, and only the side holding a checkout can answer it —
+/// which is also the only side whose answer means anything, since a name that
+/// resolves to nothing cannot be contradicted by an artifact.
+///
+/// Backslashes fold to `/` and a leading `./` drops, so one file written two
+/// ways yields one token. Order is preserved and duplicates collapse, leaving
+/// the first name a caller reported as the first one the goal gave.
+pub fn paths_named_in_goal(goal: &str) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    for raw in goal.split(|c: char| c.is_whitespace() || GOAL_TOKEN_BREAKS.contains(c)) {
+        let trimmed = raw.trim_end_matches(|c: char| GOAL_TOKEN_TRAILING.contains(c));
+        let normalized = trimmed.replace('\\', "/");
+        let candidate = normalized.strip_prefix("./").unwrap_or(&normalized);
+        if candidate.is_empty() || candidate.contains("..") {
+            continue;
+        }
+        if candidate.chars().any(|c| GOAL_PATH_ILLEGAL.contains(c)) {
+            continue;
+        }
+        if !looks_like_a_path(candidate) {
+            continue;
+        }
+        if !named.iter().any(|seen| seen == candidate) {
+            named.push(candidate.to_string());
+        }
+    }
+    named
+}
+
+/// Whether `goal` uses `name` as a name rather than as a piece of a longer
+/// word.
+///
+/// The caller brings candidates it got from somewhere real — the file names of
+/// a checkout — and asks the goal which of them it is talking about. Running
+/// the question in that direction is what keeps prose out: `improve` is never a
+/// candidate and so can never be a name, while `README` beside a real
+/// `README.md` is the goal saying which file it means.
+///
+/// A letter, digit, `_`, `-` or `.` touching the name counts as part of it, so
+/// `README` does not match inside `README.md` while the goal is naming
+/// `README.md` itself.
+pub fn mentions_name(goal: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut from = 0usize;
+    while let Some(offset) = goal[from..].find(name) {
+        let start = from + offset;
+        let end = start + name.len();
+        let opens = goal[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !name_word_char(c));
+        let closes = goal[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !name_word_char(c));
+        if opens && closes {
+            return true;
+        }
+        from = end;
+        if from >= goal.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn name_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-' || c == '.'
+}
+
+/// Whether a token has the shape of a path rather than of a word.
+///
+/// A separator is the strongest signal: prose does not put `crates/x.rs` in a
+/// sentence by accident. A trailing extension is the weaker one, so it has to
+/// look like a type anybody would name — two to six alphanumerics after the
+/// last dot — or `e.g` and `i.e` become files.
+fn looks_like_a_path(token: &str) -> bool {
+    if token.contains('/') {
+        return true;
+    }
+    std::path::Path::new(token)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            (GOAL_PATH_EXT_MIN..=GOAL_PATH_EXT_MAX).contains(&e.len())
+                && e.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+}
+
 /// Structural check of a unified diff: every hunk must carry exactly the
 /// number of lines its header declares, and the last line must be terminated.
 ///
@@ -1745,5 +1868,89 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    #[test]
+    fn a_goal_naming_files_yields_those_files() {
+        assert_eq!(
+            paths_named_in_goal("在 `README.md` 中补充 Windows 快速开始"),
+            vec!["README.md".to_string()]
+        );
+        assert_eq!(
+            paths_named_in_goal("fix the parser in crates/cog-core/src/lib.rs, keep it small"),
+            vec!["crates/cog-core/src/lib.rs".to_string()]
+        );
+    }
+
+    /// Prose is where a path gets its punctuation. A goal that ends a sentence
+    /// on the file name, or wraps it in backticks, names the same file as one
+    /// that does neither.
+    #[test]
+    fn surrounding_punctuation_is_not_part_of_the_name() {
+        assert_eq!(
+            paths_named_in_goal("please update README.md."),
+            vec!["README.md".to_string()]
+        );
+        assert_eq!(
+            paths_named_in_goal("see (`deploy/values.yaml`), it is stale"),
+            vec!["deploy/values.yaml".to_string()]
+        );
+    }
+
+    #[test]
+    fn ordinary_words_do_not_become_paths() {
+        assert!(paths_named_in_goal("improve the frontend module").is_empty());
+        assert!(paths_named_in_goal("make it faster and safer").is_empty());
+        // Abbreviations carry a dot and a single trailing letter; nothing ships
+        // an extension one character long, so they stay words.
+        assert!(paths_named_in_goal("e.g. tidy this up").is_empty());
+        assert!(paths_named_in_goal("i.e. do the same thing").is_empty());
+    }
+
+    /// A glob, a URL and an assignment all contain the characters of a path
+    /// without being one. Reading them as names would invent anchors that no
+    /// checkout can confirm or deny.
+    #[test]
+    fn path_lookalikes_are_dropped() {
+        assert!(paths_named_in_goal("touch crates/**/*.rs instead").is_empty());
+        assert!(paths_named_in_goal("see https://example.com/docs/guide.md").is_empty());
+        assert!(paths_named_in_goal("set KEY=deploy/values.yaml first").is_empty());
+    }
+
+    #[test]
+    fn one_file_written_two_ways_is_one_name() {
+        assert_eq!(
+            paths_named_in_goal(r"update .\src\main.rs and src/main.rs"),
+            vec!["src/main.rs".to_string()]
+        );
+        assert_eq!(
+            paths_named_in_goal("check ./README.md and README.md"),
+            vec!["README.md".to_string()]
+        );
+    }
+
+    /// A name that walks out of the checkout can never be confirmed by it, so
+    /// it is not a claim worth carrying to a caller that resolves against one.
+    #[test]
+    fn a_name_that_escapes_the_root_is_not_kept() {
+        assert!(paths_named_in_goal("read ../../etc/passwd now").is_empty());
+    }
+
+    #[test]
+    fn a_name_the_goal_uses_is_seen() {
+        assert!(mentions_name("改 README 里的快速开始", "README"));
+        assert!(mentions_name("update README.md please", "README.md"));
+        assert!(mentions_name("README", "README"));
+    }
+
+    /// The reason the caller gets its candidates from a filesystem instead of
+    /// from the text: prose is full of words, and only a real name can be the
+    /// subject of a claim.
+    #[test]
+    fn a_name_inside_a_longer_word_is_not_used() {
+        assert!(!mentions_name("improve the module", "README"));
+        assert!(!mentions_name("the README.md is stale", "README"));
+        assert!(!mentions_name("readmore about it", "readme"));
+        assert!(!mentions_name("anything at all", ""));
     }
 }
