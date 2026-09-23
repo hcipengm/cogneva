@@ -91,7 +91,7 @@ impl HttpClient for ReqwestHttpClient {
         let resp = request_builder
             .send()
             .await
-            .map_err(|e| SFError::Agent(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| SFError::Agent(format!("HTTP request failed: {}", describe_send_error(&e))))?;
 
         let status = resp.status().as_u16();
         let headers = resp
@@ -142,7 +142,7 @@ impl HttpClient for ReqwestHttpClient {
         let resp = request_builder
             .send()
             .await
-            .map_err(|e| SFError::Agent(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| SFError::Agent(format!("HTTP request failed: {}", describe_send_error(&e))))?;
 
         let status = resp.status().as_u16();
         let headers = resp
@@ -161,6 +161,24 @@ impl HttpClient for ReqwestHttpClient {
             stream: Box::pin(stream),
         })
     }
+}
+
+/// reqwest's own `Display` stops at "error sending request for url (...)";
+/// the actual cause - DNS lookup failure, connection refused, connect timeout -
+/// sits one link down the `source()` chain. Without walking it, persisted
+/// alerts (`infra_watch_eval_failure`) only say that a request failed, never
+/// why, so every investigation starts by guessing between a blocked egress
+/// policy, a missing Service, and a dead Prometheus. Carry the cause in the
+/// error so the alert row names the failure class directly.
+fn describe_send_error(e: &reqwest::Error) -> String {
+    let mut msg = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    msg
 }
 
 #[cfg(test)]
