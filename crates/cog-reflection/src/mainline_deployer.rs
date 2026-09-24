@@ -566,24 +566,139 @@ fn is_admission_denied(msg: &str) -> bool {
     msg.contains(ADMISSION_DENIED_MARKER)
 }
 
-/// 镜像一次都还没动时失败的归类。此时没有回滚对象，要判的只是"这次失败说不说
-/// 得出新版本的问题"：观测能力故障、授权被拒、以及撞上集群容量或策略约束的准入
-/// 拒绝都说不出，归环境类，否则归版本类。
+/// 这次失败**坏在哪**。类别说"这次失败说不说得出新版本的问题"，落点说的是
+/// "坏在哪一处"——后者是判"同 rev 反复失败是不是同一处坏"的证据。
 ///
-/// 快照阶段只有这四类非版本失败会出现——调度器判决得等新 Pod 出现，这里还没有
-/// 新 Pod。归环境类是为了不占尝试预算：拿一次纯粹的可达性抖动、一个坏掉的工具
-/// 路径、一纸发布集与授权面对不齐的拒绝、或一个打满的配额去消耗本 rev 的尝试，
-/// 会按上限把一个本来正常的版本搁置到下个 rev。
-fn classify_before_any_change(e: SFError) -> RolloutFailure {
-    let msg = e.to_string();
-    if is_cluster_unreachable(&msg)
-        || is_observation_tool_failure(&msg)
-        || is_authorization_denied(&msg)
-        || is_admission_policy_denied(&msg)
-    {
-        RolloutFailure::environment(e)
+/// 落点由代码在识别处给出，不从错误措辞里解析：措辞里带着 Pod 名、耗时、端口
+/// 这类每次都变的噪声，拿它做证据会得出"每次都是新失败"，于是永远停不下来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureLocus {
+    /// 集群不可达：看不到集群，说不出新版本好坏。
+    Unreachable,
+    /// 准入面拒绝（配额打满、LimitRange/PodSecurity 越界）：新容器一次都没起来。
+    Admission,
+    /// 调度器放不下：节点装不下，不是这份变更的事。
+    Placement,
+    /// 观测工具本身起不来：一次查询都没发出去。
+    Tool,
+    /// 授权被拒：读不到要看的东西。
+    AuthDenied,
+    /// 其余按"观测到的版本缺陷"论，含回滚过的那一支。
+    Observed,
+}
+
+impl FailureLocus {
+    /// 全部落点，供读回签名时校验值域用。
+    const ALL: [FailureLocus; 6] = [
+        FailureLocus::Unreachable,
+        FailureLocus::Admission,
+        FailureLocus::Placement,
+        FailureLocus::Tool,
+        FailureLocus::AuthDenied,
+        FailureLocus::Observed,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            FailureLocus::Unreachable => "unreachable",
+            FailureLocus::Admission => "admission",
+            FailureLocus::Placement => "placement",
+            FailureLocus::Tool => "tool",
+            FailureLocus::AuthDenied => "auth",
+            FailureLocus::Observed => "observed",
+        }
+    }
+
+    /// 这次落点说不说得出版本的问题。`before_any_change` = 一个镜像都还没动
+    /// （此时没有回滚对象，判的只是"这次失败有没有信息量"）。
+    ///
+    /// 两个阶段判据的集合有意不同：滚动中撞上授权拒绝仍要回滚（改过的东西得退
+    /// 回去），而滚动中认准入只看判定进程打的标记、不认措辞——超时记录里附着的
+    /// 现场采样与上游原文同形，用措辞再判一遍会把"这次上线自己把 requests 调过了
+    /// 配额"那一支也读成环境类，那一个真坏的版本就再也等不到回滚。
+    fn class(self, before_any_change: bool) -> FailureClass {
+        let environment = if before_any_change {
+            self != FailureLocus::Observed
+        } else {
+            matches!(
+                self,
+                FailureLocus::Unreachable
+                    | FailureLocus::Admission
+                    | FailureLocus::Placement
+                    | FailureLocus::Tool
+            )
+        };
+        if environment {
+            FailureClass::Environment
+        } else {
+            FailureClass::Version
+        }
+    }
+}
+
+/// 镜像一次都还没动时的落点。快照阶段只有这四类非版本失败会出现——调度器判决
+/// 得等新 Pod 出现，这里还没有新 Pod。
+fn locate_before_any_change(msg: &str) -> FailureLocus {
+    if is_cluster_unreachable(msg) {
+        FailureLocus::Unreachable
+    } else if is_observation_tool_failure(msg) {
+        FailureLocus::Tool
+    } else if is_authorization_denied(msg) {
+        FailureLocus::AuthDenied
+    } else if is_admission_policy_denied(msg) {
+        FailureLocus::Admission
     } else {
-        RolloutFailure::version(e)
+        FailureLocus::Observed
+    }
+}
+
+/// 镜像一次都还没动时失败的归类，外加这次失败在发布流程里的位置。位置（阶段 +
+/// 目标）与落点一起构成这次失败的签名，部署器拿它判"同 rev 反复失败是不是同一处
+/// 坏"——同一处坏两次是可复现的确定性失败，再滚只会得到同一份证据。
+fn classify_before_any_change(stage: &str, target: &str, e: SFError) -> RolloutFailure {
+    let locus = locate_before_any_change(&e.to_string());
+    RolloutFailure::at(stage, target, locus, true, e)
+}
+
+/// 一次失败的签名：类别 + 在发布流程里的位置（阶段与目标）+ 落点。同 rev 两次
+/// 失败签名相同，说明是同一处坏、可复现；签名变了说明情况在动，还值得再看一次。
+fn failure_signature(
+    class: FailureClass,
+    stage: &str,
+    target: &str,
+    locus: FailureLocus,
+) -> String {
+    format!("{}:{stage}:{target}:{}", class.as_str(), locus.as_str())
+}
+
+/// 这次失败是不是已经见过的那一处坏。证据取不到（`None`）时不做区分：读不出
+/// 落点的失败恰是"判不准"，它不排除"和上次同因"，按同因记——判不准就往停下的一
+/// 侧取，误停只是等一个新 rev，误放是无限重滚一个真坏的 rev。
+fn failure_repeats(seen: &[Option<String>], now: Option<&str>) -> bool {
+    seen.iter().any(|prev| match (prev.as_deref(), now) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    })
+}
+
+/// 从终止消息里读回失败签名。只认我们自己写下的形状（`类别:阶段:目标:落点`，
+/// 四个字段各在值域内）：容器可能因为别的原因死掉，别的进程也可能往这条通道里
+/// 写过东西，把一段陌生文本当签名会让"这次和上次是不是同一处坏"变成掷骰子。
+fn parse_failure_signature(msg: &str) -> Option<String> {
+    let text = msg.lines().next()?.trim();
+    let parts: Vec<&str> = text.split(':').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let known_class = matches!(
+        parts.first().copied(),
+        Some("version") | Some("environment")
+    );
+    let known_locus = FailureLocus::ALL.iter().any(|l| l.as_str() == parts[3]);
+    if known_class && known_locus {
+        Some(text.to_string())
+    } else {
+        None
     }
 }
 
@@ -596,17 +711,16 @@ fn classify_before_any_change(e: SFError) -> RolloutFailure {
 /// `activeDeadlineSeconds` 到点，判不出类别，按版本类靠。
 const ROLLOUT_EXIT_ENVIRONMENT: i32 = 75;
 
-/// 滚动失败的类别。分的是**这次失败说不说得出新版本的问题**，部署器据此决定
-/// 要不要把这次失败记进本 rev 的尝试预算。
+/// 滚动失败的类别。分的是**这次失败说不说得出新版本的问题**：版本类是这份
+/// 变更的结论，环境类只是集群此刻的样子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FailureClass {
     /// 观测到的版本缺陷：探针不过、启动卡死、支撑清单 apply 失败、镜像拉不下来。
-    /// 该回滚，也该占一次尝试——同一处反复失败就该停下来等人。
+    /// 该回滚；也是唯一能构成"这个 rev 坏"的结论、进而让重试停下的一类。
     #[default]
     Version,
     /// 集群环境问题：调度器放不下新 Pod，或我们看不到集群。两种都说不出新版本
-    /// 的好坏，Job 不回滚，部署器也不该把它记成"这个版本试过一次"——否则一次
-    /// 纯容量问题就会按尝试上限把一个本来正常的版本搁置，而要等下一版才解封。
+    /// 的好坏，Job 不回滚，重试也不该被当成"这个版本又坏了一次"。
     Environment,
 }
 
@@ -619,27 +733,34 @@ impl FailureClass {
     }
 }
 
-/// 滚动失败连同它的类别一起带出 `RolloutExecutor::run`。判定进程与部署器在
-/// 同一个 crate，类别走类型而不是让部署器回头解析 Job 日志里的字符串。
+/// 滚动失败连同它的类别与签名一起带出 `RolloutExecutor::run`。判定进程与部署器在
+/// 同一个 crate，类别走类型而不是让部署器回头解析 Job 日志里的字符串；签名再经
+/// 进程的终止消息（k8s 给"这个容器为什么死"留的那条窄通道）过一遍 Job 边界。
 #[derive(Debug)]
 pub struct RolloutFailure {
-    /// 这次失败属于哪一类。部署器据此决定要不要计入本 rev 的尝试预算。
+    /// 这次失败属于哪一类。
     pub class: FailureClass,
+    /// 这次失败坏在哪一处（类别 + 阶段 + 目标 + 落点）。部署器用它判"同 rev
+    /// 反复失败是不是同一处坏"。
+    pub signature: String,
     /// 原始错误，措辞与判据都不变（Job 日志、错误文本原样保留）。
     pub error: SFError,
 }
 
 impl RolloutFailure {
-    fn version(error: SFError) -> Self {
+    /// 唯一的失败构造点。类别、落点判据与签名在这里一次成形，两个阶段各自只
+    /// 提供"坏在哪"和"处在哪一步"——分开构造会让同一次失败在两处得到两种类别。
+    fn at(
+        stage: &str,
+        target: &str,
+        locus: FailureLocus,
+        before_any_change: bool,
+        error: SFError,
+    ) -> Self {
+        let class = locus.class(before_any_change);
         Self {
-            class: FailureClass::Version,
-            error,
-        }
-    }
-
-    fn environment(error: SFError) -> Self {
-        Self {
-            class: FailureClass::Environment,
+            class,
+            signature: failure_signature(class, stage, target, locus),
             error,
         }
     }
@@ -652,6 +773,14 @@ impl std::fmt::Display for RolloutFailure {
 }
 
 impl std::error::Error for RolloutFailure {}
+
+/// 部署器从一个失败的滚动 Job 上读回的东西：类别（终止码）与失败落点（终止消息）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobFailure {
+    class: FailureClass,
+    /// 读不到就是 `None`：没有区分力的证据，不是一种新的失败。
+    signature: Option<String>,
+}
 
 /// 把部署 `.spec` 归一化成可逐字节比较的「放置面」。
 ///
@@ -934,6 +1063,12 @@ fn normalize_deployed(deployed: &DeployedState, has_in_flight: bool) -> Deployed
 
 /// 前进判定（纯函数）。`is_ancestor` = deployed rev 是 bare rev 的祖先
 /// （git merge-base 判定结果，作为参数传入保持本函数无 IO）。
+///
+/// 判据分两层，因为两个问题不是同一个：**要不要动**由部署面回答（认不认得 rev、
+/// 是不是同 rev、是不是分叉），**这个 rev 还能不能滚**由失败证据回答。
+/// 部署面认不出 rev **不是**"这个 rev 没失败过"的证据——滚动失败后回滚成浮动签
+/// 留下的正是认不出 rev 的形态，把第二层挂在第一层的分支里，恰好在失败制造出来的
+/// 状态里把安全阀旁路掉，循环会无限重滚一个已知坏的 rev。
 #[derive(Debug, PartialEq, Eq)]
 enum AdvanceDecision {
     Advance,
@@ -941,20 +1076,22 @@ enum AdvanceDecision {
     NotAncestor,
     Mixed,
     InCooldown,
-    MaxAttempts,
+    /// 同一处坏在这个 rev 上复现过：确定性失败，停下等新 rev。
+    Repeated,
 }
 
-/// 上一条失败 rev 的记账。冷却、次数、上限回答的是同一个问题——"这个 rev 现在
-/// 还能不能再试"——所以合成一格，免得三个数各走各的。
+/// 上一条失败 rev 的记账。回答的是同一个问题——"这个 rev 现在还能不能再试"——
+/// 所以合成一格，免得几个数各走各的。
 #[derive(Debug, Clone, Copy)]
 struct RetryBudget {
-    /// 冷却窗截止时刻（unix 秒）。
+    /// 环境类失败的限速窗截止时刻（unix 秒）。
     cooldown_until: i64,
     /// 当前 bare rev 就是刚失败的那个（状态里的 `failed_rev` 命中了它）。
     retry_of_failed_rev: bool,
-    /// 已记的**版本类**失败次数；环境类失败不占这个预算。
-    attempts: u32,
-    max_attempts: u32,
+    /// 那次失败的类别。环境类只看限速窗，版本类只看证据有没有复现。
+    class: FailureClass,
+    /// 同一处坏已经复现过一次（证据在记账处判定，这里只读结论）。
+    repeated: bool,
 }
 
 fn evaluate_advance(
@@ -964,9 +1101,9 @@ fn evaluate_advance(
     now_ts: i64,
     retry: RetryBudget,
 ) -> AdvanceDecision {
+    // 第一层：部署面。只回答"要不要动"，不做记账判据。
     match deployed {
-        DeployedState::Legacy => AdvanceDecision::Advance,
-        DeployedState::Mixed => AdvanceDecision::Mixed,
+        DeployedState::Mixed => return AdvanceDecision::Mixed,
         DeployedState::Main(d) => {
             if rev12(d) == rev12(bare_rev) {
                 return AdvanceDecision::SameRev;
@@ -974,19 +1111,34 @@ fn evaluate_advance(
             if !is_ancestor {
                 return AdvanceDecision::NotAncestor;
             }
-            // 冷却挡的是"重试刚失败的这个 rev"，由 failed_rev 判，不能借 attempts:
-            // 环境类失败不占尝试预算（attempts 保持 0），而它恰恰是最该被冷却挡住、
-            // 等节点腾出空间的那一档。冷却若连新 rev 一起挡，fix-forward 提交
-            // （修的正是上次失败原因）会被无谓延迟一个冷却窗。
-            if retry.retry_of_failed_rev && now_ts < retry.cooldown_until {
-                return AdvanceDecision::InCooldown;
+        }
+        // 认不出 rev 只说明部署面给不出答案，不构成放行理由——记账判据在下面
+        // 按 failed_rev 独立生效。
+        DeployedState::Legacy => {}
+    }
+
+    // 第二层：这个 rev 还能不能再滚。只看失败记账，与部署面认出没认出 rev 无关。
+    if retry.retry_of_failed_rev {
+        match retry.class {
+            // 环境类不是版本结论：唯一的判据是别在同一个满节点上空转，冷却过了
+            // 就再试，没有次数上限——把"集群装不下"读成"这个版本试够了"会让一个
+            // 本来正常的版本被搁置到下个 rev。
+            FailureClass::Environment => {
+                if now_ts < retry.cooldown_until {
+                    return AdvanceDecision::InCooldown;
+                }
             }
-            if retry.attempts >= retry.max_attempts {
-                return AdvanceDecision::MaxAttempts;
+            // 版本类：同一处坏复现过就停。新的 rev 让 `retry_of_failed_rev` 变假，
+            // 于是 fix-forward 提交（修的正是上次的失败原因）立即恢复推进，不被
+            // 任何时间窗挡——那正是这条判据要保证的事。
+            FailureClass::Version => {
+                if retry.repeated {
+                    return AdvanceDecision::Repeated;
+                }
             }
-            AdvanceDecision::Advance
         }
     }
+    AdvanceDecision::Advance
 }
 
 /// 构建锁陈旧判定：持锁进程已死，或锁龄超过构建超时（进程僵死/被杀）。
@@ -1018,9 +1170,19 @@ struct MainlineState {
     last_good_rev: Option<String>,
     in_flight: Option<InFlight>,
     failed_rev: Option<String>,
+    /// 环境类失败的限速窗：环境类失败本身不含版本结论，它只决定"隔多久再看一眼
+    /// 这台集群"。版本类不走这个窗——那类失败没有时间维度可言，见 `failed_repeated`。
     failed_cooldown_until: i64,
-    /// **版本类**失败次数；环境类失败不占这个预算（见 [`FailureClass`]）。
-    failed_attempts: u32,
+    /// `failed_rev` 上**版本类**失败各自坏在哪（签名去重后的集合，`None` = 有一
+    /// 次读不出落点）。这是"这个 rev 还让不让再滚"的全部依据：签名重复出现说明
+    /// 同一处坏是可复现的确定性失败，重滚只会拿到同一份证据；签名每次都不同说明
+    /// 情况在动（每次滚得比上次远），还值得再看一次。没有次数上限、没有时间窗。
+    #[serde(default)]
+    failed_signatures: Vec<Option<String>>,
+    /// 同一处坏已经复现过一次：确定性失败，停下等人/等新 rev。它由证据推出，
+    /// 不是一个能调大调小的预算。
+    #[serde(default)]
+    failed_repeated: bool,
     /// `failed_rev` 那次失败的类别。决定重试时能否复用镜像，old state.json
     /// 没有这一格，缺省按版本类（保守：宁可重建）。
     #[serde(default)]
@@ -1705,7 +1867,8 @@ impl MainlineDeployer {
                     state.last_good_tag = Some(main_image(&self.pull_endpoint(), &inflight.rev));
                     state.in_flight = None;
                     state.failed_rev = None;
-                    state.failed_attempts = 0;
+                    state.failed_signatures.clear();
+                    state.failed_repeated = false;
                     state.failed_class = FailureClass::default();
                     state.failed_cooldown_until = 0;
                     self.save_state(&state)?;
@@ -1736,27 +1899,40 @@ impl MainlineDeployer {
                         return Ok(());
                     }
                     JobStatus::Failed => {
-                        // 类别取自 Job 的终止码（环境类不回滚也不计尝试），不是
-                        // 从 Job 日志里找字符串。
-                        let class = self.job_failure_class(&job_name(&inflight.rev)).await;
+                        // 类别取自 Job 的终止码、落点取自它的终止消息（环境类不回滚
+                        // 也不构成版本结论），不是从 Job 日志里找字符串。
+                        let failure = self.job_failure(&job_name(&inflight.rev)).await;
+                        let class = failure.class;
                         let same_rev = state.failed_rev.as_deref() == Some(inflight.rev.as_str());
-                        let attempts = match (class, same_rev) {
-                            // 环境类失败不是版本结论：不占尝试预算，只设冷却，
-                            // 等节点腾出空间后在冷却窗后再来。
-                            (FailureClass::Environment, true) => state.failed_attempts,
-                            (FailureClass::Environment, false) => 0,
-                            (FailureClass::Version, true) => state.failed_attempts + 1,
-                            (FailureClass::Version, false) => 1,
-                        };
+                        if !same_rev {
+                            // 换 rev 就是换了一份待验的东西：上一份的证据不能拿
+                            // 过来用（同一个落点在两个 rev 上不是同一处坏）。
+                            state.failed_signatures.clear();
+                            state.failed_repeated = false;
+                        }
+                        if class == FailureClass::Version {
+                            // 同一处坏第二次出现 → 可复现的确定性失败。证据取不到
+                            // （None）时不做区分：读不出落点的失败恰是"判不准"，
+                            // 它不排除"和上次同因"，按同因记。
+                            if failure_repeats(
+                                &state.failed_signatures,
+                                failure.signature.as_deref(),
+                            ) {
+                                state.failed_repeated = true;
+                            } else {
+                                state.failed_repeated = false;
+                                state.failed_signatures.push(failure.signature.clone());
+                            }
+                        }
                         warn!(
                             rev = %rev12(&inflight.rev),
                             class = class.as_str(),
-                            attempts,
+                            signature = failure.signature.as_deref().unwrap_or("unknown"),
+                            repeats = state.failed_repeated,
                             "mainline rollout job failed (rollback, if any, handled by the job itself)"
                         );
                         state.failed_rev = Some(inflight.rev.clone());
                         state.failed_class = class;
-                        state.failed_attempts = attempts;
                         state.failed_cooldown_until =
                             chrono::Utc::now().timestamp() + self.cfg.failure_cooldown_secs as i64;
                         state.in_flight = None;
@@ -1804,11 +1980,6 @@ impl MainlineDeployer {
         let deployed = normalized;
 
         let retry_of_failed_rev = state.failed_rev.as_deref() == Some(bare.as_str());
-        let attempts = if retry_of_failed_rev {
-            state.failed_attempts
-        } else {
-            0
-        };
         let is_ancestor = match &deployed {
             DeployedState::Main(d) => self.is_ancestor(d, &bare).await,
             _ => true,
@@ -1822,8 +1993,8 @@ impl MainlineDeployer {
             RetryBudget {
                 cooldown_until: state.failed_cooldown_until,
                 retry_of_failed_rev,
-                attempts,
-                max_attempts: self.cfg.max_attempts_per_rev,
+                class: state.failed_class,
+                repeated: state.failed_repeated,
             },
         );
         match decision {
@@ -2449,9 +2620,9 @@ impl MainlineDeployer {
         }
     }
 
-    /// Job 已失败时，问它的判定进程**是哪一类**失败。Job 的 Pod 模板是
+    /// Job 已失败时，问它的判定进程**是怎么失败的**。Job 的 Pod 模板是
     /// `backoffLimit: 0` + `restartPolicy: Never`，一个 Pod 一次运行，终止码
-    /// 就是这个进程的退出码。
+    /// 就是这个进程的退出码，终止消息就是它留下的失败落点。
     ///
     /// 一个 Pod 都没有时（终止码读不到、也没得读）改问 Job 的 Failed 条件：准入面
     /// 把 Pod 挡在创建之外时（配额打满、LimitRange 越界），判定进程根本不存在，
@@ -2459,9 +2630,14 @@ impl MainlineDeployer {
     /// 它和"码读不出来"不是一回事，是**采错了地方**而不是采不到。
     ///
     /// 采不到（Pod 已删、查询失败、码不可解析、条件消息为空）仍按**版本类**靠：
-    /// 类别判不准时，把环境类误记成版本类只是多花一次尝试预算，反过来则是一个真坏
-    /// 的版本被无限重试、永不停下——代价不对称，往记账侧取。
-    async fn job_failure_class(&self, name: &str) -> FailureClass {
+    /// 类别判不准时，把环境类误记成版本类只是多一轮零成本的等待，反过来则是一个
+    /// 真坏的版本被无限重试、永不停下——代价不对称，往停下的一侧取。签名同理，
+    /// 读不到就返回 `None`（部署器按"没有区分力"处理）。
+    async fn job_failure(&self, name: &str) -> JobFailure {
+        let missing = JobFailure {
+            class: FailureClass::Version,
+            signature: None,
+        };
         let out = match self
             .kubectl(
                 &[
@@ -2470,7 +2646,7 @@ impl MainlineDeployer {
                     "-l",
                     &format!("job-name={name}"),
                     "-o",
-                    "jsonpath={range .items[*]}{.status.containerStatuses[0].state.terminated.exitCode}{\"\\n\"}{end}",
+                    "jsonpath={range .items[*]}{.status.containerStatuses[0].state.terminated.exitCode}{\"|\"}{.status.containerStatuses[0].state.terminated.message}{\"\\n\"}{end}",
                 ],
                 30,
             )
@@ -2483,19 +2659,25 @@ impl MainlineDeployer {
                     error = %e,
                     "could not read the rollout job's exit code; treating its failure as version-class"
                 );
-                return FailureClass::Version;
+                return missing;
             }
         };
-        let code = out
-            .lines()
-            .filter_map(|l| l.trim().parse::<i32>().ok())
-            .next_back();
-        if let Some(code) = code {
-            return if code == ROLLOUT_EXIT_ENVIRONMENT {
-                FailureClass::Environment
-            } else {
-                FailureClass::Version
-            };
+        let mut class = None;
+        let mut signature = None;
+        for line in out.lines() {
+            let mut parts = line.splitn(2, '|');
+            let code = parts.next().unwrap_or("").trim().parse::<i32>().ok();
+            if let Some(code) = code {
+                class = Some(if code == ROLLOUT_EXIT_ENVIRONMENT {
+                    FailureClass::Environment
+                } else {
+                    FailureClass::Version
+                });
+                signature = parts.next().and_then(parse_failure_signature);
+            }
+        }
+        if let Some(class) = class {
+            return JobFailure { class, signature };
         }
         let reason = self.job_failed_condition(name).await.unwrap_or_default();
         if is_cluster_unreachable(&reason)
@@ -2508,10 +2690,12 @@ impl MainlineDeployer {
                 reason = %reason,
                 "rollout job's pod was never created; classified from the job's failure condition"
             );
-            FailureClass::Environment
-        } else {
-            FailureClass::Version
+            return JobFailure {
+                class: FailureClass::Environment,
+                signature: None,
+            };
         }
+        missing
     }
 
     /// Job 的 Failed 条件消息。Pod 被准入面挡在创建之外时，这是唯一留下原因的
@@ -2585,21 +2769,24 @@ fn heartbeat_message(
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
     format!(
-        "bare={} upstream={} last_good={} in_flight={} ci_hold={} failed_rev={} failed_class={} failed_attempts={} cooldown_remaining_secs={}",
+        "bare={} upstream={} last_good={} in_flight={} ci_hold={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
         rev12(bare_rev),
         upstream,
         state.last_good_rev.as_deref().map(rev12).unwrap_or("none"),
         in_flight,
         state.ci_hold_rev.as_deref().map(rev12).unwrap_or("none"),
         state.failed_rev.as_deref().map(rev12).unwrap_or("none"),
-        // 环境类失败不计尝试次数，`failed_rev` 与 `failed_attempts=0` 会同时出现；
+        // 环境类失败不占证据面，`failed_rev` 与 `failed_loci=0` 会同时出现；
         // 不说出类别，这一行读起来就像记账坏了。
         state
             .failed_rev
             .as_ref()
             .map(|_| state.failed_class.as_str())
             .unwrap_or("none"),
-        state.failed_attempts,
+        // "停在哪一处、是第一次还是又一处"是这一行的重点：只有这一对数能区分
+        // "还在往前走"和"卡死在同一堵墙上"。
+        state.failed_signatures.len(),
+        state.failed_repeated,
         (state.failed_cooldown_until - now_unix).max(0),
     )
 }
@@ -3779,13 +3966,13 @@ impl RolloutExecutor {
                 let text = tokio::fs::read_to_string(&support)
                     .await
                     .map_err(|e| SFError::IO(format!("read {}: {e}", support.display())))
-                    .map_err(classify_before_any_change)?;
+                    .map_err(|e| classify_before_any_change("support", "", e))?;
                 let staged = stage_rollout_manifest(
                     &text,
                     "support.yaml",
                     &std::env::temp_dir().join("mainline-support.yaml"),
                 )
-                .map_err(classify_before_any_change)?;
+                .map_err(|e| classify_before_any_change("support", "", e))?;
                 match staged {
                     Some(path) => {
                         let support_arg = path.to_string_lossy().to_string();
@@ -3796,7 +3983,7 @@ impl RolloutExecutor {
                         );
                         self.run_kubectl(&["apply", "-f", &support_arg], 120)
                             .await
-                            .map_err(classify_before_any_change)?;
+                            .map_err(|e| classify_before_any_change("support", "", e))?;
                     }
                     None => warn!(
                         source = %support.display(),
@@ -3814,13 +4001,13 @@ impl RolloutExecutor {
             let img = self
                 .current_image(t)
                 .await
-                .map_err(classify_before_any_change)?;
+                .map_err(|e| classify_before_any_change("snapshot", &t.deployment, e))?;
             // 放置面与镜像一起快照：apply 之后才分得清"排不上队"是这次上线
             // 自己加了排不上的约束（版本的事），还是节点本来就满（不是）。
             let shape = self
                 .current_placement_shape(t)
                 .await
-                .map_err(classify_before_any_change)?;
+                .map_err(|e| classify_before_any_change("snapshot", &t.deployment, e))?;
             info!(deployment = %t.deployment, prev = %img, "mainline rollout: snapshot prev image");
             prevs.push((t.deployment.clone(), img));
             prev_shapes.push((t.deployment.clone(), shape));
@@ -3833,11 +4020,15 @@ impl RolloutExecutor {
                 .map(|(_, v)| v.as_str())
                 .unwrap_or_default();
             if let Err(e) = self.apply_target(plan, target).await {
-                return self.fail_without_blind_rollback(e, &done, &prevs).await;
+                return self
+                    .fail_without_blind_rollback("apply", &target.deployment, e, &done, &prevs)
+                    .await;
             }
             if let Err(e) = self.wait_rollout_complete(target, prev_shape).await {
                 done.push(target);
-                return self.fail_without_blind_rollback(e, &done, &prevs).await;
+                return self
+                    .fail_without_blind_rollback("wait", &target.deployment, e, &done, &prevs)
+                    .await;
             }
             done.push(target);
         }
@@ -3849,7 +4040,9 @@ impl RolloutExecutor {
         tokio::time::sleep(Duration::from_secs(self.soak_secs)).await;
         for target in &plan.targets {
             if let Err(e) = self.pods_healthy(target).await {
-                return self.fail_without_blind_rollback(e, &done, &prevs).await;
+                return self
+                    .fail_without_blind_rollback("soak", &target.deployment, e, &done, &prevs)
+                    .await;
             }
         }
         info!(tag = %plan.tag, "mainline rollout complete and healthy");
@@ -3875,13 +4068,16 @@ impl RolloutExecutor {
     ///
     /// 准入那一类只认判定进程打的标记、不认措辞：超时记录里还附着一份给人看的
     /// 现场采样，措辞与上游原文同形，用措辞再判一遍会把"变更自己把 requests 调过
-    /// 了配额"那一支也放成环境类，而环境类不占尝试预算，会无限重试一个真坏的版本。
+    /// 了配额"那一支也放成环境类，而环境类不构成"这个 rev 坏"的结论，会无限重试
+    /// 一个真坏的版本。
     ///
-    /// 这里是**唯一**给失败定类别的地方：不回滚的几支判成环境类，其余（含
-    /// 回滚过的那一支）判成版本类。类别随 [`RolloutFailure`] 带到 CLI，翻成
-    /// 进程退出码交给部署器，部署器据此决定占不占尝试预算。
+    /// 不回滚的几支判成环境类，其余（含回滚过的那一支）判成版本类。类别与落点
+    /// 随 [`RolloutFailure`] 带到 CLI，翻成进程退出码与终止消息交给部署器——
+    /// 部署器据此决定这个 rev 还让不让再滚。
     async fn fail_without_blind_rollback(
         &self,
+        stage: &str,
+        target: &str,
         e: SFError,
         done: &[&RolloutTarget],
         prevs: &[(String, String)],
@@ -3892,7 +4088,13 @@ impl RolloutExecutor {
                 error = %e,
                 "cluster unreachable during the rollout; keeping the new revision (no rollback)"
             );
-            return Err(RolloutFailure::environment(e));
+            return Err(RolloutFailure::at(
+                stage,
+                target,
+                FailureLocus::Unreachable,
+                false,
+                e,
+            ));
         }
         if is_admission_denied(&msg) {
             warn!(
@@ -3900,7 +4102,13 @@ impl RolloutExecutor {
                 "the API server rejected the new pods and this revision did not change the \
                  deployment's placement shape; keeping the new revision (no rollback)"
             );
-            return Err(RolloutFailure::environment(e));
+            return Err(RolloutFailure::at(
+                stage,
+                target,
+                FailureLocus::Admission,
+                false,
+                e,
+            ));
         }
         if is_placement_blocked(&msg) {
             warn!(
@@ -3908,7 +4116,13 @@ impl RolloutExecutor {
                 "the scheduler never placed the new pods and this revision did not change the \
                  deployment's placement shape; keeping the new revision (no rollback)"
             );
-            return Err(RolloutFailure::environment(e));
+            return Err(RolloutFailure::at(
+                stage,
+                target,
+                FailureLocus::Placement,
+                false,
+                e,
+            ));
         }
         if is_observation_tool_failure(&msg) {
             warn!(
@@ -3916,10 +4130,24 @@ impl RolloutExecutor {
                 "the observation tool itself could not be run; keeping the new revision (no \
                  rollback) — rolling the image back cannot repair a broken tool path"
             );
-            return Err(RolloutFailure::environment(e));
+            return Err(RolloutFailure::at(
+                stage,
+                target,
+                FailureLocus::Tool,
+                false,
+                e,
+            ));
         }
         self.rollback(&e, done, prevs).await;
-        Err(RolloutFailure::version(e))
+        // 授权被拒这一类在滚动中仍回滚并记版本类：改过的东西要退回去。落点写成
+        // auth 而不是 observed，好让"因为读不到集群而回滚"与"版本真的没起来"在
+        // 记账和报告里分得开。
+        let locus = if is_authorization_denied(&msg) {
+            FailureLocus::AuthDenied
+        } else {
+            FailureLocus::Observed
+        };
+        Err(RolloutFailure::at(stage, target, locus, false, e))
     }
 
     /// 尽力回滚：已滚目标按快照的各自 prev 镜像反向 set image 并等收敛
@@ -4034,15 +4262,42 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
     );
     match executor.run(&plan).await {
         Ok(()) => Ok(()),
-        // 环境类失败：用独立退出码告诉部署器"这次失败说不出新版本的好坏"，
-        // 让它不把这次失败记进本 rev 的尝试预算。`process::exit` 不走返回路径，
-        // 因为 Box<dyn Error> 出去一律是 1，区分不出类别。
-        Err(f) if f.class == FailureClass::Environment => {
-            tracing::error!(error = %f, exit_code = ROLLOUT_EXIT_ENVIRONMENT, "mainline rollout failed for environment reasons");
-            std::process::exit(ROLLOUT_EXIT_ENVIRONMENT);
+        // 失败分两条通道过 Job 边界：类别走退出码（环境类用独立的 75，让部署器
+        // 知道这次失败说不出新版本的好坏），落点走进程的终止消息——类别只有两档，
+        // 而"坏在哪一处"是把两个值都塞进退出码塞不下的东西。终止消息是 k8s 给
+        // "这个容器为什么死"留的窄通道，读出端按结构化字段取，不解析日志。
+        // `process::exit` 不走返回路径，因为 Box<dyn Error> 出去一律是 1。
+        Err(f) => {
+            report_failure_signature(&f.signature);
+            if f.class == FailureClass::Environment {
+                tracing::error!(error = %f, exit_code = ROLLOUT_EXIT_ENVIRONMENT, "mainline rollout failed for environment reasons");
+                std::process::exit(ROLLOUT_EXIT_ENVIRONMENT);
+            }
+            Err(Box::new(f))
         }
-        Err(f) => Err(Box::new(f)),
     }
+}
+
+/// 容器终止消息文件（kubelet 的 `terminationMessagePath` 默认值）。失败落点写在
+/// 这里，部署器从 Pod 的 `state.terminated.message` 读回。
+const TERMINATION_LOG: &str = "/dev/termination-log";
+
+/// 尽力把失败签名写进终止消息。写不进去不能影响失败本身的交付：类别还走退出码，
+/// 签名没了只是让部署器少一份证据（它会往"停下"的一侧取，不会因此多滚一轮）。
+fn report_failure_signature(signature: &str) {
+    if let Err(e) = write_failure_signature(Path::new(TERMINATION_LOG), signature) {
+        tracing::warn!(
+            path = TERMINATION_LOG,
+            error = %e,
+            signature,
+            "could not record the rollout failure signature; the deployer will see this failure without evidence of its locus"
+        );
+    }
+}
+
+/// 终止消息只该带一行：kubelet 按 4KiB 截断，多行内容在后端 jsonpath 里也读不利索。
+fn write_failure_signature(path: &Path, signature: &str) -> std::io::Result<()> {
+    std::fs::write(path, format!("{signature}\n"))
 }
 
 // ---------------------------------------------------------------------------
@@ -4721,9 +4976,9 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             in_flight: None,
             failed_rev: None,
             failed_cooldown_until: 0,
-            failed_attempts: 0,
             failed_class: FailureClass::Version,
             ci_hold_rev: None,
+            ..Default::default()
         };
         let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", 100);
         assert!(msg.contains("bare=4dfd51ff1209"), "{msg}");
@@ -4734,7 +4989,8 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(msg.contains("in_flight=none"), "{msg}");
         assert!(msg.contains("failed_rev=none"), "{msg}");
         assert!(msg.contains("failed_class=none"), "{msg}");
-        assert!(msg.contains("failed_attempts=0"), "{msg}");
+        assert!(msg.contains("failed_loci=0"), "{msg}");
+        assert!(msg.contains("failed_repeated=false"), "{msg}");
         assert!(msg.contains("cooldown_remaining_secs=0"), "{msg}");
     }
 
@@ -4749,7 +5005,11 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             }),
             failed_rev: Some("112233445566aabb".into()),
             failed_cooldown_until: 1500,
-            failed_attempts: 2,
+            failed_signatures: vec![
+                Some("version:wait:cogneva-web:observed".into()),
+                Some("version:soak:cogneva-web:observed".into()),
+            ],
+            failed_repeated: false,
             failed_class: FailureClass::Version,
             ci_hold_rev: Some("deadbeef0011".into()),
         };
@@ -4758,19 +5018,20 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(msg.contains("upstream=up-to-date(aabbccddeeff)"), "{msg}");
         assert!(msg.contains("failed_rev=112233445566"), "{msg}");
         assert!(msg.contains("failed_class=version"), "{msg}");
-        assert!(msg.contains("failed_attempts=2"), "{msg}");
+        // 两处不同的落点 = 还在往前走；和"复现了"是两件事，不能只看个数。
+        assert!(msg.contains("failed_loci=2"), "{msg}");
+        assert!(msg.contains("failed_repeated=false"), "{msg}");
         assert!(msg.contains("cooldown_remaining_secs=500"), "{msg}");
         assert!(msg.contains("ci_hold=deadbeef0011"), "{msg}");
     }
 
-    /// 环境类失败不计尝试次数，`failed_rev` 与 `failed_attempts=0` 会同时出现：
+    /// 环境类失败不占证据面，`failed_rev` 与 `failed_loci=0` 会同时出现：
     /// 心跳必须说出类别，否则这一行读起来像记账坏了。
     #[test]
     fn heartbeat_message_names_an_environment_class_failure() {
         let state = MainlineState {
             failed_rev: Some("112233445566aabb".into()),
             failed_cooldown_until: 1500,
-            failed_attempts: 0,
             failed_class: FailureClass::Environment,
             ..Default::default()
         };
@@ -4778,7 +5039,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(msg.contains("upstream=diverged"), "{msg}");
         assert!(msg.contains("failed_rev=112233445566"), "{msg}");
         assert!(msg.contains("failed_class=environment"), "{msg}");
-        assert!(msg.contains("failed_attempts=0"), "{msg}");
+        assert!(msg.contains("failed_loci=0"), "{msg}");
     }
 
     #[test]
@@ -4909,62 +5170,168 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let main = |r: &str| DeployedState::Main(r.into());
         let now = 1000i64;
         let other = main("aa1111111111");
-        let retry = |cooldown_until, retry_of_failed_rev, attempts| RetryBudget {
+        let retry = |cooldown_until, retry_of_failed_rev, class, repeated| RetryBudget {
             cooldown_until,
             retry_of_failed_rev,
-            attempts,
-            max_attempts: 2,
+            class,
+            repeated,
         };
+        let env = FailureClass::Environment;
+        let ver = FailureClass::Version;
         // 同 rev 不前进
         assert_eq!(
-            evaluate_advance(bare, &main(bare), true, now, retry(0, false, 0)),
+            evaluate_advance(bare, &main(bare), true, now, retry(0, false, ver, false)),
             AdvanceDecision::SameRev
         );
         // 非祖先（分叉/倒退）拒
         assert_eq!(
-            evaluate_advance(bare, &other, false, now, retry(0, false, 0)),
+            evaluate_advance(bare, &other, false, now, retry(0, false, ver, false)),
             AdvanceDecision::NotAncestor
         );
-        // 冷却挡的是"重试刚失败的这个 rev"，由 failed_rev 判而非 attempts：
-        // attempts=0 正是环境类失败（不占预算）的形状，它同样要被冷却挡住。
+        // 环境类在限速窗内不重试：别在同一个满节点上空转。
         assert_eq!(
-            evaluate_advance(bare, &other, true, now, retry(2000, true, 0)),
+            evaluate_advance(bare, &other, true, now, retry(2000, true, env, false)),
             AdvanceDecision::InCooldown
         );
-        // 版本类失败同样在冷却窗内被挡
+        // 环境类没有次数上限：窗过了就照常再试。把"集群装不下"读成"这个版本试够了"
+        // 会让一个本来正常的版本被搁置到下个 rev。
         assert_eq!(
-            evaluate_advance(bare, &other, true, now, retry(2000, true, 1)),
-            AdvanceDecision::InCooldown
-        );
-        // 冷却窗内推进到新 rev（fix-forward）不挡：新提交可能正是修复
-        assert_eq!(
-            evaluate_advance(bare, &other, true, now, retry(2000, false, 0)),
+            evaluate_advance(bare, &other, true, now, retry(0, true, env, false)),
             AdvanceDecision::Advance
         );
-        // 环境类失败重试不占预算：冷却过了就照常再试，不会撞上尝试上限。
+        // 版本类不看时间窗：同一处坏没复现过就还值得再看一次（情况可能在动）。
         assert_eq!(
-            evaluate_advance(bare, &other, true, now, retry(0, true, 0)),
+            evaluate_advance(bare, &other, true, now, retry(2000, true, ver, false)),
             AdvanceDecision::Advance
         );
-        // 超次数
+        // 版本类同一处坏复现过：确定性失败，停下等新 rev。
         assert_eq!(
-            evaluate_advance(bare, &other, true, now, retry(0, true, 2)),
-            AdvanceDecision::MaxAttempts
+            evaluate_advance(bare, &other, true, now, retry(0, true, ver, true)),
+            AdvanceDecision::Repeated
         );
-        // 正常前进
+        // 复现结论只对失败的那个 rev 成立：换 rev 就是换了一份待验的东西。
         assert_eq!(
-            evaluate_advance(bare, &other, true, now, retry(0, true, 1)),
+            evaluate_advance(bare, &other, true, now, retry(0, false, ver, true)),
+            AdvanceDecision::Advance
+        );
+        // fix-forward：新 rev 到达时既不撞限速窗也不撞复现结论。
+        assert_eq!(
+            evaluate_advance(bare, &other, true, now, retry(2000, false, ver, false)),
             AdvanceDecision::Advance
         );
         // 迁移首轮（Legacy）直接前进
         assert_eq!(
-            evaluate_advance(bare, &DeployedState::Legacy, false, now, retry(0, false, 0)),
+            evaluate_advance(
+                bare,
+                &DeployedState::Legacy,
+                false,
+                now,
+                retry(0, false, ver, false)
+            ),
+            AdvanceDecision::Advance
+        );
+        // 认不出 rev（Legacy/Mixed 归一后的形态）不豁免记账判据：滚动失败回滚成
+        // 浮动签留下的就是 Legacy + failed_rev==bare，此时判据必须照常生效，否则
+        // 循环会无限重滚同一个已知坏的 rev。
+        assert_eq!(
+            evaluate_advance(
+                bare,
+                &DeployedState::Legacy,
+                true,
+                now,
+                retry(0, true, ver, true)
+            ),
+            AdvanceDecision::Repeated
+        );
+        assert_eq!(
+            evaluate_advance(
+                bare,
+                &DeployedState::Legacy,
+                true,
+                now,
+                retry(2000, true, env, false)
+            ),
+            AdvanceDecision::InCooldown
+        );
+        // 但自愈语义不能被误伤：Legacy 且失败的不是这个 rev（外部写入造成的非一致，
+        // 或冷启动首轮）仍要放行，否则部署器永久静默停摆。
+        assert_eq!(
+            evaluate_advance(
+                bare,
+                &DeployedState::Legacy,
+                true,
+                now,
+                retry(2000, false, ver, false)
+            ),
+            AdvanceDecision::Advance
+        );
+        assert_eq!(
+            evaluate_advance(
+                bare,
+                &DeployedState::Legacy,
+                true,
+                now,
+                retry(0, true, ver, false)
+            ),
             AdvanceDecision::Advance
         );
         // 混合态不前进
         assert_eq!(
-            evaluate_advance(bare, &DeployedState::Mixed, true, now, retry(0, false, 0)),
+            evaluate_advance(
+                bare,
+                &DeployedState::Mixed,
+                true,
+                now,
+                retry(0, false, ver, false)
+            ),
             AdvanceDecision::Mixed
+        );
+    }
+
+    /// 失败落点的证据规则：同一处坏第二次出现才算复现；落点读不到时按"同因"记
+    /// （判不准就往停下的一侧取）。
+    #[test]
+    fn failure_evidence_holds_only_when_the_same_locus_repeats() {
+        let a = Some("version:wait:cogneva-web:observed".to_string());
+        let b = Some("version:apply:cogneva-web:observed".to_string());
+        // 第一次失败：没有可比的证据，不算复现。
+        assert!(!failure_repeats(&[], a.as_deref()));
+        // 同一处坏第二次：复现。
+        assert!(failure_repeats(std::slice::from_ref(&a), a.as_deref()));
+        // 换了一处坏：不是复现——滚动每次比上次远，说明情况在动。
+        assert!(!failure_repeats(std::slice::from_ref(&a), b.as_deref()));
+        // 落点读不到（Pod 已删、查询失败）：不排除同因，按同因记。
+        assert!(failure_repeats(std::slice::from_ref(&a), None));
+        assert!(failure_repeats(&[None], a.as_deref()));
+        // 只有过一次读不到的失败、这次仍读不到：同样是复现（否则读不出证据就
+        // 变成了"无限重滚"的许可证）。
+        assert!(failure_repeats(&[None], None));
+    }
+
+    #[test]
+    fn failure_signatures_round_trip_through_the_termination_message() {
+        let sig = failure_signature(
+            FailureClass::Version,
+            "wait",
+            "cogneva-web",
+            FailureLocus::Observed,
+        );
+        assert_eq!(sig, "version:wait:cogneva-web:observed");
+        assert_eq!(
+            parse_failure_signature(&format!("{sig}\n")),
+            Some(sig.clone())
+        );
+        // 陌生文本不当证据：容器可能因为别的原因死掉，别的进程也可能往这条通道
+        // 里写过东西。把一段陌生字串当签名会让"是不是同一处坏"变成掷骰子。
+        assert_eq!(parse_failure_signature(""), None);
+        assert_eq!(parse_failure_signature("some other failure"), None);
+        assert_eq!(parse_failure_signature("version:wait:web:nonsense"), None);
+        assert_eq!(parse_failure_signature("fatal:wait:web:observed"), None);
+        assert_eq!(parse_failure_signature("version:wait:web"), None);
+        // 多行只取第一行：kubelet 按 4KiB 截断，后面跟着的一般是别的进程的残余。
+        assert_eq!(
+            parse_failure_signature(&format!("{sig}\ngarbage")),
+            Some(sig)
         );
     }
 
@@ -4986,7 +5353,8 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             }),
             failed_rev: None,
             failed_cooldown_until: 0,
-            failed_attempts: 0,
+            failed_signatures: vec![None, Some("version:wait:web:observed".into())],
+            failed_repeated: true,
             failed_class: FailureClass::Environment,
             ci_hold_rev: None,
         };
@@ -5242,7 +5610,6 @@ exit 0
             soak_secs: 1,
             restart_threshold: 1,
             failure_cooldown_secs: 60,
-            max_attempts_per_rev: 2,
             rollout_timeout_secs: 60,
             startup_timeout_secs: 900,
             job_cpu_request: "7m".into(),
@@ -6356,7 +6723,7 @@ exit 0
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let fake = PathBuf::from("/nonexistent");
-        let class_of = |name: &str, body: &str| {
+        let failure_of = |name: &str, body: &str| {
             let (root, bin_dir, fake) = (root.to_path_buf(), bin_dir.clone(), fake.clone());
             let name = name.to_string();
             let body = body.to_string();
@@ -6364,59 +6731,82 @@ exit 0
                 write_fake_bin(&bin_dir, &name, &body);
                 let cfg = test_config(&root, &fake, "noop", &bin_dir.join(&name).to_string_lossy());
                 MainlineDeployer::new(cfg, test_workspaces(&root, &fake))
-                    .job_failure_class("j")
+                    .job_failure("j")
                     .await
             }
         };
         assert_eq!(
-            class_of("k75", "#!/bin/sh\necho 75\nexit 0\n").await,
+            failure_of("k75", "#!/bin/sh\necho 75\nexit 0\n")
+                .await
+                .class,
             FailureClass::Environment
         );
         // 1（版本类退出）、空（Pod 还没终止）、137（信号终止：OOM / 驱逐 / 到点
         // 被杀都长这样，类别判不出）一律按版本类靠：判不准就往记账侧取。
         assert_eq!(
-            class_of("k1", "#!/bin/sh\necho 1\nexit 0\n").await,
+            failure_of("k1", "#!/bin/sh\necho 1\nexit 0\n").await.class,
             FailureClass::Version
         );
         assert_eq!(
-            class_of("kempty", "#!/bin/sh\nexit 0\n").await,
+            failure_of("kempty", "#!/bin/sh\nexit 0\n").await.class,
             FailureClass::Version
         );
         assert_eq!(
-            class_of("k137", "#!/bin/sh\necho 137\nexit 0\n").await,
+            failure_of("k137", "#!/bin/sh\necho 137\nexit 0\n")
+                .await
+                .class,
             FailureClass::Version
         );
         // 采样失败（apiserver 不可达）同样按版本类，且不产生第二个错误。
         assert_eq!(
-            class_of("kerr", "#!/bin/sh\necho 'no route to host' >&2\nexit 1\n").await,
+            failure_of("kerr", "#!/bin/sh\necho 'no route to host' >&2\nexit 1\n")
+                .await
+                .class,
             FailureClass::Version
         );
         // 一个 Pod 都没有、但 Job 的 Failed 条件写明了准入面拒绝：判定进程压根没被
         // 创建出来，退出码永远不会有，这一档要从条件消息里读成环境类——它与"码读不
         // 出来"不是一回事，是采错了地方。
         assert_eq!(
-            class_of(
+            failure_of(
                 "kquota",
                 "#!/bin/sh\ncase \"$*\" in\n  *\"job-name=\"*) exit 0 ;;\n  *\"get job\"*) echo 'Error creating: pods \"j-x\" is forbidden: exceeded quota: cogneva-quota, requested: requests.cpu=200m, used: requests.cpu=6, limited: requests.cpu=6' ;;\n  *) exit 0 ;;\nesac\nexit 0\n"
             )
-            .await,
+            .await
+            .class,
             FailureClass::Environment
         );
         // 反面：条件消息为空时仍按版本类靠，别把"没读到"读成环境类。
         assert_eq!(
-            class_of(
+            failure_of(
                 "kquotaempty",
                 "#!/bin/sh\ncase \"$*\" in\n  *\"job-name=\"*) exit 0 ;;\n  *) exit 0 ;;\nesac\nexit 0\n"
             )
-            .await,
+            .await
+            .class,
             FailureClass::Version
         );
+        // 1（版本类退出）带上终止消息里的落点：签名原样读回，类别仍来自退出码。
+        let f = failure_of(
+            "ksig",
+            "#!/bin/sh\necho '1|version:wait:cogneva-web:observed'\nexit 0\n",
+        )
+        .await;
+        assert_eq!(f.class, FailureClass::Version);
+        assert_eq!(
+            f.signature.as_deref(),
+            Some("version:wait:cogneva-web:observed")
+        );
+        // 落点不合形状（陌生文本）时签名读成"没有证据"，而不是当成一种新失败。
+        let f = failure_of("kjunk", "#!/bin/sh\necho '1|boom'\nexit 0\n").await;
+        assert_eq!(f.class, FailureClass::Version);
+        assert_eq!(f.signature, None);
     }
 
-    /// 环境类失败不是版本结论：不占本 rev 的尝试次数，但仍设冷却（不空转），
-    /// 且 rev 仍记着（下轮走"重试它"这条判据）。
+    /// 环境类失败不是版本结论：它不推翻本 rev 已有的版本证据，也不设复现结论，
+    /// 但仍设限速窗（不在同一个满节点上空转），rev 仍记着（下轮走"重试它"）。
     #[tokio::test]
-    async fn an_environment_class_failure_does_not_consume_the_attempt_budget() {
+    async fn an_environment_class_failure_does_not_touch_the_version_evidence() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
@@ -6429,7 +6819,8 @@ exit 0
         );
         let buildah = fake_buildah(&bin_dir, "");
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        // 上一轮已经记过一次版本类失败：环境类这次不该把它推到上限。
+        // 上一轮已记过一次版本类失败：这次环境类失败不该把它洗掉，也不该就此
+        // 判成"复现"。
         let state_path = seed_state(
             root,
             MainlineState {
@@ -6438,7 +6829,8 @@ exit 0
                     phase: Phase::Dispatched,
                 }),
                 failed_rev: Some(rev_b.clone()),
-                failed_attempts: 1,
+                failed_signatures: vec![Some("version:wait:cogneva-web:observed".into())],
+                failed_repeated: false,
                 failed_class: FailureClass::Version,
                 ..Default::default()
             },
@@ -6448,13 +6840,18 @@ exit 0
         deployer.poll_once().await.unwrap();
 
         let state = read_state(&state_path);
-        assert_eq!(state.failed_attempts, 1, "环境类失败不占尝试预算");
         assert_eq!(state.failed_class, FailureClass::Environment);
+        assert_eq!(
+            state.failed_signatures,
+            vec![Some("version:wait:cogneva-web:observed".to_string())],
+            "环境类失败不是版本结论，不能洗掉版本证据"
+        );
+        assert!(!state.failed_repeated, "环境类失败不构成复现");
         assert_eq!(state.failed_rev.as_deref(), Some(rev_b.as_str()));
         assert!(state.in_flight.is_none());
         assert!(
             state.failed_cooldown_until > chrono::Utc::now().timestamp(),
-            "环境类失败仍要冷却，否则部署器会在同一个满节点上空转"
+            "环境类失败仍要限速，否则部署器会在同一个满节点上空转"
         );
         // 类别必须来自 Job 的 Pod 终止码：这条查询没发生就说明判据换了来源。
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
@@ -6464,16 +6861,19 @@ exit 0
         );
     }
 
-    /// 版本类失败照旧占一次：同一处反复失败要能停下来等人。
+    /// 版本类失败：同一处坏第二次出现才判复现（确定性失败，停下等新 rev）。
     #[tokio::test]
-    async fn a_version_class_failure_consumes_an_attempt() {
+    async fn a_repeated_failure_locus_holds_the_revision() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let kubectl =
-            fake_kubectl_failed_job(&bin_dir, &main_image("localhost:30500", &rev_a), "1");
+        let kubectl = fake_kubectl_failed_job(
+            &bin_dir,
+            &main_image("localhost:30500", &rev_a),
+            "1|version:wait:cogneva-web:observed",
+        );
         let buildah = fake_buildah(&bin_dir, "");
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let state_path = seed_state(
@@ -6484,7 +6884,8 @@ exit 0
                     phase: Phase::Dispatched,
                 }),
                 failed_rev: Some(rev_b.clone()),
-                failed_attempts: 1,
+                failed_signatures: vec![Some("version:wait:cogneva-web:observed".into())],
+                failed_repeated: false,
                 failed_class: FailureClass::Version,
                 ..Default::default()
             },
@@ -6494,8 +6895,56 @@ exit 0
         deployer.poll_once().await.unwrap();
 
         let state = read_state(&state_path);
-        assert_eq!(state.failed_attempts, 2);
         assert_eq!(state.failed_class, FailureClass::Version);
+        assert!(
+            state.failed_repeated,
+            "同一处坏第二次出现就是可复现的确定性失败"
+        );
+        assert_eq!(
+            state.failed_signatures.len(),
+            1,
+            "同一处坏不重复入账：签名集合记的是见过哪些落点"
+        );
+    }
+
+    /// 版本类失败但落点变了：滚动每次比上次远说明情况在动，还值得再看一次——
+    /// 这里不能停下，否则一次半途的失败就把这个 rev 判死。
+    #[tokio::test]
+    async fn a_new_failure_locus_keeps_the_revision_moving() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl = fake_kubectl_failed_job(
+            &bin_dir,
+            &main_image("localhost:30500", &rev_a),
+            "1|version:soak:cogneva-web:observed",
+        );
+        let buildah = fake_buildah(&bin_dir, "");
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let state_path = seed_state(
+            root,
+            MainlineState {
+                in_flight: Some(InFlight {
+                    rev: rev_b.clone(),
+                    phase: Phase::Dispatched,
+                }),
+                failed_rev: Some(rev_b.clone()),
+                failed_signatures: vec![Some("version:wait:cogneva-web:observed".into())],
+                failed_repeated: false,
+                failed_class: FailureClass::Version,
+                ..Default::default()
+            },
+        );
+
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+        deployer.poll_once().await.unwrap();
+
+        let state = read_state(&state_path);
+        assert_eq!(state.failed_class, FailureClass::Version);
+        assert!(!state.failed_repeated, "换了一处坏不是复现");
+        assert_eq!(state.failed_signatures.len(), 2, "新的落点入账");
     }
 
     /// 环境类失败过的 rev，其镜像构建与推送都成功过（卡住的是调度）：重试直接
@@ -6526,7 +6975,6 @@ exit 0
             root,
             MainlineState {
                 failed_rev: Some(rev_b.clone()),
-                failed_attempts: 0,
                 failed_class: FailureClass::Environment,
                 ..Default::default()
             },
@@ -7831,7 +8279,7 @@ metadata:
                       \"resourcequotas\" in API group \"\" in the namespace \"cogneva\"";
         assert!(is_authorization_denied(denial));
         assert_eq!(
-            classify_before_any_change(SFError::IO(denial.to_string())).class,
+            classify_before_any_change("test", "", SFError::IO(denial.to_string())).class,
             FailureClass::Environment
         );
         // 谁也不许借走它的判定。
@@ -7861,13 +8309,15 @@ metadata:
         );
         assert!(!is_authorization_denied(&bundle_err.to_string()));
         assert_eq!(
-            classify_before_any_change(bundle_err).class,
+            classify_before_any_change("test", "", bundle_err).class,
             FailureClass::Version
         );
         assert_eq!(
-            classify_before_any_change(SFError::IO(
-                "kubectl apply -f support.yaml failed: invalid manifest".into()
-            ))
+            classify_before_any_change(
+                "test",
+                "",
+                SFError::IO("kubectl apply -f support.yaml failed: invalid manifest".into()),
+            )
             .class,
             FailureClass::Version
         );
@@ -7884,7 +8334,7 @@ metadata:
                     used: requests.cpu=2180m, limited: requests.cpu=6";
         assert!(is_admission_policy_denied(quota));
         assert_eq!(
-            classify_before_any_change(SFError::IO(quota.to_string())).class,
+            classify_before_any_change("test", "", SFError::IO(quota.to_string())).class,
             FailureClass::Environment
         );
         // 配额拒绝带 `is forbidden` 却不带 `User "..."` 主体——正因如此它此前从
@@ -7897,7 +8347,7 @@ metadata:
         ] {
             assert!(is_admission_policy_denied(msg), "{msg}");
             assert_eq!(
-                classify_before_any_change(SFError::IO(msg.into())).class,
+                classify_before_any_change("test", "", SFError::IO(msg.into())).class,
                 FailureClass::Environment,
                 "{msg}"
             );
@@ -7912,7 +8362,7 @@ metadata:
         ] {
             assert!(!is_admission_policy_denied(msg), "{msg}");
             assert_eq!(
-                classify_before_any_change(SFError::IO(msg.into())).class,
+                classify_before_any_change("test", "", SFError::IO(msg.into())).class,
                 FailureClass::Version,
                 "{msg}"
             );

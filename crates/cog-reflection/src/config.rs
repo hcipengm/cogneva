@@ -472,10 +472,10 @@ pub struct MainlineDeployerConfig {
     pub soak_secs: u64,
     /// Pod 重启次数超过该值判病。
     pub restart_threshold: u32,
-    /// 同一 rev 失败后的冷却（秒），冷却内不重试。
+    /// **环境类**失败后的限速窗（秒）：环境类失败不含版本结论，只决定隔多久
+    /// 再看一眼这台集群。版本类不走这个窗——"这个 rev 还让不让再滚"由失败
+    /// 落点的证据回答，没有时间维度和次数上限。
     pub failure_cooldown_secs: u64,
-    /// 同一 rev 最多尝试次数（超过则等下一个 rev）。
-    pub max_attempts_per_rev: u32,
     /// 单个 deployment 滚动等待超时（秒）。只计"就绪"预算：Pod 的 init
     /// 容器还在跑时不计入（见 startup_timeout_secs）。
     pub rollout_timeout_secs: u64,
@@ -533,7 +533,6 @@ impl Default for MainlineDeployerConfig {
             soak_secs: 120,
             restart_threshold: 1,
             failure_cooldown_secs: 3600,
-            max_attempts_per_rev: 2,
             rollout_timeout_secs: 300,
             startup_timeout_secs: 900,
             job_cpu_request: "10m".into(),
@@ -721,9 +720,6 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS") {
             self.failure_cooldown_secs =
                 parse("COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS", &v)?;
-        }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_MAX_ATTEMPTS") {
-            self.max_attempts_per_rev = parse("COGNEVA_MAINLINE_DEPLOYER_MAX_ATTEMPTS", &v)?;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_TIMEOUT_SECS") {
             self.rollout_timeout_secs =
