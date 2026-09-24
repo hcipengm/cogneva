@@ -19,6 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELM_DIR="${SCRIPT_DIR}/../helm"
 MANIFESTS_DIR="${SCRIPT_DIR}/../manifests"
 NAMESPACE="monitoring"
+GRAFANA_PW_FILE="${HOME}/.cogneva/grafana-admin-password"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -71,17 +72,54 @@ ensure_clickhouse_credentials() {
     if ! kubectl -n "${NAMESPACE}" get secret clickhouse-credentials >/dev/null 2>&1; then
         local pw
         pw="$(openssl rand -hex 24)"
-        kubectl -n "${NAMESPACE}" create secret generic clickhouse-credentials \
-            --from-literal=password="${pw}" >/dev/null
+        create_secret_from_value clickhouse-credentials password "${pw}"
         log_info "clickhouse-credentials 已生成随机密码"
     else
         log_info "clickhouse-credentials 已存在，保留不动"
     fi
 }
 
+# 用值建 Secret，值不经过 argv（--from-literal 会把密码暴露在宿主的 ps 里）。
+# 非敏感的伴生键经 extra 透传给 kubectl（形如 --from-literal=admin-user=admin）。
+create_secret_from_value() {
+    local name="$1" key="$2" value="$3"
+    shift 3
+    local dir
+    dir="$(mktemp -d)"
+    chmod 700 "${dir}"
+    ( umask 077; printf '%s' "${value}" > "${dir}/${key}" )
+    kubectl -n "${NAMESPACE}" create secret generic "${name}" \
+        --from-file="${key}=${dir}/${key}" "$@" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    rm -rf "${dir}"
+}
+
+# ─── Grafana 管理员凭证 ───────────────────────────────────────────
+# 清单里不声明这个 Secret：写字面量等于把密码提交进仓库（历史清不掉），写空值
+# 则每次 apply 都把已生效的密码清掉。所以安装时生成一次、已存在则保留，密码落
+# 一份 600 的本地文件，日志只给路径。轮换用 scripts/rotate-grafana-password.sh。
+ensure_grafana_admin_credentials() {
+    log_info "准备 Grafana 管理员凭证..."
+
+    if kubectl -n "${NAMESPACE}" get secret grafana-admin-credentials >/dev/null 2>&1; then
+        log_info "grafana-admin-credentials 已存在，保留不动"
+        return
+    fi
+
+    local pw
+    pw="$(openssl rand -base64 20)"
+    create_secret_from_value grafana-admin-credentials admin-password "${pw}" --from-literal=admin-user=admin
+    mkdir -p "$(dirname "${GRAFANA_PW_FILE}")"
+    ( umask 077; printf '%s\n' "${pw}" > "${GRAFANA_PW_FILE}" )
+    log_info "grafana-admin-credentials 已生成随机密码，写入 ${GRAFANA_PW_FILE}（权限 600）"
+}
+
 # ─── 部署基础 Manifests ───────────────────────────────────────────
 deploy_manifests() {
     log_info "部署 K8s 基础资源 (Namespace / Secrets / ServiceMonitor / Dashboard)..."
+
+    # 清单里没有 Grafana 的那个 Secret：它必须由这里在 apply 之前备好
+    # （kube-prometheus-stack 的 grafana 从 existingSecret 读）。
+    ensure_grafana_admin_credentials
 
     # 不应用的文件及原因：
     #   02-networkpolicy — 首条策略对 monitoring 全体 Pod 做 ingress 默认拒绝，
@@ -176,14 +214,14 @@ verify_deployment() {
     echo ""
     log_info "=== 服务访问地址 ==="
     echo "  Prometheus:   https://prometheus.sf-network.local"
-    echo "  Grafana:      https://grafana.sf-network.local    (admin / 查看 03-grafana-secrets.yaml)"
+    echo "  Grafana:      https://grafana.sf-network.local    (admin / 密码见 ${GRAFANA_PW_FILE})"
     echo "  Alertmanager: https://alertmanager.sf-network.local"
     echo "  Jaeger:       https://jaeger.sf-network.local"
     echo ""
     log_warn "请先配置 DNS 或 /etc/hosts 指向 Ingress IP"
     echo "  <K3s-Node-IP>  prometheus.sf-network.local grafana.sf-network.local alertmanager.sf-network.local jaeger.sf-network.local"
     echo ""
-    log_warn "生产环境请修改 03-grafana-secrets.yaml 中的默认密码后再部署！"
+    log_warn "Grafana 管理员密码由安装时随机生成（${GRAFANA_PW_FILE}），不写在清单里；对外暴露前用 rotate-grafana-password.sh 轮换一次。"
 }
 
 # ─── 主流程 ───────────────────────────────────────────────────────
