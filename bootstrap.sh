@@ -13,6 +13,10 @@ GITEE_REPO_URL="https://gitee.com/hcipengm/cogneva.git"
 TARBALL_URL="https://codeload.github.com/hcipengm/cogneva/tar.gz/refs/heads/main"
 GITEE_TARBALL_URL="https://gitee.com/hcipengm/cogneva/repository/archive/main.tar.gz"
 DEFAULT_HOME="${COGNEVA_HOME:-$HOME/.cogneva}"
+# 提权前缀（空 = 已是 root），由 ensure_privileges 结算；CN_MIRROR 同理由
+# detect_restricted_net 结算，这里给初值只是为了让 `set -u` 下的引用安全。
+SUDO=""
+CN_MIRROR=0
 # 与 README 完全同一条入口命令（VM/WSL 内复用），CN 模式 Gitee 优先
 ENTRY_CMD_INTL='(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh'
 ENTRY_CMD_CN='(curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh || curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh) | sh'
@@ -30,19 +34,151 @@ detect_os() {
     esac
 }
 
-# 受限网络探测：直接探 rustup 分发域（国内被墙），不通即走国内镜像。
+# 单条信号探活：5s 内拿到**任何** HTTP 状态码即算可达。
+# 判据用状态码而不是 curl 退出码——401/403/404 都说明"这条路通到目标了"，
+# 只有连接失败/超时（000）才是不通。用 -f 会让这些状态码被当成不通，
+# 于是把一台网络正常的机器误判成受限。
+probe_reachable() {
+    code=$(curl --proto '=https' --tlsv1.2 -sS -o /dev/null -m 5 -w '%{http_code}' "$1" 2>/dev/null || true)
+    [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+# 受限网络探测：多信号判据。信号表与 cog-core 的 RESTRICTED_NET_SIGNALS 一致
+# （Rust 侧有测试盯着这两份清单不漂移）。
+#
+# 判据方向偏保守：任何一条不可达即判受限，全部可达才判开放。两个方向的代价
+# 不对称——误判「开放」会让安装在墙前挂死（拉镜像超时、取码 404），误判
+# 「受限」只是多走一趟镜像站，慢但能成。
+# 单探一个 rustup 分发域是不够的：它可达而 GitHub 被墙的机器真实存在，
+# 那种机器会判成「开放」，紧接着源码 clone 就失败。
 # 可用 COGNEVA_CN_MIRROR=1/0 强制开关，跳过探测。
 detect_restricted_net() {
     if [ -n "${COGNEVA_CN_MIRROR:-}" ]; then
         [ "$COGNEVA_CN_MIRROR" = "1" ] && CN_MIRROR=1 || CN_MIRROR=0
         return
     fi
-    if curl --proto '=https' --tlsv1.2 -fsSL -m 5 -o /dev/null https://static.rust-lang.org/rustup/release-stable.toml 2>/dev/null; then
-        CN_MIRROR=0
-    else
+    blocked=""
+    for url in \
+        "https://registry-1.docker.io/v2/" \
+        "https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh" \
+        "https://static.rust-lang.org/rustup/release-stable.toml"
+    do
+        probe_reachable "$url" || blocked="$blocked $url"
+    done
+    if [ -n "$blocked" ]; then
         CN_MIRROR=1
-        echo "[bootstrap] 检测到受限网络（rustup 分发域不可达），启用国内镜像..."
+        echo "[bootstrap] 检测到受限网络（不可达:$blocked），启用国内镜像..."
+    else
+        CN_MIRROR=0
     fi
+}
+
+# 提权：元启动会把宿主机改成另一个状态（装 K3s、写 /etc/rancher、建
+# /var/lib/cogneva-data），硬依赖 root。非 root 时在这里把提权方式一次定下来，
+# 并在 exec 引导器时升到位——而不是把 sudo 渗透进下面每个特权步骤：漏一处就会在
+# 深处的写文件上 EACCES，报错还指向不相干的那一步（实测就是这么发生的：
+# 报的是「安装 K3s 失败」，真正失败的是它前面写 registries.yaml）。
+ensure_privileges() {
+    SUDO=""
+    [ "$(id -u)" -eq 0 ] && return 0
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        SUDO="sudo"
+        echo "[bootstrap] 非 root 运行：特权步骤经 sudo 执行"
+        return 0
+    fi
+    echo "[bootstrap] 元启动需要 root 权限（安装 K3s、写 /etc/rancher、建 /var/lib/cogneva-data）。" >&2
+    echo "  管道方式: curl -fsSL <入口地址>/bootstrap.sh | sudo sh" >&2
+    echo "  脚本方式: sudo -E ./bootstrap.sh" >&2
+    echo "  （已配置免密 sudo 时会自动提权，此处未检测到）" >&2
+    exit 1
+}
+
+# exec 引导器：非 root 时连同环境一起提权。提权边界只此一处，
+# 下游（Rust 引导器）永远以 root 运行，不必再关心权限。
+run_launcher() {
+    if [ "$(id -u)" -eq 0 ]; then
+        exec "$@"
+    fi
+    exec sudo -E "$@"
+}
+
+# 把官方 apt 源换成国内镜像基址（$1 已含发行版路径，如 .../ubuntu）。纯函数：
+# stdin 进 stdout 出，便于单测。只认这几家官方站，其余条目（第三方 PPA、
+# 内网源）原样不动。宿主清单与 Rust 侧 apt.rs 的 APT_HOST_REWRITES 同源，
+# 由那个模块的测试盯着不漂移。
+rewrite_apt_sources() {
+    sed -E \
+        -e "s#https?://archive\.ubuntu\.com/ubuntu#${1}#g" \
+        -e "s#https?://security\.ubuntu\.com/ubuntu#${1}#g" \
+        -e "s#https?://ports\.ubuntu\.com/ubuntu#${1}#g" \
+        -e "s#https?://deb\.debian\.org/debian#${1}#g" \
+        -e "s#https?://security\.debian\.org/debian-security#${1}-security#g"
+}
+
+# 探活出可用的国内 apt 镜像基址（回显；全不可达返回非零）。
+# 探测目标取 dists/<codename>/Release：镜像站有没有收录这个发行版一看便知。
+pick_cn_apt_mirror() {
+    id=ubuntu
+    codename=stable
+    if [ -r /etc/os-release ]; then
+        id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | head -n1)"
+        codename="$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | tr -d '"' | head -n1)"
+    fi
+    [ -n "$id" ] || id=ubuntu
+    [ -n "$codename" ] || codename=stable
+    for base in \
+        "https://mirrors.tuna.tsinghua.edu.cn/$id" \
+        "https://mirrors.ustc.edu.cn/$id" \
+        "https://mirrors.aliyun.com/$id" \
+        "https://mirrors.huaweicloud.com/$id"
+    do
+        if probe_reachable "$base/dists/$codename/Release"; then
+            echo "$base"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# CN 模式下换 apt 源：不换的话 `apt-get update` 直连 archive.ubuntu.com /
+# deb.debian.org，装 gcc/git 会长时间卡在这一步（国内几十 KB/s 甚至超时）。
+# 原地改并留 *.cogneva-orig 备份；标记文件记录已切到哪个基址，命中即跳过（幂等）。
+apply_apt_mirror() {
+    base="$1"
+    mark=/etc/apt/.cogneva-cn-mirror
+    if $SUDO test -f "$mark" && [ "$($SUDO cat "$mark")" = "$base" ]; then
+        return 0
+    fi
+    changed=0
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
+             /etc/apt/sources.list.d/*.sources
+    do
+        [ -f "$f" ] || continue
+        new="$(rewrite_apt_sources "$base" < "$f")"
+        if [ "$new" = "$(cat "$f")" ]; then
+            continue
+        fi
+        if [ ! -f "$f.cogneva-orig" ]; then
+            $SUDO cp -p "$f" "$f.cogneva-orig"
+        fi
+        printf '%s\n' "$new" | $SUDO tee "$f" >/dev/null
+        changed=1
+    done
+    printf '%s' "$base" | $SUDO tee "$mark" >/dev/null
+    if [ "$changed" = "1" ]; then
+        echo "[bootstrap] apt 源已切到 $base（原件备份为 *.cogneva-orig）"
+    fi
+}
+
+ensure_apt_mirror() {
+    [ "$CN_MIRROR" = "1" ] || return 0
+    command -v apt-get >/dev/null 2>&1 || return 0
+    base="$(pick_cn_apt_mirror)" || base=""
+    if [ -z "$base" ]; then
+        echo "[bootstrap] 国内 apt 镜像站均不可达，沿用原有源" >&2
+        return 0
+    fi
+    apply_apt_mirror "$base"
 }
 
 # 多镜像候选探测：按顺序探活（5s 超时），返回第一个可达的地址，
@@ -168,16 +304,8 @@ ensure_cc() {
         return
     fi
     echo "[bootstrap] 未检测到 C 工具链或 git（Rust 链接、依赖与自进化仓库需要），尝试自动安装..."
-    SUDO=""
-    if [ "$(id -u)" -ne 0 ]; then
-        if command -v sudo >/dev/null 2>&1; then
-            SUDO="sudo"
-        else
-            echo "[bootstrap] 需要 root 或 sudo 安装 gcc，请手动安装后重试" >&2
-            exit 1
-        fi
-    fi
     if command -v apt-get >/dev/null 2>&1; then
+        ensure_apt_mirror
         $SUDO apt-get update -qq && $SUDO apt-get install -y build-essential git
     elif command -v dnf >/dev/null 2>&1; then
         $SUDO dnf install -y gcc gcc-c++ make git
@@ -251,7 +379,7 @@ fetch_prebuilt_bootstrap() {
     echo "[bootstrap] 使用预编译静态引导器 $tag（$arch），移交控制权..."
     # 不 export COGNEVA_REPO_ROOT：二进制解包内嵌资产自取自用
     export COGNEVA_CN_MIRROR="$CN_MIRROR"
-    exec "$binpath"
+    run_launcher "$binpath"
 }
 
 # ---------- macOS：Lima 虚拟机提供 Linux 运行层 ----------
@@ -440,6 +568,8 @@ main() {
             ;;
     esac
     detect_restricted_net
+    # 权限在此结算：后面每一步都要写系统目录，越早失败越省事，报错也才指得准。
+    ensure_privileges
     # 默认路径：预编译静态二进制（下载 → 校验 → 运行，无需源码与 Rust）；
     # 失败自动回退源码构建路径（取码 → 装 Rust → cargo build）。
     # COGNEVA_BOOTSTRAP_FROM_SOURCE=1 强制源码构建（离线介质 / 本地改动调试）。
@@ -456,7 +586,11 @@ main() {
     echo "[bootstrap] 启动 Rust 引导器，移交控制权..."
     export COGNEVA_REPO_ROOT="$REPO_ROOT"
     export COGNEVA_CN_MIRROR="$CN_MIRROR"
-    exec "$REPO_ROOT/target/release/cogneva-bootstrap"
+    run_launcher "$REPO_ROOT/target/release/cogneva-bootstrap"
 }
 
-main "$@"
+# 测试钩子：置位时只加载函数定义、不执行安装（deploy/scripts/tests/ 下的
+# 判据测试靠它 source 本文件）。
+if [ -z "${COGNEVA_BOOTSTRAP_SOURCE_ONLY:-}" ]; then
+    main "$@"
+fi

@@ -23,7 +23,7 @@ use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use super::{cn_mirror, command_exists, probe_alive, run};
+use super::{cn_mirror, command_exists, docker_mirror_host, download, probe_alive, run};
 
 /// kubespray 容器镜像 tag（跟随官方稳定版，它钉住经测试的 K8s 版本矩阵）。
 pub(crate) const KUBESPRAY_TAG: &str = "v2.31.0";
@@ -103,11 +103,47 @@ pub(crate) fn render_inventory(workers: &[String]) -> String {
     out
 }
 
+/// 各 registry 的镜像前缀（kubespray 按 registry 分别取镜像仓库地址）。
+pub(crate) struct ImageRepoProxies {
+    pub docker: String,
+    pub quay: String,
+    pub kube: String,
+    pub gcr: String,
+    pub github: String,
+}
+
+/// 由**已选定**的 docker 镜像站推出各 registry 的代理前缀。
+///
+/// 只有 daocloud 提供按 registry 分域的代理（k8s-gcr / gcr / quay / ghcr 各一个
+/// 子域）；其余镜像站只代理 docker.io，所以它们的其余前缀整体回落到该站的 docker
+/// 前缀——命不命中取决于该站是否真收录了这些仓库，拉不到就是拉不到。这比反过来
+/// 把这些仓库写死在 daocloud 上诚实：写死会让上面的换站逻辑形同虚设（换了一个
+/// 只代理 docker.io 的站，系统镜像却还指向 daocloud）。
+pub(crate) fn proxies_for(docker_host: &str) -> ImageRepoProxies {
+    if docker_host.ends_with("m.daocloud.io") {
+        ImageRepoProxies {
+            docker: docker_host.to_string(),
+            quay: "quay.m.daocloud.io".into(),
+            kube: "k8s-gcr.m.daocloud.io".into(),
+            gcr: "gcr.m.daocloud.io".into(),
+            github: "ghcr.m.daocloud.io".into(),
+        }
+    } else {
+        ImageRepoProxies {
+            docker: docker_host.to_string(),
+            quay: docker_host.to_string(),
+            kube: docker_host.to_string(),
+            gcr: docker_host.to_string(),
+            github: docker_host.to_string(),
+        }
+    }
+}
+
 /// 渲染 group_vars/k8s_cluster/cogneva.yml。
 ///
 /// 基础项给零决策默认值（containerd / CNI / local-path 默认 SC）；CN 受限网络
 /// 追加镜像仓库覆写与 containerd registry mirror，让系统镜像不走直连。
-pub(crate) fn render_group_vars(cn: bool, cni: &str) -> String {
+pub(crate) fn render_group_vars(cn: bool, cni: &str, proxies: &ImageRepoProxies) -> String {
     let mut y = String::new();
     y.push_str("---\n");
     y.push_str("# 由 cogneva 元启动生成：标准 K8s 集群供给（kubespray）。\n");
@@ -115,32 +151,36 @@ pub(crate) fn render_group_vars(cn: bool, cni: &str) -> String {
     y.push_str(&format!("kube_network_plugin: {cni}\n"));
     y.push_str("local_path_provisioner_enabled: true\n");
     if cn {
-        y.push_str("\n# CN 受限网络：系统镜像走国内镜像站（daocloud 多 registry 代理）。\n");
-        y.push_str("kube_image_repo: k8s-gcr.m.daocloud.io\n");
-        y.push_str("gcr_image_repo: gcr.m.daocloud.io\n");
-        y.push_str("docker_image_repo: docker.m.daocloud.io\n");
-        y.push_str("quay_image_repo: quay.m.daocloud.io\n");
-        y.push_str("github_image_repo: ghcr.m.daocloud.io\n");
+        y.push_str("\n# CN 受限网络：系统镜像走探活选定的镜像站。\n");
+        y.push_str(&format!("kube_image_repo: {}\n", proxies.kube));
+        y.push_str(&format!("gcr_image_repo: {}\n", proxies.gcr));
+        y.push_str(&format!("docker_image_repo: {}\n", proxies.docker));
+        y.push_str(&format!("quay_image_repo: {}\n", proxies.quay));
+        y.push_str(&format!("github_image_repo: {}\n", proxies.github));
         // local-path helper 镜像默认写死 docker.io/library/busybox，需显式改。
-        y.push_str(
-            "local_path_provisioner_helper_image_repo: docker.m.daocloud.io/library/busybox\n",
-        );
+        y.push_str(&format!(
+            "local_path_provisioner_helper_image_repo: {}/library/busybox\n",
+            proxies.docker
+        ));
         y.push_str("containerd_registries_mirrors:\n");
-        y.push_str("  - prefix: docker.io\n    mirrors:\n");
-        y.push_str("      - host: https://docker.m.daocloud.io\n        capabilities: [\"pull\", \"resolve\"]\n");
-        y.push_str("  - prefix: registry.k8s.io\n    mirrors:\n");
-        y.push_str("      - host: https://k8s-gcr.m.daocloud.io\n        capabilities: [\"pull\", \"resolve\"]\n");
-        y.push_str("  - prefix: quay.io\n    mirrors:\n");
-        y.push_str("      - host: https://quay.m.daocloud.io\n        capabilities: [\"pull\", \"resolve\"]\n");
+        for (prefix, host) in [
+            ("docker.io", &proxies.docker),
+            ("registry.k8s.io", &proxies.kube),
+            ("quay.io", &proxies.quay),
+        ] {
+            y.push_str(&format!(
+                "  - prefix: {prefix}\n    mirrors:\n      - host: https://{host}\n        capabilities: [\"pull\", \"resolve\"]\n"
+            ));
+        }
     }
     y
 }
 
 /// 选定 kubespray 容器镜像引用。
 ///
-/// 默认 `quay.io/kubespray/kubespray:<tag>`；CN 模式在 quay 镜像站候选里探活
-/// （复用 main.rs 的 probe_alive，5s 超时）。`COGNEVA_KUBESPRAY_IMAGE` 可整体覆盖。
-pub(crate) async fn kubespray_image(cn: bool) -> String {
+/// 默认 `quay.io/kubespray/kubespray:<tag>`；CN 模式用探活选定的 quay 代理前缀
+/// （与 render_group_vars 同源，不另写一份候选）。`COGNEVA_KUBESPRAY_IMAGE` 可整体覆盖。
+pub(crate) async fn kubespray_image(cn: bool, proxies: &ImageRepoProxies) -> String {
     if let Ok(img) = std::env::var("COGNEVA_KUBESPRAY_IMAGE") {
         if !img.trim().is_empty() {
             return img.trim().to_string();
@@ -150,24 +190,12 @@ pub(crate) async fn kubespray_image(cn: bool) -> String {
     if !cn {
         return default;
     }
-    // (选用镜像前缀, 探活 URL)。
-    let candidates = [
-        (
-            format!("quay.m.daocloud.io/kubespray/kubespray:{KUBESPRAY_TAG}"),
-            "https://quay.m.daocloud.io/v2/",
-        ),
-        (
-            format!("quay.1ms.run/kubespray/kubespray:{KUBESPRAY_TAG}"),
-            "https://quay.1ms.run/v2/",
-        ),
-    ];
-    for (img, probe) in candidates {
-        if probe_alive(probe).await {
-            return img;
-        }
-        warn!("kubespray 镜像站不可达，换下一个: {probe}");
+    let mirrored = format!("{}/kubespray/kubespray:{KUBESPRAY_TAG}", proxies.quay);
+    let probe = format!("https://{}/v2/", proxies.quay);
+    if probe_alive(&probe, download::PROBE).await {
+        return mirrored;
     }
-    warn!("所有 kubespray 镜像站候选不可达，回退默认 {default}（拉取可能失败）");
+    warn!("kubespray 镜像站不可达: {probe}，回退默认 {default}（拉取可能失败）");
     default
 }
 
@@ -257,8 +285,10 @@ pub(crate) async fn node_ssh_reachable(target: &str) -> bool {
 /// 预检：python3（kubespray 目标节点依赖）+ 本机 SSH 自可达（all-in-one ansible
 /// 经 127.0.0.1 连本机）。target 为 None 表示本机。
 async fn ensure_python(target: Option<&str>) -> Result<()> {
-    let ensure =
-        "python3 --version >/dev/null 2>&1 || (apt-get update && apt-get install -y python3)";
+    // 远端节点的 apt 源不归我们改（那是别人机器上的配置），所以这里用 timeout
+    // 把它变成"有界的失败"：远端直连 archive.ubuntu.com 时不会一直挂着，
+    // 报错也带得上"是这一步超时"的线索。
+    let ensure = "python3 --version >/dev/null 2>&1 || (timeout 300 apt-get update && timeout 600 apt-get install -y python3)";
     sh_on(target, ensure).await
 }
 
@@ -267,7 +297,7 @@ async fn ensure_localhost_ssh() -> Result<()> {
     // 确保 sshd 在跑。
     sh_on(
         None,
-        "command -v sshd >/dev/null 2>&1 || (apt-get update && apt-get install -y openssh-server)",
+        "command -v sshd >/dev/null 2>&1 || (timeout 300 apt-get update && timeout 600 apt-get install -y openssh-server)",
     )
     .await?;
     sh_on(
@@ -336,6 +366,9 @@ async fn wire_kubeconfig() -> Result<()> {
 pub(crate) async fn run_kubespray(workers: &[String]) -> Result<()> {
     let cn = cn_mirror();
     let cni = std::env::var("COGNEVA_K8S_CNI").unwrap_or_else(|_| "calico".into());
+    // apt 源在这一步换：下面的 podman / python3 / openssh-server 都走 apt，
+    // 只换一处就够（幂等标记防止重复改）。
+    crate::apt::ensure_cn_apt_mirror(cn).await?;
     let runner = ensure_container_runner().await?;
 
     info!(
@@ -348,7 +381,11 @@ pub(crate) async fn run_kubespray(workers: &[String]) -> Result<()> {
         ensure_python(Some(w)).await?;
     }
 
-    let image = kubespray_image(cn).await;
+    // 镜像站只探一次：kubespray 容器镜像与 group_vars 里的系统镜像前缀都从这一份
+    // 选定结果推出来，两处不会各选各的（过去 group_vars 写死 daocloud，
+    // kubespray 容器却按探活换站，换站时两边指的是不同镜像站）。
+    let proxies = proxies_for(docker_mirror_host().await);
+    let image = kubespray_image(cn, &proxies).await;
     pull_image(&runner, &image).await?;
 
     let work = work_dir();
@@ -360,7 +397,7 @@ pub(crate) async fn run_kubespray(workers: &[String]) -> Result<()> {
         .context("写 inventory.ini")?;
     tokio::fs::write(
         work.join("group_vars/k8s_cluster/cogneva.yml"),
-        render_group_vars(cn, &cni),
+        render_group_vars(cn, &cni, &proxies),
     )
     .await
     .context("写 group_vars")?;
@@ -448,7 +485,7 @@ mod tests {
 
     #[test]
     fn group_vars_defaults() {
-        let y = render_group_vars(false, "calico");
+        let y = render_group_vars(false, "calico", &proxies_for("docker.m.daocloud.io"));
         assert!(y.contains("container_manager: containerd"));
         assert!(y.contains("kube_network_plugin: calico"));
         assert!(y.contains("local_path_provisioner_enabled: true"));
@@ -459,7 +496,7 @@ mod tests {
 
     #[test]
     fn group_vars_cn_has_mirrors_and_flannel_override() {
-        let y = render_group_vars(true, "flannel");
+        let y = render_group_vars(true, "flannel", &proxies_for("docker.m.daocloud.io"));
         assert!(y.contains("kube_network_plugin: flannel"));
         assert!(y.contains("kube_image_repo: k8s-gcr.m.daocloud.io"));
         assert!(y.contains("docker_image_repo: docker.m.daocloud.io"));
@@ -469,6 +506,20 @@ mod tests {
         assert!(y.contains("containerd_registries_mirrors"));
         assert!(y.contains("prefix: registry.k8s.io"));
         assert!(y.contains("prefix: quay.io"));
+    }
+
+    /// 换站之后 group_vars 必须跟着换。过去的形态是：镜像站按探活选，而这里
+    /// 写死 daocloud —— 选中的站和系统镜像实际拉的站不是同一个，两台"镜像站"
+    /// 都失效时也看不出来。
+    #[test]
+    fn group_vars_follow_the_selected_mirror_host() {
+        let y = render_group_vars(true, "calico", &proxies_for("docker.1ms.run"));
+        assert!(y.contains("docker_image_repo: docker.1ms.run"));
+        assert!(
+            y.contains("local_path_provisioner_helper_image_repo: docker.1ms.run/library/busybox")
+        );
+        assert!(y.contains("- host: https://docker.1ms.run"));
+        assert!(!y.contains("m.daocloud.io"), "换站后仍指向 daocloud");
     }
 
     #[test]

@@ -67,11 +67,15 @@ fn materialize_assets() -> Result<PathBuf> {
 
 use anyhow::{bail, Context, Result};
 use cogneva_bootstrap::{cli, Distro};
+use download::{curl_to_file, curl_to_string, pick_alive, probe as probe_alive, LARGE, MANDATORY};
 use serde::Serialize;
 use tokio::process::Command;
 use tracing::{info, warn};
 
+mod apt;
+mod download;
 mod kubespray;
+mod privileges;
 
 /// 构建期内嵌的部署资产（预渲染清单 / init-secrets 脚本 / helm chart），
 /// 由 build.rs 从 deploy/ 打包生成。
@@ -295,6 +299,52 @@ async fn cluster_ready() -> bool {
         .unwrap_or(false)
 }
 
+/// K3s 安装脚本地址：受限网络下 get.k3s.io 背后的 GitHub releases 必挂，
+/// 走 rancher 国内镜像站。
+const K3S_INSTALL_SH_CN: &str = "https://rancher-mirror.rancher.cn/k3s/k3s-install.sh";
+const K3S_INSTALL_SH_INTL: &str = "https://get.k3s.io";
+
+/// 下载 K3s 安装脚本到本地（带总超时）后执行。
+///
+/// 不用 `curl ... | sh -`：管道左侧的失败在 POSIX sh 里看不见（没有 pipefail 时
+/// 退出码取的是右侧），curl 超时会被表现成 sh 的语法错误或"脚本里什么都没做"，
+/// 报错指向完全无关的地方。先落盘再执行，失败点才落在真正失败的那一步。
+async fn run_k3s_install_script(env: &str) -> Result<()> {
+    let url = if cn_mirror() {
+        K3S_INSTALL_SH_CN
+    } else {
+        K3S_INSTALL_SH_INTL
+    };
+    let dir = make_workdir("k3s-install")?;
+    let script_path = dir.join("k3s-install.sh");
+    curl_to_file(url, &script_path, MANDATORY)
+        .await
+        .with_context(|| format!("下载 K3s 安装脚本失败: {url}"))?;
+    let script = script_path.to_string_lossy().into_owned();
+    let cmd = if env.is_empty() {
+        format!("sh '{script}'")
+    } else {
+        format!("{env} sh '{script}'")
+    };
+    let mut child = Command::new("sh");
+    child.arg("-c").arg(&cmd);
+    if !env.is_empty() {
+        // 环境前缀已写进命令行，这里只是把同一份环境给 sh 本身，
+        // 让安装脚本内的子进程继承（K3S_URL/K3S_TOKEN 走子进程读取）
+        for kv in env.split_whitespace() {
+            if let Some((k, v)) = kv.split_once('=') {
+                child.env(k, v);
+            }
+        }
+    }
+    let status = child.status().await?;
+    let _ = std::fs::remove_dir_all(&dir);
+    if !status.success() {
+        bail!("K3s 安装脚本退出码 {:?}", status.code());
+    }
+    Ok(())
+}
+
 async fn install_k3s() -> Result<()> {
     if cluster_ready().await {
         info!("检测到可用集群，跳过 K3s 安装");
@@ -304,24 +354,55 @@ async fn install_k3s() -> Result<()> {
     if cn_mirror() {
         write_k3s_registries_cn()?;
     }
-    // 受限网络：get.k3s.io 的 GitHub releases 下载必挂，走 rancher 国内镜像站
-    let install = if cn_mirror() {
-        "curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -"
+    let env = if cn_mirror() {
+        "INSTALL_K3S_MIRROR=cn"
     } else {
-        "curl -fsSL https://get.k3s.io | sh -"
+        ""
     };
-    let status = Command::new("sh").args(["-c", install]).status().await?;
-    if !status.success() {
-        bail!("K3s 安装失败");
-    }
+    run_k3s_install_script(env).await?;
     // 等待 kubeconfig 就绪
     for _ in 0..30 {
         if cluster_ready().await {
+            write_kubeconfig()?;
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     bail!("K3s 安装后集群未就绪");
+}
+
+/// 把 K3s 生成的 kubeconfig 接到标准位置。
+///
+/// K3s 只写 /etc/rancher/k3s/k3s.yaml，而 helm / kubectl 默认读 $KUBECONFIG 或
+/// ~/.kube/config。缺这一步时 helm 在 K3s 上根本连不上集群——错误信息是
+/// "Kubernetes cluster unreachable"，看起来像集群没起来，实际只是没人告诉 helm
+/// 去哪找 kubeconfig。这里落一份标准位置的副本（权限 0600，kubeconfig 等价于
+/// 集群管理员凭证），k3s 的原始文件保持不动。
+fn write_kubeconfig() -> Result<()> {
+    let src = Path::new("/etc/rancher/k3s/k3s.yaml");
+    if !src.is_file() {
+        return Ok(());
+    }
+    if std::env::var("KUBECONFIG").is_ok() {
+        info!("KUBECONFIG 已由环境显式指定，跳过 kubeconfig 落位");
+        return Ok(());
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let dir = PathBuf::from(home).join(".kube");
+    let dst = dir.join("config");
+    if dst.is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir)?;
+    std::fs::copy(src, &dst).context("复制 kubeconfig 到 ~/.kube/config 失败")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::env::set_var("KUBECONFIG", &dst);
+    info!("kubeconfig 已落位: {}", dst.display());
+    Ok(())
 }
 
 /// CN 模式预置 K3s containerd 镜像站配置。K3s 系统镜像（coredns /
@@ -466,17 +547,36 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
         Some(v) => format!(" INSTALL_K3S_VERSION={v}"),
         None => String::new(),
     };
-    // 管道左侧的变量前缀只对 curl 生效，K3S_URL/K3S_TOKEN 必须写在
-    // 管道右侧 sh 前面，否则安装脚本收不到会装成独立 server（脑裂），
-    // 2026-08-04 嵌套实测抓到：目标机起了 k3s.service 而非 k3s-agent
+    // 远端也先落盘再执行：`curl | sh` 的管道左侧失败在目标机上不可见（无 pipefail
+    // 时退出码取右侧），下载超时会被表现成"脚本什么都没做"。K3S_URL/K3S_TOKEN
+    // 必须作为执行脚本时的环境变量传入——过去写成管道右侧的前缀，脚本收不到会装成
+    // 独立 server（脑裂），2026-08-04 嵌套实测抓到：目标机起了 k3s.service 而非
+    // k3s-agent。
+    let script_url = if cn_mirror() {
+        K3S_INSTALL_SH_CN
+    } else {
+        K3S_INSTALL_SH_INTL
+    };
+    let mirror_env = if cn_mirror() {
+        "INSTALL_K3S_MIRROR=cn "
+    } else {
+        ""
+    };
+    let k3s_env = format!("K3S_URL={server_url} K3S_TOKEN={token}{version_env}");
+    let download = format!(
+        "curl -fsSL --connect-timeout 15 --max-time 900 --retry 2 -o /tmp/cogneva-k3s-install.sh {script_url}"
+    );
+    let run_remote = format!("{mirror_env}{k3s_env} sh /tmp/cogneva-k3s-install.sh");
     let install = if cn_mirror() {
         // agent 同样要在 k3s-agent 首启前预置 registries.yaml（pause 等系统镜像走 docker.io）
         let reg = k3s_registries_yaml()
             .replace('\n', "\\n")
             .replace('"', "\\\"");
-        format!("mkdir -p /etc/rancher/k3s && printf '{reg}' > /etc/rancher/k3s/registries.yaml && curl -fsSL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | K3S_URL={server_url} K3S_TOKEN={token}{version_env} INSTALL_K3S_MIRROR=cn sh -")
+        format!(
+            "mkdir -p /etc/rancher/k3s && printf '{reg}' > /etc/rancher/k3s/registries.yaml && {download} && {run_remote}"
+        )
     } else {
-        format!("curl -fsSL https://get.k3s.io | K3S_URL={server_url} K3S_TOKEN={token}{version_env} sh -")
+        format!("{download} && {run_remote}")
     };
     let existing_ips = cluster_internal_ips().await;
     for target in agents {
@@ -542,6 +642,9 @@ async fn ensure_buildah() -> Result<()> {
         return Ok(());
     }
     info!("安装 buildah...");
+    // 预编译引导器路径不经过 bootstrap.sh 的 ensure_cc，需要自己把 apt 源换到
+    // 国内镜像；已在 shell 层换过时这里按标记文件跳过（幂等）。
+    apt::ensure_cn_apt_mirror(cn_mirror()).await?;
     run("apt-get", &["update"]).await?;
     run("apt-get", &["install", "-y", "buildah"]).await?;
     Ok(())
@@ -555,6 +658,7 @@ async fn ensure_git() -> Result<()> {
         return Ok(());
     }
     info!("未检测到 git，尝试自动安装...");
+    apt::ensure_cn_apt_mirror(cn_mirror()).await?;
     let managers: &[(&str, &[&str])] = &[
         ("apt-get", &["apt-get", "install", "-y", "git"]),
         ("dnf", &["dnf", "install", "-y", "git"]),
@@ -638,18 +742,38 @@ async fn ensure_firecracker() -> Result<()> {
     let url = format!(
         "https://github.com/firecracker-microvm/firecracker/releases/download/{version}/firecracker-{version}-{arch}.tgz"
     );
-    let script = format!(
-        "set -e; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; cd \"$d\" && \
-         curl -fsSL '{url}' -o firecracker.tgz && tar -xzf firecracker.tgz && \
-         install -m 0755 release-{version}-{arch}/firecracker-{version}-{arch} /usr/local/bin/firecracker"
-    );
-    let status = Command::new("sh").args(["-c", &script]).status().await?;
-    if !status.success() {
-        warn!("firecracker 安装失败；沙盒保持 K8s Pod 形态（可稍后手动安装并启用 microvm）");
-        return Ok(());
+    // 可选组件：用 OPTIONAL 档（短总超时），拿不到就降级——它挂着 MicroVM 沙盒的
+    // 形态，不挂整台机器的安装。过去这里没有总超时，墙前会一直不返回，
+    // 装机就停在"安装 firecracker"这一行上。
+    let dir = make_workdir("firecracker")?;
+    let tgz = dir.join("firecracker.tgz");
+    let outcome = async {
+        curl_to_file(&url, &tgz, download::OPTIONAL).await?;
+        run(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "tar -xzf '{tgz}' -C '{dir}' && install -m 0755 '{dir}/release-{version}-{arch}/firecracker-{version}-{arch}' /usr/local/bin/firecracker",
+                    tgz = tgz.display(),
+                    dir = dir.display(),
+                ),
+            ],
+        )
+        .await
     }
-    info!("firecracker 安装完成");
-    Ok(())
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    match outcome {
+        Ok(()) => {
+            info!("firecracker 安装完成");
+            Ok(())
+        }
+        Err(e) => {
+            warn!("firecracker 安装失败（{e:#}）；沙盒保持 K8s Pod 形态（可稍后手动安装并启用 microvm）");
+            Ok(())
+        }
+    }
 }
 
 /// 应用拓扑产物目录：chart 预渲染的 profile standalone YAML（元启动读目录
@@ -749,7 +873,8 @@ fn cn_mirror() -> bool {
 // ---------- CN 镜像多候选自动选择 ----------
 // 每个环节给多家候选，按顺序探活（5s 超时），第一家能用的胜出；
 // 全部不可达时回退第一个候选（不低于过去写死单镜像的行为，
-// 后续下载层的重试机制仍会兜底）。
+// 后续下载层的重试机制仍会兜底）。探活与候选选用的实现都在 download 模块，
+// 与其它出网动作共用同一份超时纪律。
 
 /// docker.io 镜像站候选（CN 模式）。
 const DOCKER_MIRROR_CANDIDATES: &[&str] = &[
@@ -759,31 +884,6 @@ const DOCKER_MIRROR_CANDIDATES: &[&str] = &[
     "hub.rat.dev",
 ];
 
-/// 探活：5s 内拿到任何 HTTP 响应即算存活（docker registry 未认证
-/// 返回 401 也是健康），连接失败/超时才算不可达。
-async fn probe_alive(url: &str) -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    client.get(url).send().await.is_ok()
-}
-
-/// 候选表按顺序探活，返回第一个可用项的值；全挂回退第一项。
-/// 表项为（选用值，探活 URL）。
-async fn pick_alive(candidates: &[(&str, &str)]) -> String {
-    for (value, probe) in candidates {
-        if probe_alive(probe).await {
-            return (*value).to_string();
-        }
-        warn!("镜像不可达，换下一个: {probe}");
-    }
-    candidates[0].0.to_string()
-}
-
 static DOCKER_MIRROR: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
 /// 选定 docker.io 镜像站（全进程一次探测，后续复用结果）。
@@ -791,7 +891,7 @@ async fn docker_mirror_host() -> &'static str {
     DOCKER_MIRROR
         .get_or_init(|| async {
             for host in DOCKER_MIRROR_CANDIDATES {
-                if probe_alive(&format!("https://{host}/v2/")).await {
+                if probe_alive(&format!("https://{host}/v2/"), download::PROBE).await {
                     info!("docker.io 镜像站选定: {host}");
                     return host.to_string();
                 }
@@ -883,26 +983,9 @@ async fn download_parts(url: &str, workdir: &Path, tar: &str) -> Result<()> {
             (b'a' + (i / 26) as u8) as char,
             (b'a' + (i % 26) as u8) as char
         );
-        let part = workdir
-            .join(format!("part-{suffix}"))
-            .to_string_lossy()
-            .into_owned();
-        let got = run(
-            "curl",
-            &[
-                "-fsSL",
-                "--connect-timeout",
-                "15",
-                "--max-time",
-                "1800",
-                "--retry",
-                "2",
-                "-o",
-                &part,
-                &format!("{url}.part-{suffix}"),
-            ],
-        )
-        .await;
+        let part = workdir.join(format!("part-{suffix}"));
+        let got = curl_to_file(&format!("{url}.part-{suffix}"), &part, LARGE).await;
+        let part = part.to_string_lossy().into_owned();
         match got {
             Ok(()) => {
                 info!("分卷 part-{suffix} 下载完成");
@@ -949,24 +1032,10 @@ async fn fetch_prebuilt_tar() -> Result<(PathBuf, String)> {
 
     let workdir = make_workdir("prebuilt")?;
     let fetch = async {
-        let tar = workdir.join(&name).to_string_lossy().into_owned();
+        let tar_path = workdir.join(&name);
+        let tar = tar_path.to_string_lossy().into_owned();
         info!("下载预构建镜像 {url} ...");
-        let direct = run(
-            "curl",
-            &[
-                "-fsSL",
-                "--connect-timeout",
-                "15",
-                "--max-time",
-                "3600",
-                "--retry",
-                "2",
-                "-o",
-                &tar,
-                &url,
-            ],
-        )
-        .await;
+        let direct = curl_to_file(&url, &tar_path, LARGE).await;
         if let Err(e) = direct {
             // Gitee 附件单文件限 100MB，镜像包超限时按 .part-aa/.part-ab...
             // 分卷发布；整包 404 时回退逐卷下载再拼接
@@ -1267,15 +1336,11 @@ async fn kick_image_pull_pending() -> Result<()> {
     Ok(())
 }
 
+/// 取小文本（校验文件等）。走 curl 而不是 reqwest 裸调：reqwest 的默认客户端
+/// **既没有总超时也没有连接超时**，一个不响应的地址能让它无限期挂着，而这条路径
+/// 是取 `.sha256`，正好在防火墙最可能拦的位置上。
 async fn download_string(url: &str) -> Result<String> {
-    let body = reqwest::get(url)
-        .await
-        .with_context(|| format!("下载失败: {url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP 错误: {url}"))?
-        .text()
-        .await?;
-    Ok(body)
+    curl_to_string(url, MANDATORY).await
 }
 
 async fn sha256_file(path: &str) -> Result<String> {
@@ -1533,7 +1598,8 @@ enum Delivery {
 
 /// 探测投递方式。规则按"既有管理状态优先、不中途换轨"设计：
 /// - 已有同名 helm release → helm upgrade（release 生命周期不能被 apply 接管）；
-/// - 工作负载已存在但无 release → 保持 apply（helm install 会撞已存在资源）；
+/// - 已有**任何** cogneva 管理对象但无 release → 保持 apply（helm install 会撞
+///   已存在资源）；
 /// - 绿地 + 复用的既有集群 → helm install（release 可被 GitOps 接管，获得升级
 ///   回滚管理）；本机没有 helm 就自动装（CN 走国内镜像，见 ensure_helm），
 ///   装不上才回落 apply；
@@ -1544,9 +1610,9 @@ async fn detect_delivery(cluster_existed: bool) -> Delivery {
         info!("投递探测: 检测到既有 helm release cogneva → helm upgrade（保持 release 管理）");
         return Delivery::Helm;
     }
-    if cogneva_workload_exists().await {
+    if let Some(found) = existing_cogneva_objects().await {
         info!(
-            "投递探测: 工作负载已由 apply 部署且无 helm release → 保持 apply（避免资源归属冲突）"
+            "投递探测: 已存在 cogneva 对象（{found}）且无 helm release → 保持 apply（避免资源归属冲突）"
         );
         return Delivery::Apply;
     }
@@ -1560,6 +1626,96 @@ async fn detect_delivery(cluster_existed: bool) -> Delivery {
     }
     info!("投递探测: 元启动自建集群 → 预渲染清单 apply（命门链路零额外依赖）");
     Delivery::Apply
+}
+
+/// 命名空间里是否已有 cogneva 管理的对象，返回第一个命中的名字（没有则 None）。
+///
+/// 判据刻意**不**只查 `deployment/cogneva`：真正要防的是"把别人管理的资源拿 helm
+/// 再管一遍"。上一轮安装可能只走到一半（namespace 建了、Secret 建了、Deployment
+/// 还没建），这时只查 Deployment 会得出"绿地"的结论，于是切到 helm install ——
+/// helm 撞上已存在的 Namespace/Secret 直接失败，或者更糟：把 npm 的对象接管成
+/// 自己的。所以对象面要从"工作负载"放宽到"这个命名空间里有没有 cogneva 的痕迹"。
+async fn existing_cogneva_objects() -> Option<String> {
+    for (kind, name) in [
+        ("deployment", "cogneva"),
+        ("daemonset", "cogneva-image-distributor"),
+        ("statefulset", "cogneva-postgres"),
+        ("configmap", "cogneva-json"),
+        ("secret", "cogneva-secrets"),
+        ("serviceaccount", "cogneva"),
+        ("persistentvolumeclaim", "cogneva-data-pvc"),
+    ] {
+        let ok = Command::new("kubectl")
+            .args(["-n", "cogneva", "get", kind, name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(format!("{kind}/{name}"));
+        }
+    }
+    None
+}
+
+/// helm 归属三件套的键。helm 只接管**带自己标记**的对象：切投递方式时，命名空间
+/// 里已有的对象缺这三样，helm install 会直接拒绝渲染结果（报"已存在且无法并入
+/// 当前 release"的归属校验错误，提示里的 `--force` 是陷阱——它会重建资源）。
+const HELM_MANAGED_BY_KEY: &str = "app.kubernetes.io/managed-by";
+const HELM_MANAGED_BY_VALUE: &str = "Helm";
+const HELM_RELEASE_NAME_KEY: &str = "meta.helm.sh/release-name";
+const HELM_RELEASE_NS_KEY: &str = "meta.helm.sh/release-namespace";
+const HELM_RELEASE_NAME: &str = "cogneva";
+
+/// 归属补标的 merge patch 体。构造与断言都用这几个常量，避免手写 JSON 与常量
+/// 各自漂移（打错了键名 helm 照样拒，而报错只会说"归属校验失败"）。
+fn helm_ownership_patch() -> String {
+    format!(
+        "{{\"metadata\":{{\"labels\":{{\"{HELM_MANAGED_BY_KEY}\":\"{HELM_MANAGED_BY_VALUE}\"}},\
+         \"annotations\":{{\"{HELM_RELEASE_NAME_KEY}\":\"{HELM_RELEASE_NAME}\",\
+         \"{HELM_RELEASE_NS_KEY}\":\"{HELM_RELEASE_NAME}\"}}}}}}"
+    )
+}
+
+/// 从 apply 投递切到 helm 之前，给已存在的 cogneva 对象补归属标记。对象不存在
+/// （绿地安装）是正常路径；其它失败要说出来，否则后续 helm 接管失败时无从知道
+/// 是标记没打上。
+async fn ensure_helm_ownership() -> Result<()> {
+    let patch = helm_ownership_patch();
+    let mut targeted = 0;
+    for kind in [
+        "namespace/cogneva",
+        "serviceaccount/cogneva",
+        "configmap/cogneva-json",
+        "secret/cogneva-secrets",
+        "persistentvolumeclaim/cogneva-data-pvc",
+        "service/cogneva",
+        "deployment/cogneva",
+    ] {
+        let out = Command::new("kubectl")
+            .args(["patch", kind, "-n", "cogneva", "--type=merge", "-p", &patch])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => targeted += 1,
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                if !err.contains("NotFound") && !err.contains("not found") {
+                    warn!("补 helm 归属标记失败 {kind}: {}", err.trim());
+                }
+            }
+            Err(e) => warn!("补 helm 归属标记无法执行 {kind}: {e}"),
+        }
+    }
+    if targeted > 0 {
+        info!("已为 {targeted} 个既有对象补 helm 归属标记（managed-by=Helm / release=cogneva）");
+    }
+    Ok(())
 }
 
 /// helm 客户端版本的唯一权威源。安装期按它下载 helm，CI 的部署 parity /
@@ -1597,18 +1753,37 @@ async fn ensure_helm() -> bool {
     };
     info!("未检测到 helm，自动安装（多候选，失败自动换下一个）...");
     for url in candidates {
-        let script = format!(
-            "set -e; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; cd \"$d\" && \
-             curl -fsSL --connect-timeout 10 '{url}' -o helm.tgz && \
-             tar -xzf helm.tgz && install -m 0755 linux-{arch}/helm /usr/local/bin/helm"
-        );
-        match Command::new("sh").args(["-c", &script]).status().await {
-            Ok(s) if s.success() => {
-                info!("helm 安装完成（来源 {url}）");
-                return true;
+        let dir = match make_workdir("helm") {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("创建 helm 安装工作目录失败（{e:#}），回落 apply");
+                return false;
             }
-            _ => warn!("helm 下载/安装失败，换下一个候选: {url}"),
+        };
+        let tgz = dir.join("helm.tgz");
+        // 过去这里只有 --connect-timeout：连接建得起来但被限速到 KB/s 时永远不返回。
+        let ok = match curl_to_file(&url, &tgz, MANDATORY).await {
+            Ok(()) => run(
+                "sh",
+                &[
+                    "-c",
+                    &format!(
+                        "tar -xzf '{tgz}' -C '{dir}' && install -m 0755 '{dir}/linux-{arch}/helm' /usr/local/bin/helm",
+                        tgz = tgz.display(),
+                        dir = dir.display(),
+                    ),
+                ],
+            )
+            .await
+            .is_ok(),
+            Err(_) => false,
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        if ok {
+            info!("helm 安装完成（来源 {url}）");
+            return true;
         }
+        warn!("helm 下载/安装失败，换下一个候选: {url}");
     }
     warn!("helm 自动安装失败（所有候选不可达），回落预渲染清单 apply");
     false
@@ -1624,19 +1799,6 @@ async fn helm_release_exists() -> bool {
         .await;
     matches!(out, Ok(o) if o.status.success()
         && String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "cogneva"))
-}
-
-/// 工作负载是否已存在（用于判定"此前由 apply 部署"，helm release 检测先于此）。
-async fn cogneva_workload_exists() -> bool {
-    Command::new("kubectl")
-        .args(["-n", "cogneva", "get", "deployment", "cogneva"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 async fn deploy_manifests(cluster_existed: bool) -> Result<()> {
@@ -1843,6 +2005,10 @@ async fn deploy_via_helm(profile: Profile) -> Result<()> {
             args.push(format!("{key}={val}"));
         }
     }
+    // chart 自己渲染 Namespace，所以复用一个已存在的命名空间（上一次 apply 建的、
+    // 或使用者手建的）时，helm 会因为该对象"存在但无归属标记"而拒绝 install。
+    // 先补标记再交付：这类对象是同一套清单建的，本来就该由本 release 接管。
+    ensure_helm_ownership().await?;
     info!(
         "helm 投递 {} profile（upgrade --install，幂等）",
         profile.dir_name()
@@ -1870,36 +2036,8 @@ fn cn_mirror_image(image: &str, mirror: &str) -> String {
 /// ——与 render_manifests_for_cluster 的整表旋转同义，两条投递路径网络适配一致。
 /// 只置首位会把另一个镜像挤掉，CN 下 Gitee 不可达时就没有回退项了。
 fn cn_helm_value_overrides(mirror: &str) -> Result<Vec<(String, String)>> {
-    let values_path = repo_root().join("deploy/helm/cogneva/values.yaml");
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&values_path)?)?;
-    let image_at = |path: &[&str]| -> Result<String> {
-        let mut cur = &parsed;
-        for k in path {
-            cur = cur
-                .get(k)
-                .with_context(|| format!("values.yaml 缺字段 {}", path.join(".")))?;
-        }
-        cur.as_str()
-            .map(String::from)
-            .with_context(|| format!("values.yaml 字段 {} 非字符串", path.join(".")))
-    };
-    let mut out = Vec::new();
-    for (key, path) in [
-        (
-            "backends.postgres.image",
-            &["backends", "postgres", "image"][..],
-        ),
-        ("backends.redis.image", &["backends", "redis", "image"][..]),
-        (
-            "backends.qdrant.image",
-            &["backends", "qdrant", "image"][..],
-        ),
-        ("backends.nats.image", &["backends", "nats", "image"][..]),
-        ("buildah.image", &["buildah", "image"][..]),
-        ("clusterRegistry.image", &["clusterRegistry", "image"][..]),
-    ] {
-        out.push((key.to_string(), cn_mirror_image(&image_at(path)?, mirror)));
-    }
+    let parsed = chart_values()?;
+    let mut out = cn_helm_image_overrides(&parsed, mirror);
     for (key, url) in [
         ("evolution.gitRemote.seedUrls[0]", GIT_MIRROR_GITEE),
         ("evolution.gitRemote.seedUrls[1]", GIT_MIRROR_GITHUB),
@@ -1909,6 +2047,85 @@ fn cn_helm_value_overrides(mirror: &str) -> Result<Vec<(String, String)>> {
         out.push((key.to_string(), url.to_string()));
     }
     Ok(out)
+}
+
+/// 镜像部分的覆盖表（seed 地址另算），由 values.yaml **遍历生成**。
+///
+/// 这里从前是手写清单：六条镜像逐条列出，漏了 `backends.meilisearch` 与
+/// `backends.seaweedfs`（两个都会走 docker.io 直连），而手写清单与 values.yaml
+/// 是两份事实，chart 里每加一个后端就漂一次。改成遍历后，"values.yaml 里有什么
+/// 镜像"就是唯一事实源。
+///
+/// 跳过集群内 registry 引用：那些镜像由 bootstrap 自己导入节点，加公网前缀反而
+/// 会让 kubelet 去公网找一个不存在的仓库。
+fn cn_helm_image_overrides(values: &serde_yaml::Value, mirror: &str) -> Vec<(String, String)> {
+    public_image_refs(values)
+        .into_iter()
+        .map(|(key, reference)| (key, cn_mirror_image(&reference, mirror)))
+        .collect()
+}
+
+/// values.yaml 里的全部**公开**镜像引用（遍历收集 + 去掉集群内 registry）。
+/// 两条网络适配路径（helm `--set` 与清单文本替换）都从这一个函数取数，避免各自
+/// 走一遍遍历、各自漏各自的。
+fn public_image_refs(values: &serde_yaml::Value) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    collect_image_refs(values, "", &mut refs);
+    refs.retain(|(_, reference)| !is_in_cluster_image(reference));
+    refs
+}
+
+/// 递归收集 YAML 里所有镜像引用，返回 (dotted 路径, 引用)。
+///
+/// 两种形态都收：`image: postgres:16-alpine`（字符串）与
+/// `image: {repository: …, tag: …}`（映射，取 repository）。只认字符串形态会
+/// 静默漏掉映射形态，而漏掉的后果是那个镜像在 CN 下走直连。
+fn collect_image_refs(value: &serde_yaml::Value, path: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            for (k, v) in map {
+                let Some(key) = k.as_str() else { continue };
+                let child = if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match key {
+                    "image" => match v {
+                        serde_yaml::Value::String(s) => out.push((child, s.clone())),
+                        serde_yaml::Value::Mapping(_) => {
+                            if let Some(serde_yaml::Value::String(repo)) = v.get("repository") {
+                                out.push((format!("{child}.repository"), repo.clone()));
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => collect_image_refs(v, &child, out),
+                }
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            for (i, item) in seq.iter().enumerate() {
+                collect_image_refs(item, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 镜像引用是否指向集群内 registry：host 段是 localhost，或带显式端口——集群内
+/// registry 以 NodePort 暴露，引用里必然带端口，而公网仓库不带。这类引用的权威在
+/// 集群内（镜像由 bootstrap 自己导入节点），加公网前缀会让 kubelet 去公网找一个
+/// 不存在的仓库。
+///
+/// 没有 `/` 的引用（`postgres:16-alpine`、`registry:2`）是"name[:tag]"形态，没有
+/// host 段，一律算公开镜像——把它们的 `:16-alpine` 读成端口就会把整个后端的镜像
+/// 判成集群内，于是该加的镜像站前缀一条都不加。
+fn is_in_cluster_image(reference: &str) -> bool {
+    match reference.split_once('/') {
+        None => false,
+        Some((host, _)) => host == "localhost" || host.contains(':'),
+    }
 }
 
 /// CN 网络下把 seed 镜像列表整体倒序（Gitee 置首）而不只留一个地址。清单里两个
@@ -1938,8 +2155,10 @@ fn prefer_gitee_seed_mirrors(text: &str) -> String {
 async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
     let cn = cn_mirror();
     let out = make_workdir("manifests")?;
+    // 替换表读不出来即失败：静默退回空表等于 CN 下公开镜像全走直连（必挂），
+    // 而失败点会落在几十分钟后的镜像拉取超时上，看不见这里才是真因。
     let image_map = if cn {
-        cn_image_map(docker_mirror_host().await)
+        cn_image_map(&chart_values()?, docker_mirror_host().await)
     } else {
         Vec::new()
     };
@@ -1963,34 +2182,42 @@ async fn render_manifests_for_cluster(dir: &Path) -> Result<PathBuf> {
 
 /// CN 模式公开镜像替换表：按探活选定的 docker 镜像站生成前缀，
 /// 单站故障时下次安装自动换站（清单内嵌完整主机名，不走 containerd 回退）。
-fn cn_image_map(mirror: &str) -> Vec<(String, String)> {
-    [
-        ("mysql:8.0", "library/mysql:8.0"),
-        ("nats:2.10-alpine", "library/nats:2.10-alpine"),
-        ("postgres:16-alpine", "library/postgres:16-alpine"),
-        ("redis:7-alpine", "library/redis:7-alpine"),
-        ("registry:2", "library/registry:2"),
-    ]
-    .into_iter()
-    .map(|(from, to)| (format!("image: {from}"), format!("image: {mirror}/{to}")))
-    .chain([
-        (
-            "image: qdrant/qdrant:".to_string(),
-            format!("image: {mirror}/qdrant/qdrant:"),
-        ),
-        (
-            // daocloud 系镜像站的 quay 镜像对 buildah/stable 返回 401/403
-            //（未收录该仓库），改用南大 quay 镜像站
-            "image: quay.io/buildah/stable:".to_string(),
-            "image: quay.nju.edu.cn/buildah/stable:".to_string(),
-        ),
-    ])
-    .collect()
+///
+/// 替换项由 chart values.yaml 遍历生成，与 helm 投递的 --set 覆盖同源——两条投递
+/// 路径过去各自手写一份清单，于是各自漏各自的（本路径漏 meilisearch / seaweedfs，
+/// 还留着一个早已不在任何清单里的 mysql 条目）。清单文本层面替换，不解析重写
+/// YAML：渲染产物里的注释与缩进保持原样。
+fn cn_image_map(values: &serde_yaml::Value, mirror: &str) -> Vec<(String, String)> {
+    public_image_refs(values)
+        .into_iter()
+        .map(|(_, reference)| {
+            let mirrored = cn_mirror_image(&reference, mirror);
+            (format!("image: {reference}"), format!("image: {mirrored}"))
+        })
+        .collect()
 }
 
+/// chart 基础 values.yaml 解析结果（两条网络适配路径共用一份读入与解析）。
+fn chart_values() -> Result<serde_yaml::Value> {
+    let path = repo_root().join("deploy/helm/cogneva/values.yaml");
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("读取 {} 失败", path.display()))?;
+    Ok(serde_yaml::from_str(&text)?)
+}
+
+/// 就绪门禁：两个 Deployment 都 rollout 成功才算装机完成。
+///
+/// 未就绪**不是**告警：调用方在这之后就会打印"部署完成"、建端口转发、打开浏览器
+/// ——把一个没起来的系统当成功交出去，使用者看到的是一个打不开的页面，而唯一的
+/// 线索被埋在告警里。所以未就绪即返回 Err（非零退出），并且把排查入口一并给出：
+/// 只说"失败"等于把排查成本原样退回给使用者。
+///
+/// 对象不存在按"该组件未部署"处理：chart 支持 `securityGateway.enabled=false`，
+/// 而这里拿不到对象时无法区分"被关掉"与"没建出来"。
 async fn wait_ready() -> Result<()> {
+    let mut not_ready = Vec::new();
     for deploy in ["cogneva", "cogneva-security-gateway"] {
-        let status = Command::new("kubectl")
+        let out = Command::new("kubectl")
             .args([
                 "-n",
                 "cogneva",
@@ -1999,11 +2226,36 @@ async fn wait_ready() -> Result<()> {
                 &format!("deployment/{deploy}"),
                 "--timeout=180s",
             ])
-            .status()
-            .await?;
-        if !status.success() {
-            warn!("deployment/{deploy} 未在超时内 Ready，请人工检查");
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("无法执行 kubectl rollout status deployment/{deploy}"))?;
+        if out.status.success() {
+            continue;
         }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.contains("NotFound") || stderr.contains("not found") {
+            warn!("deployment/{deploy} 不存在，视为该组件未部署（安全网关注销？）");
+            continue;
+        }
+        let detail = if stderr.is_empty() {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            stderr
+        };
+        warn!("deployment/{deploy} 未在超时内 Ready: {detail}");
+        not_ready.push(deploy);
+    }
+    if !not_ready.is_empty() {
+        let hints: Vec<String> = not_ready
+            .iter()
+            .map(|d| format!("kubectl -n cogneva logs deploy/{d} --tail=100"))
+            .collect();
+        bail!(
+            "部署未就绪（{}），装机未完成：kubectl -n cogneva get pods -o wide; {}",
+            not_ready.join(", "),
+            hints.join("; ")
+        );
     }
     Ok(())
 }
@@ -2210,6 +2462,11 @@ async fn main() -> Result<()> {
     );
 
     info!("LLM 接入不在引导器做：部署完成后由 WebUI 强制向导完成（全自动零问答）");
+
+    // 身份在这一步结算：下面每一步都在写系统目录（/etc/rancher、/var/lib/cogneva-data、
+    // apt），非 root 跑下去只会在某个深处的写操作上 EACCES，而那个位置的报错通常
+    // 指向不相干的一步。`--help` / `--version` 已在上面的参数结算里返回，不经过这里。
+    privileges::require_root("元启动（安装集群并部署）")?;
 
     let hw = probe_hardware().await;
     info!(
@@ -2442,5 +2699,184 @@ mod install_claim_tests {
         assert_ne!(quantity_bytes(Some("72Gi")), quantity_bytes(Some("10Gi")));
         // 清单没声明量而在用有量 → 算差异，不能当成一致
         assert_ne!(quantity_bytes(None), quantity_bytes(Some("10Gi")));
+    }
+}
+
+/// CN 网络适配表的门禁。三份输入必须覆盖同一组镜像：chart values.yaml（覆盖表的
+/// 来源）、helm `--set` 表、清单文本替换表、以及**真正会被 apply 的渲染产物**。
+///
+/// 这一条的失效形态是**静默漏项**：漏掉的镜像在 CN 下走 docker.io 直连，失败点落在
+/// 几十分钟后的镜像拉取超时上，与替换表毫无关联，排查时根本不会往这儿看。
+#[cfg(test)]
+mod cn_image_tests {
+    use super::{
+        cn_helm_image_overrides, cn_image_map, cn_mirror_image, collect_image_refs,
+        is_in_cluster_image,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn repo_file(rel: &str) -> PathBuf {
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join(rel)
+    }
+
+    fn chart_values() -> serde_yaml::Value {
+        let path = repo_file("deploy/helm/cogneva/values.yaml");
+        serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|e| panic!("解析 {} 失败: {e}", path.display()))
+    }
+
+    /// values.yaml 里的公开镜像一个都不能漏，集群内 registry 引用一个都不能动。
+    #[test]
+    fn every_public_image_is_overridden_and_in_cluster_refs_are_not() {
+        let values = chart_values();
+        let mut refs = Vec::new();
+        collect_image_refs(&values, "", &mut refs);
+        let public: Vec<&(String, String)> = refs
+            .iter()
+            .filter(|(_, r)| !is_in_cluster_image(r))
+            .collect();
+        // 遍历自身要有效：values 被重构成另一种形态、walk 静默退化成空表时这里红
+        assert!(
+            public.len() >= 7,
+            "values.yaml 只遍历到 {} 个公开镜像（共 {} 条镜像字段）: {refs:?}",
+            public.len(),
+            refs.len()
+        );
+        let overrides = cn_helm_image_overrides(&values, "MIRROR");
+        for (path, reference) in &public {
+            assert!(
+                overrides.iter().any(|(k, _)| k == path),
+                "镜像 {reference}（{path}）没有进 CN 覆盖表"
+            );
+        }
+        // 上一版手写清单漏掉的两个后端镜像（这两个都真会走 docker.io 直连）
+        for path in ["backends.meilisearch.image", "backends.seaweedfs.image"] {
+            assert!(
+                overrides.iter().any(|(k, _)| k == path),
+                "{path} 缺 CN 覆盖"
+            );
+        }
+        // 集群内 registry（localhost:30500/cogneva）遍历得到但绝不覆盖
+        assert!(refs.iter().any(|(k, _)| k == "image.repository"));
+        assert!(overrides.iter().all(|(k, _)| k != "image.repository"));
+        assert!(overrides.iter().all(|(_, v)| !v.contains("localhost")));
+    }
+
+    /// 文本替换表与 `--set` 表同源：同一批引用、同一个镜像站前缀。
+    #[test]
+    fn text_map_and_set_map_agree() {
+        let values = chart_values();
+        let set = cn_helm_image_overrides(&values, "MIRROR");
+        let text = cn_image_map(&values, "MIRROR");
+        let mut refs = Vec::new();
+        collect_image_refs(&values, "", &mut refs);
+        for (_, reference) in refs.iter().filter(|(_, r)| !is_in_cluster_image(r)) {
+            let mirrored = cn_mirror_image(reference, "MIRROR");
+            assert!(
+                text.contains(&(format!("image: {reference}"), format!("image: {mirrored}"))),
+                "文本替换表缺 {reference} → {mirrored}"
+            );
+            assert!(set.iter().any(|(_, v)| v == &mirrored));
+        }
+        assert_eq!(text.len(), set.len(), "两张表的镜像条数应一致");
+    }
+
+    /// 端到端：**真正会被 apply 的**渲染产物里，每个公开镜像都要能被替换表认出来。
+    /// 这条读的是产出物而不是 values.yaml，所以它同时守着"清单里出现了 values.yaml
+    /// 没登记的镜像"这种漏法。
+    #[test]
+    fn rendered_manifests_reference_no_uncovered_public_image() {
+        let text = cn_image_map(&chart_values(), "MIRROR");
+        let covered: Vec<String> = text.into_iter().map(|(from, _)| from).collect();
+        let mut checked = 0;
+        for file in deployed_manifests() {
+            let content = std::fs::read_to_string(&file).unwrap();
+            for line in content.lines() {
+                let Some(rest) = line.trim().strip_prefix("image: ") else {
+                    continue;
+                };
+                let reference = rest.trim().trim_matches('"');
+                if is_in_cluster_image(reference) {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    covered.contains(&format!("image: {reference}")),
+                    "{} 引用 {reference}，但它不在 CN 替换表里（CN 下这条会走 docker.io 直连）",
+                    file.display()
+                );
+            }
+        }
+        assert!(
+            checked >= 5,
+            "只扫到 {checked} 条公开镜像引用，扫描路径疑似失效"
+        );
+    }
+
+    /// cogneva 交付面（chart 渲染产物 + 集群静态清单）下的全部 YAML。
+    /// 观测栈（`deploy/k3s/observability/`）不在其中：它有独立安装脚本与生命周期，
+    /// 镜像地址由它自己处理。
+    fn deployed_manifests() -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for dir in ["deploy/rendered", "deploy/k3s"] {
+            let root = repo_file(dir);
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().and_then(|n| n.to_str()) == Some("observability") {
+                        continue;
+                    }
+                    collect_yaml(&path, &mut files);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(!files.is_empty(), "未找到任何交付清单，路径解析有误");
+        files
+    }
+
+    fn collect_yaml(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_yaml(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// 集群内 registry 判据本身：`registry:2` 的 `:2` 是 tag 不是端口。
+    #[test]
+    fn in_cluster_predicate_reads_a_port_not_a_tag() {
+        assert!(is_in_cluster_image("localhost:30500/cogneva:local"));
+        assert!(is_in_cluster_image("127.0.0.1:5000/x/y:1"));
+        assert!(!is_in_cluster_image("registry:2"));
+        assert!(!is_in_cluster_image("postgres:16-alpine"));
+        assert!(!is_in_cluster_image("quay.io/buildah/stable:latest"));
+        assert!(!is_in_cluster_image("qdrant/qdrant:v1.13.4"));
+        assert!(!is_in_cluster_image("getmeili/meilisearch:v1.10.3"));
+    }
+
+    /// helm 归属补标的 JSON 必须带齐三件套：键名打错 helm 一样拒，而报错只会说
+    /// "归属校验失败"，与真正的错因（键名拼错）隔着好几层。
+    #[test]
+    fn helm_ownership_patch_carries_the_three_marks() {
+        let patch: serde_json::Value =
+            serde_json::from_str(&super::helm_ownership_patch()).expect("补标 JSON 不可解析");
+        let meta = &patch["metadata"];
+        assert_eq!(meta["labels"]["app.kubernetes.io/managed-by"], "Helm");
+        assert_eq!(meta["annotations"]["meta.helm.sh/release-name"], "cogneva");
+        assert_eq!(
+            meta["annotations"]["meta.helm.sh/release-namespace"],
+            "cogneva"
+        );
     }
 }
