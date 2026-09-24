@@ -44,6 +44,63 @@ impl SupersededEnvValue {
     }
 }
 
+/// 带 pod 模板的工作负载身份。清除残留之前得先知道要查哪个对象。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadRef {
+    pub kind: String,
+    pub name: String,
+    /// 清单里写的命名空间；清单通常不写（由调用方的 `-n` 决定），此时为 None。
+    pub namespace: Option<String>,
+}
+
+impl WorkloadRef {
+    /// `kubectl` 命令里用的资源写法（kind 小写）。
+    pub fn kind_arg(&self) -> String {
+        self.kind.to_lowercase()
+    }
+}
+
+/// 带 pod 模板的工作负载身份（kind、name、namespace）。其余文档返回 None——
+/// 判据只认 pod 模板在 `/spec/template/spec` 的对象，不为别的资源猜路径。
+pub fn workload_identity(doc: &Value) -> Option<WorkloadRef> {
+    let kind = doc.get("kind")?.as_str()?;
+    if !matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet" | "Job") {
+        return None;
+    }
+    doc.pointer("/spec/template/spec")?;
+    let metadata = doc.get("metadata")?;
+    let name = metadata.get("name")?.as_str()?.to_string();
+    let namespace = metadata
+        .get("namespace")
+        .and_then(|n| n.as_str())
+        .map(str::to_string);
+    Some(WorkloadRef {
+        kind: kind.to_string(),
+        name,
+        namespace,
+    })
+}
+
+/// `kubectl patch --type=json` 的删除操作序列。
+///
+/// **同一容器内按 env 下标倒序**：正向删会让后面条目的下标整体前移，patch 打偏
+/// 到别人身上。这条规则是判据的一部分，所以和判据放在一起——分散到各交付路径
+/// 手写一遍，迟早有一处写成正序。
+pub fn removal_patch_ops(removals: &[SupersededEnvValue]) -> Vec<Value> {
+    let mut ordered = removals.to_vec();
+    ordered.sort_by(|a, b| {
+        (a.container_field, a.container, std::cmp::Reverse(a.env)).cmp(&(
+            b.container_field,
+            b.container,
+            std::cmp::Reverse(b.env),
+        ))
+    });
+    ordered
+        .iter()
+        .map(|r| serde_json::json!({"op": "remove", "path": r.patch_path()}))
+        .collect()
+}
+
 const CONTAINER_FIELDS: [&str; 2] = ["containers", "initContainers"];
 
 /// 找出 live 对象上"已被清单的 `valueFrom` 取代"的 env `value`。
@@ -197,6 +254,66 @@ mod tests {
         let d = json!({"kind": "ConfigMap", "data": {"a": "b"}});
         let l = json!({"kind": "ConfigMap", "data": {"a": "b"}});
         assert!(superseded_env_values(&d, &l).is_empty());
+    }
+
+    #[test]
+    fn only_kinds_with_a_pod_template_get_an_identity() {
+        for (kind, expected) in [
+            ("Deployment", true),
+            ("StatefulSet", true),
+            ("DaemonSet", true),
+            ("Job", true),
+            ("ConfigMap", false),
+            ("Service", false),
+        ] {
+            let doc = json!({
+                "kind": kind,
+                "metadata": {"name": "w", "namespace": "ns"},
+                "spec": {"template": {"spec": {"containers": []}}}
+            });
+            assert_eq!(workload_identity(&doc).is_some(), expected, "{kind}");
+        }
+        // pod 模板不在 /spec/template/spec 上的（如 CronJob）不猜路径
+        let cron = json!({
+            "kind": "CronJob",
+            "metadata": {"name": "c"},
+            "spec": {"jobTemplate": {"spec": {"template": {"spec": {}}}}}
+        });
+        assert!(workload_identity(&cron).is_none());
+        // 命名空间是可选的：清单不写时由调用方的 -n 决定
+        let plain = json!({"kind": "Deployment", "metadata": {"name": "w"},
+            "spec": {"template": {"spec": {}}}});
+        let r = workload_identity(&plain).unwrap();
+        assert_eq!(r.namespace, None);
+        assert_eq!(r.kind_arg(), "deployment");
+    }
+
+    #[test]
+    fn removals_are_emitted_highest_index_first() {
+        // 同一容器里删两条时，先删大的下标：反过来的话第一条删掉之后，第二条的
+        // 下标已经指向别处了。
+        let found = vec![
+            SupersededEnvValue {
+                container_field: "containers",
+                container: 0,
+                env: 1,
+                name: "A".into(),
+            },
+            SupersededEnvValue {
+                container_field: "containers",
+                container: 0,
+                env: 3,
+                name: "B".into(),
+            },
+        ];
+        let ops = removal_patch_ops(&found);
+        assert_eq!(
+            ops,
+            vec![
+                json!({"op": "remove", "path": "/spec/template/spec/containers/0/env/3/value"}),
+                json!({"op": "remove", "path": "/spec/template/spec/containers/0/env/1/value"}),
+            ]
+        );
     }
 
     #[test]

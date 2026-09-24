@@ -38,7 +38,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use cog_core::{SFError, SFResult, ShutdownSignal};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{CodePlatform, MainlineDeployerConfig, RolloutTargetConfig};
 
@@ -3355,6 +3355,7 @@ impl RolloutExecutor {
                         manifest = %path_arg,
                         "mainline rollout: apply target manifest"
                     );
+                    self.clear_superseded_env_values(&staged_path).await?;
                     return self
                         .run_kubectl(&["apply", "-f", &path_arg], 60)
                         .await
@@ -3370,6 +3371,76 @@ impl RolloutExecutor {
             }
         }
         self.set_image(t, &plan.tag).await
+    }
+
+    /// 清单交付前，先把集群对象上"已被清单的 `valueFrom` 取代"的 env `value` 摘掉。
+    ///
+    /// 三方合并按 env 条目的 name 合并，清单里消失的字段不会被删掉：该条目于是
+    /// 同时带 `value` 与 `valueFrom`、被准入拒绝，本次 apply 停在这一处，而报错
+    /// 指向清单——清单是对的。这个对象从此永远 apply 不进去，直到有人手动摘掉
+    /// 那个字段；残留物往往正是我们要从清单里拿掉的明文凭证。
+    ///
+    /// 判据与 patch 序列都在 `cog_core`（纯函数），这里只负责取现状与执行。读不到
+    /// 现状（对象还不存在、查询失败）就什么都不做：首次交付本就没有残留，集群不可
+    /// 达时紧随其后的 apply 会报出真实错误，不在这里替它下结论。
+    async fn clear_superseded_env_values(&self, manifest: &Path) -> SFResult<()> {
+        let text = tokio::fs::read_to_string(manifest)
+            .await
+            .map_err(|e| SFError::IO(format!("read {}: {e}", manifest.display())))?;
+        for doc in serde_yaml::Deserializer::from_str(&text) {
+            let Ok(doc) = serde_yaml::Value::deserialize(doc) else {
+                continue;
+            };
+            let Ok(desired) = serde_json::to_value(&doc) else {
+                continue;
+            };
+            let Some(workload) = cog_core::contract::env_supersede::workload_identity(&desired)
+            else {
+                continue;
+            };
+            let live = match self
+                .run_kubectl(
+                    &["get", &workload.kind_arg(), &workload.name, "-o", "json"],
+                    30,
+                )
+                .await
+            {
+                Ok(out) => serde_json::from_str(&out).unwrap_or(serde_json::Value::Null),
+                Err(e) => {
+                    debug!(
+                        workload = %format!("{}/{}", workload.kind, workload.name),
+                        error = %e,
+                        "cannot read the live object; skipping the superseded-env check"
+                    );
+                    continue;
+                }
+            };
+            let removals =
+                cog_core::contract::env_supersede::superseded_env_values(&desired, &live);
+            if removals.is_empty() {
+                continue;
+            }
+            let ops = cog_core::contract::env_supersede::removal_patch_ops(&removals);
+            let names: Vec<&str> = removals.iter().map(|r| r.name.as_str()).collect();
+            info!(
+                workload = %format!("{}/{}", workload.kind, workload.name),
+                envs = %names.join(", "),
+                "cleared env values the manifest now injects from a source"
+            );
+            self.run_kubectl(
+                &[
+                    "patch",
+                    &workload.kind_arg(),
+                    &workload.name,
+                    "--type=json",
+                    "-p",
+                    &serde_json::Value::Array(ops).to_string(),
+                ],
+                60,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// 快照单个部署当前在跑的镜像（回滚目标）。
@@ -3981,6 +4052,9 @@ impl RolloutExecutor {
                             manifest = %support_arg,
                             "mainline rollout: applying support manifests"
                         );
+                        self.clear_superseded_env_values(&path)
+                            .await
+                            .map_err(|e| classify_before_any_change("support", "", e))?;
                         self.run_kubectl(&["apply", "-f", &support_arg], 120)
                             .await
                             .map_err(|e| classify_before_any_change("support", "", e))?;
@@ -8783,6 +8857,67 @@ metadata:
         let inflight = state.in_flight.expect("in_flight must stay for retry");
         assert_eq!(inflight.rev, rev_b);
         assert_eq!(inflight.phase, Phase::Pushed);
+    }
+
+    #[tokio::test]
+    async fn a_literal_env_superseded_by_a_source_is_cleared_before_the_apply() {
+        // 真实事故形态：集群对象上某个 env 还是明文 value，新清单改成了 valueFrom。
+        // 不先摘掉的话 apply 被准入拒绝，而报错指向清单。
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *" get "*|get\ *)
+    case "$*" in
+      *"-o json"*)
+        cat <<'JSON'
+{{"kind":"Deployment","metadata":{{"name":"cogneva-security-gateway"}},
+ "spec":{{"template":{{"spec":{{"containers":[{{"name":"security-gateway",
+ "env":[{{"name":"A","value":"1"}},{{"name":"TOKEN","value":"leaked"}}]}}]}}}}}}}}
+JSON
+        ;;
+      *) echo ok ;;
+    esac ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let manifest = tmp.path().join("deploy-cogneva-security-gateway.yaml");
+        std::fs::write(
+            &manifest,
+            "kind: Deployment\nmetadata:\n  name: cogneva-security-gateway\nspec:\n  template:\n    spec:\n      containers:\n        - name: security-gateway\n          env:\n            - name: A\n              value: \"1\"\n            - name: TOKEN\n              valueFrom:\n                secretKeyRef:\n                  name: cogneva-secrets\n                  key: github-token\n",
+        )
+        .unwrap();
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            900,
+        );
+        executor
+            .clear_superseded_env_values(&manifest)
+            .await
+            .unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("--type=json")
+                && calls.contains(r#""path":"/spec/template/spec/containers/0/env/1/value""#),
+            "the live object's superseded value must be removed by index: {calls}"
+        );
+        // 清单里那条仍是 value 的条目不该被动：判据只覆盖"被 valueFrom 取代"的。
+        assert!(
+            !calls.contains(r#""path":"/spec/template/spec/containers/0/env/0/value""#),
+            "an env the manifest still writes as a literal is not ours to touch: {calls}"
+        );
     }
 
     #[test]

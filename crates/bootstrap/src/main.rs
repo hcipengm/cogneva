@@ -1935,9 +1935,15 @@ async fn clear_superseded_env_values(text: &str) -> Result<usize> {
         let Ok(desired) = serde_json::to_value(&doc) else {
             continue;
         };
-        let Some((kind, name, namespace)) = workload_identity(&desired) else {
+        let Some(workload) = cog_core::contract::env_supersede::workload_identity(&desired) else {
             continue;
         };
+        let (kind, name) = (workload.kind.clone(), workload.name.clone());
+        // 清单一般不写命名空间（由 apply 时的 -n 决定），此时用交付面这一个。
+        let namespace = workload
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "cogneva".to_string());
         // 读不到现状（对象还不存在、查询失败）就什么都不做：首次安装本来就没有残留，
         // 集群不可达时后续交付会报出真实错误，不在这里吞掉。
         let Some(live) = live_object(&kind, &name, &namespace).await else {
@@ -1948,18 +1954,7 @@ async fn clear_superseded_env_values(text: &str) -> Result<usize> {
             continue;
         }
         // 同一容器内按下标倒序删：正向删会让后面条目的下标整体前移，patch 打偏。
-        let mut ordered = removals.clone();
-        ordered.sort_by(|a, b| {
-            (a.container_field, a.container, std::cmp::Reverse(a.env)).cmp(&(
-                b.container_field,
-                b.container,
-                std::cmp::Reverse(b.env),
-            ))
-        });
-        let ops: Vec<serde_json::Value> = ordered
-            .iter()
-            .map(|r| serde_json::json!({"op": "remove", "path": r.patch_path()}))
-            .collect();
+        let ops = cog_core::contract::env_supersede::removal_patch_ops(&removals);
         let names: Vec<&str> = removals.iter().map(|r| r.name.as_str()).collect();
         let out = Command::new("kubectl")
             .args([
@@ -1991,24 +1986,6 @@ async fn clear_superseded_env_values(text: &str) -> Result<usize> {
         cleared += removals.len();
     }
     Ok(cleared)
-}
-
-/// 带 pod 模板的工作负载身份（kind、name、namespace）。其余文档返回 None——
-/// 判据只认 pod 模板在 `/spec/template/spec` 的对象，不为别的资源猜路径。
-fn workload_identity(doc: &serde_json::Value) -> Option<(String, String, String)> {
-    let kind = doc.get("kind")?.as_str()?;
-    if !matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet" | "Job") {
-        return None;
-    }
-    doc.pointer("/spec/template/spec")?;
-    let metadata = doc.get("metadata")?;
-    let name = metadata.get("name")?.as_str()?.to_string();
-    let namespace = metadata
-        .get("namespace")
-        .and_then(|n| n.as_str())
-        .unwrap_or("cogneva")
-        .to_string();
-    Some((kind.to_string(), name, namespace))
 }
 
 /// 对象现状（`kubectl get -o json`）。不存在或查询失败返回 None。
