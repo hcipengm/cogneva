@@ -33,7 +33,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
 use tokio::io::AsyncWriteExt;
@@ -107,6 +107,29 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
+/// 镜像（以及一切走部署密钥的 git 操作）对应的 SSH 远端地址。
+///
+/// 一律**给 URL 而不是远端名**：`clone --mirror` 会在配置里留下
+/// `remote.origin.mirror=true`，它与显式 refspec 互斥（git 直接报
+/// `--mirror can't be combined with refspecs`）。给 URL 既绕开这条约束，
+/// 也让"推到哪"成为显式声明，不再依赖镜像自己的 remote 配置。
+pub(crate) fn ssh_url_for(ssh_base: &str, repo: &str) -> String {
+    format!("{ssh_base}{repo}.git")
+}
+
+/// SSH 传输命令。`accept-new` 与引导脚本同款：首次连接写入 known_hosts，之后
+/// 固定。**不设 `no`**——那会让中间人换掉主机指纹也察觉不到。`BatchMode=yes`
+/// 保证任何需要交互的提示（口令、yes/no）直接失败而不是挂住。
+///
+/// 握实测与镜像刷新必须用**逐字节相同的命令**，否则测的是"这条通道大概通不通"，
+/// 而不是"我们这条通道通不通"（少一个选项就可能在真实路径上被口令提示挂住）。
+pub(crate) fn ssh_command_for(key: &Path) -> String {
+    format!(
+        "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+        key.display()
+    )
+}
+
 /// 单通道健康态。语义与 `UpstreamHealth` 同形，但不带配额字段——git 通道
 /// 没有"上游告诉我们什么时候恢复"这回事，只有我们自己的重试节拍。
 #[derive(Default)]
@@ -162,6 +185,10 @@ impl GitTransportHealth {
 }
 
 /// 一次 git smart HTTP 请求里网关需要的东西（Pod 侧原样发来，不做改写）。
+///
+/// `Copy`：选路可能把同一个请求先后交给两条通道，逐字节相同的输入靠拷贝
+/// 保证（改了字段就只影响其中一次尝试，"降级后行为等价"也就不成立了）。
+#[derive(Clone, Copy)]
 pub(crate) struct MirrorRequest<'a> {
     /// `/git/github` 之后的剩余路径，例如 `/hcipengm/cogneva.git/info/refs`。
     pub path: &'a str,
@@ -182,6 +209,9 @@ pub(crate) struct GitTransport {
     write_lock: tokio::sync::Mutex<()>,
     /// 逐镜像的"最近一次成功 fetch 时刻"，决定是否还能当基线发出去。
     fetched_at: Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>,
+    /// 选路状态（实测排序 + 网络画像）。与镜像同生命周期：选路的所有输入
+    /// 都在这份配置里（密钥、SSH 前缀），分开放只会让两者可能指向不同的远端。
+    routing: Arc<crate::git_routing::TransportRouting>,
 }
 
 impl GitTransport {
@@ -191,6 +221,7 @@ impl GitTransport {
             health: GitTransportHealth::default(),
             write_lock: tokio::sync::Mutex::new(()),
             fetched_at: Mutex::new(std::collections::HashMap::new()),
+            routing: Arc::new(crate::git_routing::TransportRouting::from_env()),
         }
     }
 
@@ -206,6 +237,16 @@ impl GitTransport {
 
     pub fn health(&self) -> &GitTransportHealth {
         &self.health
+    }
+
+    /// 选路状态：谁该先走（实测优先、策略表兜底）。
+    pub fn routing(&self) -> &Arc<crate::git_routing::TransportRouting> {
+        &self.routing
+    }
+
+    /// 镜像配置的副本（后台实测要拿密钥与 SSH 前缀，且不能借走 `&self`）。
+    pub fn config(&self) -> GitMirrorConfig {
+        self.config.clone()
     }
 
     /// HTTPS 快路径的等待上限：GET 短、POST 长（见常量注释）。
@@ -337,22 +378,16 @@ impl GitTransport {
     /// `--mirror can't be combined with refspecs`）。给 URL 既绕开这条约束，
     /// 也让"推到哪"成为显式声明，不再依赖镜像自己的 remote 配置。
     fn ssh_url(&self, repo: &str) -> String {
-        format!("{}{repo}.git", self.config.ssh_base)
+        ssh_url_for(&self.config.ssh_base, repo)
     }
 
-    /// SSH 传输命令。`accept-new` 与 `pull-upstream-main.sh` 同款：首次连接写入
-    /// known_hosts，之后固定。**不设 `no`**——那会让中间人换掉主机指纹也察觉不到。
-    /// `BatchMode=yes` 保证任何需要交互的提示（口令、yes/no）直接失败而不是挂住。
     fn ssh_command(&self) -> String {
         let key = self
             .config
             .ssh_key
             .as_ref()
             .expect("fallback_available() 已保证私钥存在");
-        format!(
-            "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-            key.display()
-        )
+        ssh_command_for(key)
     }
 
     fn fetched_age(&self, dir: &Path) -> Option<std::time::Duration> {
@@ -606,7 +641,10 @@ fn pkt_line(payload: &str) -> Vec<u8> {
 ///
 /// 严格限两段路径且逐段校验字符集：这条路径直接参与拼接镜像目录，放任
 /// `..`、绝对路径或多余层级过去就等于把请求参数变成文件系统路径。
-fn split_repo_path(path: &str) -> Option<(String, String)> {
+///
+/// 选路的实测也复用它取 `<owner>/<repo>`：探测目标必须与被路由的请求是同一个
+/// 仓库，否则测出来的是另一条路径的通断。
+pub(crate) fn split_repo_path(path: &str) -> Option<(String, String)> {
     let trimmed = path.trim_start_matches('/');
     let idx = trimmed.find(".git/")?;
     let repo = &trimmed[..idx];

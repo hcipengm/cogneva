@@ -105,6 +105,15 @@ spec:
               value: {{ .Values.securityGateway.gitMirror.enabled | quote }}
             - name: COGNEVA_GATEWAY_GIT_SSH_KEY
               value: /etc/cogneva/git-ssh/id_ed25519
+            # 基线仓库（owner/name）：git 身份自举把公钥登记成它的部署密钥并自证，
+            # 选路的实测也拿它当探测目标。空 = 不自动登记，只把公钥挂出来等人。
+            - name: COGNEVA_GATEWAY_GIT_IDENTITY_REPO
+              value: {{ .Values.securityGateway.gitMirror.identityRepo | quote }}
+            # 部署期网络画像：restricted / open。空 = 由网关自己探（首个 git
+            # 请求按开放网络的策略表走，实测结论落地后按证据走）。它只是首帧
+            # 默认值，压不过实测结论。
+            - name: COGNEVA_GATEWAY_NET_PROFILE
+              value: {{ .Values.securityGateway.netProfile | quote }}
             # 贡献通道 Gitee OAuth 应用凭证：授权码兑换与 token 续期的唯一起点，
             # 只注入本进程，业务 Pod 零持有；缺失即授权码通道 fail-closed
             # （手动令牌/PAT 通道不受影响）。client_id 是 OAuth App 的公开标识，

@@ -6,6 +6,7 @@ pub mod codec;
 pub mod context_builder;
 pub mod dlq;
 pub mod embedding;
+pub mod env_supersede;
 pub mod eval;
 pub mod event;
 pub mod evolution_admin;

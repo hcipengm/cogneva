@@ -21,6 +21,7 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Datelike, Utc};
+use cog_core::contract::transport::{Credential, Operation, Transport};
 use cog_core::MetricsBackend;
 use cog_observability::alert_store::{AlertTransition, NewAlert, PostgresAlertStore};
 use cog_observability::analytics::{
@@ -2627,8 +2628,58 @@ async fn git_forward(
         }
     };
 
+    // ── 选路：实测优先、策略表兜底（规则表在 cog-core 的选路契约里）──
+    //
+    // 谁是首选不是配置项：受限网络下 GitHub 的 HTTPS 取码/推送会挂住，开放网络下
+    // HTTPS 反而省掉一次密钥往返。判据要看实测，但**实测不能挡在请求路径上**——
+    // 这里只读锁存结论，实测在后台补（下一批请求用上）。
+    let op = git_operation(&upstream_path, query.as_deref());
+    let cred = match mirror {
+        Some(_) => Credential::SshKey,
+        None => Credential::Token,
+    };
+    let plan = adaptive.then(|| state.git_transport.routing().plan_for(op, cred));
+    let ssh_first = plan.as_ref().and_then(|p| p.primary()) == Some(Transport::Ssh);
+    if adaptive {
+        if let Some((repo, _)) = crate::git_mirror::split_repo_path(&upstream_path) {
+            state
+                .git_transport
+                .routing()
+                .spawn_measurement(state.git_transport.config(), repo);
+        }
+    }
+    // 逐请求的选路只进 debug；换边才进 info——运维要看的是"什么时候换的"，
+    // 不是"每个请求选了谁"。
+    if let Some(p) = &plan {
+        if state.git_transport.routing().note_decision(p.primary()) {
+            tracing::info!(
+                order = ?p.order,
+                rationale = %p.rationale,
+                evidence = %state.git_transport.routing().evidence(),
+                "git 选路（首选通道变更）"
+            );
+        } else {
+            tracing::debug!(order = ?p.order, rationale = %p.rationale, "git 选路");
+        }
+    }
+
+    // 首选是 SSH 时先走镜像：受限网络下它是稳态通道，而不是"HTTPS 挂了才启用"的
+    // 兜底。失败仍按同一个结论回落 HTTPS——回落次序也是判据给出的，不是写死的。
+    if ssh_first {
+        if let Some(m) = mirror {
+            match state.git_transport.serve(m).await {
+                Ok(resp) => return Ok(resp),
+                Err((status, msg)) => tracing::warn!(
+                    %status,
+                    reason = %msg,
+                    "git SSH 首选通道失败，回落 HTTPS"
+                ),
+            }
+        }
+    }
+
     // 嫌疑窗内不必再试一次已知会挂的通道：直接交给兜底，省掉一次注定超时的等待。
-    if adaptive && !state.git_transport.health().https_available() {
+    if adaptive && !ssh_first && !state.git_transport.health().https_available() {
         if let Some(m) = mirror {
             return state.git_transport.serve(m).await;
         }
@@ -2667,9 +2718,13 @@ async fn git_forward(
                     "git HTTPS 通道连续失败，进入熔断窗"
                 );
             }
-            if let Some(m) = mirror {
-                tracing::warn!(reason = %why, "本次 git 请求改走 SSH 兜底镜像");
-                return state.git_transport.serve(m).await;
+            // 本轮已经先试过 SSH（首选就是它）且它刚失败：再试一次同一条通道
+            // 只是把同一个失败再付一遍成本，不产生新信息。
+            if !ssh_first {
+                if let Some(m) = mirror {
+                    tracing::warn!(reason = %why, "本次 git 请求改走 SSH 兜底镜像");
+                    return state.git_transport.serve(m).await;
+                }
             }
             // 没有兜底就如实报失败：换一个错误码去掩饰"通道坏了"，会让调用侧
             // 按错误类型做出错误的处置。
@@ -2680,6 +2735,21 @@ async fn git_forward(
         }
     }
     https
+}
+
+/// 这次 git 请求属于哪一类动作，用来查选路表。
+///
+/// **不能只看方法**：smart HTTP 的 push 也以
+/// `GET /info/refs?service=git-receive-pack` 开场，按方法判会把 push 判成
+/// fetch。所以按 service 判——它才是客户端声明的意图。
+fn git_operation(path: &str, query: Option<&str>) -> Operation {
+    let receive_pack = query.is_some_and(|q| q.contains("service=git-receive-pack"))
+        || path.ends_with("/git-receive-pack");
+    if receive_pack {
+        Operation::GitPush
+    } else {
+        Operation::GitFetch
+    }
 }
 
 /// HTTPS 透传本体。抽出来是为了让选路能在**不动请求提取逻辑**的前提下，
@@ -3324,6 +3394,17 @@ pub async fn run(
     }
     tokio::spawn(run_llm_health_prober(state.clone()));
     tokio::spawn(run_pool_state_publisher(state.clone()));
+    // 选路的实测在启动时就发起一次，不等第一个 git 请求：判据要先于请求落地，
+    // 否则首批请求只能按策略表猜——受限网络下那意味着先撞一次已知会挂的 HTTPS。
+    // 探测目标取身份仓库（`COGNEVA_GATEWAY_GIT_IDENTITY_REPO`）：它就是这条通道
+    // 要服务的那个基线仓库；没配就退回首请求触发，结论晚几秒而已。
+    let probe_repo = crate::git_identity::IdentityConfig::from_env().repo;
+    if !probe_repo.is_empty() {
+        state
+            .git_transport
+            .routing()
+            .spawn_measurement(state.git_transport.config(), probe_repo);
+    }
     let egress_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.egress_port));
     let llm_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.llm_port));
     let webhook_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.webhook_port));
@@ -3375,6 +3456,35 @@ mod tests {
             supports_tool_calls: None,
             requires_temperature_one: None,
         }
+    }
+
+    #[test]
+    fn a_push_is_recognised_by_its_service_not_its_method() {
+        // smart HTTP 的 push 以 GET /info/refs?service=git-receive-pack 开场；
+        // 只看方法判会把 push 说成 fetch，选路就会按错的动作查表。
+        assert_eq!(
+            git_operation(
+                "/hcipengm/cogneva.git/info/refs",
+                Some("service=git-receive-pack")
+            ),
+            Operation::GitPush
+        );
+        assert_eq!(
+            git_operation(
+                "/hcipengm/cogneva.git/info/refs",
+                Some("service=git-upload-pack")
+            ),
+            Operation::GitFetch
+        );
+        // RPC 端点同理：路径自己就说明了动作
+        assert_eq!(
+            git_operation("/hcipengm/cogneva.git/git-receive-pack", None),
+            Operation::GitPush
+        );
+        assert_eq!(
+            git_operation("/hcipengm/cogneva.git/git-upload-pack", None),
+            Operation::GitFetch
+        );
     }
 
     #[test]

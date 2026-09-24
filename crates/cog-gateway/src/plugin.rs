@@ -328,6 +328,10 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                 gateway_cfg.effective_contribution_oauth_refresh_interval_secs(),
                 gateway_cfg.effective_contribution_oauth_refresh_threshold_secs(),
             );
+            // git 身份自举：网关自己得有上游身份，否则装完机没人给它配密钥。
+            // 有 token 全自动登记部署密钥；没有则把公钥挂出来等 WebUI 收 token。
+            let _git_identity =
+                crate::git_identity::spawn_git_identity_bootstrap(broadcast_tx.0.subscribe());
         }
 
         Ok(())

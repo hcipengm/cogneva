@@ -324,7 +324,7 @@ fn unix_now() -> u64 {
 }
 
 /// Decode a base64 entry from a fetched Secret's `data` map.
-fn decode_secret_key(secret: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn decode_secret_key(secret: &serde_json::Value, key: &str) -> Option<String> {
     let b64 = secret.get("data")?.get(key)?.as_str()?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     String::from_utf8(bytes).ok()
@@ -804,6 +804,9 @@ pub async fn contribution_status_handler(
                     "github": {"configured": github},
                     "gitee": {"configured": gitee},
                     "ssh": {"key_present": ssh},
+                    // 网关自己的 git 身份：装机时没人给它配密钥，所以它自举；
+                    // 这一块告诉面板走到了哪一步、缺什么。
+                    "git_identity": crate::git_identity::status_block(&secret),
                     "github_app_configured": github_app,
                     "policy": policy.as_str(),
                     "pending_count": pending_count,
@@ -820,6 +823,9 @@ pub async fn contribution_status_handler(
             "configured": false,
             "provider": "none",
             "note": "not_in_cluster",
+            // 读不到 Secret 时身份状态是**未知**，不是"没配"：在集群外跑的面板
+            // 不该据此说"网关没有身份"。
+            "git_identity": {"state": "unknown", "note": "not_in_cluster"},
             "github_app_configured": false,
             "policy": state
                 .contribution_control
@@ -1823,7 +1829,7 @@ pub async fn contribution_disconnect_handler(
 
 /// cogneva-secrets 的 apiserver 路径。探测与读取必须指向同一个资源，
 /// 所以由同一个函数拼出来。
-fn secret_api_path(namespace: &str) -> String {
+pub(crate) fn secret_api_path(namespace: &str) -> String {
     format!("/api/v1/namespaces/{namespace}/secrets/cogneva-secrets")
 }
 

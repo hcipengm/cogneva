@@ -68,7 +68,7 @@ fn materialize_assets() -> Result<PathBuf> {
 use anyhow::{bail, Context, Result};
 use cogneva_bootstrap::{cli, Distro};
 use download::{curl_to_file, curl_to_string, pick_alive, probe as probe_alive, LARGE, MANDATORY};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -1839,6 +1839,16 @@ async fn deploy_via_apply(profile: Profile) -> Result<()> {
     // 而 `kubectl apply -f <目录>` 一处失败即中止整批——改过声明量的那几份卷就能
     // 把整套清单的安装一起打停。其余资源不受影响，仍整目录 apply。
     let kept = retain_existing_claims(&rendered).await?;
+    // 同类问题、另一条判据：清单把某个 env 从字面量改成 valueFrom 后，对象上那份
+    // 残留的 value 会让整批 apply 在这一处中止（理由见函数注释）。它和卷声明一样，
+    // 必须在交付前处理，改清单本身解决不了。
+    let cleared = clear_superseded_env_values_in_dir(&rendered).await?;
+    if cleared > 0 {
+        info!(
+            count = cleared,
+            "cleared env values the manifests now inject from the Secret"
+        );
+    }
     if kept > 0 {
         info!(
             count = kept,
@@ -1889,6 +1899,139 @@ async fn retain_existing_claims(rendered: &Path) -> Result<usize> {
         kept += 1;
     }
     Ok(kept)
+}
+
+/// 交付前清掉"清单已改用 `valueFrom`、对象上却还留着字面量 `value`"的残留 env。
+///
+/// 这类残留**改清单改不掉**：`kubectl apply` 的三方合并按 `name` 合并 env 条目，
+/// 清单去掉的字段在没有 last-applied 注解的对象上会被当成"别人写的"原样保留，
+/// 于是该条目同时带着 `value` 与 `valueFrom` 被准入拒绝——**这个对象从此永远
+/// apply 不进去**，而报错指向清单（清单其实是对的）。实测形态：安全网关的
+/// `COGNEVA_GITEE_OAUTH_CLIENT_SECRET` 从明文改成从 Secret 注入后，整批
+/// `kubectl apply -f <目录>` 就在这一处中止，元启动停在这一步。
+///
+/// 判据在 `cog_core::contract::env_supersede`（纯函数、带测试）：只有"清单声明
+/// 了 valueFrom、对象上同名条目还带 value"才动手，其余一律不碰。
+async fn clear_superseded_env_values_in_dir(rendered: &Path) -> Result<usize> {
+    let mut cleared = 0usize;
+    for entry in std::fs::read_dir(rendered)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        cleared += clear_superseded_env_values(&text).await?;
+    }
+    Ok(cleared)
+}
+
+/// 同上，输入是清单文本（helm template 的整份输出）。返回清掉的字段数。
+async fn clear_superseded_env_values(text: &str) -> Result<usize> {
+    let mut cleared = 0usize;
+    for doc in serde_yaml::Deserializer::from_str(text) {
+        let Ok(doc) = serde_yaml::Value::deserialize(doc) else {
+            continue;
+        };
+        let Ok(desired) = serde_json::to_value(&doc) else {
+            continue;
+        };
+        let Some((kind, name, namespace)) = workload_identity(&desired) else {
+            continue;
+        };
+        // 读不到现状（对象还不存在、查询失败）就什么都不做：首次安装本来就没有残留，
+        // 集群不可达时后续交付会报出真实错误，不在这里吞掉。
+        let Some(live) = live_object(&kind, &name, &namespace).await else {
+            continue;
+        };
+        let removals = cog_core::contract::env_supersede::superseded_env_values(&desired, &live);
+        if removals.is_empty() {
+            continue;
+        }
+        // 同一容器内按下标倒序删：正向删会让后面条目的下标整体前移，patch 打偏。
+        let mut ordered = removals.clone();
+        ordered.sort_by(|a, b| {
+            (a.container_field, a.container, std::cmp::Reverse(a.env)).cmp(&(
+                b.container_field,
+                b.container,
+                std::cmp::Reverse(b.env),
+            ))
+        });
+        let ops: Vec<serde_json::Value> = ordered
+            .iter()
+            .map(|r| serde_json::json!({"op": "remove", "path": r.patch_path()}))
+            .collect();
+        let names: Vec<&str> = removals.iter().map(|r| r.name.as_str()).collect();
+        let out = Command::new("kubectl")
+            .args([
+                "-n",
+                &namespace,
+                "patch",
+                &kind.to_lowercase(),
+                &name,
+                "--type=json",
+                "-p",
+                &serde_json::Value::Array(ops).to_string(),
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("清理 {kind}/{name} 的残留 env value 失败"))?;
+        if !out.status.success() {
+            bail!(
+                "清理 {kind}/{name} 上被 valueFrom 取代的 env value 失败（{}）：{}",
+                names.join(", "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        info!(
+            workload = %format!("{kind}/{name}"),
+            envs = %names.join(", "),
+            "cleared superseded env values (the manifest injects them from the Secret)"
+        );
+        cleared += removals.len();
+    }
+    Ok(cleared)
+}
+
+/// 带 pod 模板的工作负载身份（kind、name、namespace）。其余文档返回 None——
+/// 判据只认 pod 模板在 `/spec/template/spec` 的对象，不为别的资源猜路径。
+fn workload_identity(doc: &serde_json::Value) -> Option<(String, String, String)> {
+    let kind = doc.get("kind")?.as_str()?;
+    if !matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet" | "Job") {
+        return None;
+    }
+    doc.pointer("/spec/template/spec")?;
+    let metadata = doc.get("metadata")?;
+    let name = metadata.get("name")?.as_str()?.to_string();
+    let namespace = metadata
+        .get("namespace")
+        .and_then(|n| n.as_str())
+        .unwrap_or("cogneva")
+        .to_string();
+    Some((kind.to_string(), name, namespace))
+}
+
+/// 对象现状（`kubectl get -o json`）。不存在或查询失败返回 None。
+async fn live_object(kind: &str, name: &str, namespace: &str) -> Option<serde_json::Value> {
+    let out = Command::new("kubectl")
+        .args([
+            "-n",
+            namespace,
+            "get",
+            &kind.to_lowercase(),
+            name,
+            "-o",
+            "json",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
 }
 
 /// 从一份清单文本认出卷声明：返回（名字，声明的 requests.storage）。不是
@@ -1984,37 +2127,86 @@ async fn deploy_via_helm(profile: Profile) -> Result<()> {
             values.display()
         );
     }
-    let mut args: Vec<String> = vec![
-        "upgrade".into(),
-        "--install".into(),
-        "cogneva".into(),
-        chart.to_string_lossy().into_owned(),
-        "-n".into(),
-        "cogneva".into(),
-        "--create-namespace".into(),
-        "-f".into(),
-        values.to_string_lossy().into_owned(),
-        "--set".into(),
-        "secrets.create=true".into(),
-    ];
+    let mut overrides: Vec<(String, String)> = Vec::new();
     if cn_mirror() {
         // CN 适配走 values 覆盖（镜像站前缀 + seed 地址），不依赖 helm
         // 版本相关的 post-renderer 机制，release 元数据完整保留。
-        for (key, val) in cn_helm_value_overrides(docker_mirror_host().await)? {
-            args.push("--set".into());
-            args.push(format!("{key}={val}"));
-        }
+        overrides = cn_helm_value_overrides(docker_mirror_host().await)?;
     }
+    // 交付与预渲染必须拿到**逐字相同**的入参集合，否则清理所依据的清单不是交付的
+    // 那一份（镜像站覆盖差异尤其隐蔽：渲染少一个 --set，对象与清单就对不上）。
+    let common = helm_common_args(&chart, &values, &overrides);
+    let mut args: Vec<String> = vec!["upgrade".into(), "--install".into()];
+    args.extend(common.iter().cloned());
+    args.push("--create-namespace".into());
+
     // chart 自己渲染 Namespace，所以复用一个已存在的命名空间（上一次 apply 建的、
     // 或使用者手建的）时，helm 会因为该对象"存在但无归属标记"而拒绝 install。
     // 先补标记再交付：这类对象是同一套清单建的，本来就该由本 release 接管。
     ensure_helm_ownership().await?;
+    // 交付前先渲染一遍：清单与对象现状之间有类**交付本身清不掉**的差异——最典型
+    // 的是 env 从字面量改成 valueFrom 后对象上残留的 value（详见
+    // clear_superseded_env_values）。渲染只是拿来做这件事，不替代交付。
+    // 渲染失败不当门禁：交付自己的报错更准确，这里只少一次清理。
+    match helm_render(&common).await {
+        Ok(text) => {
+            let cleared = clear_superseded_env_values(&text).await?;
+            if cleared > 0 {
+                info!(
+                    count = cleared,
+                    "cleared env values the chart injects from the Secret"
+                );
+            }
+        }
+        Err(e) => warn!("helm template 预渲染失败，跳过残留 env 清理: {e}"),
+    }
     info!(
         "helm 投递 {} profile（upgrade --install，幂等）",
         profile.dir_name()
     );
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     run("helm", &refs).await
+}
+
+/// `upgrade --install` 与 `template` 的公共入参（release 名、chart、命名空间、
+/// values、镜像站覆盖）。两处共用一份，是为了让"清理依据的清单"与"交付的清单"
+/// 不可能不同。
+fn helm_common_args(chart: &Path, values: &Path, overrides: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = vec![
+        "cogneva".into(),
+        chart.to_string_lossy().into_owned(),
+        "-n".into(),
+        "cogneva".into(),
+        "-f".into(),
+        values.to_string_lossy().into_owned(),
+        "--set".into(),
+        "secrets.create=true".into(),
+    ];
+    for (key, val) in overrides {
+        out.push("--set".into());
+        out.push(format!("{key}={val}"));
+    }
+    out
+}
+
+/// 渲染 chart（不落地）：给交付前的一致性清理提供"将交付什么"的事实。
+async fn helm_render(common: &[String]) -> Result<String> {
+    let mut args: Vec<String> = vec!["template".into()];
+    args.extend(common.iter().cloned());
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = Command::new("helm")
+        .args(&refs)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("执行 helm template 失败")?;
+    if !out.status.success() {
+        bail!(
+            "helm template 退出码非零: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// 公开镜像引用加国内镜像站前缀，规则与 K3s containerd registries / apply 路径

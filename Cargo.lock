@@ -2002,6 +2002,7 @@ name = "cogneva-bootstrap"
 version = "0.5.7"
 dependencies = [
  "anyhow",
+ "cog-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

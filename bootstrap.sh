@@ -195,6 +195,135 @@ pick_first_ok() {
     echo "$1"
 }
 
+# 部署密钥路径；不存在就说明 SSH 通道结构上不可用（判据与网关/引导器同款）。
+git_ssh_key() {
+    key="${COGNEVA_GIT_SSH_KEY:-$DEFAULT_HOME/.ssh/id_ed25519}"
+    [ -f "$key" ] && printf '%s\n' "$key"
+    return 0
+}
+
+# SSH 传输命令：与网关/引导器逐字同款。BatchMode 让任何需要交互的提示直接失败，
+# 而不是在无人值守的元启动里挂住等输入。
+git_ssh_command() {
+    printf 'ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes' "$1"
+}
+
+# 当前时刻（毫秒）。优先纳秒时钟；不支持 %N 的 date 退回秒级。
+now_ms() {
+    ns=$(date +%s%N 2>/dev/null || true)
+    case "$ns" in
+        *[!0-9]*|"") echo "$(date +%s)000" ;;
+        *) echo $((ns / 1000000)) ;;
+    esac
+}
+
+# 给一条本该快速给结论的命令加硬上限。丢包型防火墙（不是回 RST）会让 TCP 连接
+# 挂满内核重传（分钟级），而没有上限的探测会把"选路"这一步变成新的卡点——
+# 这里只是挑个先后，测不出来就该立刻退回策略表。系统无 timeout 时原样执行。
+within_timeout() {
+    secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+# 一次真实握手的耗时（毫秒）；不可达则无输出。
+# 用 ls-remote 而不是 curl：判的必须是**这条通道**通不通、多快。
+git_handshake_ms() {
+    url="$1"
+    key="$2"
+    start=$(now_ms)
+    if [ -n "$key" ]; then
+        GIT_SSH_COMMAND="$(git_ssh_command "$key")" GIT_TERMINAL_PROMPT=0 \
+            within_timeout 20 git ls-remote --exit-code "$url" HEAD >/dev/null 2>&1 || return 0
+    else
+        GIT_TERMINAL_PROMPT=0 within_timeout 20 git ls-remote --exit-code "$url" HEAD >/dev/null 2>&1 || return 0
+    fi
+    echo $(( $(now_ms) - start ))
+}
+
+# git 候选远端，按序尝试。次序 = **实测优先 + 策略表兜底**，与网关/Rust 侧同一张
+# 选路表（判据本体在 cog-core 的选路契约里，这里只做同一件事）：
+#   受限网络 → SSH 优先、失败回落 HTTPS；开放网络 → HTTPS 优先、失败回落 SSH；
+#   没有部署密钥时 SSH 不进候选（不是排后面，而是结构上不可用）。
+# 实测只决定"先用哪个"，测不到就退回策略表——一次握手的耗时**不预测**大流量下的
+# 吞吐，所以两条通道始终都在候选里，先选的失败了就轮下一个。
+# 末尾恒定补一个 Gitee：它不在传输层的候选里，而是引导链自己的区域镜像（恒定
+# HTTPS），只在 GitHub 两条通道都不通时才轮到——它的 main 是对齐基线的同步点，
+# 不是基线本身。
+git_candidates() {
+    ssh_url="git@github.com:hcipengm/cogneva.git"
+    key="$(git_ssh_key)"
+    ssh_ms=""
+    [ -n "$key" ] && ssh_ms="$(git_handshake_ms "$ssh_url" "$key")"
+    https_ms="$(git_handshake_ms "$REPO_URL" "")"
+
+    if [ -n "$ssh_ms" ] && [ -n "$https_ms" ]; then
+        if [ "$ssh_ms" -le "$https_ms" ]; then first=ssh; else first=https; fi
+        why="实测 SSH ${ssh_ms}ms / HTTPS ${https_ms}ms"
+    elif [ -n "$ssh_ms" ]; then
+        first=ssh
+        why="实测仅 SSH 可达（${ssh_ms}ms）"
+    elif [ -n "$https_ms" ]; then
+        first=https
+        why="实测仅 HTTPS 可达（${https_ms}ms）"
+    else
+        # 两条都没测到：实测给不出结论，按部署期画像（策略表）
+        if [ "$CN_MIRROR" = "1" ]; then first=ssh; else first=https; fi
+        why="两条通道均未测通，按策略表（CN_MIRROR=$CN_MIRROR）"
+    fi
+    # 没有部署密钥时 SSH 即便被排在前面也走不通（不是"慢"，是结构上不可用）
+    if [ -z "$key" ] && [ "$first" = "ssh" ]; then
+        first=https
+    fi
+    echo "[bootstrap] git 选路: $why" >&2
+
+    if [ "$first" = "ssh" ]; then
+        printf '%s\n' "$ssh_url" "$REPO_URL" "$GITEE_REPO_URL"
+    elif [ -n "$key" ]; then
+        printf '%s\n' "$REPO_URL" "$ssh_url" "$GITEE_REPO_URL"
+    else
+        printf '%s\n' "$REPO_URL" "$GITEE_REPO_URL"
+    fi
+}
+
+# 按远端形态选传输：SSH 远端带部署密钥，HTTPS 远端不带凭证（公开仓库）。
+clone_repo() {
+    url="$1"
+    case "$url" in
+        git@*|ssh://*)
+            key="$(git_ssh_key)"
+            [ -n "$key" ] || return 1
+            GIT_SSH_COMMAND="$(git_ssh_command "$key")" GIT_TERMINAL_PROMPT=0 \
+                git clone --depth 1 "$url" "$REPO_ROOT"
+            ;;
+        *)
+            GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$url" "$REPO_ROOT"
+            ;;
+    esac
+}
+
+# 源码归档（恒定 HTTPS：归档不是 git 对象，SSH 结构上够不着）。
+# GitHub 与 Gitee 的先后按部署期画像排——国内直连 codeload 常年不稳，先试近的。
+fetch_source_tarball() {
+    if [ "$CN_MIRROR" = "1" ]; then
+        tb_first="$GITEE_TARBALL_URL"
+        tb_second="$TARBALL_URL"
+    else
+        tb_first="$TARBALL_URL"
+        tb_second="$GITEE_TARBALL_URL"
+    fi
+    if ! curl --proto '=https' --tlsv1.2 -fsSL -m 120 "$tb_first" | tar -xz --strip-components=1 -C "$REPO_ROOT"; then
+        echo "[bootstrap] 归档下载失败，改用另一个镜像源..."
+        rm -rf "$REPO_ROOT"
+        mkdir -p "$REPO_ROOT"
+        curl --proto '=https' --tlsv1.2 -fsSL -m 120 "$tb_second" | tar -xz --strip-components=1 -C "$REPO_ROOT"
+    fi
+}
+
 fetch_source() {
     # 已在仓库内（克隆后执行 ./bootstrap.sh）则直接使用
     if [ -f "$(dirname "$0")/crates/bootstrap/Cargo.toml" ] 2>/dev/null; then
@@ -215,19 +344,24 @@ fetch_source() {
     fi
     echo "[bootstrap] 空机器模式，获取 Cogneva 源码 → $REPO_ROOT"
     mkdir -p "$REPO_ROOT"
+    # 候选次序由 git_candidates 给出（实测优先 + 策略表兜底）；一个个试过去，
+    # 谁先成功算谁的。clone 失败会留半份目录，试下一个前必须清干净——半份克隆
+    # 上接着 clone 会以"目录非空"再失败一次，看起来像是"所有源都不通"。
     if command -v git >/dev/null 2>&1; then
-        if ! git clone --depth 1 "$REPO_URL" "$REPO_ROOT"; then
-            echo "[bootstrap] GitHub 克隆失败，改用 Gitee 镜像..."
+        for url in $(git_candidates); do
+            echo "[bootstrap] 尝试 git 远端: $url"
+            if clone_repo "$url"; then
+                return 0
+            fi
+            echo "[bootstrap] 该远端失败，试下一个..."
             rm -rf "$REPO_ROOT"
-            git clone --depth 1 "$GITEE_REPO_URL" "$REPO_ROOT"
-        fi
+            mkdir -p "$REPO_ROOT"
+        done
+        echo "[bootstrap] 所有 git 远端均失败，改用归档下载..."
     else
-        echo "[bootstrap] 无 git，改用 tarball 下载..."
-        if ! curl --proto '=https' --tlsv1.2 -fsSL -m 120 "$TARBALL_URL" | tar -xz --strip-components=1 -C "$REPO_ROOT"; then
-            echo "[bootstrap] GitHub tarball 失败，改用 Gitee 归档..."
-            curl --proto '=https' --tlsv1.2 -fsSL "$GITEE_TARBALL_URL" | tar -xz --strip-components=1 -C "$REPO_ROOT"
-        fi
+        echo "[bootstrap] 无 git，改用归档下载..."
     fi
+    fetch_source_tarball
 }
 
 ensure_rust() {

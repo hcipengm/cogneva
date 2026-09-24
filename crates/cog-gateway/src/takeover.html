@@ -402,6 +402,26 @@
   }
   .why-strip svg { flex: none; width: 14px; height: 14px; margin-top: 2px; color: var(--accent); }
   .pat-guide { margin-top: 2px; }
+
+  /* Git identity block: the gateway's own deploy key. Warn-colored because it
+     means the gateway cannot reach upstream yet — the whole channel is stalled
+     until someone acts, which is exactly what a warning strip should say. */
+  .identity-strip {
+    margin: 0 0 14px; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--warn); background: rgba(229,161,60,.10);
+    font-size: 12px; color: var(--text-1); line-height: 1.5;
+  }
+  .identity-strip.ready { border-color: var(--ok); background: var(--ok-soft); }
+  .identity-strip .keyrow {
+    display: flex; gap: 8px; align-items: center; margin: 8px 0 4px;
+  }
+  .identity-strip .keyrow code {
+    flex: 1; min-width: 0; overflow-wrap: anywhere;
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-0);
+    background: var(--bg-1); border: 1px solid var(--line-soft);
+    border-radius: 6px; padding: 6px 8px;
+  }
+  .identity-strip .fp { font-family: var(--font-mono); font-size: 11px; color: var(--text-2); }
   .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--text-2); border-top-color: var(--accent); border-radius: 50%; animation: cspin .7s linear infinite; vertical-align: -1px; margin-right: 6px; }
   @keyframes cspin { to { transform: rotate(360deg); } }
 
@@ -709,6 +729,26 @@
     <div class="seg">
       <button type="button" id="segGithub" class="active">GitHub</button>
       <button type="button" id="segGitee">Gitee</button>
+    </div>
+
+    <!-- Gateway's own git identity (deploy key). Independent of the account
+         below: this is the identity the cluster pushes/pulls with, and it is
+         bootstrapped by the gateway itself. Shown whenever it is not ready,
+         with the one action that unblocks it. -->
+    <div class="identity-strip" id="gitIdBox" style="display:none">
+      <div id="gitIdNote"></div>
+      <div class="keyrow">
+        <code id="gitIdPubKey"></code>
+        <button type="button" class="ghost sm" id="gitIdCopy" data-i18n="gitIdCopy">Copy</button>
+      </div>
+      <div class="fp" id="gitIdFp"></div>
+      <div id="gitIdTokenRow" style="margin-top:10px;display:none">
+        <div class="fine" data-i18n="gitIdTokenHint">Paste a token that can manage this repository's deploy keys. The gateway registers itself and rolls over on its own — no further steps.</div>
+        <div class="keyrow">
+          <input type="password" id="gitIdToken" placeholder="ghp_… / github_pat_…" style="flex:1" />
+          <button type="button" id="gitIdSave" data-i18n="gitIdSave">Save token</button>
+        </div>
+      </div>
     </div>
 
     <div class="pane active" id="paneGithub">
@@ -1796,6 +1836,24 @@ const I18N = {
   contribForkNote:  { en: 'Automatic mode forks the public repo under your account when it cannot push upstream, then opens cross-fork pull requests from that fork. No manual fork is needed.',
                       zh: '自动回流模式下，若无权直接推送到上游仓库，会自动在你的账号下 fork 公开仓库，并从该 fork 发起跨仓 PR，无需手动 fork。' },
 
+  // 网关自身的 git 身份（部署密钥）：与上面的账号通道相互独立——这个是集群
+  // 拉取/推送用的身份，由网关自己生成并登记。
+  gitIdTitle:       { en: 'Gateway git identity not ready', zh: '网关 git 身份未就绪' },
+  gitIdNeedsToken:  { en: 'The gateway has generated a key pair but has no token to register it with. Paste one below and it registers itself; there is nothing else to do.',
+                      zh: '网关已生成密钥对，但没有可用来登记它的令牌。在下面粘贴一份即可自动登记，无需其他操作。' },
+  gitIdNeedsKey:    { en: 'Waiting for this public key to be authorised upstream. Add it as a deploy key with write access, or paste a token below and the gateway does it itself.',
+                      zh: '等待这把公钥在上游获得授权：把它加为仓库部署密钥（写权限），或在下面粘贴一份令牌由网关自己登记。' },
+  gitIdNoKey:       { en: '(key not generated yet — the gateway is on it)', zh: '（尚未生成公钥——网关正在处理）' },
+  gitIdFp:          { en: 'Fingerprint', zh: '指纹' },
+  gitIdCopy:        { en: 'Copy', zh: '复制' },
+  gitIdCopied:      { en: 'Public key copied.', zh: '公钥已复制。' },
+  gitIdTokenHint:   { en: 'Paste a token that can manage this repository deploy keys. The gateway registers itself and rolls over on its own — no further steps.',
+                      zh: '粘贴一份能管理该仓库部署密钥的令牌。网关会自己登记并滚动重启，无需其他操作。' },
+  gitIdSave:        { en: 'Save token', zh: '保存令牌' },
+  gitIdSaved:       { en: 'Token saved. The gateway is registering its deploy key now — this usually takes under a minute.',
+                      zh: '令牌已保存。网关正在登记部署密钥，通常一分钟内完成。' },
+  gitIdServerNote:  { en: 'Last status from the gateway', zh: '网关自报状态' },
+
   // GitHub App（用户侧安装入口 + 运营者配置区）
   ghAppInstallLbl:  { en: 'Enhance: install the official Cogneva app', zh: '增强：安装官方 Cogneva App' },
   ghAppInstallHint: { en: 'Optional. Lets the public Cogneva bot collaborate directly on your fork — for example pushing review fixes to your branch. The main contribution flow does not need it.',
@@ -2018,9 +2076,94 @@ function openContrib() {
       $('giOauthBtn').style.display = giAvailable ? '' : 'none';
       $('giOauthUnavailable').style.display = giAvailable ? 'none' : '';
       renderGhAppStatus(!!s.github_app_configured);
+      renderGitIdentity(s.git_identity);
       showContribConnected(s);
     })
     .catch(() => {});
+}
+
+// The gateway's own git identity. Independent of the account channel above:
+// without it the cluster cannot fetch the baseline or push changes at all, so
+// whenever it is not ready this block says what is missing and offers the one
+// action that unblocks it. `unknown` (status not readable, e.g. running
+// outside the cluster) is deliberately silent — it is not evidence of a
+// problem.
+function renderGitIdentity(id) {
+  const box = $('gitIdBox');
+  const show = id && id.state !== 'ready' && id.state !== 'unknown';
+  box.style.display = show ? '' : 'none';
+  if (!show) return;
+  box.classList.toggle('ready', id.state === 'ready');
+  const why = id.note
+    ? t('gitIdServerNote') + '：' + id.note
+    : (id.needs_token ? t('gitIdNeedsToken') : t('gitIdNeedsKey'));
+  $('gitIdNote').textContent = why;
+  $('gitIdPubKey').textContent = id.public_key || t('gitIdNoKey');
+  $('gitIdCopy').style.display = id.public_key ? '' : 'none';
+  $('gitIdFp').textContent = id.fingerprint ? t('gitIdFp') + '：' + id.fingerprint : '';
+  // The token row only helps when a token is actually missing: with one
+  // already stored the gateway is mid-registration, and asking for another
+  // one invites a second, redundant secret.
+  $('gitIdTokenRow').style.display = id.needs_token ? '' : 'none';
+  watchGitIdentity();
+}
+
+$('gitIdCopy').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($('gitIdPubKey').textContent);
+    toast(t('gitIdCopied'), 'ok');
+  } catch {
+    // Clipboard API needs a secure context; selecting the text is the fallback
+    const r = document.createRange();
+    r.selectNodeContents($('gitIdPubKey'));
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+};
+
+$('gitIdSave').onclick = async () => {
+  const token = $('gitIdToken').value.trim();
+  if (!token) { contribErr(t('contribNeedPat')); return; }
+  $('gitIdSave').disabled = true;
+  contribErr('');
+  try {
+    // Same endpoint the account channel uses: it verifies the token against
+    // the platform and writes it to the Secret. The identity bootstrap picks
+    // it up from there.
+    await api('/api/v1/admin/contribution-config', 'POST', { provider: 'github', token });
+    $('gitIdToken').value = '';
+    toast(t('gitIdSaved'), 'ok');
+    await refreshGitIdentity();
+  } catch (e) {
+    contribErr(e.message);
+  } finally {
+    $('gitIdSave').disabled = false;
+  }
+};
+
+// Re-read just the identity block. The gateway registers the key and rolls
+// itself, so the answer changes without the user doing anything else.
+async function refreshGitIdentity() {
+  try {
+    const s = await api('/api/v1/admin/contribution-status');
+    renderGitIdentity(s.git_identity);
+  } catch { /* pod rolling — the next poll retries */ }
+}
+
+let gitIdTimer = null;
+// Poll only while the block is actually waiting on something, and stop as
+// soon as it is ready — a permanent timer against a ready identity would
+// query the cluster forever for no reason.
+function watchGitIdentity() {
+  if (gitIdTimer) return;
+  gitIdTimer = setInterval(async () => {
+    await refreshGitIdentity();
+    if ($('gitIdBox').style.display === 'none') {
+      clearInterval(gitIdTimer);
+      gitIdTimer = null;
+    }
+  }, 10000);
 }
 
 // GitHub App 状态行（运营者高级区）：私钥从不回读，只显示布尔状态。

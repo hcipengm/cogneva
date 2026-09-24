@@ -73,6 +73,33 @@ pub enum NetworkProfile {
     Restricted,
 }
 
+/// 部署期网络画像的盖章变量名。部署面（chart values / 清单）写它，网关上读它。
+///
+/// 盖章只是**首帧默认值**：网关自己会用真实探测给出结论，结论一旦落地就压过盖章
+/// （探针的证据优先于部署时的猜测）。它存在的意义是让网关启动后的第一批请求不必
+/// 先撞一次已知会挂的通道——那种网络里探测本身也要几十秒才有结论。
+pub const NET_PROFILE_ENV: &str = "COGNEVA_GATEWAY_NET_PROFILE";
+
+impl NetworkProfile {
+    /// 解析部署期盖章。认不出来就是"没盖章"（返回 `None`，调用方自行决定默认档），
+    /// 而不是猜一个——配错一个字母不该悄悄变成另一档网络。
+    pub fn from_stamp(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "restricted" => Some(Self::Restricted),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+
+    /// 盖章取值（`from_stamp` 的反向），部署面写配置时用同一个词表。
+    pub fn stamp(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Restricted => "restricted",
+        }
+    }
+}
+
 /// 受限网络判据的探测信号（探活 URL）。
 ///
 /// 三条信号都是**安装链路真正依赖**的目标，不是随便找的墙外地址：docker.io 决定
@@ -150,13 +177,10 @@ impl NetworkVerdict {
         match fresh {
             // 这一轮一条信号都没探到：不改变结论
             None => prev.cloned(),
-            Some(fresh) => match (prev.map(|p| p.profile), fresh.profile) {
-                (Some(NetworkProfile::Restricted), NetworkProfile::Open) => {
-                    // 全部信号可达才算恢复；判据已在 from_probes 里保证
-                    Some(fresh)
-                }
-                _ => Some(fresh),
-            },
+            // 恢复方向不需要在这里另设关卡：`from_probes` 已经把"有任何一条信号
+            // 不可达即判受限"钉死在判定里，所以此刻的 Open 必然带着"本轮全部信号
+            // 可达"这份证据。**不能**再叠一个时间窗——时间过去不是恢复的证据。
+            Some(fresh) => Some(fresh),
         }
     }
 }
@@ -310,6 +334,20 @@ mod tests {
         assert!(v.rationale().contains("registry-1.docker.io"));
         // 一条证据都没有：不下结论（None），而不是猜一个
         assert!(NetworkVerdict::from_probes(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn a_stamp_round_trips_and_refuses_nonsense() {
+        for p in [NetworkProfile::Open, NetworkProfile::Restricted] {
+            assert_eq!(NetworkProfile::from_stamp(p.stamp()), Some(p));
+        }
+        // 大小写与空白不该改变含义；认不出来的取值一律当作"没盖章"
+        assert_eq!(
+            NetworkProfile::from_stamp(" Restricted "),
+            Some(NetworkProfile::Restricted)
+        );
+        assert_eq!(NetworkProfile::from_stamp(""), None);
+        assert_eq!(NetworkProfile::from_stamp("cn"), None);
     }
 
     #[test]
