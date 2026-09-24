@@ -354,6 +354,10 @@ secrets:
   giteeToken: ""
   githubWebhookSecret: ""
   giteeWebhookToken: ""
+  # Gitee OAuth App 的 client_secret：与上面几条同类，是外面发的凭证，不是本实例
+  # 生成的，所以既不能随机生成、也不该写进 values——一旦进了 values 就等于进了
+  # 仓库（含历史），而它只能由 Gitee 后台轮换。留空时授权码通道 fail-closed。
+  giteeOauthClientSecret: ""
 
 # 贡献通道（向导第二步）：GitHub OAuth 设备流的 client_id 是 OAuth App 的
 # 公开标识（非密钥），留空时设备流不可用、向导自动回退手动 PAT；Gitee 走
@@ -366,11 +370,11 @@ secrets:
 # Pages 托管），页面 JS 把 code 经 window.opener.postMessage 自动递回向导；
 # 注册列表里同时保留仓库页作为手动复制兜底。自注册自有 OAuth App 的部署方
 # 把 giteeOauthRedirectUri 改成自己的回调即可。
-# 真实 token 由向导写入 cogneva-secrets，只进网关。
+# client_secret 与其它带外凭证一样只存在于 cogneva-secrets（见上面 secrets 段），
+# 由运维/向导写入，只进网关。
 contribution:
   githubOauthClientId: "Ov23liz35yGbAC5vO0OP"
   giteeOauthClientId: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
-  giteeOauthClientSecret: "99237107ca76415c65608c49612fc7fd59e9975e02829c7787c0a42b480998f9"
   giteeOauthRedirectUri: "https://hcipengm.github.io/cogneva/oauth-callback.html"
 
 # 主应用 GitOps 拉取端：poll 中央 bare 仓库的 evolution-release 分支，

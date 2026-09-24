@@ -155,6 +155,7 @@ ensure_blank github-token
 ensure_blank gitee-token
 ensure_blank github-webhook-secret
 ensure_blank gitee-webhook-token
+ensure_blank gitee-oauth-client-secret
 
 cat <<'EOF'
 ==> 完成。元启动（bootstrap）会在 apply 清单前自动调用本脚本，无需手动运行。
