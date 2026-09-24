@@ -50,6 +50,10 @@ const SECRET_GITHUB_APP_KEY: &str = "github-app-private-key";
 /// and the repository must never carry it — the wizard writes this key, the
 /// security gateway reads it from its environment.
 const SECRET_GITEE_OAUTH_CLIENT_SECRET: &str = "gitee-oauth-client-secret";
+/// Project OAuth App client secret for GitHub's authorization-code channel,
+/// same class as the Gitee one: the platform console issues it, the security
+/// gateway reads it from its environment, the wizard writes it here.
+const SECRET_GITHUB_OAUTH_CLIENT_SECRET: &str = "github-oauth-client-secret";
 
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -561,6 +565,57 @@ pub(crate) async fn exchange_gitee_code(
     parse_gitee_token(&body, unix_now())
 }
 
+/// Exchange a GitHub authorization code with credentials supplied by the
+/// caller. Only the security gateway holds them; the main application reaches
+/// this over `/v1/oauth/github/exchange` instead of reading the secret itself.
+pub(crate) async fn exchange_github_code_with(
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<String, String> {
+    let resp = http_client()
+        .post(GITHUB_TOKEN_URL)
+        .header("Accept", "application/json")
+        .json(&json!({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("无法连接 GitHub（{e}）"))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        let desc = body
+            .get("error_description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Err(format!("GitHub 授权失败：{err} {desc}"));
+    }
+    body.get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "GitHub 令牌响应缺少 access_token".to_string())
+}
+
+/// Borrow a GitHub access token through the security gateway, the only process
+/// holding the OAuth App client secret.
+pub(crate) async fn exchange_github_code(code: &str, redirect_uri: &str) -> Result<String, String> {
+    let body = oauth_gateway_call(
+        "/v1/oauth/github/exchange",
+        json!({"code": code, "redirect_uri": redirect_uri}),
+    )
+    .await?;
+    body.get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "安全网关响应缺少 access_token".to_string())
+}
+
 /// Refresh a Gitee token pair through the gateway. The refresh token rotates on
 /// every use.
 pub async fn refresh_gitee_token(refresh_token: &str) -> Result<GiteeTokenSet, String> {
@@ -820,6 +875,7 @@ pub async fn contribution_status_handler(
                     // 授权码通道要 client_id 与 client_secret 两件都齐；前者是
                     // 公开标识（随清单走），后者只能由向导投递，所以分开报。
                     "gitee_oauth_secret_configured": has(SECRET_GITEE_OAUTH_CLIENT_SECRET),
+                    "github_oauth_secret_configured": has(SECRET_GITHUB_OAUTH_CLIENT_SECRET),
                 })),
             )
                 .into_response();
@@ -837,6 +893,7 @@ pub async fn contribution_status_handler(
             "github_app_configured": false,
             // 读不到 Secret 就不知道密钥在不在，报 false 而不是"没配"的措辞。
             "gitee_oauth_secret_configured": false,
+            "github_oauth_secret_configured": false,
             "policy": state
                 .contribution_control
                 .as_ref()
@@ -1839,16 +1896,19 @@ pub async fn contribution_disconnect_handler(
 
 /// Maps a wizard-facing provider name to the Secret key that has a consumer.
 ///
-/// Only providers whose key is actually read are listed. GitHub's account
-/// channel in this deployment is the device flow, which needs no client
-/// secret, so accepting one would store a key nothing ever reads — a config
-/// surface that looks configured and changes nothing.
+/// Only providers whose key is actually read are listed: storing a key nothing
+/// consumes would report success and change nothing. Both platforms qualify
+/// now — each has an authorization-code exchange in the security gateway that
+/// needs the app secret. GitHub's device flow needs no secret, so a deployment
+/// that only uses device flow simply leaves this key empty; the exchange is
+/// what fails closed, not the account channel.
 /// Returns the canonical provider name together with that key, so the response
 /// can echo the name the mapping actually matched instead of a second copy of
 /// the literal that could drift from it.
 fn oauth_app_secret_key(provider: &str) -> Option<(&'static str, &'static str)> {
     match provider.trim().to_ascii_lowercase().as_str() {
         "gitee" => Some(("gitee", SECRET_GITEE_OAUTH_CLIENT_SECRET)),
+        "github" => Some(("github", SECRET_GITHUB_OAUTH_CLIENT_SECRET)),
         _ => None,
     }
 }
@@ -1886,7 +1946,7 @@ pub async fn oauth_app_secret_handler(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "unsupported_provider",
-                "message": "只有 Gitee 授权码通道需要客户端密钥（GitHub 走设备流，不需要）",
+                "message": "只有 GitHub/Gitee 的授权码通道需要客户端密钥",
             })),
         )
             .into_response();
@@ -2333,8 +2393,8 @@ mod tests {
 
     #[test]
     fn oauth_app_secret_key_only_covers_providers_with_a_consumer() {
-        // Gitee's client secret has a reader: the security gateway's
-        // authorization-code exchange.
+        // Both client secrets have a reader: the security gateway's
+        // authorization-code exchange for that platform.
         assert_eq!(
             oauth_app_secret_key("gitee"),
             Some(("gitee", SECRET_GITEE_OAUTH_CLIENT_SECRET))
@@ -2343,10 +2403,13 @@ mod tests {
             oauth_app_secret_key("  Gitee "),
             Some(("gitee", SECRET_GITEE_OAUTH_CLIENT_SECRET))
         );
-        // GitHub's account channel here is the device flow, which needs no
-        // client secret: writing one would create a config surface whose only
-        // observable effect is that it looks configured.
-        assert_eq!(oauth_app_secret_key("github"), None);
+        assert_eq!(
+            oauth_app_secret_key("GitHub"),
+            Some(("github", SECRET_GITHUB_OAUTH_CLIENT_SECRET))
+        );
+        // A platform with no exchange and no key of its own has nowhere for
+        // the value to go: accepting it would report success and change
+        // nothing.
         assert_eq!(oauth_app_secret_key(""), None);
         assert_eq!(oauth_app_secret_key("bitbucket"), None);
     }

@@ -96,6 +96,12 @@ pub struct SecurityGatewayConfig {
     /// 借用；两者缺一即 fail-closed，授权码通道不可用（手动令牌通道不受影响）。
     pub gitee_oauth_client_id: Option<String>,
     pub gitee_oauth_client_secret: Option<String>,
+    /// GitHub OAuth App 凭证（COGNEVA_GITHUB_OAUTH_CLIENT_ID / _SECRET）：
+    /// GitHub 授权码兑换的唯一起点，与 Gitee 对称。client_id 是公开标识、随清单
+    /// 走；secret 只能在平台后台签发，由向导投递进本进程读的 Secret。两者缺一
+    /// 即 fail-closed，授权码通道不可用——设备流不需要应用凭证，不受影响。
+    pub github_oauth_client_id: Option<String>,
+    pub github_oauth_client_secret: Option<String>,
     /// Webhook 入口通道监听端口（第三通道，面向集群外平台回调）。
     pub webhook_port: u16,
     /// 观测通道监听端口（第四通道，只挂 /health/* 与 /metrics）。
@@ -141,6 +147,17 @@ impl SecurityGatewayConfig {
         Some((id, secret))
     }
 
+    /// 贡献通道 GitHub OAuth 应用凭证，判据与 Gitee 同形：缺一即未配置。
+    /// 只有 `/v1/oauth/github/exchange` 读它。
+    fn github_oauth_creds(&self) -> Option<(&str, &str)> {
+        let id = self.github_oauth_client_id.as_deref()?;
+        let secret = self.github_oauth_client_secret.as_deref()?;
+        if id.is_empty() || secret.is_empty() {
+            return None;
+        }
+        Some((id, secret))
+    }
+
     pub fn from_env() -> Self {
         let list = |key: &str| {
             std::env::var(key)
@@ -162,6 +179,8 @@ impl SecurityGatewayConfig {
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
             gitee_oauth_client_id: token("COGNEVA_GITEE_OAUTH_CLIENT_ID"),
             gitee_oauth_client_secret: token("COGNEVA_GITEE_OAUTH_CLIENT_SECRET"),
+            github_oauth_client_id: token("COGNEVA_GITHUB_OAUTH_CLIENT_ID"),
+            github_oauth_client_secret: token("COGNEVA_GITHUB_OAUTH_CLIENT_SECRET"),
             webhook_port: env_u16("COGNEVA_SG_WEBHOOK_PORT", 8082),
             metrics_port: env_u16("COGNEVA_SG_METRICS_PORT", 9090),
             github_webhook_secret: token("COGNEVA_GITHUB_WEBHOOK_SECRET"),
@@ -2213,6 +2232,47 @@ struct GiteeOAuthExchangeBody {
     redirect_uri: String,
 }
 
+#[derive(Deserialize)]
+struct GithubOAuthExchangeBody {
+    code: String,
+    #[serde(default)]
+    redirect_uri: String,
+}
+
+/// POST /v1/oauth/github/exchange — 与 Gitee 同形：应用凭证只在本进程，
+/// 主应用送 code/redirect_uri、拿回 access_token。GitHub 的令牌响应没有
+/// refresh token，所以不回 refresh 字段。
+async fn github_oauth_exchange_handler(
+    State(state): State<AppState>,
+    Json(body): Json<GithubOAuthExchangeBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some((id, secret)) = state.config.github_oauth_creds() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error_description": "安全网关未配置 GitHub OAuth 应用凭证"
+            })),
+        );
+    };
+    match crate::contribution_admin::exchange_github_code_with(
+        id,
+        secret,
+        &body.code,
+        &body.redirect_uri,
+    )
+    .await
+    {
+        Ok(access_token) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"access_token": access_token})),
+        ),
+        Err(message) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error_description": message})),
+        ),
+    }
+}
+
 /// POST /v1/oauth/gitee/exchange — 用网关凭证兑换授权码。主应用只送
 /// code/redirect_uri，应用凭证不进业务进程。
 async fn gitee_oauth_exchange_handler(
@@ -3085,6 +3145,10 @@ fn code_channel_router() -> Router<AppState> {
         )
         .route("/v1/oauth/gitee/refresh", post(gitee_oauth_refresh_handler))
         .route(
+            "/v1/oauth/github/exchange",
+            post(github_oauth_exchange_handler),
+        )
+        .route(
             "/git/github/{*path}",
             axum::routing::any(git_github_passthrough),
         )
@@ -3603,6 +3667,8 @@ mod tests {
             gitee_token: None,
             gitee_oauth_client_id: None,
             gitee_oauth_client_secret: None,
+            github_oauth_client_id: None,
+            github_oauth_client_secret: None,
             webhook_port: 8082,
             metrics_port: 9090,
             github_webhook_secret: None,
@@ -3634,6 +3700,29 @@ mod tests {
 
         cfg.gitee_oauth_client_id = Some("".into());
         assert!(cfg.gitee_oauth_creds().is_none(), "空 client_id 视为未配置");
+    }
+
+    /// GitHub 授权码通道与 Gitee 同形：凭证成对才可用，缺一即 fail-closed。
+    /// 设备流不需要应用凭证，所以这个判据只覆盖授权码通道。
+    #[test]
+    fn github_oauth_creds_requires_both_fields() {
+        let mut cfg = cfg(&[], &[]);
+        assert!(cfg.github_oauth_creds().is_none());
+
+        cfg.github_oauth_client_id = Some("app-id".into());
+        assert!(cfg.github_oauth_creds().is_none());
+
+        cfg.github_oauth_client_secret = Some("".into());
+        assert!(cfg.github_oauth_creds().is_none(), "空 secret 视为未配置");
+
+        cfg.github_oauth_client_secret = Some("app-secret".into());
+        assert_eq!(cfg.github_oauth_creds(), Some(("app-id", "app-secret")));
+
+        cfg.github_oauth_client_id = Some("".into());
+        assert!(
+            cfg.github_oauth_creds().is_none(),
+            "空 client_id 视为未配置"
+        );
     }
 
     #[test]

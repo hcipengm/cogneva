@@ -144,6 +144,16 @@ spec:
                   name: cogneva-secrets
                   key: gitee-oauth-client-secret
                   optional: true
+            # GitHub 授权码兑换与 Gitee 同形：兑换在网关进程内完成，主应用
+            # 零持有。设备流不需要应用凭证，所以这条为空只影响授权码通道。
+            - name: COGNEVA_GITHUB_OAUTH_CLIENT_ID
+              value: "Ov23liz35yGbAC5vO0OP"
+            - name: COGNEVA_GITHUB_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: github-oauth-client-secret
+                  optional: true
             - name: COGNEVA_GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:

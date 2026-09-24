@@ -383,6 +383,10 @@ secrets:
   # 生成的，所以既不能随机生成、也不该写进 values——一旦进了 values 就等于进了
   # 仓库（含历史），而它只能由 Gitee 后台轮换。留空时授权码通道 fail-closed。
   giteeOauthClientSecret: ""
+  # GitHub OAuth App 的 client_secret：与上一条同类同命——外面签发、只能去
+  # 平台后台轮换，写进 values 就等于进了仓库（含历史）。留空时授权码通道
+  # fail-closed；设备流不需要它，不受影响。
+  githubOauthClientSecret: ""
 
 # 贡献通道（向导第二步）：GitHub OAuth 设备流的 client_id 是 OAuth App 的
 # 公开标识（非密钥），留空时设备流不可用、向导自动回退手动 PAT；Gitee 走

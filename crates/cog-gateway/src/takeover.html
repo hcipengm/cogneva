@@ -797,6 +797,19 @@
         <div class="actions">
           <button type="button" id="ghPatBtn" data-i18n="save">Save &amp; apply</button>
         </div>
+
+        <details class="adv" id="ghOauthAppAdv" style="display:none;margin-top:10px">
+          <summary data-i18n="ghOauthAppAdvSummary">Operator: configure the project GitHub OAuth App secret (regular users skip this)</summary>
+          <div class="app-status off" id="ghOauthAppState">
+            <span class="dot"></span><span id="ghOauthAppStateText"></span>
+          </div>
+          <div class="fine" data-i18n="ghOauthAppWhy">The authorization-code exchange signs with the project OAuth App secret. Only the GitHub console can issue it, so paste it here to deliver it: it goes into the cluster Secret and never into the repository. Device authorization above needs no secret and is unaffected.</div>
+          <input type="password" id="ghOauthAppSecret" data-i18n-ph="giAppSecretPh" placeholder="OAuth App client secret" style="width:100%;margin-top:8px" autocomplete="off" />
+          <div class="actions">
+            <button type="button" id="ghOauthAppSecretBtn" data-i18n="ghOauthAppSave">Save client secret</button>
+          </div>
+          <div class="fine" id="ghOauthAppNote" style="margin-top:6px"></div>
+        </details>
       </div>
     </div>
 
@@ -1850,6 +1863,11 @@ const I18N = {
   giAppNotConfigured: { en: 'OAuth App secret not configured — account authorization unavailable',
                         zh: 'OAuth 应用密钥未配置——账号授权不可用' },
   giAppNeedValue:   { en: 'Paste the client secret first.', zh: '请先粘贴客户端密钥。' },
+  ghOauthAppWhy:    { en: 'The authorization-code exchange signs with the project OAuth App secret. Only the GitHub console can issue it, so paste it here to deliver it: it goes into the cluster Secret and never into the repository. Device authorization above needs no secret and is unaffected.',
+                      zh: '授权码兑换要用项目 OAuth 应用的客户端密钥签名。它只能由 GitHub 后台签发，在这里粘贴即可投递：值只进集群 Secret，不进仓库。上面的设备授权不需要密钥，不受影响。' },
+  ghOauthAppAdvSummary: { en: 'Operator: configure the project GitHub OAuth App secret (regular users skip this)',
+                      zh: '运维：配置项目 GitHub OAuth 应用密钥（普通用户可跳过）' },
+  ghOauthAppSave:   { en: 'Save client secret', zh: '保存客户端密钥' },
   giAppSaved:       { en: 'Saved — the security gateway is rolling; authorization works once it is back.',
                       zh: '已保存——安全网关正在滚动重启，重启完成后授权即可用。' },
   skipForNow:       { en: 'Skip for now', zh: '暂时跳过' },
@@ -2101,7 +2119,8 @@ function openContrib() {
       $('giOauthBtn').style.display = giAvailable ? '' : 'none';
       $('giOauthUnavailable').style.display = giAvailable ? 'none' : '';
       renderGhAppStatus(!!s.github_app_configured);
-      renderGiteeAppSecret(!!s.gitee_oauth_secret_configured);
+      renderOauthAppSecret('gitee', !!s.gitee_oauth_secret_configured);
+      renderOauthAppSecret('github', !!s.github_oauth_secret_configured);
       renderGitIdentity(s.git_identity);
       showContribConnected(s);
     })
@@ -2111,39 +2130,56 @@ function openContrib() {
 // Project OAuth App secret. The state line stays visible even when the field
 // is empty: an operator who just pasted a value has no other way to tell
 // whether it landed, because the consumer only sees it after the security
-// gateway rolls. GitHub has no counterpart here on purpose — its channel is
-// the device flow, which needs no client secret.
-function renderGiteeAppSecret(configured) {
-  $('giAppAdv').style.display = '';
-  const line = $('giAppState');
+// gateway rolls.
+// Must stay a function whose members are indented four spaces or deeper: the
+// i18n gate parses translation entries as `key: {` lines at exactly two-space
+// indentation, so a provider map written at that depth reads as two word
+// entries and fails the build for a missing translation that never existed.
+function oauthAppFields(provider) {
+  return provider === 'gitee'
+    ? { adv: 'giAppAdv', state: 'giAppState', text: 'giAppStateText',
+        input: 'giAppSecret', btn: 'giAppSecretBtn', note: 'giAppNote' }
+    : { adv: 'ghOauthAppAdv', state: 'ghOauthAppState', text: 'ghOauthAppStateText',
+        input: 'ghOauthAppSecret', btn: 'ghOauthAppSecretBtn', note: 'ghOauthAppNote' };
+}
+
+function renderOauthAppSecret(provider, configured) {
+  const ui = oauthAppFields(provider);
+  $(ui.adv).style.display = '';
+  const line = $(ui.state);
   line.classList.toggle('on', configured);
   line.classList.toggle('off', !configured);
-  $('giAppStateText').textContent = configured
+  $(ui.text).textContent = configured
     ? t('giAppConfigured')
     : t('giAppNotConfigured');
 }
 
-$('giAppSecretBtn').onclick = async () => {
-  const value = $('giAppSecret').value;
-  if (!value.trim()) { contribErr(t('giAppNeedValue')); return; }
-  $('giAppSecretBtn').disabled = true;
-  contribErr('');
-  $('giAppNote').textContent = '';
-  try {
-    const r = await api('/api/v1/admin/contribution/oauth-app', 'POST', {
-      provider: 'gitee', client_secret: value,
-    });
-    // Clear the field whether or not the roll worked: the value is stored
-    // either way, and leaving it in the DOM keeps a live secret on screen.
-    $('giAppSecret').value = '';
-    renderGiteeAppSecret(true);
-    $('giAppNote').textContent = r.restarted === false ? (r.message || '') : t('giAppSaved');
-  } catch (e) {
-    contribErr(e.message);
-  } finally {
-    $('giAppSecretBtn').disabled = false;
-  }
-};
+function wireOauthAppSecret(provider) {
+  const ui = oauthAppFields(provider);
+  $(ui.btn).onclick = async () => {
+    const value = $(ui.input).value;
+    if (!value.trim()) { contribErr(t('giAppNeedValue')); return; }
+    $(ui.btn).disabled = true;
+    contribErr('');
+    $(ui.note).textContent = '';
+    try {
+      const r = await api('/api/v1/admin/contribution/oauth-app', 'POST', {
+        provider: provider, client_secret: value,
+      });
+      // Clear the field whether or not the roll worked: the value is stored
+      // either way, and leaving it in the DOM keeps a live secret on screen.
+      $(ui.input).value = '';
+      renderOauthAppSecret(provider, true);
+      $(ui.note).textContent = r.restarted === false ? (r.message || '') : t('giAppSaved');
+    } catch (e) {
+      contribErr(e.message);
+    } finally {
+      $(ui.btn).disabled = false;
+    }
+  };
+}
+wireOauthAppSecret('gitee');
+wireOauthAppSecret('github');
 
 // The gateway's own git identity. Independent of the account channel above:
 // without it the cluster cannot fetch the baseline or push changes at all, so

@@ -367,37 +367,14 @@ fn urlencoded(value: &str) -> String {
 }
 
 /// Exchange a GitHub authorization code for an access token.
+///
+/// The exchange is made by the security gateway, which is the only process
+/// holding the OAuth App client secret; this process never sees it. An earlier
+/// version read `COGNEVA_GITHUB_OAUTH_CLIENT_SECRET` from its own environment
+/// and no manifest ever injected it, so the path was permanently "not
+/// configured" while looking wired.
 async fn exchange_github_code(code: &str, redirect_uri: &str) -> Result<String, String> {
-    let client_id = contrib::oauth_client_id(None).ok_or("未配置 GitHub OAuth client_id")?;
-    let client_secret = std::env::var("COGNEVA_GITHUB_OAUTH_CLIENT_SECRET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or("未配置 GitHub OAuth client_secret")?;
-    let resp = contrib::http_client()
-        .post("https://github.com/login/oauth/access_token")
-        .header("Accept", "application/json")
-        .json(&json!({
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "redirect_uri": redirect_uri,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("无法连接 GitHub（{e}）"))?;
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
-        let desc = body
-            .get("error_description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        return Err(format!("GitHub 授权失败：{err} {desc}"));
-    }
-    body.get("access_token")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| "GitHub 令牌响应缺少 access_token".to_string())
+    contrib::exchange_github_code(code, redirect_uri).await
 }
 
 #[derive(Debug, Deserialize)]

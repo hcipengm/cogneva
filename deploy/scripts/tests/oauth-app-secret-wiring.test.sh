@@ -55,35 +55,42 @@ if wired_keys "${work}/unwired.yaml" | grep -qx "probe-key"; then
 fi
 
 # --- 1) the key the wizard writes is the key the workloads read -----------
-key="$(sed -n 's/.*const SECRET_GITEE_OAUTH_CLIENT_SECRET: &str = "\([^"]*\)".*/\1/p' "${admin}")"
-[ -n "${key}" ] || fail "没能从 ${admin} 提取出 gitee OAuth 密钥的键名，断言会变成空转"
+# Read from the constants rather than repeating the names here: a hand-written
+# list would keep passing after the constant moved.
+mapfile -t oauth_keys < <(
+  sed -n 's/.*const SECRET_[A-Z_]*OAUTH_CLIENT_SECRET: &str = "\([^"]*\)".*/\1/p' "${admin}"
+)
+[ "${#oauth_keys[@]}" -gt 0 ] \
+  || fail "没能从 ${admin} 提取出 OAuth 密钥键名，断言会变成空转"
 
-for manifest in \
-  "${repo}/deploy/helm/cogneva/templates/security-gateway.yaml" \
-  "${repo}/deploy/k3s/gateway-deployment.yaml"
-do
-  [ -f "${manifest}" ] || fail "找不到 ${manifest}"
-  wired_keys "${manifest}" | grep -qx "${key}" \
-    || fail "${manifest} 没有从 cogneva-secrets 读 ${key}（向导写的值没人消费）"
+for key in "${oauth_keys[@]}"; do
+  for manifest in \
+    "${repo}/deploy/helm/cogneva/templates/security-gateway.yaml" \
+    "${repo}/deploy/k3s/gateway-deployment.yaml"
+  do
+    [ -f "${manifest}" ] || fail "找不到 ${manifest}"
+    wired_keys "${manifest}" | grep -qx "${key}" \
+      || fail "${manifest} 没有从 cogneva-secrets 读 ${key}（向导写的值没人消费）"
+  done
+
+  # Rendered manifests are what the apply path actually deploys: a chart that is
+  # wired while a rendered profile is not means the value lands in a Secret
+  # nobody reads on that profile.
+  shopt -s nullglob
+  rendered=("${repo}"/deploy/rendered/*/41-deployment-cogneva-security-gateway.yaml)
+  [ "${#rendered[@]}" -gt 0 ] || fail "找不到任何预渲染的安全网关清单"
+  for manifest in "${rendered[@]}"; do
+    wired_keys "${manifest}" | grep -qx "${key}" \
+      || fail "${manifest} 没有读 ${key}"
+  done
+
+  # --- 2) the produce side exists (placeholder + chart declaration) -------
+  grep -qE "^ensure_blank[[:space:]]+${key}$" "${repo}/deploy/scripts/init-secrets.sh" \
+    || fail "init-secrets.sh 没有为 ${key} 建空占位，全新安装时向导无处可写"
+
+  grep -qE "^[[:space:]]*${key}:" "${repo}/deploy/helm/cogneva/templates/secret.yaml" \
+    || fail "chart 的 Secret 模板没有声明 ${key}"
 done
-
-# Rendered manifests are what the apply path actually deploys: a chart that is
-# wired while a rendered profile is not means the value lands in a Secret
-# nobody reads on that profile.
-shopt -s nullglob
-rendered=("${repo}"/deploy/rendered/*/41-deployment-cogneva-security-gateway.yaml)
-[ "${#rendered[@]}" -gt 0 ] || fail "找不到任何预渲染的安全网关清单"
-for manifest in "${rendered[@]}"; do
-  wired_keys "${manifest}" | grep -qx "${key}" \
-    || fail "${manifest} 没有读 ${key}"
-done
-
-# --- 2) the produce side exists (placeholder + chart declaration) ---------
-grep -qE "^ensure_blank[[:space:]]+${key}$" "${repo}/deploy/scripts/init-secrets.sh" \
-  || fail "init-secrets.sh 没有为 ${key} 建空占位，全新安装时向导无处可写"
-
-grep -qE "^[[:space:]]*${key}:" "${repo}/deploy/helm/cogneva/templates/secret.yaml" \
-  || fail "chart 的 Secret 模板没有声明 ${key}"
 
 # --- 3) out-of-band credentials survive a chart upgrade -------------------
 # Every key the wizard (or the operator, out of band) delivers lives only in
@@ -97,6 +104,7 @@ out_of_band=(
   github-webhook-secret
   gitee-webhook-token
   gitee-oauth-client-secret
+  github-oauth-client-secret
 )
 [ "${#out_of_band[@]}" -gt 0 ] || fail "带外凭证清单是空的，这一节会静默变成空转"
 
@@ -106,9 +114,11 @@ for k in "${out_of_band[@]}"; do
     || fail "chart 升级会把 ${k} 覆盖成空值：secret.yaml 没有保留既有值"
 done
 
-# The key this whole gate is about must be in that list, or the list drifted
-# away from the keys that actually exist.
-printf '%s\n' "${out_of_band[@]}" | grep -qx "${key}" \
-  || fail "${key} 不在带外凭证清单里，升级保留规则没覆盖它"
+# Every key this gate is about must be in that list, or the list drifted away
+# from the keys that actually exist.
+for key in "${oauth_keys[@]}"; do
+  printf '%s\n' "${out_of_band[@]}" | grep -qx "${key}" \
+    || fail "${key} 不在带外凭证清单里，升级保留规则没覆盖它"
+done
 
-echo "PASS: ${key} 有消费面（chart/k3s/预渲染），带外凭证在升级时全部保留"
+echo "PASS: ${oauth_keys[*]} 都有消费面（chart/k3s/预渲染），带外凭证在升级时全部保留"
