@@ -129,11 +129,23 @@ pub async fn llm_config_handler(
     let mut requests = vec![primary];
     requests.extend(req.extra_upstreams.unwrap_or_default());
 
-    // 逐条校验 + 实证探测：任一上游验证失败则整单拒绝，避免落下半残池。
+    // 逐条校验 + 实证探测：地址/可达性不过关则整单拒绝，避免落下半残池；
+    // 上游明确拒服（额度/限流/鉴权）不算不过关——池内条目互相独立，运行
+    // 时会按序转移，这类条目照样落池，只是如实标记为未验证。
     let mut pool: Vec<serde_json::Value> = Vec::with_capacity(requests.len());
+    let mut unverified: Vec<serde_json::Value> = Vec::new();
     for item in &requests {
         match resolve_upstream(item, skip_verify).await {
-            Ok(entry) => pool.push(entry),
+            Ok((entry, warning)) => {
+                if let Some(reason) = warning {
+                    unverified.push(json!({
+                        "base_url": entry["base_url"],
+                        "model": entry["model"],
+                        "reason": reason,
+                    }));
+                }
+                pool.push(entry);
+            }
             Err(resp) => return *resp,
         }
     }
@@ -193,6 +205,7 @@ pub async fn llm_config_handler(
             "ok": true,
             "restarted": [GATEWAY_DEPLOYMENT],
             "upstreams": pool.len(),
+            "unverified_upstreams": unverified,
             "message": "配置已保存，安全网关正在滚动重启，约一分钟后生效",
         })),
     )
@@ -204,7 +217,7 @@ pub async fn llm_config_handler(
 async fn resolve_upstream(
     item: &LlmUpstreamRequest,
     skip_verify: bool,
-) -> Result<serde_json::Value, Box<Response>> {
+) -> Result<(serde_json::Value, Option<String>), Box<Response>> {
     let base_url = item.base_url.trim();
     let model = item.model.trim();
     let api_key = item.api_key.trim();
@@ -236,15 +249,31 @@ async fn resolve_upstream(
     // 双协议实证探测：按首猜顺序先试，失败自动换另一种协议面，
     // 胜出者即为写入网关的 api_style（Kimi 这类 base_url 看不出协议的
     // 端点也能当场测出来）。skip_verify 时采信首猜，缺省 openai。
+    //
+    // 上游明确应答但拒服时条目仍会落池（运行时会按序转移），所以这里把
+    // 「没验证过」单独记下来回给运营者，不把拒服说成验证通过。
+    let mut unverified: Option<String> = None;
     let api_style = if skip_verify {
+        unverified = Some("已按 skip_verify 跳过连通验证".to_string());
         match style_hint {
             Some("anthropic") => "anthropic",
             _ => "openai",
         }
     } else {
         match detect_api_style(base_url, model, api_key, style_hint).await {
-            Ok(style) => style,
-            Err(message) => {
+            ApiStyleProbe::Verified(style) => style,
+            ApiStyleProbe::Refused(style, message) => {
+                tracing::warn!(
+                    base_url = %base_url,
+                    model = %model,
+                    style,
+                    detail = %message,
+                    "upstream refused the probe; admitting it unverified"
+                );
+                unverified = Some(message);
+                style
+            }
+            ApiStyleProbe::Invalid(message) => {
                 return Err(Box::new(
                     (
                         StatusCode::BAD_GATEWAY,
@@ -299,7 +328,7 @@ async fn resolve_upstream(
         }
     }
 
-    Ok(entry)
+    Ok((entry, unverified))
 }
 
 /// 把一次最小 temperature 探测的响应归成能力判定：`Some(false)` = 上游接受了
@@ -396,26 +425,73 @@ async fn detect_tool_call_support(base_url: &str, model: &str, api_key: &str) ->
     Some(has_native_tool_calls)
 }
 
+/// 一次协议面探测的结局。判据只有「上游到底怎么应答」这一条，不按状态码
+/// 推病因：同一件事（额度耗尽）各家给的码不同（429/402/403/451），按码表判
+/// 必然漏。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// 探针被 2xx 接受：这个协议面当场就能干活。
+    Accepted,
+    /// 这个协议面上没有该端点，换另一个协议面试。
+    NoSuchEndpoint,
+    /// 上游在这条协议面上明确应答了，只是拒绝服务（额度/限流/鉴权）。
+    Refused,
+}
+
+fn classify_probe(status: u16) -> ProbeOutcome {
+    if (200..300).contains(&status) {
+        ProbeOutcome::Accepted
+    } else if status == 404 {
+        ProbeOutcome::NoSuchEndpoint
+    } else {
+        ProbeOutcome::Refused
+    }
+}
+
+/// 协议探测的判决。
+enum ApiStyleProbe {
+    /// 探针当场通了这个协议面。
+    Verified(&'static str),
+    /// 上游在首猜协议面上明确应答但拒绝服务，按首猜入池（未验证）。
+    ///
+    /// 判据与运行时池内转移一致（`security_gateway` 对首字节前的任何非 2xx
+    /// 都换池内下一个）：拒绝服务是上游当下的健康问题，不是「这条不该在
+    /// 池里」。早先的判据把 401/403 整单判死，后果是**能干活的上游进不来**
+    /// ——不实现 `/models` 的端点被读成「密钥无效」，配额耗尽的被读成「地址
+    /// 或模型名错」——池因此长期为空，整个系统 503 空转。
+    Refused(&'static str, String),
+    /// 两个协议面都没拿到可归因的应答：地址写错，或根本连不上。
+    Invalid(String),
+}
+
 /// 保存前用用户手填的真 key 做实证协议探测（每种协议超时 8 秒）：
-/// 按首猜顺序先试 openai 风格 `/models`，失败换 anthropic 风格
-/// `/v1/messages`（max_tokens=1 的 ping），哪个通就返回哪个协议面。
+/// 按首猜顺序各发一个最小 chat 请求（openai 风格 `/chat/completions`，
+/// anthropic 风格 `/v1/messages`），哪个当场通了就返回哪个协议面，
 /// base_url 看不出协议的端点（如 Kimi coding）也能当场测出。
-/// 401/403 判定为密钥无效，连接失败判定为端点不可达，其余非 2xx 透传
-/// 上游状态。两种都失败时返回最后一次错误；前端可带 skip_verify 重试
-/// （部分企业网关会挡 /models 等探测路径）。
+///
+/// 探针走的是**真实调用路径**而不是 `GET /models`：后者是可选端点，
+/// 不实现它的 OpenAI 兼容网关会把可用的上游读成「密钥无效」。
+///
+/// 拒绝服务不整单判死（见 `ApiStyleProbe::Refused`），只有「两个协议面都
+/// 没有该端点」或「连不上」才拒收。前端仍可带 skip_verify 直接采信首猜。
 async fn detect_api_style(
     base_url: &str,
     model: &str,
     api_key: &str,
     style_hint: Option<&str>,
-) -> Result<&'static str, String> {
-    let client = reqwest::Client::builder()
+) -> ApiStyleProbe {
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
-        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+    {
+        Ok(client) => client,
+        Err(e) => return ApiStyleProbe::Invalid(format!("HTTP 客户端构建失败: {e}")),
+    };
     let base = base_url.trim_end_matches('/');
     let first_openai = style_hint != Some("anthropic");
-    let mut last_err = String::new();
+
+    let mut refused: Option<(&'static str, String)> = None;
+    let mut unreachable: Option<String> = None;
     for style in if first_openai {
         ["openai", "anthropic"]
     } else {
@@ -424,8 +500,13 @@ async fn detect_api_style(
         let result = match style {
             "openai" => {
                 client
-                    .get(format!("{base}/models"))
+                    .post(format!("{base}/chat/completions"))
                     .bearer_auth(api_key)
+                    .json(&json!({
+                        "model": model,
+                        "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "ping"}]
+                    }))
                     .send()
                     .await
             }
@@ -444,28 +525,42 @@ async fn detect_api_style(
             }
         };
         match result {
-            Ok(resp) if resp.status().is_success() => return Ok(style),
-            Ok(resp) => {
-                let status = resp.status();
-                last_err = match status.as_u16() {
-                    401 | 403 => {
-                        format!("密钥被 {base_url} 拒绝（HTTP {status}），请检查 API Key")
+            Ok(resp) => match classify_probe(resp.status().as_u16()) {
+                ProbeOutcome::Accepted => return ApiStyleProbe::Verified(style),
+                ProbeOutcome::NoSuchEndpoint => continue,
+                ProbeOutcome::Refused => {
+                    let status = resp.status();
+                    let detail: String = resp
+                        .text()
+                        .await
+                        .unwrap_or_default()
+                        .chars()
+                        .take(160)
+                        .collect();
+                    if refused.is_none() {
+                        refused = Some((style, format!("{base_url} 返回 HTTP {status}: {detail}")));
                     }
-                    _ => format!("{base_url} 返回 HTTP {status}，请检查地址与模型名"),
-                };
-                // 认证类错误换协议面重试无意义，直接失败
-                if status.as_u16() == 401 || status.as_u16() == 403 {
-                    return Err(last_err);
                 }
-            }
+            },
             Err(e) => {
-                last_err = format!("无法连接 {base_url}（{e}），请检查地址与网络");
-                // 连接都建立不了，换协议面也连不上，直接失败
-                return Err(last_err);
+                // 连接都建立不了，换协议面也一样，但仍试完另一面——base_url
+                // 的路径可能只对其中一种协议面成立。
+                if unreachable.is_none() {
+                    unreachable = Some(format!("无法连接 {base_url}（{e}），请检查地址与网络"));
+                }
             }
         }
     }
-    Err(last_err)
+
+    if let Some((style, message)) = refused {
+        return ApiStyleProbe::Refused(style, message);
+    }
+    if let Some(message) = unreachable {
+        return ApiStyleProbe::Invalid(message);
+    }
+    ApiStyleProbe::Invalid(format!(
+        "{base_url} 上没有可用的协议端点（两种协议面都返回 404），请检查 base_url 是否为不带 /chat/completions 的根地址"
+    ))
 }
 
 /// apiserver 的判决里，哪些码明确定性为「这个进程不持有该权限」。
@@ -621,7 +716,29 @@ impl KubeClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{apiserver_denies_ownership, classify_temperature_probe};
+    use super::{
+        apiserver_denies_ownership, classify_probe, classify_temperature_probe, ProbeOutcome,
+    };
+
+    #[test]
+    fn probe_outcome_follows_the_upstream_answer_not_a_status_table() {
+        // 2xx 是当场通了。
+        for status in [200, 201, 204] {
+            assert_eq!(classify_probe(status), ProbeOutcome::Accepted);
+        }
+        // 404 是「这个协议面上没有该端点」，换另一个协议面再试。
+        assert_eq!(classify_probe(404), ProbeOutcome::NoSuchEndpoint);
+        // 其余一律是「上游明确应答但拒服」：配额各家用不同码
+        // （429/402/403/451），鉴权与限流也在其中，按码表判必然漏。
+        // 这类拒服要入池（运行时会转移），不是「这条不该在池里」。
+        for status in [400, 401, 402, 403, 409, 422, 429, 451, 500, 503] {
+            assert_eq!(
+                classify_probe(status),
+                ProbeOutcome::Refused,
+                "status {status} must be read as a refusal, not as a dead endpoint"
+            );
+        }
+    }
 
     #[test]
     fn only_permission_verdicts_deny_ownership() {
