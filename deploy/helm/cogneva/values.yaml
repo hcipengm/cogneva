@@ -97,7 +97,7 @@ image:
   repository: localhost:30500/cogneva
   # 默认 tag = 应用版本（与 Cargo.toml workspace version 同源，发布脚本强制校验）。
   # 自举部署的 profile values 覆盖为 local（浮动签，随导入的 release 镜像走）。
-  tag: "0.5.7"
+  tag: "0.5.8"
   # 必须 Always：静态清单把四部署指回浮动签 :local，内容可被 bootstrap/swap-image
   # 重新播种。IfNotPresent 下节点缓存里那份旧内容会被无限期复用——tag 字符串没变、
   # registry 上 :local 也是新的，唯独节点跑的是旧二进制，任何基于清单/registry 的

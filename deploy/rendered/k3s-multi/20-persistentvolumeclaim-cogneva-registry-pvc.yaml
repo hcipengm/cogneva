@@ -18,7 +18,7 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/instance: cogneva
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.5.7"
+    app.kubernetes.io/version: "0.5.8"
     app.kubernetes.io/component: cluster-registry
   annotations:
     # 卸载不销毁数据卷：重装要接着用同一份状态（已分发的镜像层、身份、记忆、

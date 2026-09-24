@@ -53,7 +53,14 @@ jobs:
           set -euo pipefail
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           sudo apt-get update && sudo apt-get install -y musl-tools
-          python3 -m pip install --quiet --user cargo-zigbuild ziglang
+          # Pinned pair, verified together on a musl cross-build. cargo-zigbuild
+          # writes the CC wrapper and zig parses the target query, so the two
+          # must agree on the triple spelling: an unpinned zig that drops or
+          # renames a field fails every C compile in the arm64 leg, and this
+          # step runs before the upload, so the whole release would publish
+          # zero assets. Bump both together and re-verify, never one alone.
+          python3 -m pip install --quiet --user \
+            cargo-zigbuild==0.23.4 ziglang==0.16.0
           export PATH="$HOME/.local/bin:$PATH"
           TAG="${GITHUB_REF_NAME:-dev}"
           cargo build --release --locked \

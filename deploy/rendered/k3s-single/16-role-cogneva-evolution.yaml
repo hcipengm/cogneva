@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/instance: cogneva
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.5.7"
+    app.kubernetes.io/version: "0.5.8"
     app.kubernetes.io/component: evolution
 rules:
   # 主线跟踪部署器随镜像下发清单包：滚动 Job 以 apply 交付发布集里的支撑

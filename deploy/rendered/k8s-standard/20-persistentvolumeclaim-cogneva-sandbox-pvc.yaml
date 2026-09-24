@@ -13,7 +13,7 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/instance: cogneva
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.5.7"
+    app.kubernetes.io/version: "0.5.8"
     app.kubernetes.io/component: sandbox-executor
   annotations:
     # 卸载不销毁：工作树与裸仓库跨重装继续可用。

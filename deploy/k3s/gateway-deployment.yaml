@@ -11,7 +11,7 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: security-gateway
-    app.kubernetes.io/version: "0.5.7"
+    app.kubernetes.io/version: "0.5.8"
 spec:
   replicas: 1
   # No surge: every profile runs a single replica on a single node, so a surging
@@ -31,7 +31,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
-        app.kubernetes.io/version: "0.5.7"
+        app.kubernetes.io/version: "0.5.8"
     spec:
       containers:
         - name: security-gateway
