@@ -251,7 +251,7 @@ fetch_prebuilt_bootstrap() {
     echo "[bootstrap] 使用预编译静态引导器 $tag（$arch），移交控制权..."
     # 不 export COGNEVA_REPO_ROOT：二进制解包内嵌资产自取自用
     export COGNEVA_CN_MIRROR="$CN_MIRROR"
-    exec "$binpath" "$@"
+    exec "$binpath"
 }
 
 # ---------- macOS：Lima 虚拟机提供 Linux 运行层 ----------
@@ -377,7 +377,53 @@ macos_bootstrap() {
     fi
 }
 
+usage() {
+    cat <<'EOF'
+Cogneva 元启动入口（Shell 层：取引导器并移交控制权）
+
+用法:
+    curl -fsSL <地址>/bootstrap.sh | sh
+
+本脚本不接受参数，安装参数一律经环境变量传入；不认识的参数一律拒绝执行。
+（管道方式下要传参得写成 `sh -s -- <参数>`，参数才会到本脚本。）
+
+    COGNEVA_CN_MIRROR=1              强制国内镜像路径（0 强制海外），缺省自动探测
+    COGNEVA_HOME=<目录>              安装目录，缺省 ~/.cogneva
+    COGNEVA_BOOTSTRAP_FROM_SOURCE=1  强制源码构建引导器（离线介质 / 本地改动调试）
+    COGNEVA_BOOTSTRAP_NONINTERACTIVE=1   全程不提问（无人值守）
+    COGNEVA_REPO_ROOT=<目录>         引导器使用的部署资产目录
+
+引导器（cogneva-bootstrap）自身的选项见 `cogneva-bootstrap --help`。
+EOF
+}
+
+# 参数在入口处就结算：本脚本会把宿主机改成另一个状态（装集群、写
+# /var/lib/cogneva-data、装宿主工具），静默吞掉一个参数等于让调用方以为它
+# 生效了——安装照样成功，错的是配置而不是结果，事后无从发现。所以不认识的
+# 参数只能拒绝，而不是丢给下一环去丢。
+settle_args() {
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -V|--version)
+                echo "[bootstrap] 本入口脚本无版本号：引导器版本在安装时按最新 release 选定。" >&2
+                echo "  安装后可运行 cogneva-bootstrap --version 查看实际版本。" >&2
+                exit 2
+                ;;
+            *)
+                echo "[bootstrap] 无法识别的参数: $arg" >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+    done
+}
+
 main() {
+    settle_args "$@"
     detect_os
     case "$BOOTSTRAP_OS" in
         darwin)
@@ -397,7 +443,8 @@ main() {
     # 默认路径：预编译静态二进制（下载 → 校验 → 运行，无需源码与 Rust）；
     # 失败自动回退源码构建路径（取码 → 装 Rust → cargo build）。
     # COGNEVA_BOOTSTRAP_FROM_SOURCE=1 强制源码构建（离线介质 / 本地改动调试）。
-    if [ -z "${COGNEVA_BOOTSTRAP_FROM_SOURCE:-}" ] && fetch_prebuilt_bootstrap "$@"; then
+    # 参数已由 settle_args 结算，两条路径都不再透传任何参数。
+    if [ -z "${COGNEVA_BOOTSTRAP_FROM_SOURCE:-}" ] && fetch_prebuilt_bootstrap; then
         exit 0
     fi
     echo "[bootstrap] 预编译引导器不可用，回退源码构建路径..."
@@ -409,7 +456,7 @@ main() {
     echo "[bootstrap] 启动 Rust 引导器，移交控制权..."
     export COGNEVA_REPO_ROOT="$REPO_ROOT"
     export COGNEVA_CN_MIRROR="$CN_MIRROR"
-    exec "$REPO_ROOT/target/release/cogneva-bootstrap" "$@"
+    exec "$REPO_ROOT/target/release/cogneva-bootstrap"
 }
 
 main "$@"

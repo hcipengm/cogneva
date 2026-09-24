@@ -4,6 +4,8 @@
 //! 统一计划，框架按环境标签把同一计划渲染为 Helm values（profile）并同步
 //! 到目标集群。backend 选择规则内聚于此，无需业务代码改动。
 
+pub mod cli;
+
 use serde::{Deserialize, Serialize};
 
 /// 集群供给发行版：元启动新建集群时装什么。`K3s` = 装 K3s（单节点或多节点）；

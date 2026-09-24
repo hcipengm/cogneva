@@ -66,7 +66,7 @@ fn materialize_assets() -> Result<PathBuf> {
 }
 
 use anyhow::{bail, Context, Result};
-use cogneva_bootstrap::Distro;
+use cogneva_bootstrap::{cli, Distro};
 use serde::Serialize;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -2158,6 +2158,26 @@ async fn ensure_port_forward(webui: &str) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Arguments are settled first, before the tracing subscriber and before the
+    // asset unpacking below — the latter writes a work directory, and a run
+    // that only prints the usage must not leave one behind.
+    match cli::Command::parse(std::env::args().skip(1)) {
+        Ok(cli::Command::Run) => {}
+        Ok(cli::Command::Help) => {
+            println!("{}", cli::USAGE);
+            return Ok(());
+        }
+        Ok(cli::Command::Version) => {
+            println!("cogneva-bootstrap {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Err(unknown) => {
+            eprintln!("cogneva-bootstrap: 无法识别的参数: {unknown}");
+            eprintln!("{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
