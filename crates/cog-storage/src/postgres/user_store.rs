@@ -50,6 +50,23 @@ fn user_from_row(r: UserRow) -> User {
 const USER_COLS: &str =
     "id, phone, email, username, display_name, avatar_url, status, user_type, created_at, updated_at";
 
+/// The same column list, qualified with a table alias.
+///
+/// Any query that joins another table must use this instead of the bare list.
+/// `platform_identities` carries its own `id`, `created_at` and `updated_at`,
+/// so the unqualified names are ambiguous and PostgreSQL rejects the statement
+/// at parse time — before a single row is read, which is why a lookup that is
+/// only ever reached on a first login can stay broken with everything else
+/// green. Deriving it from `USER_COLS` keeps the two spellings from drifting:
+/// adding a column to one cannot silently miss the other.
+fn qualified_user_cols(alias: &str) -> String {
+    USER_COLS
+        .split(',')
+        .map(|col| format!("{alias}.{}", col.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn to_sf(err: sqlx::Error) -> SFError {
     SFError::Database(err.to_string())
 }
@@ -235,9 +252,10 @@ impl PlatformIdentityStore for PostgresUserStore {
         provider_user_id: &str,
     ) -> SFResult<Option<User>> {
         let row: Option<UserRow> = sqlx::query_as(&format!(
-            "SELECT {USER_COLS} FROM users u \
+            "SELECT {} FROM users u \
              JOIN platform_identities p ON p.user_id = u.id \
-             WHERE p.provider = $1 AND p.provider_user_id = $2"
+             WHERE p.provider = $1 AND p.provider_user_id = $2",
+            qualified_user_cols("u")
         ))
         .bind(provider)
         .bind(provider_user_id)

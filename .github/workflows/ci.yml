@@ -69,6 +69,14 @@ jobs:
         run: cargo test -p cogneva --test backup_pg -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The platform-identity lookup fails at parse time against the real
+      # schema (both tables own an `id`), so it cannot be caught without a
+      # server. Leaving it out of the gate is how a query that is only reached
+      # on a first login stays broken while every DB-free test passes.
+      - name: Live-DB platform identity lookup
+        run: cargo test -p cog-storage --test platform_identity -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
 
   fmt:
     name: Format
