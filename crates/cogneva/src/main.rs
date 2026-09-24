@@ -1,5 +1,7 @@
 //! Cogneva binary entry point.
-//! Delegates all work to `cogneva::run_app()`.
+//! Parses the command line (`cogneva::cli`) and dispatches to one entry point.
+
+use cogneva::cli::{Command, USAGE};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -7,43 +9,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CryptoProvider，首次 TLS 调用会 panic——必须在任何 TLS 使用之前安装。
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!(
-            "cogneva {} (rev {})",
-            env!("CARGO_PKG_VERSION"),
-            env!("COGNEVA_GIT_REVISION")
-        );
-        return Ok(());
-    }
+    let command = match Command::parse(std::env::args().skip(1)) {
+        Ok(command) => command,
+        Err(unknown) => {
+            // Anything we do not recognize must stop here. Falling through used to
+            // start the whole application, so `--help` answered with a plugin
+            // initialization error and `--health-check` with a port conflict.
+            eprintln!("cogneva: unrecognized argument: {unknown}");
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    };
 
-    #[cfg(windows)]
-    if std::env::args().any(|a| a == "--service") {
-        return cogneva::windows_service::run();
+    match command {
+        // 完整应用（无参数时的默认行为）。
+        Command::Run => cogneva::run_app().await,
+        Command::Help => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        Command::Version => {
+            println!(
+                "cogneva {} (rev {})",
+                env!("CARGO_PKG_VERSION"),
+                env!("COGNEVA_GIT_REVISION")
+            );
+            Ok(())
+        }
+        // 镜像 HEALTHCHECK 调用的探针：只探本进程的 HTTP 端口，不启动应用。
+        Command::HealthCheck => cogneva::health_check::run(),
+        // 独立安全网关模式（deploy/k3s/gateway-deployment.yaml 的启动命令）。
+        Command::SecurityGateway => {
+            cog_gateway::security_gateway::run_from_env(Some(env!("COGNEVA_GIT_REVISION"))).await
+        }
+        // 独立沙箱执行器模式（deploy/k3s/sandbox-executor-deployment.yaml 的启动命令）。
+        Command::SandboxExecutor => cog_extension::command_server::run_from_env().await,
+        // 启动前配置与依赖校验（审计 Phase 2 任务 2.5）。
+        Command::ValidateConfig => cogneva::validate_config::run().await,
+        // 主线跟踪自动部署的滚动端：独立 Job Pod 内执行，四部署门禁滚动，
+        // 任一失败反向回滚 prev tag（进程本身跑在新镜像里，顺带 smoke test）。
+        Command::MainlineRollout => cog_reflection::run_rollout_cli().await,
+        // 数据面备份与恢复：CronJob 每日打包，换机/重装由一次性恢复 Job 消费。
+        Command::Backup => cogneva::backup::run_backup_from_env().await,
+        Command::Restore => cogneva::backup::run_restore_from_env().await,
+        Command::WindowsService => {
+            #[cfg(windows)]
+            {
+                cogneva::windows_service::run()
+            }
+            #[cfg(not(windows))]
+            {
+                Err("--service is only supported on Windows".into())
+            }
+        }
     }
-    // 独立安全网关模式（deploy/k3s/gateway-deployment.yaml 的启动命令）。
-    if std::env::args().nth(1).as_deref() == Some("security-gateway") {
-        return cog_gateway::security_gateway::run_from_env(Some(env!("COGNEVA_GIT_REVISION")))
-            .await;
-    }
-    // 独立沙箱执行器模式（deploy/k3s/sandbox-executor-deployment.yaml 的启动命令）。
-    if std::env::args().nth(1).as_deref() == Some("sandbox-executor") {
-        return cog_extension::command_server::run_from_env().await;
-    }
-    // 启动前配置与依赖校验（审计 Phase 2 任务 2.5）。
-    if std::env::args().nth(1).as_deref() == Some("validate-config") {
-        return cogneva::validate_config::run().await;
-    }
-    // 主线跟踪自动部署的滚动端：独立 Job Pod 内执行，四部署门禁滚动，
-    // 任一失败反向回滚 prev tag（进程本身跑在新镜像里，顺带 smoke test）。
-    if std::env::args().nth(1).as_deref() == Some("mainline-rollout") {
-        return cog_reflection::run_rollout_cli().await;
-    }
-    // 数据面备份与恢复：CronJob 每日打包，换机/重装由一次性恢复 Job 消费。
-    if std::env::args().nth(1).as_deref() == Some("backup") {
-        return cogneva::backup::run_backup_from_env().await;
-    }
-    if std::env::args().nth(1).as_deref() == Some("restore") {
-        return cogneva::backup::run_restore_from_env().await;
-    }
-    cogneva::run_app().await
 }

@@ -5,9 +5,11 @@
 pub mod assembly;
 pub mod backup;
 pub mod bootstrap;
+pub mod cli;
 pub mod config_loader;
 pub mod config_watcher;
 pub mod daemon;
+pub mod health_check;
 pub mod hot_reload;
 pub mod pidfile;
 pub mod platform;
