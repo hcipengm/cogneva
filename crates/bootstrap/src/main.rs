@@ -884,6 +884,15 @@ const DOCKER_MIRROR_CANDIDATES: &[&str] = &[
     "hub.rat.dev",
 ];
 
+/// registry.k8s.io 镜像站候选。只镜像 docker.io 覆盖不到它，而
+/// kube-prometheus-stack 的 kube-state-metrics 正在这个 registry 上：
+/// 受限网络里 chart 会卡在它的 ImagePullBackOff 直到 --wait 超时。
+const K8S_IO_MIRROR_CANDIDATES: &[&str] =
+    &["k8s-gcr.m.daocloud.io", "m.daocloud.io/registry.k8s.io"];
+
+/// quay.io 镜像站候选。prometheus-operator 等控制面镜像在这个 registry 上。
+const QUAY_IO_MIRROR_CANDIDATES: &[&str] = &["quay.m.daocloud.io", "quay.nju.edu.cn"];
+
 static DOCKER_MIRROR: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
 /// 选定 docker.io 镜像站（全进程一次探测，后续复用结果）。
@@ -903,11 +912,21 @@ async fn docker_mirror_host() -> &'static str {
 }
 
 /// K3s containerd registries.yaml：endpoint 全列，containerd 自己按序回退，
-/// 无需探活；全部 endpoint 失败后 containerd 还会回源 docker.io 直连。
+/// 无需探活；全部 endpoint 失败后 containerd 还会回源原 registry 直连。
+///
+/// 三个 registry 都要覆盖，不是只镜像 docker.io：系统镜像与 chart 依赖分别落在
+/// registry.k8s.io 和 quay.io 上，漏掉哪个都会在受限网络里卡住 pull。
 fn k3s_registries_yaml() -> String {
-    let mut s = String::from("mirrors:\n  docker.io:\n    endpoint:\n");
-    for h in DOCKER_MIRROR_CANDIDATES {
-        s.push_str(&format!("      - \"https://{h}\"\n"));
+    let mut s = String::from("mirrors:\n");
+    for (registry, candidates) in [
+        ("docker.io", DOCKER_MIRROR_CANDIDATES),
+        ("registry.k8s.io", K8S_IO_MIRROR_CANDIDATES),
+        ("quay.io", QUAY_IO_MIRROR_CANDIDATES),
+    ] {
+        s.push_str(&format!("  {registry}:\n    endpoint:\n"));
+        for h in candidates {
+            s.push_str(&format!("      - \"https://{h}\"\n"));
+        }
     }
     s
 }
@@ -2774,6 +2793,21 @@ mod profile_tests {
         assert!(dir
             .join("deploy/rendered/k3s-single/00-namespace-cogneva.yaml")
             .is_file());
+    }
+
+    #[test]
+    fn registries_yaml_covers_every_registry_the_charts_pull_from() {
+        let y = super::k3s_registries_yaml();
+        // 只镜像 docker.io 时，kube-prometheus-stack 的 kube-state-metrics
+        // （registry.k8s.io）在受限网络里会一直 ImagePullBackOff 到 --wait 超时。
+        for registry in ["docker.io", "registry.k8s.io", "quay.io"] {
+            assert!(
+                y.contains(&format!("  {registry}:\n")),
+                "registries.yaml 缺 {registry} 段: {y}"
+            );
+        }
+        assert!(y.contains("k8s-gcr.m.daocloud.io"), "缺 k8s.io 镜像站: {y}");
+        assert!(y.contains("quay.m.daocloud.io"), "缺 quay 镜像站: {y}");
     }
 
     #[test]
