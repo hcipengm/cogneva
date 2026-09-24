@@ -243,22 +243,35 @@ async fn measure_https(client: &NetworkProbeClient, repo: &str) -> TransportMeas
 
 /// SSH 通道的握手实测：用**与镜像刷新逐字节相同的命令**做一次 `ls-remote`。
 /// 没有部署密钥时返回 None（这条通道不可用，不是"不可达"）。
+///
+/// 超时走的就是"丢弃即杀组"那条路（[`crate::git_mirror::spawn_git_group`] 的守卫）：
+/// 探测自己是一次硬超时（不是镜像那两档预算），但子进程链一样是
+/// `git → sh → ssh → 远端`，一刀只砍组长会留下挂着 SSH 连接的孤儿——实测过：
+/// 探针 20s 就判了不可达，它下面的 `ls-remote`/`ssh` 又在容器里活了六分多钟。
 async fn measure_ssh(config: &GitMirrorConfig, repo: &str) -> Option<TransportMeasurement> {
     let key = config.ssh_key.as_ref()?;
     let url = ssh_url_for(&config.ssh_base, repo);
     let started = Instant::now();
-    let out = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        tokio::process::Command::new("git")
-            .env("GIT_SSH_COMMAND", ssh_command_for(key))
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .args(["ls-remote", "--exit-code", &url, "HEAD"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status(),
-    )
-    .await;
-    let reachable = matches!(out, Ok(Ok(s)) if s.success());
+    let reachable = match crate::git_mirror::spawn_git_group(
+        &config.git_bin,
+        &["ls-remote", "--exit-code", &url, "HEAD"],
+        Some(&ssh_command_for(key)),
+        std::process::Stdio::null(),
+        std::process::Stdio::null(),
+    ) {
+        Ok((mut child, mut guard)) => {
+            // 守卫在这里的作用是"超时丢下 future 时把整组带走"：它跟着这个
+            // 作用域走，`timeout` 一到期，wait 的 future 先被丢掉，守卫随后被丢。
+            let out = tokio::time::timeout(HANDSHAKE_TIMEOUT, child.wait()).await;
+            if out.is_ok() {
+                // 进程已经归位，号可以被复用了：对**复用后的号**发信号就是误伤
+                // 别的进程。守卫只负责"没等到结果"这一种形态。
+                guard.disarm();
+            }
+            matches!(out, Ok(Ok(s)) if s.success())
+        }
+        Err(_) => false,
+    };
     Some(TransportMeasurement {
         transport: Transport::Ssh,
         reachable,

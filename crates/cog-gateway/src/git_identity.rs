@@ -70,6 +70,8 @@ pub(crate) struct IdentityConfig {
     pub key_path: PathBuf,
     /// SSH 远端前缀，用于自证握手。
     pub ssh_base: String,
+    /// git 可执行文件（与镜像刷新同源，见 `git_mirror::git_bin_from_env`）。
+    pub git_bin: PathBuf,
     /// 待确认状态的重试节拍。
     pub retry_secs: u64,
 }
@@ -87,6 +89,7 @@ impl IdentityConfig {
                 .unwrap_or_else(|| PathBuf::from(crate::git_mirror::DEFAULT_SSH_KEY)),
             ssh_base: nonempty("COGNEVA_GATEWAY_GIT_SSH_BASE")
                 .unwrap_or_else(|| crate::git_mirror::DEFAULT_SSH_BASE.to_string()),
+            git_bin: crate::git_mirror::git_bin_from_env(),
             // 下界 60s：节拍读成 1 会让"等人输入 token"变成每秒一次 SSH 握手。
             retry_secs: nonempty("COGNEVA_GATEWAY_GIT_IDENTITY_RETRY_SECS")
                 .and_then(|v| v.parse().ok())
@@ -502,26 +505,56 @@ async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> bool {
          -o ConnectTimeout=10",
         dir.path().display()
     );
-    let out = tokio::process::Command::new("git")
-        .args(["ls-remote", "--exit-code", &url, "HEAD"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", ssh)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await;
+    // 这条 git 走的是"起进程 + 进程组 + 一次硬超时"那条共用路径：`ssh` 的
+    // `ConnectTimeout` 只管到建连为止，建上之后对端不吐字节就是**没有边界的
+    // 等待**——而这里是自举链路的自证步骤，卡住就意味着状态位永远停在待确认。
+    let (child, mut guard) = match crate::git_mirror::spawn_git_group(
+        &config.git_bin,
+        &["ls-remote", "--exit-code", &url, "HEAD"],
+        Some(&ssh),
+        std::process::Stdio::piped(),
+        std::process::Stdio::piped(),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            info!(target: "git_identity", "SSH 自证无法执行: {e}");
+            return false;
+        }
+    };
+
+    let out = tokio::time::timeout(SSH_PROBE_TIMEOUT, child.wait_with_output()).await;
     match out {
-        Ok(out) if out.status.success() => true,
-        Ok(out) => {
+        Ok(Ok(out)) if out.status.success() => {
+            // 进程已经归位、号可以被复用：守卫到此为止。留在后面 disarm，
+            // 会变成对一个可能已经属于别人的进程组发 SIGKILL。
+            guard.disarm();
+            true
+        }
+        Ok(Ok(out)) => {
+            guard.disarm();
             let stderr = String::from_utf8_lossy(&out.stderr);
             info!(target: "git_identity", "SSH 自证未通过: {}", stderr.trim());
             false
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             info!(target: "git_identity", "SSH 自证无法执行: {e}");
+            false
+        }
+        // 超时：守卫随作用域被丢弃，整条 `git → sh → ssh` 一起走。
+        Err(_) => {
+            info!(
+                target: "git_identity",
+                "SSH 自证超时（{}s），已杀进程组",
+                SSH_PROBE_TIMEOUT.as_secs()
+            );
             false
         }
     }
 }
+
+/// SSH 自证握手的硬超时。与选路探测同量级（那是一条 `ls-remote` 的一次往返），
+/// 但要留出"密钥被接受、仓库可读"这一段真实往返的余量。
+const SSH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// 把私钥写到临时文件（0600）供 git 使用。私钥不进命令行、不进环境变量，
 /// 只以一个权限受限的临时文件存在，用完随 TempDir 一起消失。
