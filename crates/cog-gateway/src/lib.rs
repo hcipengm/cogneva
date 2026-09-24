@@ -533,6 +533,13 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/admin/contribution-config",
             post(contribution_admin::contribution_config_handler),
         )
+        // An OAuth App secret is issued by the platform console only; nothing
+        // in the cluster can derive it. This endpoint is the delivery path
+        // (write the Secret, roll the consumer), never the source.
+        .route(
+            "/api/v1/admin/contribution/oauth-app",
+            post(contribution_admin::oauth_app_secret_handler),
+        )
         .route(
             "/api/v1/admin/contribution/github-app",
             post(contribution_admin::github_app_config_handler)

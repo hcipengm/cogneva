@@ -45,6 +45,11 @@ const SECRET_CONTRIB_CONFIG: &str = "contribution-config";
 const SECRET_GITHUB_APP_ID: &str = "github-app-id";
 const SECRET_GITHUB_APP_INSTALLATION_ID: &str = "github-app-installation-id";
 const SECRET_GITHUB_APP_KEY: &str = "github-app-private-key";
+/// Project OAuth App client secret (Gitee authorization-code exchange). Only
+/// the platform console can issue it, so nothing in the cluster can derive it
+/// and the repository must never carry it — the wizard writes this key, the
+/// security gateway reads it from its environment.
+const SECRET_GITEE_OAUTH_CLIENT_SECRET: &str = "gitee-oauth-client-secret";
 
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -812,6 +817,9 @@ pub async fn contribution_status_handler(
                     "pending_count": pending_count,
                     "device_flow_available": oauth_client_id(None).is_some(),
                     "gitee_oauth_available": gitee_oauth_available().await,
+                    // 授权码通道要 client_id 与 client_secret 两件都齐；前者是
+                    // 公开标识（随清单走），后者只能由向导投递，所以分开报。
+                    "gitee_oauth_secret_configured": has(SECRET_GITEE_OAUTH_CLIENT_SECRET),
                 })),
             )
                 .into_response();
@@ -827,6 +835,8 @@ pub async fn contribution_status_handler(
             // 不该据此说"网关没有身份"。
             "git_identity": {"state": "unknown", "note": "not_in_cluster"},
             "github_app_configured": false,
+            // 读不到 Secret 就不知道密钥在不在，报 false 而不是"没配"的措辞。
+            "gitee_oauth_secret_configured": false,
             "policy": state
                 .contribution_control
                 .as_ref()
@@ -1827,6 +1837,110 @@ pub async fn contribution_disconnect_handler(
         .into_response()
 }
 
+/// Maps a wizard-facing provider name to the Secret key that has a consumer.
+///
+/// Only providers whose key is actually read are listed. GitHub's account
+/// channel in this deployment is the device flow, which needs no client
+/// secret, so accepting one would store a key nothing ever reads — a config
+/// surface that looks configured and changes nothing.
+/// Returns the canonical provider name together with that key, so the response
+/// can echo the name the mapping actually matched instead of a second copy of
+/// the literal that could drift from it.
+fn oauth_app_secret_key(provider: &str) -> Option<(&'static str, &'static str)> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "gitee" => Some(("gitee", SECRET_GITEE_OAUTH_CLIENT_SECRET)),
+        _ => None,
+    }
+}
+
+/// Trims a pasted secret and rejects the empty result.
+///
+/// The consumer treats an empty secret as "not configured" (`gitee_oauth_creds`
+/// returns `None`), so storing one would silently close the authorization-code
+/// channel while reporting success to the operator who just pasted a value.
+fn clean_oauth_app_secret(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+#[derive(Deserialize)]
+pub struct OAuthAppSecretRequest {
+    pub provider: String,
+    pub client_secret: String,
+}
+
+/// POST /api/v1/admin/contribution/oauth-app — store an OAuth App client
+/// secret and roll the process that reads it.
+///
+/// The value can only be issued by the platform console; this endpoint is the
+/// *delivery* path, not the source. That matters for the failure modes: the
+/// write is reported separately from the roll, because a failed roll means
+/// "stored, not yet in effect" (the consumer holds it in an environment
+/// variable, which only a new process reads), not "lost".
+pub async fn oauth_app_secret_handler(
+    State(_state): State<Arc<crate::GatewayState>>,
+    Json(req): Json<OAuthAppSecretRequest>,
+) -> Response {
+    let Some((provider, key)) = oauth_app_secret_key(&req.provider) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "unsupported_provider",
+                "message": "只有 Gitee 授权码通道需要客户端密钥（GitHub 走设备流，不需要）",
+            })),
+        )
+            .into_response();
+    };
+    let Some(secret) = clean_oauth_app_secret(&req.client_secret) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "missing_client_secret",
+                "message": "请粘贴 OAuth 应用客户端密钥",
+            })),
+        )
+            .into_response();
+    };
+    let kube = match KubeClient::in_cluster() {
+        Ok(kube) => kube,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "not_in_cluster", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = kube
+        .patch(
+            &secret_api_path(kube.namespace()),
+            json!({ "stringData": { key: secret } }),
+        )
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "secret_patch_failed", "message": e})),
+        )
+            .into_response();
+    }
+    let rolled = kube.restart_gateway().await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "provider": provider,
+            "stored": true,
+            "restarted": rolled.is_ok(),
+            "message": match rolled {
+                Ok(()) => "已写入 Secret，安全网关正在滚动重启；重启完成后授权码通道即可用",
+                Err(_) => "已写入 Secret，但安全网关滚动重启失败；值已保存，待该 Deployment 下次重启生效",
+            },
+        })),
+    )
+        .into_response()
+}
+
 /// cogneva-secrets 的 apiserver 路径。探测与读取必须指向同一个资源，
 /// 所以由同一个函数拼出来。
 pub(crate) fn secret_api_path(namespace: &str) -> String {
@@ -2215,5 +2329,39 @@ mod tests {
         );
         assert_eq!(take_oauth_state(&state), None);
         assert_eq!(take_oauth_state("never-issued"), None);
+    }
+
+    #[test]
+    fn oauth_app_secret_key_only_covers_providers_with_a_consumer() {
+        // Gitee's client secret has a reader: the security gateway's
+        // authorization-code exchange.
+        assert_eq!(
+            oauth_app_secret_key("gitee"),
+            Some(("gitee", SECRET_GITEE_OAUTH_CLIENT_SECRET))
+        );
+        assert_eq!(
+            oauth_app_secret_key("  Gitee "),
+            Some(("gitee", SECRET_GITEE_OAUTH_CLIENT_SECRET))
+        );
+        // GitHub's account channel here is the device flow, which needs no
+        // client secret: writing one would create a config surface whose only
+        // observable effect is that it looks configured.
+        assert_eq!(oauth_app_secret_key("github"), None);
+        assert_eq!(oauth_app_secret_key(""), None);
+        assert_eq!(oauth_app_secret_key("bitbucket"), None);
+    }
+
+    #[test]
+    fn oauth_app_secret_is_trimmed_and_blank_is_rejected() {
+        // A secret pasted with surrounding whitespace must land as the value
+        // itself, or the exchange fails with an error that points nowhere.
+        assert_eq!(
+            clean_oauth_app_secret("  s3cr3t\n"),
+            Some("s3cr3t".to_string())
+        );
+        // Blank would be read as "not configured" by the consumer while this
+        // endpoint reported success.
+        assert_eq!(clean_oauth_app_secret("   "), None);
+        assert_eq!(clean_oauth_app_secret(""), None);
     }
 }

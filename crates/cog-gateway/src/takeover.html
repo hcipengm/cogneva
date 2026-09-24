@@ -842,6 +842,19 @@
           <div class="fine" id="giOauthUnavailable" style="display:none;margin-top:8px" data-i18n="giOauthUnavailable">Account authorization needs the project OAuth App configured; use a personal access token below for now.</div>
         </div>
 
+        <details class="adv" id="giAppAdv" style="display:none;margin-top:10px">
+          <summary data-i18n="giAppAdvSummary">Operator: configure the project Gitee OAuth App secret (regular users skip this)</summary>
+          <div class="app-status off" id="giAppState">
+            <span class="dot"></span><span id="giAppStateText"></span>
+          </div>
+          <div class="fine" data-i18n="giAppWhy">Account authorization exchanges the authorization code with the project OAuth App secret. Only the Gitee console can issue it, so paste it here to deliver it: it goes into the cluster Secret and never into the repository.</div>
+          <input type="password" id="giAppSecret" data-i18n-ph="giAppSecretPh" placeholder="OAuth App client secret" style="width:100%;margin-top:8px" autocomplete="off" />
+          <div class="actions">
+            <button type="button" id="giAppSecretBtn" data-i18n="giAppSave">Save client secret</button>
+          </div>
+          <div class="fine" id="giAppNote" style="margin-top:6px"></div>
+        </details>
+
         <div class="divider" data-i18n="orPat">or paste a token</div>
         <div class="steps pat-guide" style="margin-top:0">
           <div class="step"><span class="n">1</span><span><span data-i18n="giPatStep1">Open the token page (login required)</span> <a href="https://gitee.com/profile/personal_access_tokens/new" target="_blank" rel="noopener">gitee.com/profile/personal_access_tokens/new →</a></span></div>
@@ -1827,6 +1840,18 @@ const I18N = {
   giNeedStart:      { en: 'Start the authorization with the button above first.', zh: '请先点上方按钮发起授权。' },
   giOauthUnavailable: { en: 'Account authorization needs the project OAuth App configured; use a personal access token below for now.',
                         zh: '账号授权需项目方配置 OAuth App；可先用下方个人令牌连接。' },
+  giAppWhy:         { en: 'Account authorization exchanges the code with the project OAuth App secret. Only the Gitee console can issue it, so paste it here to deliver it: it goes into the cluster Secret and never into the repository.',
+                      zh: '账号授权要用项目 OAuth 应用的客户端密钥兑换授权码。它只能由 Gitee 后台签发，在这里粘贴即可投递：值只进集群 Secret，不进仓库。' },
+  giAppSecretPh:    { en: 'OAuth App client secret', zh: 'OAuth 应用客户端密钥' },
+  giAppSave:        { en: 'Save client secret', zh: '保存客户端密钥' },
+  giAppAdvSummary:  { en: 'Operator: configure the project Gitee OAuth App secret (regular users skip this)',
+                      zh: '运维：配置项目 Gitee OAuth 应用密钥（普通用户可跳过）' },
+  giAppConfigured:  { en: 'OAuth App secret configured', zh: 'OAuth 应用密钥已配置' },
+  giAppNotConfigured: { en: 'OAuth App secret not configured — account authorization unavailable',
+                        zh: 'OAuth 应用密钥未配置——账号授权不可用' },
+  giAppNeedValue:   { en: 'Paste the client secret first.', zh: '请先粘贴客户端密钥。' },
+  giAppSaved:       { en: 'Saved — the security gateway is rolling; authorization works once it is back.',
+                      zh: '已保存——安全网关正在滚动重启，重启完成后授权即可用。' },
   skipForNow:       { en: 'Skip for now', zh: '暂时跳过' },
   contribKeyNote:   { en: 'The token is written to the cluster Secret only, held by the security gateway, and never echoed back. An SSH key is generated and its public half uploaded.',
                       zh: '令牌只写入集群 Secret、由安全网关代持，不会回显。同时生成 SSH 密钥并自动上传公钥。' },
@@ -2076,11 +2101,49 @@ function openContrib() {
       $('giOauthBtn').style.display = giAvailable ? '' : 'none';
       $('giOauthUnavailable').style.display = giAvailable ? 'none' : '';
       renderGhAppStatus(!!s.github_app_configured);
+      renderGiteeAppSecret(!!s.gitee_oauth_secret_configured);
       renderGitIdentity(s.git_identity);
       showContribConnected(s);
     })
     .catch(() => {});
 }
+
+// Project OAuth App secret. The state line stays visible even when the field
+// is empty: an operator who just pasted a value has no other way to tell
+// whether it landed, because the consumer only sees it after the security
+// gateway rolls. GitHub has no counterpart here on purpose — its channel is
+// the device flow, which needs no client secret.
+function renderGiteeAppSecret(configured) {
+  $('giAppAdv').style.display = '';
+  const line = $('giAppState');
+  line.classList.toggle('on', configured);
+  line.classList.toggle('off', !configured);
+  $('giAppStateText').textContent = configured
+    ? t('giAppConfigured')
+    : t('giAppNotConfigured');
+}
+
+$('giAppSecretBtn').onclick = async () => {
+  const value = $('giAppSecret').value;
+  if (!value.trim()) { contribErr(t('giAppNeedValue')); return; }
+  $('giAppSecretBtn').disabled = true;
+  contribErr('');
+  $('giAppNote').textContent = '';
+  try {
+    const r = await api('/api/v1/admin/contribution/oauth-app', 'POST', {
+      provider: 'gitee', client_secret: value,
+    });
+    // Clear the field whether or not the roll worked: the value is stored
+    // either way, and leaving it in the DOM keeps a live secret on screen.
+    $('giAppSecret').value = '';
+    renderGiteeAppSecret(true);
+    $('giAppNote').textContent = r.restarted === false ? (r.message || '') : t('giAppSaved');
+  } catch (e) {
+    contribErr(e.message);
+  } finally {
+    $('giAppSecretBtn').disabled = false;
+  }
+};
 
 // The gateway's own git identity. Independent of the account channel above:
 // without it the cluster cannot fetch the baseline or push changes at all, so
