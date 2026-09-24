@@ -85,6 +85,14 @@ spec:
               value: "http://cogneva-security-gateway:8081/gitee"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
+            # git 身份自举的基线仓库（owner/name）。自举循环跑在**本进程**：
+            # cogneva-secrets 的属主就是这里（WebUI 向导与贡献通道写同一份），
+            # 而自举要的正是属主手里的三样东西——Secret 读写、到 GitHub 的
+            # egress、以及滚安全网关的权限。少了这个值自举只剩"生成公钥挂到
+            # WebUI"那一半，自动登记这一支永远不触发（值本身是共享的，见
+            # values.yaml 的 gitIdentity）。业务调用仍零持有，经网关代理。
+            - name: COGNEVA_GATEWAY_GIT_IDENTITY_REPO
+              value: "hcipengm/cogneva"
             # webhook 验签在安全网关完成，本进程只验网关转发的内部 HMAC；
             # 未配置时事件入口不启动（fail-closed）。
             - name: COGNEVA_WEBHOOK_INTERNAL_SECRET

@@ -111,8 +111,9 @@ spec:
               value: "true"
             - name: COGNEVA_GATEWAY_GIT_SSH_KEY
               value: /etc/cogneva/git-ssh/id_ed25519
-            # 基线仓库（owner/name）：git 身份自举把公钥登记成它的部署密钥并自证，
-            # 选路的实测也拿它当探测目标。空 = 不自动登记，只把公钥挂出来等人。
+            # 基线仓库（owner/name）：选路的实测拿它当探测目标，SSH 兜底也用它
+            # 拼远端前缀。登记这一半不在这里（自举循环跑在主应用进程），两边读
+            # 同一个共享值。
             - name: COGNEVA_GATEWAY_GIT_IDENTITY_REPO
               value: "hcipengm/cogneva"
             # 部署期网络画像：restricted / open。空 = 由网关自己探（首个 git

@@ -115,6 +115,17 @@ gateway:
       cpu: 1000m
       memory: 2Gi
 
+# git 身份基线（owner/name）。两个进程消费同一个值，所以定义在共享层而不是
+# 挂在任一侧名下——拆成两份必然漂移，而漂移的后果是无声的：自举登记的仓库与
+# 选路探测的仓库一旦不同，SSH 自证就永远握手不过，身份停在 pending。
+#   - 主应用进程：git 身份自举的后台循环跑在这里——它同时握着自举需要的三样
+#     东西（cogneva-secrets 的读写权、到达 GitHub 的 egress、以及网关部署的
+#     滚动权），所以生成的公钥由它登记成这个仓库的部署密钥，并滚网关让私钥
+#     被兜底通道读进去。空 = 不自动登记，只把公钥挂到 WebUI 等人给 token。
+#   - 安全网关：传输选路的实测拿它当探测目标，SSH 兜底也用它拼远端前缀。
+gitIdentity:
+  repo: hcipengm/cogneva
+
 # 独立安全网关：代持全部敏感凭证，沙盒 Pod 零凭证
 securityGateway:
   enabled: true
@@ -150,10 +161,6 @@ securityGateway:
     # 标了 keep 只会在反复重装时堆出无主的陈旧镜像。5Gi 对 cogneva 仓库
     # （含历史与 LFS 外的全部对象）绰绰有余。
     storage: 5Gi
-    # 基线仓库（owner/name）：网关自举自己的 git 身份时，把生成的公钥登记成
-    # **这个仓库**的部署密钥，并用一次真实握手自证；选路的实测也拿它当探测目标。
-    # 空 = 不自动登记（只把公钥挂到 WebUI 上等人给 token 或手工加 key）。
-    identityRepo: hcipengm/cogneva
   # 部署期网络画像盖章（restricted / open）。空 = 不盖章，由网关自己探。
   # 它只是**首帧默认值**：网关启动就发起一次真实握手实测，结论落地即压过盖章
   # （证据优先于部署时的猜测）。用途是让首批 git 请求不必先撞一次已知会挂的

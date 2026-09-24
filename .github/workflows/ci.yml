@@ -171,6 +171,10 @@ jobs:
         run: bash deploy/scripts/check-deploy-parity.sh
       - name: Check rendered profiles are fresh
         run: bash deploy/scripts/render-deploy.sh --check
+      # git 身份自举的接线：Secret 写权的宿主必须带基线仓库 env，且全集群同值。
+      # 这类缺陷在渲染期没有症状（清单合法、parity 也绿），只有这条判据盯得住。
+      - name: Check git identity wiring
+        run: bash deploy/scripts/check-git-identity-wiring.sh
 
   bootstrap-cross-platform:
     name: Bootstrap Cross-Platform Check
