@@ -4378,11 +4378,11 @@ mod tests {
             // 测试里兜底恒不可用（没有私钥）：走的就是纯 HTTPS 透传那条路，
             // 与加这个模块之前被测的行为完全一致。
             git_transport: std::sync::Arc::new(crate::git_mirror::GitTransport::new(
-                crate::git_mirror::GitMirrorConfig {
-                    root: std::path::PathBuf::from("/tmp/cogneva-mirror-test"),
-                    ssh_key: None,
-                    ssh_base: crate::git_mirror::DEFAULT_SSH_BASE.into(),
-                },
+                crate::git_mirror::GitMirrorConfig::from_parts(
+                    std::path::PathBuf::from("/tmp/cogneva-mirror-test"),
+                    None,
+                    crate::git_mirror::DEFAULT_SSH_BASE.into(),
+                ),
             )),
             pool_obs: std::sync::Arc::new(PoolObservability {
                 metrics: std::sync::Arc::new(PrometheusMetricsBackend::new("")),

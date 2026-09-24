@@ -118,6 +118,15 @@ spec:
               value: "true"
             - name: COGNEVA_GATEWAY_GIT_SSH_KEY
               value: /etc/cogneva/git-ssh/id_ed25519
+            # 兜底传输的两条执行预算（秒）：静默多久判死、单次传输总上限。判据在
+            # 代码里，这里只是让部署面能按链路特征收放；两者都有地板，配得比地板
+            # 小按地板生效。默认值来自实测：本链路一次完整镜像克隆约 97 秒，
+            # 静默窗 180 秒判的是"链路死了"而不是"链路慢"；总上限 1800 秒防的是
+            # 远端一直在吐进度却永远不结束。
+            - name: COGNEVA_GATEWAY_GIT_MIRROR_STALL_SECS
+              value: "180"
+            - name: COGNEVA_GATEWAY_GIT_MIRROR_TIMEOUT_SECS
+              value: "1800"
             # 基线仓库（owner/name）：git 身份自举把公钥登记成它的部署密钥并自证，
             # 选路的实测也拿它当探测目标。空 = 不自动登记，只把公钥挂出来等人。
             - name: COGNEVA_GATEWAY_GIT_IDENTITY_REPO

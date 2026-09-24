@@ -1543,6 +1543,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "jsonwebtoken 9.3.1",
+ "libc",
  "rand 0.8.6",
  "rand_core 0.6.4",
  "redis",

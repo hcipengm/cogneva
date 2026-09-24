@@ -44,6 +44,9 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand_core = "0.6"
 # 私钥只以权限受限的临时文件交给 git 使用（git 身份自举的自证握手）。
 tempfile = "3"
+# SIGKILL 到进程组：git 兜底传输是一条 `git → sh → ssh → 远端` 的链，超时只杀
+# 直接子进程会留下仍在写镜像的孙进程（见 git_mirror 的传输看门狗）。
+libc = "0.2"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

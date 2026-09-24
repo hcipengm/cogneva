@@ -105,6 +105,15 @@ spec:
               value: {{ .Values.securityGateway.gitMirror.enabled | quote }}
             - name: COGNEVA_GATEWAY_GIT_SSH_KEY
               value: /etc/cogneva/git-ssh/id_ed25519
+            # 兜底传输的两条执行预算（秒）：静默多久判死、单次传输总上限。判据在
+            # 代码里，这里只是让部署面能按链路特征收放；两者都有地板，配得比地板
+            # 小按地板生效。默认值来自实测：这条链路上一次完整镜像克隆约 97 秒，
+            # 静默窗 180 秒足够宽（判的是"链路死了"而不是"链路慢"），总上限
+            # 1800 秒防的是另一种形态——远端一直在吐进度却永远不结束。
+            - name: COGNEVA_GATEWAY_GIT_MIRROR_STALL_SECS
+              value: {{ .Values.securityGateway.gitMirror.stallSecs | quote }}
+            - name: COGNEVA_GATEWAY_GIT_MIRROR_TIMEOUT_SECS
+              value: {{ .Values.securityGateway.gitMirror.timeoutSecs | quote }}
             # 基线仓库（owner/name）：选路的实测拿它当探测目标，SSH 兜底也用它
             # 拼远端前缀。登记这一半不在这里（自举循环跑在主应用进程），两边读
             # 同一个共享值。

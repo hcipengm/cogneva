@@ -36,7 +36,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::security_gateway::suspect_backoff_secs;
 
@@ -59,6 +59,32 @@ const HTTPS_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20
 const HTTPS_POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// 镜像单次响应体上限，与透传路径的 256MB 缓冲约定一致。
 const MAX_MIRROR_BODY: usize = 256 * 1024 * 1024;
+/// git 可执行文件。镜像路径只经由它跑 clone/fetch/push/show-ref。
+const DEFAULT_GIT_BIN: &str = "git";
+
+/// 兜底传输的**静默判死**秒数：SSH 侧超过这么久没有任何输出（进度、远端消息）
+/// 就判定这条传输已经死了。
+///
+/// 为什么判"静默"而不是判"总时长"：这条链路的故障形态是**传了几 MB 之后彻底
+/// 没声**，而 `git clone`/`fetch` 带 `--progress` 的进度输出是秒级的——静默 N 秒
+/// 就等于"没有进展"。用总时长判会把"链路慢"和"链路死"压成同一个结论，而这两种
+/// 情况该做的事相反：慢要等，死要立刻换通道。总时长上限另外设一层（见下）。
+const DEFAULT_MIRROR_STALL_SECS: u64 = 180;
+/// 静默判死的下限。允许部署面调小，但不允许小到把正常传输误杀。
+const MIRROR_STALL_FLOOR_SECS: u64 = 30;
+/// 单次 clone/fetch/push 的总时长上限（秒）。沉默判死之外再压一层，防的是另一种
+/// 形态：远端**一直在吐进度却永远不结束**——那样静默判据永远不触发，只看总时长。
+const DEFAULT_MIRROR_OP_TIMEOUT_SECS: u64 = 1800;
+const MIRROR_OP_TIMEOUT_FLOOR_SECS: u64 = 60;
+/// 看门狗巡检间隔的上限；实际间隔按静默窗的四分之一取（见
+/// [`GitTransport::watchdog_interval`]），这样测试里把窗口压到秒级仍然判得准。
+const MIRROR_WATCHDOG_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// 失败信息里保留的 stderr 尾巴长度：传输失败的**原因在最后几行**，而前几千行
+/// 是进度刷屏。留尾部才留得住原因，同时也别让一条日志带上几 MB。
+const STDERR_TAIL_CHARS: usize = 600;
+/// 临时物/锁的清理门槛下限：比这新的东西可能是**活着的**传输手里的
+/// （进度秒级更新、锁活不过一次请求），只有明显陈旧才是死进程的遗物。
+const RESIDUE_MIN_AGE_SECS: u64 = 60;
 
 /// 兜底路径的部署配置。全部来自环境变量，未配置私钥即视为**未启用**。
 #[derive(Clone, Debug)]
@@ -69,9 +95,30 @@ pub(crate) struct GitMirrorConfig {
     /// SSH 目标前缀，拼在 `<owner>/<repo>.git` 前面。默认指向 GitHub；
     /// 独立部署（GitHub Enterprise、自建镜像站）改这一项即可。
     pub ssh_base: String,
+    /// git 可执行文件。放进配置面有两个理由：镜像里 git 装在哪是**部署事实**
+    /// （不一定在 PATH 上），以及传输超时判据要能在不联网的前提下被实测
+    /// （指到一个假 git 上）。
+    pub git_bin: PathBuf,
+    /// 传输静默多久判死。
+    pub stall: std::time::Duration,
+    /// 单次传输的总时长上限。
+    pub op_timeout: std::time::Duration,
 }
 
 impl GitMirrorConfig {
+    /// 只给部署三要素，执行预算取生产默认值。选路测量与测试用这个构造——它们
+    /// 关心的是"镜像在哪、拿哪把钥匙"，与超时预算无关。
+    pub(crate) fn from_parts(root: PathBuf, ssh_key: Option<PathBuf>, ssh_base: String) -> Self {
+        Self {
+            root,
+            ssh_key,
+            ssh_base,
+            git_bin: PathBuf::from(DEFAULT_GIT_BIN),
+            stall: std::time::Duration::from_secs(DEFAULT_MIRROR_STALL_SECS),
+            op_timeout: std::time::Duration::from_secs(DEFAULT_MIRROR_OP_TIMEOUT_SECS),
+        }
+    }
+
     pub fn from_env() -> Self {
         let root = env_nonempty("COGNEVA_GATEWAY_GIT_MIRROR_ROOT")
             .map(PathBuf::from)
@@ -95,16 +142,42 @@ impl GitMirrorConfig {
                 "git SSH 兜底未启用（HTTPS 单通道），缺私钥或已被显式关闭"
             );
         }
-        Self {
-            root,
-            ssh_key,
-            ssh_base,
+        let mut cfg = Self::from_parts(root, ssh_key, ssh_base);
+        if let Some(bin) = env_nonempty("COGNEVA_GATEWAY_GIT_BIN") {
+            cfg.git_bin = PathBuf::from(bin);
         }
+        if let Some(secs) = env_secs(
+            "COGNEVA_GATEWAY_GIT_MIRROR_STALL_SECS",
+            MIRROR_STALL_FLOOR_SECS,
+        ) {
+            cfg.stall = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = env_secs(
+            "COGNEVA_GATEWAY_GIT_MIRROR_TIMEOUT_SECS",
+            MIRROR_OP_TIMEOUT_FLOOR_SECS,
+        ) {
+            cfg.op_timeout = std::time::Duration::from_secs(secs);
+        }
+        cfg
     }
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// 读一个"秒"配置，带地板：给得比地板小、或者根本不是数字，都按地板生效并打
+/// 一条警告。地板是这里的承重墙——一个被手滑配成 `1` 的静默窗会把每次正常传输
+/// 都当成死的杀掉，而症状看起来像"SSH 通道坏了"。
+fn env_secs(key: &str, floor: u64) -> Option<u64> {
+    let raw = env_nonempty(key)?;
+    match raw.trim().parse::<u64>() {
+        Ok(v) if v >= floor => Some(v),
+        _ => {
+            tracing::warn!(key, raw = %raw, floor, "git 传输超时配置低于地板或无法解析，按地板生效");
+            Some(floor)
+        }
+    }
 }
 
 /// 镜像（以及一切走部署密钥的 git 操作）对应的 SSH 远端地址。
@@ -422,27 +495,132 @@ impl GitTransport {
         }
 
         let ssh = self.ssh_command();
+        let url = self.ssh_url(repo);
         let dir_str = dir.to_string_lossy().to_string();
-        let freshly_cloned = !dir.join("HEAD").is_file();
-        if freshly_cloned {
+        let started = std::time::Instant::now();
+
+        // 目录存在不等于"库是完整的"：`clone` 会**先把仓库骨架写出来**
+        // （HEAD/config/objects/refs），再传对象。所以一个被中断的 clone 留下
+        // 的是"看着像已经克隆过了"的半个库——按旧判据（HEAD 在即视为已克隆）
+        // 它会被就地 fetch，而它连 ref 都还没有，于是"有库但发不出基线"。
+        // 判据改成结构性的：能续传就地续传，不能续传就清掉重来。
+        let state = match mirror_state(&dir) {
+            MirrorState::Unusable => {
+                std::fs::remove_dir_all(&dir)
+                    .map_err(|e| format!("清理结构不完整的镜像 {} 失败: {e}", dir.display()))?;
+                tracing::warn!(repo, dir = %dir.display(), "镜像结构不完整（上次 clone 未写完骨架），已清掉重来");
+                MirrorState::Absent
+            }
+            s => s,
+        };
+
+        if state == MirrorState::Absent {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("创建镜像目录 {} 失败: {e}", parent.display()))?;
             }
-            let url = self.ssh_url(repo);
-            self.run_git(&["clone", "--mirror", &url, &dir_str], Some(&ssh))
-                .await?;
+            tracing::info!(repo, url = %url, "git 兜底镜像首次克隆（SSH），期间不向外发基线");
+            self.run_git_progress(
+                &["clone", "--progress", "--mirror", &url, &dir_str],
+                Some(&ssh),
+            )
+            .await
+            .map_err(|e| format!("镜像首次克隆失败（耗时 {}s）: {e}", elapsed_secs(started)))?;
         } else {
-            // `clone --mirror` 已把 refspec 配成 `+refs/*:refs/*`，所以不带
-            // 显式 refspec 的 fetch 就是全量镜像语义（含 tag）。
-            self.run_git(&["-C", &dir_str, "fetch", "--prune", "origin"], Some(&ssh))
-                .await?;
+            let residue = clean_interrupted_transfer(&dir, self.residue_max_age());
+            if residue.total() > 0 {
+                tracing::warn!(
+                    repo,
+                    tmp_packs = residue.tmp_packs,
+                    locks = residue.locks,
+                    "清掉上次中断的传输留下的临时物（陈旧才算：新的可能属于活着的传输）"
+                );
+            }
+            // 显式给 URL 与 refspec，不用镜像自己的 origin 配置：被中断的 clone
+            // 留下的 config 是可用的，但我们不该把"能不能续传"押在它身上
+            // （配置文件本身也可能是半截的）。`+refs/*:refs/*` 与 `--mirror`
+            // 同语义（全量 ref，含 tag），`--prune` 保持镜像与上游一致。
+            //
+            // fetch 能**就地续传**半个库：对象是内容寻址的，已收到的部分不会被
+            // 重传，缺的 ref 会在这一轮补上。这就是"不清掉重来"的理由——重来会
+            // 在一条传不完的链路上永远从零开始。
+            self.run_git_progress(
+                &[
+                    "-C",
+                    &dir_str,
+                    "fetch",
+                    "--progress",
+                    "--prune",
+                    &url,
+                    "+refs/*:refs/*",
+                ],
+                Some(&ssh),
+            )
+            .await
+            .map_err(|e| format!("镜像续传失败（耗时 {}s）: {e}", elapsed_secs(started)))?;
+            if head_is_dangling(&dir) {
+                // fetch 只按 refspec 搬 ref，**不碰本地 HEAD**。被中断的 clone
+                // 把 HEAD 留在默认初始分支上（`ref: refs/heads/master`），而
+                // 上游的默认分支是 main——留着的后果不是报错，是**静默空克隆**：
+                // 从镜像 clone 的客户端以那个不存在的分支为默认分支，git 只打
+                // 一句 warn 就交出一个空工作树。
+                if let Err(e) = self.repair_head_from_remote(repo, &dir, &ssh).await {
+                    tracing::warn!(repo, error = %e, "镜像 HEAD 悬空且未能按远端修正");
+                }
+            }
         }
         self.fetched_at
             .lock()
             .unwrap()
             .insert(dir, std::time::Instant::now());
-        tracing::info!(repo, freshly_cloned, "git 镜像已刷新（SSH 兜底）");
+        tracing::info!(
+            repo,
+            cloned = state == MirrorState::Absent,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "git 镜像已刷新（SSH 兜底）"
+        );
+        Ok(())
+    }
+
+    /// 临时物/锁的清理门槛：静默窗与一分钟取大。比它新的东西**不动**——它们
+    /// 可能握在一个活着的传输手里，删锁等于让两份 git 同时改同一个 ref。
+    fn residue_max_age(&self) -> std::time::Duration {
+        self.config
+            .stall
+            .max(std::time::Duration::from_secs(RESIDUE_MIN_AGE_SECS))
+    }
+
+    /// 按远端默认分支修正悬空的 HEAD。只在 [`head_is_dangling`] 成立时调用：
+    /// 正常路径上 HEAD 是对的，不必每轮多跑一次 SSH 往返。
+    async fn repair_head_from_remote(
+        &self,
+        repo: &str,
+        dir: &Path,
+        ssh: &str,
+    ) -> Result<(), String> {
+        let url = self.ssh_url(repo);
+        // `ls-remote --symref` 会把 `ref: refs/heads/<x>\tHEAD` 放在首行。
+        let out = self
+            .run_git(&["ls-remote", "--symref", &url, "HEAD"], Some(ssh))
+            .await?;
+        let branch = String::from_utf8_lossy(&out)
+            .lines()
+            .find_map(|l| l.strip_prefix("ref: "))
+            .and_then(|l| l.split_whitespace().next())
+            .map(str::to_string)
+            .ok_or_else(|| "远端没有报告 HEAD 的符号引用".to_string())?;
+        self.run_git(
+            &[
+                "-C",
+                &dir.to_string_lossy(),
+                "symbolic-ref",
+                "HEAD",
+                &branch,
+            ],
+            None,
+        )
+        .await?;
+        tracing::info!(repo, branch, "镜像 HEAD 已按远端默认分支修正");
         Ok(())
     }
 
@@ -505,9 +683,9 @@ impl GitTransport {
         let dir_str = dir.to_string_lossy().to_string();
         let ssh = self.ssh_command();
         let url = self.ssh_url(repo);
-        let mut args: Vec<&str> = vec!["-C", &dir_str, "push", "--atomic", &url];
+        let mut args: Vec<&str> = vec!["-C", &dir_str, "push", "--progress", "--atomic", &url];
         args.extend(refspecs.iter().map(|s| s.as_str()));
-        match self.run_git(&args, Some(&ssh)).await {
+        match self.run_git_progress(&args, Some(&ssh)).await {
             Ok(_) => {
                 tracing::info!(repo, refs = ?refspecs, "推送已同步到 GitHub（SSH 兜底）");
                 Ok(())
@@ -601,6 +779,20 @@ impl GitTransport {
         Ok(out.stdout)
     }
 
+    /// 长传输专用（clone/fetch/push），带静默看门狗。调用点必须给 `--progress`：
+    /// git 在管道里默认不打进度，不给的话"静默"就不再是"没有进展"的证据。
+    async fn run_git_progress(&self, args: &[&str], ssh: Option<&str>) -> Result<Vec<u8>, String> {
+        let out = self.run_git_bounded(args, ssh, true).await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {} 失败: {}",
+                args.first().copied().unwrap_or(""),
+                tail_text(&out.stderr, STDERR_TAIL_CHARS)
+            ));
+        }
+        Ok(out.stdout)
+    }
+
     async fn run_git_allow_failure(
         &self,
         args: &[&str],
@@ -614,7 +806,35 @@ impl GitTransport {
         args: &[&str],
         ssh: Option<&str>,
     ) -> Result<std::process::Output, String> {
-        let mut cmd = tokio::process::Command::new("git");
+        self.run_git_bounded(args, ssh, false).await
+    }
+
+    /// 看门狗巡检间隔：静默窗的四分之一（封顶五秒）。由静默窗**派生**而不是
+    /// 另立一个旋钮——两个独立旋钮必然会出现"窗口 30s、巡检 60s"这种判据比
+    /// 被判断的对象还粗的组合；测试里把窗口压到秒级时它也跟着变细。
+    fn watchdog_interval(&self) -> std::time::Duration {
+        (self.config.stall / 4).clamp(
+            std::time::Duration::from_millis(50),
+            MIRROR_WATCHDOG_MAX_INTERVAL,
+        )
+    }
+
+    /// 跑一条 git 命令，并把它的执行**封顶**。
+    ///
+    /// `watch_stall` 只对会打进度的子命令（clone/fetch/push）为真——那些命令的
+    /// stderr 是"还在动"的证据；`show-ref` 这类瞬时命令沉默不代表卡住，只看总上限。
+    ///
+    /// 超时必须**杀进程组**：SSH 兜底是一条 `git → sh → ssh → 远端` 的链，只杀
+    /// 直接子进程会留下还在往镜像里写 pack 的孙进程（上一次事故里 `git index-pack`
+    /// 在父进程死后又活了十几分钟，下一次 refresh 与它抢同一个对象库）。所以子
+    /// 进程自己成组，超时对整组发 SIGKILL。
+    async fn run_git_bounded(
+        &self,
+        args: &[&str],
+        ssh: Option<&str>,
+        watch_stall: bool,
+    ) -> Result<std::process::Output, String> {
+        let mut cmd = tokio::process::Command::new(&self.config.git_bin);
         cmd.args(args);
         // Pod 里没有 tty：任何等待输入的提示（凭证、口令）都会把请求挂死到
         // 超时，所以直接禁掉交互，让它响亮地失败。
@@ -624,10 +844,253 @@ impl GitTransport {
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        cmd.output()
-            .await
-            .map_err(|e| format!("执行 git 失败: {e}"))
+        cmd.process_group(0);
+        // 兜底：任何提前返回（比如下面某个 ?）都杀掉组长进程，不留半条链。
+        cmd.kill_on_drop(true);
+
+        let label = args.first().copied().unwrap_or("").to_string();
+        let started = std::time::Instant::now();
+        let mut child = cmd.spawn().map_err(|e| format!("执行 git 失败: {e}"))?;
+        let pid = child.id().ok_or_else(|| "git 子进程没有 pid".to_string())?;
+        let stdout = child.stdout.take().ok_or("git stdout 未接管")?;
+        let stderr = child.stderr.take().ok_or("git stderr 未接管")?;
+
+        let last_output = Arc::new(Mutex::new(std::time::Instant::now()));
+        let out_task = tokio::spawn(read_all(stdout));
+        let err_task = tokio::spawn(read_tail(stderr, last_output.clone()));
+        let mut wait_task = tokio::spawn(async move { child.wait().await });
+
+        let verdict: Result<std::process::ExitStatus, String> = loop {
+            tokio::select! {
+                res = &mut wait_task => {
+                    // 两级 Result：外层是"等进程"这个任务自己失败，内层是 wait 失败。
+                    let waited = match res {
+                        Ok(inner) => inner,
+                        Err(e) => break Err(format!("等待 git 进程失败: {e}")),
+                    };
+                    match waited {
+                        Ok(status) => break Ok(status),
+                        Err(e) => break Err(format!("等待 git 进程失败: {e}")),
+                    }
+                }
+                _ = tokio::time::sleep(self.watchdog_interval()) => {
+                    let total = started.elapsed();
+                    if total >= self.config.op_timeout {
+                        break Err(format!(
+                            "git {label} 超过总上限 {}s 仍未结束（判为传输不收敛，已杀进程组）",
+                            self.config.op_timeout.as_secs()
+                        ));
+                    }
+                    let idle = last_output.lock().unwrap().elapsed();
+                    if watch_stall && idle >= self.config.stall {
+                        break Err(format!(
+                            "git {label} 静默 {}s（无任何进度输出，判为传输已死，已杀进程组）",
+                            idle.as_secs()
+                        ));
+                    }
+                }
+            }
+        };
+
+        let status = match verdict {
+            Ok(status) => status,
+            Err(reason) => {
+                kill_group(pid);
+                let _ = tokio::time::timeout(WATCHDOG_REAP_TIMEOUT, &mut wait_task).await;
+                let tail = tokio::time::timeout(WATCHDOG_REAP_TIMEOUT, err_task)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                return Err(format!(
+                    "{reason}，耗时 {}s{}",
+                    elapsed_secs(started),
+                    tail_suffix(&tail, STDERR_TAIL_CHARS)
+                ));
+            }
+        };
+
+        Ok(std::process::Output {
+            status,
+            stdout: out_task.await.unwrap_or_default(),
+            stderr: err_task.await.unwrap_or_default(),
+        })
     }
+}
+
+/// 超时后等被杀的进程/读取任务收尾的上限。杀的是整个进程组，正常情况下管道
+/// 立刻断开；给个上限只为不让"已判定超时"的路径自己再挂住。
+const WATCHDOG_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 对进程组发 SIGKILL。`pid` 是组长（调用点用 `process_group(0)` 让子进程自己
+/// 成组，组长 pid 即组 id）。
+///
+/// 不用 `Child::kill()`：它只杀组长，`sh`/`ssh`/`index-pack` 这些孙进程会活下来
+/// 继续写镜像——那正是上一次事故的形态。
+fn kill_group(pid: u32) {
+    // SAFETY: 只传一个 pid 与一个信号常量；无指针、无所有权语义。返回 -1
+    // （组已不存在）是"超时判死"与"进程自己刚退出"赛跑时的正常结果。
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+async fn read_all(mut r: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = r.read_to_end(&mut out).await;
+    out
+}
+
+/// 读 stderr 并**顺带记下最后一次输出的时刻**——这就是"还在动"的证据本身。
+///
+/// 只留尾部（`STDERR_TAIL_CHARS` 的一小段缓冲）：进度刷屏可能几 MB，而失败原因
+/// 在最后几行。
+async fn read_tail(
+    mut r: impl tokio::io::AsyncRead + Unpin,
+    last_output: Arc<Mutex<std::time::Instant>>,
+) -> Vec<u8> {
+    let cap = STDERR_TAIL_CHARS * 8;
+    let mut buf = vec![0u8; 4096];
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                *last_output.lock().unwrap() = std::time::Instant::now();
+                out.extend_from_slice(&buf[..n]);
+                if out.len() > cap {
+                    let drop = out.len() - cap;
+                    out.drain(..drop);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn elapsed_secs(since: std::time::Instant) -> u64 {
+    since.elapsed().as_secs()
+}
+
+fn tail_text(bytes: &[u8], max_chars: usize) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let s = s.trim();
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        return s.to_string();
+    }
+    chars[chars.len() - max_chars..].iter().collect()
+}
+
+fn tail_suffix(bytes: &[u8], max_chars: usize) -> String {
+    let tail = tail_text(bytes, max_chars);
+    if tail.is_empty() {
+        String::new()
+    } else {
+        format!("；stderr 尾部: {tail}")
+    }
+}
+
+/// 镜像目录的结构状态。判的是"能不能就地续传"，不是"新鲜不新鲜"。
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorState {
+    /// 目录不存在——从头 clone。
+    Absent,
+    /// 目录在，但不是一个能 fetch 的 git 库（缺 HEAD/objects/refs：上次 `clone`
+    /// 在写仓库骨架时就断了）。留着只会让后续每条 git 命令各自报一个更难懂的
+    /// 错，清掉重来。
+    Unusable,
+    /// 结构完整，可就地续传（可能从未刷完过）。
+    Usable,
+}
+
+fn mirror_state(dir: &Path) -> MirrorState {
+    if !dir.is_dir() {
+        return MirrorState::Absent;
+    }
+    // 骨架三件套。**不查 config**：续传用的是显式 URL + refspec，不依赖镜像
+    // 自己的 origin 配置，所以配置文件半截不影响判决。
+    let skeleton =
+        dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir();
+    if skeleton {
+        MirrorState::Usable
+    } else {
+        MirrorState::Unusable
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Residue {
+    tmp_packs: usize,
+    locks: usize,
+}
+
+impl Residue {
+    fn total(&self) -> usize {
+        self.tmp_packs + self.locks
+    }
+}
+
+/// 清掉上次被中断的传输留下的临时物，只清**明显陈旧**的（超过 `max_age`）。
+///
+/// 两类：
+/// - `objects/pack/tmp_pack_*`：`index-pack` 边收边写的未成包文件。它不是有效
+///   对象（收全并校验通过才会改名成 `pack-*.pack`），实测 `git fetch` 自己不会
+///   清它——留着白占空间，也让"这个库完不完整"更难判。
+/// - `*.lock`：死进程留下的锁。它们在时下一条命令直接报 `Unable to create ...:
+///   File exists`，把一个可自愈的状态变成卡死。
+///
+/// **不动 `*.keep`**：那是"这个 pack 先别合并"的标记，删了会把清理越界成改语义。
+fn clean_interrupted_transfer(dir: &Path, max_age: std::time::Duration) -> Residue {
+    let mut out = Residue::default();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let old = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= max_age);
+            if !old {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("tmp_pack_") {
+                if std::fs::remove_file(&path).is_ok() {
+                    out.tmp_packs += 1;
+                }
+            } else if name.ends_with(".lock") && std::fs::remove_file(&path).is_ok() {
+                out.locks += 1;
+            }
+        }
+    }
+    out
+}
+
+/// HEAD 指向的分支在镜像里不存在。refs 可能被打包进 `packed-refs`，两侧都要查。
+fn head_is_dangling(dir: &Path) -> bool {
+    let Ok(head) = std::fs::read_to_string(dir.join("HEAD")) else {
+        return false;
+    };
+    let Some(target) = head.trim().strip_prefix("ref: ") else {
+        return false;
+    };
+    let target = target.trim();
+    if dir.join(target).is_file() {
+        return false;
+    }
+    let packed = std::fs::read_to_string(dir.join("packed-refs")).unwrap_or_default();
+    let needle = format!(" {target}");
+    !packed.lines().any(|l| l.ends_with(&needle))
 }
 
 /// pkt-line 编码：4 位十六进制长度（**含这 4 字节本身**）+ 载荷。
@@ -731,12 +1194,143 @@ mod tests {
     fn fallback_is_off_without_a_key() {
         // 没挂私钥就是未启用——选路的唯一开关，错了会让每个请求都去试
         // 注定失败的 SSH。
-        let t = GitTransport::new(GitMirrorConfig {
-            root: PathBuf::from("/tmp/cogneva-mirror-test"),
-            ssh_key: None,
-            ssh_base: DEFAULT_SSH_BASE.into(),
-        });
+        let t = GitTransport::new(GitMirrorConfig::from_parts(
+            PathBuf::from("/tmp/cogneva-mirror-test"),
+            None,
+            DEFAULT_SSH_BASE.into(),
+        ));
         assert!(!t.fallback_available());
+    }
+
+    // ── 传输看门狗与"半个镜像"的判据 ──────────────────────────
+
+    #[test]
+    fn mirror_state_separates_absent_from_half_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("github").join("o").join("r.git");
+        assert_eq!(
+            mirror_state(&dir),
+            MirrorState::Absent,
+            "不存在就是从头 clone"
+        );
+
+        // `clone` 先写骨架再传对象：骨架写一半就被打断的目录**不能**当作
+        // "已经克隆过了"——旧判据（HEAD 在即已克隆）会让它被就地 fetch，
+        // 而它连 ref 都没有。
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/master\n").unwrap();
+        assert_eq!(
+            mirror_state(&dir),
+            MirrorState::Unusable,
+            "缺 objects/refs 是骨架都不全"
+        );
+
+        std::fs::create_dir_all(dir.join("objects")).unwrap();
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        assert_eq!(
+            mirror_state(&dir),
+            MirrorState::Usable,
+            "骨架齐全就该就地续传，而不是清掉重来"
+        );
+    }
+
+    #[test]
+    fn residue_cleanup_spares_what_a_live_transfer_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("r.git");
+        std::fs::create_dir_all(dir.join("objects").join("pack")).unwrap();
+        std::fs::create_dir_all(dir.join("refs").join("heads")).unwrap();
+        let stale_tmp = dir.join("objects").join("pack").join("tmp_pack_OLD");
+        let fresh_tmp = dir.join("objects").join("pack").join("tmp_pack_NEW");
+        let stale_lock = dir.join("refs").join("heads").join("main.lock");
+        let fresh_lock = dir.join("packed-refs.lock");
+        let keep = dir.join("objects").join("pack").join("pack-abc.keep");
+        for p in [&stale_tmp, &fresh_tmp, &stale_lock, &fresh_lock, &keep] {
+            std::fs::write(p, "x").unwrap();
+        }
+        age_file(&stale_tmp, 600);
+        age_file(&stale_lock, 600);
+
+        let removed = clean_interrupted_transfer(&dir, std::time::Duration::from_secs(60));
+
+        assert_eq!(
+            removed,
+            Residue {
+                tmp_packs: 1,
+                locks: 1
+            },
+            "只清明显陈旧的临时物与锁"
+        );
+        assert!(!stale_tmp.exists() && !stale_lock.exists());
+        assert!(
+            fresh_tmp.exists() && fresh_lock.exists(),
+            "新鲜的东西可能握在一个活着的传输手里，删锁会让两份 git 同时改同一个 ref"
+        );
+        assert!(keep.exists(), "*.keep 是语义标记，不是垃圾");
+    }
+
+    #[test]
+    fn head_is_dangling_catches_the_interrupted_clone_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("r.git");
+        std::fs::create_dir_all(dir.join("refs").join("heads")).unwrap();
+        // 被中断的 clone 留下的正是这个形状：HEAD 指向默认初始分支 master，
+        // 而上游的默认分支是 main。
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/master\n").unwrap();
+        assert!(head_is_dangling(&dir));
+
+        // 松散 ref 在就算不悬空。
+        std::fs::write(dir.join("refs").join("heads").join("master"), "0").unwrap();
+        assert!(!head_is_dangling(&dir));
+        std::fs::remove_file(dir.join("refs").join("heads").join("master")).unwrap();
+
+        // 打包进 packed-refs 的 ref 同样算在。
+        std::fs::write(
+            dir.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled sorted \n0 refs/heads/master\n",
+        )
+        .unwrap();
+        assert!(!head_is_dangling(&dir));
+
+        // 非符号 HEAD（detached）没有"悬空"可言。
+        std::fs::write(
+            dir.join("HEAD"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("packed-refs")).unwrap();
+        assert!(!head_is_dangling(&dir));
+    }
+
+    #[test]
+    fn stderr_tail_keeps_the_reason_and_drops_the_progress_spam() {
+        // 失败原因在最后几行；前几千行是进度刷屏。留头等于把原因扔掉。
+        let mut body = String::new();
+        for i in 0..500 {
+            body.push_str(&format!("remote: Receiving objects: {i}%\r"));
+        }
+        body.push_str("fatal: the remote end hung up unexpectedly");
+        let tail = tail_text(body.as_bytes(), 80);
+        assert!(tail.contains("the remote end hung up unexpectedly"));
+        assert!(tail.chars().count() <= 80);
+    }
+
+    /// 把文件改成 `secs` 秒前。清理门槛判的是年龄，所以判据测试必须能造出
+    /// 陈旧的文件，不能只造"刚写的"。
+    fn age_file(path: &Path, secs: i64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let t = libc::timeval {
+            tv_sec: now - secs,
+            tv_usec: 0,
+        };
+        let times = [t, t];
+        let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: 两个指针都指向本函数栈上的有效数据，调用期间不会失效。
+        let rc = unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes 失败: {}", path.display());
     }
 
     // ── 端到端：真实 git 客户端 ────────────────────────────────
@@ -844,12 +1438,12 @@ mod tests {
         // 而 origin 是本地路径，SSH 命令根本不会被调用。
         let key = tmp.path().join("dummy_key");
         std::fs::write(&key, "not-a-real-key\n").unwrap();
-        let transport = std::sync::Arc::new(GitTransport::new(GitMirrorConfig {
+        let transport = std::sync::Arc::new(GitTransport::new(GitMirrorConfig::from_parts(
             root,
-            ssh_key: Some(key),
+            Some(key),
             // 末尾斜杠是必须的：它就是拼在 `<owner>/<repo>.git` 前面的前缀。
-            ssh_base: format!("{}/", upstream_base.display()),
-        }));
+            format!("{}/", upstream_base.display()),
+        )));
         assert!(transport.fallback_available());
 
         let app = axum::Router::new()
@@ -886,16 +1480,230 @@ mod tests {
         );
     }
 
+    // ── 看门狗：真的会杀掉整条链 ─────────────────────────────
+
+    /// 造一个假 git，把它指成镜像路径的 `git_bin`。
+    ///
+    /// 超时判据只能用假 git 测：真 git 要挂住就得有一条真的会死的链路，而
+    /// 那不可复现。这里造的是"输出一行进度之后彻底静默"，正是线上事故的形态。
+    fn write_fake_git(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("fake-git");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p
+    }
+
+    /// 假 git 的 exec 在并行测试里会撞上一个微秒级竞态：刚写完的脚本此刻还被
+    /// 别的测试 fork 出来的进程持着一个写 fd（CLOEXEC 要等它自己 exec 才关），
+    /// 内核就回 `Text file busy`。这和被测的判据无关，重试一次。
+    async fn refresh_retrying_text_busy(t: &GitTransport) -> Result<(), String> {
+        match t.refresh("local/repo", true).await {
+            Err(e) if e.contains("Text file busy") => t.refresh("local/repo", true).await,
+            other => other,
+        }
+    }
+
+    fn test_transport(
+        root: &Path,
+        git_bin: PathBuf,
+        ssh_base: String,
+        stall_secs: u64,
+        timeout_secs: u64,
+    ) -> GitTransport {
+        let mut cfg =
+            GitMirrorConfig::from_parts(root.to_path_buf(), Some(root.join("dummy_key")), ssh_base);
+        cfg.git_bin = git_bin;
+        cfg.stall = std::time::Duration::from_secs(stall_secs);
+        cfg.op_timeout = std::time::Duration::from_secs(timeout_secs);
+        GitTransport::new(cfg)
+    }
+
+    /// 进程是不是还活着（僵尸不算活着：它已经死了，只是没人回收）。
+    fn process_alive(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit(')')
+            .next()
+            .and_then(|s| s.split_whitespace().next())
+            != Some("Z")
+    }
+
+    #[tokio::test]
+    async fn silent_transfer_is_killed_along_with_its_whole_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("grandchild.pid");
+        // 形态与线上一致：先来一行进度，然后永远不再出声；并且它**有子进程**
+        // （`git → sh → ssh → 远端`），子进程也会往镜像里写东西。
+        let fake = write_fake_git(
+            tmp.path(),
+            &format!(
+                "echo 'remote: Receiving objects: 1%' >&2\n\
+                 sleep 300 &\n\
+                 echo $! > {}\n\
+                 sleep 300\n",
+                pidfile.display()
+            ),
+        );
+        let t = test_transport(tmp.path(), fake, DEFAULT_SSH_BASE.into(), 1, 30);
+
+        let started = std::time::Instant::now();
+        let err = refresh_retrying_text_busy(&t)
+            .await
+            .expect_err("静默的传输必须被判死");
+        let elapsed = started.elapsed();
+        assert!(err.contains("静默"), "错误应说清是静默判死: {err}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "静默窗 1s，判死不该拖这么久: {elapsed:?}"
+        );
+
+        // 只杀组长会留下还在写镜像的孙进程——线上那次 index-pack 就活了十几分钟。
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("假 git 应写下孙进程 pid")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_alive(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!process_alive(pid), "孙进程 {pid} 必须一起被杀掉");
+    }
+
+    #[tokio::test]
+    async fn progressing_transfer_survives_the_stall_watchdog() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 每次间隔都短于静默窗：这是"慢"而不是"死"，判死就是误杀。
+        let fake = write_fake_git(
+            tmp.path(),
+            "echo 'remote: Receiving objects: 10%' >&2\n\
+             sleep 0.3\n\
+             echo 'remote: Receiving objects: 50%' >&2\n\
+             sleep 0.3\n\
+             echo 'remote: Receiving objects: 90%' >&2\n\
+             sleep 0.3\n\
+             exit 0",
+        );
+        let t = test_transport(tmp.path(), fake, DEFAULT_SSH_BASE.into(), 1, 30);
+
+        let started = std::time::Instant::now();
+        refresh_retrying_text_busy(&t)
+            .await
+            .expect("一直在输出的传输不该被杀");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn chatty_but_endless_transfer_hits_the_total_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 反面形态：远端一直在吐进度却永不结束。静默判据永远不触发，只有总上限
+        // 拦得住——少了这层，一个"一直在动但推不完"的传输就能把写锁占死。
+        let fake = write_fake_git(
+            tmp.path(),
+            "i=0\n\
+             while [ $i -lt 400 ]; do\n\
+             \techo \"remote: Receiving objects: $i%\" >&2\n\
+             \tsleep 0.2\n\
+             \ti=$((i+1))\n\
+             done",
+        );
+        let t = test_transport(tmp.path(), fake, DEFAULT_SSH_BASE.into(), 5, 1);
+
+        let started = std::time::Instant::now();
+        let err = refresh_retrying_text_busy(&t)
+            .await
+            .expect_err("总上限必须拦下永不结束的传输");
+        assert!(err.contains("总上限"), "错误应说清是总上限: {err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "总上限 1s，判死不该拖这么久: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 半个镜像要**就地在原对象库上续传**，不是清掉重来。
+    ///
+    /// 这条判据是"链路传不完时系统还能不能前进"的承重墙：清掉重来会在同一条
+    /// 传不完的链路上永远从零开始，而就地 fetch 每轮都能把已收到的对象留住、
+    /// 把缺的 ref 补上。
+    #[tokio::test]
+    async fn half_clone_is_resumed_instead_of_recloned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_base = tmp.path().join("upstream");
+        let upstream = upstream_base.join("local").join("repo.git");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(upstream.parent().unwrap()).unwrap();
+        git(
+            tmp.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                upstream.to_str().unwrap(),
+            ],
+        )
+        .await;
+        git(
+            tmp.path(),
+            &["init", "-q", "-b", "main", work.to_str().unwrap()],
+        )
+        .await;
+        std::fs::write(work.join("a.txt"), "hello\n").unwrap();
+        git(&work, &["add", "."]).await;
+        git(&work, &["commit", "-qm", "first"]).await;
+        git(&work, &["push", "-q", upstream.to_str().unwrap(), "main"]).await;
+        let tip = git(&work, &["rev-parse", "HEAD"]).await;
+
+        // 造"被中断的 clone"：骨架齐全、没有任何 ref、HEAD 停在默认初始分支、
+        // 还留着一个上一次传输的 tmp_pack。
+        let root = tmp.path().join("mirror-root");
+        let dir = root.join("github").join("local").join("repo.git");
+        std::fs::create_dir_all(dir.join("objects").join("pack")).unwrap();
+        std::fs::create_dir_all(dir.join("refs").join("heads")).unwrap();
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/master\n").unwrap();
+        let leftover = dir.join("objects").join("pack").join("tmp_pack_LEFT");
+        std::fs::write(&leftover, "half a pack").unwrap();
+
+        // ssh_base 指向本地裸仓：这一测只验"半个库能不能就地续传"，不碰网络。
+        let t = test_transport(
+            &root,
+            PathBuf::from("git"),
+            format!("{}/", upstream_base.display()),
+            180,
+            1800,
+        );
+        assert_eq!(mirror_state(&dir), MirrorState::Usable);
+
+        t.refresh("local/repo", true).await.expect("续传应当成功");
+
+        assert_eq!(
+            git(&dir, &["rev-parse", "refs/heads/main"]).await,
+            tip,
+            "续传后镜像必须有上游的 ref"
+        );
+        // HEAD 悬空时按远端默认分支修正：留着它的后果是"静默空克隆"。
+        assert_eq!(
+            std::fs::read_to_string(dir.join("HEAD")).unwrap(),
+            "ref: refs/heads/main\n"
+        );
+    }
+
     /// 镜像没有私钥时不该被选中——这是"部署事实 vs 瞬时故障"的边界：
     /// 缺私钥若被当成故障去重试，会把每个请求都拖到超时。
     #[tokio::test]
     async fn serve_refuses_paths_outside_owner_repo_shape() {
         let tmp = tempfile::tempdir().unwrap();
-        let t = GitTransport::new(GitMirrorConfig {
-            root: tmp.path().to_path_buf(),
-            ssh_key: None,
-            ssh_base: DEFAULT_SSH_BASE.into(),
-        });
+        let t = GitTransport::new(GitMirrorConfig::from_parts(
+            tmp.path().to_path_buf(),
+            None,
+            DEFAULT_SSH_BASE.into(),
+        ));
         let err = t
             .serve(MirrorRequest {
                 path: "/../../etc/passwd.git/info/refs",
