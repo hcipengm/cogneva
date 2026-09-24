@@ -225,7 +225,15 @@ spec:
             # 0400：OpenSSH 只在**属主是自己**时才检查权限位。容器以 1001 运行、
             # 而 Secret 卷文件属主是 root（fsGroup 只加组读），所以这条检查会被
             # 跳过；但把权限收窄到最小仍然是对的——这个文件是账号级的写权限。
-            defaultMode: 0400
+            #
+            # Written as decimal 256, not as 0400. The rollout path parses every
+            # manifest with a YAML 1.2 reader before re-emitting it, and 1.2
+            # rejects the leading-zero octal form: "0400" comes back as the
+            # string '0400', which the API server then refuses with
+            # "unrecognized type: int32" — so the whole rollout dies on the
+            # first target. Decimal is the only spelling both readers agree on
+            # (here 256 == 0o400). Do not "tidy" this back to 0400.
+            defaultMode: 256
             items:
               - key: git-ssh-private-key
                 path: id_ed25519
