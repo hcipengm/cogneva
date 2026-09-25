@@ -267,6 +267,40 @@ fn describe_api_error(body: &[u8]) -> Option<String> {
     )
 }
 
+/// Fill a rule summary from the sample that fired it.
+///
+/// `{value}` becomes the sample's value; every other `{name}` is taken from the
+/// sample's labels, because a summary like "pending state for {stream} ..." is
+/// telling the reader which series fired and the series carries that in a
+/// label, not in a separate field. A placeholder that names neither the value
+/// nor a label of this sample is left exactly as written: a summary that reads
+/// `{asset}` is visibly wrong, while dropping the name would silently produce a
+/// sentence about nobody — and the reader cannot tell that from a rule that
+/// legitimately has no third party to name.
+pub fn render_summary(template: &str, value: f64, labels: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let name = &after[..close];
+        match name {
+            "value" => out.push_str(&format!("{value:.2}")),
+            other => match labels.get(other) {
+                Some(v) => out.push_str(v),
+                None => out.push_str(&rest[open..open + close + 2]),
+            },
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Parse a Prometheus instant-vector response body into samples. Anything
 /// that is not a successful vector result is an error — silently treating it
 /// as "no series" would resolve firing alerts on a Prometheus hiccup.
@@ -339,9 +373,7 @@ async fn fire(
     key: &str,
     outlets: &InfraWatchOutlets,
 ) {
-    let message = rule
-        .summary
-        .replace("{value}", &format!("{:.2}", sample.value));
+    let message = render_summary(&rule.summary, sample.value, &sample.labels);
     let mut labels: HashMap<String, String> = sample
         .labels
         .iter()
@@ -485,6 +517,7 @@ async fn notify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn parse_vector_extracts_labels_and_values() {
@@ -527,6 +560,145 @@ mod tests {
         assert_eq!(dedup_key("disk", &a), "disk:node=vm-1");
         // pod is an identity label (which pod is crashlooping matters)
         assert_eq!(dedup_key("crash", &b), "crash:node=vm-1,pod=exporter-abc");
+    }
+
+    /// The live reading this comes from: an alert that fired with the summary
+    /// "Pending state for {stream} has not been measured for 372.37s" — the
+    /// stream was in the labels the whole time, the renderer just never looked.
+    #[test]
+    fn summary_placeholders_are_filled_from_the_firing_sample() {
+        let labels = BTreeMap::from([
+            ("stream".to_string(), "changes".to_string()),
+            ("pod".to_string(), "cogneva-evolution-0".to_string()),
+        ]);
+        assert_eq!(
+            render_summary(
+                "Pending state for {stream} has not been measured for {value}s",
+                372.375,
+                &labels
+            ),
+            "Pending state for changes has not been measured for 372.38s"
+        );
+        // A placeholder naming neither the value nor a label of this sample
+        // stays visible: the reader must be able to see the rule is not
+        // producing the sentence it was written to produce.
+        assert_eq!(
+            render_summary("tier {tier} demoted for {value}s", 12.0, &labels),
+            "tier {tier} demoted for 12.00s"
+        );
+        // Not a placeholder at all: an unclosed brace is literal text.
+        assert_eq!(render_summary("cost {usd", 1.0, &labels), "cost {usd");
+        assert_eq!(
+            render_summary("no placeholders", 1.0, &labels),
+            "no placeholders"
+        );
+    }
+
+    /// Filling a summary means asserting the series carries that label, so the
+    /// allowed vocabulary is read from the two places labels come from — the
+    /// label names the metrics declare in code, and the label names the shipped
+    /// rules' own PromQL selects — never from a list written here. A name
+    /// spelled wrong, or one whose producer was renamed, fails this instead of
+    /// reaching the reader as `{stram}`.
+    #[test]
+    fn shipped_rule_summaries_only_name_value_or_a_label_that_exists() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        // Every label any metric declares. Scanned from source so a produced
+        // label needs no second edit here.
+        let mut declared: BTreeSet<String> = BTreeSet::new();
+        let mut files = 0;
+        for entry in walk_rs_files(&root.join("crates")) {
+            let text = std::fs::read_to_string(&entry).expect("read crate source");
+            files += 1;
+            for rest in text.split(".with_label(\"").skip(1) {
+                if let Some(name) = rest.split('"').next() {
+                    declared.insert(name.to_string());
+                }
+            }
+        }
+        assert!(
+            files > 0,
+            "no crate sources scanned; the workspace path moved"
+        );
+        assert!(
+            declared.contains("stream") && declared.contains("tier") && declared.contains("asset"),
+            "the scan missed labels it must see: {declared:?}"
+        );
+
+        let path = root.join("deploy/helm/cogneva/files/cogneva.json");
+        let text = std::fs::read_to_string(&path).expect("read the chart's cogneva.json");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("chart JSON parses");
+        let rules = parsed["observability"]["infra_watch"]["rules"]
+            .as_array()
+            .expect("rules array");
+        let mut checked = 0;
+        for rule in rules {
+            let promql = rule["promql"].as_str().unwrap_or_default();
+            // Labels this rule's own PromQL names: `label="..."` matchers and
+            // `by (...)` groupings both keep that label on the sample.
+            let mut selected: BTreeSet<String> = BTreeSet::new();
+            for kv in promql
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '='))
+                .filter(|s| s.contains('='))
+            {
+                if let Some((name, _)) = kv.split_once('=') {
+                    if !name.is_empty() {
+                        selected.insert(name.to_string());
+                    }
+                }
+            }
+            for group in promql
+                .split("by (")
+                .skip(1)
+                .chain(promql.split("without (").skip(1))
+            {
+                if let Some(list) = group.split(')').next() {
+                    for name in list.split(',') {
+                        let name = name.trim();
+                        if !name.is_empty() {
+                            selected.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+
+            let summary = rule["summary"].as_str().unwrap_or_default();
+            let mut rest = summary;
+            while let Some(open) = rest.find('{') {
+                let after = &rest[open + 1..];
+                let close = after.find('}').expect("summary has an unclosed brace");
+                let name = &after[..close];
+                assert!(
+                    name == "value" || declared.contains(name) || selected.contains(name),
+                    "rule {} summary names {{{name}}}, which is neither the value, a label the \
+                     metrics declare, nor a label this rule selects: {summary}",
+                    rule["name"].as_str().unwrap_or_default()
+                );
+                rest = &after[close + 1..];
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, rules.len(), "every shipped rule was inspected");
+        assert!(checked > 0, "no rules read; the config path moved");
+    }
+
+    /// Test-only source walk: reads filenames, never follows symlinks out of
+    /// the tree, so a stray link cannot make the scan read something unrelated.
+    fn walk_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_rs_files(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
     }
 
     #[test]
