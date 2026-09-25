@@ -227,6 +227,21 @@ const SUPPORT_WORKLOAD_KINDS: &[&str] = &["deploy", "statefulset"];
 const SUPPORT_SETTLE_JSONPATH: &str =
     "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.readyReplicas}";
 
+/// 每个工作负载读了哪些 ConfigMap 的读法：名字，然后四个消费面各一段，竖线分段。
+/// 卷、projected 里的 ConfigMap 源、envFrom、env.valueFrom（容器与 initContainer
+/// 各两段）。竖线显式占位：一个没有卷的工作负载整段是空的，不能让缺字段把后面的
+/// 段顶掉。
+const CONFIG_CONSUMER_JSONPATH: &str = concat!(
+    "jsonpath={range .items[*]}{.metadata.name}{'|'}",
+    "{range .spec.template.spec.volumes[*]}{.configMap.name}{','}{end}{'|'}",
+    "{range .spec.template.spec.volumes[*]}{.projected.sources[*].configMap.name}{','}{end}{'|'}",
+    "{range .spec.template.spec.containers[*].envFrom[*]}{.configMapRef.name}{','}{end}{'|'}",
+    "{range .spec.template.spec.containers[*].env[*].valueFrom.configMapKeyRef.name}{','}{end}{'|'}",
+    "{range .spec.template.spec.initContainers[*].envFrom[*]}{.configMapRef.name}{','}{end}{'|'}",
+    "{range .spec.template.spec.initContainers[*].env[*].valueFrom.configMapKeyRef.name}{','}{end}",
+    "{'\\n'}{end}"
+);
+
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
 const ROLLOUT_POLL_SECS: u64 = 5;
 
@@ -3548,6 +3563,101 @@ fn support_settled(readout: &str) -> Option<bool> {
     Some(observed >= generation && ready >= want)
 }
 
+/// 一个工作负载读了哪些 ConfigMap。消费形态取自 Pod 模板本身（卷、projected
+/// 卷里的 ConfigMap 源、`envFrom`、`env.valueFrom`，容器与 initContainer 都算），
+/// 不写名单：新加一个消费点不需要谁记得来这里补一行。
+///
+/// 与 `mounters_of_config`（拉取端从清单里读挂载关系）的差别在**读哪一面**：
+/// 交付端问的是"我这次要 apply 的清单里谁挂了它"，部署器问的是"集群上现在谁在
+/// 读它"——一个是随版本走的声明，一个是实际生效面，部署器要判的正是后者。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigConsumer {
+    /// kubectl 子命令用的单数资源名（deploy / statefulset）。
+    kind: String,
+    name: String,
+    configmaps: Vec<String>,
+}
+
+impl ConfigConsumer {
+    fn display(&self) -> String {
+        format!("{}/{}", self.kind, self.name)
+    }
+}
+
+/// 把消费面读数（每行一个工作负载，竖线分段、段内逗号分隔）解析成消费者。
+///
+/// 段序：name|卷里的 ConfigMap|projected 里的 ConfigMap|envFrom|env.valueFrom|
+/// initContainer 的 envFrom|initContainer 的 env.valueFrom。空段与空项都要能读：
+/// 没有卷的工作负载整段是空的，而不是缺一列——位置由竖线固定，缺字段（omitempty）
+/// 不能把后面的段顶掉。
+fn config_consumers(readout: &str, kind: &str) -> Vec<ConfigConsumer> {
+    let mut out = Vec::new();
+    for line in readout.lines() {
+        let fields: Vec<&str> = line.split('|').collect();
+        let Some(name) = fields.first().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let mut configmaps: Vec<String> = fields[1..]
+            .iter()
+            .flat_map(|field| field.split(','))
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        configmaps.sort();
+        configmaps.dedup();
+        out.push(ConfigConsumer {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            configmaps,
+        });
+    }
+    out
+}
+
+/// 这次 apply 之后内容变了的 ConfigMap 名字（新增的也算：上次不在、这次在）。
+fn changed_configmaps(
+    before: &BTreeMap<String, serde_json::Value>,
+    after: &BTreeMap<String, serde_json::Value>,
+) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(name, data)| before.get(*name) != Some(*data))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// 这份 ConfigMap 的这次内容变化，要不要滚动它的消费者。
+///
+/// 带分段表的配置文档按表判：只有"启动时才生效"的段变了才值得滚一次，热更新面
+/// 覆盖到的段交付即生效，滚了是白重启（还会把一次纯配置改动记成一次服务中断）。
+/// 没有分段表的 ConfigMap 只能按内容判——它的读法不在这张表里，说不清，就按安全
+/// 侧来：内容变了就滚。
+fn config_change_needs_restart(
+    name: &str,
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+) -> bool {
+    if name != cog_core::config_sections::CONFIG_CONFIGMAP {
+        return true;
+    }
+    let document = |data: Option<&serde_json::Value>| -> Option<serde_json::Value> {
+        data.and_then(|d| d.get(cog_core::config_sections::CONFIG_DOCUMENT_KEY))
+            .and_then(|text| text.as_str())
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .filter(|doc| doc.is_object())
+    };
+    match (document(before), document(after)) {
+        (Some(before), Some(after)) => {
+            !cog_core::config_sections::sections_needing_restart_on_change(&before, &after)
+                .is_empty()
+        }
+        // 有一侧读不成文档：这次改了哪几段说不清，按安全侧算——多滚一次，而不是
+        // 押"改的都是热段"。
+        _ => true,
+    }
+}
+
 pub struct RolloutExecutor {
     kubectl: String,
     ns: String,
@@ -3664,16 +3774,151 @@ impl RolloutExecutor {
         self.set_image(t, &plan.tag).await
     }
 
-    /// 清单交付前，先把集群对象上"已被清单的 `valueFrom` 取代"的 env `value` 摘掉。
+    /// 采一次命名空间里每份 ConfigMap 的内容（`data` 段），用来在 apply 前后比出
+    /// 这次到底改了哪几份。
     ///
-    /// 三方合并按 env 条目的 name 合并，清单里消失的字段不会被删掉：该条目于是
-    /// 同时带 `value` 与 `valueFrom`、被准入拒绝，本次 apply 停在这一处，而报错
-    /// 指向清单——清单是对的。这个对象从此永远 apply 不进去，直到有人手动摘掉
-    /// 那个字段；残留物往往正是我们要从清单里拿掉的明文凭证。
+    /// 读不到就返回 None：调用方据此走"说不清"的那一支（照样滚），而不是把读不到
+    /// 当"没变"——那正好是这条判据要防的静默失效。
+    async fn configmap_contents(&self) -> Option<BTreeMap<String, serde_json::Value>> {
+        let readout = match self
+            .run_kubectl(&["get", "configmap", "-o", "json"], 60)
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                warn!(error = %e, "config effect: cannot read the ConfigMaps, treating every consumer as needing a roll");
+                return None;
+            }
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&readout) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "config effect: unreadable ConfigMap listing");
+                return None;
+            }
+        };
+        let mut out = BTreeMap::new();
+        for item in parsed.get("items").and_then(|v| v.as_array())? {
+            let Some(name) = item.pointer("/metadata/name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let data = item.get("data").cloned().unwrap_or(serde_json::Value::Null);
+            out.insert(name.to_string(), data);
+        }
+        Some(out)
+    }
+
+    /// 集群上每个工作负载读了哪些 ConfigMap。
+    async fn live_config_consumers(&self) -> SFResult<Vec<ConfigConsumer>> {
+        let mut out = Vec::new();
+        for kind in SUPPORT_WORKLOAD_KINDS {
+            let readout = self
+                .run_kubectl(&["get", kind, "-o", CONFIG_CONSUMER_JSONPATH], 30)
+                .await?;
+            out.extend(config_consumers(&readout, kind));
+        }
+        Ok(out)
+    }
+
+    /// 让这次 apply 改到的配置真正生效：内容变了、而进程只在启动时读它，工作负载
+    /// 的 spec 没动、代数不变，逐目标的滚动与支撑等待都不会碰它——文件是新的、进程
+    /// 还是旧的、记录说已生效。这里按内容差自己算出该滚谁，把 restartedAt 打上去
+    /// （Pod 模板变了才会滚出新副本），返回滚动名单。
     ///
-    /// 判据与 patch 序列都在 `cog_core`（纯函数），这里只负责取现状与执行。读不到
-    /// 现状（对象还不存在、查询失败）就什么都不做：首次交付本就没有残留，集群不可
-    /// 达时紧随其后的 apply 会报出真实错误，不在这里替它下结论。
+    /// 读不到内容（None）时按"每份都变了"处理：说不清就有多滚一次，不留静默失效。
+    async fn roll_config_change_consumers(
+        &self,
+        before: Option<&BTreeMap<String, serde_json::Value>>,
+        after: Option<&BTreeMap<String, serde_json::Value>>,
+    ) -> SFResult<Vec<String>> {
+        let empty = BTreeMap::new();
+        let before = before.unwrap_or(&empty);
+        let consumers = self.live_config_consumers().await?;
+        // 后一次读不到：这次 apply 到底落了什么没有第二面可比。此时能拿到的只有
+        // "谁在读哪些 ConfigMap"，那就按"每一份都可能变了"算——多滚一次，而不是
+        // 一次都不滚。
+        let changed: Vec<String> = match after {
+            Some(after) => changed_configmaps(before, after),
+            None => {
+                warn!("config effect: no reading after the apply, rolling every consumer");
+                let mut names: Vec<String> = consumers
+                    .iter()
+                    .flat_map(|c| c.configmaps.iter().cloned())
+                    .collect();
+                names.sort();
+                names.dedup();
+                names
+            }
+        };
+        let stamp = cog_core::config_sections::restart_stamp();
+        let body = cog_core::config_sections::restart_patch_body(&stamp);
+        let needs_restart: Vec<&String> = changed
+            .iter()
+            .filter(|name| {
+                config_change_needs_restart(
+                    name,
+                    before.get(*name),
+                    after.and_then(|a| a.get(*name)),
+                )
+            })
+            .collect();
+
+        // 配置文件有"只有重启才生效"的段变了，却没有任何活着的消费者：这份文档
+        // 已经 apply 上去了，而集群里没有任何进程会读它——报成功就是把"文件是新的、
+        // 没人读、记录说已生效"记成一次成功的交付。
+        let reads_config = |c: &ConfigConsumer| {
+            c.configmaps
+                .iter()
+                .any(|m| m == cog_core::config_sections::CONFIG_CONFIGMAP)
+        };
+        if needs_restart
+            .iter()
+            .any(|n| *n == cog_core::config_sections::CONFIG_CONFIGMAP)
+            && !consumers.iter().any(reads_config)
+        {
+            return Err(SFError::Validation(format!(
+                "the configuration document changed in sections that only take effect at startup, \
+                 but no workload in the namespace reads {}: the ConfigMap is applied and nothing \
+                 will pick it up",
+                cog_core::config_sections::CONFIG_CONFIGMAP
+            )));
+        }
+
+        let mut rolled: Vec<String> = Vec::new();
+        for name in &needs_restart {
+            for consumer in consumers
+                .iter()
+                .filter(|c| c.configmaps.iter().any(|m| m == *name))
+            {
+                if rolled.contains(&consumer.name) {
+                    continue;
+                }
+                // 打在 apply 之后的支撑快照之前：这样它是"这次 apply 动过的工作负载"
+                // 之一，非目标的那几个由既有的支撑等待一并等它回就绪。
+                self.run_kubectl(
+                    &[
+                        "patch",
+                        &consumer.kind,
+                        &consumer.name,
+                        "--type",
+                        "merge",
+                        "-p",
+                        &body,
+                    ],
+                    60,
+                )
+                .await?;
+                info!(
+                    workload = %consumer.display(),
+                    configmap = %name,
+                    "config effect: rolled a workload whose configuration is only read at startup"
+                );
+                rolled.push(consumer.name.clone());
+            }
+        }
+        Ok(rolled)
+    }
+
     /// 采一次命名空间里支撑工作负载的代数，用来在 apply 之后认出这次动过谁。
     async fn support_workloads(&self) -> SFResult<Vec<SupportWorkload>> {
         let mut out = Vec::new();
@@ -3741,6 +3986,16 @@ impl RolloutExecutor {
         Ok(())
     }
 
+    /// 清单交付前，先把集群对象上"已被清单的 `valueFrom` 取代"的 env `value` 摘掉。
+    ///
+    /// 三方合并按 env 条目的 name 合并，清单里消失的字段不会被删掉：该条目于是
+    /// 同时带 `value` 与 `valueFrom`、被准入拒绝，本次 apply 停在这一处，而报错
+    /// 指向清单——清单是对的。这个对象从此永远 apply 不进去，直到有人手动摘掉
+    /// 那个字段；残留物往往正是我们要从清单里拿掉的明文凭证。
+    ///
+    /// 判据与 patch 序列都在 `cog_core`（纯函数），这里只负责取现状与执行。读不到
+    /// 现状（对象还不存在、查询失败）就什么都不做：首次交付本就没有残留，集群不可
+    /// 达时紧随其后的 apply 会报出真实错误，不在这里替它下结论。
     async fn clear_superseded_env_values(&self, manifest: &Path) -> SFResult<()> {
         let text = tokio::fs::read_to_string(manifest)
             .await
@@ -4436,6 +4691,9 @@ impl RolloutExecutor {
                             .support_workloads()
                             .await
                             .map_err(|e| classify_before_any_change("support-snapshot", "", e))?;
+                        // 配置文件的现状也要在 apply 之前取：进程读的是 apply 前那份，
+                        // 只有拿它当对照才说得清这次改了什么。取不到就走"说不清→都滚"。
+                        let configs_before = self.configmap_contents().await;
                         info!(
                             source = %support.display(),
                             manifest = %support_arg,
@@ -4447,6 +4705,7 @@ impl RolloutExecutor {
                         self.run_kubectl(&["apply", "-f", &support_arg], 120)
                             .await
                             .map_err(|e| classify_before_any_change("support", "", e))?;
+                        let configs_after = self.configmap_contents().await;
                         // 支撑清单里除了 ConfigMap/Service，还有后端与集群内
                         // registry 这些工作负载，而目标部署的镜像要从这个 registry
                         // 拉、启动要连这些后端。apply 只改动的那些会滚动重启几秒到
@@ -4456,6 +4715,25 @@ impl RolloutExecutor {
                         // 版本——线上实测过一次：一次 support apply 带上后端探针
                         // 变更，四个后端与 registry 一起重启，目标在 4 秒后被判
                         // ErrImagePull 版本类失败并回滚。
+                        //
+                        // 配置改动走不了"按代数认人"这条路：apply 一份 ConfigMap 不改
+                        // 任何工作负载的 spec，代数不动，逐目标滚动与支撑等待都不会碰
+                        // 它的消费者——只改配置的 rev（镜像 tag 与上一版相同时连目标都
+                        // 不会滚）就这么静默停用。所以这里按内容差自己判一份该滚的名单，
+                        // 滚在拍代数快照之前，让下面的等待一并等它。
+                        let config_rolled = self
+                            .roll_config_change_consumers(
+                                configs_before.as_ref(),
+                                configs_after.as_ref(),
+                            )
+                            .await
+                            .map_err(|e| classify_before_any_change("config-effect", "", e))?;
+                        if !config_rolled.is_empty() {
+                            info!(
+                                workloads = %config_rolled.join(","),
+                                "mainline rollout: rolled the workloads whose configuration is only read at startup"
+                            );
+                        }
                         let after = self
                             .support_workloads()
                             .await
@@ -7990,6 +8268,281 @@ exit 0
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         (manifests, log)
+    }
+
+    /// 消费面读数（与真实 jsonpath 的字段序一致）：卷、projected、envFrom、
+    /// env.valueFrom、initContainer 的两段，外加一个什么都不读的工作负载——
+    /// 空段不能把后面的段顶掉，没有消费的工作负载也不能被当成读了一堆空名字。
+    #[test]
+    fn config_consumers_reads_every_consumption_face() {
+        let readout = [
+            // 卷两个（cogneva-json 与 prompts）、envFrom 一个、initContainer 的 envFrom 一个。
+            "cogneva|,cogneva-json,cogneva-prompts,|,,|cogneva-config,|||cogneva-evolution-config,",
+            // 什么都不读：整段空，名字后面只有分隔符。
+            "postgres||||||",
+            "   ",
+        ]
+        .join("\n");
+        let consumers = config_consumers(&readout, "deploy");
+        assert_eq!(consumers.len(), 2, "{consumers:?}");
+        let cogneva = &consumers[0];
+        assert_eq!(cogneva.name, "cogneva");
+        assert_eq!(
+            cogneva.configmaps,
+            vec![
+                "cogneva-config".to_string(),
+                "cogneva-evolution-config".to_string(),
+                "cogneva-json".to_string(),
+                "cogneva-prompts".to_string(),
+            ]
+        );
+        assert!(consumers[1].configmaps.is_empty());
+    }
+
+    /// 内容变了才算变：新增（上次不在）也算——它落下去的那一刻就是一次新交付。
+    #[test]
+    fn changed_configmaps_notices_edits_and_additions() {
+        let before: BTreeMap<String, serde_json::Value> = [
+            (
+                "cogneva-json".to_string(),
+                serde_json::json!({"cogneva.json": "a"}),
+            ),
+            ("untouched".to_string(), serde_json::json!({"k": "v"})),
+        ]
+        .into_iter()
+        .collect();
+        let after: BTreeMap<String, serde_json::Value> = [
+            (
+                "cogneva-json".to_string(),
+                serde_json::json!({"cogneva.json": "b"}),
+            ),
+            ("untouched".to_string(), serde_json::json!({"k": "v"})),
+            ("brand-new".to_string(), serde_json::json!({"k": "v"})),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            changed_configmaps(&before, &after),
+            vec!["brand-new".to_string(), "cogneva-json".to_string()]
+        );
+    }
+
+    /// 有分段表的配置文件按表判：热更新面覆盖到的段变了不滚（滚了是白重启），
+    /// 只有重启才生效的段变了才滚。没有分段表的 ConfigMap 只能按内容判。
+    #[test]
+    fn a_hot_reloaded_section_does_not_roll_the_consumers() {
+        let document = |body: &str| serde_json::json!({ "cogneva.json": body });
+        let hot_old = document(r#"{"tuning": {"stream_capacity": 8}}"#);
+        let hot_new = document(r#"{"tuning": {"stream_capacity": 16}}"#);
+        assert!(!config_change_needs_restart(
+            cog_core::config_sections::CONFIG_CONFIGMAP,
+            Some(&hot_old),
+            Some(&hot_new)
+        ));
+        let startup_new = document(r#"{"observability": {"alert_rules": []}}"#);
+        assert!(config_change_needs_restart(
+            cog_core::config_sections::CONFIG_CONFIGMAP,
+            Some(&hot_old),
+            Some(&startup_new)
+        ));
+        // 读不出文档（形状不对）：说不清就走安全侧。
+        assert!(config_change_needs_restart(
+            cog_core::config_sections::CONFIG_CONFIGMAP,
+            Some(&serde_json::json!("not an object")),
+            Some(&hot_new)
+        ));
+        // 没有分段表的那几份：内容变了就滚。
+        assert!(config_change_needs_restart(
+            "cogneva-config",
+            Some(&serde_json::json!({"k": "v"})),
+            Some(&serde_json::json!({"k": "w"}))
+        ));
+    }
+
+    /// fake kubectl：support apply 只改 ConfigMap（工作负载代数不动），配置文档里
+    /// `observability` 段在 apply 前后不同。两个读它的工作负载（一个目标是
+    /// `cogneva`、一个是非目标的 `cogneva-patcher`）都要被 patch 上 restartedAt，
+    /// 且都发生在任何 set image 之前；非目标那个还要被支撑等待等到就绪。
+    fn fake_kubectl_config_effect(dir: &Path, hot_only: bool) -> (PathBuf, PathBuf) {
+        let manifests = dir.join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(
+            manifests.join("support.yaml"),
+            "kind: ConfigMap\nmetadata:\n  name: cogneva-json\n",
+        )
+        .unwrap();
+
+        let log = dir.join("kubectl.log");
+        let applied = dir.join("applied.marker");
+        let patched = dir.join("patched.marker");
+        let settled = dir.join("settled.marker");
+        // 热更新面覆盖到的段（tuning）变了：没有值得滚的理由，配置文档照样变。
+        // 内层文档要按 JSON 字符串嵌进 configmap 列表里，引号得转义。
+        let (before_body, after_body) = if hot_only {
+            (
+                r#"{\"tuning\":{\"stream_capacity\":8}}"#,
+                r#"{\"tuning\":{\"stream_capacity\":16}}"#,
+            )
+        } else {
+            (
+                r#"{\"observability\":{\"alert_rules\":[]}}"#,
+                r#"{\"observability\":{\"alert_rules\":[{\"name\":\"x\"}]}}"#,
+            )
+        };
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*|json) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *"apply -f "*)
+    touch '{applied}'
+    echo "configmap/cogneva-json configured" ;;
+  # 配置现状：apply 之前是旧文档，之后是新文档。
+  *"get configmap -o json"*)
+    if [ -f '{applied}' ]; then
+      echo '{{"items":[{{"metadata":{{"name":"cogneva-json"}},"data":{{"cogneva.json":"{after_body}"}}}}]}}'
+    else
+      echo '{{"items":[{{"metadata":{{"name":"cogneva-json"}},"data":{{"cogneva.json":"{before_body}"}}}}]}}'
+    fi ;;
+  # 消费面：只有这一种读法会提到 configMapRef（支撑代数读法走下面那一支）。
+  *"configMapRef"*)
+    echo 'cogneva|cogneva-json|'
+    echo 'cogneva-patcher|cogneva-json|'
+    echo 'meilisearch||||||' ;;
+  *"get deploy -o"*)
+    if [ -f '{patched}' ]; then echo "cogneva-patcher 2"; else echo "cogneva-patcher 1"; fi
+    echo "meilisearch 1" ;;
+  *"get statefulset -o"*) ;;
+  # 被 patch 过之后代数才算前进，等它就绪才是"等这次 apply 动过的工作负载"。
+  *"get deploy cogneva-patcher -o"*)
+    if [ -f '{patched}' ]; then touch '{settled}'; echo "2|2|1|1|"; else echo "1|1|1|1|"; fi
+    ;;
+  *"patch deploy cogneva-patcher"*) touch '{patched}'; echo "deployment.apps/cogneva-patcher patched" ;;
+  *"patch deploy cogneva "*) touch '{patched}'; echo "deployment.apps/cogneva patched" ;;
+  *"get deployment "*)
+    echo "1|1|1|1|1|" ;;
+  *"set image "*)
+    if [ "{expect_patch}" = "yes" ] && [ ! -f '{patched}' ]; then
+      echo "target rolled while a config consumer had not been rolled yet" >&2
+      exit 1
+    fi
+    echo "deployment.apps/x image updated" ;;
+  *"terminated.finishedAt"*) ;;
+  *"deletionTimestamp"*) echo "p-new|Running|true|||2026-09-17T15:46:29Z|" ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) ;;
+  *"get pods"*) ;;
+  # 只有它不是 jsonpath：`-o jsonpath=...` 也以 `-o json` 开头，所以放最后。
+  *" -o json"*) echo '{{}}' ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            applied = applied.display(),
+            patched = patched.display(),
+            settled = settled.display(),
+            before_body = before_body,
+            after_body = after_body,
+            expect_patch = if hot_only { "no" } else { "yes" }
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        (manifests, log)
+    }
+
+    fn config_effect_executor(manifests: &Path) -> RolloutPlan {
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        plan
+    }
+
+    /// 只改配置的 rev：工作负载代数一个都没动（apply 一份 ConfigMap 不动任何 spec），
+    /// 逐目标滚动与支撑等待都不会碰它。配置文档里只有重启才生效的段变了，读它的
+    /// 工作负载就必须被滚——否则文件是新的、进程还是旧的、记录说已生效。
+    #[tokio::test]
+    async fn a_config_only_change_rolls_the_workloads_that_read_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) = fake_kubectl_config_effect(&bin_dir, false);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        executor
+            .run(&config_effect_executor(&manifests))
+            .await
+            .expect("rollout should succeed");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        // 按字节位置比而不是按行：假 kubectl 用 `echo "$@"` 落日志，实参里的
+        // `\n`（jsonpath 的换行转义）会被 sh 的 echo 展开成真换行，行切分靠不住。
+        let first_target = calls.find("set image ").expect("no target rolled");
+        for workload in ["cogneva-patcher", "cogneva"] {
+            let patch = calls
+                .find(&format!("patch deploy {workload} "))
+                .unwrap_or_else(|| panic!("{workload} was never rolled: {calls}"));
+            assert!(
+                patch < first_target,
+                "{workload} was rolled after the targets started rolling: {calls}"
+            );
+        }
+        assert!(
+            calls.contains("cogneva.io/restartedAt"),
+            "the roll has to stamp the pod template, not just the object: {calls}"
+        );
+        // 非目标那个由支撑等待一并等它回就绪。
+        assert!(
+            calls.contains("get deploy cogneva-patcher -o"),
+            "an off-target config consumer has to be waited on: {calls}"
+        );
+        // 没读这份配置的工作负载不进滚动名单。
+        assert!(
+            !calls.contains("patch deploy meilisearch"),
+            "a workload that does not read the config must not be rolled: {calls}"
+        );
+    }
+
+    /// 配置文档变了，但变的都是热更新面覆盖得到的段：交付即生效，滚一次是白重启，
+    /// 还会把一个纯配置改动记成一次服务中断。
+    #[tokio::test]
+    async fn a_hot_reloaded_config_change_rolls_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) = fake_kubectl_config_effect(&bin_dir, true);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        executor
+            .run(&config_effect_executor(&manifests))
+            .await
+            .expect("rollout should succeed");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("restartedAt"),
+            "a hot-reloadable change must not cost a restart: {calls}"
+        );
     }
 
     /// fake kubectl：init 容器进度与 deployment 状态按轮次推进。第 1 轮

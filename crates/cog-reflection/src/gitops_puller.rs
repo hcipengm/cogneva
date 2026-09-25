@@ -638,10 +638,8 @@ impl GitOpsPuller {
                 if rolled.contains(&name) {
                     continue;
                 }
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs().to_string())
-                    .unwrap_or_default();
+                let stamp = cog_core::config_sections::restart_stamp();
+                let body = cog_core::config_sections::restart_patch_body(&stamp);
                 self.run(
                     &self.config.kubectl_bin.clone(),
                     &[
@@ -653,9 +651,7 @@ impl GitOpsPuller {
                         "--type",
                         "merge",
                         "-p",
-                        &format!(
-                            r#"{{"spec":{{"template":{{"metadata":{{"annotations":{{"cogneva.io/restartedAt":"{stamp}"}}}}}}}}}}"#
-                        ),
+                        &body,
                     ],
                     None,
                     60,
@@ -1968,7 +1964,7 @@ fn config_document(manifest: &str) -> serde_json::Value {
         .ok()
         .and_then(|blob| {
             blob.get("data")
-                .and_then(|data| data.get("cogneva.json"))
+                .and_then(|data| data.get(cog_core::config_sections::CONFIG_DOCUMENT_KEY))
                 .and_then(|text| text.as_str())
                 .map(str::to_string)
         })
@@ -2008,7 +2004,7 @@ fn mounters_of_config(manifest: &str) -> Vec<String> {
             .map(|volumes| {
                 volumes.iter().any(|volume| {
                     volume.pointer("/configMap/name").and_then(|n| n.as_str())
-                        == Some("cogneva-json")
+                        == Some(cog_core::config_sections::CONFIG_CONFIGMAP)
                 })
             })
             .unwrap_or(false);

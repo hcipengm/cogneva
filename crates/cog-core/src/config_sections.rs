@@ -279,6 +279,35 @@ pub fn sections_missing_from_document(doc: &Value) -> Vec<&'static str> {
     out
 }
 
+/// ConfigMap that carries the configuration document, and the key inside it.
+///
+/// A delivery path that re-applies this ConfigMap has to roll the workloads that
+/// mount it whenever a section that only takes effect at startup has changed:
+/// the object moves on, the process keeps the document it read at start, and the
+/// delivery is otherwise reported as applied.
+pub const CONFIG_CONFIGMAP: &str = "cogneva-json";
+pub const CONFIG_DOCUMENT_KEY: &str = "cogneva.json";
+
+/// Stamp that rolls a workload onto the configuration it mounts.
+///
+/// Wall-clock seconds: two rolls in the same second would write the same value
+/// and the second one would not change the pod template at all, so the workload
+/// the second change was for would keep running the older document.
+pub fn restart_stamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
+/// Strategic-merge body that rolls one workload: an annotation on the pod
+/// template, which is what the workload's own selector hashes.
+pub fn restart_patch_body(stamp: &str) -> String {
+    format!(
+        r#"{{"spec":{{"template":{{"metadata":{{"annotations":{{"cogneva.io/restartedAt":"{stamp}"}}}}}}}}}}"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +387,18 @@ mod tests {
             sections_needing_restart_on_change(&old, &new),
             vec!["gateway".to_string()]
         );
+    }
+
+    /// The roll body has to land the annotation where the pod template is
+    /// compared, and the stamp has to be a value the API server accepts.
+    #[test]
+    fn the_restart_body_annotates_the_pod_template() {
+        let body: Value = serde_json::from_str(&restart_patch_body("1700000000")).unwrap();
+        assert_eq!(
+            body.pointer("/spec/template/metadata/annotations/cogneva.io~1restartedAt")
+                .and_then(|v| v.as_str()),
+            Some("1700000000")
+        );
+        assert!(!restart_stamp().is_empty());
     }
 }
