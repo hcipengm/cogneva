@@ -563,7 +563,9 @@
       "redrive_on_ci_failure": true,
       "ci_watch_timeout_secs": 1800,
       "ci_poll_interval_secs": 60,
-      "max_land_attempts": 3
+      "max_land_attempts": 3,
+      "redrive_max_rounds_per_cause": 1,
+      "redrive_cause_window_secs": 86400
     },
     "human_required_labels": [
       "security",

@@ -342,6 +342,17 @@ pub struct LandingPolicy {
     /// a newer base tip. Each retry re-fetches and re-applies the change onto
     /// the new tip.
     pub max_land_attempts: u32,
+    /// How many generation rounds one CI failure cause may be given inside
+    /// `redrive_cause_window_secs` before the channel stops generating against
+    /// it and leaves it to a human.
+    ///
+    /// The cause is the failure's signature — which jobs failed and which
+    /// tests, errors, or compiler codes it named — not the change: the fix a
+    /// round produces is a new change with its own re-drive allowance, so a
+    /// per-change flag cannot bound the chain.
+    pub redrive_max_rounds_per_cause: u32,
+    /// The window those rounds are counted over (seconds).
+    pub redrive_cause_window_secs: u64,
 }
 
 impl Default for LandingPolicy {
@@ -359,6 +370,16 @@ impl Default for LandingPolicy {
             ci_watch_timeout_secs: 1800,
             ci_poll_interval_secs: 60,
             max_land_attempts: 3,
+            // One round per cause. That is the policy the re-drive path always
+            // claimed — a change that breaks CI twice is out of the
+            // generator's reach — stated over the cause instead of over the
+            // change, which is what makes it hold along the chain.
+            redrive_max_rounds_per_cause: 1,
+            // A day. The unit is the one the landing rules already measure
+            // churn over: within a day a cause that keeps failing is the same
+            // situation, and a day later the branch has moved enough that it
+            // is a new one.
+            redrive_cause_window_secs: 86400,
         }
     }
 }

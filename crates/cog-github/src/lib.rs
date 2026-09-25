@@ -27,6 +27,7 @@ pub mod outcome_recorder;
 pub mod pending_changes;
 pub mod plugin;
 pub mod provider;
+pub mod redrive_budget;
 pub mod triage;
 pub mod webhook;
 

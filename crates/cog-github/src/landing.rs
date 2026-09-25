@@ -125,10 +125,16 @@ impl From<std::io::Error> for LandingError {
     }
 }
 
+/// Where the channel keeps everything it has to remember across a restart.
+pub fn data_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into()),
+    )
+}
+
 /// Directory holding one `<change_id>.json` file per landing.
 pub fn landing_dir() -> PathBuf {
-    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
-    PathBuf::from(dir).join("landing")
+    data_dir().join("landing")
 }
 
 /// Where a landing's scratch working tree is built.
@@ -432,6 +438,28 @@ impl MainChannel {
             warn!(
                 category = category.as_str(),
                 "cannot record landing failure: {e}"
+            );
+        }
+    }
+
+    /// Count one re-drive that was not submitted, under the reason it was not.
+    ///
+    /// A refused re-drive is generation being switched off for a cause, and
+    /// the only reason it is ever noticed is this counter: the alternative
+    /// reading of the same quiet is "nothing needed a fix". Logged and dropped
+    /// on failure, like the landing failure counter, and for the same reason.
+    pub(crate) async fn note_redrive_refusal(&self, reason: crate::redrive_budget::RedriveRefusal) {
+        let Some(metrics) = self.metrics.get().cloned() else {
+            return;
+        };
+        let labels = HashMap::from([("reason".to_string(), reason.as_str().to_string())]);
+        if let Err(e) = metrics
+            .record_counter(crate::redrive_budget::REDRIVE_REFUSALS_METRIC, 1.0, labels)
+            .await
+        {
+            warn!(
+                reason = reason.as_str(),
+                "cannot record a refused re-drive: {e}"
             );
         }
     }
@@ -966,7 +994,40 @@ pub async fn watch_landed(
                 }
 
                 if policy.redrive_on_ci_failure && !record.redriven {
-                    redrive(orchestrator, &record, &log).await;
+                    let window = chrono::Duration::seconds(policy.redrive_cause_window_secs as i64);
+                    let mut ledger = crate::redrive_budget::load_ledger().await;
+                    match crate::redrive_budget::decide(
+                        &log,
+                        &ledger,
+                        policy.redrive_max_rounds_per_cause,
+                        window,
+                        now,
+                    ) {
+                        crate::redrive_budget::RedriveDecision::Spend { signature } => {
+                            // Charged before the generation it pays for: the
+                            // charge is what the round costs, and a charge
+                            // written after the work would be skipped by a
+                            // restart during it. A charge that cannot be
+                            // written is logged and the round still runs —
+                            // losing the accounting must not turn a fixable
+                            // failure into a halt in generation.
+                            ledger.spend(&signature, window, now);
+                            if let Err(e) = crate::redrive_budget::save_ledger(&ledger).await {
+                                tracing::warn!(error = %e,
+                                    "could not persist the re-drive budget; this round will be \
+                                     charged again the next time this cause fails");
+                            }
+                            redrive(orchestrator, &record, &log).await;
+                        }
+                        crate::redrive_budget::RedriveDecision::Refuse(reason) => {
+                            tracing::warn!(
+                                change_id = %record.change.change_id,
+                                reason = reason.as_str(),
+                                "not re-driving generation for this CI failure"
+                            );
+                            channel.note_redrive_refusal(reason).await;
+                        }
+                    }
                 }
                 remove_record(&record.change.change_id).await;
             }
@@ -974,9 +1035,14 @@ pub async fn watch_landed(
     }
 }
 
-/// re-drive pushed the task is submitted exactly once per landing: the
-/// `redriven` flag is persisted, so a restart between the revert and the
-/// re-drive does not produce a second identical fix task.
+/// Submit a fix task for a reverted landing, once per landing: the `redriven`
+/// flag is persisted, so a restart between the revert and the re-drive does
+/// not produce a second identical fix task.
+///
+/// That flag is not a budget. It stops the second re-drive of one change, and
+/// the fix it submits is a new change carrying its own flag, so a fix that
+/// also breaks CI opens a fresh round — the chain is what the cause ledger in
+/// `redrive_budget` bounds, and this only submits what that decision paid for.
 async fn redrive(
     orchestrator: Option<&dyn cog_core::OrchestratorControl>,
     record: &LandingRecord,

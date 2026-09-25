@@ -52,6 +52,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-observability/src/process_zombies.rs",
     ),
     (
+        "cogneva_redrive_refusals_total",
+        "crates/cog-github/src/redrive_budget.rs",
+    ),
+    (
         "cogneva_stream_pending_claim_idle_seconds",
         "crates/cog-orchestrator/src/observable.rs",
     ),

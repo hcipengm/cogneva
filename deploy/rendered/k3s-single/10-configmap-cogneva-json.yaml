@@ -693,6 +693,24 @@ data:
               },
               "severity": "warning",
               "summary": "Landing failed {value} times in the last six hours with category {category}. An environment failure means the landing machinery itself could not run, and a rejection means the push was refused for a reason re-applying cannot fix, so the change will not land however often it is retried; conflicts and lost races are excluded here because those are expected and retried"
+            },
+            {
+              "name": "redrive_cause_exhausted",
+              "promql": "sum(increase(cogneva_redrive_refusals_total{reason=\"cause_exhausted\"}[24h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The channel refused {value} re-drives in the last day because the CI failure each of them was aimed at had already used up its generation rounds: the same failure came back after a fix had been generated for it, so one more round would be the same attempt at the same failure for the price of a full generation and a full CI run. Read the failure this cause names and settle it by hand, or lower the cost of a round before letting generation back at it"
+            },
+            {
+              "name": "redrive_refused_without_evidence",
+              "promql": "sum(increase(cogneva_redrive_refusals_total{reason=\"no_evidence\"}[24h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The channel refused {value} re-drives in the last day because the CI failure arrived with no log to generate against, so there was no cause to build a fix from and a round would have been a guess. The landing was reverted either way, so this is a reading that broke rather than a change: check that the CI run and its job logs can still be fetched before the generator is expected to answer failures again"
             }
           ]
         },
@@ -841,7 +859,9 @@ data:
           "redrive_on_ci_failure": true,
           "ci_watch_timeout_secs": 1800,
           "ci_poll_interval_secs": 60,
-          "max_land_attempts": 3
+          "max_land_attempts": 3,
+          "redrive_max_rounds_per_cause": 1,
+          "redrive_cause_window_secs": 86400
         },
         "human_required_labels": [
           "security",
