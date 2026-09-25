@@ -27,6 +27,19 @@ pub struct TaskDecompositionPattern {
 }
 
 /// A previously executed implementation of a specific task type.
+///
+/// One per task type, holding the most recent successful run of it:
+/// `observed_count` is how many successes of this type have been recorded,
+/// and the summaries describe the newest one. One row per type rather than one
+/// per run is what keeps the namespace growing with the vocabulary of task
+/// types instead of with the work done — and the vocabulary is what
+/// [`crate::TaskType`] is: a fixed set of names plus whatever a producer puts
+/// in [`crate::TaskType::Custom`], which can extend it.
+///
+/// The field was named `used_count` while nothing wrote it, which made it read
+/// as "how often this example was retrieved" in a prompt that could never
+/// count that. It is not a usage counter: the write side observes runs, not
+/// retrievals.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImplementationExample {
     pub example_id: String,
@@ -34,10 +47,13 @@ pub struct ImplementationExample {
     pub input_summary: String,
     pub output_summary: String,
     pub score: f32,
-    pub used_count: u64,
+    pub observed_count: u64,
 }
 
 /// A documented failure pattern for a given task type.
+///
+/// One per task type, holding the most recent failure of it; see
+/// [`ImplementationExample`] for why the cardinality is the task type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FailurePattern {
     pub pattern_id: String,
@@ -81,6 +97,17 @@ pub trait KnowledgeBackend: Send + Sync {
     ) -> SFResult<Vec<TaskDecompositionPattern>>;
 
     /// Retrieve historical similar task implementations (for Generator atom-tasks).
+    ///
+    /// `task_type` is what the entries are keyed and matched on; `input_summary`
+    /// ranks the matches that come back, because the store matches a query as a
+    /// substring of an entry's name or key and a summary — free text, often a
+    /// serialized object — is not a substring of anything. A summary used as the
+    /// query would therefore answer "no prior implementation" for every task,
+    /// which is exactly what an empty namespace answers too.
+    ///
+    /// One implementation per task type is what the write side records, so an
+    /// empty result means this type has never succeeded, not that a match was
+    /// missed.
     async fn retrieve_similar_implementations(
         &self,
         task_type: &str,
@@ -89,6 +116,10 @@ pub trait KnowledgeBackend: Send + Sync {
     ) -> SFResult<Vec<ImplementationExample>>;
 
     /// Retrieve common failure patterns for a task type (for Evaluator).
+    ///
+    /// As with [`Self::retrieve_similar_implementations`], the task type is the
+    /// key the entries are written under and the only dimension a query can
+    /// match on.
     async fn retrieve_failure_patterns(
         &self,
         task_type: &str,
@@ -99,5 +130,12 @@ pub trait KnowledgeBackend: Send + Sync {
     async fn retrieve_task_history(&self, task_id: &str) -> SFResult<Vec<TaskExecutionRecord>>;
 
     /// Archive the current task execution result into long-term memory.
+    ///
+    /// This is the write side of every retrieval above that asks about past
+    /// runs: an implementation that succeeded and a failure that was observed
+    /// are both recorded from here, under the task type those queries key on.
+    /// The retrieval namespaces are the backend's own, so the key shape that
+    /// makes an entry findable is derived here rather than by a caller that
+    /// would have to guess the query it has to match.
     async fn archive_execution(&self, task: &Task, result: &crate::TaskResult) -> SFResult<()>;
 }

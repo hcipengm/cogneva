@@ -64,6 +64,60 @@ const NS_FAILURE: &str = "failure_pattern";
 const NS_EXECUTION: &str = "task_execution";
 const NS_KNOWLEDGE: &str = "knowledge";
 
+/// How much of a record's free text is kept, in characters.
+///
+/// These summaries end up in a prompt, so the cap is on the producer: a task's
+/// input is a serialized object of unbounded size, and clipping it at the
+/// write side keeps the ceiling on what the namespace holds rather than on
+/// what a reader is allowed to see.
+const SUMMARY_MAX_CHARS: usize = 500;
+
+/// How many rows a retrieval asks the store for before it ranks them.
+///
+/// Wider than any answer it can give, because ranking happens after the
+/// store's own limit: asking for exactly `top_k` lets near-matching keys fill
+/// the window and push out the row the caller wanted. Bounded rather than
+/// open, so no single retrieval turns into a scan of the namespace.
+fn scan_window(top_k: usize) -> usize {
+    top_k.saturating_mul(4).clamp(8, 256)
+}
+
+/// How many distinct terms two summaries share.
+///
+/// Lexical on purpose: the store scores every match the same, so a caller
+/// reordering results has only the text in front of it.
+fn shared_terms(left: &str, right: &str) -> usize {
+    fn terms(text: &str) -> std::collections::HashSet<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|term| !term.is_empty())
+            .map(|term| term.to_lowercase())
+            .collect()
+    }
+    let (left, right) = (terms(left), terms(right));
+    left.intersection(&right).count()
+}
+
+/// The count a row reaches after one more observation, given what reading it
+/// said.
+///
+/// Separated from the read so the decision can be exercised without a store:
+/// `Err` means the count is unknown, and unknown is not zero.
+fn advance_count(prior: SFResult<Option<SchemaEntry>>) -> Option<u64> {
+    match prior {
+        Ok(Some(entry)) => Some(entry.occurrences.saturating_add(1)),
+        Ok(None) => Some(1),
+        Err(_) => None,
+    }
+}
+
+/// The leading `SUMMARY_MAX_CHARS` characters of `text`, never splitting one.
+fn clip(text: &str) -> String {
+    if text.chars().count() <= SUMMARY_MAX_CHARS {
+        return text.to_string();
+    }
+    text.chars().take(SUMMARY_MAX_CHARS).collect()
+}
+
 // ---------------------------------------------------------------------------
 // KnowledgeBackend implementation
 // ---------------------------------------------------------------------------
@@ -196,17 +250,30 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             return Ok(Vec::new());
         };
 
-        // Combine task_type and input_summary for broader matching.
-        let query = format!("{} {}", task_type, input_summary);
+        // The store matches a query as a substring of an entry's name or key
+        // and has no scoring of its own, so the query has to be the dimension
+        // the entries are keyed on — the task type. Asking with the summary
+        // appended makes the query a string no entry contains, which answers
+        // "no prior implementation" for every task and is indistinguishable
+        // from a namespace nothing was ever stored in.
         let results = memory
-            .search_schema(NS_IMPLEMENTATION, &query, top_k)
+            .search_schema(NS_IMPLEMENTATION, task_type, scan_window(top_k))
             .await?;
-        let examples: Vec<ImplementationExample> = results
+        let mut examples: Vec<ImplementationExample> = results
             .into_iter()
             .filter_map(|r| {
                 serde_json::from_value::<ImplementationExample>(r.entry.properties.clone()).ok()
             })
             .collect();
+        // Rank what came back by how much of the summary it shares. The task
+        // type alone cannot separate two runs of the same type, and it is the
+        // only signal available: no vector layer on a host without the weights,
+        // and every stored match comes back at the same score.
+        examples.sort_by(|a, b| {
+            shared_terms(input_summary, &b.input_summary)
+                .cmp(&shared_terms(input_summary, &a.input_summary))
+        });
+        examples.truncate(top_k);
         Ok(examples)
     }
 
@@ -250,8 +317,9 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         };
 
         let record_id = format!("exec:{}:{}", task.id, chrono::Utc::now().timestamp_millis());
+        let task_type = format!("{:?}", task.task_type);
         let result_summary = serde_json::to_string(&result.output)
-            .map(|s| s.chars().take(500).collect::<String>())
+            .map(|output| clip(&output))
             .unwrap_or_default();
 
         // --- Layer 1: Schema ---
@@ -266,7 +334,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         .with_properties(serde_json::json!({
             "record_id": record_id,
             "task_id": task.id,
-            "task_type": format!("{:?}", task.task_type),
+            "task_type": task_type,
             "status": if result.success { "success" } else { "failure" },
             "result_summary": result_summary,
             "executed_at": chrono::Utc::now(),
@@ -315,7 +383,184 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             tracing::warn!("failed to archive execution summary: {}", e);
         }
 
+        // --- Retrieval namespaces ---
+        // `retrieve_similar_implementations` and `retrieve_failure_patterns`
+        // read namespaces that had no writer: the reads were in place, so an
+        // empty answer was indistinguishable from a namespace nothing had ever
+        // been stored in. The archive is the one point that already sees how a
+        // task ended, and the key shape belongs to the namespace's owner —
+        // a caller writing rows here directly would have to guess the query
+        // they have to match.
+        let input_summary = serde_json::to_string(&task.input)
+            .map(|input| clip(&input))
+            .unwrap_or_default();
+        if result.success {
+            self.archive_implementation(
+                memory,
+                &task_type,
+                &input_summary,
+                &result_summary,
+                result.metadata.score.unwrap_or_default() as f32,
+            )
+            .await;
+        } else {
+            self.archive_failure(
+                memory,
+                &task_type,
+                &result_summary,
+                result.metadata.feedback.as_deref().unwrap_or_default(),
+            )
+            .await;
+        }
+
         Ok(())
+    }
+}
+
+impl UnifiedKnowledgeBackend {
+    /// Record what a task of this type looks like when it works.
+    ///
+    /// One row per task type, holding the newest success and the count of
+    /// them: the retrievals ask by task type, and a row per run would grow the
+    /// namespace without bound while every query keeps returning the same
+    /// shape of answer.
+    async fn archive_implementation(
+        &self,
+        memory: &Arc<dyn MemoryBackend>,
+        task_type: &str,
+        input_summary: &str,
+        output_summary: &str,
+        score: f32,
+    ) {
+        // The key is also the entry's name: both are matched against the
+        // retrieval's query, so the two have to carry the task type, and one
+        // string carrying it once cannot drift from another carrying it again.
+        let key = format!("implementation:{task_type}");
+        let Some(observed) = self
+            .next_count(memory, NS_IMPLEMENTATION, SchemaKind::Learning, &key)
+            .await
+        else {
+            return;
+        };
+        let example = ImplementationExample {
+            example_id: cog_core::schema_entry_id(NS_IMPLEMENTATION, SchemaKind::Learning, &key),
+            task_type: task_type.to_string(),
+            input_summary: input_summary.to_string(),
+            output_summary: output_summary.to_string(),
+            score,
+            observed_count: observed,
+        };
+        let properties = match serde_json::to_value(&example) {
+            Ok(properties) => properties,
+            Err(e) => {
+                tracing::warn!("failed to serialize implementation example: {}", e);
+                return;
+            }
+        };
+        self.upsert(
+            memory,
+            NS_IMPLEMENTATION,
+            SchemaKind::Learning,
+            &key,
+            properties,
+            observed,
+        )
+        .await;
+    }
+
+    /// Record how a task of this type tends to fail.
+    async fn archive_failure(
+        &self,
+        memory: &Arc<dyn MemoryBackend>,
+        task_type: &str,
+        failure_summary: &str,
+        root_cause: &str,
+    ) {
+        let key = format!("failure:{task_type}");
+        let Some(occurrences) = self
+            .next_count(memory, NS_FAILURE, SchemaKind::ErrorPattern, &key)
+            .await
+        else {
+            return;
+        };
+        let pattern = FailurePattern {
+            pattern_id: cog_core::schema_entry_id(NS_FAILURE, SchemaKind::ErrorPattern, &key),
+            task_type: task_type.to_string(),
+            failure_summary: failure_summary.to_string(),
+            root_cause: clip(root_cause),
+            occurrence_count: occurrences,
+            last_occurrence: chrono::Utc::now(),
+        };
+        let properties = match serde_json::to_value(&pattern) {
+            Ok(properties) => properties,
+            Err(e) => {
+                tracing::warn!("failed to serialize failure pattern: {}", e);
+                return;
+            }
+        };
+        self.upsert(
+            memory,
+            NS_FAILURE,
+            SchemaKind::ErrorPattern,
+            &key,
+            properties,
+            occurrences,
+        )
+        .await;
+    }
+
+    /// The count this observation brings the row for `key` to, or `None` when
+    /// the count the row already holds could not be read.
+    ///
+    /// The count is part of what the row states, so it cannot be invented: a
+    /// row holding seven observations that could not be read is not a row
+    /// holding none, and writing 1 over it would replace a wrong number rather
+    /// than a missing one. Nothing is lost by skipping the refresh — the run
+    /// itself is already archived under its own record, and this row is the
+    /// retrieval aid derived from it, so what is skipped is freshness.
+    async fn next_count(
+        &self,
+        memory: &Arc<dyn MemoryBackend>,
+        namespace: &str,
+        kind: SchemaKind,
+        key: &str,
+    ) -> Option<u64> {
+        let id = cog_core::schema_entry_id(namespace, kind, key);
+        let prior = memory.get_schema(namespace, &id).await;
+        if let Err(e) = &prior {
+            tracing::warn!(
+                "not refreshing {} for {}: its count could not be read: {}",
+                namespace,
+                key,
+                e
+            );
+        }
+        advance_count(prior)
+    }
+
+    async fn upsert(
+        &self,
+        memory: &Arc<dyn MemoryBackend>,
+        namespace: &str,
+        kind: SchemaKind,
+        key: &str,
+        properties: serde_json::Value,
+        observations: u64,
+    ) {
+        let id = cog_core::schema_entry_id(namespace, kind, key);
+        let mut entry = SchemaEntry::new(
+            &id,
+            namespace,
+            kind,
+            key,
+            key,
+            SourceRef::new(&id, "unified_knowledge_backend::archive_execution"),
+        )
+        .with_properties(properties);
+        entry.occurrences = observations;
+        if let Err(e) = memory.update_schema(namespace, &entry).await {
+            tracing::warn!("failed to archive {} entry: {}", namespace, e);
+        }
     }
 }
 
@@ -451,5 +696,47 @@ mod tests {
             metadata: cog_core::TaskResultMetadata::new("test"),
         };
         assert!(backend.archive_execution(&task, &result).await.is_ok());
+    }
+
+    /// A row that could not be read is not a row holding nothing: the count is
+    /// part of what the record states, so a failure to read it has to stop the
+    /// refresh rather than restart the count at one.
+    #[test]
+    fn an_unreadable_count_is_unknown_rather_than_zero() {
+        assert_eq!(
+            advance_count(Err(cog_core::SFError::Internal("store down".into()))),
+            None
+        );
+        assert_eq!(advance_count(Ok(None)), Some(1), "第一次观察从 1 起算");
+
+        let mut entry = SchemaEntry::new(
+            "id",
+            NS_IMPLEMENTATION,
+            SchemaKind::Learning,
+            "implementation:Generator",
+            "implementation:Generator",
+            SourceRef::new("raw", "test"),
+        );
+        entry.occurrences = 7;
+        assert_eq!(
+            advance_count(Ok(Some(entry))),
+            Some(8),
+            "已观察 7 次的行走一步是 8，不是 1"
+        );
+    }
+
+    /// The scan window has to be wider than the answer, because ranking happens
+    /// after the store's own limit — asking for exactly `top_k` lets a
+    /// near-matching key fill the window and push out the row the caller wanted.
+    /// It also has to stay finite: one retrieval must not become a namespace scan.
+    #[test]
+    fn a_retrieval_window_is_wider_than_the_answer_but_bounded() {
+        for top_k in [1_usize, 3, 50] {
+            let window = scan_window(top_k);
+            assert!(window > top_k, "top_k={top_k} 时窗口不能等于答案数");
+            assert!(window <= 256, "top_k={top_k} 时窗口要有界");
+        }
+        assert!(scan_window(0) > 0, "top_k=0 也要能取到候选再排序");
+        assert_eq!(scan_window(usize::MAX), 256, "溢出不得变成无界扫描");
     }
 }
