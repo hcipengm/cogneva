@@ -479,6 +479,15 @@ data:
               "summary": "cogneva workload container last exit was OOMKilled; memory footprint exceeds its limit"
             },
             {
+              "name": "redis_restarted",
+              "promql": "increase(kube_pod_container_status_restarts_total{namespace=\"cogneva\", container=\"redis\"}[1h])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "the message queue restarted ({value} times in 1h). A restart is either a planned spec change or an unclean stop of its host; after an unclean stop Redis had a torn AOF tail that the aof-repair init container drops at startup, and the number of bytes given up is in that container's log. pod_restarting_fast only counts fast loops, so a single restart shows up nowhere else"
+            },
+            {
               "name": "sandbox_command_oom_killed",
               "promql": "increase(sandbox_oom_kills_total[30m])",
               "condition": {
