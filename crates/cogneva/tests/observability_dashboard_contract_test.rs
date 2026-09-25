@@ -215,6 +215,51 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir"],
         "crates/cog-reflection/src/build_cache_readings.rs",
     ),
+    // What the cap is, so a panel can draw the cache against it rather than
+    // beside it. Published as a flat zero when no cap is set: measured and
+    // uncapped is a reading, and a missing line would be the same shape as no
+    // cache being measured at all.
+    (
+        "cogneva_build_target_bytes_cap",
+        &["dir"],
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
+    // The part of what is held that the cap says should not be there.
+    (
+        "cogneva_build_target_over_limit_bytes",
+        &["dir"],
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
+    // The part of that a pass could not reach. A cap that cannot be met reads
+    // here and nowhere else -- the plan reaching no further is
+    // indistinguishable from a cap nothing crossed.
+    (
+        "cogneva_build_target_unmet_bytes",
+        &["dir"],
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
+    // What passes actually freed, and when one last did. The count is what
+    // separates a cap holding because it is enforced from one holding because
+    // nothing grew; the timestamp is what tells a pass that stopped apart from
+    // a cache that needs no pass.
+    (
+        "cogneva_build_target_reclaimed_bytes_total",
+        &["dir"],
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
+    (
+        "cogneva_build_target_last_reclaim_seconds",
+        &["dir"],
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
+    // Every over-cap pass, split by how it ended. The outcome label is the
+    // whole reading: reclaimed, unmet, busy and ungated are four different
+    // reasons no bytes moved, and folded into one count they would read as one.
+    (
+        "cogneva_build_target_over_cap_total",
+        &["dir", "outcome"],
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

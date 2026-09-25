@@ -15,14 +15,48 @@
 //!   grain that separates the things a reader can decide differently about: the
 //!   `deps` and `.fingerprint` halves are the compiled results (dropping them is
 //!   the cold rebuild), while `incremental` and `tmp` are speed and scratch
-//!   space whose cost to lose is a slower next build.
+//!   space whose cost to lose is a slower next build. A file that cargo hardlinks
+//!   under two names — which is what it does with everything it lifts out of
+//!   `deps` — is counted once, under the first of its names in path order, and
+//!   its pass frees its bytes once, because that is how many times they are on
+//!   the volume.
 //! - `cogneva_build_target_bytes_scan_age_seconds` -- how long ago the cache was
 //!   measured. The sizes keep their last reading when a walk fails, which is the
 //!   right thing to publish and is also invisible: a scan loop that died leaves
 //!   behind a cache that reads as unchanging rather than as unmeasured.
 //!
-//! Nothing is capped here yet -- this is the reading a cap will be held against,
-//! and the cap belongs with the code that removes bytes, not with the reading.
+//! A cap can be held against that total, and when one is configured the same
+//! walk that produces the reading also enforces it: the module that removes
+//! bytes (`build_cache_reclaim`) is driven from here so that the number a cap is
+//! checked against and the plan that acts on it come from one snapshot. The
+//! decision of *what* to drop is that module's; this one owns the timer, the
+//! measurement and the state a reader sees afterwards.
+//!
+//! The cap family, published only when a cap is configured:
+//!
+//! - `cogneva_build_target_bytes_cap{dir}` -- the cap itself, so a panel can
+//!   draw the wall the other lines are measured against.
+//! - `cogneva_build_target_over_limit_bytes{dir}` -- how far above it the cache
+//!   is, as of the last walk. The earlier of the two numbers that say the cap is
+//!   not holding.
+//! - `cogneva_build_target_unmet_bytes{dir}` -- how far above it the cache
+//!   stayed after a pass ran. Not the same reading: the first says the cache is
+//!   over its cap, this one says removing what may be removed did not fix it,
+//!   and they call for different actions (wait for the next pass; or change the
+//!   cap or the permissions).
+//! - `cogneva_build_target_over_cap_total{outcome}` -- walks that found the cache
+//!   over its cap, by what happened next: `reclaimed` (a pass brought it under),
+//!   `unmet` (a pass ran and could not), `busy` (a build held the slot, so no
+//!   pass ran) or `ungated` (no build gate is in force, so nothing may be
+//!   removed). A growing `busy` or `ungated` is a cap that is not being enforced
+//!   at all rather than one that is failing.
+//! - `cogneva_build_target_reclaimed_bytes_total{dir}` -- bytes removed so far.
+//! - `cogneva_build_target_last_reclaim_seconds{dir}` -- when a pass last ran,
+//!   and the process start when none has. A pass that never runs has to age
+//!   somewhere, or a cache over its cap reads the same as one being fixed.
+//! - `cogneva_build_target_scan_interval_seconds{dir}` -- the configured
+//!   interval, so a rule can say "no pass in six intervals" without a constant
+//!   that goes stale when the interval is configured differently.
 //!
 //! Only the process that owns the directory publishes it, which is the process
 //! that runs builds: a deployment with no builder has no cache to report rather
@@ -36,8 +70,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cog_core::build_gate::dir_identity;
-use cog_core::fs_size;
+use cog_core::build_gate::{dir_identity, BuildGate};
+use cog_core::fs_size::{self, FileEntry};
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::{SFResult, ShutdownSignal};
 use tracing::{info, warn};
@@ -47,6 +81,52 @@ pub const BUILD_TARGET_BYTES_METRIC: &str = "cogneva_build_target_bytes";
 
 /// Seconds since the cache was last measured.
 pub const BUILD_TARGET_SCAN_AGE_METRIC: &str = "cogneva_build_target_bytes_scan_age_seconds";
+
+/// The cap the cache is held to, in bytes. Published only when one is set.
+pub const BUILD_TARGET_CAP_METRIC: &str = "cogneva_build_target_bytes_cap";
+
+/// Bytes the cache is above its cap, as of the last walk.
+pub const BUILD_TARGET_OVER_LIMIT_METRIC: &str = "cogneva_build_target_over_limit_bytes";
+
+/// Bytes still above the cap after the last pass that ran.
+pub const BUILD_TARGET_UNMET_METRIC: &str = "cogneva_build_target_unmet_bytes";
+
+/// Walks that found the cache over its cap, by what happened next.
+pub const BUILD_TARGET_OVER_CAP_METRIC: &str = "cogneva_build_target_over_cap_total";
+
+/// The label naming what a pass did, or why it did not run.
+pub const OUTCOME_LABEL: &str = "outcome";
+
+/// A pass ran and brought the cache under its cap.
+pub const OUTCOME_RECLAIMED: &str = "reclaimed";
+
+/// A pass ran and the cache stayed above its cap.
+pub const OUTCOME_UNMET: &str = "unmet";
+
+/// A build held the only build slot, so no pass ran.
+pub const OUTCOME_BUSY: &str = "busy";
+
+/// No build gate is in force, so nothing may be removed.
+pub const OUTCOME_UNGATED: &str = "ungated";
+
+/// Every value the outcome label takes, so a reader can see the whole domain
+/// with zeros rather than inferring it from whichever values happened to occur.
+pub const RECLAIM_OUTCOMES: &[&str] = &[
+    OUTCOME_RECLAIMED,
+    OUTCOME_UNMET,
+    OUTCOME_BUSY,
+    OUTCOME_UNGATED,
+];
+
+/// Bytes removed from the cache by this process so far.
+pub const BUILD_TARGET_RECLAIMED_METRIC: &str = "cogneva_build_target_reclaimed_bytes_total";
+
+/// When a reclamation pass last ran, in unix seconds.
+pub const BUILD_TARGET_LAST_RECLAIM_METRIC: &str = "cogneva_build_target_last_reclaim_seconds";
+
+/// The configured scan interval, so a rule can say how long is too long without
+/// carrying a copy of the interval that goes stale when it is configured.
+pub const BUILD_TARGET_SCAN_INTERVAL_METRIC: &str = "cogneva_build_target_scan_interval_seconds";
 
 /// The layer label.
 pub const LAYER_LABEL: &str = "layer";
@@ -84,6 +164,16 @@ pub const MAX_PUBLISHED_LAYERS: usize = 12;
 /// building, so it holds no value being fresher than minutes.
 pub const MIN_SCAN_INTERVAL_SECS: u64 = 60;
 
+/// What the last pass left behind.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReclaimState {
+    /// Bytes above the cap as of the last walk; `None` before one has been made
+    /// with a cap configured.
+    over_limit: Option<u64>,
+    /// Bytes above the cap after the last pass that ran; `None` before one has.
+    unmet: Option<u64>,
+}
+
 /// The cache this process owns, as measured by the last completed walk.
 ///
 /// The measurement is written by the scan loop and read by the metrics pull,
@@ -94,6 +184,18 @@ pub struct BuildCacheReadings {
     layers: Mutex<BTreeMap<String, u64>>,
     /// Unix seconds of the last completed walk; 0 before one has happened.
     scanned_at: AtomicU64,
+    /// Bytes the cache may hold, or 0 when it is measured but not bounded.
+    cap_bytes: u64,
+    scan_interval_secs: u64,
+    reclaim: Mutex<ReclaimState>,
+    reclaimed_bytes: AtomicU64,
+    /// Passes that found the cache over its cap, by outcome.
+    over_cap: Mutex<BTreeMap<String, u64>>,
+    /// Unix seconds of the last pass that ran. The process start until one does,
+    /// so a pass that never runs ages against a clock a rule can read: were this
+    /// absent until the first pass, "no pass has ever run" would be the one state
+    /// with no reading at all.
+    last_pass_at: AtomicU64,
 }
 
 impl BuildCacheReadings {
@@ -102,11 +204,39 @@ impl BuildCacheReadings {
             dir: dir.into(),
             layers: Mutex::new(BTreeMap::new()),
             scanned_at: AtomicU64::new(0),
+            cap_bytes: 0,
+            scan_interval_secs: 0,
+            reclaim: Mutex::new(ReclaimState::default()),
+            reclaimed_bytes: AtomicU64::new(0),
+            over_cap: Mutex::new(BTreeMap::new()),
+            last_pass_at: AtomicU64::new(unix_now()),
         }
+    }
+
+    /// Bound the cache to `max_bytes`, re-walked every `scan_interval_secs`.
+    ///
+    /// `max_bytes = 0` leaves the cache measured and unbounded, which is the
+    /// default: what the number should be is a deployment's own decision —
+    /// derived from the volume behind the directory — and a default that started
+    /// removing bytes on upgrade would be making that decision silently.
+    pub fn with_cap(mut self, max_bytes: u64, scan_interval_secs: u64) -> Self {
+        self.cap_bytes = max_bytes;
+        self.scan_interval_secs = scan_interval_secs;
+        self
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The cap, or `None` when this cache is not bounded.
+    pub fn cap_bytes(&self) -> Option<u64> {
+        (self.cap_bytes > 0).then_some(self.cap_bytes)
+    }
+
+    /// How long between walks.
+    pub fn scan_interval_secs(&self) -> u64 {
+        self.scan_interval_secs.max(MIN_SCAN_INTERVAL_SECS)
     }
 
     /// Record one completed walk.
@@ -159,6 +289,165 @@ impl BuildCacheReadings {
         out.push((OTHER_LAYER.to_string(), folded));
         out
     }
+
+    /// Bring the cache back under its cap, if it is over one and a build slot
+    /// can be taken.
+    ///
+    /// `files` are the entries of the walk that produced the measurement being
+    /// published, so the total the cap is judged against and the plan that acts
+    /// on it come from one snapshot. Nothing is removed without holding the
+    /// build slot: a file deleted under a running build fails that build for a
+    /// reason that has nothing to do with it, and that failure would be recorded
+    /// against a change rather than against the host.
+    pub async fn enforce_cap(&self, files: &[FileEntry], gate: Option<&Arc<BuildGate>>) {
+        let Some(cap) = self.cap_bytes() else {
+            return;
+        };
+        let total = fs_size::counted_bytes(files);
+        let excess = total.saturating_sub(cap);
+        {
+            let mut state = self.reclaim.lock().unwrap_or_else(|e| e.into_inner());
+            state.over_limit = Some(excess);
+        }
+        if excess == 0 {
+            return;
+        }
+
+        // The gate is what makes "no build is running" a fact rather than a hope.
+        // Where it is not in force, the cap is reported as unenforceable instead
+        // of being enforced against a guess.
+        let Some(gate) = gate.filter(|g| g.in_force()) else {
+            self.count_outcome(OUTCOME_UNGATED);
+            warn!(
+                dir = %self.dir.display(),
+                over_limit_bytes = excess,
+                "build cache is over its cap and no build gate is in force, so nothing was removed"
+            );
+            return;
+        };
+        let permit = match gate.try_acquire("build-cache-reclaim").await {
+            Ok(permit) => permit,
+            Err(_) => {
+                // A build holds the slot. Not a failure: the cache is over its
+                // cap while the host is busy building into it, and the next walk
+                // will try again. It is counted separately because a cache that
+                // is *never* reclaimed and one that cannot be reclaimed call for
+                // different things.
+                self.count_outcome(OUTCOME_BUSY);
+                info!(
+                    dir = %self.dir.display(),
+                    over_limit_bytes = excess,
+                    "build cache is over its cap; a build holds the slot, so the pass waits for the next walk"
+                );
+                return;
+            }
+        };
+
+        let plan = crate::build_cache_reclaim::plan_reclaim(files, total, cap);
+        let outcome = crate::build_cache_reclaim::apply_reclaim(&self.dir, &plan);
+        // Held for the whole deletion: the slot is what keeps a build from
+        // reading a file this pass is about to remove.
+        drop(permit);
+
+        let freed = outcome.freed_bytes;
+        self.reclaimed_bytes.fetch_add(freed, Ordering::Relaxed);
+        let remaining = excess.saturating_sub(freed);
+        {
+            let mut state = self.reclaim.lock().unwrap_or_else(|e| e.into_inner());
+            state.unmet = Some(remaining);
+        }
+        self.last_pass_at.store(unix_now(), Ordering::Release);
+        self.count_outcome(if remaining == 0 {
+            OUTCOME_RECLAIMED
+        } else {
+            OUTCOME_UNMET
+        });
+
+        let failures: Vec<String> = outcome
+            .failures
+            .iter()
+            .take(5)
+            .map(|(path, why)| format!("{}: {why}", path.display()))
+            .collect();
+        if remaining == 0 && outcome.failures.is_empty() {
+            info!(
+                dir = %self.dir.display(),
+                deleted_names = outcome.deleted_names,
+                freed_files = outcome.freed_files,
+                freed_bytes = freed,
+                cap_bytes = cap,
+                "build cache reclaimed down to its cap"
+            );
+        } else {
+            warn!(
+                dir = %self.dir.display(),
+                deleted_names = outcome.deleted_names,
+                freed_files = outcome.freed_files,
+                freed_bytes = freed,
+                cap_bytes = cap,
+                unmet_bytes = remaining,
+                failures = outcome.failures.len(),
+                first_failures = ?failures,
+                "build cache could not be reclaimed down to its cap"
+            );
+        }
+    }
+
+    /// Record one walk that found the cache over its cap.
+    fn count_outcome(&self, outcome: &str) {
+        let mut counts = self.over_cap.lock().unwrap_or_else(|e| e.into_inner());
+        let count = counts.entry(outcome.to_string()).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    /// The cap family, or nothing when this cache is not bounded.
+    fn cap_metrics(&self, dir: &str) -> Vec<RawMetric> {
+        let Some(cap) = self.cap_bytes() else {
+            return Vec::new();
+        };
+        let state = *self.reclaim.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = vec![
+            RawMetric::new(BUILD_TARGET_CAP_METRIC, cap as f64).with_label(DIR_LABEL, dir),
+            RawMetric::new(
+                BUILD_TARGET_SCAN_INTERVAL_METRIC,
+                self.scan_interval_secs() as f64,
+            )
+            .with_label(DIR_LABEL, dir),
+            RawMetric::new(
+                BUILD_TARGET_RECLAIMED_METRIC,
+                self.reclaimed_bytes.load(Ordering::Relaxed) as f64,
+            )
+            .with_label(DIR_LABEL, dir),
+            RawMetric::new(
+                BUILD_TARGET_LAST_RECLAIM_METRIC,
+                self.last_pass_at.load(Ordering::Acquire) as f64,
+            )
+            .with_label(DIR_LABEL, dir),
+        ];
+        if let Some(over) = state.over_limit {
+            out.push(
+                RawMetric::new(BUILD_TARGET_OVER_LIMIT_METRIC, over as f64)
+                    .with_label(DIR_LABEL, dir),
+            );
+        }
+        if let Some(unmet) = state.unmet {
+            out.push(
+                RawMetric::new(BUILD_TARGET_UNMET_METRIC, unmet as f64).with_label(DIR_LABEL, dir),
+            );
+        }
+        let counts = self.over_cap.lock().unwrap_or_else(|e| e.into_inner());
+        for outcome in RECLAIM_OUTCOMES {
+            out.push(
+                RawMetric::new(
+                    BUILD_TARGET_OVER_CAP_METRIC,
+                    counts.get(*outcome).copied().unwrap_or(0) as f64,
+                )
+                .with_label(DIR_LABEL, dir)
+                .with_label(OUTCOME_LABEL, *outcome),
+            );
+        }
+        out
+    }
 }
 
 /// Unix seconds now, saturating at the epoch.
@@ -175,22 +464,29 @@ impl Observable for BuildCacheReadings {
     /// checked against does not exist yet rather than existing with a value
     /// nothing measured.
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
-        let Some(layers) = self.measured() else {
-            return Ok(Vec::new());
-        };
         let dir = dir_identity(&self.dir);
-        let mut out: Vec<RawMetric> = self
-            .published_layers(&layers)
-            .into_iter()
-            .map(|(layer, bytes)| {
-                RawMetric::new(BUILD_TARGET_BYTES_METRIC, bytes as f64)
-                    .with_label(DIR_LABEL, dir.clone())
-                    .with_label(LAYER_LABEL, layer)
-            })
-            .collect();
+        // The cap family comes first and does not depend on a walk having
+        // succeeded: a cap is a configuration and "nothing reclaimed yet" is a
+        // count of zero, not a claim about the cache. A cache whose walk keeps
+        // failing is exactly when a reader most needs to see that it is supposed
+        // to be bounded.
+        let mut out: Vec<RawMetric> = self.cap_metrics(&dir);
+        let Some(layers) = self.measured() else {
+            return Ok(out);
+        };
+        out.extend(
+            self.published_layers(&layers)
+                .into_iter()
+                .map(|(layer, bytes)| {
+                    RawMetric::new(BUILD_TARGET_BYTES_METRIC, bytes as f64)
+                        .with_label(DIR_LABEL, dir.clone())
+                        .with_label(LAYER_LABEL, layer)
+                }),
+        );
         if let Some(age) = self.scan_age_secs(unix_now()) {
             out.push(
-                RawMetric::new(BUILD_TARGET_SCAN_AGE_METRIC, age as f64).with_label(DIR_LABEL, dir),
+                RawMetric::new(BUILD_TARGET_SCAN_AGE_METRIC, age as f64)
+                    .with_label(DIR_LABEL, dir.clone()),
             );
         }
         Ok(out)
@@ -208,21 +504,30 @@ impl Observable for BuildCacheReadings {
     }
 }
 
-/// Re-measure the cache on a timer and publish the result on `readings`.
-pub async fn run_build_cache_watch(
-    readings: Arc<BuildCacheReadings>,
-    interval_secs: u64,
-    shutdown: ShutdownSignal,
-) {
+/// Re-measure the cache on a timer, publish the result on `readings`, and
+/// enforce its cap.
+pub async fn run_build_cache_watch(readings: Arc<BuildCacheReadings>, shutdown: ShutdownSignal) {
     let dir = readings.dir().to_path_buf();
-    let interval = Duration::from_secs(interval_secs.max(MIN_SCAN_INTERVAL_SECS));
-    info!(
-        dir = %dir.display(),
-        interval_secs = interval.as_secs(),
-        depth = CACHE_LAYER_DEPTH,
-        metric = BUILD_TARGET_BYTES_METRIC,
-        "build cache watcher started"
-    );
+    let interval = Duration::from_secs(readings.scan_interval_secs());
+    match readings.cap_bytes() {
+        Some(cap) => info!(
+            dir = %dir.display(),
+            interval_secs = interval.as_secs(),
+            depth = CACHE_LAYER_DEPTH,
+            cap_bytes = cap,
+            metric = BUILD_TARGET_BYTES_METRIC,
+            "build cache watcher started; the cache is capped"
+        ),
+        // Said out loud, because the same watcher with no cap looks the same in
+        // the readings as a cap that is never reached.
+        None => info!(
+            dir = %dir.display(),
+            interval_secs = interval.as_secs(),
+            depth = CACHE_LAYER_DEPTH,
+            metric = BUILD_TARGET_BYTES_METRIC,
+            "build cache watcher started; no cap is configured, so the cache is measured and not bounded"
+        ),
+    }
 
     let mut ticker = tokio::time::interval(interval);
     loop {
@@ -234,12 +539,22 @@ pub async fn run_build_cache_watch(
                 // Off the runtime: the walk is metadata-only but it is a walk of
                 // a large tree, and it must not hold up the cycles that build
                 // into this cache.
+                //
+                // One walk, not two: the files are what the cap is enforced
+                // against and the layers are what is published, and a plan built
+                // from a different snapshot than the published total would be
+                // enforcing a figure nobody can see.
                 let walked = tokio::task::spawn_blocking(move || {
-                    fs_size::dir_layers(&path, CACHE_LAYER_DEPTH, &[])
+                    fs_size::dir_files(&path, CACHE_LAYER_DEPTH, &[])
                 })
                 .await;
                 match walked {
-                    Ok(Ok(layers)) => readings.set_layers(layers, unix_now()),
+                    Ok(Ok(files)) => {
+                        readings.set_layers(fs_size::layer_totals(&files), unix_now());
+                        readings
+                            .enforce_cap(&files, cog_core::build_gate::global().as_ref())
+                            .await;
+                    }
                     // A failed walk yields a total that is too small, which can
                     // only silence a cap. Keep the last measurement rather than
                     // publish a fictional small one, and say so.
@@ -377,5 +692,257 @@ mod tests {
         assert_eq!(published.len(), 2);
         assert_eq!(published[0].1, dir_identity(&dir));
         assert_ne!(published[0].1, dir.display().to_string());
+    }
+
+    /// A gate in force, over its own slot directory.
+    fn gate(lock_dir: &Path, slots: usize, enabled: bool) -> Arc<BuildGate> {
+        Arc::new(BuildGate::new(&cog_core::config::BuildGateConfig {
+            enabled,
+            max_concurrent: slots,
+            wait_secs: 0,
+            lock_dir: lock_dir.display().to_string(),
+        }))
+    }
+
+    /// A cache on disk: `(relative path, bytes)` under a fresh directory.
+    fn cache(files: &[(&str, usize)]) -> (tempfile::TempDir, Vec<FileEntry>) {
+        let root = tempfile::tempdir().unwrap();
+        for (rel, bytes) in files {
+            let path = root.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![b'x'; *bytes]).unwrap();
+        }
+        let entries = fs_size::dir_files(root.path(), CACHE_LAYER_DEPTH, &[]).unwrap();
+        (root, entries)
+    }
+
+    fn on_disk(root: &Path) -> u64 {
+        fs_size::dir_size_bytes(root, &[]).unwrap()
+    }
+
+    async fn reading(
+        readings: &BuildCacheReadings,
+        metric: &str,
+        outcome: Option<&str>,
+    ) -> Option<f64> {
+        readings
+            .collect_metrics("")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| {
+                m.name == metric
+                    && outcome
+                        .is_none_or(|o| m.labels.get(OUTCOME_LABEL).map(String::as_str) == Some(o))
+            })
+            .map(|m| m.value)
+    }
+
+    /// With a cap set and the slot free, the cache is brought under it: the
+    /// bytes actually leave the disk, and the pass is readable as having done
+    /// it.
+    #[tokio::test]
+    async fn a_cache_over_its_cap_is_brought_under_it() {
+        let lock = tempfile::tempdir().unwrap();
+        let (root, files) = cache(&[
+            ("release/incremental/one", 1000),
+            ("release/incremental/two", 1000),
+            ("release/incremental/three", 1000),
+            ("release/deps/lib.rlib", 1000),
+        ]);
+        let readings = BuildCacheReadings::new(root.path()).with_cap(3000, 300);
+
+        readings
+            .enforce_cap(&files, Some(&gate(lock.path(), 1, true)))
+            .await;
+
+        assert_eq!(on_disk(root.path()), 3000, "the excess must leave the disk");
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_OVER_LIMIT_METRIC, None).await,
+            Some(1000.0)
+        );
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_UNMET_METRIC, None).await,
+            Some(0.0),
+            "a pass that reached the cap has nothing left unmet"
+        );
+        assert_eq!(
+            reading(
+                &readings,
+                BUILD_TARGET_OVER_CAP_METRIC,
+                Some(OUTCOME_RECLAIMED)
+            )
+            .await,
+            Some(1.0)
+        );
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_RECLAIMED_METRIC, None).await,
+            Some(1000.0)
+        );
+        // The compiled result was not touched while the speed layer could pay.
+        assert!(root.path().join("release/deps/lib.rlib").exists());
+    }
+
+    /// A build holding the slot is not an error and not a deletion: the pass
+    /// waits for the next walk, and says which of the two it was.
+    #[tokio::test]
+    async fn a_build_in_flight_defers_the_pass_rather_than_deleting() {
+        let lock = tempfile::tempdir().unwrap();
+        let gate = gate(lock.path(), 1, true);
+        let held = gate.try_acquire("a build").await.unwrap();
+        let (root, files) = cache(&[
+            ("release/incremental/one", 1000),
+            ("release/incremental/two", 1000),
+            ("release/incremental/three", 1000),
+        ]);
+        let readings = BuildCacheReadings::new(root.path()).with_cap(2000, 300);
+
+        readings.enforce_cap(&files, Some(&gate)).await;
+
+        assert_eq!(on_disk(root.path()), 3000, "nothing may be removed");
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_OVER_CAP_METRIC, Some(OUTCOME_BUSY)).await,
+            Some(1.0)
+        );
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_UNMET_METRIC, None).await,
+            None,
+            "no pass ran, so there is no result to report"
+        );
+        drop(held);
+
+        readings.enforce_cap(&files, Some(&gate)).await;
+        assert_eq!(on_disk(root.path()), 2000, "the next free pass does it");
+        assert_eq!(
+            reading(
+                &readings,
+                BUILD_TARGET_OVER_CAP_METRIC,
+                Some(OUTCOME_RECLAIMED)
+            )
+            .await,
+            Some(1.0)
+        );
+    }
+
+    /// No gate is no permission to delete: without the slot there is no fact
+    /// saying a build is not reading this cache, and a file removed under a
+    /// build fails that build for a reason that is not its own.
+    #[tokio::test]
+    async fn nothing_is_removed_without_a_gate_in_force() {
+        let lock = tempfile::tempdir().unwrap();
+        let (root, files) = cache(&[("release/incremental/one", 1000)]);
+        let readings = BuildCacheReadings::new(root.path()).with_cap(1, 300);
+
+        readings.enforce_cap(&files, None).await;
+        readings
+            .enforce_cap(&files, Some(&gate(lock.path(), 1, false)))
+            .await;
+
+        assert_eq!(on_disk(root.path()), 1000);
+        assert_eq!(
+            reading(
+                &readings,
+                BUILD_TARGET_OVER_CAP_METRIC,
+                Some(OUTCOME_UNGATED)
+            )
+            .await,
+            Some(2.0)
+        );
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_RECLAIMED_METRIC, None).await,
+            Some(0.0)
+        );
+    }
+
+    /// A cap the cache cannot be brought under — one below what the per-layer
+    /// floor keeps — is reported as unmet rather than retried forever in
+    /// silence, and the floor's file is still on disk.
+    #[tokio::test]
+    async fn a_cap_under_the_floor_is_reported_as_unmet() {
+        let lock = tempfile::tempdir().unwrap();
+        let (root, files) = cache(&[("release/incremental/one", 1000)]);
+        let readings = BuildCacheReadings::new(root.path()).with_cap(1, 300);
+
+        readings
+            .enforce_cap(&files, Some(&gate(lock.path(), 1, true)))
+            .await;
+
+        assert_eq!(on_disk(root.path()), 1000, "the floor holds the only file");
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_UNMET_METRIC, None).await,
+            Some(999.0),
+            "the 1 byte of the cap is reachable; the floor file's other 999 are not"
+        );
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_OVER_CAP_METRIC, Some(OUTCOME_UNMET)).await,
+            Some(1.0)
+        );
+    }
+
+    /// With no cap configured nothing is ever removed, and the cap family is not
+    /// published at all: a cache with no cap must not read as a cache of zero
+    /// bytes that is inside it.
+    #[tokio::test]
+    async fn an_uncapped_cache_is_measured_and_left_alone() {
+        let lock = tempfile::tempdir().unwrap();
+        let (root, files) = cache(&[("release/incremental/one", 1000)]);
+        let readings = BuildCacheReadings::new(root.path());
+
+        readings
+            .enforce_cap(&files, Some(&gate(lock.path(), 1, true)))
+            .await;
+
+        assert_eq!(on_disk(root.path()), 1000);
+        let metrics = readings.collect_metrics("").await.unwrap();
+        assert!(
+            !metrics
+                .iter()
+                .any(|m| m.name.contains("_cap") || m.name.contains("reclaim")),
+            "{:?}",
+            metrics.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// The whole family is published with a cap configured, including the
+    /// outcomes that have not happened, so a reader sees the domain with zeros
+    /// rather than inferring it from what occurred.
+    #[tokio::test]
+    async fn the_cap_family_is_published_with_its_zeros() {
+        let root = tempfile::tempdir().unwrap();
+        let readings = BuildCacheReadings::new(root.path()).with_cap(4096, 300);
+
+        let metrics = readings.collect_metrics("").await.unwrap();
+        let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+        for expected in [
+            BUILD_TARGET_CAP_METRIC,
+            BUILD_TARGET_SCAN_INTERVAL_METRIC,
+            BUILD_TARGET_RECLAIMED_METRIC,
+            BUILD_TARGET_LAST_RECLAIM_METRIC,
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} missing from {names:?}"
+            );
+        }
+        // No walk has happened, so nothing claims to have measured the cache.
+        assert!(!names.contains(&BUILD_TARGET_OVER_LIMIT_METRIC));
+        assert!(!names.contains(&BUILD_TARGET_BYTES_METRIC));
+        let outcomes: Vec<&str> = metrics
+            .iter()
+            .filter(|m| m.name == BUILD_TARGET_OVER_CAP_METRIC)
+            .map(|m| {
+                m.labels
+                    .get(OUTCOME_LABEL)
+                    .map(String::as_str)
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(outcomes.len(), RECLAIM_OUTCOMES.len(), "{outcomes:?}");
+        for value in RECLAIM_OUTCOMES {
+            assert!(
+                outcomes.contains(value),
+                "{value} missing from {outcomes:?}"
+            );
+        }
     }
 }

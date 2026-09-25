@@ -18,16 +18,21 @@
 //! forever. Directory entries are read without following links, so a symlink is
 //! skipped by being neither a regular file nor a directory.
 //!
-//! Hardlinks are counted once per path rather than once per inode. Telling the
-//! two apart means keeping the walked inodes in memory; what that buys is the
-//! one link cargo makes (the linked binary is a hardlink into `deps`), so the
-//! total reads a few hundred megabytes above what `du` reports. `du` answers
-//! "how much disk does this hold"; this answers "how many bytes are stored
-//! here", and the two differ by exactly those links.
+//! Hardlinked files are counted once, under the first name of them in path
+//! order, because the bytes are on the volume once: counting every name would
+//! report more than the directory holds, and a cap held against that total
+//! could be met by removing a name that frees nothing. The other names are
+//! reported as aliases of the one that counts. cargo makes such a link whenever
+//! it lifts an artifact out of `deps` up into the profile directory, so a build
+//! cache read any other way reads high by the size of everything it built.
+//!
+//! Where the filesystem does not report a file's identity, every path stands
+//! for a file of its own, since two names cannot be told apart without it.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// The layer of files that sit directly in the measured directory.
 ///
@@ -45,6 +50,83 @@ pub fn dir_size_bytes(dir: &Path, exclude: &[PathBuf]) -> io::Result<u64> {
     Ok(dir_layers(dir, 1, exclude)?.values().sum())
 }
 
+/// Identity of a file, as opposed to identity of a name: two entries with the
+/// same id are two names of one file on disk, and its bytes are on the volume
+/// once however many names it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// One regular file a walk found, with the layer it belongs to.
+///
+/// Materialised rather than summed because the decision this feeds is about the
+/// set: how much a cache has to give up depends on what every layer holds and on
+/// what has to stay, which a running total cannot answer. The size and the
+/// timestamp are the ones the walk read, so a plan built from these entries is
+/// about the tree state that was measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    /// Path as walked, below the directory the walk started at.
+    pub path: PathBuf,
+    /// The layer the file falls into, at the depth the walk was given.
+    pub layer: String,
+    /// Apparent size in bytes.
+    pub len: u64,
+    /// Last modification time, when the filesystem reports one.
+    pub modified: Option<SystemTime>,
+    /// The file this path names, where the filesystem reports it.
+    pub id: Option<FileId>,
+    /// How many names this file has, where the filesystem reports it. A file
+    /// with more names than the walk saw has one outside the measured tree.
+    pub links: Option<u64>,
+    /// Set by [`dir_files`]: another name of this same file is the one its
+    /// bytes are counted under, so these are reported as stored and must not be
+    /// added to a total again. Removing this name alone frees nothing.
+    pub alias: bool,
+}
+
+/// Every regular file below `dir`, leaving out the paths in `exclude` and
+/// everything below them.
+///
+/// Same traversal as [`dir_layers`], and the same answers about symlinks,
+/// exclusions and unreadable directories: a total and the files it was summed
+/// from have to come from one walk, or a decision made against the files is
+/// made against a tree state nobody measured.
+///
+/// One name of each file is marked as the one that counts, and it is the first
+/// in path order rather than the first the filesystem happened to list: which
+/// layer holds an artifact's bytes must not change between two walks of an
+/// unchanged tree.
+pub fn dir_files(dir: &Path, depth: usize, exclude: &[PathBuf]) -> io::Result<Vec<FileEntry>> {
+    let mut files = Vec::new();
+    walk(dir, depth, exclude, |entry| files.push(entry))?;
+    mark_aliases(&mut files);
+    Ok(files)
+}
+
+/// Name the entry per file whose bytes count, and mark the rest as aliases.
+fn mark_aliases(files: &mut [FileEntry]) {
+    let mut counted: BTreeMap<FileId, usize> = BTreeMap::new();
+    for (index, file) in files.iter().enumerate() {
+        let Some(id) = file.id else {
+            continue;
+        };
+        match counted.get(&id) {
+            Some(&held) if files[held].path <= file.path => {}
+            _ => {
+                counted.insert(id, index);
+            }
+        }
+    }
+    for (index, file) in files.iter_mut().enumerate() {
+        if let Some(id) = file.id {
+            file.alias = counted.get(&id) != Some(&index);
+        }
+    }
+}
+
 /// Apparent bytes below `dir`, totalled per layer, where a layer is the first
 /// `depth` components of a file's directory below `dir`.
 ///
@@ -59,6 +141,11 @@ pub fn dir_size_bytes(dir: &Path, exclude: &[PathBuf]) -> io::Result<u64> {
 /// valid prefix. The bytes are still counted; only the layer name is coarser,
 /// which is the direction a reader can see.
 ///
+/// A layer whose files are all aliases of files counted elsewhere is reported
+/// with the zero bytes it holds rather than left out: the names are there, and
+/// a layer that vanishes from the reading is one a reader cannot tell from a
+/// layer the walk could not see.
+///
 /// An unreadable subdirectory fails the whole walk. The caller is expected to
 /// keep its last measurement: a partial total is smaller than the truth, and a
 /// smaller cache reading can only silence a cap.
@@ -67,11 +154,51 @@ pub fn dir_layers(
     depth: usize,
     exclude: &[PathBuf],
 ) -> io::Result<BTreeMap<String, u64>> {
+    Ok(layer_totals(&dir_files(dir, depth, exclude)?))
+}
+
+/// The layer totals of one walk's entries.
+///
+/// The fold [`dir_layers`] is defined as, exposed for a caller that already has
+/// the entries and has to act on them: it totals them by the same rule instead
+/// of writing a second one that could drift from the first.
+pub fn layer_totals(files: &[FileEntry]) -> BTreeMap<String, u64> {
     let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+    for entry in files {
+        let total = totals.entry(entry.layer.clone()).or_default();
+        if !entry.alias {
+            *total = total.saturating_add(entry.len);
+        }
+    }
+    totals
+}
+
+/// Apparent bytes of one walk's entries, counted once per file.
+///
+/// The same number [`dir_size_bytes`] reads off the disk, from entries a caller
+/// is already holding: the cap and the plan that enforces it are about one
+/// total, and neither of them needs a second walk to have it.
+pub fn counted_bytes(files: &[FileEntry]) -> u64 {
+    files
+        .iter()
+        .filter(|entry| !entry.alias)
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.len))
+}
+
+/// The one traversal both readings are built from.
+fn walk(
+    dir: &Path,
+    depth: usize,
+    exclude: &[PathBuf],
+    mut on_file: impl FnMut(FileEntry),
+) -> io::Result<()> {
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
-        for entry in std::fs::read_dir(&current)? {
-            let entry = entry?;
+        // Read whole and in name order: which name of a file comes first decides
+        // which layer counts its bytes, and a directory listing is not ordered.
+        let mut children = std::fs::read_dir(&current)?.collect::<io::Result<Vec<_>>>()?;
+        children.sort_by_key(|entry| entry.file_name());
+        for entry in children {
             let path = entry.path();
             if exclude.iter().any(|excluded| excluded == &path) {
                 continue;
@@ -82,12 +209,52 @@ pub fn dir_layers(
             if meta.is_dir() {
                 pending.push(path);
             } else if meta.is_file() {
-                let total = totals.entry(layer_of(dir, &path, depth)).or_default();
-                *total = total.saturating_add(meta.len());
+                on_file(FileEntry {
+                    layer: layer_of(dir, &path, depth),
+                    path,
+                    len: meta.len(),
+                    // Absent when the filesystem does not report one. Kept as an
+                    // absence rather than a substituted epoch: a reclamation
+                    // rule that ranks by age has to be able to tell "built long
+                    // ago" from "age unknown".
+                    modified: meta.modified().ok(),
+                    id: file_id(&meta),
+                    links: link_count(&meta),
+                    // Set by `dir_files`, which is the only thing that can see
+                    // two names of one file at once.
+                    alias: false,
+                });
             }
         }
     }
-    Ok(totals)
+    Ok(())
+}
+
+/// The file a directory entry names, where the filesystem reports it.
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> Option<FileId> {
+    None
+}
+
+/// How many names the file has, where the filesystem reports it.
+#[cfg(unix)]
+fn link_count(meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.nlink())
+}
+
+#[cfg(not(unix))]
+fn link_count(_meta: &std::fs::Metadata) -> Option<u64> {
+    None
 }
 
 /// The layer a file belongs to, as a path relative to `dir`.
@@ -126,6 +293,36 @@ mod tests {
     fn write(path: &Path, bytes: usize) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, vec![b'x'; bytes]).unwrap();
+    }
+
+    /// The file walk and the layer totals are one traversal seen two ways: a
+    /// plan built from the entries has to be a plan against the total that was
+    /// published beside them.
+    #[test]
+    fn the_file_walk_totals_to_the_same_bytes_as_the_layers() {
+        let root = scratch("files");
+        write(&root.join("debug/deps/lib.rlib"), 100);
+        write(&root.join("debug/incremental/obj"), 30);
+        write(&root.join("tmp/scratch"), 4);
+
+        let files = dir_files(&root, 2, &[]).unwrap();
+        assert_eq!(files.len(), 3);
+        let per_layer: BTreeMap<String, u64> = files.iter().fold(BTreeMap::new(), |mut acc, f| {
+            *acc.entry(f.layer.clone()).or_default() += f.len;
+            acc
+        });
+        assert_eq!(per_layer, dir_layers(&root, 2, &[]).unwrap());
+        assert_eq!(
+            files.iter().map(|f| f.len).sum::<u64>(),
+            dir_size_bytes(&root, &[]).unwrap()
+        );
+        for file in &files {
+            assert!(file.path.starts_with(&root), "{file:?}");
+            assert!(file.modified.is_some(), "{file:?}");
+        }
+        // The same exclusions and the same symlink rules as the totals.
+        let exclude = vec![root.join("tmp")];
+        assert_eq!(dir_files(&root, 2, &exclude).unwrap().len(), 2);
     }
 
     /// The total is the sum of the layers: one walk answers both readings, so a
@@ -213,6 +410,50 @@ mod tests {
         let layers = dir_layers(&root, 1, &[]).unwrap();
         assert_eq!(layers.get(ROOT_LAYER), Some(&3), "{layers:?}");
         assert_eq!(layers.len(), 1, "{layers:?}");
+    }
+
+    /// Two names of one file are one file's worth of bytes, held under the name
+    /// that comes first in path order. A cache read any other way reports more
+    /// than it holds, and a cap held against that total could be met by
+    /// removing a name that frees nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlinked_file_is_counted_once_under_its_first_name() {
+        let root = scratch("hardlink");
+        write(&root.join("debug/deps/lib.rlib"), 100);
+        write(&root.join("debug/deps/other.rlib"), 5);
+        fs::hard_link(
+            root.join("debug/deps/lib.rlib"),
+            root.join("debug/lib.rlib"),
+        )
+        .unwrap();
+
+        let files = dir_files(&root, 2, &[]).unwrap();
+        assert_eq!(files.len(), 3, "every name is reported: {files:?}");
+        let counted = files.iter().find(|f| !f.alias).unwrap();
+        assert_eq!(
+            counted.path,
+            root.join("debug/deps/lib.rlib"),
+            "the first name in path order owns the bytes, not the one the \
+             filesystem happened to list first"
+        );
+        assert_eq!(counted.layer, "debug/deps");
+        assert_eq!(counted.links, Some(2));
+        let alias = files
+            .iter()
+            .find(|f| f.path == root.join("debug/lib.rlib"))
+            .unwrap();
+        assert!(alias.alias, "{alias:?}");
+        assert_eq!(alias.links, Some(2));
+
+        assert_eq!(counted_bytes(&files), 105);
+        assert_eq!(dir_size_bytes(&root, &[]).unwrap(), 105);
+        let layers = dir_layers(&root, 2, &[]).unwrap();
+        assert_eq!(layers.get("debug/deps"), Some(&105));
+        // The layer the other name is in still exists in the reading, holding
+        // the zero bytes it has: a layer that vanishes cannot be told from one
+        // the walk could not see.
+        assert_eq!(layers.get("debug"), Some(&0));
     }
 
     /// A tree the walk cannot read fails rather than reporting what it managed

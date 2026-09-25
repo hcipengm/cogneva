@@ -1030,6 +1030,23 @@ pub struct SelfEvolutionWorkspaceConfig {
     /// large, and a scan per scrape would spend host IO on a number that moves
     /// in hours.
     pub cache_scan_interval_secs: u64,
+    /// Apparent bytes the shared build cache may hold, or 0 to leave it
+    /// unbounded.
+    ///
+    /// A cap rather than a retention age, because growth is what fills the
+    /// volume the cache sits on and a build that fails on a full disk is how
+    /// that is found out otherwise. When the cache is over it, the bytes that
+    /// cost a build only time are given up first (`tmp`, `incremental`,
+    /// `build`) and the compiled results after them — an enforced cap is worth a
+    /// recompile. Removal happens only while the build gate holds the slot, so
+    /// no build can be reading a file the pass is about to drop.
+    ///
+    /// 0 by default: the number belongs to the deployment, derived from the
+    /// volume behind the directory, and a default that started removing bytes on
+    /// upgrade would be a deployment's decision made silently by whoever wrote
+    /// the default. The cache is measured either way, and the readings say which
+    /// of the two states a cache is in.
+    pub target_max_bytes: u64,
 }
 
 impl Default for SelfEvolutionWorkspaceConfig {
@@ -1040,6 +1057,7 @@ impl Default for SelfEvolutionWorkspaceConfig {
             ephemeral_ttl_secs: 21600,
             orphan_branch_ttl_secs: 2592000,
             cache_scan_interval_secs: 300,
+            target_max_bytes: 0,
         }
     }
 }

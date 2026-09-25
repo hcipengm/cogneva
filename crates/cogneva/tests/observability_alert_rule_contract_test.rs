@@ -66,6 +66,25 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_build_gate_slots",
         "crates/cog-core/src/build_gate.rs",
     ),
+    // The cap family. Two of them are read by the rules that decide whether the
+    // cap is being enforced at all: over-limit is what says there is something
+    // to pay down, and the pair of timestamps is what says no pass has.
+    (
+        "cogneva_build_target_unmet_bytes",
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
+    (
+        "cogneva_build_target_over_limit_bytes",
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
+    (
+        "cogneva_build_target_last_reclaim_seconds",
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
+    (
+        "cogneva_build_target_scan_interval_seconds",
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
     (
         "cogneva_evolution_build_outcomes_total",
         "crates/cog-reflection/src/evolution_build_readings.rs",

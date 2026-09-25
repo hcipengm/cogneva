@@ -825,7 +825,7 @@ data:
         {
           "id": 23,
           "title": "Build Cache Measurement Age",
-          "description": "How long ago the build cache was measured, over 6h. A walk that fails keeps the last reading instead of publishing a smaller one, because a smaller number would read as a cache that shrank -- so the sizes alone cannot tell a cache nothing is writing to from a scan loop that stopped walking it. This series is the one that separates them: a flat size with a rising age is an unmeasured cache, and the same flat size with the age staying near the scan interval is a cache that is idle but watched. No threshold is drawn, as elsewhere: what counts as stale is the interval the deployment configured, which a panel cannot read.",
+          "description": "How long ago the build cache was measured, and how long ago a pass last removed anything from it, both over 6h. A walk that fails keeps the last reading instead of publishing a smaller one, because a smaller number would read as a cache that shrank -- so the sizes alone cannot tell a cache nothing is writing to from a scan loop that stopped walking it. The first series is what separates them: a flat size with a rising age is an unmeasured cache, and the same flat size with the age staying near the scan interval is a cache that is idle but watched. The second is the same question one step further on, about the pass rather than the walk: a cache that is over its cap and whose last paying pass is hours old is a cap that stopped being enforced -- which looks exactly like a cap that was never needed if you only read the size. It carries no value until a pass has run, so an absent line means no pass has ever paid down this directory. No threshold is drawn, as elsewhere: what counts as stale is the interval the deployment configured, which a panel cannot read.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -841,11 +841,113 @@ data:
                 "type": "prometheus",
                 "uid": "${datasource}"
               }
+            },
+            {
+              "expr": "time() - cogneva_build_target_last_reclaim_seconds",
+              "legendFormat": "{{dir}} since last pass that paid",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
             }
           ],
           "fieldConfig": {
             "defaults": {
               "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 24,
+          "title": "Build Cache Against Its Cap",
+          "description": "What the shared build cache holds, what it is allowed to hold, and what a pass did about the difference, over 6h. The cap is a volume's budget, so it is published per directory and never summed across them; the same path is mounted from different volumes in the builder and the executor. An unset cap reads as a flat zero rather than as a missing line, which is what makes 'measured but not capped' distinguishable from 'nobody measured it' -- the measurement age panel is the second half of that pair. over by is the part of what is held that the cap says should not be there; unmet is the part of it that a pass could not reach, because one file per layer is kept so that a layer that emptied is not indistinguishable from one the walk could not see. A rising unmet that never comes down is the one reading that means the cap cannot be met at its current value, and it is the reading a smaller cap makes larger. reclaimed (6h) is what passes actually freed, so a cap being enforced and a cap holding because nothing grew look different here.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 96
+          },
+          "targets": [
+            {
+              "expr": "sum by (dir) (cogneva_build_target_bytes)",
+              "legendFormat": "{{dir}} held",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_target_bytes_cap",
+              "legendFormat": "{{dir}} cap",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_target_over_limit_bytes",
+              "legendFormat": "{{dir}} over by",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_target_unmet_bytes",
+              "legendFormat": "{{dir}} unmet",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "increase(cogneva_build_target_reclaimed_bytes_total[6h])",
+              "legendFormat": "{{dir}} reclaimed (6h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 25,
+          "title": "Build Cache Over-Cap Outcomes (6h)",
+          "description": "How each over-cap pass ended, counted over 6h and split by outcome. The four are the four different things a reader can do about it, which is why they are not folded into one number: reclaimed means the cap was reached and nothing is owed, unmet means the cache could not be brought down to the cap at its current value, busy means a build held the slot and the pass deferred rather than deleting under a running build, and ungated means no build gate was in force so no pass ran at all. Only the first is a cache at its cap; the other three are each a different reason no bytes moved, and a single 'over cap' count would read them as one.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 96
+          },
+          "targets": [
+            {
+              "expr": "sum by (outcome) (increase(cogneva_build_target_over_cap_total[6h]))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
               "custom": {
                 "drawStyle": "line",
                 "lineWidth": 2

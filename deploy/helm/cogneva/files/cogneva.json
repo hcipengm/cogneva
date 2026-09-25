@@ -108,6 +108,7 @@
     "COGNEVA_SELF_EVOLUTION_WORKSPACES_EPHEMERAL_TTL_SECS": "self_evolution.workspaces.ephemeral_ttl_secs",
     "COGNEVA_SELF_EVOLUTION_WORKSPACES_ORPHAN_BRANCH_TTL_SECS": "self_evolution.workspaces.orphan_branch_ttl_secs",
     "COGNEVA_SELF_EVOLUTION_WORKSPACES_CACHE_SCAN_INTERVAL_SECS": "self_evolution.workspaces.cache_scan_interval_secs",
+    "COGNEVA_SELF_EVOLUTION_WORKSPACES_TARGET_MAX_BYTES": "self_evolution.workspaces.target_max_bytes",
     "COGNEVA_BUILD_GATE_ENABLED": "self_evolution.build_gate.enabled",
     "COGNEVA_BUILD_GATE_MAX_CONCURRENT": "self_evolution.build_gate.max_concurrent",
     "COGNEVA_BUILD_GATE_WAIT_SECS": "self_evolution.build_gate.wait_secs",
@@ -876,6 +877,24 @@
           },
           "severity": "warning",
           "summary": "tasks were routed {value} time(s) in the last day and not one of them declared a scope: the tiering that routes a small prose-only change to the lightest topology reads the files a request names and the diff it attaches, and this reading says neither ever arrived. The routing is not failing, it is inert -- and a dead rule looks exactly like a quiet day, because both leave the shortcut cell at zero. Usual causes: goals stopped naming the paths they will touch (the measure reads them out of the goal text), or a caller stopped passing affected_files. Every route is still decided by the keyword and score rules it fell back to"
+        },
+        {
+          "name": "build_cache_cap_unmet",
+          "promql": "cogneva_build_target_unmet_bytes > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "the shared build cache is {value} byte(s) above its cap and a pass has already removed everything it is allowed to: this is not a pass that failed, it is a cap this cache cannot be brought to. One file per layer is kept whatever the cap says, so that a layer that emptied is not indistinguishable from one the walk could not see -- and in a cache whose newest compiled result is also its largest, that floor is most of the cache. Nothing is at risk while it reads this way: the cache has stopped at the floor rather than growing, and every build still hits its incremental state. What is gone is the bound, and the bound is the reason the cap was set. The decision to make is the cap's value against the volume it sits on (cogneva_build_target_bytes_cap, and the panel Build Cache Against Its Cap draws both): a cap below the floor is a cap that cannot be met and should be raised to it or left unset, which reads as a flat zero here rather than as this"
+        },
+        {
+          "name": "build_cache_reclaim_stalled",
+          "promql": "(max by (dir) (cogneva_build_target_over_limit_bytes) > 0) and on (dir) (time() - max by (dir) (cogneva_build_target_last_reclaim_seconds) > 6 * max by (dir) (cogneva_build_target_scan_interval_seconds))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "the shared build cache has been {value} byte(s) over its cap for more than six of its own scan intervals and no pass has paid any of it down. A pass never deletes without the build slot -- a file removed under a running build fails that build for a reason that has nothing to do with it -- so this reading has two causes that need opposite responses, and the measurement age panel separates them: an age that keeps rising is a watcher that stopped walking, while an age that stays near the scan interval is a host whose builds have held the slot for every one of those walks. Read the outcome counts on Build Cache Over-Cap Outcomes before acting: busy and ungated are two different reasons no bytes moved (a build was running, versus no gate in force at all), and only one of them is a host that is too busy. A cache left over its cap is not immediately harmful -- it keeps filling the volume until the volume is full, and a build failing on a full disk is what the cap exists to prevent"
         }
       ]
     },

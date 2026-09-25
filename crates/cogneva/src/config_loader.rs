@@ -303,6 +303,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "self_evolution.workspaces.cache_scan_interval_secs".into(),
     );
     m.insert(
+        "COGNEVA_SELF_EVOLUTION_WORKSPACES_TARGET_MAX_BYTES".into(),
+        "self_evolution.workspaces.target_max_bytes".into(),
+    );
+    m.insert(
         "COGNEVA_BUILD_GATE_ENABLED".into(),
         "self_evolution.build_gate.enabled".into(),
     );

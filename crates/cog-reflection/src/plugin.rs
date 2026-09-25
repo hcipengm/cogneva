@@ -826,10 +826,15 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // a process with no cache of its own has nothing to report, and
                 // reporting zero for it would read as an empty cache. The scan
                 // loop is armed in start(), with the rest of the loops.
-                let build_cache =
-                    std::sync::Arc::new(crate::build_cache_readings::BuildCacheReadings::new(
+                let build_cache = std::sync::Arc::new(
+                    crate::build_cache_readings::BuildCacheReadings::new(
                         self_evolution.workspaces.target_dir.clone(),
-                    ));
+                    )
+                    .with_cap(
+                        self_evolution.workspaces.target_max_bytes,
+                        self_evolution.workspaces.cache_scan_interval_secs,
+                    ),
+                );
                 ctx.publish_observable(build_cache.clone());
                 self.build_cache = executor_enabled.then_some(build_cache);
 
@@ -962,10 +967,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 }
                 tokio::spawn(crate::build_cache_readings::run_build_cache_watch(
                     readings.clone(),
-                    ctx.config()
-                        .self_evolution
-                        .workspaces
-                        .cache_scan_interval_secs,
                     shutdown,
                 ));
             }
