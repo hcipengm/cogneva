@@ -67,6 +67,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-core/src/build_gate.rs",
     ),
     (
+        "cogneva_evolution_build_outcomes_total",
+        "crates/cog-reflection/src/evolution_build_readings.rs",
+    ),
+    (
         "cogneva_change_fate_total",
         "crates/cog-github/src/change_funnel.rs",
     ),

@@ -179,6 +179,25 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "role"],
         "crates/cog-core/src/build_gate.rs",
     ),
+    // What each change's release build cost the host. Every reading carries the
+    // change kind, because the decision these panels feed is which kind of
+    // change to spend the next build on, and the outcome, because a deploy
+    // budget kill and a build that ended on its own are not the same purchase.
+    (
+        "cogneva_evolution_build_seconds_total",
+        &["intent", "outcome"],
+        "crates/cog-reflection/src/evolution_build_readings.rs",
+    ),
+    (
+        "cogneva_evolution_build_last_seconds",
+        &["intent"],
+        "crates/cog-reflection/src/evolution_build_readings.rs",
+    ),
+    (
+        "cogneva_evolution_build_outcomes_total",
+        &["intent", "outcome"],
+        "crates/cog-reflection/src/evolution_build_readings.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

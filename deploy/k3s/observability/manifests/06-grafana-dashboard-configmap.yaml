@@ -642,6 +642,84 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 18,
+          "title": "Evolution Build Cost by Change Kind",
+          "description": "What one release build costs, split by which entry point the change came from. The mean and the last build are over the builds that ended on their own: a build the budget killed has no duration of its own, so its seconds are the budget it was cut off at and are drawn separately -- a kind whose killed-build line is walking up is losing changes to its budget while still paying for them. The mean is per build over the window and is blank when no build of that kind ran in it, which is an empty window rather than a broken panel. Nothing here is summed across the kinds: a total would say builds cost time, and the decision is which kind to spend the next one on. The change kind is the same one the landing funnel counts, so build cost can be read against what those changes ended up doing; a build whose entry point was not carried to the deployer reads as unattributed.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 72
+          },
+          "targets": [
+            {
+              "expr": "sum by (intent) (rate(cogneva_evolution_build_seconds_total{outcome=~\"built|failed\"}[30m])) / sum by (intent) (rate(cogneva_evolution_build_outcomes_total{outcome=~\"built|failed\"}[30m]))",
+              "legendFormat": "{{intent}} mean build",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (intent) (cogneva_evolution_build_last_seconds)",
+              "legendFormat": "{{intent}} last build",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum by (intent) (increase(cogneva_evolution_build_seconds_total{outcome=\"timed_out\"}[1h]))",
+              "legendFormat": "{{intent}} killed by budget (1h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 19,
+          "title": "Evolution Build Outcomes by Change Kind",
+          "description": "How the build attempts of each change kind ended, over 6h. Four classes, because they call for four different responses: built means the binary was staged; failed means cargo ran and produced nothing, so the change's own code is the thing to look at (the rule evolution_build_failed fires on this class); timed_out means the deployment budget killed it, a knob rather than a defect and already counted by deployment_killed_by_budget; unstarted means the build never reached cargo -- the host had no slot or the binary could not be spawned -- so nothing was judged and the change is still waiting. unstarted is the one class with no duration anywhere: a build that never ran has no time to report, and reporting zero seconds for it would read as a build that cost nothing.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 72
+          },
+          "targets": [
+            {
+              "expr": "sum by (intent, outcome) (increase(cogneva_evolution_build_outcomes_total[6h]))",
+              "legendFormat": "{{intent}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

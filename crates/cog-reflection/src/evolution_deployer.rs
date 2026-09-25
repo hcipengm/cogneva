@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cog_core::{SFError, SFResult};
+use cog_core::{EvolutionIntent, SFError, SFResult};
 use tracing::{info, warn};
+
+use crate::evolution_build_readings::{BuildEnding, EvolutionBuildReadings};
 
 /// Artifact produced by a successful build.
 #[derive(Debug, Clone)]
@@ -37,6 +39,9 @@ pub struct EvolutionDeployer {
     /// Where the builds this deployer bounds report what they did against the
     /// budget. Absent for a deployer nothing observes.
     budget: Option<Arc<crate::verification_budget::VerificationBudget>>,
+    /// Where the builds this deployer runs report what they cost. Absent for a
+    /// deployer nothing observes.
+    build_readings: Option<Arc<EvolutionBuildReadings>>,
 }
 
 impl EvolutionDeployer {
@@ -55,6 +60,7 @@ impl EvolutionDeployer {
             git_email: "self-evolution@cogneva.ai".to_string(),
             target_dir: None,
             budget: None,
+            build_readings: None,
         }
     }
 
@@ -67,6 +73,21 @@ impl EvolutionDeployer {
         self.build_timeout_secs = budget.timeout_secs(crate::verification_budget::KIND_BUILD);
         self.budget = Some(budget);
         self
+    }
+
+    /// Attach the sink the builds report their cost to. One instance is shared
+    /// by every surface that deploys through this deployer, so the reading
+    /// covers the builds of the automatic cycle and the admin-triggered ones
+    /// alike.
+    pub fn with_build_readings(mut self, readings: Arc<EvolutionBuildReadings>) -> Self {
+        self.build_readings = Some(readings);
+        self
+    }
+
+    fn record_build(&self, intent: Option<EvolutionIntent>, ending: BuildEnding) {
+        if let Some(readings) = &self.build_readings {
+            readings.record(intent, ending);
+        }
     }
 
     pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -102,23 +123,45 @@ impl EvolutionDeployer {
     ///
     /// On build failure the git commit is rolled back with `git reset --hard HEAD~1`.
     pub async fn commit_and_build(&self, change_id: &str) -> SFResult<BuildArtifact> {
-        self.commit_and_build_in(change_id, &self.project_root)
+        self.commit_and_build_in(change_id, &self.project_root, None)
             .await
     }
 
     /// 在指定工作树里提交并构建。每轮演进用自己的临时工作树，构建产物仍落
     /// 共享 target 目录。
+    ///
+    /// `intent` is which entry point the change came from, for the reading that
+    /// splits build cost by change kind. The call site is the only place that
+    /// knows it, and a change that arrives without one is recorded as
+    /// unattributed rather than under a kind someone guessed.
     pub async fn commit_and_build_in(
         &self,
         change_id: &str,
         workdir: &Path,
+        intent: Option<EvolutionIntent>,
     ) -> SFResult<BuildArtifact> {
         // The build slot is taken before the commit, not inside the build: a
         // refusal has to leave the tree untouched. Taken after the commit, a
         // host that was busy for the whole wait budget would end up in the
-        // branch below, which rolls the commit back -- the change would be
-        // destroyed and the host's load would be on its record.
-        let build_slot = cog_core::build_gate::acquire("evolution build").await?;
+        // rollback arm below -- the change would be destroyed and the host's
+        // load would be on its record.
+        //
+        // A refusal is that arm's whole error path, and it ends here: the gate
+        // refuses with the one error it has, and nothing after this point can
+        // produce it, so a refused build never reaches the rollback. It is
+        // recorded as a build that never ran, which is what it was.
+        let build_slot = match cog_core::build_gate::acquire("evolution build").await {
+            Ok(slot) => slot,
+            Err(e) => {
+                warn!(
+                    change_id = %change_id,
+                    error = %e,
+                    "Release build got no slot; commit kept, nothing judged"
+                );
+                self.record_build(intent, BuildEnding::Unstarted);
+                return Err(e);
+            }
+        };
 
         info!(change_id = %change_id, "Committing evolution changes");
         self.git_add_all(workdir).await?;
@@ -126,7 +169,7 @@ impl EvolutionDeployer {
 
         info!(change_id = %change_id, "Building release binary");
         let start = Instant::now();
-        let build_result = self.run_cargo_build(workdir, build_slot).await;
+        let build_result = self.run_cargo_build(workdir, build_slot, intent).await;
         let duration = start.elapsed();
 
         match build_result {
@@ -140,18 +183,9 @@ impl EvolutionDeployer {
                     build_duration_secs: duration.as_secs(),
                 })
             }
-            // Nothing was judged and nothing failed to compile: there was no
-            // build. Rolling back here would charge the host's load to the
-            // change, so the commit is kept and the caller is told which of the
-            // two happened by the error's type rather than by reading its text.
-            Err(e) if e.is_build_slot_refused() => {
-                warn!(
-                    change_id = %change_id,
-                    error = %e,
-                    "Release build got no slot; commit kept, nothing judged"
-                );
-                Err(e)
-            }
+            // Everything that reaches here is a build that ran and did not
+            // produce a binary. A refusal cannot: the slot was taken before the
+            // commit, so a refused build never got this far.
             Err(e) => {
                 warn!(
                     change_id = %change_id,
@@ -245,6 +279,7 @@ impl EvolutionDeployer {
         &self,
         workdir: &Path,
         _slot: Option<cog_core::build_gate::BuildPermit>,
+        intent: Option<EvolutionIntent>,
     ) -> SFResult<()> {
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.args(["build", "--release", "--bin", &self.binary_name])
@@ -259,8 +294,16 @@ impl EvolutionDeployer {
                 .await
             {
                 Ok(result) => {
-                    let output = result
-                        .map_err(|e| SFError::IO(format!("Failed to run cargo build: {}", e)))?;
+                    let output = match result {
+                        Ok(output) => output,
+                        Err(e) => {
+                            // cargo could not be spawned at all, so no build
+                            // happened: same class as a build the gate refused,
+                            // and no duration is reported for it.
+                            self.record_build(intent, BuildEnding::Unstarted);
+                            return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
+                        }
+                    };
                     if let Some(budget) = &self.budget {
                         budget.record_run(
                             crate::verification_budget::KIND_BUILD,
@@ -276,6 +319,13 @@ impl EvolutionDeployer {
                     if let Some(budget) = &self.budget {
                         budget.record_timeout(crate::verification_budget::KIND_BUILD);
                     }
+                    // The host time this build spent is the budget it was cut
+                    // off at, and it is reported as such rather than as a
+                    // measurement of the work.
+                    self.record_build(
+                        intent,
+                        BuildEnding::TimedOut(Duration::from_secs(self.build_timeout_secs)),
+                    );
                     return Err(SFError::IO(format!(
                         "cargo build --release exceeded the {}s deployment budget and was killed",
                         self.build_timeout_secs
@@ -284,6 +334,7 @@ impl EvolutionDeployer {
             };
 
         if !output.status.success() {
+            self.record_build(intent, BuildEnding::Failed(started.elapsed()));
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::Agent(format!(
@@ -291,6 +342,7 @@ impl EvolutionDeployer {
                 stdout, stderr
             )));
         }
+        self.record_build(intent, BuildEnding::Built(started.elapsed()));
         Ok(())
     }
 

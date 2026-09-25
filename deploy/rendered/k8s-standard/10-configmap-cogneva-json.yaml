@@ -875,6 +875,15 @@ data:
               "summary": "a process that runs builds has had no build gate in force for 5 minutes: concurrent builds in it are unbounded again, and the refusal counter cannot show this because nothing is being refused -- nothing is being bounded. Usually the slot directory could not be created or written (the gate is installed but not in force, and the reason is in the warning it logged at startup), or the gate is switched off in configuration. Read the dir label on cogneva_build_gate_slots: a builder whose dir differs from the other builders' is bounding only itself"
             },
             {
+              "name": "evolution_build_failed",
+              "promql": "sum by (intent) (increase(cogneva_evolution_build_outcomes_total{outcome=\"failed\"}[6h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "A change from the {intent} entry point failed to build {value} time(s) in 6h: cargo ran and produced no binary, so the commit was rolled back and the change is gone. This is the class that says the code a change carries does not compile; a build that never reached cargo (the host had no slot) and one killed at the deployment budget are classes of their own with their own readings, so a run of these is a generation defect rather than a busy host. Read the build error in the cycle log for the pattern before generating more from {intent}"
+            },
+            {
               "name": "routing_declaration_face_gone",
               "promql": "sum(increase(collab_route_decisions_total[24h])) unless sum(increase(collab_declared_scale_total{tier=~\"shortcut|deep|none\"}[24h])) > 0",
               "condition": {

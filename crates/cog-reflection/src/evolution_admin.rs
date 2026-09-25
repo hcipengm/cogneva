@@ -364,9 +364,12 @@ impl EvolutionAdminService {
             )));
         }
 
+        // The admin path holds a change id and a workspace and nothing that
+        // says which entry point the change came from, so its build is recorded
+        // as unattributed rather than under a kind resolved from somewhere else.
         let artifact = self
             .deployer
-            .commit_and_build_in(change_id, workdir)
+            .commit_and_build_in(change_id, workdir, None)
             .await?;
         info!(
             change_id = %artifact.change_id,

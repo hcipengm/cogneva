@@ -576,15 +576,26 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 .with_promotion_policy(promotion.clone())
                 .with_target_dir(&self_evolution.workspaces.target_dir);
 
+                // What each change's build cost the host, split by which entry
+                // point the change came from and by how it ended: a compile
+                // failure, a budget kill and a refusal are three different
+                // things to do about, and one "build failed" count cannot tell
+                // which of them a run of failures was.
+                let build_readings = std::sync::Arc::new(
+                    crate::evolution_build_readings::EvolutionBuildReadings::new(),
+                );
+
                 let deployer = crate::EvolutionDeployer::new(
                     &project_root,
                     &self_evolution.binary_dir,
                     &self_evolution.backup_dir,
                 )
                 .with_verification_budget(budget.clone())
+                .with_build_readings(build_readings.clone())
                 .with_target_dir(&self_evolution.workspaces.target_dir);
 
                 ctx.publish_observable(budget);
+                ctx.publish_observable(build_readings);
 
                 let binary_switcher = ctx.consume_service::<dyn cog_core::BinarySwitcher>();
                 // 变更上游通道（平台集成侧实现）：沙盒验过的提交经它落到主分支。
@@ -1864,8 +1875,14 @@ async fn run_evolution_cycle_in(
         } else if !config.auto_apply || config.manual_approve {
             info!(change_id = %result.change_id, "Change awaiting manual approval");
         } else {
+            // The change's entry point is carried on the landing record when it
+            // came from one. A change that came in through the local artifact
+            // queue has no such record here, and its build is recorded as
+            // unattributed: naming it after the queue would put a kind on the
+            // reading that nobody determined.
+            let intent = recorded.get(&result.change_id).and_then(|c| c.intent);
             let artifact = match deployer
-                .commit_and_build_in(&result.change_id, workdir)
+                .commit_and_build_in(&result.change_id, workdir, intent)
                 .await
             {
                 Ok(a) => a,
