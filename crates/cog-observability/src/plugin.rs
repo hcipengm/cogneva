@@ -283,6 +283,13 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             self.data_volume.push((target, volume));
         }
 
+        // ── Orphaned processes adopted as PID 1 ──
+        // The container entrypoint is the only process that can collect an
+        // orphan, and nothing else reports whether it is still doing so: a
+        // reaper that stopped and a reaper with nothing to do read the same
+        // from the outside. Publishing the count is what tells them apart.
+        ctx.publish_observable(Arc::new(crate::process_zombies::ProcessZombieObservable));
+
         // ── Persistent alert state machine ──
         // Created here (not in start) so the read-side ActiveAlertSource is
         // published before any plugin's start runs — init_all completes

@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod observable;
 pub mod plugin;
 pub mod probes;
+pub mod process_zombies;
 pub mod raw_stream;
 pub mod search_index;
 pub mod snapshot;

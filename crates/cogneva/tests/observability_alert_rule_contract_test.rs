@@ -36,6 +36,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-observability/src/data_volume.rs",
     ),
     (
+        "cogneva_process_zombies",
+        "crates/cog-observability/src/process_zombies.rs",
+    ),
+    (
         "cogneva_stream_pending_claim_idle_seconds",
         "crates/cog-orchestrator/src/observable.rs",
     ),

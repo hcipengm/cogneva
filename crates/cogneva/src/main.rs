@@ -9,6 +9,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CryptoProvider，首次 TLS 调用会 panic——必须在任何 TLS 使用之前安装。
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // 容器入口即 PID 1，孤儿进程只会被落到这里；这是唯一能收集它们的进程
+    // （git 为本地远端起的 sh -c git-upload-pack 就是这类孤儿）。子命令无关：
+    // 三个常驻模式都以 PID 1 身份跑，非 PID 1 时该函数直接返回。
+    cog_observability::process_zombies::start_orphan_reaper();
+
     let command = match Command::parse(std::env::args().skip(1)) {
         Ok(command) => command,
         Err(unknown) => {

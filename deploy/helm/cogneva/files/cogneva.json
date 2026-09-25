@@ -513,6 +513,15 @@
           "summary": "Volume holds {value}x its declared size: the workload writes past the PVC's requests.storage, and nothing enforces that request, so the declared size is not a ceiling. For a directory-backed volume the excess lands on the node filesystem and the per-volume capacity the kubelet reports is the node's, not this volume's. Either the declaration is wrong for what this deployment writes, or the growth belongs somewhere else"
         },
         {
+          "name": "orphans_unreaped",
+          "promql": "(cogneva_process_zombies > 0) and (cogneva_process_zombies == (cogneva_process_zombies offset 30m))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "PID 1 has held {value} uncollected child process(es) for 30m: the container entrypoint is the only process the kernel reparents orphans to, so a process that outlives its parent stays a zombie for the life of the container unless the entrypoint collects it. Sweeps leave a fresh orphan in place for one interval, so a reading that persists this long means collection stopped, not that a sweep is between ticks"
+        },
+        {
           "name": "trace_tier_demotion_stalled",
           "promql": "(cogneva_trace_tier_overdue > 0) and (cogneva_trace_tier_overdue == (cogneva_trace_tier_overdue offset 3h))",
           "condition": {
