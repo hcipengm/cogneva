@@ -57,7 +57,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo test --workspace
+      # A red run has to name the test that broke. The job log is behind a
+      # token, so without one all that is readable -- by a person or by anything
+      # that reads CI status programmatically -- is "the suite failed", which is
+      # the state a flaky test hides in: the same commit passes in the other job
+      # that runs this suite, and the two readings cannot be told apart.
+      # Annotations need no token, so the failing names are lifted into them.
+      # --no-fail-fast so one run names every failing test rather than stopping
+      # at the first.
+      - name: Run cargo test --workspace
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/cargo-test.log || {
+            grep -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
+              /tmp/cargo-test.log | head -30 | while IFS= read -r line; do
+                printf '::error::%s\n' "$line"
+              done
+            exit 1
+          }
       - name: Live-DB partition tests
         run: cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
@@ -166,8 +183,20 @@ jobs:
       # 审计 1.4：--fail-under-lines 基线阈值防退化，只升不降。
       # 2026-07-23 tarpaulin 基线 42.59%、阈值 40；2026-09-07 换 llvm-cov
       # （编译器内生插桩，缓存友好，CI 墙钟砍半），计数口径不同需重标基线。
+      # Same reason as the test job: a red run has to name the test that broke,
+      # and the log needs a token to read. This job runs the same suite under
+      # instrumentation, so a failure here and a failure there are two readings
+      # of one flake unless both say which test it was.
       - name: Generate coverage
-        run: cargo llvm-cov --workspace --cobertura --output-path cobertura.xml --fail-under-lines 40
+        run: |
+          set -o pipefail
+          cargo llvm-cov --workspace --cobertura --output-path cobertura.xml --fail-under-lines 40 2>&1 | tee /tmp/coverage.log || {
+            grep -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
+              /tmp/coverage.log | head -30 | while IFS= read -r line; do
+                printf '::error::%s\n' "$line"
+              done
+            exit 1
+          }
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
