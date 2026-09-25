@@ -35,15 +35,12 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         let redis_client = ctx.require::<cog_storage::RedisClient>()?.0.clone();
 
         let quota_manager = {
-            let conn = redis_client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|e| {
-                    cog_core::SFError::Config(format!(
-                        "Redis connection for quota manager failed: {}",
-                        e
-                    ))
-                })?;
+            let conn = cog_redis::connect(&redis_client).await.map_err(|e| {
+                cog_core::SFError::Config(format!(
+                    "Redis connection for quota manager failed: {}",
+                    e
+                ))
+            })?;
             Arc::new(crate::QuotaManager::new(conn, 50_000))
         };
         ctx.publish(quota_manager.clone());
@@ -54,7 +51,7 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         info!("QuotaPlugin quota manager published");
 
         let hierarchy_manager = {
-            let conn = redis_client.get_multiplexed_async_connection().await.ok();
+            let conn = cog_redis::connect(&redis_client).await.ok();
             conn.map(|c| {
                 let limits = crate::QuotaLimits::from_hard(50_000, 0.8);
                 Arc::new(crate::HierarchyManager::new(c, limits))

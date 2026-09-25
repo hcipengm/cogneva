@@ -17,7 +17,7 @@ impl RedisBackend {
             provider: "redis".into(),
             message: format!("open client failed: {}", e),
         })?;
-        let conn = ConnectionManager::new(client)
+        let conn = cog_redis::connect(&client)
             .await
             .map_err(|e| SFError::Adapter {
                 provider: "redis".into(),

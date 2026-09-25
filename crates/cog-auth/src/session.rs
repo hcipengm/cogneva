@@ -1,5 +1,5 @@
 use chrono::Utc;
-use redis::{aio::MultiplexedConnection, AsyncCommands};
+use redis::{aio::ConnectionManager, AsyncCommands};
 use uuid::Uuid;
 
 use crate::error::{AuthError, AuthResult};
@@ -19,12 +19,12 @@ fn user_sessions_key(user_id: Uuid) -> String {
 /// Redis-backed session manager.
 #[derive(Clone)]
 pub struct SessionManager {
-    redis: std::sync::Arc<tokio::sync::Mutex<MultiplexedConnection>>,
+    redis: std::sync::Arc<tokio::sync::Mutex<ConnectionManager>>,
     ttl_seconds: u64,
 }
 
 impl SessionManager {
-    pub fn new(redis: MultiplexedConnection) -> Self {
+    pub fn new(redis: ConnectionManager) -> Self {
         Self {
             redis: std::sync::Arc::new(tokio::sync::Mutex::new(redis)),
             ttl_seconds: SESSION_TTL_SECONDS,

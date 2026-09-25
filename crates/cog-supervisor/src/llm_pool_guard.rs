@@ -21,13 +21,13 @@ use crate::scheduler_gate::SchedulerGate;
 
 /// Reads the snapshot the gateway writes to Redis.
 pub struct RedisLlmPoolStatusSource {
-    conn: redis::aio::MultiplexedConnection,
+    conn: redis::aio::ConnectionManager,
 }
 
 impl RedisLlmPoolStatusSource {
     pub async fn connect(redis_url: &str) -> Result<Self, redis::RedisError> {
         let client = redis::Client::open(redis_url)?;
-        let conn = client.get_multiplexed_async_connection().await?;
+        let conn = cog_redis::connect(&client).await?;
         Ok(Self { conn })
     }
 }

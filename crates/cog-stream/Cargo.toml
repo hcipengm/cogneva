@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
+cog-redis = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }

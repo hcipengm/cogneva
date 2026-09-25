@@ -25,10 +25,22 @@ use cog_core::{validate_dag, ActionPlan, AtomicTask, SFError, SFResult, Skill};
 /// When a Redis connection is configured, all operations persist to Redis
 /// (hash key `sf:action_plans`) so plans survive process restarts. Without
 /// Redis the store falls back to an in-memory `HashMap`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ActionPlanStore {
     inner: Arc<Mutex<HashMap<String, StoredActionPlan>>>,
-    redis: Option<redis::aio::MultiplexedConnection>,
+    redis: Option<redis::aio::ConnectionManager>,
+}
+
+impl std::fmt::Debug for ActionPlanStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The connection manager has no `Debug` of its own: whether this store
+        // persists to Redis at all is what a reader needs, its socket internals
+        // are not.
+        f.debug_struct("ActionPlanStore")
+            .field("inner", &self.inner)
+            .field("redis", &self.redis.as_ref().map(|_| "redis connection"))
+            .finish()
+    }
 }
 
 impl Default for ActionPlanStore {
@@ -49,8 +61,7 @@ impl ActionPlanStore {
     pub async fn with_redis(redis_url: &str) -> SFResult<Self> {
         let client = redis::Client::open(redis_url)
             .map_err(|e| SFError::Redis(format!("redis client: {}", e)))?;
-        let conn = client
-            .get_multiplexed_async_connection()
+        let conn = cog_redis::connect(&client)
             .await
             .map_err(|e| SFError::Redis(format!("redis connection: {}", e)))?;
         Ok(Self {

@@ -304,21 +304,31 @@ impl WalBackend for MemoryWalBackend {
 /// Redis-based WAL backend.
 /// Uses Redis Lists for ordered storage of WAL records per session.
 /// Each session maps to a Redis List key: `wal:{session_id}`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RedisWalBackend {
-    client: redis::aio::MultiplexedConnection,
+    client: redis::aio::ConnectionManager,
     /// Maximum number of entries per session list.
     /// When exceeded, older entries are trimmed via LTRIM.
     /// `None` disables auto-trim (default).
     max_entries: Option<usize>,
 }
 
+impl std::fmt::Debug for RedisWalBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The connection manager has no `Debug` of its own: whether one is held
+        // is what a reader needs from this type, its socket internals are not.
+        f.debug_struct("RedisWalBackend")
+            .field("client", &"redis connection")
+            .field("max_entries", &self.max_entries)
+            .finish()
+    }
+}
+
 impl RedisWalBackend {
     pub async fn new(redis_url: &str) -> Result<Self, WalError> {
         let client =
             redis::Client::open(redis_url).map_err(|e| WalError::Backend(e.to_string()))?;
-        let conn = client
-            .get_multiplexed_async_connection()
+        let conn = cog_redis::connect(&client)
             .await
             .map_err(|e| WalError::Backend(e.to_string()))?;
         Ok(Self {

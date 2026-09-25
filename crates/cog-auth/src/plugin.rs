@@ -45,15 +45,12 @@ impl cog_core::SystemPlugin for AuthPlugin {
         info!("AuthPlugin JWT manager published");
 
         let session_manager: Arc<dyn cog_core::SessionManager> = {
-            let conn = redis_client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|e| {
-                    cog_core::SFError::Config(format!(
-                        "Redis connection for session manager failed: {}",
-                        e
-                    ))
-                })?;
+            let conn = cog_redis::connect(&redis_client).await.map_err(|e| {
+                cog_core::SFError::Config(format!(
+                    "Redis connection for session manager failed: {}",
+                    e
+                ))
+            })?;
             Arc::new(crate::SessionManager::new(conn))
         };
         ctx.publish_service(session_manager);

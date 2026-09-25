@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
 use std::collections::HashMap;
 
@@ -10,7 +10,7 @@ use cog_core::{AgentState, ContextBoard, Event, SFError, SFResult, StateBackend,
 
 /// Redis-backed state backend.
 pub struct RedisStateBackend {
-    connection: MultiplexedConnection,
+    connection: ConnectionManager,
 }
 
 impl RedisStateBackend {
@@ -18,7 +18,7 @@ impl RedisStateBackend {
         let client = redis::Client::open(redis_url).map_err(|e| SFError::Redis(e.to_string()))?;
         let mut last_err = None;
         for attempt in 0..3 {
-            match client.get_multiplexed_async_connection().await {
+            match cog_redis::connect(&client).await {
                 Ok(connection) => return Ok(Self { connection }),
                 Err(e) => {
                     last_err = Some(e);

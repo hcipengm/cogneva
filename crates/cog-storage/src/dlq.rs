@@ -16,7 +16,7 @@ use redis::AsyncCommands;
 /// Redis-backed dead-letter queue (uses a Redis list).
 #[cfg(feature = "redis")]
 pub struct RedisDeadLetterQueue {
-    connection: redis::aio::MultiplexedConnection,
+    connection: redis::aio::ConnectionManager,
     queue_key: String,
 }
 
@@ -24,8 +24,7 @@ pub struct RedisDeadLetterQueue {
 impl RedisDeadLetterQueue {
     pub async fn new(redis_url: &str, queue_key: impl Into<String>) -> SFResult<Self> {
         let client = redis::Client::open(redis_url).map_err(|e| SFError::Redis(e.to_string()))?;
-        let connection = client
-            .get_multiplexed_async_connection()
+        let connection = cog_redis::connect(&client)
             .await
             .map_err(|e| SFError::Redis(e.to_string()))?;
         Ok(Self {

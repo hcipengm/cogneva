@@ -34,7 +34,7 @@ impl BackendHealthProbe {
 
         let redis_start = std::time::Instant::now();
         let redis_status = match redis::Client::open(self.redis_url.clone()) {
-            Ok(client) => match client.get_multiplexed_async_connection().await {
+            Ok(client) => match cog_redis::connect(&client).await {
                 Ok(_) => "up".to_string(),
                 Err(e) => {
                     overall = "degraded".to_string();

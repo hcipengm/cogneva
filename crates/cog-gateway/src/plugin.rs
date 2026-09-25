@@ -110,7 +110,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // without Redis the limiter stays off (login itself still works).
         let login_rate_limiter: Option<Arc<crate::auth::LoginRateLimiter>> =
             match ctx.consume::<cog_storage::RedisClient>() {
-                Some(client) => match client.0.get_multiplexed_async_connection().await {
+                Some(client) => match cog_redis::connect(&client.0).await {
                     Ok(conn) => Some(Arc::new(crate::auth::LoginRateLimiter::new(
                         conn,
                         crate::auth::LOGIN_MAX_ATTEMPTS,

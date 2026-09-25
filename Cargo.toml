@@ -18,6 +18,7 @@ members = [
     "crates/cog-guardrail",
     "crates/cog-protocol",
     "crates/cog-stream",
+    "crates/cog-redis",
     "crates/cog-net",
     "crates/cog-notification",
     "crates/cog-extension",
@@ -142,6 +143,7 @@ cog-protocol = { path = "crates/cog-protocol" }
 cog-extension = { path = "crates/cog-extension" }
 cog-skill = { path = "crates/cog-skill" }
 cog-stream = { path = "crates/cog-stream" }
+cog-redis = { path = "crates/cog-redis" }
 cog-net = { path = "crates/cog-net" }
 cog-notification = { path = "crates/cog-notification" }
 cog-gateway = { path = "crates/cog-gateway" }

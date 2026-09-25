@@ -72,6 +72,7 @@ zstd = { workspace = true }
 windows-service = "0.7"
 
 [dev-dependencies]
+cog-redis = { workspace = true }
 tempfile = "3"
 filetime = "0.2"
 async-trait = "0.1"

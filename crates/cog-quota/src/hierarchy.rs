@@ -28,16 +28,28 @@ use crate::{
 };
 
 /// Hierarchy checker built on top of Redis.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HierarchyManager {
-    redis: Arc<Mutex<redis::aio::MultiplexedConnection>>,
+    redis: Arc<Mutex<redis::aio::ConnectionManager>>,
     default_limits: QuotaLimits,
     /// History retention in days (default 30).
     history_days: u32,
 }
 
+impl std::fmt::Debug for HierarchyManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The connection manager has no `Debug` of its own: whether one is held
+        // is what a reader needs from this type, its socket internals are not.
+        f.debug_struct("HierarchyManager")
+            .field("redis", &"redis connection")
+            .field("default_limits", &self.default_limits)
+            .field("history_days", &self.history_days)
+            .finish()
+    }
+}
+
 impl HierarchyManager {
-    pub fn new(redis: redis::aio::MultiplexedConnection, default_limits: QuotaLimits) -> Self {
+    pub fn new(redis: redis::aio::ConnectionManager, default_limits: QuotaLimits) -> Self {
         Self {
             redis: Arc::new(Mutex::new(redis)),
             default_limits,

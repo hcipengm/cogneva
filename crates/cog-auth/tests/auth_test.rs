@@ -242,13 +242,13 @@ fn test_redis_url() -> String {
 
 /// Connect to the session store, or return `None` when none is reachable so
 /// the test can skip instead of panicking.
-async fn open_test_redis() -> Option<redis::aio::MultiplexedConnection> {
+async fn open_test_redis() -> Option<redis::aio::ConnectionManager> {
     open_test_redis_at(&test_redis_url()).await
 }
 
 /// The endpoint is a parameter so the skip rule can be checked without
 /// mutating the environment the parallel session tests read.
-async fn open_test_redis_at(redis_url: &str) -> Option<redis::aio::MultiplexedConnection> {
+async fn open_test_redis_at(redis_url: &str) -> Option<redis::aio::ConnectionManager> {
     let client = match redis::Client::open(redis_url) {
         Ok(client) => client,
         Err(e) => {
@@ -256,7 +256,7 @@ async fn open_test_redis_at(redis_url: &str) -> Option<redis::aio::MultiplexedCo
             return None;
         }
     };
-    match client.get_multiplexed_async_connection().await {
+    match cog_redis::connect(&client).await {
         Ok(conn) => Some(conn),
         Err(e) => {
             eprintln!("SKIP: no Redis reachable ({e})");

@@ -86,7 +86,7 @@ RUN if [ -n "$CARGO_REGISTRY_SPARSE" ]; then \
     fi
 
 # Copy workspace manifest files first for dependency caching.
-# 工作区全部 26 个成员的 Cargo.toml 都必须齐全，缺任何一个 workspace 解析直接失败
+# 工作区全部 27 个成员的 Cargo.toml 都必须齐全，缺任何一个 workspace 解析直接失败
 #（曾经只复制 14 个，导致下面的依赖预热层秒挂、缓存从未生效）。
 COPY Cargo.toml ./
 COPY Cargo.lock ./
@@ -109,6 +109,7 @@ COPY crates/cog-guardrail/Cargo.toml crates/cog-guardrail/
 COPY crates/cog-protocol/Cargo.toml crates/cog-protocol/
 COPY crates/cog-stream/Cargo.toml crates/cog-stream/
 COPY crates/cog-net/Cargo.toml crates/cog-net/
+COPY crates/cog-redis/Cargo.toml crates/cog-redis/
 COPY crates/cog-notification/Cargo.toml crates/cog-notification/
 COPY crates/cog-extension/Cargo.toml crates/cog-extension/
 COPY crates/cog-skill/Cargo.toml crates/cog-skill/
@@ -122,7 +123,7 @@ COPY crates/bootstrap/Cargo.toml crates/bootstrap/
 #（cog-storage 的 cog-migrate bin、cog-collaboration 的 pge_cycle bench）也要补占位文件。
 RUN for crate in cog-core cog-storage cog-llm cog-agent cog-collaboration cog-orchestrator \
     cogneva cog-auth cog-quota cog-wiki cog-observability cog-memory cog-reflection cog-prompt \
-    cog-eval cog-guardrail cog-protocol cog-stream cog-net cog-notification cog-extension \
+    cog-eval cog-guardrail cog-protocol cog-stream cog-net cog-redis cog-notification cog-extension \
     cog-skill cog-gateway cog-supervisor cog-github bootstrap; do \
     mkdir -p crates/$crate/src && \
     echo '' > crates/$crate/src/lib.rs && \

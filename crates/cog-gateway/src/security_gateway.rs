@@ -667,7 +667,7 @@ struct AppState {
     /// 池健康的落盘出口（指标/时序/告警）。
     pool_obs: Arc<PoolObservability>,
     /// 跨进程池状态信号连接（调度侧读同一个键决定是否暂停 LLM 依赖型任务）。
-    redis: Option<redis::aio::MultiplexedConnection>,
+    redis: Option<redis::aio::ConnectionManager>,
     /// 池不可用判定（证据锁存）。任何一次"全上游都承接不了"的观测置位；
     /// 只有某个上游实证成功才清除。健康表为空表示**没有证据**，不等于证据表明
     /// 可用——进程刚起来、或流量停了一阵，表就是空的。若把空表当可用，判定会
@@ -3264,7 +3264,7 @@ async fn build_pool_observability(
     http_client: &Arc<dyn cog_core::HttpClient>,
 ) -> (
     Arc<PoolObservability>,
-    Option<redis::aio::MultiplexedConnection>,
+    Option<redis::aio::ConnectionManager>,
 ) {
     let obs = &config.observability;
     let metrics = Arc::new(PrometheusMetricsBackend::new(""));
@@ -3313,7 +3313,7 @@ async fn build_pool_observability(
 
     let redis = match config.redis_url.as_deref() {
         Some(url) => match redis::Client::open(url) {
-            Ok(client) => match client.get_multiplexed_async_connection().await {
+            Ok(client) => match cog_redis::connect(&client).await {
                 Ok(conn) => {
                     tracing::info!("池状态跨进程信号已接 Redis");
                     Some(conn)

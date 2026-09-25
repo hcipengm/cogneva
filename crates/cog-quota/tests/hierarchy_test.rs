@@ -19,11 +19,11 @@ async fn fresh_manager(prefix: &str) -> Option<(HierarchyManager, redis::Client)
         Ok(c) => c,
         Err(_) => return None,
     };
-    let conn = match client.get_multiplexed_async_connection().await {
+    let conn = match cog_redis::connect(&client).await {
         Ok(c) => c,
         Err(_) => return None,
     };
-    let mgr = HierarchyManager::new(conn.clone(), QuotaLimits::new(80, 100));
+    let mgr = HierarchyManager::new(conn, QuotaLimits::new(80, 100));
     cleanup(&client, prefix).await;
     Some((mgr, client))
 }

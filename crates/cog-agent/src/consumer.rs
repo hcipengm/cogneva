@@ -5,7 +5,7 @@
 use chrono::{DateTime, Utc};
 use cog_core::{SFError, SFResult};
 use futures::StreamExt;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
 use serde_json::Value;
 
@@ -24,7 +24,7 @@ pub struct InboxMessage {
 /// Each Agent gets its own consumer name inside a shared consumer group,
 /// enabling load-balancing and automatic failover via `XCLAIM`.
 pub struct AgentInboxConsumer {
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     stream_name: String,
     group_name: String,
     consumer_name: String,
@@ -42,8 +42,7 @@ impl AgentInboxConsumer {
         consumer_name: impl Into<String>,
     ) -> SFResult<Self> {
         let client = redis::Client::open(redis_url).map_err(|e| SFError::Redis(e.to_string()))?;
-        let conn = client
-            .get_multiplexed_async_connection()
+        let conn = cog_redis::connect(&client)
             .await
             .map_err(|e| SFError::Redis(e.to_string()))?;
         Ok(Self {
@@ -359,7 +358,7 @@ mod tests {
     }
 
     /// Helper to push a raw JSON payload onto a stream.
-    async fn push_payload(conn: &mut MultiplexedConnection, stream: &str, payload: &str) {
+    async fn push_payload(conn: &mut ConnectionManager, stream: &str, payload: &str) {
         let _: String = conn
             .xadd(stream, "*", &[("payload", payload)])
             .await

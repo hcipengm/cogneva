@@ -109,7 +109,7 @@ impl ContextBoard for InMemoryContextBoard {
 /// through `redis-rs`'s string commands without further encoding hops.
 #[derive(Clone)]
 pub struct RedisContextBoard {
-    connection: redis::aio::MultiplexedConnection,
+    connection: redis::aio::ConnectionManager,
     key: String,
 }
 
@@ -126,8 +126,7 @@ impl RedisContextBoard {
     /// The key is computed as `orchestrator:squad:{squad_id}:board`.
     pub async fn connect(redis_url: &str, squad_id: impl Into<String>) -> SFResult<Self> {
         let client = redis::Client::open(redis_url).map_err(|e| SFError::Redis(e.to_string()))?;
-        let connection = client
-            .get_multiplexed_async_connection()
+        let connection = cog_redis::connect(&client)
             .await
             .map_err(|e| SFError::Redis(e.to_string()))?;
         let squad: String = squad_id.into();
@@ -140,7 +139,7 @@ impl RedisContextBoard {
     /// Re-use an existing Redis connection. Useful when the caller already
     /// has a connection pool bound to other infrastructure.
     pub fn with_connection(
-        connection: redis::aio::MultiplexedConnection,
+        connection: redis::aio::ConnectionManager,
         squad_id: impl Into<String>,
     ) -> Self {
         let squad: String = squad_id.into();

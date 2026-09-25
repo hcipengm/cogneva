@@ -15,14 +15,25 @@ pub struct DailyUsage {
 }
 
 /// Manages per-user and per-workspace token quotas backed by Redis.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct QuotaManager {
-    redis: Arc<Mutex<redis::aio::MultiplexedConnection>>,
+    redis: Arc<Mutex<redis::aio::ConnectionManager>>,
     default_quota: u64,
 }
 
+impl std::fmt::Debug for QuotaManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The connection manager has no `Debug` of its own: whether one is held
+        // is what a reader needs from this type, its socket internals are not.
+        f.debug_struct("QuotaManager")
+            .field("redis", &"redis connection")
+            .field("default_quota", &self.default_quota)
+            .finish()
+    }
+}
+
 impl QuotaManager {
-    pub fn new(redis: redis::aio::MultiplexedConnection, default_quota: u64) -> Self {
+    pub fn new(redis: redis::aio::ConnectionManager, default_quota: u64) -> Self {
         Self {
             redis: Arc::new(Mutex::new(redis)),
             default_quota,
@@ -65,7 +76,7 @@ impl QuotaManager {
     /// Bootstrap a missing quota key to `default_quota` with TTL until midnight.
     async fn bootstrap_key(
         &self,
-        conn: &mut redis::aio::MultiplexedConnection,
+        conn: &mut redis::aio::ConnectionManager,
         key: &str,
     ) -> QuotaResult<()> {
         let ttl = Self::seconds_until_midnight();

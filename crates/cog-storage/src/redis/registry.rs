@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -21,12 +21,12 @@ const REGISTRY_INDEX_KEY: &str = "orchestrator:agents:index";
 
 /// Redis-backed [`AgentRegistry`].
 pub struct RedisAgentRegistry {
-    connection: MultiplexedConnection,
+    connection: ConnectionManager,
     ttl_seconds: u64,
 }
 
 impl RedisAgentRegistry {
-    pub fn new(connection: MultiplexedConnection) -> Self {
+    pub fn new(connection: ConnectionManager) -> Self {
         Self {
             connection,
             ttl_seconds: 30,
@@ -40,8 +40,7 @@ impl RedisAgentRegistry {
 
     pub async fn from_url(url: &str) -> SFResult<Self> {
         let client = redis::Client::open(url).map_err(|e| SFError::Redis(e.to_string()))?;
-        let connection = client
-            .get_multiplexed_async_connection()
+        let connection = cog_redis::connect(&client)
             .await
             .map_err(|e| SFError::Redis(e.to_string()))?;
         Ok(Self::new(connection))

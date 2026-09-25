@@ -497,8 +497,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // ── Redis client ──
         let redis_client = redis::Client::open(redis_url.clone())
             .map_err(|e| cog_core::SFError::Config(format!("Redis client open failed: {}", e)))?;
-        let redis_conn = redis_client
-            .get_multiplexed_async_connection()
+        let redis_conn = cog_redis::connect(&redis_client)
             .await
             .map_err(|e| cog_core::SFError::Config(format!("Redis connection failed: {}", e)))?;
         info!("Redis connection established");

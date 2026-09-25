@@ -1,7 +1,7 @@
 //! Redis Streams-backed [`MessageBackend`] implementation.
 
 use async_trait::async_trait;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
 
 use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
@@ -16,16 +16,13 @@ const PENDING_STATS_PAGE: usize = 1024;
 /// Redis Streams-backed [`MessageBackend`].
 pub struct RedisMessageBackend {
     client: redis::Client,
-    connection: MultiplexedConnection,
+    connection: ConnectionManager,
 }
 
 impl RedisMessageBackend {
     pub async fn new(redis_url: &str) -> SFResult<Self> {
         let client = redis::Client::open(redis_url).map_err(|e| SFError::Redis(e.to_string()))?;
-        let connection = client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| SFError::Redis(e.to_string()))?;
+        let connection = connect(&client).await?;
         Ok(Self { client, connection })
     }
 
@@ -34,12 +31,32 @@ impl RedisMessageBackend {
     /// sharing one connection across N consumers makes every consumer poll at
     /// most once per N x block-time (observed: dozens of system + agent
     /// consumers slowed backlog drain to ~1 message/minute).
-    async fn subscribe_connection(&self) -> SFResult<MultiplexedConnection> {
-        self.client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| SFError::Redis(e.to_string()))
+    /// Its own manager means its own socket and its own reconnect as well: one
+    /// consumer's dead connection cannot stall the rest.
+    async fn subscribe_connection(&self) -> SFResult<ConnectionManager> {
+        connect(&self.client).await
     }
+}
+
+/// A connection that replaces its own socket when the socket dies.
+///
+/// A bare multiplexed connection does not: once the peer closes it, every
+/// later command is issued on the same dead socket and fails with the same
+/// I/O error, forever (observed in the cluster: a pod repeating "broken
+/// pipe" for hours until it was restarted by hand, its consumers frozen on
+/// a message stream nobody was reading). The manager swaps the socket in on
+/// an I/O error and hands that one error back to the caller, so the next
+/// command goes out on a fresh connection — retries that already exist
+/// therefore recover, and a command is never issued twice, so a failed
+/// publish is never silently duplicated.
+///
+/// The other half — that this connection is not worth waiting minutes for — is
+/// [`cog_redis::connect`]'s, and it is a property of that one call site for
+/// every backend in the workspace.
+async fn connect(client: &redis::Client) -> SFResult<ConnectionManager> {
+    cog_redis::connect(client)
+        .await
+        .map_err(|e| SFError::Redis(e.to_string()))
 }
 
 #[async_trait]
@@ -347,7 +364,7 @@ impl MessageBackend for RedisMessageBackend {
 }
 
 async fn group_read(
-    conn: &mut MultiplexedConnection,
+    conn: &mut ConnectionManager,
     subject: &str,
     group: &str,
     id: &str,
@@ -389,6 +406,9 @@ fn extract_messages(reply: redis::streams::StreamReadReply) -> Vec<(String, Vec<
 mod tests {
     use super::*;
     use futures::StreamExt;
+    // The tests stand in for an outside client of the server, so they keep
+    // using the bare connection the backend no longer does.
+    use redis::aio::MultiplexedConnection;
     use std::sync::Arc;
 
     async fn pending_count(raw: &mut MultiplexedConnection, stream: &str, group: &str) -> i64 {

@@ -331,16 +331,28 @@ return count
 "#;
 
 /// Rate-limits failed login attempts per identifier.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LoginRateLimiter {
-    redis: Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    redis: Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     max_attempts: u32,
     window_seconds: u64,
 }
 
+impl std::fmt::Debug for LoginRateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The connection manager has no `Debug` of its own: whether one is held
+        // is what a reader needs from this type, its socket internals are not.
+        f.debug_struct("LoginRateLimiter")
+            .field("redis", &"redis connection")
+            .field("max_attempts", &self.max_attempts)
+            .field("window_seconds", &self.window_seconds)
+            .finish()
+    }
+}
+
 impl LoginRateLimiter {
     pub fn new(
-        redis: redis::aio::MultiplexedConnection,
+        redis: redis::aio::ConnectionManager,
         max_attempts: u32,
         window_seconds: u64,
     ) -> Self {
