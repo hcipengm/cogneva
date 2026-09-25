@@ -61,18 +61,21 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: meili-master-key
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+{{ toYaml .Values.healthProbes.startup | indent 12 }}
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 20
-            periodSeconds: 20
+{{ toYaml .Values.healthProbes.liveness | indent 12 }}
           readinessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
+{{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
             requests:
               cpu: 100m

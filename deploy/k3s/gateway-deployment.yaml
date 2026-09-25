@@ -226,18 +226,27 @@ spec:
             # 观测通道监听端口；与容器端口同源，避免两处漂移。
             - name: COGNEVA_SG_METRICS_PORT
               value: "9090"
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: egress-proxy
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /health/live
               port: egress-proxy
-            initialDelaySeconds: 10
-            periodSeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /health/ready
               port: egress-proxy
-            initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             requests:
               cpu: 100m

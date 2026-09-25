@@ -38,23 +38,23 @@ spec:
             - sh
             - -c
             - redis-server --appendonly yes --dir /data --requirepass "$REDIS_PASSWORD"
+          # 启动预算单独给：加载 40Mi 级 AOF 的耗时由数据量决定，与"运行中还
+          # 能不能应答"是两件事；混用会让数据一多就把健康的实例判死。
+          startupProbe:
+            tcpSocket:
+              port: redis
+{{ toYaml .Values.healthProbes.startup | indent 12 }}
           livenessProbe:
             tcpSocket:
               port: redis
-            initialDelaySeconds: 15
-            periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
+{{ toYaml .Values.healthProbes.liveness | indent 12 }}
           readinessProbe:
             exec:
               command:
                 - sh
                 - -c
                 - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
+{{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
             requests:
               cpu: 100m

@@ -41,23 +41,29 @@ spec:
             - sh
             - -c
             - redis-server --appendonly yes --dir /data --requirepass "$REDIS_PASSWORD"
+          # 启动预算单独给：加载 40Mi 级 AOF 的耗时由数据量决定，与"运行中还
+          # 能不能应答"是两件事；混用会让数据一多就把健康的实例判死。
+          startupProbe:
+            tcpSocket:
+              port: redis
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 5
           livenessProbe:
             tcpSocket:
               port: redis
-            initialDelaySeconds: 15
+            failureThreshold: 6
             periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
+            timeoutSeconds: 10
           readinessProbe:
             exec:
               command:
                 - sh
                 - -c
                 - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping
-            initialDelaySeconds: 5
+            failureThreshold: 6
             periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
+            timeoutSeconds: 10
           resources:
             requests:
               cpu: 100m

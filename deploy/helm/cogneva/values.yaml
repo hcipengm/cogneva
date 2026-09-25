@@ -318,6 +318,28 @@ clusterRegistry:
       cpu: 200m
       memory: 256Mi
 
+# 后端探针的失败预算。探针测的是"这个后端还能不能干活"，而 kubelet 判死一个 Pod
+# 靠的是"在预算内有没有应答"，预算按空闲节点取就必然在节点忙时误杀：共址构建把
+# load 拉到 20+、可用内存掉到几百 Mi 时，kubelet 连自己的 Pod IP 都 dial 不进去
+# （实测 redis 因此被 liveness 杀掉，后端再断一次）。所以两类预算分开取：
+# 启动预算按"最慢的合法启动"（加载大 AOF、首次 initdb、建索引），运行预算按
+# "节点最忙时仍应答应答"；把两者混成一个预算，必然在其中一边取值错。
+# 探针省略 timeoutSeconds 时 kubelet 默认 1 秒、failureThreshold 默认 3 次，
+# 所以这里必须显式写全——"省略"本身就是按空闲节点取值。
+healthProbes:
+  startup:
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 60
+  liveness:
+    periodSeconds: 20
+    timeoutSeconds: 10
+    failureThreshold: 6
+  readiness:
+    periodSeconds: 10
+    timeoutSeconds: 10
+    failureThreshold: 6
+
 # 可选后端；禁用即假定使用外部服务（在 config 中指向外部地址）
 backends:
   postgres:

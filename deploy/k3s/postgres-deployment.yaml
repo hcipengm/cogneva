@@ -39,6 +39,17 @@ spec:
                   key: pg-password
             - name: POSTGRES_DB
               value: "cogneva"
+          startupProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - cog_user
+                - -d
+                - cogneva
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
           livenessProbe:
             exec:
               command:
@@ -47,10 +58,9 @@ spec:
                 - cog_user
                 - -d
                 - cogneva
-            initialDelaySeconds: 30
             periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
+            timeoutSeconds: 10
+            failureThreshold: 6
           readinessProbe:
             exec:
               command:
@@ -59,10 +69,9 @@ spec:
                 - cog_user
                 - -d
                 - cogneva
-            initialDelaySeconds: 5
             periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             requests:
               cpu: 250m

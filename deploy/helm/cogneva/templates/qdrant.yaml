@@ -54,22 +54,21 @@ spec:
           # timeoutSeconds 必须显式给：Kubernetes 默认 1 秒，而 Qdrant 在段合并
           # 或大查询期间响应会超过 1 秒——默认值下探针连续失败会判活失败并重启
           # 一个其实健康的实例，重启又让它重新加载段文件。
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+{{ toYaml .Values.healthProbes.startup | indent 12 }}
           livenessProbe:
             httpGet:
               path: /
               port: http
-            initialDelaySeconds: 30
-            periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
+{{ toYaml .Values.healthProbes.liveness | indent 12 }}
           readinessProbe:
             httpGet:
               path: /
               port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
+{{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
             requests:
               cpu: 250m

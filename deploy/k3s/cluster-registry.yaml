@@ -56,18 +56,27 @@ spec:
             - name: registry
               containerPort: 5000
               protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /v2/
+              port: registry
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /v2/
               port: registry
-            initialDelaySeconds: 10
-            periodSeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /v2/
               port: registry
-            initialDelaySeconds: 3
-            periodSeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             requests:
               cpu: 20m

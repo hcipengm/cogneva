@@ -40,23 +40,27 @@ spec:
             - sh
             - -c
             - redis-server --appendonly yes --dir /data --requirepass "$REDIS_PASSWORD"
+          startupProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
           livenessProbe:
             tcpSocket:
               port: redis
-            initialDelaySeconds: 15
             periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
+            timeoutSeconds: 10
+            failureThreshold: 6
           readinessProbe:
             exec:
               command:
                 - sh
                 - -c
                 - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping
-            initialDelaySeconds: 5
             periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             requests:
               cpu: 100m

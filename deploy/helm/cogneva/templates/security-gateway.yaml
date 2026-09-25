@@ -218,18 +218,21 @@ spec:
           # 有动静），/health/live 与 /health/ready 由网关自己答，不对上游发请求。
           # 没有 liveness 时一个卡死的网关会一直被 Service 指向并持续吞掉全部
           # LLM 与 git 出口调用；没有 readiness 时新 Pod 未就绪就先接流量。
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: egress-proxy
+{{ toYaml .Values.healthProbes.startup | indent 12 }}
           livenessProbe:
             httpGet:
               path: /health/live
               port: egress-proxy
-            initialDelaySeconds: 10
-            periodSeconds: 15
+{{ toYaml .Values.healthProbes.liveness | indent 12 }}
           readinessProbe:
             httpGet:
               path: /health/ready
               port: egress-proxy
-            initialDelaySeconds: 5
-            periodSeconds: 10
+{{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
             {{- toYaml .Values.securityGateway.resources | nindent 12 }}
           {{- if .Values.securityGateway.gitMirror.enabled }}

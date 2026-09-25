@@ -59,18 +59,21 @@ spec:
             - name: monitor
               containerPort: 8222
               protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+{{ toYaml .Values.healthProbes.startup | indent 12 }}
           livenessProbe:
             httpGet:
               path: /healthz
               port: monitor
-            initialDelaySeconds: 10
-            periodSeconds: 15
+{{ toYaml .Values.healthProbes.liveness | indent 12 }}
           readinessProbe:
             httpGet:
               path: /healthz
               port: monitor
-            initialDelaySeconds: 5
-            periodSeconds: 10
+{{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
             requests:
               cpu: 100m

@@ -55,20 +55,29 @@ spec:
           # 主进程含四个角色，探针分开测：存活看 master 的 HTTP 接口（未鉴权、
           # 恒 200），就绪额外确认 S3 网关真的在应答——端口被 bind 不等于网关
           # 已经接上 filer，提早放流量会让首次写入失败。
+          startupProbe:
+            httpGet:
+              path: /cluster/status
+              port: master
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /cluster/status
               port: master
-            initialDelaySeconds: 15
+            failureThreshold: 6
             periodSeconds: 20
+            timeoutSeconds: 10
           readinessProbe:
             exec:
               command:
                 - /bin/sh
                 - -c
                 - wget -qS -O /dev/null http://127.0.0.1:8333/ 2>&1 | grep -q 'HTTP/1.1'
-            initialDelaySeconds: 5
+            failureThreshold: 6
             periodSeconds: 10
+            timeoutSeconds: 10
           resources:
             requests:
               cpu: 100m

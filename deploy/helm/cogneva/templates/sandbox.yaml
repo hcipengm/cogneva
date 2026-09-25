@@ -154,18 +154,21 @@ spec:
               value: {{ .Values.sandboxExecutor.repoFetchIntervalSecs | quote }}
             - name: SANDBOX_MAX_TASK_WORKSPACES
               value: {{ .Values.sandboxExecutor.maxTaskWorkspaces | quote }}
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: executor
+{{ toYaml .Values.healthProbes.startup | indent 12 }}
           livenessProbe:
             httpGet:
               path: /health/live
               port: executor
-            initialDelaySeconds: 10
-            periodSeconds: 15
+{{ toYaml .Values.healthProbes.liveness | indent 12 }}
           readinessProbe:
             httpGet:
               path: /health/ready
               port: executor
-            initialDelaySeconds: 5
-            periodSeconds: 10
+{{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
             {{- toYaml .Values.sandboxExecutor.resources | nindent 12 }}
           volumeMounts:

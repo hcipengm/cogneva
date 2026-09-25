@@ -44,20 +44,25 @@ spec:
           # timeoutSeconds 必须显式给：Kubernetes 默认 1 秒，而 pg_isready 在
           # checkpoint 或复制压力下会超过 1 秒——默认值下探针连续失败会判活失败
           # 并重启数据库，重启期间全部写入方（进化、triage、告警落盘）一起断。
+          # 首次启动要 initdb，预算按数据目录最慢的合法启动给。
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "cog_user", "-d", "cogneva"]
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 5
           livenessProbe:
             exec:
               command: ["pg_isready", "-U", "cog_user", "-d", "cogneva"]
-            initialDelaySeconds: 30
+            failureThreshold: 6
             periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
+            timeoutSeconds: 10
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "cog_user", "-d", "cogneva"]
-            initialDelaySeconds: 5
+            failureThreshold: 6
             periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
+            timeoutSeconds: 10
           resources:
             requests:
               cpu: 250m

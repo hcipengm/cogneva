@@ -137,18 +137,27 @@ spec:
               value: "300"
             - name: SANDBOX_MAX_TASK_WORKSPACES
               value: "8"
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: executor
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /health/live
               port: executor
-            initialDelaySeconds: 10
-            periodSeconds: 15
+            failureThreshold: 6
+            periodSeconds: 20
+            timeoutSeconds: 10
           readinessProbe:
             httpGet:
               path: /health/ready
               port: executor
-            initialDelaySeconds: 5
+            failureThreshold: 6
             periodSeconds: 10
+            timeoutSeconds: 10
           resources:
             limits:
               cpu: 1000m
