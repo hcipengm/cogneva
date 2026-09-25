@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod build_gate;
 pub mod config;
+pub mod config_sections;
 pub mod contract;
 pub mod error;
 pub mod secrets;

@@ -1108,6 +1108,65 @@ mod tests {
         });
     }
 
+    /// Both shipped forms of the deploy config, parsed. Kept in one place so a
+    /// gate that must hold for what the cluster receives reads the blob rather
+    /// than assuming the chart's copy is the same document.
+    fn shipped_documents() -> Vec<(&'static str, serde_json::Value)> {
+        let chart_path = deploy_file("helm/cogneva/files/cogneva.json");
+        let chart_raw = std::fs::read_to_string(&chart_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", chart_path.display()));
+        let chart: serde_json::Value = serde_json::from_str(&chart_raw)
+            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", chart_path.display()));
+
+        let baseline_path = deploy_file("k3s/cogneva-json-configmap.yaml");
+        let baseline_raw = std::fs::read_to_string(&baseline_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", baseline_path.display()));
+        let embedded = configmap_block_scalar(&baseline_raw, "cogneva.json").unwrap_or_else(|| {
+            panic!(
+                "{} carries no `cogneva.json: |` block",
+                baseline_path.display()
+            )
+        });
+        let baseline: serde_json::Value = serde_json::from_str(&embedded).unwrap_or_else(|e| {
+            panic!(
+                "the JSON block in {} is not valid: {e}",
+                baseline_path.display()
+            )
+        });
+
+        vec![("chart", chart), ("k3s configmap", baseline)]
+    }
+
+    /// Every top-level section of the shipped document carries a disposition.
+    ///
+    /// The reload path applies a hand-written list of sections and says nothing
+    /// about the rest, so a section arriving without a disposition is one whose
+    /// changes nobody has decided how to deliver: the file moves, the process
+    /// keeps the copy it read, and the only report is the one nobody wrote. A
+    /// delivered alert rule set stayed inert that way. Both shipped forms are
+    /// checked, because a disposition can be true of the chart and false of the
+    /// blob the cluster applies.
+    #[test]
+    fn every_shipped_config_section_has_a_reload_disposition() {
+        for (label, doc) in shipped_documents() {
+            let unclassified = cog_core::config_sections::unclassified_sections(&doc);
+            assert!(
+                unclassified.is_empty(),
+                "{label}: sections with no reload disposition: {unclassified:?}\n\
+                 add them to cog_core::config_sections::CONFIG_SECTIONS with the effect \
+                 they actually have (ConfigEffect::HotReloaded only when every field the \
+                 running process reads from the section is re-applied on reload) and a \
+                 note saying who reads it"
+            );
+            let missing = cog_core::config_sections::sections_missing_from_document(&doc);
+            assert!(
+                missing.is_empty(),
+                "{label}: dispositions for sections the document no longer has: {missing:?}\n\
+                 a stale entry claims a section nobody delivers, and it hides the next gap"
+            );
+        }
+    }
+
     /// Env mappings whose JSON path the serialized config cannot hold. The
     /// loader writes through `set_json_path`, which creates intermediate
     /// objects on demand — so a mistyped segment does not fail, it writes into

@@ -177,6 +177,22 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // 初始与每轮热重载都经 cog-llm 自载器读 cogneva.json。
         let initial_llm_routing = cog_llm::LLMRoutingConfig::load()
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+        // The reload path below re-applies a handful of sections; every other
+        // section is read once while a plugin starts, so a change to it stays
+        // inert until the pod restarts. State which those are once at startup:
+        // the coverage of the reload path is otherwise something a reader has to
+        // infer from what it happens to log.
+        let startup_only: Vec<&str> = cog_core::config_sections::CONFIG_SECTIONS
+            .iter()
+            .filter(|s| s.effect == cog_core::config_sections::ConfigEffect::RestartRequired)
+            .map(|s| s.name)
+            .collect();
+        tracing::info!(
+            "config sections that only take effect at startup ({}): {}",
+            startup_only.len(),
+            startup_only.join(", ")
+        );
         tokio::spawn(async move {
             let mut active_llm_routing = initial_llm_routing;
             while rx.changed().await.is_ok() {

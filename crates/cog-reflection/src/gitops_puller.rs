@@ -7,7 +7,9 @@
 //!   → 找 HEAD 上的 promote/* tag，读 tag message（level / change_id）
 //!   → 台账幂等：本集群已处理过该 change 则跳过
 //!   → L0（l0_config）：提取变化的配置文件
-//!       deploy/k3s/cogneva-json-configmap.yaml → kubectl apply（ConfigWatcher 热更新）
+//!       deploy/k3s/cogneva-json-configmap.yaml → kubectl apply；若变化的段里有
+//!       「进程启动时读一次」的段（见 cog_core::config_sections），再滚动挂载该
+//!       configmap 的工作负载——热更新只覆盖一部分段，剩下的段只有重启才生效
 //!       prompts/** → 重建 prompts configmap → kubectl apply（hot_reload 热更新）
 //!   → L1（l1_rollout）：拉取镜像（推送端已 push 到外部仓库或集群内
 //!       registry，拉取端只产出引用，绝不本地构建）→ 金丝雀发布
@@ -545,11 +547,25 @@ impl GitOpsPuller {
 
         let mut applied = Vec::new();
         let mut prompts_touched = false;
+        let mut restart_sections: Vec<String> = Vec::new();
         for file in changed.lines() {
             if file == "deploy/k3s/cogneva-json-configmap.yaml" {
                 let content = self
                     .run("git", &["show", &format!("HEAD:{file}")], Some(&dir), 30)
                     .await?;
+                // The document on the left of the comparison is only there to say
+                // which sections moved. A file that the parent commit does not
+                // carry reads as an empty document, which makes every section look
+                // changed: the direction is a rollout too many, never a change
+                // that stays inert.
+                let previous = self
+                    .run("git", &["show", &format!("HEAD~1:{file}")], Some(&dir), 30)
+                    .await
+                    .unwrap_or_default();
+                restart_sections = cog_core::config_sections::sections_needing_restart_on_change(
+                    &config_document(&previous),
+                    &config_document(&content),
+                );
                 self.kubectl_apply_stdin(&content).await?;
                 applied.push(file.to_string());
             } else if file.starts_with("prompts/") {
@@ -561,6 +577,20 @@ impl GitOpsPuller {
             applied.push(self.rebuild_prompts_configmap().await?);
         }
 
+        // Applying the ConfigMap only moves the file the pods mount. The reload
+        // path re-applies a handful of sections to a running process and stays
+        // silent about the rest, so a section it does not cover is delivered,
+        // reported as applied, and inert until the pod restarts. The workloads
+        // that mount it are rolled here for exactly those sections.
+        if !restart_sections.is_empty() {
+            let rolled = self.roll_config_consumers().await?;
+            applied.push(format!(
+                "rolled {} for sections that only take effect at startup: {}",
+                rolled.join(", "),
+                restart_sections.join(", ")
+            ));
+        }
+
         if applied.is_empty() {
             return Err(SFError::Validation(format!(
                 "L0 commit {} 未触及任何配置路径",
@@ -568,6 +598,81 @@ impl GitOpsPuller {
             )));
         }
         Ok(format!("config applied: {}", applied.join(", ")))
+    }
+
+    /// Roll every workload that mounts the config ConfigMap.
+    ///
+    /// The set is read from the manifests at the commit being applied rather
+    /// than listed here: a workload that starts mounting the config has to be
+    /// rolled without anyone remembering to add it, and a hand-written list
+    /// fails by silently skipping the new one. No mount at all is an error
+    /// rather than a no-op — the ConfigMap has already been applied by then, so
+    /// reporting success would leave a cluster whose file and processes disagree
+    /// while the record says the change landed.
+    async fn roll_config_consumers(&self) -> SFResult<Vec<String>> {
+        let dir = self.work_dir();
+        let listed = self
+            .run(
+                "git",
+                &["ls-tree", "-r", "--name-only", "HEAD", "deploy/k3s"],
+                Some(&dir),
+                30,
+            )
+            .await?;
+
+        let mut rolled = Vec::new();
+        for path in listed.lines() {
+            if !path.ends_with(".yaml") {
+                continue;
+            }
+            let Ok(text) = self
+                .run("git", &["show", &format!("HEAD:{path}")], Some(&dir), 30)
+                .await
+            else {
+                // One unreadable manifest must not stop the roll: the workload it
+                // holds would stay on the previous configuration.
+                warn!(manifest = %path, "config consumers: manifest unreadable, skipping");
+                continue;
+            };
+            for name in mounters_of_config(&text) {
+                if rolled.contains(&name) {
+                    continue;
+                }
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs().to_string())
+                    .unwrap_or_default();
+                self.run(
+                    &self.config.kubectl_bin.clone(),
+                    &[
+                        "-n",
+                        &self.config.namespace.clone(),
+                        "patch",
+                        "deployment",
+                        &name,
+                        "--type",
+                        "merge",
+                        "-p",
+                        &format!(
+                            r#"{{"spec":{{"template":{{"metadata":{{"annotations":{{"cogneva.io/restartedAt":"{stamp}"}}}}}}}}}}"#
+                        ),
+                    ],
+                    None,
+                    60,
+                )
+                .await?;
+                rolled.push(name);
+            }
+        }
+
+        if rolled.is_empty() {
+            return Err(SFError::Validation(
+                "配置里有只有重启才生效的段，但没有任何工作负载挂载该 configmap——\
+                 configmap 已应用、进程仍在用旧值，滚动没发生"
+                    .to_string(),
+            ));
+        }
+        Ok(rolled)
     }
 
     /// prompts/ 全量重建 cogneva-prompts configmap（挂载进主 Pod，
@@ -1853,6 +1958,70 @@ fn quantile_from_buckets(buckets: &[(f64, u64)], q: f64) -> Option<f64> {
     None
 }
 
+/// The JSON document inside the config ConfigMap blob.
+///
+/// Anything unreadable yields `Null`, which compares as a change against every
+/// section of a readable document: the failure direction is a rollout that was
+/// not needed, never a section that silently stays inert.
+fn config_document(manifest: &str) -> serde_json::Value {
+    serde_yaml::from_str::<serde_yaml::Value>(manifest)
+        .ok()
+        .and_then(|blob| {
+            blob.get("data")
+                .and_then(|data| data.get("cogneva.json"))
+                .and_then(|text| text.as_str())
+                .map(str::to_string)
+        })
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Names of the workloads whose pod template mounts the config ConfigMap.
+///
+/// Read from the manifest rather than listed in code, so a workload that starts
+/// mounting the config is rolled without anyone remembering to add it here. Any
+/// workload kind with a pod template counts; what makes a workload a consumer is
+/// the mount, not its kind.
+fn mounters_of_config(manifest: &str) -> Vec<String> {
+    use serde::Deserialize;
+
+    let mut out = Vec::new();
+    for doc in serde_yaml::Deserializer::from_str(manifest) {
+        let Ok(yaml) = serde_yaml::Value::deserialize(doc) else {
+            continue;
+        };
+        // Read the fields through the JSON view: the two value types address a
+        // nested field differently, and one of them has to be picked so the
+        // lookups read the same here as everywhere else in this file.
+        let Ok(value) = serde_json::to_value(yaml) else {
+            continue;
+        };
+        if !matches!(
+            value.get("kind").and_then(|k| k.as_str()),
+            Some("Deployment" | "StatefulSet" | "DaemonSet")
+        ) {
+            continue;
+        }
+        let mounts = value
+            .pointer("/spec/template/spec/volumes")
+            .and_then(|v| v.as_array())
+            .map(|volumes| {
+                volumes.iter().any(|volume| {
+                    volume.pointer("/configMap/name").and_then(|n| n.as_str())
+                        == Some("cogneva-json")
+                })
+            })
+            .unwrap_or(false);
+        if !mounts {
+            continue;
+        }
+        if let Some(name) = value.pointer("/metadata/name").and_then(|n| n.as_str()) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2771,6 +2940,129 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
                 10.0
             ),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_consumer_tests {
+    use super::*;
+
+    fn blob(json: &str) -> String {
+        format!(
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cogneva-json\n  namespace: cogneva\ndata:\n  cogneva.json: |\n{}",
+            json.lines()
+                .map(|line| format!("    {line}\n"))
+                .collect::<String>()
+        )
+    }
+
+    /// The document has to come out of the blob, not out of the YAML around it:
+    /// a reader that missed the block would compare empty documents and report no
+    /// change at all, which is the failure this whole path exists to prevent.
+    #[test]
+    fn the_document_comes_out_of_the_configmap_blob() {
+        let doc = config_document(&blob(
+            r#"{"observability": {"infra_watch": {"enabled": true}}}"#,
+        ));
+        assert_eq!(
+            doc.pointer("/observability/infra_watch/enabled"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_blob_is_not_an_empty_document() {
+        assert!(config_document("not: [a, configmap").is_null());
+        assert!(
+            config_document("kind: ConfigMap\ndata:\n  other.json: |\n    {}\n").is_null(),
+            "a blob with no cogneva.json entry yields no document"
+        );
+    }
+
+    #[test]
+    fn consumers_are_found_by_the_mount_not_by_a_list() {
+        let manifest = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cogneva-json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cogneva
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cogneva-json
+          configMap:
+            name: cogneva-json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unrelated
+spec:
+  template:
+    spec:
+      volumes:
+        - name: other
+          configMap:
+            name: other-config
+"#;
+        assert_eq!(mounters_of_config(manifest), vec!["cogneva".to_string()]);
+    }
+
+    /// The seam the roll depends on: a section the reload path re-applies must
+    /// not cost a restart, and one read at startup must.
+    #[test]
+    fn only_startup_sections_produce_a_restart_decision() {
+        let old = config_document(&blob(r#"{"tuning": {"stream_capacity": 8}}"#));
+        let new = config_document(&blob(r#"{"tuning": {"stream_capacity": 16}}"#));
+        assert!(
+            cog_core::config_sections::sections_needing_restart_on_change(&old, &new).is_empty(),
+            "a section the reload path applies needs no rollout"
+        );
+
+        let old = config_document(&blob(
+            r#"{"observability": {"infra_watch": {"rules": []}}}"#,
+        ));
+        let new = config_document(&blob(
+            r#"{"observability": {"infra_watch": {"rules": [{"name": "pod_oom_killed"}]}}}"#,
+        ));
+        assert_eq!(
+            cog_core::config_sections::sections_needing_restart_on_change(&old, &new),
+            vec!["observability".to_string()]
+        );
+    }
+
+    /// The scanner against the manifests the cluster is built from, not against a
+    /// fixture written to suit it: a scan that finds nothing would be read at
+    /// runtime as "no workload to roll", and a rollout that never happens is
+    /// indistinguishable from one that was not needed.
+    #[test]
+    fn the_shipped_manifests_name_their_config_consumers() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut found = Vec::new();
+        let mut files = 0;
+        for entry in std::fs::read_dir(root.join("deploy/k3s")).expect("deploy/k3s readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            files += 1;
+            let text = std::fs::read_to_string(&path).expect("manifest readable");
+            found.extend(mounters_of_config(&text));
+        }
+        assert!(files > 0, "no manifests were read at all");
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["cogneva".to_string(), "cogneva-evolution".to_string()],
+            "the workloads that mount the config, read from the manifests; a rename here is a \
+             rename of what the config roll targets"
         );
     }
 }
