@@ -60,6 +60,22 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-orchestrator/src/observable.rs",
     ),
     (
+        "cogneva_stream_read_block_seconds",
+        "crates/cog-stream/src/observable.rs",
+    ),
+    (
+        "cogneva_stream_read_silent_seconds",
+        "crates/cog-stream/src/observable.rs",
+    ),
+    (
+        "cogneva_runtime_asset_manifest_absent",
+        "crates/cog-reflection/src/runtime_assets.rs",
+    ),
+    (
+        "cogneva_runtime_asset_manifest_unusable",
+        "crates/cog-reflection/src/runtime_assets.rs",
+    ),
+    (
         "cogneva_runtime_asset_state",
         "crates/cog-reflection/src/runtime_assets.rs",
     ),
