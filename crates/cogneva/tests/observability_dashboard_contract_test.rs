@@ -14,47 +14,171 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+#[path = "common/producer.rs"]
+mod producer;
 #[path = "common/promql.rs"]
 mod promql;
 
+use producer::carries_the_producer;
 use promql::metric_names_in;
 
 const DASHBOARD: &str = "deploy/k3s/observability/manifests/06-grafana-dashboard-configmap.yaml";
 
-/// Series this workspace produces, with the labels each one carries.
-/// Recorded at the call sites: `http_requests_total` / `http_request_duration_ms`
-/// share one label map, as do `llm_calls_total` / `llm_call_latency_ms`.
-const PRODUCED: &[(&str, &[&str])] = &[
-    ("http_requests_total", &["method", "endpoint", "status"]),
+/// Series this workspace produces: the labels each one carries, and the file
+/// that publishes it.
+///
+/// The labels are recorded at the call sites: `http_requests_total` /
+/// `http_request_duration_ms` share one label map, as do `llm_calls_total` /
+/// `llm_call_latency_ms`. The file is read and searched for the name, so a
+/// producer that was renamed or removed fails the test instead of licensing a
+/// panel that can never draw anything.
+///
+/// The third column is what makes the first two a contract rather than a
+/// preference: it is the series' own producer, not another reader of it.
+const PRODUCED: &[(&str, &[&str], &str)] = &[
+    (
+        "http_requests_total",
+        &["method", "endpoint", "status"],
+        "crates/cog-gateway/src/lib.rs",
+    ),
     (
         "http_request_duration_ms",
         &["method", "endpoint", "status"],
+        "crates/cog-gateway/src/lib.rs",
     ),
-    ("llm_calls_total", &["upstream", "model", "result", "actor"]),
+    (
+        "llm_calls_total",
+        &["upstream", "model", "result", "actor"],
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     (
         "llm_call_latency_ms",
         &["upstream", "model", "result", "actor"],
+        "crates/cog-gateway/src/security_gateway.rs",
     ),
     // Agent run counters carry no labels: they are totals for the process, not
     // per-task readings, so nothing distinguishes one sample from the next.
-    ("agent_success_count", &[]),
-    ("agent_budget_exhausted_count", &[]),
+    (
+        "agent_success_count",
+        &[],
+        "crates/cog-agent/src/observable.rs",
+    ),
+    (
+        "agent_budget_exhausted_count",
+        &[],
+        "crates/cog-agent/src/observable.rs",
+    ),
     // The iteration ceiling is derived per role, so which role is being cut off
     // is the question; a single unlabelled total could not answer it.
-    ("agent_iteration_budget_exhausted", &["role"]),
+    (
+        "agent_iteration_budget_exhausted",
+        &["role"],
+        "crates/cog-agent/src/observable.rs",
+    ),
     // Pool recovery readings. Three separate series rather than one "recovers
     // at" number: which upstream said it, when we will probe again, and how long
     // the window an upstream stated is are answers of different strength, and
     // collapsing them is how a probe cadence gets read as a promise.
-    ("llm_pool_evidenced_recovery_unix", &[]),
-    ("llm_pool_next_attempt_unix", &[]),
-    ("llm_pool_quota_window_secs", &[]),
-    ("cogneva_verification_budget_seconds", &["kind"]),
-    ("cogneva_verification_last_run_seconds", &["kind"]),
-    ("cogneva_verification_timeouts_total", &["kind"]),
-    ("llm_upstream_quota_window_secs", &["upstream"]),
-    ("llm_upstream_quota_reset_unix", &["upstream"]),
-    ("llm_upstream_consecutive_failures", &["upstream"]),
+    (
+        "llm_pool_evidenced_recovery_unix",
+        &[],
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    (
+        "llm_pool_next_attempt_unix",
+        &[],
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    (
+        "llm_pool_quota_window_secs",
+        &[],
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    (
+        "cogneva_verification_budget_seconds",
+        &["kind"],
+        "crates/cog-reflection/src/verification_budget.rs",
+    ),
+    (
+        "cogneva_verification_last_run_seconds",
+        &["kind"],
+        "crates/cog-reflection/src/verification_budget.rs",
+    ),
+    (
+        "cogneva_verification_timeouts_total",
+        &["kind"],
+        "crates/cog-reflection/src/verification_budget.rs",
+    ),
+    (
+        "llm_upstream_quota_window_secs",
+        &["upstream"],
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    (
+        "llm_upstream_quota_reset_unix",
+        &["upstream"],
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    (
+        "llm_upstream_consecutive_failures",
+        &["upstream"],
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    // The host-wide build bound. Every reading carries the slot directory it is
+    // about, because two processes that point at different directories bound
+    // only themselves and nothing in the numbers would say so, and the role that
+    // published it, because a process that runs no builds publishes the same
+    // series at zero on purpose.
+    (
+        "cogneva_build_gate_slots",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_in_flight",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_waiting",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_acquired_total",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_refused_total",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_wait_ms_total",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_wait_ms_max",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_held_ms_total",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_held_ms_max",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_wait_budget_ms",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the
@@ -70,11 +194,13 @@ const FOREIGN: &[(&str, &str)] = &[
 ];
 
 fn dashboard_text() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(DASHBOARD);
+    let path = repo_root().join(DASHBOARD);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("dashboard manifest unreadable at {}: {e}", path.display()))
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 /// Whether an `expr` filters a datasource other than the metric store, i.e. a
@@ -100,7 +226,7 @@ fn legend_labels_in(legend: &str) -> BTreeSet<String> {
 #[test]
 fn every_series_the_dashboard_reads_is_one_something_produces() {
     let text = dashboard_text();
-    let produced: BTreeSet<&str> = PRODUCED.iter().map(|(n, _)| *n).collect();
+    let produced: BTreeSet<&str> = PRODUCED.iter().map(|(n, _, _)| *n).collect();
     let foreign: BTreeSet<&str> = FOREIGN.iter().map(|(n, _)| *n).collect();
 
     let mut unknown: BTreeSet<String> = BTreeSet::new();
@@ -141,14 +267,42 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
     );
 }
 
+/// The other half of the same claim, and the half no other check can make: the
+/// table says something records these series, and that is the file it names.
+///
+/// The check above only compares the panel against the table, and the panel and
+/// the table are both edited by whoever changes the dashboard. A producer
+/// renamed in its own crate moves neither, so every check here stays green while
+/// the panel draws nothing at all — the empty panel this file exists to catch,
+/// arrived at from the side nothing was watching. The name in the table is the
+/// only place that claim lives, so it is the only place that can be held to it.
+#[test]
+fn every_series_the_table_claims_is_produced_is_named_by_its_producer() {
+    let root = repo_root();
+    let mut missing: Vec<String> = Vec::new();
+    for (name, _, source) in PRODUCED {
+        let text = std::fs::read_to_string(root.join(source))
+            .unwrap_or_else(|e| panic!("{source} unreadable: {e}"));
+        if !carries_the_producer(&text, name) {
+            missing.push(format!("{name} 记在 {source}，该文件里找不到这个名字"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "PRODUCED 表登记的产出点已经不存在，面板上的这个序列会永远画不出东西:\n{}",
+        missing.join("\n")
+    );
+}
+
 #[test]
 fn every_label_a_legend_names_is_on_the_series_it_describes() {
     let text = dashboard_text();
     let labels_of = |name: &str| -> Option<&'static [&'static str]> {
         PRODUCED
             .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, labels)| *labels)
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, labels, _)| *labels)
     };
 
     // Panels pair one expr with one legend within the same object; walking the

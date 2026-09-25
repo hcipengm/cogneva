@@ -19,9 +19,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+#[path = "common/producer.rs"]
+mod producer;
 #[path = "common/promql.rs"]
 mod promql;
 
+use producer::carries_the_producer;
 use promql::metric_names_in;
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -277,29 +280,6 @@ fn every_series_an_alert_rule_reads_is_one_something_produces() {
             .collect::<Vec<_>>()
             .join("\n")
     );
-}
-
-/// Whether a file still carries the producer of `name`.
-///
-/// A producer writes a series in one of two ways, and both count. It can carry
-/// the wire name — that is what a scrape-only series looks like, and what the
-/// store-writing ones used to look like before the registry held the names. Or
-/// it can bind the registry's constant: the wire form then lives in the
-/// registry, where the compiler keeps the list complete, and the file that
-/// publishes the series carries the binding instead.
-///
-/// The binding is what a deleted producer takes with it, so accepting it keeps
-/// the claim this gate makes intact. It is resolved to the series the constant
-/// declares rather than accepted for its presence: a file that binds some other
-/// constant is not publishing this series, and passing it would turn the entry
-/// back into the empty license the gate exists to refuse.
-fn carries_the_producer(text: &str, name: &str) -> bool {
-    text.contains(name)
-        || cog_core::metric_names::IDENTIFIED
-            .iter()
-            .any(|(ident, metric)| {
-                metric.as_str() == name && text.contains(&format!("metric_names::{ident}"))
-            })
 }
 
 #[test]

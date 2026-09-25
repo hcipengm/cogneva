@@ -50,6 +50,18 @@
 //! What no reading here can show is a builder that never asked: the token only
 //! bounds the build paths that call it, and a path nobody wired up produces no
 //! series at all rather than a zero.
+//!
+//! How long the bound costs is measured over the builds that took a slot, and
+//! over those alone: how long they queued, and how long they then held the host.
+//! A wait that ended in a refusal is deliberately outside both — it is not a
+//! build that ran, and its length is not a reading at all: a refusal has either
+//! waited the whole budget or, for a caller that will come back later, not
+//! waited at all, so its duration is fixed by which of the two it was, which
+//! [`BUILD_GATE_REFUSED_TOTAL`] already says. Folding those waits into the mean
+//! would drag it towards zero every time a polling caller asked and was turned
+//! away, which is the one number a reader would then use to size the bound.
+//! Counting them into the maximum instead would compare two different events
+//! under one name.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,6 +84,38 @@ pub const BUILD_GATE_SLOTS: &str = "cogneva_build_gate_slots";
 pub const BUILD_GATE_ACQUIRED_TOTAL: &str = "cogneva_build_gate_acquired_total";
 /// Builds that were refused a slot, as a counter.
 pub const BUILD_GATE_REFUSED_TOTAL: &str = "cogneva_build_gate_refused_total";
+/// Time builds have spent waiting for a slot, in milliseconds, summed over the
+/// builds that went on to take one.
+///
+/// Divided by [`BUILD_GATE_ACQUIRED_TOTAL`] this is the queue delay of a build
+/// that ran; it is not divided here because the division belongs to whoever
+/// picks the window, and a mean published by the producer would be a mean over
+/// the process's whole life, which is history rather than a reading.
+pub const BUILD_GATE_WAIT_MS_TOTAL: &str = "cogneva_build_gate_wait_ms_total";
+/// The longest a single build has waited before taking a slot, in milliseconds.
+///
+/// A mean cannot show whether a bound is mildly tight or whether one build
+/// waited out the whole budget while others walked straight in, and the second
+/// is the case that sizes the bound. A high-water mark of this process: after a
+/// restart it reads lower than the host has seen, so it is a floor.
+pub const BUILD_GATE_WAIT_MS_MAX: &str = "cogneva_build_gate_wait_ms_max";
+/// Time builds have spent holding slots, in milliseconds, summed over the same
+/// builds as [`BUILD_GATE_WAIT_MS_TOTAL`].
+///
+/// This is what a build occupies the host for, and the budget on it is the wait
+/// budget: a builder that holds a slot for longer than everyone is willing to
+/// wait is a bound that refuses everyone else.
+pub const BUILD_GATE_HELD_MS_TOTAL: &str = "cogneva_build_gate_held_ms_total";
+/// The longest single slot hold, in milliseconds. A high-water mark.
+pub const BUILD_GATE_HELD_MS_MAX: &str = "cogneva_build_gate_held_ms_max";
+/// How long a build is willing to wait for a slot, in milliseconds; 0 when no
+/// gate is in force.
+///
+/// The wall the wait is measured against: a wait that reached this value either
+/// took the slot at the buzzer or was refused, and without the wall on the same
+/// axis a wait of 25s reads as small or as enormous depending on the deployment
+/// it is not shown beside.
+pub const BUILD_GATE_WAIT_BUDGET_MS: &str = "cogneva_build_gate_wait_budget_ms";
 /// Name of the rule that reads the refusal counter, so the pairing can be asserted.
 pub const BUILD_GATE_RULE: &str = "build_gate_refused";
 /// Name of the rule that reads the slot count of a process that runs builds, so
@@ -161,12 +205,10 @@ impl Observable for InactiveBuildGate {
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
         Ok(readings(
             0,
-            0,
-            0,
-            0,
-            0,
+            Counters::default(),
             &dir_identity(Path::new(&self.dir)),
             BUILD_GATE_ROLE_CONTROL_PLANE,
+            0,
         ))
     }
 
@@ -179,17 +221,30 @@ impl Observable for InactiveBuildGate {
     }
 }
 
+/// Everything a gate counts, gathered in one value so the series set has one
+/// source. A gate that is not in force publishes [`Counters::default`] — the
+/// zero of every counter is also the reading of a process that runs nothing.
+#[derive(Default)]
+struct Counters {
+    in_flight: u64,
+    waiting: u64,
+    acquired: u64,
+    refused: u64,
+    wait_ms_total: u64,
+    wait_ms_max: u64,
+    held_ms_total: u64,
+    held_ms_max: u64,
+}
+
 /// The whole series set, in one place: a reader that has to tell "no bound here"
 /// from "this deployment never reported" cannot do it if the two sources of the
 /// set can drift.
 fn readings(
     slots: usize,
-    in_flight: u64,
-    waiting: u64,
-    acquired: u64,
-    refused: u64,
+    c: Counters,
     dir: &str,
     role: &str,
+    wait_budget_ms: u64,
 ) -> Vec<RawMetric> {
     let label = |m: RawMetric| {
         m.with_label("dir", dir.to_string())
@@ -197,10 +252,24 @@ fn readings(
     };
     vec![
         label(RawMetric::new(BUILD_GATE_SLOTS, slots as f64)),
-        label(RawMetric::new(BUILD_GATE_IN_FLIGHT, in_flight as f64)),
-        label(RawMetric::new(BUILD_GATE_WAITING, waiting as f64)),
-        label(RawMetric::new(BUILD_GATE_ACQUIRED_TOTAL, acquired as f64)),
-        label(RawMetric::new(BUILD_GATE_REFUSED_TOTAL, refused as f64)),
+        label(RawMetric::new(BUILD_GATE_IN_FLIGHT, c.in_flight as f64)),
+        label(RawMetric::new(BUILD_GATE_WAITING, c.waiting as f64)),
+        label(RawMetric::new(BUILD_GATE_ACQUIRED_TOTAL, c.acquired as f64)),
+        label(RawMetric::new(BUILD_GATE_REFUSED_TOTAL, c.refused as f64)),
+        label(RawMetric::new(
+            BUILD_GATE_WAIT_MS_TOTAL,
+            c.wait_ms_total as f64,
+        )),
+        label(RawMetric::new(BUILD_GATE_WAIT_MS_MAX, c.wait_ms_max as f64)),
+        label(RawMetric::new(
+            BUILD_GATE_HELD_MS_TOTAL,
+            c.held_ms_total as f64,
+        )),
+        label(RawMetric::new(BUILD_GATE_HELD_MS_MAX, c.held_ms_max as f64)),
+        label(RawMetric::new(
+            BUILD_GATE_WAIT_BUDGET_MS,
+            wait_budget_ms as f64,
+        )),
     ]
 }
 
@@ -266,6 +335,10 @@ pub struct BuildGate {
     waiting: AtomicU64,
     acquired: AtomicU64,
     refused: AtomicU64,
+    wait_ms_total: AtomicU64,
+    wait_ms_max: AtomicU64,
+    held_ms_total: AtomicU64,
+    held_ms_max: AtomicU64,
 }
 
 impl std::fmt::Debug for BuildGate {
@@ -300,12 +373,56 @@ impl BuildGate {
             waiting: AtomicU64::new(0),
             acquired: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            wait_ms_total: AtomicU64::new(0),
+            wait_ms_max: AtomicU64::new(0),
+            held_ms_total: AtomicU64::new(0),
+            held_ms_max: AtomicU64::new(0),
         }
     }
 
     /// Whether this gate is excluding anything at all.
     pub fn in_force(&self) -> bool {
         self.installed && self.slots > 0
+    }
+
+    /// The counters as they stand, for the reading.
+    fn counters(&self) -> Counters {
+        Counters {
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+            waiting: self.waiting.load(Ordering::Relaxed),
+            acquired: self.acquired.load(Ordering::Relaxed),
+            refused: self.refused.load(Ordering::Relaxed),
+            wait_ms_total: self.wait_ms_total.load(Ordering::Relaxed),
+            wait_ms_max: self.wait_ms_max.load(Ordering::Relaxed),
+            held_ms_total: self.held_ms_total.load(Ordering::Relaxed),
+            held_ms_max: self.held_ms_max.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The budget a waiter is refused at, in milliseconds; 0 when no gate is in
+    /// force, since nothing is being waited for.
+    fn wait_budget_ms(&self) -> u64 {
+        if self.in_force() {
+            self.wait.as_millis() as u64
+        } else {
+            0
+        }
+    }
+
+    /// Records a wait that ended in taking a slot, and hands back when the slot
+    /// was taken so the hold can be measured when it is released.
+    fn slot_taken(&self, waited: Duration) -> Instant {
+        let waited_ms = waited.as_millis() as u64;
+        self.wait_ms_total.fetch_add(waited_ms, Ordering::Relaxed);
+        self.wait_ms_max.fetch_max(waited_ms, Ordering::Relaxed);
+        Instant::now()
+    }
+
+    /// Records a slot being released after `held`.
+    fn slot_released(&self, held: Duration) {
+        let held_ms = held.as_millis() as u64;
+        self.held_ms_total.fetch_add(held_ms, Ordering::Relaxed);
+        self.held_ms_max.fetch_max(held_ms, Ordering::Relaxed);
     }
 
     /// Where the slot files live.
@@ -343,6 +460,7 @@ impl BuildGate {
             return Ok(BuildPermit {
                 gate: Arc::clone(self),
                 held: None,
+                taken_at: None,
                 what: what.to_string(),
             });
         }
@@ -360,12 +478,13 @@ impl BuildGate {
                     self.waiting.fetch_sub(1, Ordering::Relaxed);
                     self.in_flight.fetch_add(1, Ordering::Relaxed);
                     let total = self.acquired.fetch_add(1, Ordering::Relaxed) + 1;
-                    let waited = started.elapsed().as_secs();
-                    if waited > 0 {
+                    let waited = started.elapsed();
+                    let taken_at = self.slot_taken(waited);
+                    if waited.as_secs() > 0 {
                         tracing::info!(
                             what,
                             slot,
-                            waited_secs = waited,
+                            waited_secs = waited.as_secs(),
                             "build took a slot after waiting"
                         );
                     }
@@ -373,6 +492,7 @@ impl BuildGate {
                     return Ok(BuildPermit {
                         gate: Arc::clone(self),
                         held: Some(file),
+                        taken_at: Some(taken_at),
                         what: what.to_string(),
                     });
                 }
@@ -411,6 +531,10 @@ pub struct BuildPermit {
     /// The locked file, when a slot was actually taken. Closing it -- which drop
     /// does -- is what releases the lock.
     held: Option<std::fs::File>,
+    /// When the slot was taken, set with `held` and read only where `held` is
+    /// set: a permit that holds nothing was never counted as a build that ran,
+    /// so it contributes no hold to the readings either.
+    taken_at: Option<Instant>,
     what: String,
 }
 
@@ -423,8 +547,9 @@ impl BuildPermit {
 
 impl Drop for BuildPermit {
     fn drop(&mut self) {
-        if self.held.is_some() {
+        if let (Some(_), Some(taken_at)) = (&self.held, self.taken_at) {
             self.gate.in_flight.fetch_sub(1, Ordering::Relaxed);
+            self.gate.slot_released(taken_at.elapsed());
             tracing::debug!(what = %self.what, "build released its slot");
         }
     }
@@ -488,12 +613,10 @@ impl Observable for BuildGate {
         let slots = if self.in_force() { self.slots } else { 0 };
         Ok(readings(
             slots,
-            self.in_flight.load(Ordering::Relaxed),
-            self.waiting.load(Ordering::Relaxed),
-            self.acquired.load(Ordering::Relaxed),
-            self.refused.load(Ordering::Relaxed),
+            self.counters(),
             &self.identity(),
             BUILD_GATE_ROLE_BUILDER,
+            self.wait_budget_ms(),
         ))
     }
 
@@ -636,6 +759,124 @@ mod tests {
         SFError::ResourceExhausted("busy".into()).is_environment_failure()
     }
 
+    /// How long the bound costs is the reason to look at it at all: a gate at
+    /// its bound with a build queued behind it reads the same as a gate nobody
+    /// is waiting on unless the queue time is measured, and the wait alone says
+    /// nothing about whether the slot comes back — a build holding a slot for
+    /// longer than anyone waits starves everyone else.
+    #[tokio::test]
+    async fn a_build_that_waited_reports_how_long_it_queued_and_how_long_it_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 30);
+
+        let holder = gate.try_acquire("holder").await.unwrap();
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.acquire("waiter").await })
+        };
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        drop(holder);
+        let permit = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter takes the freed slot")
+            .unwrap()
+            .unwrap();
+
+        let worst_wait = reading(&gate, BUILD_GATE_WAIT_MS_MAX).await;
+        assert!(
+            worst_wait >= 400.0,
+            "the wait in the queue is measured, got {worst_wait}ms"
+        );
+        assert!(
+            reading(&gate, BUILD_GATE_WAIT_MS_TOTAL).await >= worst_wait,
+            "the wait is summed over the builds that took a slot as well"
+        );
+
+        // The holder is still holding when the waiter is let in, so by the time
+        // both are released the gate has seen two holds: the totals cannot come
+        // out below the worst of them.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        drop(permit);
+        let worst_hold = reading(&gate, BUILD_GATE_HELD_MS_MAX).await;
+        assert!(
+            worst_hold >= 400.0,
+            "the hold on the slot is measured, got {worst_hold}ms"
+        );
+        let held_total = reading(&gate, BUILD_GATE_HELD_MS_TOTAL).await;
+        assert_eq!(
+            reading(&gate, BUILD_GATE_ACQUIRED_TOTAL).await,
+            2.0,
+            "both builds took a slot, so the denominator of the means is 2"
+        );
+        assert!(
+            held_total >= 800.0 && held_total > worst_hold,
+            "both holds are summed, got {held_total}ms against a worst of {worst_hold}ms"
+        );
+    }
+
+    /// A gate that refuses a build is not a gate that made it queue: the wait
+    /// that ended in a refusal is either the whole budget or, for a caller that
+    /// comes back later, no wait at all, so its length is already said by which
+    /// of the two it was. Summing it into the queue delay would let a polling
+    /// caller that is turned away every tick drag the mean towards zero — the
+    /// one number a reader would size the bound with.
+    #[tokio::test]
+    async fn a_wait_that_ended_in_a_refusal_is_not_a_queue_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 1);
+
+        let _held = gate.try_acquire("holder").await.unwrap();
+        let waited_before = reading(&gate, BUILD_GATE_WAIT_MS_TOTAL).await;
+        let worst_before = reading(&gate, BUILD_GATE_WAIT_MS_MAX).await;
+
+        let started = Instant::now();
+        assert!(
+            gate.acquire("one-shot build").await.is_err(),
+            "the gate is full"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the refused caller really did wait out the budget"
+        );
+
+        assert_eq!(
+            reading(&gate, BUILD_GATE_WAIT_MS_TOTAL).await,
+            waited_before,
+            "the refused wait was added to the queue delay"
+        );
+        assert_eq!(
+            reading(&gate, BUILD_GATE_WAIT_MS_MAX).await,
+            worst_before,
+            "the refused wait was counted as the worst wait of a build that ran"
+        );
+    }
+
+    /// Whether a wait of 25s is short or long depends on the budget it was
+    /// allowed to use, and that number is configuration: a reader comparing a
+    /// wait against a value they had to go and look up elsewhere is not reading
+    /// a panel.
+    #[tokio::test]
+    async fn the_wait_budget_is_published_as_the_wall_a_wait_is_refused_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let budgeted = gate(dir.path(), 1, 30);
+        assert_eq!(
+            reading(&budgeted, BUILD_GATE_WAIT_BUDGET_MS).await,
+            30_000.0
+        );
+
+        let off = Arc::new(BuildGate::new(&BuildGateConfig {
+            enabled: false,
+            max_concurrent: 4,
+            wait_secs: 30,
+            lock_dir: dir.path().to_string_lossy().into_owned(),
+        }));
+        assert_eq!(
+            reading(&off, BUILD_GATE_WAIT_BUDGET_MS).await,
+            0.0,
+            "no gate in force means no wall, not a budget nobody enforces"
+        );
+    }
+
     /// A gate that is not in force must not silently look like one that is: the
     /// slot reading is 0, and the permit says it holds nothing.
     #[tokio::test]
@@ -651,8 +892,14 @@ mod tests {
 
         let permit = disabled.try_acquire("ungated build").await.unwrap();
         assert!(!permit.held());
+        drop(permit);
         assert_eq!(disabled.in_flight.load(Ordering::Relaxed), 0);
         assert_eq!(disabled.refused.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            reading(&disabled, BUILD_GATE_HELD_MS_TOTAL).await,
+            0.0,
+            "a build that was never gated never held a slot to report"
+        );
         let slots = reading(&disabled, BUILD_GATE_SLOTS).await;
         assert_eq!(slots, 0.0, "an out-of-force gate publishes no slots");
     }
@@ -739,6 +986,11 @@ mod tests {
                 BUILD_GATE_WAITING,
                 BUILD_GATE_ACQUIRED_TOTAL,
                 BUILD_GATE_REFUSED_TOTAL,
+                BUILD_GATE_WAIT_MS_TOTAL,
+                BUILD_GATE_WAIT_MS_MAX,
+                BUILD_GATE_HELD_MS_TOTAL,
+                BUILD_GATE_HELD_MS_MAX,
+                BUILD_GATE_WAIT_BUDGET_MS,
             ],
             "the series set does not depend on whether this process builds"
         );

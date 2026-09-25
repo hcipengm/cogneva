@@ -532,6 +532,116 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 16,
+          "title": "Host Build Slots",
+          "description": "Builds running on the host against the bound, and builds queued behind them. The bound is per host, but each process publishes its own reading of it, which is why both roles are drawn: a builder line is a process that takes slots, and a control-plane line flat at zero is a process that runs no builds and deliberately bounds nothing. Two builders whose slot directories differ bound only themselves and would both look normal here, so the dir label is on the series for whoever is comparing them by hand; the rule build_gate_not_in_force is what notices.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 64
+          },
+          "targets": [
+            {
+              "expr": "cogneva_build_gate_slots",
+              "legendFormat": "{{role}} bound",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_gate_in_flight",
+              "legendFormat": "{{role}} running",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_gate_waiting",
+              "legendFormat": "{{role}} queued",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 17,
+          "title": "Build Gate Queue and Hold",
+          "description": "The two durations the bound costs, in milliseconds, against the budget a build is allowed to wait. A queue time that walks up towards the budget is the warning, and it arrives while builds are still being admitted: the refusal counter only starts moving once they are not. Hold is what a build occupies the host for, so a hold above everyone's budget starves the others whatever the slot count says. The means are per build that took a slot over the window, and they are blank when no build ran in it - that is an empty window, not a broken panel. Waits that ended in a refusal are in neither the means nor the worst wait: a refusal waited either the whole budget or no time at all, which the refusal counter already says, and folding those into the mean would let a caller that is turned away every tick drag it towards zero.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 64
+          },
+          "targets": [
+            {
+              "expr": "cogneva_build_gate_wait_budget_ms",
+              "legendFormat": "{{role}} wait budget",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_gate_wait_ms_max",
+              "legendFormat": "{{role}} worst queue wait",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "rate(cogneva_build_gate_wait_ms_total[10m]) / rate(cogneva_build_gate_acquired_total[10m])",
+              "legendFormat": "{{role}} mean queue wait",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_gate_held_ms_max",
+              "legendFormat": "{{role}} longest slot hold",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "rate(cogneva_build_gate_held_ms_total[10m]) / rate(cogneva_build_gate_acquired_total[10m])",
+              "legendFormat": "{{role}} mean slot hold",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
