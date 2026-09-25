@@ -35,15 +35,14 @@ use crate::config::InfraWatchConfig;
 /// Labels that never identify an alert instance — they describe the scrape,
 /// not the thing being watched. Keeping them in the dedup key would fork a
 /// new alert row every time the monitoring stack reschedules its own pods.
-const NON_IDENTITY_LABELS: &[&str] = &[
-    "__name__",
-    "job",
-    "endpoint",
-    "service",
-    "container",
-    "namespace",
-    "prometheus",
-];
+///
+/// `namespace` and `container` are deliberately absent. They read as scrape
+/// labels only while every rule happens to be scoped to one namespace with one
+/// container per pod; the moment a rule spans namespaces, leaving them out
+/// makes two different victims share one row, and the pair flaps firing and
+/// resolved against each other. A pod name identifies neither once more than
+/// one namespace is in play.
+const NON_IDENTITY_LABELS: &[&str] = &["__name__", "job", "endpoint", "service", "prometheus"];
 
 /// Rule name for the watcher's self-alert: a rule whose query keeps failing
 /// is itself an incident (dead Prometheus, blocked network path), raised
@@ -555,11 +554,23 @@ mod tests {
         let b = BTreeMap::from([
             ("node".to_string(), "vm-1".to_string()),
             ("job".to_string(), "other-scrape".to_string()),
+            ("namespace".to_string(), "monitoring".to_string()),
             ("pod".to_string(), "exporter-abc".to_string()),
+            ("container".to_string(), "exporter".to_string()),
         ]);
         assert_eq!(dedup_key("disk", &a), "disk:node=vm-1");
-        // pod is an identity label (which pod is crashlooping matters)
-        assert_eq!(dedup_key("crash", &b), "crash:node=vm-1,pod=exporter-abc");
+        // pod is an identity label (which pod is crashlooping matters), and so
+        // are its namespace and container: the same pod name in another
+        // namespace is another victim, and one pod can run several containers.
+        assert_eq!(
+            dedup_key("crash", &b),
+            "crash:container=exporter,namespace=monitoring,node=vm-1,pod=exporter-abc"
+        );
+        // The failure this guards: two crashlooping pods that differ only in
+        // namespace used to land on one key, so the row flapped between them.
+        let mut elsewhere = b.clone();
+        elsewhere.insert("namespace".to_string(), "cogneva".to_string());
+        assert_ne!(dedup_key("crash", &b), dedup_key("crash", &elsewhere));
     }
 
     /// The live reading this comes from: an alert that fired with the summary

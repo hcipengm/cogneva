@@ -157,6 +157,10 @@ const PRODUCED: &[(&str, &str)] = &[
 /// Listing them keeps the check honest: an unlisted foreign series fails the
 /// test rather than being silently ignored.
 const FOREIGN: &[(&str, &str)] = &[
+    (
+        "container_memory_working_set_bytes",
+        "cadvisor（kubelet 内置）",
+    ),
     ("kube_node_status_allocatable", "kube-state-metrics"),
     ("kube_node_status_condition", "kube-state-metrics"),
     (

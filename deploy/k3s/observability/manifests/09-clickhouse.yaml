@@ -96,16 +96,18 @@ spec:
             periodSeconds: 20
             timeoutSeconds: 10
             failureThreshold: 5
-          # 请求压到最小：单节点可支配内存本就紧（节点请求量已近 allocatable），
-          # 本后端是旁路导出面，写入量小，给调度器一个低成本占位即可；
-          # 上限留 1Gi 兜住突发批量。装到多节点生产可上调。
+          # 请求按实测给：稳态工作集 780–890MiB，128Mi 的请求是对调度器说的假话，节点内存
+          # 压力下的驱逐排序也会把它排在最前——最该留住的旁路反而先被赶走。
+          # 上限 2Gi 的依据是同一批读数：1Gi 上限下它在一个小时窗口里被 OOMKilled 五次
+          # （重启计数器 03:30 起从 0 走到 5），而死前最后一个采样点就在 948MiB——不是突发
+          # 超了上限，是稳态离上限只剩一成余量。装到节点更小的机器上按 allocatable 重算。
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
+              memory: 1Gi
             limits:
               cpu: 1000m
-              memory: 1Gi
+              memory: 2Gi
   volumeClaimTemplates:
     - metadata:
         name: data

@@ -457,21 +457,39 @@ data:
             },
             {
               "name": "pod_restarting_fast",
-              "promql": "increase(kube_pod_container_status_restarts_total{namespace=\"cogneva\"}[15m])",
+              "promql": "increase(kube_pod_container_status_restarts_total[15m])",
               "condition": {
                 "greater_than": 5.0
               },
               "severity": "warning",
-              "summary": "cogneva pod restarting more than 5 times in 15m ({value})"
+              "summary": "A container restarted more than 5 times in 15m ({value}). Not scoped to one namespace: a crash loop is the same defect wherever it runs, and a namespace matcher is a hand-written list -- the observability backends sat outside the one we had and their loop reached no rule at all"
+            },
+            {
+              "name": "pod_restarting_repeatedly",
+              "promql": "increase(kube_pod_container_status_restarts_total[6h])",
+              "condition": {
+                "greater_than": 2.0
+              },
+              "severity": "warning",
+              "summary": "A container restarted more than twice in 6h ({value}). The fast rule needs five inside 15m, so a container that comes back and dies again every hour or two trips nothing -- clickhouse did exactly that for an hour. A planned spec change restarts a container once, so a third return means something is killing it; kube_pod_container_status_last_terminated_reason names what"
             },
             {
               "name": "pod_oom_killed",
-              "promql": "kube_pod_container_status_last_terminated_reason{namespace=\"cogneva\", reason=\"OOMKilled\"}",
+              "promql": "kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"}",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "critical",
-              "summary": "cogneva workload container last exit was OOMKilled; memory footprint exceeds its limit"
+              "summary": "A container's last exit was OOMKilled ({value}); its footprint exceeded the limit it was given. Not scoped to one namespace, and a state rather than a rate: a container killed at its cap holds this state until a clean stop, and one that dies every couple of hours never trips a restart-rate rule. The clickhouse instance in monitoring was killed five times in one hour while this rule could not see it"
+            },
+            {
+              "name": "container_memory_near_limit",
+              "promql": "container_memory_working_set_bytes{container!=\"\", container!=\"POD\"} / on(namespace, pod, container) (kube_pod_container_resource_limits{resource=\"memory\"} > 0)",
+              "condition": {
+                "greater_than": 0.75
+              },
+              "severity": "warning",
+              "summary": "A container is running at {value} of the memory limit it was given. Working set against the limit kube-state-metrics reports, and only for containers that have a limit -- an unbounded container is not near anything. The threshold is the floor of the band the killed observability backend lived in: it sat between 0.74 and 0.93 of its cap for hours and its own burst amplitude crossed the rest, so anything at or above this is one burst away from being killed at its limit. Nothing else in the cluster comes near it, the next largest being 0.56"
             },
             {
               "name": "redis_restarted",
@@ -480,7 +498,7 @@ data:
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "the message queue restarted ({value} times in 1h). A restart is either a planned spec change or an unclean stop of its host; after an unclean stop Redis had a torn AOF tail that the aof-repair init container drops at startup, and the number of bytes given up is in that container's log. pod_restarting_fast only counts fast loops, so a single restart shows up nowhere else"
+              "summary": "the message queue restarted ({value} times in 1h). A restart is either a planned spec change or an unclean stop of its host; after an unclean stop Redis had a torn AOF tail that the aof-repair init container drops at startup, and the number of bytes given up is in that container's log. pod_restarting_fast only counts fast loops and pod_restarting_repeatedly needs three in 6h, so a single restart shows up nowhere else"
             },
             {
               "name": "sandbox_command_oom_killed",
@@ -646,12 +664,12 @@ data:
             },
             {
               "name": "node_capacity_overcommitted",
-              "promql": "sum by (node, resource) (kube_pod_container_resource_limits{namespace=\"cogneva\", resource=~\"cpu|memory\"} and on(pod) kube_pod_status_phase{phase=\"Running\"} == 1) / on(node, resource) group_left sum by (node, resource) (kube_node_status_allocatable{resource=~\"cpu|memory\"})",
+              "promql": "sum by (node, resource) (kube_pod_container_resource_limits{resource=~\"cpu|memory\"} and on(namespace, pod) kube_pod_status_phase{phase=\"Running\"} == 1) / on(node, resource) group_left sum by (node, resource) (kube_node_status_allocatable{resource=~\"cpu|memory\"})",
               "condition": {
                 "greater_than": 1.0
               },
               "severity": "warning",
-              "summary": "Node {node} has declared {value} times its allocatable {resource} in container limits, so no container on it can reach its own limit: under pressure the kernel decides who dies by paging and OOM-killing rather than each cgroup being held to its own ceiling. Only running pods are counted, and work that runs on the host outside the cluster (builds, the sandbox) has no such limit at all, so this is a lower bound on the overcommit. Re-derive the account before raising a limit"
+              "summary": "Node {node} has declared {value} times its allocatable {resource} in container limits, counted across every namespace and joined on namespace and pod (a pod name alone does not identify a container once more than one namespace is in play), so no container on it can reach its own limit: under pressure the kernel decides who dies by paging and OOM-killing rather than each cgroup being held to its own ceiling. Only running pods are counted, and work that runs on the host outside the cluster (builds, the sandbox) has no such limit at all, so this is a lower bound on the overcommit. Re-derive the account before raising a limit"
             },
             {
               "name": "node_capacity_changed",
