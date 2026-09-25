@@ -6,7 +6,7 @@ use tracing::info;
 use crate::{
     actors::ModeSelectorActor,
     profile::derive_task_profile,
-    squad::{SquadConfig, SquadExecutor},
+    squad::{SquadConfig, SquadExecutor, SquadResult},
 };
 
 /// Identity carried on the actionability verdict's outbound request. Without it
@@ -529,10 +529,7 @@ impl CollaborationExecutor {
             .await;
 
         if !result.success {
-            let error = result
-                .error
-                .unwrap_or_else(|| "Squad execution failed".into());
-            return Err(SFError::Agent(error));
+            return Err(self.fail_run(task, "collaboration", &result, "Squad execution failed"));
         }
 
         info!(task_id=%task.id, "Collaboration decomposition succeeded");
@@ -699,10 +696,12 @@ impl CollaborationExecutor {
         }
 
         if !result.success {
-            let error = result
-                .error
-                .unwrap_or_else(|| "Squad atomic execution failed".into());
-            return Err(SFError::Agent(error));
+            return Err(self.fail_run(
+                task,
+                "collaboration_atomic",
+                &result,
+                "Squad atomic execution failed",
+            ));
         }
 
         info!(task_id=%task.id, "Atomic task execution via Squad succeeded");
@@ -795,8 +794,52 @@ impl CollaborationExecutor {
         Ok(task_result)
     }
 
-    /// Archive a successful execution into the KnowledgeBackend in the
-    /// background. Failures are logged but never block the task result.
+    /// Archive a run that ended without delivering, and produce the error it
+    /// returns.
+    ///
+    /// A failed run is the only production source of the knowledge layer's
+    /// failure-pattern namespace: the archive is what writes it, and every
+    /// archive call site up to now built a delivered envelope, so the failure
+    /// arm of that write was unreachable however many writers the namespace
+    /// has. The archive is dispatched here, before the error is returned, and
+    /// in the background like every other knowledge write so it cannot decide
+    /// whether the task is done.
+    ///
+    /// The reason archived is the run's own, never `fallback`: `fallback` is a
+    /// sentence for the error this returns, and a sentence invented here would
+    /// become the root cause the Evaluator reads back for this class of task.
+    /// A run that states no reason leaves the field empty — "no cause recorded"
+    /// is a reading, "something failed" is not.
+    fn fail_run(
+        &self,
+        task: &Task,
+        executor_id: &str,
+        result: &SquadResult,
+        fallback: &str,
+    ) -> SFError {
+        let reason = result.error.clone().unwrap_or_default();
+        let mut metadata = TaskResultMetadata::new(executor_id);
+        if !reason.is_empty() {
+            metadata = metadata.with_feedback(&reason);
+        }
+        self.archive_execution(
+            task,
+            &TaskResult {
+                success: false,
+                output: serde_json::json!({ "squad_result": result }),
+                metadata,
+            },
+        );
+        SFError::Agent(if reason.is_empty() {
+            fallback.to_string()
+        } else {
+            reason
+        })
+    }
+
+    /// Archive one run's outcome into the KnowledgeBackend in the background,
+    /// whichever way it ended. Failures are logged but never block the task
+    /// result.
     fn archive_execution(&self, task: &Task, result: &TaskResult) {
         let Some(ref kb) = self.knowledge_backend else {
             return;
@@ -1092,6 +1135,170 @@ impl CollaborationExecutor {
 #[cfg(test)]
 mod tests {
     use super::CollaborationExecutor;
+
+    /// Keeps the envelopes the archive is handed, so a test can read back how a
+    /// run ended without a store behind it.
+    #[derive(Default)]
+    struct RecordingArchive {
+        archived: std::sync::Mutex<Vec<cog_core::TaskResult>>,
+    }
+
+    impl RecordingArchive {
+        /// The envelope handed to the archive, once it has arrived. The write is
+        /// spawned, so this waits for it rather than assuming it has run.
+        async fn archived(&self) -> cog_core::TaskResult {
+            for _ in 0..500 {
+                if let Some(result) = self.archived.lock().unwrap().first().cloned() {
+                    return result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            panic!("nothing reached the archive");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::KnowledgeBackend for RecordingArchive {
+        async fn retrieve_relevant(
+            &self,
+            _task: &cog_core::Task,
+            _query: &str,
+            _top_k: usize,
+        ) -> cog_core::SFResult<Vec<cog_core::KnowledgeEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn retrieve_similar_decompositions(
+            &self,
+            _goal_class: &str,
+            _goal: &str,
+            _top_k: usize,
+        ) -> cog_core::SFResult<Vec<cog_core::TaskDecompositionPattern>> {
+            Ok(Vec::new())
+        }
+
+        async fn retrieve_similar_implementations(
+            &self,
+            _task_type: &str,
+            _input_summary: &str,
+            _top_k: usize,
+        ) -> cog_core::SFResult<Vec<cog_core::ImplementationExample>> {
+            Ok(Vec::new())
+        }
+
+        async fn retrieve_failure_patterns(
+            &self,
+            _task_type: &str,
+            _top_k: usize,
+        ) -> cog_core::SFResult<Vec<cog_core::FailurePattern>> {
+            Ok(Vec::new())
+        }
+
+        async fn retrieve_task_history(
+            &self,
+            _task_id: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::TaskExecutionRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn archive_execution(
+            &self,
+            _task: &cog_core::Task,
+            result: &cog_core::TaskResult,
+        ) -> cog_core::SFResult<()> {
+            self.archived.lock().unwrap().push(result.clone());
+            Ok(())
+        }
+
+        async fn archive_decomposition(
+            &self,
+            _task: &cog_core::Task,
+            _sub_task_types: &[String],
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    fn squad_failure(reason: Option<&str>) -> crate::squad::SquadResult {
+        crate::squad::SquadResult {
+            squad_id: "squad-1".into(),
+            success: false,
+            result: None,
+            retry_count: 1,
+            error: reason.map(str::to_string),
+            pge_mode: crate::profile::PgeMode::Pipeline,
+            reflection: None,
+        }
+    }
+
+    /// A run that failed reaches the archive as a failure, with the reason the
+    /// run itself gave. This is the production source of the failure-pattern
+    /// namespace: without it the archive's failure arm is unreachable and the
+    /// Evaluator's common failures are empty for every task type, in the same
+    /// way an empty namespace is.
+    #[tokio::test]
+    async fn a_failed_run_is_archived_as_a_failure_with_its_own_reason() {
+        let archive = std::sync::Arc::new(RecordingArchive::default());
+        let executor = CollaborationExecutor::new().with_knowledge_backend(archive.clone());
+        let task = cog_core::Task::new(
+            "task-1",
+            cog_core::TaskType::Generator,
+            serde_json::json!({}),
+        );
+
+        let error = executor.fail_run(
+            &task,
+            "collaboration",
+            &squad_failure(Some("the planner never produced a task list")),
+            "Squad execution failed",
+        );
+
+        assert!(
+            error
+                .to_string()
+                .ends_with("the planner never produced a task list"),
+            "返回的错误要是这一次运行的原因: {error}"
+        );
+        let archived = archive.archived().await;
+        assert!(!archived.success, "失败要按失败归档");
+        assert_eq!(
+            archived.metadata.feedback.as_deref(),
+            Some("the planner never produced a task list"),
+            "失败模式里的因由来自这一次运行，不能换成调用点编的句子"
+        );
+    }
+
+    /// A run that states no reason has no reason. The sentence the call site
+    /// returns as the task's error is not a cause, and archiving it would put a
+    /// fabricated root cause in front of the Evaluator for that whole class.
+    #[tokio::test]
+    async fn a_run_that_states_no_reason_does_not_get_one_invented_for_it() {
+        let archive = std::sync::Arc::new(RecordingArchive::default());
+        let executor = CollaborationExecutor::new().with_knowledge_backend(archive.clone());
+        let task = cog_core::Task::new(
+            "task-2",
+            cog_core::TaskType::Generator,
+            serde_json::json!({}),
+        );
+
+        let error = executor.fail_run(
+            &task,
+            "collaboration_atomic",
+            &squad_failure(None),
+            "Squad atomic execution failed",
+        );
+
+        assert!(
+            error.to_string().ends_with("Squad atomic execution failed"),
+            "运行没给原因时返回调用点的兜底句子: {error}"
+        );
+        let archived = archive.archived().await;
+        assert!(!archived.success);
+        assert_eq!(
+            archived.metadata.feedback, None,
+            "运行没给因由，归档里就该是空的"
+        );
+    }
 
     #[test]
     fn the_actionability_verdict_carries_an_actor() {

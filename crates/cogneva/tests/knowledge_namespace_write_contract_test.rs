@@ -22,6 +22,14 @@
 //! [`EXTERNAL_WRITERS`] with the file and the pattern that proves the writer
 //! exists: an exemption is a claim about the code, so a claim that stops being
 //! true fails the test rather than quietly licensing the read.
+//!
+//! A writer is not enough. An entry point that writes a different namespace per
+//! arm of the envelope it is handed — the archive writes one for runs that
+//! delivered and another for runs that failed — has a writer for both and still
+//! leaves one of them empty forever if the calling code only ever builds one
+//! way for it to end. Both ends look like a working namespace from the reading
+//! side, so the reachability of each arm is checked the same way: statically,
+//! over the code that calls the entry point. See [`ARCHIVE_ARMS`].
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -258,22 +266,47 @@ fn production_code(src: &str) -> String {
 
 /// The text between the parentheses of the call opening at `open`.
 fn call_body(chars: &[char], open: usize) -> &[char] {
+    bracketed(chars, open, '(', ')')
+}
+
+/// The text between the braces of the literal opening at `open`.
+fn brace_body(chars: &[char], open: usize) -> &[char] {
+    bracketed(chars, open, '{', '}')
+}
+
+/// The text inside the bracket pair opening at `open`.
+fn bracketed(chars: &[char], open: usize, open_char: char, close_char: char) -> &[char] {
     let mut depth = 0i32;
     let mut i = open;
     while i < chars.len() {
-        match chars[i] {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &chars[open + 1..i];
-                }
+        if chars[i] == open_char {
+            depth += 1;
+        } else if chars[i] == close_char {
+            depth -= 1;
+            if depth == 0 {
+                return &chars[open + 1..i];
             }
-            _ => {}
         }
         i += 1;
     }
     &[]
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `needle` sits at `i` in `chars` as a whole word, so `success` is not
+/// read out of `succeeded`.
+fn word_at(chars: &[char], i: usize, needle: &[char]) -> bool {
+    if chars.len() < i + needle.len() || chars[i..i + needle.len()] != *needle {
+        return false;
+    }
+    let before = i == 0 || !is_ident_char(chars[i - 1]);
+    let after = !chars
+        .get(i + needle.len())
+        .is_some_and(|c| is_ident_char(*c));
+    before && after
 }
 
 /// The first `n` comma-separated arguments of an already unparenthesised body.
@@ -514,6 +547,289 @@ fn findings(scan: &Scan) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Arm reachability
+// ---------------------------------------------------------------------------
+
+/// One arm of an archive entry point that selects between namespaces.
+///
+/// The gate above asks whether a namespace has a writer. This asks the question
+/// the answer to that one cannot cover: whether the branch the writer sits in
+/// can be reached at all. An entry point that branches on a field of the
+/// envelope it is handed has one arm per value of that field, and an arm whose
+/// value the calling code never builds is a namespace nothing will ever write —
+/// however many writers the namespace has, and however green the gate above
+/// stays.
+struct ArchiveArm {
+    /// The file implementing the entry point. The arm's namespace is written
+    /// there, so an entry naming a namespace that file no longer writes is
+    /// stale bookkeeping rather than a live arm.
+    owner: &'static str,
+    /// The call spelling production uses to hand an envelope to the archive.
+    entry: &'static str,
+    /// The envelope field that selects the arm.
+    discriminator: &'static str,
+    /// The value of that field which selects this arm.
+    value: &'static str,
+    /// The namespace this arm writes.
+    namespace: &'static str,
+}
+
+const ARCHIVE_ARMS: &[ArchiveArm] = &[
+    ArchiveArm {
+        owner: "crates/cog-wiki/src/unified_knowledge_backend.rs",
+        entry: "archive_execution(",
+        discriminator: "success",
+        value: "true",
+        namespace: "implementation",
+    },
+    ArchiveArm {
+        owner: "crates/cog-wiki/src/unified_knowledge_backend.rs",
+        entry: "archive_execution(",
+        discriminator: "success",
+        value: "false",
+        namespace: "failure_pattern",
+    },
+];
+
+/// The entry point and the field this gate reads, taken from the table so the
+/// reach assertions cannot drift from the arms they are there to guard.
+const ARCHIVE_ENTRY: &str = ARCHIVE_ARMS[0].entry;
+const ARCHIVE_DISCRIMINATOR: &str = ARCHIVE_ARMS[0].discriminator;
+
+/// Whether `code` calls `entry`. A declaration of it is not a call.
+fn has_call(code: &str, entry: &str) -> bool {
+    !call_sites(code, entry, 1).is_empty()
+}
+
+/// The values `field` carries in the envelopes handed to `entry`.
+///
+/// An envelope reaches the call either built in place or through a binding the
+/// call site passes, so both are read. Only those two count: the file's other
+/// `TaskResult` literals are results this entry point is never handed, and
+/// reading them would let an envelope built for something else stand in for the
+/// arm being checked. An argument that resolves to neither contributes nothing,
+/// which leaves its arm unproven — the safe direction, since the defect here is
+/// a namespace that stays empty while everything looks written.
+fn archived_values(code: &str, entry: &str, field: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, args) in call_sites(code, entry, usize::MAX) {
+        for arg in &args {
+            if arg.contains("TaskResult") {
+                out.extend(discriminator_values(arg, field));
+            } else if let Some(name) = bound_ident(arg) {
+                out.extend(binding_discriminator(code, &name, field));
+            }
+        }
+    }
+    out
+}
+
+/// The identifier `arg` names, when it is one: `&task_result` and `mut x` name
+/// a binding, a call or a field access names nothing this can follow.
+fn bound_ident(arg: &str) -> Option<String> {
+    let text = arg.trim().trim_start_matches('&').trim();
+    let text = text.strip_prefix("mut ").unwrap_or(text).trim();
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return None;
+    }
+    if !text.chars().all(is_ident_char) {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+/// The value `field` carries in the `TaskResult` bound to `name`, if the binding
+/// in `code` builds one.
+fn binding_discriminator(code: &str, name: &str, field: &str) -> Option<String> {
+    const BINDING: &str = "=TaskResult{";
+    let chars: Vec<char> = code.chars().collect();
+    let needle = format!("let {name}");
+    let field: Vec<char> = field.chars().collect();
+    let mut search = 0;
+    while let Some(pos) = find_from(&chars, &needle, search) {
+        search = pos + needle.chars().count();
+        if chars.get(search).is_some_and(|c| is_ident_char(*c)) {
+            continue;
+        }
+        // The spelling with the whitespace taken out, so a line break between
+        // the `=` and the type still reads as one binding.
+        let mut i = search;
+        let mut text = String::new();
+        while i < chars.len() && text.len() < BINDING.len() {
+            if !chars[i].is_whitespace() {
+                text.push(chars[i]);
+            }
+            i += 1;
+        }
+        if text == BINDING {
+            return field_value(brace_body(&chars, i - 1), &field);
+        }
+    }
+    None
+}
+
+/// Every `TaskResult` struct literal in `code`, as the text assigned to `field`.
+///
+/// Only the literals count, and a literal that does not set the field is not
+/// reported: the arm is selected by what the envelope says, so an envelope
+/// built without the field says nothing about which arm it takes.
+fn discriminator_values(code: &str, field: &str) -> Vec<String> {
+    let chars: Vec<char> = code.chars().collect();
+    let needle: Vec<char> = field.chars().collect();
+    let mut out = Vec::new();
+    let mut search = 0;
+    while let Some(pos) = find_from(&chars, "TaskResult", search) {
+        search = pos + "TaskResult".len();
+        let mut i = search;
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if chars.get(i) != Some(&'{') {
+            continue;
+        }
+        if let Some(value) = field_value(brace_body(&chars, i), &needle) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// The text assigned to `field` in one struct-literal body, read at the body's
+/// own depth so a field of a nested literal is not taken for this one's.
+fn field_value(body: &[char], field: &[char]) -> Option<String> {
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < body.len() {
+        match body[i] {
+            '{' | '(' | '[' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            '}' | ')' | ']' => {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if depth == 0 && word_at(body, i, field) {
+            let mut j = i + field.len();
+            while j < body.len() && body[j].is_whitespace() {
+                j += 1;
+            }
+            if body.get(j) != Some(&':') {
+                i += 1;
+                continue;
+            }
+            j += 1;
+            let start = j;
+            let mut inner = 0i32;
+            while j < body.len() {
+                match body[j] {
+                    '{' | '(' | '[' => inner += 1,
+                    '}' | ')' | ']' => inner -= 1,
+                    ',' if inner == 0 => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let text: String = body[start..j].iter().collect();
+            return Some(text.trim().to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The arms whose value the code that archives never builds.
+///
+/// The surface this reads is the file that hands envelopes to the entry point:
+/// a value built anywhere else is not evidence that this call site can produce
+/// it. That is a requirement on the code, not a limitation of the parser — the
+/// envelope is built where the outcome is known, which is where the archive is
+/// called from. Failing closed when the construction moves away is the safe
+/// direction: a gate that says nothing when it can see nothing is the silence
+/// this file exists to refuse.
+fn arm_findings(sources: &[(String, String)]) -> Vec<String> {
+    let code: Vec<(String, String)> = sources
+        .iter()
+        .map(|(path, text)| (path.clone(), production_code(text)))
+        .collect();
+
+    let mut entries: Vec<&str> = ARCHIVE_ARMS.iter().map(|arm| arm.entry).collect();
+    entries.sort_unstable();
+    entries.dedup();
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let arms: Vec<&ArchiveArm> = ARCHIVE_ARMS
+            .iter()
+            .filter(|arm| arm.entry == entry)
+            .collect();
+        let callers: Vec<&str> = code
+            .iter()
+            .filter(|(_, text)| has_call(text, entry))
+            .map(|(path, _)| path.as_str())
+            .collect();
+        if callers.is_empty() {
+            out.push(format!(
+                "`{entry}` 没有任何调用点：表里登记在它名下的每条臂都没有产出方，\
+                 命名空间 {:?} 与登记本身一起过期了",
+                arms.iter().map(|arm| arm.namespace).collect::<Vec<_>>()
+            ));
+            continue;
+        }
+
+        let values: Vec<String> = code
+            .iter()
+            .filter(|(_, text)| has_call(text, entry))
+            .flat_map(|(_, text)| archived_values(text, entry, arms[0].discriminator))
+            .collect();
+
+        for value in &values {
+            if !arms.iter().any(|arm| arm.value == value) {
+                out.push(format!(
+                    "`{entry}` 的信封里 {} 的取值 `{value}` 不是字面量，这条臂可不可达从源码读不出来。\
+                     判别字段写成字面量，门禁才有东西可读",
+                    arms[0].discriminator
+                ));
+            }
+        }
+
+        let missing: Vec<&&ArchiveArm> = arms
+            .iter()
+            .filter(|arm| !values.iter().any(|value| value == arm.value))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        out.push(format!(
+            "`{entry}` 的调用点只构造过 {} = {} 的信封，从没构造过 {}：\n  \
+             调用这个入口的文件：{}\n  \
+             于是命名空间 {} 的写入分支到不了，它永远为空——而空读起来和「这件事还没发生过」一样，\n  \
+             读它的那一侧拿到的就是一条永远为空的答案。在失败的路径上也构造信封并归档。",
+            arms[0].discriminator,
+            values.join(" / "),
+            missing
+                .iter()
+                .map(|arm| arm.value)
+                .collect::<Vec<_>>()
+                .join(" / "),
+            callers.join(", "),
+            missing
+                .iter()
+                .map(|arm| format!("`{}`", arm.namespace))
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -640,4 +956,133 @@ fn a_write_in_a_test_module_is_not_a_writer() {
     let found = findings(&scan(&[("fixture.rs".into(), source.into())]));
     assert_eq!(found.len(), 1, "测试里的写入不算写入侧: {found:?}");
     assert!(found[0].contains("NS_TEST_ONLY"), "{found:?}");
+}
+
+/// Every arm of every archive entry point has to be built by the code that
+/// archives. A namespace with a writer is not a namespace anything writes to:
+/// if the only value the calling code ever puts in the envelope is `true`, the
+/// failure arm — and the namespace it owns — is unreachable, while the gate
+/// above sees a writer and stays green.
+#[test]
+fn every_arm_of_an_archive_is_built_by_the_code_that_calls_it() {
+    let sources = crate_sources();
+
+    // The scan is only as good as its reach, and a scan that stopped matching
+    // the call sites reports nothing, which looks the same as a tree where
+    // every arm is built. The archive is dispatched from one file today, so a
+    // pass has to have seen it and read an envelope through it. What it read is
+    // not asserted here: "only one value" is the finding below, and asserting it
+    // here as well would report a missing arm as a broken scanner.
+    let code: Vec<(String, String)> = sources
+        .iter()
+        .map(|(path, text)| (path.clone(), production_code(text)))
+        .collect();
+    let callers: Vec<&str> = code
+        .iter()
+        .filter(|(_, text)| has_call(text, ARCHIVE_ENTRY))
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert!(
+        callers.contains(&"crates/cog-collaboration/src/collaboration_executor.rs"),
+        "扫描没看到归档的调用点（看到的是 {callers:?}）：下面的空结果不算数"
+    );
+    let seen: Vec<String> = code
+        .iter()
+        .filter(|(_, text)| has_call(text, ARCHIVE_ENTRY))
+        .flat_map(|(_, text)| archived_values(text, ARCHIVE_ENTRY, ARCHIVE_DISCRIMINATOR))
+        .collect();
+    assert!(
+        !seen.is_empty(),
+        "扫描读不到归档调用点上任何一个信封的判别字段：扫描面漏了，下面的空结果不算数"
+    );
+
+    let bad = arm_findings(&sources);
+    assert!(
+        bad.is_empty(),
+        "归档的某条臂没有任何调用点构造它的信封：那条臂写不进去，而读它的一侧拿到的空\n\
+         和「这件事还没发生过」一模一样。\n{}",
+        bad.join("\n")
+    );
+}
+
+/// An arm's namespace has to be one the file implementing the entry point still
+/// writes. The table says which namespace each arm owns so the message can name
+/// what goes empty; a table that keeps saying it after the arm stopped writing
+/// there would send the next reader after the wrong namespace.
+#[test]
+fn every_arm_names_a_namespace_its_owner_still_writes() {
+    let sources = crate_sources();
+    let mut bad = Vec::new();
+    for arm in ARCHIVE_ARMS {
+        let text = sources
+            .iter()
+            .find(|(path, _)| path == arm.owner)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_else(|| panic!("{} 不在 crates/*/src 里了", arm.owner));
+        let code = production_code(&text);
+        let constants: Vec<(String, String)> = namespace_constants(&code);
+        let written: BTreeSet<String> = written_namespaces(&code)
+            .into_iter()
+            .map(|ns| {
+                constants
+                    .iter()
+                    .find(|(ident, _)| *ident == ns)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or(ns)
+            })
+            .collect();
+        if !written.contains(arm.namespace) {
+            bad.push(format!(
+                "{} 登记的臂说 `{}` 由 {} 写，那个文件里没有它的写入",
+                arm.entry, arm.namespace, arm.owner
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// The gate has to be able to fail. This drives it over a fixture that archives
+/// outcomes and only ever builds one of them, so a scanner that reported
+/// nothing — because it stopped reading the envelopes, say — cannot pass as a
+/// tree where both arms exist.
+#[test]
+fn the_gate_reports_an_arm_the_calling_code_never_builds() {
+    let source = r#"
+        fn record(&self, task: &Task, result: &SquadResult) {
+            let task_result = TaskResult {
+                success: true,
+                output: serde_json::json!({ "squad_result": result }),
+                metadata: TaskResultMetadata::new("collaboration"),
+            };
+            self.archive_execution(task, &task_result);
+        }
+    "#;
+    let found = arm_findings(&[("fixture.rs".into(), source.into())]);
+    assert_eq!(found.len(), 1, "只该报没人构造的那条臂: {found:?}");
+    assert!(found[0].contains("failure_pattern"), "{found:?}");
+}
+
+/// The discriminator has to be a literal for the gate to read anything. A value
+/// computed at the call site leaves the arm unprovable, and unproven is not
+/// proven: reporting it keeps the gate from passing on a tree where nothing can
+/// be said about reachability.
+#[test]
+fn the_gate_reports_an_arm_it_cannot_read_from_the_source() {
+    let source = r#"
+        fn record(&self, task: &Task, delivered: bool) {
+            self.archive_execution(
+                task,
+                &TaskResult {
+                    success: delivered,
+                    output: serde_json::json!({}),
+                    metadata: TaskResultMetadata::new("collaboration"),
+                },
+            );
+        }
+    "#;
+    let found = arm_findings(&[("fixture.rs".into(), source.into())]);
+    assert!(
+        found.iter().any(|f| f.contains("不是字面量")),
+        "没把不可读的判别字段报出来: {found:?}"
+    );
 }
