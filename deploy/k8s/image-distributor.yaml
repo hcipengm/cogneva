@@ -49,6 +49,12 @@ spec:
               port: 8080
             initialDelaySeconds: 1
             periodSeconds: 2
+            # 预算必须显式给：kubelet 默认 timeoutSeconds 1 秒 / failureThreshold 3 次，
+            # 省略即按空闲节点取值。共址构建把节点 load 拉到 20+ 时，连 3 秒的上限都被击穿过
+            # （redis 探针曾因此被判死重启）；端口探测一旦假阴性，分发器在别的节点上就等不到端点。
+            # 超时特意大于周期：健康时节奏仍是 2 秒，只是忙时单次最多等 10 秒。
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             # 显式声明极小资源：不声明会吃 LimitRange 默认值（500m/512Mi），
             # 命名空间 ResourceQuota 按业务负载+分发器开销总量设计，不能浪费
@@ -166,6 +172,9 @@ spec:
                 - test -f /workspace/done-${NODE_NAME}
             initialDelaySeconds: 5
             periodSeconds: 5
+            # 同上的理由：exec 探针走本地 shell，忙时起进程本身就要数秒
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             requests:
               cpu: 50m

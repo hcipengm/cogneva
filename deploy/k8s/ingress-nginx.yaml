@@ -70,6 +70,9 @@ spec:
             - name: webhook
               containerPort: 8443
               protocol: TCP
+          # 探针预算显式给出：kubelet 对 timeoutSeconds 默认 1 秒、failureThreshold 默认 3 次，
+          # 省略就等于按空闲节点取值。共址构建把节点 load 拉到 20+ 时，连 3 秒的上限都被击穿过
+          # （redis 探针曾因此被判死重启）；默认的 1 秒会让 controller 也被判死，入口跟着断一次。
           livenessProbe:
             httpGet:
               path: /healthz
@@ -77,6 +80,8 @@ spec:
               scheme: HTTP
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /readyz
@@ -84,6 +89,8 @@ spec:
               scheme: HTTP
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             requests:
               cpu: 100m

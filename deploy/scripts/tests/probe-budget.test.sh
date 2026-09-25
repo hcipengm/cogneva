@@ -8,6 +8,12 @@
 # 被 liveness 杀掉，后端跟着再断一次）。判据只问"有没有取值面、是不是同一个"，
 # 不问"值合不合理"——后者取决于负载事实，不是结构问题。
 #
+# 被查的文件由**内容**发现（`deploy/` 下谁写了探针就查谁），不列在名单里：名单
+# 必然会漏掉新长出来的目录——`k3s/observability/manifests/` 与 `k8s/` 就是这么
+# 漏掉的，两处正在犯这条判据要治的病（漏 timeoutSeconds）。为了让"漏掉"这件事
+# 在结构上不可能，判据同时核对**覆盖面 census**：今天带探针的目录集合等于一个
+# 显式声明的集合，多出一个目录即失败，逼下一次加树的人把它纳入判据。
+#
 # 判据自带对照组：同一份检查函数喂一个故意漏写 timeoutSeconds 的样例必须报错，
 # 否则这条门禁是空转的。
 set -euo pipefail
@@ -60,14 +66,47 @@ if yaml is None:
 
 problems = []
 
-# 1) 部署清单（bootstrap 静态消费的那份）：探针预算必须写全。
-for path in sorted((repo / "deploy" / "k3s").glob("*.yaml")):
-    problems += check_docs(list(yaml.safe_load_all(path.read_text())), path.name)
+templates = repo / "deploy" / "helm" / "cogneva" / "templates"
+
+# 1) 每一份会被 apply 的清单（静态树与预渲染产物）都要写全预算。chart 模板除外：
+#    那里的键由 `toYaml` 渲染，文本里看不到，由第 2 段按另一条规则查。
+checked = {}
+for path in sorted((repo / "deploy").rglob("*.yaml")):
+    if templates in path.parents:
+        continue
+    text = path.read_text()
+    if not any(key in text for key in probe_keys):
+        continue
+    rel = str(path.relative_to(repo))
+    checked[rel] = str(path.parent.relative_to(repo / "deploy"))
+    problems += check_docs(list(yaml.safe_load_all(text)), rel)
+
+# 覆盖面 census：带探针的目录集合必须与声明一致。两个方向都会失败——新目录出现
+# （有人加了一份带探针的清单而没进判据）或目录消失（有人搬了树而声明没跟上）。
+declared_trees = {
+    "k3s",
+    "k3s/observability/manifests",
+    "k8s",
+    "rendered/k3s-single",
+    "rendered/k3s-multi",
+    "rendered/k8s-standard",
+}
+found_trees = set(checked.values())
+if found_trees != declared_trees:
+    for missing in sorted(declared_trees - found_trees):
+        problems.append(
+            f"声明的探针目录 {missing} 下一份带探针的清单都没有：判据的覆盖面 census 过期了"
+        )
+    for extra in sorted(found_trees - declared_trees):
+        problems.append(
+            f"{extra} 下有带探针的清单但不在声明的目录集合里："
+            "把它纳入判据（并确认这些探针写全了预算）后再更新 census"
+        )
 
 # 2) chart 模板：探针的数值必须来自 .Values.healthProbes，不允许字面量。
 #    字面量会让"改配置面"与"改部署"变成两件事，两侧必然漂移。
 literal = re.compile(r"^\s*(initialDelaySeconds|periodSeconds|timeoutSeconds|failureThreshold):")
-for path in sorted((repo / "deploy" / "helm" / "cogneva" / "templates").glob("*.yaml")):
+for path in sorted(templates.glob("*.yaml")):
     lines = path.read_text().splitlines()
     for i, line in enumerate(lines):
         key = line.strip().rstrip(":")

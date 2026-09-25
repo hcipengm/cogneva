@@ -127,12 +127,16 @@ spec:
               mountPath: /etc/loki
             - name: data
               mountPath: /data
+          # 探针预算显式给出：kubelet 对 timeoutSeconds 默认 1 秒、failureThreshold 默认 3 次，
+          # 省略就等于按空闲节点取值。共址构建把节点 load 拉到 20+ 时，连 3 秒的上限都被击穿过
+          # （redis 探针曾因此被判死重启），默认的 1 秒会把好好的 Pod 判死。
           readinessProbe:
             httpGet:
               path: /ready
               port: http
             initialDelaySeconds: 30
             periodSeconds: 10
+            timeoutSeconds: 10
             failureThreshold: 6
           livenessProbe:
             httpGet:
@@ -140,6 +144,7 @@ spec:
               port: http
             initialDelaySeconds: 45
             periodSeconds: 20
+            timeoutSeconds: 10
             failureThreshold: 5
           # 请求压到最小：单节点可支配内存本就紧，滚动更新要留出一个 Pod 的余量；
           # 本后端是日志旁路，给调度器一个低成本占位即可，上限留 2Gi 兜住查询突发。
