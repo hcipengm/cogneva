@@ -691,6 +691,24 @@
           },
           "severity": "warning",
           "summary": "The channel refused {value} re-drives in the last day because the CI failure arrived with no log to generate against, so there was no cause to build a fix from and a round would have been a guess. The landing was reverted either way, so this is a reading that broke rather than a change: check that the CI run and its job logs can still be fetched before the generator is expected to answer failures again"
+        },
+        {
+          "name": "redrive_budget_forgotten",
+          "promql": "sum(increase(cogneva_redrive_budget_losses_total{side=\"read\"}[24h])) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The re-drive budget could not be read {value} times in the last day, so the rounds already spent were forgotten and every cause started over. The generation that follows is the same attempt at the same failure the budget was there to stop, and nothing else about the quiet would show it: check that the data volume holding the budget file is readable, and that its contents are still a ledger rather than a truncated write"
+        },
+        {
+          "name": "redrive_charge_not_persisted",
+          "promql": "sum(increase(cogneva_redrive_budget_losses_total{side=\"write\"}[24h])) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "A re-drive round was spent but its charge could not be written {value} times in the last day, so the same cause can buy a fresh round on the next process. This one is invisible from the refusals: the round that is charged again is charged after a restart with nothing to refuse it until the charge is written a second time. Check that the data volume has room and is writable"
         }
       ]
     },

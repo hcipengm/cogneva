@@ -22,7 +22,7 @@
 //! therefore bounded per cause and per window, not in total.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -52,11 +52,46 @@ pub enum RedriveRefusal {
 }
 
 impl RedriveRefusal {
+    /// Every reason, so a gate can check that each one reaches a rule.
+    pub const ALL: [Self; 2] = [Self::NoEvidence, Self::CauseExhausted];
+
     /// The metric label. Stable: alert rules read these.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NoEvidence => "no_evidence",
             Self::CauseExhausted => "cause_exhausted",
+        }
+    }
+}
+
+/// Round charge lost, by which side of the ledger lost it.
+///
+/// The ledger is what makes the budget mean the same thing twice, so losing it
+/// is losing the bound: a read that failed grants the rounds a fresh ledger
+/// would, and a write that failed leaves a round uncharged so the same cause
+/// can buy another one after a restart. Both directions end in a budget that
+/// quietly stopped applying, which is why they are counted, and they are kept
+/// apart because the two repairs are different.
+pub const REDRIVE_BUDGET_LOSSES_METRIC: &str = "cogneva_redrive_budget_losses_total";
+
+/// Which half of the ledger lost a charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetSide {
+    /// The ledger could not be read, so its rounds were forgotten.
+    Read,
+    /// The ledger could not be written, so this round was not charged.
+    Write,
+}
+
+impl BudgetSide {
+    /// Every side, so a gate can check that each one reaches a rule.
+    pub const ALL: [Self; 2] = [Self::Read, Self::Write];
+
+    /// The metric label. Stable: alert rules read these.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
         }
     }
 }
@@ -219,20 +254,40 @@ fn ledger_path() -> PathBuf {
     crate::landing::data_dir().join("redrive-budget.json")
 }
 
-/// Load the ledger. A missing or unreadable file is an empty ledger: it grants
-/// the rounds a fresh start would, and refusing every re-drive because the
-/// ledger could not be read would turn a filesystem fault into a halt in
-/// generation.
-pub async fn load_ledger() -> CauseLedger {
-    let Ok(text) = tokio::fs::read_to_string(ledger_path()).await else {
-        return CauseLedger::default();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
+/// Load the ledger.
+///
+/// A file that is not there yet is an empty ledger and not an error: that is
+/// the normal state before the first round is charged. Anything else (an
+/// unreadable file, a ledger that no longer parses) is returned to the caller
+/// as an error so the loss can be counted — the caller still carries on with
+/// an empty ledger, because refusing every re-drive over a filesystem fault
+/// would turn the fault into a halt in generation.
+pub async fn load_ledger() -> SFResult<CauseLedger> {
+    load_ledger_at(&ledger_path()).await
 }
 
 /// Persist the ledger after spending a round.
 pub async fn save_ledger(ledger: &CauseLedger) -> SFResult<()> {
-    let path = ledger_path();
+    save_ledger_at(&ledger_path(), ledger).await
+}
+
+async fn load_ledger_at(path: &Path) -> SFResult<CauseLedger> {
+    let text = match tokio::fs::read_to_string(path).await {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CauseLedger::default()),
+        Err(e) => return Err(SFError::IO(format!("read redrive budget: {e}"))),
+    };
+    parse_ledger(&text)
+}
+
+/// What a ledger file's text says. Pure, so the reader's two failure
+/// directions can be asserted without a filesystem: valid text loads, text that
+/// is not a ledger does not.
+fn parse_ledger(text: &str) -> SFResult<CauseLedger> {
+    serde_json::from_str(text).map_err(|e| SFError::Internal(format!("parse redrive budget: {e}")))
+}
+
+async fn save_ledger_at(path: &Path, ledger: &CauseLedger) -> SFResult<()> {
     if let Some(dir) = path.parent() {
         tokio::fs::create_dir_all(dir)
             .await
@@ -240,7 +295,7 @@ pub async fn save_ledger(ledger: &CauseLedger) -> SFResult<()> {
     }
     let json = serde_json::to_string_pretty(ledger)
         .map_err(|e| SFError::Internal(format!("serialize redrive budget: {e}")))?;
-    tokio::fs::write(&path, json)
+    tokio::fs::write(path, json)
         .await
         .map_err(|e| SFError::IO(format!("write redrive budget: {e}")))
 }
@@ -381,5 +436,54 @@ mod tests {
         // A ledger written before the field existed still loads.
         let older: CauseLedger = serde_json::from_str("{}").unwrap();
         assert_eq!(older.rounds_in_window(&sig, window(), at(5)), 0);
+    }
+
+    fn ledger_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cogneva-redrive-{}-{name}.json",
+            std::process::id()
+        ))
+    }
+
+    /// A file that was never written is the state before the first round, not a
+    /// lost budget. If this read reported an error, every fresh install would
+    /// look like a budget that stopped applying.
+    #[tokio::test]
+    async fn a_ledger_that_was_never_written_is_empty_and_not_a_loss() {
+        let path = ledger_file("missing");
+        let _ = tokio::fs::remove_file(&path).await;
+        let ledger = load_ledger_at(&path)
+            .await
+            .expect("an absent ledger is not an error");
+        assert!(ledger.causes.is_empty());
+    }
+
+    /// Text that is not a ledger has to reach the caller as an error: read as
+    /// "no rounds spent" it would grant a fresh round per cause, and the round
+    /// is a full generation plus a full CI run.
+    #[tokio::test]
+    async fn a_ledger_that_does_not_parse_is_a_loss_the_caller_sees() {
+        let path = ledger_file("corrupt");
+        tokio::fs::write(&path, "{\"causes\": ").await.unwrap();
+        assert!(load_ledger_at(&path).await.is_err());
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// The charge has to be in the file the next process reads, which is the
+    /// only thing that stops a restart from re-funding a spend cause.
+    #[tokio::test]
+    async fn a_charge_written_is_a_charge_read_back() {
+        let path = ledger_file("roundtrip");
+        let sig = failure_signature(LOG_A).unwrap();
+        let mut ledger = CauseLedger::default();
+        ledger.spend(&sig, window(), at(0));
+        save_ledger_at(&path, &ledger).await.unwrap();
+        let back = load_ledger_at(&path).await.unwrap();
+        assert_eq!(back.rounds_in_window(&sig, window(), at(5)), 1);
+        assert_eq!(
+            decide(LOG_A, &back, 1, window(), at(5)),
+            RedriveDecision::Refuse(RedriveRefusal::CauseExhausted)
+        );
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }

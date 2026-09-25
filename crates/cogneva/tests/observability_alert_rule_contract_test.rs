@@ -52,6 +52,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-observability/src/process_zombies.rs",
     ),
     (
+        "cogneva_redrive_budget_losses_total",
+        "crates/cog-github/src/redrive_budget.rs",
+    ),
+    (
         "cogneva_redrive_refusals_total",
         "crates/cog-github/src/redrive_budget.rs",
     ),
@@ -222,6 +226,41 @@ fn every_series_recorded_as_produced_is_still_published_there() {
         missing.is_empty(),
         "PRODUCED 表登记的产出点已经不存在，登记本身成了空头许可:\n{}",
         missing.join("\n")
+    );
+}
+
+#[test]
+fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
+    use cog_github::redrive_budget::{BudgetSide, RedriveRefusal};
+
+    let rules = chart_rules();
+    let domains: [(&str, Vec<&str>); 2] = [
+        (
+            cog_github::redrive_budget::REDRIVE_REFUSALS_METRIC,
+            RedriveRefusal::ALL.iter().map(|r| r.as_str()).collect(),
+        ),
+        (
+            cog_github::redrive_budget::REDRIVE_BUDGET_LOSSES_METRIC,
+            BudgetSide::ALL.iter().map(|s| s.as_str()).collect(),
+        ),
+    ];
+
+    let mut unread: Vec<String> = Vec::new();
+    for (metric, values) in domains {
+        for value in values {
+            let quoted = format!("\"{value}\"");
+            let read = rules
+                .iter()
+                .any(|(_, promql)| promql.contains(metric) && promql.contains(&quoted));
+            if !read {
+                unread.push(format!("{metric}{{…=\"{value}\"}}"));
+            }
+        }
+    }
+
+    assert!(
+        unread.is_empty(),
+        "这些计数器的取值没有任何规则在读，对应的事件会静默发生（名字被读了不算，取值没被读）: {unread:?}"
     );
 }
 

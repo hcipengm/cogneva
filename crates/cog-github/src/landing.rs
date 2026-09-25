@@ -464,6 +464,32 @@ impl MainChannel {
         }
     }
 
+    /// Count one round charge the ledger lost, under the side that lost it.
+    ///
+    /// This is the counter that keeps the budget honest about itself: a read
+    /// that failed grants the rounds a fresh ledger would, and a write that
+    /// failed leaves a round uncharged, and neither one shows up anywhere else.
+    /// Logged and dropped on failure, like the counters above.
+    pub(crate) async fn note_budget_loss(&self, side: crate::redrive_budget::BudgetSide) {
+        let Some(metrics) = self.metrics.get().cloned() else {
+            return;
+        };
+        let labels = HashMap::from([("side".to_string(), side.as_str().to_string())]);
+        if let Err(e) = metrics
+            .record_counter(
+                crate::redrive_budget::REDRIVE_BUDGET_LOSSES_METRIC,
+                1.0,
+                labels,
+            )
+            .await
+        {
+            warn!(
+                side = side.as_str(),
+                "cannot record a lost budget charge: {e}"
+            );
+        }
+    }
+
     async fn record_landed(&self, change: &GeneratedChange, base: &str, rev: &str) -> Result<()> {
         let now = Utc::now();
         let existing = load_record(&change.change_id).await;
@@ -995,7 +1021,22 @@ pub async fn watch_landed(
 
                 if policy.redrive_on_ci_failure && !record.redriven {
                     let window = chrono::Duration::seconds(policy.redrive_cause_window_secs as i64);
-                    let mut ledger = crate::redrive_budget::load_ledger().await;
+                    // A ledger that cannot be read is carried on with as an
+                    // empty one — a filesystem fault must not turn into a halt
+                    // in generation — but it is counted, because the budget
+                    // that stopped applying is otherwise invisible.
+                    let mut ledger = match crate::redrive_budget::load_ledger().await {
+                        Ok(ledger) => ledger,
+                        Err(e) => {
+                            tracing::warn!(error = %e,
+                                "could not read the re-drive budget; continuing with an empty one, \
+                                 so this cause's rounds start over");
+                            channel
+                                .note_budget_loss(crate::redrive_budget::BudgetSide::Read)
+                                .await;
+                            crate::redrive_budget::CauseLedger::default()
+                        }
+                    };
                     match crate::redrive_budget::decide(
                         &log,
                         &ledger,
@@ -1016,6 +1057,9 @@ pub async fn watch_landed(
                                 tracing::warn!(error = %e,
                                     "could not persist the re-drive budget; this round will be \
                                      charged again the next time this cause fails");
+                                channel
+                                    .note_budget_loss(crate::redrive_budget::BudgetSide::Write)
+                                    .await;
                             }
                             redrive(orchestrator, &record, &log).await;
                         }
