@@ -196,16 +196,27 @@ fn floating_pin_is_converged(declared_rev: Option<&str>, bare_rev: &str) -> bool
     matches!(declared_rev, Some(r) if rev12(r) == rev12(bare_rev))
 }
 
-/// 命中即无自救可能的 Pod 等待态：拉不到镜像、镜像引用非法、挂载/配置
-/// 错误、容器反复崩溃退出。出现这些状态的新副本永远不会 ready，等再久
-/// 也只会烧 rollout 超时，必须立即判败触发回滚。
+/// 命中即无自救可能的 Pod 等待态：镜像引用非法、挂载/配置错误、容器反复
+/// 崩溃退出。出现这些状态的新副本永远不会 ready，等再久也只会烧 rollout
+/// 超时，必须立即判败触发回滚。
 const FATAL_WAITING_REASONS: &[&str] = &[
-    "ImagePullBackOff",
-    "ErrImagePull",
     "InvalidImageName",
     "CreateContainerConfigError",
     "CrashLoopBackOff",
 ];
+
+/// 拉取失败的等待态。**不能**与上面那组并列——它们各自都说不出自己的病因：
+/// k8s 的这两个 reason 只说明"有过一次拉取失败"，既可能是镜像源此刻不服务
+/// （registry 正在重启、被驱逐、网络闪断，会自愈），也可能是永远不会有这个
+/// 镜像。判据只有 reason 一个字符面时两种因同形，判死就会回滚一份完好的版本：
+/// 线上实测过一次，一次 support apply 让 registry 与四个后端一起重启，目标 Pod
+/// 在 4 秒后被读成 `ErrImagePull` 版本类失败并回滚（那正是 support 等待那次修的
+/// 那一段空窗；但空窗不止我们自己造成的那一种）。
+///
+/// 而这类失败的真实性质是**新版本一次都没跑起来**：它说不出新版本的好坏，
+/// 所以归环境类、不回滚，等镜像源恢复后新副本自己就能起来（见
+/// IMAGE_SOURCE_UNAVAILABLE_MARKER）。
+const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImagePullBackOff"];
 
 /// 支撑清单 apply 会动到的工作负载种类。滚动目标本身是 Deployment，但目标由
 /// 逐目标等待单独负责，这里的判据不覆盖它们。
@@ -384,14 +395,29 @@ fn rollout_pods_ready(samples: &[PodSample]) -> Option<bool> {
     Some(own.iter().all(|p| p.ready))
 }
 
-/// 自己的副本里有没有必死等待态（拉不到镜像、配置错误、CrashLoop）。这些副本
+/// 自己的副本里有没有必死等待态（配置错误、CrashLoop、镜像引用非法）。这些副本
 /// 永远等不到 ready，等下去只会把预算烧完；判据与超时路径同一份枚举。
+///
+/// 拉取失败的等待态不在这一份里：它判不了死（见 IMAGE_PULL_WAITING_REASONS），
+/// 归预算到期那一刻的环境类处置。
 fn rollout_pods_fatal(samples: &[PodSample]) -> Option<String> {
     samples
         .iter()
         .filter(|p| !p.terminating)
         .find(|p| FATAL_WAITING_REASONS.contains(&p.waiting_reason.as_str()))
         .map(|p| format!("{} waiting={}", p.name, p.waiting_reason))
+}
+
+/// 这批等待原因里有没有「拉取失败」。init 容器与主容器一起看：init 拉不到镜像时
+/// 主容器只报 PodInitializing，只看主容器会把这一档整个漏掉。
+///
+/// 返回命中的那个原因本身（而不是布尔）：判词里要写出是哪一个等待态，人才知道
+/// kubelet 停在哪一步。
+fn image_pull_blocked(reasons: &[String]) -> Option<&str> {
+    reasons
+        .iter()
+        .map(String::as_str)
+        .find(|r| IMAGE_PULL_WAITING_REASONS.contains(r))
 }
 
 /// 就绪预算的起算点：自己的、尚未就绪的副本里**最近**启动的那个容器。取最近的
@@ -575,6 +601,18 @@ fn is_admission_denied(msg: &str) -> bool {
     msg.contains(ADMISSION_DENIED_MARKER)
 }
 
+/// 新副本卡在拉镜像上、整段预算里一次都没跑起来：这次失败**没有观测到版本**，
+/// 说不出新版本的好坏——镜像源自己可能就是病因。带这个标记的失败按环境类处理
+/// 且不回滚：回滚到一个更旧的镜像并不能让镜像源恢复，而留在那里的新版本在镜像
+/// 源恢复后自己就能起来；判成版本类则会把这个 rev 记成"坏"而不再重试。
+///
+/// 措辞只说"没拿到证据"，不说断言：镜像到底在不在，这条判定不负责回答。
+const IMAGE_SOURCE_UNAVAILABLE_MARKER: &str = "image source unavailable";
+
+fn is_image_source_unavailable(msg: &str) -> bool {
+    msg.contains(IMAGE_SOURCE_UNAVAILABLE_MARKER)
+}
+
 /// 这次失败**坏在哪**。类别说"这次失败说不说得出新版本的问题"，落点说的是
 /// "坏在哪一处"——后者是判"同 rev 反复失败是不是同一处坏"的证据。
 ///
@@ -592,18 +630,21 @@ enum FailureLocus {
     Tool,
     /// 授权被拒：读不到要看的东西。
     AuthDenied,
+    /// 镜像源没供上镜像：新副本卡在拉取上，一次都没跑起来。
+    ImageSource,
     /// 其余按"观测到的版本缺陷"论，含回滚过的那一支。
     Observed,
 }
 
 impl FailureLocus {
     /// 全部落点，供读回签名时校验值域用。
-    const ALL: [FailureLocus; 6] = [
+    const ALL: [FailureLocus; 7] = [
         FailureLocus::Unreachable,
         FailureLocus::Admission,
         FailureLocus::Placement,
         FailureLocus::Tool,
         FailureLocus::AuthDenied,
+        FailureLocus::ImageSource,
         FailureLocus::Observed,
     ];
 
@@ -614,6 +655,7 @@ impl FailureLocus {
             FailureLocus::Placement => "placement",
             FailureLocus::Tool => "tool",
             FailureLocus::AuthDenied => "auth",
+            FailureLocus::ImageSource => "image-source",
             FailureLocus::Observed => "observed",
         }
     }
@@ -625,6 +667,8 @@ impl FailureLocus {
     /// 回去），而滚动中认准入只看判定进程打的标记、不认措辞——超时记录里附着的
     /// 现场采样与上游原文同形，用措辞再判一遍会把"这次上线自己把 requests 调过了
     /// 配额"那一支也读成环境类，那一个真坏的版本就再也等不到回滚。
+    ///
+    /// 镜像源同理属环境：它说的是"新版本一次都没跑起来"，不是版本好坏。
     fn class(self, before_any_change: bool) -> FailureClass {
         let environment = if before_any_change {
             self != FailureLocus::Observed
@@ -635,6 +679,7 @@ impl FailureLocus {
                     | FailureLocus::Admission
                     | FailureLocus::Placement
                     | FailureLocus::Tool
+                    | FailureLocus::ImageSource
             )
         };
         if environment {
@@ -724,12 +769,13 @@ const ROLLOUT_EXIT_ENVIRONMENT: i32 = 75;
 /// 变更的结论，环境类只是集群此刻的样子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FailureClass {
-    /// 观测到的版本缺陷：探针不过、启动卡死、支撑清单 apply 失败、镜像拉不下来。
+    /// 观测到的版本缺陷：探针不过、启动卡死、支撑清单 apply 失败、容器反复崩溃。
     /// 该回滚；也是唯一能构成"这个 rev 坏"的结论、进而让重试停下的一类。
     #[default]
     Version,
-    /// 集群环境问题：调度器放不下新 Pod，或我们看不到集群。两种都说不出新版本
-    /// 的好坏，Job 不回滚，重试也不该被当成"这个版本又坏了一次"。
+    /// 集群环境问题：调度器放不下新 Pod、准入面挡在建 Pod 之前、我们看不到集群，
+    /// 或新副本卡在拉镜像上（镜像源此刻供不上，会自愈）。这些都说不出新版本的好
+    /// 坏，Job 不回滚，重试也不该被当成"这个版本又坏了一次"。
     Environment,
 }
 
@@ -3669,6 +3715,8 @@ impl RolloutExecutor {
     /// updated/ready 副本数达期望（短查询，Job 在爆炸半径外不怕被杀）。
     /// 轮询同时查 Pod 致命等待态：崩溃镜像永远不会 ready，干等 rollout 超时
     /// （默认 300s）既拖慢回滚又让故障窗口白白拉长，命中即早退触发回滚。
+    /// 拉取失败的等待态不在此列——它等不到 ready 但会自愈，且没有观测到版本，
+    /// 预算到期时按环境类处置（见 IMAGE_PULL_WAITING_REASONS）。
     ///
     /// 两段预算：Pod 的 init 容器还没结束时是**启动阶段**，只吃
     /// startup_timeout_secs；init 全部结束后才开始吃 rollout_timeout_secs
@@ -3809,6 +3857,11 @@ impl RolloutExecutor {
                 let now_shape = self.current_placement_shape(t).await.ok();
                 let environment = environment_class(&blocked, prev_shape, now_shape.as_deref());
                 let denied = admission_rejection(&replicasets, prev_shape, now_shape.as_deref());
+                // 卡在拉镜像上：整段预算里新版本一次都没跑起来，这次失败没有观测到
+                // 版本，说不出它的好坏。先取下来（临时值不能活到下面的格式化里），
+                // 命不命中都在这里判，判词里带上是哪一个等待态。
+                let pull_blocked =
+                    image_pull_blocked(&self.waiting_reasons(t).await).map(|r| r.to_string());
                 return Err(if !observed_ever {
                     // 一次都没看到过部署态：这是观测能力故障，不是版本结论。
                     SFError::IO(format!(
@@ -3833,6 +3886,15 @@ impl RolloutExecutor {
                          (last: {note}{suffix})",
                         t.deployment, budget
                     ))
+                } else if let Some(reason) = pull_blocked {
+                    // 镜像源的问题不是版本的问题：判词只说"没拿到证据"，不回滚。
+                    SFError::IO(format!(
+                        "{IMAGE_SOURCE_UNAVAILABLE_MARKER}: rollout of deployment/{} did not \
+                         complete within {}s ({phase} phase) — its pod(s) are still waiting on the \
+                         image (waiting={reason}) and the new revision has not run once, so this \
+                         failure says nothing about it (last: {note}{suffix})",
+                        t.deployment, budget
+                    ))
                 } else if starting {
                     SFError::Agent(format!(
                         "deployment/{} stuck in startup phase after {}s \
@@ -3850,12 +3912,10 @@ impl RolloutExecutor {
         }
     }
 
-    /// 只查致命等待态（拉不到镜像、配置错误、CrashLoop），init 容器与主
-    /// 容器一并查：init 拉不到镜像时主容器只报 PodInitializing，不算致命，
-    /// 只看主容器就会把启动阶段的上界白白耗光。滚动交替期 containerStatuses
-    /// 缺失或查询临时失败均返回 Ok——由调用方的超时与后续 pods_healthy 兜底，
-    /// 这里只负责让"必死"的滚动快速失败。
-    async fn fatal_pod_state(&self, t: &RolloutTarget) -> SFResult<()> {
+    /// 本次滚动的 Pod 上所有等待原因，init 容器与主容器一并取：init 容器拉不到
+    /// 镜像时主容器只报 PodInitializing，只看主容器会把这一档整个漏掉。查询失败
+    /// 返回空表——滚动交替期 containerStatuses 本就可能缺失，由调用方的超时兜底。
+    async fn waiting_reasons(&self, t: &RolloutTarget) -> Vec<String> {
         let selector = pod_selector(&t.name, &t.component);
         let out = match self
             .run_kubectl(
@@ -3872,11 +3932,20 @@ impl RolloutExecutor {
             .await
         {
             Ok(out) => out,
-            Err(_) => return Ok(()),
+            Err(_) => return Vec::new(),
         };
-        for line in out.lines() {
-            let reason = line.trim();
-            if FATAL_WAITING_REASONS.contains(&reason) {
+        out.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect()
+    }
+
+    /// 只查致命等待态（配置错误、CrashLoop、镜像引用非法），查询临时失败返回
+    /// Ok——由调用方的超时与后续 pods_healthy 兜底，这里只负责让"必死"的滚动
+    /// 快速失败。拉取失败不在这里判（见 IMAGE_PULL_WAITING_REASONS）。
+    async fn fatal_pod_state(&self, t: &RolloutTarget) -> SFResult<()> {
+        for reason in self.waiting_reasons(t).await {
+            if FATAL_WAITING_REASONS.contains(&reason.as_str()) {
                 return Err(SFError::Agent(format!(
                     "pod of deployment/{} in fatal waiting state {reason}",
                     t.deployment
@@ -4369,6 +4438,22 @@ impl RolloutExecutor {
                 stage,
                 target,
                 FailureLocus::Placement,
+                false,
+                e,
+            ));
+        }
+        if is_image_source_unavailable(&msg) {
+            warn!(
+                error = %e,
+                "the new pods never pulled their image, so the new revision has not run once; \
+                 keeping the new revision (no rollback) — rolling back to an older image cannot \
+                 repair the image source, and the revision left in place starts on its own once \
+                 the source answers"
+            );
+            return Err(RolloutFailure::at(
+                stage,
+                target,
+                FailureLocus::ImageSource,
                 false,
                 e,
             ));
@@ -5073,6 +5158,64 @@ COPY ["prompts", "/opt/cogneva/prompts"]
         assert!(!is_placement_blocked(&format!(
             "{CLUSTER_UNREACHABLE_MARKER}: never observed"
         )));
+    }
+
+    /// 拉取失败与致命等待态必须是两份判据：前者说不出病因（镜像源此刻不服务，
+    /// 会自愈），判死就会回滚一份完好的版本、并把这个 rev 记成"坏"而不再重试。
+    #[test]
+    fn a_pull_failure_is_not_a_fatal_waiting_state() {
+        // 非空转：致命那一份仍然握着它自己的三种形态。
+        for reason in [
+            "InvalidImageName",
+            "CreateContainerConfigError",
+            "CrashLoopBackOff",
+        ] {
+            assert!(FATAL_WAITING_REASONS.contains(&reason), "{reason}");
+        }
+        // 镜像引用非法留在致命那一份：它不会自愈，与"镜像源此刻不服务"不同。
+        for reason in IMAGE_PULL_WAITING_REASONS {
+            assert!(!FATAL_WAITING_REASONS.contains(reason), "{reason}");
+        }
+        assert!(IMAGE_PULL_WAITING_REASONS.contains(&"ErrImagePull"));
+        assert!(IMAGE_PULL_WAITING_REASONS.contains(&"ImagePullBackOff"));
+
+        // 只认拉取那一类，别的等待态不许借走它的处置。
+        let pull = vec![
+            "ImagePullBackOff".to_string(),
+            "PodInitializing".to_string(),
+        ];
+        assert_eq!(image_pull_blocked(&pull), Some("ImagePullBackOff"));
+        assert_eq!(image_pull_blocked(&["CrashLoopBackOff".to_string()]), None);
+        assert_eq!(image_pull_blocked(&[]), None);
+    }
+
+    /// 镜像源的标记自成一类：不许被别的标记命中，也不许命中别的标记。
+    #[test]
+    fn the_image_source_marker_is_its_own_class() {
+        let e = format!(
+            "{IMAGE_SOURCE_UNAVAILABLE_MARKER}: rollout of deployment/x did not complete \
+             within 300s (readiness phase) — its pod(s) are still waiting on the image \
+             (waiting=ErrImagePull)"
+        );
+        assert!(is_image_source_unavailable(&e));
+        assert!(!is_cluster_unreachable(&e));
+        assert!(!is_placement_blocked(&e));
+        assert!(!is_admission_denied(&e));
+        assert!(!is_observation_tool_failure(&e));
+        assert!(!is_image_source_unavailable(&format!(
+            "{PLACEMENT_BLOCKED_MARKER}: x"
+        )));
+
+        // 落点归环境类（两个阶段都是），才能不回滚、不被记成"这个 rev 坏"。
+        assert_eq!(
+            FailureLocus::ImageSource.class(false),
+            FailureClass::Environment
+        );
+        assert_eq!(
+            FailureLocus::ImageSource.class(true),
+            FailureClass::Environment
+        );
+        assert_eq!(FailureLocus::ImageSource.as_str(), "image-source");
     }
 
     /// 观测工具起不来是第三类，谁也不许借走它的判定：它既不是"看不到集群"
@@ -7901,13 +8044,15 @@ exit 0
         );
     }
 
+    /// init 容器拉不到镜像时主容器只报 PodInitializing：这一档必须能读到（判据
+    /// 要覆盖 init 容器），但**不能**判成版本坏——新版本一次都没跑起来，镜像源
+    /// 自己可能就是病因。线上实测过：registry 与四个后端一起重启，目标 Pod 在
+    /// 4 秒后被读成 ErrImagePull 版本类失败并回滚，回滚掉的是一份完好的版本。
     #[tokio::test]
-    async fn a_fatal_init_container_waiting_state_fails_fast() {
+    async fn a_pod_that_cannot_pull_its_image_is_blamed_on_the_source_not_the_revision() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         let log = bin_dir.join("kubectl.log");
-        // init 容器拉不到镜像：主容器只报 PodInitializing（非致命），只看
-        // 主容器就会把启动阶段的上界耗光才判败。
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
@@ -7923,21 +8068,44 @@ exit 0
             log = log.display()
         );
         write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        // 启动预算 0：判败走的是预算到期那一刻的判定，而不是首轮的早退——拉取
+        // 失败会自愈，判它快慢没有意义。（这个部署带 init 容器，到期的是启动
+        // 预算：init 一直没结束，就绪预算还没起算。）
         let executor = RolloutExecutor::new(
             bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
             "cogneva",
-            1,
+            0,
             1,
             300,
-            300,
+            0,
         );
         let plan = sandbox_executor_plan("localhost:30500/cogneva:main-new");
 
         let err = executor.run(&plan).await.unwrap_err();
+        let rendered = format!("{err:?}");
+        assert_eq!(err.class, FailureClass::Environment, "{rendered}");
         assert!(
-            err.to_string()
-                .contains("fatal waiting state ImagePullBackOff"),
-            "{err}"
+            err.error
+                .to_string()
+                .contains(IMAGE_SOURCE_UNAVAILABLE_MARKER),
+            "{rendered}"
+        );
+        // 判词要写出是哪一个等待态，人才知道 kubelet 停在哪一步。
+        assert!(
+            err.error.to_string().contains("waiting=ImagePullBackOff"),
+            "{rendered}"
+        );
+        // 不回滚：回滚到一个更旧的镜像并不能让镜像源恢复。判据是"旧镜像一次都
+        // 没被写回去"——正向那次 set image 本来就该发生，所以不能笼统地禁 set
+        // image；回滚的两种形状（写回 prev tag、rollout undo）都要禁掉。
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("main-old") && !calls.contains("rollout undo"),
+            "no rollback should happen: {calls}"
+        );
+        assert!(
+            calls.contains("set image") && calls.contains("main-new"),
+            "the new revision must still be the one being rolled out: {calls}"
         );
     }
 
