@@ -1025,6 +1025,11 @@ pub struct SelfEvolutionWorkspaceConfig {
     /// 之间的间隔——存活实例的分支每次移植都会被强推刷新，长期不动的分支说明
     /// 其所属实例已经不在了。
     pub orphan_branch_ttl_secs: u64,
+    /// How often the shared build cache is re-measured, in seconds. Clamped up
+    /// to the reading's own floor: the walk is metadata-only but the cache is
+    /// large, and a scan per scrape would spend host IO on a number that moves
+    /// in hours.
+    pub cache_scan_interval_secs: u64,
 }
 
 impl Default for SelfEvolutionWorkspaceConfig {
@@ -1034,6 +1039,7 @@ impl Default for SelfEvolutionWorkspaceConfig {
             target_dir: "/opt/cogneva/sandbox/src/target".into(),
             ephemeral_ttl_secs: 21600,
             orphan_branch_ttl_secs: 2592000,
+            cache_scan_interval_secs: 300,
         }
     }
 }

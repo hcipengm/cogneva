@@ -38,6 +38,7 @@ data:
   # int 转换不可省：values 里的数字经 chart 解析成 float64，2592000 直接
   # quote 会渲染成 "2.592e+06"，落进 env 就是个解析不了的秒数。
   COGNEVA_SELF_EVOLUTION_WORKSPACES_ORPHAN_BRANCH_TTL_SECS: "2592000"
+  COGNEVA_SELF_EVOLUTION_WORKSPACES_CACHE_SCAN_INTERVAL_SECS: "300"
   # 宿主级构建闸门。判据是"同一宿主上同时有几条编译/打镜像在跑"，而它是宿主的
   # 属性不是进程的属性：部署器、变更验证、基线搬运、镜像构建分属不同进程，各自
   # "有活就起一个"正是和数涨上去的方式。取不到槽位时一次性构建排队（waitSecs

@@ -29,6 +29,7 @@ pub const REFLECTION_NAMESPACE: &str = "reflection";
 
 pub mod auto_promoter;
 pub mod baseline_port;
+pub mod build_cache_readings;
 pub mod change_pipeline;
 pub mod config;
 pub mod crew;

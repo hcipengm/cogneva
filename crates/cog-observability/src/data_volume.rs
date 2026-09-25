@@ -265,37 +265,17 @@ impl Observable for DataVolumeObservable {
 /// Walk `dir` and total the size of every regular file below it, skipping any
 /// entry whose path is listed in `exclude`.
 ///
-/// Apparent size (file length), not allocated blocks: it is the amount of data
-/// that was written, which is the quantity a declared size is about. Block
-/// accounting adds per-file allocation slack that a directory with many small
-/// files inflates without anything having grown.
+/// The walk itself lives in [`cog_core::fs_size`], shared with the build cache
+/// reading: two walkers would each have their own idea of symlinks, of apparent
+/// size and of what an exclusion covers, and one directory would then have two
+/// sizes with nothing to explain the difference.
 ///
 /// An excluded path is neither counted nor descended into, and the exclusion is
-/// on the top-level directory alone rather than on its contents: a mount inside
+/// on the named directory alone rather than on its contents: a mount inside
 /// this volume is the work of a different claim, and its bytes would otherwise
 /// be reported against both.
-///
-/// Symlinks are neither counted nor descended into: their targets may live
-/// outside the volume, and following them could revisit a directory forever.
 fn dir_size_bytes(dir: &Path, exclude: &[PathBuf]) -> std::io::Result<u64> {
-    let mut total: u64 = 0;
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(current) = pending.pop() {
-        for entry in std::fs::read_dir(&current)? {
-            let entry = entry?;
-            let path = entry.path();
-            if exclude.contains(&path) {
-                continue;
-            }
-            let meta = entry.metadata()?;
-            if meta.is_dir() {
-                pending.push(path);
-            } else if meta.is_file() {
-                total = total.saturating_add(meta.len());
-            }
-        }
-    }
-    Ok(total)
+    cog_core::fs_size::dir_size_bytes(dir, exclude)
 }
 
 /// Re-measure the target's directory on a timer and publish the result on

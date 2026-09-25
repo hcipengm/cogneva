@@ -198,6 +198,23 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["intent", "outcome"],
         "crates/cog-reflection/src/evolution_build_readings.rs",
     ),
+    // What the shared build cache holds. The layer label is what makes the
+    // reading actionable -- dropping the compiled layers is a cold rebuild and
+    // dropping the scratch ones is not -- and the dir label is what keeps two
+    // caches behind one path from being summed into one number.
+    (
+        "cogneva_build_target_bytes",
+        &["dir", "layer"],
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
+    // The age of the reading above. Published separately because a failed walk
+    // keeps the last size, so this is the only series that can tell a cache
+    // nobody writes to from a scan loop that stopped.
+    (
+        "cogneva_build_target_bytes_scan_age_seconds",
+        &["dir"],
+        "crates/cog-reflection/src/build_cache_readings.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

@@ -299,6 +299,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "self_evolution.workspaces.orphan_branch_ttl_secs".into(),
     );
     m.insert(
+        "COGNEVA_SELF_EVOLUTION_WORKSPACES_CACHE_SCAN_INTERVAL_SECS".into(),
+        "self_evolution.workspaces.cache_scan_interval_secs".into(),
+    );
+    m.insert(
         "COGNEVA_BUILD_GATE_ENABLED".into(),
         "self_evolution.build_gate.enabled".into(),
     );

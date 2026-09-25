@@ -563,8 +563,14 @@ fn create_slot_dir(dir: &Path) -> SFResult<()> {
 
 /// `dev:ino` of a directory, read from the filesystem rather than remembered, so
 /// the reading follows the directory the gate actually bounds.
+///
+/// Public because it is the identity of a directory rather than of the gate: any
+/// reading that has to tell "the same path" from "the same directory" publishes
+/// this value, and a reader can then join those readings to one directory. Two
+/// workloads mount different volumes at the same path, and a label carrying the
+/// path would merge their readings into one number.
 #[cfg(unix)]
-fn dir_identity(dir: &Path) -> String {
+pub fn dir_identity(dir: &Path) -> String {
     use std::os::unix::fs::MetadataExt;
     match std::fs::metadata(dir) {
         Ok(md) => format!("{}:{}", md.dev(), md.ino()),
@@ -573,7 +579,7 @@ fn dir_identity(dir: &Path) -> String {
 }
 
 #[cfg(not(unix))]
-fn dir_identity(_dir: &Path) -> String {
+pub fn dir_identity(_dir: &Path) -> String {
     "unsupported".to_string()
 }
 

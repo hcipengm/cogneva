@@ -790,6 +790,68 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 22,
+          "title": "Build Cache Bytes by Layer",
+          "description": "What the shared build cache holds, divided by layer, over 6h. This is the reading a cache cap has to be checked against: every change built adds to this directory and nothing removed anything from it, so the first sign of it filling its volume was a build failing on a full disk, whose only remedy is dropping the whole cache and paying a cold rebuild of every workspace. A layer is a directory two levels inside the cache: the deps and .fingerprint halves are compiled results, where dropping them is the cold rebuild, while incremental and build are speed and scratch space whose loss costs a slower next build -- which is why the division is by layer rather than one total. other is published on every scrape, so a zero there is the normal reading (cargo's own layout stays under the published cap) and a rising one is a cache that grew a shape nothing planned for. Kept per directory, not summed into one number: the same path is mounted from different volumes in the builder and the executor, the cap is a volume's property, and the dir label is what tells those two apart.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 88
+          },
+          "targets": [
+            {
+              "expr": "sum by (dir, layer) (cogneva_build_target_bytes)",
+              "legendFormat": "{{dir}} {{layer}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 23,
+          "title": "Build Cache Measurement Age",
+          "description": "How long ago the build cache was measured, over 6h. A walk that fails keeps the last reading instead of publishing a smaller one, because a smaller number would read as a cache that shrank -- so the sizes alone cannot tell a cache nothing is writing to from a scan loop that stopped walking it. This series is the one that separates them: a flat size with a rising age is an unmeasured cache, and the same flat size with the age staying near the scan interval is a cache that is idle but watched. No threshold is drawn, as elsewhere: what counts as stale is the interval the deployment configured, which a panel cannot read.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 88
+          },
+          "targets": [
+            {
+              "expr": "cogneva_build_target_bytes_scan_age_seconds",
+              "legendFormat": "{{dir}} since last walk",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

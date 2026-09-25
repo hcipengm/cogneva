@@ -4,6 +4,7 @@ pub mod config;
 pub mod config_sections;
 pub mod contract;
 pub mod error;
+pub mod fs_size;
 pub mod secrets;
 pub mod types;
 

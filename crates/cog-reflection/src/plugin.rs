@@ -47,6 +47,10 @@ pub struct ReflectionPlugin {
     meta_learning: Option<Arc<crate::MetaLearningEngine>>,
     /// 产物级进化的写侧：保存新版本并热替换 active 指针。
     artifact_evolution: Option<Arc<crate::ArtifactEvolution>>,
+    /// The shared build cache's readings, published in init and measured from
+    /// start(). Only the deployment that runs builds has a cache of its own, so
+    /// every other one holds None here.
+    build_cache: Option<Arc<crate::build_cache_readings::BuildCacheReadings>>,
 }
 
 impl ReflectionPlugin {
@@ -59,6 +63,7 @@ impl ReflectionPlugin {
             workspaces: None,
             meta_learning: None,
             artifact_evolution: None,
+            build_cache: None,
         }
     }
 }
@@ -815,6 +820,19 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     cog_core::build_gate::install_for(&self_evolution.build_gate, executor_enabled);
                 ctx.publish_observable(build_gate);
 
+                // What the shared build cache holds, layer by layer. Published
+                // by every process so the series set does not depend on which
+                // role this one has, and measured only by the one that builds:
+                // a process with no cache of its own has nothing to report, and
+                // reporting zero for it would read as an empty cache. The scan
+                // loop is armed in start(), with the rest of the loops.
+                let build_cache =
+                    std::sync::Arc::new(crate::build_cache_readings::BuildCacheReadings::new(
+                        self_evolution.workspaces.target_dir.clone(),
+                    ));
+                ctx.publish_observable(build_cache.clone());
+                self.build_cache = executor_enabled.then_some(build_cache);
+
                 if executor_enabled {
                     let poll_interval =
                         std::time::Duration::from_secs(self_evolution.poll_interval_secs);
@@ -926,6 +944,35 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             ));
         } else {
             info!("signal watcher: no orchestrator; self-discovery intents disabled");
+        }
+
+        // The cache size belongs to the role that builds: only the executor
+        // deployment owns that directory, so on every other one the series does
+        // not exist at all rather than existing as a zero nothing measured.
+        match self.build_cache.as_ref() {
+            Some(readings) => {
+                let shutdown = cog_core::ShutdownSignal::new();
+                if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                    let shutdown = shutdown.clone();
+                    let mut rx = broadcast_tx.0.subscribe();
+                    tokio::spawn(async move {
+                        let _ = rx.recv().await;
+                        shutdown.trigger();
+                    });
+                }
+                tokio::spawn(crate::build_cache_readings::run_build_cache_watch(
+                    readings.clone(),
+                    ctx.config()
+                        .self_evolution
+                        .workspaces
+                        .cache_scan_interval_secs,
+                    shutdown,
+                ));
+            }
+            None => info!(
+                dir = %ctx.config().self_evolution.workspaces.target_dir,
+                "this process runs no builds; the build cache is measured where it is built"
+            ),
         }
 
         // 产物级进化的自主触发者：拿本进程已记录的决策结果重放候选参数，
