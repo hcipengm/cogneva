@@ -3187,6 +3187,7 @@ pub fn build_rollout_bundle(
                 "kustomization resource {res} missing from bundle files"
             ))
         })?;
+        reject_dialect_dependent_scalars(content, res)?;
         if let Some(t) = targets
             .iter()
             .find(|t| t.manifest.as_deref() == Some(res.as_str()))
@@ -3261,6 +3262,163 @@ fn stage_rollout_manifest(text: &str, origin: &str, out: &Path) -> SFResult<Opti
     std::fs::write(out, render_docs(&docs)?)
         .map_err(|e| SFError::IO(format!("write {}: {e}", out.display())))?;
     Ok(Some(out.to_path_buf()))
+}
+
+/// A plain scalar whose meaning depends on which YAML dialect reads it: the
+/// manifest is parsed here by a 1.2-style reader and written back out, and the
+/// cluster parses that re-emission with a 1.1-style one. The two disagree on
+/// the *type* of a small set of bare spellings — `0400` is an octal integer to
+/// the cluster and a string to us, `yes`/`on`/`no` are booleans to the cluster
+/// and strings to us. Re-emitting "our" reading pins the disagreement: a
+/// quoted `'0400'` reaches the API server as a string where it wants an int32,
+/// and the rollout dies at apply with the error pointing at our staged copy
+/// rather than at the manifest anyone wrote.
+///
+/// The judgement is made on the source text, not on the parsed tree: in the
+/// tree a string `0400` and a deliberately quoted `'0400'` are the same value,
+/// and only the spelling tells them apart.
+///
+/// Returns how each side reads the spelling — (here, there) — or `None` when
+/// both readers agree, which is the case for everything ordinary.
+fn dialect_readings(tok: &str) -> Option<(&'static str, String)> {
+    /// 1.1's boolean words. `true`/`false` are not here: both dialects type
+    /// those as booleans, so they read the same either way.
+    const BOOLS: [&str; 16] = [
+        "y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO", "on", "On", "ON", "off", "Off",
+        "OFF",
+    ];
+    if BOOLS.contains(&tok) {
+        return Some(("string", "boolean".to_string()));
+    }
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    // A leading zero is an octal integer to the cluster, a string to us.
+    if tok.len() > 1 && digits(tok) && tok.starts_with('0') {
+        return Some(("string", format!("octal integer {tok}")));
+    }
+    // `0o400` is 1.2-only: an integer to us, a string to the cluster.
+    if let Some(rest) = tok.strip_prefix("0o").or_else(|| tok.strip_prefix("0O")) {
+        if digits(rest) {
+            return Some(("integer", "string".to_string()));
+        }
+    }
+    // `1_000`: the cluster reads the underscores as digit separators, we read
+    // them as ordinary characters.
+    if tok.contains('_') && tok.bytes().all(|b| b.is_ascii_digit() || b == b'_') {
+        return Some(("string", format!("integer {}", tok.replace('_', ""))));
+    }
+    // `1:30` is ninety to the cluster (sexagesimal) and a string to us.
+    let parts: Vec<&str> = tok.split(':').collect();
+    if parts.len() > 1 && parts.iter().all(|p| digits(p)) {
+        return Some(("string", "sexagesimal integer".to_string()));
+    }
+    None
+}
+
+/// The value text a manifest line carries, before any judgement about whether
+/// it is a bare scalar. `None` when the line carries no value at all: blank,
+/// a comment, or a key that opens a nested mapping.
+fn value_of(line: &str) -> Option<&str> {
+    let mut rest = line.trim();
+    while let Some(after) = rest.strip_prefix("- ") {
+        rest = after.trim_start();
+    }
+    if rest.is_empty() || rest.starts_with('#') {
+        return None;
+    }
+    let value = match rest.find(": ") {
+        Some(i) => rest[i + 2..].trim_start(),
+        // A trailing colon opens a nested mapping; there is no value here.
+        None if rest.ends_with(':') => return None,
+        None => rest,
+    };
+    if value.is_empty() {
+        return None;
+    }
+    Some(value)
+}
+
+/// The bare scalar a manifest line carries, if it carries one. Multi-word
+/// values never qualify: a space makes the value a string to both dialects.
+fn plain_scalar_of(line: &str) -> Option<&str> {
+    let value = value_of(line)?;
+    // Quoted, block, flow, anchored or tagged: not a bare scalar, so both
+    // dialects read it as written.
+    if value.starts_with(['"', '\'', '|', '>', '[', '{', '&', '*', '!', '%', '@', '`']) {
+        return None;
+    }
+    let value = match value.find(" #") {
+        Some(i) => value[..i].trim_end(),
+        None => value,
+    };
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(value)
+}
+
+/// Whether the line opens a block scalar (`|` or `>` with its indicators):
+/// every following line indented deeper than this one is that one string.
+fn opens_block_scalar(line: &str) -> bool {
+    value_of(line).is_some_and(|v| v.starts_with('|') || v.starts_with('>'))
+}
+
+/// Refuse a manifest bundle that carries a bare scalar the two YAML dialects
+/// type differently, and say which spellings both readers agree on.
+///
+/// Checked over every document in the bundle rather than only the ones this
+/// rollout applies: the rewrite is per file with one reader, so a single
+/// ambiguous spelling anywhere in it makes that rewrite untrustworthy.
+///
+/// Called on the source text the bundle builder reads out of the revision, not
+/// on the manifest staging later hands to `kubectl`: by then the text has been
+/// through this process's own reader and writer, and a source `0400` and a
+/// source `'0400'` both arrive there as the same quoted string. The source
+/// checkout is the last place the two spellings are still distinguishable.
+fn reject_dialect_dependent_scalars(text: &str, origin: &str) -> SFResult<()> {
+    // Lines inside a block scalar are one string to both readers, so nothing in
+    // them is a scalar of the document. They are skipped by indentation: a
+    // block runs until a line that indents no deeper than the line opening it.
+    // Refusing them would cost a rollout for text the cluster never retypes —
+    // and prompts and embedded config live in exactly such blocks.
+    let mut in_block: Option<usize> = None;
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if let Some(opened_at) = in_block {
+            if indent > opened_at {
+                continue;
+            }
+            in_block = None;
+        }
+        if opens_block_scalar(line) {
+            in_block = Some(indent);
+            continue;
+        }
+        let Some(tok) = plain_scalar_of(line) else {
+            continue;
+        };
+        let Some((here, there)) = dialect_readings(tok) else {
+            continue;
+        };
+        // A leading-zero spelling has a decimal twin worth naming: it is the
+        // spelling the cluster and we agree on, and the one the value usually
+        // means (an octal file mode).
+        let respell = u32::from_str_radix(tok, 8)
+            .ok()
+            .filter(|_| tok.starts_with('0') && tok.len() > 1)
+            .map(|v| format!(" — `{v}` is the same value and needs no quotes"))
+            .unwrap_or_default();
+        return Err(SFError::Config(format!(
+            "{origin}:{}: the bare value `{tok}` is typed differently by the two YAML \
+             dialects this manifest passes through: it is a {here} to this process and a \
+             {there} to the cluster, so the staged copy would carry the other type. Write \
+             it in a spelling both readers agree on: quote it if it means a string{respell}",
+            idx + 1
+        )));
+    }
+    Ok(())
 }
 
 /// 发布集去重校验：kustomization resources 不允许重复条目（重复会让
@@ -8739,6 +8897,149 @@ exit 0
         let secret = "kind: Secret\nmetadata:\n  name: s\n";
         let err = namespace_docs(secret, "secret.yaml").unwrap_err();
         assert!(err.to_string().contains("forbidden"), "{err}");
+    }
+
+    /// 真实事故向量：清单里写着 `defaultMode: 0400`，我们按 1.2 读成字符串、
+    /// 重排后加引号写回，集群按 1.1 读成八进制整数 256——于是 apply 阶段报
+    /// `unrecognized type: int32`，错误指向我们产出的那份副本，而不是任何人
+    /// 手写的那份清单。门禁在**读源文本时**就要拦住它，并给出双方都认的写法。
+    #[test]
+    fn an_octal_file_mode_is_refused_before_any_rewrite() {
+        let text = "kind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  template:\n    spec:\n      volumes:\n        - name: key\n          secret:\n            secretName: git-key\n            defaultMode: 0400\n";
+        let err = reject_dialect_dependent_scalars(text, "deployment.yaml").unwrap_err();
+        let msg = err.to_string();
+        // 行号指到那一行，而不是整份清单。
+        assert!(msg.contains("deployment.yaml:11"), "{msg}");
+        // 两种读法都写出来，读的人不必自己推。
+        assert!(msg.contains("`0400`"), "{msg}");
+        assert!(msg.contains("string"), "{msg}");
+        assert!(msg.contains("octal integer 0400"), "{msg}");
+        // 并给出等价的中性写法，照抄即可修好。
+        assert!(msg.contains("`256`"), "{msg}");
+
+        // 两个对照：写出集群要的十进制整数、或显式引号声明这是字符串，都放行。
+        let decimal = text.replace("defaultMode: 0400", "defaultMode: 256");
+        assert!(reject_dialect_dependent_scalars(&decimal, "deployment.yaml").is_ok());
+        let quoted = text.replace("defaultMode: 0400", "defaultMode: \"0400\"");
+        assert!(reject_dialect_dependent_scalars(&quoted, "deployment.yaml").is_ok());
+    }
+
+    /// 一份清单里可能出现多种两方言不同型的裸写法，每一种都要被认出来；
+    /// 而普通值（含两位数的端口、`true`/`false`、带空格的字符串、被引号或
+    /// 块标量显式定型的值）一个都不许误伤。
+    #[test]
+    fn every_dialect_dependent_spelling_is_named_and_ordinary_values_are_not() {
+        for (line, expected) in [
+            ("enableServiceLinks: yes", "boolean"),
+            ("shareProcessNamespace: on", "boolean"),
+            ("foo: No", "boolean"),
+            ("mode: 0o400", "string"),
+            ("millis: 1_000", "string"),
+            ("duration: 1:30", "string"),
+            ("port: 0755", "octal integer 0755"),
+        ] {
+            let text = format!("kind: ConfigMap\nmetadata:\n  name: c\n{line}\n");
+            let err = reject_dialect_dependent_scalars(&text, "c.yaml")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("c.yaml:4"), "{line} -> {err}");
+            assert!(err.contains(expected), "{line} -> {err}");
+        }
+        for line in [
+            // 两位十进制、`true`/`false`、两个方言同型。
+            "port: 8080",
+            "enabled: true",
+            "disabled: false",
+            // 空格让它成为字符串，两边一致。
+            "command: chmod 0400 /key",
+            // 引号/块标量/流式/标签显式定型，两边一致。
+            "mode: \"0400\"",
+            "note: |",
+            "ports: [8080, 9090]",
+            "tag: !!str 0400",
+            "inherit: *anchor",
+            // 序列项前缀与注释不该被当成值。
+            "- name: x",
+            "# defaultMode: 0400",
+            "metadata:",
+        ] {
+            let text = format!("kind: ConfigMap\nmetadata:\n  name: c\n{line}\n");
+            assert!(
+                reject_dialect_dependent_scalars(&text, "c.yaml").is_ok(),
+                "{line} must pass"
+            );
+        }
+    }
+
+    /// 块标量里的每一行都是同一个字符串，集群不会把它重新定型——所以块里的
+    /// 裸 `no` / `0400` 一个都不该拦：prompt 与内嵌配置就住在这样的块里，
+    /// 拦下来等于为一段谁都不会重新读的文本卡死整条落地通道。
+    #[test]
+    fn text_inside_a_block_scalar_is_not_a_scalar_of_the_document() {
+        let text = "kind: ConfigMap\nmetadata:\n  name: c\ndata:\n  prompt: |\n    answer with yes or no\n    mode: 0400\n    - off\n  other: 1\n";
+        assert!(reject_dialect_dependent_scalars(text, "c.yaml").is_ok());
+        // 块结束（缩进不再更深）之后的那一行照旧在判据面内。
+        let after = text.replace("  other: 1", "  other: 0400");
+        let err = reject_dialect_dependent_scalars(&after, "c.yaml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("c.yaml:9"), "{err}");
+    }
+
+    /// 门禁的输入是发布集里的文件内容，所以要在**真的会进滚动包的那些清单**上
+    /// 验一遍：一个误伤就把整条落地通道卡死在一个与本次版本无关的理由上。
+    /// 清单名从 `kustomization.yaml` 反查，不手写文件名——手写的清单会随新增
+    /// 资源静默过期。
+    #[test]
+    fn the_shipped_manifests_pass_the_dialect_gate() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // `deploy/k3s` 是部署器默认读的发布集；预渲染目录也在内，因为发布集目录
+        // 是配置面（`manifest_dir`），把它指到任一预渲染目录是受支持的用法，
+        // 那些文件同样会被重排后再 apply。
+        for rel in [
+            "deploy/k3s",
+            "deploy/rendered/k3s-single",
+            "deploy/rendered/k3s-multi",
+            "deploy/rendered/k8s-standard",
+        ] {
+            let dir = root.join(rel);
+            // 发布集目录用 kustomization 反查；预渲染目录是一堆平铺清单，
+            // 目录里的每一项都在发布面内。
+            let names: Vec<String> = match std::fs::read_to_string(dir.join("kustomization.yaml")) {
+                Ok(k) => parse_kustomization_resources(&k).unwrap(),
+                Err(_) => {
+                    let mut v: Vec<String> = std::fs::read_dir(&dir)
+                        .unwrap_or_else(|e| panic!("read_dir {rel}: {e}"))
+                        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                        .filter(|n| n.ends_with(".yaml"))
+                        .collect();
+                    v.sort();
+                    v
+                }
+            };
+            assert!(!names.is_empty(), "{rel} has no manifests to check");
+            for name in &names {
+                let path = dir.join(name);
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                if let Err(e) = reject_dialect_dependent_scalars(&text, name) {
+                    panic!("{rel}/{name} would be refused by the dialect gate: {e}");
+                }
+            }
+            // 对照组：全绿本身不能证明门禁在真的读这些文件——也可能它什么都没
+            // 读到。把真实事故那一段追加进目录里第一份清单，必须当场被拦。
+            let first = &names[0];
+            let text = std::fs::read_to_string(dir.join(first)).unwrap();
+            let armed = format!(
+                "{text}---\nkind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  template:\n    \
+                 spec:\n      volumes:\n        - name: k\n          secret:\n            \
+                 secretName: s\n            defaultMode: 0400\n"
+            );
+            assert!(
+                reject_dialect_dependent_scalars(&armed, first).is_err(),
+                "{rel}/{first}: the gate read nothing out of a real shipped manifest"
+            );
+        }
     }
 
     /// 治理对象就在发布集里（元启动的自建集群走 `kubectl apply -k deploy/k3s`，
