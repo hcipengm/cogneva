@@ -46,10 +46,28 @@ esac
 case " $* " in
   *" create "*) printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: stub\n' ;;
 esac
+# 真 kubectl 只在 `apply -f -` 时读 stdin，桩要按同一条判据读。不读会让管道上游
+# 写一个已关闭的管道，而安装脚本开着 pipefail，上游的 SIGPIPE（141）就成了安装脚本
+# 的失败，只在机器有负载时随机出现；读得比真 kubectl 多（对 `-f <文件>` 也读）则会
+# 吃掉调用方的 stdin——安装脚本正常跑时就在终端上，那会直接挂住。
+case " $* " in
+  *" apply -f - "*) cat >/dev/null ;;
+esac
 exit 0
 EOF
 
 chmod +x "${stub}/openssl" "${stub}/helm" "${stub}/kubectl"
+
+# 桩先自证，再拿它当事实：apply 必须像真 kubectl 一样把 stdin 读走。判据写成
+# 大于管道缓冲（64KiB）的输入——输入小的时候上游一次就写进去了，桩读不读都通过，
+# 只有输入大到上游必须等下游读走时才分得出。差的桩会让上游吃 SIGPIPE，而安装
+# 脚本开着 pipefail，上游的死就变成安装脚本的死，只在机器有负载时随机出现。
+if ! ARGV_LOG="${work}/argv-selfcheck.log" \
+  bash -c 'set -euo pipefail; head -c 200000 /dev/zero | "$0" apply -f -' \
+  "${stub}/kubectl" >/dev/null 2>&1; then
+  echo "FAIL: 桩 kubectl 不读 stdin，与真 kubectl 不一致（上游会吃到 SIGPIPE）"
+  exit 1
+fi
 
 HOME="${work}/home" PATH="${stub}:${PATH}" ARGV_LOG="${argv_log}" BACKENDS=0 PROFILE=small \
   bash "${installer}" >"${work}/out.log" 2>&1 || {
