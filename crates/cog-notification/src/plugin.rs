@@ -146,6 +146,14 @@ impl cog_core::SystemPlugin for NotificationPlugin {
     }
 }
 
+/// Static descriptor for auto-discovery.
+pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
+    name: "notification",
+    requires: &["net"],
+    optional_requires: &[],
+    factory: || Box::new(NotificationPlugin::new()),
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
