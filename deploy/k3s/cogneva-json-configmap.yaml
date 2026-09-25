@@ -656,6 +656,33 @@ data:
               },
               "severity": "warning",
               "summary": "The allocatable {resource} of node {node} changed in the last six hours. That is not a fault by itself, but every number derived from the old capacity is now resting on a stale premise: the limits account above, how much build concurrency the host can take, and the probe and cache budgets that were sized against the old machine. Re-derive them; this clears on its own once the change ages out"
+            },
+            {
+              "name": "change_funnel_never_lands",
+              "promql": "sum by (intent) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0 and on(intent) (sum by (intent) (increase(cogneva_change_fate_total{fate=\"landed\"}[24h])) == 0)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} changes from the {intent} entry point were withdrawn by verification in the last day and not one change from that entry point landed in the same window, so generation here is spending its budget without putting anything on the base branch. The window is a full generate-and-verify cycle, so an entry point that is merely slow has not landed within it either; read the retired reasons before generating more from {intent}"
+            },
+            {
+              "name": "change_funnel_unattributed",
+              "promql": "sum(cogneva_change_funnel{intent=\"unattributed\"}) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} held changes carry an entry point this build cannot name, so they are counted under no entry point and the funnel cannot say which producer is unproductive. Either a producer declares a task kind outside the classified set, or the record predates the intent travelling with the change; new work of either kind will keep landing in this bucket until the kind is classified"
+            },
+            {
+              "name": "change_landing_failures",
+              "promql": "sum by (category) (increase(cogneva_landing_failures_total{category=~\"environment|rejected\"}[6h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Landing failed {value} times in the last six hours with category {category}. An environment failure means the landing machinery itself could not run, and a rejection means the push was refused for a reason re-applying cannot fix, so the change will not land however often it is retried; conflicts and lost races are excluded here because those are expected and retried"
             }
           ]
         },

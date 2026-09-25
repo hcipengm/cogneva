@@ -718,6 +718,7 @@ impl CollaborationExecutor {
                     &Self::pge_mode_str(&result.pge_mode),
                     task.input.get("issue_number").and_then(|v| v.as_u64()),
                     &task.id,
+                    task.evolution_intent(),
                 );
                 let extracted = !changes.is_empty();
                 for change in changes {
@@ -836,6 +837,7 @@ impl CollaborationExecutor {
         pge_mode: &str,
         issue_number: Option<u64>,
         task_id: &str,
+        intent: Option<cog_core::EvolutionIntent>,
     ) -> Vec<cog_core::GeneratedChange> {
         let mut changes = Vec::new();
         let Some(ref result_val) = squad_result.result else {
@@ -881,6 +883,7 @@ impl CollaborationExecutor {
                 pge_mode: pge_mode.into(),
                 self_review_score: Self::extract_score(squad_result).map(|s| s as f32),
                 issue_number,
+                intent,
             });
         }
 

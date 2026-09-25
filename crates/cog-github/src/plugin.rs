@@ -116,6 +116,10 @@ fn spawn_landing_watch(
                 orchestrator.as_deref(),
             )
             .await;
+            // The census rides this tick because the funnel only moves when a
+            // landing or a verdict does, and this is the one loop that runs
+            // whether or not change generation is producing anything.
+            channel.publish_funnel().await;
         }
     })
 }

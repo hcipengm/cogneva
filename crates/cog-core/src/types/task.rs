@@ -163,6 +163,87 @@ pub enum TaskType {
     Custom(String),
 }
 
+/// Which entry point put a self-evolution task into the main flow.
+///
+/// Bounded on purpose. A producer spells its task kind as a free-form string —
+/// `TaskType::Custom(String)` or the `task_kind` input field — and a metric
+/// label carrying those verbatim would take a new value every time someone
+/// typed a new name, so the series count would grow with the vocabulary rather
+/// than with the work. The set below is fixed; anything outside it reads as
+/// `Unattributed`, which is itself a finding about the producer rather than a
+/// silent drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvolutionIntent {
+    /// A condition the platform detected about itself: a recurring task
+    /// failure, a queue that is not draining, or a firing alert.
+    SelfSignal,
+    /// The periodic audit of the platform's own repository.
+    SelfAudit,
+    /// A red CI run on the base branch, including the re-drive that a failed
+    /// landing triggers.
+    CiFix,
+    /// A tracked public issue.
+    IssueFix,
+    /// An external pull request whose intent should be carried out.
+    PrIntent,
+    /// A move of the tracked upstream baseline invalidated an earlier attempt.
+    BaselineRework,
+    /// The explicit `self_evolution` task form, without a narrower producer.
+    SelfEvolution,
+    /// A self-evolution task whose kind is not one of the above.
+    Unattributed,
+}
+
+impl EvolutionIntent {
+    /// Every value. A producer that publishes one series per class needs the
+    /// classes it has none of as well, or an empty class is indistinguishable
+    /// from a class that was never wired up. The list is the enum, so adding a
+    /// variant cannot leave a reader silently short of a series.
+    pub const ALL: [EvolutionIntent; 8] = [
+        EvolutionIntent::SelfSignal,
+        EvolutionIntent::SelfAudit,
+        EvolutionIntent::CiFix,
+        EvolutionIntent::IssueFix,
+        EvolutionIntent::PrIntent,
+        EvolutionIntent::BaselineRework,
+        EvolutionIntent::SelfEvolution,
+        EvolutionIntent::Unattributed,
+    ];
+
+    /// The label spelling. The variants are the whole domain, so these strings
+    /// are too.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EvolutionIntent::SelfSignal => "self_signal",
+            EvolutionIntent::SelfAudit => "self_audit",
+            EvolutionIntent::CiFix => "ci_fix",
+            EvolutionIntent::IssueFix => "issue_fix",
+            EvolutionIntent::PrIntent => "pr_intent",
+            EvolutionIntent::BaselineRework => "baseline_rework",
+            EvolutionIntent::SelfEvolution => "self_evolution",
+            EvolutionIntent::Unattributed => "unattributed",
+        }
+    }
+
+    /// Classify a producer's own spelling of a task kind.
+    ///
+    /// One definition, because the reading is only useful if every producer is
+    /// classified the same way wherever it is counted.
+    pub fn classify(kind: &str) -> Self {
+        match kind {
+            "self_signal" => EvolutionIntent::SelfSignal,
+            "self_audit" => EvolutionIntent::SelfAudit,
+            "platform_ci_fix" => EvolutionIntent::CiFix,
+            "platform_issue_fix" => EvolutionIntent::IssueFix,
+            "platform_pr_intent" => EvolutionIntent::PrIntent,
+            "baseline_port_rework" => EvolutionIntent::BaselineRework,
+            "self_evolution" => EvolutionIntent::SelfEvolution,
+            _ => EvolutionIntent::Unattributed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -331,6 +412,34 @@ impl Task {
             || self.input.get("evolution_mode").and_then(|v| v.as_str()) == Some("generate_change")
     }
 
+    /// Which entry point submitted this self-evolution task, or `None` for a
+    /// task that is not one.
+    ///
+    /// Read from the task, like [`Self::is_self_evolution`], and for the same
+    /// reason: the kind lives on the task and disappears from every context
+    /// built out of it.
+    ///
+    /// The `task_kind` input field wins over the task type because a producer
+    /// that sets it is naming its own entry point more precisely than the type
+    /// string does — the signal watcher submits several distinct signals under
+    /// one type. Producers that only fill in the type are read from there.
+    pub fn evolution_intent(&self) -> Option<EvolutionIntent> {
+        if !self.is_self_evolution() {
+            return None;
+        }
+        let kind = self
+            .input
+            .get("task_kind")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or(match &self.task_type {
+                TaskType::Custom(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Some(EvolutionIntent::classify(kind))
+    }
+
     pub fn is_ready(&self, dag: &TaskDAG) -> bool {
         self.blocked_by.iter().all(|dep_id| {
             dag.tasks
@@ -448,5 +557,132 @@ mod tests {
             serde_json::json!({}),
         );
         assert!(!generated.is_self_evolution());
+    }
+
+    /// The `task_kind` field names the entry point more precisely than the task
+    /// type does, and wins where both are present: the signal watcher submits
+    /// several distinct signals under the one `self_signal` type.
+    #[test]
+    fn the_entry_point_is_read_from_the_task_kind_field_first() {
+        let task = Task::new(
+            "t1",
+            TaskType::Custom("self_signal".into()),
+            serde_json::json!({"evolution_mode": "generate_change", "task_kind": "self_audit"}),
+        );
+        assert_eq!(task.evolution_intent(), Some(EvolutionIntent::SelfAudit));
+    }
+
+    /// Producers that only fill in the task type are read from there, and an
+    /// empty `task_kind` is treated as absent rather than as an unnamed class —
+    /// a producer that leaves the field blank means "use the type".
+    #[test]
+    fn the_task_type_carries_the_entry_point_when_the_field_is_blank() {
+        let typed = Task::new(
+            "t1",
+            TaskType::Custom("platform_pr_intent".into()),
+            serde_json::json!({"evolution_mode": "generate_change"}),
+        );
+        assert_eq!(typed.evolution_intent(), Some(EvolutionIntent::PrIntent));
+
+        let blank = Task::new(
+            "t2",
+            TaskType::Custom("platform_ci_fix".into()),
+            serde_json::json!({"evolution_mode": "generate_change", "task_kind": ""}),
+        );
+        assert_eq!(blank.evolution_intent(), Some(EvolutionIntent::CiFix));
+    }
+
+    /// A task that is not generating changes has no entry point, and saying
+    /// `None` is what keeps an ordinary task out of the funnel rather than in
+    /// it under a borrowed class.
+    #[test]
+    fn a_task_that_is_not_self_evolution_has_no_intent() {
+        let plain = Task::new(
+            "t1",
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({"goal": "fix it"}),
+        );
+        assert_eq!(plain.evolution_intent(), None);
+    }
+
+    /// Every task kind a producer in this workspace declares is a named class.
+    ///
+    /// The file is read and searched for the kind: a producer that is renamed
+    /// or deleted fails here instead of quietly leaving its class unreachable,
+    /// and a kind that a new producer invents lands in `Unattributed` — which
+    /// the census publishes as its own series and the alert rules watch, so an
+    /// entry point added later is visible rather than absorbed.
+    #[test]
+    fn every_declared_task_kind_classifies_to_a_named_entry_point() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let declared: &[(&str, &[&str], EvolutionIntent)] = &[
+            (
+                "self_signal",
+                &["crates/cog-reflection/src/signal_watcher.rs"],
+                EvolutionIntent::SelfSignal,
+            ),
+            (
+                "self_audit",
+                &["crates/cog-reflection/src/signal_watcher.rs"],
+                EvolutionIntent::SelfAudit,
+            ),
+            (
+                "platform_ci_fix",
+                &[
+                    "crates/cog-github/src/discovery_loop.rs",
+                    "crates/cog-github/src/landing.rs",
+                ],
+                EvolutionIntent::CiFix,
+            ),
+            (
+                "platform_issue_fix",
+                &["crates/cog-github/src/discovery_loop.rs"],
+                EvolutionIntent::IssueFix,
+            ),
+            (
+                "platform_pr_intent",
+                &["crates/cog-github/src/discovery_loop.rs"],
+                EvolutionIntent::PrIntent,
+            ),
+            (
+                "baseline_port_rework",
+                &["crates/cog-reflection/src/baseline_port.rs"],
+                EvolutionIntent::BaselineRework,
+            ),
+            (
+                "self_evolution",
+                &["crates/cog-core/src/types/task.rs"],
+                EvolutionIntent::SelfEvolution,
+            ),
+        ];
+
+        let mut problems: Vec<String> = Vec::new();
+        for (kind, files, expected) in declared {
+            let mapped = EvolutionIntent::classify(kind);
+            if mapped != *expected {
+                problems.push(format!("{kind} classifies as {mapped:?}, not {expected:?}"));
+            }
+            if mapped == EvolutionIntent::Unattributed {
+                problems.push(format!("{kind} is declared by a producer but unattributed"));
+            }
+            for file in *files {
+                let text = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+                if !text.contains(kind) {
+                    problems.push(format!("{kind} is no longer declared in {file}"));
+                }
+            }
+        }
+
+        // A class with no declared producer is either a producer this table
+        // has not caught up with or a class nothing can reach; both are worth
+        // failing over, and neither is visible from the mapping alone.
+        let named: Vec<EvolutionIntent> = declared.iter().map(|(_, _, i)| *i).collect();
+        for intent in EvolutionIntent::ALL {
+            if intent != EvolutionIntent::Unattributed && !named.contains(&intent) {
+                problems.push(format!("{intent:?} has no producer declaring it"));
+            }
+        }
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 }

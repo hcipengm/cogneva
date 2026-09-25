@@ -146,6 +146,7 @@ mod tests {
             pge_mode: "squad".into(),
             self_review_score: None,
             issue_number: None,
+            intent: Some(cog_core::EvolutionIntent::IssueFix),
         }
     }
 

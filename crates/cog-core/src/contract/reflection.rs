@@ -91,6 +91,14 @@ pub struct GeneratedChange {
     /// issue. Sinks use it to link the PR back (`Fixes #N`) so competing
     /// solutions for the same issue can be grouped.
     pub issue_number: Option<u64>,
+    /// Which entry point produced this change, carried forward from the task.
+    ///
+    /// On the change rather than looked up from the task later: the stages that
+    /// need it — landing and its census — run long after the task is gone, and
+    /// a reading that has to resolve an identity against a deleted row reports
+    /// nothing exactly when the backlog is oldest. Records written before this
+    /// field read as `None`, which the census reports as unattributed.
+    pub intent: Option<crate::types::task::EvolutionIntent>,
 }
 
 /// Sink for collaboration-generated changes. Implemented by the reflection

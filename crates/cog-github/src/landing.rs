@@ -303,6 +303,13 @@ impl MainChannel {
         let _ = self.metrics.set(metrics);
     }
 
+    /// The metrics backend, once `start` has attached it. `None` before that,
+    /// when the channel is built during `init`: a reading published from a
+    /// layer above has to tolerate the window rather than panic in it.
+    pub(crate) fn metrics_handle(&self) -> Option<Arc<dyn cog_core::MetricsBackend>> {
+        self.metrics.get().cloned()
+    }
+
     /// The base branch this channel commits to.
     pub fn base_branch(&self) -> &str {
         &self.config.base_branch
@@ -431,10 +438,12 @@ impl MainChannel {
 
     async fn record_landed(&self, change: &GeneratedChange, base: &str, rev: &str) -> Result<()> {
         let now = Utc::now();
-        let created = load_record(&change.change_id)
-            .await
-            .map(|r| r.created_at)
-            .unwrap_or(now);
+        let existing = load_record(&change.change_id).await;
+        // The landing is counted on its edge: a second call for a change
+        // already on the branch is the idempotency check working, not a second
+        // landing.
+        let first_landing = crate::change_funnel::is_first_landing(existing.as_ref());
+        let created = existing.map(|r| r.created_at).unwrap_or(now);
         save_record(&LandingRecord {
             change: change.clone(),
             base: base.to_string(),
@@ -452,6 +461,10 @@ impl MainChannel {
         // A change that was staged awaiting a decision is no longer pending:
         // the owner's click (or the policy) put it on the branch.
         crate::pending_changes::remove_staged(&change.change_id).await;
+        if first_landing {
+            self.note_change_fate(change, crate::change_funnel::FunnelFate::Landed)
+                .await;
+        }
         Ok(())
     }
 
@@ -796,7 +809,12 @@ impl cog_core::ChangeLanding for MainChannel {
         record.state = LandingState::Retired;
         record.retired_reason = Some(reason.to_string());
         record.updated_at = Utc::now();
-        save_record(&record).await
+        save_record(&record).await?;
+        // The guards above already made this an edge: only a record that was
+        // still unverified reaches here, and it leaves retired.
+        self.note_change_fate(&record.change, crate::change_funnel::FunnelFate::Retired)
+            .await;
+        Ok(())
     }
 }
 
@@ -1324,6 +1342,7 @@ mod tests {
             pge_mode: "squad".into(),
             self_review_score: Some(0.9),
             issue_number: None,
+            intent: Some(cog_core::EvolutionIntent::CiFix),
         }
     }
 

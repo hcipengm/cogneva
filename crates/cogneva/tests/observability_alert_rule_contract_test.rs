@@ -32,8 +32,20 @@ const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 /// can never fire.
 const PRODUCED: &[(&str, &str)] = &[
     (
+        "cogneva_change_fate_total",
+        "crates/cog-github/src/change_funnel.rs",
+    ),
+    (
+        "cogneva_change_funnel",
+        "crates/cog-github/src/change_funnel.rs",
+    ),
+    (
         "cogneva_data_volume_used_bytes",
         "crates/cog-observability/src/data_volume.rs",
+    ),
+    (
+        "cogneva_landing_failures_total",
+        "crates/cog-github/src/landing.rs",
     ),
     (
         "cogneva_process_zombies",
