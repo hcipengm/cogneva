@@ -710,7 +710,25 @@
           },
           "severity": "warning",
           "summary": "A re-drive round was spent but its charge could not be written {value} times in the last day, so the same cause can buy a fresh round on the next process. This one is invisible from the refusals: the round that is charged again is charged after a restart with nothing to refuse it until the charge is written a second time. Check that the data volume has room and is writable"
-        }
+        },
+      {
+        "name": "verification_killed_by_budget",
+        "promql": "increase(cogneva_verification_timeouts_total{kind=\"test\"}[6h])",
+        "condition": {
+          "greater_than": 0.0
+        },
+        "severity": "warning",
+        "summary": "A change's verification was killed {value} time(s) in the last 6h, having run its whole verification budget for {kind} runs. The change was then retired for the budget and not for its content: it was never judged. The budget it ran against is the cogneva_verification_budget_seconds reading for the test kind, and cogneva_verification_last_run_seconds for the same kind is how long the runs that do finish are taking — a host that got slower shows up there first, and once that line reaches the budget every change is retired on arrival, which reads exactly like a pipeline with nothing to do"
+      },
+      {
+        "name": "deployment_killed_by_budget",
+        "promql": "increase(cogneva_verification_timeouts_total{kind=\"build\"}[6h])",
+        "condition": {
+          "greater_than": 0.0
+        },
+        "severity": "warning",
+        "summary": "A change's release build was killed {value} time(s) in the last 6h, having run its whole deployment budget for {kind} runs, so the commit was rolled back and the change is gone. This is a different loss from a build that failed: nothing about the code was judged either way, and the rollback leaves no other trace that the change ever existed. The budget is the cogneva_verification_budget_seconds reading for the build kind"
+      }
       ]
     },
     "trace_collector": {

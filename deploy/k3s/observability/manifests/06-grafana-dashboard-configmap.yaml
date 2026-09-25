@@ -462,6 +462,76 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 14,
+          "title": "Verification Budget vs Last Run",
+          "description": "How much room the verification and deployment budgets have left, per kind. The budget is the wall the run is killed at; the last run is how long the work actually took. Read them together: a last-run line walking up towards its budget is the warning, and it arrives while changes are still landing — the counter on the next panel only starts moving once they are not. No threshold is drawn on purpose: what counts as 'close' depends on how much the host's load varies, and a ratio picked here would be a guess that fires wrong. Both kinds are on one axis because they share a unit, not because they share a cause.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 48
+          },
+          "targets": [
+            {
+              "expr": "cogneva_verification_budget_seconds",
+              "legendFormat": "{{kind}} budget",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_verification_last_run_seconds",
+              "legendFormat": "{{kind}} last run",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 15,
+          "title": "Runs Killed by Their Budget",
+          "description": "Runs the budget killed, per kind, since this process started. Each one is a change that was retired or rolled back without ever being judged, so the code was neither cleared nor blamed. A non-zero flat line here is history rather than a current fault; what matters is whether it is still climbing.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 56
+          },
+          "targets": [
+            {
+              "expr": "cogneva_verification_timeouts_total",
+              "legendFormat": "{{kind}} killed",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

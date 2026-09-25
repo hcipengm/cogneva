@@ -63,6 +63,7 @@ pub mod sandbox;
 pub mod signal_watcher;
 pub mod squad;
 pub mod types;
+pub mod verification_budget;
 pub mod workspace;
 
 #[cfg(test)]

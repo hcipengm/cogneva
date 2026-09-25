@@ -554,6 +554,16 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     return Err(e);
                 }
 
+                // 两个超时曾经只是配置面上的两个字段：写进去、没人读、也没有读数。
+                // 现在它们是这一对运行的执行边界，所以既被 enforcement 读、也被观测面报，
+                // 且**同一个对象**提供这两个数——分开传就会出现"读到 3600、实际按 1800 杀"
+                // 的观测面，那比没有读数更坏。
+                let budget =
+                    std::sync::Arc::new(crate::verification_budget::VerificationBudget::new(
+                        self_evolution.test_timeout_secs,
+                        self_evolution.build_timeout_secs,
+                    ));
+
                 let pipeline = crate::ChangePipeline::new(
                     &project_root,
                     &self_evolution.change_dir,
@@ -562,7 +572,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     // the admin API, even when auto_apply is enabled.
                     self_evolution.auto_apply && !self_evolution.manual_approve,
                 )
-                .with_test_timeout(self_evolution.test_timeout_secs)
+                .with_verification_budget(budget.clone())
                 .with_promotion_policy(promotion.clone())
                 .with_target_dir(&self_evolution.workspaces.target_dir);
 
@@ -571,8 +581,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     &self_evolution.binary_dir,
                     &self_evolution.backup_dir,
                 )
-                .with_build_timeout(self_evolution.build_timeout_secs)
+                .with_verification_budget(budget.clone())
                 .with_target_dir(&self_evolution.workspaces.target_dir);
+
+                ctx.publish_observable(budget);
 
                 let binary_switcher = ctx.consume_service::<dyn cog_core::BinarySwitcher>();
                 // 变更上游通道（平台集成侧实现）：沙盒验过的提交经它落到主分支。

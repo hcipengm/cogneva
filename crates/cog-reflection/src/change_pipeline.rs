@@ -9,7 +9,8 @@
 //! - Report results by updating the evolution status.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cog_core::{SFError, SFResult};
 use tracing::{info, warn};
@@ -98,6 +99,11 @@ pub struct ChangePipeline {
     /// 共享 CARGO_TARGET_DIR：把编译产物留在工作树之外，临时工作树用完即弃
     /// 也不会丢增量缓存。
     target_dir: Option<PathBuf>,
+    /// Where the runs this pipeline bounds report what they did against the
+    /// budget. Absent for a pipeline nothing observes — the tests and the admin
+    /// service build their own — and an absent sink reports nothing rather than
+    /// reporting a budget nobody enforced.
+    budget: Option<Arc<crate::verification_budget::VerificationBudget>>,
 }
 
 impl ChangePipeline {
@@ -113,7 +119,24 @@ impl ChangePipeline {
             test_timeout_secs: 3600,
             promotion_policy: None,
             target_dir: None,
+            budget: None,
         }
+    }
+
+    /// Attach the observation sink and take the budget from it.
+    ///
+    /// The budget is read out of the sink rather than passed separately so that
+    /// the number reported and the number enforced cannot be two numbers: a
+    /// deployment whose reading said 3600 while its runs were being killed at
+    /// 1800 would be an observation surface that disagrees with the decision it
+    /// is supposed to explain.
+    pub fn with_verification_budget(
+        mut self,
+        budget: Arc<crate::verification_budget::VerificationBudget>,
+    ) -> Self {
+        self.test_timeout_secs = budget.timeout_secs(crate::verification_budget::KIND_TEST);
+        self.budget = Some(budget);
+        self
     }
 
     pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -828,14 +851,26 @@ impl ChangePipeline {
             cmd.env(key, value);
         }
 
+        let started = Instant::now();
         let output =
             match tokio::time::timeout(Duration::from_secs(self.test_timeout_secs), cmd.output())
                 .await
             {
                 Ok(result) => {
-                    result.map_err(|e| SFError::IO(format!("Failed to run cargo test: {}", e)))?
+                    let output = result
+                        .map_err(|e| SFError::IO(format!("Failed to run cargo test: {}", e)))?;
+                    if let Some(budget) = &self.budget {
+                        budget.record_run(
+                            crate::verification_budget::KIND_TEST,
+                            started.elapsed().as_secs(),
+                        );
+                    }
+                    output
                 }
                 Err(_) => {
+                    if let Some(budget) = &self.budget {
+                        budget.record_timeout(crate::verification_budget::KIND_TEST);
+                    }
                     return Err(SFError::IO(format!(
                         "cargo test exceeded the {}s verification budget and was killed",
                         self.test_timeout_secs
@@ -969,6 +1004,122 @@ fn names_same_or_nested(target: &str, anchor: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crate whose only test sleeps, so a run against it is slow for a reason
+    /// the budget can measure rather than one that depends on how warm this
+    /// machine's build cache happens to be.
+    fn write_sleeping_crate(root: &std::path::Path, sleep_secs: u64) {
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"budget-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            format!(
+                "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn slow() {{\n        \
+                 std::thread::sleep(std::time::Duration::from_secs({sleep_secs}));\n    }}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The `kind = "test"` reading the scrape would carry.
+    async fn test_kind_reading(
+        budget: &crate::verification_budget::VerificationBudget,
+        metric: &str,
+    ) -> Option<f64> {
+        use cog_core::observability::Observable;
+        budget
+            .collect_metrics("")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| {
+                m.name == metric
+                    && m.labels
+                        .get(crate::verification_budget::KIND_LABEL)
+                        .map(String::as_str)
+                        == Some(crate::verification_budget::KIND_TEST)
+            })
+            .map(|m| m.value)
+    }
+
+    /// A verification run that does not fit its budget is killed, and the error
+    /// names the budget that killed it.
+    ///
+    /// What this replaces was not a wrong verdict but an absent one: the knob
+    /// was stored on the pipeline and never read, so a stuck
+    /// `cargo test --workspace` held the executor's only in-flight slot
+    /// indefinitely and every change behind it queued forever. The reason
+    /// matters as much as the kill — a retired change is read afterwards by
+    /// whoever investigates it, and only "exceeded the Ns budget" says the
+    /// change was never judged.
+    ///
+    /// The sleep is what makes this deterministic. The run is slow for a reason
+    /// the test controls, so the budget is exceeded whether the kill lands
+    /// during the compile or during the test.
+    #[tokio::test]
+    async fn a_run_that_outlives_its_budget_is_killed_with_the_budget_named() {
+        let root = tempfile::tempdir().unwrap();
+        write_sleeping_crate(root.path(), 30);
+        let budget = Arc::new(crate::verification_budget::VerificationBudget::new(1, 60));
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false)
+            .with_verification_budget(budget.clone());
+
+        let err = pipeline
+            .run_cargo_test(root.path())
+            .await
+            .expect_err("a run that cannot finish in a second must not be waited on");
+
+        assert!(
+            err.to_string()
+                .contains("exceeded the 1s verification budget"),
+            "the rejection has to name the budget that caused it: {err}"
+        );
+        assert_eq!(
+            test_kind_reading(&budget, crate::verification_budget::TIMEOUTS_TOTAL_METRIC).await,
+            Some(1.0),
+            "a killed run has to be readable as a kill, not only as a log line"
+        );
+        assert_eq!(
+            test_kind_reading(&budget, crate::verification_budget::LAST_RUN_SECONDS_METRIC).await,
+            None,
+            "a run cut short at the budget has no duration of its own to report"
+        );
+    }
+
+    /// A run that finishes inside its budget is not counted as a kill, and its
+    /// duration reaches the scrape — the reading that says the budget is close
+    /// to binding before anything has been retired for it.
+    #[tokio::test]
+    async fn a_run_that_fits_its_budget_reports_its_duration() {
+        let root = tempfile::tempdir().unwrap();
+        write_sleeping_crate(root.path(), 1);
+        let budget = Arc::new(crate::verification_budget::VerificationBudget::new(120, 60));
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false)
+            .with_verification_budget(budget.clone());
+
+        let (passed, output) = pipeline
+            .run_cargo_test(root.path())
+            .await
+            .expect("a run inside its budget must be waited on");
+
+        assert!(
+            passed,
+            "the sleeping crate passes once it finishes: {output}"
+        );
+        assert_eq!(
+            test_kind_reading(&budget, crate::verification_budget::TIMEOUTS_TOTAL_METRIC).await,
+            Some(0.0)
+        );
+        let elapsed =
+            test_kind_reading(&budget, crate::verification_budget::LAST_RUN_SECONDS_METRIC)
+                .await
+                .expect("a finished run has a duration to report");
+        assert!(elapsed >= 1.0, "the run slept a second: {elapsed}");
+    }
 
     /// A diff that introduces one brand-new file, the shape the generator
     /// produces when it answers a request about an existing file by writing a

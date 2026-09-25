@@ -7,6 +7,7 @@
 //! - Stage the new binary for the supervisor's binary switcher.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cog_core::{SFError, SFResult};
@@ -33,6 +34,9 @@ pub struct EvolutionDeployer {
     git_email: String,
     /// 共享 CARGO_TARGET_DIR：产物不进临时工作树，工作树用完即弃不丢缓存。
     target_dir: Option<PathBuf>,
+    /// Where the builds this deployer bounds report what they did against the
+    /// budget. Absent for a deployer nothing observes.
+    budget: Option<Arc<crate::verification_budget::VerificationBudget>>,
 }
 
 impl EvolutionDeployer {
@@ -50,7 +54,19 @@ impl EvolutionDeployer {
             git_name: "Cogneva Self-Evolution".to_string(),
             git_email: "self-evolution@cogneva.ai".to_string(),
             target_dir: None,
+            budget: None,
         }
+    }
+
+    /// Attach the observation sink and take the budget from it, for the same
+    /// reason the pipeline does: one number enforced and reported, not two.
+    pub fn with_verification_budget(
+        mut self,
+        budget: Arc<crate::verification_budget::VerificationBudget>,
+    ) -> Self {
+        self.build_timeout_secs = budget.timeout_secs(crate::verification_budget::KIND_BUILD);
+        self.budget = Some(budget);
+        self
     }
 
     pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -211,17 +227,29 @@ impl EvolutionDeployer {
         if let Some(target) = &self.target_dir {
             cmd.env("CARGO_TARGET_DIR", target);
         }
+        let started = Instant::now();
         let output =
             match tokio::time::timeout(Duration::from_secs(self.build_timeout_secs), cmd.output())
                 .await
             {
                 Ok(result) => {
-                    result.map_err(|e| SFError::IO(format!("Failed to run cargo build: {}", e)))?
+                    let output = result
+                        .map_err(|e| SFError::IO(format!("Failed to run cargo build: {}", e)))?;
+                    if let Some(budget) = &self.budget {
+                        budget.record_run(
+                            crate::verification_budget::KIND_BUILD,
+                            started.elapsed().as_secs(),
+                        );
+                    }
+                    output
                 }
                 Err(_) => {
                     // An unbounded release build outlives the pod's own
                     // resources long before it is useful; give up and let the
                     // caller roll the commit back.
+                    if let Some(budget) = &self.budget {
+                        budget.record_timeout(crate::verification_budget::KIND_BUILD);
+                    }
                     return Err(SFError::IO(format!(
                         "cargo build --release exceeded the {}s deployment budget and was killed",
                         self.build_timeout_secs

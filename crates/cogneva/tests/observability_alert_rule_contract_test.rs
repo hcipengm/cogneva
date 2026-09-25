@@ -131,6 +131,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "sandbox_oom_kills_total",
         "crates/cog-extension/src/runtime/cgroup.rs",
     ),
+    (
+        "cogneva_verification_timeouts_total",
+        "crates/cog-reflection/src/verification_budget.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
