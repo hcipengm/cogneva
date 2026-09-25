@@ -754,6 +754,11 @@
     "schemas": {},
     "local_repair_max": 2
   },
+  "ralph": {
+    "_comment": "Ralph Loop 的预算与停滞窗口。这两条界决定一条不收敛的链在什么位置停下：max_iterations 是单次执行的迭代硬上限，stagnation_window 是最近多少轮没有进展即终止。两条都按次计、不跨执行累计。",
+    "max_iterations": 50,
+    "stagnation_window": 5
+  },
   "lifecycle": {
     "heartbeat_interval_secs": 5,
     "suspect_threshold": 2,

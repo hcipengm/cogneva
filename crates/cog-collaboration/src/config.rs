@@ -237,51 +237,297 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A shipped template is a claim about this section's type: serde passes
-    /// over a key with no field behind it without a word, so an entry nothing
-    /// reads looks exactly like one that was applied. The comparison is an
-    /// equality because the other direction matters too — a field read but
-    /// never written ships a value the operator can neither see nor change,
-    /// which is how the repair budget stayed unreachable from every
-    /// deployment while the code that read it was already there.
-    fn assert_pge_surface_matches(file: &Path) {
-        let raw = std::fs::read_to_string(file)
-            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        let doc: serde_json::Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", file.display()));
-        let section = doc
-            .get("pge")
-            .unwrap_or_else(|| panic!("{} has no pge section", file.display()));
+    /// A configuration section this crate reads: the pointer a template has to
+    /// write it under, and the type that decides what the section may contain.
+    struct Section {
+        pointer: &'static str,
+        /// Read a copy back through the type and serialize it again. The
+        /// comparison is against *that* rather than against a field list
+        /// written here, so a field added to the type joins the check without
+        /// anyone remembering to write it down twice.
+        read_back: fn(&serde_json::Value) -> serde_json::Value,
+        /// What the type produces when nothing sets anything. Every key here is
+        /// one a deployment has to be able to see and change.
+        defaults: fn() -> serde_json::Value,
+    }
 
-        let mut expected: Vec<String> = serde_json::to_value(PgeSettings::default())
-            .expect("PgeSettings serializes")
-            .as_object()
-            .expect("PgeSettings serializes to an object")
-            .keys()
-            .cloned()
+    impl Section {
+        fn of<T>(pointer: &'static str) -> Self
+        where
+            T: serde::de::DeserializeOwned + serde::Serialize + Default,
+        {
+            Self {
+                pointer,
+                read_back: |value| {
+                    let typed: T = serde_json::from_value(value.clone())
+                        .unwrap_or_else(|e| panic!("a section does not fit its type: {e}"));
+                    serde_json::to_value(typed).expect("a section read back serializes")
+                },
+                defaults: || serde_json::to_value(T::default()).expect("a default serializes"),
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            self.pointer.trim_start_matches('/')
+        }
+
+        /// Whether the type demonstrably has a field at `key`, proved by
+        /// handing it a value and reading it back.
+        ///
+        /// Needed because a section may write an optional key as `null`, and a
+        /// null is dropped on the way back out exactly like a key that no field
+        /// stands behind — so the round trip alone cannot tell an unset knob
+        /// from a typo'd one. A probe value can: a real field keeps it, an
+        /// unknown key drops every one of them.
+        fn has_field(
+            &self,
+            section: &serde_json::Map<String, serde_json::Value>,
+            key: &str,
+        ) -> bool {
+            let probes = [
+                serde_json::json!("probe"),
+                serde_json::json!(1),
+                serde_json::json!(true),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ];
+            probes.iter().any(|probe| {
+                let mut probed = section.clone();
+                probed.insert(key.to_string(), probe.clone());
+                let read_back = (self.read_back)(&serde_json::Value::Object(probed));
+                read_back.get(key).is_some()
+            })
+        }
+    }
+
+    /// Every section this crate reads.
+    fn sections() -> Vec<Section> {
+        vec![
+            Section::of::<BoundaryConfig>("/boundary"),
+            Section::of::<PgeSettings>("/pge"),
+            Section::of::<RalphSettings>("/ralph"),
+            Section::of::<SelfReviewSettings>("/self_review"),
+        ]
+    }
+
+    /// The pointers the loader can actually be asked for, read out of this
+    /// crate's source instead of listed here a second time.
+    ///
+    /// This function is the point of the gate. `ralph` was read by the code and
+    /// written by no template, and nothing compared the two — so the list of
+    /// things to compare cannot be another hand-written list, which would let
+    /// the next section escape the same way.
+    fn pointers_the_loader_can_be_asked_for() -> Vec<String> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop() {
+            for entry in
+                std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                for line in text.lines() {
+                    let call = line.trim_start();
+                    let args = call
+                        .strip_prefix("load_section_from(")
+                        .or_else(|| call.strip_prefix("load_section("));
+                    let Some(args) = args else { continue };
+                    // Both call shapes put the pointer in the first quoted
+                    // string: the plain one takes it as its only argument, the
+                    // `_from` one as its second, after the path.
+                    if let Some(pointer) = args.split('"').nth(1) {
+                        out.push(pointer.to_string());
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The config a deployment ships, wherever it is embedded.
+    ///
+    /// Three places embed it: the chart's file, the static manifest the cluster
+    /// pulls, and the rendered profiles. They have to agree, so the comparison
+    /// is over all of them rather than over the one that happens to be edited.
+    fn shipped_configs(root: &Path) -> Vec<(String, serde_json::Value)> {
+        let mut out = vec![(
+            "cogneva.example.json".to_string(),
+            read_config(&root.join("cogneva.example.json")),
+        )];
+        for relative in [
+            "deploy/helm/cogneva/files/cogneva.json",
+            "deploy/k3s/cogneva-json-configmap.yaml",
+        ] {
+            out.push((relative.to_string(), read_config(&root.join(relative))));
+        }
+        let rendered = root.join("deploy/rendered");
+        let mut profiles: Vec<_> = std::fs::read_dir(&rendered)
+            .unwrap_or_else(|e| panic!("read {}: {e}", rendered.display()))
+            .map(|e| e.expect("readable dir entry").path())
+            .filter(|p| p.is_dir())
             .collect();
-        let mut actual: Vec<String> = section
-            .as_object()
-            .unwrap()
-            .keys()
-            .filter(|k| !k.starts_with('_'))
-            .cloned()
-            .collect();
-        expected.sort();
-        actual.sort();
+        profiles.sort();
+        for dir in profiles {
+            let file = dir.join("10-configmap-cogneva-json.yaml");
+            out.push((file.display().to_string(), read_config(&file)));
+        }
+        out
+    }
+
+    /// Read the config wherever it is shipped: the chart and the example keep it
+    /// as a file of its own, a ConfigMap manifest keeps it as a block scalar.
+    fn read_config(path: &Path) -> serde_json::Value {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => read_json(path),
+            Some("yaml") => read_config_manifest(path),
+            other => panic!("{} has no known config format ({other:?})", path.display()),
+        }
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()))
+    }
+
+    /// Pull the config back out of a ConfigMap manifest.
+    ///
+    /// The payload is a YAML block scalar indented under its key, so it is
+    /// de-indented and parsed as the JSON it is. A manifest that stops carrying
+    /// the key, or carries it empty, fails here rather than passing quietly.
+    fn read_config_manifest(path: &Path) -> serde_json::Value {
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let lines: Vec<&str> = raw.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("  ") && l.trim_start().starts_with("cogneva.json: |"))
+            .unwrap_or_else(|| panic!("{} embeds no cogneva.json block", path.display()));
+        let mut payload = String::new();
+        for line in &lines[start + 1..] {
+            match line.strip_prefix("    ") {
+                Some(rest) => {
+                    payload.push_str(rest);
+                    payload.push('\n');
+                }
+                None if line.trim().is_empty() => payload.push('\n'),
+                None => break,
+            }
+        }
+        serde_json::from_str(&payload)
+            .unwrap_or_else(|e| panic!("{} embeds an unparseable config: {e}", path.display()))
+    }
+
+    /// Every section the loader can be asked for is declared, and every
+    /// declared section is asked for somewhere. A new section read by the code
+    /// but missing from `sections()` would go unchecked, which is the state
+    /// `ralph` was in.
+    #[test]
+    fn every_section_the_loader_reads_is_declared() {
+        let mut declared: Vec<String> = sections().iter().map(|s| s.pointer.to_string()).collect();
+        declared.sort();
         assert_eq!(
-            expected,
-            actual,
-            "{} pge section drifted from PgeSettings",
-            file.display()
+            pointers_the_loader_can_be_asked_for(),
+            declared,
+            "the sections this crate loads and the sections the template check covers disagree"
         );
     }
 
+    /// A shipped template is a claim about each section's type, and both
+    /// directions of that claim have to hold.
+    ///
+    /// serde passes over a key with no field behind it without a word, so an
+    /// entry nothing reads looks exactly like one that was applied — that is
+    /// the direction a typo hides in. A field read but never written ships a
+    /// value the operator can neither see nor change, and a section the code
+    /// reads but no template writes is the same defect one level up: the knob
+    /// is invisible, and only its built-in default can apply.
+    fn assert_sections_match(file: &str, doc: &serde_json::Value) {
+        for section in sections() {
+            let name = section.name();
+            let value = doc.get(name).unwrap_or_else(|| {
+                panic!(
+                    "{file} writes no `{name}` section, which the code reads: every \
+                     deployment silently takes the built-in default"
+                )
+            });
+            let object = value
+                .as_object()
+                .unwrap_or_else(|| panic!("{file} `{name}` is not an object"));
+            let written: Vec<&String> = object.keys().filter(|k| !k.starts_with('_')).collect();
+
+            // Every key the type produces on its own has to be visible in the
+            // template, or the deployment has a value no one can read or set.
+            let defaults = (section.defaults)();
+            for key in defaults.as_object().expect("defaults are an object").keys() {
+                assert!(
+                    written.contains(&key),
+                    "{file} `{name}` does not write `{key}`, which the type always \
+                     produces: the deployment cannot set what the code reads"
+                );
+            }
+
+            // Every key the template writes has to be one the type knows. The
+            // round trip answers it for anything with a value in it; a key
+            // sitting at `null` is dropped either way, so it is decided by
+            // probing instead.
+            let read_back = (section.read_back)(value);
+            let read_back_keys = read_back
+                .as_object()
+                .expect("a section read back is an object");
+            for key in &written {
+                if read_back_keys.contains_key(*key) || section.has_field(object, key) {
+                    continue;
+                }
+                panic!(
+                    "{file} `{name}.{key}` has no field behind it: serde passes it \
+                     over in silence, so it reads as applied while nothing uses it"
+                );
+            }
+        }
+    }
+
     #[test]
-    fn shipped_config_templates_track_the_pge_field_surface() {
+    fn shipped_config_templates_track_every_section_surface() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        assert_pge_surface_matches(&root.join("cogneva.example.json"));
-        assert_pge_surface_matches(&root.join("deploy/helm/cogneva/files/cogneva.json"));
+        let mut seen = 0;
+        for (file, doc) in shipped_configs(&root) {
+            assert_sections_match(&file, &doc);
+            seen += 1;
+        }
+        assert!(seen >= 5, "only {seen} shipped configs were found");
+    }
+
+    /// The three embedders of the config ship one and the same document. The
+    /// rendered profiles and the static manifest are separate files from the
+    /// chart's, and only the chart's is edited by hand, so a change that misses
+    /// one of them would otherwise reach the cluster as two different configs
+    /// with no reading saying which one a pod got.
+    #[test]
+    fn the_embedders_ship_one_and_the_same_config() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut configs = shipped_configs(&root)
+            .into_iter()
+            .filter(|(file, _)| !file.ends_with("cogneva.example.json"));
+        let (reference_file, reference) = configs.next().expect("a chart source config");
+        for (file, doc) in configs {
+            assert_eq!(
+                doc, reference,
+                "{file} ships a different config than {reference_file}"
+            );
+        }
     }
 
     #[test]
