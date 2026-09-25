@@ -308,6 +308,12 @@ impl EvolutionAdminService {
         }
     }
 
+    async fn record_change_rejected(&self, cause: cog_core::RejectionCause) {
+        if let Some(ref m) = self.evolution_metrics {
+            m.record_change_rejected(cause).await;
+        }
+    }
+
     /// 取一棵 admin 临时工作树；未接分配器时返回 None（调用方用进程工作目录）。
     /// 操作结束必须 [`EvolutionAdminService::release_admin_workspace`] 归还。
     async fn acquire_admin_workspace(&self) -> SFResult<Option<crate::workspace::Workspace>> {
@@ -435,10 +441,10 @@ impl EvolutionAdminService {
             evo.update_status(change_id, result.new_status).await;
         }
 
-        let failed = !result.test_passed;
-        if failed {
+        if let Some(cause) = result.verdict.cause() {
             self.record_event(true).await;
             self.record_change_failed().await;
+            self.record_change_rejected(cause).await;
         } else {
             self.record_event(false).await;
         }
@@ -446,7 +452,8 @@ impl EvolutionAdminService {
             change_id,
             "change.apply",
             serde_json::json!({
-                "test_passed": result.test_passed,
+                "test_passed": result.verdict.passed(),
+                "rejection_cause": result.verdict.cause().map(|c| c.as_str()),
                 "new_status": format!("{:?}", result.new_status).to_lowercase(),
             }),
         )
@@ -454,7 +461,8 @@ impl EvolutionAdminService {
 
         Ok(EvolutionApplyResponse {
             change_id: result.change_id,
-            test_passed: result.test_passed,
+            test_passed: result.verdict.passed(),
+            rejection_cause: result.verdict.cause(),
             test_output: result.test_output,
             new_status: format!("{:?}", result.new_status).to_lowercase(),
             files_changed: result

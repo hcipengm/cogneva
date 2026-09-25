@@ -1580,7 +1580,7 @@ async fn merge_verification_inputs(
 /// 只在"对变更本身的确定性判据"上退休（解析/校验/apply/测试），环境类失败
 /// （校验管线报错、构建、落地、部署）不移除：那些是环境的问题，环境修好后同一个
 /// 变更还该能落地。判据与环境的边界由 `apply_and_test_in` 的返回类型划开——判定走
-/// `Ok(test_passed = false)`，环境走 `Err`。
+/// `Ok(verdict: Refused(..))`，环境走 `Err`。
 ///
 /// 同一个变更可能来自两条输入通道之一——本地队列（`.diff` 文件）或落地记录——
 /// 所以两处都要收口，各自只认自己那一份，缺席的一方是空操作。只收口一边，另一边
@@ -1590,10 +1590,26 @@ async fn fail_and_retire_change(
     engine: &crate::ReflectionEngine,
     pipeline: &crate::ChangePipeline,
     landing: Option<&dyn cog_core::ChangeLanding>,
-    change_id: &str,
-    reason: &str,
+    outcome: &crate::change_pipeline::ApplyResult,
 ) {
-    let _ = engine.record_change_outcome(change_id, false, reason).await;
+    let change_id = outcome.change_id.as_str();
+    let reason = outcome.test_output.as_str();
+    // 拒绝的结论要带上判据与它落在哪些文件上：学习里的重复计数就是按这两件事
+    // 归并的，只留一句英文 dump 的话，两条不同的判据会被算成同一个反复出现的缺陷
+    // ——而"反复出现"正是触发再生成的唯一依据。
+    if let Some(cause) = outcome.verdict.cause() {
+        let _ = engine
+            .record_change_refusal(change_id, cause, &outcome.files_changed, reason)
+            .await;
+    } else {
+        // 调用方只在判定类失败上走这条路，没有判据说明调用点错了；记一条不带
+        // 判据的结论而不是凭空补一个，免得把"读不到判据"写成某个具体判据。
+        warn!(
+            change_id = %change_id,
+            "A change was retired without a refusal cause; its record cannot be counted by criterion"
+        );
+        let _ = engine.record_change_outcome(change_id, false, reason).await;
+    }
     if let Err(e) = pipeline.retire_change(change_id, reason).await {
         warn!(
             change_id = %change_id,
@@ -1752,13 +1768,13 @@ async fn run_evolution_cycle_in(
     // Process changes serially. Each change is applied, tested, committed,
     // built, and (when configured) deployed before moving to the next one.
     for change in changes {
-        let mut change_failed = false;
+        let mut refused: Option<cog_core::RejectionCause> = None;
 
         let result = match pipeline.apply_and_test_in(&change, workdir).await {
             Ok(r) => r,
             Err(e) => {
                 // `Err` 意味着管线没能对这个变更做出判定（工作树脏、git 起不来），
-                // 判定类失败都以 `Ok(test_passed = false)` 返回并在下面处理。环境
+                // 判定类失败都以 `Ok(verdict: Refused(..))` 返回并在下面处理。环境
                 // 问题可以靠重试自愈，变更本身未必有毛病，所以只记结论、不移出队列
                 // ——在这里退休会因一次环境抖动丢掉一个好变更。
                 warn!(error = %e, "Change apply/test could not reach a verdict");
@@ -1781,7 +1797,7 @@ async fn run_evolution_cycle_in(
             .update_status(&result.change_id, result.new_status)
             .await;
 
-        if !result.test_passed {
+        if let Some(cause) = result.verdict.cause() {
             // The reason is already in the result; carrying it into the log is
             // what makes a rejection diagnosable without digging the artifact
             // out of the sandbox by hand.
@@ -1789,18 +1805,12 @@ async fn run_evolution_cycle_in(
             warn!(
                 change_id = %result.change_id,
                 status = ?result.new_status,
+                cause = cause.as_str(),
                 reason = %reason,
                 "Change rejected; skipping deploy"
             );
-            fail_and_retire_change(
-                engine,
-                pipeline,
-                landing.map(|l| l.as_ref()),
-                &result.change_id,
-                &result.test_output,
-            )
-            .await;
-            change_failed = true;
+            fail_and_retire_change(engine, pipeline, landing.map(|l| l.as_ref()), &result).await;
+            refused = Some(cause);
         } else if !config.auto_apply || config.manual_approve {
             info!(change_id = %result.change_id, "Change awaiting manual approval");
         } else {
@@ -1969,10 +1979,16 @@ async fn run_evolution_cycle_in(
             }
         }
 
-        if change_failed {
+        if let Some(cause) = refused {
             if let Some(m) = evolution_metrics {
                 m.record_event(true).await;
                 m.record_change_failed().await;
+                // Counted under its criterion as well as in the aggregate: the
+                // aggregate says how much the loop is losing, the criterion
+                // says whether to look at the generator, at what it reads from,
+                // or at the verification run — three different repairs that one
+                // number cannot tell apart.
+                m.record_change_rejected(cause).await;
             }
         } else if !config.auto_deploy || config.manual_approve {
             // Change succeeded tests but is waiting for approval; count as

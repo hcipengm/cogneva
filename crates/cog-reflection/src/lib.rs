@@ -121,6 +121,55 @@ pub mod plugin;
 
 use std::sync::Arc;
 
+/// The recurrence key of a refused change: which criterion, and on what.
+///
+/// Pure, because the merging rule is the whole contract and has to be checkable
+/// without a store: two refusals accumulate into one count exactly when this key
+/// matches, the matcher treats an exact key match as similarity 1.0, and that
+/// path does not depend on embeddings — of which this deployment has none.
+///
+/// The files, rather than the goal text, are what "what" means here. The goal
+/// is prose, so two refusals about the same file worded differently would take
+/// two counts and neither would ever mature; the file set is the same fact
+/// however it was described. Sorted and deduplicated so the same set is one key
+/// whichever order the diff listed it in. A refusal that never got as far as
+/// naming a file keys on the criterion alone, which is what it is: generation
+/// emitting artifacts nothing can read.
+pub fn refusal_pattern_key(
+    cause: cog_core::RejectionCause,
+    files: &[std::path::PathBuf],
+) -> String {
+    format!("change:refused:{}:{}", cause.as_str(), named_files(files))
+}
+
+/// The files a refusal names, spelled the one way the key and the record both
+/// use them: sorted, deduplicated, comma-joined, empty when the refusal never
+/// got as far as naming one.
+fn named_files(files: &[std::path::PathBuf]) -> String {
+    let mut named: Vec<String> = files
+        .iter()
+        .map(|file| file.to_string_lossy().to_string())
+        .collect();
+    named.sort();
+    named.dedup();
+    named.join(",")
+}
+
+/// What the record says the refusal was about.
+///
+/// A refusal that named no file says so instead of leaving the field blank: an
+/// empty value reads as "no file was involved", while the fact is that nothing
+/// about this artifact could be read at all — the difference between a defect
+/// in one file and generation emitting something no check can parse.
+fn refusal_subject(cause: cog_core::RejectionCause, files: &[std::path::PathBuf]) -> String {
+    let named = named_files(files);
+    if named.is_empty() {
+        format!("no file named (a {} refusal)", cause.as_str())
+    } else {
+        named
+    }
+}
+
 /// Convenience builder that wires together all Phase-1 components.
 pub struct ReflectionEngine {
     pub detector: Arc<dyn LearningDetector>,
@@ -768,6 +817,89 @@ impl ReflectionEngine {
         self.recorder.record_learning(learning.clone()).await?;
         self.matcher.update_recurrence(&mut learning).await?;
 
+        self.note_change_skill_outcome(change_id, success).await?;
+
+        Ok(())
+    }
+
+    /// Record a change that a deterministic gate criterion refused.
+    ///
+    /// The refusal is the strongest evidence this system produces about its own
+    /// generation: an artifact was written, the gate read it, and a check that
+    /// needs no judgement said no. Two things make it usable, and neither was
+    /// here.
+    ///
+    /// First, the recurrence key. A learning's count is what decides whether a
+    /// defect is recurring enough to generate for, and between two refusals
+    /// that count was decided by how much English their dumps happened to share
+    /// — two changes stopped by two different checks could accumulate into one
+    /// count, and one check failing on two files could fail to accumulate at
+    /// all. The key here is built from the two facts that make the count mean
+    /// something: which criterion, and which files it was refused on.
+    ///
+    /// Second, the offer to the triggers. Every other learning path hands its
+    /// learning to `maybe_trigger_evolution_from_learning`; this one
+    /// ended at the recorder, so the corpus grew a Correction per refused change
+    /// while generation was never told about any of them. That is the whole
+    /// reason a refusal is recorded at all.
+    ///
+    /// The general [`Self::record_change_outcome`] deliberately does not call
+    /// the trigger: it also carries failures that are already answered by
+    /// something bounded — a CI failure is re-driven under a per-cause budget —
+    /// and generating from the same evidence as well would spend two budgets on
+    /// one defect.
+    pub async fn record_change_refusal(
+        &self,
+        change_id: &str,
+        cause: cog_core::RejectionCause,
+        files: &[std::path::PathBuf],
+        detail: &str,
+    ) -> cog_core::SFResult<()> {
+        let truncated = if detail.len() > 2000 {
+            &detail[..2000]
+        } else {
+            detail
+        };
+        let mut learning = cog_core::Learning::new(
+            cog_core::LearningCategory::Correction,
+            cog_core::Priority::High,
+            cog_core::Area::Backend,
+            format!(
+                "Change {} was refused by the {} check",
+                change_id,
+                cause.as_str()
+            ),
+            format!(
+                "Refused on: {}\nEvidence: {}",
+                refusal_subject(cause, files),
+                truncated
+            ),
+            format!(
+                "Read what the {} check reported before generating for this again",
+                cause.as_str()
+            ),
+            cog_core::LearningSource::SelfReview,
+        );
+        learning.pattern_key = Some(refusal_pattern_key(cause, files));
+        learning.rejection_cause = Some(cause);
+        learning.related_tasks.push(change_id.to_string());
+        self.recorder.record_learning(learning.clone()).await?;
+        self.matcher.update_recurrence(&mut learning).await?;
+        self.note_change_skill_outcome(change_id, false).await?;
+
+        self.maybe_trigger_evolution_from_learning(&learning).await;
+        Ok(())
+    }
+
+    /// Feed one change's outcome to the skill effectiveness tracker.
+    ///
+    /// Shared by every way a change can end so the skill reading counts the
+    /// same population whichever path recorded it.
+    async fn note_change_skill_outcome(
+        &self,
+        change_id: &str,
+        success: bool,
+    ) -> cog_core::SFResult<()> {
         if let Some(ref tracker) = self.effectiveness_tracker {
             let outcome = cog_core::SkillOutcome {
                 skill_id: "change_deployment".into(),
@@ -780,7 +912,6 @@ impl ReflectionEngine {
             };
             tracker.record_outcome(outcome).await?;
         }
-
         Ok(())
     }
 
@@ -1517,5 +1648,125 @@ mod tests {
         let listed = evolution.list_results().await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].status, EvolutionStatus::Generated);
+    }
+
+    /// A refusal is recorded in order to be acted on, and the chain that acts
+    /// on learnings — recurrence over the threshold, then generation — was
+    /// reachable from self-review and from context but not from a refused
+    /// change, which ends at the recorder. The whole point of the record is
+    /// that the second refusal of the same defect is worth a generation.
+    #[tokio::test]
+    async fn a_repeated_refusal_reaches_generation() {
+        let (mut engine, calls) = engine_that_counts_generation();
+        engine.change_recurrence_threshold = 2;
+        engine.set_cooldown_secs(0);
+
+        let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
+        engine
+            .record_change_refusal("c-1", cog_core::RejectionCause::TestsFailed, &files, "boom")
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().await,
+            0,
+            "one refusal is not a recurrence worth generating for"
+        );
+
+        engine
+            .record_change_refusal("c-2", cog_core::RejectionCause::TestsFailed, &files, "boom")
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().await,
+            1,
+            "the same criterion failing again on the same file is the recurrence \
+             the generation trigger exists for"
+        );
+    }
+
+    /// The other half: two refusals of different criteria are not each other's
+    /// recurrence, however alike the prose they carry. Merged, they would mature
+    /// twice as fast and the generation they trigger would be aimed at a check
+    /// that only one of them actually failed.
+    #[tokio::test]
+    async fn a_different_criterion_is_not_the_same_recurrence() {
+        let (mut engine, calls) = engine_that_counts_generation();
+        engine.change_recurrence_threshold = 2;
+        engine.set_cooldown_secs(0);
+
+        let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
+        engine
+            .record_change_refusal("c-1", cog_core::RejectionCause::TestsFailed, &files, "boom")
+            .await
+            .unwrap();
+        engine
+            .record_change_refusal(
+                "c-2",
+                cog_core::RejectionCause::MalformedDiff,
+                &files,
+                "boom",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().await,
+            0,
+            "a refusal by one check did not recur as a refusal by another"
+        );
+    }
+
+    /// The recurrence key is what merges two refusals into one count, so its
+    /// rule is worth pinning on its own: the same criterion and the same files
+    /// is one key however the diff happened to order them, and any change to
+    /// either half makes it another.
+    #[test]
+    fn a_refusal_key_is_the_criterion_and_the_files() {
+        let a = std::path::PathBuf::from("crates/a/src/lib.rs");
+        let b = std::path::PathBuf::from("crates/b/src/lib.rs");
+        let cause = cog_core::RejectionCause::TestsFailed;
+
+        let one = std::slice::from_ref(&a);
+        let other = std::slice::from_ref(&b);
+        assert_eq!(
+            refusal_pattern_key(cause, &[a.clone(), b.clone()]),
+            refusal_pattern_key(cause, &[b.clone(), a.clone()]),
+            "the order the diff listed the files in is not part of the defect"
+        );
+        assert_eq!(
+            refusal_pattern_key(cause, &[a.clone(), a.clone()]),
+            refusal_pattern_key(cause, one),
+            "the same file named twice is the same defect"
+        );
+        assert_ne!(
+            refusal_pattern_key(cause, one),
+            refusal_pattern_key(cause, other),
+            "the same criterion on another file is another defect"
+        );
+        assert_ne!(
+            refusal_pattern_key(cause, one),
+            refusal_pattern_key(cog_core::RejectionCause::MalformedDiff, one),
+            "another criterion on the same file is another defect"
+        );
+        assert_ne!(
+            refusal_pattern_key(cause, &[]),
+            refusal_pattern_key(cog_core::RejectionCause::MalformedDiff, &[]),
+            "an artifact nothing could read still says which check refused it"
+        );
+    }
+
+    /// An engine whose generation attempts are counted rather than performed.
+    fn engine_that_counts_generation() -> (ReflectionEngine, Arc<tokio::sync::Mutex<u32>>) {
+        let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
+        let mut engine = ReflectionEngine::new_in_memory(registry);
+        let calls = Arc::new(tokio::sync::Mutex::new(0u32));
+        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(CountingLlm {
+            calls: calls.clone(),
+        });
+        engine.evolution = Some(Arc::new(EvolutionEngine::new(
+            llm,
+            Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
+            None,
+        )));
+        (engine, calls)
     }
 }

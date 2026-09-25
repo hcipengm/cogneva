@@ -101,6 +101,95 @@ pub struct GeneratedChange {
     pub intent: Option<crate::types::task::EvolutionIntent>,
 }
 
+/// Which deterministic criterion a generated change failed.
+///
+/// A change can be refused by the gate for reasons that call for opposite
+/// responses — a diff that does not parse is a generation defect, a patch whose
+/// context no longer fits the tree is staleness, and a verification run that
+/// could not start is neither — and every one of them used to leave the same
+/// trace: one sentence of English in a free-text field, and one increment of an
+/// aggregate counter. A count that cannot be split cannot be acted on: a run of
+/// `tests_failed` says fix the generator, a run of `context_does_not_apply` says
+/// fix the freshness of what it reads from, and the two are indistinguishable
+/// once they share a number.
+///
+/// Closed, with no catch-all variant. A catch-all would be the same defect one
+/// level down: an unclassified refusal would land in a bucket named "other" and
+/// every reading taken from this axis would silently include it. The variants
+/// below are the complete set of verdicts the gate can reach, and
+/// [`Self::ALL`] carries them so a reader can publish the whole axis — including
+/// the causes that have never happened, since an absent series and a zero read
+/// alike to a scraper.
+///
+/// This is the criterion, not the outcome. Whether a refused change is retired
+/// or retried, and whether the refusal is terminal, are separate questions the
+/// caller answers; the cause is what the caller dispatches on when it decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionCause {
+    /// The artifact is not a parseable unified diff.
+    MalformedDiff,
+    /// The promotion policy refuses the target set — a protected file, or a
+    /// diff too large to review.
+    PromotionGateRefused,
+    /// The change touches a path it may not, or rewrites one that is not there.
+    ForbiddenPath,
+    /// The change does not answer the goal it carries.
+    IntentMismatch,
+    /// The patch does not fit the tree it is applied to: the dry-run rejected
+    /// its context.
+    ContextDoesNotApply,
+    /// The dry run passed and the real apply failed anyway.
+    ApplyFailed,
+    /// The verification suite could not be run to a verdict — no cargo, or the
+    /// run outlived its budget.
+    TestRunUnavailable,
+    /// The suite ran and this change broke it.
+    TestsFailed,
+}
+
+impl RejectionCause {
+    /// Every cause, so a reader publishes the axis instead of the values it
+    /// happens to have seen.
+    pub const ALL: &'static [RejectionCause] = &[
+        Self::MalformedDiff,
+        Self::PromotionGateRefused,
+        Self::ForbiddenPath,
+        Self::IntentMismatch,
+        Self::ContextDoesNotApply,
+        Self::ApplyFailed,
+        Self::TestRunUnavailable,
+        Self::TestsFailed,
+    ];
+
+    /// The wire form, for label values and records.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MalformedDiff => "malformed_diff",
+            Self::PromotionGateRefused => "promotion_gate_refused",
+            Self::ForbiddenPath => "forbidden_path",
+            Self::IntentMismatch => "intent_mismatch",
+            Self::ContextDoesNotApply => "context_does_not_apply",
+            Self::ApplyFailed => "apply_failed",
+            Self::TestRunUnavailable => "test_run_unavailable",
+            Self::TestsFailed => "tests_failed",
+        }
+    }
+
+    /// Where this cause sits in [`Self::ALL`].
+    ///
+    /// A reader keeps one counter per cause and addresses them by this. The
+    /// invariant it leans on — that the list is every variant, once each — is
+    /// held by the test beside this type rather than by a second hand-written
+    /// ordering, which would be one more list to drift.
+    pub fn slot(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|cause| *cause == self)
+            .expect("ALL lists every rejection cause")
+    }
+}
+
 /// Sink for collaboration-generated changes. Implemented by the reflection
 /// layer so that collaboration does not depend on reflection concrete types.
 #[async_trait::async_trait]
@@ -1264,6 +1353,21 @@ pub struct Learning {
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub related_tasks: Vec<String>,
+    /// The gate criterion that refused the change this learning is about.
+    ///
+    /// A refusal is recorded in order to be counted, and counting is merging:
+    /// how many times a defect has recurred is what decides whether it is worth
+    /// generating a fix for. Two refusals of *different* criteria are two
+    /// different defects however alike their evidence reads, so the criterion
+    /// travels as a value the similarity rule can veto on rather than only as
+    /// words inside `details`, where it would be weighed against prose.
+    ///
+    /// `None` for every learning that is not about a refused change, and for
+    /// rows written before this field existed — which is not the same as "was
+    /// refused by nothing", so the veto only fires when both sides name a
+    /// criterion.
+    #[serde(default)]
+    pub rejection_cause: Option<RejectionCause>,
 }
 
 impl Learning {
@@ -1304,6 +1408,7 @@ impl Learning {
             first_seen: now,
             last_seen: now,
             related_tasks: Vec::new(),
+            rejection_cause: None,
         }
     }
 
@@ -1412,6 +1517,40 @@ pub trait MetaLearning: Send + Sync + std::fmt::Debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ALL` is every variant, once each — the invariant `slot` addresses
+    /// counters by. The match below has no catch-all arm, so a new variant
+    /// stops this test compiling; the pinned count is what then forces it into
+    /// the list, because a variant listed nowhere would leave a counter nothing
+    /// can reach and no reading of that axis would show the difference.
+    #[test]
+    fn the_cause_list_is_every_cause_once() {
+        let mut seen: Vec<&'static str> = Vec::new();
+        for cause in RejectionCause::ALL {
+            let spelling = match cause {
+                RejectionCause::MalformedDiff => "malformed_diff",
+                RejectionCause::PromotionGateRefused => "promotion_gate_refused",
+                RejectionCause::ForbiddenPath => "forbidden_path",
+                RejectionCause::IntentMismatch => "intent_mismatch",
+                RejectionCause::ContextDoesNotApply => "context_does_not_apply",
+                RejectionCause::ApplyFailed => "apply_failed",
+                RejectionCause::TestRunUnavailable => "test_run_unavailable",
+                RejectionCause::TestsFailed => "tests_failed",
+            };
+            assert_eq!(cause.as_str(), spelling, "{cause:?} spells two ways");
+            assert_eq!(
+                serde_json::to_string(&cause).unwrap(),
+                format!("\"{spelling}\""),
+                "{cause:?} does not reach a record under the spelling it reports"
+            );
+            assert!(!seen.contains(&spelling), "{spelling} is in the list twice");
+            seen.push(spelling);
+        }
+        assert_eq!(seen.len(), 8, "ALL is missing a cause: {seen:?}");
+        for (index, cause) in RejectionCause::ALL.iter().enumerate() {
+            assert_eq!(cause.slot(), index, "{cause:?} does not sit at {index}");
+        }
+    }
 
     #[test]
     fn contribution_policy_roundtrips_strings() {

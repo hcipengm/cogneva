@@ -106,6 +106,20 @@ impl DefaultLearningMatcher {
     }
 
     fn compute_similarity(a: &Learning, b: &Learning, embed_sim: Option<f32>) -> f32 {
+        // Two refusals of different gate criteria are two different defects:
+        // one says the generator emitted something unreadable, the other says
+        // what it emitted no longer fits the tree, and a reader that merged them
+        // would report whichever is newer as a recurrence of the other and
+        // generate a fix aimed at the wrong check. Decided here, as a value,
+        // rather than left to the words in `details` — similarity over prose is
+        // a heuristic and this is not: no amount of overlapping text makes two
+        // different criteria the same defect.
+        if let (Some(cause_a), Some(cause_b)) = (a.rejection_cause, b.rejection_cause) {
+            if cause_a != cause_b {
+                return 0.0;
+            }
+        }
+
         // Pattern-key exact match is the strongest signal.
         if let (Some(pk_a), Some(pk_b)) = (&a.pattern_key, &b.pattern_key) {
             if pk_a == pk_b {

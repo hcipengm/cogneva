@@ -84,12 +84,45 @@ fn verification_env(
     env
 }
 
+/// What the pipeline decided about one change.
+///
+/// The cause travels with the refusal instead of sitting beside it as a second
+/// field, so a refused change without a reason cannot be built: every caller
+/// that dispatches on the verdict has the criterion in hand, and no caller has
+/// to re-derive it by matching on prose. The prose stays in
+/// [`ApplyResult::test_output`] for whoever reads the record; it is not the
+/// protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeVerdict {
+    /// The change is applied, or held for review, and nothing refused it.
+    Passed,
+    /// A deterministic criterion refused it. The change is not going to start
+    /// fitting the tree by being tried again, so the caller retires it — unless
+    /// the cause is one that names the run rather than the artifact, which is
+    /// the caller's call to make.
+    Refused(cog_core::RejectionCause),
+}
+
+impl ChangeVerdict {
+    pub fn passed(&self) -> bool {
+        matches!(self, Self::Passed)
+    }
+
+    /// The criterion that refused the change, if one did.
+    pub fn cause(&self) -> Option<cog_core::RejectionCause> {
+        match self {
+            Self::Passed => None,
+            Self::Refused(cause) => Some(*cause),
+        }
+    }
+}
+
 /// Result of applying and testing a single change.
 #[derive(Debug, Clone)]
 pub struct ApplyResult {
     pub change_id: String,
     pub files_changed: Vec<PathBuf>,
-    pub test_passed: bool,
+    pub verdict: ChangeVerdict,
     pub test_output: String,
     pub new_status: EvolutionStatus,
 }
@@ -322,7 +355,7 @@ impl ChangePipeline {
     ) -> SFResult<ApplyResult> {
         info!(change_id = %change.artifact_id, "Applying evolution change");
 
-        // 判定类失败一律走 `Ok(ApplyResult { test_passed: false, .. })`，`Err` 只留给
+        // 判定类失败一律走 `Ok(ApplyResult { verdict: Refused(..), .. })`，`Err` 只留给
         // "管线没能对一个变更做出判定"（工作树脏、git 起不来这类环境问题）。调用方
         // 据此决定要不要把变更移出待处理队列：环境问题重试有意义，判定不是。把解析/
         // 校验的失败塞进 `Err` 会让这条界线失效——分不清"这个变更不行"和"现在这个
@@ -335,7 +368,7 @@ impl ChangePipeline {
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed: Vec::new(),
-                    test_passed: false,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::MalformedDiff),
                     test_output: format!("Change is not a usable diff: {e}"),
                     new_status: EvolutionStatus::ValidationFailed,
                 });
@@ -362,7 +395,7 @@ impl ChangePipeline {
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
-                    test_passed: false,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::PromotionGateRefused),
                     test_output: format!("Promotion gate rejected: {reason}"),
                     new_status: EvolutionStatus::Rejected,
                 });
@@ -376,7 +409,7 @@ impl ChangePipeline {
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
-                    test_passed: false,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ForbiddenPath),
                     test_output: format!("Change touches a forbidden or missing path: {e}"),
                     new_status: EvolutionStatus::ValidationFailed,
                 });
@@ -395,7 +428,7 @@ impl ChangePipeline {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
-                test_passed: false,
+                verdict: ChangeVerdict::Refused(cog_core::RejectionCause::IntentMismatch),
                 test_output: format!("Change does not answer its goal: {reason}"),
                 new_status: EvolutionStatus::ValidationFailed,
             });
@@ -407,7 +440,7 @@ impl ChangePipeline {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
-                test_passed: false,
+                verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ContextDoesNotApply),
                 test_output: format!("Change pre-check failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
             });
@@ -417,7 +450,7 @@ impl ChangePipeline {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
-                test_passed: false,
+                verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ApplyFailed),
                 test_output: format!("Change application failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
             });
@@ -431,7 +464,7 @@ impl ChangePipeline {
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
-                    test_passed: false,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
                     test_output: format!("Failed to execute cargo test: {}", e),
                     new_status: EvolutionStatus::ValidationFailed,
                 });
@@ -453,10 +486,16 @@ impl ChangePipeline {
             EvolutionStatus::ValidationFailed
         };
 
+        let verdict = if test_passed {
+            ChangeVerdict::Passed
+        } else {
+            ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed)
+        };
+
         Ok(ApplyResult {
             change_id: change.artifact_id.clone(),
             files_changed,
-            test_passed,
+            verdict,
             test_output,
             new_status,
         })
@@ -1317,7 +1356,10 @@ mod tests {
             .await
             .expect("a judgement about the change is not an environment error");
 
-        assert!(!result.test_passed);
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::IntentMismatch)
+        );
         assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
         assert!(
             result.test_output.contains("README.md"),
@@ -1666,7 +1708,10 @@ index 1111111..2222222 100644
         };
 
         let result = pipeline.apply_and_test(&change).await.unwrap();
-        assert!(!result.test_passed);
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::PromotionGateRefused)
+        );
         assert_eq!(result.new_status, crate::types::EvolutionStatus::Rejected);
         assert!(result.test_output.contains("Promotion gate rejected"));
     }
@@ -1752,14 +1797,153 @@ index 1111111..2222222 100644
             .apply_and_test(&change)
             .await
             .expect("不可解析的变更是一个判定，不是管线错误");
-        assert!(!result.test_passed);
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::MalformedDiff)
+        );
         assert_eq!(
             result.new_status,
             crate::types::EvolutionStatus::ValidationFailed
         );
     }
 
-    /// 另一侧：工作树脏是环境问题，必须保持 `Err`。若它变成 `Ok(test_passed = false)`，
+    /// Every refusal names the criterion it hit, and the criteria are not
+    /// interchangeable: a path the change may not touch calls for telling the
+    /// generator what it may write, a patch whose context is gone calls for
+    /// looking at what it was given to read. Sharing a word between them would
+    /// make both readings useless.
+    #[tokio::test]
+    async fn a_change_that_leaves_the_tree_is_refused_for_its_path() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), true);
+        let change = crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::CodeChange,
+            artifact_id: "escaping-1".into(),
+            description: "补一个模块".into(),
+            content: creates("../outside.rs"),
+            status: crate::types::EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::ForbiddenPath)
+        );
+        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
+    }
+
+    /// A patch whose context no longer fits the tree is refused for the tree,
+    /// not for its syntax — the diff is well formed, it is the file it was
+    /// written against that moved.
+    #[tokio::test]
+    async fn a_change_whose_context_is_gone_is_refused_for_the_tree() {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(root.path().join("a.txt"), "now\n")
+            .await
+            .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "stale-1".into(),
+            description: "调整这一行的取值".into(),
+            // The diff expects the file to still say `old`.
+            content: rewrites("a.txt"),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::ContextDoesNotApply)
+        );
+        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
+    }
+
+    /// The suite ran and the change broke it — the one refusal whose evidence
+    /// is the failing run itself rather than a check that can be re-read from
+    /// the artifact alone.
+    #[tokio::test]
+    async fn a_change_that_breaks_the_suite_is_refused_for_the_tests() {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn answer() -> i32 {\n    41\n}\n\n#[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "breaking-1".into(),
+            description: "修正这个取值的计算".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -1,3 +1,3 @@\n\
+                      \x20pub fn answer() -> i32 {\n\
+                      -    41\n\
+                      +    40\n\
+                      \x20}\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed)
+        );
+        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
+        // Control for the control: the suite really ran and really failed. Any
+        // nonzero exit lands in this cause — a build that never started
+        // included — so the output has to name the test that broke.
+        assert!(
+            result.test_output.contains("answer_is_42"),
+            "the failing test is not in the evidence: {}",
+            result.test_output
+        );
+    }
+
+    /// 另一侧：工作树脏是环境问题，必须保持 `Err`。若它变成 `Ok(verdict: Refused(..))`，
     /// 一次并发残留就会把一个完好的变更永久退休掉。
     #[tokio::test]
     async fn a_dirty_workspace_stays_an_error_so_the_change_is_not_retired() {

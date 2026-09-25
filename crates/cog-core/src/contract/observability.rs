@@ -427,6 +427,21 @@ pub trait EvolutionMetrics: Send + Sync {
     async fn record_event(&self, failed: bool);
     async fn record_change_applied(&self);
     async fn record_change_failed(&self);
+
+    /// Record one change refused by the gate, under the criterion it failed.
+    ///
+    /// Beside [`Self::record_change_failed`], not instead of it: that one counts
+    /// every way a change can fail — build, staging, landing — of which the
+    /// gate's verdicts are one kind, and folding the criteria into it would
+    /// make a number that answers neither question. This one answers which
+    /// criterion, which is what tells a reader whether to fix generation, the
+    /// freshness of what generation reads, or the verification run itself.
+    ///
+    /// Required, with no default. A default would compile everywhere and drop
+    /// the reading, leaving a counter that is absent rather than zero — and an
+    /// absent series reads as "nothing was refused", which is the failure this
+    /// axis exists to expose.
+    async fn record_change_rejected(&self, cause: crate::RejectionCause);
 }
 
 // ─── Infrastructure vs business traffic ────────────────────────────────────

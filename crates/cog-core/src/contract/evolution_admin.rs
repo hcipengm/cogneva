@@ -50,6 +50,15 @@ pub struct EvolutionApplyResponse {
     pub test_passed: bool,
     pub test_output: String,
     pub new_status: String,
+    /// Which deterministic criterion refused it; `None` when it passed.
+    ///
+    /// A different axis from `new_status`: the status says what the engine does
+    /// with the change next, the cause says which check it hit. Read through the
+    /// status alone, a change that is not even valid syntax and one whose patch
+    /// no longer fits the tree are the same word, and they call for opposite
+    /// repairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_cause: Option<crate::RejectionCause>,
     pub files_changed: Vec<String>,
 }
 
