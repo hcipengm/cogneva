@@ -298,6 +298,22 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_SELF_EVOLUTION_WORKSPACES_ORPHAN_BRANCH_TTL_SECS".into(),
         "self_evolution.workspaces.orphan_branch_ttl_secs".into(),
     );
+    m.insert(
+        "COGNEVA_BUILD_GATE_ENABLED".into(),
+        "self_evolution.build_gate.enabled".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_MAX_CONCURRENT".into(),
+        "self_evolution.build_gate.max_concurrent".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_WAIT_SECS".into(),
+        "self_evolution.build_gate.wait_secs".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_LOCK_DIR".into(),
+        "self_evolution.build_gate.lock_dir".into(),
+    );
     // system
     m.insert(
         "COGNEVA_SKILL_HOT_RELOAD_INTERVAL_SECS".into(),

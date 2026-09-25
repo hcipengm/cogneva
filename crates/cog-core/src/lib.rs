@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod build_gate;
 pub mod config;
 pub mod contract;
 pub mod error;

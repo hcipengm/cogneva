@@ -2090,6 +2090,20 @@ impl MainlineDeployer {
             None => return Ok(()),
         };
 
+        // The host build gate as well as the cycle lock, because they bound
+        // different things: this lock keeps one deployer's advance from racing
+        // its own state file, the gate keeps this advance's compile and image
+        // build from landing on top of another builder's. Refusing here rather
+        // than waiting is right for a polling cycle -- it never touched state
+        // yet, and it comes back on its own.
+        let _build_slot = match cog_core::build_gate::try_acquire("mainline advance").await {
+            Ok(slot) => slot,
+            Err(e) => {
+                info!(error = %e, "host is building; deferring the advance to the next cycle");
+                return Ok(());
+            }
+        };
+
         // 同一镜像两个引用端点：buildah 在 Pod 内走集群 DNS push/from；
         // Job manifest 与 set image 走节点 NodePort（kubelet 不解析集群 DNS）。
         let push_tag = main_image(&self.push_endpoint(), &bare);

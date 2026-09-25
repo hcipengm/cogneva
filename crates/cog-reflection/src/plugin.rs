@@ -780,6 +780,18 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // worker 抢工作树。先取出来：下面的 spawn 会把 self_evolution
                 // 整体 move 进闭包，事后再读它会触发 use-after-move。
                 let executor_enabled = self_evolution.executor_enabled;
+
+                // The build gate is a property of a process that runs builds, so
+                // it is installed by role: the executor process takes the gate
+                // (it runs the cycles, the mainline deployer and the porter, all
+                // of which build), and the control plane publishes zero readings
+                // instead of locking a private copy of the directory. Here
+                // because nothing above builds and the spawns below move the
+                // config into their closures.
+                let build_gate =
+                    cog_core::build_gate::install_for(&self_evolution.build_gate, executor_enabled);
+                ctx.publish_observable(build_gate);
+
                 if executor_enabled {
                     let poll_interval =
                         std::time::Duration::from_secs(self_evolution.poll_interval_secs);
@@ -1819,6 +1831,19 @@ async fn run_evolution_cycle_in(
                 .await
             {
                 Ok(a) => a,
+                // No slot for the whole wait budget: the build never ran, so
+                // nothing about the change was judged and nothing failed. It is
+                // not a change failure and does not go on that account -- the
+                // refusal is already its own reading, and charging the host's
+                // load to the change is how a busy machine reads as broken code.
+                Err(e) if e.is_build_slot_refused() => {
+                    warn!(
+                        change_id = %result.change_id,
+                        error = %e,
+                        "Change not built this cycle: host had no build slot"
+                    );
+                    continue;
+                }
                 Err(e) => {
                     warn!(change_id = %result.change_id, error = %e, "Change commit/build failed");
                     let _ = engine

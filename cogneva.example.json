@@ -95,6 +95,10 @@
     "COGNEVA_SELF_EVOLUTION_POLL_INTERVAL_SECS": "self_evolution.poll_interval_secs",
     "COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS": "self_evolution.test_timeout_secs",
     "COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS": "self_evolution.build_timeout_secs",
+    "COGNEVA_BUILD_GATE_ENABLED": "self_evolution.build_gate.enabled",
+    "COGNEVA_BUILD_GATE_MAX_CONCURRENT": "self_evolution.build_gate.max_concurrent",
+    "COGNEVA_BUILD_GATE_WAIT_SECS": "self_evolution.build_gate.wait_secs",
+    "COGNEVA_BUILD_GATE_LOCK_DIR": "self_evolution.build_gate.lock_dir",
     "COGNEVA_TOOL_TIMEOUT_SECS": "system.tool_timeout_secs",
     "COGNEVA_SHELL_TIMEOUT_SECS": "system.shell_timeout_secs",
     "COGNEVA_SKILL_HOT_RELOAD_INTERVAL_SECS": "system.skill_hot_reload_interval_secs",
@@ -507,7 +511,14 @@
     "build_timeout_secs": 1800,
     "poll_interval_secs": 60,
     "notify_on_success": true,
-    "notify_on_failure": true
+    "notify_on_failure": true,
+    "build_gate": {
+      "_comment": "宿主级构建闸门：同一宿主同时进行的编译/打镜像条数上限。构建与集群同宿主，多路叠加足以把整机拖进换页，此后连应该把这件事报出来的事件循环也一起退化。闸门只装在跑构建的进程里，锁定的是 lock_dir 这一个目录：两个进程指向同一个目录（同一 dev:ino）才互相设界，指向不同目录则各自设界——读数 cogneva_build_gate_slots 的 dir 标签就是用来分辨这件事的，role 标签分辨「跑构建的进程（builder）」与「不跑构建的进程（control-plane，只发零值）」。",
+      "enabled": true,
+      "max_concurrent": 1,
+      "wait_secs": 1800,
+      "lock_dir": "/opt/cogneva/sandbox/build-gate"
+    }
   },
   "multi_backend_consumer": {
     "enabled": true,

@@ -23,6 +23,7 @@ jsonschema = { workspace = true }
 blake3 = { workspace = true }
 zstd = { workspace = true }
 regex = "1.11"
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"

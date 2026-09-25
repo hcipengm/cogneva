@@ -60,6 +60,16 @@ pub enum SFError {
     #[error("Backpressure: channel capacity exceeded")]
     Backpressure,
 
+    /// The host could not supply what this call needed right now -- for
+    /// instance a build slot, when the build gate is already at its bound.
+    ///
+    /// Environmental by construction: the work is unchanged and the same call
+    /// succeeds once the host frees up. A caller that cannot tell this apart
+    /// from the work failing would retire a change because the machine was
+    /// busy, so it is classified with the other environment failures below.
+    #[error("Resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     #[error("Timeout")]
     Timeout,
 
@@ -88,13 +98,23 @@ impl SFError {
     /// 少次都是同一个结果，才是死信。
     pub fn is_environment_failure(&self) -> bool {
         match self {
-            SFError::LLM(_) | SFError::Timeout => true,
+            SFError::LLM(_) | SFError::Timeout | SFError::ResourceExhausted(_) => true,
             // 上游明确拒绝：限流、配额、鉴权、服务端故障、连不上。请求本身不
             // 合法那一档不算——那是我们自己的请求写错了，归到环境里就又是一次
             // 把自身缺陷记成外部故障。
             SFError::Upstream { cause, .. } => cause.is_environment_failure(),
             _ => false,
         }
+    }
+
+    /// 这次失败是不是"宿主当时给不出一个构建槽"。
+    ///
+    /// 故意比 [`Self::is_environment_failure`] 窄：那一类还包含超时与上游故障，
+    /// 而这里要回答的是一个更具体的判定——**这次构建根本没跑**。调用方拿它决定
+    /// 要不要回滚一个已提交的变更：把宿主的忙记到变更头上，等于用机器负载给代码
+    /// 定罪，变更会因此消失，而其内容一次都没被评判过。
+    pub fn is_build_slot_refused(&self) -> bool {
+        matches!(self, SFError::ResourceExhausted(_))
     }
 
     /// 这次失败是"重试同一请求在外部窗口复位或凭证更换前不可能成功"，还是

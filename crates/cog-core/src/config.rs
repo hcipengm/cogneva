@@ -1038,6 +1038,43 @@ impl Default for SelfEvolutionWorkspaceConfig {
     }
 }
 
+/// 同一宿主上同时进行的构建（编译 / 打镜像）数量上限。
+///
+/// 构建与集群同宿主：一次 `cargo build --release` 叠上一次
+/// `cargo test --workspace` 就足以让整机进入换页，此后所有工作负载一起退化，
+/// 包括那些本该把这件事报出来的事件循环。**要卡的是并发构建的条数**，而它是
+/// 宿主的属性不是进程的属性——部署器、变更验证、基线搬运、镜像构建跑在不同
+/// 进程里，各自"有活就起一个"正是和数涨上去的方式。
+///
+/// `enabled=false` 或 `max_concurrent=0` 时不设界；`lock_dir` 必须**是所有
+/// 构建方看到的同一个目录**，否则每个进程各卡各的，读数里那个
+/// `dev:ino` 就是用来分辨这件事的。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BuildGateConfig {
+    pub enabled: bool,
+    /// 同时允许的构建条数。默认 1：构建是宿主的负载尖峰，串行是唯一不靠
+    /// 调参也不会打满的取值。
+    pub max_concurrent: usize,
+    /// 一次性构建（变更验证这类没有下一轮可回的）愿意排队多久，超过即拒。
+    /// 取 0 表示只试一次、不排队。
+    pub wait_secs: u64,
+    /// 槽位文件所在目录。必须在宿主的共享文件系统上（同一个 hostPath），
+    /// 否则闸门退化成每个进程各自为政。
+    pub lock_dir: String,
+}
+
+impl Default for BuildGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrent: 1,
+            wait_secs: 1800,
+            lock_dir: "/opt/cogneva/sandbox/build-gate".into(),
+        }
+    }
+}
+
 /// Configuration for the self-evolution auto-deploy pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1094,6 +1131,8 @@ pub struct SelfEvolutionConfig {
     pub microvm: MicroVmConfig,
     /// 工作树动态分配；默认值即生产路径，通常无需显式配置。
     pub workspaces: SelfEvolutionWorkspaceConfig,
+    /// 宿主级构建闸门：同时进行的编译 / 打镜像条数上限。
+    pub build_gate: BuildGateConfig,
 }
 
 /// Where synthesized hooks live inside the change directory. The writer (hook
@@ -1131,6 +1170,7 @@ impl Default for SelfEvolutionConfig {
             image_rollout: ImageRolloutConfig::default(),
             microvm: MicroVmConfig::default(),
             workspaces: SelfEvolutionWorkspaceConfig::default(),
+            build_gate: BuildGateConfig::default(),
         }
     }
 }

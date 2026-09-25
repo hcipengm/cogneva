@@ -113,13 +113,20 @@ impl EvolutionDeployer {
         change_id: &str,
         workdir: &Path,
     ) -> SFResult<BuildArtifact> {
+        // The build slot is taken before the commit, not inside the build: a
+        // refusal has to leave the tree untouched. Taken after the commit, a
+        // host that was busy for the whole wait budget would end up in the
+        // branch below, which rolls the commit back -- the change would be
+        // destroyed and the host's load would be on its record.
+        let build_slot = cog_core::build_gate::acquire("evolution build").await?;
+
         info!(change_id = %change_id, "Committing evolution changes");
         self.git_add_all(workdir).await?;
         let commit_hash = self.git_commit(workdir, change_id).await?;
 
         info!(change_id = %change_id, "Building release binary");
         let start = Instant::now();
-        let build_result = self.run_cargo_build(workdir).await;
+        let build_result = self.run_cargo_build(workdir, build_slot).await;
         let duration = start.elapsed();
 
         match build_result {
@@ -132,6 +139,18 @@ impl EvolutionDeployer {
                     new_binary_path,
                     build_duration_secs: duration.as_secs(),
                 })
+            }
+            // Nothing was judged and nothing failed to compile: there was no
+            // build. Rolling back here would charge the host's load to the
+            // change, so the commit is kept and the caller is told which of the
+            // two happened by the error's type rather than by reading its text.
+            Err(e) if e.is_build_slot_refused() => {
+                warn!(
+                    change_id = %change_id,
+                    error = %e,
+                    "Release build got no slot; commit kept, nothing judged"
+                );
+                Err(e)
             }
             Err(e) => {
                 warn!(
@@ -219,7 +238,14 @@ impl EvolutionDeployer {
         Ok(())
     }
 
-    async fn run_cargo_build(&self, workdir: &Path) -> SFResult<()> {
+    /// The slot is passed in rather than taken here: the build must run under a
+    /// slot its caller already holds, and a caller that holds none cannot reach
+    /// this function.
+    async fn run_cargo_build(
+        &self,
+        workdir: &Path,
+        _slot: Option<cog_core::build_gate::BuildPermit>,
+    ) -> SFResult<()> {
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.args(["build", "--release", "--bin", &self.binary_name])
             .current_dir(workdir)

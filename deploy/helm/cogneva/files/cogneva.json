@@ -103,6 +103,10 @@
     "COGNEVA_SELF_EVOLUTION_SCHEMA_REPAIR_INTERVAL_SECS": "self_evolution.schema_repair_interval_secs",
     "COGNEVA_SELF_EVOLUTION_TEST_TIMEOUT_SECS": "self_evolution.test_timeout_secs",
     "COGNEVA_SELF_EVOLUTION_BUILD_TIMEOUT_SECS": "self_evolution.build_timeout_secs",
+    "COGNEVA_BUILD_GATE_ENABLED": "self_evolution.build_gate.enabled",
+    "COGNEVA_BUILD_GATE_MAX_CONCURRENT": "self_evolution.build_gate.max_concurrent",
+    "COGNEVA_BUILD_GATE_WAIT_SECS": "self_evolution.build_gate.wait_secs",
+    "COGNEVA_BUILD_GATE_LOCK_DIR": "self_evolution.build_gate.lock_dir",
     "COGNEVA_TOOL_TIMEOUT_SECS": "system.tool_timeout_secs",
     "COGNEVA_SHELL_TIMEOUT_SECS": "system.shell_timeout_secs",
     "COGNEVA_SANDBOX_EXECUTOR_URL": "system.sandbox_executor_url",
@@ -711,24 +715,24 @@
           "severity": "warning",
           "summary": "A re-drive round was spent but its charge could not be written {value} times in the last day, so the same cause can buy a fresh round on the next process. This one is invisible from the refusals: the round that is charged again is charged after a restart with nothing to refuse it until the charge is written a second time. Check that the data volume has room and is writable"
         },
-      {
-        "name": "verification_killed_by_budget",
-        "promql": "increase(cogneva_verification_timeouts_total{kind=\"test\"}[6h])",
-        "condition": {
-          "greater_than": 0.0
+        {
+          "name": "verification_killed_by_budget",
+          "promql": "increase(cogneva_verification_timeouts_total{kind=\"test\"}[6h])",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "A change's verification was killed {value} time(s) in the last 6h, having run its whole verification budget for {kind} runs. The change was then retired for the budget and not for its content: it was never judged. The budget it ran against is the cogneva_verification_budget_seconds reading for the test kind, and cogneva_verification_last_run_seconds for the same kind is how long the runs that do finish are taking — a host that got slower shows up there first, and once that line reaches the budget every change is retired on arrival, which reads exactly like a pipeline with nothing to do"
         },
-        "severity": "warning",
-        "summary": "A change's verification was killed {value} time(s) in the last 6h, having run its whole verification budget for {kind} runs. The change was then retired for the budget and not for its content: it was never judged. The budget it ran against is the cogneva_verification_budget_seconds reading for the test kind, and cogneva_verification_last_run_seconds for the same kind is how long the runs that do finish are taking — a host that got slower shows up there first, and once that line reaches the budget every change is retired on arrival, which reads exactly like a pipeline with nothing to do"
-      },
-      {
-        "name": "deployment_killed_by_budget",
-        "promql": "increase(cogneva_verification_timeouts_total{kind=\"build\"}[6h])",
-        "condition": {
-          "greater_than": 0.0
+        {
+          "name": "deployment_killed_by_budget",
+          "promql": "increase(cogneva_verification_timeouts_total{kind=\"build\"}[6h])",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "A change's release build was killed {value} time(s) in the last 6h, having run its whole deployment budget for {kind} runs, so the commit was rolled back and the change is gone. This is a different loss from a build that failed: nothing about the code was judged either way, and the rollback leaves no other trace that the change ever existed. The budget is the cogneva_verification_budget_seconds reading for the build kind"
         },
-        "severity": "warning",
-        "summary": "A change's release build was killed {value} time(s) in the last 6h, having run its whole deployment budget for {kind} runs, so the commit was rolled back and the change is gone. This is a different loss from a build that failed: nothing about the code was judged either way, and the rollback leaves no other trace that the change ever existed. The budget is the cogneva_verification_budget_seconds reading for the build kind"
-      },
         {
           "name": "series_held_without_producer",
           "promql": "cogneva_metric_held_without_producer",
@@ -746,6 +750,24 @@
           },
           "severity": "warning",
           "summary": "The scrape could not enumerate the series the metric store holds, so the held-without-producer reading did not run this time and its silence means nothing either way. Fix the store's reachability; the reading resumes on its own once the enumeration succeeds"
+        },
+        {
+          "name": "build_gate_refused",
+          "promql": "increase(cogneva_build_gate_refused_total[1h])",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "a build was refused a slot {value} time(s) in 1h: the host-wide build gate bounds how many builds run at once, because builds share the host with the cluster and the sum of them pages the machine instead of failing. A refusal means a build that had nothing to come back to gave up after its wait budget -- the change or rollout it belonged to did not fail, it did not run, so a refusal that keeps happening is a bound set too low or a builder holding its slot far too long (see cogneva_build_gate_in_flight and cogneva_build_gate_waiting)"
+        },
+        {
+          "name": "build_gate_not_in_force",
+          "promql": "min_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m])",
+          "condition": {
+            "less_than": 1.0
+          },
+          "severity": "warning",
+          "summary": "a process that runs builds has had no build gate in force for 5 minutes: concurrent builds in it are unbounded again, and the refusal counter cannot show this because nothing is being refused -- nothing is being bounded. Usually the slot directory could not be created or written (the gate is installed but not in force, and the reason is in the warning it logged at startup), or the gate is switched off in configuration. Read the dir label on cogneva_build_gate_slots: a builder whose dir differs from the other builders' is bounding only itself"
         }
       ]
     },
@@ -819,6 +841,13 @@
     "build_timeout_secs": 3600,
     "poll_interval_secs": 60,
     "schema_repair_interval_secs": 600,
+    "build_gate": {
+      "_comment": "宿主级构建闸门：同一宿主同时进行的编译/打镜像条数上限。构建与集群同宿主，多路叠加足以把整机拖进换页，此后连应该把这件事报出来的事件循环也一起退化。闸门只装在跑构建的进程里，锁定的是 lock_dir 这一个目录：两个进程指向同一个目录（同一 dev:ino）才互相设界，指向不同目录则各自设界——读数 cogneva_build_gate_slots 的 dir 标签就是用来分辨这件事的，role 标签分辨「跑构建的进程（builder）」与「不跑构建的进程（control-plane，只发零值）」。",
+      "enabled": true,
+      "max_concurrent": 1,
+      "wait_secs": 1800,
+      "lock_dir": "/opt/cogneva/sandbox/build-gate"
+    },
     "notify_on_success": true,
     "notify_on_failure": true,
     "artifact_evolution": {
@@ -827,8 +856,20 @@
       "interval_secs": 3600,
       "policy_name": "meta_learning.mode",
       "min_trials": 40,
-      "min_samples_grid": [2, 3, 5, 8],
-      "margin_grid": [0.0, 0.05, 0.1, 0.15, 0.2, 0.3]
+      "min_samples_grid": [
+        2,
+        3,
+        5,
+        8
+      ],
+      "margin_grid": [
+        0.0,
+        0.05,
+        0.1,
+        0.15,
+        0.2,
+        0.3
+      ]
     }
   },
   "multi_backend_consumer": {

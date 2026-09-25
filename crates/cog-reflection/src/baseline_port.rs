@@ -1191,6 +1191,7 @@ impl BaselinePorter {
     }
 
     async fn run_cargo(&self, args: &[&str], timeout_secs: u64) -> SFResult<(bool, String)> {
+        let _slot = cog_core::build_gate::acquire("baseline evaluation").await?;
         let cmdline = format!("cargo {}", args.join(" "));
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.args(args)

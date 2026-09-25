@@ -236,6 +236,15 @@ evolution:
     # 未并入的等超过这个时长（默认 30 天）才回收。存活实例的分支每次移植都会
     # 被强推刷新，长期不动即说明所属实例已不在。
     orphanBranchTtlSecs: 2592000
+  # 宿主级构建闸门：同一宿主同时进行的编译 / 打镜像条数上限。构建与集群同宿主，
+  # 多路叠加足以让整机进入换页，此后连"该把这件事报出来"的事件循环也一起退化。
+  # lockDir 必须落在所有构建方共享的 hostPath 上，否则闸门退化成各自为政
+  # （读数里 `cogneva_build_gate_slots` 的 dir 标签就是用来分辨这件事的）。
+  buildGate:
+    enabled: true
+    maxConcurrent: 1
+    waitSecs: 1800
+    lockDir: /opt/cogneva/sandbox/build-gate
   resources:
     requests:
       cpu: 500m
