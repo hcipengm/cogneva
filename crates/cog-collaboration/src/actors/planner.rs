@@ -171,7 +171,17 @@ impl PlannerActor {
 
         // Inject historical decomposition patterns if knowledge backend is wired.
         if let Some(ref k) = self.knowledge {
-            match k.retrieve_similar_decompositions(goal, 3).await {
+            // The class, not the goal, is what the entries are keyed on, and it
+            // is read from the goal's own carrier: the decomposition loop hands
+            // the planner a synthetic task that holds nothing but the goal text,
+            // so a class taken from this task's type would name the loop instead
+            // of the work and aggregate every goal under one row.
+            let class = cog_core::GoalClass::of(task);
+            crate::observable::global_observable().record_goal_class_source(class.source.as_str());
+            match k
+                .retrieve_similar_decompositions(&class.value, goal, 3)
+                .await
+            {
                 Ok(patterns) if !patterns.is_empty() => {
                     ctx["historical_decompositions"] = serde_json::json!(patterns);
                 }

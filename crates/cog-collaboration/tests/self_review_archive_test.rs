@@ -277,6 +277,7 @@ impl KnowledgeBackend for MockKnowledgeBackend {
 
     async fn retrieve_similar_decompositions(
         &self,
+        _goal_class: &str,
         _goal: &str,
         _top_k: usize,
     ) -> cog_core::SFResult<Vec<TaskDecompositionPattern>> {
@@ -310,6 +311,14 @@ impl KnowledgeBackend for MockKnowledgeBackend {
     async fn archive_execution(&self, task: &Task, result: &TaskResult) -> cog_core::SFResult<()> {
         assert!(result.success, "only successful results should be archived");
         self.archived.lock().unwrap().push(task.id.clone());
+        Ok(())
+    }
+
+    async fn archive_decomposition(
+        &self,
+        _task: &Task,
+        _sub_task_types: &[String],
+    ) -> cog_core::SFResult<()> {
         Ok(())
     }
 }

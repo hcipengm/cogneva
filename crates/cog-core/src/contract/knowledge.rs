@@ -15,13 +15,26 @@ pub struct KnowledgeEntry {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Historical pattern of how a goal was decomposed into tasks.
+/// Historical pattern of how goals of one class were decomposed into tasks.
+///
+/// One per class, holding the newest decomposition and the aggregate of the
+/// ones before it, like [`ImplementationExample`] holds one per task type. A
+/// row per planning run would grow the namespace with the work while every
+/// query kept returning the same shape of answer, and the class is what the
+/// store can match on: it compares a query against an entry's name and key as
+/// substrings, and a goal is free text no key of another goal contains.
+///
+/// `avg_sub_task_count` is the mean width of the recorded decompositions — the
+/// one per-run quantity the archive observes. It is deliberately not a success
+/// rate: the archive runs when a task ends, and a run that delivered no
+/// sub-tasks is not a failed decomposition but the absence of one, so a rate
+/// over "recorded runs" could only ever read 1.0.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskDecompositionPattern {
     pub pattern_id: String,
     pub goal_summary: String,
     pub task_types: Vec<String>,
-    pub avg_success_rate: f32,
+    pub avg_sub_task_count: f32,
     pub used_count: u64,
     pub last_used: DateTime<Utc>,
 }
@@ -90,8 +103,20 @@ pub trait KnowledgeBackend: Send + Sync {
     ) -> SFResult<Vec<KnowledgeEntry>>;
 
     /// Retrieve historical task decomposition patterns (for Planner meta-tasks).
+    ///
+    /// `goal_class` is what the entries are keyed and matched on; `goal` ranks
+    /// the matches that come back. As with
+    /// [`Self::retrieve_similar_implementations`], the store matches a query as
+    /// a substring of an entry's name or key and has no scoring of its own, so
+    /// a query built from the goal text — free text, matched against keys that
+    /// name a class — would answer "no prior decomposition" for every goal and
+    /// answer it the same way for a namespace nothing was ever written to.
+    ///
+    /// An empty result therefore means this class has no recorded
+    /// decomposition, not that a match was missed.
     async fn retrieve_similar_decompositions(
         &self,
+        goal_class: &str,
         goal: &str,
         top_k: usize,
     ) -> SFResult<Vec<TaskDecompositionPattern>>;
@@ -138,4 +163,18 @@ pub trait KnowledgeBackend: Send + Sync {
     /// makes an entry findable is derived here rather than by a caller that
     /// would have to guess the query it has to match.
     async fn archive_execution(&self, task: &Task, result: &crate::TaskResult) -> SFResult<()>;
+
+    /// Archive a decomposition a planning run delivered, for the class the goal
+    /// belongs to.
+    ///
+    /// Separate from [`Self::archive_execution`] because the deliverable is not
+    /// in the task result: a decomposition is the sub-task list a plan produced,
+    /// and only the caller holding that plan can say what it was. The class is
+    /// read from the task the goal belongs to, so the key this builds is the one
+    /// [`Self::retrieve_similar_decompositions`] queries with.
+    ///
+    /// A run that delivered no sub-tasks records nothing: the observation is the
+    /// decomposition, and a row is a statement about the decompositions that
+    /// happened.
+    async fn archive_decomposition(&self, task: &Task, sub_task_types: &[String]) -> SFResult<()>;
 }

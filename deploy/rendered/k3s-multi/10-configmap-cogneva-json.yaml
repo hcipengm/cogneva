@@ -596,6 +596,15 @@ data:
               "summary": "A declared failure class is being announced while its series stays at zero, so the classification is being lost between the producer and the termination record; the class label names which one"
             },
             {
+              "name": "goal_class_not_carried",
+              "promql": "increase(collab_goal_class_source_total{source=\"host_type\"}[6h])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The planner read {value} batch(es) of similar decompositions in the last 6h under the type of whatever task happened to hold the goal, not under the class the goal was submitted with. Every production caller re-hosts a goal onto a synthetic planning task, so that host type names the loop rather than the work: all goals of all classes then collapse onto one row and the retrieval keeps answering with something plausible, which is why nothing else shows this. Usual cause: a re-hosting caller stopped carrying `goal_class` along with the goal"
+            },
+            {
               "name": "self_evolution_yields_no_change",
               "promql": "increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|submit_failed\"}[6h])",
               "condition": {

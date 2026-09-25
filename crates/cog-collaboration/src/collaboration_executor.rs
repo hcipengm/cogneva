@@ -514,7 +514,7 @@ impl CollaborationExecutor {
                 task.id.clone(),
                 SquadConfig {
                     goal,
-                    context: task.input.clone(),
+                    context: Self::goal_context(task),
                     pge_mode: crate::profile::PgeMode::PlanOnly,
                     max_retries: task.max_retries,
                     profile: Some(profile),
@@ -538,6 +538,7 @@ impl CollaborationExecutor {
         info!(task_id=%task.id, "Collaboration decomposition succeeded");
         let atomic_tasks = Self::extract_atomic_tasks(&result);
         let score = Self::extract_score(&result);
+        let sub_task_types = Self::sub_task_types(&atomic_tasks);
 
         let output = serde_json::json!({
             "atomic_tasks": atomic_tasks,
@@ -554,6 +555,7 @@ impl CollaborationExecutor {
             metadata,
         };
         self.archive_execution(task, &task_result);
+        self.archive_decomposition(task, sub_task_types);
         Ok(task_result)
     }
 
@@ -640,7 +642,7 @@ impl CollaborationExecutor {
             squad_executor = squad_executor.with_local_repair_max(max);
         }
 
-        let mut context = task.input.clone();
+        let mut context = Self::goal_context(task);
         if is_self_evolution {
             context = Self::build_self_evolution_context(context, &goal);
         }
@@ -781,7 +783,15 @@ impl CollaborationExecutor {
             output,
             metadata,
         };
+        // The pipeline's plan is a decomposition too when it carries sub-tasks:
+        // which topology ran says nothing about whether the goal was split. A
+        // plan without them — the shape self-evolution runs have — passes an
+        // empty list, which the archive does not record.
         self.archive_execution(task, &task_result);
+        self.archive_decomposition(
+            task,
+            Self::sub_task_types(&Self::extract_atomic_tasks(&result)),
+        );
         Ok(task_result)
     }
 
@@ -799,6 +809,43 @@ impl CollaborationExecutor {
                 tracing::warn!(task_id = %task.id, error = %e, "Failed to archive execution");
             }
         });
+    }
+
+    /// Archive a delivered decomposition into the KnowledgeBackend in the
+    /// background, like [`Self::archive_execution`] and for the same reason:
+    /// what the run produced is already in hand, and a knowledge write must
+    /// never decide whether the task is done.
+    fn archive_decomposition(&self, task: &Task, sub_task_types: Vec<String>) {
+        let Some(ref kb) = self.knowledge_backend else {
+            return;
+        };
+        if sub_task_types.is_empty() {
+            // Nothing to say about how this class of goal is split. Recording it
+            // would put a row in the namespace for a run that decomposed nothing.
+            return;
+        }
+        let kb = kb.clone();
+        let task = task.clone();
+        tokio::spawn(async move {
+            if let Err(e) = kb.archive_decomposition(&task, &sub_task_types).await {
+                tracing::warn!(task_id = %task.id, error = %e, "Failed to archive decomposition");
+            }
+        });
+    }
+
+    /// The task input, plus the class of the goal it carries.
+    ///
+    /// The class has to travel with the goal because the pipeline re-hosts the
+    /// goal on tasks of its own making: the decomposition loop plans a synthetic
+    /// task whose only job is to hold the goal text, and that task's type names
+    /// the loop, not the work. A reader that falls back to the host's type still
+    /// gets an answer — under a class that says nothing — so the field is
+    /// written here, where the goal is read off its original carrier.
+    fn goal_context(task: &Task) -> serde_json::Value {
+        let mut context = task.input.clone();
+        context[cog_core::GoalClass::INPUT_FIELD] =
+            serde_json::json!(cog_core::GoalClass::of(task).value);
+        context
     }
 
     fn pge_mode_str(mode: &crate::profile::PgeMode) -> String {
@@ -989,6 +1036,18 @@ impl CollaborationExecutor {
             }
         }
         tasks
+    }
+
+    /// The sub-task types a decomposition produced, as the namespace records
+    /// them. The atomic list is the platform's own reading of "what this goal
+    /// was split into", so the pattern is derived from it rather than from the
+    /// plan JSON a second time.
+    fn sub_task_types(atomic_tasks: &[AtomicTask]) -> Vec<String> {
+        atomic_tasks
+            .iter()
+            .filter_map(|task| task.skill_id.clone())
+            .filter(|task_type| !task_type.is_empty())
+            .collect()
     }
 
     fn task_spec_to_atomic(spec: &crate::TaskSpec) -> AtomicTask {

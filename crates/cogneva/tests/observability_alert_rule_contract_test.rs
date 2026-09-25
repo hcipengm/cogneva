@@ -164,6 +164,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-collaboration/src/observable.rs",
     ),
     (
+        "collab_goal_class_source_total",
+        "crates/cog-collaboration/src/observable.rs",
+    ),
+    (
         "collab_route_decisions_total",
         "crates/cog-collaboration/src/observable.rs",
     ),

@@ -110,6 +110,68 @@ fn advance_count(prior: SFResult<Option<SchemaEntry>>) -> Option<u64> {
     }
 }
 
+/// The row a delivered decomposition produces from the one already held.
+///
+/// Separated from the read so the aggregate can be exercised without a store.
+/// `None` means the row already held could not be read back — either the read
+/// failed or its properties are not a pattern any more. Both leave the old row
+/// standing: the count and the mean it holds are part of what the row states,
+/// so a refresh computed from an unreadable prior would replace a real
+/// aggregate with an invented one, which is a worse answer than a stale one.
+fn fold_decomposition(
+    prior: SFResult<Option<SchemaEntry>>,
+    pattern_id: &str,
+    goal_summary: &str,
+    delivered: &[String],
+) -> Option<TaskDecompositionPattern> {
+    let (used_count, avg_sub_task_count, mut task_types, prior_goal) = match prior {
+        Err(e) => {
+            tracing::warn!("not refreshing decomposition {pattern_id}: {e}");
+            return None;
+        }
+        Ok(None) => (0_u64, 0.0_f32, Vec::new(), String::new()),
+        Ok(Some(entry)) => {
+            match serde_json::from_value::<TaskDecompositionPattern>(entry.properties) {
+                Ok(pattern) => (
+                    pattern.used_count,
+                    pattern.avg_sub_task_count,
+                    pattern.task_types,
+                    pattern.goal_summary,
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        "not refreshing decomposition {pattern_id}: held row is unreadable: {e}"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
+    task_types.extend(delivered.iter().cloned());
+    task_types.sort();
+    task_types.dedup();
+
+    let observations = used_count.saturating_add(1) as f32;
+    let avg_sub_task_count =
+        (avg_sub_task_count * used_count as f32 + delivered.len() as f32) / observations;
+
+    Some(TaskDecompositionPattern {
+        pattern_id: pattern_id.to_string(),
+        // A goal of this class was recorded; a row with an empty summary would
+        // read as "a decomposition of nothing", which is not what happened.
+        goal_summary: if goal_summary.is_empty() {
+            prior_goal
+        } else {
+            goal_summary.to_string()
+        },
+        task_types,
+        avg_sub_task_count,
+        used_count: used_count.saturating_add(1),
+        last_used: chrono::Utc::now(),
+    })
+}
+
 /// The leading `SUMMARY_MAX_CHARS` characters of `text`, never splitting one.
 fn clip(text: &str) -> String {
     if text.chars().count() <= SUMMARY_MAX_CHARS {
@@ -223,6 +285,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
 
     async fn retrieve_similar_decompositions(
         &self,
+        goal_class: &str,
         goal: &str,
         top_k: usize,
     ) -> SFResult<Vec<TaskDecompositionPattern>> {
@@ -230,13 +293,23 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             return Ok(Vec::new());
         };
 
-        let results = memory.search_schema(NS_DECOMPOSITION, goal, top_k).await?;
-        let patterns: Vec<TaskDecompositionPattern> = results
+        // Same shape as the implementation retrieval, for the same reason: the
+        // query has to be the dimension the rows are keyed on, and the goal is
+        // free text that ranks what came back rather than a string any key
+        // contains.
+        let results = memory
+            .search_schema(NS_DECOMPOSITION, goal_class, scan_window(top_k))
+            .await?;
+        let mut patterns: Vec<TaskDecompositionPattern> = results
             .into_iter()
             .filter_map(|r| {
                 serde_json::from_value::<TaskDecompositionPattern>(r.entry.properties.clone()).ok()
             })
             .collect();
+        patterns.sort_by(|a, b| {
+            shared_terms(goal, &b.goal_summary).cmp(&shared_terms(goal, &a.goal_summary))
+        });
+        patterns.truncate(top_k);
         Ok(patterns)
     }
 
@@ -317,7 +390,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         };
 
         let record_id = format!("exec:{}:{}", task.id, chrono::Utc::now().timestamp_millis());
-        let task_type = format!("{:?}", task.task_type);
+        let task_type = task.task_type.retrieval_class();
         let result_summary = serde_json::to_string(&result.output)
             .map(|output| clip(&output))
             .unwrap_or_default();
@@ -413,6 +486,74 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             .await;
         }
 
+        Ok(())
+    }
+
+    async fn archive_decomposition(&self, task: &Task, sub_task_types: &[String]) -> SFResult<()> {
+        let Some(ref memory) = self.memory else {
+            return Ok(());
+        };
+
+        // A plan without sub-tasks is not a narrow decomposition, it is no
+        // decomposition: counting it would put a row in the namespace for a run
+        // that has nothing to say about how goals of this class get split.
+        let delivered: Vec<String> = {
+            let mut types: Vec<String> = sub_task_types
+                .iter()
+                .filter(|task_type| !task_type.is_empty())
+                .cloned()
+                .collect();
+            types.sort();
+            types.dedup();
+            types
+        };
+        if delivered.is_empty() {
+            tracing::warn!(
+                task_id = %task.id,
+                "decomposition archived with no sub-task types; nothing to record"
+            );
+            return Ok(());
+        }
+
+        // The class comes from the goal's own carrier, through the same reader
+        // the Planner queries with: deriving it here from the task type alone
+        // would build a key under one spelling and query it under another the
+        // day a caller re-hosts the goal.
+        let class = cog_core::GoalClass::of(task).value;
+        let key = format!("decomposition:{class}");
+        let goal_summary = task
+            .input
+            .get("goal")
+            .and_then(|goal| goal.as_str())
+            .map(clip)
+            .unwrap_or_default();
+        let id = cog_core::schema_entry_id(NS_DECOMPOSITION, SchemaKind::Learning, &key);
+
+        let Some(pattern) = fold_decomposition(
+            memory.get_schema(NS_DECOMPOSITION, &id).await,
+            &id,
+            &goal_summary,
+            &delivered,
+        ) else {
+            return Ok(());
+        };
+
+        let properties = match serde_json::to_value(&pattern) {
+            Ok(properties) => properties,
+            Err(e) => {
+                tracing::warn!("failed to serialize decomposition pattern: {}", e);
+                return Ok(());
+            }
+        };
+        self.upsert(
+            memory,
+            NS_DECOMPOSITION,
+            SchemaKind::Learning,
+            &key,
+            properties,
+            pattern.used_count,
+        )
+        .await;
         Ok(())
     }
 }
@@ -571,7 +712,7 @@ impl UnifiedKnowledgeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::{WikiDocument, WikiSearchResult};
+    use cog_core::{SFError, WikiDocument, WikiSearchResult};
 
     /// Wiki-only mock: returns three documents with distinct scores.
     struct MockWiki;
@@ -670,7 +811,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(backend
-            .retrieve_similar_decompositions("goal", 5)
+            .retrieve_similar_decompositions("class", "goal", 5)
             .await
             .unwrap()
             .is_empty());
@@ -738,5 +879,90 @@ mod tests {
         }
         assert!(scan_window(0) > 0, "top_k=0 也要能取到候选再排序");
         assert_eq!(scan_window(usize::MAX), 256, "溢出不得变成无界扫描");
+    }
+
+    fn held_pattern(goal_summary: &str, task_types: &[&str], avg: f32, used: u64) -> SchemaEntry {
+        let key = "decomposition:Custom(\"x\")";
+        let mut entry = SchemaEntry::new(
+            "schema-id",
+            NS_DECOMPOSITION,
+            SchemaKind::Learning,
+            key,
+            key,
+            SourceRef::new("raw", "test"),
+        );
+        entry.properties = serde_json::to_value(TaskDecompositionPattern {
+            pattern_id: "schema-id".into(),
+            goal_summary: goal_summary.into(),
+            task_types: task_types.iter().map(|t| t.to_string()).collect(),
+            avg_sub_task_count: avg,
+            used_count: used,
+            last_used: chrono::Utc::now(),
+        })
+        .unwrap();
+        entry
+    }
+
+    /// The first decomposition of a class starts the row it will be read from.
+    #[test]
+    fn the_first_decomposition_opens_the_row() {
+        let delivered = vec!["generate".to_string(), "evaluate".to_string()];
+        let pattern = fold_decomposition(Ok(None), "id", "fix the build", &delivered).unwrap();
+
+        assert_eq!(pattern.used_count, 1);
+        assert_eq!(pattern.task_types, vec!["evaluate", "generate"]);
+        assert_eq!(pattern.avg_sub_task_count, 2.0);
+        assert_eq!(pattern.goal_summary, "fix the build");
+    }
+
+    /// The row aggregates: the count moves, the mean folds the new width in, and
+    /// the types of both runs stay, because a class of goals is split in more
+    /// than one way.
+    #[test]
+    fn a_second_decomposition_carries_the_aggregate_forward() {
+        let prior = held_pattern("an older goal", &["generate"], 1.0, 3);
+        let delivered = vec!["generate".to_string(), "review".to_string()];
+        let pattern =
+            fold_decomposition(Ok(Some(prior)), "id", "a newer goal", &delivered).unwrap();
+
+        assert_eq!(pattern.used_count, 4);
+        assert_eq!(pattern.task_types, vec!["generate", "review"]);
+        assert_eq!(
+            pattern.avg_sub_task_count, 1.25,
+            "(1.0 * 3 + 2) / 4 — the mean is over recorded runs, not over the newest one"
+        );
+        assert_eq!(pattern.goal_summary, "a newer goal");
+    }
+
+    /// A row whose prior could not be read is left alone: the count and the mean
+    /// it holds are part of what it states, and a refresh computed from a missing
+    /// prior would replace a real aggregate with an invented one.
+    #[test]
+    fn an_unreadable_prior_leaves_the_row_standing() {
+        let delivered = vec!["generate".to_string()];
+        assert!(fold_decomposition(
+            Err(SFError::Agent("store down".into())),
+            "id",
+            "goal",
+            &delivered
+        )
+        .is_none());
+
+        let mut corrupt = held_pattern("g", &["generate"], 1.0, 2);
+        corrupt.properties = serde_json::json!({"not": "a pattern"});
+        assert!(fold_decomposition(Ok(Some(corrupt)), "id", "goal", &delivered).is_none());
+    }
+
+    /// A goal that cannot be read off the task leaves the summary it already had
+    /// rather than blanking the row: an empty summary reads as "a decomposition of
+    /// nothing".
+    #[test]
+    fn a_missing_goal_keeps_the_summary_the_row_had() {
+        let prior = held_pattern("the goal it was recorded with", &["generate"], 1.0, 1);
+        let delivered = vec!["generate".to_string()];
+        let pattern = fold_decomposition(Ok(Some(prior)), "id", "", &delivered).unwrap();
+
+        assert_eq!(pattern.goal_summary, "the goal it was recorded with");
+        assert_eq!(pattern.used_count, 2);
     }
 }

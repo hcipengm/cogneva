@@ -163,6 +163,86 @@ pub enum TaskType {
     Custom(String),
 }
 
+impl TaskType {
+    /// The spelling a retrieval keys its rows on and builds its query from.
+    ///
+    /// One spelling, in one place, because the write side derives the key from
+    /// it and the read side derives the query from it: two spellings of the
+    /// same type are two strings that have to stay equal, and the store
+    /// matches a query as a substring of a key, so the day they diverge the
+    /// namespace reads back empty with every row still sitting in it.
+    pub fn retrieval_class(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+/// Where a goal's class was read from.
+///
+/// Kept apart rather than folded into the class itself: a class carried with
+/// the goal and a class taken from whatever task happens to hold it are two
+/// different pieces of evidence about the same string, and the second one is
+/// the shape a missing producer takes — the retrieval still answers, under a
+/// class that names the run instead of the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GoalClassSource {
+    /// The goal carried it: whoever re-hosted the goal named the class.
+    Carried,
+    /// The class is the host task's own type.
+    HostType,
+}
+
+impl GoalClassSource {
+    /// The label this source is published under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GoalClassSource::Carried => "carried",
+            GoalClassSource::HostType => "host_type",
+        }
+    }
+
+    /// Both sources, so a caller publishing them can publish the empty cell
+    /// too: a source nothing uses and a source that stopped being used have to
+    /// read differently.
+    pub const ALL: [GoalClassSource; 2] = [GoalClassSource::Carried, GoalClassSource::HostType];
+}
+
+/// The class a goal is retrievable under.
+///
+/// A goal outlives the task that carried it: the decomposition loop plans it
+/// on a synthetic task whose only job is to hold the goal text, and that task's
+/// own type says nothing about the work. So the class travels with the goal
+/// under the `goal_class` input field — the same channel the goal text itself
+/// uses — and a task that does not carry one is the goal's original host, whose
+/// own type is the class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalClass {
+    pub value: String,
+    pub source: GoalClassSource,
+}
+
+impl GoalClass {
+    /// The field a re-hosting caller writes the class into.
+    pub const INPUT_FIELD: &'static str = "goal_class";
+
+    pub fn of(task: &Task) -> Self {
+        match task
+            .input
+            .get(Self::INPUT_FIELD)
+            .and_then(|v| v.as_str())
+            .filter(|class| !class.is_empty())
+        {
+            Some(class) => Self {
+                value: class.to_string(),
+                source: GoalClassSource::Carried,
+            },
+            None => Self {
+                value: task.task_type.retrieval_class(),
+                source: GoalClassSource::HostType,
+            },
+        }
+    }
+}
+
 /// Which entry point put a self-evolution task into the main flow.
 ///
 /// Bounded on purpose. A producer spells its task kind as a free-form string —

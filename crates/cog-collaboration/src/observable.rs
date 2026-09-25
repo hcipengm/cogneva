@@ -68,6 +68,12 @@ pub struct CollaborationObservable {
     /// a declaration no caller sends is visible as a cell that never moves
     /// rather than as an inference from reading the tiering's source.
     declaration_inputs: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Where the class a decomposition was retrieved under came from (carried
+    /// with the goal, or the host task's own type). The two are the same string
+    /// only as long as every caller that re-hosts a goal carries the class
+    /// along; when one stops, the rows still come back and only this face says
+    /// they now name the run instead of the work.
+    goal_class_sources: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -139,6 +145,15 @@ impl CollaborationObservable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry(input.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record where one planner's goal class came from.
+    pub fn record_goal_class_source(&self, source: &str) {
+        let mut map = self
+            .goal_class_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(source.to_string()).or_insert(0) += 1;
     }
 
     /// 记一次分类声明（产生端调用）。临界区只有一次 map 插入，同步加锁
@@ -251,6 +266,23 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("collab_declaration_inputs_total", count as f64)
                         .with_label("input", input.as_str()),
+                );
+            }
+
+            // Which of the two readings the planner's goal class came from.
+            // Both cells are published: a class always carried and a class
+            // never carried have to look different, and the second is what a
+            // forgotten producer of the field looks like.
+            let sources = self
+                .goal_class_sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for source in cog_core::GoalClassSource::ALL {
+                let count = sources.get(source.as_str()).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("collab_goal_class_source_total", count as f64)
+                        .with_label("source", source.as_str()),
                 );
             }
 
