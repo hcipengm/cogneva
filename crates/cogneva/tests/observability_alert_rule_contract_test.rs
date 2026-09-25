@@ -52,6 +52,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-gateway/src/lib.rs",
     ),
     (
+        "cogneva_metric_held_unreadable",
+        "crates/cog-gateway/src/lib.rs",
+    ),
+    (
         "cogneva_process_zombies",
         "crates/cog-observability/src/process_zombies.rs",
     ),

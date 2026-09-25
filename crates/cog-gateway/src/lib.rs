@@ -1210,17 +1210,22 @@ fn metric_help(help: &[(&str, &str)], name: &str) -> String {
 /// the retirement take effect at the moment the new binary serves, and keeps a
 /// retired series out of the exposition even where no deployment ever runs the
 /// release.
+///
+/// Answers whether the names are the backend's own or the described fallback,
+/// because the caller's judgement against the build's registry is only about
+/// the store when they are: a difference computed over the fallback names would
+/// be a fact about this file, not about the store.
 async fn listed_metric_names(
     backend: &dyn cog_core::MetricsBackend,
     metric_type: cog_core::MetricType,
     help: &[(&str, &str)],
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     match backend.list_metric_names(metric_type).await {
         Ok(mut names) => {
             names.retain(|name| !cog_core::is_retired_metric(name));
             names.sort_unstable();
             names.dedup();
-            names
+            (names, true)
         }
         Err(e) => {
             tracing::warn!(
@@ -1228,7 +1233,10 @@ async fn listed_metric_names(
                 metric_type.as_str(),
                 e
             );
-            help.iter().map(|(name, _)| (*name).to_string()).collect()
+            (
+                help.iter().map(|(name, _)| (*name).to_string()).collect(),
+                false,
+            )
         }
     }
 }
@@ -1255,7 +1263,28 @@ async fn listed_metric_names(
 ///
 /// Retired names never reach here: [`listed_metric_names`] has already dropped
 /// them, which is the state a held-but-unwritten series is supposed to end in.
-fn render_unproduced_series(held: &[String]) -> String {
+///
+/// A reading whose healthy answer is silence has to say which silence it is, so
+/// this one carries its own input failure. When the backend could not be asked
+/// — `read` false, the held names are the described fallback — the difference
+/// would be computed against this file's own list and would come out empty
+/// whatever the store holds. That empty is not an answer about the store, so
+/// the difference is not reported at all: what is published instead says the
+/// store was not read. Same treatment either way for the flag itself, one
+/// series, because "the check ran and found nothing" and "the check could not
+/// run" must never render identically.
+fn render_held_series_readings(held: &[String], read: bool) -> String {
+    if !read {
+        return format!(
+            "\n# HELP {name} The store's held series could not be enumerated this scrape, so the \
+             reading that compares them against this build's registry did not run — its absence \
+             says nothing about whether any series is left without a producer\n\
+             # TYPE {name} gauge\n\
+             {name} 1\n",
+            name = UNREADABLE_HELD_METRIC
+        );
+    }
+
     let unproduced: BTreeSet<&str> = held
         .iter()
         .map(String::as_str)
@@ -1280,13 +1309,20 @@ fn render_unproduced_series(held: &[String]) -> String {
     out
 }
 
-/// The series name this reading is published under.
+/// The series name the held-out reading is published under.
 ///
 /// It is declared here rather than in the registry: the reading is rendered
 /// into the scrape body, and a name that only ever reaches the store through
 /// `record_*` has no business being in a list of writable names — the registry's
 /// completeness is what the reading itself is computed from.
 pub const UNPRODUCED_SERIES_METRIC: &str = "cogneva_metric_held_without_producer";
+
+/// The series name that says the reading above could not be computed.
+///
+/// Declared here for the same reason, and separate from it for the opposite
+/// one: a reader has to be able to tell an empty answer from a missing one, and
+/// one series cannot carry both.
+pub const UNREADABLE_HELD_METRIC: &str = "cogneva_metric_held_unreadable";
 
 /// A label value with the three characters the text format reserves escaped.
 ///
@@ -1317,6 +1353,7 @@ fn escape_label_value(value: &str) -> String {
 async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     let mut body = String::new();
     let mut held: Vec<String> = Vec::new();
+    let mut read_ok = true;
 
     // Nothing here is read over a window. Each kind is read as the observation
     // state a scrape needs: counters and histograms as their cumulations, so
@@ -1325,7 +1362,10 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     // a reader looks is the reader's decision — Prometheus holds one in its own
     // scrape interval — and a window chosen here would be this exporter making
     // that decision for every reader at once.
-    for name in listed_metric_names(mb, cog_core::MetricType::Counter, COUNTER_HELP).await {
+    let (counter_names, counter_read) =
+        listed_metric_names(mb, cog_core::MetricType::Counter, COUNTER_HELP).await;
+    read_ok &= counter_read;
+    for name in counter_names {
         held.push(name.clone());
         match mb.query_counter_totals(&name).await {
             Ok(samples) => {
@@ -1341,7 +1381,10 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
         }
     }
 
-    for name in listed_metric_names(mb, cog_core::MetricType::Histogram, HISTOGRAM_HELP).await {
+    let (histogram_names, histogram_read) =
+        listed_metric_names(mb, cog_core::MetricType::Histogram, HISTOGRAM_HELP).await;
+    read_ok &= histogram_read;
+    for name in histogram_names {
         held.push(name.clone());
         match mb.query_histogram_totals(&name).await {
             Ok(samples) => {
@@ -1357,7 +1400,10 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
         }
     }
 
-    for name in listed_metric_names(mb, cog_core::MetricType::Gauge, GAUGE_HELP).await {
+    let (gauge_names, gauge_read) =
+        listed_metric_names(mb, cog_core::MetricType::Gauge, GAUGE_HELP).await;
+    read_ok &= gauge_read;
+    for name in gauge_names {
         held.push(name.clone());
         match mb.query_gauge_latest(&name).await {
             Ok(samples) => {
@@ -1373,7 +1419,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
         }
     }
 
-    body.push_str(&render_unproduced_series(&held));
+    body.push_str(&render_held_series_readings(&held, read_ok));
 
     // Declare what the `_total` series mean. The scrape side versions
     // independently of this binary, so the declaration has to travel in the
@@ -3049,6 +3095,10 @@ mod metrics_exposition_tests {
             "没有无产出的序列时，暴露面上不该出现这条读数: {body}"
         );
         assert!(
+            !body.contains(UNREADABLE_HELD_METRIC),
+            "存储读得到时不得报「读不到」——这条读数的缺省态是沉默，不是常驻: {body}"
+        );
+        assert!(
             body.lines().any(|line| {
                 !line.starts_with('#')
                     && line.starts_with(cog_core::metric_names::LLM_POOL_AVAILABLE.as_str())
@@ -3064,7 +3114,7 @@ mod metrics_exposition_tests {
     /// escaping has to hold from this side.
     #[test]
     fn a_held_name_is_escaped_into_a_single_label_value() {
-        let rendered = render_unproduced_series(&["a\"b\nc\\d".to_string()]);
+        let rendered = render_held_series_readings(&["a\"b\nc\\d".to_string()], true);
         let samples: Vec<&str> = rendered
             .lines()
             .filter(|line| line.starts_with(UNPRODUCED_SERIES_METRIC))
@@ -3081,6 +3131,130 @@ mod metrics_exposition_tests {
         );
     }
 
+    /// A backend that cannot enumerate: every other call behaves like the
+    /// in-memory one, so the only difference in the rendered body is the
+    /// reading's input.
+    struct UnreadableBackend(cog_storage::mem::MemoryMetricsBackend);
+
+    #[async_trait::async_trait]
+    impl MetricsBackend for UnreadableBackend {
+        async fn record_gauge(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.0.record_gauge(name, value, labels).await
+        }
+
+        async fn record_counter(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.0.record_counter(name, value, labels).await
+        }
+
+        async fn record_histogram(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.0.record_histogram(name, value, labels).await
+        }
+
+        async fn query_gauge_range(
+            &self,
+            name: &str,
+            start: chrono::DateTime<chrono::Utc>,
+            end: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            self.0.query_gauge_range(name, start, end).await
+        }
+
+        async fn query_gauge_latest(
+            &self,
+            name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            self.0.query_gauge_latest(name).await
+        }
+
+        async fn query_counter_range(
+            &self,
+            name: &str,
+            start: chrono::DateTime<chrono::Utc>,
+            end: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            self.0.query_counter_range(name, start, end).await
+        }
+
+        async fn query_counter_totals(
+            &self,
+            name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            self.0.query_counter_totals(name).await
+        }
+
+        async fn query_histogram_totals(
+            &self,
+            name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::HistogramTotals>> {
+            self.0.query_histogram_totals(name).await
+        }
+
+        async fn query_histogram_range(
+            &self,
+            name: &str,
+            start: chrono::DateTime<chrono::Utc>,
+            end: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            self.0.query_histogram_range(name, start, end).await
+        }
+
+        async fn list_metric_names(
+            &self,
+            _metric_type: cog_core::MetricType,
+        ) -> cog_core::SFResult<Vec<String>> {
+            Err(cog_core::SFError::Internal("store unreachable".into()))
+        }
+
+        async fn health_check(&self) -> cog_core::SFResult<()> {
+            self.0.health_check().await
+        }
+    }
+
+    /// The reading's healthy answer is silence, so a store it could not read
+    /// must not render as that silence. The names it falls back to are this
+    /// file's own list, and a difference against them is a fact about this file
+    /// — reporting it as an empty result would say "nothing is unwritable"
+    /// while the store was never asked.
+    #[tokio::test]
+    async fn a_store_that_cannot_be_read_says_so_instead_of_reporting_nothing() {
+        let inner = cog_storage::mem::MemoryMetricsBackend::new();
+        inner
+            .record_gauge(
+                cog_core::MetricName::for_tests_only("a_producer_that_is_gone"),
+                1.0,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let mb = UnreadableBackend(inner);
+
+        let body = render_backend_metrics(&mb).await;
+
+        assert!(
+            body.contains(&format!("{UNREADABLE_HELD_METRIC} 1")),
+            "读不到存储时暴露面必须自己说读不到: {body}"
+        );
+        assert!(
+            !body.contains(UNPRODUCED_SERIES_METRIC),
+            "读不到存储时不得报出按回退名单算出的差集（那是对本文件的断言）: {body}"
+        );
+    }
+
     /// The reading's own name is not a series any build can write and not one
     /// that has been retired. Being writable would put it in the registry the
     /// reading is computed from, licensing a series nothing produces — the
@@ -3088,14 +3262,16 @@ mod metrics_exposition_tests {
     /// put it in the state the reading's own subjects are supposed to reach.
     #[test]
     fn the_reading_name_is_neither_registered_nor_retired() {
-        assert!(
-            !cog_core::is_registered_metric(UNPRODUCED_SERIES_METRIC),
-            "{UNPRODUCED_SERIES_METRIC} 进了登记表就等于宣称本构建会写它"
-        );
-        assert!(
-            !cog_core::is_retired_metric(UNPRODUCED_SERIES_METRIC),
-            "{UNPRODUCED_SERIES_METRIC} 不是退场的序列，它是这次读数本身"
-        );
+        for name in [UNPRODUCED_SERIES_METRIC, UNREADABLE_HELD_METRIC] {
+            assert!(
+                !cog_core::is_registered_metric(name),
+                "{name} 进了登记表就等于宣称本构建会写它"
+            );
+            assert!(
+                !cog_core::is_retired_metric(name),
+                "{name} 不是退场的序列，它是这次读数本身"
+            );
+        }
     }
 }
 

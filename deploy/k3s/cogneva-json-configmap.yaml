@@ -747,6 +747,15 @@ data:
               },
               "severity": "warning",
               "summary": "A series the metric store holds can be written by no name this build knows, so nothing refreshes it and its last value is served forever: a frozen counter reads downstream as no traffic rather than as a series that is gone. The name label says which one. Retire it if its producer is gone for good, or restore the registration if it was dropped by mistake. A producer that is merely slow does not appear here: the judgement is over the build registry, not over how long ago the rows were written"
+            },
+            {
+              "name": "held_series_check_unreadable",
+              "promql": "cogneva_metric_held_unreadable",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The scrape could not enumerate the series the metric store holds, so the held-without-producer reading did not run this time and its silence means nothing either way. Fix the store's reachability; the reading resumes on its own once the enumeration succeeds"
             }
           ]
         },
