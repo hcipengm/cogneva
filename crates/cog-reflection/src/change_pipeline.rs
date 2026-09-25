@@ -26,6 +26,17 @@ use crate::EvolutionEngine;
 /// on one deployment and rejected on another. Everything listed here is what
 /// it takes to launch the toolchain and find its caches; nothing that
 /// describes a deployment.
+///
+/// A compiler *wrapper* is deliberately not on the list even though it belongs
+/// to neither category. A wrapper is a substitution of the compiler, so what
+/// the verification builds would be whatever the parent process's build
+/// configuration says it is — and a wrapper that only serves the build that
+/// set it does not merely change the answer, it fails outright: a missing
+/// compiler makes every verification fail, so every change is rejected for a
+/// reason that has nothing to do with the change. The pipeline cannot tell a
+/// transparent cache from a substitution, and this is not a place to guess.
+/// Compile speed for a verification comes from the shared target directory
+/// instead, which the pipeline sets itself.
 const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
     "PATH",
     "HOME",
@@ -41,7 +52,6 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
-    "RUSTC_WRAPPER",
     "RUSTFLAGS",
     "SCCACHE_DIR",
     "SSL_CERT_FILE",
@@ -1887,6 +1897,47 @@ index 1111111..2222222 100644
             "产品命名空间的变量不得进入判据进程，实测进了：{keys:?}"
         );
         assert!(!keys.contains(&"PG_PASSWORD"), "部署侧凭证不得进入判据进程");
+    }
+
+    /// 编译器包装器不得进入判据进程，两个方向都钉死：白名单里现在没有，将来加回来
+    /// 也会在第一条断言上红；就算绕过白名单直接 `env` 进来，第二条断言看的是判定进程
+    /// 实际拿到的键。
+    ///
+    /// 病因不是"判定变慢"：包装器换掉的是编译器本身，父进程的构建配置于是决定了判据
+    /// 进程编译出什么。实测过一次真实的失败形态——父进程（覆盖率插桩）设了
+    /// `RUSTC_WRAPPER`，判据进程继承后 cargo 探测编译器即失败（`<wrapper> <rustc> -vV`），
+    /// 变更**从未被编译**就被判为不通过。一个从未被评判的变更被判为不合格，是这套判定
+    /// 面最坏的失效方向：它看起来和"变更确实是坏的"一模一样。
+    ///
+    /// `RUSTC_WORKSPACE_WRAPPER` 一并钉住：它是同一个机制的另一半，漏掉就等于留了
+    /// 一条绕过路径。
+    #[test]
+    fn verification_env_carries_no_compiler_wrapper() {
+        assert!(
+            !VERIFICATION_ENV_PASSTHROUGH
+                .iter()
+                .any(|key| key.ends_with("_WRAPPER")),
+            "编译器包装器不得进白名单（判据必须只依赖变更本身，实测白名单：\
+             {VERIFICATION_ENV_PASSTHROUGH:?}）"
+        );
+
+        let polluted = |key: &str| match key {
+            "PATH" => Some("/usr/local/bin:/usr/bin".to_string()),
+            "RUSTC_WRAPPER" => Some("/home/runner/.cargo/bin/cargo-llvm-cov".to_string()),
+            "RUSTC_WORKSPACE_WRAPPER" => Some("/usr/local/bin/sccache".to_string()),
+            _ => None,
+        };
+        let env = verification_env(polluted, None);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(keys.contains(&"PATH"), "工具链需要 PATH 才能启动");
+        for wrapper in ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"] {
+            assert!(
+                !keys.contains(&wrapper),
+                "{wrapper} 进了判据进程：判定结果会随部署的构建配置变化，\
+                 而只为父进程构建服务的包装器会让判定直接失败"
+            );
+        }
     }
 
     /// 共享 target 目录必须在清空环境后显式补回，否则验证会退回工作树内的
