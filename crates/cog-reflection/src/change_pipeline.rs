@@ -500,6 +500,16 @@ impl ChangePipeline {
 
         let (test_passed, test_output) = match self.run_cargo_test(workdir).await {
             Ok(result) => result,
+            // No slot for the whole wait budget: the tests never ran, so nothing
+            // about the change was judged. This stays an `Err` -- the caller
+            // treats an error as "no verdict yet" and keeps the change, while a
+            // `Refused` retires it. Folding a busy host in here would retire a
+            // sound change for the load the machine happened to be under.
+            Err(e) if e.is_build_slot_refused() => {
+                warn!(change_id = %change.artifact_id, error = %e, "cargo test got no build slot");
+                let _ = self.git_reset_hard(workdir).await;
+                return Err(e);
+            }
             Err(e) => {
                 warn!(change_id = %change.artifact_id, error = %e, "cargo test execution failed");
                 let _ = self.git_reset_hard(workdir).await;
@@ -1020,6 +1030,10 @@ impl ChangePipeline {
     /// problem.
     async fn run_cargo_test(&self, workdir: &Path) -> SFResult<(bool, String)> {
         info!("Running cargo test --workspace");
+        // The heaviest build this host runs, so it is the one the slot exists
+        // for. Bound to a named variable, not `_`: an underscore drops the
+        // permit on the spot and would bound nothing at all.
+        let _slot = cog_core::build_gate::acquire("change verification").await?;
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.args(["test", "--workspace", "--no-fail-fast"])
             .current_dir(workdir)
