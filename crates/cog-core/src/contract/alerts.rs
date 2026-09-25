@@ -294,6 +294,12 @@ pub struct PersistedAlert {
     pub message: String,
     pub labels: serde_json::Value,
     pub fired_at: DateTime<Utc>,
+    /// When the condition was last evaluated and still found true. `fired_at`
+    /// says since when, this says whether anyone is still looking: a consumer
+    /// that only reads the edge cannot tell a condition being confirmed every
+    /// tick from a row whose producer stopped. `None` when the row carries no
+    /// sighting yet.
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 /// Read-side handle over persisted alerts. Published by whichever plugin owns

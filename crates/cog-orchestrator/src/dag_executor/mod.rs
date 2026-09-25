@@ -1519,6 +1519,7 @@ mod orphan_reconciler_tests {
                 message: String::new(),
                 labels: serde_json::json!({"parent_task_id": "orphan-old"}),
                 fired_at: chrono::Utc::now() - chrono::Duration::minutes(10),
+                last_seen_at: Some(chrono::Utc::now()),
             });
         let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
 
@@ -1582,6 +1583,7 @@ mod orphan_reconciler_tests {
                 message: String::new(),
                 labels: serde_json::json!({"parent_task_id": "orphan-new"}),
                 fired_at: chrono::Utc::now(),
+                last_seen_at: Some(chrono::Utc::now()),
             });
         let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
 

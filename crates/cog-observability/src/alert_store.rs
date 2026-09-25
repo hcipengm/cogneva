@@ -81,6 +81,30 @@ fn payload_differs(stored: &StoredAlert, alert: &NewAlert) -> bool {
         || stored.labels != alert.labels
 }
 
+/// What one evaluation writes to an already-firing row.
+///
+/// Pure, so the clock contract is assertable: the liveness clock advances on
+/// every evaluation, the payload clock only when the reading moved. Folding
+/// the two into one statement keyed on `payload_differs` is the regression
+/// this exists to catch — it is silent at runtime, and its symptom (a stale
+/// row that looks exactly like a live one) is the thing the extra clock is
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoChangeWrites {
+    /// Whether the sighting clock moves. True for every evaluation that finds
+    /// the condition still true.
+    pub advance_last_seen: bool,
+    /// Whether the payload and its clock are rewritten.
+    pub rewrite_payload: bool,
+}
+
+fn no_change_writes(stored: &StoredAlert, alert: &NewAlert) -> NoChangeWrites {
+    NoChangeWrites {
+        advance_last_seen: true,
+        rewrite_payload: payload_differs(stored, alert),
+    }
+}
+
 /// One stored alert row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlertRecord {
@@ -94,7 +118,15 @@ pub struct AlertRecord {
     pub labels: Value,
     pub fired_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+    /// When this row's payload last read differently. A clock of the *reading*.
     pub updated_at: DateTime<Utc>,
+    /// When this condition was last evaluated and still found true. A clock of
+    /// the *watcher*, which is why it is not the same field: for a rule whose
+    /// payload is stable the two diverge, and a reader holding only
+    /// `updated_at` cannot tell a condition nobody is looking at any more from
+    /// one being confirmed every tick. `None` only for rows written before the
+    /// column existed, and only until their next evaluation.
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 /// PostgreSQL alert store.
@@ -132,6 +164,15 @@ impl PostgresAlertStore {
         )
         .execute(&self.pool)
         .await?;
+        // Additive migration. Deliberately no backfill from `updated_at`: for
+        // the rules whose payload is stable that value is the firing edge, not
+        // a sighting, and copying it here would manufacture the very
+        // conflation the column exists to end. Rows predating the column read
+        // as "not yet confirmed" and pick up a real value on their next
+        // evaluation, which any firing condition reaches within one tick.
+        sqlx::query("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
+            .execute(&self.pool)
+            .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(state, fired_at DESC)")
             .execute(&self.pool)
             .await?;
@@ -148,6 +189,15 @@ impl PostgresAlertStore {
     /// is history — but has its payload rewritten whenever the new evaluation
     /// reads differently, so an open alert describes the condition now rather
     /// than the moment it started.
+    ///
+    /// Three clocks are maintained, and they answer three different questions:
+    /// `fired_at` when the condition became true, `updated_at` when the row's
+    /// payload last read differently, `last_seen_at` when the condition was
+    /// last seen still true. The first two are history and move rarely; the
+    /// third is the only one that shows whether anything is still looking. A
+    /// single timestamp covering both jobs would leave a stable rule's row
+    /// frozen at its firing edge with no way to tell it from an alert whose
+    /// producer died — the condition reads exactly the same either way.
     pub async fn set_alert(
         &self,
         condition: bool,
@@ -172,8 +222,8 @@ impl PostgresAlertStore {
                     r#"
                     INSERT INTO alerts
                         (id, rule, dedup_key, severity, state, message, labels,
-                         fired_at, resolved_at, updated_at)
-                    VALUES ($1, $2, $3, $4, 'firing', $5, $6, $7, NULL, $7)
+                         fired_at, resolved_at, updated_at, last_seen_at)
+                    VALUES ($1, $2, $3, $4, 'firing', $5, $6, $7, NULL, $7, $7)
                     ON CONFLICT (dedup_key) DO UPDATE SET
                         severity   = EXCLUDED.severity,
                         state      = 'firing',
@@ -181,7 +231,8 @@ impl PostgresAlertStore {
                         labels     = EXCLUDED.labels,
                         fired_at   = EXCLUDED.fired_at,
                         resolved_at = NULL,
-                        updated_at = EXCLUDED.updated_at
+                        updated_at = EXCLUDED.updated_at,
+                        last_seen_at = EXCLUDED.last_seen_at
                     "#,
                 )
                 .bind(uuid::Uuid::new_v4().to_string())
@@ -209,8 +260,22 @@ impl PostgresAlertStore {
             }
             AlertTransition::NoChange => {
                 if let Some(open) = stored.as_ref().filter(|s| s.is_firing()) {
-                    if payload_differs(open, alert) {
-                        let now = Utc::now();
+                    let plan = no_change_writes(open, alert);
+                    let now = Utc::now();
+                    // Unconditional while firing: this is the liveness clock,
+                    // and a clock that only moves when the payload moves is
+                    // not one.
+                    if plan.advance_last_seen {
+                        sqlx::query(
+                            "UPDATE alerts SET last_seen_at = $2 \
+                             WHERE dedup_key = $1 AND state = 'firing'",
+                        )
+                        .bind(&alert.dedup_key)
+                        .bind(now)
+                        .execute(&self.pool)
+                        .await?;
+                    }
+                    if plan.rewrite_payload {
                         sqlx::query(
                             "UPDATE alerts SET severity = $2, message = $3, labels = $4, \
                              updated_at = $5 WHERE dedup_key = $1 AND state = 'firing'",
@@ -233,7 +298,7 @@ impl PostgresAlertStore {
     pub async fn list_active(&self, limit: i64) -> anyhow::Result<Vec<AlertRecord>> {
         let rows = sqlx::query(
             "SELECT id, rule, dedup_key, severity, state, message, labels, \
-             fired_at, resolved_at, updated_at FROM alerts \
+             fired_at, resolved_at, updated_at, last_seen_at FROM alerts \
              WHERE state = 'firing' ORDER BY fired_at DESC LIMIT $1",
         )
         .bind(limit)
@@ -246,7 +311,7 @@ impl PostgresAlertStore {
     pub async fn list_history(&self, limit: i64) -> anyhow::Result<Vec<AlertRecord>> {
         let rows = sqlx::query(
             "SELECT id, rule, dedup_key, severity, state, message, labels, \
-             fired_at, resolved_at, updated_at FROM alerts \
+             fired_at, resolved_at, updated_at, last_seen_at FROM alerts \
              ORDER BY fired_at DESC LIMIT $1",
         )
         .bind(limit)
@@ -268,6 +333,7 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> AlertRecord {
         fired_at: row.get("fired_at"),
         resolved_at: row.get("resolved_at"),
         updated_at: row.get("updated_at"),
+        last_seen_at: row.get("last_seen_at"),
     }
 }
 
@@ -289,6 +355,7 @@ impl cog_core::ActiveAlertSource for PostgresAlertStore {
                     message: r.message,
                     labels: r.labels,
                     fired_at: r.fired_at,
+                    last_seen_at: r.last_seen_at,
                 })
                 .collect(),
             Err(e) => {
@@ -339,6 +406,7 @@ impl cog_core::PersistentAlertSink for PostgresAlertStore {
                     message: r.message,
                     labels: r.labels,
                     fired_at: r.fired_at,
+                    last_seen_at: r.last_seen_at,
                 })
                 .collect(),
             Err(e) => {
@@ -449,5 +517,30 @@ mod tests {
             &open,
             &alert(POOL_MESSAGE, 1_789_744_595, "critical")
         ));
+    }
+
+    /// An unchanged reading still advances the sighting clock. This is the
+    /// whole point of keeping it apart from `updated_at`: for a rule whose
+    /// payload is stable — the stall alert's, whose weekly breakdown only moves
+    /// when a week does — the payload clock sits at the firing edge forever,
+    /// and a reader holding only that cannot tell the row from one whose
+    /// producer died.
+    #[test]
+    fn an_unchanged_reading_still_counts_as_a_sighting() {
+        let open = stored("firing");
+        let writes = no_change_writes(&open, &alert(POOL_MESSAGE, 1_789_744_595, "critical"));
+        assert!(writes.advance_last_seen);
+        assert!(!writes.rewrite_payload);
+    }
+
+    /// A moved reading advances both. The failure this rules out is the
+    /// opposite regression: making the sighting conditional on the payload,
+    /// which leaves the clock frozen for exactly the rules that need it most.
+    #[test]
+    fn a_moved_reading_advances_both_clocks() {
+        let open = stored("firing");
+        let writes = no_change_writes(&open, &alert(POOL_MESSAGE, 1_789_749_020, "critical"));
+        assert!(writes.advance_last_seen);
+        assert!(writes.rewrite_payload);
     }
 }

@@ -2029,6 +2029,7 @@ fn merge_active_alerts(
             task_id: None,
             crew_id: None,
             timestamp: alert.fired_at.to_rfc3339(),
+            last_seen_at: alert.last_seen_at.map(|t| t.to_rfc3339()),
             resolved: false,
             source: "durable",
         });
@@ -2065,6 +2066,10 @@ async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Respon
                     task_id: alert.task_id,
                     crew_id: alert.crew_id,
                     timestamp: alert.timestamp.to_rfc3339(),
+                    // The in-memory store keeps no sighting clock: its entries
+                    // are events pushed by the supervisor, not conditions
+                    // re-evaluated against a store.
+                    last_seen_at: None,
                     resolved: alert.resolved,
                     source: "supervisor",
                 })
@@ -2935,6 +2940,12 @@ mod active_alert_merge_tests {
     use super::*;
 
     fn durable(rule: &str) -> cog_core::PersistedAlert {
+        durable_at(rule, chrono::Utc::now())
+    }
+
+    /// A durable row whose two clocks are set explicitly, so a test can tell
+    /// the edge from the sighting instead of reading one twice.
+    fn durable_at(rule: &str, fired_at: chrono::DateTime<chrono::Utc>) -> cog_core::PersistedAlert {
         cog_core::PersistedAlert {
             rule: rule.to_string(),
             dedup_key: rule.to_string(),
@@ -2942,7 +2953,8 @@ mod active_alert_merge_tests {
             state: "firing".to_string(),
             message: format!("{rule} is firing"),
             labels: serde_json::json!({}),
-            fired_at: chrono::Utc::now(),
+            fired_at,
+            last_seen_at: Some(chrono::Utc::now()),
         }
     }
 
@@ -2956,6 +2968,7 @@ mod active_alert_merge_tests {
             task_id: None,
             crew_id: None,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            last_seen_at: None,
             resolved: false,
             source: "supervisor",
         }
@@ -2980,6 +2993,35 @@ mod active_alert_merge_tests {
     fn a_durable_entry_carries_the_durable_source_label() {
         let merged = merge_active_alerts(vec![], vec![durable("pod_oom_killed")]);
         assert_eq!(merged[0].source, "durable");
+    }
+
+    /// The listing must carry both clocks, each under its own name. A row
+    /// firing since long ago but confirmed a moment ago is an alert someone is
+    /// still watching; the same row with a day-old sighting is one whose
+    /// producer went quiet, and the condition alone cannot say which. Collapsed
+    /// into `timestamp` the two read identically.
+    #[test]
+    fn a_durable_entry_separates_the_firing_edge_from_the_last_sighting() {
+        let fired_at = chrono::Utc::now() - chrono::Duration::hours(6);
+        let merged = merge_active_alerts(vec![], vec![durable_at("promotion_stall", fired_at)]);
+
+        assert_eq!(merged[0].timestamp, fired_at.to_rfc3339());
+        let seen = merged[0]
+            .last_seen_at
+            .as_deref()
+            .expect("durable rows carry a sighting");
+        assert_ne!(seen, merged[0].timestamp);
+        let seen = chrono::DateTime::parse_from_rfc3339(seen).expect("a valid instant");
+        assert!(seen > fired_at, "the sighting is newer than the edge");
+    }
+
+    /// The process-local half has no sighting clock, and says so with `None`
+    /// rather than borrowing the event time, which would claim a confirmation
+    /// nobody made.
+    #[test]
+    fn a_supervisor_entry_reports_no_sighting_rather_than_a_borrowed_one() {
+        let merged = merge_active_alerts(vec![in_memory("agent_unhealthy")], vec![]);
+        assert_eq!(merged[0].last_seen_at, None);
     }
 
     /// The source label survives the merge on the half that stays: the record

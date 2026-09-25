@@ -703,6 +703,7 @@ mod tests {
             message: "m".into(),
             labels: serde_json::json!({}),
             fired_at: Utc::now(),
+            last_seen_at: Some(Utc::now()),
         }
     }
 
