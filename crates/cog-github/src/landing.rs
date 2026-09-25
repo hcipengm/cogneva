@@ -1276,14 +1276,12 @@ fn path_forbidden(path: &str, pattern: &str) -> bool {
 }
 
 /// Changed lines in a unified diff (additions + deletions, headers excluded).
+///
+/// The shared counter, not a local one: the same number decides this policy's
+/// cap and the routing rule that tiers work by declared size, and two counters
+/// would let one change be over the cap here and under it there.
 fn count_changed_lines(diff: &str) -> usize {
-    diff.lines()
-        .filter(|l| {
-            (l.starts_with('+') || l.starts_with('-'))
-                && !l.starts_with("+++")
-                && !l.starts_with("---")
-        })
-        .count()
+    cog_core::count_diff_lines(diff)
 }
 
 /// Escape regex metacharacters so a change id can be embedded in a `git log`

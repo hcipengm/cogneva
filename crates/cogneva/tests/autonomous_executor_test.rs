@@ -578,29 +578,14 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
     }
 }
 
-/// Derive a TaskProfile from a Task for PGE mode selection.
+/// The production profile, not a copy of it.
+///
+/// A copy drifts: this one was written before the profile learned to read a
+/// task's declared change scale, and it would have kept routing on the five old
+/// dimensions while the real rule answered `PgeMode::Direct` for prose-only
+/// goals — a test asserting routing behaviour against a rule nothing runs.
 fn derive_task_profile(task: &cog_core::Task) -> cog_collaboration::TaskProfile {
-    let input_len = task.input.to_string().len() as f64;
-    let dep_count = task.blocked_by.len() as f64;
-
-    cog_collaboration::TaskProfile {
-        novelty: match task.task_type {
-            TaskType::Custom(_) => 0.7,
-            TaskType::WasmSkill | TaskType::Skill => 0.6,
-            _ => 0.3,
-        },
-        risk: (dep_count / 10.0).min(1.0),
-        ambiguity: if input_len < 50.0 {
-            0.8
-        } else if input_len < 200.0 {
-            0.5
-        } else {
-            0.3
-        },
-        dependency_count: (dep_count / 20.0).min(1.0),
-        token_budget: 1.0,
-        historical_success: 1.0,
-    }
+    cog_collaboration::derive_task_profile(task)
 }
 
 // ─── Test 1: Simple goal executes autonomously ───────────────────────

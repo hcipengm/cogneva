@@ -426,6 +426,97 @@ impl SquadExecutor {
                 .await;
         }
 
+        // 声明式范围路径：请求自己说清了要改哪些文件，于是没有 planner 阶段，
+        // 计划由请求的声明充当。生成器与评估器都在，逐条装配与别的路径相同——
+        // 省的是一个阶段，不是 PGE 的判据面。
+        if matches!(squad.config.pge_mode, PgeMode::Direct) {
+            let (Some(manager), Some(llm)) = (agent_manager.as_ref(), llm_provider.as_ref()) else {
+                return RalphVerdict::Unrecoverable {
+                    reason: "AgentManager not available to create the Generator agent".into(),
+                    iterations: 0,
+                    history: Vec::new(),
+                };
+            };
+            let generator = match manager
+                .create_agent(&format!("{}-generator", squad.id), "generator", llm.clone())
+                .await
+            {
+                Ok(agent) => agent,
+                Err(e) => {
+                    tracing::warn!("Failed to create the declared-scope generator agent: {}", e);
+                    return RalphVerdict::Unrecoverable {
+                        reason: format!("Failed to create the Generator agent: {e}"),
+                        iterations: 0,
+                        history: Vec::new(),
+                    };
+                }
+            };
+            let evaluator = match manager
+                .create_agent(&format!("{}-evaluator", squad.id), "evaluator", llm.clone())
+                .await
+            {
+                Ok(agent) => agent,
+                Err(e) => {
+                    tracing::warn!("Failed to create the declared-scope evaluator agent: {}", e);
+                    return RalphVerdict::Unrecoverable {
+                        reason: format!("Failed to create the Evaluator agent: {e}"),
+                        iterations: 0,
+                        history: Vec::new(),
+                    };
+                }
+            };
+            let mut generator_actor = GeneratorActor::new(generator);
+            let mut evaluator_actor = EvaluatorActor::new(evaluator);
+            if let Some(ref kb) = knowledge_backend {
+                generator_actor = generator_actor.with_knowledge(kb.clone());
+                evaluator_actor = evaluator_actor.with_knowledge(kb.clone());
+            }
+            if let Some(ref cfg) = self_review {
+                generator_actor = generator_actor.with_self_review(cfg.clone());
+                evaluator_actor = evaluator_actor.with_self_review(cfg.clone());
+            }
+            if let Some(s) = schema_for("generator") {
+                generator_actor = generator_actor.with_output_schema(s);
+            }
+            if let Some(s) = schema_for("evaluator") {
+                evaluator_actor = evaluator_actor.with_output_schema(s);
+            }
+            if let Some(ref sk) = generator_skill {
+                generator_actor = generator_actor.with_prompt_skill(sk.clone());
+            }
+            if let Some(ref sk) = evaluator_skill {
+                evaluator_actor = evaluator_actor.with_prompt_skill(sk.clone());
+            }
+            // 范围取自已算好的 profile：路由是按它判的，计划就必须按同一个读数
+            // 写，否则"为什么走这条路径"与"计划说了什么"会各自成立却对不上。
+            let scale = squad
+                .config
+                .profile
+                .map(|p| p.declared_scale)
+                .unwrap_or_default();
+            let declared = crate::squad::pge::pipeline::declared_plan(&squad.config.goal, scale);
+            let mut pipeline_config = PgePipelineConfig::default();
+            if squad.config.is_self_evolution {
+                // 与 Pipeline 同一条：自进化任务对延迟敏感，一次尝试交给外层
+                // Ralph 做全局重置就够。
+                pipeline_config.max_retries = 1;
+            }
+            pipeline_config.local_repair_max = deps
+                .local_repair_max
+                .unwrap_or(crate::DEFAULT_LOCAL_REPAIR_MAX);
+            let pipeline = PgePipeline::new(pipeline_config);
+            return ralph
+                .run_declared_scope(
+                    &squad.config.goal,
+                    squad.config.context.clone(),
+                    &pipeline,
+                    &declared,
+                    &generator_actor,
+                    &evaluator_actor,
+                )
+                .await;
+        }
+
         let (planner, generator, evaluator, moderator) = match (agent_manager, llm_provider) {
             (Some(manager), Some(llm)) => {
                 let planner_id = format!("{}-planner", squad.id);
@@ -463,6 +554,13 @@ impl SquadExecutor {
             // 分解在上面的早返回里处理掉了：走到这里必然是有拓扑的模式。
             PgeMode::PlanOnly => RalphVerdict::Unrecoverable {
                 reason: "PlanOnly squads run before the PGE dispatch".into(),
+                iterations: 0,
+                history: Vec::new(),
+            },
+            // 同上：声明式范围也在早返回里跑完了，它不需要下面这套
+            // planner/generator/evaluator 的装配。
+            PgeMode::Direct => RalphVerdict::Unrecoverable {
+                reason: "Declared-scope squads run before the PGE dispatch".into(),
                 iterations: 0,
                 history: Vec::new(),
             },

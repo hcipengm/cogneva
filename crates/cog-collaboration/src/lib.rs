@@ -23,7 +23,10 @@ pub use hierarchy::{
 };
 pub use ipc::{FileSystemIpc, IpcChannel, IpcMessage};
 pub use observable::CollaborationObservable;
-pub use profile::{complexity_score, select_mode, PgeMode, TaskProfile, PIPELINE_SCORE_THRESHOLD};
+pub use profile::{
+    change_tier, complexity_score, declared_scale, derive_task_profile, select_mode, ChangeTier,
+    DeclaredScale, PgeMode, TaskProfile, PIPELINE_SCORE_THRESHOLD,
+};
 pub use squad::pge::{
     parse_evaluation_result, parse_generator_output, parse_planner_output, Artifact, ContextBoard,
     Criterion, EvaluationResult, GeneratorOutput, InMemoryContextBoard, PgePipeline,

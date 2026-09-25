@@ -2,7 +2,9 @@ use cog_core::Agent;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::profile::{complexity_score, select_mode, PgeMode, TaskProfile};
+use crate::profile::{
+    change_tier, complexity_score, select_mode, ChangeTier, DeclaredScale, PgeMode, TaskProfile,
+};
 
 /// ModeSelector Actor — semantic wrapper around a `dyn Agent`.
 ///
@@ -72,6 +74,18 @@ impl ModeSelectorActor {
     ) -> (PgeMode, String) {
         let goal_lower = goal.to_lowercase();
 
+        // --- Stage 0: declared change scale (deterministic) ---
+        // Ahead of the keyword stage on purpose. A word in the goal is weaker
+        // evidence than the files the request names, and this is the only stage
+        // that can tell a change too large for the lightest topology from one
+        // that was merely described in one sentence — the keyword stage reads
+        // the sentence and would down-route the former on a word like "simple".
+        if let Some(profile) = profile {
+            if let Some(result) = Self::declared_scale_verdict(profile.declared_scale) {
+                return result;
+            }
+        }
+
         // --- Stage 1: keyword heuristic (zero cost) ---
         if let Some(result) = Self::keyword_heuristic(&goal_lower) {
             return result;
@@ -135,6 +149,23 @@ impl ModeSelectorActor {
             PgeMode::Roundtable,
             "Default: Roundtable (quality-first when uncertain)".into(),
         )
+    }
+
+    /// What a measured change scale settles on its own, before any word in the
+    /// goal is read. `None` when the request declared nothing readable — the
+    /// keyword and score stages then decide exactly as they did before.
+    fn declared_scale_verdict(scale: DeclaredScale) -> Option<(PgeMode, String)> {
+        let (mode, why) = match change_tier(scale)? {
+            ChangeTier::Shortcut => (
+                PgeMode::Direct,
+                "every file the request names is prose, so its scope is stated",
+            ),
+            ChangeTier::Deep => (
+                PgeMode::Roundtable,
+                "the request declares a change too large for the lightest topology",
+            ),
+        };
+        Some((mode, format!("Declared scale {scale:?} → {mode:?}: {why}")))
     }
 
     /// Zero-cost keyword heuristic.
@@ -322,5 +353,62 @@ impl ModeSelectorActor {
 impl Default for ModeSelectorActor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(declared_scale: DeclaredScale) -> TaskProfile {
+        TaskProfile {
+            declared_scale,
+            ..Default::default()
+        }
+    }
+
+    /// A word in the goal is weaker evidence than the files the request names.
+    /// "simple" used to be enough to send a multi-file rewrite to the lightest
+    /// topology, and the sentence that asks for a big change is often a short
+    /// one — which is exactly the case the keyword stage cannot see.
+    #[tokio::test]
+    async fn a_measured_big_change_is_not_down_routed_by_a_keyword() {
+        let p = profile(DeclaredScale::Measured {
+            files: 6,
+            code_files: 6,
+            lines: None,
+        });
+        let (mode, reason) = ModeSelectorActor::new()
+            .select_mode("simple refactor of the parser", Some(&p), None)
+            .await;
+        assert_eq!(mode, PgeMode::Roundtable);
+        assert!(reason.contains("Declared scale"), "{reason}");
+    }
+
+    /// And the same precedence the other way round: a prose-only edit is not
+    /// sent to a debate because the request said "review".
+    #[tokio::test]
+    async fn a_measured_prose_change_wins_over_a_roundtable_keyword() {
+        let p = profile(DeclaredScale::Measured {
+            files: 1,
+            code_files: 0,
+            lines: None,
+        });
+        let (mode, reason) = ModeSelectorActor::new()
+            .select_mode("review the wording in docs/quickstart.md", Some(&p), None)
+            .await;
+        assert_eq!(mode, PgeMode::Direct);
+        assert!(reason.contains("Declared scale"), "{reason}");
+    }
+
+    /// Nothing measured leaves the stages below exactly as they were.
+    #[tokio::test]
+    async fn an_undeclared_scope_leaves_the_keywords_and_the_score_in_charge() {
+        let p = profile(DeclaredScale::Unknown);
+        let (mode, reason) = ModeSelectorActor::new()
+            .select_mode("summarize the changelog", Some(&p), None)
+            .await;
+        assert_eq!(mode, PgeMode::Pipeline);
+        assert!(reason.contains("Keyword heuristic"), "{reason}");
     }
 }

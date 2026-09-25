@@ -109,6 +109,56 @@ pub struct PgePipeline {
     config: PgePipelineConfig,
 }
 
+/// Where an attempt's plan comes from.
+///
+/// Two shapes, because they are two different facts: a planner works the
+/// request's shape out and can fail to reach its upstream, while a declared scope
+/// is stated by the request and has no upstream to reach. Carrying both in one
+/// `Option` would make "no planner and no declaration" representable, and every
+/// reader would then have to decide for itself what that means.
+pub enum PlanScope<'a> {
+    /// A planner agent writes the plan, once per attempt.
+    Planned(&'a PlannerActor),
+    /// The request states its own scope, so the plan stands for every attempt.
+    Declared(&'a PlannerOutput),
+}
+
+/// The plan a declared scope stands for.
+///
+/// It carries what the request declared and nothing else: no sub-tasks to
+/// decompose and no acceptance criteria of its own, which leaves the evaluator's
+/// generic rubric in charge — the same rubric, and the same deterministic gates,
+/// as a planned run.
+pub fn declared_plan(goal: &str, scale: crate::profile::DeclaredScale) -> PlannerOutput {
+    let (files, code_files, lines) = match scale {
+        crate::profile::DeclaredScale::Measured {
+            files,
+            code_files,
+            lines,
+        } => (files, code_files, lines),
+        crate::profile::DeclaredScale::Unknown => (0, 0, None),
+    };
+    PlannerOutput {
+        summary: format!(
+            "declared scope: {files} file(s) named in the request, {code_files} of them source{}, \
+             no planning stage",
+            match lines {
+                Some(lines) => format!(", {lines} line(s) in the attached diff"),
+                None => String::new(),
+            }
+        ),
+        plan: serde_json::json!({
+            "scope": "declared",
+            "declared_files": files,
+            "declared_source_files": code_files,
+            "declared_lines": lines,
+            "goal": goal,
+        }),
+        sub_tasks: Vec::new(),
+        acceptance_criteria: Vec::new(),
+    }
+}
+
 impl PgePipeline {
     pub fn new(config: PgePipelineConfig) -> Self {
         Self { config }
@@ -172,8 +222,56 @@ impl PgePipeline {
     pub async fn execute_task(
         &self,
         task: &cog_core::Task,
-        _context: serde_json::Value,
+        context: serde_json::Value,
         planner: &PlannerActor,
+        generator: &GeneratorActor,
+        evaluator: &EvaluatorActor,
+    ) -> PgePipelineResult {
+        self.execute(
+            task,
+            context,
+            PlanScope::Planned(planner),
+            generator,
+            evaluator,
+        )
+        .await
+    }
+
+    /// Run the pipeline on a request that declares its own scope: no planner.
+    ///
+    /// The declared plan stands for every attempt. There is no planner output a
+    /// reset could replace — the scope of a request does not change between
+    /// attempts, and a stage that would restate it is the cost this path exists
+    /// to avoid.
+    pub async fn execute_declared_scope(
+        &self,
+        task: &cog_core::Task,
+        context: serde_json::Value,
+        declared_plan: &PlannerOutput,
+        generator: &GeneratorActor,
+        evaluator: &EvaluatorActor,
+    ) -> PgePipelineResult {
+        self.execute(
+            task,
+            context,
+            PlanScope::Declared(declared_plan),
+            generator,
+            evaluator,
+        )
+        .await
+    }
+
+    /// The Pipeline body, told where an attempt's plan comes from.
+    ///
+    /// The plan source is a parameter rather than a flag on the config because it
+    /// decides whether a planner exists at all: a run without one has no planner
+    /// to reach for, and a branch that had to check "is there a planner" on every
+    /// use would leave that answer unenforced everywhere it mattered.
+    async fn execute(
+        &self,
+        task: &cog_core::Task,
+        _context: serde_json::Value,
+        scope: PlanScope<'_>,
         generator: &GeneratorActor,
         evaluator: &EvaluatorActor,
     ) -> PgePipelineResult {
@@ -184,21 +282,27 @@ impl PgePipeline {
         let mut stall = StallDetector::new(self.config.stall_threshold);
 
         for attempt in 1..=max_attempts {
-            // Stage 1: Planner.
-            let plan = planner
-                .plan(
-                    task,
-                    attempt,
-                    last_evaluation.as_ref().map(|e| e.feedback.as_str()),
-                    last_evaluation.as_ref().and_then(|e| e.score),
-                    None,
-                    None,
-                )
-                .await;
+            // Stage 1: Planner — or, on a declared scope, the plan the request
+            // already states.
+            let plan = match scope {
+                PlanScope::Planned(planner) => {
+                    planner
+                        .plan(
+                            task,
+                            attempt,
+                            last_evaluation.as_ref().map(|e| e.feedback.as_str()),
+                            last_evaluation.as_ref().and_then(|e| e.score),
+                            None,
+                            None,
+                        )
+                        .await
+                }
+                PlanScope::Declared(declared) => (*declared).clone(),
+            };
 
             // 计划侧的确定性环境失败：planner 的 prompt 没到上游，重试必然同样
             // 失败。在这里收口，既不白花一次生成，也不把一个空计划当成正常计划
-            // 一路送进评估。
+            // 一路送进评估。（声明式计划没有上游可言，这一分支对它天然不成立。）
             if plan.is_terminal_env_failure() {
                 tracing::warn!(
                     attempt,

@@ -395,6 +395,25 @@ pub fn parse_diff_affected_files(content: &str) -> crate::SFResult<Vec<String>> 
     Ok(files)
 }
 
+/// Changed lines in a unified diff: additions plus deletions, with the `---` /
+/// `+++` file headers excluded.
+///
+/// Pure, and shared by every layer that measures a change against a line budget
+/// — the landing policy's cap and the routing rule that tiers work by declared
+/// size. Two counters would let the same diff be over the cap for one reader and
+/// under it for another, and nothing downstream could tell which reading was the
+/// one that let the change through.
+pub fn count_diff_lines(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|l| {
+            (l.starts_with('+') || l.starts_with('-'))
+                && !l.starts_with("+++")
+                && !l.starts_with("---")
+        })
+        .count()
+}
+
 /// Names a change may not rewrite: the build, deployment and configuration
 /// manifests.
 ///
@@ -1571,6 +1590,28 @@ mod tests {
         }
         assert_eq!(ContributionPolicy::parse("bogus"), None);
         assert_eq!(ContributionPolicy::default(), ContributionPolicy::Auto);
+    }
+
+    /// A diff's size is its content lines, and the file headers are what both
+    /// readers of that number exclude: counting them would put a one-line edit
+    /// at three lines, and a header would then be deciding a line budget.
+    #[test]
+    fn a_diffs_size_counts_content_lines_only() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n\
+                    --- a/src/a.rs\n\
+                    +++ b/src/a.rs\n\
+                    @@ -1,2 +1,2 @@\n\
+                    -old line\n\
+                    +new line\n\
+                    context line\n";
+        assert_eq!(count_diff_lines(diff), 2);
+        assert_eq!(count_diff_lines(""), 0);
+        // A lone `+` or `-` is still a changed line: it is a line the change
+        // rewrites, whatever the model wrote after it.
+        assert_eq!(count_diff_lines("+\n-\n"), 2);
+        // The `\ No newline at end of file` marker belongs to no side and is
+        // not a change.
+        assert_eq!(count_diff_lines("-old\n\\ No newline at end of file\n"), 1);
     }
 
     #[test]

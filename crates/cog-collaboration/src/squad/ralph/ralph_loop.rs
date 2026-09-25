@@ -8,10 +8,10 @@
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::squad::classify::classify;
-use crate::squad::pge::pipeline::PgePipeline;
+use crate::squad::pge::pipeline::{PgePipeline, PlanScope};
 use crate::squad::pge::roundtable::{PgeRoundtable, PgeRoundtableResult};
 use crate::squad::pge::stall::{made_progress, ProgressSignals};
-use crate::squad::pge::types::{EvaluationResult, RoundOutcome, Verdict};
+use crate::squad::pge::types::{EvaluationResult, PlannerOutput, RoundOutcome, Verdict};
 use cog_core::{Task, TaskType};
 use std::sync::Arc;
 
@@ -536,9 +536,55 @@ impl RalphLoop {
     pub async fn run_pipeline(
         &mut self,
         goal: &str,
-        mut context: serde_json::Value,
+        context: serde_json::Value,
         pipeline: &PgePipeline,
         planner: &PlannerActor,
+        generator: &GeneratorActor,
+        evaluator: &EvaluatorActor,
+    ) -> RalphVerdict {
+        self.run_pipeline_scoped(
+            goal,
+            context,
+            pipeline,
+            PlanScope::Planned(planner),
+            generator,
+            evaluator,
+        )
+        .await
+    }
+
+    /// 以 Pipeline 模式运行 Ralph Loop，计划由请求自己声明的范围充当——没有
+    /// planner 阶段。
+    ///
+    /// 外层循环与 [`Self::run_pipeline`] 完全同构：预算、停滞判据、失败分析与
+    /// 全局重置都照旧。省掉的只是一个阶段，不是这套循环本身——声明式范围不需要
+    /// 谁来"重新计划"，所以重置只是再生成一次。
+    pub async fn run_declared_scope(
+        &mut self,
+        goal: &str,
+        context: serde_json::Value,
+        pipeline: &PgePipeline,
+        declared_plan: &PlannerOutput,
+        generator: &GeneratorActor,
+        evaluator: &EvaluatorActor,
+    ) -> RalphVerdict {
+        self.run_pipeline_scoped(
+            goal,
+            context,
+            pipeline,
+            PlanScope::Declared(declared_plan),
+            generator,
+            evaluator,
+        )
+        .await
+    }
+
+    async fn run_pipeline_scoped(
+        &mut self,
+        goal: &str,
+        mut context: serde_json::Value,
+        pipeline: &PgePipeline,
+        scope: PlanScope<'_>,
         generator: &GeneratorActor,
         evaluator: &EvaluatorActor,
     ) -> RalphVerdict {
@@ -565,9 +611,24 @@ impl RalphLoop {
                 TaskType::Custom("ralph_pipeline_goal".into()),
                 input,
             );
-            let pge_result = pipeline
-                .execute_task(&task, context.clone(), planner, generator, evaluator)
-                .await;
+            let pge_result = match scope {
+                PlanScope::Planned(planner) => {
+                    pipeline
+                        .execute_task(&task, context.clone(), planner, generator, evaluator)
+                        .await
+                }
+                PlanScope::Declared(declared) => {
+                    pipeline
+                        .execute_declared_scope(
+                            &task,
+                            context.clone(),
+                            declared,
+                            generator,
+                            evaluator,
+                        )
+                        .await
+                }
+            };
             let passed = matches!(pge_result.final_evaluation.verdict, Verdict::Pass);
             let feedback = pge_result.final_evaluation.feedback.clone();
 
