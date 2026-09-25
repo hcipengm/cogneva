@@ -44,7 +44,7 @@ pub struct FileReport {
     pub size_before: u64,
     /// Bytes dropped from the tail; 0 means the file was left alone.
     pub dropped: u64,
-    /// First interior zero run at or above [`SUSPECTED_INTERIOR_RUN`] that is
+    /// First interior zero run at or above `SUSPECTED_INTERIOR_RUN` that is
     /// followed by non-zero data, as (offset, run length). Reported only.
     pub suspected_interior: Option<(u64, usize)>,
 }
