@@ -20,7 +20,7 @@ mod producer;
 mod promql;
 
 use producer::carries_the_producer;
-use promql::metric_names_in;
+use promql::{metric_names_in, shape_complaints};
 
 const DASHBOARD: &str = "deploy/k3s/observability/manifests/06-grafana-dashboard-configmap.yaml";
 
@@ -209,6 +209,15 @@ const FOREIGN: &[(&str, &str)] = &[
         "container_memory_working_set_bytes",
         "kubelet/cAdvisor 采集",
     ),
+    ("kube_pod_container_resource_limits", "kube-state-metrics"),
+    (
+        "kube_pod_container_status_restarts_total",
+        "kube-state-metrics",
+    ),
+    (
+        "kube_pod_container_status_last_terminated_reason",
+        "kube-state-metrics",
+    ),
     ("ALERTS", "Prometheus 由告警规则合成的序列"),
 ];
 
@@ -231,6 +240,39 @@ fn is_log_query(expr: &str) -> bool {
     expr.trim_start().starts_with('{')
 }
 
+/// The decoded value of one string field on a line of the manifest.
+///
+/// The dashboard is JSON inside a YAML block scalar, so a label value in it
+/// arrives as `\"firing\"`. Every reader that kept the escapes read that span as
+/// opened and never closed, and the rest of the line disappeared into it --
+/// which is how a check over this file comes to cover less than it looks like
+/// it does. Decoding here means what is analysed is the text Prometheus is
+/// given, and that text has no backslashes in it.
+fn json_field(line: &str, key: &str) -> Option<String> {
+    let object = format!("{{{}}}", line.trim().trim_end_matches(','));
+    let value: serde_json::Value = serde_json::from_str(&object).ok()?;
+    Some(value.get(key)?.as_str()?.to_string())
+}
+
+/// Every metric `expr` in the dashboard, with the line it sits on.
+///
+/// One reader for the name check and the shape check both, so a panel one of
+/// them refuses to see is not a panel the other silently stops covering.
+fn metric_exprs(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(n, line)| {
+            let expr = json_field(line, "expr")?;
+            // A log query selects by label, not by series name; the extractor
+            // would read its `$variable` references as metrics.
+            if expr.is_empty() || is_log_query(&expr) {
+                return None;
+            }
+            Some((n + 1, expr))
+        })
+        .collect()
+}
+
 /// Label names a legend template asks for: every `{{...}}` in the format.
 fn legend_labels_in(legend: &str) -> BTreeSet<String> {
     legend
@@ -249,18 +291,8 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
     let foreign: BTreeSet<&str> = FOREIGN.iter().map(|(n, _)| *n).collect();
 
     let mut unknown: BTreeSet<String> = BTreeSet::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix("\"expr\":") else {
-            continue;
-        };
-        let expr = rest.trim().trim_matches(|c| c == '"' || c == ',').trim();
-        // A log query selects by label, not by series name; the extractor would
-        // read its `$variable` references as metrics.
-        if expr.is_empty() || is_log_query(expr) {
-            continue;
-        }
-        for name in metric_names_in(expr) {
+    for (_, expr) in metric_exprs(&text) {
+        for name in metric_names_in(&expr) {
             if produced.contains(name.as_str()) || foreign.contains(name.as_str()) {
                 continue;
             }
@@ -283,6 +315,30 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
         unknown.is_empty(),
         "面板读了本仓库不产出、也没登记为外来序列的名字: {unknown:?}\n\
          要么把它接上产出面，要么把它记进 FOREIGN 并写明属主"
+    );
+}
+
+/// A panel whose expression does not parse draws nothing, exactly like a panel
+/// whose series nothing produces — and the check above passes it, because every
+/// series in it is really produced.
+///
+/// The shape this catches is the one a hand edit makes: an operator dropped
+/// between two operands that a matching clause then sits in front of. Nothing
+/// in this repository reads PromQL grammar, so before this test the only thing
+/// between such an edit and a blank panel was a person noticing.
+#[test]
+fn every_expression_the_dashboard_writes_is_one_prometheus_can_parse() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (line, expr) in metric_exprs(&dashboard_text()) {
+        for complaint in shape_complaints(&expr) {
+            complaints.push(format!("第 {line} 行: {complaint}\n    {expr}"));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "面板表达式 Prometheus 解析不了，面板会一直是空的:\n{}",
+        complaints.join("\n")
     );
 }
 
@@ -330,23 +386,20 @@ fn every_label_a_legend_names_is_on_the_series_it_describes() {
     let mut current: Option<String> = None;
     let mut mismatches: Vec<String> = Vec::new();
     for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("\"expr\":") {
-            let expr = rest.trim().trim_matches(|c| c == '"' || c == ',').trim();
-            current = if is_log_query(expr) {
+        if let Some(expr) = json_field(line, "expr") {
+            current = if is_log_query(&expr) {
                 None
             } else {
-                metric_names_in(expr).into_iter().next()
+                metric_names_in(&expr).into_iter().next()
             };
-        } else if let Some(rest) = trimmed.strip_prefix("\"legendFormat\":") {
-            let legend = rest.trim().trim_matches(|c| c == '"' || c == ',').trim();
+        } else if let Some(legend) = json_field(line, "legendFormat") {
             let (Some(metric), Some(expected)) = (
                 current.as_ref(),
                 labels_of(current.as_ref().unwrap().as_str()),
             ) else {
                 continue;
             };
-            for label in legend_labels_in(legend) {
+            for label in legend_labels_in(&legend) {
                 if !expected.contains(&label.as_str()) {
                     mismatches.push(format!(
                         "{metric} 的 legend 引用了它没有的标签 {{{{{label}}}}}; 实际标签: {expected:?}"

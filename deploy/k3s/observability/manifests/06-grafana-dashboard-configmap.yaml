@@ -720,6 +720,76 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 20,
+          "title": "Container OOM Kills by Pod",
+          "description": "Which containers the kernel killed at their memory cap, and how much they restarted, over 6h. kube-state-metrics carries the reason of a container's last termination as a state, not as a counter: a container killed at its cap holds OOMKilled until it stops cleanly, so one that dies every couple of hours never moves the state and is invisible to any rate over it -- the clickhouse instance in monitoring was killed five times inside one hour that way. The kill line is the restart count of containers whose last exit was an OOM kill; the second line is every restart, and the gap between them says how much of the churn was the cap rather than the code. Nothing is scoped to a namespace, because the same kill is the same defect wherever it runs. pod_oom_killed fires on the state; this panel is where the state and the count can be read together, and the memory-against-limit panel is where the containers about to be counted show up first.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 80
+          },
+          "targets": [
+            {
+              "expr": "sum by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total[6h]) and on(namespace, pod, container) (kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} > 0))",
+              "legendFormat": "{{pod}}/{{container}} OOM kills (6h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "topk(10, sum by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total[6h])))",
+              "legendFormat": "{{pod}}/{{container}} restarts (6h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 21,
+          "title": "Container Memory Against Its Limit",
+          "description": "How much of the memory limit each container is using, over 6h. Only containers that have a limit: an unbounded container is not near anything, and the division drops the ones given none. This is the reading container_memory_near_limit's floor was derived from -- the killed observability backend sat between 0.74 and 0.93 of its cap for hours, its own burst amplitude crossing the rest, while nothing else in the cluster came near -- so a container holding above three quarters here is one burst away from being killed at its limit, which is what the OOM panel counts. No threshold is drawn on purpose: what counts as close is the alert's decision, and a second copy of it here would be a constant to keep in step with the first.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 80
+          },
+          "targets": [
+            {
+              "expr": "container_memory_working_set_bytes{container!=\"\", container!=\"POD\"} / on(namespace, pod, container) (kube_pod_container_resource_limits{resource=\"memory\"} > 0)",
+              "legendFormat": "{{pod}}/{{container}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

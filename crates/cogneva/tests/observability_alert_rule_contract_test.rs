@@ -25,7 +25,7 @@ mod producer;
 mod promql;
 
 use producer::carries_the_producer;
-use promql::metric_names_in;
+use promql::{metric_names_in, shape_complaints};
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 
@@ -283,6 +283,32 @@ fn every_series_an_alert_rule_reads_is_one_something_produces() {
             .map(|(name, rules)| format!("  {name} <- {}", rules.join(", ")))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+/// A rule whose expression does not parse never fires, and the check above
+/// passes it for the same reason a blank panel passes: every series it names is
+/// really produced.
+///
+/// The shape this catches is the one a hand edit makes: an operator dropped
+/// between two operands that a matching clause then sits in front of. Nothing
+/// in this repository reads PromQL grammar, so before this test the only thing
+/// between such an edit and an alert that stays quiet through its own incident
+/// was a person noticing. A rule and a panel fail the same way here, which is
+/// why both sides of this contract ask the same question about their text.
+#[test]
+fn every_expression_a_rule_writes_is_one_prometheus_can_parse() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        for complaint in shape_complaints(&promql) {
+            complaints.push(format!("{rule}: {complaint}\n    {promql}"));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "告警规则的表达式 Prometheus 解析不了，这条规则永远不会触发:\n{}",
+        complaints.join("\n")
     );
 }
 
