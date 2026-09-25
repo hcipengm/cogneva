@@ -581,13 +581,19 @@ impl CollaborationExecutor {
         let is_self_evolution = task.is_self_evolution();
 
         let mode_selector = self.mode_selector_with_agent().await;
-        let (pge_mode, reason) = mode_selector
+        // The decision is counted by the selector itself; the stage is logged
+        // here as well so a reader of this line can see which rule decided
+        // without going to the metric plane.
+        let decision = mode_selector
             .select_mode(&goal, Some(&profile), Some(&task.id))
             .await;
+        let pge_mode = decision.mode;
+        let reason = &decision.reason;
 
         info!(
             task_id=%task.id,
             ?pge_mode,
+            stage=%decision.stage.as_str(),
             %reason,
             self_evolution=%is_self_evolution,
             "ModeSelectorActor decision (atomic execution)"

@@ -25,6 +25,11 @@ pub struct TaskProfile {
     /// where a long sentence could out-vote a named file.
     #[serde(default)]
     pub declared_scale: DeclaredScale,
+    /// Which of the request's declarations produced the scale above. Travels
+    /// with it so the count and the provenance are never read off different
+    /// readings of the same request.
+    #[serde(default)]
+    pub declaration_inputs: DeclarationInputs,
 }
 
 impl Default for TaskProfile {
@@ -37,6 +42,7 @@ impl Default for TaskProfile {
             token_budget: 1.0,
             historical_success: 1.0,
             declared_scale: DeclaredScale::Unknown,
+            declaration_inputs: DeclarationInputs::empty(),
         }
     }
 }
@@ -86,6 +92,96 @@ pub const DEEP_MIN_FILES: usize = 4;
 /// Declared diff lines at which a change is too big for the lightest topology.
 pub const DEEP_MIN_LINES: usize = 120;
 
+/// One of the request's own declarations the scale is read from.
+///
+/// The tiering reads three things and nothing else. Naming them is what makes
+/// "this input has no producer in this deployment" a reading instead of a claim
+/// only a source dive can settle: an input nothing supplies leaves the tier
+/// cells that input alone could move sitting at zero — which is also exactly
+/// what a quiet day looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DeclarationInput {
+    /// Paths named in the goal text.
+    GoalPaths,
+    /// The explicit `affected_files` list.
+    AffectedFiles,
+    /// An attached diff, read for its line count.
+    Diff,
+}
+
+impl DeclarationInput {
+    /// Every declaration the tiering reads. The metric surface publishes one
+    /// cell per entry, zeros included: a variant missing from here is an input
+    /// whose use is counted nowhere.
+    pub const ALL: [DeclarationInput; 3] = [
+        DeclarationInput::GoalPaths,
+        DeclarationInput::AffectedFiles,
+        DeclarationInput::Diff,
+    ];
+
+    /// The task input field this declaration is read from. Kept as a method
+    /// rather than a table so the reader and the name cannot be updated apart.
+    pub const fn field(&self) -> &'static str {
+        match self {
+            DeclarationInput::GoalPaths => "goal",
+            DeclarationInput::AffectedFiles => "affected_files",
+            DeclarationInput::Diff => "diff",
+        }
+    }
+
+    /// Position in [`Self::ALL`], and the bit this input occupies in
+    /// [`DeclarationInputs`].
+    pub const fn index(&self) -> usize {
+        match self {
+            DeclarationInput::GoalPaths => 0,
+            DeclarationInput::AffectedFiles => 1,
+            DeclarationInput::Diff => 2,
+        }
+    }
+
+    /// The value published on the metric surface.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            DeclarationInput::GoalPaths => "goal_paths",
+            DeclarationInput::AffectedFiles => "affected_files",
+            DeclarationInput::Diff => "diff",
+        }
+    }
+}
+
+/// Which of the request's declarations were actually present.
+///
+/// A set rather than a count: "two of three" does not say which input went
+/// missing, and which one is missing is the whole question — a request that
+/// names files but attaches no diff keeps the file branch of the tiering alive
+/// while the line branch stays unreachable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeclarationInputs(u8);
+
+impl DeclarationInputs {
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub fn insert(&mut self, input: DeclarationInput) {
+        self.0 |= 1 << input.index();
+    }
+
+    pub const fn contains(&self, input: DeclarationInput) -> bool {
+        self.0 & (1 << input.index()) != 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = DeclarationInput> + '_ {
+        DeclarationInput::ALL
+            .into_iter()
+            .filter(move |input| self.contains(*input))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// Extensions whose files are prose rather than something a compiler, a schema
 /// or a test run reads.
 ///
@@ -106,6 +202,63 @@ fn is_prose_path(path: &str) -> bool {
     }
 }
 
+/// What a request declares, read once.
+///
+/// Both the scale and its provenance are taken from here, so what was counted
+/// and the naming of what was counted cannot drift apart — the same reason an
+/// attached diff is measured by the one function the landing budget uses.
+struct Declarations {
+    goal_paths: Vec<String>,
+    affected_files: Vec<String>,
+    lines: Option<usize>,
+}
+
+/// Read the declarations a request carries. Every field of `task.input` the
+/// tiering ever looks at is read here and nowhere else.
+fn declarations(task: &cog_core::Task) -> Declarations {
+    let goal = task
+        .input
+        .get("goal")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    Declarations {
+        goal_paths: cog_core::paths_named_in_goal(goal),
+        affected_files: task
+            .input
+            .get("affected_files")
+            .and_then(|v| v.as_array())
+            .map(|named| {
+                named
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        lines: task
+            .input
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .map(cog_core::count_diff_lines),
+    }
+}
+
+impl Declarations {
+    fn inputs(&self) -> DeclarationInputs {
+        let mut inputs = DeclarationInputs::empty();
+        if !self.goal_paths.is_empty() {
+            inputs.insert(DeclarationInput::GoalPaths);
+        }
+        if !self.affected_files.is_empty() {
+            inputs.insert(DeclarationInput::AffectedFiles);
+        }
+        if self.lines.is_some() {
+            inputs.insert(DeclarationInput::Diff);
+        }
+        inputs
+    }
+}
+
 /// What the request declares about the size of the change it asks for.
 ///
 /// Two declarations are read, because they are the two a request can make: the
@@ -113,37 +266,35 @@ fn is_prose_path(path: &str) -> bool {
 /// attaches. Anything else about the request — its length, its tone — is a
 /// property of the asking, not of the change.
 pub fn declared_scale(task: &cog_core::Task) -> DeclaredScale {
-    let goal = task
-        .input
-        .get("goal")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    let declared = declarations(task);
     let mut files: Vec<String> = Vec::new();
-    for path in cog_core::paths_named_in_goal(goal) {
-        if !files.contains(&path) {
-            files.push(path);
+    for path in declared
+        .goal_paths
+        .iter()
+        .chain(declared.affected_files.iter())
+    {
+        if !files.contains(path) {
+            files.push(path.clone());
         }
     }
-    if let Some(named) = task.input.get("affected_files").and_then(|v| v.as_array()) {
-        for path in named.iter().filter_map(|v| v.as_str()) {
-            if !files.contains(&path.to_string()) {
-                files.push(path.to_string());
-            }
-        }
-    }
-    let lines = task
-        .input
-        .get("diff")
-        .and_then(|v| v.as_str())
-        .map(cog_core::count_diff_lines);
-    if files.is_empty() && lines.is_none() {
+    if files.is_empty() && declared.lines.is_none() {
         return DeclaredScale::Unknown;
     }
     DeclaredScale::Measured {
         files: files.len(),
         code_files: files.iter().filter(|p| !is_prose_path(p)).count(),
-        lines,
+        lines: declared.lines,
     }
+}
+
+/// Which declarations a request actually carries.
+///
+/// Published so that a judgement reading an input nothing supplies reports
+/// itself as unreachable rather than as a rule with nothing to say: the tiering
+/// can only be decided by the declarations that arrived, and a declaration no
+/// caller sends is a branch of the rule that no deployment traffic reaches.
+pub fn declaration_inputs(task: &cog_core::Task) -> DeclarationInputs {
+    declarations(task).inputs()
 }
 
 /// Which orchestration a measured scale entitles the task to.
@@ -213,6 +364,20 @@ pub enum PgeMode {
 }
 
 impl PgeMode {
+    /// Every mode this build can name, so a reader that counts decisions can
+    /// publish a cell per mode rather than only the ones it happened to see.
+    ///
+    /// `PlanOnly` is in here although the selector never returns it: the
+    /// decomposition path sets it directly, and a surface that omitted it could
+    /// not tell "topology selection never chose it, correctly" from "the
+    /// decomposition path stopped running".
+    pub const ALL: [PgeMode; 4] = [
+        PgeMode::Pipeline,
+        PgeMode::Roundtable,
+        PgeMode::PlanOnly,
+        PgeMode::Direct,
+    ];
+
     /// 这个模式在台账与学习数据里的名字。
     ///
     /// `None` = 它不是一次模式选择，别记账：分解路径从来没有"选哪种拓扑更好"
@@ -235,6 +400,83 @@ impl PgeMode {
             PgeMode::Direct => "direct",
             PgeMode::PlanOnly => "plan_only",
         }
+    }
+}
+
+/// Which rule decided a task's topology.
+///
+/// A type rather than a phrase inside the reason, because the two answer
+/// different questions and only one of them may move. The reason is written for
+/// a person and can be reworded any time; the stage is what the routing
+/// observation surface counts by. Recovering it by parsing the reason would make
+/// every rewording a silent change in what the metrics mean, and a stage whose
+/// wording drifted would read exactly like a stage that never decided anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteStage {
+    /// A measured [`DeclaredScale`] settled it on its own.
+    DeclaredScale,
+    /// A word in the goal.
+    Keyword,
+    /// The static complexity score.
+    Score,
+    /// The mode-selection agent's own judgement.
+    Agent,
+    /// Nothing decided it; quality-first default.
+    Default,
+}
+
+impl RouteStage {
+    /// Every stage this build can return.
+    ///
+    /// The observation surface publishes a cell per entry rather than only the
+    /// stages that happened to fire: a series that is absent because a stage is
+    /// dead and one that is absent because it was never wired up are the same
+    /// reading otherwise, and the second is the one worth catching.
+    pub const ALL: [RouteStage; 5] = [
+        RouteStage::DeclaredScale,
+        RouteStage::Keyword,
+        RouteStage::Score,
+        RouteStage::Agent,
+        RouteStage::Default,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RouteStage::DeclaredScale => "declared_scale",
+            RouteStage::Keyword => "keyword",
+            RouteStage::Score => "score",
+            RouteStage::Agent => "agent",
+            RouteStage::Default => "default",
+        }
+    }
+}
+
+/// A routing decision together with the stage that made it.
+#[derive(Debug, Clone)]
+pub struct RouteDecision {
+    pub mode: PgeMode,
+    pub stage: RouteStage,
+    /// For a person reading a log line. Never parsed back into a stage.
+    pub reason: String,
+}
+
+/// Every name [`scale_label`] can return, so the routing surface can publish a
+/// cell per name instead of only the ones that occurred.
+pub const SCALE_LABELS: [&str; 4] = ["unknown", "none", "shortcut", "deep"];
+
+/// The name a declared scale is counted under.
+///
+/// Four values, and the last two are the ones that make the tiering's input
+/// face readable: `unknown` says the request declared nothing (so no tier could
+/// have been earned), `none` says it declared a scope the tiering does not act
+/// on. Without them a routing surface cannot tell "no prose-only request
+/// arrived" from "requests stopped declaring anything at all".
+pub fn scale_label(scale: DeclaredScale) -> &'static str {
+    match change_tier(scale) {
+        Some(ChangeTier::Shortcut) => "shortcut",
+        Some(ChangeTier::Deep) => "deep",
+        None if matches!(scale, DeclaredScale::Measured { .. }) => "none",
+        None => "unknown",
     }
 }
 
@@ -266,12 +508,22 @@ pub fn complexity_score(p: &TaskProfile) -> f64 {
 /// [`complexity_score`] is below [`PIPELINE_SCORE_THRESHOLD`], otherwise
 /// [`PgeMode::Roundtable`]. When the score is right on the boundary we prefer
 /// Roundtable — quality over speed when the decision is uncertain.
-pub fn select_mode(p: &TaskProfile) -> PgeMode {
-    match change_tier(p.declared_scale) {
-        Some(ChangeTier::Shortcut) => PgeMode::Direct,
-        Some(ChangeTier::Deep) => PgeMode::Roundtable,
-        None if complexity_score(p) < PIPELINE_SCORE_THRESHOLD => PgeMode::Pipeline,
-        None => PgeMode::Roundtable,
+pub fn select_mode(p: &TaskProfile) -> RouteDecision {
+    let score = complexity_score(p);
+    let (mode, stage) = match change_tier(p.declared_scale) {
+        Some(ChangeTier::Shortcut) => (PgeMode::Direct, RouteStage::DeclaredScale),
+        Some(ChangeTier::Deep) => (PgeMode::Roundtable, RouteStage::DeclaredScale),
+        None if score < PIPELINE_SCORE_THRESHOLD => (PgeMode::Pipeline, RouteStage::Score),
+        None => (PgeMode::Roundtable, RouteStage::Score),
+    };
+    RouteDecision {
+        mode,
+        stage,
+        reason: format!(
+            "{} rule: declared_scale={:?}, complexity_score={score:.2} → {mode:?}",
+            stage.as_str(),
+            p.declared_scale
+        ),
     }
 }
 
@@ -297,6 +549,7 @@ pub fn derive_task_profile(task: &cog_core::Task) -> TaskProfile {
         token_budget: 1.0,
         historical_success: 1.0,
         declared_scale: declared_scale(task),
+        declaration_inputs: declaration_inputs(task),
     }
 }
 
@@ -308,7 +561,7 @@ mod tests {
     fn default_profile_picks_pipeline() {
         let p = TaskProfile::default();
         assert!(complexity_score(&p) < PIPELINE_SCORE_THRESHOLD);
-        assert_eq!(select_mode(&p), PgeMode::Pipeline);
+        assert_eq!(select_mode(&p).mode, PgeMode::Pipeline);
     }
 
     #[test]
@@ -322,6 +575,7 @@ mod tests {
             token_budget: 1.0,
             historical_success: 1.0,
             declared_scale: DeclaredScale::Unknown,
+            declaration_inputs: DeclarationInputs::empty(),
         };
         let score = complexity_score(&p);
         // 0.5*0.25 + 0.5*0.30 + 0.5*0.20 = 0.125 + 0.15 + 0.10 = 0.375
@@ -330,7 +584,7 @@ mod tests {
             "score={}",
             score
         );
-        assert_eq!(select_mode(&p), PgeMode::Pipeline);
+        assert_eq!(select_mode(&p).mode, PgeMode::Pipeline);
     }
 
     #[test]
@@ -343,9 +597,10 @@ mod tests {
             token_budget: 1.0,
             historical_success: 0.1,
             declared_scale: DeclaredScale::Unknown,
+            declaration_inputs: DeclarationInputs::empty(),
         };
         assert!(complexity_score(&p) >= PIPELINE_SCORE_THRESHOLD);
-        assert_eq!(select_mode(&p), PgeMode::Roundtable);
+        assert_eq!(select_mode(&p).mode, PgeMode::Roundtable);
     }
 
     #[test]
@@ -361,6 +616,7 @@ mod tests {
             // dependency_count 1.0 contributes 0.10. 0.30 + 0.10 = 0.40.
             historical_success: 1.0,
             declared_scale: DeclaredScale::Unknown,
+            declaration_inputs: DeclarationInputs::empty(),
         };
         let p = TaskProfile {
             risk: 1.0,
@@ -369,7 +625,7 @@ mod tests {
         };
         let score = complexity_score(&p);
         assert!((score - 0.4).abs() < f64::EPSILON);
-        assert_eq!(select_mode(&p), PgeMode::Roundtable);
+        assert_eq!(select_mode(&p).mode, PgeMode::Roundtable);
     }
 
     #[test]
@@ -382,17 +638,18 @@ mod tests {
             token_budget: 1.0,
             historical_success: 0.0,
             declared_scale: DeclaredScale::Unknown,
+            declaration_inputs: DeclarationInputs::empty(),
         };
         // 0.6*0.30 + 1.0*0.15 = 0.18 + 0.15 = 0.33 → Pipeline.
-        assert_eq!(select_mode(&p), PgeMode::Pipeline);
+        assert_eq!(select_mode(&p).mode, PgeMode::Pipeline);
 
         let p = TaskProfile { risk: 0.8, ..p };
         // 0.8*0.30 + 0.15 = 0.24 + 0.15 = 0.39 → Pipeline.
-        assert_eq!(select_mode(&p), PgeMode::Pipeline);
+        assert_eq!(select_mode(&p).mode, PgeMode::Pipeline);
 
         let p = TaskProfile { risk: 0.9, ..p };
         // 0.9*0.30 + 0.15 = 0.27 + 0.15 = 0.42 → Roundtable.
-        assert_eq!(select_mode(&p), PgeMode::Roundtable);
+        assert_eq!(select_mode(&p).mode, PgeMode::Roundtable);
     }
 
     fn task_with(goal: &str, extra: serde_json::Value) -> cog_core::Task {
@@ -428,7 +685,125 @@ mod tests {
         );
         // The score alone would still send it down; that is what the scale is for.
         assert!(complexity_score(&p) < PIPELINE_SCORE_THRESHOLD);
-        assert_eq!(select_mode(&p), PgeMode::Roundtable);
+        assert_eq!(select_mode(&p).mode, PgeMode::Roundtable);
+    }
+
+    /// The provenance names the declarations that arrived, and nothing else.
+    ///
+    /// Each case carries one declaration, so a set built from the wrong field
+    /// (or from the request merely existing) shows up as a cell lit that no
+    /// input lit.
+    #[test]
+    fn the_provenance_names_the_declarations_that_arrived() {
+        let named_only = task_with("touch crates/cog-parser/src/lib.rs", serde_json::json!({}));
+        assert_eq!(
+            declaration_inputs(&named_only).iter().collect::<Vec<_>>(),
+            vec![DeclarationInput::GoalPaths]
+        );
+
+        let listed_only = task_with(
+            "make the change",
+            serde_json::json!({ "affected_files": ["docs/quickstart.md"] }),
+        );
+        assert_eq!(
+            declaration_inputs(&listed_only).iter().collect::<Vec<_>>(),
+            vec![DeclarationInput::AffectedFiles]
+        );
+
+        let diff_only = task_with(
+            "apply the patch",
+            serde_json::json!({ "diff": "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-a\n+b\n" }),
+        );
+        assert_eq!(
+            declaration_inputs(&diff_only).iter().collect::<Vec<_>>(),
+            vec![DeclarationInput::Diff]
+        );
+    }
+
+    /// A request that declares nothing carries no provenance, so the surface
+    /// reads the same as it does before any traffic — which is not the same
+    /// reading as "this declaration has no producer".
+    #[test]
+    fn a_request_that_declares_nothing_names_no_input() {
+        let task = task_with("make it better", serde_json::json!({}));
+        let inputs = declaration_inputs(&task);
+        assert!(inputs.is_empty(), "{inputs:?}");
+        assert_eq!(declared_scale(&task), DeclaredScale::Unknown);
+    }
+
+    /// The set holds every declaration it was given at once, and each one lands
+    /// on its own cell.
+    #[test]
+    fn each_declaration_has_its_own_cell() {
+        let mut indices: Vec<usize> = DeclarationInput::ALL.iter().map(|i| i.index()).collect();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            (0..DeclarationInput::ALL.len()).collect::<Vec<_>>()
+        );
+        for input in DeclarationInput::ALL {
+            let mut set = DeclarationInputs::empty();
+            set.insert(input);
+            assert_eq!(set.iter().collect::<Vec<_>>(), vec![input], "{input:?}");
+        }
+    }
+
+    /// Every task input field the tiering reads is one the surface can count.
+    ///
+    /// The provenance series is complete only if it covers the reader: a field
+    /// added to `declarations` without a [`DeclarationInput`] for it can decide
+    /// a route while its cell stays at zero — the exact state this surface
+    /// exists to make visible, and the one that is otherwise found by reading
+    /// this file.
+    #[test]
+    fn every_field_the_tiering_reads_is_one_the_surface_counts() {
+        let source = include_str!("profile.rs");
+        let signature = "fn declarations(task: &cog_core::Task) -> Declarations {";
+        let start = source
+            .find(signature)
+            .expect("the tiering no longer reads the task in a function named `declarations`");
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("`declarations` has no closing brace at column 0");
+        let body = &body[..end];
+
+        let mut read: Vec<String> = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find(".get(\"") {
+            rest = &rest[at + 6..];
+            match rest.find('"') {
+                Some(close) => {
+                    read.push(rest[..close].to_string());
+                    rest = &rest[close..];
+                }
+                None => break,
+            }
+        }
+        assert!(
+            !read.is_empty(),
+            "the scan found no input field in `declarations`, so it confirms nothing"
+        );
+
+        let known: Vec<&str> = DeclarationInput::ALL.iter().map(|i| i.field()).collect();
+        let uncounted: Vec<&String> = read
+            .iter()
+            .filter(|k| !known.contains(&k.as_str()))
+            .collect();
+        assert!(
+            uncounted.is_empty(),
+            "the tiering reads task fields nothing can count: {uncounted:?}; \
+             known fields are {known:?}"
+        );
+        let unread: Vec<&&str> = known
+            .iter()
+            .filter(|f| !read.iter().any(|k| k == *f))
+            .collect();
+        assert!(
+            unread.is_empty(),
+            "these declarations name a field the tiering no longer reads, so their \
+             cell can only ever be zero: {unread:?}"
+        );
     }
 
     /// And its other end: a docs-only edit whose files the request names takes
@@ -448,7 +823,7 @@ mod tests {
                 lines: None
             }
         );
-        assert_eq!(select_mode(&p), PgeMode::Direct);
+        assert_eq!(select_mode(&p).mode, PgeMode::Direct);
     }
 
     /// A measured change that is ordinary keeps the route it had. The rule
@@ -469,7 +844,7 @@ mod tests {
             }
         );
         assert!(complexity_score(&p) < PIPELINE_SCORE_THRESHOLD);
-        assert_eq!(select_mode(&p), PgeMode::Pipeline);
+        assert_eq!(select_mode(&p).mode, PgeMode::Pipeline);
     }
 
     /// Silence earns nothing. A request that names no file and attaches no diff
@@ -483,7 +858,7 @@ mod tests {
         assert_eq!(p.declared_scale, DeclaredScale::Unknown);
         // 0.7*0.25 + 0.8*0.20 = 0.335 → Pipeline, as before the rule.
         assert!(complexity_score(&p) < PIPELINE_SCORE_THRESHOLD);
-        assert_eq!(select_mode(&p), PgeMode::Pipeline);
+        assert_eq!(select_mode(&p).mode, PgeMode::Pipeline);
     }
 
     /// The shortcut is an allow-list of prose extensions, so a name this rule
@@ -507,7 +882,7 @@ mod tests {
                 },
                 "{path}"
             );
-            assert_ne!(select_mode(&p), PgeMode::Direct, "{path}");
+            assert_ne!(select_mode(&p).mode, PgeMode::Direct, "{path}");
         }
     }
 
@@ -552,7 +927,7 @@ mod tests {
                 lines: Some(DEEP_MIN_LINES)
             }
         );
-        assert_eq!(select_mode(&p), PgeMode::Roundtable);
+        assert_eq!(select_mode(&p).mode, PgeMode::Roundtable);
     }
 
     /// A diff with no file named next to it is a line count without a scope:

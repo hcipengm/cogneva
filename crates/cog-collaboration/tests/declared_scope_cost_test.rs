@@ -320,7 +320,7 @@ async fn run_declared(task: Task) -> (bool, Arc<CallLog>) {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let mode = select_mode(&derive_task_profile(&task));
+    let mode = select_mode(&derive_task_profile(&task)).mode;
     let log = Arc::new(CallLog::default());
     let executor = SquadExecutor::new()
         .with_llm_provider(Arc::new(StubLlm))

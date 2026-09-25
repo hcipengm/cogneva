@@ -24,8 +24,9 @@ pub use hierarchy::{
 pub use ipc::{FileSystemIpc, IpcChannel, IpcMessage};
 pub use observable::CollaborationObservable;
 pub use profile::{
-    change_tier, complexity_score, declared_scale, derive_task_profile, select_mode, ChangeTier,
-    DeclaredScale, PgeMode, TaskProfile, PIPELINE_SCORE_THRESHOLD,
+    change_tier, complexity_score, declaration_inputs, declared_scale, derive_task_profile,
+    scale_label, select_mode, ChangeTier, DeclarationInput, DeclarationInputs, DeclaredScale,
+    PgeMode, RouteDecision, RouteStage, TaskProfile, PIPELINE_SCORE_THRESHOLD, SCALE_LABELS,
 };
 pub use squad::pge::{
     parse_evaluation_result, parse_generator_output, parse_planner_output, Artifact, ContextBoard,

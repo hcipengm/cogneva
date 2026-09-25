@@ -3,7 +3,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::profile::{
-    change_tier, complexity_score, select_mode, ChangeTier, DeclaredScale, PgeMode, TaskProfile,
+    change_tier, complexity_score, select_mode, ChangeTier, DeclaredScale, PgeMode, RouteDecision,
+    RouteStage, TaskProfile,
 };
 
 /// ModeSelector Actor — semantic wrapper around a `dyn Agent`.
@@ -71,7 +72,34 @@ impl ModeSelectorActor {
         goal: &str,
         profile: Option<&TaskProfile>,
         task_id: Option<&str>,
-    ) -> (PgeMode, String) {
+    ) -> RouteDecision {
+        let decision = self.decide(goal, profile, task_id).await;
+        // Recorded here rather than by the caller: this is where the stage is
+        // decided, so a new caller cannot take a route that never reaches the
+        // surface. The declared scale is recorded only when a profile was
+        // handed in — with none, nothing was measured about the request, and
+        // writing that down as "declared nothing" would be a reading invented
+        // for the sake of a non-empty series.
+        let observable = crate::observable::global_observable();
+        observable.record_route_decision(decision.stage.as_str(), decision.mode.as_str());
+        if let Some(profile) = profile {
+            observable.record_declared_scale(crate::profile::scale_label(profile.declared_scale));
+            // Recorded per declaration rather than as one value: which input is
+            // missing is the question, and "two of three present" does not
+            // answer it.
+            for input in profile.declaration_inputs.iter() {
+                observable.record_declaration_input(input.as_str());
+            }
+        }
+        decision
+    }
+
+    async fn decide(
+        &self,
+        goal: &str,
+        profile: Option<&TaskProfile>,
+        task_id: Option<&str>,
+    ) -> RouteDecision {
         let goal_lower = goal.to_lowercase();
 
         // --- Stage 0: declared change scale (deterministic) ---
@@ -93,13 +121,7 @@ impl ModeSelectorActor {
 
         // --- Stage 2: static profile rule (cheap, no I/O) ---
         if let Some(profile) = profile {
-            let mode = select_mode(profile);
-            let reason = format!(
-                "Static rule: complexity_score={:.2} → {:?}",
-                complexity_score(profile),
-                mode
-            );
-            return (mode, reason);
+            return select_mode(profile);
         }
 
         // --- Stage 3: Knowledge-backed historical context ---
@@ -145,16 +167,17 @@ impl ModeSelectorActor {
         }
 
         // --- Stage 5: default ---
-        (
-            PgeMode::Roundtable,
-            "Default: Roundtable (quality-first when uncertain)".into(),
-        )
+        RouteDecision {
+            mode: PgeMode::Roundtable,
+            stage: RouteStage::Default,
+            reason: "Default: Roundtable (quality-first when uncertain)".into(),
+        }
     }
 
     /// What a measured change scale settles on its own, before any word in the
     /// goal is read. `None` when the request declared nothing readable — the
     /// keyword and score stages then decide exactly as they did before.
-    fn declared_scale_verdict(scale: DeclaredScale) -> Option<(PgeMode, String)> {
+    fn declared_scale_verdict(scale: DeclaredScale) -> Option<RouteDecision> {
         let (mode, why) = match change_tier(scale)? {
             ChangeTier::Shortcut => (
                 PgeMode::Direct,
@@ -165,12 +188,16 @@ impl ModeSelectorActor {
                 "the request declares a change too large for the lightest topology",
             ),
         };
-        Some((mode, format!("Declared scale {scale:?} → {mode:?}: {why}")))
+        Some(RouteDecision {
+            mode,
+            stage: RouteStage::DeclaredScale,
+            reason: format!("Declared scale {scale:?} → {mode:?}: {why}"),
+        })
     }
 
     /// Zero-cost keyword heuristic.
-    /// Returns `Some((mode, reason))` when the goal contains strong signals.
-    fn keyword_heuristic(goal_lower: &str) -> Option<(PgeMode, String)> {
+    /// Returns `Some` when the goal contains strong signals.
+    fn keyword_heuristic(goal_lower: &str) -> Option<RouteDecision> {
         // Strong Roundtable indicators: tasks that benefit from debate / consensus.
         let roundtable_keywords = [
             "debate",
@@ -192,10 +219,11 @@ impl ModeSelectorActor {
         ];
         for kw in &roundtable_keywords {
             if goal_lower.contains(kw) {
-                return Some((
-                    PgeMode::Roundtable,
-                    format!("Keyword heuristic: '{}' suggests Roundtable", kw),
-                ));
+                return Some(RouteDecision {
+                    mode: PgeMode::Roundtable,
+                    stage: RouteStage::Keyword,
+                    reason: format!("Keyword heuristic: '{}' suggests Roundtable", kw),
+                });
             }
         }
 
@@ -219,10 +247,11 @@ impl ModeSelectorActor {
         ];
         for kw in &pipeline_keywords {
             if goal_lower.contains(kw) {
-                return Some((
-                    PgeMode::Pipeline,
-                    format!("Keyword heuristic: '{}' suggests Pipeline", kw),
-                ));
+                return Some(RouteDecision {
+                    mode: PgeMode::Pipeline,
+                    stage: RouteStage::Keyword,
+                    reason: format!("Keyword heuristic: '{}' suggests Pipeline", kw),
+                });
             }
         }
 
@@ -266,7 +295,7 @@ impl ModeSelectorActor {
         knowledge_context: Option<&String>,
         agent: &dyn Agent,
         task_id: Option<&str>,
-    ) -> Option<(PgeMode, String)> {
+    ) -> Option<RouteDecision> {
         let input = self.build_input(goal, profile, ml_context, knowledge_context);
 
         let result = match task_id {
@@ -282,22 +311,25 @@ impl ModeSelectorActor {
 
         if text.contains("roundtable") {
             info!(mode = "Roundtable", %goal, "LLM selected Roundtable");
-            Some((
-                PgeMode::Roundtable,
-                "LLM semantic decision: Roundtable (iterative debate recommended)".into(),
-            ))
+            Some(RouteDecision {
+                mode: PgeMode::Roundtable,
+                stage: RouteStage::Agent,
+                reason: "LLM semantic decision: Roundtable (iterative debate recommended)".into(),
+            })
         } else if text.contains("pipeline") {
             info!(mode = "Pipeline", %goal, "LLM selected Pipeline");
-            Some((
-                PgeMode::Pipeline,
-                "LLM semantic decision: Pipeline (linear execution sufficient)".into(),
-            ))
+            Some(RouteDecision {
+                mode: PgeMode::Pipeline,
+                stage: RouteStage::Agent,
+                reason: "LLM semantic decision: Pipeline (linear execution sufficient)".into(),
+            })
         } else {
             warn!(response = %text, "LLM returned unparseable mode, will fallback to Roundtable");
-            Some((
-                PgeMode::Roundtable,
-                "LLM returned unparseable mode; defaulting to Roundtable".into(),
-            ))
+            Some(RouteDecision {
+                mode: PgeMode::Roundtable,
+                stage: RouteStage::Agent,
+                reason: "LLM returned unparseable mode; defaulting to Roundtable".into(),
+            })
         }
     }
 
@@ -378,11 +410,12 @@ mod tests {
             code_files: 6,
             lines: None,
         });
-        let (mode, reason) = ModeSelectorActor::new()
+        let decision = ModeSelectorActor::new()
             .select_mode("simple refactor of the parser", Some(&p), None)
             .await;
-        assert_eq!(mode, PgeMode::Roundtable);
-        assert!(reason.contains("Declared scale"), "{reason}");
+        assert_eq!(decision.mode, PgeMode::Roundtable);
+        assert_eq!(decision.stage, RouteStage::DeclaredScale);
+        assert!(decision.reason.contains("Declared scale"), "{decision:?}");
     }
 
     /// And the same precedence the other way round: a prose-only edit is not
@@ -394,21 +427,199 @@ mod tests {
             code_files: 0,
             lines: None,
         });
-        let (mode, reason) = ModeSelectorActor::new()
+        let decision = ModeSelectorActor::new()
             .select_mode("review the wording in docs/quickstart.md", Some(&p), None)
             .await;
-        assert_eq!(mode, PgeMode::Direct);
-        assert!(reason.contains("Declared scale"), "{reason}");
+        assert_eq!(decision.mode, PgeMode::Direct);
+        assert_eq!(decision.stage, RouteStage::DeclaredScale);
+        assert!(decision.reason.contains("Declared scale"), "{decision:?}");
     }
 
     /// Nothing measured leaves the stages below exactly as they were.
     #[tokio::test]
     async fn an_undeclared_scope_leaves_the_keywords_and_the_score_in_charge() {
         let p = profile(DeclaredScale::Unknown);
-        let (mode, reason) = ModeSelectorActor::new()
+        let decision = ModeSelectorActor::new()
             .select_mode("summarize the changelog", Some(&p), None)
             .await;
-        assert_eq!(mode, PgeMode::Pipeline);
-        assert!(reason.contains("Keyword heuristic"), "{reason}");
+        assert_eq!(decision.mode, PgeMode::Pipeline);
+        assert_eq!(decision.stage, RouteStage::Keyword);
+        assert!(
+            decision.reason.contains("Keyword heuristic"),
+            "{decision:?}"
+        );
+    }
+
+    /// Every stage a decision can carry is one the observation surface knows
+    /// how to count.
+    ///
+    /// The routing metrics publish a cell per entry of [`RouteStage::ALL`]. A
+    /// stage the selector can return but `ALL` does not list would be dropped
+    /// from the surface entirely — the decision would be taken and counted
+    /// nowhere, and the series would look like a stage that never fired.
+    #[tokio::test]
+    async fn every_stage_the_selector_returns_is_one_the_surface_counts() {
+        let cases: Vec<(DeclaredScale, &str)> = vec![
+            (
+                DeclaredScale::Measured {
+                    files: 1,
+                    code_files: 0,
+                    lines: None,
+                },
+                "polish the wording in `docs/quickstart.md`",
+            ),
+            (DeclaredScale::Unknown, "review the landing policy"),
+            (DeclaredScale::Unknown, "summarize the changelog"),
+        ];
+        for (scale, goal) in cases {
+            let p = profile(scale);
+            let decision = ModeSelectorActor::new()
+                .select_mode(goal, Some(&p), None)
+                .await;
+            assert!(
+                RouteStage::ALL.contains(&decision.stage),
+                "{goal:?} produced stage {:?}, which the routing surface does not publish",
+                decision.stage
+            );
+            assert!(
+                PgeMode::ALL.contains(&decision.mode),
+                "{goal:?} produced mode {:?}, which the routing surface does not publish",
+                decision.mode
+            );
+        }
+    }
+
+    /// No two stages share a label, and the set is non-empty.
+    ///
+    /// The surface publishes one cell per entry, so two entries with the same
+    /// label would merge their counts into one series while the reader believes
+    /// it is looking at one stage — a stage that decided nothing would be
+    /// visible as another stage's traffic.
+    #[test]
+    fn no_two_stages_share_a_label() {
+        let labels: Vec<&str> = RouteStage::ALL.iter().map(|s| s.as_str()).collect();
+        let unique: std::collections::HashSet<&&str> = labels.iter().collect();
+        assert!(!labels.is_empty());
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "two stages share a label, so their counts merge: {labels:?}"
+        );
+    }
+
+    /// A decision taken through the real entry point reaches the metric plane.
+    ///
+    /// The surface has its own tests, and they call the recorders directly —
+    /// which would pass just as well if nothing in the selector ever called
+    /// them. Measured as a delta rather than an absolute value because the
+    /// observable is process-wide and other tests in this binary record into
+    /// it.
+    #[tokio::test]
+    async fn a_decision_taken_here_reaches_the_metric_plane() {
+        use cog_core::Observable;
+
+        async fn cell(stage: &str, mode: &str) -> f64 {
+            crate::observable::global_observable()
+                .collect_metrics("D8")
+                .await
+                .unwrap()
+                .iter()
+                .find(|m| {
+                    m.name == "collab_route_decisions_total"
+                        && m.labels.get("stage").map(String::as_str) == Some(stage)
+                        && m.labels.get("mode").map(String::as_str) == Some(mode)
+                })
+                .map(|m| m.value)
+                .unwrap_or_default()
+        }
+        async fn tier(label: &str) -> f64 {
+            crate::observable::global_observable()
+                .collect_metrics("D8")
+                .await
+                .unwrap()
+                .iter()
+                .find(|m| {
+                    m.name == "collab_declared_scale_total"
+                        && m.labels.get("tier").map(String::as_str) == Some(label)
+                })
+                .map(|m| m.value)
+                .unwrap_or_default()
+        }
+
+        let p = profile(DeclaredScale::Measured {
+            files: 1,
+            code_files: 0,
+            lines: None,
+        });
+        let before = (
+            cell("declared_scale", "direct").await,
+            tier("shortcut").await,
+        );
+        let decision = ModeSelectorActor::new()
+            .select_mode("polish the wording in `docs/quickstart.md`", Some(&p), None)
+            .await;
+        assert_eq!(decision.mode, PgeMode::Direct);
+        let after = (
+            cell("declared_scale", "direct").await,
+            tier("shortcut").await,
+        );
+
+        assert!(
+            after.0 > before.0,
+            "the decision must land in collab_route_decisions_total{{stage=\"declared_scale\",mode=\"direct\"}}"
+        );
+        assert!(
+            after.1 > before.1,
+            "the declared scale must land in collab_declared_scale_total{{tier=\"shortcut\"}}"
+        );
+    }
+
+    /// A declaration a request actually carried is counted, from the task the
+    /// profile was derived from rather than from a set assembled in the test.
+    ///
+    /// This is the reading that answers "does this declaration have a producer
+    /// here": built from a real task, so a provenance set that is populated
+    /// nowhere — or populated from the wrong field — leaves the cell at zero.
+    #[tokio::test]
+    async fn a_declaration_the_request_carried_is_counted_where_it_was_read() {
+        use cog_core::Observable;
+
+        async fn input_cell(input: &str) -> f64 {
+            crate::observable::global_observable()
+                .collect_metrics("D8")
+                .await
+                .unwrap()
+                .iter()
+                .find(|m| {
+                    m.name == "collab_declaration_inputs_total"
+                        && m.labels.get("input").map(String::as_str) == Some(input)
+                })
+                .map(|m| m.value)
+                .unwrap_or_default()
+        }
+
+        let task = cog_core::Task::new(
+            "t",
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({ "goal": "touch crates/cog-parser/src/lib.rs" }),
+        );
+        let profile = crate::profile::derive_task_profile(&task);
+        assert!(
+            profile
+                .declaration_inputs
+                .contains(crate::profile::DeclarationInput::GoalPaths),
+            "the profile has to carry the provenance of its own scale"
+        );
+
+        let before = input_cell("goal_paths").await;
+        ModeSelectorActor::new()
+            .select_mode("touch crates/cog-parser/src/lib.rs", Some(&profile), None)
+            .await;
+        let after = input_cell("goal_paths").await;
+
+        assert!(
+            after > before,
+            "the declaration must land in collab_declaration_inputs_total{{input=\"goal_paths\"}}"
+        );
     }
 }

@@ -844,6 +844,15 @@
           },
           "severity": "warning",
           "summary": "a process that runs builds has had no build gate in force for 5 minutes: concurrent builds in it are unbounded again, and the refusal counter cannot show this because nothing is being refused -- nothing is being bounded. Usually the slot directory could not be created or written (the gate is installed but not in force, and the reason is in the warning it logged at startup), or the gate is switched off in configuration. Read the dir label on cogneva_build_gate_slots: a builder whose dir differs from the other builders' is bounding only itself"
+        },
+        {
+          "name": "routing_declaration_face_gone",
+          "promql": "sum(increase(collab_route_decisions_total[24h])) unless sum(increase(collab_declared_scale_total{tier=~\"shortcut|deep|none\"}[24h])) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "tasks were routed {value} time(s) in the last day and not one of them declared a scope: the tiering that routes a small prose-only change to the lightest topology reads the files a request names and the diff it attaches, and this reading says neither ever arrived. The routing is not failing, it is inert -- and a dead rule looks exactly like a quiet day, because both leave the shortcut cell at zero. Usual causes: goals stopped naming the paths they will touch (the measure reads them out of the goal text), or a caller stopped passing affected_files. Every route is still decided by the keyword and score rules it fell back to"
         }
       ]
     },

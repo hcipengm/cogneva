@@ -521,7 +521,7 @@ async fn execute_ready_task(state: &AutonomousTestState, task_id: &str) {
     let config = SquadConfig {
         goal: format!("Execute task: {}", task_id),
         context: task.input.clone(),
-        pge_mode: cog_collaboration::select_mode(&derive_task_profile(&task)),
+        pge_mode: cog_collaboration::select_mode(&derive_task_profile(&task)).mode,
         max_retries: 3,
         profile: None,
         context_window_size: None,
