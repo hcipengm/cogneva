@@ -539,10 +539,13 @@ impl LLMProvider for OpenAIProvider {
             tracing::info!(provider = "openai", url = %url, model = %model.id, "OpenAIProvider executing stream request");
             let http_response = match client.execute_stream(req).await {
                 Ok(r) => {
+                    // 拿到响应不等于成功：状态码还没看。措辞只陈述已确证的事实
+                    // ——早先这里写 "succeeded"，于是 503/429 被逐条记成成功，
+                    // 读日志的人看到的是"请求都成功了"，正是故障最严重时的读数。
                     tracing::info!(
                         provider = "openai",
                         status = r.status,
-                        "OpenAIProvider stream request succeeded"
+                        "OpenAIProvider received stream response"
                     );
                     r
                 }
