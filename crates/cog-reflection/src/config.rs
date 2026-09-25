@@ -507,6 +507,8 @@ pub struct MainlineDeployerConfig {
     /// 是否让滚动 Job 以 apply 仓库清单交付完整 spec。false 时退回纯
     /// set image 旧路径（清单变更不随镜像下发）。
     pub deliver_manifests: bool,
+    /// 可观测性栈清单的收敛面（与主线滚动的四部署是两条独立的判据）。
+    pub observability_stack: ObservabilityStackConfig,
     /// 滚动目标，顺序即滚动顺序。默认：网关代理面先行，进化宿主最后。
     pub targets: Vec<RolloutTargetConfig>,
 }
@@ -542,6 +544,7 @@ impl Default for MainlineDeployerConfig {
             heartbeat_log_secs: 3600,
             manifest_dir: "deploy/k3s".into(),
             deliver_manifests: true,
+            observability_stack: ObservabilityStackConfig::default(),
             targets: vec![
                 RolloutTargetConfig {
                     deployment: "cogneva-security-gateway".into(),
@@ -572,6 +575,58 @@ impl Default for MainlineDeployerConfig {
                     manifest: Some("evolution-deployment.yaml".into()),
                 },
             ],
+        }
+    }
+}
+
+/// 可观测性栈清单的收敛配置。
+///
+/// 这个栈的清单（`deploy/k3s/observability/manifests/**`）只有安装脚本一条交付
+/// 路径，装完一次之后仓库与现场各走各的：改探针预算、改资源、改面板都只是改
+/// git，集群要等下一次有人想起来跑安装脚本。于是这里给它们一个周期收敛面——
+/// 按仓库当前 rev 的内容 apply，把现场修回声明态，并把修不回的部分报出去。
+///
+/// 三件它**不做**的事，都是刻意的：装 helm chart（要网络与 helm，属安装期）、
+/// 应用 `Role`/`RoleBinding`（一份清单能长出权限就等于权限可以自我扩张）、
+/// 创建 Namespace（集群级，属安装期）。这三样缺失时它报出来，不自己补。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObservabilityStackConfig {
+    /// 默认开：这条路的缺陷正是"没人跑"，默认关等于把缺陷留在原地。
+    /// 没有这个栈的部署（比如不带监控的 k8s-standard）在这里显式关掉。
+    pub enabled: bool,
+    /// 两轮收敛之间的间隔（秒）。下限见 [`Self::MIN_INTERVAL_SECS`]。
+    pub interval_secs: u64,
+    /// 清单目录（仓库内相对路径，与安装脚本的 `manifests/` 同一处）。
+    pub manifest_dir: String,
+    /// 清单所在命名空间。apply 落在这里，也是"栈没装"的判据来源（不存在的
+    /// 命名空间会让 apply 报错，据此报出"整机不存在"）。
+    pub namespace: String,
+    /// 日志/时序明细后端（Loki / ClickHouse）是否交付。与安装脚本的
+    /// `BACKENDS` 是同一个开关的两面：清单的处置表把这两个文件标成
+    /// `backends`，两边都读它。
+    pub backends: bool,
+    /// 单次 apply 的超时（秒）。
+    pub apply_timeout_secs: u64,
+    /// 一次收敛最多在告警消息里点名几个资源（其余折叠成计数，消息有界）。
+    pub max_named_resources: usize,
+}
+
+impl ObservabilityStackConfig {
+    /// 间隔下限：低于它，一次 apply 还没落地就进下一轮，日志与 API 都被刷屏。
+    pub const MIN_INTERVAL_SECS: u64 = 60;
+}
+
+impl Default for ObservabilityStackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 300,
+            manifest_dir: "deploy/k3s/observability/manifests".into(),
+            namespace: "monitoring".into(),
+            backends: true,
+            apply_timeout_secs: 120,
+            max_named_resources: 6,
         }
     }
 }
@@ -750,6 +805,32 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_DELIVER_MANIFESTS") {
             self.deliver_manifests = parse("COGNEVA_MAINLINE_DEPLOYER_DELIVER_MANIFESTS", &v)?;
         }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_ENABLED") {
+            self.observability_stack.enabled =
+                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_ENABLED", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS") {
+            self.observability_stack.interval_secs =
+                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_MANIFEST_DIR") {
+            self.observability_stack.manifest_dir = v;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_NAMESPACE") {
+            self.observability_stack.namespace = v;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS") {
+            self.observability_stack.backends =
+                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS") {
+            self.observability_stack.apply_timeout_secs =
+                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES") {
+            self.observability_stack.max_named_resources =
+                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", &v)?;
+        }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BUILDER_BIN") {
             self.builder_bin = v;
         }
@@ -810,6 +891,45 @@ mod tests {
             .into_iter()
             .collect();
         let mut cfg = BaselinePortConfig::default();
+        assert!(cfg
+            .apply_env_with(|k| bad.get(k).map(|s| s.to_string()))
+            .is_err());
+    }
+
+    /// 栈收敛的每个度都要能从部署面改：段不在 cogneva.json 里（这个部署
+    /// 全走 env 层），少一个 env 键就等于那个度钉死在代码里。
+    #[test]
+    fn stack_env_overrides_and_invalid_is_loud() {
+        let env: HashMap<&str, &str> = [
+            ("COGNEVA_MAINLINE_DEPLOYER_STACK_ENABLED", "false"),
+            ("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS", "900"),
+            (
+                "COGNEVA_MAINLINE_DEPLOYER_STACK_MANIFEST_DIR",
+                "deploy/other",
+            ),
+            ("COGNEVA_MAINLINE_DEPLOYER_STACK_NAMESPACE", "mon"),
+            ("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", "false"),
+            ("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS", "45"),
+            ("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", "3"),
+        ]
+        .into_iter()
+        .collect();
+        let mut cfg = MainlineDeployerConfig::default();
+        cfg.apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap();
+        let stack = &cfg.observability_stack;
+        assert!(!stack.enabled);
+        assert_eq!(stack.interval_secs, 900);
+        assert_eq!(stack.manifest_dir, "deploy/other");
+        assert_eq!(stack.namespace, "mon");
+        assert!(!stack.backends);
+        assert_eq!(stack.apply_timeout_secs, 45);
+        assert_eq!(stack.max_named_resources, 3);
+
+        let bad: HashMap<&str, &str> = [("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS", "soon")]
+            .into_iter()
+            .collect();
+        let mut cfg = MainlineDeployerConfig::default();
         assert!(cfg
             .apply_env_with(|k| bad.get(k).map(|s| s.to_string()))
             .is_err());

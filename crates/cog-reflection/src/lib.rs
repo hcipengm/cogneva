@@ -50,6 +50,7 @@ pub mod image_rollout;
 pub mod mainline_deployer;
 pub mod matcher;
 pub mod meta_learning;
+pub mod observability_stack;
 pub mod policy_evolution;
 pub mod policy_store;
 pub mod promoter;
@@ -76,7 +77,10 @@ pub use baseline_port::{
 };
 pub use change_pipeline::{ApplyResult, ChangePipeline};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
-pub use config::{BaselinePortConfig, GitOpsConfig, MainlineDeployerConfig, PromotionGateConfig};
+pub use config::{
+    BaselinePortConfig, GitOpsConfig, MainlineDeployerConfig, ObservabilityStackConfig,
+    PromotionGateConfig,
+};
 pub use detector::{DefaultLearningDetector, LearningDetector};
 pub use discovery::DiscoveryEngine;
 pub use effectiveness::SkillEffectivenessTracker;
@@ -95,11 +99,12 @@ pub use gitops_publisher::GitOpsPublisher;
 pub use gitops_puller::{parse_tag_message, run_puller_loop, GitOpsPuller, PromotionCandidate};
 pub use image_rollout::ImageRollout;
 pub use mainline_deployer::{
-    run_mainline_loop, run_rollout_cli, FailureClass, MainlineDeployer, RolloutExecutor,
-    RolloutFailure, RolloutPlan, RolloutTarget,
+    classify_doc, run_mainline_loop, run_rollout_cli, DocFate, FailureClass, MainlineDeployer,
+    RolloutExecutor, RolloutFailure, RolloutPlan, RolloutTarget,
 };
 pub use matcher::{DefaultLearningMatcher, LearningMatcher};
 pub use meta_learning::{DecisionStatsSnapshot, MetaLearningEngine};
+pub use observability_stack::{StackConvergence, STACK_NOT_CONVERGED_RULE};
 pub use policy_evolution::{
     run_policy_evolution_loop, PolicyEvolutionConfig, PolicyEvolutionDriver, PolicyEvolutionOutcome,
 };

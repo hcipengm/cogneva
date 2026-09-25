@@ -104,3 +104,17 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT: "256Mi"
   # 滚动 Job Pod 挂载宿主 k3s 多调用二进制作为 kubectl（镜像不内置 kubectl）。
   COGNEVA_MAINLINE_DEPLOYER_KUBECTL_HOST_PATH: "/usr/local/bin/k3s"
+  # 可观测性栈清单的周期收敛：仓库声明什么，现场就该是什么。那些清单此前只有
+  # 安装脚本一条交付路径，装完一次之后仓库与现场各走各的，而「清单没生效」这件
+  # 事没有判据（判据本身也住在同一套清单描述的栈里）。它不装 helm chart、不应用
+  # Role/RoleBinding、不创建 Namespace——缺了报出来，不自己补。
+  # BACKENDS 与安装脚本的 BACKENDS 是同一个开关：清单目录的处置表把 09-clickhouse
+  # 与 10-loki 标成 backends，两边都读它。
+  COGNEVA_MAINLINE_DEPLOYER_STACK_ENABLED: "true"
+  COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS: "300"
+  COGNEVA_MAINLINE_DEPLOYER_STACK_MANIFEST_DIR: "deploy/k3s/observability/manifests"
+  COGNEVA_MAINLINE_DEPLOYER_STACK_NAMESPACE: "monitoring"
+  COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS: "true"
+  COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS: "120"
+  # 一次收敛最多在告警消息里点名几个资源，其余折成计数。
+  COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES: "6"

@@ -113,21 +113,88 @@ ensure_grafana_admin_credentials() {
     log_info "grafana-admin-credentials 已生成随机密码，写入 ${GRAFANA_PW_FILE}（权限 600）"
 }
 
-# ─── 部署基础 Manifests ───────────────────────────────────────────
-# 需要 kube-prometheus-stack 带来的 CRD（monitoring.coreos.com/v1 下的
-# ServiceMonitor）的清单：CRD 由 chart 安装，先应用会直接报
-# "no matches for kind"，所以这几个只能在 chart 之后，见下面那个函数。
-CRD_DEPENDENT_MANIFESTS="04-servicemonitor-cogneva.yaml 08-servicemonitor-gateway.yaml 11-podmonitor-redis.yaml"
+# ─── 清单交付处置（与集群内收敛循环共用一张表）─────────────────────
+# 哪些清单永不交付、哪些由 BACKENDS 开关决定，写在
+# `manifests/delivery-dispositions.txt` 里。首次安装（本脚本）与周期收敛
+# （部署器 Pod）读同一份：两处各留一份名单必然会分叉，分叉的样子是
+# 「装的时候跳过、收敛的时候照做」，互相拆台。
+DISPOSITIONS_FILE="${MANIFESTS_DIR}/delivery-dispositions.txt"
 
-is_crd_dependent() {
-    case " ${CRD_DEPENDENT_MANIFESTS} " in
-        *" $1 "*) return 0 ;;
-        *) return 1 ;;
+# 打出该文件的处置（`exempt`/`backends`）；没登记则打空并返回 1。
+# 没登记不是跳过理由——调用方按「交付」处理，这是刻意的失效方向。
+disposition_of() {
+    local want="$1" name disp reason
+    [ -f "${DISPOSITIONS_FILE}" ] || return 1
+    while read -r name disp reason; do
+        case "${name}" in ''|'#'*) continue ;; esac
+        if [ "${name}" = "${want}" ]; then
+            printf '%s' "${disp}"
+            return 0
+        fi
+    done < "${DISPOSITIONS_FILE}"
+    return 1
+}
+
+# 需要 monitoring.coreos.com CRD 的清单：CRD 由 chart 安装，先应用会直接报
+# "no matches for kind"，所以这几个只能在 chart 之后。按**文件内容的 kind**
+# 判，不按名单——名单会漏掉新加的那个 ServiceMonitor。
+needs_monitoring_crds() {
+    grep -qE '^[[:space:]]*kind:[[:space:]]*(ServiceMonitor|PodMonitor)[[:space:]]*$' "$1"
+}
+
+# 该文件这一轮该不该交付：打印跳过理由，空表示交付。
+#
+# 未登记 → 交付。这是刻意的失效方向：漏登记的结果是它被应用（看得见），反
+# 方向是静默不交付，而那正是这条路要修的缺陷。覆盖方向由 CI 门禁兜（目录里
+# 每个 yaml 都必须在这里有一行），所以漏登记进不了仓库，运行时这一步只是兜底。
+skip_reason() {
+    local base="$1" disp
+    disp="$(disposition_of "${base}")" || disp=""
+    case "${disp}" in
+        ''|deliver)
+            return 0 ;;
+        exempt)
+            printf '%s' "已登记为永不交付（见 delivery-dispositions.txt）" ;;
+        backends)
+            if [ "${BACKENDS}" != "1" ]; then
+                printf '%s' "BACKENDS=0"
+            fi ;;
     esac
 }
 
+# 处置表自身的检查：取值只认那两个，指向的文件必须真在。
+# 放在部署之前跑一次，而不是在 skip_reason 里 `exit`——那个函数是在命令替换
+# 里调的，`exit` 只会结束子 shell，表写错会退化成"静默按交付处理"。
+validate_dispositions() {
+    local name disp reason
+    [ -f "${DISPOSITIONS_FILE}" ] || { log_error "缺少 ${DISPOSITIONS_FILE}"; exit 1; }
+    while read -r name disp reason; do
+        case "${name}" in ''|'#'*) continue ;; esac
+        case "${disp}" in
+            deliver|exempt|backends) ;;
+            *)
+                log_error "${DISPOSITIONS_FILE##*/}: ${name} 的处置值非法: ${disp:-（空）}"
+                exit 1
+                ;;
+        esac
+        if [ ! -f "${MANIFESTS_DIR}/${name}" ]; then
+            log_error "${DISPOSITIONS_FILE##*/}: ${name} 指向的文件不存在"
+            exit 1
+        fi
+    done < "${DISPOSITIONS_FILE}"
+
+    # 反向覆盖：目录里有、表里没有的清单。这里只警告不拦——记账的小疏漏不该
+    # 挡住监控装机（按「交付」处理，方向是安全的），拦的责任在 CI 门禁。
+    local f
+    for f in "${MANIFESTS_DIR}"/*.yaml; do
+        if ! disposition_of "$(basename "$f")" >/dev/null; then
+            log_warn "${DISPOSITIONS_FILE##*/}: $(basename "$f") 没有登记处置，按交付处理"
+        fi
+    done
+}
+
 deploy_manifests() {
-    log_info "部署 K8s 基础资源 (Namespace / Secrets / ServiceMonitor / Dashboard)..."
+    log_info "部署 K8s 基础资源 (Namespace / Secret / ServiceMonitor / Dashboard)..."
 
     # 命名空间先于一切：下面的凭证准备要在它里面建 Secret，首次安装时它还
     # 不存在——若等遍历清单时才创建，凭证那一步会在空命名空间上失败。
@@ -138,41 +205,23 @@ deploy_manifests() {
     # （kube-prometheus-stack 的 grafana 从 existingSecret 读）。
     ensure_grafana_admin_credentials
 
-    # 不应用的文件及原因：
-    #   01-namespace — 已在上面应用（凭证准备依赖它）。
-    #   02-networkpolicy — 首条策略对 monitoring 全体 Pod 做 ingress 默认拒绝，
-    #     但放行来源按 Pod 标签匹配 ingress controller；hostNetwork 模式的
-    #     ingress-nginx 源地址是节点 IP，匹配不上，会把反代流量全拦下。
-    #     生产形态（controller 非 hostNetwork）再启用。
-    #   05-podmonitor — 与 04-servicemonitor 二选一的替代方案，避免双份抓取。
-    #   09-clickhouse / 10-loki — 日志与时序明细后端，由 BACKENDS 开关控制。
     for f in "${MANIFESTS_DIR}"/*.yaml; do
-        local base
+        local base reason
         base="$(basename "$f")"
-        case "$base" in
-            01-namespace.yaml)
-                continue ;;
-            02-networkpolicy.yaml|05-podmonitor-cogneva.yaml)
-                log_warn "跳过: $base"
-                continue ;;
-            09-clickhouse.yaml|10-loki.yaml)
-                if [ "${BACKENDS}" = "1" ]; then
-                    # 凭证只能在清单之前备好：ClickHouse 从 secretKeyRef 读密码。
-                    if [ "$base" = "09-clickhouse.yaml" ]; then
-                        ensure_clickhouse_credentials
-                    fi
-                    log_info "应用: $base"
-                    kubectl apply -f "$f"
-                else
-                    log_warn "跳过: $base（BACKENDS=0）"
-                fi
-                continue ;;
-        esac
-        if is_crd_dependent "$base"; then
-            log_info "延后: $base（等待 chart 安装 CRD）"
+        # 01 已在上面应用（凭证准备依赖它）。
+        [ "${base}" = "01-namespace.yaml" ] && continue
+        reason="$(skip_reason "${base}")"
+        if [ -n "${reason}" ]; then
+            log_warn "跳过: ${base}（${reason}）"
             continue
         fi
-        log_info "应用: $base"
+        # 凭证只能在清单之前备好：ClickHouse 从 secretKeyRef 读密码。
+        [ "${base}" = "09-clickhouse.yaml" ] && ensure_clickhouse_credentials
+        if needs_monitoring_crds "$f"; then
+            log_info "延后: ${base}（等待 chart 安装 CRD）"
+            continue
+        fi
+        log_info "应用: ${base}"
         kubectl apply -f "$f"
     done
 
@@ -181,9 +230,17 @@ deploy_manifests() {
 
 # ─── chart 安装之后才能应用的清单 ─────────────────────────────────
 deploy_crd_dependent_manifests() {
-    for base in ${CRD_DEPENDENT_MANIFESTS}; do
+    for f in "${MANIFESTS_DIR}"/*.yaml; do
+        local base reason
+        base="$(basename "$f")"
+        needs_monitoring_crds "$f" || continue
+        reason="$(skip_reason "${base}")"
+        if [ -n "${reason}" ]; then
+            log_warn "跳过: ${base}（${reason}）"
+            continue
+        fi
         log_info "应用: ${base}"
-        kubectl apply -f "${MANIFESTS_DIR}/${base}"
+        kubectl apply -f "$f"
     done
 }
 
@@ -267,6 +324,8 @@ main() {
     echo ""
 
     check_prerequisites
+    # 交付处置表先自检：表写错就在这里断，别等它退化成"静默按交付处理"。
+    validate_dispositions
     add_helm_repos
     deploy_manifests
     deploy_prometheus_stack

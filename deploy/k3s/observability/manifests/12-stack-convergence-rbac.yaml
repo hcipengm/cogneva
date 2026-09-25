@@ -1,0 +1,51 @@
+# 授权面：让集群内的收敛循环（部署器 Pod，SA cogneva-evolution）能把本目录
+# 已交付的清单 apply 回 monitoring。这个文件**只能由安装期交付**——收敛循环
+# 按构造不应用 Role/RoleBinding（一份清单能给自己长权限，就等于权限可以自我
+# 扩张），所以它出现在这里、由 install.sh 应用，而循环读它只读到一条「授权面，
+# 不交付」的日志。
+#
+# 授权范围刻意等于「本目录交付面 union」：monitors（抓取目标）、configmaps
+# （Grafana 面板与 Loki 配置）、services / statefulsets（两个日志与明细后端）、
+# ingresses（对外入口）。没有 delete：收敛面没有删除路径，缺了它等于把
+# 「删掉一个对象」这件事从循环的能力面里拿掉。Role 自身命名空间有界，管不到
+# cogneva 命名空间里的任何东西。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cogneva-stack-convergence
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+    app.kubernetes.io/component: stack-convergence
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors", "podmonitors"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cogneva-stack-convergence
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+    app.kubernetes.io/component: stack-convergence
+subjects:
+  # 跨命名空间引用：主体是 cogneva 里的 SA，授权面留在这个 Role 自己的
+  # 命名空间里。
+  - kind: ServiceAccount
+    name: cogneva-evolution
+    namespace: cogneva
+roleRef:
+  kind: Role
+  name: cogneva-stack-convergence
+  apiGroup: rbac.authorization.k8s.io

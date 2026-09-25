@@ -969,6 +969,32 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 interval_secs = ml_config.poll_interval_secs,
                 "mainline deployer enabled"
             );
+            // 可观测性栈清单的收敛：那些清单只有安装脚本一条交付路径，装完
+            // 一次之后仓库与现场各走各的。这一步与主线滚动分开跑——主线循环
+            // 在"没有新 rev"时直接返回，挂上去会让这条收敛几乎不运行。
+            if ml_config.observability_stack.enabled {
+                crate::observability_stack::validate_config(&ml_config.observability_stack)?;
+                // 没有持久化告警口，结论只进日志——一条只在日志里的事实和
+                // 「没人报」长得一样。
+                let alert_sink = ctx.consume_service::<dyn cog_core::PersistentAlertSink>();
+                if alert_sink.is_none() {
+                    warn!("PersistentAlertSink not published; observability stack verdicts stay report-only");
+                }
+                let stack = crate::observability_stack::StackConvergence::new(
+                    deployer.clone(),
+                    ml_config.observability_stack.clone(),
+                    alert_sink,
+                );
+                info!(
+                    namespace = %ml_config.observability_stack.namespace,
+                    manifest_dir = %ml_config.observability_stack.manifest_dir,
+                    interval_secs = ml_config.observability_stack.interval_secs,
+                    "observability stack convergence enabled"
+                );
+                tokio::spawn(stack.run(shutdown.clone()));
+            } else {
+                info!("observability stack convergence disabled by config");
+            }
             tokio::spawn(crate::run_mainline_loop(deployer, shutdown));
         } else {
             info!("mainline deployer disabled by config");

@@ -1427,7 +1427,7 @@ impl MainlineDeployer {
     }
 
     /// bare 仓库指定分支的完整 rev。
-    async fn bare_main_rev(&self) -> SFResult<String> {
+    pub(crate) async fn bare_main_rev(&self) -> SFResult<String> {
         let out = self
             .run_cmd(
                 "git",
@@ -2586,7 +2586,7 @@ impl MainlineDeployer {
 
     /// 从 bare 仓库读指定 rev 下的文件内容（不触碰沙盒工作树，构建与
     /// 组包互不干扰）。
-    async fn git_show(&self, rev: &str, path: &str) -> SFResult<String> {
+    pub(crate) async fn git_show(&self, rev: &str, path: &str) -> SFResult<String> {
         let spec = format!("{rev}:{path}");
         self.run_cmd(
             "git",
@@ -2595,6 +2595,72 @@ impl MainlineDeployer {
             30,
         )
         .await
+    }
+
+    /// rev 下某个目录里的文件名（只一层）。收件面由此**枚举**交付对象，而不是
+    /// 拿一份写死的名字清单：清单外的文件会因此被看见，而不是静默缺席。
+    pub(crate) async fn git_ls_dir(&self, rev: &str, dir: &str) -> SFResult<Vec<String>> {
+        let spec = format!("{}:/{}/", rev, dir.trim_end_matches('/'));
+        let out = self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "ls-tree",
+                    "--name-only",
+                    &spec,
+                ],
+                None,
+                30,
+            )
+            .await?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// `kubectl apply -f -` 落到指定命名空间，并把 stdout/stderr 交回调用方。
+    ///
+    /// 与 [`Self::apply_stdin`] 的差别是**不把失败变成 Err**：收敛面要用 apply
+    /// 自己的报错分类成因（命名空间不存在 / CRD 不存在 / 权限被拒），失败本身
+    /// 就是读数，包成一句 IO 错误就把它丢了。
+    pub(crate) async fn apply_capture(
+        &self,
+        namespace: &str,
+        body: &[u8],
+        timeout_secs: u64,
+    ) -> SFResult<(bool, String, String)> {
+        let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
+            .args(["-n", namespace, "apply", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| SFError::IO(format!("spawn kubectl apply: {e}")))?;
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| SFError::IO("kubectl stdin unavailable".into()))?;
+            stdin.write_all(body).await?;
+            stdin.shutdown().await?;
+        }
+        let output =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+                .await
+                .map_err(|_| SFError::IO(format!("kubectl apply timed out after {timeout_secs}s")))?
+                .map_err(|e| SFError::IO(format!("kubectl apply: {e}")))?;
+        Ok((
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
     }
 
     /// 读 rev 处的发布清单并组装清单包。image 必须是节点 pull 端点引用
@@ -3034,12 +3100,54 @@ const GOVERNANCE_KINDS: &[&str] = &["ResourceQuota", "LimitRange"];
 /// 校核，落盘现状由 `data_volume_over_declared_size` 规则比对声明量发现。
 const STORAGE_CLAIM_KINDS: &[&str] = &["PersistentVolumeClaim"];
 
-/// 拆分多文档 YAML 并过滤进支撑包：Secret 硬报错（零带外凭证红线，密钥
-/// 永不进清单链路）；集群级 kind、权限面 kind（Role/RoleBinding）、治理
-/// kind（ResourceQuota/LimitRange）与卷声明 kind（PersistentVolumeClaim）
-/// 跳过并记日志（由安装面管理，理由见 [`RBAC_KINDS`]、[`GOVERNANCE_KINDS`]
-/// 与 [`STORAGE_CLAIM_KINDS`]）；空文档（`---` 分隔产生）跳过。
-fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Value>> {
+/// 一份文档在交付面上的归处。
+///
+/// 拆成一个纯函数是因为它有两个消费面：主线滚动组包（`namespace_docs`）与
+/// 可观测性栈的周期收敛。两份实现一定会分叉，而分叉的样子是"同一个对象在一条
+/// 路上交付、在另一条路上被跳过"。
+///
+/// 公开是因为它同时是**授权面**的判据：给收敛循环授什么权，取决于这套清单里
+/// 到底有哪些文档真的会被它 apply。授权清单与这张表分叉，会得到"授了权却永不
+/// 交付"或"要交付却没权"两种都没人看得见的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocFate {
+    /// 交付。
+    Deliver,
+    /// 集群级 kind：进化 SA 只有命名空间级 Role，apply 必然被拒，由安装面管理。
+    ClusterScoped,
+    /// 权限面 kind：一份清单能长出权限就等于权限可以自我扩张。
+    Rbac,
+    /// 治理 kind：上限是运维标定的，循环每 rev 重放一份钉死的默认值就是拿它
+    /// 覆盖运维调过的天花板。
+    Governance,
+    /// 卷声明 kind：绑定后的 spec 除扩容外不可变，声明与历史不一致会被拒，
+    /// 而那不是"新版本不好"。
+    StorageClaim,
+    /// Secret：零带外凭证红线，密钥永不进清单链路。
+    ForbiddenSecret,
+}
+
+pub fn classify_doc(kind: &str) -> DocFate {
+    if kind == "Secret" {
+        return DocFate::ForbiddenSecret;
+    }
+    if is_cluster_scoped_kind(kind) {
+        return DocFate::ClusterScoped;
+    }
+    if RBAC_KINDS.contains(&kind) {
+        return DocFate::Rbac;
+    }
+    if GOVERNANCE_KINDS.contains(&kind) {
+        return DocFate::Governance;
+    }
+    if STORAGE_CLAIM_KINDS.contains(&kind) {
+        return DocFate::StorageClaim;
+    }
+    DocFate::Deliver
+}
+
+/// 拆分多文档 YAML（只拆，不过滤）：空文档（`---` 分隔产生）跳过。
+pub(crate) fn split_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Value>> {
     let mut docs = Vec::new();
     for doc in serde_yaml::Deserializer::from_str(yaml_text) {
         let v = serde_yaml::Value::deserialize(doc)
@@ -3047,29 +3155,40 @@ fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Val
         if v.is_null() {
             continue;
         }
-        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        if kind == "Secret" {
-            return Err(SFError::Config(format!(
-                "{origin}: Secret in manifest bundle is forbidden; secrets never travel through manifests"
-            )));
-        }
-        if is_cluster_scoped_kind(kind) {
-            info!(origin = %origin, kind = %kind, "manifest bundle: skipping cluster-scoped kind");
-            continue;
-        }
-        if RBAC_KINDS.contains(&kind) {
-            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping RBAC kind; permission changes must be applied out-of-band");
-            continue;
-        }
-        if GOVERNANCE_KINDS.contains(&kind) {
-            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping resource governance kind; the ceiling is the operator's and is applied at install time, not by the loop");
-            continue;
-        }
-        if STORAGE_CLAIM_KINDS.contains(&kind) {
-            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping volume claim; a bound claim's spec is immutable and is created at install time, not by the loop");
-            continue;
-        }
         docs.push(v);
+    }
+    Ok(docs)
+}
+
+/// 拆分多文档 YAML 并过滤进支撑包：Secret 硬报错（零带外凭证红线，密钥
+/// 永不进清单链路）；集群级 kind、权限面 kind（Role/RoleBinding）、治理
+/// kind（ResourceQuota/LimitRange）与卷声明 kind（PersistentVolumeClaim）
+/// 跳过并记日志（由安装面管理，理由见 [`RBAC_KINDS`]、[`GOVERNANCE_KINDS`]
+/// 与 [`STORAGE_CLAIM_KINDS`]）；空文档（`---` 分隔产生）跳过。
+fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Value>> {
+    let mut docs = Vec::new();
+    for v in split_docs(yaml_text, origin)? {
+        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        match classify_doc(kind) {
+            DocFate::Deliver => docs.push(v),
+            DocFate::ForbiddenSecret => {
+                return Err(SFError::Config(format!(
+                    "{origin}: Secret in manifest bundle is forbidden; secrets never travel through manifests"
+                )));
+            }
+            DocFate::ClusterScoped => {
+                info!(origin = %origin, kind = %kind, "manifest bundle: skipping cluster-scoped kind")
+            }
+            DocFate::Rbac => {
+                warn!(origin = %origin, kind = %kind, "manifest bundle: skipping RBAC kind; permission changes must be applied out-of-band")
+            }
+            DocFate::Governance => {
+                warn!(origin = %origin, kind = %kind, "manifest bundle: skipping resource governance kind; the ceiling is the operator's and is applied at install time, not by the loop")
+            }
+            DocFate::StorageClaim => {
+                warn!(origin = %origin, kind = %kind, "manifest bundle: skipping volume claim; a bound claim's spec is immutable and is created at install time, not by the loop")
+            }
+        }
     }
     Ok(docs)
 }
@@ -6447,6 +6566,7 @@ exit 0
             kubectl_bin: kubectl.into(),
             kubectl_host_path: String::new(),
             state_dir: root.join("state").to_string_lossy().into_owned(),
+            observability_stack: crate::config::ObservabilityStackConfig::default(),
             build_timeout_secs: 60,
             cargo_build_jobs: 2,
             soak_secs: 1,

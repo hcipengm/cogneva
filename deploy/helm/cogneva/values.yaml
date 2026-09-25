@@ -523,3 +523,21 @@ mainlineDeployer:
     memoryRequest: 32Mi
     cpuLimit: 500m
     memoryLimit: 256Mi
+  # 可观测性栈清单（deploy/k3s/observability/manifests/**）的周期收敛：按仓库
+  # 当前 rev 的内容 apply，把现场修回声明态。那些清单此前只有安装脚本一条交付
+  # 路径，装完一次之后仓库与现场各走各的，而「清单没生效」这件事没有判据。
+  # 它不装 helm chart、不应用 Role/RoleBinding、不创建 Namespace：这三样属安装期，
+  # 缺了会报出来而不是自己补（授权面自己给自己长权限是不允许的）。
+  observabilityStack:
+    enabled: true
+    intervalSecs: 300
+    # 仓库内相对路径，与安装脚本的 manifests/ 同一处。
+    manifestDir: "deploy/k3s/observability/manifests"
+    namespace: monitoring
+    # 与安装脚本的 BACKENDS 是同一个开关：清单里的 09-clickhouse / 10-loki
+    # 标着 backends 处置，两边都按它决定交付与否。
+    backends: true
+    applyTimeoutSecs: 120
+    # 一次收敛最多在告警消息里点名几个资源，其余折成计数（消息有界）。集群可以
+    # 漂移一百个对象，消息不能长到没人读。
+    maxNamedResources: 6

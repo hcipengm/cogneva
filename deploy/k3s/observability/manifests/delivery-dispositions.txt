@@ -1,0 +1,42 @@
+# 这份目录里每个清单的交付处置。两个消费面共用它：安装脚本
+# `../scripts/install.sh`（首次安装）与集群内收敛循环（部署器 Pod，周期比对
+# 现场与仓库并修回漂移）。两块都不能自己留一份判断——两份判断一定会分叉，
+# 而分叉的后果是「装的时候跳过、收敛的时候照做」这种互相拆台。
+#
+# 目录里有几个 `*.yaml`，这里就得有几行，一行不多一行不少：这张表是**整套
+# 清单的盘点**，加一个新文件必须在这里写下它算什么、为什么。门禁按此检查
+# （见 crates/cogneva/tests/observability_stack_convergence_test.rs），安装
+# 脚本对缺行只警告不拦——记账的小疏漏不该挡住监控装机。
+#
+# 格式：`<文件名> <处置> # <理由>`。理由必须有：一条没有理由的处置就是下一
+# 个没人知道的洞。处置只有三个取值：
+#   deliver  —— 正常交付。理由写这个文件是干什么的。
+#   exempt   —— 永不交付（写清为什么它**不能**交付，而不是"暂时不想"）。
+#   backends —— 由 BACKENDS 开关决定（日志/时序明细后端那两个）。
+#
+# 未登记的 `*.yaml` 一律按「交付」处理。这是刻意的失效方向：漏登记的结果是
+# 它被交付（看得见），而不是被静默跳过（看不见）——静默不交付正是这条路要
+# 修的缺陷。覆盖方向由门禁兜，运行时这一步只是兜底，遇到会记一条警告。
+#
+# 两类**不靠这张表**的不交付（代码里的不变式，不是表里的一条）：
+#   - 集群级 kind（Namespace）与治理面（ResourceQuota/LimitRange）：循环的
+#     SA 只有命名空间级 Role，apply 必然被拒；由安装面管理。
+#   - 授权面（Role/RoleBinding）与 Secret：前者是「一份清单能给自己长权限
+#     就等于权限可以自我扩张」，后者是零带外凭证红线。两者一律只在安装期
+#     交付，循环读到时会在日志里点名。
+#   - 需要 monitoring.coreos.com CRD 的清单（ServiceMonitor / PodMonitor）：
+#     由消费面自己从文件内容的 kind 判出来、排在指标栈之后应用。写成名单就
+#     会漏掉新加的那个。
+
+01-namespace.yaml deliver # 命名空间本身与它的配额/默认上限；集群级，只在安装期落地
+02-networkpolicy.yaml exempt # 首条策略对 monitoring 全体 Pod 做 ingress 默认拒绝，而放行来源按 Pod 标签匹配；hostNetwork 模式的 ingress-nginx 源地址是节点 IP，匹配不上，会把反代流量整条拦掉。生产形态（controller 非 hostNetwork）再启用
+03-grafana-secrets.yaml exempt # Grafana 管理员 Secret 根本不在清单里（安装期随机生成）；这个文件留下的是一条**没有任何 chart 引用**的占位 webhook，真值是带外凭证——交付它只可能把真人填的值覆盖成占位串
+04-servicemonitor-cogneva.yaml deliver # 主服务（网关/进化 Pod）的指标抓取目标
+05-podmonitor-cogneva.yaml exempt # 与 04-servicemonitor-cogneva.yaml 是二选一的替代方案，两个都应用就是双份抓取
+06-grafana-dashboard-configmap.yaml deliver # Cogneva 自己的 Grafana 面板；Grafana sidecar 按标签热加载，改这里就是改面板
+07-ingress-monitoring.yaml deliver # Prometheus / Grafana / Alertmanager 的对外入口
+08-servicemonitor-gateway.yaml deliver # 安全网关的指标抓取目标（与 04 是不同服务、不是替代关系）
+09-clickhouse.yaml backends # 时序明细后端，只有开了日志/明细后端才装
+10-loki.yaml backends # 日志后端，同上
+11-podmonitor-redis.yaml deliver # Redis 的 AOF 修复明细导出（sidecar 暴露 /metrics），自发现规则的数据来源
+12-stack-convergence-rbac.yaml deliver # 授权面：让收敛循环能 apply 上面这些；只能安装期交付（循环按 kind 不应用 Role/RoleBinding），这一行说的是安装期的处置
