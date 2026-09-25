@@ -508,7 +508,61 @@ data:
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "the message queue restarted ({value} times in 1h). A restart is either a planned spec change or an unclean stop of its host; after an unclean stop Redis had a torn AOF tail that the aof-repair init container drops at startup, and the number of bytes given up is in that container's log. pod_restarting_fast only counts fast loops and pod_restarting_repeatedly needs three in 6h, so a single restart shows up nowhere else"
+              "summary": "the message queue restarted ({value} times in 1h). A restart is either a planned spec change or an unclean stop of its host; after an unclean stop Redis had a torn AOF tail that the aof-repair init container drops at startup, and the number of bytes given up is published by that container as cogneva_aof_repair_dropped_bytes. pod_restarting_fast only counts fast loops and pod_restarting_repeatedly needs three in 6h, so a single restart shows up nowhere else"
+            },
+            {
+              "name": "aof_repair_gave_up_bytes",
+              "promql": "cogneva_aof_repair_dropped_bytes > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "the message queue gave up {value} byte(s) off the tail of its append-only file when it last started. An incomplete record at the end of an AOF is read by Redis as corruption rather than as end-of-file, so without the repair the instance refuses to start at all; the repair drops the torn tail so that it can. Those bytes are gone — everything written after the last intact record is lost, and redis_restarted fires for the same event but counts planned spec changes too, so this is the reading that says data was actually given up. It describes that startup, not the moment it is read: it stands until the pod is recreated, and carries its own date in cogneva_aof_repair_pass_timestamp_seconds"
+            },
+            {
+              "name": "aof_repair_untouched_torn_tail",
+              "promql": "cogneva_aof_repair_untouched_torn_tail_bytes > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "the aof-repair init container found {value} byte(s) of unwritten data at the tail of a file it does not own and left it alone: base and manifest files are rewritten whole by Redis, so truncating one is as likely to destroy the dataset as to recover it. Nothing is broken yet — this is the same unclean stop that tears an increment, seen on a file where the repair has no safe move. If Redis then refuses to start, that trailing run is what to look at, and its length says how far back the damage reaches"
+            },
+            {
+              "name": "aof_repair_suspected_interior_holes",
+              "promql": "cogneva_aof_repair_suspected_interior_holes > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} zero run(s) inside an append-only file were followed by real data at the last start. A torn tail never does that; a hole punched into an already-written region does, which is what a page cache losing writes to an unclean stop leaves behind. The repair reports it and changes nothing, because a legitimate binary payload can hold a long zero run and only a person can tell the two apart. Expect the instance to load and then fail on those records, or to be quietly missing them: cogneva_aof_repair_pass_timestamp_seconds says which start this was, and the volume underneath is where the hole came from"
+            },
+            {
+              "name": "aof_repair_unhandled_layout",
+              "promql": "cogneva_aof_repair_unhandled_layout > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "the AOF directory holds a layout the repair does not handle, so at the last start it inspected nothing at all — and a pass that inspected nothing is not a clean pass, it is an unknown one. Every other aof_repair_* reading is zero or absent because of this, not because the dataset was found intact. The layout changed under the repair (a Redis that writes a different file set, or a different --dir), and until the repair is taught the new one a torn tail will hold the instance in a failed start with nothing attempted"
+            },
+            {
+              "name": "aof_repair_verdict_absent",
+              "promql": "cogneva_aof_repair_verdict_published == 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "the message queue started without publishing an AOF repair verdict: the image predates the repair command, the run died before it could publish, or the operand it was given was not honoured. Every aof_repair_* series is then absent rather than zero, and an absent reading cannot be read as a clean start — check the pod's aof-repair init container log and the image tag it resolved to. This rule exists so that a blind observation face fails loudly instead of passing for a healthy one"
+            },
+            {
+              "name": "aof_repair_reading_absent",
+              "promql": "count(kube_pod_init_container_info{namespace=\"cogneva\", container=\"aof-repair\"} and on(pod) kube_pod_status_phase{namespace=\"cogneva\", phase=\"Running\"} == 1) - (count(cogneva_aof_repair_pass_timestamp_seconds) or vector(0))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} pod(s) that run the AOF repair are up while no repair reading reached Prometheus — the two sides are counted, not assumed, so a scaled-down redis is silent and a broken scrape path is not. Every aof_repair_* rule is silent in this state, and silence here is indistinguishable from a clean start, which is what makes it worth a rule of its own. Usual causes: the redis PodMonitor was never applied (the observability manifests have no automatic delivery path), its port selector no longer matches the port name the sidecar declares, or the exporter cannot read the textfile directory"
             },
             {
               "name": "sandbox_command_oom_killed",

@@ -1,0 +1,38 @@
+# PodMonitor — 抓 redis Pod 上那个只做 textfile 采集的 node-exporter 边车。
+#
+# 为什么要多一跳：AOF 修复是一次性 init 容器的结论（"这次启动放弃了多少字节、
+# 有没有看不懂的布局"），redis-server 本身没有任何 metrics 端点，容器日志也没有
+# 任何采集管道（Loki 只收网关直推的那一份）。于是结论写在 Pod 内的 emptyDir 上、
+# 由边车当 textfile 目录对外提供，是唯一能被抓到的形态。
+#
+# 按 Pod 抓、不经 Service：这份读数是 Pod 级事实，没有值得为之建 Service 的
+# 服务面（与 04/05 抓主应用、08 抓网关不同，那些是常驻的指标端点）。
+# 端口名必须与 redis StatefulSet 里边车声明的端口名一致——两侧写同一个名字就
+# 会漂移，所以 aof-repair-wiring 判据按清单里声明的端口名核对这一份（抓一个
+# 没人提供的端口，等于这份读数在每条查询里都不存在，而"不存在"看起来和
+# "没发生"一样）。
+#
+# 这份读数的采集面本身也有判据看着：cogneva_workload_metrics_unscraped 数的是
+# "跑着但没被抓的 cogneva 镜像容器"，init 容器算进去、被抓目标也算进去，所以
+# 本 PodMonitor 一旦没被应用（或端口名改错），那条既有告警会报出来。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: redis-aof-report
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - cogneva
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+      app.kubernetes.io/component: message-queue
+  podMetricsEndpoints:
+    - port: aof-metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true

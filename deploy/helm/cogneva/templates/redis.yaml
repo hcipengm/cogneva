@@ -28,6 +28,13 @@ spec:
       # would otherwise hold the pod in Init forever. Standing aside with a
       # warning is the honest outcome there; redis still refuses to load and its
       # own error is then the one that says why.
+      #
+      # The verdict is published as well as printed: container logs are shipped
+      # nowhere, so "this startup gave up 208 bytes" had no reader at all. The
+      # second guard is not a capability probe but the reading itself — a
+      # path-named file that is still empty after the repair means the operand was
+      # not honoured, and that absence has to be stated rather than left to look
+      # like a clean pass.
       initContainers:
         - name: aof-repair
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
@@ -36,11 +43,19 @@ spec:
             - sh
             - -c
             - |
+              report=/report/aof-repair.prom
               if ! /opt/cogneva/cogneva --help 2>&1 | grep -q 'repair-aof'; then
+                printf '%s 0\n' cogneva_aof_repair_verdict_published > "$report"
                 echo "aof-repair: level=warn this image predates the repair-aof command; nothing was inspected"
                 exit 0
               fi
-              exec /opt/cogneva/cogneva repair-aof /data/appendonlydir
+              /opt/cogneva/cogneva repair-aof /data/appendonlydir --metrics-file "$report"
+              rc=$?
+              if [ ! -s "$report" ]; then
+                printf '%s 0\n' cogneva_aof_repair_verdict_published > "$report"
+                echo "aof-repair: level=warn no verdict was published (rc=$rc); the AOF findings are unobservable"
+              fi
+              exit $rc
           resources:
             requests:
               cpu: 10m
@@ -51,6 +66,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: aof-report
+              mountPath: /report
       containers:
         - name: redis
           image: {{ .Values.backends.redis.image }}
@@ -96,6 +113,40 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+        # Serves the verdict the init container wrote. redis-server exposes no
+        # metrics endpoint, so a textfile collector beside it is the only way a
+        # one-shot container's reading can reach a scraper; the file lives on an
+        # emptyDir shared with that one-shot container, so the reading dies with
+        # the pod it describes — which is right, it is a statement about this
+        # startup, not about the instance over time.
+        - name: aof-report-exporter
+          image: {{ .Values.backends.redis.aofReportExporter.image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --collector.disable-defaults
+            - --collector.textfile
+            - --collector.textfile.directory=/report
+          ports:
+            - name: aof-metrics
+              containerPort: 9100
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: aof-report
+              mountPath: /report
+              readOnly: true
+      volumes:
+        - name: aof-report
+          emptyDir:
+            # The whole payload is one gauge per finding class, a few hundred
+            # bytes. The bound is here so a broken writer cannot grow it.
+            sizeLimit: 1Mi
   volumeClaimTemplates:
     - metadata:
         name: data

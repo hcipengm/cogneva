@@ -117,7 +117,7 @@ ensure_grafana_admin_credentials() {
 # 需要 kube-prometheus-stack 带来的 CRD（monitoring.coreos.com/v1 下的
 # ServiceMonitor）的清单：CRD 由 chart 安装，先应用会直接报
 # "no matches for kind"，所以这几个只能在 chart 之后，见下面那个函数。
-CRD_DEPENDENT_MANIFESTS="04-servicemonitor-cogneva.yaml 08-servicemonitor-gateway.yaml"
+CRD_DEPENDENT_MANIFESTS="04-servicemonitor-cogneva.yaml 08-servicemonitor-gateway.yaml 11-podmonitor-redis.yaml"
 
 is_crd_dependent() {
     case " ${CRD_DEPENDENT_MANIFESTS} " in

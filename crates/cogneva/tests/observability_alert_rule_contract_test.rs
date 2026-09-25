@@ -32,6 +32,30 @@ const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 /// can never fire.
 const PRODUCED: &[(&str, &str)] = &[
     (
+        "cogneva_aof_repair_dropped_bytes",
+        "crates/cogneva/src/aof_repair.rs",
+    ),
+    (
+        "cogneva_aof_repair_pass_timestamp_seconds",
+        "crates/cogneva/src/aof_repair.rs",
+    ),
+    (
+        "cogneva_aof_repair_suspected_interior_holes",
+        "crates/cogneva/src/aof_repair.rs",
+    ),
+    (
+        "cogneva_aof_repair_unhandled_layout",
+        "crates/cogneva/src/aof_repair.rs",
+    ),
+    (
+        "cogneva_aof_repair_untouched_torn_tail_bytes",
+        "crates/cogneva/src/aof_repair.rs",
+    ),
+    (
+        "cogneva_aof_repair_verdict_published",
+        "crates/cogneva/src/aof_repair.rs",
+    ),
+    (
         "cogneva_build_gate_refused_total",
         "crates/cog-core/src/build_gate.rs",
     ),
@@ -168,6 +192,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "kube-state-metrics",
     ),
     ("kube_pod_container_info", "kube-state-metrics"),
+    (
+        "kube_pod_init_container_info",
+        "kube-state-metrics（init 容器单独一个序列，不在 container_info 里）",
+    ),
     ("kube_pod_container_resource_limits", "kube-state-metrics"),
     (
         "kube_pod_container_status_last_terminated_reason",

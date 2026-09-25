@@ -359,6 +359,11 @@ backends:
     enabled: true
     image: redis:7-alpine
     storage: 5Gi
+    # Serves the AOF repair verdict beside redis as a scrapeable textfile gauge.
+    # redis-server has no metrics endpoint of its own, so an exporter next to it
+    # is the only way a one-shot container's reading can reach a scraper.
+    aofReportExporter:
+      image: quay.io/prometheus/node-exporter:v1.12.1-distroless
   qdrant:
     enabled: true
     image: qdrant/qdrant:v1.13.4

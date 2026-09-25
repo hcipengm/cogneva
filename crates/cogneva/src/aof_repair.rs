@@ -27,6 +27,37 @@ use std::path::{Path, PathBuf};
 /// is a valid repair.
 const INCR_SUFFIX: &str = ".incr.aof";
 
+/// Operand naming the file this pass publishes its verdict to.
+///
+/// The verdict used to be a set of `level=warn` lines on the init container's
+/// stdout, and container logs are shipped nowhere: the reading existed and had
+/// no reader. The same findings written in the Prometheus text format are
+/// readable by a rule, so "the host stopped uncleanly and redis had to give up
+/// the tail of its AOF at startup" stops depending on someone thinking to look.
+pub const METRICS_FILE_OPERAND: &str = "--metrics-file";
+
+/// One gauge per finding class, never one per verdict: bytes given up, a torn
+/// tail left in a file redis owns whole, a suspected hole inside an increment,
+/// and a directory whose layout this repair does not know are four different
+/// things to know, and a reader who is handed their sum cannot act on it.
+pub const AOF_REPAIR_DROPPED_BYTES_METRIC: &str = "cogneva_aof_repair_dropped_bytes";
+pub const AOF_REPAIR_UNTOUCHED_TORN_TAIL_BYTES_METRIC: &str =
+    "cogneva_aof_repair_untouched_torn_tail_bytes";
+pub const AOF_REPAIR_SUSPECTED_INTERIOR_HOLES_METRIC: &str =
+    "cogneva_aof_repair_suspected_interior_holes";
+pub const AOF_REPAIR_UNHANDLED_LAYOUT_METRIC: &str = "cogneva_aof_repair_unhandled_layout";
+pub const AOF_REPAIR_EXAMINED_INCREMENTS_METRIC: &str = "cogneva_aof_repair_examined_increments";
+pub const AOF_REPAIR_PASS_TIMESTAMP_METRIC: &str = "cogneva_aof_repair_pass_timestamp_seconds";
+
+/// Whether a verdict is being published at all.
+///
+/// The repair runs from the image the deployment floats, so a pod can start an
+/// image that predates the operand that publishes this — and then every series
+/// above is simply absent, which a rule keyed on `> 0` reads as "clean". This
+/// gauge is the positive statement that the reading exists; the wrapper in the
+/// deployment writes 0 when the image it got cannot produce one.
+pub const AOF_REPAIR_VERDICT_PUBLISHED_METRIC: &str = "cogneva_aof_repair_verdict_published";
+
 /// Zero run length that makes an interior hole worth reporting. A hole punched
 /// by the page cache is at least a partial write, but a legitimate payload can
 /// hold a long run of real 0x00 bytes; 4096 keeps the report from crying wolf on
@@ -158,6 +189,122 @@ impl RepairReport {
         ));
         out
     }
+
+    /// This pass as Prometheus text, with `pass_unix_seconds` as its date.
+    ///
+    /// Every series is published on every pass, zeros included. A rule keyed on
+    /// `> 0` cannot tell an absent reading from a clean one, so the clean pass is
+    /// the thing that has to be sayable — otherwise the observation face is
+    /// silent in exactly the two situations it exists to separate.
+    pub fn metrics(&self, pass_unix_seconds: u64) -> String {
+        let untouched_bytes: u64 = self.untouched_tails.iter().map(|(_, run)| run).sum();
+        let holes = self
+            .increments
+            .iter()
+            .filter(|f| f.suspected_interior.is_some())
+            .count() as u64;
+
+        let mut out = String::new();
+        push_gauge(
+            &mut out,
+            AOF_REPAIR_DROPPED_BYTES_METRIC,
+            "Bytes dropped from a torn AOF tail at this startup; 0 means nothing was given up",
+            self.dropped_bytes(),
+        );
+        push_gauge(
+            &mut out,
+            AOF_REPAIR_UNTOUCHED_TORN_TAIL_BYTES_METRIC,
+            "Zero bytes at the tail of a file redis owns whole: reported, never modified, \
+             because truncating a file redis rewrites is not a repair",
+            untouched_bytes,
+        );
+        push_gauge(
+            &mut out,
+            AOF_REPAIR_SUSPECTED_INTERIOR_HOLES_METRIC,
+            "Zero runs inside an increment that are followed by data: reported, never \
+             modified, because they may be real payload bytes",
+            holes,
+        );
+        push_gauge(
+            &mut out,
+            AOF_REPAIR_UNHANDLED_LAYOUT_METRIC,
+            "1 when the AOF directory holds a layout this repair does not handle: nothing \
+             was inspected, and a pass that inspected nothing is not a clean pass",
+            u64::from(matches!(self.outcome, PassOutcome::ForeignLayout(_))),
+        );
+        push_gauge(
+            &mut out,
+            AOF_REPAIR_EXAMINED_INCREMENTS_METRIC,
+            "Append-only increments examined at this startup; 0 means there was nothing to \
+             look at, which is a first start rather than a clean one",
+            self.increments.len() as u64,
+        );
+        push_gauge(
+            &mut out,
+            AOF_REPAIR_PASS_TIMESTAMP_METRIC,
+            "When this pass ran. The reading stands for as long as the pod does, so it \
+             carries its own date instead of borrowing the scrape's",
+            pass_unix_seconds,
+        );
+        push_gauge(
+            &mut out,
+            AOF_REPAIR_VERDICT_PUBLISHED_METRIC,
+            "1 when the image that ran this repair could publish its verdict; 0 means the \
+             findings above are absent rather than empty",
+            1,
+        );
+        out
+    }
+}
+
+/// One gauge, in the text format a textfile collector reads.
+fn push_gauge(out: &mut String, name: &str, help: &str, value: u64) {
+    out.push_str(&format!(
+        "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+    ));
+}
+
+/// Wall-clock seconds of this pass.
+fn pass_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// The file named by [`METRICS_FILE_OPERAND`], or `None` when the operand is
+/// absent.
+///
+/// An operand with no path is an error rather than "no file": a manifest writes
+/// this, and a flag without its value is a wiring mistake that would otherwise
+/// look exactly like a clean pass.
+pub fn metrics_file_operand(args: &[String]) -> Result<Option<PathBuf>, String> {
+    match args.iter().position(|a| a == METRICS_FILE_OPERAND) {
+        None => Ok(None),
+        Some(i) => match args.get(i + 1) {
+            Some(path) => Ok(Some(PathBuf::from(path))),
+            None => Err(format!(
+                "usage: cogneva repair-aof <aof-dir> {METRICS_FILE_OPERAND} <path>"
+            )),
+        },
+    }
+}
+
+/// Publish a pass where a scraper can read it.
+///
+/// Written beside the destination and renamed into place. The rename is not for
+/// this process's readers — an init container has exited before anything serves
+/// the directory — but for the next writer: an exporter that collects a
+/// half-written file reports a parse error and then nothing at all for that
+/// target, which is a wider silence than the one being fixed.
+pub fn publish_metrics(
+    path: &Path,
+    report: &RepairReport,
+    pass_unix_seconds: u64,
+) -> std::io::Result<()> {
+    let staging = path.with_extension("prom.tmp");
+    fs::write(&staging, report.metrics(pass_unix_seconds))?;
+    fs::rename(&staging, path)
 }
 
 /// Number of 0x00 bytes at the end of `path`, counting back in [`SCAN_CHUNK`]
@@ -316,19 +463,23 @@ pub fn repair_dir(dir: &Path) -> std::io::Result<RepairReport> {
     Ok(report)
 }
 
-/// `cogneva repair-aof <aof-dir>`: repair, report, exit.
+/// `cogneva repair-aof <aof-dir> [--metrics-file <path>]`: repair, report, exit.
 ///
 /// A repair that dropped bytes still exits 0 — the point of running on the
-/// startup path is that Redis comes up afterwards. The record of what was
-/// dropped is the `level=warn` line, not the exit code.
+/// startup path is that Redis comes up afterwards. What was dropped leaves as a
+/// `level=warn` line and, when the operand names a place, as a published
+/// reading; the exit code is reserved for "this could not run".
 pub fn run_from_args() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::args()
-        .nth(2)
-        .ok_or("usage: cogneva repair-aof <aof-dir>")?;
-    let report = repair_dir(Path::new(&dir))?;
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let dir = args.first().ok_or("usage: cogneva repair-aof <aof-dir>")?;
+    let metrics_file = metrics_file_operand(&args)?;
+    let report = repair_dir(Path::new(dir))?;
     let mut out = std::io::stdout();
     for line in report.lines() {
         writeln!(out, "{line}")?;
+    }
+    if let Some(path) = metrics_file {
+        publish_metrics(&path, &report, pass_unix_seconds())?;
     }
     Ok(())
 }
@@ -521,5 +672,192 @@ mod tests {
             .lines()
             .iter()
             .any(|l| l.contains("level=warn") && l.contains("nothing was inspected")));
+    }
+
+    /// Value of one published series, or `None` when the series is absent.
+    ///
+    /// Deliberately a real parse of the text rather than a substring search: the
+    /// point of these tests is that the collector will find the reading, and
+    /// `# HELP` lines mention the same names.
+    fn published(text: &str, name: &str) -> Option<u64> {
+        text.lines()
+            .find(|l| l.starts_with(name) && l.as_bytes().get(name.len()) == Some(&b' '))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+    }
+
+    /// A clean pass has to be sayable: an absent series and a zero read the same
+    /// way to a rule that only asks `> 0`, and "nothing was wrong" is precisely
+    /// what this face exists to be able to report.
+    #[test]
+    fn a_clean_pass_publishes_its_zeros_and_its_date() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "appendonly.aof.1.incr.aof", HEALTHY);
+        let report = repair_dir(dir.path()).unwrap();
+
+        let text = report.metrics(1_700_000_000);
+        assert_eq!(published(&text, AOF_REPAIR_DROPPED_BYTES_METRIC), Some(0));
+        assert_eq!(
+            published(&text, AOF_REPAIR_UNTOUCHED_TORN_TAIL_BYTES_METRIC),
+            Some(0)
+        );
+        assert_eq!(
+            published(&text, AOF_REPAIR_SUSPECTED_INTERIOR_HOLES_METRIC),
+            Some(0)
+        );
+        assert_eq!(
+            published(&text, AOF_REPAIR_UNHANDLED_LAYOUT_METRIC),
+            Some(0)
+        );
+        assert_eq!(
+            published(&text, AOF_REPAIR_EXAMINED_INCREMENTS_METRIC),
+            Some(1)
+        );
+        assert_eq!(
+            published(&text, AOF_REPAIR_VERDICT_PUBLISHED_METRIC),
+            Some(1)
+        );
+        assert_eq!(
+            published(&text, AOF_REPAIR_PASS_TIMESTAMP_METRIC),
+            Some(1_700_000_000)
+        );
+    }
+
+    /// The reading the row exists for: this startup gave up bytes, which is the
+    /// record of a host that did not stop cleanly.
+    #[test]
+    fn a_given_up_tail_is_published_as_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut torn = HEALTHY.to_vec();
+        torn.extend_from_slice(&[0u8; 208]);
+        write_file(dir.path(), "appendonly.aof.1.incr.aof", &torn);
+
+        let text = repair_dir(dir.path()).unwrap().metrics(0);
+        assert_eq!(published(&text, AOF_REPAIR_DROPPED_BYTES_METRIC), Some(208));
+        assert_eq!(
+            published(&text, AOF_REPAIR_EXAMINED_INCREMENTS_METRIC),
+            Some(1)
+        );
+    }
+
+    /// A pass that inspected nothing must not be publishable as a clean one, and
+    /// the two ways of inspecting nothing are distinguished by the examined
+    /// count: a first start has no files, a foreign layout has them under a name
+    /// this repair does not read.
+    #[test]
+    fn a_blind_pass_publishes_that_it_inspected_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "appendonly.aof", HEALTHY);
+
+        let text = repair_dir(&dir.path().join("appendonlydir"))
+            .unwrap()
+            .metrics(0);
+        assert_eq!(
+            published(&text, AOF_REPAIR_UNHANDLED_LAYOUT_METRIC),
+            Some(1)
+        );
+        assert_eq!(
+            published(&text, AOF_REPAIR_EXAMINED_INCREMENTS_METRIC),
+            Some(0)
+        );
+        assert_eq!(published(&text, AOF_REPAIR_DROPPED_BYTES_METRIC), Some(0));
+    }
+
+    /// Findings this repair declines to act on are still findings: they are the
+    /// ones a person has to look at, and a log line nobody reads is not a
+    /// reading.
+    #[test]
+    fn findings_that_were_left_alone_are_published_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owned_whole = HEALTHY.to_vec();
+        owned_whole.extend_from_slice(&[0u8; 64]);
+        write_file(dir.path(), "appendonly.aof.1.base.aof", &owned_whole);
+
+        let text = repair_dir(dir.path()).unwrap().metrics(0);
+        assert_eq!(
+            published(&text, AOF_REPAIR_UNTOUCHED_TORN_TAIL_BYTES_METRIC),
+            Some(64)
+        );
+        assert_eq!(published(&text, AOF_REPAIR_DROPPED_BYTES_METRIC), Some(0));
+    }
+
+    #[test]
+    fn the_operand_names_the_file_and_needs_a_path() {
+        let none = metrics_file_operand(&["/data/appendonlydir".to_string()]).unwrap();
+        assert_eq!(none, None);
+
+        let named = metrics_file_operand(&[
+            "/data/appendonlydir".to_string(),
+            METRICS_FILE_OPERAND.to_string(),
+            "/report/aof-repair.prom".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(named, Some(PathBuf::from("/report/aof-repair.prom")));
+
+        // A flag with nothing after it is a wiring mistake, not "no file": read
+        // as "no file" it would look exactly like a clean pass.
+        let dangling = metrics_file_operand(&[
+            "/data/appendonlydir".to_string(),
+            METRICS_FILE_OPERAND.to_string(),
+        ]);
+        assert!(dangling.is_err());
+    }
+
+    #[test]
+    fn the_published_file_holds_the_pass_and_leaves_no_staging_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "appendonly.aof.1.incr.aof", HEALTHY);
+        let report = repair_dir(dir.path()).unwrap();
+
+        let report_dir = tempfile::tempdir().unwrap();
+        let target = report_dir.path().join("aof-repair.prom");
+        publish_metrics(&target, &report, 42).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), report.metrics(42));
+        assert_eq!(
+            published(
+                &fs::read_to_string(&target).unwrap(),
+                AOF_REPAIR_PASS_TIMESTAMP_METRIC
+            ),
+            Some(42)
+        );
+        let left: Vec<String> = fs::read_dir(report_dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, vec!["aof-repair.prom".to_string()]);
+    }
+
+    /// The rule that reads the published gauge has to treat it as a presence
+    /// statement. A rename on either side of the contract is caught by the
+    /// alert-rule table; what that table cannot see is the comparison, and
+    /// `> 0` on a gauge that is 1 whenever the reading exists alerts on every
+    /// healthy redis instead of on the one that cannot publish.
+    #[test]
+    fn the_deployed_rule_reads_the_published_gauge_as_a_presence_statement() {
+        let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let text = fs::read_to_string(&chart)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
+        let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
+        let rules = root
+            .pointer("/observability/infra_watch/rules")
+            .and_then(|v| v.as_array())
+            .expect("infra_watch.rules present");
+
+        let rule = rules
+            .iter()
+            .find(|r| {
+                r["promql"]
+                    .as_str()
+                    .is_some_and(|p| p.contains(AOF_REPAIR_VERDICT_PUBLISHED_METRIC))
+            })
+            .unwrap_or_else(|| panic!("no rule queries {AOF_REPAIR_VERDICT_PUBLISHED_METRIC}"));
+        let promql = rule["promql"].as_str().unwrap();
+        assert!(
+            promql.contains("== 0"),
+            "the absence of a verdict is what the rule is for, got: {promql}"
+        );
     }
 }
