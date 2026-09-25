@@ -114,14 +114,32 @@ ensure_grafana_admin_credentials() {
 }
 
 # ─── 部署基础 Manifests ───────────────────────────────────────────
+# 需要 kube-prometheus-stack 带来的 CRD（monitoring.coreos.com/v1 下的
+# ServiceMonitor）的清单：CRD 由 chart 安装，先应用会直接报
+# "no matches for kind"，所以这几个只能在 chart 之后，见下面那个函数。
+CRD_DEPENDENT_MANIFESTS="04-servicemonitor-cogneva.yaml 08-servicemonitor-gateway.yaml"
+
+is_crd_dependent() {
+    case " ${CRD_DEPENDENT_MANIFESTS} " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 deploy_manifests() {
     log_info "部署 K8s 基础资源 (Namespace / Secrets / ServiceMonitor / Dashboard)..."
+
+    # 命名空间先于一切：下面的凭证准备要在它里面建 Secret，首次安装时它还
+    # 不存在——若等遍历清单时才创建，凭证那一步会在空命名空间上失败。
+    log_info "应用: 01-namespace.yaml"
+    kubectl apply -f "${MANIFESTS_DIR}/01-namespace.yaml"
 
     # 清单里没有 Grafana 的那个 Secret：它必须由这里在 apply 之前备好
     # （kube-prometheus-stack 的 grafana 从 existingSecret 读）。
     ensure_grafana_admin_credentials
 
     # 不应用的文件及原因：
+    #   01-namespace — 已在上面应用（凭证准备依赖它）。
     #   02-networkpolicy — 首条策略对 monitoring 全体 Pod 做 ingress 默认拒绝，
     #     但放行来源按 Pod 标签匹配 ingress controller；hostNetwork 模式的
     #     ingress-nginx 源地址是节点 IP，匹配不上，会把反代流量全拦下。
@@ -129,28 +147,44 @@ deploy_manifests() {
     #   05-podmonitor — 与 04-servicemonitor 二选一的替代方案，避免双份抓取。
     #   09-clickhouse / 10-loki — 日志与时序明细后端，由 BACKENDS 开关控制。
     for f in "${MANIFESTS_DIR}"/*.yaml; do
-        case "$(basename "$f")" in
+        local base
+        base="$(basename "$f")"
+        case "$base" in
+            01-namespace.yaml)
+                continue ;;
             02-networkpolicy.yaml|05-podmonitor-cogneva.yaml)
-                log_warn "跳过: $(basename "$f")"
+                log_warn "跳过: $base"
                 continue ;;
             09-clickhouse.yaml|10-loki.yaml)
                 if [ "${BACKENDS}" = "1" ]; then
                     # 凭证只能在清单之前备好：ClickHouse 从 secretKeyRef 读密码。
-                    if [ "$(basename "$f")" = "09-clickhouse.yaml" ]; then
+                    if [ "$base" = "09-clickhouse.yaml" ]; then
                         ensure_clickhouse_credentials
                     fi
-                    log_info "应用: $(basename "$f")"
+                    log_info "应用: $base"
                     kubectl apply -f "$f"
                 else
-                    log_warn "跳过: $(basename "$f")（BACKENDS=0）"
+                    log_warn "跳过: $base（BACKENDS=0）"
                 fi
                 continue ;;
         esac
-        log_info "应用: $(basename "$f")"
+        if is_crd_dependent "$base"; then
+            log_info "延后: $base（等待 chart 安装 CRD）"
+            continue
+        fi
+        log_info "应用: $base"
         kubectl apply -f "$f"
     done
 
     log_info "基础资源部署完成 ✓"
+}
+
+# ─── chart 安装之后才能应用的清单 ─────────────────────────────────
+deploy_crd_dependent_manifests() {
+    for base in ${CRD_DEPENDENT_MANIFESTS}; do
+        log_info "应用: ${base}"
+        kubectl apply -f "${MANIFESTS_DIR}/${base}"
+    done
 }
 
 # ─── 把 ClickHouse 密码镜像给安全网关命名空间 ─────────────────────
@@ -236,6 +270,8 @@ main() {
     add_helm_repos
     deploy_manifests
     deploy_prometheus_stack
+    # ServiceMonitor 依赖 chart 带来的 CRD，只能排在 chart 之后。
+    deploy_crd_dependent_manifests
     # Loki / ClickHouse 清单已在 deploy_manifests 应用；这里把 ClickHouse 密码同步给
     # 网关命名空间，网关据此连 ClickHouse 写时序明细
     # （securityGateway.observability.clickhouse）。
