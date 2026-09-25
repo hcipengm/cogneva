@@ -207,6 +207,15 @@ const FATAL_WAITING_REASONS: &[&str] = &[
     "CrashLoopBackOff",
 ];
 
+/// 支撑清单 apply 会动到的工作负载种类。滚动目标本身是 Deployment，但目标由
+/// 逐目标等待单独负责，这里的判据不覆盖它们。
+const SUPPORT_WORKLOAD_KINDS: &[&str] = &["deploy", "statefulset"];
+
+/// 支撑工作负载"这次滚动可以往下走了"的读法：代数、观测到的代数、期望副本数、
+/// 就绪副本数。竖线显式占位，缺字段（omitempty）不能顶掉后面的位置。
+const SUPPORT_SETTLE_JSONPATH: &str =
+    "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.readyReplicas}";
+
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
 const ROLLOUT_POLL_SECS: u64 = 5;
 
@@ -2411,13 +2420,16 @@ impl MainlineDeployer {
             "spec": {
                 "backoffLimit": 0,
                 // 上界必须覆盖最坏情况：每个目标最多吃 startup + rollout + 15s
-                // 宽限（到点即判败回滚）；Job 被 activeDeadlineSeconds 杀掉
-                // 走不到 Job 自己的回滚，留短了会把集群停在半滚状态。
+                // 宽限（到点即判败回滚），加上支撑工作负载等就绪的那一段（同为
+                // startup 预算）；Job 被 activeDeadlineSeconds 杀掉走不到 Job
+                // 自己的回滚，留短了会把集群停在半滚状态。
                 "activeDeadlineSeconds": (self.cfg.startup_timeout_secs
                     + self.cfg.rollout_timeout_secs
                     + 15)
                     * self.cfg.targets.len().max(1) as u64
-                    + self.cfg.soak_secs,
+                    + self.cfg.soak_secs
+                    + self.cfg.startup_timeout_secs
+                    + 15,
                 "ttlSecondsAfterFinished": 86400,
                 "template": {
                     "metadata": {
@@ -3257,6 +3269,67 @@ impl RolloutPlan {
     }
 }
 
+/// 支撑清单里可能被 apply 动到的工作负载（后端与集群内 registry）。apply 只改
+/// 自己那份 spec：没改动的工作负载原地不动，改动的会滚动重启几秒到几十秒。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupportWorkload {
+    /// kubectl 子命令用的单数资源名（deploy / statefulset）。
+    kind: &'static str,
+    name: String,
+    generation: i64,
+}
+
+impl SupportWorkload {
+    fn display(&self) -> String {
+        format!("{}/{}", self.kind, self.name)
+    }
+}
+
+/// 这次 apply 真的动过哪些支撑工作负载：代数变了，或 apply 之前根本不在（新增
+/// 的工作负载一样要等到就绪）。目标部署不在此列——它们的滚动由逐目标等待负责，
+/// 判据与预算都是另一套，在这里再等一遍会让同一件事有两个判据。
+fn changed_workloads(
+    before: &[SupportWorkload],
+    after: &[SupportWorkload],
+    targets: &[RolloutTarget],
+) -> Vec<SupportWorkload> {
+    after
+        .iter()
+        .filter(|w| {
+            !targets
+                .iter()
+                .any(|t| w.kind == "deploy" && t.deployment == w.name)
+        })
+        .filter(
+            |w| match before.iter().find(|b| b.kind == w.kind && b.name == w.name) {
+                Some(b) => b.generation != w.generation,
+                None => true,
+            },
+        )
+        .cloned()
+        .collect()
+}
+
+/// 支撑工作负载是否已经回到"这次滚动可以往下走"：控制器已经处理过这一代 spec
+/// （observedGeneration 追平 generation），且就绪副本数达到 spec 要的数目。读法
+/// 解析不出来就返回 None（没读到答案，不是"就绪"）。spec.replicas 缺省时按 1
+/// 算：Deployment/StatefulSet 的缺省都是 1，读成 0 会把一个单副本工作负载判成
+/// "不需要就绪"而直接放行。
+fn support_settled(readout: &str) -> Option<bool> {
+    let mut parts = readout.split('|');
+    let generation: i64 = parts.next()?.trim().parse().ok()?;
+    let observed: i64 = parts.next()?.trim().parse().unwrap_or(0);
+    let want: i32 = parts
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1);
+    let ready: i32 = parts
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    Some(observed >= generation && ready >= want)
+}
+
 pub struct RolloutExecutor {
     kubectl: String,
     ns: String,
@@ -3383,6 +3456,73 @@ impl RolloutExecutor {
     /// 判据与 patch 序列都在 `cog_core`（纯函数），这里只负责取现状与执行。读不到
     /// 现状（对象还不存在、查询失败）就什么都不做：首次交付本就没有残留，集群不可
     /// 达时紧随其后的 apply 会报出真实错误，不在这里替它下结论。
+    /// 采一次命名空间里支撑工作负载的代数，用来在 apply 之后认出这次动过谁。
+    async fn support_workloads(&self) -> SFResult<Vec<SupportWorkload>> {
+        let mut out = Vec::new();
+        for kind in SUPPORT_WORKLOAD_KINDS {
+            let text = self
+                .run_kubectl(
+                    &[
+                        "get",
+                        kind,
+                        "-o",
+                        "jsonpath={range .items[*]}{.metadata.name} {.metadata.generation}{\"\\n\"}{end}",
+                    ],
+                    30,
+                )
+                .await?;
+            for line in text.lines() {
+                let mut parts = line.split_whitespace();
+                let (Some(name), Some(generation)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                let Ok(generation) = generation.parse::<i64>() else {
+                    continue;
+                };
+                out.push(SupportWorkload {
+                    kind,
+                    name: name.to_string(),
+                    generation,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// 等这次 apply 动过的支撑工作负载回到就绪。等不到（或读不到集群）都把错误
+    /// 交回调用方按落点分类：读不到集群是环境类，能读却一直起不来是这份发布集的
+    /// 事（支撑清单也在本次下发的内容里），此时一个镜像都还没动，谈不上回滚。
+    async fn wait_support_settled(&self, workloads: &[SupportWorkload]) -> SFResult<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(self.startup_timeout_secs);
+        let mut pending: Vec<&SupportWorkload> = workloads.iter().collect();
+        let mut last = String::new();
+        while !pending.is_empty() {
+            let mut still: Vec<&SupportWorkload> = Vec::new();
+            for w in pending {
+                let readout = self
+                    .run_kubectl(&["get", w.kind, &w.name, "-o", SUPPORT_SETTLE_JSONPATH], 30)
+                    .await?;
+                if support_settled(&readout) == Some(true) {
+                    continue;
+                }
+                last = format!("{} generation|observed|want|ready={readout}", w.display());
+                still.push(w);
+            }
+            pending = still;
+            if pending.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SFError::Agent(format!(
+                    "support workload this rollout restarted did not become ready within {}s: {last}",
+                    self.startup_timeout_secs
+                )));
+            }
+            tokio::time::sleep(Duration::from_secs(ROLLOUT_POLL_SECS)).await;
+        }
+        Ok(())
+    }
+
     async fn clear_superseded_env_values(&self, manifest: &Path) -> SFResult<()> {
         let text = tokio::fs::read_to_string(manifest)
             .await
@@ -4047,6 +4187,14 @@ impl RolloutExecutor {
                 match staged {
                     Some(path) => {
                         let support_arg = path.to_string_lossy().to_string();
+                        // apply 之前先记下支撑工作负载的代数：apply 之后只有代数
+                        // 变了的那些是真被这次滚动搅动的，其余原地没动。少了这份
+                        // 快照就只能"等所有支撑工作负载"，那会把一个与本次上线
+                        // 无关、恰好没起来的后端也算到这次滚动头上。
+                        let before = self
+                            .support_workloads()
+                            .await
+                            .map_err(|e| classify_before_any_change("support-snapshot", "", e))?;
                         info!(
                             source = %support.display(),
                             manifest = %support_arg,
@@ -4058,6 +4206,33 @@ impl RolloutExecutor {
                         self.run_kubectl(&["apply", "-f", &support_arg], 120)
                             .await
                             .map_err(|e| classify_before_any_change("support", "", e))?;
+                        // 支撑清单里除了 ConfigMap/Service，还有后端与集群内
+                        // registry 这些工作负载，而目标部署的镜像要从这个 registry
+                        // 拉、启动要连这些后端。apply 只改动的那些会滚动重启几秒到
+                        // 几十秒；不等它们回到就绪就滚目标，我们自己制造的这段空窗
+                        // 会以 ErrImagePull（registry 正好在重启）或连不上后端的
+                        // 身份落到目标 Pod 上，被读成"新版本坏了"并回滚一个完好的
+                        // 版本——线上实测过一次：一次 support apply 带上后端探针
+                        // 变更，四个后端与 registry 一起重启，目标在 4 秒后被判
+                        // ErrImagePull 版本类失败并回滚。
+                        let after = self
+                            .support_workloads()
+                            .await
+                            .map_err(|e| classify_before_any_change("support-snapshot", "", e))?;
+                        let restarted = changed_workloads(&before, &after, &plan.targets);
+                        if !restarted.is_empty() {
+                            info!(
+                                workloads = %restarted
+                                    .iter()
+                                    .map(SupportWorkload::display)
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                "mainline rollout: waiting for support workloads this apply restarted"
+                            );
+                            self.wait_support_settled(&restarted)
+                                .await
+                                .map_err(|e| classify_before_any_change("support-settle", "", e))?;
+                        }
                     }
                     None => warn!(
                         source = %support.display(),
@@ -7288,6 +7463,218 @@ exit 0
         // 健康。
         std::fs::write(&pods_file, "0 true ").unwrap();
         assert!(executor.pods_healthy(&target).await.is_ok());
+    }
+
+    fn support_workload(kind: &'static str, name: &str, generation: i64) -> SupportWorkload {
+        SupportWorkload {
+            kind,
+            name: name.to_string(),
+            generation,
+        }
+    }
+
+    #[test]
+    fn changed_workloads_selects_what_this_apply_restarted() {
+        let before = vec![
+            support_workload("deploy", "cogneva-registry", 1),
+            support_workload("deploy", "meilisearch", 3),
+            support_workload("statefulset", "postgres", 1),
+        ];
+        let after = vec![
+            // 代数前进：apply 改了 spec，这个会滚动重启。
+            support_workload("deploy", "cogneva-registry", 2),
+            // 没改：原地不动，不该等。
+            support_workload("deploy", "meilisearch", 3),
+            // apply 之前不在：新增的工作负载同样要等到就绪。
+            support_workload("statefulset", "nats", 1),
+            // 目标部署自己：由逐目标等待负责，不在这里再等一遍。
+            support_workload("deploy", "cogneva-security-gateway", 9),
+            support_workload("statefulset", "postgres", 1),
+        ];
+        let targets = vec![RolloutTarget {
+            deployment: "cogneva-security-gateway".into(),
+            container: "security-gateway".into(),
+            component: "security-gateway".into(),
+            name: "cogneva".into(),
+        }];
+        let changed: Vec<String> = changed_workloads(&before, &after, &targets)
+            .iter()
+            .map(SupportWorkload::display)
+            .collect();
+        assert_eq!(changed, vec!["deploy/cogneva-registry", "statefulset/nats"]);
+    }
+
+    #[test]
+    fn support_settled_requires_observed_generation_and_ready_replicas() {
+        // generation|observed|want|ready
+        assert_eq!(support_settled("2|2|1|1|"), Some(true));
+        // 控制器还没看到这一代 spec：新副本一个都还没起。
+        assert_eq!(support_settled("2|1|1|1|"), Some(false));
+        // 滚动中：就绪副本还没补齐。
+        assert_eq!(support_settled("2|2|3|2|"), Some(false));
+        // 缩到 0 副本：spec 要 0 个，就绪 0 个成立。
+        assert_eq!(support_settled("2|2|0|"), Some(true));
+        // replicas 缺省（读作 1）而就绪数读不到：不能当成"不需要就绪"。
+        assert_eq!(support_settled("2|2||"), Some(false));
+        // 读不出来不是"就绪"。
+        assert_eq!(support_settled(""), None);
+        assert_eq!(support_settled("|2|1|1|"), None);
+    }
+
+    /// 支撑清单 apply 会连带重启后端与集群内 registry：目标部署的镜像要从这个
+    /// registry 拉、启动要连这些后端，所以必须等它们回到就绪再滚目标。
+    ///
+    /// 假 kubectl 把这条判据做成硬失败：目标在支撑工作负载就绪之前被 `set image`
+    /// 就报错退出。少了这段等待，滚动会直接失败（而不是靠断言顺序来推断）。
+    #[tokio::test]
+    async fn rollout_waits_for_the_support_workloads_its_own_apply_restarted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, 2);
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        executor.run(&plan).await.unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        // 按字节位置比而不是按行：假 kubectl 用 `echo "$@"` 落日志，实参里的
+        // `\n`（jsonpath 的换行转义）会被 sh 的 echo 展开成真换行，行切分靠不住。
+        let first_target = calls.find("set image ").expect("no target rolled");
+        let last_settle_poll = calls
+            .rfind("get deploy cogneva-registry")
+            .expect("the restarted support workload was never waited on");
+        assert!(
+            last_settle_poll < first_target,
+            "the target rolled before the support workload this apply restarted was ready: {calls}"
+        );
+        // 没被这次 apply 动过的工作负载不进等待：等它就是把无关的故障算到这次上线头上。
+        assert!(
+            !calls.contains("get deploy meilisearch"),
+            "an untouched support workload must not gate the rollout: {calls}"
+        );
+    }
+
+    /// 等不到就绪就停下，一个目标都不滚。类别按落点判：集群读得到而工作负载一直
+    /// 起不来，怀疑的是这次下发的支撑清单（这份发布集里就有它），判版本类；读不到
+    /// 集群才判环境类。此处前者成立，且一个镜像都还没动——所以只停，没有回滚对象。
+    #[tokio::test]
+    async fn unsettled_support_workload_stops_before_any_target_rolls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        // 采样永远落后一代：这个支撑工作负载不会就绪。
+        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, 999);
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            1,
+        );
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        let err = executor.run(&plan).await.unwrap_err();
+        assert_eq!(err.class, FailureClass::Version, "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("support workload this rollout restarted did not become ready"),
+            "{err}"
+        );
+        // 这条失败有自己的签名：与目标滚动失败是不同的落点，部署器据此判"同 rev
+        // 反复失败是不是同一处坏"。
+        assert_eq!(err.signature, "version:support-settle::observed");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("set image "),
+            "no target may be rolled while the support workload it depends on is not ready: {calls}"
+        );
+    }
+
+    /// 假 kubectl：支撑清单里 registry 被 apply 改了 spec（代数前进），`set image`
+    /// 在它回到就绪之前一律硬失败。`settle_at` 是第几次采样才报就绪。
+    fn fake_kubectl_support_settle(dir: &Path, settle_at: u32) -> (PathBuf, PathBuf) {
+        let manifests = dir.join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(
+            manifests.join("support.yaml"),
+            "kind: ConfigMap\nmetadata:\n  name: cogneva-config\n",
+        )
+        .unwrap();
+
+        let log = dir.join("kubectl.log");
+        let applied = dir.join("applied.marker");
+        let settled = dir.join("settled.marker");
+        let count = dir.join("settle.count");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *"apply -f "*)
+    touch '{applied}'
+    echo "configmap/cogneva-config configured" ;;
+  # 支撑工作负载表：apply 之后 registry 的代数前进，其余没动。
+  *"get deploy -o"*)
+    if [ -f '{applied}' ]; then echo "cogneva-registry 2"; else echo "cogneva-registry 1"; fi
+    echo "meilisearch 1"
+    ;;
+  *"get statefulset -o"*) ;;
+  # 等就绪：第 settle_at 次采样才就绪，之前一直落后一代。
+  *"get deploy cogneva-registry -o"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    if [ "$n" -ge {settle_at} ]; then touch '{settled}'; echo "2|2|1|1|"; else echo "2|1|1|0|"; fi
+    ;;
+  *"get deployment "*)
+    echo "1|1|1|1|1|" ;;
+  *"set image "*)
+    if [ ! -f '{settled}' ]; then
+      echo "target rolled while the support workload this apply restarted was not ready" >&2
+      exit 1
+    fi
+    echo "deployment.apps/x image updated" ;;
+  *"terminated.finishedAt"*) ;;
+  *"deletionTimestamp"*) echo "p-new|Running|true|||2026-09-17T15:46:29Z|" ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) ;;
+  *"get pods"*) ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            applied = applied.display(),
+            settled = settled.display(),
+            count = count.display(),
+            settle_at = settle_at
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        (manifests, log)
     }
 
     /// fake kubectl：init 容器进度与 deployment 状态按轮次推进。第 1 轮
