@@ -745,13 +745,25 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         let metrics_url = std::env::var("COGNEVA_GITOPS_METRICS_URL")
                             .ok()
                             .filter(|s| !s.trim().is_empty());
+                        // A gate that could not read all watch needs its verdict
+                        // to have a successor: a verdict that reaches only the
+                        // ledger and the log reads like nobody being told. Without
+                        // a sink, say so and stay report-only.
+                        let alert_sink = ctx.consume_service::<dyn cog_core::PersistentAlertSink>();
+                        if alert_sink.is_none() {
+                            warn!(
+                                "PersistentAlertSink not published; canary gate blindness \
+                                 stays report-only"
+                            );
+                        }
                         let puller = Arc::new(
                             crate::GitOpsPuller::new(
                                 promotion.gitops.clone(),
                                 ledger,
                                 cluster.clone(),
                             )
-                            .with_metrics_url(metrics_url),
+                            .with_metrics_url(metrics_url)
+                            .with_alert_sink(alert_sink),
                         );
                         let puller_shutdown = cog_core::ShutdownSignal::new();
                         if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {

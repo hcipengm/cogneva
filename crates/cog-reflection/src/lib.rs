@@ -96,7 +96,9 @@ pub use fault_classifier::RuleBasedFaultClassifier;
 pub use firecracker::{FirecrackerSandbox, MicroVm, MicroVmOutcome};
 pub use flywheel::{JsonlFileSink, LearningSink, WarehouseRecorder};
 pub use gitops_publisher::GitOpsPublisher;
-pub use gitops_puller::{parse_tag_message, run_puller_loop, GitOpsPuller, PromotionCandidate};
+pub use gitops_puller::{
+    parse_tag_message, run_puller_loop, GitOpsPuller, PromotionCandidate, CANARY_GATE_BLIND_RULE,
+};
 pub use image_rollout::ImageRollout;
 pub use mainline_deployer::{
     classify_doc, run_mainline_loop, run_rollout_cli, DocFate, FailureClass, MainlineDeployer,

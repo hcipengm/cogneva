@@ -34,6 +34,24 @@ use cog_core::{
 };
 use tracing::{debug, info, warn};
 
+/// Rule name for this process's own alert: a canary metric gate spent a whole
+/// watch without a reading, for a reason that traffic does not explain.
+///
+/// It must not collide with a configured rule name: the alert table is shared,
+/// and a consumer that reads a name as its own adopts and resolves rows it did
+/// not raise.
+pub const CANARY_GATE_BLIND_RULE: &str = "canary_metric_gate_blind";
+
+/// The gates a canary rolls on. One list: the coverage summary, the blindness
+/// verdict and the alert rows all read it, so a gate cannot be added to one
+/// and forgotten in the others.
+const CANARY_GATES: [&str; 2] = ["latency", "error-rate"];
+
+/// Pseudo-gate for a watch that never formed a single window: neither gate ran
+/// at all, so there is no per-gate verdict to report. Named so it can carry its
+/// own alert row instead of hiding inside one of the real gates.
+const WHOLE_WATCH_GATE: &str = "watch";
+
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromotionCandidate {
@@ -71,6 +89,11 @@ pub struct GitOpsPuller {
     cluster: String,
     /// 可选 metrics 抓取地址（配置了才做指标阈值比对看护）。
     metrics_url: Option<String>,
+    /// Optional persistent alert surface: a verdict about a gate that could not
+    /// read needs a successor. Without it the verdict lives only in the ledger
+    /// and the log, and a verdict that reaches nothing but a log reads exactly
+    /// like nobody being told.
+    alert_sink: Option<Arc<dyn cog_core::PersistentAlertSink>>,
 }
 
 impl GitOpsPuller {
@@ -80,11 +103,17 @@ impl GitOpsPuller {
             ledger,
             cluster,
             metrics_url: None,
+            alert_sink: None,
         }
     }
 
     pub fn with_metrics_url(mut self, url: Option<String>) -> Self {
         self.metrics_url = url;
+        self
+    }
+
+    pub fn with_alert_sink(mut self, sink: Option<Arc<dyn cog_core::PersistentAlertSink>>) -> Self {
+        self.alert_sink = sink;
         self
     }
 
@@ -1036,12 +1065,78 @@ impl GitOpsPuller {
         coverage.no_window = coverage.metrics_off.is_none() && window.is_none();
         let summary = coverage.summary();
         // 有判据整轮没拿到读数时按 warn 记：这是需要有人看一眼的形态，不是常态。
-        if coverage.measured("latency") && coverage.measured("error-rate") {
+        if CANARY_GATES.iter().all(|g| coverage.measured(g)) {
             info!(cluster = %self.cluster, "{summary}");
         } else {
             warn!(cluster = %self.cluster, "{summary}");
         }
+        self.publish_gate_blindness(&coverage).await;
         Ok(coverage)
+    }
+
+    /// Turn "this gate read nothing all watch, for a reason traffic does not
+    /// explain" into a persistent alert row, and let the first watch that reads
+    /// the gate resolve that same row.
+    ///
+    /// The condition is latched in the alert surface rather than in this
+    /// process: the puller runs inside the deployment it rolls, so the roll a
+    /// blind gate let through is the very event that restarts this process. An
+    /// in-process streak counter would be reset by the event it exists to span.
+    ///
+    /// Both gates are driven on every watch, the readable one as a resolution.
+    /// Only then does "blind last time, fine now" clear the row instead of
+    /// leaving it for the next reader to guess about.
+    async fn publish_gate_blindness(&self, coverage: &GateCoverage) {
+        let blind = coverage.blind_gates();
+        for gate in CANARY_GATES.iter().copied().chain([WHOLE_WATCH_GATE]) {
+            let (firing, cause, ticks, message) = match blind.iter().find(|b| b.gate == gate) {
+                Some(entry) => (
+                    true,
+                    entry.cause.label(),
+                    entry.ticks,
+                    entry.message(coverage.pod_checks),
+                ),
+                // Read this watch, or merely idle: resolve this gate's row.
+                None => (
+                    false,
+                    "readable",
+                    0,
+                    format!("canary {gate} gate reads again; condition cleared"),
+                ),
+            };
+            if firing {
+                warn!(cluster = %self.cluster, gate, "{}", message);
+            }
+            let Some(ref sink) = self.alert_sink else {
+                continue;
+            };
+            let draft = self.blindness_draft(gate, cause, ticks, message);
+            if let Err(e) = sink.set_persistent_alert(firing, &draft).await {
+                warn!(error = %e, gate, firing, "canary gate blindness not persisted");
+            }
+        }
+    }
+
+    fn blindness_draft(
+        &self,
+        gate: &str,
+        cause: &str,
+        ticks: u32,
+        message: String,
+    ) -> cog_core::PersistentAlertDraft {
+        cog_core::PersistentAlertDraft {
+            rule: CANARY_GATE_BLIND_RULE.into(),
+            // One row per gate: resolving one gate cannot clear another's fault.
+            dedup_key: format!("{CANARY_GATE_BLIND_RULE}:{gate}"),
+            severity: "warning".into(),
+            message,
+            labels: serde_json::json!({
+                "cluster": self.cluster,
+                "gate": gate,
+                "cause": cause,
+                "ticks": ticks,
+            }),
+        }
     }
 
     /// 抓取一组副本，连同「刮的是谁、正文声明什么语义」一起记下。
@@ -1272,6 +1367,14 @@ impl GitOpsPuller {
         let outcome = latency_outcome(baseline_p99, candidate_p99);
         debug!("canary latency gate: {outcome}");
         coverage.record("latency", outcome);
+        let latency_cause = latency_missing_cause(baseline_p99, candidate_p99);
+        if latency_cause.is_some() {
+            coverage.record_missing(
+                "latency",
+                latency_cause,
+                latency_why(baseline_p99, candidate_p99),
+            );
+        }
         if let (LatencyRead::Measured(b), LatencyRead::Measured(c)) = (baseline_p99, candidate_p99)
         {
             if b > 0.0 && c > b * self.config.canary_p99_multiplier {
@@ -1289,6 +1392,9 @@ impl GitOpsPuller {
             "canary error-rate gate: {}", read.label()
         );
         coverage.record("error-rate", read.label());
+        if let Some((cause, why)) = read.blind() {
+            coverage.record_missing("error-rate", Some(cause), why);
+        }
         if let RateRead::Measured {
             candidate,
             baseline,
@@ -1441,6 +1547,45 @@ enum CounterSemantics {
     Windowed,
 }
 
+impl CounterSemantics {
+    /// Named for readings that have to say which two semantics disagreed.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Cumulative => "cumulative",
+            Self::Windowed => "windowed",
+        }
+    }
+}
+
+/// Why one tick produced no rate on one side.
+///
+/// The two are different facts with different owners: too few requests is the
+/// deployment's traffic, while a cumulative counter that went backwards
+/// contradicts what the body declares about itself — nothing about the declared
+/// semantics allows it, so the delta is not a count and no reading can be
+/// formed from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateMiss {
+    /// Fewer than `min_requests` new requests in the window: a rate over too
+    /// small a denominator says more about the denominator than about the
+    /// version.
+    NoTraffic,
+    /// The cumulative counter decreased between the two reads.
+    CounterWentBackwards,
+}
+
+impl RateMiss {
+    fn why(&self) -> &'static str {
+        match self {
+            Self::NoTraffic => "too few new requests in the window",
+            Self::CounterWentBackwards => {
+                "the cumulative counter decreased between two reads, which its \
+                 declared semantics do not allow"
+            }
+        }
+    }
+}
+
 /// 一侧（旧版本或候选）在一次抓取里的观测。
 ///
 /// 带上「刮的是哪一组副本」与「正文声明什么语义」：这两样一变，这一读与之前那读
@@ -1508,6 +1653,57 @@ impl LatencyRead {
             Self::Malformed => "malformed",
         }
     }
+
+    /// What kind of missing reading this is, or `None` when it read.
+    fn missing_cause(&self) -> Option<MissingCause> {
+        match self {
+            Self::Measured(_) => None,
+            // Nothing served, or nothing served *here*: the same gate reads
+            // fine once traffic arrives, so the surface is not the problem.
+            Self::NoSeries | Self::NoObservations => Some(MissingCause::NoTraffic),
+            // The body is not a histogram that can be read at all. No amount of
+            // traffic fixes that.
+            Self::Malformed => Some(MissingCause::Unusable),
+            // The counters were reset between the two reads, so they are not one
+            // continuous history. Not a blind gate: a restart during the watch
+            // already fails the canary through the pod signal, so this reading
+            // cannot be the only thing that noticed.
+            Self::Restarted => Some(MissingCause::NoTraffic),
+        }
+    }
+}
+
+/// Why a gate could not read, split by who can change it.
+///
+/// "No reading" is not one condition. A gate that is quiet because nothing was
+/// served is idle, and it reads fine under traffic; raising that as a fault
+/// leaves a permanent alert on a healthy deployment, and an alert that is
+/// always firing is read as no alert at all. A gate that cannot read because
+/// the two sides are not comparable, or because the body is not a readable
+/// histogram, is a judgement surface that does not work — and a roll that
+/// changed the counter semantics is what created it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MissingCause {
+    NoTraffic,
+    Unusable,
+}
+
+impl MissingCause {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::NoTraffic => "no-traffic",
+            Self::Unusable => "unusable",
+        }
+    }
+
+    /// The worse of two causes: an unusable side is what names the blindness,
+    /// whichever side the idle one was on.
+    fn worst(self, other: Option<Self>) -> Self {
+        match other {
+            Some(MissingCause::Unusable) => MissingCause::Unusable,
+            _ => self,
+        }
+    }
 }
 
 /// 一拍错误率判据的读数。三种「读不到」是三个不同的事实，都不是「通过」。
@@ -1524,20 +1720,63 @@ enum RateRead {
         baseline: f64,
     },
     /// 候选侧窗口内新增请求不到下限：一条 5xx 就能把小增量抬到任意高。
-    NoDelta,
+    NoDelta(RateMiss),
     /// 基线一侧没有读数：没有基线的相对量就没有相对判据。
-    NoBaseline,
+    NoBaseline(RateMiss),
     /// 两侧正文声明的计数器语义不同，没有任何单一读法能同时解释两侧。
-    SemanticsMismatch,
+    /// Both semantics are carried along: this almost always means a roll changed
+    /// the semantics the exporter declares, and a reader needs to know which
+    /// side went from what to what, not merely that they differ.
+    SemanticsMismatch {
+        old: CounterSemantics,
+        new: CounterSemantics,
+    },
 }
 
 impl RateRead {
     fn label(&self) -> &'static str {
         match self {
             Self::Measured { .. } => "measured",
-            Self::NoDelta => "no-delta",
-            Self::NoBaseline => "no-baseline",
-            Self::SemanticsMismatch => "semantics-mismatch",
+            Self::NoDelta(_) => "no-delta",
+            Self::NoBaseline(_) => "no-baseline",
+            Self::SemanticsMismatch { .. } => "semantics-mismatch",
+        }
+    }
+
+    /// The cause of the missing reading plus a sentence a reader can act on, or
+    /// `None` when this tick read.
+    ///
+    /// They come back together on purpose: the cause decides whether this is
+    /// worth an alert, the sentence decides whether whoever reads that alert
+    /// knows where to look. Two methods would leave a caller free to take one
+    /// and drop the other.
+    fn blind(&self) -> Option<(MissingCause, String)> {
+        match self {
+            Self::Measured { .. } => None,
+            Self::SemanticsMismatch { old, new } => Some((
+                MissingCause::Unusable,
+                format!(
+                    "the two sides declare different counter semantics \
+                     (old={} new={}), so no single reading explains both",
+                    old.label(),
+                    new.label()
+                ),
+            )),
+            Self::NoDelta(miss) | Self::NoBaseline(miss) => Some((
+                match miss {
+                    RateMiss::NoTraffic => MissingCause::NoTraffic,
+                    RateMiss::CounterWentBackwards => MissingCause::Unusable,
+                },
+                format!(
+                    "{} on the {} side",
+                    miss.why(),
+                    if matches!(self, Self::NoDelta(_)) {
+                        "candidate"
+                    } else {
+                        "baseline"
+                    }
+                ),
+            )),
         }
     }
 }
@@ -1559,6 +1798,52 @@ struct GateCoverage {
     pod_checks: u32,
     /// (判据, 结局) → 拍数。结局名带得出病因而非只说「跳过了」。
     outcomes: std::collections::BTreeMap<(String, String), u32>,
+    /// (gate, cause) → why that tick produced no reading. Separate from
+    /// `outcomes`: that table is the ledger (how many ticks per gate per
+    /// outcome), this one carries the attribution — under one `no-delta` label,
+    /// an idle window and a counter running backwards are handled differently.
+    missing: std::collections::BTreeMap<(String, MissingCause), BlindTicks>,
+}
+
+/// Ticks one gate accumulated on one cause, and how the first of them read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlindTicks {
+    ticks: u32,
+    /// What the first such tick said. Later ticks with the same cause say the
+    /// same thing, so one is enough — and it keeps a sentence that grows with
+    /// the streak out of the alert.
+    why: String,
+}
+
+/// A gate that produced no reading in a whole watch, for a cause other than an
+/// idle deployment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlindGate {
+    gate: &'static str,
+    cause: MissingCause,
+    ticks: u32,
+    why: String,
+}
+
+impl BlindGate {
+    /// A sentence fit for the alert surface: which gate, how many ticks, why,
+    /// and what that cost the promotion. The "let through" half is not optional:
+    /// the subject of this alert is not that something could not be read, it is
+    /// that a roll was promoted while this gate was not there to judge it.
+    fn message(&self, ticks_in_watch: u32) -> String {
+        if self.gate == WHOLE_WATCH_GATE {
+            return format!(
+                "canary gates: no gate ran in any of the {ticks_in_watch} ticks of the watch \
+                 — {}; the roll was allowed through with no metric judgement",
+                self.why
+            );
+        }
+        format!(
+            "canary {} gate: no reading in any of the {ticks_in_watch} ticks of the watch \
+             ({} could not be read) — {}; the roll was allowed through without this gate",
+            self.gate, self.ticks, self.why
+        )
+    }
 }
 
 impl GateCoverage {
@@ -1567,6 +1852,71 @@ impl GateCoverage {
             .outcomes
             .entry((gate.to_string(), outcome.into()))
             .or_default() += 1;
+    }
+
+    /// Record why this tick had no reading (pass `None` when it read one).
+    fn record_missing(&mut self, gate: &str, cause: Option<MissingCause>, why: String) {
+        let Some(cause) = cause else {
+            return;
+        };
+        let entry = self
+            .missing
+            .entry((gate.to_string(), cause))
+            .or_insert(BlindTicks { ticks: 0, why });
+        entry.ticks += 1;
+    }
+
+    /// The gates that produced no reading all watch for a cause other than
+    /// "there was no traffic".
+    ///
+    /// This is the only tier worth an alert. The idle tier means no more than
+    /// "this gate did not take part this time": the same gate reads fine under
+    /// traffic, so raising it as a fault leaves a permanent alert on a healthy
+    /// but idle deployment — and an alert that is always firing is read as no
+    /// alert at all.
+    ///
+    /// One reading anywhere in the watch is enough to disqualify a gate: that
+    /// tick produced a verdict, and the blind ticks after it changed nothing
+    /// about what the promotion rested on.
+    fn blind_gates(&self) -> Vec<BlindGate> {
+        let mut out: Vec<BlindGate> = CANARY_GATES
+            .iter()
+            .filter(|gate| !self.measured(gate))
+            .filter_map(|gate| {
+                // One gate can carry several causes (semantics first, an
+                // unreadable body later). Report the heaviest: a reader wants to
+                // know why the gate cannot stand, not a tally.
+                self.missing
+                    .iter()
+                    .filter(|((g, cause), _)| g == gate && *cause == MissingCause::Unusable)
+                    .max_by_key(|((_, cause), t)| (*cause, t.ticks))
+                    // The cause comes from the entry that matched rather than
+                    // being written in: hard-coding it means the day this filter
+                    // widens the alert names the wrong cause, and a wrong cause
+                    // is harder to chase than a missing one.
+                    .map(|((_, cause), t)| BlindGate {
+                        gate,
+                        cause: *cause,
+                        ticks: t.ticks,
+                        why: t.why.clone(),
+                    })
+            })
+            .collect();
+        // A whole watch without ever forming a reference point: neither gate
+        // ran even once. Per gate that reads as "nothing recorded", so only a
+        // verdict of its own says the observation surface was never up (an
+        // unreachable endpoint, a network policy refusing the scrape).
+        if self.no_window {
+            out.push(BlindGate {
+                gate: WHOLE_WATCH_GATE,
+                cause: MissingCause::Unusable,
+                ticks: self.pod_checks,
+                why: "the candidate and the old group were never both scrapeable, so no \
+                       gate ever ran"
+                    .to_string(),
+            });
+        }
+        out
     }
 
     fn outcomes_of(&self, gate: &str) -> Vec<String> {
@@ -1599,9 +1949,17 @@ impl GateCoverage {
             counts.join(" ")
         };
         let tag = if self.measured(gate) {
-            "measured"
+            "measured".to_string()
+        } else if self
+            .missing
+            .contains_key(&(gate.to_string(), MissingCause::Unusable))
+        {
+            // Two ways to have no reading, and the ledger has to tell them
+            // apart at a glance: `unusable` is a gate that does not stand (which
+            // someone has to act on), a bare NO-EVIDENCE is an idle window.
+            format!("NO-EVIDENCE/{}", MissingCause::Unusable.label())
         } else {
-            "NO-EVIDENCE"
+            "NO-EVIDENCE".to_string()
         };
         format!("{gate}={tag}[{counts}]")
     }
@@ -1626,11 +1984,11 @@ impl GateCoverage {
         } else {
             String::new()
         };
+        let gates: Vec<String> = CANARY_GATES.iter().map(|g| self.one_gate(g)).collect();
         format!(
-            "gates: pods=ok x{}{resets} {} {}",
+            "gates: pods=ok x{}{resets} {}",
             self.pod_checks,
-            self.one_gate("latency"),
-            self.one_gate("error-rate"),
+            gates.join(" "),
         )
     }
 }
@@ -1646,25 +2004,31 @@ fn error_rate(
     current: CanarySignals,
     semantics: CounterSemantics,
     min_requests: f64,
-) -> Option<f64> {
+) -> Result<f64, RateMiss> {
     match semantics {
         CounterSemantics::Windowed => {
             if current.requests > 0.0 {
-                Some(current.errors / current.requests)
+                Ok(current.errors / current.requests)
             } else {
-                None
+                Err(RateMiss::NoTraffic)
             }
         }
         CounterSemantics::Cumulative => {
             let requests = current.requests - baseline.requests;
             let errors = current.errors - baseline.errors;
-            // 累积计数器只会上升；下降说明取值与自称的语义不符（或进程重启
-            // 把计数器清零），此时的增量不能拿来算速率。
-            if requests < min_requests || errors < 0.0 {
-                None
-            } else {
-                Some(errors / requests)
+            // A cumulative counter only rises. Either one falling means the
+            // values contradict the semantics the body declares (or a restart
+            // zeroed them), so the delta is not a count of anything. The two
+            // causes are reported apart: this one is a broken value surface,
+            // whereas too small a delta is merely an idle window — and they are
+            // handled very differently.
+            if errors < 0.0 || requests < 0.0 {
+                return Err(RateMiss::CounterWentBackwards);
             }
+            if requests < min_requests {
+                return Err(RateMiss::NoTraffic);
+            }
+            Ok(errors / requests)
         }
     }
 }
@@ -1821,6 +2185,50 @@ fn latency_outcome(baseline: LatencyRead, candidate: LatencyRead) -> String {
     }
 }
 
+/// Which cause a latency tick could not read for, or `None` when it read.
+///
+/// The same facts the outcome label spells out (which side, reading what — both
+/// sides' causes belong in that label); this answers who can change it. The
+/// worse of the two sides wins: which side is idle does not change the verdict,
+/// which side cannot be read decides whether this tick judged anything.
+fn latency_missing_cause(baseline: LatencyRead, candidate: LatencyRead) -> Option<MissingCause> {
+    match (baseline, candidate) {
+        // Both sides read, and the baseline is positive: this tick judged.
+        (LatencyRead::Measured(b), LatencyRead::Measured(_)) if b > 0.0 => None,
+        // A zero baseline means no timed request reached the baseline in this
+        // window — idle traffic, like a baseline that cannot be read at all, and
+        // not a broken surface. It is the `no-baseline:non-positive` case.
+        (LatencyRead::Measured(_), LatencyRead::Measured(_)) => Some(MissingCause::NoTraffic),
+        (b, c) => match (b.missing_cause(), c.missing_cause()) {
+            (None, None) => None,
+            (None, Some(cause)) | (Some(cause), None) => Some(cause),
+            // Both sides unreadable: the worse one wins, since which side is
+            // idle does not change the verdict.
+            (Some(b), Some(c)) => Some(c.worst(Some(b))),
+        },
+    }
+}
+
+/// A sentence naming which side of the latency gate could not be read, and as
+/// what. Only called for ticks that had no reading.
+fn latency_why(baseline: LatencyRead, candidate: LatencyRead) -> String {
+    match (baseline, candidate) {
+        (LatencyRead::Measured(b), LatencyRead::Measured(_)) if b > 0.0 => "measured".to_string(),
+        (LatencyRead::Measured(b), _) if b <= 0.0 => {
+            "the baseline side read a zero p99: no timed request reached it in this \
+             window"
+                .to_string()
+        }
+        (LatencyRead::Measured(_), c) => format!("the candidate side reads {}", c.label()),
+        (b, LatencyRead::Measured(_)) => format!("the baseline side reads {}", b.label()),
+        (b, c) => format!(
+            "the baseline side reads {} and the candidate side reads {}",
+            b.label(),
+            c.label()
+        ),
+    }
+}
+
 /// 一拍错误率闸门的读数：两侧各按本侧的两点算出速率，再相除比。
 ///
 /// 读不出候选侧的速率，与读不出基线侧的速率，是两个不同的缺口；两者都返回
@@ -1836,18 +2244,21 @@ fn error_rate_gate(
     // 同一个 semantics，而语义不同的两侧没有一个共用读法——挑一侧的语义去解释
     // 另一侧，得到的是一条看着像读数、实则是错的基线速率。
     if old.semantics != new.semantics {
-        return RateRead::SemanticsMismatch;
+        return RateRead::SemanticsMismatch {
+            old: old.semantics,
+            new: new.semantics,
+        };
     }
     let semantics = new.semantics;
     let candidate = error_rate(window.new.signals, new.signals, semantics, min_requests);
     let baseline = error_rate(window.old.signals, old.signals, semantics, min_requests);
     match (candidate, baseline) {
-        (Some(candidate), Some(baseline)) => RateRead::Measured {
+        (Ok(candidate), Ok(baseline)) => RateRead::Measured {
             candidate,
             baseline,
         },
-        (None, _) => RateRead::NoDelta,
-        (Some(_), None) => RateRead::NoBaseline,
+        (Err(miss), _) => RateRead::NoDelta(miss),
+        (Ok(_), Err(miss)) => RateRead::NoBaseline(miss),
     }
 }
 
@@ -2024,7 +2435,7 @@ mod tests {
 
     /// 窗口求和语义下的错误率，就是改造前的「值本身相除」。
     fn windowed_rate(signals: CanarySignals) -> Option<f64> {
-        error_rate(signals, signals, CounterSemantics::Windowed, f64::INFINITY)
+        error_rate(signals, signals, CounterSemantics::Windowed, f64::INFINITY).ok()
     }
 
     /// 正文取自网关 `/metrics` 的真实输出形态：延迟以毫秒记在
@@ -2405,6 +2816,41 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
         )
     }
 
+    /// Records every alert drive as (condition, dedup key, message).
+    #[derive(Default)]
+    struct RecordingSink {
+        calls: std::sync::Mutex<Vec<(bool, String, String)>>,
+    }
+
+    impl RecordingSink {
+        fn take(&self) -> Vec<(bool, String, String)> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::PersistentAlertSink for RecordingSink {
+        async fn set_persistent_alert(
+            &self,
+            condition: bool,
+            draft: &cog_core::PersistentAlertDraft,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push((
+                condition,
+                draft.dedup_key.clone(),
+                draft.message.clone(),
+            ));
+            Ok(())
+        }
+        async fn list_active_persistent_alerts(
+            &self,
+            _rule_prefix: &str,
+            _limit: i64,
+        ) -> Vec<cog_core::PersistedAlert> {
+            Vec::new()
+        }
+    }
+
     fn signals(errors: f64, requests: f64) -> CanarySignals {
         CanarySignals { errors, requests }
     }
@@ -2742,9 +3188,13 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
                 baseline: 0.0,
             }
             .label(),
-            RateRead::NoDelta.label(),
-            RateRead::NoBaseline.label(),
-            RateRead::SemanticsMismatch.label(),
+            RateRead::NoDelta(RateMiss::NoTraffic).label(),
+            RateRead::NoBaseline(RateMiss::NoTraffic).label(),
+            RateRead::SemanticsMismatch {
+                old: CounterSemantics::Windowed,
+                new: CounterSemantics::Cumulative,
+            }
+            .label(),
         ];
         let unique: std::collections::BTreeSet<_> = labels.iter().collect();
         assert_eq!(
@@ -2886,6 +3336,274 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
         assert_ne!(flapping.summary(), measured.summary());
     }
 
+    /// Every kind of missing reading is classified, and classified by an
+    /// exhaustive match: adding a new kind has to break this test rather than
+    /// slip through into neither the ledger nor an alert.
+    #[test]
+    fn every_missing_reading_is_classified_by_who_can_fix_it() {
+        fn expected_rate(read: RateRead) -> Option<MissingCause> {
+            match read {
+                RateRead::Measured { .. } => None,
+                RateRead::NoDelta(RateMiss::NoTraffic)
+                | RateRead::NoBaseline(RateMiss::NoTraffic) => Some(MissingCause::NoTraffic),
+                RateRead::NoDelta(RateMiss::CounterWentBackwards)
+                | RateRead::NoBaseline(RateMiss::CounterWentBackwards) => {
+                    Some(MissingCause::Unusable)
+                }
+                RateRead::SemanticsMismatch { .. } => Some(MissingCause::Unusable),
+            }
+        }
+        fn expected_latency(read: LatencyRead) -> Option<MissingCause> {
+            match read {
+                LatencyRead::Measured(_) => None,
+                LatencyRead::NoSeries | LatencyRead::NoObservations | LatencyRead::Restarted => {
+                    Some(MissingCause::NoTraffic)
+                }
+                LatencyRead::Malformed => Some(MissingCause::Unusable),
+            }
+        }
+        let rates = [
+            RateRead::Measured {
+                candidate: 0.0,
+                baseline: 0.0,
+            },
+            RateRead::NoDelta(RateMiss::NoTraffic),
+            RateRead::NoDelta(RateMiss::CounterWentBackwards),
+            RateRead::NoBaseline(RateMiss::NoTraffic),
+            RateRead::NoBaseline(RateMiss::CounterWentBackwards),
+            RateRead::SemanticsMismatch {
+                old: CounterSemantics::Windowed,
+                new: CounterSemantics::Cumulative,
+            },
+        ];
+        for read in rates {
+            assert_eq!(read.blind().map(|(cause, _)| cause), expected_rate(read));
+            // The ledger decides "was there a reading" from the label, the alert
+            // decides "should this be raised" from the cause. Both must answer
+            // the same way for the same variant, or the ledger reports no
+            // reading while the alert surface reports nothing wrong.
+            assert_eq!(read.label() == "measured", read.blind().is_none());
+        }
+        let latencies = [
+            LatencyRead::Measured(1.0),
+            LatencyRead::NoSeries,
+            LatencyRead::NoObservations,
+            LatencyRead::Restarted,
+            LatencyRead::Malformed,
+        ];
+        for read in latencies {
+            assert_eq!(read.missing_cause(), expected_latency(read));
+            assert_eq!(read.label() == "measured", read.missing_cause().is_none());
+        }
+    }
+
+    /// Two sides that disagree on semantics is a judgement surface that does not
+    /// stand: every tick of the watch carries that cause, and what created it —
+    /// a roll that changed the declared semantics — is the change being promoted.
+    #[test]
+    fn a_semantics_change_blinds_the_gate_and_names_both_sides() {
+        let puller = test_puller();
+        let windowed = CounterSemantics::Windowed;
+        let cumulative = CounterSemantics::Cumulative;
+        let w = CanaryWindow {
+            old: side(windowed, signals(2.0, 100.0)),
+            new: side(cumulative, signals(0.0, 0.0)),
+        };
+        let (baseline_history, candidate_history) = p99_points(100.0);
+        let mut old = side(windowed, signals(5.0, 200.0));
+        old.hist = baseline_history;
+        let mut new = side(cumulative, signals(50.0, 1_200.0));
+        new.hist = candidate_history;
+        let (result, mut coverage) = one_tick(&puller, &w, &old, &new);
+        assert!(result.is_ok(), "口径不明不能回滚：{result:?}");
+        coverage.pod_checks = 20;
+        // The latency gate read (histogram buckets do not depend on counter
+        // semantics); the error-rate gate did not.
+        let blind = coverage.blind_gates();
+        assert_eq!(blind.len(), 1, "{blind:?}");
+        assert_eq!(blind[0].gate, "error-rate");
+        assert_eq!(blind[0].cause, MissingCause::Unusable);
+        assert!(
+            blind[0].why.contains("old=windowed new=cumulative"),
+            "告警要说清是哪一侧从什么变成了什么: {}",
+            blind[0].why
+        );
+        let message = blind[0].message(20);
+        assert!(message.contains("error-rate"), "{message}");
+        assert!(message.contains("without this gate"), "{message}");
+        // The ledger has to say so too: this gate has no reading because it
+        // could not stand, not because nothing happened.
+        assert!(
+            coverage
+                .summary()
+                .contains("error-rate=NO-EVIDENCE/unusable"),
+            "{}",
+            coverage.summary()
+        );
+    }
+
+    /// No traffic is a property of the deployment, not a broken gate: the ledger
+    /// still says the gate had no evidence all watch, but nothing is raised — a
+    /// healthy idle deployment should not carry a permanent row.
+    #[test]
+    fn an_idle_deployment_is_not_a_blind_gate() {
+        let puller = test_puller();
+        let cumulative = CounterSemantics::Cumulative;
+        // Same semantics on both sides, bodies readable, but fewer new requests
+        // in the window than the floor.
+        let w = window_of(cumulative, signals(10.0, 1_000.0), signals(10.0, 1_000.0));
+        let (baseline_history, candidate_history) = p99_points(100.0);
+        let mut old = side(cumulative, signals(11.0, 2_000.0));
+        old.hist = baseline_history;
+        let mut new = side(cumulative, signals(11.0, 1_020.0));
+        new.hist = candidate_history;
+        let (result, mut coverage) = one_tick(&puller, &w, &old, &new);
+        assert!(result.is_ok());
+        coverage.pod_checks = 20;
+        assert_eq!(coverage.outcomes_of("error-rate"), vec!["no-delta x1"]);
+        assert!(
+            coverage.blind_gates().is_empty(),
+            "{:?}",
+            coverage.blind_gates()
+        );
+        let summary = coverage.summary();
+        assert!(summary.contains("error-rate=NO-EVIDENCE["), "{summary}");
+        assert!(!summary.contains("unusable"), "{summary}");
+    }
+
+    /// One reading anywhere disqualifies a gate: that tick produced a verdict,
+    /// and the blind ticks after it changed nothing the promotion rested on.
+    #[test]
+    fn a_gate_that_read_even_once_is_not_blind() {
+        let mut coverage = GateCoverage {
+            pod_checks: 20,
+            ..Default::default()
+        };
+        for _ in 0..19 {
+            coverage.record("error-rate", "semantics-mismatch");
+            coverage.record_missing(
+                "error-rate",
+                Some(MissingCause::Unusable),
+                "two sides disagree".into(),
+            );
+        }
+        coverage.record("error-rate", "measured");
+        coverage.record_missing("error-rate", None, String::new());
+        assert!(coverage.measured("error-rate"));
+        assert!(
+            coverage.blind_gates().is_empty(),
+            "读到过就不算盲: {:?}",
+            coverage.blind_gates()
+        );
+    }
+
+    /// A counter running backwards contradicts the semantics the body declares
+    /// and must not be filed as an idle window: one sends someone to look at the
+    /// exporter, the other calls for nothing at all.
+    #[test]
+    fn a_counter_going_backwards_is_unusable_not_idle() {
+        let puller = test_puller();
+        let cumulative = CounterSemantics::Cumulative;
+        // The baseline side's rate is unreadable: its cumulative error count
+        // fell.
+        let w = window_of(cumulative, signals(10.0, 1_000.0), signals(10.0, 1_000.0));
+        let (baseline_history, candidate_history) = p99_points(100.0);
+        let mut old = side(cumulative, signals(6.0, 1_100.0));
+        old.hist = baseline_history;
+        let mut new = side(cumulative, signals(60.0, 1_200.0));
+        new.hist = candidate_history;
+        let (_, coverage) = one_tick(&puller, &w, &old, &new);
+        let blind = coverage.blind_gates();
+        assert_eq!(blind.len(), 1, "{blind:?}");
+        assert_eq!(blind[0].gate, "error-rate");
+        assert_eq!(blind[0].cause, MissingCause::Unusable);
+        assert!(blind[0].why.contains("baseline"), "{}", blind[0].why);
+        assert!(blind[0].why.contains("decreased"), "{}", blind[0].why);
+    }
+
+    /// A watch that never formed a reference point: neither gate ran once. Per
+    /// gate that is "nothing recorded", and only a verdict of its own explains
+    /// that the observation surface was never up.
+    #[test]
+    fn a_watch_that_never_formed_a_window_is_blind_as_a_whole() {
+        let coverage = GateCoverage {
+            pod_checks: 20,
+            no_window: true,
+            ..Default::default()
+        };
+        let blind = coverage.blind_gates();
+        assert_eq!(blind.len(), 1, "{blind:?}");
+        assert_eq!(blind[0].gate, WHOLE_WATCH_GATE);
+        assert_eq!(blind[0].cause, MissingCause::Unusable);
+        let message = blind[0].message(20);
+        assert!(message.contains("no gate ran"), "{message}");
+        assert!(message.contains("no metric judgement"), "{message}");
+        // No metrics endpoint is not a fault: the ledger records it, no alert
+        // is raised.
+        let off = GateCoverage {
+            pod_checks: 20,
+            metrics_off: Some("no metrics endpoint configured"),
+            ..Default::default()
+        };
+        assert!(off.blind_gates().is_empty(), "{:?}", off.blind_gates());
+    }
+
+    /// The verdict needs a successor: a gate that could not read is raised as a
+    /// persistent alert row, and the next watch that reads it resolves the row.
+    /// The condition is latched in the alert surface rather than in this process
+    /// — the roll a blind gate let through is what restarts this process.
+    #[tokio::test]
+    async fn gate_blindness_is_latched_and_resolved_through_the_alert_sink() {
+        let sink = Arc::new(RecordingSink::default());
+        let puller = test_puller()
+            .with_alert_sink(Some(sink.clone() as Arc<dyn cog_core::PersistentAlertSink>));
+
+        let mut blind = GateCoverage {
+            pod_checks: 20,
+            ..Default::default()
+        };
+        for _ in 0..20 {
+            blind.record("error-rate", "semantics-mismatch");
+            blind.record_missing(
+                "error-rate",
+                Some(MissingCause::Unusable),
+                "old=windowed new=cumulative".into(),
+            );
+            blind.record("latency", "measured");
+        }
+        puller.publish_gate_blindness(&blind).await;
+        let calls = sink.take();
+        // Three drives: error-rate raised, the other two resolved. A readable
+        // gate is driven every watch, otherwise "blind last time, fine now"
+        // leaves a row nobody clears.
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        let fired: Vec<&(bool, String, String)> =
+            calls.iter().filter(|(firing, _, _)| *firing).collect();
+        assert_eq!(fired.len(), 1, "{calls:?}");
+        assert_eq!(fired[0].1, format!("{CANARY_GATE_BLIND_RULE}:error-rate"));
+        assert!(
+            fired[0].2.contains("old=windowed new=cumulative"),
+            "{}",
+            fired[0].2
+        );
+        assert!(fired[0].2.contains("without this gate"), "{}", fired[0].2);
+        assert!(calls.iter().any(|(f, k, _)| !*f && k.ends_with(":latency")));
+
+        // The next watch reads it: the same row is resolved.
+        let mut readable = GateCoverage {
+            pod_checks: 20,
+            ..Default::default()
+        };
+        readable.record("error-rate", "measured");
+        readable.record("latency", "measured");
+        puller.publish_gate_blindness(&readable).await;
+        let calls = sink.take();
+        assert!(
+            calls.iter().all(|(firing, _, _)| !*firing),
+            "读到了就要解除: {calls:?}"
+        );
+    }
+
     /// 正文没有语义标记时按窗口求和处理：旧版正文的行为不能因为这次改造
     /// 而变成按增量解读（那会把窗口边界的抖动当成速率）。
     #[test]
@@ -2925,9 +3643,11 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
                 CounterSemantics::Cumulative,
                 100.0
             ),
-            Some(0.05)
+            Ok(0.05)
         );
-        // 计数器下降说明自称的语义与取值不符，不能拿负增量算速率。
+        // A falling counter contradicts the semantics the body declares, so no
+        // rate can be formed from a negative delta. That is not the same fact
+        // as an idle window: one is a broken value surface, the other is quiet.
         assert_eq!(
             error_rate(
                 signals(5.0, 300.0),
@@ -2935,7 +3655,17 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
                 CounterSemantics::Cumulative,
                 10.0
             ),
-            None
+            Err(RateMiss::CounterWentBackwards)
+        );
+        // Fewer new requests than the floor: idle, not a broken surface.
+        assert_eq!(
+            error_rate(
+                signals(5.0, 100.0),
+                signals(5.5, 105.0),
+                CounterSemantics::Cumulative,
+                100.0
+            ),
+            Err(RateMiss::NoTraffic)
         );
     }
 }

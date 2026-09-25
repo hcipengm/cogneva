@@ -216,6 +216,11 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+fn read(rel: &str) -> String {
+    let path = repo_root().join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
+}
+
 /// Every rule in the chart, name to promql, in file order.
 fn chart_rules() -> Vec<(String, String)> {
     let path = repo_root().join(CHART_CONFIG);
@@ -339,7 +344,7 @@ fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
     );
 }
 
-/// Rule names the watcher raises about itself, which must stay outside the
+/// Rule names this workspace raises about itself, which must stay outside the
 /// configured rule set.
 ///
 /// The watcher adopts the rows it finds for the rules it evaluates and resolves
@@ -347,12 +352,17 @@ fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
 /// these names would therefore let the watcher close the very row that reports
 /// the rule set as incomplete — the one alert whose subject is the missing
 /// judgement would be cancelled by the judgement that is missing.
+///
+/// The list is every rule this workspace raises about itself, whichever
+/// component raises it: the puller's verdicts are read by the same watcher,
+/// through the same rule set, as the watcher's own.
 #[test]
 fn the_watchers_own_rule_names_are_not_configured_rule_names() {
     let own = [
         cog_observability::infra_watch::EVAL_FAILURE_RULE,
         cog_observability::config_delivery::CONFIG_DECLARATION_RULE,
         cog_reflection::observability_stack::STACK_NOT_CONVERGED_RULE,
+        cog_reflection::CANARY_GATE_BLIND_RULE,
     ];
     for name in own {
         assert!(!name.is_empty());
@@ -394,5 +404,45 @@ fn the_tables_hold_no_series_that_no_rule_reads() {
     assert!(
         stale.is_empty(),
         "表里登记的名字没有任何规则在读，说明规则被删或改名后表没跟着收敛: {stale:?}"
+    );
+}
+
+/// The gate-blindness verdict must have a successor.
+///
+/// A canary gate that could not read used to leave its verdict in the rollout
+/// note and a warn log, and nothing else: the promotion went through and the
+/// only record of the judgement that was missing was a sentence nobody reads.
+/// That is the same shape as a rule whose expression names a series nothing
+/// produces — it stays quiet through exactly the incident it exists for. The
+/// fix is that the verdict reaches the persistent alert surface, which means
+/// the puller has to be handed that sink; without this wiring the alert surface
+/// is empty while the code around it looks complete.
+#[test]
+fn the_puller_is_handed_the_persistent_alert_sink() {
+    let plugin = read("crates/cog-reflection/src/plugin.rs");
+    let construct = plugin
+        .find("GitOpsPuller::new(")
+        .expect("plugin.rs no longer constructs the GitOps puller here");
+    // The whole block that constructs and starts this process's puller: from
+    // the enabled guard to the spawn.
+    let start = plugin[..construct]
+        .rfind("promotion.gitops.puller_enabled")
+        .expect("拉取端的构造不在 puller_enabled 守卫里了");
+    let end = plugin[construct..]
+        .find("run_puller_loop")
+        .map(|i| construct + i)
+        .expect("the puller is no longer started right after it is constructed");
+    let block = &plugin[start..end];
+    assert!(
+        block.contains("PersistentAlertSink"),
+        "拉取端没拿到持久化告警面：判据读不出数的结论又只剩台账与日志了"
+    );
+    assert!(
+        block.contains("with_alert_sink"),
+        "拉取端拿到了 sink 但没有交给自己（构造完之后必须 with_alert_sink）"
+    );
+    assert!(
+        block.contains("report-only"),
+        "sink 缺席时的降级路径没有留下痕迹：那时告警面是空的，而代码看起来什么都有"
     );
 }
