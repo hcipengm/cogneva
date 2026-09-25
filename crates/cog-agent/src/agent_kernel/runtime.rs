@@ -372,6 +372,24 @@ impl AgentRuntime {
         }
     }
 
+    /// Begin the next run on a clean context, keeping everything this instance
+    /// was assembled with.
+    ///
+    /// A reset is about the run, not about the runtime. Rebuilding the instance
+    /// from its configuration would keep every field the configuration carries
+    /// and drop every one the caller attached afterwards — the tool registry
+    /// above all, but also the hook engine, the WAL, the checkpoint store, the
+    /// sandbox backend and the registries. A loop rebuilt that way answers with
+    /// nothing to call and still looks healthy: it starts, it thinks, it
+    /// produces a final answer with no tool in it. Clearing in place cannot
+    /// lose a field, including fields this type gains later.
+    pub fn reset(&mut self) {
+        self.context.clear();
+        self.state = RuntimeState::Idle;
+        self.steps.clear();
+        self.start_time = None;
+    }
+
     /// Set the checkpoint store for persistence.
     pub fn with_checkpoint_store(mut self, store: Arc<dyn cog_core::CheckpointStore>) -> Self {
         self.checkpoint_store = Some(store);
@@ -1575,6 +1593,66 @@ impl cog_core::AgentRuntime for AgentRuntime {
 mod tests {
     use super::*;
     use cog_core::SkillConfig;
+
+    /// A reset clears the run's context and keeps everything the instance was
+    /// built with.
+    ///
+    /// The defect this replaces was not "reset forgot the tools" so much as
+    /// "reset rebuilt the loop from a config": every attachment the caller had
+    /// made — the tools, the hook engine, the WAL, the checkpoint store, the
+    /// sandbox backend, the registries — was silently gone, and the rebuilt
+    /// loop then started, thought and answered with no tool call in it. Nothing
+    /// about that run looks broken; it looks like a model that chose not to use
+    /// its tools.
+    ///
+    /// The tool registry is the reading taken here because it is the attachment
+    /// whose absence is invisible. The context assertion is the other half: a
+    /// reset that kept the tools and the old conversation would not be a reset.
+    #[test]
+    fn reset_keeps_the_attachments_and_clears_the_context() {
+        let config = RuntimeConfig {
+            role: "reset-attachment-test".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let registry = crate::tools::ToolRegistry::new();
+        cog_core::ToolRegistry::register(&registry, crate::tools::builtins::read_file());
+        let mut agent_loop = AgentRuntime::new(config, tx).with_tools(registry);
+        assert!(
+            !agent_loop.get_tools().is_empty(),
+            "the fixture has to start with a tool, or the assertion below proves nothing"
+        );
+
+        // Seed the conversation through the restore path, which is the only
+        // way in from outside: it exists precisely to put someone else's
+        // messages into this window.
+        let seeded = cog_core::AgentCheckpoint {
+            checkpoint_id: "reset-fixture".into(),
+            task_id: "reset-fixture".into(),
+            agent_state: serde_json::json!({}),
+            context_window: vec![cog_core::Message::user("a previous run's input")],
+            event_offset: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        agent_loop
+            .restore(&seeded)
+            .expect("fixture context restores");
+        assert!(
+            !agent_loop.get_context().messages().is_empty(),
+            "the fixture's conversation has to be in the window before a reset can be said to clear it"
+        );
+
+        agent_loop.reset();
+
+        assert!(
+            !agent_loop.get_tools().is_empty(),
+            "a reset must not take the loop's tools with it"
+        );
+        assert!(
+            agent_loop.get_context().messages().is_empty(),
+            "a reset that keeps the previous conversation is not a reset"
+        );
+    }
 
     #[test]
     fn agent_loop_config_uses_skill_prompt() {

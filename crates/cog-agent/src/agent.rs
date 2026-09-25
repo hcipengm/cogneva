@@ -376,7 +376,7 @@ impl Agent {
                 }
             });
 
-            run_agent_task(&mut agent_loop, cmd_rx, event_tx, llm, loop_event_cap).await;
+            run_agent_task(&mut agent_loop, cmd_rx, event_tx, llm).await;
 
             forward_handle.abort();
         });
@@ -785,7 +785,7 @@ impl Agent {
                 }
             });
 
-            run_agent_task(&mut agent_loop, cmd_rx, event_tx, llm, loop_event_cap).await;
+            run_agent_task(&mut agent_loop, cmd_rx, event_tx, llm).await;
 
             forward_handle.abort();
         });
@@ -1169,7 +1169,6 @@ async fn run_agent_task(
     mut cmd_rx: mpsc::Receiver<AgentCommand>,
     _event_tx: broadcast::Sender<AgentEvent>,
     llm: Arc<dyn cog_core::LlmClient>,
-    loop_event_channel_capacity: usize,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -1197,39 +1196,12 @@ async fn run_agent_task(
                 let _ = context;
             }
             AgentCommand::Reset => {
-                // Recreate the agent loop with fresh context
-                let (loop_event_tx, mut loop_event_rx) = mpsc::channel(loop_event_channel_capacity);
-                let forward_handle =
-                    tokio::spawn(
-                        async move { while let Some(_event) = loop_event_rx.recv().await {} },
-                    );
-
-                let cfg = agent_loop.config();
-                *agent_loop = AgentRuntime::new(
-                    RuntimeConfig {
-                        agent_id: agent_loop
-                            .get_context()
-                            .messages()
-                            .first()
-                            .and_then(|m| match m {
-                                cog_core::Message::System { content, .. } => {
-                                    Some(content.split_whitespace().next()?.to_string())
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "agent".into()),
-                        role: cfg.role.clone(),
-                        max_iterations: cfg.max_iterations,
-                        context_window_size: cfg.context_window_size,
-                        skill_cache_ttl_secs: cfg.skill_cache_ttl_secs,
-                        think_stall_timeout_secs: cfg.think_stall_timeout_secs,
-                        skill_config: cfg.skill_config.clone(),
-                        crew_id: cfg.crew_id.clone(),
-                        squad_id: cfg.squad_id.clone(),
-                    },
-                    loop_event_tx,
-                );
-                forward_handle.abort();
+                // Clear the loop in place. Rebuilding it from its own config was
+                // the previous behaviour and silently dropped everything the
+                // caller had attached after construction — the tools first of
+                // all — so a reset loop answered with nothing to call while
+                // still running its state machine normally.
+                agent_loop.reset();
             }
             AgentCommand::Snapshot { task_id, result_tx } => {
                 let snap = agent_loop.checkpoint(&task_id);
