@@ -205,15 +205,35 @@ pub struct LlmPoolStatus {
 }
 
 impl LlmPoolStatus {
-    /// Seconds from `now_unix` until the pool might serve a request again.
+    /// Seconds from `now_unix` until a caller should resume the work it is
+    /// holding back, given how long that caller needs to observe one trial run.
+    ///
+    /// The two bounds are statements of different strength, so the observation
+    /// window applies to only one of them. `evidenced_recovery_unix` is an
+    /// upstream saying when it will serve again: nothing is added to a stated
+    /// instant, because waiting past it would be waiting past the answer.
+    /// `next_attempt_unix` is our own probe cadence, and a probe has to happen
+    /// and be observable before a caller learns anything from it — resuming
+    /// exactly at the probe means resuming before its outcome exists, which is
+    /// how a retry loop reads as progress while nothing has changed.
+    ///
+    /// `observation_secs == 0` resumes at the bound itself.
     ///
     /// `None` means no bound lies in the future — the recovery point is unknown
     /// rather than imminent, so callers fall back to their own recheck cadence
     /// instead of polling once a second. A bound already in the past is no
     /// future opening either: the upstream said its quota resets at a time that
-    /// came and went without a call succeeding.
-    pub fn wait_secs(&self, now_unix: i64) -> Option<u64> {
-        [self.evidenced_recovery_unix, self.next_attempt_unix]
+    /// came and went without a call succeeding. An absent cadence bound stays
+    /// absent: adding a window to `0` would invent a bound out of "nothing is
+    /// suspect", which is the opposite of what it says.
+    pub fn resume_wait_secs(&self, now_unix: i64, observation_secs: u64) -> Option<u64> {
+        let observation = i64::try_from(observation_secs).unwrap_or(i64::MAX);
+        let retry = if self.next_attempt_unix > 0 {
+            self.next_attempt_unix.saturating_add(observation)
+        } else {
+            0
+        };
+        [self.evidenced_recovery_unix, retry]
             .into_iter()
             .filter(|t| *t > now_unix)
             .map(|t| (t - now_unix) as u64)
@@ -479,18 +499,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wait_secs_takes_the_nearer_future_bound() {
+    fn resume_wait_takes_the_nearer_future_bound() {
         let status = LlmPoolStatus {
             unavailable: true,
             evidenced_recovery_unix: 1_000,
             next_attempt_unix: 400,
             unavailable_upstreams: vec![],
         };
-        assert_eq!(status.wait_secs(100), Some(300), "the nearer bound decides");
+        assert_eq!(
+            status.resume_wait_secs(100, 0),
+            Some(300),
+            "no observation window: the nearer bound decides"
+        );
+        assert_eq!(
+            status.resume_wait_secs(100, 300),
+            Some(600),
+            "the probe bound carries the window, so it decides"
+        );
+    }
+
+    /// The window belongs to the cadence bound, not to a stated instant: an
+    /// upstream that named a time is not made to wait longer than it said.
+    #[test]
+    fn a_stated_instant_is_not_pushed_back_by_the_observation_window() {
+        let status = LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: 400,
+            next_attempt_unix: 1_000,
+            unavailable_upstreams: vec![],
+        };
+        assert_eq!(status.resume_wait_secs(100, 300), Some(300));
+    }
+
+    /// `next_attempt_unix == 0` means nothing is suspect, not "a probe is due
+    /// now". Adding a window to it would turn that reading into a bound a few
+    /// minutes out and resume against a pool that said nothing at all.
+    #[test]
+    fn an_absent_cadence_bound_does_not_become_one() {
+        let status = LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: 0,
+            next_attempt_unix: 0,
+            unavailable_upstreams: vec![],
+        };
+        assert_eq!(status.resume_wait_secs(100, 300), None);
     }
 
     #[test]
-    fn wait_secs_is_none_when_no_bound_lies_ahead() {
+    fn resume_wait_is_none_when_no_bound_lies_ahead() {
         let status = LlmPoolStatus {
             unavailable: true,
             evidenced_recovery_unix: 50,
@@ -499,13 +555,13 @@ mod tests {
         };
         // A reset that has already elapsed is not a future opening: the upstream
         // named a time that came and went without a call succeeding.
-        assert_eq!(status.wait_secs(100), None);
+        assert_eq!(status.resume_wait_secs(100, 300), None);
         assert_eq!(
             LlmPoolStatus {
                 unavailable: true,
                 ..Default::default()
             }
-            .wait_secs(100),
+            .resume_wait_secs(100, 300),
             None
         );
     }
@@ -528,6 +584,11 @@ mod tests {
             status.evidenced_recovery_unix, 0,
             "the old field carried no evidence about any upstream"
         );
-        assert_eq!(status.wait_secs(1_789_744_595 - 10), Some(10));
+        assert_eq!(status.resume_wait_secs(1_789_744_595 - 10, 0), Some(10));
+        assert_eq!(
+            status.resume_wait_secs(1_789_744_595 - 10, 300),
+            Some(310),
+            "the loaded bound is a retry bound, so it carries the window"
+        );
     }
 }

@@ -115,6 +115,14 @@ pub struct MemoryIngestorConfig {
     pub pull_pause_max_secs: u64,
     /// 读取池状态快照的最小间隔（秒）。
     pub pool_check_secs: u64,
+    /// 试跑观察窗（秒）：池快照给出的**重试节拍**到点后，还要再等这么久才重开
+    /// 拉取闸门。
+    ///
+    /// 节拍不等于恢复：到点只说明网关会再探一次，而探测结果要过一拍才在快照里
+    /// 可见。恰好在这个时刻重开，等于在结果存在之前就恢复——闸门开一条缝、把
+    /// 不该花的尝试放进来，而读数上它与"上游真的回来了"同形。上游**自报的复位
+    /// 时刻**不加这个窗（它已经明说了什么时候回来），见 `LlmPoolStatus::resume_wait_secs`。
+    pub pull_resume_observation_secs: u64,
     /// 积压深度告警起点：深度首次达到该值及之后每翻倍一次打一条 WARN，
     /// 让吞不下的事件洪峰在日志里可见而不是静默排队。
     pub backlog_warn_at: usize,
@@ -146,6 +154,7 @@ impl Default for MemoryIngestorConfig {
             pull_pause_initial_secs: 60,
             pull_pause_max_secs: 1800,
             pool_check_secs: 30,
+            pull_resume_observation_secs: 300,
             backlog_warn_at: 64,
             bus_group: "memory-ingestor".into(),
             bus_claim_interval_secs: 30,
@@ -170,6 +179,7 @@ impl From<&IngestConfig> for MemoryIngestorConfig {
             pull_pause_initial_secs: c.pull_pause_initial_secs,
             pull_pause_max_secs: c.pull_pause_max_secs,
             pool_check_secs: c.pool_check_secs,
+            pull_resume_observation_secs: c.pull_resume_observation_secs,
             backlog_warn_at: c.backlog_warn_at,
             bus_group: c.bus_group.clone(),
             bus_claim_interval_secs: c.bus_claim_interval_secs,
@@ -246,6 +256,8 @@ struct PullGate {
     initial_secs: u64,
     max_secs: u64,
     check_secs: u64,
+    /// 试跑观察窗（秒）：重试节拍到点后还要等多久才重开闸门。
+    resume_observation_secs: u64,
     state: std::sync::Mutex<PullGateState>,
 }
 
@@ -260,6 +272,7 @@ impl PullGate {
             initial_secs: config.pull_pause_initial_secs.max(1),
             max_secs: config.pull_pause_max_secs.max(1),
             check_secs: config.pool_check_secs.max(1),
+            resume_observation_secs: config.pull_resume_observation_secs,
             state: std::sync::Mutex::new(PullGateState::default()),
         }
     }
@@ -329,16 +342,18 @@ impl PullGate {
         None
     }
 
-    /// 快照给出的等待时长：到池内下一个可能承接请求的时刻，但封顶。配额复位
-    /// 时刻可能远在几天之后，也可能因为上游说法不一致而不准——睡死了就错过
-    /// 恢复，所以按上限醒来重判。
+    /// 快照给出的等待时长：到池内下一个可能承接请求的时刻（重试节拍那一支再
+    /// 加上试跑观察窗），但封顶。配额复位时刻可能远在几天之后，也可能因为上游
+    /// 说法不一致而不准——睡死了就错过恢复，所以按上限醒来重判。
     ///
-    /// 等待取两个上界里更近的那个：上游报告的恢复时刻，或我们自己的退避窗到期
-    /// （那时会再试一次，试成了就是恢复）。池报不可用、两个上界都不在未来时，
-    /// 恢复点是未知而不是"马上就好"：按常规复查节拍重判，别给 1 秒——那会让
-    /// 闸门以每秒一次的频率去读同一份什么都没变的快照。
+    /// 等待取两个上界里更近的那个：上游报告的恢复时刻，或我们自己的退避窗加上
+    /// 观察窗到期（那时会再试一次，试成了就是恢复）。池报不可用、两个上界都不在
+    /// 未来时，恢复点是未知而不是"马上就好"：按常规复查节拍重判，别给 1 秒——
+    /// 那会让闸门以每秒一次的频率去读同一份什么都没变的快照。
     fn snapshot_wait(&self, status: cog_core::LlmPoolStatus) -> Duration {
-        let Some(until) = status.wait_secs(chrono::Utc::now().timestamp()) else {
+        let Some(until) =
+            status.resume_wait_secs(chrono::Utc::now().timestamp(), self.resume_observation_secs)
+        else {
             return Duration::from_secs(self.check_secs.clamp(1, self.max_secs));
         };
         Duration::from_secs(until.min(self.max_secs))
@@ -2103,6 +2118,8 @@ mod tests {
             pull_pause_initial_secs: 60,
             pull_pause_max_secs: 1800,
             pool_check_secs: 30,
+            // 这一条量的是封顶与兜底，观察窗置 0：窗本身另有回归（见下一条）。
+            pull_resume_observation_secs: 0,
             ..Default::default()
         };
         let gate = PullGate::new(None, &config);
@@ -2161,6 +2178,55 @@ mod tests {
             }),
             Duration::from_secs(120),
             "the nearer of the two bounds decides the wait"
+        );
+    }
+
+    /// 回归：重试节拍到点**不等于**上游回来了——到点只说明网关会再探一次，而
+    /// 探测结果要过一拍才在快照里可见。闸门恰好在节拍点重开，就是把不该花的
+    /// 尝试放进去，而它在读数上与"真的恢复"同形。
+    #[tokio::test]
+    async fn a_due_retry_waits_out_the_observation_window() {
+        let config = MemoryIngestorConfig {
+            pull_pause_max_secs: 1800,
+            pool_check_secs: 30,
+            pull_resume_observation_secs: 300,
+            ..Default::default()
+        };
+        let gate = PullGate::new(None, &config);
+        let now = chrono::Utc::now().timestamp();
+
+        assert_eq!(
+            gate.snapshot_wait(cog_core::LlmPoolStatus {
+                unavailable: true,
+                evidenced_recovery_unix: 0,
+                next_attempt_unix: now + 120,
+                unavailable_upstreams: vec![],
+            }),
+            Duration::from_secs(420),
+            "节拍到点之后还要等一个观察窗，不是到点就重开"
+        );
+        // 上游**自报**的复位时刻不加窗：它已经明说了什么时候回来，等过那个
+        // 时刻等于不采信它自己的说法。
+        assert_eq!(
+            gate.snapshot_wait(cog_core::LlmPoolStatus {
+                unavailable: true,
+                evidenced_recovery_unix: now + 120,
+                next_attempt_unix: now + 600,
+                unavailable_upstreams: vec![],
+            }),
+            Duration::from_secs(120),
+            "自报时刻不加窗，取更近的那个"
+        );
+        // 加窗后越顶仍按封顶走：观察窗不能把等待推到上限之外。
+        assert_eq!(
+            gate.snapshot_wait(cog_core::LlmPoolStatus {
+                unavailable: true,
+                evidenced_recovery_unix: 0,
+                next_attempt_unix: now + 1700,
+                unavailable_upstreams: vec![],
+            }),
+            Duration::from_secs(1800),
+            "the cap holds after the window is added"
         );
     }
 

@@ -91,6 +91,10 @@ pub struct IngestConfig {
     /// 读取池状态快照的最小间隔（秒）。快照本身由网关按自己的节拍写，读得太密
     /// 只是把同一个答案取回来。
     pub pool_check_secs: u64,
+    /// 试跑观察窗（秒）：池快照给的**重试节拍**到点后，还要再等这么久才重开
+    /// 拉取闸门。默认取网关嫌疑窗首窗的量级（300 秒）——一次探测从发起到结果
+    /// 写进快照大致就是这个尺度。上游自报的复位时刻不加这个窗。
+    pub pull_resume_observation_secs: u64,
     /// 积压深度告警起点（达到后每翻倍打一条 WARN）。
     pub backlog_warn_at: usize,
     /// 总线消费组名（durable consumer / consumer group）。
@@ -118,6 +122,7 @@ impl Default for IngestConfig {
             pull_pause_initial_secs: 60,
             pull_pause_max_secs: 1800,
             pool_check_secs: 30,
+            pull_resume_observation_secs: 300,
             backlog_warn_at: 64,
             bus_group: "memory-ingestor".into(),
             bus_claim_interval_secs: 30,

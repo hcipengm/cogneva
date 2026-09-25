@@ -321,6 +321,7 @@
       "pull_pause_initial_secs": 60,
       "pull_pause_max_secs": 1800,
       "pool_check_secs": 30,
+      "pull_resume_observation_secs": 300,
       "backlog_warn_at": 64,
       "bus_group": "memory-ingestor",
       "bus_claim_interval_secs": 30,
