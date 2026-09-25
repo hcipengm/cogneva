@@ -352,6 +352,18 @@ where
         .filter_map(|b| b.as_text())
         .collect::<String>();
 
+    // No text and no error signal is not a malformed answer: it is no answer.
+    // Parsing it reports a JSON syntax error at column 0, which reads as "the
+    // model emitted garbage" — a defect in the model rather than an upstream
+    // that returned nothing. The variants carry that distinction, so the empty
+    // body has to take the one meant for a call the environment did not serve.
+    if text.trim().is_empty() {
+        return Err(SFError::LLM(format!(
+            "provider answered with no content and no error signal (stop_reason={:?})",
+            response.stop_reason
+        )));
+    }
+
     let value: serde_json::Value = serde_json::from_str(&text).map_err(SFError::Serialization)?;
 
     let schema_value = serde_json::to_value(&root_schema).map_err(SFError::Serialization)?;
@@ -420,5 +432,148 @@ mod retry_after_tests {
     fn a_past_date_reads_as_due_now() {
         let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc2822();
         assert_eq!(parse_retry_after_secs(&past), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod structured_output_tests {
+    use super::*;
+
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Probe {
+        n: u32,
+    }
+
+    /// A provider that answers exactly what the test hands it. The failure
+    /// shapes below differ only in what the transport reported, so a stub is
+    /// the only way to reach them without an unreachable upstream.
+    struct StubProvider {
+        response: ChatResponse,
+    }
+
+    #[async_trait]
+    impl LlmClient for StubProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<ChatResponse> {
+            Ok(self.response.clone())
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<AssistantMessageEventStream> {
+            let (stream, mut producer) = EventStream::with_capacity(1);
+            producer.end(self.response.clone());
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &CompleteOptions,
+        ) -> SFResult<AssistantMessageEventStream> {
+            self.chat_stream(&[], &ChatOptions::default()).await
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn answering(text: &str, stop_reason: StopReason, error: Option<&str>) -> ChatResponse {
+        ChatResponse {
+            content: if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentBlock::Text {
+                    text: text.to_string(),
+                    text_signature: None,
+                }]
+            },
+            stop_reason,
+            error_message: error.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    async fn ask(provider: &StubProvider) -> SFResult<Probe> {
+        execute_structured::<Probe>(
+            provider,
+            &[Message::user("count them")],
+            &ChatOptions::default(),
+        )
+        .await
+    }
+
+    /// An upstream that could not serve the call reports it in-band, and that
+    /// reason is what the caller classifies on. Parsing the empty body instead
+    /// reports a JSON syntax error, which puts the failure on the model.
+    #[tokio::test]
+    async fn a_failed_call_arrives_as_the_upstreams_own_reason() {
+        let provider = StubProvider {
+            response: answering("", StopReason::Error, Some("upstream returned 503")),
+        };
+        let err = ask(&provider)
+            .await
+            .expect_err("a failed call is not an answer");
+        assert!(
+            matches!(err, SFError::LLM(_)),
+            "an unserved call is an LLM failure, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("upstream returned 503"),
+            "the upstream's own reason has to survive, got: {err}"
+        );
+    }
+
+    /// A call that produced no text and reported nothing is still not an
+    /// answer: nothing was answered. Reading it as a parse failure says the
+    /// model emitted garbage, and the two call for different repairs.
+    #[tokio::test]
+    async fn an_answer_with_no_content_is_not_a_malformed_answer() {
+        let provider = StubProvider {
+            response: answering("   \n", StopReason::Stop, None),
+        };
+        let err = ask(&provider)
+            .await
+            .expect_err("an empty answer is not an answer");
+        assert!(
+            matches!(err, SFError::LLM(_)),
+            "no content is an unserved call, not a malformed one, got: {err:?}"
+        );
+    }
+
+    /// The control for the stub itself: an ordinary answer still comes back as
+    /// the parsed value. Without it the two failure tests would pass on a
+    /// provider whose wire path never worked at all.
+    #[tokio::test]
+    async fn an_answer_that_arrives_parses() {
+        let provider = StubProvider {
+            response: answering("{\"n\": 7}", StopReason::Stop, None),
+        };
+        let parsed = ask(&provider).await.expect("a well-formed answer parses");
+        assert_eq!(parsed.n, 7);
+    }
+
+    /// The control: a body that arrived and is not JSON is the model's own
+    /// defect, and must keep reading as one. A blanket "any unparsable body is
+    /// an environment failure" would hide it and retry a message that can never
+    /// come out right.
+    #[tokio::test]
+    async fn a_body_that_is_not_json_is_still_the_models_defect() {
+        let provider = StubProvider {
+            response: answering("not json at all", StopReason::Stop, None),
+        };
+        let err = ask(&provider)
+            .await
+            .expect_err("a non-JSON body cannot parse");
+        assert!(
+            matches!(err, SFError::Serialization(_)),
+            "a delivered body that does not parse is a serialization failure, got: {err:?}"
+        );
     }
 }
