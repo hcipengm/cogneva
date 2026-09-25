@@ -176,3 +176,95 @@ fn every_label_a_legend_names_is_on_the_series_it_describes() {
         mismatches.join("\n")
     );
 }
+
+/// The `data:` entries of the dashboard ConfigMap as `(key, value)`.
+///
+/// Read line by line rather than through a YAML parser: the structure this
+/// contract needs is one block scalar per key, and a parser would be a
+/// dependency carried by every test in this crate for it.
+fn configmap_data_blocks(text: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut lines = text.lines().peekable();
+    let mut in_data = false;
+    while let Some(line) = lines.next() {
+        if line == "data:" {
+            in_data = true;
+            continue;
+        }
+        if !in_data {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            in_data = false;
+            continue;
+        }
+        let Some((key, _)) = line.trim().split_once(": |") else {
+            continue;
+        };
+        let indent = line.len() - line.trim_start().len();
+        let mut value = String::new();
+        while let Some(next) = lines.peek() {
+            if !next.trim().is_empty() && next.len() - next.trim_start().len() <= indent {
+                break;
+            }
+            let body = lines.next().unwrap_or_default();
+            // The block scalar holds whatever is indented past the key; cutting
+            // the same amount off every line is what makes it parse as JSON.
+            value.push_str(body.get(indent + 2..).unwrap_or(""));
+            value.push('\n');
+        }
+        blocks.push((key.trim().to_string(), value));
+    }
+    blocks
+}
+
+/// A dashboard a ConfigMap ships has to be one Grafana will load.
+///
+/// Grafana's file provider reads each file as the panel model itself. The API
+/// payload shape that wraps the model in `{"dashboard": ..., "overwrite": true}`
+/// parses as JSON and reads as a model with an empty title, so Grafana drops
+/// the dashboard and logs one line — every panel in it silently stops existing
+/// while the manifest still looks like a dashboard to everyone reading the
+/// repository. That is the failure this test exists for: the manifest is the
+/// only artifact a reviewer sees, and it was wrong in exactly this way.
+#[test]
+fn every_dashboard_a_configmap_ships_is_one_grafana_can_load() {
+    let text = dashboard_text();
+    let blocks = configmap_data_blocks(&text);
+    assert!(
+        !blocks.is_empty(),
+        "机读不到 data 里的面板 JSON，这份门禁会变成空转"
+    );
+
+    for (key, value) in blocks {
+        let model: serde_json::Value = serde_json::from_str(&value)
+            .unwrap_or_else(|e| panic!("{key} 不是合法 JSON，Grafana 也读不了: {e}"));
+        assert!(
+            model.get("dashboard").is_none() && model.get("overwrite").is_none(),
+            "{key} 是 API 的 dashboard/overwrite 包装；\
+             文件供给器要的是面板模型本身，包装会让它读到空标题并整张丢弃"
+        );
+        let title = model.get("title").and_then(|t| t.as_str()).unwrap_or("");
+        assert!(!title.is_empty(), "{key} 没有 title，Grafana 会拒绝加载");
+        let panels = model
+            .get("panels")
+            .and_then(|p| p.as_array())
+            .unwrap_or_else(|| panic!("{key} 没有 panels 数组"));
+        // Grafana 按 id 定位面板，两块面板共用一个 id 只会渲染出一块。
+        let mut ids = BTreeSet::new();
+        for panel in panels {
+            let id = panel
+                .get("id")
+                .and_then(|i| i.as_i64())
+                .unwrap_or_else(|| panic!("{key}: 面板没有 id: {panel}"));
+            assert!(ids.insert(id), "{key}: 面板 id {id} 重复");
+            let panel_title = panel.get("title").and_then(|t| t.as_str()).unwrap_or("");
+            assert!(!panel_title.is_empty(), "{key}: 面板 {id} 没有标题");
+            let queries = panel
+                .get("targets")
+                .and_then(|t| t.as_array())
+                .unwrap_or_else(|| panic!("{key}: 面板 {id} 没有 targets，是块装饰"));
+            assert!(!queries.is_empty(), "{key}: 面板 {id} 一条查询都没有");
+        }
+    }
+}
