@@ -2,6 +2,7 @@
 //! This crate is both a library (for integration tests) and a binary.
 //! All modules are declared here so tests can access them via `cogneva::`.
 
+pub mod aof_repair;
 pub mod assembly;
 pub mod backup;
 pub mod bootstrap;

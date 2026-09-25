@@ -57,6 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 数据面备份与恢复：CronJob 每日打包，换机/重装由一次性恢复 Job 消费。
         Command::Backup => cogneva::backup::run_backup_from_env().await,
         Command::Restore => cogneva::backup::run_restore_from_env().await,
+        // Torn AOF tail repair: runs in the redis Pod's init container, which is
+        // what moves "a host that died uncleanly means truncating the AOF by
+        // hand" onto the startup path.
+        Command::RepairAof => cogneva::aof_repair::run_from_args(),
         Command::WindowsService => {
             #[cfg(windows)]
             {

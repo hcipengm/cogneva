@@ -24,18 +24,20 @@ pub enum Command {
     MainlineRollout,
     Backup,
     Restore,
+    RepairAof,
     WindowsService,
 }
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 6] = [
+const SUBCOMMANDS: [(&str, Command); 7] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("validate-config", Command::ValidateConfig),
     ("mainline-rollout", Command::MainlineRollout),
     ("backup", Command::Backup),
     ("restore", Command::Restore),
+    ("repair-aof", Command::RepairAof),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -61,6 +63,7 @@ COMMANDS:
     mainline-rollout       Roll the mainline revision across deployments (in-cluster Job)
     backup                 Package the data plane into a backup file
     restore <package>      Restore the data plane from a backup file
+    repair-aof <aof-dir>   Drop a torn tail from Redis' AOF files, then exit
 
     With no COMMAND the full application starts.
 
@@ -125,11 +128,16 @@ mod tests {
 
     #[test]
     fn operands_after_a_subcommand_are_left_to_it() {
-        // Both forms exist in the deployment: `restore <package>` in the restore
-        // Job and `mainline-rollout --tag <rev> ...` in the rollout Job.
+        // These forms all exist in the deployment: `restore <package>` in the
+        // restore Job, `mainline-rollout --tag <rev> ...` in the rollout Job, and
+        // `repair-aof <dir>` in the redis pod's init container.
         assert_eq!(
             parse(&["restore", "/backups/x.tar.zst"]),
             Ok(Command::Restore)
+        );
+        assert_eq!(
+            parse(&["repair-aof", "/data/appendonlydir"]),
+            Ok(Command::RepairAof)
         );
         assert_eq!(
             parse(&[

@@ -20,6 +20,37 @@ spec:
         app.kubernetes.io/name: redis
         app.kubernetes.io/component: message-queue
     spec:
+      # Runs before redis-server so a torn AOF tail — the artefact an unclean host
+      # stop leaves behind, which redis reads as a malformed record rather than as
+      # end-of-file — is dropped instead of making the instance refuse to start.
+      # The probe before the subcommand exists because the deployment pins the
+      # floating :local tag: an image seeded from a release predating this command
+      # would otherwise hold the pod in Init forever. Standing aside with a
+      # warning is the honest outcome there; redis still refuses to load and its
+      # own error is then the one that says why.
+      initContainers:
+        - name: aof-repair
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              if ! /opt/cogneva/cogneva --help 2>&1 | grep -q 'repair-aof'; then
+                echo "aof-repair: level=warn this image predates the repair-aof command; nothing was inspected"
+                exit 0
+              fi
+              exec /opt/cogneva/cogneva repair-aof /data/appendonlydir
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
       containers:
         - name: redis
           image: {{ .Values.backends.redis.image }}
