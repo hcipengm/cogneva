@@ -418,6 +418,37 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             info!("alert bridge disabled: no webhook and no PostgreSQL store");
         }
 
+        // ── Delivered configuration document vs. this revision's ──
+        // The alert rules travel inside that document, so no rule in it can
+        // report the document's own absence or lag; this judgement runs in code
+        // instead, on the document this process read at start, against the copy
+        // compiled into this binary.
+        let declaration_notifier =
+            match (&webhook, ctx.consume_service::<dyn cog_core::HttpClient>()) {
+                (Some((url, timeout_secs)), Some(http)) => Some(Arc::new(
+                    crate::alerts::AlertManager::new(
+                        Vec::new(),
+                        vec![AlertChannel::Webhook {
+                            url: url.clone(),
+                            headers: HashMap::new(),
+                        }],
+                    )
+                    .with_timeout(*timeout_secs)
+                    .with_client(http),
+                )),
+                _ => None,
+            };
+        tokio::spawn(crate::config_delivery::run_config_declaration_check(
+            std::time::Duration::from_secs(
+                obs_cfg
+                    .config_declaration
+                    .settle_secs
+                    .max(crate::config::ConfigDeclarationConfig::MIN_SETTLE_SECS),
+            ),
+            self.alert_store.clone(),
+            declaration_notifier,
+        ));
+
         // ── Infra alert watcher: PromQL rules → persisted alerts ──
         // Infrastructure faults (node disk pressure, crash loops) happen
         // below the supervisor's view; without this they never become

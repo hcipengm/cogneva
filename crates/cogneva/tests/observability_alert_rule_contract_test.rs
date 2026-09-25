@@ -339,6 +339,43 @@ fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
     );
 }
 
+/// Rule names the watcher raises about itself, which must stay outside the
+/// configured rule set.
+///
+/// The watcher adopts the rows it finds for the rules it evaluates and resolves
+/// the ones whose condition no longer holds. A configured rule carrying one of
+/// these names would therefore let the watcher close the very row that reports
+/// the rule set as incomplete — the one alert whose subject is the missing
+/// judgement would be cancelled by the judgement that is missing.
+#[test]
+fn the_watchers_own_rule_names_are_not_configured_rule_names() {
+    let own = [
+        cog_observability::infra_watch::EVAL_FAILURE_RULE,
+        cog_observability::config_delivery::CONFIG_DECLARATION_RULE,
+    ];
+    for name in own {
+        assert!(!name.is_empty());
+    }
+    let mut distinct = own.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        own.len(),
+        "two self-alerts share a rule name"
+    );
+
+    let configured: BTreeSet<String> = chart_rules().into_iter().map(|(name, _)| name).collect();
+    let collision: Vec<&&str> = own
+        .iter()
+        .filter(|name| configured.contains(**name))
+        .collect();
+    assert!(
+        collision.is_empty(),
+        "这些自我告警的规则名同时存在于 configuration 的规则集里，watcher 会把它们当成自己的行来 adopt/resolve: {collision:?}"
+    );
+}
+
 #[test]
 fn the_tables_hold_no_series_that_no_rule_reads() {
     let read: BTreeSet<String> = chart_rules()

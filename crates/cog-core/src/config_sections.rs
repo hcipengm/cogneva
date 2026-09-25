@@ -288,6 +288,227 @@ pub fn sections_missing_from_document(doc: &Value) -> Vec<&'static str> {
 pub const CONFIG_CONFIGMAP: &str = "cogneva-json";
 pub const CONFIG_DOCUMENT_KEY: &str = "cogneva.json";
 
+/// Where the alert rules live inside the document.
+///
+/// Named once because more than one reader selects it from a document: the
+/// comparison below, and the gate that checks the deployed rule set against
+/// what this workspace publishes.
+pub const ALERT_RULES_POINTER: &str = "/observability/infra_watch/rules";
+
+/// How the document a process was handed differs from the one its revision
+/// declares.
+///
+/// Compared by section and by rule name rather than by a digest of the whole
+/// document: the reading a person has to act on is which rules are not in
+/// force, and a digest answers only "different". Comment keys (`_comment*`, at
+/// any depth) are left out of the comparison — they carry prose, so a document
+/// that differs only in them is in force exactly as declared, and reporting it
+/// would spend the credibility of the one alert that must always be believable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigDeclaration {
+    /// Declared sections the delivered document does not have at all.
+    pub absent: Vec<String>,
+    /// Sections both documents have, holding different values.
+    pub changed: Vec<String>,
+    /// Sections the delivered document has that this revision does not declare.
+    pub undeclared: Vec<String>,
+    /// Alert rules this revision declares that the delivered document lacks.
+    pub rules_absent: Vec<String>,
+    /// Alert rules the delivered document carries that this revision does not
+    /// declare.
+    pub rules_undeclared: Vec<String>,
+}
+
+impl ConfigDeclaration {
+    /// Whether the delivered document is the one this revision declares.
+    pub fn matches(&self) -> bool {
+        self.absent.is_empty()
+            && self.changed.is_empty()
+            && self.undeclared.is_empty()
+            && self.rules_absent.is_empty()
+            && self.rules_undeclared.is_empty()
+    }
+}
+
+/// Compare a delivered document against the one this revision declares.
+pub fn compare_declaration(delivered: &Value, declared: &Value) -> ConfigDeclaration {
+    let delivered = without_comment_keys(delivered);
+    let declared = without_comment_keys(declared);
+    let mut out = ConfigDeclaration::default();
+    for name in declared.as_object().map(|m| m.keys()).into_iter().flatten() {
+        match delivered.get(name) {
+            None => out.absent.push(name.clone()),
+            Some(value) if value != &declared[name] => out.changed.push(name.clone()),
+            Some(_) => {}
+        }
+    }
+    for name in delivered
+        .as_object()
+        .map(|m| m.keys())
+        .into_iter()
+        .flatten()
+    {
+        if declared.get(name).is_none() {
+            out.undeclared.push(name.clone());
+        }
+    }
+    let delivered_rules = rule_names(&delivered);
+    let declared_rules = rule_names(&declared);
+    out.rules_absent = declared_rules
+        .iter()
+        .filter(|n| !delivered_rules.contains(n))
+        .cloned()
+        .collect();
+    out.rules_undeclared = delivered_rules
+        .iter()
+        .filter(|n| !declared_rules.contains(n))
+        .cloned()
+        .collect();
+    out.absent.sort();
+    out.changed.sort();
+    out.undeclared.sort();
+    out.rules_absent.sort();
+    out.rules_undeclared.sort();
+    out
+}
+
+/// The document with every `_comment*` key removed, at any depth.
+fn without_comment_keys(doc: &Value) -> Value {
+    match doc {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| !key.starts_with("_comment"))
+                .map(|(key, value)| (key.clone(), without_comment_keys(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_comment_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The alert rule names a document declares, in document order.
+fn rule_names(doc: &Value) -> Vec<String> {
+    doc.pointer(ALERT_RULES_POINTER)
+        .and_then(|rules| rules.as_array())
+        .map(|rules| {
+            rules
+                .iter()
+                .filter_map(|rule| rule.get("name").and_then(|n| n.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a process was handed, judged against the declaration compiled into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentDelivery {
+    /// Nothing at the path the process reads. Not by itself a fault: a process
+    /// can be configured entirely from the environment.
+    Absent,
+    /// Something is at the path and it is not a usable document.
+    Unusable(String),
+    /// Delivered, usable, and not this revision's document.
+    Differs(ConfigDeclaration),
+    /// Delivered and this revision's document.
+    Matches,
+}
+
+/// Judge delivered text against the declared document.
+///
+/// Pure, and takes the delivered text rather than a path: the caller owns
+/// reading the file, so every verdict — nothing there, unparseable, a
+/// different revision — can be exercised without a filesystem.
+pub fn judge_delivery(delivered: Option<&str>, declared: &str) -> DocumentDelivery {
+    let Some(text) = delivered else {
+        return DocumentDelivery::Absent;
+    };
+    let delivered: Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(e) => return DocumentDelivery::Unusable(e.to_string()),
+    };
+    let declared: Value = serde_json::from_str(declared)
+        .expect("the declaration compiled into this binary is valid JSON");
+    if !delivered.is_object() || !declared.is_object() {
+        // Two non-objects compare "equal" against nothing and would read as a
+        // match: a document whose shape is wrong is judged unusable instead.
+        return DocumentDelivery::Unusable("the document is not a JSON object".to_string());
+    }
+    let difference = compare_declaration(&delivered, &declared);
+    if difference.matches() {
+        DocumentDelivery::Matches
+    } else {
+        DocumentDelivery::Differs(difference)
+    }
+}
+
+/// Longest message this module composes, in characters.
+///
+/// Bounded on characters rather than on the number of names: a list budget
+/// multiplies by the length of the names, and section or rule names come from
+/// the document rather than from this code.
+const MAX_MESSAGE_CHARS: usize = 600;
+
+/// Names per list before the rest are counted instead of spelled out.
+const MAX_NAMES_PER_LIST: usize = 6;
+
+/// Say what was delivered, for the alert row and the log.
+pub fn describe_delivery(source: &str, delivery: &DocumentDelivery) -> String {
+    let text = match delivery {
+        DocumentDelivery::Matches => {
+            format!("configuration document at {source} is the one this revision declares")
+        }
+        DocumentDelivery::Absent => format!(
+            "no configuration document at {source}: this process runs on built-in defaults and \
+             environment overrides"
+        ),
+        DocumentDelivery::Unusable(e) => {
+            format!("the configuration document at {source} cannot be used: {e}")
+        }
+        DocumentDelivery::Differs(d) => {
+            let mut parts: Vec<String> = Vec::new();
+            push_difference(&mut parts, &d.rules_absent, "declared alert rule(s) absent");
+            push_difference(
+                &mut parts,
+                &d.rules_undeclared,
+                "rule(s) it does not declare",
+            );
+            push_difference(&mut parts, &d.absent, "section(s) absent");
+            push_difference(&mut parts, &d.changed, "section(s) changed");
+            push_difference(&mut parts, &d.undeclared, "section(s) it does not declare");
+            format!(
+                "the configuration document this process started with ({source}) is not the one \
+                 this revision declares: {}",
+                parts.join("; ")
+            )
+        }
+    };
+    let mut chars = text.chars();
+    let bounded: String = chars.by_ref().take(MAX_MESSAGE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
+/// Add one non-empty list to the message, named and counted.
+fn push_difference(parts: &mut Vec<String>, names: &[String], what: &str) {
+    if !names.is_empty() {
+        parts.push(format!("{} {what} {}", names.len(), join_names(names)));
+    }
+}
+
+/// Render one list of names, counting whatever does not fit instead of dropping
+/// it: a list that silently stops at six reads as if it were complete.
+fn join_names(names: &[String]) -> String {
+    if names.len() <= MAX_NAMES_PER_LIST {
+        return format!("[{}]", names.join(", "));
+    }
+    let shown = names[..MAX_NAMES_PER_LIST].join(", ");
+    format!("[{shown}, +{} more]", names.len() - MAX_NAMES_PER_LIST)
+}
+
 /// Stamp that rolls a workload onto the configuration it mounts.
 ///
 /// Wall-clock seconds: two rolls in the same second would write the same value
@@ -400,5 +621,185 @@ mod tests {
             Some("1700000000")
         );
         assert!(!restart_stamp().is_empty());
+    }
+
+    /// A document of the shape the deployment delivers: two sections, one rule.
+    fn declared_document() -> Value {
+        json!({
+            "_comment": "free-form note",
+            "app": {"log_level": "info"},
+            "self_evolution": {"build_gate": {"slots": 1}},
+            "observability": {
+                "infra_watch": {
+                    "rules": [
+                        {"name": "node_disk", "promql": "up == 0"},
+                        {"name": "aof_repair_gave_up_bytes", "promql": "x > 0"}
+                    ]
+                }
+            }
+        })
+    }
+
+    fn delivery_of(delivered: &Value) -> DocumentDelivery {
+        judge_delivery(
+            Some(&delivered.to_string()),
+            &declared_document().to_string(),
+        )
+    }
+
+    /// The control: a document that is the declaration is not a finding.
+    #[test]
+    fn the_declared_document_itself_matches() {
+        assert_eq!(delivery_of(&declared_document()), DocumentDelivery::Matches);
+    }
+
+    /// Prose is not configuration. A document that differs only in comment
+    /// keys, at any depth, is in force exactly as declared.
+    #[test]
+    fn a_comment_only_difference_is_not_a_difference() {
+        let mut delivered = declared_document();
+        delivered["observability"]["infra_watch"]["_comment_poll"] =
+            json!("the delivered copy explains the interval differently");
+        delivered["_comment"] = json!("another revision's prose");
+        assert_eq!(delivery_of(&delivered), DocumentDelivery::Matches);
+    }
+
+    /// The documented incident: the delivered document predates the revision,
+    /// so the section the newer code reads is simply not there.
+    #[test]
+    fn a_section_the_delivered_document_lacks_is_named() {
+        let mut delivered = declared_document();
+        delivered.as_object_mut().unwrap().remove("self_evolution");
+        match delivery_of(&delivered) {
+            DocumentDelivery::Differs(d) => {
+                assert_eq!(d.absent, vec!["self_evolution".to_string()]);
+                assert!(d.changed.is_empty() && d.undeclared.is_empty());
+            }
+            other => panic!("expected a difference, got {other:?}"),
+        }
+    }
+
+    /// A nested edit is a change of its section, and the comparison reports the
+    /// section rather than staying silent because the top level looks the same.
+    #[test]
+    fn a_nested_edit_in_a_shared_section_is_reported() {
+        let mut delivered = declared_document();
+        delivered["app"]["log_level"] = json!("debug");
+        match delivery_of(&delivered) {
+            DocumentDelivery::Differs(d) => {
+                assert_eq!(d.changed, vec!["app".to_string()]);
+                assert!(d.absent.is_empty());
+            }
+            other => panic!("expected a difference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_section_the_revision_does_not_declare_is_reported() {
+        let mut delivered = declared_document();
+        delivered["a_section_added_ahead_of_this_revision"] = json!({"x": 1});
+        match delivery_of(&delivered) {
+            DocumentDelivery::Differs(d) => {
+                assert_eq!(
+                    d.undeclared,
+                    vec!["a_section_added_ahead_of_this_revision".to_string()]
+                );
+            }
+            other => panic!("expected a difference, got {other:?}"),
+        }
+    }
+
+    /// A rule the newer revision declares and the delivered document does not
+    /// have: the rule set in force is smaller than the one this code believes
+    /// it shipped, which is silent everywhere else.
+    #[test]
+    fn a_declared_rule_the_delivered_document_lacks_is_named() {
+        let mut delivered = declared_document();
+        delivered["observability"]["infra_watch"]["rules"] = json!([{"name": "node_disk"}]);
+        match delivery_of(&delivered) {
+            DocumentDelivery::Differs(d) => {
+                assert_eq!(d.rules_absent, vec!["aof_repair_gave_up_bytes".to_string()]);
+                assert!(d.changed.contains(&"observability".to_string()));
+            }
+            other => panic!("expected a difference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rule_the_revision_does_not_declare_is_named() {
+        let mut delivered = declared_document();
+        delivered["observability"]["infra_watch"]["rules"] = json!([
+            {"name": "node_disk"},
+            {"name": "aof_repair_gave_up_bytes"},
+            {"name": "left_behind_by_a_rollback"}
+        ]);
+        match delivery_of(&delivered) {
+            DocumentDelivery::Differs(d) => {
+                assert_eq!(
+                    d.rules_undeclared,
+                    vec!["left_behind_by_a_rollback".to_string()]
+                );
+                assert!(d.rules_absent.is_empty());
+            }
+            other => panic!("expected a difference, got {other:?}"),
+        }
+    }
+
+    /// Each of the three ways a document can fail to be usable has its own
+    /// verdict: reading them as one would make "nothing there" and "something
+    /// broken there" the same report.
+    #[test]
+    fn nothing_delivered_and_unusable_text_are_told_apart() {
+        let declared = declared_document().to_string();
+        assert_eq!(judge_delivery(None, &declared), DocumentDelivery::Absent);
+        assert!(matches!(
+            judge_delivery(Some("{not json"), &declared),
+            DocumentDelivery::Unusable(_)
+        ));
+        // Valid JSON of the wrong shape compares equal to nothing, so it must
+        // not be allowed to read as a match.
+        assert!(matches!(
+            judge_delivery(Some("[]"), &declared),
+            DocumentDelivery::Unusable(_)
+        ));
+    }
+
+    #[test]
+    fn the_message_names_the_source_and_what_is_missing() {
+        let source = "/etc/cogneva/cogneva.json";
+        let mut delivered = declared_document();
+        delivered["observability"]["infra_watch"]["rules"] = json!([{"name": "node_disk"}]);
+        delivered.as_object_mut().unwrap().remove("self_evolution");
+        let text = describe_delivery(source, &delivery_of(&delivered));
+        assert!(text.contains(source), "{text}");
+        assert!(text.contains("aof_repair_gave_up_bytes"), "{text}");
+        assert!(text.contains("self_evolution"), "{text}");
+    }
+
+    #[test]
+    fn the_message_matches_the_delivered_document_wording() {
+        let source = "/etc/cogneva/cogneva.json";
+        assert!(describe_delivery(source, &DocumentDelivery::Matches).contains(source));
+        assert!(describe_delivery(source, &DocumentDelivery::Absent).contains("defaults"));
+        assert!(
+            describe_delivery(source, &DocumentDelivery::Unusable("bad".into())).contains("bad")
+        );
+    }
+
+    /// A long list is truncated by characters and says how much it left out:
+    /// a message that stops without a count reads as if it were complete.
+    #[test]
+    fn the_message_stays_bounded_when_the_lists_are_long() {
+        let mut delivered = declared_document();
+        delivered["observability"]["infra_watch"]["rules"] = json!([]);
+        let mut declared = declared_document();
+        let rules: Vec<Value> = (0..200)
+            .map(|i| json!({"name": format!("rule_{i}_with_a_name_of_its_own")}))
+            .collect();
+        declared["observability"]["infra_watch"]["rules"] = json!(rules);
+        let delivery = judge_delivery(Some(&delivered.to_string()), &declared.to_string());
+        let text = describe_delivery("/etc/cogneva/cogneva.json", &delivery);
+        assert!(text.chars().count() <= MAX_MESSAGE_CHARS + 1, "{text}");
+        assert!(text.contains("more"), "{text}");
     }
 }

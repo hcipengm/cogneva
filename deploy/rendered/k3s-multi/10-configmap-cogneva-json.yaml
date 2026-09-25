@@ -422,6 +422,10 @@ data:
         "skill_cache_ttl_secs": 30
       },
       "observability": {
+        "config_declaration": {
+          "_comment": "本进程读到的配置文档，与本 rev 声明的那份是否同一份。规则住在文档里，所以没有任何一条规则能报出文档自己没到；这一判在代码里跑，拿进程启动时读的那份，比对本二进制编译进来的那份。两次读取间隔 settle_secs：中间那次是为了把「正在换版」和「文档确实落后」分开——文件在此期间已经前进，说明进程只是被替换的路上，不是卡住。",
+          "settle_secs": 60
+        },
         "infra_watch": {
           "_comment": "基础设施告警→持久化→自发现。规则即部署策略：阈值改这里不用重建镜像。series 消失或条件不再成立会自动 resolve；规则查询失败不会误 resolve。",
           "enabled": true,

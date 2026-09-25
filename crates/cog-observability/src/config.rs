@@ -7,6 +7,27 @@ use serde::{Deserialize, Serialize};
 
 use cog_core::{SFError, SFResult};
 
+/// The document this revision declares, compiled into the binary.
+///
+/// The chart's copy is the single source both delivery paths render from — the
+/// helm ConfigMap takes the file as it is, and the k3s carrier is held
+/// field-for-field equal to it by the deploy parity gate — so one embed covers
+/// both. Compiled in rather than read from disk: this is the reference side of
+/// a judgement about what *was* delivered, and a reference the deployment could
+/// rewrite would answer nothing.
+pub const DECLARED_CONFIG_JSON: &str =
+    include_str!("../../../deploy/helm/cogneva/files/cogneva.json");
+
+/// Where this process reads its configuration document.
+///
+/// One resolution for the loader and for the delivery check: two copies of the
+/// path would let a check judge a file the process never reads.
+pub fn config_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("COGNEVA_CONFIG_PATH").unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into()),
+    )
+}
+
 /// Observability exporters configuration (Loki / Jaeger / ClickHouse / Alertmanager).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,6 +40,39 @@ pub struct ObservabilityExportersConfig {
     pub infra_watch: InfraWatchConfig,
     pub trace_collector: TraceCollectorConfig,
     pub data_volume_watch: DataVolumeWatchConfig,
+    pub config_declaration: ConfigDeclarationConfig,
+}
+
+/// The delivered document against the one this revision declares.
+///
+/// The check runs because the delivered document is where the alert rules live,
+/// so a document that lags its revision cannot report its own lag: every rule
+/// that would say "these rules are not in force" is in the document that did
+/// not arrive. Only the reading cadence is configurable — there is deliberately
+/// no switch, because the one check whose subject is "the configuration did not
+/// reach me" must not be something the configuration can turn off.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigDeclarationConfig {
+    /// How long to wait before the second read that separates a deployment
+    /// still rolling from a document that is genuinely behind. A pod can
+    /// legitimately start on the previous document while the ConfigMap is
+    /// applied around it; when the file has moved on by the second read, the
+    /// process is on its way to being replaced rather than stuck.
+    pub settle_secs: u64,
+}
+
+impl Default for ConfigDeclarationConfig {
+    fn default() -> Self {
+        Self { settle_secs: 60 }
+    }
+}
+
+impl ConfigDeclarationConfig {
+    /// Floor for the settle window. The mount is refreshed by kubelet on its
+    /// own sync period, so a window shorter than that would read the same stale
+    /// document twice and call a rollout a permanent gap.
+    pub const MIN_SETTLE_SECS: u64 = 10;
 }
 
 /// Persistent-volume footprint watcher: measures the application data
@@ -317,15 +371,17 @@ const OBS_ENV: &[(&str, &str)] = &[
         "COGNEVA_DATA_VOLUME_INTERVAL_SECS",
         "data_volume_watch.interval_secs",
     ),
+    (
+        "COGNEVA_CONFIG_DECLARATION_SETTLE_SECS",
+        "config_declaration.settle_secs",
+    ),
 ];
 
 impl ObservabilityExportersConfig {
     /// 自读 cogneva.json `observability` 段 + env 覆盖；文件/段缺失回退
     /// 默认，段存在但解析失败响亮报错。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
-        Self::load_from(std::path::Path::new(&path))
+        Self::load_from(&config_path())
     }
 
     /// 从指定文件加载（测试与自定义路径用）。
