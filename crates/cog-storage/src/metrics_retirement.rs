@@ -55,7 +55,7 @@ const RELEASE_BATCH: i64 = 5_000;
 /// One series per table rather than one total: a table that keeps reporting a
 /// non-zero removal is the reading that says a release is not draining, and a
 /// merged scalar would hide which of the four it is.
-const RETIRED_ROWS_REMOVED_METRIC: &str = "metrics_retired_rows_removed";
+use cog_core::metric_names::METRICS_RETIRED_ROWS_REMOVED as RETIRED_ROWS_REMOVED_METRIC;
 
 /// What one release pass removed, per table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -272,7 +272,7 @@ impl RetirementPass {
             {
                 warn!(
                     error = %e,
-                    metric = RETIRED_ROWS_REMOVED_METRIC,
+                    metric = %RETIRED_ROWS_REMOVED_METRIC,
                     table,
                     "retirement removal gauge emit failed"
                 );

@@ -950,8 +950,11 @@ impl MemoryIngestor {
             return;
         };
         for (name, value) in [
-            ("memory_unextracted_raw", scan.total()),
-            ("memory_unextracted_raw_aged_out", scan.aged_out),
+            (cog_core::metric_names::MEMORY_UNEXTRACTED_RAW, scan.total()),
+            (
+                cog_core::metric_names::MEMORY_UNEXTRACTED_RAW_AGED_OUT,
+                scan.aged_out,
+            ),
         ] {
             if let Err(e) = metrics
                 .record_gauge(name, value as f64, HashMap::new())
@@ -1836,17 +1839,20 @@ mod tests {
     impl cog_core::MetricsBackend for RecordingMetrics {
         async fn record_gauge(
             &self,
-            name: &str,
+            name: cog_core::MetricName,
             value: f64,
             _labels: HashMap<String, String>,
         ) -> cog_core::SFResult<()> {
-            self.gauges.lock().unwrap().push((name.to_string(), value));
+            self.gauges
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value));
             Ok(())
         }
 
         async fn record_counter(
             &self,
-            _name: &str,
+            _name: cog_core::MetricName,
             _value: f64,
             _labels: HashMap<String, String>,
         ) -> cog_core::SFResult<()> {
@@ -1855,7 +1861,7 @@ mod tests {
 
         async fn record_histogram(
             &self,
-            _name: &str,
+            _name: cog_core::MetricName,
             _value: f64,
             _labels: HashMap<String, String>,
         ) -> cog_core::SFResult<()> {

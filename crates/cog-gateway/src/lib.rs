@@ -10,7 +10,7 @@ use base64::Engine as _;
 use cog_core::TraceContext;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -940,13 +940,21 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
                             labels.insert("endpoint".into(), endpoint.clone());
                             labels.insert("status".into(), status.to_string());
                             if let Err(e) = mb
-                                .record_counter("http_requests_total", 1.0, labels.clone())
+                                .record_counter(
+                                    cog_core::metric_names::HTTP_REQUESTS_TOTAL,
+                                    1.0,
+                                    labels.clone(),
+                                )
                                 .await
                             {
                                 tracing::warn!("Failed to record http request counter: {}", e);
                             }
                             if let Err(e) = mb
-                                .record_histogram("http_request_duration_ms", duration_ms, labels)
+                                .record_histogram(
+                                    cog_core::metric_names::HTTP_REQUEST_DURATION_MS,
+                                    duration_ms,
+                                    labels,
+                                )
                                 .await
                             {
                                 tracing::warn!("Failed to record http request histogram: {}", e);
@@ -1067,7 +1075,10 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "memory_operation_errors_total",
         "Total number of failed memory backend operations",
     ),
-    ("http_requests_total", "Total number of HTTP requests"),
+    (
+        cog_core::metric_names::HTTP_REQUESTS_TOTAL.as_str(),
+        "Total number of HTTP requests",
+    ),
     (
         "tier_migration_total",
         "Total number of storage tier migrations",
@@ -1097,7 +1108,7 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
         "Memory backend operation latency in milliseconds",
     ),
     (
-        "http_request_duration_ms",
+        cog_core::metric_names::HTTP_REQUEST_DURATION_MS.as_str(),
         "HTTP request duration in milliseconds",
     ),
 ];
@@ -1222,6 +1233,81 @@ async fn listed_metric_names(
     }
 }
 
+/// The held series that no name in this build's registry can write, as series.
+///
+/// A series outlives its producer. When the code that wrote a name is deleted
+/// and nobody adds that name to [`cog_core::RETIRED_METRIC_NAMES`], the rows
+/// stay and the value freezes — and a frozen counter is read downstream as "no
+/// traffic" rather than "this series is gone". Nothing in the source tree can
+/// notice: the producer is gone, so there is no longer a place for the name to
+/// appear and nothing to search for. The store is the only witness that the
+/// series ever existed, and this function sits where both sides are known at
+/// once — the backend's held names and the build's registry — so the judgement
+/// belongs here.
+///
+/// A reading, never a trigger: nothing deletes the rows this names, and the
+/// names it reports are candidates for the operator to retire, not verdicts to
+/// act on. The distinction is what keeps it honest in the other direction — a
+/// producer that is merely slow, or a deployment scaled to zero, is
+/// indistinguishable from a dead one when judged from the store's side, while a
+/// name outside the registry cannot be written by this build at all. That is a
+/// fact about the binary, not a guess about a series.
+///
+/// Retired names never reach here: [`listed_metric_names`] has already dropped
+/// them, which is the state a held-but-unwritten series is supposed to end in.
+fn render_unproduced_series(held: &[String]) -> String {
+    let unproduced: BTreeSet<&str> = held
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !cog_core::is_registered_metric(name))
+        .collect();
+    if unproduced.is_empty() {
+        return String::new();
+    }
+
+    let mut out = format!(
+        "\n# HELP {name} Series the store holds that no metric name this build can write accounts for\n\
+         # TYPE {name} gauge\n",
+        name = UNPRODUCED_SERIES_METRIC
+    );
+    for name in unproduced {
+        out.push_str(&format!(
+            "{} {{name=\"{}\"}} 1\n",
+            UNPRODUCED_SERIES_METRIC,
+            escape_label_value(name)
+        ));
+    }
+    out
+}
+
+/// The series name this reading is published under.
+///
+/// It is declared here rather than in the registry: the reading is rendered
+/// into the scrape body, and a name that only ever reaches the store through
+/// `record_*` has no business being in a list of writable names — the registry's
+/// completeness is what the reading itself is computed from.
+pub const UNPRODUCED_SERIES_METRIC: &str = "cogneva_metric_held_without_producer";
+
+/// A label value with the three characters the text format reserves escaped.
+///
+/// The values are series names, which are declared in this crate's own registry
+/// when all is well — but the whole point of this reading is the case where a
+/// name is *not* theirs, so it is text from the store and has to be escaped
+/// like any other: a stored name carrying a quote or a newline would otherwise
+/// split one series into two lines and the scrape would be malformed.
+fn escape_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 /// Render every series the backend holds, in Prometheus text format.
 ///
 /// Takes the backend rather than the gateway state so the rendering can be
@@ -1230,6 +1316,7 @@ async fn listed_metric_names(
 /// tests is the kind that drifts.
 async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     let mut body = String::new();
+    let mut held: Vec<String> = Vec::new();
 
     // Nothing here is read over a window. Each kind is read as the observation
     // state a scrape needs: counters and histograms as their cumulations, so
@@ -1239,6 +1326,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     // scrape interval — and a window chosen here would be this exporter making
     // that decision for every reader at once.
     for name in listed_metric_names(mb, cog_core::MetricType::Counter, COUNTER_HELP).await {
+        held.push(name.clone());
         match mb.query_counter_totals(&name).await {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_counters(
@@ -1254,6 +1342,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     }
 
     for name in listed_metric_names(mb, cog_core::MetricType::Histogram, HISTOGRAM_HELP).await {
+        held.push(name.clone());
         match mb.query_histogram_totals(&name).await {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_histograms(
@@ -1269,6 +1358,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     }
 
     for name in listed_metric_names(mb, cog_core::MetricType::Gauge, GAUGE_HELP).await {
+        held.push(name.clone());
         match mb.query_gauge_latest(&name).await {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_gauges(
@@ -1282,6 +1372,8 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
             }
         }
     }
+
+    body.push_str(&render_unproduced_series(&held));
 
     // Declare what the `_total` series mean. The scrape side versions
     // independently of this binary, so the declaration has to travel in the
@@ -2746,12 +2838,20 @@ mod metrics_exposition_tests {
     /// 记一条 gauge，名字故意不在帮助表里——模拟"有人新增产出面但没来这边登记"。
     async fn backend_with_extra_gauge() -> cog_storage::mem::MemoryMetricsBackend {
         let mb = cog_storage::mem::MemoryMetricsBackend::new();
-        mb.record_gauge("some_future_gauge", 7.0, HashMap::new())
-            .await
-            .unwrap();
-        mb.record_counter("some_future_counter_total", 3.0, HashMap::new())
-            .await
-            .unwrap();
+        mb.record_gauge(
+            cog_core::MetricName::for_tests_only("some_future_gauge"),
+            7.0,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        mb.record_counter(
+            cog_core::MetricName::for_tests_only("some_future_counter_total"),
+            3.0,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
         mb
     }
 
@@ -2804,7 +2904,7 @@ mod metrics_exposition_tests {
         for name in [
             "memory_operations_total",
             "memory_operation_errors_total",
-            "http_requests_total",
+            cog_core::metric_names::HTTP_REQUESTS_TOTAL.as_str(),
             "tier_migration_total",
             "llm_calls_total",
             "llm_tokens_total",
@@ -2816,7 +2916,10 @@ mod metrics_exposition_tests {
                 "counter {name} 缺描述"
             );
         }
-        for name in ["memory_operation_latency_ms", "http_request_duration_ms"] {
+        for name in [
+            "memory_operation_latency_ms",
+            cog_core::metric_names::HTTP_REQUEST_DURATION_MS.as_str(),
+        ] {
             assert!(
                 !metric_help(HISTOGRAM_HELP, name).starts_with("Undocumented"),
                 "histogram {name} 缺描述"
@@ -2877,6 +2980,122 @@ mod metrics_exposition_tests {
                 "{name} 已退场，不该再被描述"
             );
         }
+    }
+
+    /// The case the reading exists for: the store holds a series whose name no
+    /// name in this build's registry can write. Nothing in the source tree can
+    /// see it — the producer is gone, so there is no longer a place for the
+    /// name to appear — and without this the series keeps being served with its
+    /// frozen last value, which downstream reads as an idle producer rather
+    /// than as a series that is gone.
+    ///
+    /// The registered name in the same store is the control: having a producer
+    /// is what keeps a held series out of the reading, and a reading that
+    /// reported everything held would be noise nobody reads.
+    #[tokio::test]
+    async fn a_held_series_no_name_in_this_build_can_write_is_reported() {
+        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+        mb.record_gauge(
+            cog_core::MetricName::for_tests_only("a_producer_that_is_gone"),
+            1.0,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        mb.record_gauge(
+            cog_core::metric_names::MEMORY_UNEXTRACTED_RAW,
+            4.0,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = render_backend_metrics(&mb).await;
+
+        assert!(
+            body.contains(&format!(
+                "{} {{name=\"a_producer_that_is_gone\"}} 1",
+                UNPRODUCED_SERIES_METRIC
+            )),
+            "持有但本构建写不出的序列必须被点名报出: {body}"
+        );
+        assert!(
+            !body.contains(&format!(
+                "name=\"{}\"",
+                cog_core::metric_names::MEMORY_UNEXTRACTED_RAW.as_str()
+            )),
+            "登记在册的名字有产出方，不该被报成无产出: {body}"
+        );
+    }
+
+    /// A store whose names are all writable produces no reading at all. The
+    /// empty case is the one that has to stay empty: a reading that fires on a
+    /// healthy store teaches its reader to ignore it.
+    #[tokio::test]
+    async fn a_store_holding_only_registered_series_reports_nothing() {
+        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+        mb.record_gauge(
+            cog_core::metric_names::LLM_POOL_AVAILABLE,
+            1.0,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = render_backend_metrics(&mb).await;
+
+        assert!(
+            !body.contains(UNPRODUCED_SERIES_METRIC),
+            "没有无产出的序列时，暴露面上不该出现这条读数: {body}"
+        );
+        assert!(
+            body.lines().any(|line| {
+                !line.starts_with('#')
+                    && line.starts_with(cog_core::metric_names::LLM_POOL_AVAILABLE.as_str())
+            }),
+            "控制组：登记在册的序列本身还是要被服务: {body}"
+        );
+    }
+
+    /// The reported values are names read back out of the store, so they are
+    /// text like any other: a name carrying a quote or a newline, unescaped,
+    /// splits one series into two lines and the whole scrape is malformed. The
+    /// reading is where a store's contents become a scrape body, so the
+    /// escaping has to hold from this side.
+    #[test]
+    fn a_held_name_is_escaped_into_a_single_label_value() {
+        let rendered = render_unproduced_series(&["a\"b\nc\\d".to_string()]);
+        let samples: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with(UNPRODUCED_SERIES_METRIC))
+            .collect();
+
+        assert_eq!(samples.len(), 1, "一个名字只能渲染成一行样本: {rendered}");
+        assert_eq!(
+            samples[0],
+            format!(
+                "{} {{name=\"a\\\"b\\nc\\\\d\"}} 1",
+                UNPRODUCED_SERIES_METRIC
+            ),
+            "名字里的引号、换行与反斜杠都必须转义: {rendered}"
+        );
+    }
+
+    /// The reading's own name is not a series any build can write and not one
+    /// that has been retired. Being writable would put it in the registry the
+    /// reading is computed from, licensing a series nothing produces — the
+    /// direction the retirement gate has always guarded. Being retired would
+    /// put it in the state the reading's own subjects are supposed to reach.
+    #[test]
+    fn the_reading_name_is_neither_registered_nor_retired() {
+        assert!(
+            !cog_core::is_registered_metric(UNPRODUCED_SERIES_METRIC),
+            "{UNPRODUCED_SERIES_METRIC} 进了登记表就等于宣称本构建会写它"
+        );
+        assert!(
+            !cog_core::is_retired_metric(UNPRODUCED_SERIES_METRIC),
+            "{UNPRODUCED_SERIES_METRIC} 不是退场的序列，它是这次读数本身"
+        );
     }
 }
 

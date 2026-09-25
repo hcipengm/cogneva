@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cog_core::{HistogramTotals, MetricSample, MetricsBackend, SFError, SFResult};
+use cog_core::{HistogramTotals, MetricName, MetricSample, MetricsBackend, SFError, SFResult};
 use prometheus::core::Collector;
 use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Registry,
@@ -220,33 +220,33 @@ impl PrometheusMetricsBackend {
 impl MetricsBackend for PrometheusMetricsBackend {
     async fn record_gauge(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
-        let gauge = self.get_or_create_gauge(name, &labels)?;
+        let gauge = self.get_or_create_gauge(name.as_str(), &labels)?;
         gauge.set(value);
         Ok(())
     }
 
     async fn record_counter(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
-        let counter = self.get_or_create_counter(name, &labels)?;
+        let counter = self.get_or_create_counter(name.as_str(), &labels)?;
         counter.inc_by(value);
         Ok(())
     }
 
     async fn record_histogram(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
-        let hist = self.get_or_create_histogram(name, &labels)?;
+        let hist = self.get_or_create_histogram(name.as_str(), &labels)?;
         hist.observe(value);
         Ok(())
     }

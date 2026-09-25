@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cog_core::{MetricSample, MetricsBackend, SFResult};
+use cog_core::{MetricName, MetricSample, MetricsBackend, SFResult};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -89,31 +89,31 @@ fn label_key(labels: &HashMap<String, String>) -> String {
 impl MetricsBackend for MockMetricsBackend {
     async fn record_gauge(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
-        self.push(MetricKind::Gauge, name, value, labels);
+        self.push(MetricKind::Gauge, name.as_str(), value, labels);
         Ok(())
     }
 
     async fn record_counter(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
-        self.push(MetricKind::Counter, name, value, labels);
+        self.push(MetricKind::Counter, name.as_str(), value, labels);
         Ok(())
     }
 
     async fn record_histogram(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
-        self.push(MetricKind::Histogram, name, value, labels);
+        self.push(MetricKind::Histogram, name.as_str(), value, labels);
         Ok(())
     }
 

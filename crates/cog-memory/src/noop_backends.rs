@@ -1,7 +1,7 @@
 //! No-op backends for graceful degradation when StoragePlugin is unavailable.
 
 use async_trait::async_trait;
-use cog_core::{MetricsBackend, SFResult, VectorBackend, VectorSearchResult};
+use cog_core::{MetricName, MetricsBackend, SFResult, VectorBackend, VectorSearchResult};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -24,7 +24,7 @@ impl NoopMetricsBackend {
 impl MetricsBackend for NoopMetricsBackend {
     async fn record_gauge(
         &self,
-        _name: &str,
+        _name: MetricName,
         _value: f64,
         _labels: HashMap<String, String>,
     ) -> SFResult<()> {
@@ -33,7 +33,7 @@ impl MetricsBackend for NoopMetricsBackend {
 
     async fn record_counter(
         &self,
-        _name: &str,
+        _name: MetricName,
         _value: f64,
         _labels: HashMap<String, String>,
     ) -> SFResult<()> {
@@ -42,7 +42,7 @@ impl MetricsBackend for NoopMetricsBackend {
 
     async fn record_histogram(
         &self,
-        _name: &str,
+        _name: MetricName,
         _value: f64,
         _labels: HashMap<String, String>,
     ) -> SFResult<()> {

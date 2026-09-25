@@ -48,6 +48,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-github/src/landing.rs",
     ),
     (
+        "cogneva_metric_held_without_producer",
+        "crates/cog-gateway/src/lib.rs",
+    ),
+    (
         "cogneva_process_zombies",
         "crates/cog-observability/src/process_zombies.rs",
     ),
@@ -214,6 +218,29 @@ fn every_series_an_alert_rule_reads_is_one_something_produces() {
     );
 }
 
+/// Whether a file still carries the producer of `name`.
+///
+/// A producer writes a series in one of two ways, and both count. It can carry
+/// the wire name — that is what a scrape-only series looks like, and what the
+/// store-writing ones used to look like before the registry held the names. Or
+/// it can bind the registry's constant: the wire form then lives in the
+/// registry, where the compiler keeps the list complete, and the file that
+/// publishes the series carries the binding instead.
+///
+/// The binding is what a deleted producer takes with it, so accepting it keeps
+/// the claim this gate makes intact. It is resolved to the series the constant
+/// declares rather than accepted for its presence: a file that binds some other
+/// constant is not publishing this series, and passing it would turn the entry
+/// back into the empty license the gate exists to refuse.
+fn carries_the_producer(text: &str, name: &str) -> bool {
+    text.contains(name)
+        || cog_core::metric_names::IDENTIFIED
+            .iter()
+            .any(|(ident, metric)| {
+                metric.as_str() == name && text.contains(&format!("metric_names::{ident}"))
+            })
+}
+
 #[test]
 fn every_series_recorded_as_produced_is_still_published_there() {
     let root = repo_root();
@@ -221,7 +248,7 @@ fn every_series_recorded_as_produced_is_still_published_there() {
     for (name, source) in PRODUCED {
         let text = std::fs::read_to_string(root.join(source))
             .unwrap_or_else(|e| panic!("{source} unreadable: {e}"));
-        if !text.contains(name) {
+        if !carries_the_producer(&text, name) {
             missing.push(format!("{name} 记在 {source}，该文件里找不到这个名字"));
         }
     }
@@ -240,11 +267,11 @@ fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
     let rules = chart_rules();
     let domains: [(&str, Vec<&str>); 2] = [
         (
-            cog_github::redrive_budget::REDRIVE_REFUSALS_METRIC,
+            cog_github::redrive_budget::REDRIVE_REFUSALS_METRIC.as_str(),
             RedriveRefusal::ALL.iter().map(|r| r.as_str()).collect(),
         ),
         (
-            cog_github::redrive_budget::REDRIVE_BUDGET_LOSSES_METRIC,
+            cog_github::redrive_budget::REDRIVE_BUDGET_LOSSES_METRIC.as_str(),
             BudgetSide::ALL.iter().map(|s| s.as_str()).collect(),
         ),
     ];

@@ -6,9 +6,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use cog_core::{
     AgentEvent, AgentState, ClusterOverview, ContextBoard, Event, EventFilter, HistogramTotals,
-    LogEntry, MetricSample, MetricType, MetricsBackend, ObservabilityGateway, RawLogIndex,
-    RawLogIndexEntry, RawLogIndexStore, RawLogQuery, SFError, SFResult, SquadState, SquadStatus,
-    StateBackend, TaskCheckpoint, TaskMetrics, UpstreamFailure, VectorBackend, VectorSearchResult,
+    LogEntry, MetricName, MetricSample, MetricType, MetricsBackend, ObservabilityGateway,
+    RawLogIndex, RawLogIndexEntry, RawLogIndexStore, RawLogQuery, SFError, SFResult, SquadState,
+    SquadStatus, StateBackend, TaskCheckpoint, TaskMetrics, UpstreamFailure, VectorBackend,
+    VectorSearchResult,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -825,7 +826,7 @@ impl MemoryMetricsBackend {
 impl MetricsBackend for MemoryMetricsBackend {
     async fn record_gauge(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
@@ -833,13 +834,13 @@ impl MetricsBackend for MemoryMetricsBackend {
             .gauges
             .write()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        Self::push_sample(&mut store, name, value, labels);
+        Self::push_sample(&mut store, name.as_str(), value, labels);
         Ok(())
     }
 
     async fn record_counter(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
@@ -847,13 +848,13 @@ impl MetricsBackend for MemoryMetricsBackend {
             .counters
             .write()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        Self::push_sample(&mut store, name, value, labels);
+        Self::push_sample(&mut store, name.as_str(), value, labels);
         Ok(())
     }
 
     async fn record_histogram(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
@@ -861,7 +862,7 @@ impl MetricsBackend for MemoryMetricsBackend {
             .histograms
             .write()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        Self::push_sample(&mut store, name, value, labels);
+        Self::push_sample(&mut store, name.as_str(), value, labels);
         Ok(())
     }
 

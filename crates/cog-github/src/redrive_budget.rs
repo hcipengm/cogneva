@@ -34,7 +34,7 @@ use cog_core::{SFError, SFResult};
 /// reading surface has to carry: without this, "nothing is being generated"
 /// and "generation was switched off for this cause" look the same from
 /// outside.
-pub const REDRIVE_REFUSALS_METRIC: &str = "cogneva_redrive_refusals_total";
+pub use cog_core::metric_names::REDRIVE_REFUSALS_TOTAL as REDRIVE_REFUSALS_METRIC;
 
 /// Why a re-drive was refused.
 ///
@@ -72,7 +72,7 @@ impl RedriveRefusal {
 /// can buy another one after a restart. Both directions end in a budget that
 /// quietly stopped applying, which is why they are counted, and they are kept
 /// apart because the two repairs are different.
-pub const REDRIVE_BUDGET_LOSSES_METRIC: &str = "cogneva_redrive_budget_losses_total";
+pub use cog_core::metric_names::REDRIVE_BUDGET_LOSSES_TOTAL as REDRIVE_BUDGET_LOSSES_METRIC;
 
 /// Which half of the ledger lost a charge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

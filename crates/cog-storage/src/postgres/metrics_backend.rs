@@ -5,8 +5,8 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 
 use cog_core::{
-    histogram_bucket_bounds, HistogramTotals, MetricSample, MetricType, MetricsBackend, SFError,
-    SFResult,
+    histogram_bucket_bounds, HistogramTotals, MetricName, MetricSample, MetricType, MetricsBackend,
+    SFError, SFResult,
 };
 
 /// PostgreSQL-backed metrics backend.
@@ -270,32 +270,34 @@ impl PostgresMetricsBackend {
 impl MetricsBackend for PostgresMetricsBackend {
     async fn record_gauge(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
-        self.record("gauge", name, value, labels).await
+        self.record("gauge", name.as_str(), value, labels).await
     }
 
     async fn record_counter(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
         // Both the sample log and the running total are kept: the log answers
         // range queries, the total answers the scrape endpoint, and callers of
         // either must keep working.
+        let name = name.as_str();
         self.record("counter", name, value, labels.clone()).await?;
         self.increment_counter_total(name, value, &labels).await
     }
 
     async fn record_histogram(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
+        let name = name.as_str();
         self.record("histogram", name, value, labels.clone())
             .await?;
         self.increment_histogram_bucket(name, value, &labels).await

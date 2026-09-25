@@ -869,23 +869,33 @@ fn pool_status_ttl_secs(state: &AppState, next_attempt_unix: i64) -> u64 {
 
 /// 记一次 gauge。指标注册表是进程内的，写失败只可能是标签类型冲突，降级为
 /// debug 日志，绝不影响请求路径。
-async fn record_gauge(state: &AppState, name: &str, value: f64, labels: &[(&str, &str)]) {
+async fn record_gauge(
+    state: &AppState,
+    name: cog_core::MetricName,
+    value: f64,
+    labels: &[(&str, &str)],
+) {
     let map: HashMap<String, String> = labels
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect();
     if let Err(e) = state.pool_obs.metrics.record_gauge(name, value, map).await {
-        tracing::debug!(error = %e, metric = name, "指标写入失败");
+        tracing::debug!(error = %e, metric = %name, "指标写入失败");
     }
 }
 
 /// 记一次 counter（+1）。
-async fn record_counter(state: &AppState, name: &str, labels: &[(&str, &str)]) {
+async fn record_counter(state: &AppState, name: cog_core::MetricName, labels: &[(&str, &str)]) {
     record_counter_add(state, name, 1.0, labels).await;
 }
 
 /// 记一次 counter 增量。token 计量这类非一维计数走这里。
-async fn record_counter_add(state: &AppState, name: &str, amount: f64, labels: &[(&str, &str)]) {
+async fn record_counter_add(
+    state: &AppState,
+    name: cog_core::MetricName,
+    amount: f64,
+    labels: &[(&str, &str)],
+) {
     let map: HashMap<String, String> = labels
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -896,12 +906,17 @@ async fn record_counter_add(state: &AppState, name: &str, amount: f64, labels: &
         .record_counter(name, amount, map)
         .await
     {
-        tracing::debug!(error = %e, metric = name, "指标写入失败");
+        tracing::debug!(error = %e, metric = %name, "指标写入失败");
     }
 }
 
 /// 记一次 histogram 观测。与 counter 同源：写失败只降级为 debug，不碰请求路径。
-async fn record_histogram(state: &AppState, name: &str, value: f64, labels: &[(&str, &str)]) {
+async fn record_histogram(
+    state: &AppState,
+    name: cog_core::MetricName,
+    value: f64,
+    labels: &[(&str, &str)],
+) {
     let map: HashMap<String, String> = labels
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -912,7 +927,7 @@ async fn record_histogram(state: &AppState, name: &str, value: f64, labels: &[(&
         .record_histogram(name, value, map)
         .await
     {
-        tracing::debug!(error = %e, metric = name, "指标写入失败");
+        tracing::debug!(error = %e, metric = %name, "指标写入失败");
     }
 }
 
@@ -963,11 +978,17 @@ async fn record_llm_call(
         ("result", result),
         ("actor", actor),
     ];
-    record_counter(state, "llm_calls_total", &labels).await;
+    record_counter(state, cog_core::metric_names::LLM_CALLS_TOTAL, &labels).await;
     // The latency the caller already measured, landed here as well as in the
     // ClickHouse detail. Without it the per-model latency panel has no series
     // to read: the detail row is not something PromQL can query.
-    record_histogram(state, "llm_call_latency_ms", latency_ms as f64, &labels).await;
+    record_histogram(
+        state,
+        cog_core::metric_names::LLM_CALL_LATENCY_MS,
+        latency_ms as f64,
+        &labels,
+    )
+    .await;
     record_event(
         state,
         AnalyticsEvent::new("llm_call")
@@ -1040,7 +1061,7 @@ async fn record_llm_tokens(
     if tokens_input > 0 {
         record_counter_add(
             state,
-            "llm_tokens_total",
+            cog_core::metric_names::LLM_TOKENS_TOTAL,
             tokens_input as f64,
             &[("upstream", &key), ("kind", "input"), ("actor", actor)],
         )
@@ -1049,7 +1070,7 @@ async fn record_llm_tokens(
     if tokens_output > 0 {
         record_counter_add(
             state,
-            "llm_tokens_total",
+            cog_core::metric_names::LLM_TOKENS_TOTAL,
             tokens_output as f64,
             &[("upstream", &key), ("kind", "output"), ("actor", actor)],
         )
@@ -1377,7 +1398,7 @@ async fn refresh_pool_state(state: &AppState) {
     for reading in state.llm_health.snapshot(upstreams) {
         record_gauge(
             state,
-            "llm_upstream_healthy",
+            cog_core::metric_names::LLM_UPSTREAM_HEALTHY,
             if reading.healthy { 1.0 } else { 0.0 },
             &[("upstream", &reading.key)],
         )
@@ -1386,7 +1407,7 @@ async fn refresh_pool_state(state: &AppState) {
         // 什么时候探测"不是一回事，混进上面那条只会让人以为它是恢复时刻。
         record_gauge(
             state,
-            "llm_upstream_quota_window_secs",
+            cog_core::metric_names::LLM_UPSTREAM_QUOTA_WINDOW_SECS,
             reading.quota_window_secs.unwrap_or(0) as f64,
             &[("upstream", &reading.key)],
         )
@@ -1395,7 +1416,7 @@ async fn refresh_pool_state(state: &AppState) {
         // 才能回答"这个数是哪家说的"。
         record_gauge(
             state,
-            "llm_upstream_quota_reset_unix",
+            cog_core::metric_names::LLM_UPSTREAM_QUOTA_RESET_UNIX,
             reading.quota_reset_unix.unwrap_or(0) as f64,
             &[("upstream", &reading.key)],
         )
@@ -1404,7 +1425,7 @@ async fn refresh_pool_state(state: &AppState) {
         // 判据的输入不上观测面，读图的人就只能看到一个凭空的退避时长。
         record_gauge(
             state,
-            "llm_upstream_consecutive_failures",
+            cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES,
             reading.consecutive_failures as f64,
             &[("upstream", &reading.key)],
         )
@@ -1412,7 +1433,7 @@ async fn refresh_pool_state(state: &AppState) {
     }
     record_gauge(
         state,
-        "llm_pool_available",
+        cog_core::metric_names::LLM_POOL_AVAILABLE,
         if down { 0.0 } else { 1.0 },
         &[],
     )
@@ -1422,14 +1443,14 @@ async fn refresh_pool_state(state: &AppState) {
     // 到底是哪种证据。
     record_gauge(
         state,
-        "llm_pool_evidenced_recovery_unix",
+        cog_core::metric_names::LLM_POOL_EVIDENCED_RECOVERY_UNIX,
         bounds.evidenced_unix as f64,
         &[],
     )
     .await;
     record_gauge(
         state,
-        "llm_pool_next_attempt_unix",
+        cog_core::metric_names::LLM_POOL_NEXT_ATTEMPT_UNIX,
         bounds.next_probe_unix as f64,
         &[],
     )
@@ -1438,7 +1459,7 @@ async fn refresh_pool_state(state: &AppState) {
     // 与前两条都不同源，也不封顶——6h 封顶是对我们自己的探测节拍说的。
     record_gauge(
         state,
-        "llm_pool_quota_window_secs",
+        cog_core::metric_names::LLM_POOL_QUOTA_WINDOW_SECS,
         bounds.window_secs as f64,
         &[],
     )
@@ -1885,7 +1906,7 @@ async fn stream_forward(
             let upstream_key = LlmHealthTable::key(upstream);
             record_counter(
                 &state,
-                "llm_request_param_clamped_total",
+                cog_core::metric_names::LLM_REQUEST_PARAM_CLAMPED_TOTAL,
                 &[("field", "temperature"), ("upstream", &upstream_key)],
             )
             .await;
@@ -1965,7 +1986,7 @@ async fn stream_forward(
             if request_shape_error {
                 record_counter(
                     &state,
-                    "llm_upstream_client_errors_total",
+                    cog_core::metric_names::LLM_UPSTREAM_CLIENT_ERRORS_TOTAL,
                     &[("upstream", &LlmHealthTable::key(upstream))],
                 )
                 .await;
@@ -2039,7 +2060,7 @@ async fn mark_upstream_failure(
 ) {
     record_counter(
         state,
-        "llm_upstream_failures_total",
+        cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL,
         &[("upstream", &LlmHealthTable::key(upstream))],
     )
     .await;
@@ -4350,7 +4371,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "指标应反映池不可用: {text}"
         );
         assert!(
-            text.contains("llm_upstream_healthy"),
+            text.contains(cog_core::metric_names::LLM_UPSTREAM_HEALTHY.as_str()),
             "应有逐上游健康 gauge"
         );
         assert!(
@@ -4358,7 +4379,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "应暴露上游报告的恢复时刻: {text}"
         );
         assert!(
-            text.contains("llm_pool_next_attempt_unix"),
+            text.contains(cog_core::metric_names::LLM_POOL_NEXT_ATTEMPT_UNIX.as_str()),
             "退避重试节拍要自成一条序列，不能被当成恢复时刻: {text}"
         );
 
@@ -4617,7 +4638,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 以为自己在控温而实际没有。
         let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
         assert!(
-            text.contains("llm_request_param_clamped_total"),
+            text.contains(cog_core::metric_names::LLM_REQUEST_PARAM_CLAMPED_TOTAL.as_str()),
             "钳制必须留痕: {text}"
         );
 
@@ -4634,7 +4655,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
         let text = String::from_utf8(plain_state.pool_obs.metrics.encode().unwrap()).unwrap();
         assert!(
-            !text.contains("llm_request_param_clamped_total"),
+            !text.contains(cog_core::metric_names::LLM_REQUEST_PARAM_CLAMPED_TOTAL.as_str()),
             "没钳过就不该有这个读数: {text}"
         );
     }

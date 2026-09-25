@@ -9,6 +9,7 @@
 //   memory domain layer (Raw → Schema → Summary).
 
 use crate::contract::llm::UpstreamFailure;
+use crate::contract::metric_names::MetricName;
 use crate::{SFError, SFResult};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -125,12 +126,19 @@ pub fn cumulative_semantics_declaration() -> String {
 /// Runtime metrics-collection abstraction for time-series data.
 /// Infrastructure-layer metrics trait for runtime health recording.
 /// Implementations: Memory (testing), Prometheus (production).
+///
+/// The three write methods take a [`crate::MetricName`] rather than a string:
+/// whether a stored series still has a producer is judged by comparing the
+/// store's held names against [`crate::metric_names::ALL`], and a write path
+/// that accepted an unregistered name would make that judgement accuse a live
+/// series. Read methods stay on `&str` — a query names a series it was handed,
+/// it does not introduce one.
 #[async_trait]
 pub trait MetricsBackend: Send + Sync {
     /// Record a gauge value (point-in-time measurement).
     async fn record_gauge(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()>;
@@ -138,7 +146,7 @@ pub trait MetricsBackend: Send + Sync {
     /// Increment a counter by `value`.
     async fn record_counter(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()>;
@@ -146,7 +154,7 @@ pub trait MetricsBackend: Send + Sync {
     /// Record a histogram observation.
     async fn record_histogram(
         &self,
-        name: &str,
+        name: MetricName,
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()>;

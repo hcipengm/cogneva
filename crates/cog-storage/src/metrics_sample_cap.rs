@@ -296,31 +296,46 @@ impl SampleLogCap {
     async fn report(&self, outcome: &SweepOutcome) {
         let Some(ref mb) = self.metrics else { return };
 
-        self.emit(mb, "metrics_samples_rows", outcome.held as f64)
-            .await;
+        self.emit(
+            mb,
+            cog_core::metric_names::METRICS_SAMPLES_ROWS,
+            outcome.held as f64,
+        )
+        .await;
         if let Some(budget) = outcome.budget {
-            self.emit(mb, "metrics_samples_budget_rows", budget as f64)
-                .await;
+            self.emit(
+                mb,
+                cog_core::metric_names::METRICS_SAMPLES_BUDGET_ROWS,
+                budget as f64,
+            )
+            .await;
         }
         self.emit(
             mb,
-            "metrics_samples_over_capacity",
+            cog_core::metric_names::METRICS_SAMPLES_OVER_CAPACITY,
             outcome.floor_held as u8 as f64,
         )
         .await;
 
         match self.table_bytes().await {
-            Ok(bytes) => self.emit(mb, "metrics_samples_bytes", bytes as f64).await,
+            Ok(bytes) => {
+                self.emit(
+                    mb,
+                    cog_core::metric_names::METRICS_SAMPLES_BYTES,
+                    bytes as f64,
+                )
+                .await
+            }
             Err(e) => warn!(table = self.table, error = %e, "sample log size unavailable"),
         }
     }
 
-    async fn emit(&self, mb: &Arc<dyn MetricsBackend>, name: &str, value: f64) {
+    async fn emit(&self, mb: &Arc<dyn MetricsBackend>, name: cog_core::MetricName, value: f64) {
         if let Err(e) = mb
             .record_gauge(name, value, std::collections::HashMap::new())
             .await
         {
-            warn!(error = %e, metric = name, "metrics sample log gauge emit failed");
+            warn!(error = %e, metric = %name, "metrics sample log gauge emit failed");
         }
     }
 

@@ -42,7 +42,7 @@ const CHANGE_ID_TRAILER: &str = "Change-Id";
 /// same from outside. The category is the only part of the failure that
 /// aggregates: the message names a file and a hunk, the category says whether
 /// the branch moved under the change or the change itself is the problem.
-pub const LANDING_FAILURES_METRIC: &str = "cogneva_landing_failures_total";
+pub use cog_core::metric_names::LANDING_FAILURES_TOTAL as LANDING_FAILURES_METRIC;
 
 /// Why a landing call failed, as a closed set the metric labels.
 ///
@@ -1623,7 +1623,7 @@ mod tests {
     /// Recorded count for one failure category, zero when it has no series.
     async fn failure_count(metrics: &cog_storage::MemoryMetricsBackend, category: &str) -> f64 {
         metrics
-            .query_counter_totals(LANDING_FAILURES_METRIC)
+            .query_counter_totals(LANDING_FAILURES_METRIC.as_str())
             .await
             .unwrap()
             .into_iter()
@@ -1634,7 +1634,7 @@ mod tests {
 
     async fn series_count(metrics: &cog_storage::MemoryMetricsBackend) -> usize {
         metrics
-            .query_counter_totals(LANDING_FAILURES_METRIC)
+            .query_counter_totals(LANDING_FAILURES_METRIC.as_str())
             .await
             .unwrap()
             .len()

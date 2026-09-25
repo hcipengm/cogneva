@@ -24,6 +24,8 @@ pub use contract::knowledge::*;
 pub use contract::llm::*;
 pub use contract::media::*;
 pub use contract::memory::*;
+pub use contract::metric_names;
+pub use contract::metric_names::{is_registered_metric, metric_name_of_ident, MetricName};
 pub use contract::net::*;
 pub use contract::notification::*;
 pub use contract::observability::*;

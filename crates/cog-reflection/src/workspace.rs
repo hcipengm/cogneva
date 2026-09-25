@@ -27,11 +27,11 @@ use tracing::{info, warn};
 
 /// 一棵常驻工作树的下一次 `reset --hard` 会重写多少个已跟踪文件——索引没记住的
 /// 都算在内，健康时为 0。
-pub const WORKTREE_INDEX_MISSING_FILES_METRIC: &str = "cogneva_worktree_index_missing_files";
+pub use cog_core::metric_names::WORKTREE_INDEX_MISSING_FILES as WORKTREE_INDEX_MISSING_FILES_METRIC;
 
 /// 这棵工作树的索引文件是否在。0 与「在、但一个条目都没有」会让上一条都等于全树
 /// 大小，这一条把两者分开：前者是文件被删或没挂上，后者是写到一半被截断。
-pub const WORKTREE_INDEX_PRESENT_METRIC: &str = "cogneva_worktree_index_present";
+pub use cog_core::metric_names::WORKTREE_INDEX_PRESENT as WORKTREE_INDEX_PRESENT_METRIC;
 
 /// 工作树默认根目录（沙盒 PVC 内，与 bin/backups/changes/mainline 同级）。
 pub const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
@@ -847,12 +847,12 @@ impl WorkspaceManager {
 /// 所以错误只留一行日志。
 async fn report(
     metrics: &dyn cog_core::MetricsBackend,
-    name: &str,
+    name: cog_core::MetricName,
     value: f64,
     labels: &HashMap<String, String>,
 ) {
     if let Err(e) = metrics.record_gauge(name, value, labels.clone()).await {
-        warn!(metric = name, "index sample: cannot report: {e}");
+        warn!(metric = %name, "index sample: cannot report: {e}");
     }
 }
 
@@ -1051,11 +1051,16 @@ mod tests {
         mgr.sample_index_health(&ws).await;
 
         assert_eq!(
-            gauge_of(&mb, WORKTREE_INDEX_PRESENT_METRIC, "mainline").await,
+            gauge_of(&mb, WORKTREE_INDEX_PRESENT_METRIC.as_str(), "mainline").await,
             1.0
         );
         assert_eq!(
-            gauge_of(&mb, WORKTREE_INDEX_MISSING_FILES_METRIC, "mainline").await,
+            gauge_of(
+                &mb,
+                WORKTREE_INDEX_MISSING_FILES_METRIC.as_str(),
+                "mainline"
+            )
+            .await,
             0.0
         );
     }
@@ -1085,11 +1090,16 @@ mod tests {
         mgr.sample_index_health(&ws).await;
 
         assert_eq!(
-            gauge_of(&mb, WORKTREE_INDEX_PRESENT_METRIC, "mainline").await,
+            gauge_of(&mb, WORKTREE_INDEX_PRESENT_METRIC.as_str(), "mainline").await,
             0.0
         );
         assert_eq!(
-            gauge_of(&mb, WORKTREE_INDEX_MISSING_FILES_METRIC, "mainline").await,
+            gauge_of(
+                &mb,
+                WORKTREE_INDEX_MISSING_FILES_METRIC.as_str(),
+                "mainline"
+            )
+            .await,
             tracked
         );
     }
@@ -1109,7 +1119,7 @@ mod tests {
         mgr.sample_index_health(&ws).await;
 
         assert!(
-            mb.query_gauge_latest(WORKTREE_INDEX_PRESENT_METRIC)
+            mb.query_gauge_latest(WORKTREE_INDEX_PRESENT_METRIC.as_str())
                 .await
                 .unwrap()
                 .is_empty(),

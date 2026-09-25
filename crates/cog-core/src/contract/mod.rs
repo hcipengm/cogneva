@@ -17,6 +17,7 @@ pub mod knowledge;
 pub mod llm;
 pub mod media;
 pub mod memory;
+pub mod metric_names;
 pub mod net;
 pub mod notification;
 pub mod observability;

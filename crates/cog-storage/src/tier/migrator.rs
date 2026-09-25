@@ -107,7 +107,11 @@ impl TierMigrator {
             let mut labels = std::collections::HashMap::new();
             labels.insert("tier".into(), tier.into());
             if let Err(e) = mb
-                .record_counter("tier_migration_total", count as f64, labels)
+                .record_counter(
+                    cog_core::metric_names::TIER_MIGRATION_TOTAL,
+                    count as f64,
+                    labels,
+                )
                 .await
             {
                 tracing::warn!("tier_migration_total emit failed: {}", e);
@@ -119,7 +123,9 @@ impl TierMigrator {
         let Some(ref mb) = self.metrics else { return };
         let mut labels = std::collections::HashMap::new();
         labels.insert("tier".into(), "error".into());
-        let _ = mb.record_counter("tier_migration_total", 1.0, labels).await;
+        let _ = mb
+            .record_counter(cog_core::metric_names::TIER_MIGRATION_TOTAL, 1.0, labels)
+            .await;
     }
 
     /// Run one full pass: scan every stream subdirectory, migrate eligible

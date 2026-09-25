@@ -982,19 +982,19 @@ impl EvolutionEngine {
         };
         for (name, value) in [
             (
-                "evolution_generated_change_files_total",
+                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_FILES_TOTAL,
                 fidelity.files_total as f64,
             ),
             (
-                "evolution_generated_change_files_faithful",
+                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_FILES_FAITHFUL,
                 fidelity.files_faithful as f64,
             ),
             (
-                "evolution_generated_change_hunks_total",
+                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_HUNKS_TOTAL,
                 fidelity.hunks_total as f64,
             ),
             (
-                "evolution_generated_change_hunks_faithful",
+                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_HUNKS_FAITHFUL,
                 fidelity.hunks_faithful as f64,
             ),
         ] {
@@ -1002,7 +1002,7 @@ impl EvolutionEngine {
                 .record_counter(name, value, std::collections::HashMap::new())
                 .await
             {
-                warn!(error = %e, metric = name, "failed to record change fidelity");
+                warn!(error = %e, metric = %name, "failed to record change fidelity");
             }
         }
     }

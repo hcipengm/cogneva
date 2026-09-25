@@ -1,7 +1,17 @@
 use chrono::{Duration, Utc};
+use cog_core::metric_names::{
+    MEMORY_OPERATIONS_TOTAL, MEMORY_OPERATION_LATENCY_MS, MEMORY_UNEXTRACTED_RAW,
+    MEMORY_UNEXTRACTED_RAW_AGED_OUT, METRICS_SAMPLES_ROWS,
+};
 use cog_core::MetricsBackend;
 use cog_storage::MemoryMetricsBackend;
 use std::collections::HashMap;
+
+// The series here are registry constants rather than invented strings: a name
+// reaches a store only through the type that carries every name a build can
+// write, and that list is what the exposition judges a stored series' liveness
+// against. A test writing a name outside it would be writing something no build
+// can produce — the state the exposition reports as a zombie.
 
 fn labels() -> HashMap<String, String> {
     let mut m = HashMap::new();
@@ -15,13 +25,13 @@ async fn test_memory_record_and_query_gauge() {
     let before = Utc::now() - Duration::seconds(1);
 
     backend
-        .record_gauge("cpu_usage", 42.0, labels())
+        .record_gauge(MEMORY_UNEXTRACTED_RAW, 42.0, labels())
         .await
         .unwrap();
 
     let after = Utc::now() + Duration::seconds(1);
     let samples = backend
-        .query_gauge_range("cpu_usage", before, after)
+        .query_gauge_range(MEMORY_UNEXTRACTED_RAW.as_str(), before, after)
         .await
         .unwrap();
 
@@ -36,17 +46,17 @@ async fn test_memory_record_and_query_counter() {
     let before = Utc::now() - Duration::seconds(1);
 
     backend
-        .record_counter("requests", 1.0, labels())
+        .record_counter(MEMORY_OPERATIONS_TOTAL, 1.0, labels())
         .await
         .unwrap();
     backend
-        .record_counter("requests", 2.0, labels())
+        .record_counter(MEMORY_OPERATIONS_TOTAL, 2.0, labels())
         .await
         .unwrap();
 
     let after = Utc::now() + Duration::seconds(1);
     let samples = backend
-        .query_counter_range("requests", before, after)
+        .query_counter_range(MEMORY_OPERATIONS_TOTAL.as_str(), before, after)
         .await
         .unwrap();
 
@@ -65,19 +75,22 @@ async fn counter_total_is_cumulative_per_label_set() {
     other.insert("agent_id".to_string(), "a-2".to_string());
 
     backend
-        .record_counter("requests", 1.0, labels())
+        .record_counter(MEMORY_OPERATIONS_TOTAL, 1.0, labels())
         .await
         .unwrap();
     backend
-        .record_counter("requests", 2.0, labels())
+        .record_counter(MEMORY_OPERATIONS_TOTAL, 2.0, labels())
         .await
         .unwrap();
     backend
-        .record_counter("requests", 5.0, other)
+        .record_counter(MEMORY_OPERATIONS_TOTAL, 5.0, other)
         .await
         .unwrap();
 
-    let totals = backend.query_counter_totals("requests").await.unwrap();
+    let totals = backend
+        .query_counter_totals(MEMORY_OPERATIONS_TOTAL.as_str())
+        .await
+        .unwrap();
     assert_eq!(totals.len(), 2, "one total per label set: {totals:?}");
 
     let a1 = totals
@@ -98,17 +111,17 @@ async fn test_memory_record_and_query_histogram() {
     let before = Utc::now() - Duration::seconds(1);
 
     backend
-        .record_histogram("latency_ms", 150.0, labels())
+        .record_histogram(MEMORY_OPERATION_LATENCY_MS, 150.0, labels())
         .await
         .unwrap();
     backend
-        .record_histogram("latency_ms", 200.0, labels())
+        .record_histogram(MEMORY_OPERATION_LATENCY_MS, 200.0, labels())
         .await
         .unwrap();
 
     let after = Utc::now() + Duration::seconds(1);
     let samples = backend
-        .query_histogram_range("latency_ms", before, after)
+        .query_histogram_range(MEMORY_OPERATION_LATENCY_MS.as_str(), before, after)
         .await
         .unwrap();
 
@@ -122,11 +135,18 @@ async fn test_memory_query_range_filters_by_time() {
     let old = Utc::now() - Duration::hours(1);
     let recent = Utc::now();
 
-    backend.record_gauge("temp", 100.0, labels()).await.unwrap();
+    backend
+        .record_gauge(METRICS_SAMPLES_ROWS, 100.0, labels())
+        .await
+        .unwrap();
 
     // Query old range should return nothing
     let old_samples = backend
-        .query_gauge_range("temp", old - Duration::seconds(10), old)
+        .query_gauge_range(
+            METRICS_SAMPLES_ROWS.as_str(),
+            old - Duration::seconds(10),
+            old,
+        )
         .await
         .unwrap();
     assert!(old_samples.is_empty());
@@ -134,7 +154,7 @@ async fn test_memory_query_range_filters_by_time() {
     // Query recent range should return the sample
     let recent_samples = backend
         .query_gauge_range(
-            "temp",
+            METRICS_SAMPLES_ROWS.as_str(),
             recent - Duration::seconds(10),
             recent + Duration::seconds(10),
         )
@@ -160,19 +180,22 @@ async fn test_memory_multiple_metrics_isolated() {
     let backend = MemoryMetricsBackend::new();
     let before = Utc::now() - Duration::seconds(1);
 
-    backend.record_gauge("cpu", 10.0, labels()).await.unwrap();
     backend
-        .record_gauge("memory", 50.0, labels())
+        .record_gauge(METRICS_SAMPLES_ROWS, 10.0, labels())
+        .await
+        .unwrap();
+    backend
+        .record_gauge(MEMORY_UNEXTRACTED_RAW_AGED_OUT, 50.0, labels())
         .await
         .unwrap();
 
     let after = Utc::now() + Duration::seconds(1);
     let cpu = backend
-        .query_gauge_range("cpu", before, after)
+        .query_gauge_range(METRICS_SAMPLES_ROWS.as_str(), before, after)
         .await
         .unwrap();
     let memory = backend
-        .query_gauge_range("memory", before, after)
+        .query_gauge_range(MEMORY_UNEXTRACTED_RAW_AGED_OUT.as_str(), before, after)
         .await
         .unwrap();
 

@@ -738,7 +738,16 @@ data:
             },
             "severity": "warning",
             "summary": "A change's release build was killed {value} time(s) in the last 6h, having run its whole deployment budget for {kind} runs, so the commit was rolled back and the change is gone. This is a different loss from a build that failed: nothing about the code was judged either way, and the rollback leaves no other trace that the change ever existed. The budget is the cogneva_verification_budget_seconds reading for the build kind"
-          }
+          },
+            {
+              "name": "series_held_without_producer",
+              "promql": "cogneva_metric_held_without_producer",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "A series the metric store holds can be written by no name this build knows, so nothing refreshes it and its last value is served forever: a frozen counter reads downstream as no traffic rather than as a series that is gone. The name label says which one. Retire it if its producer is gone for good, or restore the registration if it was dropped by mistake. A producer that is merely slow does not appear here: the judgement is over the build registry, not over how long ago the rows were written"
+            }
           ]
         },
         "trace_collector": {

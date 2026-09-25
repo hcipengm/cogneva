@@ -21,7 +21,7 @@ use cog_core::{EvolutionIntent, GeneratedChange};
 use crate::landing::{load_records, LandingRecord, LandingState};
 
 /// How many changes sit at each stage, by the entry point that produced them.
-pub const CHANGE_FUNNEL_METRIC: &str = "cogneva_change_funnel";
+pub use cog_core::metric_names::CHANGE_FUNNEL as CHANGE_FUNNEL_METRIC;
 
 /// How many changes have ended each way, by the entry point that produced them.
 ///
@@ -36,7 +36,7 @@ pub const CHANGE_FUNNEL_METRIC: &str = "cogneva_change_funnel";
 /// nothing, which reads exactly like "nothing was ever staged". The label names
 /// the question — which way did it end — and its values are the only ones it
 /// can take.
-pub const CHANGE_FATE_METRIC: &str = "cogneva_change_fate_total";
+pub use cog_core::metric_names::CHANGE_FATE_TOTAL as CHANGE_FATE_METRIC;
 
 /// A way a change has ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

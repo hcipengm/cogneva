@@ -39,17 +39,29 @@ impl MetricsInstrumentedMemoryBackend {
 
         let _ = self
             .metrics
-            .record_counter("memory_operations_total", 1.0, labels.clone())
+            .record_counter(
+                cog_core::metric_names::MEMORY_OPERATIONS_TOTAL,
+                1.0,
+                labels.clone(),
+            )
             .await;
         let _ = self
             .metrics
-            .record_histogram("memory_operation_latency_ms", latency_ms, labels.clone())
+            .record_histogram(
+                cog_core::metric_names::MEMORY_OPERATION_LATENCY_MS,
+                latency_ms,
+                labels.clone(),
+            )
             .await;
 
         if is_err {
             let _ = self
                 .metrics
-                .record_counter("memory_operation_errors_total", 1.0, labels)
+                .record_counter(
+                    cog_core::metric_names::MEMORY_OPERATION_ERRORS_TOTAL,
+                    1.0,
+                    labels,
+                )
                 .await;
         }
 
