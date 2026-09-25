@@ -64,6 +64,11 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
     "no_proxy",
 ];
 
+/// Default wall-clock bound on the format check. Formatted-or-not is settled by
+/// parsing every file in the workspace, which takes seconds; a run that
+/// outlives this bound is a hung `rustfmt`, not a large workspace.
+const DEFAULT_FMT_TIMEOUT_SECS: u64 = 60;
+
 /// Resolve the environment for the verification test process: the passthrough
 /// set as reported by `get`, plus an explicit target directory.
 ///
@@ -138,6 +143,11 @@ pub struct ChangePipeline {
     /// runs a single test, so this bounds a build-plus-test, not just a test;
     /// a budget shorter than one real run turns every verdict into a timeout.
     test_timeout_secs: u64,
+    /// Wall-clock bound on the format check. Short on purpose: the check does
+    /// not compile anything, so a run this side of the bound is a hung process
+    /// rather than a slow one — and a hung process would hold the executor's
+    /// only in-flight slot, which is the state this bound exists to end.
+    fmt_timeout_secs: u64,
     promotion_policy: Option<crate::PromotionGateConfig>,
     /// 共享 CARGO_TARGET_DIR：把编译产物留在工作树之外，临时工作树用完即弃
     /// 也不会丢增量缓存。
@@ -160,6 +170,7 @@ impl ChangePipeline {
             change_dir: change_dir.into(),
             auto_apply,
             test_timeout_secs: 3600,
+            fmt_timeout_secs: DEFAULT_FMT_TIMEOUT_SECS,
             promotion_policy: None,
             target_dir: None,
             budget: None,
@@ -454,6 +465,37 @@ impl ChangePipeline {
                 test_output: format!("Change application failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
             });
+        }
+
+        // Formatted before it is compiled, and rolled back either way: a change
+        // refused here must leave the tree as it found it, or the next run would
+        // be verifying this one's leftovers.
+        match self.run_cargo_fmt(workdir).await {
+            Ok((true, _)) => {}
+            Ok((false, output)) => {
+                warn!(change_id = %change.artifact_id, "Change is not formatted; rolling back");
+                let _ = self.git_reset_hard(workdir).await;
+                return Ok(ApplyResult {
+                    change_id: change.artifact_id.clone(),
+                    files_changed,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::FormattingDiffers),
+                    test_output: format!(
+                        "Change is not what this workspace's formatter produces:\n{output}"
+                    ),
+                    new_status: EvolutionStatus::ValidationFailed,
+                });
+            }
+            Err(e) => {
+                warn!(change_id = %change.artifact_id, error = %e, "cargo fmt execution failed");
+                let _ = self.git_reset_hard(workdir).await;
+                return Ok(ApplyResult {
+                    change_id: change.artifact_id.clone(),
+                    files_changed,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
+                    test_output: format!("Failed to execute cargo fmt: {}", e),
+                    new_status: EvolutionStatus::ValidationFailed,
+                });
+            }
         }
 
         let (test_passed, test_output) = match self.run_cargo_test(workdir).await {
@@ -882,6 +924,94 @@ impl ChangePipeline {
         Ok(())
     }
 
+    /// Hand `cmd` the environment a verdict is allowed to see: cleared, then the
+    /// passthrough allowlist with the shared target directory.
+    ///
+    /// Single-sourced on purpose. The rule it enforces — a process that judges a
+    /// change must not inherit what the parent was compiled or configured with —
+    /// is the entire reason the allowlist exists, and a second cargo-invoking
+    /// site that rebuilt these lines by hand would be free to drop it. That is
+    /// not hypothetical: a wrapper left in the passthrough set made a change
+    /// fail a compilation it was never given, and the fix only holds as long as
+    /// every caller goes through one place.
+    fn apply_verification_env(&self, cmd: &mut tokio::process::Command) {
+        cmd.env_clear();
+        for (key, value) in verification_env(|k| std::env::var(k).ok(), self.target_dir.as_deref())
+        {
+            cmd.env(key, value);
+        }
+    }
+
+    /// Spawn one `cargo fmt` invocation under the verification environment and
+    /// the format bound, returning (succeeded, combined_output).
+    ///
+    /// The probe and the check both come through here so that "what may the
+    /// formatter see" and "how long may it take" keep one answer each rather
+    /// than one per call site.
+    async fn run_cargo_fmt_cmd(&self, workdir: &Path, args: &[&str]) -> SFResult<(bool, String)> {
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.args(args).current_dir(workdir).kill_on_drop(true);
+        self.apply_verification_env(&mut cmd);
+
+        let output =
+            match tokio::time::timeout(Duration::from_secs(self.fmt_timeout_secs), cmd.output())
+                .await
+            {
+                Ok(result) => result.map_err(|e| {
+                    SFError::IO(format!("Failed to run cargo {}: {}", args.join(" "), e))
+                })?,
+                Err(_) => {
+                    return Err(SFError::IO(format!(
+                        "cargo {} exceeded the {}s format budget and was killed",
+                        args.join(" "),
+                        self.fmt_timeout_secs
+                    )))
+                }
+            };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok((output.status.success(), format!("{}{}", stdout, stderr)))
+    }
+
+    /// Run `cargo fmt --all -- --check` and return (clean, combined_output).
+    ///
+    /// A file the formatter would rewrite is refused here rather than landed,
+    /// because the commit it lands as fails CI's format check: the deployer
+    /// reads that, resets the commit, and the change ends up retired with
+    /// nothing having judged what it does. The check is deterministic, so the
+    /// cost of refusing is one reformat by whoever generated the change, while
+    /// the cost of letting it through is a whole landing-and-rollback cycle —
+    /// which is how this gate came to exist.
+    ///
+    /// Two questions rather than one, because a single exit code cannot answer
+    /// both. `cargo fmt --check` exits 1 for a file it would rewrite — and exits
+    /// 1 just as well when the toolchain it was told to use is not installed,
+    /// which is reachable here: `RUSTUP_TOOLCHAIN` is in the passthrough set.
+    /// Reading those as one answer would refuse every change that a deployment
+    /// whose toolchain had moved was asked to verify, which is a change refused
+    /// for being unverifiable rather than for being wrong. So the probe goes
+    /// first and settles whether there is a formatter to ask at all; only after
+    /// that does a nonzero exit mean the tree is what the formatter rewrites.
+    ///
+    /// Runs before the test run and takes no build slot: the check parses the
+    /// workspace without compiling any of it, so it is both the cheapest way a
+    /// change can be sent back and no competition for the host while a real
+    /// build is in flight.
+    async fn run_cargo_fmt(&self, workdir: &Path) -> SFResult<(bool, String)> {
+        let (available, why) = self
+            .run_cargo_fmt_cmd(workdir, &["fmt", "--version"])
+            .await?;
+        if !available {
+            return Err(SFError::IO(format!(
+                "the format check has no formatter to ask: {why}"
+            )));
+        }
+        info!("Running cargo fmt --all -- --check");
+        self.run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
+            .await
+    }
+
     /// Run `cargo test --workspace` and return (success, combined_output).
     ///
     /// `--no-fail-fast` because the verdict is read by whoever investigates a
@@ -894,11 +1024,7 @@ impl ChangePipeline {
         cmd.args(["test", "--workspace", "--no-fail-fast"])
             .current_dir(workdir)
             .kill_on_drop(true);
-        cmd.env_clear();
-        for (key, value) in verification_env(|k| std::env::var(k).ok(), self.target_dir.as_deref())
-        {
-            cmd.env(key, value);
-        }
+        self.apply_verification_env(&mut cmd);
 
         let started = Instant::now();
         let output =
@@ -1053,6 +1179,10 @@ fn names_same_or_nested(target: &str, anchor: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seeded source of the formatting fixtures: line 2 is the line the two
+    /// tests change, so they differ in nothing else.
+    const FORMATTED_PROBE_SOURCE: &str = "pub fn answer() -> i32 {\n    41\n}\n";
 
     /// A crate whose only test sleeps, so a run against it is slow for a reason
     /// the budget can measure rather than one that depends on how warm this
@@ -1941,6 +2071,133 @@ index 1111111..2222222 100644
             "the failing test is not in the evidence: {}",
             result.test_output
         );
+    }
+
+    /// A change the formatter would rewrite is refused before anything compiles
+    /// it, and the tree is left as it was found.
+    ///
+    /// The refusal exists because the commit this would land as fails CI's
+    /// format check, and the answer to that is to reset the commit — so the
+    /// change gets retired without anything having judged what it does. Note
+    /// what the fixture has to get right for a whole-tree check to mean
+    /// anything: the seeded tree is already formatted, so the diff is the only
+    /// thing this refusal can be about. A tree that was not clean to begin with
+    /// could not use this check to blame a change.
+    ///
+    /// The change compiles and its tests would pass — `41+1` is valid Rust that
+    /// `rustfmt` spells `41 + 1`. That is deliberate: it keeps the refusal
+    /// attributable to the formatting alone.
+    #[tokio::test]
+    async fn a_change_that_is_not_formatted_is_refused_before_it_is_compiled() {
+        let (root, pipeline) = formatted_probe_workspace().await;
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "unformatted-1".into(),
+            description: "修正这个取值的计算".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -1,3 +1,3 @@\n\
+                      \x20pub fn answer() -> i32 {\n\
+                      -    41\n\
+                      +    41+1\n\
+                      \x20}\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::FormattingDiffers)
+        );
+        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
+        assert!(
+            result.test_output.contains("src/lib.rs"),
+            "the evidence has to name what the formatter would rewrite: {}",
+            result.test_output
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.path().join("src/lib.rs"))
+                .await
+                .unwrap(),
+            FORMATTED_PROBE_SOURCE,
+            "a refused change must not leave its own text behind for the next run to judge"
+        );
+    }
+
+    /// The other side: a change that is formatted is not refused for it. A gate
+    /// is only worth having if it can be told apart from one that always fires,
+    /// and a false refusal here is the more expensive mistake — it retires a
+    /// change that was fine and spends a generation to get it back.
+    #[tokio::test]
+    async fn a_formatted_change_is_not_refused_for_its_formatting() {
+        let (root, pipeline) = formatted_probe_workspace().await;
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "formatted-1".into(),
+            description: "修正这个取值的计算".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -1,3 +1,3 @@\n\
+                      \x20pub fn answer() -> i32 {\n\
+                      -    41\n\
+                      +    42\n\
+                      \x20}\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Passed,
+            "a formatted change reached a verdict: {:?}",
+            result.verdict
+        );
+    }
+
+    /// A crate that is formatted to begin with, and a pipeline over it.
+    ///
+    /// Shared by the two formatting tests so that the only thing between them is
+    /// the line the change writes: one of them has to be refused and the other
+    /// must not be, and a fixture that differed in any other way could not show
+    /// which of the two the gate is answering.
+    async fn formatted_probe_workspace() -> (tempfile::TempDir, ChangePipeline) {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fmt-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("src/lib.rs"), FORMATTED_PROBE_SOURCE)
+            .await
+            .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        (root, pipeline)
     }
 
     /// 另一侧：工作树脏是环境问题，必须保持 `Err`。若它变成 `Ok(verdict: Refused(..))`，

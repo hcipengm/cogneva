@@ -47,7 +47,13 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
+      # rustfmt is requested rather than inherited: the pipeline's format gate
+      # runs `cargo fmt --check`, and its tests run it here. Whether the action's
+      # default profile happens to carry rustfmt is not something a gate that
+      # refuses changes may depend on.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -147,9 +153,11 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
+      # This job runs the workspace test suite under instrumentation, so it needs
+      # the formatter the same way the test job does.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: llvm-tools-preview
+          components: llvm-tools-preview, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

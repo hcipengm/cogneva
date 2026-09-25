@@ -141,6 +141,9 @@ pub enum RejectionCause {
     ContextDoesNotApply,
     /// The dry run passed and the real apply failed anyway.
     ApplyFailed,
+    /// The applied change is not what this workspace's formatter produces, so
+    /// the commit it would land as is one CI rejects on its format check.
+    FormattingDiffers,
     /// The verification suite could not be run to a verdict — no cargo, or the
     /// run outlived its budget.
     TestRunUnavailable,
@@ -158,6 +161,7 @@ impl RejectionCause {
         Self::IntentMismatch,
         Self::ContextDoesNotApply,
         Self::ApplyFailed,
+        Self::FormattingDiffers,
         Self::TestRunUnavailable,
         Self::TestsFailed,
     ];
@@ -171,6 +175,7 @@ impl RejectionCause {
             Self::IntentMismatch => "intent_mismatch",
             Self::ContextDoesNotApply => "context_does_not_apply",
             Self::ApplyFailed => "apply_failed",
+            Self::FormattingDiffers => "formatting_differs",
             Self::TestRunUnavailable => "test_run_unavailable",
             Self::TestsFailed => "tests_failed",
         }
@@ -1534,6 +1539,7 @@ mod tests {
                 RejectionCause::IntentMismatch => "intent_mismatch",
                 RejectionCause::ContextDoesNotApply => "context_does_not_apply",
                 RejectionCause::ApplyFailed => "apply_failed",
+                RejectionCause::FormattingDiffers => "formatting_differs",
                 RejectionCause::TestRunUnavailable => "test_run_unavailable",
                 RejectionCause::TestsFailed => "tests_failed",
             };
@@ -1546,7 +1552,7 @@ mod tests {
             assert!(!seen.contains(&spelling), "{spelling} is in the list twice");
             seen.push(spelling);
         }
-        assert_eq!(seen.len(), 8, "ALL is missing a cause: {seen:?}");
+        assert_eq!(seen.len(), 9, "ALL is missing a cause: {seen:?}");
         for (index, cause) in RejectionCause::ALL.iter().enumerate() {
             assert_eq!(cause.slot(), index, "{cause:?} does not sit at {index}");
         }
