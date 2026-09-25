@@ -13,11 +13,36 @@ use cog_core::EvolutionMetricsSnapshot;
 use serde_json::json;
 use std::sync::Arc;
 
-/// List all known evolution artifacts.
+/// List all known evolution artifacts, and say which queue the list came from.
+///
+/// The queue a listing reads is not the same directory in every process: it is
+/// resolved against each process's own working directory, and each deployment
+/// mounts a different volume at it. Without the provenance, an empty list from a
+/// process that cannot see the queue is indistinguishable from an empty queue,
+/// and those two call for opposite things.
 pub async fn list_changes_handler(State(state): State<Arc<crate::GatewayState>>) -> Response {
     match state.evolution_admin {
         Some(ref admin) => match admin.list_changes().await {
-            Ok(changes) => (StatusCode::OK, Json(json!({ "changes": changes }))).into_response(),
+            Ok(changes) => {
+                let queue = match admin.change_queue_view().await {
+                    Ok(queue) => queue,
+                    // A provenance that could not be read is reported as absent,
+                    // not as an empty queue: the listing above still answers, and
+                    // it is the reader of an empty one that needs to know why.
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "could not read the change queue's provenance"
+                        );
+                        None
+                    }
+                };
+                (
+                    StatusCode::OK,
+                    Json(json!({ "changes": changes, "queue": queue })),
+                )
+                    .into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "list_failed", "message": e.to_string()})),

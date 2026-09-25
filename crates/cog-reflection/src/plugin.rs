@@ -618,6 +618,32 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 }
                 let engine = engine.clone();
 
+                // 本进程是否承担变更执行器职责。主应用（executor_enabled=false）
+                // 只保留控制面（admin 服务 / GitOps 拉取端），不派生进化循环，
+                // 也就不与共用同一实例指纹 / 裸仓库 / 工作树根目录的专用进化
+                // worker 抢工作树。在这里读一次：下面的 spawn 会把 self_evolution
+                // 整体 move 进闭包，事后再读它会触发 use-after-move，而队列读数
+                // 与下面的循环都要这个值。
+                let executor_enabled = self_evolution.executor_enabled;
+
+                // The queue this process reads, published by every process and
+                // measured only by the one that drains it: the role flag has to
+                // exist on the control plane too, or "no process is set up to
+                // drain this queue" would read the same as a series nobody
+                // scraped. Same object the admin listing reports as its source,
+                // so the directory a reader sees and the one a rule groups by
+                // cannot drift apart.
+                let queue_readings = Arc::new(
+                    crate::evolution_queue_readings::EvolutionQueueReadings::new(
+                        self_evolution.change_dir.clone(),
+                        executor_enabled,
+                        self_evolution.poll_interval_secs,
+                        pipeline.clone(),
+                        engine.evolution.clone(),
+                    ),
+                );
+                ctx.publish_observable(queue_readings.clone());
+
                 // 自动晋级运行时一键暂停开关：admin API 与 AutoPromoter
                 // 共享同一实例，暂停立即对排队晋级生效。
                 let promotion_switch = Arc::new(crate::PromotionSwitch::new());
@@ -637,7 +663,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     binary_switcher.clone(),
                     evolution_metrics.clone(),
                 )
-                .with_evolution_stream(stream_tx);
+                .with_evolution_stream(stream_tx)
+                .with_change_queue(queue_readings);
                 if let Some(ref stream) = audit_stream {
                     admin = admin.with_audit_stream(stream.clone());
                 }
@@ -801,13 +828,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         warn!("PromotionLedger not published; GitOps puller disabled");
                     }
                 }
-
-                // 本进程是否承担变更执行器职责。主应用（executor_enabled=false）
-                // 只保留控制面（admin 服务 / GitOps 拉取端），不派生进化循环，
-                // 也就不与共用同一实例指纹 / 裸仓库 / 工作树根目录的专用进化
-                // worker 抢工作树。先取出来：下面的 spawn 会把 self_evolution
-                // 整体 move 进闭包，事后再读它会触发 use-after-move。
-                let executor_enabled = self_evolution.executor_enabled;
 
                 // The build gate is a property of a process that runs builds, so
                 // it is installed by role: the executor process takes the gate
@@ -1225,7 +1245,8 @@ async fn notify_sandbox_downgrade(ctx: &cog_core::PluginContext, reason: &str) {
 /// Checks / fixes:
 /// - Required CLI tools (`cargo`, `git`, `rustc`) are on PATH.
 /// - `project_root` exists and is a directory.
-/// - `change_dir`, `binary_dir`, `backup_dir` exist and are writable.
+/// - `binary_dir` and `backup_dir` exist and are writable, and `change_dir`
+///   does too — but only on the process that drains that queue.
 /// - The project is inside a git repository.
 /// - For `self_exec` switch mode, the current executable is installed at
 ///   the configured binary path.
@@ -1281,7 +1302,20 @@ async fn ensure_self_evolution_environment(
     let backup_dir = resolve(&config.backup_dir);
 
     // Create and ensure writable directories.
-    for dir in [&change_dir, &binary_dir, &backup_dir] {
+    //
+    // The queue directory belongs to the process that drains it. A process
+    // without the executor role never receives a change to consume, so an
+    // `evolution-changes` directory it created would sit empty on a filesystem
+    // where nothing reads it, and "the queue is empty" is exactly the reading
+    // that must not be manufactured: whoever inspects it cannot tell it from a
+    // queue the reader is not allowed to see. The other two stay for every
+    // process — staging and rolling back a binary is an action an admin API on
+    // a non-executor can still take.
+    let mut dirs: Vec<&std::path::PathBuf> = vec![&binary_dir, &backup_dir];
+    if config.executor_enabled {
+        dirs.push(&change_dir);
+    }
+    for dir in dirs {
         ensure_dir_writable(dir, config.sandbox_mode).await?;
     }
 
@@ -2352,6 +2386,45 @@ mod tests {
         assert!(result.is_ok(), "expected ensure to pass: {:?}", result);
 
         assert!(project_root.join("changes").is_dir());
+        assert!(project_root.join("bin").is_dir());
+        assert!(project_root.join("backups").is_dir());
+    }
+
+    /// A process without the executor role never consumes a change, so it must
+    /// not create a queue directory either: an empty `evolution-changes` on a
+    /// filesystem nobody reads from is a decoy that reads exactly like a queue
+    /// that is empty. The sibling test above is the control here — it runs the
+    /// same configuration with the default role, which is the one that drains
+    /// the queue, and asserts the directory is created.
+    #[tokio::test]
+    async fn ensure_env_leaves_no_queue_dir_on_a_process_that_does_not_drain_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("repo");
+        tokio::fs::create_dir_all(&project_root).await.unwrap();
+        let init = tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&project_root)
+            .output()
+            .await
+            .unwrap();
+        assert!(init.status.success());
+
+        let config = cog_core::SelfEvolutionConfig {
+            change_dir: "changes".to_string(),
+            binary_dir: "bin".to_string(),
+            backup_dir: "backups".to_string(),
+            switch_mode: "systemd".to_string(),
+            executor_enabled: false,
+            ..Default::default()
+        };
+
+        let result = ensure_self_evolution_environment(&project_root, &config).await;
+        assert!(result.is_ok(), "expected ensure to pass: {:?}", result);
+
+        assert!(
+            !project_root.join("changes").exists(),
+            "a non-owner must not manufacture a queue it never reads"
+        );
         assert!(project_root.join("bin").is_dir());
         assert!(project_root.join("backups").is_dir());
     }

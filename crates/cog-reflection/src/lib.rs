@@ -43,6 +43,7 @@ pub mod evolution;
 pub mod evolution_admin;
 pub mod evolution_build_readings;
 pub mod evolution_deployer;
+pub mod evolution_queue_readings;
 pub mod extractor;
 pub mod fault_classifier;
 pub mod firecracker;

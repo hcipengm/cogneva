@@ -85,6 +85,29 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_build_target_scan_interval_seconds",
         "crates/cog-reflection/src/build_cache_readings.rs",
     ),
+    // The change queue. The role flag is read on its own, because it is the only
+    // one of the four a process publishes without draining the queue: the rule
+    // that says no executor exists reads the flag rather than the depth, since
+    // with no executor there is no depth series to be silent about.
+    (
+        "cogneva_evolution_change_queue_owner",
+        "crates/cog-reflection/src/evolution_queue_readings.rs",
+    ),
+    // The other three are the owner's: the depth and the age of what is waiting,
+    // and the interval that turns "waiting a long time" into a comparison
+    // against this deployment's own cycle rather than a constant.
+    (
+        "cogneva_evolution_change_queue_pending",
+        "crates/cog-reflection/src/evolution_queue_readings.rs",
+    ),
+    (
+        "cogneva_evolution_change_queue_oldest_seconds",
+        "crates/cog-reflection/src/evolution_queue_readings.rs",
+    ),
+    (
+        "cogneva_evolution_change_queue_poll_interval_seconds",
+        "crates/cog-reflection/src/evolution_queue_readings.rs",
+    ),
     (
         "cogneva_evolution_build_outcomes_total",
         "crates/cog-reflection/src/evolution_build_readings.rs",

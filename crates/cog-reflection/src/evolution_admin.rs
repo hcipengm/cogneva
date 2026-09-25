@@ -37,6 +37,9 @@ pub struct EvolutionAdminService {
     /// 工作区分配器：admin 触发的应用/构建各取一棵临时工作树，与自动流水线
     /// 和各轮演进互不干涉。未接线时退回进程工作目录（单测场景）。
     workspaces: Option<Arc<crate::workspace::WorkspaceManager>>,
+    /// 本进程读的那个变更队列（目录 + 是否属主 + 周期）。与观测面共用同一个
+    /// 对象，所以列举报的目录与指标挂的目录不可能是两个目录。
+    queue: Option<Arc<crate::evolution_queue_readings::EvolutionQueueReadings>>,
 }
 
 /// 从 unified diff 文本提取一行摘要（"3 files, +42 -17"）；非 diff 内容返回 None。
@@ -92,7 +95,19 @@ impl EvolutionAdminService {
             promotion_config_enabled: false,
             trend_latest: None,
             workspaces: None,
+            queue: None,
         }
+    }
+
+    /// 接入变更队列读数：本进程读的是哪个队列目录、是不是它的属主、按什么周期
+    /// 消费。接入后列举会把这条出处一并交出去——空列表在两种情形下长得一样，
+    /// 而它们要做的事相反。
+    pub fn with_change_queue(
+        mut self,
+        queue: Arc<crate::evolution_queue_readings::EvolutionQueueReadings>,
+    ) -> Self {
+        self.queue = Some(queue);
+        self
     }
 
     /// 接入工作区分配器：admin 操作在临时工作树里跑。
@@ -219,23 +234,32 @@ impl EvolutionAdminService {
         // source `find_pending_change` consults — so both surfaces judge
         // "pending" by one predicate. Entries the engine already knows keep
         // their richer record; the scan only contributes what it alone has.
-        if let Some(ref evo) = self.engine.evolution {
-            match self.pipeline.pending_changes(Some(evo)).await {
-                Ok(pending) => {
-                    let known: std::collections::HashSet<String> =
-                        results.iter().map(|r| r.artifact_id.clone()).collect();
-                    for change in pending {
-                        if !known.contains(&change.artifact_id) {
-                            results.push(change);
-                        }
+        //
+        // The scan does not depend on an engine being attached: the two answer
+        // different questions. The engine knows each change's status, the
+        // directory knows which changes exist, and `pending_changes` takes the
+        // engine as an optional refinement for exactly that reason. Gating the
+        // scan on it would blind the listing in the one process where the
+        // directory is the only source left.
+        match self
+            .pipeline
+            .pending_changes(self.engine.evolution.as_deref())
+            .await
+        {
+            Ok(pending) => {
+                let known: std::collections::HashSet<String> =
+                    results.iter().map(|r| r.artifact_id.clone()).collect();
+                for change in pending {
+                    if !known.contains(&change.artifact_id) {
+                        results.push(change);
                     }
                 }
-                Err(e) => warn!(
-                    error = %e,
-                    "could not read the change directory for the listing; \
-                     showing only in-memory results"
-                ),
             }
+            Err(e) => warn!(
+                error = %e,
+                "could not read the change directory for the listing; \
+                 showing only in-memory results"
+            ),
         }
 
         results
@@ -486,6 +510,12 @@ impl EvolutionAdmin for EvolutionAdminService {
             out.push(self.row_for(r).await);
         }
         Ok(out)
+    }
+
+    /// 这次列举读的是哪个队列目录、本进程是不是它的属主。列举不带这条出处时，
+    /// 一个结构上看不到那些变更的进程回出的空列表就是一句无从核对的声明。
+    async fn change_queue_view(&self) -> SFResult<Option<cog_core::EvolutionQueueView>> {
+        Ok(self.queue.as_ref().map(|q| q.view()))
     }
 
     async fn evaluate_policy(
@@ -852,6 +882,71 @@ mod tests {
         let events = admin.list_events(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "from-a-previous-process");
+    }
+
+    /// The directory is the queue, and the engine is only an enrichment of it: a
+    /// process with no LLM has no engine attached, and it still has a queue to
+    /// list. Gating the scan on the engine would make the listing go blind in
+    /// exactly the process where the directory is the only source left.
+    #[tokio::test]
+    async fn admin_service_lists_the_queue_with_no_engine_attached() {
+        let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
+        let engine = crate::ReflectionEngine::new_in_memory(registry);
+        assert!(engine.evolution.is_none(), "this test is about that case");
+
+        let project_root = std::env::current_dir().unwrap();
+        let change_dir =
+            std::env::temp_dir().join(format!("cogneva-test-changes-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        tokio::fs::write(
+            change_dir.join("nobody-is-running-me.diff"),
+            "--- a/x.txt\n+++ b/x.txt\n@@ -0,0 +1 @@\n+one\n",
+        )
+        .await
+        .unwrap();
+        let binary_dir =
+            std::env::temp_dir().join(format!("cogneva-test-bin-{}", uuid::Uuid::new_v4()));
+        let backup_dir =
+            std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
+
+        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        let deployer = crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir);
+        let queue = Arc::new(
+            crate::evolution_queue_readings::EvolutionQueueReadings::new(
+                &change_dir,
+                false,
+                cog_core::config::SelfEvolutionConfig::default().poll_interval_secs,
+                pipeline.clone(),
+                None,
+            ),
+        );
+        let admin =
+            crate::EvolutionAdminService::new(Arc::new(engine), pipeline, deployer, None, None)
+                .with_change_queue(queue);
+
+        let ids: Vec<String> = admin
+            .list_changes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec!["nobody-is-running-me"]);
+
+        // The listing says which queue it read and that this process is not the
+        // one draining it: an empty list and a list from a process that cannot
+        // see the queue have to be told apart by their reader.
+        let view = admin.change_queue_view().await.unwrap().unwrap();
+        assert!(!view.owner);
+        assert_eq!(view.dir, change_dir.display().to_string());
+    }
+
+    /// Without the queue wired in, the listing reports no provenance rather than
+    /// claiming the queue it read is the one that matters.
+    #[tokio::test]
+    async fn a_listing_with_no_queue_wired_reports_no_provenance() {
+        let admin = build_admin(None);
+        assert!(admin.change_queue_view().await.unwrap().is_none());
     }
 
     struct MockSwitcher {

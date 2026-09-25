@@ -895,6 +895,24 @@
           },
           "severity": "warning",
           "summary": "the shared build cache has been {value} byte(s) over its cap for more than six of its own scan intervals and no pass has paid any of it down. A pass never deletes without the build slot -- a file removed under a running build fails that build for a reason that has nothing to do with it -- so this reading has two causes that need opposite responses, and the measurement age panel separates them: an age that keeps rising is a watcher that stopped walking, while an age that stays near the scan interval is a host whose builds have held the slot for every one of those walks. Read the outcome counts on Build Cache Over-Cap Outcomes before acting: busy and ungated are two different reasons no bytes moved (a build was running, versus no gate in force at all), and only one of them is a host that is too busy. A cache left over its cap is not immediately harmful -- it keeps filling the volume until the volume is full, and a build failing on a full disk is what the cap exists to prevent"
+        },
+        {
+          "name": "evolution_queue_has_no_executor",
+          "promql": "avg_over_time((sum(cogneva_evolution_change_queue_owner) < bool 1)[15m:1m])",
+          "condition": {
+            "greater_than": 0.5
+          },
+          "severity": "warning",
+          "summary": "no process claimed the change-executor role for {value} of the last 15m (the value is the fraction of the window, not a count): changes generated for the queue are not verified or landed until one does. Read from the role flag rather than from the queue, because every process publishes the flag while the queue's depth is published only by the process that drains it -- so with no executor there is no depth reading to be silent about, and this is the only surface that can say so. Fires both when the role was disabled in both deployments and when the executor pod is gone, which are different repairs. Silent when nothing reports the flag at all: that is a broken scrape rather than an absent executor, and an absent reading is not evidence of absence"
+        },
+        {
+          "name": "evolution_queue_not_draining",
+          "promql": "(max by (dir) (cogneva_evolution_change_queue_oldest_seconds) > 6 * max by (dir) (cogneva_evolution_change_queue_poll_interval_seconds)) and on (dir) (max by (dir) (cogneva_evolution_change_queue_pending) > 0)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "a change has been waiting {value} second(s) in the queue, more than six of the cycles this deployment consumes it on, and the depth says it is still there. A cycle retires a change it cannot apply, so an entry surviving six of them is not a change the pipeline keeps failing to apply -- it is a queue nothing is reading, which the depth alone cannot distinguish from an idle one. Usual causes: the executor is up but its cycle is not running (a build slot held for the whole window, a workspace allocator that never returned), or the entry keeps failing on a path the retire step does not cover. This rule is silent when the executor process itself is gone: its series went with it, and evolution_queue_has_no_executor is the rule for that state"
         }
       ]
     },

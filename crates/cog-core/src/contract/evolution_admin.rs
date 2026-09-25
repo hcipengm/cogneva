@@ -24,6 +24,21 @@ pub struct EvolutionChangeInfo {
     pub eval_summary: Option<String>,
 }
 
+/// 一次变更列举的出处：读的是哪个队列目录，以及本进程是不是那个队列的属主。
+///
+/// 队列不是一个部署共用的一份：`change_dir` 在出厂配置里是相对路径，按各进程
+/// 自己的工作目录解析，而两个部署把不同的卷挂在这些路径上。于是「生成变更的
+/// 进程」与「替接管台列举变更的进程」读的不是同一批文件，而一个不读那个目录的
+/// 进程回出的空列表，与「队列真的是空的」在没有这条读数时是同一个东西——
+/// 这两件事要做的事相反。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionQueueView {
+    /// 这次列举实际读的目录（相对路径按本进程工作目录解析后的绝对形式）。
+    pub dir: String,
+    /// 本进程是否承担变更执行器职责，即这个队列是否由它消费。
+    pub owner: bool,
+}
+
 /// Request to evaluate an artifact-level policy candidate against a baseline
 /// (产物级进化 §14.3). The verdict is gated by a two-proportion z-test;
 /// an `Adopt` verdict does **not** activate the policy — it stages the
@@ -161,6 +176,15 @@ pub struct PromotionTrendWeek {
 pub trait EvolutionAdmin: Send + Sync {
     /// List all known evolution artifacts (newest first).
     async fn list_changes(&self) -> crate::SFResult<Vec<EvolutionChangeInfo>>;
+
+    /// 变更列举的出处：这次读的是哪个队列目录、本进程是不是它的属主。
+    ///
+    /// 列举本身不带这条信息是危险的：空列表在两种情形下长得一样，而它们要做
+    /// 的事相反（一条变更都没有，还是这个进程结构上看不到那些变更）。
+    /// 默认：不提供——消费侧按「不知道」处理，不要把缺席读成「队列是空的」。
+    async fn change_queue_view(&self) -> crate::SFResult<Option<EvolutionQueueView>> {
+        Ok(None)
+    }
 
     /// Apply a single change to the working tree and run the test suite.
     async fn apply_change(&self, change_id: &str) -> crate::SFResult<EvolutionApplyResponse>;
