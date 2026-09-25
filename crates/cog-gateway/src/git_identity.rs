@@ -24,6 +24,12 @@
 //! **状态存在 Secret 里**：装机期间进程可能重启多次，进程内状态每次归零。归零的
 //! 后果很具体：待确认的密钥被重新生成，于是使用者刚粘到平台上的那把公钥又对不
 //! 上了。
+//!
+//! **公钥从私钥导出，不照抄 Secret 里那行**：集群手里只有私钥，而 OpenSSH 私钥
+//! 自带公钥 blob（外面那一段就是），所以"这对密钥的公钥是什么"是可以读出来的
+//! 事实。Secret 里那行可以与私钥不是同一对——人工换过密钥而没换那行、或那行来自
+//! 更早一代——那时面板显示、重新登记、指纹比对全都在描述一把集群里并不存在的
+//! 密钥，而唯一的症状是 SSH 每次都被拒。写下来的那半必须能被手里这半验证。
 
 use std::path::{Path, PathBuf};
 
@@ -115,16 +121,21 @@ pub(crate) enum Step {
 }
 
 /// 判据表。`state` 是 Secret 里记的身份状态，`has_live_key` 是生效键位有没有私钥，
-/// `has_candidate_key` 是待确认键位有没有私钥。
+/// `has_candidate_key` 是待确认键位有没有私钥，`pair_consistent` 是记下来的公钥与
+/// 生效私钥是不是同一对（读不出任一半时为真）。
 ///
-/// 生效 + `ready` 直接短路：这是稳态，不该每次启动都去握一次手。
+/// 生效 + `ready` 直接短路：这是稳态，不该每次启动都去握一次手。**但 `ready` 与
+/// 密钥成对是两件事**：状态位说"验证过"，而"验证过的那把密钥"只有公钥也与私钥
+/// 对得上才成立。对不上时不短路——此时重新登记能把那半纠正回来，而短路会让面板
+/// 与 git 兜底通道长期描述一把集群里不存在的密钥。
 pub(crate) fn next_step(
     state: Option<&str>,
     has_live_key: bool,
     has_candidate_key: bool,
     has_token: bool,
+    pair_consistent: bool,
 ) -> Step {
-    if has_live_key && state == Some(STATE_READY) {
+    if has_live_key && state == Some(STATE_READY) && pair_consistent {
         return Step::Settled;
     }
     match (has_live_key || has_candidate_key, has_token) {
@@ -161,7 +172,7 @@ impl Outcome {
 /// `ssh-keygen -lf` 同款。日志里报指纹而不是整行公钥，是为了让"这把密钥变了吗"
 /// 一眼可答，且不必把公钥刷满日志。
 pub(crate) fn fingerprint(public_line: &str) -> Option<String> {
-    let blob = public_line.split_whitespace().nth(1)?;
+    let blob = key_blob(public_line)?;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(blob)
         .ok()?;
@@ -173,6 +184,75 @@ pub(crate) fn fingerprint(public_line: &str) -> Option<String> {
             .trim_end_matches('=')
     ))
 }
+
+/// 公钥行里的密钥材料（base64 那一段），不带算法名与注释。指纹与"两半是不是一对"
+/// 都只看这一段：注释是给人认的，改注释不该让同一把密钥看起来换了一把。
+fn key_blob(public_line: &str) -> Option<&str> {
+    public_line.split_whitespace().nth(1)
+}
+
+/// OpenSSH v1 私钥容器开头的那串魔数。
+const OPENSSH_KEY_MAGIC: &[u8] = b"openssh-key-v1\0";
+
+/// 从 OpenSSH v1 私钥里读出它自带的公钥，渲染成 `<算法> <blob>`。
+///
+/// 读的是容器结构本身：魔数 → ciphername → kdfname → kdfoptions → 密钥条数 →
+/// 公钥段（一个 length-prefixed blob）。公钥段就在明文里，所以这一步不需要解密、
+/// 不需要派生，也不碰私钥材料。
+///
+/// **不支持或读不出就给 `None`**，绝不猜：这是个"能读出来就对一对"的检查，不是
+/// 判生死的门槛——读不出时下面所有判定都放行（见 `Facts::pair_consistent`）。
+pub(crate) fn public_line_of(private_key: &str) -> Option<String> {
+    /// 一个 length-prefixed 段，返回 (内容, 剩余)。
+    fn take(raw: &[u8]) -> Option<(&[u8], &[u8])> {
+        let len = u32::from_be_bytes(raw.get(..4)?.try_into().ok()?) as usize;
+        let end = 4usize.checked_add(len)?;
+        Some((raw.get(4..end)?, raw.get(end..)?))
+    }
+
+    let body: String = private_key
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .ok()?;
+    let rest = raw.strip_prefix(OPENSSH_KEY_MAGIC)?;
+    let (_, rest) = take(rest)?; // ciphername
+    let (_, rest) = take(rest)?; // kdfname
+    let (_, rest) = take(rest)?; // kdf options
+    let count = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?);
+    if count != 1 {
+        return None;
+    }
+    let (blob, _) = take(rest.get(4..)?)?;
+    let (algo, _) = take(blob)?;
+    let algo = std::str::from_utf8(algo).ok()?;
+    Some(format!(
+        "{algo} {}",
+        base64::engine::general_purpose::STANDARD.encode(blob)
+    ))
+}
+
+/// 两半是不是一对：记下来的公钥行与生效私钥里自带的那半比。
+///
+/// **读不出任一半时为真**。这是"两个读数互相矛盾"的判据，而缺席不是矛盾：私钥是
+/// 别人给的别的格式、公钥行只有算法名、Secret 里干脆没有那一行——这些都只是没读到
+/// 证据，不该把一份本来能用的身份判成坏的（那正是"没拿到证据"与"拿到反证"的区别）。
+fn pair_matches(live_key: Option<&str>, recorded_line: Option<&str>) -> bool {
+    match (
+        live_key.and_then(public_line_of),
+        recorded_line.and_then(key_blob),
+    ) {
+        (Some(derived), Some(recorded)) => key_blob(&derived) == Some(recorded),
+        _ => true,
+    }
+}
+
+/// 公钥与私钥对不上时的理由。面板显示的就是自举写下的这一句，两处共用同一个串，
+/// 免得"人看到的"与"日志里写的"变成两句话。
+pub(crate) const NOTE_KEY_PAIR_MISMATCH: &str =
+    "Secret 里的公钥与生效私钥不是同一对；已按私钥导出的公钥为准，将重新自证或登记";
 
 /// 登记部署密钥的应答判决。
 ///
@@ -210,13 +290,22 @@ pub(crate) fn status_block(secret: &serde_json::Value) -> serde_json::Value {
             .and_then(|b64| engine.decode(b64).ok())
             .and_then(|bytes| String::from_utf8(bytes).ok())
     };
-    let public_line = field(SECRET_SSH_PUBLIC_KEY);
-    let has_live = field(SECRET_SSH_PRIVATE_KEY).is_some();
+    let live_key = field(SECRET_SSH_PRIVATE_KEY);
+    let has_live = live_key.is_some();
+    let recorded_line = field(SECRET_SSH_PUBLIC_KEY);
+    // 展示的公钥从生效私钥导出，只有导不出时才退回 Secret 里那行：人要拿去平台登记、
+    // 要照着比指纹的，必须是手里这把密钥对应的那半。
+    let public_line = live_key
+        .as_deref()
+        .and_then(public_line_of)
+        .or_else(|| recorded_line.clone());
+    let pair_consistent = pair_matches(live_key.as_deref(), recorded_line.as_deref());
     let note = field(SECRET_IDENTITY_NOTE);
     let state = match field(SECRET_IDENTITY_STATE).as_deref() {
-        Some(STATE_READY) if has_live => STATE_READY,
+        Some(STATE_READY) if has_live && pair_consistent => STATE_READY,
         // 私钥在但没有状态位：**未确认**。把它读成 ready 会让面板对着一把
-        // 还没登记成功的密钥说"配好了"。
+        // 还没登记成功的密钥说"配好了"。状态位在、但公钥不是这一对的，同理：
+        // 那句 ready 描述的不是手里这把密钥。
         _ if has_live || field(SECRET_SSH_PENDING_KEY).is_some() => "pending",
         _ => "absent",
     };
@@ -229,8 +318,15 @@ pub(crate) fn status_block(secret: &serde_json::Value) -> serde_json::Value {
         "repo_configured": !IdentityConfig::from_env().repo.is_empty(),
         // 下一步该谁动手：有 token 的安装会自己走完，没有就需要人给一份。
         "needs_token": state != STATE_READY && !has_token,
-        // 卡在哪一步。ready 时不该有理由，也不显示上一次的旧理由。
-        "note": if state == STATE_READY { None } else { note },
+        // 卡在哪一步。ready 时不该有理由，也不显示上一次的旧理由。两半对不上是唯一
+        // 一个不必等自举写下理由就该当场说清的状态：面板判它 pending，理由得同时到位。
+        "note": if !pair_consistent {
+            Some(NOTE_KEY_PAIR_MISMATCH.to_string())
+        } else if state == STATE_READY {
+            None
+        } else {
+            note
+        },
     })
 }
 
@@ -272,12 +368,23 @@ impl Facts {
         }
     }
 
+    /// 生效私钥里自带的那半公钥。登记、比对、展示都用它。
+    fn derived_public_line(&self) -> Option<String> {
+        self.live_key.as_deref().and_then(public_line_of)
+    }
+
+    /// 记下来的公钥与生效私钥是不是同一对（读不出任一半时为真）。
+    fn pair_consistent(&self) -> bool {
+        pair_matches(self.live_key.as_deref(), self.public_line.as_deref())
+    }
+
     fn step(&self) -> Step {
         next_step(
             self.state.as_deref(),
             self.live_key.is_some(),
             self.candidate_key.is_some(),
             self.token.is_some(),
+            self.pair_consistent(),
         )
     }
 }
@@ -356,10 +463,20 @@ async fn confirm_or_prompt(
     facts: &Facts,
     private_key: &str,
 ) -> Outcome {
-    let Some(public_line) = facts.public_line.clone() else {
-        // 生效键位里有一把密钥，但 Secret 里没有它的公钥：无法登记它，也无法
-        // 把它讲给人听。只能重造一把。
-        warn!("git 身份自举：私钥存在但缺对应公钥，重造密钥对");
+    let derived = facts.derived_public_line();
+    if let (Some(derived), Some(recorded)) = (derived.as_deref(), facts.public_line.as_deref()) {
+        if key_blob(derived) != key_blob(recorded) {
+            warn!(
+                recorded = %fingerprint(recorded).unwrap_or_default(),
+                derived_from_key = %fingerprint(derived).unwrap_or_default(),
+                "git 身份自举：Secret 里的公钥与生效私钥不是同一对，按私钥导出的那半为准"
+            );
+        }
+    }
+    let Some(public_line) = derived.or_else(|| facts.public_line.clone()) else {
+        // 生效键位里有一把密钥，但既读不出它自带的公钥、Secret 里也没有一行：
+        // 无法登记它，也无法把它讲给人听。只能重造一把。
+        warn!("git 身份自举：私钥存在但读不出对应公钥，重造密钥对");
         let keypair = generate_ssh_keypair("cogneva-gateway");
         return register_and_promote(
             kube,
@@ -388,6 +505,10 @@ async fn confirm_or_prompt(
 
     let reason = if config.repo.is_empty() {
         "未配置目标仓库（COGNEVA_GATEWAY_GIT_IDENTITY_REPO），无法自动登记".to_string()
+    } else if !facts.pair_consistent() {
+        // 对不上时登记的会是私钥导出的那半（上面已经选了它），所以这里要说清
+        // 发生了什么，而不是笼统地说"公钥还没登记"。
+        NOTE_KEY_PAIR_MISMATCH.to_string()
     } else {
         "SSH 握手未通过（公钥尚未登记到上游仓库）".to_string()
     };
@@ -400,6 +521,7 @@ async fn confirm_or_prompt(
     Outcome::AwaitingToken(reason)
 }
 
+/// 登记 + 自证 + 晋级。登记只是把公钥交给平台；`ready` 仍然只由一次真实握手写。
 async fn register_and_promote(
     kube: &KubeClient,
     config: &IdentityConfig,
@@ -420,6 +542,15 @@ async fn register_and_promote(
             public_key = %public_line,
             "git 身份自举：可把上面这行公钥手工加为仓库部署密钥，本网关会自证接管"
         );
+        return Outcome::AwaitingToken(reason);
+    }
+    // 登记成功也要再握一次手才晋级。写进平台的那次调用只说"平台收下了这个请求"，
+    // 而且**422 有两种含义**（已存在的密钥、无效的密钥），都被判成功；把它当成
+    // "身份已生效"，等于用一个 HTTP 状态码顶替一次真实的认证。握手是同一件事的
+    // 直接读数，成了才写 `ready`。
+    if !verify_ssh(config, private_key).await {
+        let reason = "部署密钥已登记，但 SSH 握手仍未通过（密钥未在仓库生效）".to_string();
+        warn!(repo = %config.repo, public_key = %public_line, "{reason}");
         return Outcome::AwaitingToken(reason);
     }
     match promote(kube, config, private_key, public_line).await {
@@ -655,48 +786,115 @@ mod tests {
 
     #[test]
     fn a_settled_identity_is_left_alone() {
-        // 常态：生效键位有私钥 + 状态 ready → 既不握手也不写 Secret
+        // 常态：生效键位有私钥 + 状态 ready + 两半成对 → 既不握手也不写 Secret
         assert_eq!(
-            next_step(Some(STATE_READY), true, false, false),
+            next_step(Some(STATE_READY), true, false, false, true),
             Step::Settled
         );
         assert_eq!(
-            next_step(Some(STATE_READY), true, false, true),
+            next_step(Some(STATE_READY), true, false, true, true),
             Step::Settled
+        );
+    }
+
+    #[test]
+    fn a_pair_that_does_not_match_is_not_left_alone() {
+        // 状态位说 ready、私钥也在，但记下来的公钥不是这一对的。此时那句 ready
+        // 描述的不是手里这把密钥，而面板与重新登记都会照着错的那半来。
+        assert_eq!(
+            next_step(Some(STATE_READY), true, false, true, false),
+            Step::Register,
+            "有 token 时重新登记能把公钥那半纠正回来"
+        );
+        assert_eq!(
+            next_step(Some(STATE_READY), true, false, false, false),
+            Step::AwaitHuman,
+            "没有 token 时只能等人，不能当成稳态收工"
         );
     }
 
     #[test]
     fn a_key_without_evidence_needs_confirmation() {
         // 私钥在但状态不是 ready（首装、或人工刚登记）：先自证，自证不过才登记
-        assert_eq!(next_step(None, true, false, true), Step::Register);
+        assert_eq!(next_step(None, true, false, true, true), Step::Register);
         assert_eq!(
-            next_step(Some("pending"), true, false, false),
+            next_step(Some("pending"), true, false, false, true),
             Step::AwaitHuman
         );
         // 贡献通道写入的私钥没有状态位：同样落到"待确认"，不会被当成已生效
-        assert_eq!(next_step(None, true, false, false), Step::AwaitHuman);
+        assert_eq!(next_step(None, true, false, false, true), Step::AwaitHuman);
     }
 
     #[test]
     fn a_fresh_machine_generates_first() {
         assert_eq!(
-            next_step(None, false, false, true),
+            next_step(None, false, false, true, true),
             Step::GenerateThenRegister
         );
         assert_eq!(
-            next_step(None, false, false, false),
+            next_step(None, false, false, false, true),
             Step::GenerateThenAwaitHuman
         );
         // 待确认键位上有密钥就不必再生成一对：重造会把人工刚粘好的公钥作废
         assert_eq!(
-            next_step(Some("pending"), false, true, false),
+            next_step(Some("pending"), false, true, false, true),
             Step::AwaitHuman
         );
         assert_eq!(
-            next_step(Some("pending"), false, true, true),
+            next_step(Some("pending"), false, true, true, true),
             Step::Register
         );
+    }
+
+    #[test]
+    fn the_public_half_is_read_out_of_the_private_key() {
+        let keypair = generate_ssh_keypair("cogneva-gateway");
+        let derived = public_line_of(&keypair.private_pem).expect("OpenSSH v1 私钥自带公钥那一段");
+        assert_eq!(key_blob(&derived), key_blob(&keypair.public_line));
+        assert_eq!(fingerprint(&derived), fingerprint(&keypair.public_line));
+        // 导出行不带注释（私钥里那半段只有算法名与 blob）——比对只看 blob，正是
+        // 为了不让注释差别看起来像换了一把密钥
+        assert!(derived.starts_with("ssh-ed25519 "));
+        assert_eq!(derived.split_whitespace().count(), 2);
+
+        // 读不出来就给 None，而不是编一行出来
+        assert!(public_line_of("").is_none());
+        assert!(public_line_of("not a key at all").is_none());
+        // 别家格式（PEM）没有可读的公钥段
+        assert!(
+            public_line_of("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n")
+                .is_none()
+        );
+        // 魔数对但后面截断：结构不完整同样不猜
+        let truncated = base64::engine::general_purpose::STANDARD.encode(b"openssh-key-v1\0");
+        assert!(public_line_of(&format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{truncated}\n-----END OPENSSH PRIVATE KEY-----\n"
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn a_public_line_is_checked_against_the_key_that_must_use_it() {
+        let keypair = generate_ssh_keypair("cogneva-gateway");
+        let other = generate_ssh_keypair("cogneva-gateway");
+        assert!(pair_matches(
+            Some(&keypair.private_pem),
+            Some(&keypair.public_line)
+        ));
+        // 注释不同不算换密钥
+        let commented = format!(
+            "ssh-ed25519 {} elsewhere",
+            key_blob(&keypair.public_line).unwrap()
+        );
+        assert!(pair_matches(Some(&keypair.private_pem), Some(&commented)));
+        assert!(!pair_matches(
+            Some(&keypair.private_pem),
+            Some(&other.public_line)
+        ));
+        // 读不出任一半是"没拿到证据"，不是反证：放行，否则一份能用的身份会被判坏
+        assert!(pair_matches(None, Some(&other.public_line)));
+        assert!(pair_matches(Some(&keypair.private_pem), None));
+        assert!(pair_matches(Some("not a key"), Some(&other.public_line)));
     }
 
     #[test]
@@ -777,6 +975,51 @@ mod tests {
             status_block(&secret(vec![(SECRET_IDENTITY_STATE, "pending")]))["state"],
             "absent"
         );
+    }
+
+    #[test]
+    fn the_status_block_does_not_call_a_mismatched_pair_ready() {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let live = generate_ssh_keypair("cogneva-gateway");
+        let other = generate_ssh_keypair("cogneva-gateway");
+        let secret = |fields: Vec<(&str, String)>| {
+            let mut data = serde_json::Map::new();
+            for (k, v) in fields {
+                data.insert(k.into(), json!(engine.encode(v)));
+            }
+            json!({ "data": data })
+        };
+
+        let mismatched = status_block(&secret(vec![
+            (SECRET_SSH_PRIVATE_KEY, live.private_pem.clone()),
+            (SECRET_SSH_PUBLIC_KEY, other.public_line.clone()),
+            (SECRET_IDENTITY_STATE, STATE_READY.to_string()),
+        ]));
+        assert_eq!(
+            mismatched["state"], "pending",
+            "状态位写的是 ready，但记下来的公钥不是手里这把密钥的——那就不是已生效"
+        );
+        assert_eq!(mismatched["note"], NOTE_KEY_PAIR_MISMATCH);
+        // 摆给人和平台的公钥必须来自私钥：照着错的那半去登记，登记的还是错的
+        assert_eq!(
+            key_blob(mismatched["public_key"].as_str().unwrap()),
+            key_blob(&live.public_line),
+            "面板显示的必须是手里这把密钥的公钥"
+        );
+        assert_eq!(
+            mismatched["fingerprint"],
+            json!(fingerprint(&live.public_line).unwrap())
+        );
+
+        // 成对时照旧 ready、且不显示任何理由
+        let consistent = status_block(&secret(vec![
+            (SECRET_SSH_PRIVATE_KEY, live.private_pem.clone()),
+            (SECRET_SSH_PUBLIC_KEY, live.public_line.clone()),
+            (SECRET_IDENTITY_STATE, STATE_READY.to_string()),
+            (SECRET_IDENTITY_NOTE, "旧理由".to_string()),
+        ]));
+        assert_eq!(consistent["state"], STATE_READY);
+        assert!(consistent["note"].is_null());
     }
 
     #[test]
