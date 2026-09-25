@@ -117,12 +117,14 @@ const PRODUCED: &[(&str, &str)] = &[
 /// Listing them keeps the check honest: an unlisted foreign series fails the
 /// test rather than being silently ignored.
 const FOREIGN: &[(&str, &str)] = &[
+    ("kube_node_status_allocatable", "kube-state-metrics"),
     ("kube_node_status_condition", "kube-state-metrics"),
     (
         "kube_persistentvolumeclaim_resource_requests_storage_bytes",
         "kube-state-metrics",
     ),
     ("kube_pod_container_info", "kube-state-metrics"),
+    ("kube_pod_container_resource_limits", "kube-state-metrics"),
     (
         "kube_pod_container_status_last_terminated_reason",
         "kube-state-metrics",

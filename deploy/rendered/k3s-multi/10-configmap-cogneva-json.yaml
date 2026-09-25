@@ -648,6 +648,24 @@ data:
               },
               "severity": "warning",
               "summary": "The runtime asset record this image carries cannot be read, so every declared asset is unjudged — the per-asset rules are silent because the comparison never happened, not because the assets matched. The path and the parse error are in this process's own log line for the check"
+            },
+            {
+              "name": "node_capacity_overcommitted",
+              "promql": "sum by (node, resource) (kube_pod_container_resource_limits{namespace=\"cogneva\", resource=~\"cpu|memory\"} and on(pod) kube_pod_status_phase{phase=\"Running\"} == 1) / on(node, resource) group_left sum by (node, resource) (kube_node_status_allocatable{resource=~\"cpu|memory\"})",
+              "condition": {
+                "greater_than": 1.0
+              },
+              "severity": "warning",
+              "summary": "Node {node} has declared {value} times its allocatable {resource} in container limits, so no container on it can reach its own limit: under pressure the kernel decides who dies by paging and OOM-killing rather than each cgroup being held to its own ceiling. Only running pods are counted, and work that runs on the host outside the cluster (builds, the sandbox) has no such limit at all, so this is a lower bound on the overcommit. Re-derive the account before raising a limit"
+            },
+            {
+              "name": "node_capacity_changed",
+              "promql": "changes(kube_node_status_allocatable{node=~\".+\", resource=~\"cpu|memory|ephemeral_storage\"}[6h])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The allocatable {resource} of node {node} changed in the last six hours. That is not a fault by itself, but every number derived from the old capacity is now resting on a stale premise: the limits account above, how much build concurrency the host can take, and the probe and cache budgets that were sized against the old machine. Re-derive them; this clears on its own once the change ages out"
             }
           ]
         },
