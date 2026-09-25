@@ -271,6 +271,40 @@ pub struct DagExecutorConfig {
     /// a rolling replacement is picked up long before the next one.
     #[serde(default = "default_task_lease_secs")]
     pub task_lease_secs: u64,
+    /// How long one blocking stream read waits for a message before the
+    /// consumer re-issues it (milliseconds). This is the consumer's quiet
+    /// period: a stream that is merely empty answers every block with "no
+    /// message", so the observed silence of a consumer is bounded by this
+    /// value, and a reader that stays silent for several multiples of it is
+    /// not idle — it is failing. That is why the value is also published as a
+    /// reading: the staleness rule takes its bound from here instead of from
+    /// a constant written next to the rule.
+    #[serde(default = "default_redis_read_block_ms")]
+    pub redis_read_block_ms: u64,
+    /// Same, for the read that resumes from an id already seen rather than
+    /// from the newest entry. It is shorter because that read is normally
+    /// drained immediately: the id is known to exist, so waiting a full block
+    /// for it only delays the consumers behind it.
+    #[serde(default = "default_redis_read_resume_block_ms")]
+    pub redis_read_resume_block_ms: u64,
+}
+
+/// Five seconds: long enough that an empty stream costs one round trip per
+/// block per consumer, short enough that a message reaches an idle consumer
+/// promptly. Every consumer holds its own connection, so this is a per-consumer
+/// quiet period, not a shared polling budget.
+pub const DEFAULT_REDIS_READ_BLOCK_MS: u64 = 5000;
+
+/// One second: the resume read is a drain, and the entries it is looking for
+/// are already in the stream.
+pub const DEFAULT_REDIS_READ_RESUME_BLOCK_MS: u64 = 1000;
+
+fn default_redis_read_block_ms() -> u64 {
+    DEFAULT_REDIS_READ_BLOCK_MS
+}
+
+fn default_redis_read_resume_block_ms() -> u64 {
+    DEFAULT_REDIS_READ_RESUME_BLOCK_MS
 }
 
 /// Two minutes: the renewal cadence is a third of this, so a process may miss
@@ -312,6 +346,8 @@ impl Default for DagExecutorConfig {
             result_claim_batch: default_result_claim_batch(),
             self_evolution_timeout_secs: default_self_evolution_timeout_secs(),
             task_lease_secs: default_task_lease_secs(),
+            redis_read_block_ms: default_redis_read_block_ms(),
+            redis_read_resume_block_ms: default_redis_read_resume_block_ms(),
         }
     }
 }

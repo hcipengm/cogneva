@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
+use std::sync::Arc;
 
+use crate::read_health::ReadHealth;
 use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
 
 /// Upper bound on how many over-threshold entries one measurement lists. The
@@ -17,13 +19,62 @@ const PENDING_STATS_PAGE: usize = 1024;
 pub struct RedisMessageBackend {
     client: redis::Client,
     connection: ConnectionManager,
+    /// Read health of every consumer this backend handed a stream to.
+    health: Arc<ReadHealth>,
+    /// Block periods the read loops issue with, from the deployment's config.
+    /// Held as `usize` because that is what the read command takes; the config
+    /// itself stays in milliseconds.
+    read_block_ms: usize,
+    resume_block_ms: usize,
 }
 
 impl RedisMessageBackend {
+    /// Backend reading at the configured block periods' defaults.
     pub async fn new(redis_url: &str) -> SFResult<Self> {
+        Self::with_block_periods(
+            redis_url,
+            cog_core::config::DEFAULT_REDIS_READ_BLOCK_MS,
+            cog_core::config::DEFAULT_REDIS_READ_RESUME_BLOCK_MS,
+            Arc::new(ReadHealth::new(
+                cog_core::config::DEFAULT_REDIS_READ_BLOCK_MS,
+            )),
+        )
+        .await
+    }
+
+    /// Backend whose consumers read with the given block periods and report
+    /// their health into `health`.
+    ///
+    /// The periods are the consumer's quiet period: a stream with nothing to
+    /// deliver still answers every block, so a consumer that goes silent for
+    /// several blocks is failing rather than idle. Passing them in keeps the
+    /// value in the deployment's configuration and lets the same value be
+    /// published as the bound the staleness rule compares against.
+    ///
+    /// `health` is owned by the caller rather than by the backend so the same
+    /// record is both written by the read loops and published as readings: a
+    /// record created here and published from elsewhere would be two objects,
+    /// and the published one would always be empty.
+    pub async fn with_block_periods(
+        redis_url: &str,
+        read_block_ms: u64,
+        resume_block_ms: u64,
+        health: Arc<ReadHealth>,
+    ) -> SFResult<Self> {
         let client = redis::Client::open(redis_url).map_err(|e| SFError::Redis(e.to_string()))?;
         let connection = connect(&client).await?;
-        Ok(Self { client, connection })
+        Ok(Self {
+            client,
+            connection,
+            health,
+            read_block_ms: read_block_ms as usize,
+            resume_block_ms: resume_block_ms as usize,
+        })
+    }
+
+    /// The read health of this process's consumers, for publishing.
+    pub fn read_health(&self) -> Arc<ReadHealth> {
+        Arc::clone(&self.health)
     }
 
     /// Open a dedicated connection for one long-lived subscription.
@@ -111,25 +162,44 @@ impl MessageBackend for RedisMessageBackend {
         // the following None as a clean exit — one transient Redis error then
         // stalls the consumer group silently until the pod restarts (observed:
         // groups frozen for days while lag piled up).
-        let stream = futures::stream::try_unfold((conn, 0u64), move |(mut conn, mut backoff)| {
-            let subject = subject.clone();
-            let group = group.clone();
-            async move {
-                loop {
-                    match group_read(&mut conn, &subject, &group, ">", 5000).await {
-                        Ok(Some(item)) => return Ok(Some((item, (conn, 0)))),
-                        Ok(None) => backoff = 0,
-                        Err(e) => {
-                            tracing::warn!(
-                                stream = %subject,
-                                "XREADGROUP failed, retrying with backoff: {e}"
-                            );
-                            backoff = sleep_backoff(backoff).await;
+        //
+        // Retrying in place is only half of it: a loop that never recovers
+        // looks exactly like an idle one from outside. The guard and the health
+        // record are the other half — they are what says, in the observation
+        // surface, that this consumer has not been answered for a while.
+        let health = self.read_health();
+        let guard = ReadHealth::track(&health, &subject, &group);
+        let block_ms = self.read_block_ms;
+        let stream = futures::stream::try_unfold(
+            (conn, 0u64, guard),
+            move |(mut conn, mut backoff, guard)| {
+                let subject = subject.clone();
+                let group = group.clone();
+                let health = Arc::clone(&health);
+                async move {
+                    loop {
+                        match group_read(&mut conn, &subject, &group, ">", block_ms).await {
+                            Ok(Some(item)) => {
+                                health.note_ok(&subject, &group);
+                                return Ok(Some((item, (conn, 0, guard))));
+                            }
+                            Ok(None) => {
+                                health.note_ok(&subject, &group);
+                                backoff = 0;
+                            }
+                            Err(e) => {
+                                health.note_failure(&subject, &group);
+                                tracing::warn!(
+                                    stream = %subject,
+                                    "XREADGROUP failed, retrying with backoff: {e}"
+                                );
+                                backoff = sleep_backoff(backoff).await;
+                            }
                         }
                     }
                 }
-            }
-        });
+            },
+        );
 
         Ok(Box::pin(stream))
     }
@@ -146,25 +216,38 @@ impl MessageBackend for RedisMessageBackend {
         let start_id = start_id.to_string();
 
         // State carries the one-shot start id; the blocking tail reads ">".
-        // Errors retry in place for the same reason as `subscribe` above.
+        // Errors retry in place for the same reason as `subscribe` above, and
+        // the health record is shared with it for the same reason too.
+        let health = self.read_health();
+        let guard = ReadHealth::track(&health, &subject, &group);
+        let read_block_ms = self.read_block_ms;
+        let resume_block_ms = self.resume_block_ms;
         let stream = futures::stream::try_unfold(
-            (conn, Some(start_id), 0u64),
-            move |(mut conn, mut first_id, mut backoff)| {
+            (conn, Some(start_id), 0u64, guard),
+            move |(mut conn, mut first_id, mut backoff, guard)| {
                 let subject = subject.clone();
                 let group = group.clone();
+                let health = Arc::clone(&health);
                 async move {
                     loop {
                         let id = first_id.as_deref().unwrap_or(">");
-                        let block_ms = if first_id.is_some() { 1000 } else { 5000 };
+                        let block_ms = if first_id.is_some() {
+                            resume_block_ms
+                        } else {
+                            read_block_ms
+                        };
                         match group_read(&mut conn, &subject, &group, id, block_ms).await {
                             Ok(Some(item)) => {
-                                return Ok(Some((item, (conn, None, 0))));
+                                health.note_ok(&subject, &group);
+                                return Ok(Some((item, (conn, None, 0, guard))));
                             }
                             Ok(None) => {
+                                health.note_ok(&subject, &group);
                                 first_id = None;
                                 backoff = 0;
                             }
                             Err(e) => {
+                                health.note_failure(&subject, &group);
                                 tracing::warn!(
                                     stream = %subject,
                                     "XREADGROUP failed, retrying with backoff: {e}"

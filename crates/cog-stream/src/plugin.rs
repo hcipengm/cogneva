@@ -32,15 +32,29 @@ impl cog_core::SystemPlugin for StreamPlugin {
             return Ok(());
         }
 
-        let (nats_urls, redis_url, strict_persistence, event_channel_capacity) = {
+        let (
+            nats_urls,
+            redis_url,
+            strict_persistence,
+            event_channel_capacity,
+            read_block_ms,
+            resume_block_ms,
+        ) = {
             let config = ctx.config();
             (
                 config.dag_executor.nats.urls.clone(),
                 config.dag_executor.redis_url.clone(),
                 config.system.strict_persistence,
                 config.system.event_channel_capacity,
+                config.dag_executor.redis_read_block_ms,
+                config.dag_executor.redis_read_resume_block_ms,
             )
         };
+        let health = Arc::new(crate::ReadHealth::new(read_block_ms));
+        ctx.publish_observable(Arc::new(crate::StreamReadObservable::new(Arc::clone(
+            &health,
+        ))));
+        info!("StreamPlugin consumer read health published");
 
         let backend: Option<Arc<dyn cog_core::MessageBackend>> = if !nats_urls.is_empty() {
             match crate::NatsMessageBackend::new(&cog_core::NatsConfig {
@@ -61,7 +75,14 @@ impl cog_core::SystemPlugin for StreamPlugin {
                         )));
                     }
                     warn!("NatsMessageBackend failed: {}. Falling back to Redis.", e);
-                    match crate::RedisMessageBackend::new(&redis_url).await {
+                    match crate::RedisMessageBackend::with_block_periods(
+                        &redis_url,
+                        read_block_ms,
+                        resume_block_ms,
+                        Arc::clone(&health),
+                    )
+                    .await
+                    {
                         Ok(b) => Some(Arc::new(b)),
                         Err(e2) => {
                             warn!(
@@ -74,7 +95,14 @@ impl cog_core::SystemPlugin for StreamPlugin {
                 }
             }
         } else {
-            match crate::RedisMessageBackend::new(&redis_url).await {
+            match crate::RedisMessageBackend::with_block_periods(
+                &redis_url,
+                read_block_ms,
+                resume_block_ms,
+                Arc::clone(&health),
+            )
+            .await
+            {
                 Ok(b) => Some(Arc::new(b)),
                 Err(e) => {
                     if strict_persistence {

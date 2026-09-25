@@ -8,8 +8,13 @@
 pub mod memory;
 #[cfg(feature = "nats")]
 pub mod nats;
+pub mod observable;
+pub mod read_health;
 #[cfg(feature = "redis")]
 pub mod redis;
+
+pub use observable::StreamReadObservable;
+pub use read_health::{ReadGuard, ReadHealth};
 
 #[cfg(feature = "mem")]
 pub use memory::MemoryMessageBackend;

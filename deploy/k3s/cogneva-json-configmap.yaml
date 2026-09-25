@@ -611,6 +611,15 @@ data:
               },
               "severity": "warning",
               "summary": "The live copy of {asset} is not the copy the overlay recorded writing into this image. The overlay digests the checkout tree it copies and the application digests the same path at startup; the two differ, so either the copy did not land, or the destination still carries files the source no longer ships — a copy onto a pre-existing directory merges, and does not delete what it no longer contains"
+            },
+            {
+              "name": "stream_consumer_stalled",
+              "promql": "cogneva_stream_read_silent_seconds > 12 * max(cogneva_stream_read_block_seconds)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "critical",
+              "summary": "Consumer group {consumer_group} of stream {stream} has had no answer from the message bus for {value}s — more than twelve read periods. A consumer with nothing to deliver is still answered every block, so this one is failing rather than idle: it is retrying with backoff and everything fed by that stream has stopped moving, while the process stays up and its health checks stay green. The count of refused reads is in cogneva_stream_read_failures_total, and the period this was measured against in cogneva_stream_read_block_seconds"
             }
           ]
         },
