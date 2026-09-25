@@ -42,6 +42,16 @@ const PRODUCED: &[(&str, &[&str])] = &[
     // The iteration ceiling is derived per role, so which role is being cut off
     // is the question; a single unlabelled total could not answer it.
     ("agent_iteration_budget_exhausted", &["role"]),
+    // Pool recovery readings. Three separate series rather than one "recovers
+    // at" number: which upstream said it, when we will probe again, and how long
+    // the window an upstream stated is are answers of different strength, and
+    // collapsing them is how a probe cadence gets read as a promise.
+    ("llm_pool_evidenced_recovery_unix", &[]),
+    ("llm_pool_next_attempt_unix", &[]),
+    ("llm_pool_quota_window_secs", &[]),
+    ("llm_upstream_quota_window_secs", &["upstream"]),
+    ("llm_upstream_quota_reset_unix", &["upstream"]),
+    ("llm_upstream_consecutive_failures", &["upstream"]),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

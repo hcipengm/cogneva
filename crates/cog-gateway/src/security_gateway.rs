@@ -377,6 +377,89 @@ fn looks_like_offset(token: &str) -> bool {
         && token[1..].chars().all(|c| c.is_ascii_digit() || c == ':')
 }
 
+/// 上游自述的配额**窗口长度**（秒）。仅当上游给的是"周期"而不是时刻时有值。
+///
+/// 有些上游只报"这是周窗口、窗口走完即复位"，不给任何具体时刻（实测：kimi 的
+/// 403 正文 `You've reached your weekly (7-day) usage limit. Your quota will
+/// reset when the current 7-day window ends.`，响应头里也没有 `Retry-After`）。
+/// 此时 `parse_quota_reset` 什么也拿不到，嫌疑窗只能回落到指数退避的 6h 封顶。
+/// 那个封顶是对**探测节拍**的正确约束（恢复要能被及时发现），但它不是上游关于
+/// 自己何时恢复的说法：把两者当成同一个数播报，会把"本周已用尽"说成"19 分钟后
+/// 可再来"，而这正是两种完全不同的处境。窗口长度是可取到的、最接近恢复 horizon
+/// 的证据，因此单独持有、单独播报。
+///
+/// 取正文里**最先**出现的那个周期（上游通常先说结论），并只认与配额语义同现的
+/// 文本：正文里没有 limit / quota / usage 字样时返回 None，免得把"7 天试用期"
+/// 这类无关短语读成配额窗口。
+fn parse_quota_window_secs(body: &str) -> Option<u64> {
+    let lowered = body.to_ascii_lowercase();
+    if !["limit", "quota", "usage", "rate"]
+        .iter()
+        .any(|k| lowered.contains(k))
+    {
+        return None;
+    }
+
+    // (出现位置, 秒数)：单词形态与数字形态一起找，谁先出现取谁。
+    let mut found: Option<(usize, u64)> = None;
+    let mut take = |pos: usize, secs: u64| {
+        if found.is_none_or(|(p, _)| pos < p) {
+            found = Some((pos, secs));
+        }
+    };
+    for (word, secs) in [
+        ("hourly", 3_600u64),
+        ("daily", 86_400),
+        ("weekly", 7 * 86_400),
+        ("monthly", 30 * 86_400),
+    ] {
+        if let Some(pos) = lowered.find(word) {
+            take(pos, secs);
+        }
+    }
+
+    // 数字形态 `7-day` / `7 day` / `7 days` / `30-day`：扫数字串，看后面跟的
+    // 是不是周期单位。窗口是"多久"，不是"多少次"，所以单位必须落在时间词上。
+    let bytes = lowered.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut n: u64 = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            n = n
+                .saturating_mul(10)
+                .saturating_add((bytes[i] - b'0') as u64);
+            i += 1;
+        }
+        let rest = &lowered[i..];
+        let rest = rest.trim_start_matches(['-', '_', ' ']);
+        for (unit, secs) in [
+            ("second", 1u64),
+            ("minute", 60),
+            ("min", 60),
+            ("hour", 3_600),
+            ("hr", 3_600),
+            ("day", 86_400),
+            ("week", 7 * 86_400),
+            ("month", 30 * 86_400),
+        ] {
+            if rest.starts_with(unit) {
+                take(start, n.saturating_mul(secs).min(MAX_QUOTA_WINDOW_SECS));
+                break;
+            }
+        }
+    }
+    found.map(|(_, secs)| secs)
+}
+
+/// 窗口长度的上界：上游写什么我们都不当"永远不可用"播报，超过一年的数只可能是
+/// 解析错了或上游文案变了，按一年截断并保留"这只是个窗口"的语义。
+const MAX_QUOTA_WINDOW_SECS: u64 = 366 * 86_400;
+
 /// 补年份（无年份格式）：落在过去一天以上说明跨年了，加一年。
 fn fix_year(naive: chrono::NaiveDateTime) -> i64 {
     let now = Utc::now();
@@ -407,6 +490,9 @@ struct UpstreamHealth {
     /// 上游给出的配额恢复时刻（unix 秒），仅配额类失败有。它把"嫌疑"升级为
     /// "确定性不可用"：此刻之前不可能恢复，池级熔断据此判定。
     quota_reset_unix: Option<i64>,
+    /// 上游自述的配额窗口长度（秒），仅当它报的是周期而非时刻时有值。窗口不是
+    /// 恢复时刻，进不了嫌疑窗的长度计算，只用来把"多久之后"如实报给调用侧。
+    quota_window_secs: Option<u64>,
 }
 
 /// 池内两个恢复上界，来源不同、结论强度也不同，因此分开持有而不是先取 min
@@ -416,12 +502,16 @@ struct UpstreamHealth {
 ///   这是关于上游状态的证据。
 /// * `next_probe_unix`：我们自己的嫌疑窗到期时刻里最早的一个。这只是"我们下次
 ///   会再试一次"，对上游会不会恢复没有任何断言。
+/// * `window_secs`：某个嫌疑上游**自己报告**的配额窗口长度里最长的那个。上游只说
+///   "周窗口走完才复位"时没有时刻可报，此时它是唯一关于"还有多久"的说法；0 表示
+///   没有上游报过窗口。
 ///
-/// 两者都为 0 表示池内没有嫌疑上游。
+/// 三者都为 0 表示池内没有嫌疑上游。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RecoveryBounds {
     evidenced_unix: i64,
     next_probe_unix: i64,
+    window_secs: u64,
 }
 
 impl RecoveryBounds {
@@ -435,6 +525,20 @@ impl RecoveryBounds {
             (evidenced, probe) => evidenced.min(probe),
         }
     }
+}
+
+/// 一个上游的当前读数，指标与时序事件共用一份。做成具名结构而不是元组：五个
+/// 字段里有三个是 `Option`，元组读起来要靠位置分辨"哪个是恢复时刻、哪个是窗口"，
+/// 而这两个恰恰是要分开报的。
+#[derive(Debug, Clone)]
+struct UpstreamReading {
+    key: String,
+    healthy: bool,
+    consecutive_failures: u32,
+    /// 上游给出的配额恢复时刻（unix 秒）。
+    quota_reset_unix: Option<i64>,
+    /// 上游自述的配额窗口长度（秒）。
+    quota_window_secs: Option<u64>,
 }
 
 /// 两个"0 表示未知"的 unix 时刻里更早的那个。
@@ -486,6 +590,7 @@ impl LlmHealthTable {
         u: &LlmUpstream,
         probe_interval_secs: u64,
         quota_reset_unix: Option<i64>,
+        quota_window_secs: Option<u64>,
     ) -> Option<(u32, u64)> {
         let now = std::time::Instant::now();
         let mut states = self.states.lock().unwrap();
@@ -493,12 +598,16 @@ impl LlmHealthTable {
             consecutive_failures: 0,
             suspect_until: None,
             quota_reset_unix: None,
+            quota_window_secs: None,
         });
         if entry.suspect_until.is_some_and(|t| now < t) {
-            // 窗口内的重复失败不重开窗，但一旦上游给了恢复时刻就吸收它：
+            // 窗口内的重复失败不重开窗，但一旦上游给了恢复时刻或窗口就吸收它：
             // 首字节前的并发失败里，只有部分响应体带配额信息。
             if quota_reset_unix.is_some() {
                 entry.quota_reset_unix = quota_reset_unix;
+            }
+            if quota_window_secs.is_some() {
+                entry.quota_window_secs = quota_window_secs;
             }
             return None;
         }
@@ -509,6 +618,7 @@ impl LlmHealthTable {
             secs = secs.max(until_reset).min(SUSPECT_BACKOFF_CAP_SECS);
         }
         entry.quota_reset_unix = quota_reset_unix;
+        entry.quota_window_secs = quota_window_secs;
         entry.suspect_until = Some(now + std::time::Duration::from_secs(secs));
         Some((entry.consecutive_failures, secs))
     }
@@ -555,26 +665,42 @@ impl LlmHealthTable {
             if let Some(reset) = h.quota_reset_unix {
                 bounds.evidenced_unix = earlier_known(bounds.evidenced_unix, reset);
             }
+            // 取最长的那个：池里只要有一个上游报的是周窗口，池的恢复 horizon
+            // 就不会短于一周，报最短会把它的处境说轻。
+            if let Some(window) = h.quota_window_secs {
+                bounds.window_secs = bounds.window_secs.max(window);
+            }
         }
         bounds
     }
 
-    /// 逐上游健康快照：`(身份, 是否健康, 连续失败数, 配额恢复时刻)`。
-    /// 供指标与时序事件使用。
+    /// 逐上游健康快照。供指标与时序事件使用。
     ///
     /// 健康与池级判定用**同一条规则**：有未平账的失败就是不可用，只有一次真实
     /// 成功（表项被移除）才算恢复。退避窗到期只说明"值得再试一次"，不是恢复的
     /// 证据——若按"窗口未到期"报健康，同一个上游会在窗口到时的那一刻报 1，而池
     /// 因为锁存仍报 0，读图的人从两个面上得到相反的结论。
-    fn snapshot(&self, upstreams: &[LlmUpstream]) -> Vec<(String, bool, u32, Option<i64>)> {
+    fn snapshot(&self, upstreams: &[LlmUpstream]) -> Vec<UpstreamReading> {
         let states = self.states.lock().unwrap();
         upstreams
             .iter()
             .map(|u| {
                 let key = Self::key(u);
                 match states.get(&key) {
-                    Some(h) => (key, false, h.consecutive_failures, h.quota_reset_unix),
-                    None => (key, true, 0, None),
+                    Some(h) => UpstreamReading {
+                        key,
+                        healthy: false,
+                        consecutive_failures: h.consecutive_failures,
+                        quota_reset_unix: h.quota_reset_unix,
+                        quota_window_secs: h.quota_window_secs,
+                    },
+                    None => UpstreamReading {
+                        key,
+                        healthy: true,
+                        consecutive_failures: 0,
+                        quota_reset_unix: None,
+                        quota_window_secs: None,
+                    },
                 }
             })
             .collect()
@@ -711,14 +837,21 @@ impl AppState {
     /// 判据都会失效，于是每次调用照样把整个池打一遍。窗口到期即离开全灭态，
     /// 真实请求仍会立刻试一次，所以按全灭熔断不损失机会性恢复；窗口内的遍历
     /// 才是纯烧请求。
-    fn pool_circuit_break(&self, candidates: &[&LlmUpstream]) -> Option<u64> {
+    /// 池级熔断：返回 `(何时可重试, 上游自述的配额窗口)`。两个数分开给，因为
+    /// 它们答的是不同的问题——前者是"我们什么时候值得再试一次"（由探测节拍决定，
+    /// 封顶 6h），后者是"上游自己说还要多久"（可能是整整一周）。合成一个数播报，
+    /// 调用侧就无法区分"刚断了一下"和"本周的额度已经用尽"。
+    fn pool_circuit_break(&self, candidates: &[&LlmUpstream]) -> Option<(u64, u64)> {
         let owned: Vec<LlmUpstream> = candidates.iter().map(|u| (*u).clone()).collect();
         if !self.llm_health.all_suspect(&owned) {
             return None;
         }
-        let next_attempt = self.llm_health.recovery_bounds(&owned).next_attempt_unix();
-        let wait = next_attempt.saturating_sub(Utc::now().timestamp()).max(60) as u64;
-        Some(wait)
+        let bounds = self.llm_health.recovery_bounds(&owned);
+        let wait = bounds
+            .next_attempt_unix()
+            .saturating_sub(Utc::now().timestamp())
+            .max(60) as u64;
+        Some((wait, bounds.window_secs))
     }
 }
 
@@ -1082,6 +1215,7 @@ fn record_upstream_state(
     healthy: bool,
     failures: u32,
     quota_reset_unix: Option<i64>,
+    quota_window_secs: Option<u64>,
 ) {
     let key = LlmHealthTable::key(upstream);
     let reset = quota_reset_unix.unwrap_or(0);
@@ -1094,7 +1228,11 @@ fn record_upstream_state(
                 serde_json::json!(if healthy { "healthy" } else { "suspect" }),
             )
             .property("consecutive_failures", serde_json::json!(failures))
-            .property("quota_reset_unix", serde_json::json!(reset)),
+            .property("quota_reset_unix", serde_json::json!(reset))
+            .property(
+                "quota_window_secs",
+                serde_json::json!(quota_window_secs.unwrap_or(0)),
+            ),
     );
 }
 
@@ -1236,12 +1374,39 @@ async fn refresh_pool_state(state: &AppState) {
     };
     let bounds = state.llm_health.recovery_bounds(upstreams);
 
-    for (key, healthy, _failures, _reset) in state.llm_health.snapshot(upstreams) {
+    for reading in state.llm_health.snapshot(upstreams) {
         record_gauge(
             state,
             "llm_upstream_healthy",
-            if healthy { 1.0 } else { 0.0 },
-            &[("upstream", &key)],
+            if reading.healthy { 1.0 } else { 0.0 },
+            &[("upstream", &reading.key)],
+        )
+        .await;
+        // 窗口长度单独一条序列：它是上游自述"还要多久"的唯一线索，与"我们下次
+        // 什么时候探测"不是一回事，混进上面那条只会让人以为它是恢复时刻。
+        record_gauge(
+            state,
+            "llm_upstream_quota_window_secs",
+            reading.quota_window_secs.unwrap_or(0) as f64,
+            &[("upstream", &reading.key)],
+        )
+        .await;
+        // 池级那条恢复时刻只报"最早的一个"，看不出是被谁拉住的；按上游分开报，
+        // 才能回答"这个数是哪家说的"。
+        record_gauge(
+            state,
+            "llm_upstream_quota_reset_unix",
+            reading.quota_reset_unix.unwrap_or(0) as f64,
+            &[("upstream", &reading.key)],
+        )
+        .await;
+        // 连续失败数是嫌疑窗长度的唯一输入，而窗长决定"下次什么时候再试"。
+        // 判据的输入不上观测面，读图的人就只能看到一个凭空的退避时长。
+        record_gauge(
+            state,
+            "llm_upstream_consecutive_failures",
+            reading.consecutive_failures as f64,
+            &[("upstream", &reading.key)],
         )
         .await;
     }
@@ -1266,6 +1431,15 @@ async fn refresh_pool_state(state: &AppState) {
         state,
         "llm_pool_next_attempt_unix",
         bounds.next_probe_unix as f64,
+        &[],
+    )
+    .await;
+    // 第三条：上游自述的窗口长度（0 = 没有上游报过窗口）。它答的是"还要多久"，
+    // 与前两条都不同源，也不封顶——6h 封顶是对我们自己的探测节拍说的。
+    record_gauge(
+        state,
+        "llm_pool_quota_window_secs",
+        bounds.window_secs as f64,
         &[],
     )
     .await;
@@ -1628,9 +1802,10 @@ async fn stream_forward(
 
     // 池级熔断：同协议面没有一个上游当下能承接请求时，遍历重试只烧请求。
     // 直接 503 + Retry-After 让调用方立刻知道何时可再来。
-    if let Some(retry_after) = state.pool_circuit_break(&candidates) {
+    if let Some((retry_after, quota_window)) = state.pool_circuit_break(&candidates) {
         tracing::warn!(
             retry_after_secs = retry_after,
+            quota_window_secs = quota_window,
             "LLM 上游池当前无可用上游，快速失败 503"
         );
         return Ok(axum::response::Response::builder()
@@ -1641,6 +1816,15 @@ async fn stream_forward(
                 serde_json::json!({
                     "error": "所有 LLM 上游当前不可用",
                     "retry_after_seconds": retry_after,
+                    // 上游自述的窗口长度（秒），没有上游报过就是 null。它与
+                    // retry_after_seconds 答的是两个问题：那个是"什么时候值得再试"
+                    // （探测节拍，封顶 6h），这个是"上游自己说还要多久"。少了它，
+                    // 调用侧会把一次周窗口用尽读成一次短暂抖动。
+                    "quota_window_secs": if quota_window == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(quota_window)
+                    },
                 })
                 .to_string(),
             ))
@@ -1732,7 +1916,7 @@ async fn stream_forward(
                     &actor,
                 )
                 .await;
-                mark_upstream_failure(&state, upstream, base, None).await;
+                mark_upstream_failure(&state, upstream, base, None, None).await;
                 continue;
             }
         };
@@ -1754,6 +1938,7 @@ async fn stream_forward(
                 .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
             let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
+            let quota_window = parse_quota_window_secs(&text);
             // 请求形态错误（400/404/422：坏消息链、不支持的参数、端点不存在）
             // 是调用侧问题，不是上游健康问题：同一条请求换到任何兼容上游都会
             // 被拒，把它记进嫌疑窗会让一条坏请求依次毒化全池（2026-09-15
@@ -1785,7 +1970,7 @@ async fn stream_forward(
                 )
                 .await;
             } else {
-                mark_upstream_failure(&state, upstream, base, quota_reset).await;
+                mark_upstream_failure(&state, upstream, base, quota_reset, quota_window).await;
             }
             last_err = format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text));
             last_failure = Some((status, ctype, text, retry_after));
@@ -1793,7 +1978,7 @@ async fn stream_forward(
         }
         if state.note_upstream_success(upstream) {
             tracing::info!(upstream = %base, "LLM 上游恢复健康（真实请求实证）");
-            record_upstream_state(&state, upstream, true, 0, None);
+            record_upstream_state(&state, upstream, true, 0, None, None);
         }
         let elapsed_ms = start.elapsed().as_millis() as u64;
         state.llm_stats.record(elapsed_ms);
@@ -1842,12 +2027,15 @@ async fn stream_forward(
 /// 请求路径上的上游失败记账：进/加嫌疑窗，开新窗时打一条 WARN
 /// （窗口内的并发失败突发不重复计数也不刷日志），并落指标与时序明细。
 /// `quota_reset_unix` 是上游给出的配额恢复时刻（解析得到才有），
-/// 它让嫌疑窗精确覆盖到恢复时刻，窗口内不再浪费探测请求。
+/// 它让嫌疑窗精确覆盖到恢复时刻，窗口内不再浪费探测请求；
+/// `quota_window_secs` 是上游自述的窗口长度（只有周期、没有时刻时才有），
+/// 它不进嫌疑窗长度，只跟着读数走——两者的区别见 `RecoveryBounds`。
 async fn mark_upstream_failure(
     state: &AppState,
     upstream: &LlmUpstream,
     base: &str,
     quota_reset_unix: Option<i64>,
+    quota_window_secs: Option<u64>,
 ) {
     record_counter(
         state,
@@ -1859,15 +2047,24 @@ async fn mark_upstream_failure(
         upstream,
         state.config.llm_health_probe_secs,
         quota_reset_unix,
+        quota_window_secs,
     ) {
         tracing::warn!(
             upstream = %base,
             consecutive_failures = consecutive,
             suspect_window_secs = secs,
             quota_reset_unix = quota_reset_unix.unwrap_or(0),
+            quota_window_secs = quota_window_secs.unwrap_or(0),
             "LLM 上游标记嫌疑，探测窗口到期后复测"
         );
-        record_upstream_state(state, upstream, false, consecutive, quota_reset_unix);
+        record_upstream_state(
+            state,
+            upstream,
+            false,
+            consecutive,
+            quota_reset_unix,
+            quota_window_secs,
+        );
     }
 }
 
@@ -1905,24 +2102,33 @@ async fn probe_suspect_upstreams(state: &AppState) {
             Ok(()) => {
                 if state.note_upstream_success(&upstream) {
                     tracing::info!(upstream = %base, "LLM 上游探测复通，热恢复进池");
-                    record_upstream_state(state, &upstream, true, 0, None);
+                    record_upstream_state(state, &upstream, true, 0, None, None);
                 }
             }
-            Err((msg, quota_reset)) => {
+            Err((msg, quota_reset, quota_window)) => {
                 if let Some((consecutive, secs)) = state.llm_health.note_failure(
                     &upstream,
                     state.config.llm_health_probe_secs,
                     quota_reset,
+                    quota_window,
                 ) {
                     tracing::warn!(
                         upstream = %base,
                         consecutive_failures = consecutive,
                         suspect_window_secs = secs,
                         quota_reset_unix = quota_reset.unwrap_or(0),
+                        quota_window_secs = quota_window.unwrap_or(0),
                         error = %msg,
                         "LLM 上游探测仍失败，指数加窗"
                     );
-                    record_upstream_state(state, &upstream, false, consecutive, quota_reset);
+                    record_upstream_state(
+                        state,
+                        &upstream,
+                        false,
+                        consecutive,
+                        quota_reset,
+                        quota_window,
+                    );
                 }
             }
         }
@@ -1934,7 +2140,7 @@ async fn probe_suspect_upstreams(state: &AppState) {
 async fn probe_upstream(
     state: &AppState,
     upstream: &LlmUpstream,
-) -> Result<(), (String, Option<i64>)> {
+) -> Result<(), (String, Option<i64>, Option<u64>)> {
     let base = upstream.base_url.trim_end_matches('/');
     let url = match upstream.api_style.as_str() {
         "anthropic" => format!("{base}/v1/messages"),
@@ -1959,7 +2165,7 @@ async fn probe_upstream(
     let resp = builder
         .send()
         .await
-        .map_err(|e| (format!("连接失败: {e}"), None))?;
+        .map_err(|e| (format!("连接失败: {e}"), None, None))?;
     let status = resp.status();
     if status.is_success() {
         Ok(())
@@ -1971,9 +2177,11 @@ async fn probe_upstream(
             .map(|s| s.to_string());
         let text = resp.text().await.unwrap_or_default();
         let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
+        let quota_window = parse_quota_window_secs(&text);
         Err((
             format!("HTTP {status}: {}", error_excerpt(&text)),
             quota_reset,
+            quota_window,
         ))
     }
 }
@@ -1991,14 +2199,21 @@ async fn call_llm(
     // 与透传路径同一套热切换语义：健康优先，任何单上游失败（含鉴权类——
     // 池内各家凭证互相独立，A 家 key 坏不代表 B 家坏）都切下一个。
     let next_candidates: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
-    if let Some(retry_after) = state.pool_circuit_break(&next_candidates) {
+    if let Some((retry_after, quota_window)) = state.pool_circuit_break(&next_candidates) {
         tracing::warn!(
             retry_after_secs = retry_after,
+            quota_window_secs = quota_window,
             "LLM 上游池当前无可用上游，快速失败 503"
         );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("所有 LLM 上游当前不可用，{retry_after} 秒后重试"),
+            match quota_window {
+                0 => format!("所有 LLM 上游当前不可用，{retry_after} 秒后重试"),
+                w => format!(
+                    "所有 LLM 上游当前不可用，{retry_after} 秒后重试；\
+                     有上游自述处在 {w} 秒量级的配额窗口内（窗口走完才可能复位）"
+                ),
+            },
         ));
     }
     let candidates = order_by_health(next_candidates, &state.llm_health);
@@ -2012,7 +2227,7 @@ async fn call_llm(
             Ok(resp) => {
                 if state.note_upstream_success(upstream) {
                     tracing::info!(upstream = %upstream.base_url, "LLM 上游恢复健康（真实请求实证）");
-                    record_upstream_state(state, upstream, true, 0, None);
+                    record_upstream_state(state, upstream, true, 0, None, None);
                 }
                 record_llm_call(
                     state,
@@ -2024,7 +2239,7 @@ async fn call_llm(
                 .await;
                 return Ok(resp);
             }
-            Err((msg, quota_reset)) => {
+            Err((msg, quota_reset, quota_window)) => {
                 tracing::warn!(upstream = %upstream.base_url, error = %msg, "LLM 上游调用失败，切换池内下一个");
                 record_llm_call(
                     state,
@@ -2039,6 +2254,7 @@ async fn call_llm(
                     upstream,
                     upstream.base_url.trim_end_matches('/'),
                     quota_reset,
+                    quota_window,
                 )
                 .await;
                 last_err = msg;
@@ -2056,7 +2272,7 @@ async fn call_one_upstream(
     upstream: &LlmUpstream,
     messages: &[ChatMessage],
     actor: &str,
-) -> Result<Json<LlmResponse>, (String, Option<i64>)> {
+) -> Result<Json<LlmResponse>, (String, Option<i64>, Option<u64>)> {
     let start = std::time::Instant::now();
     let base = upstream.base_url.trim_end_matches('/');
     if upstream.api_style == "anthropic" {
@@ -2085,7 +2301,7 @@ async fn call_one_upstream(
             }))
             .send()
             .await
-            .map_err(|e| (format!("连接上游 {base} 失败: {e}"), None))?;
+            .map_err(|e| (format!("连接上游 {base} 失败: {e}"), None, None))?;
         let status = resp.status();
         if !status.is_success() {
             let retry_after = resp
@@ -2095,15 +2311,17 @@ async fn call_one_upstream(
                 .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
             let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
+            let quota_window = parse_quota_window_secs(&text);
             return Err((
                 format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
                 quota_reset,
+                quota_window,
             ));
         }
         let v: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None))?;
+            .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None, None))?;
         let (usage_in, usage_out) = extract_usage(&v);
         record_llm_tokens(
             state,
@@ -2135,7 +2353,7 @@ async fn call_one_upstream(
         }))
         .send()
         .await
-        .map_err(|e| (format!("连接上游 {base} 失败: {e}"), None))?;
+        .map_err(|e| (format!("连接上游 {base} 失败: {e}"), None, None))?;
     let status = resp.status();
     if !status.is_success() {
         let retry_after = resp
@@ -2145,15 +2363,17 @@ async fn call_one_upstream(
             .map(|s| s.to_string());
         let text = resp.text().await.unwrap_or_default();
         let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
+        let quota_window = parse_quota_window_secs(&text);
         return Err((
             format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
             quota_reset,
+            quota_window,
         ));
     }
     let v: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None))?;
+        .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None, None))?;
     let (usage_in, usage_out) = extract_usage(&v);
     record_llm_tokens(
         state,
@@ -3865,11 +4085,11 @@ mod tests {
         };
         assert!(!table.is_suspect(&u));
         // 首次失败开新窗：返回计数供调用方打 WARN。
-        assert_eq!(table.note_failure(&u, 300, None), Some((1, 300)));
+        assert_eq!(table.note_failure(&u, 300, None, None), Some((1, 300)));
         assert!(table.is_suspect(&u));
         assert!(!table.due_for_probe(&u));
         // 窗口内的后续失败静默（不重复计数、不刷日志）。
-        assert_eq!(table.note_failure(&u, 300, None), None);
+        assert_eq!(table.note_failure(&u, 300, None, None), None);
         // 成功即恢复健康；note_success 报告此前确实处于嫌疑。
         assert!(table.note_success(&u));
         assert!(!table.is_suspect(&u));
@@ -3914,6 +4134,80 @@ mod tests {
         assert!(parse_quota_reset("reset at 09-18 15:39:00 UTC.", Some("soon")).is_some());
     }
 
+    /// 只报窗口、不给时刻的上游（实测形态）：窗口能被读出来，而"恢复时刻"读不到。
+    /// 这两个结论必须同时成立——若把窗口当成时刻，嫌疑窗就会被设到一个编出来的
+    /// 时间点上；若读不出窗口，调用侧只能看到 6h 封顶后的探测节拍。
+    #[test]
+    fn a_quota_window_without_an_instant_is_a_window_and_not_a_time() {
+        const KIMI: &str = r#"{"error":{"message":"You've reached your weekly (7-day) usage limit. \
+Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage \
+or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
+"type":"access_terminated_error"}}"#;
+        assert_eq!(parse_quota_window_secs(KIMI), Some(7 * 86_400));
+        assert!(
+            parse_quota_reset(KIMI, None).is_none(),
+            "这种体里没有恢复时刻，读出来的只能是窗口"
+        );
+
+        // 数字形态与单词形态都认，且取正文里最先出现的那个。
+        assert_eq!(
+            parse_quota_window_secs("daily usage limit reached"),
+            Some(86_400)
+        );
+        assert_eq!(
+            parse_quota_window_secs("quota exceeded: 30-day limit"),
+            Some(30 * 86_400)
+        );
+        assert_eq!(
+            parse_quota_window_secs("rate limit: reset in 2 hours"),
+            Some(3_600 * 2)
+        );
+        // 与配额无关的文本里出现"7 天"不是窗口。
+        assert_eq!(
+            parse_quota_window_secs("your 7-day free trial starts"),
+            None
+        );
+        assert_eq!(parse_quota_window_secs(""), None);
+        // 离谱的数字按一年截断，不播报成"永远不可用"。
+        assert_eq!(
+            parse_quota_window_secs("quota: 9999-day window"),
+            Some(MAX_QUOTA_WINDOW_SECS)
+        );
+    }
+
+    /// 上游报了窗口，封顶仍必须卡在探测节拍上：嫌疑窗长度不变（自愈要能及时
+    /// 发现恢复），窗口长度单独持有（如实告诉调用侧"还有多久"）。
+    #[test]
+    fn a_stated_window_does_not_stretch_the_probe_window() {
+        let table = LlmHealthTable::default();
+        let u = LlmUpstream {
+            api_style: "openai".into(),
+            base_url: "https://a".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            supports_tool_calls: None,
+            requires_temperature_one: None,
+        };
+        let pool = vec![u.clone()];
+        assert_eq!(
+            table.note_failure(&u, 300, None, Some(7 * 86_400)),
+            Some((1, 300)),
+            "窗口不参与嫌疑窗长度计算，首窗仍是探测间隔"
+        );
+        let bounds = table.recovery_bounds(&pool);
+        assert_eq!(bounds.evidenced_unix, 0, "没有恢复时刻就没有证据时刻");
+        assert_eq!(bounds.window_secs, 7 * 86_400, "窗口原样持有");
+
+        // 池内两家各报各的窗口时取最长的：池的 horizon 由最难的那家决定。
+        let v = LlmUpstream {
+            base_url: "https://b".into(),
+            ..u.clone()
+        };
+        table.note_failure(&v, 300, None, Some(86_400));
+        let bounds = table.recovery_bounds(&[u, v]);
+        assert_eq!(bounds.window_secs, 7 * 86_400);
+    }
+
     #[test]
     fn health_table_quota_window_and_pool_verdicts() {
         let table = LlmHealthTable::default();
@@ -3934,13 +4228,13 @@ mod tests {
         assert_eq!(table.recovery_bounds(&pool), RecoveryBounds::default());
 
         // 配额窗：窗口被拉到恢复时刻，且给出恢复时间上界。
-        table.note_failure(&a, 300, Some(far));
+        table.note_failure(&a, 300, Some(far), None);
         assert!(table.is_suspect(&a));
         assert!(!table.all_suspect(&pool), "还有健康上游时池未全灭");
         assert_eq!(table.recovery_bounds(&pool).evidenced_unix, far);
 
         // 第二个上游只是瞬时失败（无 reset）→ 同样计入"全灭"：它当下也承接不了。
-        table.note_failure(&b, 300, None);
+        table.note_failure(&b, 300, None, None);
         assert!(table.all_suspect(&pool));
         // b 的退避窗（300s）比 a 的配额恢复上界（7200s）近，等待用的一刻取 b 的窗；
         // 但 a 报告过的恢复时刻不能被它顶掉——那是两种证据。合并成一个数就会把
@@ -3974,12 +4268,13 @@ mod tests {
 
         assert_eq!(state.pool_circuit_break(&all), None, "池健康时不熔断");
 
-        state.llm_health.note_failure(&a, 300, Some(far));
+        state.llm_health.note_failure(&a, 300, Some(far), None);
         assert_eq!(state.pool_circuit_break(&all), None, "池内仍有健康上游");
 
-        state.llm_health.note_failure(&b, 300, Some(far));
-        let wait = state.pool_circuit_break(&all).expect("全在嫌疑窗内即熔断");
+        state.llm_health.note_failure(&b, 300, Some(far), None);
+        let (wait, window) = state.pool_circuit_break(&all).expect("全在嫌疑窗内即熔断");
         assert!((3_500..=3_600).contains(&wait), "Retry-After 指向最早恢复");
+        assert_eq!(window, 0, "没有上游报过窗口时不编造一个");
 
         // 异构全灭：一家配额以 429 + reset 给出，另一家配额以 403 给出且不带
         // 恢复时刻。必须照样熔断——否则每次调用仍会把整个池遍历一遍，烧掉
@@ -3990,8 +4285,8 @@ mod tests {
         ]);
         let c = stub_upstream("https://c.example.com", "m3");
         let d = stub_upstream("https://d.example.com", "m4");
-        state.llm_health.note_failure(&c, 300, Some(far));
-        state.llm_health.note_failure(&d, 300, None);
+        state.llm_health.note_failure(&c, 300, Some(far), None);
+        state.llm_health.note_failure(&d, 300, None, None);
         let all: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
         assert!(
             state.pool_circuit_break(&all).is_some(),
@@ -4009,7 +4304,7 @@ mod tests {
         let far = Utc::now().timestamp() + 1_200;
         let state = test_state(vec![stub_upstream("https://dead.example.com", "m1")]);
         let u = stub_upstream("https://dead.example.com", "m1");
-        state.llm_health.note_failure(&u, 300, Some(far));
+        state.llm_health.note_failure(&u, 300, Some(far), None);
 
         let req = axum::extract::Request::builder()
             .method("POST")
@@ -4046,7 +4341,7 @@ mod tests {
 
         // 配额全灭：池不可用，边沿置位。
         let far = Utc::now().timestamp() + 600;
-        state.llm_health.note_failure(&u, 300, Some(far));
+        state.llm_health.note_failure(&u, 300, Some(far), None);
         refresh_pool_state(&state).await;
         assert!(state.pool_down.load(Ordering::SeqCst));
         let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
@@ -4079,7 +4374,7 @@ mod tests {
         let u = stub_upstream("https://a.example.com", "m1");
         let far = Utc::now().timestamp() + 600;
 
-        state.llm_health.note_failure(&u, 300, Some(far));
+        state.llm_health.note_failure(&u, 300, Some(far), None);
         refresh_pool_state(&state).await;
         assert!(state.pool_down.load(Ordering::SeqCst), "全上游不可用即置位");
 
@@ -4102,7 +4397,7 @@ mod tests {
         let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
         let u = stub_upstream("https://a.example.com", "m1");
         let key = LlmHealthTable::key(&u);
-        state.llm_health.note_failure(&u, 300, None);
+        state.llm_health.note_failure(&u, 300, None, None);
         refresh_pool_state(&state).await;
 
         let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
@@ -4180,7 +4475,7 @@ mod tests {
         let a = mk("https://a");
         let b = mk("https://b");
         let c = mk("https://c");
-        table.note_failure(&b, 300, None);
+        table.note_failure(&b, 300, None, None);
         let ordered = order_by_health(vec![&a, &b, &c], &table);
         assert_eq!(ordered[0].base_url, "https://a");
         assert_eq!(ordered[1].base_url, "https://c");
@@ -4361,7 +4656,7 @@ mod tests {
         // 手工把第一个上游标记为嫌疑（模拟上一轮失败开窗）。
         state
             .llm_health
-            .note_failure(&stub_upstream(&first, "m1"), 300, None);
+            .note_failure(&stub_upstream(&first, "m1"), 300, None, None);
 
         let req = axum::extract::Request::builder()
             .method("POST")
@@ -4391,7 +4686,7 @@ mod tests {
         .await;
         let state = test_state(vec![stub_upstream(&alive, "m1")]);
         let u = stub_upstream(&alive, "m1");
-        state.llm_health.note_failure(&u, 300, None);
+        state.llm_health.note_failure(&u, 300, None, None);
         assert!(state.llm_health.is_suspect(&u));
         assert!(!state.llm_health.due_for_probe(&u));
 
@@ -4418,7 +4713,7 @@ mod tests {
             spawn_stub_upstream(403, r#"{"error":{"type":"access_terminated_error"}}"#).await;
         let state = test_state(vec![stub_upstream(&dead, "m1")]);
         let u = stub_upstream(&dead, "m1");
-        state.llm_health.note_failure(&u, 300, None);
+        state.llm_health.note_failure(&u, 300, None, None);
         {
             let mut states = state.llm_health.states.lock().unwrap();
             let entry = states

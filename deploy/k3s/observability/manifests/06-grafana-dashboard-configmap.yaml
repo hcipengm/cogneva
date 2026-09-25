@@ -345,6 +345,123 @@ data:
             "wrapLogMessage": true,
             "sortOrder": "Descending"
           }
+        },
+        {
+          "id": 11,
+          "title": "LLM Pool Recovery Horizon",
+          "description": "How long until the pool is tried again, and on whose word. The first two series are time-to-that-instant; the third is not a countdown at all but the length of the quota window an upstream stated about itself, so a weekly window stays visible as ~604800 even while the pool keeps probing every few minutes. A horizon that keeps re-reading the same small number is our probe cadence, not an upstream promise to be back.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 40
+          },
+          "targets": [
+            {
+              "expr": "clamp_min(llm_pool_evidenced_recovery_unix - time(), 0)",
+              "legendFormat": "reset an upstream reported",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "clamp_min(llm_pool_next_attempt_unix - time(), 0)",
+              "legendFormat": "when we probe again",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "llm_pool_quota_window_secs",
+              "legendFormat": "window an upstream stated",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 12,
+          "title": "Upstream Stated Quota State",
+          "description": "Per upstream, what it said about its own quota, in seconds. A series pinned near 604800 is a weekly allowance that has run out, and no amount of retrying will bring it back sooner; a series at 0 on the window means that upstream has not refused with a window, not that its window is short. The reset series is the same word as time-to-that-instant, so it shows which upstream is holding the pool horizon up.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 40
+          },
+          "targets": [
+            {
+              "expr": "llm_upstream_quota_window_secs",
+              "legendFormat": "window stated: {{upstream}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "clamp_min(llm_upstream_quota_reset_unix - time(), 0)",
+              "legendFormat": "reset stated: {{upstream}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 13,
+          "title": "Upstream Failure Streaks",
+          "description": "Consecutive failures per upstream, the only input to how long that upstream is backed off for. A streak that keeps climbing while the pool horizon stays small is an upstream failing for a reason it is not telling us about.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 48
+          },
+          "targets": [
+            {
+              "expr": "llm_upstream_consecutive_failures",
+              "legendFormat": "{{upstream}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
