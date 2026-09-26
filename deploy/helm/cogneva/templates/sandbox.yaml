@@ -154,6 +154,23 @@ spec:
               value: {{ .Values.sandboxExecutor.repoFetchIntervalSecs | quote }}
             - name: SANDBOX_MAX_TASK_WORKSPACES
               value: {{ .Values.sandboxExecutor.maxTaskWorkspaces | quote }}
+            {{- if .Values.hostDocuments.scopes }}
+            {{- $mount := required "hostDocuments.mountPath is required when hostDocuments.scopes is set" .Values.hostDocuments.mountPath }}
+            {{- $pairs := list }}
+            {{- range $name, $path := .Values.hostDocuments.scopes }}
+            {{- if not $path }}{{ fail (printf "hostDocuments.scopes.%s has no host path" $name) }}{{ end }}
+            {{- $pairs = append $pairs (printf "%s=%s/%s" $name $mount $name) }}
+            {{- end }}
+            # 文档范围按身份绑定：名字来自这份清单，路径由模板算出，模型只产出
+            # 相对路径。挂载点与 scope 名一一对应，所以"能碰到谁的文件"在部署
+            # 面上就定死了。
+            - name: HOST_DOCS_SCOPES
+              value: {{ join "," $pairs | quote }}
+            - name: HOST_DOCS_JOURNAL_DIR
+              value: {{ .Values.hostDocuments.journalDir | quote }}
+            - name: HOST_DOCS_MAX_WRITE_BYTES
+              value: {{ .Values.hostDocuments.maxWriteBytes | quote }}
+            {{- end }}
           startupProbe:
             httpGet:
               path: /health/live
@@ -174,10 +191,28 @@ spec:
           volumeMounts:
             - name: sandbox-data
               mountPath: /opt/cogneva/sandbox
+            {{- if .Values.hostDocuments.scopes }}
+            {{- $mount := .Values.hostDocuments.mountPath }}
+            {{- range $name, $path := .Values.hostDocuments.scopes }}
+            - name: host-docs-{{ $name }}
+              mountPath: {{ $mount }}/{{ $name }}
+            {{- end }}
+            {{- end }}
       volumes:
         - name: sandbox-data
           persistentVolumeClaim:
             claimName: cogneva-sandbox-pvc
+        {{- if .Values.hostDocuments.scopes }}
+        {{- range $name, $path := .Values.hostDocuments.scopes }}
+        # type: Directory（非 DirectoryOrCreate）：宿主上路径不对就让 Pod 起不来，
+        # 而不是替运维在宿主上建一个空目录——那会把"配置写错了"变成"整理出了
+        # 一个空文件夹"。
+        - name: host-docs-{{ $name }}
+          hostPath:
+            path: {{ $path | quote }}
+            type: Directory
+        {{- end }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

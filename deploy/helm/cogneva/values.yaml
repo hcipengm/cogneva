@@ -300,6 +300,24 @@ sandboxExecutor:
       cpu: 1000m
       memory: 1Gi
 
+# 宿主机文档整理：把文档所在的目录**窄挂载**进沙箱执行器，让平台代文档属主
+# 整理这些文档。边界是挂载范围而不是白名单代码——只把属主自己的目录挂进来，
+# 宿主其余部分根本不在这台容器的文件系统里，于是没有"判断写错"的余地。
+# 默认 `scopes: {}` = 能力关闭：执行器不挂任何宿主目录，文档路由答 409。
+#
+# key 是 scope 名（= 文档属主的身份），value 是该属主在**宿主**上的目录。
+# 容器内挂载点固定为 `<mountPath>/<name>`；`hostPath.type: Directory`（不是
+# DirectoryOrCreate）——路径写错就 Pod 起不来，而不是在宿主上凭空建一个空目录。
+# 执行器以 uid 1001 运行，宿主目录要对该 uid 可写，否则第一次写入会以明确错误失败。
+hostDocuments:
+  scopes: {}
+  mountPath: /opt/cogneva/host-docs
+  # 回滚日志落在执行器自己的持久卷上：日志随进程一起消失的部署，等于没有回滚。
+  journalDir: /opt/cogneva/sandbox/host-docs-journal
+  # 单份文档的重写上限（字节）。回滚要留一份原文副本，这个上限同时界住了
+  # 一次操作与一份日志的大小。
+  maxWriteBytes: 8388608
+
 # 节点镜像构建（buildah DaemonSet）：每节点提供 buildah 能力，产物导入节点
 # containerd 作暖缓存；工作负载运行时镜像权威走集群内 registry（见 image.repository）。
 # containerdSocket 是容器运行时 socket 在宿主的路径，随发行版不同：

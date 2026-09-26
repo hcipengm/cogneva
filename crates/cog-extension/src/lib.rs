@@ -9,6 +9,7 @@
 
 pub mod command_server;
 pub mod executor;
+pub mod hostdocs;
 pub mod plugin;
 pub mod registry;
 pub mod runtime;
