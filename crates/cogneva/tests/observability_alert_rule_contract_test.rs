@@ -569,3 +569,404 @@ fn the_puller_is_handed_the_persistent_alert_sink() {
         "sink 缺席时的降级路径没有留下痕迹：那时告警面是空的，而代码看起来什么都有"
     );
 }
+
+// ── 表达式的值能不能满足它自己的条件 ─────────────────────────────────────────
+
+/// A range of values, open or closed at each end. Infinities stand for "no
+/// bound"; an infinite end is never inclusive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Range {
+    low: f64,
+    low_inclusive: bool,
+    high: f64,
+    high_inclusive: bool,
+}
+
+impl Range {
+    fn everything() -> Self {
+        Self {
+            low: f64::NEG_INFINITY,
+            low_inclusive: false,
+            high: f64::INFINITY,
+            high_inclusive: false,
+        }
+    }
+
+    fn at(value: f64) -> Self {
+        Self {
+            low: value,
+            low_inclusive: true,
+            high: value,
+            high_inclusive: true,
+        }
+    }
+
+    fn above(value: f64, inclusive: bool) -> Self {
+        Self {
+            low: value,
+            low_inclusive: inclusive,
+            high: f64::INFINITY,
+            high_inclusive: false,
+        }
+    }
+
+    fn below(value: f64, inclusive: bool) -> Self {
+        Self {
+            low: f64::NEG_INFINITY,
+            low_inclusive: false,
+            high: value,
+            high_inclusive: inclusive,
+        }
+    }
+
+    /// Whether the two ranges share at least one value.
+    fn intersects(&self, other: &Range) -> bool {
+        if self.low > self.high || other.low > other.high {
+            return false;
+        }
+        let (low, low_inclusive) = if self.low > other.low {
+            (self.low, self.low_inclusive)
+        } else if other.low > self.low {
+            (other.low, other.low_inclusive)
+        } else {
+            (self.low, self.low_inclusive && other.low_inclusive)
+        };
+        let (high, high_inclusive) = if self.high < other.high {
+            (self.high, self.high_inclusive)
+        } else if other.high < self.high {
+            (other.high, other.high_inclusive)
+        } else {
+            (self.high, self.high_inclusive && other.high_inclusive)
+        };
+        low < high || (low == high && low_inclusive && high_inclusive)
+    }
+}
+
+fn is_word_byte(c: u8) -> bool {
+    (c as char).is_ascii_alphanumeric() || c == b'_'
+}
+
+/// Split on the leftmost top-level `and` / `or` / `unless`, if there is one.
+fn split_set_operator(expr: &str) -> Option<(&'static str, &str, &str)> {
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] as char {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && bytes[i].is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            let op = match &expr[start..i] {
+                "and" => Some("and"),
+                "or" => Some("or"),
+                "unless" => Some("unless"),
+                _ => None,
+            };
+            if let Some(op) = op {
+                let mut right_start = i;
+                while right_start < bytes.len()
+                    && (bytes[right_start] as char).is_ascii_whitespace()
+                {
+                    right_start += 1;
+                }
+                // `and on(pod) (...)` carries a matching clause between the
+                // operator and its right operand. The clause does not change
+                // which side supplies the values, so it stays attached to the
+                // right half.
+                return Some((op, &expr[..start], &expr[right_start..]));
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip one layer of balanced parentheses wrapping the whole expression.
+fn strip_outer_parens(expr: &str) -> &str {
+    let mut cur = expr.trim();
+    loop {
+        if !(cur.starts_with('(') && cur.ends_with(')')) {
+            return cur;
+        }
+        let mut depth = 0i32;
+        let bytes = cur.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            match *b as char {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    // The opening paren closed before the end: not a wrapper.
+                    if depth == 0 && i + 1 != bytes.len() {
+                        return cur;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return cur;
+        }
+        cur = cur[1..cur.len() - 1].trim();
+    }
+}
+
+/// The range a leaf expression reports, or `None` when this cannot tell.
+fn leaf_range(expr: &str) -> Option<Range> {
+    let expr = strip_outer_parens(expr);
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut found: Option<(usize, &'static str)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] as char {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            let rest = &expr[i..];
+            let op = if rest.starts_with("==") {
+                Some("==")
+            } else if rest.starts_with("!=") {
+                Some("!=")
+            } else if rest.starts_with("<=") {
+                Some("<=")
+            } else if rest.starts_with(">=") {
+                Some(">=")
+            } else if rest.starts_with('=') || rest.starts_with("=~") || rest.starts_with("!~") {
+                // A bare `=` or a regex matcher belongs inside braces; at depth
+                // zero it is a typo this check does not own.
+                None
+            } else if rest.starts_with('<') {
+                Some("<")
+            } else if rest.starts_with('>') {
+                Some(">")
+            } else {
+                None
+            };
+            if let Some(op) = op {
+                found = Some((i, op));
+                i += op.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let (at, op) = found?;
+    let rhs = expr[at + op.len()..].trim();
+    // `bool` turns the comparison into a 0/1 indicator rather than a filter, so
+    // the operand's own value no longer arrives. What the indicator can hold is
+    // bounded, but reading its exact domain is not this check's job.
+    if rhs.starts_with("bool") {
+        return None;
+    }
+    let value: f64 = rhs.parse().ok()?;
+    Some(match op {
+        "==" => Range::at(value),
+        "<" => Range::below(value, false),
+        "<=" => Range::below(value, true),
+        ">" => Range::above(value, false),
+        ">=" => Range::above(value, true),
+        _ => return None,
+    })
+}
+
+/// The ranges of values an expression can hand to its rule's condition.
+///
+/// Only the outermost operators decide. `and` and `unless` report the left
+/// operand's values and `or` reports either side's, so this walks the top-level
+/// set operators down to the leaves they leave. Anything unrecognised widens to
+/// every real number.
+fn reported_ranges(expr: &str) -> Vec<Range> {
+    match split_set_operator(expr) {
+        Some(("and" | "unless", left, _)) => reported_ranges(left),
+        Some(("or", left, right)) => {
+            let mut both = reported_ranges(left);
+            both.extend(reported_ranges(right));
+            both
+        }
+        _ => vec![leaf_range(expr).unwrap_or_else(Range::everything)],
+    }
+}
+
+/// The values a condition accepts, or `None` when it accepts too much to pin
+/// down (which reads as "no complaint").
+fn accepted_range(condition: &cog_core::AlertCondition) -> Option<Range> {
+    use cog_core::AlertCondition as C;
+    Some(match condition {
+        C::GreaterThan(t) => Range::above(*t, false),
+        C::GreaterThanOrEqual(t) => Range::above(*t, true),
+        C::LessThan(t) => Range::below(*t, false),
+        C::LessThanOrEqual(t) => Range::below(*t, true),
+        C::Equal(t) => Range::at(*t),
+        // Every real number but one satisfies `!= t`, and an expression that
+        // can only report a single point is not what a threshold rule is for.
+        C::NotEqual(_) => return None,
+    })
+}
+
+/// Complaints about a rule whose condition can never be satisfied by the value
+/// its own expression reports.
+///
+/// A comparison without `bool` is a filter: Prometheus keeps the operand's own
+/// value, so `x == 0` hands the condition 0 rather than 1, and a condition of
+/// `> 0` then asks for a value the expression cannot produce. The rule is
+/// silent for good, through exactly the incident it was written for — and the
+/// name-level checks cannot see it, because every series in the expression is
+/// really produced and the expression really parses.
+///
+/// This is not an evaluator. It reads the outermost operators, and any shape it
+/// cannot classify counts as satisfiable: a shape it misses leaves the rule as
+/// silent as it already is, while a wrong complaint would block a rule that
+/// works.
+fn unreachable_condition_complaints(
+    expr: &str,
+    condition: &cog_core::AlertCondition,
+) -> Vec<String> {
+    let Some(accepted) = accepted_range(condition) else {
+        return Vec::new();
+    };
+    let reachable = reported_ranges(expr);
+    if reachable.iter().any(|r| r.intersects(&accepted)) {
+        return Vec::new();
+    }
+    vec![format!(
+        "表达式报给条件的值落在 {reachable:?}，而条件的取值域是 {accepted:?}，两者不相交：\
+         这条规则永远不会触发（比较运算符不带 `bool` 时是过滤，报的是操作数自己的值，\
+         不是比较的结果）"
+    )]
+}
+
+fn chart_rules_with_condition() -> Vec<(String, String, cog_core::AlertCondition)> {
+    let path = repo_root().join(CHART_CONFIG);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("chart config unreadable at {}: {e}", path.display()));
+    let value: serde_json::Value =
+        serde_json::from_str(&text).expect("chart config is not valid JSON");
+    value["observability"]["infra_watch"]["rules"]
+        .as_array()
+        .expect("observability.infra_watch.rules is not an array")
+        .iter()
+        .map(|rule| {
+            let condition = serde_json::from_value(rule["condition"].clone())
+                .unwrap_or_else(|e| panic!("rule {} has no readable condition: {e}", rule["name"]));
+            (
+                rule["name"].as_str().unwrap_or_default().to_string(),
+                rule["promql"].as_str().unwrap_or_default().to_string(),
+                condition,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn every_condition_can_be_reached_by_the_value_its_rule_reports() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql, condition) in chart_rules_with_condition() {
+        for complaint in unreachable_condition_complaints(&promql, &condition) {
+            complaints.push(format!("{rule}: {complaint}\n    {promql}"));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "这些规则的条件永远满足不了，规则不会触发:\n{}",
+        complaints.join("\n")
+    );
+}
+
+#[test]
+fn a_condition_its_own_filter_contradicts_is_reported() {
+    use cog_core::AlertCondition as C;
+    // The shape this check exists for: the filter pins the value to 0 and the
+    // condition then asks for something greater than 0.
+    let complaints = unreachable_condition_complaints(
+        "cogneva_aof_repair_verdict_published == 0",
+        &C::GreaterThan(0.0),
+    );
+    assert_eq!(complaints.len(), 1, "{complaints:?}");
+    assert!(complaints[0].contains("永远不会触发"), "{}", complaints[0]);
+
+    // The same expression against a threshold it can reach is accepted, which
+    // is what the rule was rewritten to.
+    assert!(unreachable_condition_complaints(
+        "cogneva_aof_repair_verdict_published < 1",
+        &C::LessThan(1.0)
+    )
+    .is_empty());
+    assert!(unreachable_condition_complaints(
+        "cogneva_aof_repair_verdict_published == 0",
+        &C::LessThan(1.0)
+    )
+    .is_empty());
+}
+
+#[test]
+fn filters_the_written_rules_use_are_not_reported() {
+    use cog_core::AlertCondition as C;
+    let fine = [
+        ("cogneva_aof_repair_dropped_bytes > 0", C::GreaterThan(0.0)),
+        (
+            "sum by (intent) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0 \
+             and on(intent) (sum by (intent) (increase(cogneva_change_fate_total{fate=\"landed\"}[24h])) == 0)",
+            C::GreaterThan(0.0),
+        ),
+        (
+            "(cogneva_process_zombies > 0) and (cogneva_process_zombies == (cogneva_process_zombies offset 30m))",
+            C::GreaterThan(0.0),
+        ),
+        (
+            "count(kube_pod_init_container_info{namespace=\"cogneva\", container=\"aof-repair\"} \
+             and on(pod) kube_pod_status_phase{namespace=\"cogneva\", phase=\"Running\"} == 1) \
+             - (count(cogneva_aof_repair_pass_timestamp_seconds) or vector(0))",
+            C::GreaterThan(0.0),
+        ),
+        ("cogneva_runtime_asset_manifest_absent", C::GreaterThan(0.0)),
+        (
+            "container_memory_working_set_bytes{container!=\"\"} \
+             / on(namespace, pod, container) (kube_pod_container_resource_limits{resource=\"memory\"} > 0)",
+            C::GreaterThan(0.75),
+        ),
+    ];
+    for (expr, condition) in fine {
+        let complaints = unreachable_condition_complaints(expr, &condition);
+        assert!(complaints.is_empty(), "{expr}: {complaints:?}");
+    }
+}
+
+#[test]
+fn a_cap_below_the_threshold_is_reported_and_an_unreadable_operand_is_not() {
+    use cog_core::AlertCondition as C;
+    assert_eq!(
+        unreachable_condition_complaints("a < 5", &C::GreaterThan(10.0)).len(),
+        1
+    );
+    // Widening beats guessing: an operand this cannot read is not a complaint.
+    assert!(unreachable_condition_complaints("a > 2 * b", &C::GreaterThan(0.0)).is_empty());
+    assert!(unreachable_condition_complaints("a > b", &C::GreaterThan(0.0)).is_empty());
+    assert!(unreachable_condition_complaints("a == bool 0", &C::GreaterThan(0.0)).is_empty());
+    assert!(unreachable_condition_complaints("a != 0", &C::GreaterThan(0.0)).is_empty());
+}
+
+#[test]
+fn set_operators_decide_which_side_supplies_the_value() {
+    use cog_core::AlertCondition as C;
+    assert!(
+        unreachable_condition_complaints("(a == 0) or (b > 5)", &C::GreaterThan(3.0)).is_empty()
+    );
+    assert_eq!(
+        unreachable_condition_complaints("(a == 0) and (b > 5)", &C::GreaterThan(3.0)).len(),
+        1
+    );
+    assert_eq!(
+        unreachable_condition_complaints("(a == 0) unless (b > 5)", &C::GreaterThan(3.0)).len(),
+        1
+    );
+}

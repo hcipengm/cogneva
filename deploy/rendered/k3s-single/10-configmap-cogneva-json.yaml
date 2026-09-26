@@ -569,9 +569,9 @@ data:
             },
             {
               "name": "aof_repair_verdict_absent",
-              "promql": "cogneva_aof_repair_verdict_published == 0",
+              "promql": "cogneva_aof_repair_verdict_published < 1",
               "condition": {
-                "greater_than": 0.0
+                "less_than": 1.0
               },
               "severity": "warning",
               "summary": "the message queue started without publishing an AOF repair verdict: the image predates the repair command, the run died before it could publish, or the operand it was given was not honoured. Every aof_repair_* series is then absent rather than zero, and an absent reading cannot be read as a clean start — check the pod's aof-repair init container log and the image tag it resolved to. This rule exists so that a blind observation face fails loudly instead of passing for a healthy one"

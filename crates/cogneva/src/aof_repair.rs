@@ -830,10 +830,15 @@ mod tests {
     }
 
     /// The rule that reads the published gauge has to treat it as a presence
-    /// statement. A rename on either side of the contract is caught by the
-    /// alert-rule table; what that table cannot see is the comparison, and
-    /// `> 0` on a gauge that is 1 whenever the reading exists alerts on every
-    /// healthy redis instead of on the one that cannot publish.
+    /// statement: it fires on the reading that says nothing was published and
+    /// stays quiet on the reading that says something was. A rename on either
+    /// side of the contract is caught by the alert-rule table; what that table
+    /// could not see is whether the condition can be satisfied by the value the
+    /// expression hands it, and a condition that cannot is silent through
+    /// exactly the incident the rule was written for.
+    ///
+    /// Asserted on the values, not on the operators, so a rewrite of either
+    /// half is still held to the same statement.
     #[test]
     fn the_deployed_rule_reads_the_published_gauge_as_a_presence_statement() {
         let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -854,10 +859,20 @@ mod tests {
                     .is_some_and(|p| p.contains(AOF_REPAIR_VERDICT_PUBLISHED_METRIC))
             })
             .unwrap_or_else(|| panic!("no rule queries {AOF_REPAIR_VERDICT_PUBLISHED_METRIC}"));
-        let promql = rule["promql"].as_str().unwrap();
+        let condition: cog_core::AlertCondition = serde_json::from_value(rule["condition"].clone())
+            .unwrap_or_else(|e| panic!("rule {} has no readable condition: {e}", rule["name"]));
+
         assert!(
-            promql.contains("== 0"),
-            "the absence of a verdict is what the rule is for, got: {promql}"
+            condition.evaluate(0.0),
+            "a verdict that was never published is what the rule is for, got {} / {}",
+            rule["promql"],
+            rule["condition"]
+        );
+        assert!(
+            !condition.evaluate(1.0),
+            "a redis that published its verdict must not alert, got {} / {}",
+            rule["promql"],
+            rule["condition"]
         );
     }
 }
