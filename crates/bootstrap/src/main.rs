@@ -345,15 +345,65 @@ async fn run_k3s_install_script(env: &str) -> Result<()> {
     Ok(())
 }
 
-async fn install_k3s() -> Result<()> {
+/// K3s reads both the server's and an agent's settings from this file; it must
+/// exist before the first start of the service.
+const K3S_CONFIG_PATH: &str = "/etc/rancher/k3s/config.yaml";
+
+/// Write the node's memory QoS settings where K3s will read them.
+///
+/// Never overwrites: a config file on the node is an operator's decision, and
+/// this one file holds every kubelet argument -- taking it over would silently
+/// discard whatever else is in it. The reservation and the eviction threshold
+/// are derived from this node's own readings, so the same code produces the
+/// right numbers on a small node and a large one.
+fn write_k3s_qos_config(mem_total_mb: u64, cpu_cores: usize) -> Result<()> {
+    let path = Path::new(K3S_CONFIG_PATH);
+    if path.exists() {
+        warn!(
+            "{K3S_CONFIG_PATH} 已存在，保留不覆盖：请自行确认其中含节点内存预留与 \
+             memory.available 驱逐阈值（本次未按 {mem_total_mb}MiB / {cpu_cores} 核推导的值写入）"
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all("/etc/rancher/k3s")?;
+    let qos = cogneva_bootstrap::node_qos(mem_total_mb, cpu_cores as u32);
+    std::fs::write(path, cogneva_bootstrap::k3s_qos_config_yaml(&qos))?;
+    info!(
+        "已预置节点内存 QoS（非 Pod 预留 cpu={}m / memory={}MiB，memory.available<{}MiB 触发驱逐）→ {K3S_CONFIG_PATH}",
+        qos.reserved_cpu_milli, qos.reserved_memory_mb, qos.eviction_memory_mb
+    );
+    Ok(())
+}
+
+/// Report a cluster that is already running without the node QoS settings.
+///
+/// The settings are read once, at K3s' first start, so a cluster that was
+/// provisioned before this file existed keeps running with `allocatable ==
+/// capacity` and no memory eviction threshold -- nothing on the node stops a
+/// pod from taking the memory the host itself needs. Naming the gap is all
+/// this path can do: picking it up needs the service restarted.
+fn warn_if_qos_missing() {
+    if Path::new(K3S_CONFIG_PATH).exists() {
+        return;
+    }
+    warn!(
+        "现有集群从未写过 {K3S_CONFIG_PATH}：节点没有内存预留，也没有 memory.available \
+         驱逐阈值（allocatable 等于 capacity，即容器可以吃掉整机内存，内核只能换页）。\
+         写入后需重启 K3s 才生效，这一步不在元启动里自动做"
+    );
+}
+
+async fn install_k3s(hw: &Hardware) -> Result<()> {
     if cluster_ready().await {
         info!("检测到可用集群，跳过 K3s 安装");
+        warn_if_qos_missing();
         return Ok(());
     }
     info!("安装 K3s（官方脚本）...");
     if cn_mirror() {
         write_k3s_registries_cn()?;
     }
+    write_k3s_qos_config(hw.mem_total_mb, hw.cpu_cores)?;
     let env = if cn_mirror() {
         "INSTALL_K3S_MIRROR=cn"
     } else {
@@ -495,7 +545,7 @@ async fn cluster_internal_ips() -> Vec<String> {
 /// 或标准 K8s）则只复用、不重建。
 ///
 /// 已有可用集群时仅补齐声明中缺失的 agent；无集群且无节点声明 → 失败前置。
-async fn ensure_multi_node_cluster() -> Result<()> {
+async fn ensure_multi_node_cluster(hw: &Hardware) -> Result<()> {
     let agents = cluster_nodes_env();
     if !cluster_ready().await {
         if agents.is_empty() {
@@ -504,7 +554,7 @@ async fn ensure_multi_node_cluster() -> Result<()> {
                  声明工作节点（本机将作为 server，需 SSH 免密可达），或预先搭建集群"
             );
         }
-        install_k3s().await?;
+        install_k3s(hw).await?;
     }
     if agents.is_empty() {
         info!("未声明 COGNEVA_CLUSTER_NODES，使用现有集群节点");
@@ -567,16 +617,16 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
         "curl -fsSL --connect-timeout 15 --max-time 900 --retry 2 -o /tmp/cogneva-k3s-install.sh {script_url}"
     );
     let run_remote = format!("{mirror_env}{k3s_env} sh /tmp/cogneva-k3s-install.sh");
-    let install = if cn_mirror() {
+    let prep = if cn_mirror() {
         // agent 同样要在 k3s-agent 首启前预置 registries.yaml（pause 等系统镜像走 docker.io）
         let reg = k3s_registries_yaml()
             .replace('\n', "\\n")
             .replace('"', "\\\"");
         format!(
-            "mkdir -p /etc/rancher/k3s && printf '{reg}' > /etc/rancher/k3s/registries.yaml && {download} && {run_remote}"
+            "mkdir -p /etc/rancher/k3s && printf '{reg}' > /etc/rancher/k3s/registries.yaml && "
         )
     } else {
-        format!("{download} && {run_remote}")
+        String::new()
     };
     let existing_ips = cluster_internal_ips().await;
     for target in agents {
@@ -587,7 +637,18 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
         }
         info!("安装 K3s agent: {target}（加入 {server_url}）...");
         let (ssh_target, port) = parse_ssh_target(target);
-        let remote = &install;
+        // 每个 agent 按**它自己的**读数推导，而不是照抄 server 的：内存与核数
+        // 逐节点不同，同一份数字会让小节点留得过多、大节点留得过少。
+        let remote = match remote_qos_config(&ssh_target, port.as_ref()).await {
+            Some(qos) => format!("{prep}{}{download} && {run_remote}", qos_remote_write(&qos)),
+            None => {
+                warn!(
+                    "读不到 {target} 的内存 / 核数，该节点将不带内存预留与驱逐阈值启动：\
+                     装完后按它自己的读数写 {K3S_CONFIG_PATH} 并重启 K3s"
+                );
+                format!("{prep}{download} && {run_remote}")
+            }
+        };
         let mut args: Vec<String> = vec![
             "-o".into(),
             "BatchMode=yes".into(),
@@ -601,13 +662,72 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
             args.push(p);
         }
         args.push(ssh_target);
-        args.push(remote.to_string());
+        args.push(remote);
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         run("ssh", &arg_refs)
             .await
             .with_context(|| format!("agent 安装失败 {target}（需要本机到目标的 SSH 免密可达）"))?;
     }
     Ok(())
+}
+
+/// SSH into a node and return its stdout, in the same invocation shape the
+/// install path uses (same options, so a node reachable there is reachable
+/// here). None covers every way the probe can fail: the reading is optional.
+async fn ssh_capture(ssh_target: &str, port: Option<&String>, command: &str) -> Option<String> {
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+    ];
+    if let Some(p) = port {
+        args.push("-p".into());
+        args.push(p.clone());
+    }
+    args.push(ssh_target.to_string());
+    args.push(command.to_string());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = Command::new("ssh")
+        .args(&arg_refs)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The QoS config an agent should start with, rendered from that node's own
+/// memory and CPU count.
+async fn remote_qos_config(ssh_target: &str, port: Option<&String>) -> Option<String> {
+    // MemTotal is in kB; nproc is the CPU count the kubelet will see.
+    let out = ssh_capture(
+        ssh_target,
+        port,
+        "awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo; nproc",
+    )
+    .await?;
+    let mut lines = out.lines().filter(|l| !l.trim().is_empty());
+    let mem_total_mb: u64 = lines.next()?.trim().parse().ok()?;
+    let cpu_cores: u32 = lines.next()?.trim().parse().ok()?;
+    Some(cogneva_bootstrap::k3s_qos_config_yaml(
+        &cogneva_bootstrap::node_qos(mem_total_mb, cpu_cores),
+    ))
+}
+
+/// Write the config on the node before K3s' first start, keeping whatever file
+/// is already there. A heredoc rather than printf: the thresholds carry `%`,
+/// which printf would read as a conversion and eat.
+fn qos_remote_write(yaml: &str) -> String {
+    format!(
+        "if [ ! -f {K3S_CONFIG_PATH} ]; then mkdir -p /etc/rancher/k3s && \
+         cat > {K3S_CONFIG_PATH} <<'COGNEVA_QOS'\n{yaml}COGNEVA_QOS\nfi && "
+    )
 }
 
 async fn wait_all_nodes_ready(expected: usize) -> Result<()> {
@@ -2697,8 +2817,8 @@ async fn main() -> Result<()> {
     let cluster_existed = cluster_ready().await;
     match decision.distro {
         // K3s：单节点本机装 server；多节点 server + agents。
-        Distro::K3s if !decision.multi => install_k3s().await?,
-        Distro::K3s => ensure_multi_node_cluster().await?,
+        Distro::K3s if !decision.multi => install_k3s(&hw).await?,
+        Distro::K3s => ensure_multi_node_cluster(&hw).await?,
         // kubespray：跑官方镜像新建标准 Kubernetes（本机为控制面，声明节点作 worker）。
         Distro::Kubespray => kubespray::run_kubespray(&cluster_nodes_env()).await?,
     }
@@ -3081,5 +3201,44 @@ mod cn_image_tests {
             meta["annotations"]["meta.helm.sh/release-namespace"],
             "cogneva"
         );
+    }
+}
+
+#[cfg(test)]
+mod node_qos_wiring_tests {
+    /// K3s reads `/etc/rancher/k3s/config.yaml` once, when the service first
+    /// starts, so writing it after the install script is the same as never
+    /// writing it: the node would come up with no reservation and no memory
+    /// eviction threshold, and nothing on it would say so.
+    #[test]
+    fn the_node_qos_config_is_written_before_k3s_starts() {
+        let src = include_str!("main.rs");
+        for (path, write, start) in [
+            (
+                "async fn install_k3s(",
+                "write_k3s_qos_config",
+                "run_k3s_install_script",
+            ),
+            (
+                "async fn install_k3s_agents(",
+                "qos_remote_write",
+                "run(\"ssh\"",
+            ),
+        ] {
+            let body = src
+                .split(path)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{path} 不在 main.rs 里"));
+            let write_at = body
+                .find(write)
+                .unwrap_or_else(|| panic!("{path} 没有调用 {write}"));
+            let start_at = body
+                .find(start)
+                .unwrap_or_else(|| panic!("{path} 没有调用 {start}"));
+            assert!(
+                write_at < start_at,
+                "{path} 里 {write} 必须排在 {start} 之前（配置只在首启时被读一次）"
+            );
+        }
     }
 }

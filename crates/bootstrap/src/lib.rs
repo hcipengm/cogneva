@@ -270,6 +270,93 @@ impl ManagementPlan {
     }
 }
 
+/// What a node keeps for everything that is not a pod, and when it starts
+/// taking memory back from pods.
+///
+/// K3s ships `--eviction-hard=imagefs.available<5%,nodefs.available<5%`: it
+/// replaces the whole flag, so the upstream memory threshold never reaches the
+/// kubelet and a node with a full page cache and no free memory evicts nothing
+/// -- the kernel reclaims first and pages until it thrashes. The node also
+/// starts with `allocatable == capacity` (no reservation at all), so the
+/// scheduler is free to fill every byte the host's own processes need. Both
+/// facts are the same defect: nothing on the node distinguishes the memory a
+/// pod may take from the memory the machine needs to keep running.
+///
+/// The numbers are derived from the node's own readings rather than chosen:
+/// the memory reservation is the documented Kubernetes table for system
+/// daemons applied to this node's total, the CPU reservation is that table's
+/// per-core rule, and the eviction threshold is 5% of the node -- the same
+/// share K3s itself uses for the file-system signals -- with the upstream
+/// 100Mi floor so a small node is not left with a threshold that means nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeQos {
+    /// Reserved for the non-pod processes, in millicores.
+    pub reserved_cpu_milli: u64,
+    /// Reserved for the non-pod processes, in MiB.
+    pub reserved_memory_mb: u64,
+    /// `memory.available` at or below which the kubelet evicts, in MiB.
+    pub eviction_memory_mb: u64,
+}
+
+/// Memory a node keeps for non-pod processes, from the documented table:
+/// 255Mi below 1GiB, then 25% / 20% / 10% / 6% / 2% of the total as the node
+/// grows. Rounded up to 100MiB: the reading behind it is a `/proc/meminfo`
+/// total, and rounding up never reserves less than the table asks for.
+fn reserved_memory_mb(mem_total_mb: u64) -> u64 {
+    match mem_total_mb {
+        0..=1023 => 255,
+        _ => {
+            let percent = match mem_total_mb {
+                1024..=4095 => 25,
+                4096..=16383 => 20,
+                16384..=65535 => 10,
+                65536..=262143 => 6,
+                _ => 2,
+            };
+            // percent/100 of the total, rounded up to the next 100MiB.
+            (mem_total_mb * percent).div_ceil(10_000) * 100
+        }
+    }
+}
+
+/// CPU a node keeps for non-pod processes: 6% of the first core, 1% of the
+/// second, 0.5% of the next two, 0.25% of the rest. Millicores are integers,
+/// so 0.25% is rounded up to 3m per core and the total to the next 10m.
+fn reserved_cpu_milli(cpu_cores: u32) -> u64 {
+    let cores = cpu_cores as u64;
+    let milli = 60 * cores.min(1)
+        + 10 * cores.min(2).saturating_sub(1)
+        + 5 * (cores.min(4).saturating_sub(2))
+        + 3 * cores.saturating_sub(4);
+    milli.div_ceil(10) * 10
+}
+
+/// The reservations and eviction threshold this node should run with.
+pub fn node_qos(mem_total_mb: u64, cpu_cores: u32) -> NodeQos {
+    let share = mem_total_mb.div_ceil(20);
+    NodeQos {
+        reserved_cpu_milli: reserved_cpu_milli(cpu_cores),
+        reserved_memory_mb: reserved_memory_mb(mem_total_mb),
+        // Never below the upstream 100Mi default, rounded up like the
+        // reservation so both numbers read as deliberate.
+        eviction_memory_mb: share.max(100).div_ceil(100) * 100,
+    }
+}
+
+/// Render the K3s config file that carries the node's QoS settings.
+///
+/// Every eviction signal is written out together, including the two K3s
+/// already sets and the two inode signals: changing the flag replaces the
+/// default set rather than extending it, and a signal left out is silently
+/// zero -- an `imagefs` with no threshold is a disk that fills up without the
+/// kubelet noticing.
+pub fn k3s_qos_config_yaml(qos: &NodeQos) -> String {
+    format!(
+        "kubelet-arg:\n  - \"system-reserved=cpu={}m,memory={}Mi\"\n  - \"eviction-hard=memory.available<{}Mi,nodefs.available<5%,imagefs.available<5%,nodefs.inodesFree<5%,imagefs.inodesFree<5%\"\n",
+        qos.reserved_cpu_milli, qos.reserved_memory_mb, qos.eviction_memory_mb
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +443,50 @@ mod tests {
         // 标准 K8s 形态序列化为 k8s-standard，与 Helm profile 同名。
         let stdk8s = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::Kubespray);
         assert!(stdk8s.to_yaml().unwrap().contains("k8s-standard"));
+    }
+
+    #[test]
+    fn the_qos_reservation_follows_the_documented_capacity_table() {
+        // 64199MiB / 24 cores: 10% of the total (the 16-64GiB bucket), the
+        // per-core CPU rule, and a fifth of the node as the eviction floor.
+        let qos = node_qos(64199, 24);
+        assert_eq!(qos.reserved_memory_mb, 6500);
+        assert_eq!(qos.reserved_cpu_milli, 140);
+        assert_eq!(qos.eviction_memory_mb, 3300);
+    }
+
+    #[test]
+    fn a_small_node_reserves_a_share_it_can_afford() {
+        // 512MiB: the table's fixed floor, not a percentage of nearly nothing.
+        let small = node_qos(512, 1);
+        assert_eq!(small.reserved_memory_mb, 255);
+        assert_eq!(small.reserved_cpu_milli, 60);
+        // The eviction threshold keeps the upstream 100Mi default instead of
+        // shrinking to 5% of half a gigabyte.
+        assert_eq!(small.eviction_memory_mb, 100);
+        // 4GiB takes the 20% bucket; 8 cores take the flat rate past the fourth.
+        let medium = node_qos(4096, 8);
+        assert_eq!(medium.reserved_memory_mb, 900);
+        assert_eq!(medium.reserved_cpu_milli, 100);
+    }
+
+    #[test]
+    fn every_eviction_signal_is_written_out() {
+        let yaml = k3s_qos_config_yaml(&node_qos(64199, 24));
+        for signal in [
+            "memory.available<3300Mi",
+            "nodefs.available<5%",
+            "imagefs.available<5%",
+            "nodefs.inodesFree<5%",
+            "imagefs.inodesFree<5%",
+        ] {
+            assert!(yaml.contains(signal), "missing {signal} in {yaml}");
+        }
+        assert!(yaml.contains("system-reserved=cpu=140m,memory=6500Mi"));
+        // The file is a kubelet-arg list and nothing else: K3s reads it before
+        // the first start, so a stray key here is a node that never comes up.
+        assert_eq!(yaml.lines().filter(|l| !l.starts_with("  - ")).count(), 1);
+        assert!(yaml.starts_with("kubelet-arg:\n"));
     }
 
     #[test]
