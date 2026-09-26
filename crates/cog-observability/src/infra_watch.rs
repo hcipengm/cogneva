@@ -51,6 +51,9 @@ const NON_IDENTITY_LABELS: &[&str] = &["__name__", "job", "endpoint", "service",
 /// rule names so the series-resolution pass never touches these rows.
 pub const EVAL_FAILURE_RULE: &str = "infra_watch_eval_failure";
 
+/// This loop's name in the liveness census.
+pub const INFRA_WATCH_LOOP: &str = "infra_watch";
+
 /// Outlets the watcher drives. Both are optional: with no store the watcher
 /// still notifies, with no notifier it still persists, with neither it does
 /// not run at all (the plugin decides).
@@ -71,6 +74,15 @@ pub async fn run_infra_watch_loop(
             .poll_interval_secs
             .max(InfraWatchConfig::MIN_POLL_INTERVAL_SECS),
     );
+    // Everything this loop reports is a judgement about other people's series, so
+    // its death is the one failure it cannot report: the rules it evaluates go
+    // quiet, and a rule that is quiet because nothing is wrong looks exactly like
+    // a rule that is quiet because nobody is evaluating it.
+    let beat = cog_core::loop_health::register(
+        INFRA_WATCH_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+    );
+    let _mortality = beat.watch_death(shutdown.clone());
     info!(
         rules = config.rules.len(),
         interval_secs = interval.as_secs(),
@@ -90,6 +102,10 @@ pub async fn run_infra_watch_loop(
 
     let mut ticker = tokio::time::interval(interval);
     loop {
+        // Stamped once per cycle, on every cycle: a rule set that found nothing
+        // to fire is the ordinary state, and it must not read as a watcher that
+        // is not running.
+        beat.beat();
         tokio::select! {
             biased;
             _ = shutdown.wait() => break,

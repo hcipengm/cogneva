@@ -557,6 +557,9 @@ async fn tick(
     }
 }
 
+/// This loop's name in the liveness census.
+pub const SIGNAL_WATCHER_LOOP: &str = "signal_watcher";
+
 /// Background loop; follows the same shutdown pattern as the baseline port
 /// trigger loop.
 pub async fn run_signal_watcher_loop(
@@ -575,7 +578,18 @@ pub async fn run_signal_watcher_loop(
         "self-discovery signal watcher started"
     );
     let mut ticker = tokio::time::interval(interval);
+    // Self-discovery: if this loop stops, the system stops noticing its own
+    // failures, and the signals it derives simply stop appearing -- which reads
+    // the same as a system with nothing wrong.
+    let beat = cog_core::loop_health::register(
+        SIGNAL_WATCHER_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+    );
+    let _mortality = beat.watch_death(shutdown.clone());
     loop {
+        // Every cycle is stamped, including the many that find nothing to
+        // report: a quiet system is the ordinary case here.
+        beat.beat();
         tokio::select! {
             biased;
             _ = shutdown.wait() => break,

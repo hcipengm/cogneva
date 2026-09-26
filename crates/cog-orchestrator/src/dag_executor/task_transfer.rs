@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 /// Default Redis stream name for task-transfer events.
 pub const TASK_TRANSFER_STREAM: &str = "orchestrator:events:task_transfer";
 
+/// Loop name reported through the background-loop liveness family.
+pub const STALE_TASK_SWEEP_LOOP: &str = "orchestrator_stale_task_sweep";
+
 /// Reason a task is being transferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -249,7 +252,13 @@ impl StaleTaskDetector {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let beat = cog_core::loop_health::register(
+                STALE_TASK_SWEEP_LOOP,
+                cog_core::loop_health::Cadence::Periodic(interval),
+            );
+            let _mortality = beat.watch_death(cancel.clone());
             loop {
+                beat.beat();
                 tokio::select! {
                     _ = ticker.tick() => {
                         if let Err(e) = self.sweep().await {

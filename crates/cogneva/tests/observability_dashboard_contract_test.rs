@@ -260,6 +260,30 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "outcome"],
         "crates/cog-reflection/src/build_cache_readings.rs",
     ),
+    // The background loop census and its liveness. The loop label is the only
+    // label these carry: the same loop runs in every process that enables its
+    // plugin, and Prometheus's own instance label is what separates those lines,
+    // so no legend here names it.
+    (
+        "cogneva_loop_tick_age_seconds",
+        &["loop"],
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_period_seconds",
+        &["loop"],
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_registered",
+        &["loop"],
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_deaths_total",
+        &["loop"],
+        "crates/cog-core/src/loop_health.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

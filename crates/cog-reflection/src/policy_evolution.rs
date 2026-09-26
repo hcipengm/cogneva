@@ -249,6 +249,9 @@ impl PolicyEvolutionDriver {
     }
 }
 
+/// This loop's name in the liveness census.
+pub const POLICY_EVOLUTION_LOOP: &str = "policy_evolution";
+
 /// 周期性跑一轮。间隔下限 60s——一轮是纯本地计算，没有需要保护的外部
 /// 依赖，但也不该比反思周期更密。
 pub async fn run_policy_evolution_loop(
@@ -263,7 +266,15 @@ pub async fn run_policy_evolution_loop(
         "artifact-level evolution driver started"
     );
     let mut ticker = tokio::time::interval(interval);
+    // Two of the three outcomes of a round change nothing, so the loop's own
+    // output cannot say whether it is running; its liveness comes from here.
+    let beat = cog_core::loop_health::register(
+        POLICY_EVOLUTION_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+    );
+    let _mortality = beat.watch_death(shutdown.clone());
     loop {
+        beat.beat();
         tokio::select! {
             biased;
             _ = shutdown.wait() => break,

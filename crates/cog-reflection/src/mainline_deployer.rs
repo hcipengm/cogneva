@@ -2944,6 +2944,9 @@ fn heartbeat_message(
     )
 }
 
+/// This loop's name in the liveness census.
+pub const MAINLINE_DEPLOYER_LOOP: &str = "mainline_deployer";
+
 /// 构建侧后台循环入口（插件 spawn）。
 pub async fn run_mainline_loop(
     deployer: std::sync::Arc<MainlineDeployer>,
@@ -2987,7 +2990,17 @@ pub async fn run_mainline_loop(
     // 空闲心跳：SameRev 路径静默返回，靠周期性 INFO 摘要证明部署器存活。
     let heartbeat_every = Duration::from_secs(deployer.cfg.heartbeat_log_secs);
     let mut last_heartbeat: Option<tokio::time::Instant> = None;
+    // The heartbeat log exists to prove this loop is alive, and a log line is not
+    // something a rule can read: without a stamp, a deployer that stopped looks
+    // exactly like a main that needs no work.
+    let beat = cog_core::loop_health::register(
+        MAINLINE_DEPLOYER_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+    );
+    let _mortality = beat.watch_death(shutdown.clone());
     loop {
+        // Stamped every cycle, including the SameRev ones that return silently.
+        beat.beat();
         tokio::select! {
             biased;
             _ = shutdown.wait() => break,

@@ -384,6 +384,9 @@ impl MemoryBackendRecorder {
     }
 }
 
+/// This loop's name in the liveness census.
+pub const MEMORY_SCHEMA_REPAIR_LOOP: &str = "memory_schema_repair";
+
 /// 按间隔补齐缺失的派生层，直到收到停机信号。间隔为 0 表示不重扫。
 ///
 /// 属主不用配置判定，用结构性证据：谁手里有这批 raw 才能补谁。反思条目的
@@ -398,7 +401,18 @@ pub async fn run_schema_repair_loop(
     shutdown: cog_core::ShutdownSignal,
 ) {
     let mut ticker = tokio::time::interval(interval);
+    // This loop repairs schemas for entries that were archived without one. A
+    // loop that died leaves no trace of its own -- the repairs it would have made
+    // are simply never made, and the archived entries stay unreachable.
+    let beat = cog_core::loop_health::register(
+        MEMORY_SCHEMA_REPAIR_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+    );
+    let _mortality = beat.watch_death(shutdown.clone());
     loop {
+        // Stamped on every cycle: most find nothing to repair, and that is the
+        // healthy state rather than evidence the loop stopped.
+        beat.beat();
         tokio::select! {
             _ = ticker.tick() => {}
             _ = shutdown.wait() => return,

@@ -124,6 +124,27 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_data_volume_used_bytes",
         "crates/cog-observability/src/data_volume.rs",
     ),
+    // The loop liveness family. The age is derived at scrape time from a stamp
+    // the loop leaves behind — which is the point: a loop that died stops
+    // stamping and its own series cannot report that, so the reading has to come
+    // from a face that outlives it. The period is the loop's own declared
+    // cadence, which is what the age is compared against here rather than a
+    // constant written into the rule. The census series
+    // (`cogneva_loop_registered`, and the loop-name label domain it makes
+    // countable) is not read by any rule and is registered with the dashboard
+    // contract instead.
+    (
+        "cogneva_loop_period_seconds",
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_tick_age_seconds",
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_deaths_total",
+        "crates/cog-core/src/loop_health.rs",
+    ),
     (
         "cogneva_landing_failures_total",
         "crates/cog-github/src/landing.rs",

@@ -954,6 +954,84 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 26,
+          "title": "Background Loop Liveness",
+          "description": "How long since each background loop last reached the top of its cycle, against the period that loop declared for itself, over 6h. A loop has no parent task: when it panics or returns early it is simply gone, and every series it published stops being written -- which from Prometheus reads exactly like a subsystem with nothing to report. So liveness is read here, from a stamp the loop leaves behind, with the age computed when the scrape arrives; a loop that died stops stamping and its age keeps climbing on its own. The declared period is on the panel for the same reason it is not a constant in the alert rule: what counts as stalled is a loop's own cadence, and a loop with no cadence publishes zero and is not judged this way -- a consumer waiting on an empty queue and one stuck inside a handler look the same from here, and the queue's own readings are what separate them. A rising age whose deaths line stays at zero is a loop stuck inside one iteration; both rising is a loop that is gone. Every process that runs the loop draws its own line, and the same loop name in two pods is two lines: one pod's loop dying is not the other's.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 104
+          },
+          "targets": [
+            {
+              "expr": "cogneva_loop_tick_age_seconds",
+              "legendFormat": "{{loop}} since last cycle",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_loop_period_seconds",
+              "legendFormat": "{{loop}} declared period (0 = no cadence)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 27,
+          "title": "Background Loop Deaths and Census",
+          "description": "Background loops that ended while their process was still running, and the census of loops each process started, over 6h. registered is 1 for every loop a process started and 0 for none, so the lines are the loop population of each process: a loop missing from a process that should run it is a plugin or a role that changed, and a count that drops between two deploys is a loop that left the code. deaths counts loops that returned early or panicked, classified against the shutdown their process was asked for -- a clean stop is not counted. Zero is published for every loop that never died, which is why a deaths line at zero is drawn at all: 'never happened' and 'not being counted' are otherwise the same silence. Nothing restarts a dead loop in place, so a deaths line that rises stays up until that process restarts, and the loop's other readings disappear at the same moment -- this panel is where that disappearance gets an explanation.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 104
+          },
+          "targets": [
+            {
+              "expr": "cogneva_loop_registered",
+              "legendFormat": "{{loop}} registered (1 = this process runs it)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_loop_deaths_total",
+              "legendFormat": "{{loop}} deaths",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

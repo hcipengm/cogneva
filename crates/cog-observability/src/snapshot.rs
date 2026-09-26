@@ -6,6 +6,9 @@
 ///   **Machine layer**: event stream is the SSOT for rebuilding agent state.
 use chrono::Utc;
 use cog_core::AgentEvent;
+
+/// Loop name reported through the background-loop liveness family.
+pub const TRACE_COLLECTOR_LOOP: &str = "observability_trace_collector";
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -209,7 +212,13 @@ impl TraceCollector {
 
         tokio::spawn(async move {
             let mut buffers: HashMap<String, AgentBuffer> = HashMap::new();
+            let beat = cog_core::loop_health::register(
+                TRACE_COLLECTOR_LOOP,
+                cog_core::loop_health::Cadence::EventDriven,
+            );
+            let _mortality = beat.watch_death(shutdown.clone());
             loop {
+                beat.beat();
                 tokio::select! {
                     result = event_rx.recv() => {
                         match result {

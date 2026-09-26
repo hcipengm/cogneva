@@ -134,6 +134,11 @@ impl TaskExecutorRouter {
         // a random UUID; Redis Streams consumer groups are persistent and a
         // restarted consumer will resume from the last acknowledged ID.
         let group = format!("executor-loop-{workspace_id}");
+        // One loop instance per consumed ready stream, so the liveness name has to
+        // carry the stream: a shared name would let a dead stream's consumer hide
+        // behind the beats of the stream that is still being served.
+        let consumer_loop_name = format!("orchestrator_ready_consumer[{ready_stream}]");
+        let reclaim_loop_name = format!("orchestrator_ready_reclaim[{ready_stream}]");
 
         task_backend
             .create_consumer_group(&ready_stream, &group)
@@ -151,6 +156,7 @@ impl TaskExecutorRouter {
         // 静止，而抓取面上一条静止的序列和一条干净流量的序列是同一个样子——
         // 刚好把最该被看见的停滞藏了起来。
         crate::observable::spawn_pending_observer(
+            crate::observable::READY_STREAM_PENDING_LOOP,
             task_backend.clone(),
             ready_stream.clone(),
             group.clone(),
@@ -167,7 +173,13 @@ impl TaskExecutorRouter {
             let sweep_slots = claim_slots.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
+                let beat = cog_core::loop_health::register(
+                    reclaim_loop_name,
+                    cog_core::loop_health::Cadence::Periodic(ticker.period()),
+                );
+                let _mortality = beat.watch_death(sweep_shutdown.clone());
                 loop {
+                    beat.beat();
                     tokio::select! {
                         biased;
                         _ = sweep_shutdown.wait() => break,
@@ -223,7 +235,13 @@ impl TaskExecutorRouter {
         // Resubscribe on stream failure/end instead of exiting the spawned
         // task: a single transient read error historically ended the loop and
         // froze the ready group for days until the next pod restart.
+        let beat = cog_core::loop_health::register(
+            consumer_loop_name,
+            cog_core::loop_health::Cadence::EventDriven,
+        );
+        let _mortality = beat.watch_death(shutdown.clone());
         'subscribe: loop {
+            beat.beat();
             let mut stream = match task_backend.subscribe(&ready_stream, &group).await {
                 Ok(s) => s,
                 Err(e) => {

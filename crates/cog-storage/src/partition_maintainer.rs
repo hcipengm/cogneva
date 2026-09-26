@@ -58,6 +58,9 @@ const MONTHS_AHEAD: i32 = 2;
 /// How far back maintenance reaches, so a recently dropped partition heals.
 const MONTHS_BEHIND: i32 = 1;
 
+/// Loop name reported through the background-loop liveness family.
+pub const PARTITION_MAINTENANCE_LOOP: &str = "storage_partition_maintenance";
+
 /// Opens monthly partitions ahead of the clock and installs a DEFAULT
 /// partition per table.
 pub struct PartitionMaintainer {
@@ -73,7 +76,13 @@ impl PartitionMaintainer {
     /// Run once immediately, then every `interval_secs` until shutdown.
     pub async fn run(&self, interval_secs: u64, shutdown: ShutdownSignal) {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+        let beat = cog_core::loop_health::register(
+            PARTITION_MAINTENANCE_LOOP,
+            cog_core::loop_health::Cadence::Periodic(interval.period()),
+        );
+        let _mortality = beat.watch_death(shutdown.clone());
         loop {
+            beat.beat();
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(e) = self.maintain().await {

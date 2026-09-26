@@ -3,6 +3,11 @@
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+/// Loop name reported through the background-loop liveness family.
+pub const MICROVM_EVOLUTION_LOOP: &str = "reflection_microvm_evolution";
+/// Loop name reported through the background-loop liveness family.
+pub const CHANGE_VERIFICATION_LOOP: &str = "reflection_change_verification";
+
 /// 延迟持有的 LLM 上游池暂停句柄。`SchedulerGate` 由 supervisor 插件在
 /// init 阶段发布，而 reflection 的 init 早于 supervisor（supervisor 可选依赖
 /// reflection）；自进化循环在 init 阶段就已 spawn，因此用这个句柄跨越
@@ -510,7 +515,16 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     let pool_gate = self.pool_gate.clone();
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(poll);
+                        let beat = cog_core::loop_health::register(
+                            MICROVM_EVOLUTION_LOOP,
+                            cog_core::loop_health::Cadence::Periodic(poll),
+                        );
+                        // Nothing hands this loop a stop signal, and it has no exit
+                        // of its own: if it ends while the process lives, the
+                        // evolution work it drives has stopped with it.
+                        let _mortality = beat.watch_death_unconditionally();
                         loop {
+                            beat.beat();
                             interval.tick().await;
                             if pool_gate.llm_paused() {
                                 info!("LLM upstream pool unavailable; skipping microvm evolution cycle");
@@ -872,7 +886,15 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
 
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(poll_interval);
+                        let beat = cog_core::loop_health::register(
+                            CHANGE_VERIFICATION_LOOP,
+                            cog_core::loop_health::Cadence::Periodic(poll_interval),
+                        );
+                        // No stop signal reaches this loop and it has no exit of its
+                        // own, so any end means pending changes stop being verified.
+                        let _mortality = beat.watch_death_unconditionally();
                         loop {
+                            beat.beat();
                             interval.tick().await;
                             // 本轮是纯确定性消费：同步工作树、取出待验变更、apply/test/
                             // build、落地、切二进制，全程不调 LLM。上游全灭时跳过它，只会让

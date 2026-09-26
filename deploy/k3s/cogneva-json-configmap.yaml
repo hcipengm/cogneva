@@ -923,6 +923,24 @@ data:
               },
               "severity": "warning",
               "summary": "a change has been waiting {value} second(s) in the queue, more than six of the cycles this deployment consumes it on, and the depth says it is still there. A cycle retires a change it cannot apply, so an entry surviving six of them is not a change the pipeline keeps failing to apply -- it is a queue nothing is reading, which the depth alone cannot distinguish from an idle one. Usual causes: the executor is up but its cycle is not running (a build slot held for the whole window, a workspace allocator that never returned), or the entry keeps failing on a path the retire step does not cover. This rule is silent when the executor process itself is gone: its series went with it, and evolution_queue_has_no_executor is the rule for that state"
+            },
+            {
+              "name": "background_loop_stalled",
+              "promql": "(cogneva_loop_tick_age_seconds > 6 * cogneva_loop_period_seconds) and (cogneva_loop_period_seconds > 0)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "a background loop in this series has not reached the top of its cycle for {value} second(s), more than six of the periods that loop declared for itself. The period is compared as the loop's own registration published it, not as a constant written here, so changing a loop's interval moves this judgement with it; a loop with no cadence publishes a period of zero and is excluded by design, because a consumer waiting on an empty queue and a consumer stuck inside a handler look the same from the outside. The age is derived when the scrape arrives from a stamp the loop leaves behind, which is why the reading survives the loop: a task that panicked stops stamping and keeps aging. Usual causes, in the order worth checking: the task is gone (background_loop_died in the same process says so), it is blocked inside one iteration -- a directory walk, a query, a lock -- or the process is too starved to schedule it. Each instance is judged on its own readings, so this can be the app pod and not the evolution pod for the same loop name"
+            },
+            {
+              "name": "background_loop_died",
+              "promql": "cogneva_loop_deaths_total > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "critical",
+              "summary": "a background loop ended {value} time(s) in this series while the process was still running and its shutdown had not been signalled: it returned early or panicked. Nothing restarts it in place, so it is gone until that process restarts, and every series it published stops being written -- from here on, the subsystem it watched reads exactly like one with nothing to report. Zero is published for every loop that has never done it, so a rising count is the only thing this rule reacts to, and it stays firing because the loop does not come back. Usual causes: a panic inside one iteration (the panic message is in that container's log at the same moment, since a task that no one awaits leaves no other trace), or an early return on a path the loop treats as ordinary such as a channel closing or a source that failed to initialize. The count is per process and resets when the process restarts, so a loop that died shortly before a restart is visible in the logs and no longer in this reading"
             }
           ]
         },

@@ -550,6 +550,9 @@ impl LokiPushClient {
     }
 }
 
+/// This loop's name in the liveness census.
+pub const LOKI_FLUSH_LOOP: &str = "loki_flush";
+
 /// Background task that periodically flushes buffered log entries to Loki.
 pub struct LokiBackgroundPusher {
     client: Arc<LokiPushClient>,
@@ -589,7 +592,17 @@ impl LokiBackgroundPusher {
 
     pub async fn run_loop(&self) {
         let mut interval = tokio::time::interval(self.interval);
+        // No shutdown path exists for this pusher, so any exit is one nobody
+        // asked for, and the entries it is holding are never sent. Its cadence
+        // is the flush interval — one iteration per tick, whether or not there
+        // was anything to push.
+        let beat = cog_core::loop_health::register(
+            LOKI_FLUSH_LOOP,
+            cog_core::loop_health::Cadence::Periodic(self.interval),
+        );
+        let _mortality = beat.watch_death_unconditionally();
         loop {
+            beat.beat();
             interval.tick().await;
             let batch = {
                 let mut buf = self.buffer.lock().unwrap();

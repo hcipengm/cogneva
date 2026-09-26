@@ -46,6 +46,7 @@ pub fn stream_pending_observable() -> Arc<StreamPendingObservable> {
 /// measure a second time right after that first measurement; one measurement
 /// per tick after.
 pub fn spawn_pending_observer(
+    loop_name: &'static str,
     backend: Arc<dyn cog_core::MessageBackend>,
     stream: String,
     group: String,
@@ -73,7 +74,13 @@ pub fn spawn_pending_observer(
         }
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
+        let beat = cog_core::loop_health::register(
+            loop_name,
+            cog_core::loop_health::Cadence::Periodic(interval),
+        );
+        let _mortality = beat.watch_death(shutdown.clone());
         loop {
+            beat.beat();
             observer
                 .measure(
                     &*backend,
@@ -91,6 +98,13 @@ pub fn spawn_pending_observer(
         }
     })
 }
+
+/// Loop name reported through the background-loop liveness family. Each
+/// observed stream gets its own name: a shared one would let a dead observer
+/// hide behind its live sibling's beats.
+pub const RESULT_STREAM_PENDING_LOOP: &str = "orchestrator_result_stream_pending";
+/// Loop name reported through the background-loop liveness family.
+pub const READY_STREAM_PENDING_LOOP: &str = "orchestrator_ready_stream_pending";
 
 /// Entries pending right now on one consumed stream.
 pub const STREAM_PENDING_COUNT_METRIC: &str = "cogneva_stream_pending_count";

@@ -1450,6 +1450,9 @@ fn sanitize(change_id: &str) -> String {
         .collect()
 }
 
+/// This loop's name in the liveness census.
+pub const GITOPS_PULLER_LOOP: &str = "gitops_puller";
+
 /// 拉取端后台循环入口（插件 spawn）。
 pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::ShutdownSignal) {
     // 本地路径仓库（如 Pod 内挂载的 /host-git，属主 root）会撞 git
@@ -1477,7 +1480,18 @@ pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::Shut
         "GitOps puller loop started"
     );
     let mut ticker = tokio::time::interval(interval);
+    // The GitOps puller is what brings the cluster's desired state in, and the
+    // only readings it leaves behind are its own poll outcomes: a puller that
+    // died and a cluster with nothing to pull look the same from them.
+    let beat = cog_core::loop_health::register(
+        GITOPS_PULLER_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+    );
+    let _mortality = beat.watch_death(shutdown.clone());
     loop {
+        // Stamped on every cycle, pulled or not: a poll that found no new rev is
+        // the ordinary state, and it must not read as a puller that stopped.
+        beat.beat();
         tokio::select! {
             biased;
             _ = shutdown.wait() => break,

@@ -3,6 +3,9 @@
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Loop name reported through the background-loop liveness family.
+pub const GRPC_CONTROL_HEARTBEAT_LOOP: &str = "agent_grpc_control_heartbeat";
+
 /// Agent plugin that self-assembles and publishes hook engine, agent registry,
 /// and tool registry.
 use futures::StreamExt;
@@ -363,7 +366,15 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 let agent_id = agent_id.clone();
                 async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                    let beat = cog_core::loop_health::register(
+                        GRPC_CONTROL_HEARTBEAT_LOOP,
+                        cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(5)),
+                    );
+                    // No stop signal and no exit of its own: ending means this agent
+                    // stops reporting itself to the control plane.
+                    let _mortality = beat.watch_death_unconditionally();
                     loop {
+                        beat.beat();
                         interval.tick().await;
                         if let Err(e) = client.heartbeat(&agent_id, "active").await {
                             tracing::warn!("gRPC heartbeat failed: {}", e);

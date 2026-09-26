@@ -90,12 +90,19 @@ impl UnixHeartbeatClient {
     ) -> tokio::task::JoinHandle<()> {
         let path = self.socket_path.clone();
         let agent_id = self.agent_id.clone();
+        let loop_name = format!("supervisor_unix_heartbeat[{agent_id}]");
         tokio::spawn(async move {
             let mut ticker =
                 tokio::time::interval(tokio::time::Duration::from_secs(interval_secs.max(1)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
+            let beat = cog_core::loop_health::register(
+                loop_name,
+                cog_core::loop_health::Cadence::Periodic(ticker.period()),
+            );
+            let _mortality = beat.watch_death(cancel.clone());
             loop {
+                beat.beat();
                 tokio::select! {
                     _ = ticker.tick() => {
                         let packet = serde_json::json!({

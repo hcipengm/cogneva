@@ -5,6 +5,7 @@ pub mod config_sections;
 pub mod contract;
 pub mod error;
 pub mod fs_size;
+pub mod loop_health;
 pub mod secrets;
 pub mod types;
 

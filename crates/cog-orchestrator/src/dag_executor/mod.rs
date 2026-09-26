@@ -4,6 +4,15 @@ use std::sync::Arc;
 use cog_core::{DagMessage, MessageBackend, SFError, SFResult, ShutdownSignal, Task};
 use futures::StreamExt;
 
+/// Loop name reported through the background-loop liveness family.
+pub const RESULT_RECLAIM_LOOP: &str = "orchestrator_result_reclaim";
+/// Loop name reported through the background-loop liveness family.
+pub const TASK_CONSUMER_LOOP: &str = "orchestrator_task_consumer";
+/// Loop name reported through the background-loop liveness family.
+pub const GOAL_CONSUMER_LOOP: &str = "orchestrator_goal_consumer";
+/// Loop name reported through the background-loop liveness family.
+pub const ORPHAN_RECONCILER_LOOP: &str = "orchestrator_orphan_reconciler";
+
 pub mod circuit_registry;
 pub mod orchestrator;
 pub mod retry_matrix;
@@ -188,6 +197,7 @@ impl DagExecutorRuntime {
         // "处理得越久，指标越静止"，而抓取面上一条静止的序列和一条干净流量的
         // 序列是同一个样子——恰好把最该被看见的停滞藏了起来。
         crate::observable::spawn_pending_observer(
+            crate::observable::RESULT_STREAM_PENDING_LOOP,
             self.backend.clone(),
             result_stream.clone(),
             group_name.clone(),
@@ -205,7 +215,13 @@ impl DagExecutorRuntime {
             tokio::spawn(async move {
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                let beat = cog_core::loop_health::register(
+                    RESULT_RECLAIM_LOOP,
+                    cog_core::loop_health::Cadence::Periodic(ticker.period()),
+                );
+                let _mortality = beat.watch_death(sweep_shutdown.clone());
                 loop {
+                    beat.beat();
                     tokio::select! {
                         biased;
                         _ = sweep_shutdown.wait() => break,
@@ -242,7 +258,13 @@ impl DagExecutorRuntime {
         // Resubscribe on stream failure/end: exiting the task would freeze the
         // consumer group until the next pod restart (a single transient error
         // historically stalled groups for days).
+        let beat = cog_core::loop_health::register(
+            TASK_CONSUMER_LOOP,
+            cog_core::loop_health::Cadence::EventDriven,
+        );
+        let _mortality = beat.watch_death(shutdown.clone());
         'subscribe: loop {
+            beat.beat();
             let mut stream = match self.backend.subscribe(&result_stream, &group_name).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -429,7 +451,13 @@ impl DagExecutorRuntime {
                 return Err(e);
             }
         }
+        let beat = cog_core::loop_health::register(
+            GOAL_CONSUMER_LOOP,
+            cog_core::loop_health::Cadence::EventDriven,
+        );
+        let _mortality = beat.watch_death(shutdown.clone());
         'subscribe: loop {
+            beat.beat();
             let mut stream = match self.backend.subscribe(&goal_stream, &group).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -580,7 +608,13 @@ impl DagExecutorRuntime {
         let dwell = chrono::Duration::seconds(dwell_secs as i64);
         let mut adopted = false;
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        let beat = cog_core::loop_health::register(
+            ORPHAN_RECONCILER_LOOP,
+            cog_core::loop_health::Cadence::Periodic(ticker.period()),
+        );
+        let _mortality = beat.watch_death(shutdown.clone());
         loop {
+            beat.beat();
             tokio::select! {
                 biased;
                 _ = shutdown.wait() => break,

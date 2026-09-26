@@ -10,6 +10,10 @@ use cog_core::{AgentEvent, SFResult};
 use cog_core::{MemoryBackend, MessageBackend, RawSource};
 
 use crate::IngestConfig;
+/// Loop name reported through the background-loop liveness family.
+pub const MEMORY_RECONCILE_LOOP: &str = "memory_ingest_reconcile";
+/// Loop name reported through the background-loop liveness family.
+pub const MEMORY_BUS_CLAIM_LOOP: &str = "memory_ingest_bus_claim";
 
 /// 归档 id 里来源 slug 的长度上限。与时间戳/随机段合计仍远低于文件系统
 /// NAME_MAX(255 字节)，同时保留足够前缀让人能从对象键认出来源。
@@ -463,7 +467,16 @@ impl MemoryIngestor {
 
         inner.start_dispatcher(job_rx, backlog.clone());
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        inner.start_reconcile_ticker(&job_tx, backlog.clone(), stopping.clone());
+        // The loops below stop on this flag rather than on a signal; the signal
+        // exists so their exits can be told apart from a defect. It is triggered
+        // wherever the flag is set.
+        let loop_stop = cog_core::ShutdownSignal::new();
+        inner.start_reconcile_ticker(
+            &job_tx,
+            backlog.clone(),
+            stopping.clone(),
+            loop_stop.clone(),
+        );
 
         tokio::spawn(async move {
             info!("MemoryIngestor started");
@@ -504,6 +517,7 @@ impl MemoryIngestor {
             }
             // 关掉入口：派发循环收完残余任务后自然退出，在途抽取跑完。
             stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+            loop_stop.trigger();
             drop(job_tx);
         });
 
@@ -529,7 +543,16 @@ impl MemoryIngestor {
 
         inner.start_dispatcher(job_rx, backlog.clone());
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        inner.start_reconcile_ticker(&job_tx, backlog.clone(), stopping.clone());
+        // The loops below stop on this flag rather than on a signal; the signal
+        // exists so their exits can be told apart from a defect. It is triggered
+        // wherever the flag is set.
+        let loop_stop = cog_core::ShutdownSignal::new();
+        inner.start_reconcile_ticker(
+            &job_tx,
+            backlog.clone(),
+            stopping.clone(),
+            loop_stop.clone(),
+        );
 
         // pending 清扫：把"投递给了已死消费者、始终没 ack"的消息认领回来。
         // JetStream 靠 ack_wait 自动红投，claim_pending 默认返回空；Redis
@@ -541,12 +564,19 @@ impl MemoryIngestor {
             let job_tx = job_tx.clone();
             let backlog = backlog.clone();
             let inner = inner.clone();
+            let claim_stop = loop_stop.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(
                     inner.config.bus_claim_interval_secs,
                 ));
                 interval.tick().await; // 跳过立即触发的那一拍
+                let beat = cog_core::loop_health::register(
+                    MEMORY_BUS_CLAIM_LOOP,
+                    cog_core::loop_health::Cadence::Periodic(interval.period()),
+                );
+                let _mortality = beat.watch_death(claim_stop);
                 loop {
+                    beat.beat();
                     interval.tick().await;
                     if job_tx.is_closed() {
                         break;
@@ -654,6 +684,7 @@ impl MemoryIngestor {
             }
             // 关掉入口：派发循环收完残余任务后自然退出，在途抽取跑完。
             stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+            loop_stop.trigger();
             drop(job_tx);
         });
 
@@ -864,6 +895,7 @@ impl MemoryIngestor {
         job_tx: &mpsc::UnboundedSender<QueuedRaw>,
         backlog: Arc<std::sync::atomic::AtomicUsize>,
         stopping: Arc<std::sync::atomic::AtomicBool>,
+        loop_stop: cog_core::ShutdownSignal,
     ) {
         let secs = self.config.reconcile_interval_secs;
         if secs == 0 {
@@ -874,7 +906,13 @@ impl MemoryIngestor {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(secs));
             interval.tick().await; // 第一拍即启动对账已覆盖的那一次
+            let beat = cog_core::loop_health::register(
+                MEMORY_RECONCILE_LOOP,
+                cog_core::loop_health::Cadence::Periodic(interval.period()),
+            );
+            let _mortality = beat.watch_death(loop_stop);
             loop {
+                beat.beat();
                 interval.tick().await;
                 // 退出判据取显式的停止标志，不靠"通道已关"：这个任务自己握着
                 // 一个 job_tx，通道不会因为主循环退出而关闭，靠它判会一直重扫。

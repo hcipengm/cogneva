@@ -7,6 +7,9 @@ use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
 
 use crate::autonomous::{AutonomousCollaborator, AutonomousConfig};
+
+/// Loop name reported through the background-loop liveness family.
+pub const SUPERVISOR_LOOP: &str = "supervisor_main";
 use crate::control_plane::{ControlPlaneClient, HttpControlPlaneClient, SupervisorStatus};
 use crate::error::SupervisorResult;
 use crate::event_aggregator::EventAggregator;
@@ -431,6 +434,29 @@ impl Supervisor {
         let mut control_plane_tick = tokio::time::interval(cfg.control_plane_interval);
         control_plane_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // The loop beats whenever any of its tickers fires, so the cadence it can
+        // be held to is the shortest of them: one stall threshold for all of them
+        // has to be the tightest one, or a slow arm would read as a stall.
+        let beat_period = [
+            cfg.health_interval,
+            cfg.quota_interval,
+            cfg.rebalance_interval,
+            cfg.event_window,
+            Duration::from_secs(cfg.autonomous.decision_interval_secs),
+            cfg.control_plane_interval,
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or(cfg.health_interval);
+        let beat = cog_core::loop_health::register(
+            SUPERVISOR_LOOP,
+            cog_core::loop_health::Cadence::Periodic(beat_period),
+        );
+        // The caller's future is this loop's stop condition, so the exit it leads
+        // to is the intended one and must not be counted as a death.
+        let supervisor_stop = cog_core::ShutdownSignal::new();
+        let _mortality = beat.watch_death(supervisor_stop.clone());
+
         let mut cycle: u64 = 0;
         let shutdown = std::pin::pin!(shutdown);
         let mut shutdown = shutdown;
@@ -453,6 +479,7 @@ impl Supervisor {
         );
 
         loop {
+            beat.beat();
             let config_tick = async {
                 match &mut config_rx {
                     Some(rx) => {
@@ -555,6 +582,7 @@ impl Supervisor {
                     }
                 }
                 _ = &mut shutdown => {
+                    supervisor_stop.trigger();
                     info!("Supervisor shutdown signal received");
                     break;
                 }

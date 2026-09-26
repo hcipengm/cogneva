@@ -85,7 +85,18 @@ impl UdpHeartbeatClient {
     /// Spawn an async task that sends heartbeat packets every `interval_secs`,
     /// with 3 redundant packets per interval (spaced 10 ms apart).
     pub fn spawn(self, interval_secs: u64, cancel: ShutdownSignal) -> JoinHandle<()> {
+        // Registered before the socket is set up: a heartbeat loop whose client
+        // never came up is not a loop that is fine, so the early return below has
+        // to read as the loop having ended.
+        let loop_name = format!("supervisor_udp_heartbeat[{}]", self.agent_id);
         tokio::spawn(async move {
+            let beat = cog_core::loop_health::register(
+                loop_name,
+                cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(
+                    interval_secs.max(1),
+                )),
+            );
+            let _mortality = beat.watch_death(cancel.clone());
             let socket = match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => s,
                 Err(e) => {
@@ -105,6 +116,7 @@ impl UdpHeartbeatClient {
             ticker.tick().await;
 
             loop {
+                beat.beat();
                 tokio::select! {
                     _ = ticker.tick() => {
                         let packet = HeartbeatPacket {

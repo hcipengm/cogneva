@@ -10,6 +10,9 @@ use super::retry_matrix::RetryMatrix;
 use super::task_phase::PhasedTask;
 use cog_core::{DeadLetterEntry, DeadLetterQueue, RetryAttempt, SuggestedAction};
 
+/// Loop name reported through the background-loop liveness family.
+pub const ARCHIVE_LOOP: &str = "orchestrator_task_archive";
+
 /// Serializable snapshot of the DAG executor state for persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DagStateSnapshot {
@@ -436,7 +439,16 @@ impl DagExecutor {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let beat = cog_core::loop_health::register(
+                ARCHIVE_LOOP,
+                cog_core::loop_health::Cadence::Periodic(interval.period()),
+            );
+            // Nothing hands this loop a stop signal: it is started for the life of
+            // the process, so every way it can end — including a clean return —
+            // leaves the archiving undone.
+            let _mortality = beat.watch_death_unconditionally();
             loop {
+                beat.beat();
                 interval.tick().await;
                 this.archive_terminated_tasks().await;
             }

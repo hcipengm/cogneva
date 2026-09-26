@@ -1448,6 +1448,9 @@ async fn port_tick(
     Ok(())
 }
 
+/// This loop's name in the liveness census.
+pub const BASELINE_PORT_LOOP: &str = "baseline_port";
+
 /// 基线移植触发循环。第一轮立即执行（启动即对齐新基线，不等一个
 /// 轮询周期），之后按 `poll_interval_secs` 周期运行直到 shutdown。
 pub async fn run_baseline_port_loop(
@@ -1465,7 +1468,15 @@ pub async fn run_baseline_port_loop(
         "baseline port trigger loop started"
     );
     let mut ticker = tokio::time::interval(interval);
+    // A port that fails keeps its last state and retries on the next tick, so a
+    // loop that died leaves nothing behind but a version that never moves.
+    let beat = cog_core::loop_health::register(
+        BASELINE_PORT_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+    );
+    let _mortality = beat.watch_death(shutdown.clone());
     loop {
+        beat.beat();
         tokio::select! {
             biased;
             _ = shutdown.wait() => break,

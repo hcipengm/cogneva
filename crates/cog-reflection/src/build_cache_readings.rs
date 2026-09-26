@@ -109,6 +109,9 @@ pub const OUTCOME_BUSY: &str = "busy";
 /// No build gate is in force, so nothing may be removed.
 pub const OUTCOME_UNGATED: &str = "ungated";
 
+/// This loop's name in the liveness census.
+pub const BUILD_CACHE_WATCH_LOOP: &str = "build_cache_watch";
+
 /// Every value the outcome label takes, so a reader can see the whole domain
 /// with zeros rather than inferring it from whichever values happened to occur.
 pub const RECLAIM_OUTCOMES: &[&str] = &[
@@ -509,6 +512,15 @@ impl Observable for BuildCacheReadings {
 pub async fn run_build_cache_watch(readings: Arc<BuildCacheReadings>, shutdown: ShutdownSignal) {
     let dir = readings.dir().to_path_buf();
     let interval = Duration::from_secs(readings.scan_interval_secs());
+    // Every series this watcher publishes is its own measurement — the size, the
+    // cap it is held to, what a pass reclaimed. If the task died, all of them
+    // stop being written, and a cache nobody is measuring reads exactly like a
+    // cache that is small. Its liveness therefore cannot come from itself.
+    let beat = cog_core::loop_health::register(
+        BUILD_CACHE_WATCH_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+    );
+    let _mortality = beat.watch_death(shutdown.clone());
     match readings.cap_bytes() {
         Some(cap) => info!(
             dir = %dir.display(),
@@ -531,6 +543,9 @@ pub async fn run_build_cache_watch(readings: Arc<BuildCacheReadings>, shutdown: 
 
     let mut ticker = tokio::time::interval(interval);
     loop {
+        // One stamp per pass, whatever the pass measured: a cache that did not
+        // grow is not a watcher that stopped.
+        beat.beat();
         tokio::select! {
             biased;
             _ = shutdown.wait() => break,

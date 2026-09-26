@@ -3,6 +3,13 @@
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Loop name reported through the background-loop liveness family.
+pub const DAG_CHECKPOINT_LOOP: &str = "orchestrator_dag_checkpoint";
+/// Loop name reported through the background-loop liveness family.
+pub const READY_TASK_PUBLISHER_LOOP: &str = "orchestrator_ready_task_publisher";
+/// Loop name reported through the background-loop liveness family.
+pub const TASK_LEASE_RENEWER_LOOP: &str = "orchestrator_task_lease_renewer";
+
 /// Orchestrator plugin that self-assembles the DAG executor and related services.
 pub struct OrchestratorPlugin {
     initialized: bool,
@@ -272,16 +279,27 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
                 let orch = orch.clone();
                 let mut shutdown_rx = broadcast_tx.0.subscribe();
+                let checkpoint_stop = cog_core::ShutdownSignal::new();
+                let checkpoint_guard = checkpoint_stop.clone();
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let beat = cog_core::loop_health::register(
+                        DAG_CHECKPOINT_LOOP,
+                        cog_core::loop_health::Cadence::Periodic(interval.period()),
+                    );
+                    let _mortality = beat.watch_death(checkpoint_guard);
                     loop {
+                        beat.beat();
                         tokio::select! {
                             _ = interval.tick() => {
                                 orch.force_checkpoint().await;
                                 tracing::debug!("DagExecutor periodic checkpoint saved");
                             }
                             _ = shutdown_rx.recv() => {
+                                // The broadcast is this loop's own stop event, so
+                                // it must also mark the exit as intended.
+                                checkpoint_stop.trigger();
                                 tracing::info!("DagExecutor checkpoint task shutting down gracefully");
                                 break;
                             }
@@ -350,7 +368,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             );
                             interval
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            let beat = cog_core::loop_health::register(
+                                READY_TASK_PUBLISHER_LOOP,
+                                cog_core::loop_health::Cadence::Periodic(interval.period()),
+                            );
+                            let _mortality = beat.watch_death(pub_shutdown.clone());
                             loop {
+                                beat.beat();
                                 tokio::select! {
                                     _ = interval.tick() => {
                                         if let Err(e) = publisher_runtime.publish_ready_tasks().await
@@ -382,7 +406,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             let mut interval = tokio::time::interval(cadence);
                             interval
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            let beat = cog_core::loop_health::register(
+                                TASK_LEASE_RENEWER_LOOP,
+                                cog_core::loop_health::Cadence::Periodic(interval.period()),
+                            );
+                            let _mortality = beat.watch_death(renew_shutdown.clone());
                             loop {
+                                beat.beat();
                                 tokio::select! {
                                     _ = interval.tick() => {
                                         if let Err(e) = renew_orchestrator.renew_leases().await {

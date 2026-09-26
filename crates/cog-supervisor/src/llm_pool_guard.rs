@@ -19,6 +19,9 @@ use tokio::sync::broadcast;
 
 use crate::scheduler_gate::SchedulerGate;
 
+/// Loop name reported through the background-loop liveness family.
+pub const LLM_POOL_GUARD_LOOP: &str = "supervisor_llm_pool_guard";
+
 /// Reads the snapshot the gateway writes to Redis.
 pub struct RedisLlmPoolStatusSource {
     conn: redis::aio::ConnectionManager,
@@ -110,7 +113,15 @@ impl LlmPoolGuard {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
+            let beat = cog_core::loop_health::register(
+                LLM_POOL_GUARD_LOOP,
+                cog_core::loop_health::Cadence::Periodic(interval),
+            );
+            // Nothing hands this loop a stop signal: it is spawned for the life of
+            // the process, so ending for any reason leaves the pool unguarded.
+            let _mortality = beat.watch_death_unconditionally();
             loop {
+                beat.beat();
                 ticker.tick().await;
                 match self.enforce().await {
                     PoolTransition::Down(status) => {

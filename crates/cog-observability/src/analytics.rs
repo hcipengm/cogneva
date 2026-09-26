@@ -703,6 +703,9 @@ impl AnalyticsRow {
 
 // ─── Background Event Buffer ───────────────────────────────────────
 
+/// This loop's name in the liveness census.
+pub const ANALYTICS_FLUSH_LOOP: &str = "analytics_flush";
+
 /// Background task that buffers analytics events and flushes them to
 /// ClickHouse in batches.
 /// Events are collected via an unbounded channel and flushed either when
@@ -722,8 +725,20 @@ impl ClickHouseEventBuffer {
         tokio::spawn(async move {
             let mut buffer = Vec::with_capacity(max_batch_size);
             let mut interval = tokio::time::interval(flush_interval);
+            // This loop has no shutdown path at all, so any exit is one nobody
+            // asked for. Its cadence is the flush interval: the tick branch
+            // guarantees an iteration at least that often even when no event
+            // arrives, which is what makes an idle buffer distinguishable from a
+            // task that is gone — and a task that is gone is buffered events
+            // nobody flushes.
+            let beat = cog_core::loop_health::register(
+                ANALYTICS_FLUSH_LOOP,
+                cog_core::loop_health::Cadence::Periodic(flush_interval),
+            );
+            let _mortality = beat.watch_death_unconditionally();
 
             loop {
+                beat.beat();
                 tokio::select! {
                     Some(event) = rx.recv() => {
                         buffer.push(event);

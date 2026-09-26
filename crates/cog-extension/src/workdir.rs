@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+/// Loop name reported through the background-loop liveness family.
+pub const WORKTREE_GC_LOOP: &str = "extension_worktree_gc";
+
 const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
 const DEFAULT_BARE_REPO: &str = "/opt/cogneva/sandbox/repo.git";
 const DEFAULT_TARGET_DIR: &str = "/opt/cogneva/sandbox/src/target";
@@ -558,7 +561,15 @@ impl WorkdirRouter {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(gc.cfg.gc_interval);
             ticker.tick().await;
+            let beat = cog_core::loop_health::register(
+                WORKTREE_GC_LOOP,
+                cog_core::loop_health::Cadence::Periodic(gc.cfg.gc_interval),
+            );
+            // No stop signal and no exit of its own: ending means worktrees stop
+            // being reclaimed, which fills the volume the tasks run on.
+            let _mortality = beat.watch_death_unconditionally();
             loop {
+                beat.beat();
                 ticker.tick().await;
                 if let Err(e) = gc.gc_once().await {
                     warn!(error = %e, "task worktree GC failed");

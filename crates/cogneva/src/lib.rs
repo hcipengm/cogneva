@@ -83,6 +83,16 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     asset_observable.record(asset_report).await;
     ctx.publish_observable(asset_observable);
 
+    // A background loop has no parent task: when it panics or returns early it
+    // takes the series it produced with it, and "nobody writes this series any
+    // more" reads the same as "the subsystem behind it has nothing to report".
+    // The census of loops therefore lives in a module-level registry and its age
+    // is computed when the scrape arrives — there is no publisher task, because a
+    // publisher is another thing that can die silently. Published from the
+    // composition root so every process reports its own census, whatever plugins
+    // it enabled.
+    ctx.publish_observable(cog_core::loop_health::observable());
+
     let (daemon, _pid_file) = assembly::infra::init_daemon_and_pidfile();
 
     let task_event_tx = tokio::sync::broadcast::channel::<cog_core::TaskEvent>(

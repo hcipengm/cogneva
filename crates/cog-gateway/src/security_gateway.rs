@@ -1488,11 +1488,24 @@ async fn refresh_pool_state(state: &AppState) {
     sync_pool_alert(state, down).await;
 }
 
+/// Loop name reported through the background-loop liveness family.
+pub const POOL_STATE_PUBLISHER_LOOP: &str = "gateway_pool_state_publisher";
+/// Loop name reported through the background-loop liveness family.
+pub const LLM_HEALTH_PROBER_LOOP: &str = "gateway_llm_health_prober";
+
 /// 池状态发布循环：把进程内的池健康周期性落成指标/时序/告警/跨进程信号。
 async fn run_pool_state_publisher(state: AppState) {
     let period = std::time::Duration::from_secs(state.config.pool_check_secs.max(5));
     let mut ticker = tokio::time::interval(period);
+    let beat = cog_core::loop_health::register(
+        POOL_STATE_PUBLISHER_LOOP,
+        cog_core::loop_health::Cadence::Periodic(period),
+    );
+    // Nothing hands this loop a stop signal: it runs for the life of the gateway
+    // process, so any exit leaves the pool state unprojected.
+    let _mortality = beat.watch_death_unconditionally();
     loop {
+        beat.beat();
         ticker.tick().await;
         refresh_pool_state(&state).await;
     }
@@ -2096,7 +2109,15 @@ async fn mark_upstream_failure(
 async fn run_llm_health_prober(state: AppState) {
     let period = std::time::Duration::from_secs(state.config.llm_health_probe_secs.max(30));
     let mut ticker = tokio::time::interval(period);
+    let beat = cog_core::loop_health::register(
+        LLM_HEALTH_PROBER_LOOP,
+        cog_core::loop_health::Cadence::Periodic(period),
+    );
+    // Nothing hands this loop a stop signal: it runs for the life of the gateway
+    // process, and without it a suspect upstream is never retested.
+    let _mortality = beat.watch_death_unconditionally();
     loop {
+        beat.beat();
         ticker.tick().await;
         probe_suspect_upstreams(&state).await;
     }
@@ -3297,22 +3318,43 @@ async fn health_ready(State(state): State<AppState>) -> &'static str {
 /// `/metrics`：标准 Prometheus 文本，供抓取端消费。
 /// 网关自有的请求/延迟统计保留在 `/metrics/json`（旧调用方零影响）。
 async fn metrics_handler(State(state): State<AppState>) -> axum::response::Response {
-    match state.pool_obs.metrics.encode() {
-        Ok(bytes) => axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-            .body(axum::body::Body::from(bytes))
-            .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())),
+    let encoded = match state.pool_obs.metrics.encode() {
+        Ok(bytes) => bytes,
         Err(e) => {
             tracing::warn!(error = %e, "指标编码失败");
-            axum::response::Response::builder()
+            return axum::response::Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(axum::body::Body::from(format!(
                     "metrics encode failed: {e}"
                 )))
-                .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
+                .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()));
         }
+    };
+    // The pool registry holds the upstream readings; the background loops of this
+    // process live outside it. They are rendered here because a loop whose
+    // readings nobody publishes is a loop nobody can tell is gone — and the one
+    // this process runs flushes the log buffer, so its disappearance is silent by
+    // construction.
+    let mut body = match String::from_utf8(encoded) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!(error = %e, "指标编码结果不是 UTF-8");
+            return axum::response::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::from("metrics encode is not utf-8"))
+                .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()));
+        }
+    };
+    let loops = cog_core::loop_health::registry();
+    match cog_core::Observable::collect_metrics(loops.as_ref(), "").await {
+        Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
+        Err(e) => tracing::warn!(error = %e, "background loop readings unavailable this scrape"),
     }
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
 }
 
 /// 旧的 JSON 形态（网关自有的 egress/llm/code 统计），保持向后兼容。

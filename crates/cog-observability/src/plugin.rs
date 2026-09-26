@@ -8,6 +8,9 @@ use tracing::{info, warn};
 
 use crate::alert_store::{NewAlert, PostgresAlertStore};
 
+/// Loop name reported through the background-loop liveness family.
+pub const TRACE_TIER_MIGRATION_LOOP: &str = "observability_trace_tier_migration";
+
 /// Observability plugin that self-assembles and publishes raw logger, metrics,
 /// Loki, ClickHouse, Jaeger, and Elasticsearch services.
 pub struct ObservabilityPlugin {
@@ -352,7 +355,13 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 .unwrap_or_default();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(interval);
+                let beat = cog_core::loop_health::register(
+                    TRACE_TIER_MIGRATION_LOOP,
+                    cog_core::loop_health::Cadence::Periodic(interval.period()),
+                );
+                let _mortality = beat.watch_death(shutdown.clone());
                 loop {
+                    beat.beat();
                     tokio::select! {
                         _ = interval.tick() => {
                             if let Err(e) = trace_migrator.run_migration().await {

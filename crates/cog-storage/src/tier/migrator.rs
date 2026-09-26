@@ -9,6 +9,9 @@ use cog_core::{
     SFResult, ShutdownSignal, StorageTier, TierMigratorConfig, TierPolicy,
 };
 
+/// Loop name reported through the background-loop liveness family.
+pub const TIER_MIGRATION_LOOP: &str = "storage_tier_migration";
+
 /// Background migrator. Use [`TierMigrator::spawn`] to start a periodic loop
 /// or [`TierMigrator::run_once`] for an explicit pass (used by tests).
 pub struct TierMigrator {
@@ -68,7 +71,13 @@ impl TierMigrator {
             // pass costs the feature.
             let mut interval = tokio::time::interval(self.policy.scan_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let beat = cog_core::loop_health::register(
+                TIER_MIGRATION_LOOP,
+                cog_core::loop_health::Cadence::Periodic(interval.period()),
+            );
+            let _mortality = beat.watch_death(shutdown.clone());
             loop {
+                beat.beat();
                 tokio::select! {
                     _ = interval.tick() => {
                         match self.run_once().await {

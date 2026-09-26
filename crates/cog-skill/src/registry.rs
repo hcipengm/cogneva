@@ -10,6 +10,9 @@ use tokio::sync::RwLock;
 use crate::discovery::discover_all;
 use crate::loader::load_skill;
 
+/// Loop name reported through the background-loop liveness family.
+pub const SKILL_HOT_RELOAD_LOOP: &str = "skill_hot_reload";
+
 /// Configuration for skill directories.
 #[derive(Debug, Clone)]
 pub struct SkillConfig {
@@ -102,7 +105,15 @@ impl SkillRegistryImpl {
             let interval_secs = registry.config.hot_reload_interval_secs;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let beat = cog_core::loop_health::register(
+                SKILL_HOT_RELOAD_LOOP,
+                cog_core::loop_health::Cadence::Periodic(interval.period()),
+            );
+            // No stop signal and no exit of its own: ending means a skill edited on
+            // disk is never picked up again.
+            let _mortality = beat.watch_death_unconditionally();
             loop {
+                beat.beat();
                 interval.tick().await;
                 if let Err(e) = registry.check_and_reload().await {
                     tracing::warn!("Skill hot-reload check failed: {}", e);

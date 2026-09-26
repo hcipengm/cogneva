@@ -28,6 +28,9 @@ pub const DATA_VOLUME_USED_METRIC_RULE: &str = "data_volume_over_declared_size";
 /// and cheap, but it holds no value being fresher than the scrape interval.
 pub const MIN_SCAN_INTERVAL_SECS: u64 = 30;
 
+/// This loop's name in the liveness census.
+pub const DATA_VOLUME_WATCH_LOOP: &str = "data_volume_watch";
+
 /// One directory to measure: the claim that backs it, the directory itself,
 /// and any nested directories below it that belong to a different claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +291,14 @@ pub async fn run_data_volume_watch(
 ) {
     let WatchedTarget { dir, exclude, .. } = target;
     let interval = Duration::from_secs(interval_secs.max(MIN_SCAN_INTERVAL_SECS));
+    // The footprint gauge is this loop's own reading, so the loop being gone and
+    // the walk having nothing to say would read the same: the liveness of the
+    // watcher has to come from a face that outlives it.
+    let beat = cog_core::loop_health::register(
+        DATA_VOLUME_WATCH_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+    );
+    let _mortality = beat.watch_death(shutdown.clone());
     info!(
         dir = %dir.display(),
         claim = %observable.claim(),
@@ -299,6 +310,10 @@ pub async fn run_data_volume_watch(
 
     let mut ticker = tokio::time::interval(interval);
     loop {
+        // Stamped whether or not this pass found anything to measure: the age is
+        // a reading of the loop, and a loop that only stamps when it did
+        // something reports the state of the directory as its own liveness.
+        beat.beat();
         tokio::select! {
             biased;
             _ = shutdown.wait() => break,
