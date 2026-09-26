@@ -20,6 +20,25 @@ fn platform_parts(cfg: &Option<cog_core::PlatformWebhookConfig>) -> Option<(&str
         .map(|c| (c.webhook_url.as_str(), c.secret.as_deref()))
 }
 
+/// The config path each outlet reads its address from, in registration order.
+///
+/// This is the producer's own claim about where its addresses live, and it is
+/// the only place that claim exists: a deployment writes these paths and finds
+/// out nothing when one of them is wrong. An outlet whose path no deployment
+/// can write is a dispatcher present in code that can never be registered, and
+/// at runtime that is indistinguishable from "no address configured" — a
+/// legitimate state. The test below pins each path to the predicate that reads
+/// it, so the table cannot drift from the registration.
+pub const OUTLET_ADDRESS_PATHS: [(&str, &str); 4] = [
+    ("webhook", "gateway.notification_webhook_url"),
+    ("dingtalk", "gateway.notification_dingtalk.webhook_url"),
+    ("feishu", "gateway.notification_feishu.webhook_url"),
+    (
+        "wechat-work",
+        "gateway.notification_wechat_work.webhook_url",
+    ),
+];
+
 /// Names of the outlets this configuration enables, in registration order.
 ///
 /// Built from the same two predicates the registration below uses, so the
@@ -218,5 +237,28 @@ mod tests {
         config.gateway.notification_feishu = robot("", Some("s"));
         assert!(enabled_outlets(&config).is_empty());
         assert_eq!(platform_parts(&config.gateway.notification_feishu), None);
+    }
+
+    /// Each declared path, written through the loader's own setter on the
+    /// default tree, has to enable the outlet it is declared for. This is the
+    /// tie the table needs: the path in a deployment's env map and the field
+    /// the predicate reads are two different names for one thing, and a table
+    /// checked only against itself would keep agreeing with itself while the
+    /// deployment wrote somewhere nobody reads. Note the default tree: the
+    /// robot sections serialize as `null`, so this also pins that a write
+    /// through an unset section lands.
+    #[test]
+    fn each_declared_path_enables_its_outlet() {
+        for (outlet, path) in OUTLET_ADDRESS_PATHS {
+            let mut value =
+                serde_json::to_value(cog_core::Config::default()).expect("config serializes");
+            cog_core::config::set_json_path(&mut value, path, "https://example.invalid/hook");
+            let config: cog_core::Config =
+                serde_json::from_value(value).unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert!(
+                enabled_outlets(&config).contains(&outlet),
+                "writing {path} did not enable {outlet}"
+            );
+        }
     }
 }

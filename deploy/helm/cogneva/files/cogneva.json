@@ -140,6 +140,9 @@
     "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS": "gateway.contribution_oauth_refresh_interval_secs",
     "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS": "gateway.contribution_oauth_refresh_threshold_secs",
     "COGNEVA_NOTIFICATION_WEBHOOK_URL": "gateway.notification_webhook_url",
+    "COGNEVA_NOTIFICATION_DINGTALK_URL": "gateway.notification_dingtalk.webhook_url",
+    "COGNEVA_NOTIFICATION_FEISHU_URL": "gateway.notification_feishu.webhook_url",
+    "COGNEVA_NOTIFICATION_WECHAT_WORK_URL": "gateway.notification_wechat_work.webhook_url",
     "COGNEVA_STREAM_CAPACITY": "tuning.stream_capacity",
     "COGNEVA_HIGH_WATERMARK": "tuning.high_watermark",
     "COGNEVA_LOW_WATERMARK": "tuning.low_watermark",
@@ -284,7 +287,10 @@
     "request_timeout_secs": 30,
     "contribution_oauth_refresh_interval_secs": 3600,
     "contribution_oauth_refresh_threshold_secs": 14400,
-    "notification_webhook_url": null
+    "notification_webhook_url": null,
+    "notification_dingtalk": null,
+    "notification_feishu": null,
+    "notification_wechat_work": null
   },
   "metrics": {
     "enabled": true,

@@ -1245,7 +1245,7 @@ pub fn apply_env_paths(value: &mut serde_json::Value, entries: &[(&str, &str)]) 
 
 /// Walk a dot-separated path (`app.name`, `gateway.http_port`) inside a
 /// JSON object and overwrite the leaf with `new_val`.
-/// Intermediate objects are created automatically if missing.
+/// Intermediate objects are created automatically if missing or `null`.
 /// Numeric segments index into arrays (`llm_routing.backends.0.base_url`),
 /// but only into existing elements — arrays are never grown implicitly.
 pub fn set_json_path(value: &mut serde_json::Value, path: &str, new_val: &str) {
@@ -1271,6 +1271,18 @@ fn set_json_path_at(current: &mut serde_json::Value, parts: &[&str], leaf: serde
     let Some((head, rest)) = parts.split_first() else {
         return;
     };
+    // `null` is how a section the type leaves unset appears in the merged
+    // document — an `Option` that is `None` serializes to it. "Not configured"
+    // and "absent" are the same fact, so a path through it has to be able to
+    // build the object; refusing drops the write without a word and leaves the
+    // deployment believing it turned a knob. This has to happen here, before
+    // the descent decides anything: the write itself arrives as a leaf, and a
+    // leaf cannot be put into a `null`. A numeric segment is not that case — a
+    // `null` where an array belongs stays a no-op, because arrays are never
+    // grown.
+    if current.is_null() && head.parse::<usize>().is_err() {
+        *current = serde_json::Value::Object(serde_json::Map::new());
+    }
     if rest.is_empty() {
         match current {
             serde_json::Value::Object(map) => {
@@ -1308,6 +1320,60 @@ fn set_json_path_at(current: &mut serde_json::Value, parts: &[&str], leaf: serde
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dot path through a section the type leaves unset has to land.
+    ///
+    /// An `Option` that is `None` serializes to `null`, so a field reached
+    /// through it — `gateway.notification_dingtalk.webhook_url` beside the
+    /// sibling that is already set — arrives at a `null` node rather than a
+    /// missing one. Creating only on *missing* nodes dropped the write in
+    /// silence: the variable parsed, applied nothing, and no reading said so.
+    #[test]
+    fn a_path_through_an_unset_section_lands() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        // The premise: this section really is null in the tree, not absent.
+        assert_eq!(
+            value_at_path(&value, "gateway.notification_dingtalk"),
+            Some(&serde_json::Value::Null)
+        );
+
+        set_json_path(&mut value, "gateway.notification_dingtalk.webhook_url", "u");
+        let cfg: Config = serde_json::from_value(value).expect("the write keeps the tree loadable");
+        assert_eq!(
+            cfg.gateway
+                .notification_dingtalk
+                .as_ref()
+                .map(|c| c.webhook_url.as_str()),
+            Some("u")
+        );
+        // The sibling is untouched: building through the null must not clear
+        // the address that was already configured.
+        assert!(cfg.gateway.notification_webhook_url.is_none());
+    }
+
+    /// A numeric segment is not the same case: arrays are never grown, so a
+    /// path that expects an element where there is no array stays a no-op
+    /// rather than turning the node into an object with a "0" key.
+    #[test]
+    fn a_numeric_segment_through_null_stays_a_no_op() {
+        let mut value = serde_json::json!({ "backends": null });
+        set_json_path(&mut value, "backends.0.base_url", "u");
+        assert_eq!(value, serde_json::json!({ "backends": null }));
+    }
+
+    /// The value a document holds at a dot-path, if any.
+    fn value_at_path<'a>(
+        value: &'a serde_json::Value,
+        path: &str,
+    ) -> Option<&'a serde_json::Value> {
+        let segments: Vec<&str> = path.split('.').collect();
+        let (leaf, parents) = segments.split_last()?;
+        let mut cursor = Some(value);
+        for segment in parents {
+            cursor = cursor.and_then(|c| c.get(*segment));
+        }
+        cursor.and_then(|c| c.get(*leaf))
+    }
 
     /// A deployment config that predates `trace_scan_batch` must still scan:
     /// the struct derives `Default`, so a zero would parse cleanly and leave

@@ -396,6 +396,22 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_NOTIFICATION_WEBHOOK_URL".into(),
         "gateway.notification_webhook_url".into(),
     );
+    // The platform robots answer to an address just like the generic webhook
+    // does. Without a mapping a dispatcher that exists in code has no way in
+    // from any deployment, and that reads as "no address configured" — a
+    // legitimate state — rather than as an unreachable feature.
+    m.insert(
+        "COGNEVA_NOTIFICATION_DINGTALK_URL".into(),
+        "gateway.notification_dingtalk.webhook_url".into(),
+    );
+    m.insert(
+        "COGNEVA_NOTIFICATION_FEISHU_URL".into(),
+        "gateway.notification_feishu.webhook_url".into(),
+    );
+    m.insert(
+        "COGNEVA_NOTIFICATION_WECHAT_WORK_URL".into(),
+        "gateway.notification_wechat_work.webhook_url".into(),
+    );
     // tuning
     // agent_pool
     // multi_backend_consumer
@@ -970,6 +986,17 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Whether a write at `target` shows up in the default tree at all. The
+    /// writer parses digits and `true`/`false` into numbers and booleans, so
+    /// this checks that the path is present afterwards rather than that it
+    /// holds `raw` verbatim.
+    fn write_lands_in_tree(target: &str, raw: &str) -> bool {
+        let mut value =
+            serde_json::to_value(AppConfig::default()).expect("AppConfig serializes to JSON");
+        cog_core::config::set_json_path(&mut value, target, raw);
+        value_at(&value, target).is_some()
+    }
+
     /// The value a document holds at a dot-path, if any.
     fn value_at<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
         let segments: Vec<&str> = path.split('.').collect();
@@ -1043,11 +1070,25 @@ mod tests {
                 serde_json::Value::Bool(b) => Some(b.to_string()),
                 _ => None,
             });
+            // The document holds no scalar here for two very different reasons:
+            // the section is a `null` (`Option::None`), or the file simply does
+            // not set it. A sentinel tells them apart from "nothing landed" —
+            // it must not look like a number, because the writer parses digits
+            // into numbers and the check reads the tree back.
+            let probe = probed.clone().unwrap_or_else(|| "probe-sentinel".into());
+            // The writer's own contract, checked separately from what reads the
+            // value: a mapping whose write is dropped in the tree is decoration
+            // however well-formed the schema looks. This has to be its own
+            // conjunct because `holds_path` answers `true` for a path under a
+            // `null` parent (that is exactly the case it tolerates), so it can
+            // never distinguish "the type has this field" from "the write never
+            // happened" — which is how three robot-URL mappings first shipped
+            // writing nowhere at all.
+            let landed = write_lands_in_tree(target, &probe);
             let reaches_core = holds_path(&schema, target)
-                || probed
-                    .map(|raw| write_reaches_the_config(target, &raw))
-                    .unwrap_or(false);
-            if !reaches_core && !honored_by_owner {
+                || write_reaches_the_config(target, &probe)
+                || honored_by_owner;
+            if !landed || !reaches_core {
                 broken.push(format!("{key} -> {target}"));
             }
         }

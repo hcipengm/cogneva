@@ -49,6 +49,13 @@ data:
   # 变成同一件事。主应用与进化 Pod 都经 envFrom 取这一份。
   COGNEVA_NOTIFICATION_WEBHOOK_URL: ""
 
+  # 平台机器人地址。四个出口在代码里都能挂上，但在此之前只有通用 webhook 有一条
+  # 配置路径——另外三个「永远挂不上」的那种坏法没有任何读数：插件只会报「没有出口」，
+  # 而这是运维没配地址的合法状态。地址一律渲染成空串而不是省略，理由同上。
+  COGNEVA_NOTIFICATION_DINGTALK_URL: ""
+  COGNEVA_NOTIFICATION_FEISHU_URL: ""
+  COGNEVA_NOTIFICATION_WECHAT_WORK_URL: ""
+
   # raw_logger 段不在这里覆盖：与下面的 memory 段同理，同一件事在文件里写一份、
   # 在 env 里再写一份，读文件的人推不出 runtime 用的是哪份——文件里曾写着
   # enabled=false 与一个打不开的目录，实跑却是 true 与 raw-logs。要改改文件。
