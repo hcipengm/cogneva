@@ -1277,6 +1277,17 @@ pub struct MainlineDeployer {
     upstream_note: std::sync::Mutex<String>,
 }
 
+/// git 的 tree-ish 形式：`<rev>:<path>`，路径**不带前导斜杠**。
+///
+/// 带斜杠的那一版（`<rev>:/<path>`）不是「路径多了一个字符」这么轻：git 会把整串
+/// 当成一个 object name 去解，然后报 `Not a valid object name`——于是目录枚举永远
+/// 失败，收敛面每轮都停在「没有结论」，`apply` 一次也没跑过。前导斜杠看上去与
+/// 工作树里的绝对路径同形，正是它值得一条判据守的原因：这里构造的是 git 的
+/// tree-ish，不是文件系统路径。
+fn tree_ish_dir(rev: &str, dir: &str) -> String {
+    format!("{}:{}/", rev, dir.trim_matches('/'))
+}
+
 impl MainlineDeployer {
     pub fn new(
         cfg: MainlineDeployerConfig,
@@ -2600,7 +2611,7 @@ impl MainlineDeployer {
     /// rev 下某个目录里的文件名（只一层）。收件面由此**枚举**交付对象，而不是
     /// 拿一份写死的名字清单：清单外的文件会因此被看见，而不是静默缺席。
     pub(crate) async fn git_ls_dir(&self, rev: &str, dir: &str) -> SFResult<Vec<String>> {
-        let spec = format!("{}:/{}/", rev, dir.trim_end_matches('/'));
+        let spec = tree_ish_dir(rev, dir);
         let out = self
             .run_cmd(
                 "git",
@@ -5228,6 +5239,94 @@ mod tests {
     fn rev12_truncates() {
         assert_eq!(rev12("abcdef0123456789"), "abcdef012345");
         assert_eq!(rev12("short"), "short");
+    }
+
+    /// 名字不带前导斜杠，目录名前后多余的斜杠由这里收掉。
+    #[test]
+    fn tree_ish_dir_names_a_directory_inside_the_rev() {
+        assert_eq!(tree_ish_dir("HEAD", "deploy/k3s"), "HEAD:deploy/k3s/");
+        assert_eq!(tree_ish_dir("HEAD", "/deploy/k3s/"), "HEAD:deploy/k3s/");
+    }
+
+    /// 承重的那一条：**带前导斜杠的形式真的会被 git 拒**。
+    ///
+    /// 只断言拼出来的字符串长什么样的测试，在 git 换个版本改了 tree-ish 解析之后
+    /// 仍然绿；这里把两种形式都交给真 git 跑一遍——能列出文件的只有不带斜杠的那
+    /// 一种。历史缺陷正是带斜杠的那个：目录枚举每轮失败，收敛面每轮停在「没有
+    /// 结论」，apply 一次也没跑到。
+    #[test]
+    fn only_the_slashes_free_tree_ish_lists_a_directory() {
+        let repo = temp_git_repo();
+        let listed = git_ls_tree(&repo, &tree_ish_dir("HEAD", "deploy/k3s"));
+        assert!(
+            listed.contains(&"a.yaml".to_string()),
+            "the directory should be listable: {listed:?}"
+        );
+        // 对照组：同一路径写成 `HEAD:/deploy/k3s/` 时，git 把整串当成一个 object
+        // name 去解，于是什么都列不出来——而这里的「什么都列不出来」正是当年线上
+        // 那个「这一轮没有结论」。
+        let rejected = git_ls_tree(&repo, "HEAD:/deploy/k3s/");
+        assert!(
+            rejected.is_empty(),
+            "git accepted the leading-slash form; the case this guard exists for changed: {rejected:?}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// 一个只含 `deploy/k3s/a.yaml` 的临时仓库，用完删掉。
+    fn temp_git_repo() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cogneva-tree-ish-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("deploy/k3s")).expect("create temp repo");
+        std::fs::write(dir.join("deploy/k3s/a.yaml"), "kind: ConfigMap\n").expect("write file");
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.email=gate@example.invalid",
+                "-c",
+                "user.name=gate",
+                "commit",
+                "--quiet",
+                "-m",
+                "seed",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(&args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        dir
+    }
+
+    /// 一层目录的文件名；git 不认这个 spec 时按「列不出来」返回空。
+    fn git_ls_tree(repo: &std::path::Path, spec: &str) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["ls-tree", "--name-only", spec])
+            .output()
+            .expect("git runs");
+        if !out.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// 最终镜像阶段每条 `COPY`/`ADD` 的落点（shell 与 JSON 两种写法都能读）。
