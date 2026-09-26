@@ -509,80 +509,91 @@ impl Observable for BuildCacheReadings {
 
 /// Re-measure the cache on a timer, publish the result on `readings`, and
 /// enforce its cap.
-pub async fn run_build_cache_watch(readings: Arc<BuildCacheReadings>, shutdown: ShutdownSignal) {
+pub fn spawn_build_cache_watch(
+    readings: Arc<BuildCacheReadings>,
+    shutdown: ShutdownSignal,
+) -> tokio::task::JoinHandle<()> {
     let dir = readings.dir().to_path_buf();
     let interval = Duration::from_secs(readings.scan_interval_secs());
     // Every series this watcher publishes is its own measurement — the size, the
     // cap it is held to, what a pass reclaimed. If the task died, all of them
     // stop being written, and a cache nobody is measuring reads exactly like a
     // cache that is small. Its liveness therefore cannot come from itself.
-    let beat = cog_core::loop_health::register(
+    cog_core::loop_health::spawn(
         BUILD_CACHE_WATCH_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
-    );
-    let _mortality = beat.watch_death(shutdown.clone());
-    match readings.cap_bytes() {
-        Some(cap) => info!(
-            dir = %dir.display(),
-            interval_secs = interval.as_secs(),
-            depth = CACHE_LAYER_DEPTH,
-            cap_bytes = cap,
-            metric = BUILD_TARGET_BYTES_METRIC,
-            "build cache watcher started; the cache is capped"
-        ),
-        // Said out loud, because the same watcher with no cap looks the same in
-        // the readings as a cap that is never reached.
-        None => info!(
-            dir = %dir.display(),
-            interval_secs = interval.as_secs(),
-            depth = CACHE_LAYER_DEPTH,
-            metric = BUILD_TARGET_BYTES_METRIC,
-            "build cache watcher started; no cap is configured, so the cache is measured and not bounded"
-        ),
-    }
-
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        // One stamp per pass, whatever the pass measured: a cache that did not
-        // grow is not a watcher that stopped.
-        beat.beat();
-        tokio::select! {
-            biased;
-            _ = shutdown.wait() => break,
-            _ = ticker.tick() => {
-                let path = dir.clone();
-                // Off the runtime: the walk is metadata-only but it is a walk of
-                // a large tree, and it must not hold up the cycles that build
-                // into this cache.
-                //
-                // One walk, not two: the files are what the cap is enforced
-                // against and the layers are what is published, and a plan built
-                // from a different snapshot than the published total would be
-                // enforcing a figure nobody can see.
-                let walked = tokio::task::spawn_blocking(move || {
-                    fs_size::dir_files(&path, CACHE_LAYER_DEPTH, &[])
-                })
-                .await;
-                match walked {
-                    Ok(Ok(files)) => {
-                        readings.set_layers(fs_size::layer_totals(&files), unix_now());
-                        readings
-                            .enforce_cap(&files, cog_core::build_gate::global().as_ref())
-                            .await;
-                    }
-                    // A failed walk yields a total that is too small, which can
-                    // only silence a cap. Keep the last measurement rather than
-                    // publish a fictional small one, and say so.
-                    Ok(Err(e)) => warn!(
-                        error = %e,
+        shutdown.clone(),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let readings = Arc::clone(&readings);
+            let dir = dir.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                match readings.cap_bytes() {
+                    Some(cap) => info!(
                         dir = %dir.display(),
-                        "build cache scan failed; keeping the last measurement"
+                        interval_secs = interval.as_secs(),
+                        depth = CACHE_LAYER_DEPTH,
+                        cap_bytes = cap,
+                        metric = BUILD_TARGET_BYTES_METRIC,
+                        "build cache watcher started; the cache is capped"
                     ),
-                    Err(e) => warn!(error = %e, "build cache scan task panicked"),
+                    // Said out loud, because the same watcher with no cap looks the same in
+                    // the readings as a cap that is never reached.
+                    None => info!(
+                        dir = %dir.display(),
+                        interval_secs = interval.as_secs(),
+                        depth = CACHE_LAYER_DEPTH,
+                        metric = BUILD_TARGET_BYTES_METRIC,
+                        "build cache watcher started; no cap is configured, so the cache is measured and not bounded"
+                    ),
+                }
+
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    // One stamp per pass, whatever the pass measured: a cache that did not
+                    // grow is not a watcher that stopped.
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = ticker.tick() => {
+                            let path = dir.clone();
+                            // Off the runtime: the walk is metadata-only but it is a walk of
+                            // a large tree, and it must not hold up the cycles that build
+                            // into this cache.
+                            //
+                            // One walk, not two: the files are what the cap is enforced
+                            // against and the layers are what is published, and a plan built
+                            // from a different snapshot than the published total would be
+                            // enforcing a figure nobody can see.
+                            let walked = tokio::task::spawn_blocking(move || {
+                                fs_size::dir_files(&path, CACHE_LAYER_DEPTH, &[])
+                            })
+                            .await;
+                            match walked {
+                                Ok(Ok(files)) => {
+                                    readings.set_layers(fs_size::layer_totals(&files), unix_now());
+                                    readings
+                                        .enforce_cap(&files, cog_core::build_gate::global().as_ref())
+                                        .await;
+                                }
+                                // A failed walk yields a total that is too small, which can
+                                // only silence a cap. Keep the last measurement rather than
+                                // publish a fictional small one, and say so.
+                                Ok(Err(e)) => warn!(
+                                    error = %e,
+                                    dir = %dir.display(),
+                                    "build cache scan failed; keeping the last measurement"
+                                ),
+                                Err(e) => warn!(error = %e, "build cache scan task panicked"),
+                            }
+                        }
+                    }
                 }
             }
-        }
-    }
+        },
+    )
 }
 
 #[cfg(test)]

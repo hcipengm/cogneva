@@ -36,40 +36,50 @@ impl HeartbeatDriver {
     ) -> Self {
         let agent_id = agent_id.into();
         let loop_name = format!("supervisor_heartbeat[{agent_id}]");
-        let handle = tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(tokio::time::Duration::from_secs(interval_seconds.max(1)));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await;
-            let beat = cog_core::loop_health::register(
-                loop_name,
-                cog_core::loop_health::Cadence::Periodic(ticker.period()),
-            );
-            let _mortality = beat.watch_death(cancel.clone());
-            loop {
-                beat.beat();
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        if let Err(e) = registry.heartbeat(&agent_id).await {
-                            tracing::warn!(
-                                agent_id = %agent_id,
-                                "heartbeat failed: {e}"
-                            );
+        let interval = tokio::time::Duration::from_secs(interval_seconds.max(1));
+        // The supervised task's own handle comes back rather than an outer task's:
+        // `abort` has to reach the task that is running the loop, and with a
+        // wrapper task it would leave the loop running with nothing holding it.
+        let handle = cog_core::loop_health::spawn(
+            loop_name,
+            cog_core::loop_health::Cadence::Periodic(interval),
+            cancel.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let registry = Arc::clone(&registry);
+                let agent_id = agent_id.clone();
+                let event_tx = event_tx.clone();
+                let cancel = cancel.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    ticker.tick().await;
+                    loop {
+                        beat.beat();
+                        tokio::select! {
+                            _ = ticker.tick() => {
+                                if let Err(e) = registry.heartbeat(&agent_id).await {
+                                    tracing::warn!(
+                                        agent_id = %agent_id,
+                                        "heartbeat failed: {e}"
+                                    );
+                                }
+                                if let Some(ref tx) = event_tx {
+                                    let event = AgentEvent::Heartbeat {
+                                        agent_id: agent_id.clone(),
+                                        timestamp: chrono::Utc::now(),
+                                    };
+                                    let _ = tx.send(event);
+                                }
+                            }
+                            _ = cancel.wait() => {
+                                break;
+                            }
                         }
-                        if let Some(ref tx) = event_tx {
-                            let event = AgentEvent::Heartbeat {
-                                agent_id: agent_id.clone(),
-                                timestamp: chrono::Utc::now(),
-                            };
-                            let _ = tx.send(event);
-                        }
-                    }
-                    _ = cancel.wait() => {
-                        break;
                     }
                 }
-            }
-        });
+            },
+        );
         Self { handle }
     }
 

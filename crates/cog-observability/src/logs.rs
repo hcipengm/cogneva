@@ -590,31 +590,41 @@ impl LokiBackgroundPusher {
         }
     }
 
-    pub async fn run_loop(&self) {
-        let mut interval = tokio::time::interval(self.interval);
+    /// Start the flush loop and hand back its handle.
+    ///
+    /// Returns the handle rather than running the loop because the loop now
+    /// lives under the supervisor, which needs its body as a value it can build
+    /// again — see `cog_core::loop_health`.
+    pub fn run_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         // No shutdown path exists for this pusher, so any exit is one nobody
         // asked for, and the entries it is holding are never sent. Its cadence
         // is the flush interval — one iteration per tick, whether or not there
         // was anything to push.
-        let beat = cog_core::loop_health::register(
+        cog_core::loop_health::spawn_unstoppable(
             LOKI_FLUSH_LOOP,
             cog_core::loop_health::Cadence::Periodic(self.interval),
-        );
-        let _mortality = beat.watch_death_unconditionally();
-        loop {
-            beat.beat();
-            interval.tick().await;
-            let batch = {
-                let mut buf = self.buffer.lock().unwrap();
-                if buf.is_empty() {
-                    continue;
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = Arc::clone(&self);
+                async move {
+                    let mut interval = tokio::time::interval(this.interval);
+                    loop {
+                        beat.beat();
+                        interval.tick().await;
+                        let batch = {
+                            let mut buf = this.buffer.lock().unwrap();
+                            if buf.is_empty() {
+                                continue;
+                            }
+                            std::mem::replace(&mut *buf, Vec::with_capacity(this.max_batch_size))
+                        };
+                        if let Err(e) = this.client.push(batch).await {
+                            tracing::warn!("Loki background push failed: {}", e);
+                        }
+                    }
                 }
-                std::mem::replace(&mut *buf, Vec::with_capacity(self.max_batch_size))
-            };
-            if let Err(e) = self.client.push(batch).await {
-                tracing::warn!("Loki background push failed: {}", e);
-            }
-        }
+            },
+        )
     }
 }
 

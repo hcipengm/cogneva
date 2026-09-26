@@ -996,8 +996,8 @@ data:
         },
         {
           "id": 27,
-          "title": "Background Loop Deaths and Census",
-          "description": "Background loops that ended while their process was still running, and the census of loops each process started, over 6h. registered is 1 for every loop a process started and 0 for none, so the lines are the loop population of each process: a loop missing from a process that should run it is a plugin or a role that changed, and a count that drops between two deploys is a loop that left the code. deaths counts loops that returned early or panicked, classified against the shutdown their process was asked for -- a clean stop is not counted. Zero is published for every loop that never died, which is why a deaths line at zero is drawn at all: 'never happened' and 'not being counted' are otherwise the same silence. Nothing restarts a dead loop in place, so a deaths line that rises stays up until that process restarts, and the loop's other readings disappear at the same moment -- this panel is where that disappearance gets an explanation.",
+          "title": "Background Loop Deaths, Restarts and Census",
+          "description": "Background loops that ended while their process was still running, the ones that were run again after a panic, and the census of loops each process started, over 6h. registered is 1 for every loop a process started and 0 for none, so the lines are the loop population of each process: a loop missing from a process that should run it is a plugin or a role that changed, and a count that drops between two deploys is a loop that left the code. deaths counts loops that returned early or panicked with their restart budget spent, classified against the shutdown their process was asked for -- a clean stop is not counted. restarts counts panics that were run again in place; the loop is alive at the moment it is counted, and it is drawn here because a repaired loop publishes every series it had, so on every other panel it looks like a loop that never stopped. The two lines are read together: restarts alone is a panic the supervisor absorbed, deaths alone is a loop that chose to end, both is a loop that kept panicking until the budget ran out and is now gone. Zero is published for every loop that never died or never restarted, which is why a line at zero is drawn at all: 'never happened' and 'not being counted' are otherwise the same silence. Once the budget is spent nothing runs the loop again, so a deaths line that rises stays up until that process restarts, and the loop's other readings disappear at the same moment -- this panel is where that disappearance gets an explanation.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -1017,6 +1017,14 @@ data:
             {
               "expr": "cogneva_loop_deaths_total",
               "legendFormat": "{{loop}} deaths",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_loop_restarts_total",
+              "legendFormat": "{{loop}} restarts (panicked, run again)",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

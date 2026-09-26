@@ -91,36 +91,42 @@ impl UnixHeartbeatClient {
         let path = self.socket_path.clone();
         let agent_id = self.agent_id.clone();
         let loop_name = format!("supervisor_unix_heartbeat[{agent_id}]");
-        tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs.max(1)));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await;
-            let beat = cog_core::loop_health::register(
-                loop_name,
-                cog_core::loop_health::Cadence::Periodic(ticker.period()),
-            );
-            let _mortality = beat.watch_death(cancel.clone());
-            loop {
-                beat.beat();
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let packet = serde_json::json!({
-                            "agent_id": &agent_id,
-                            "ts": chrono::Utc::now().timestamp(),
-                        });
-                        match UnixStream::connect(&path).await {
-                            Ok(mut stream) => {
-                                let _ = stream.write_all(packet.to_string().as_bytes()).await;
+        let interval = tokio::time::Duration::from_secs(interval_secs.max(1));
+        cog_core::loop_health::spawn(
+            loop_name,
+            cog_core::loop_health::Cadence::Periodic(interval),
+            cancel.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let path = path.clone();
+                let agent_id = agent_id.clone();
+                let cancel = cancel.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    ticker.tick().await;
+                    loop {
+                        beat.beat();
+                        tokio::select! {
+                            _ = ticker.tick() => {
+                                let packet = serde_json::json!({
+                                    "agent_id": &agent_id,
+                                    "ts": chrono::Utc::now().timestamp(),
+                                });
+                                match UnixStream::connect(&path).await {
+                                    Ok(mut stream) => {
+                                        let _ = stream.write_all(packet.to_string().as_bytes()).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(agent_id=%agent_id, "Unix heartbeat connect failed: {}", e);
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(agent_id=%agent_id, "Unix heartbeat connect failed: {}", e);
-                            }
+                            _ = cancel.wait() => break,
                         }
                     }
-                    _ = cancel.wait() => break,
                 }
-            }
-        })
+            },
+        )
     }
 }

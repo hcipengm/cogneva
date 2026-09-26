@@ -1467,26 +1467,40 @@ pub async fn run_baseline_port_loop(
         version = %current_version,
         "baseline port trigger loop started"
     );
-    let mut ticker = tokio::time::interval(interval);
     // A port that fails keeps its last state and retries on the next tick, so a
-    // loop that died leaves nothing behind but a version that never moves.
-    let beat = cog_core::loop_health::register(
+    // loop that died leaves nothing behind but a version that never moves. The
+    // supervised shape adds the repair: a panicking tick is run again and counted,
+    // instead of ending the loop with a healthy looking series.
+    let _ = cog_core::loop_health::spawn(
         BASELINE_PORT_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
-    );
-    let _mortality = beat.watch_death(shutdown.clone());
-    loop {
-        beat.beat();
-        tokio::select! {
-            biased;
-            _ = shutdown.wait() => break,
-            _ = ticker.tick() => {
-                if let Err(e) = port_tick(&porter, &current_version, &config, &state_path).await {
-                    warn!(error = %e, "baseline port tick failed");
+        shutdown.clone(),
+        move |beat| {
+            let porter = Arc::clone(&porter);
+            let current_version = current_version.clone();
+            let config = config.clone();
+            let state_path = state_path.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = ticker.tick() => {
+                            if let Err(e) =
+                                port_tick(&porter, &current_version, &config, &state_path).await
+                            {
+                                warn!(error = %e, "baseline port tick failed");
+                            }
+                        }
+                    }
                 }
             }
-        }
-    }
+        },
+    )
+    .await;
 }
 
 /// 输出尾部截断（编译/测试错误集中在尾部），按字符边界裁剪。

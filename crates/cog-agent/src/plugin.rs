@@ -361,27 +361,30 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // ── gRPC control plane heartbeat + command subscription ──
         if let Some(client) = self.lifecycle_client.clone() {
             let agent_id = format!("cogneva-agent-{}", std::process::id());
-            tokio::spawn({
-                let client = client.clone();
-                let agent_id = agent_id.clone();
-                async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                    let beat = cog_core::loop_health::register(
-                        GRPC_CONTROL_HEARTBEAT_LOOP,
-                        cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(5)),
-                    );
-                    // No stop signal and no exit of its own: ending means this agent
-                    // stops reporting itself to the control plane.
-                    let _mortality = beat.watch_death_unconditionally();
-                    loop {
-                        beat.beat();
-                        interval.tick().await;
-                        if let Err(e) = client.heartbeat(&agent_id, "active").await {
-                            tracing::warn!("gRPC heartbeat failed: {}", e);
+            let heartbeat_period = std::time::Duration::from_secs(5);
+            let hb_client = client.clone();
+            let hb_agent_id = agent_id.clone();
+            // No stop signal and no exit of its own: ending means this agent
+            // stops reporting itself to the control plane.
+            drop(cog_core::loop_health::spawn_unstoppable(
+                GRPC_CONTROL_HEARTBEAT_LOOP,
+                cog_core::loop_health::Cadence::Periodic(heartbeat_period),
+                // Rebuilt per attempt, so everything the body consumes is cloned here.
+                move |beat| {
+                    let client = hb_client.clone();
+                    let agent_id = hb_agent_id.clone();
+                    async move {
+                        let mut interval = tokio::time::interval(heartbeat_period);
+                        loop {
+                            beat.beat();
+                            interval.tick().await;
+                            if let Err(e) = client.heartbeat(&agent_id, "active").await {
+                                tracing::warn!("gRPC heartbeat failed: {}", e);
+                            }
                         }
                     }
-                }
-            });
+                },
+            ));
             tokio::spawn(async move {
                 match client.subscribe_commands(&agent_id).await {
                     Ok(mut stream) => {

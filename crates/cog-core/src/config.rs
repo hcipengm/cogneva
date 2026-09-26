@@ -774,6 +774,16 @@ pub struct SystemConfig {
     pub shutdown_timeout_ms: u64,
     /// Interval between timeout-checker ticks (seconds).
     pub timeout_checker_interval_secs: u64,
+    /// How many times in a row a background loop may be run again after
+    /// panicking. 0 disables the restart entirely, which makes a panic as
+    /// fatal as it was before the mechanism existed. A loop past its budget
+    /// is left dead, and the death counter and the stall rule report it.
+    pub loop_restart_max_consecutive: u32,
+    /// Floor for the wait before running a panicked loop again (seconds). A
+    /// loop with a cadence waits by its own period; only event-driven loops
+    /// have no period and take this floor. The wait doubles per attempt and
+    /// is capped at six times this value.
+    pub loop_restart_backoff_floor_secs: u64,
     /// Stale-task detector poll interval (seconds).
     pub stale_task_detector_poll_secs: u64,
     /// Interval between monthly-partition maintenance rounds (seconds).
@@ -847,6 +857,8 @@ impl Default for SystemConfig {
             task_event_channel_capacity: 256,
             shutdown_timeout_ms: 30_000,
             timeout_checker_interval_secs: 30,
+            loop_restart_max_consecutive: 3,
+            loop_restart_backoff_floor_secs: 5,
             stale_task_detector_poll_secs: 15,
             partition_maintenance_interval_secs: 3600,
             tool_timeout_secs: 30,

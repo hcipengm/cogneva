@@ -36,6 +36,15 @@
 //!   than omitted, because "never died" and "not being counted" are otherwise
 //!   the same silence.
 //!
+//! A loop that panics is run again, because a panic is the one exit whose intent
+//! is not ambiguous: the loop did not decide to stop, a cycle killed it. The
+//! attempts are bounded, and the bound is what keeps the repair honest — a loop
+//! that cannot survive even with a fresh start is a defect, and running it again
+//! forever would only replace a dead loop that is reported with a live one that
+//! panics invisibly. Past the budget the loop stays dead and the readings above
+//! report it, which is also why the restarts have a counter of their own: a
+//! repair that leaves no reading turns "this is broken" into "this is quiet".
+//!
 //! The count is what a shutdown request is compared against: a stopping process
 //! triggers the signal its loops select on, those loops break, and the guard that
 //! notices the exit asks whether that is why it exited. Without that comparison
@@ -50,11 +59,13 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::FutureExt;
 
 use crate::contract::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use crate::contract::shutdown::ShutdownSignal;
@@ -69,6 +80,15 @@ pub const LOOP_PERIOD_SECONDS: &str = "cogneva_loop_period_seconds";
 pub const LOOP_TICK_AGE_SECONDS: &str = "cogneva_loop_tick_age_seconds";
 /// Times a loop ended while the process was still running, as a counter.
 pub const LOOP_DEATHS_TOTAL: &str = "cogneva_loop_deaths_total";
+/// Times a loop was restarted after panicking, as a counter.
+///
+/// Separate from the deaths, because the two answer different questions and are
+/// repaired differently: a death is a loop that stayed dead, while a restart is
+/// a loop that panicked and is running again. Counting restarts as deaths would
+/// make the two indistinguishable exactly in the case a reader has to act on,
+/// and counting them nowhere would let a loop panic every hour forever without
+/// anything saying so — a repair that leaves no reading is a defect made quiet.
+pub const LOOP_RESTARTS_TOTAL: &str = "cogneva_loop_restarts_total";
 /// Label naming the loop. Its value set is bounded by configuration rather than
 /// by traffic: one value per loop instance the process starts, so a site that
 /// runs one instance per configured stream or workspace names it after that
@@ -76,6 +96,13 @@ pub const LOOP_DEATHS_TOTAL: &str = "cogneva_loop_deaths_total";
 /// unbounded, and a name shared by two instances would let a dead one hide
 /// behind the beats of its live sibling.
 pub const LOOP_LABEL: &str = "loop";
+
+/// The deployed rule that reads the age this module publishes.
+pub const STALL_RULE: &str = "background_loop_stalled";
+/// The deployed rule that reads the death counter this module publishes.
+pub const DEATH_RULE: &str = "background_loop_died";
+/// The deployed rule that reads the restart counter this module publishes.
+pub const RESTART_RULE: &str = "background_loop_restarted";
 
 /// How often a loop is expected to reach the top of its cycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +125,115 @@ impl Cadence {
     }
 }
 
+/// What this process allows a loop that panicked, before it is left dead.
+///
+/// Installed once at startup from the configuration document, because the budget
+/// belongs to the process's loops rather than to any one of them: three loops
+/// holding three different budgets would make the same defect read differently
+/// depending on which loop happened to hit it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestartSettings {
+    /// How many times in a row a loop is run again after panicking.
+    ///
+    /// Three, because a fault that a restart repairs is repaired by the first
+    /// one: the second and third exist for the faults that need the state they
+    /// tripped over to be gone, and a loop that panics past all three is not
+    /// having a bad cycle — it is a defect, and a fourth attempt would only
+    /// postpone the reading that says so. Zero turns restarting off and leaves
+    /// a panic as fatal as it was before this existed.
+    pub max_consecutive: u32,
+    /// The floor under a loop's first wait between attempts, in seconds.
+    ///
+    /// A loop with a cadence waits its own period; a loop that only wakes on work
+    /// has no rhythm to wait, so it waits this. Five seconds is long enough that
+    /// a loop which panics immediately does not fill the log with attempts (the
+    /// waits double from here, so a spent budget is tens of seconds, not
+    /// milliseconds) and short enough that an event-driven loop is back before
+    /// the next burst of work.
+    pub backoff_floor_secs: u64,
+}
+
+impl Default for RestartSettings {
+    fn default() -> Self {
+        Self {
+            max_consecutive: 3,
+            backoff_floor_secs: 5,
+        }
+    }
+}
+
+/// The process's restart budget. First install wins; see
+/// [`install_restart_settings`].
+static RESTART_SETTINGS: OnceLock<RestartSettings> = OnceLock::new();
+
+/// Install the process-wide restart budget, from the configuration document.
+///
+/// The first install wins, and a later one that disagrees is logged rather than
+/// applied: the loops this governs are already running by the time a second
+/// caller could install one, so a budget that moved underneath them would judge
+/// the same panic differently depending on when it happened.
+pub fn install_restart_settings(settings: RestartSettings) {
+    if RESTART_SETTINGS.set(settings).is_err() && RESTART_SETTINGS.get().copied() != Some(settings)
+    {
+        tracing::warn!(
+            installed_max_consecutive = RESTART_SETTINGS.get().map(|s| s.max_consecutive),
+            offered_max_consecutive = settings.max_consecutive,
+            "restart budget installed twice with different values; the first one is in force"
+        );
+    }
+}
+
+/// The restart budget in force, or the documented default when nothing installed
+/// one — a process that never reads a configuration document still restarts its
+/// loops.
+fn restart_settings() -> RestartSettings {
+    *RESTART_SETTINGS.get_or_init(RestartSettings::default)
+}
+
+/// The restart budget one loop is judged by, derived from what it declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestartPolicy {
+    /// Restarts allowed back to back before the loop is left dead.
+    pub max_consecutive: u32,
+    /// The wait before the first attempt to run the loop again; it doubles from
+    /// there, up to [`Self::backoff_max`].
+    pub backoff: Duration,
+    /// The longest wait, and the lifetime an attempt has to reach to count as
+    /// having taken.
+    pub backoff_max: Duration,
+}
+
+/// How many of a loop's own periods the longest restart wait spans.
+///
+/// Six is not a value chosen here: it is the multiple the deployed stall rule
+/// already measures a loop against. Waiting longer than that would keep a loop
+/// from beating past the point where it is announced as stalled, so the two
+/// readings would describe the same state in opposite directions.
+const STALL_PERIODS: u32 = 6;
+
+impl RestartPolicy {
+    /// The budget for a loop with this cadence under these settings.
+    pub fn for_cadence(cadence: Cadence, settings: RestartSettings) -> Self {
+        let declared = match cadence {
+            Cadence::Periodic(period) => period,
+            Cadence::EventDriven => Duration::ZERO,
+        };
+        let base = declared.max(Duration::from_secs(settings.backoff_floor_secs));
+        Self {
+            max_consecutive: settings.max_consecutive,
+            backoff: base,
+            backoff_max: base * STALL_PERIODS,
+        }
+    }
+
+    /// How long to wait before the `run`th attempt in a row.
+    fn wait_before(&self, run: u32) -> Duration {
+        self.backoff
+            .saturating_mul(1u32 << (run - 1).min(16))
+            .min(self.backoff_max)
+    }
+}
+
 /// What this module knows about one loop.
 struct LoopState {
     name: String,
@@ -107,6 +243,7 @@ struct LoopState {
     /// loop that has not beaten since before it started.
     last_beat_ms: AtomicU64,
     deaths: AtomicU64,
+    restarts: AtomicU64,
 }
 
 impl LoopState {
@@ -157,6 +294,7 @@ impl LoopHealth {
                 // must age like one, not look newborn forever.
                 last_beat_ms: AtomicU64::new(now_ms()),
                 deaths: AtomicU64::new(0),
+                restarts: AtomicU64::new(0),
             })
         });
         if state.period_secs != period_secs {
@@ -216,6 +354,13 @@ pub fn register(name: impl Into<String>, cadence: Cadence) -> Beat {
 /// classified against `shutdown`: a loop that ends while that signal has not been
 /// triggered is counted as a death, and one that ends because it was triggered is
 /// the ordinary stop.
+///
+/// A body that panics is run again, up to the process's restart budget. The body
+/// is called once per attempt, so it has to be able to start over: what it
+/// consumes it creates inside itself, and what it shares it clones on the way in.
+/// A body that returns, by contrast, is never restarted — a return is the loop
+/// saying it is done, which is a decision this module cannot overrule and has no
+/// reading that would let it.
 pub fn spawn<F, Fut>(
     name: impl Into<String>,
     cadence: Cadence,
@@ -223,15 +368,134 @@ pub fn spawn<F, Fut>(
     body: F,
 ) -> tokio::task::JoinHandle<()>
 where
-    F: FnOnce(Beat) -> Fut + Send + 'static,
+    F: FnMut(Beat) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let policy = RestartPolicy::for_cadence(cadence, restart_settings());
+    spawn_with_policy(name, cadence, Some(shutdown), policy, body)
+}
+
+/// Start a loop whose owner never gave it a way to stop.
+///
+/// Symmetric with [`Beat::watch_death_unconditionally`]: there is no signal that
+/// could excuse an exit, so every exit is one nobody asked for — and a panic is
+/// run again for the same reason it is counted, because nothing about this loop's
+/// exit was intended.
+pub fn spawn_unstoppable<F, Fut>(
+    name: impl Into<String>,
+    cadence: Cadence,
+    body: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut(Beat) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let policy = RestartPolicy::for_cadence(cadence, restart_settings());
+    spawn_with_policy(name, cadence, None, policy, body)
+}
+
+/// Start a loop under a budget given here rather than derived.
+///
+/// For the caller that has to judge a specific panic rate, and for tests, which
+/// need waits they can drive instead of wall-clock waits.
+pub fn spawn_with_policy<F, Fut>(
+    name: impl Into<String>,
+    cadence: Cadence,
+    shutdown: Option<ShutdownSignal>,
+    policy: RestartPolicy,
+    body: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut(Beat) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let beat = register(name, cadence);
-    let watch = beat.watch_death(shutdown);
-    tokio::spawn(async move {
-        let _mortality = watch;
-        body(beat).await;
-    })
+    tokio::spawn(supervise(beat, shutdown, policy, body))
+}
+
+/// Run a loop's body, and run it again if it panics.
+///
+/// The waits are taken from the loop's own cadence rather than from a timer of
+/// this module's: a loop that beats every minute and a loop that beats every
+/// second are not equally broken when they panic, and a single wait for both
+/// would be too long for one and too short for the other.
+async fn supervise<F, Fut>(
+    beat: Beat,
+    shutdown: Option<ShutdownSignal>,
+    policy: RestartPolicy,
+    mut body: F,
+) where
+    F: FnMut(Beat) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let _mortality = match &shutdown {
+        Some(signal) => beat.watch_death(signal.clone()),
+        None => beat.watch_death_unconditionally(),
+    };
+    let mut run: u32 = 0;
+    loop {
+        let attempt = tokio::time::Instant::now();
+        let payload = match AssertUnwindSafe(body(beat.clone())).catch_unwind().await {
+            // The loop chose to end. Its exit is not this module's to overrule,
+            // and the guard above is what decides what the exit meant.
+            Ok(()) => return,
+            Err(payload) => payload,
+        };
+        if shutdown.as_ref().is_some_and(|s| s.is_triggered()) {
+            tracing::debug!(
+                loop_name = beat.name(),
+                "a background loop panicked while the process was stopping; not running it again"
+            );
+            return;
+        }
+        // An attempt that lived as long as the longest wait counts as having
+        // taken, so the panic that ended it starts a new run instead of
+        // extending one. Without this a loop that panics once a week would be
+        // given up on after three panics spread over a month.
+        if attempt.elapsed() >= policy.backoff_max {
+            run = 0;
+        }
+        if run + 1 > policy.max_consecutive {
+            tracing::error!(
+                loop_name = beat.name(),
+                restarts = policy.max_consecutive,
+                "a background loop panicked again with its restart budget spent; leaving it \
+                 dead, which the death counter and the stall rule report from here. The panic \
+                 message just above this line is the defect"
+            );
+            return;
+        }
+        run += 1;
+        let restarts = beat.note_restart();
+        let wait = policy.wait_before(run);
+        tracing::warn!(
+            loop_name = beat.name(),
+            restarts,
+            consecutive = run,
+            wait_ms = wait.as_millis() as u64,
+            panic = panic_message(&payload),
+            "a background loop panicked; running it again"
+        );
+        match &shutdown {
+            Some(signal) => tokio::select! {
+                biased;
+                _ = signal.wait() => return,
+                _ = tokio::time::sleep(wait) => {}
+            },
+            None => tokio::time::sleep(wait).await,
+        }
+    }
+}
+
+/// A panic payload as text, for the line that reports the panic.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        text
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.as_str()
+    } else {
+        "a panic whose payload is not text"
+    }
 }
 
 /// A loop's beat handle: one stamp per cycle.
@@ -253,6 +517,11 @@ impl Beat {
     /// The loop's name, as it appears in the label.
     pub fn name(&self) -> &str {
         &self.state.name
+    }
+
+    /// Count a restart of this loop and return the running total.
+    fn note_restart(&self) -> u64 {
+        self.state.restarts.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Record this loop's exit as a death unless `shutdown` was triggered.
@@ -329,6 +598,13 @@ impl Observable for LoopHealth {
                 RawMetric::new(
                     LOOP_DEATHS_TOTAL,
                     state.deaths.load(Ordering::Relaxed) as f64,
+                )
+                .with_label(LOOP_LABEL, label),
+            );
+            out.push(
+                RawMetric::new(
+                    LOOP_RESTARTS_TOTAL,
+                    state.restarts.load(Ordering::Relaxed) as f64,
                 )
                 .with_label(LOOP_LABEL, label),
             );
@@ -524,6 +800,252 @@ mod tests {
         assert_eq!(metric(&metrics, LOOP_REGISTERED, "dead_probe"), Some(1.0));
     }
 
+    /// A body that panics on the attempts `panic_on` picks and returns on the
+    /// rest, with the attempts counted where the test can read them.
+    fn flaky_body(
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+        panic_on: Arc<dyn Fn(u32) -> bool + Send + Sync>,
+    ) -> impl FnMut(Beat) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static
+    {
+        move |beat| {
+            let attempts = Arc::clone(&attempts);
+            let panic_on = Arc::clone(&panic_on);
+            Box::pin(async move {
+                beat.beat();
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                if panic_on(attempt) {
+                    panic!("attempt {attempt} panicked on purpose");
+                }
+            })
+        }
+    }
+
+    fn policy(max_consecutive: u32, backoff_ms: u64) -> RestartPolicy {
+        RestartPolicy {
+            max_consecutive,
+            backoff: Duration::from_millis(backoff_ms),
+            backoff_max: Duration::from_millis(backoff_ms * 4),
+        }
+    }
+
+    /// The restart budget a loop is judged by follows the cadence the loop
+    /// declared, because a loop that beats every minute and one that beats every
+    /// second are not equally broken when they panic.
+    #[test]
+    fn the_restart_waits_are_derived_from_the_loop_cadence() {
+        let settings = RestartSettings {
+            max_consecutive: 2,
+            backoff_floor_secs: 5,
+        };
+        let slow = RestartPolicy::for_cadence(Cadence::Periodic(Duration::from_secs(60)), settings);
+        assert_eq!(slow.backoff, Duration::from_secs(60));
+        assert_eq!(slow.backoff_max, Duration::from_secs(360));
+        // A loop with no cadence has no rhythm to wait, so the floor stands in.
+        let idle = RestartPolicy::for_cadence(Cadence::EventDriven, settings);
+        assert_eq!(idle.backoff, Duration::from_secs(5));
+        assert_eq!(idle.backoff_max, Duration::from_secs(30));
+        // A loop faster than the floor waits the floor: a one-second loop that
+        // panics immediately must not be run again every second.
+        let fast = RestartPolicy::for_cadence(Cadence::Periodic(Duration::from_secs(1)), settings);
+        assert_eq!(fast.backoff, Duration::from_secs(5));
+        assert_eq!(fast.max_consecutive, 2);
+        assert_eq!(slow.wait_before(1), Duration::from_secs(60));
+        assert_eq!(slow.wait_before(2), Duration::from_secs(120));
+        assert_eq!(slow.wait_before(3), Duration::from_secs(240));
+        assert_eq!(slow.wait_before(4), Duration::from_secs(360));
+        assert_eq!(slow.wait_before(9), Duration::from_secs(360));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_that_panics_is_run_again_and_the_restart_is_counted() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let handle = spawn_with_policy(
+            "restarted_probe",
+            Cadence::EventDriven,
+            None,
+            policy(3, 100),
+            {
+                let attempts = Arc::clone(&attempts);
+                move |beat| {
+                    let attempts = Arc::clone(&attempts);
+                    Box::pin(async move {
+                        beat.beat();
+                        let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                        if attempt == 1 {
+                            panic!("the first attempt panicked on purpose");
+                        }
+                        // The second attempt is the loop back at work, and it
+                        // stays at work: the reading below is taken while it is
+                        // running, which is the whole difference between a
+                        // restart and a death.
+                        std::future::pending::<()>().await;
+                    }) as std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+                }
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let metrics = collect(&registry()).await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            metric(&metrics, LOOP_RESTARTS_TOTAL, "restarted_probe"),
+            Some(1.0)
+        );
+        // A panic that was repaired is not a death: a reader that saw both
+        // counters move could not tell whether the loop came back.
+        assert_eq!(
+            metric(&metrics, LOOP_DEATHS_TOTAL, "restarted_probe"),
+            Some(0.0)
+        );
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// The budget is what makes the repair honest: a loop that cannot survive a
+    /// fresh start is left dead and reported, rather than run again forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_that_keeps_panicking_is_left_dead_once_its_budget_is_spent() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let handle = spawn_with_policy(
+            "broken_probe",
+            Cadence::Periodic(Duration::from_secs(5)),
+            None,
+            policy(2, 100),
+            flaky_body(Arc::clone(&attempts), Arc::new(|_| true)),
+        );
+        // Two restarts happen, and the third panic ends it: three attempts.
+        handle.await.unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        let metrics = collect(&registry()).await;
+        assert_eq!(
+            metric(&metrics, LOOP_RESTARTS_TOTAL, "broken_probe"),
+            Some(2.0)
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_DEATHS_TOTAL, "broken_probe"),
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_that_returns_is_not_run_again() {
+        let handle = spawn_with_policy(
+            "returning_probe",
+            Cadence::EventDriven,
+            None,
+            policy(3, 100),
+            |beat| {
+                beat.beat();
+                async move {}
+            },
+        );
+        handle.await.unwrap();
+        let metrics = collect(&registry()).await;
+        // A return is the loop saying it is done. Restarting it would make this
+        // module the author of a loop the body decided to end.
+        assert_eq!(
+            metric(&metrics, LOOP_RESTARTS_TOTAL, "returning_probe"),
+            Some(0.0)
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_DEATHS_TOTAL, "returning_probe"),
+            Some(1.0)
+        );
+    }
+
+    /// An attempt that lived as long as the longest wait counts as having taken,
+    /// so its panic starts a new run instead of spending the rest of the budget.
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_that_stayed_up_clears_the_run() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let handle = spawn_with_policy(
+            "recovering_probe",
+            Cadence::EventDriven,
+            None,
+            policy(1, 100),
+            {
+                let attempts = Arc::clone(&attempts);
+                move |beat| {
+                    let attempts = Arc::clone(&attempts);
+                    Box::pin(async move {
+                        beat.beat();
+                        let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                        if attempt < 3 {
+                            // The second attempt outlives the longest wait, so
+                            // the third panic is the first of a new run rather
+                            // than the second of the old one.
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            panic!("attempt {attempt} panicked on purpose");
+                        }
+                    }) as std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+                }
+            },
+        );
+        handle.await.unwrap();
+        let metrics = collect(&registry()).await;
+        // With a budget of one and no clearing, the second panic would have ended
+        // it: two restarts is what says the run was cleared in between.
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            metric(&metrics, LOOP_RESTARTS_TOTAL, "recovering_probe"),
+            Some(2.0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_that_panics_while_the_process_is_stopping_is_not_run_again() {
+        let shutdown = ShutdownSignal::new();
+        let handle = spawn_with_policy(
+            "stopping_probe",
+            Cadence::EventDriven,
+            Some(shutdown.clone()),
+            policy(3, 100),
+            {
+                let shutdown = shutdown.clone();
+                move |beat| {
+                    let shutdown = shutdown.clone();
+                    async move {
+                        beat.beat();
+                        shutdown.trigger();
+                        panic!("panicked while stopping");
+                    }
+                }
+            },
+        );
+        handle.await.unwrap();
+        let metrics = collect(&registry()).await;
+        assert_eq!(
+            metric(&metrics, LOOP_RESTARTS_TOTAL, "stopping_probe"),
+            Some(0.0)
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_DEATHS_TOTAL, "stopping_probe"),
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_with_no_way_to_stop_is_run_again_after_a_panic() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let handle = spawn_unstoppable(
+            "unstoppable_probe",
+            Cadence::EventDriven,
+            flaky_body(Arc::clone(&attempts), Arc::new(|attempt| attempt == 1)),
+        );
+        // Nothing about this loop's exit is intended, so the run ends only with
+        // the body returning on its own.
+        handle.await.unwrap();
+        let metrics = collect(&registry()).await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            metric(&metrics, LOOP_RESTARTS_TOTAL, "unstoppable_probe"),
+            Some(1.0)
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_DEATHS_TOTAL, "unstoppable_probe"),
+            Some(1.0)
+        );
+    }
+
     #[tokio::test]
     async fn a_started_loop_stamps_and_its_exit_is_counted_as_a_death() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -531,9 +1053,15 @@ mod tests {
             "spawned_probe",
             Cadence::Periodic(Duration::from_secs(5)),
             ShutdownSignal::new(),
-            move |beat| async move {
-                beat.beat();
-                let _ = tx.send(beat.name().to_string()).await;
+            // The clone is the shape every restartable body has to have: the
+            // attempt that runs gets its own handle, so a second attempt can be
+            // built from the same closure.
+            move |beat| {
+                let tx = tx.clone();
+                async move {
+                    beat.beat();
+                    let _ = tx.send(beat.name().to_string()).await;
+                }
             },
         );
         assert_eq!(rx.recv().await, Some(String::from("spawned_probe")));
@@ -571,5 +1099,61 @@ mod tests {
             metric(&metrics, LOOP_PERIOD_SECONDS, "shutdown_probe"),
             Some(0.0)
         );
+    }
+
+    /// The three rules, each asserted against the series this module publishes.
+    ///
+    /// Renaming either side leaves both ends self-consistent and the signal
+    /// gone: the rule keeps its shape, the reading keeps being published, and
+    /// nothing connects them. The restart rule is asserted the same way as the
+    /// other two even though a restart repairs the loop, because the reading
+    /// exists precisely so that a repair is not a way to keep a defect quiet.
+    #[test]
+    fn deployed_rules_query_the_metrics_this_module_publishes() {
+        let rules = chart_rules();
+        let find = |name: &str| -> String {
+            rules
+                .iter()
+                .find(|(rule, _)| rule == name)
+                .map(|(_, promql)| promql.clone())
+                .unwrap_or_else(|| panic!("rule {name} missing"))
+        };
+
+        let stalled = find(STALL_RULE);
+        assert!(
+            stalled.contains(LOOP_TICK_AGE_SECONDS) && stalled.contains(LOOP_PERIOD_SECONDS),
+            "rule {STALL_RULE} must compare the age against the declared period, got: {stalled}"
+        );
+
+        let died = find(DEATH_RULE);
+        assert!(
+            died.contains(LOOP_DEATHS_TOTAL),
+            "rule {DEATH_RULE} must query {LOOP_DEATHS_TOTAL}, got: {died}"
+        );
+
+        let restarted = find(RESTART_RULE);
+        assert!(
+            restarted.contains(LOOP_RESTARTS_TOTAL),
+            "rule {RESTART_RULE} must query {LOOP_RESTARTS_TOTAL}, got: {restarted}"
+        );
+    }
+
+    fn chart_rules() -> Vec<(String, String)> {
+        let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let text = std::fs::read_to_string(&chart)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
+        let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
+        root.pointer("/observability/infra_watch/rules")
+            .and_then(|v| v.as_array())
+            .expect("infra_watch.rules present")
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().expect("rule name").to_string(),
+                    r["promql"].as_str().expect("rule promql").to_string(),
+                )
+            })
+            .collect()
     }
 }

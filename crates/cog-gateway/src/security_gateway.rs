@@ -1494,21 +1494,26 @@ pub const POOL_STATE_PUBLISHER_LOOP: &str = "gateway_pool_state_publisher";
 pub const LLM_HEALTH_PROBER_LOOP: &str = "gateway_llm_health_prober";
 
 /// 池状态发布循环：把进程内的池健康周期性落成指标/时序/告警/跨进程信号。
-async fn run_pool_state_publisher(state: AppState) {
+fn spawn_pool_state_publisher(state: AppState) -> tokio::task::JoinHandle<()> {
     let period = std::time::Duration::from_secs(state.config.pool_check_secs.max(5));
-    let mut ticker = tokio::time::interval(period);
-    let beat = cog_core::loop_health::register(
-        POOL_STATE_PUBLISHER_LOOP,
-        cog_core::loop_health::Cadence::Periodic(period),
-    );
     // Nothing hands this loop a stop signal: it runs for the life of the gateway
     // process, so any exit leaves the pool state unprojected.
-    let _mortality = beat.watch_death_unconditionally();
-    loop {
-        beat.beat();
-        ticker.tick().await;
-        refresh_pool_state(&state).await;
-    }
+    cog_core::loop_health::spawn_unstoppable(
+        POOL_STATE_PUBLISHER_LOOP,
+        cog_core::loop_health::Cadence::Periodic(period),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let state = state.clone();
+            async move {
+                let mut ticker = tokio::time::interval(period);
+                loop {
+                    beat.beat();
+                    ticker.tick().await;
+                    refresh_pool_state(&state).await;
+                }
+            }
+        },
+    )
 }
 
 /// 凭证泄露模式：命中即拦截并记日志。
@@ -2106,21 +2111,26 @@ async fn mark_upstream_failure(
 /// 只探嫌疑上游——健康上游由真实请求持续实证，不额外烧配额；嫌疑上游
 /// 每退避窗口最多烧一次 max_tokens=1 的探测，配额消耗有界。
 /// 探测成功即热恢复（进程内清嫌疑，零重启），失败则指数加窗。
-async fn run_llm_health_prober(state: AppState) {
+fn spawn_llm_health_prober(state: AppState) -> tokio::task::JoinHandle<()> {
     let period = std::time::Duration::from_secs(state.config.llm_health_probe_secs.max(30));
-    let mut ticker = tokio::time::interval(period);
-    let beat = cog_core::loop_health::register(
-        LLM_HEALTH_PROBER_LOOP,
-        cog_core::loop_health::Cadence::Periodic(period),
-    );
     // Nothing hands this loop a stop signal: it runs for the life of the gateway
     // process, and without it a suspect upstream is never retested.
-    let _mortality = beat.watch_death_unconditionally();
-    loop {
-        beat.beat();
-        ticker.tick().await;
-        probe_suspect_upstreams(&state).await;
-    }
+    cog_core::loop_health::spawn_unstoppable(
+        LLM_HEALTH_PROBER_LOOP,
+        cog_core::loop_health::Cadence::Periodic(period),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let state = state.clone();
+            async move {
+                let mut ticker = tokio::time::interval(period);
+                loop {
+                    beat.beat();
+                    ticker.tick().await;
+                    probe_suspect_upstreams(&state).await;
+                }
+            }
+        },
+    )
 }
 
 /// 单轮探测：对所有"嫌疑窗已到期"的上游各发一次最小复测请求。
@@ -3528,10 +3538,9 @@ fn init_gateway_logging(
             std::time::Duration::from_secs(obs.loki.flush_interval_sec.max(1)),
             obs.loki.max_batch_size.max(1),
         ));
-        tokio::spawn({
-            let pusher = pusher.clone();
-            async move { pusher.run_loop().await }
-        });
+        // The handle is no longer held: the loop supervises itself (a panic is
+        // run again in place) and goes away with the process on shutdown.
+        drop(pusher.clone().run_loop());
         Some(pusher)
     } else {
         None
@@ -3739,8 +3748,8 @@ pub async fn run(
     if state.github_app.is_some() {
         tracing::info!("安全网关：检测到 GitHub App 凭证，代码平台出口将以 App bot 身份发出");
     }
-    tokio::spawn(run_llm_health_prober(state.clone()));
-    tokio::spawn(run_pool_state_publisher(state.clone()));
+    drop(spawn_llm_health_prober(state.clone()));
+    drop(spawn_pool_state_publisher(state.clone()));
     // 选路的实测在启动时就发起一次，不等第一个 git 请求：判据要先于请求落地，
     // 否则首批请求只能按策略表猜——受限网络下那意味着先撞一次已知会挂的 HTTPS。
     // 探测目标取身份仓库（`COGNEVA_GATEWAY_GIT_IDENTITY_REPO`）：它就是这条通道

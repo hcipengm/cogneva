@@ -55,48 +55,56 @@ pub fn spawn_pending_observer(
     shutdown: cog_core::ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
     let observer = stream_pending_observable();
-    tokio::spawn(async move {
-        // The measurement reads what the group holds unacked, so the group
-        // must exist before the first read. A pending_stats that answers
-        // NOGROUP now reports "nothing pending" instead of failing, but the
-        // reclaim pass this series reports on still cannot run without the
-        // group, and leaving its existence to whichever consumer subscribes
-        // first is exactly the race that fired stream_pending_measure_failing
-        // on a healthy queue. Creating it here is idempotent (BUSYGROUP is
-        // tolerated by the backend), mirroring the guarantee subscribe()
-        // already gives the read loops.
-        if let Err(e) = backend.create_consumer_group(&stream, &group).await {
-            tracing::warn!(
-                stream = %stream,
-                group = %group,
-                "pending observer: consumer group creation failed, measuring anyway: {e}"
-            );
-        }
-        let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await;
-        let beat = cog_core::loop_health::register(
-            loop_name,
-            cog_core::loop_health::Cadence::Periodic(interval),
-        );
-        let _mortality = beat.watch_death(shutdown.clone());
-        loop {
-            beat.beat();
-            observer
-                .measure(
-                    &*backend,
-                    &stream,
-                    &group,
-                    claim_idle_ms,
-                    interval.as_secs(),
-                )
-                .await;
-            tokio::select! {
-                biased;
-                _ = shutdown.wait() => break,
-                _ = ticker.tick() => {}
+    cog_core::loop_health::spawn(
+        loop_name,
+        cog_core::loop_health::Cadence::Periodic(interval),
+        shutdown.clone(),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let observer = Arc::clone(&observer);
+            let backend = Arc::clone(&backend);
+            let stream = stream.clone();
+            let group = group.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                // The measurement reads what the group holds unacked, so the group
+                // must exist before the first read. A pending_stats that answers
+                // NOGROUP now reports "nothing pending" instead of failing, but the
+                // reclaim pass this series reports on still cannot run without the
+                // group, and leaving its existence to whichever consumer subscribes
+                // first is exactly the race that fired stream_pending_measure_failing
+                // on a healthy queue. Creating it here is idempotent (BUSYGROUP is
+                // tolerated by the backend), mirroring the guarantee subscribe()
+                // already gives the read loops.
+                if let Err(e) = backend.create_consumer_group(&stream, &group).await {
+                    tracing::warn!(
+                        stream = %stream,
+                        group = %group,
+                        "pending observer: consumer group creation failed, measuring anyway: {e}"
+                    );
+                }
+                let mut ticker = tokio::time::interval(interval);
+                ticker.tick().await;
+                loop {
+                    beat.beat();
+                    observer
+                        .measure(
+                            &*backend,
+                            &stream,
+                            &group,
+                            claim_idle_ms,
+                            interval.as_secs(),
+                        )
+                        .await;
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = ticker.tick() => {}
+                    }
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 /// Loop name reported through the background-loop liveness family. Each

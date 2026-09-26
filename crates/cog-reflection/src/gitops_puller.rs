@@ -1479,29 +1479,40 @@ pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::Shut
         interval_secs = interval.as_secs(),
         "GitOps puller loop started"
     );
-    let mut ticker = tokio::time::interval(interval);
     // The GitOps puller is what brings the cluster's desired state in, and the
     // only readings it leaves behind are its own poll outcomes: a puller that
     // died and a cluster with nothing to pull look the same from them.
-    let beat = cog_core::loop_health::register(
+    //
+    // Awaited in place: the setup above is done once, and what a caller waits on
+    // here is the loop itself.
+    let _ = cog_core::loop_health::spawn(
         GITOPS_PULLER_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
-    );
-    let _mortality = beat.watch_death(shutdown.clone());
-    loop {
-        // Stamped on every cycle, pulled or not: a poll that found no new rev is
-        // the ordinary state, and it must not read as a puller that stopped.
-        beat.beat();
-        tokio::select! {
-            biased;
-            _ = shutdown.wait() => break,
-            _ = ticker.tick() => {
-                if let Err(e) = puller.poll_once().await {
-                    warn!(error = %e, "GitOps puller poll failed");
+        shutdown.clone(),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let puller = Arc::clone(&puller);
+            let shutdown = shutdown.clone();
+            async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    // Stamped on every cycle, pulled or not: a poll that found no new rev is
+                    // the ordinary state, and it must not read as a puller that stopped.
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = ticker.tick() => {
+                            if let Err(e) = puller.poll_once().await {
+                                warn!(error = %e, "GitOps puller poll failed");
+                            }
+                        }
+                    }
                 }
             }
-        }
-    }
+        },
+    )
+    .await;
 }
 
 /// 把配置里的指标地址套到某个副本上：只换 host，scheme/端口/路径照旧。

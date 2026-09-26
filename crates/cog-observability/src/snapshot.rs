@@ -189,7 +189,7 @@ impl TraceCollector {
     /// The task stops when the broadcast channel closes or `shutdown` fires.
     pub fn spawn_collection_task(
         self: Arc<Self>,
-        mut event_rx: tokio::sync::broadcast::Receiver<AgentEvent>,
+        event_rx: tokio::sync::broadcast::Receiver<AgentEvent>,
         shutdown: cog_core::ShutdownSignal,
         buffer_max_bytes: usize,
     ) -> tokio::task::JoinHandle<()> {
@@ -210,141 +210,157 @@ impl TraceCollector {
             serde_json::to_vec(event).map(|v| v.len()).unwrap_or(0)
         }
 
-        tokio::spawn(async move {
-            let mut buffers: HashMap<String, AgentBuffer> = HashMap::new();
-            let beat = cog_core::loop_health::register(
-                TRACE_COLLECTOR_LOOP,
-                cog_core::loop_health::Cadence::EventDriven,
-            );
-            let _mortality = beat.watch_death(shutdown.clone());
-            loop {
-                beat.beat();
-                tokio::select! {
-                    result = event_rx.recv() => {
-                        match result {
-                            Ok(event) => {
-                                let agent_id = match &event {
-                                    AgentEvent::AgentStart { agent_id, .. } => {
-                                        let bytes = event_size(&event);
-                                        buffers.insert(
-                                            agent_id.clone(),
-                                            AgentBuffer {
-                                                events: vec![event.clone()],
-                                                bytes,
-                                                run_id: uuid::Uuid::new_v4().to_string(),
-                                                flushed: 0,
-                                            },
-                                        );
-                                        continue;
-                                    }
-                                    AgentEvent::AgentEnd { agent_id, .. } => {
-                                        let entry = buffers.remove(agent_id);
-                                        let (events, trace_id) = match entry {
-                                            Some(mut entry) => {
-                                                entry.events.push(event.clone());
-                                                let trace_id = if entry.flushed == 0 {
-                                                    format!("{}-{}", agent_id, entry.run_id)
-                                                } else {
-                                                    format!(
-                                                        "{}-{}-part{}",
-                                                        agent_id, entry.run_id, entry.flushed
-                                                    )
-                                                };
-                                                (entry.events, trace_id)
-                                            }
-                                            // AgentEnd without a seen AgentStart (collector
-                                            // joined mid-run): still persist the terminal
-                                            // event, as before chunking existed.
-                                            None => (
-                                                vec![event.clone()],
-                                                format!(
-                                                    "{}-{}",
-                                                    agent_id,
-                                                    uuid::Uuid::new_v4()
-                                                ),
-                                            ),
-                                        };
-                                        if let Err(e) = self.collect(
-                                            &trace_id,
-                                            None,
-                                            None,
-                                            Some(agent_id.clone()),
-                                            events,
-                                        ).await {
-                                            tracing::warn!("Trace collection failed: {}", e);
-                                        }
-                                        continue;
-                                    }
-                                    AgentEvent::CheckpointSaved { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::TurnStart { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::TurnEnd { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::MessageStart { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::MessageUpdate { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::MessageEnd { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::ToolExecutionStart { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::ToolExecutionUpdate { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::ToolExecutionEnd { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::ReActStepStart { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::ReActStepEnd { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::SelfReview { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::StateChange { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::TaskStatusChange { agent_id, .. } => {
-                                        if let Some(id) = agent_id {
-                                            id.clone()
-                                        } else {
+        // The receiver goes into a shared lock and survives a restart, so every
+        // attempt reads the same subscription: re-subscribing would place the
+        // loop at the channel's current tail and drop everything queued while
+        // it was dead — which is exactly the window the restart exists for.
+        // This lock has one holder, so holding it across an await blocks nobody.
+        let event_rx = Arc::new(tokio::sync::Mutex::new(event_rx));
+        cog_core::loop_health::spawn(
+            TRACE_COLLECTOR_LOOP,
+            cog_core::loop_health::Cadence::EventDriven,
+            shutdown.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = Arc::clone(&self);
+                let event_rx = Arc::clone(&event_rx);
+                let shutdown = shutdown.clone();
+                async move {
+                    // Per attempt: a panic costs the partial traces buffered for
+                    // the agents in flight, and nothing else -- without the
+                    // restart it cost every event from then on.
+                    let mut buffers: HashMap<String, AgentBuffer> = HashMap::new();
+                    loop {
+                        beat.beat();
+                        let mut event_rx = event_rx.lock().await;
+                        tokio::select! {
+                        result = event_rx.recv() => {
+                            match result {
+                                Ok(event) => {
+                                    let agent_id = match &event {
+                                        AgentEvent::AgentStart { agent_id, .. } => {
+                                            let bytes = event_size(&event);
+                                            buffers.insert(
+                                                agent_id.clone(),
+                                                AgentBuffer {
+                                                    events: vec![event.clone()],
+                                                    bytes,
+                                                    run_id: uuid::Uuid::new_v4().to_string(),
+                                                    flushed: 0,
+                                                },
+                                            );
                                             continue;
                                         }
-                                    }
-                                    AgentEvent::AgentError { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::ResourceAlert { agent_id, .. } => agent_id.clone(),
-                                    AgentEvent::Heartbeat { agent_id, .. } => agent_id.clone(),
-                                };
-                                if let Some(entry) = buffers.get_mut(&agent_id) {
-                                    let size = event_size(&event);
-                                    if buffer_max_bytes > 0
-                                        && entry.bytes + size > buffer_max_bytes
-                                        && !entry.events.is_empty()
-                                    {
-                                        let chunk = std::mem::take(&mut entry.events);
-                                        let trace_id = format!(
-                                            "{}-{}-part{}",
-                                            agent_id, entry.run_id, entry.flushed
-                                        );
-                                        entry.flushed += 1;
-                                        entry.bytes = 0;
-                                        tracing::info!(
-                                            agent_id = %agent_id,
-                                            part = entry.flushed,
-                                            buffer_max_bytes,
-                                            "trace buffer budget reached; flushed partial trace chunk"
-                                        );
-                                        if let Err(e) = self.collect(
-                                            &trace_id,
-                                            None,
-                                            None,
-                                            Some(agent_id.clone()),
-                                            chunk,
-                                        ).await {
-                                            tracing::warn!("Trace chunk collection failed: {}", e);
+                                        AgentEvent::AgentEnd { agent_id, .. } => {
+                                            let entry = buffers.remove(agent_id);
+                                            let (events, trace_id) = match entry {
+                                                Some(mut entry) => {
+                                                    entry.events.push(event.clone());
+                                                    let trace_id = if entry.flushed == 0 {
+                                                        format!("{}-{}", agent_id, entry.run_id)
+                                                    } else {
+                                                        format!(
+                                                            "{}-{}-part{}",
+                                                            agent_id, entry.run_id, entry.flushed
+                                                        )
+                                                    };
+                                                    (entry.events, trace_id)
+                                                }
+                                                // AgentEnd without a seen AgentStart (collector
+                                                // joined mid-run): still persist the terminal
+                                                // event, as before chunking existed.
+                                                None => (
+                                                    vec![event.clone()],
+                                                    format!(
+                                                        "{}-{}",
+                                                        agent_id,
+                                                        uuid::Uuid::new_v4()
+                                                    ),
+                                                ),
+                                            };
+                                            if let Err(e) = this.collect(
+                                                &trace_id,
+                                                None,
+                                                None,
+                                                Some(agent_id.clone()),
+                                                events,
+                                            ).await {
+                                                tracing::warn!("Trace collection failed: {}", e);
+                                            }
+                                            continue;
                                         }
+                                        AgentEvent::CheckpointSaved { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::TurnStart { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::TurnEnd { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::MessageStart { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::MessageUpdate { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::MessageEnd { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::ToolExecutionStart { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::ToolExecutionUpdate { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::ToolExecutionEnd { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::ReActStepStart { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::ReActStepEnd { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::SelfReview { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::StateChange { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::TaskStatusChange { agent_id, .. } => {
+                                            if let Some(id) = agent_id {
+                                                id.clone()
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        AgentEvent::AgentError { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::ResourceAlert { agent_id, .. } => agent_id.clone(),
+                                        AgentEvent::Heartbeat { agent_id, .. } => agent_id.clone(),
+                                    };
+                                    if let Some(entry) = buffers.get_mut(&agent_id) {
+                                        let size = event_size(&event);
+                                        if buffer_max_bytes > 0
+                                            && entry.bytes + size > buffer_max_bytes
+                                            && !entry.events.is_empty()
+                                        {
+                                            let chunk = std::mem::take(&mut entry.events);
+                                            let trace_id = format!(
+                                                "{}-{}-part{}",
+                                                agent_id, entry.run_id, entry.flushed
+                                            );
+                                            entry.flushed += 1;
+                                            entry.bytes = 0;
+                                            tracing::info!(
+                                                agent_id = %agent_id,
+                                                part = entry.flushed,
+                                                buffer_max_bytes,
+                                                "trace buffer budget reached; flushed partial trace chunk"
+                                            );
+                                            if let Err(e) = this.collect(
+                                                &trace_id,
+                                                None,
+                                                None,
+                                                Some(agent_id.clone()),
+                                                chunk,
+                                            ).await {
+                                                tracing::warn!("Trace chunk collection failed: {}", e);
+                                            }
+                                        }
+                                        entry.bytes += size;
+                                        entry.events.push(event);
                                     }
-                                    entry.bytes += size;
-                                    entry.events.push(event);
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    tracing::warn!("Trace collector lagged by {} events", n);
                                 }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::warn!("Trace collector lagged by {} events", n);
-                            }
                         }
-                    }
-                    _ = shutdown.wait() => {
-                        tracing::info!("Trace collection task shutting down");
-                        break;
+                        _ = shutdown.wait() => {
+                            tracing::info!("Trace collection task shutting down");
+                            break;
+                        }
+                            }
                     }
                 }
-            }
-        })
+            },
+        )
     }
 }
 

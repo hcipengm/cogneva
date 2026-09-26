@@ -781,11 +781,11 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
-            let maintainer = crate::PartitionMaintainer::new(
+            let maintainer = std::sync::Arc::new(crate::PartitionMaintainer::new(
                 pool,
                 crate::partition_maintainer::time_series_tables(),
-            );
-            tokio::spawn(async move { maintainer.run(interval_secs, shutdown).await });
+            ));
+            drop(maintainer.spawn(interval_secs, shutdown));
             info!("PartitionMaintainer started");
         } else {
             info!("PartitionMaintainer disabled (no PostgreSQL pool)");

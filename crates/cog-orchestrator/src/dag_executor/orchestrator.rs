@@ -436,23 +436,27 @@ impl DagExecutor {
     pub fn start_archive_loop(self: &Arc<Self>) {
         let this = self.clone();
         let interval_secs = self.archive_poll_interval_secs;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let beat = cog_core::loop_health::register(
-                ARCHIVE_LOOP,
-                cog_core::loop_health::Cadence::Periodic(interval.period()),
-            );
-            // Nothing hands this loop a stop signal: it is started for the life of
-            // the process, so every way it can end — including a clean return —
-            // leaves the archiving undone.
-            let _mortality = beat.watch_death_unconditionally();
-            loop {
-                beat.beat();
-                interval.tick().await;
-                this.archive_terminated_tasks().await;
-            }
-        });
+        // Nothing hands this loop a stop signal: it is started for the life of
+        // the process, so every way it can end — including a clean return —
+        // leaves the archiving undone.
+        drop(cog_core::loop_health::spawn_unstoppable(
+            ARCHIVE_LOOP,
+            cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(interval_secs)),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = this.clone();
+                async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        beat.beat();
+                        interval.tick().await;
+                        this.archive_terminated_tasks().await;
+                    }
+                }
+            },
+        ));
         tracing::info!(
             "DagExecutor archive loop started (interval={}s)",
             interval_secs

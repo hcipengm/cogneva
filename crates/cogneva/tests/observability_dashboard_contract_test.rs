@@ -284,6 +284,15 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["loop"],
         "crates/cog-core/src/loop_health.rs",
     ),
+    // Restarts are on the same panel as deaths because the whole point of the
+    // pair is reading them together: a loop that panicked and came back shows
+    // restarts alone, one that used up its budget shows both, and a loop that
+    // returned on its own shows deaths alone.
+    (
+        "cogneva_loop_restarts_total",
+        &["loop"],
+        "crates/cog-core/src/loop_health.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

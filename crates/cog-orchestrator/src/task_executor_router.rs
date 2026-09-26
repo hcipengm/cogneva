@@ -171,131 +171,162 @@ impl TaskExecutorRouter {
             let sweep_shutdown = shutdown.clone();
             let sweep_pipe = pipe.clone();
             let sweep_slots = claim_slots.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
-                let beat = cog_core::loop_health::register(
-                    reclaim_loop_name,
-                    cog_core::loop_health::Cadence::Periodic(ticker.period()),
-                );
-                let _mortality = beat.watch_death(sweep_shutdown.clone());
-                loop {
-                    beat.beat();
-                    tokio::select! {
-                        biased;
-                        _ = sweep_shutdown.wait() => break,
-                        _ = ticker.tick() => {
-                            match sweep_task_backend
-                                .claim_pending(
-                                    &sweep_pipe.ready_stream,
-                                    &sweep_pipe.group,
-                                    PENDING_IDLE_MS,
-                                    CLAIM_BATCH,
-                                )
-                                .await
-                            {
-                                Ok(claimed) if !claimed.is_empty() => {
-                                    tracing::warn!(
-                                        stream = %sweep_pipe.ready_stream,
-                                        count = claimed.len(),
-                                        "Claimed idle pending ready messages for re-execution"
-                                    );
-                                    for (msg_id, bytes) in claimed {
-                                        // 先拿许可再派发：限制重执行并发，shutdown
-                                        // 时也不再起新执行；许可在处理任务内持有到
-                                        // 执行结束。
+            // Detached: this sweeper's fate is not the caller's. The consumer
+            // loop below is awaited in place, and the two end together on the
+            // same shutdown signal.
+            drop(cog_core::loop_health::spawn(
+                reclaim_loop_name,
+                cog_core::loop_health::Cadence::Periodic(CLAIM_INTERVAL),
+                sweep_shutdown.clone(),
+                // Rebuilt per attempt, so everything the body consumes is cloned here.
+                move |beat| {
+                    let sweeper = sweeper.clone();
+                    let sweep_task_backend = Arc::clone(&sweep_task_backend);
+                    let sweep_shutdown = sweep_shutdown.clone();
+                    let sweep_pipe = Arc::clone(&sweep_pipe);
+                    let sweep_slots = Arc::clone(&sweep_slots);
+                    async move {
+                        let mut ticker = tokio::time::interval(CLAIM_INTERVAL);
+                        loop {
+                            beat.beat();
+                            tokio::select! {
+                                biased;
+                                _ = sweep_shutdown.wait() => break,
+                                _ = ticker.tick() => {
+                                    match sweep_task_backend
+                                        .claim_pending(
+                                            &sweep_pipe.ready_stream,
+                                            &sweep_pipe.group,
+                                            PENDING_IDLE_MS,
+                                            CLAIM_BATCH,
+                                        )
+                                        .await
+                                    {
+                                        Ok(claimed) if !claimed.is_empty() => {
+                                            tracing::warn!(
+                                                stream = %sweep_pipe.ready_stream,
+                                                count = claimed.len(),
+                                                "Claimed idle pending ready messages for re-execution"
+                                            );
+                                            for (msg_id, bytes) in claimed {
+                                                // 先拿许可再派发：限制重执行并发，shutdown
+                                                // 时也不再起新执行；许可在处理任务内持有到
+                                                // 执行结束。
+                                                let permit = tokio::select! {
+                                                    _ = sweep_shutdown.wait() => break,
+                                                    acquired = sweep_slots.clone().acquire_owned() => match acquired {
+                                                        Ok(permit) => permit,
+                                                        Err(_) => break,
+                                                    },
+                                                };
+                                                sweeper.spawn_ready_processing(
+                                                    sweep_pipe.clone(),
+                                                    msg_id,
+                                                    bytes,
+                                                    permit,
+                                                );
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                stream = %sweep_pipe.ready_stream,
+                                                "Pending claim sweep failed: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            ));
+        }
+
+        // Resubscribe on stream failure/end instead of exiting the spawned
+        // task: a single transient read error historically ended the loop and
+        // froze the ready group for days until the next pod restart. The
+        // resubscription lives inside the body, so a restart resumes reading
+        // the same group.
+        //
+        // Awaited in place rather than detached: the caller of this function
+        // awaits until the loop stops, and its return is what says the stream
+        // is no longer served.
+        let this = self.clone();
+        let _ = cog_core::loop_health::spawn(
+            consumer_loop_name,
+            cog_core::loop_health::Cadence::EventDriven,
+            shutdown.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = this.clone();
+                let task_backend = Arc::clone(&task_backend);
+                let ready_stream = ready_stream.clone();
+                let group = group.clone();
+                let shutdown = shutdown.clone();
+                let claim_slots = Arc::clone(&claim_slots);
+                let pipe = Arc::clone(&pipe);
+                async move {
+                    'subscribe: loop {
+                        beat.beat();
+                        let mut stream = match task_backend.subscribe(&ready_stream, &group).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("ready stream subscribe failed, retrying: {e}");
+                                tokio::select! {
+                                    _ = shutdown.wait() => break 'subscribe,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
+                                }
+                            }
+                        };
+
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = shutdown.wait() => break 'subscribe,
+                                msg = stream.next() => match msg {
+                                    // 读取与执行解耦：订阅循环只负责投递，处理在独立
+                                    // 任务里跑。串行 await 执行会让一条长任务（timeout
+                                    // 最长 30 分钟）期间完全不发 XREADGROUP，积压消息
+                                    // 全部队头阻塞（实测重启后 lag 被占住 ~30 分钟）。
+                                    // 许可在读取侧获取：在途执行打满时订阅自然背压，
+                                    // 不会无限派发。
+                                    Some(Ok((msg_id, bytes))) => {
                                         let permit = tokio::select! {
-                                            _ = sweep_shutdown.wait() => break,
-                                            acquired = sweep_slots.clone().acquire_owned() => match acquired {
+                                            _ = shutdown.wait() => break 'subscribe,
+                                            acquired = claim_slots.clone().acquire_owned() => match acquired {
                                                 Ok(permit) => permit,
-                                                Err(_) => break,
+                                                Err(_) => break 'subscribe,
                                             },
                                         };
-                                        sweeper.spawn_ready_processing(
-                                            sweep_pipe.clone(),
+                                        this.spawn_ready_processing(
+                                            pipe.clone(),
                                             msg_id,
                                             bytes,
                                             permit,
                                         );
                                     }
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::warn!(
-                                        stream = %sweep_pipe.ready_stream,
-                                        "Pending claim sweep failed: {e}"
-                                    );
+                                    Some(Err(e)) => {
+                                        tracing::warn!("task stream error, resubscribing: {e}");
+                                        break;
+                                    }
+                                    None => {
+                                        tracing::warn!("ready stream ended, resubscribing");
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    }
-                }
-            });
-        }
 
-        // Resubscribe on stream failure/end instead of exiting the spawned
-        // task: a single transient read error historically ended the loop and
-        // froze the ready group for days until the next pod restart.
-        let beat = cog_core::loop_health::register(
-            consumer_loop_name,
-            cog_core::loop_health::Cadence::EventDriven,
-        );
-        let _mortality = beat.watch_death(shutdown.clone());
-        'subscribe: loop {
-            beat.beat();
-            let mut stream = match task_backend.subscribe(&ready_stream, &group).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("ready stream subscribe failed, retrying: {e}");
-                    tokio::select! {
-                        _ = shutdown.wait() => break 'subscribe,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
-                    }
-                }
-            };
-
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.wait() => break 'subscribe,
-                    msg = stream.next() => match msg {
-                        // 读取与执行解耦：订阅循环只负责投递，处理在独立
-                        // 任务里跑。串行 await 执行会让一条长任务（timeout
-                        // 最长 30 分钟）期间完全不发 XREADGROUP，积压消息
-                        // 全部队头阻塞（实测重启后 lag 被占住 ~30 分钟）。
-                        // 许可在读取侧获取：在途执行打满时订阅自然背压，
-                        // 不会无限派发。
-                        Some(Ok((msg_id, bytes))) => {
-                            let permit = tokio::select! {
-                                _ = shutdown.wait() => break 'subscribe,
-                                acquired = claim_slots.clone().acquire_owned() => match acquired {
-                                    Ok(permit) => permit,
-                                    Err(_) => break 'subscribe,
-                                },
-                            };
-                            self.spawn_ready_processing(
-                                pipe.clone(),
-                                msg_id,
-                                bytes,
-                                permit,
-                            );
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!("task stream error, resubscribing: {e}");
-                            break;
-                        }
-                        None => {
-                            tracing::warn!("ready stream ended, resubscribing");
-                            break;
+                        tokio::select! {
+                            _ = shutdown.wait() => break 'subscribe,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                         }
                     }
                 }
-            }
-
-            tokio::select! {
-                _ = shutdown.wait() => break 'subscribe,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-            }
-        }
+            },
+        )
+        .await;
 
         Ok(())
     }

@@ -565,54 +565,62 @@ impl MemoryIngestor {
             let backlog = backlog.clone();
             let inner = inner.clone();
             let claim_stop = loop_stop.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(
-                    inner.config.bus_claim_interval_secs,
-                ));
-                interval.tick().await; // 跳过立即触发的那一拍
-                let beat = cog_core::loop_health::register(
-                    MEMORY_BUS_CLAIM_LOOP,
-                    cog_core::loop_health::Cadence::Periodic(interval.period()),
-                );
-                let _mortality = beat.watch_death(claim_stop);
-                loop {
-                    beat.beat();
-                    interval.tick().await;
-                    if job_tx.is_closed() {
-                        break;
-                    }
-                    if inner.pull_gate.blocked_for().await.is_some() {
-                        // 认领也是一种投递：闸门关着时认领回来的消息只会再失败
-                        // 一遍并占用投递次数，一样留到恢复后再接。
-                        debug!("Memory ingest claim paused: LLM upstream unavailable");
-                        continue;
-                    }
-                    match bus
-                        .claim_pending(
-                            &channel,
-                            &group,
-                            inner.config.bus_claim_min_idle_ms,
-                            inner.config.bus_claim_batch,
-                        )
-                        .await
-                    {
-                        Ok(claimed) => {
-                            if !claimed.is_empty() {
-                                info!(
-                                    "Memory ingest claimed {} pending bus messages",
-                                    claimed.len()
-                                );
+            let claim_interval = Duration::from_secs(inner.config.bus_claim_interval_secs);
+            let claim_min_idle_ms = inner.config.bus_claim_min_idle_ms;
+            let claim_batch = inner.config.bus_claim_batch;
+            // The loop supervises itself (a panic is run again in place) and
+            // nobody holds its handle: its stop is the signal passed in, and it
+            // goes away with the process.
+            drop(cog_core::loop_health::spawn(
+                MEMORY_BUS_CLAIM_LOOP,
+                cog_core::loop_health::Cadence::Periodic(claim_interval),
+                claim_stop,
+                // Rebuilt per attempt, so everything the body consumes is cloned here.
+                move |beat| {
+                    let bus = bus.clone();
+                    let channel = channel.clone();
+                    let group = group.clone();
+                    let job_tx = job_tx.clone();
+                    let backlog = backlog.clone();
+                    let inner = inner.clone();
+                    async move {
+                        let mut interval = tokio::time::interval(claim_interval);
+                        interval.tick().await; // 跳过立即触发的那一拍
+                        loop {
+                            beat.beat();
+                            interval.tick().await;
+                            if job_tx.is_closed() {
+                                break;
                             }
-                            for (id, payload) in claimed {
-                                inner.enqueue_bus_payload(
-                                    &job_tx, &backlog, &bus, &channel, id, &payload,
-                                );
+                            if inner.pull_gate.blocked_for().await.is_some() {
+                                // 认领也是一种投递：闸门关着时认领回来的消息只会再失败
+                                // 一遍并占用投递次数，一样留到恢复后再接。
+                                debug!("Memory ingest claim paused: LLM upstream unavailable");
+                                continue;
+                            }
+                            match bus
+                                .claim_pending(&channel, &group, claim_min_idle_ms, claim_batch)
+                                .await
+                            {
+                                Ok(claimed) => {
+                                    if !claimed.is_empty() {
+                                        info!(
+                                            "Memory ingest claimed {} pending bus messages",
+                                            claimed.len()
+                                        );
+                                    }
+                                    for (id, payload) in claimed {
+                                        inner.enqueue_bus_payload(
+                                            &job_tx, &backlog, &bus, &channel, id, &payload,
+                                        );
+                                    }
+                                }
+                                Err(e) => warn!("Memory ingest claim_pending failed: {e}"),
                             }
                         }
-                        Err(e) => warn!("Memory ingest claim_pending failed: {e}"),
                     }
-                }
-            });
+                },
+            ));
         }
 
         tokio::spawn(async move {
@@ -903,31 +911,43 @@ impl MemoryIngestor {
         }
         let inner = self.clone();
         let job_tx = job_tx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(secs));
-            interval.tick().await; // 第一拍即启动对账已覆盖的那一次
-            let beat = cog_core::loop_health::register(
-                MEMORY_RECONCILE_LOOP,
-                cog_core::loop_health::Cadence::Periodic(interval.period()),
-            );
-            let _mortality = beat.watch_death(loop_stop);
-            loop {
-                beat.beat();
-                interval.tick().await;
-                // 退出判据取显式的停止标志，不靠"通道已关"：这个任务自己握着
-                // 一个 job_tx，通道不会因为主循环退出而关闭，靠它判会一直重扫。
-                if stopping.load(std::sync::atomic::Ordering::SeqCst) || job_tx.is_closed() {
-                    break;
+        let period = Duration::from_secs(secs);
+        // The loop supervises itself (a panic is run again in place) and nobody
+        // holds its handle: its stop is the flag it checks, and it goes away
+        // with the process.
+        drop(cog_core::loop_health::spawn(
+            MEMORY_RECONCILE_LOOP,
+            cog_core::loop_health::Cadence::Periodic(period),
+            loop_stop,
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let inner = inner.clone();
+                let job_tx = job_tx.clone();
+                let backlog = Arc::clone(&backlog);
+                let stopping = Arc::clone(&stopping);
+                async move {
+                    let mut interval = tokio::time::interval(period);
+                    interval.tick().await; // 第一拍即启动对账已覆盖的那一次
+                    loop {
+                        beat.beat();
+                        interval.tick().await;
+                        // 退出判据取显式的停止标志，不靠"通道已关"：这个任务自己握着
+                        // 一个 job_tx，通道不会因为主循环退出而关闭，靠它判会一直重扫。
+                        if stopping.load(std::sync::atomic::Ordering::SeqCst) || job_tx.is_closed()
+                        {
+                            break;
+                        }
+                        // 扫描不需要 LLM：它是一条 SQL 加一次对象存储读，产出的是
+                        // 「还有多少 raw 没有 summary」这个观测。上游断供时把它一并跳过，
+                        // 等于在最需要知道积压规模的时候关掉唯一的观测面，而且恢复之后
+                        // 那些已经掉出回看窗的 raw 再也不会被捡起来。所以扫描照跑，
+                        // 只把入队那一步按住——那一步之后才真的去调 LLM。
+                        let upstream_available = inner.pull_gate.blocked_for().await.is_none();
+                        inner.reconcile(&job_tx, &backlog, upstream_available).await;
+                    }
                 }
-                // 扫描不需要 LLM：它是一条 SQL 加一次对象存储读，产出的是
-                // 「还有多少 raw 没有 summary」这个观测。上游断供时把它一并跳过，
-                // 等于在最需要知道积压规模的时候关掉唯一的观测面，而且恢复之后
-                // 那些已经掉出回看窗的 raw 再也不会被捡起来。所以扫描照跑，
-                // 只把入队那一步按住——那一步之后才真的去调 LLM。
-                let upstream_available = inner.pull_gate.blocked_for().await.is_none();
-                inner.reconcile(&job_tx, &backlog, upstream_available).await;
-            }
-        });
+            },
+        ));
     }
 
     /// 启动对账：扫最近窗口内的会话 raw，把没有 summary 的重新入队。

@@ -558,24 +558,28 @@ impl WorkdirRouter {
     /// Spawn the GC and fetch background loops. Call once after [`Self::recover`].
     pub fn spawn_maintenance(self: &Arc<Self>) {
         let gc = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(gc.cfg.gc_interval);
-            ticker.tick().await;
-            let beat = cog_core::loop_health::register(
-                WORKTREE_GC_LOOP,
-                cog_core::loop_health::Cadence::Periodic(gc.cfg.gc_interval),
-            );
-            // No stop signal and no exit of its own: ending means worktrees stop
-            // being reclaimed, which fills the volume the tasks run on.
-            let _mortality = beat.watch_death_unconditionally();
-            loop {
-                beat.beat();
-                ticker.tick().await;
-                if let Err(e) = gc.gc_once().await {
-                    warn!(error = %e, "task worktree GC failed");
+        let gc_interval = gc.cfg.gc_interval;
+        // No stop signal and no exit of its own: ending means worktrees stop
+        // being reclaimed, which fills the volume the tasks run on.
+        drop(cog_core::loop_health::spawn_unstoppable(
+            WORKTREE_GC_LOOP,
+            cog_core::loop_health::Cadence::Periodic(gc_interval),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let gc = Arc::clone(&gc);
+                async move {
+                    let mut ticker = tokio::time::interval(gc_interval);
+                    ticker.tick().await;
+                    loop {
+                        beat.beat();
+                        ticker.tick().await;
+                        if let Err(e) = gc.gc_once().await {
+                            warn!(error = %e, "task worktree GC failed");
+                        }
+                    }
                 }
-            }
-        });
+            },
+        ));
         let fetch = Arc::clone(self);
         tokio::spawn(async move {
             // Refresh immediately in the background rather than on the startup

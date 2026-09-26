@@ -268,7 +268,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         interval_secs = repair_interval,
                         "memory schema repair loop started"
                     );
-                    tokio::spawn(crate::recorder::run_schema_repair_loop(
+                    drop(crate::recorder::spawn_schema_repair_loop(
                         recorder,
                         std::time::Duration::from_secs(repair_interval),
                         shutdown,
@@ -513,45 +513,52 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     let metrics = evolution_metrics.clone();
                     let poll = std::time::Duration::from_secs(self_evolution.poll_interval_secs);
                     let pool_gate = self.pool_gate.clone();
-                    tokio::spawn(async move {
-                        let mut interval = tokio::time::interval(poll);
-                        let beat = cog_core::loop_health::register(
-                            MICROVM_EVOLUTION_LOOP,
-                            cog_core::loop_health::Cadence::Periodic(poll),
-                        );
-                        // Nothing hands this loop a stop signal, and it has no exit
-                        // of its own: if it ends while the process lives, the
-                        // evolution work it drives has stopped with it.
-                        let _mortality = beat.watch_death_unconditionally();
-                        loop {
-                            beat.beat();
-                            interval.tick().await;
-                            if pool_gate.llm_paused() {
-                                info!("LLM upstream pool unavailable; skipping microvm evolution cycle");
-                                continue;
-                            }
-                            match microvm.run_evolution().await {
-                                Ok(outcome) => {
-                                    if let Some(m) = metrics.as_ref() {
-                                        m.record_event(!outcome.completed).await;
+                    let microvm = std::sync::Arc::new(microvm);
+                    // Nothing hands this loop a stop signal, and it has no exit
+                    // of its own: if it ends while the process lives, the
+                    // evolution work it drives has stopped with it.
+                    drop(cog_core::loop_health::spawn_unstoppable(
+                        MICROVM_EVOLUTION_LOOP,
+                        cog_core::loop_health::Cadence::Periodic(poll),
+                        // Rebuilt per attempt, so everything the body consumes is
+                        // cloned here.
+                        move |beat| {
+                            let microvm = std::sync::Arc::clone(&microvm);
+                            let metrics = metrics.clone();
+                            let pool_gate = pool_gate.clone();
+                            async move {
+                                let mut interval = tokio::time::interval(poll);
+                                loop {
+                                    beat.beat();
+                                    interval.tick().await;
+                                    if pool_gate.llm_paused() {
+                                        info!("LLM upstream pool unavailable; skipping microvm evolution cycle");
+                                        continue;
                                     }
-                                    if outcome.completed {
-                                        info!(
-                                            vm_id = %outcome.vm_id,
-                                            secs = outcome.duration_secs,
-                                            "microvm evolution cycle complete"
-                                        );
+                                    match microvm.run_evolution().await {
+                                        Ok(outcome) => {
+                                            if let Some(m) = metrics.as_ref() {
+                                                m.record_event(!outcome.completed).await;
+                                            }
+                                            if outcome.completed {
+                                                info!(
+                                                    vm_id = %outcome.vm_id,
+                                                    secs = outcome.duration_secs,
+                                                    "microvm evolution cycle complete"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if let Some(m) = metrics.as_ref() {
+                                                m.record_event(true).await;
+                                            }
+                                            warn!(error = %e, "microvm evolution cycle failed");
+                                        }
                                     }
                                 }
-                                Err(e) => {
-                                    if let Some(m) = metrics.as_ref() {
-                                        m.record_event(true).await;
-                                    }
-                                    warn!(error = %e, "microvm evolution cycle failed");
-                                }
                             }
-                        }
-                    });
+                        },
+                    ));
                     self.initialized = true;
                     return Ok(());
                 }
@@ -884,39 +891,54 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     let cycle_instance = instance_id.clone();
                     let cycle_version = version.clone();
 
-                    tokio::spawn(async move {
-                        let mut interval = tokio::time::interval(poll_interval);
-                        let beat = cog_core::loop_health::register(
-                            CHANGE_VERIFICATION_LOOP,
-                            cog_core::loop_health::Cadence::Periodic(poll_interval),
-                        );
-                        // No stop signal reaches this loop and it has no exit of its
-                        // own, so any end means pending changes stop being verified.
-                        let _mortality = beat.watch_death_unconditionally();
-                        loop {
-                            beat.beat();
-                            interval.tick().await;
-                            // 本轮是纯确定性消费：同步工作树、取出待验变更、apply/test/
-                            // build、落地、切二进制，全程不调 LLM。上游全灭时跳过它，只会让
-                            // 一条已经生成好的变更干等（生成侧的池门在 discovery 那边）。
-                            let deps = CycleDeps {
-                                pipeline: &pipeline,
-                                deployer: &deployer,
-                                binary_switcher: binary_switcher.as_ref(),
-                                engine: &engine,
-                                config: &self_evolution,
-                                evolution_metrics: evolution_metrics.as_ref(),
-                                promoter: promoter.as_ref(),
-                                workspaces: &cycle_workspaces,
-                                landing: landing.as_ref(),
-                            };
-                            if let Err(e) =
-                                run_evolution_cycle(deps, &cycle_instance, &cycle_version).await
-                            {
-                                warn!(error = %e, "Self-evolution cycle failed");
+                    // No stop signal reaches this loop and it has no exit of its
+                    // own, so any end means pending changes stop being verified.
+                    drop(cog_core::loop_health::spawn_unstoppable(
+                        CHANGE_VERIFICATION_LOOP,
+                        cog_core::loop_health::Cadence::Periodic(poll_interval),
+                        // Rebuilt per attempt, so everything the body consumes is
+                        // cloned here.
+                        move |beat| {
+                            let pipeline = pipeline.clone();
+                            let deployer = deployer.clone();
+                            let binary_switcher = binary_switcher.clone();
+                            let engine = engine.clone();
+                            let self_evolution = self_evolution.clone();
+                            let evolution_metrics = evolution_metrics.clone();
+                            let promoter = promoter.clone();
+                            let cycle_workspaces = cycle_workspaces.clone();
+                            let landing = landing.clone();
+                            let cycle_instance = cycle_instance.clone();
+                            let cycle_version = cycle_version.clone();
+                            async move {
+                                let mut interval = tokio::time::interval(poll_interval);
+                                loop {
+                                    beat.beat();
+                                    interval.tick().await;
+                                    // 本轮是纯确定性消费：同步工作树、取出待验变更、apply/test/
+                                    // build、落地、切二进制，全程不调 LLM。上游全灭时跳过它，只会让
+                                    // 一条已经生成好的变更干等（生成侧的池门在 discovery 那边）。
+                                    let deps = CycleDeps {
+                                        pipeline: &pipeline,
+                                        deployer: &deployer,
+                                        binary_switcher: binary_switcher.as_ref(),
+                                        engine: &engine,
+                                        config: &self_evolution,
+                                        evolution_metrics: evolution_metrics.as_ref(),
+                                        promoter: promoter.as_ref(),
+                                        workspaces: &cycle_workspaces,
+                                        landing: landing.as_ref(),
+                                    };
+                                    if let Err(e) =
+                                        run_evolution_cycle(deps, &cycle_instance, &cycle_version)
+                                            .await
+                                    {
+                                        warn!(error = %e, "Self-evolution cycle failed");
+                                    }
+                                }
                             }
-                        }
-                    });
+                        },
+                    ));
 
                     info!("Self-evolution auto-deploy pipeline started");
                 } else {
@@ -983,7 +1005,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             if alert_source.is_none() {
                 info!("signal watcher: no ActiveAlertSource; persisted-alert channel off");
             }
-            tokio::spawn(crate::run_signal_watcher_loop(
+            drop(crate::spawn_signal_watcher_loop(
                 orch,
                 sw_config,
                 shutdown,
@@ -1007,7 +1029,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         shutdown.trigger();
                     });
                 }
-                tokio::spawn(crate::build_cache_readings::run_build_cache_watch(
+                drop(crate::build_cache_readings::spawn_build_cache_watch(
                     readings.clone(),
                     shutdown,
                 ));

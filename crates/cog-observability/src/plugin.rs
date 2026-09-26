@@ -353,25 +353,33 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(interval);
-                let beat = cog_core::loop_health::register(
-                    TRACE_TIER_MIGRATION_LOOP,
-                    cog_core::loop_health::Cadence::Periodic(interval.period()),
-                );
-                let _mortality = beat.watch_death(shutdown.clone());
-                loop {
-                    beat.beat();
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            if let Err(e) = trace_migrator.run_migration().await {
-                                warn!("Trace tier migration failed: {}", e);
+            // The loop supervises itself (a panic is run again in place) and
+            // nobody holds its handle: shutdown closes it through the signal,
+            // and the task goes away with the process either way.
+            drop(cog_core::loop_health::spawn(
+                TRACE_TIER_MIGRATION_LOOP,
+                cog_core::loop_health::Cadence::Periodic(interval),
+                shutdown.clone(),
+                // Rebuilt per attempt, so everything the body consumes is cloned here.
+                move |beat| {
+                    let trace_migrator = trace_migrator.clone();
+                    let shutdown = shutdown.clone();
+                    async move {
+                        let mut interval = tokio::time::interval(interval);
+                        loop {
+                            beat.beat();
+                            tokio::select! {
+                                _ = interval.tick() => {
+                                    if let Err(e) = trace_migrator.run_migration().await {
+                                        warn!("Trace tier migration failed: {}", e);
+                                    }
+                                }
+                                _ = shutdown.wait() => break,
                             }
                         }
-                        _ = shutdown.wait() => break,
                     }
-                }
-            });
+                },
+            ));
         }
 
         // ── Data directory footprint ──

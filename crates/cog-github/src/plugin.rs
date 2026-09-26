@@ -66,21 +66,28 @@ fn spawn_polling_loop(
         name,
         cog_core::loop_health::Cadence::Periodic(interval),
         shutdown,
-        move |beat| async move {
-            loop {
-                // 每轮盖一次，抓到没有都盖：这一轮的轮询没发现新东西是常态，
-                // 不能读成循环停了。
-                beat.beat();
-                tokio::select! {
-                    biased;
-                    _ = stop.wait() => {
-                        info!(platform, "discovery polling loop shutting down");
-                        return;
+        // One set of handles per attempt: the body is rebuilt every time it is
+        // restarted, so what it consumes has to be cloned inside the closure —
+        // otherwise the second call has nothing to build itself from.
+        move |beat| {
+            let stop = stop.clone();
+            let shared = Arc::clone(&shared);
+            async move {
+                loop {
+                    // 每轮盖一次，抓到没有都盖：这一轮的轮询没发现新东西是常态，
+                    // 不能读成循环停了。
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait() => {
+                            info!(platform, "discovery polling loop shutting down");
+                            return;
+                        }
+                        _ = tokio::time::sleep(interval) => {}
                     }
-                    _ = tokio::time::sleep(interval) => {}
-                }
-                if let Err(e) = shared.lock().await.run_once().await {
-                    warn!(platform, error = %e, "discovery round failed");
+                    if let Err(e) = shared.lock().await.run_once().await {
+                        warn!(platform, error = %e, "discovery round failed");
+                    }
                 }
             }
         },
@@ -101,27 +108,34 @@ fn spawn_staged_drain(
         STAGED_CHANGE_DRAIN_LOOP,
         cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(300)),
         shutdown,
-        move |beat| async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-            interval.tick().await; // 消费立即触发的首拍，让启动 drain 先跑
-            loop {
-                beat.beat();
-                tokio::select! {
-                    biased;
-                    _ = stop.wait() => return,
-                    _ = interval.tick() => {}
-                }
-                // 策略门禁：ask 档等属主逐条确认（走 ContributionControl::flush_pending），
-                // local 档永不自动回流；两者都跳过自动补发。
-                if controller.should_stage() {
-                    continue;
-                }
-                if crate::pending_changes::load_pending().await.is_empty() {
-                    continue;
-                }
-                let n = crate::pending_changes::drain_into(channel.as_ref()).await;
-                if n > 0 {
-                    info!(count = n, "staged changes flushed by background drain");
+        // The body is rebuilt per attempt, so handles are cloned in the closure;
+        // see spawn_polling_loop.
+        move |beat| {
+            let stop = stop.clone();
+            let channel = Arc::clone(&channel);
+            let controller = Arc::clone(&controller);
+            async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                interval.tick().await; // 消费立即触发的首拍，让启动 drain 先跑
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait() => return,
+                        _ = interval.tick() => {}
+                    }
+                    // 策略门禁：ask 档等属主逐条确认（走 ContributionControl::flush_pending），
+                    // local 档永不自动回流；两者都跳过自动补发。
+                    if controller.should_stage() {
+                        continue;
+                    }
+                    if crate::pending_changes::load_pending().await.is_empty() {
+                        continue;
+                    }
+                    let n = crate::pending_changes::drain_into(channel.as_ref()).await;
+                    if n > 0 {
+                        info!(count = n, "staged changes flushed by background drain");
+                    }
                 }
             }
         },
@@ -145,28 +159,36 @@ fn spawn_landing_watch(
         LANDING_CI_WATCH_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
         shutdown,
-        move |beat| async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                beat.beat();
-                tokio::select! {
-                    biased;
-                    _ = stop.wait() => {
-                        info!("landing CI watch shutting down");
-                        return;
+        // The body is rebuilt per attempt, so handles are cloned in the closure;
+        // see spawn_polling_loop.
+        move |beat| {
+            let stop = stop.clone();
+            let channel = Arc::clone(&channel);
+            let reflection = reflection.clone();
+            let orchestrator = orchestrator.clone();
+            async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait() => {
+                            info!("landing CI watch shutting down");
+                            return;
+                        }
+                        _ = ticker.tick() => {}
                     }
-                    _ = ticker.tick() => {}
+                    crate::landing::watch_landed(
+                        channel.as_ref(),
+                        reflection.as_deref(),
+                        orchestrator.as_deref(),
+                    )
+                    .await;
+                    // The census rides this tick because the funnel only moves when a
+                    // landing or a verdict does, and this is the one loop that runs
+                    // whether or not change generation is producing anything.
+                    channel.publish_funnel().await;
                 }
-                crate::landing::watch_landed(
-                    channel.as_ref(),
-                    reflection.as_deref(),
-                    orchestrator.as_deref(),
-                )
-                .await;
-                // The census rides this tick because the funnel only moves when a
-                // landing or a verdict does, and this is the one loop that runs
-                // whether or not change generation is producing anything.
-                channel.publish_funnel().await;
             }
         },
     )

@@ -62,39 +62,45 @@ impl TierMigrator {
     /// can drop when the program exits; cancellation is signalled by the
     /// shared [`ShutdownSignal`].
     pub fn spawn(self: Arc<Self>, shutdown: ShutdownSignal) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            // The first pass runs at once rather than after one interval. The
-            // loop only makes progress while the process lives, and a
-            // deployment that ships often replaces it well inside an interval
-            // — waiting a full one would mean the pass never runs at all.
-            // Scanning the same state twice costs one listing; missing every
-            // pass costs the feature.
-            let mut interval = tokio::time::interval(self.policy.scan_interval);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let beat = cog_core::loop_health::register(
-                TIER_MIGRATION_LOOP,
-                cog_core::loop_health::Cadence::Periodic(interval.period()),
-            );
-            let _mortality = beat.watch_death(shutdown.clone());
-            loop {
-                beat.beat();
-                tokio::select! {
-                    _ = interval.tick() => {
-                        match self.run_once().await {
-                            Ok(stats) => self.emit_metrics(&stats).await,
-                            Err(e) => {
-                                tracing::warn!("TierMigrator pass failed: {}", e);
-                                self.emit_error_metric().await;
+        let scan_interval = self.policy.scan_interval;
+        // The first pass runs at once rather than after one interval. The
+        // loop only makes progress while the process lives, and a
+        // deployment that ships often replaces it well inside an interval
+        // — waiting a full one would mean the pass never runs at all.
+        // Scanning the same state twice costs one listing; missing every
+        // pass costs the feature.
+        cog_core::loop_health::spawn(
+            TIER_MIGRATION_LOOP,
+            cog_core::loop_health::Cadence::Periodic(scan_interval),
+            shutdown.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let migrator = Arc::clone(&self);
+                let shutdown = shutdown.clone();
+                async move {
+                    let mut interval = tokio::time::interval(scan_interval);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        beat.beat();
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                match migrator.run_once().await {
+                                    Ok(stats) => migrator.emit_metrics(&stats).await,
+                                    Err(e) => {
+                                        tracing::warn!("TierMigrator pass failed: {}", e);
+                                        migrator.emit_error_metric().await;
+                                    }
+                                }
+                            }
+                            _ = shutdown.wait() => {
+                                tracing::info!("TierMigrator shutting down");
+                                break;
                             }
                         }
                     }
-                    _ = shutdown.wait() => {
-                        tracing::info!("TierMigrator shutting down");
-                        break;
-                    }
                 }
-            }
-        })
+            },
+        )
     }
 
     async fn emit_metrics(&self, stats: &MigrationStats) {

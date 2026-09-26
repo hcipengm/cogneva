@@ -111,43 +111,50 @@ impl LlmPoolGuard {
         event_tx: broadcast::Sender<SupervisorEvent>,
         interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            let beat = cog_core::loop_health::register(
-                LLM_POOL_GUARD_LOOP,
-                cog_core::loop_health::Cadence::Periodic(interval),
-            );
-            // Nothing hands this loop a stop signal: it is spawned for the life of
-            // the process, so ending for any reason leaves the pool unguarded.
-            let _mortality = beat.watch_death_unconditionally();
-            loop {
-                beat.beat();
-                ticker.tick().await;
-                match self.enforce().await {
-                    PoolTransition::Down(status) => {
-                        tracing::warn!(
-                            evidenced_recovery_unix = status.evidenced_recovery_unix,
-                            next_attempt_unix = status.next_attempt_unix,
-                            upstreams = ?status.unavailable_upstreams,
-                            "LLM 上游池全灭，暂停 LLM 依赖型任务"
-                        );
-                        let _ = event_tx.send(SupervisorEvent::LlmUpstreamPoolDown {
-                            evidenced_recovery_unix: status.evidenced_recovery_unix,
-                            next_attempt_unix: status.next_attempt_unix,
-                            unavailable: status.unavailable_upstreams,
-                            timestamp: chrono::Utc::now(),
-                        });
+        // The handle comes from the supervised task itself: an outer wrapper would
+        // complete as soon as it had spawned, and a caller awaiting it would read
+        // "the guard is over" while the guard was still running.
+        // Nothing hands this loop a stop signal: it is spawned for the life of
+        // the process, so ending for any reason leaves the pool unguarded.
+        cog_core::loop_health::spawn_unstoppable(
+            LLM_POOL_GUARD_LOOP,
+            cog_core::loop_health::Cadence::Periodic(interval),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = Arc::clone(&self);
+                let event_tx = event_tx.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    loop {
+                        beat.beat();
+                        ticker.tick().await;
+                        match this.enforce().await {
+                            PoolTransition::Down(status) => {
+                                tracing::warn!(
+                                    evidenced_recovery_unix = status.evidenced_recovery_unix,
+                                    next_attempt_unix = status.next_attempt_unix,
+                                    upstreams = ?status.unavailable_upstreams,
+                                    "LLM 上游池全灭，暂停 LLM 依赖型任务"
+                                );
+                                let _ = event_tx.send(SupervisorEvent::LlmUpstreamPoolDown {
+                                    evidenced_recovery_unix: status.evidenced_recovery_unix,
+                                    next_attempt_unix: status.next_attempt_unix,
+                                    unavailable: status.unavailable_upstreams,
+                                    timestamp: chrono::Utc::now(),
+                                });
+                            }
+                            PoolTransition::Recovered => {
+                                tracing::info!("LLM 上游池恢复，LLM 依赖型任务自动恢复");
+                                let _ = event_tx.send(SupervisorEvent::LlmUpstreamPoolRecovered {
+                                    timestamp: chrono::Utc::now(),
+                                });
+                            }
+                            PoolTransition::Steady => {}
+                        }
                     }
-                    PoolTransition::Recovered => {
-                        tracing::info!("LLM 上游池恢复，LLM 依赖型任务自动恢复");
-                        let _ = event_tx.send(SupervisorEvent::LlmUpstreamPoolRecovered {
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
-                    PoolTransition::Steady => {}
                 }
-            }
-        })
+            },
+        )
     }
 }
 

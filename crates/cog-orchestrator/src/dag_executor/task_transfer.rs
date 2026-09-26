@@ -249,25 +249,31 @@ impl StaleTaskDetector {
     /// `poll_interval` until `cancel.wait()` resolves.
     pub fn spawn(self: Arc<Self>, cancel: cog_core::ShutdownSignal) -> tokio::task::JoinHandle<()> {
         let interval = self.poll_interval;
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let beat = cog_core::loop_health::register(
-                STALE_TASK_SWEEP_LOOP,
-                cog_core::loop_health::Cadence::Periodic(interval),
-            );
-            let _mortality = beat.watch_death(cancel.clone());
-            loop {
-                beat.beat();
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        if let Err(e) = self.sweep().await {
-                            tracing::warn!("stale-task sweep failed: {e}");
+        let this = Arc::clone(&self);
+        cog_core::loop_health::spawn(
+            STALE_TASK_SWEEP_LOOP,
+            cog_core::loop_health::Cadence::Periodic(interval),
+            cancel.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = Arc::clone(&this);
+                let cancel = cancel.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        beat.beat();
+                        tokio::select! {
+                            _ = ticker.tick() => {
+                                if let Err(e) = this.sweep().await {
+                                    tracing::warn!("stale-task sweep failed: {e}");
+                                }
+                            }
+                            _ = cancel.wait() => break,
                         }
                     }
-                    _ = cancel.wait() => break,
                 }
-            }
-        })
+            },
+        )
     }
 }

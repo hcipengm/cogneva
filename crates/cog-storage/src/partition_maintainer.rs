@@ -11,6 +11,7 @@
 //! Rows landing in DEFAULT mean the window fell behind, so they are counted
 //! and reported rather than silently accumulated.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, Utc};
@@ -74,24 +75,37 @@ impl PartitionMaintainer {
     }
 
     /// Run once immediately, then every `interval_secs` until shutdown.
-    pub async fn run(&self, interval_secs: u64, shutdown: ShutdownSignal) {
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
-        let beat = cog_core::loop_health::register(
+    pub fn spawn(
+        self: &Arc<Self>,
+        interval_secs: u64,
+        shutdown: ShutdownSignal,
+    ) -> tokio::task::JoinHandle<()> {
+        let period = Duration::from_secs(interval_secs.max(1));
+        let this = Arc::clone(self);
+        cog_core::loop_health::spawn(
             PARTITION_MAINTENANCE_LOOP,
-            cog_core::loop_health::Cadence::Periodic(interval.period()),
-        );
-        let _mortality = beat.watch_death(shutdown.clone());
-        loop {
-            beat.beat();
-            tokio::select! {
-                _ = interval.tick() => {
-                    if let Err(e) = self.maintain().await {
-                        warn!(error = %e, "Partition maintenance round failed");
+            cog_core::loop_health::Cadence::Periodic(period),
+            shutdown.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let maintainer = Arc::clone(&this);
+                let shutdown = shutdown.clone();
+                async move {
+                    let mut interval = tokio::time::interval(period);
+                    loop {
+                        beat.beat();
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                if let Err(e) = maintainer.maintain().await {
+                                    warn!(error = %e, "Partition maintenance round failed");
+                                }
+                            }
+                            _ = shutdown.wait() => break,
+                        }
                     }
                 }
-                _ = shutdown.wait() => break,
-            }
-        }
+            },
+        )
     }
 
     /// Ensure every table has its window open and its DEFAULT partition.

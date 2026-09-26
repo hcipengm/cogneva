@@ -2059,6 +2059,11 @@ pub fn spawn_gitee_token_refresher(
     interval_secs: u64,
     refresh_threshold_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
+    // The task below is the deployment gate, not the loop: it ends by starting
+    // the loop, so a caller must not read its completion as the loop's fate.
+    // The gate cannot be asked at plugin init instead — one of its two inputs is
+    // an HTTP call to the security gateway, which would both block startup and
+    // read "not reachable yet" as "not configured".
     tokio::spawn(async move {
         // 属主判定放在最前，且每条退出路径都带原因。只报「起来了」是不够的：
         // 属主拿 OAuth App 配置当门时，App 被撤掉那一支会静默返回，于是
@@ -2096,25 +2101,32 @@ pub fn spawn_gitee_token_refresher(
         );
         // 登记在这一行之后：属主与轮换材料两道门都在前面，没过的进程不是「刷新
         // 循环死了」，而是这个部署里本来就没有这个循环，上面那两行日志已经把它
-        // 为什么没有说清了。
-        let beat = cog_core::loop_health::register(
+        // 为什么没有说清了。登记之后再退出会被记成一次死亡，而那说的不是这里
+        // 发生的事。
+        drop(cog_core::loop_health::spawn(
             GITEE_TOKEN_REFRESHER_LOOP,
             cog_core::loop_health::Cadence::Periodic(Duration::from_secs(interval_secs)),
-        );
-        let _mortality = beat.watch_death(shutdown.clone());
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        interval.tick().await; // first tick is immediate; skip it
-        loop {
-            beat.beat();
-            tokio::select! {
-                biased;
-                _ = shutdown.wait() => return,
-                _ = interval.tick() => {}
-            }
-            if let Err(e) = gitee_refresh_tick(refresh_threshold_secs).await {
-                tracing::warn!(error = %e, "gitee token refresh tick failed");
-            }
-        }
+            shutdown.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let shutdown = shutdown.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+                    interval.tick().await; // first tick is immediate; skip it
+                    loop {
+                        beat.beat();
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.wait() => return,
+                            _ = interval.tick() => {}
+                        }
+                        if let Err(e) = gitee_refresh_tick(refresh_threshold_secs).await {
+                            tracing::warn!(error = %e, "gitee token refresh tick failed");
+                        }
+                    }
+                }
+            },
+        ));
     })
 }
 

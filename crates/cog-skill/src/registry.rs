@@ -101,25 +101,29 @@ impl SkillRegistryImpl {
     /// and hot-reloads skills every 30 seconds.
     pub fn spawn_watcher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let registry = self.clone();
-        tokio::spawn(async move {
-            let interval_secs = registry.config.hot_reload_interval_secs;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let beat = cog_core::loop_health::register(
-                SKILL_HOT_RELOAD_LOOP,
-                cog_core::loop_health::Cadence::Periodic(interval.period()),
-            );
-            // No stop signal and no exit of its own: ending means a skill edited on
-            // disk is never picked up again.
-            let _mortality = beat.watch_death_unconditionally();
-            loop {
-                beat.beat();
-                interval.tick().await;
-                if let Err(e) = registry.check_and_reload().await {
-                    tracing::warn!("Skill hot-reload check failed: {}", e);
+        let interval_secs = registry.config.hot_reload_interval_secs;
+        let period = std::time::Duration::from_secs(interval_secs);
+        // No stop signal and no exit of its own: ending means a skill edited on
+        // disk is never picked up again.
+        cog_core::loop_health::spawn_unstoppable(
+            SKILL_HOT_RELOAD_LOOP,
+            cog_core::loop_health::Cadence::Periodic(period),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let registry = registry.clone();
+                async move {
+                    let mut interval = tokio::time::interval(period);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        beat.beat();
+                        interval.tick().await;
+                        if let Err(e) = registry.check_and_reload().await {
+                            tracing::warn!("Skill hot-reload check failed: {}", e);
+                        }
+                    }
                 }
-            }
-        })
+            },
+        )
     }
 
     /// Compare disk state with in-memory cache and reload changed skills.

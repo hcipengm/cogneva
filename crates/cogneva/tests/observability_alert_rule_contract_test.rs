@@ -145,6 +145,13 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_loop_deaths_total",
         "crates/cog-core/src/loop_health.rs",
     ),
+    // The restarts are a rule of their own rather than a note on the death rule:
+    // a loop that panicked and was run again publishes all of its series again,
+    // so every other reading in the deployment shows a loop that never stopped.
+    (
+        "cogneva_loop_restarts_total",
+        "crates/cog-core/src/loop_health.rs",
+    ),
     (
         "cogneva_landing_failures_total",
         "crates/cog-github/src/landing.rs",

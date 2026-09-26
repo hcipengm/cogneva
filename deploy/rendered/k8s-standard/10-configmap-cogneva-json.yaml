@@ -25,6 +25,9 @@ data:
         "task_event_channel_capacity": 256,
         "shutdown_timeout_ms": 30000,
         "timeout_checker_interval_secs": 30,
+        "loop_restart_max_consecutive": 3,
+        "loop_restart_backoff_floor_secs": 5,
+        "_comment_loop_restart": "后台循环 panic 后原地重跑的次数上限（连续计），以及事件驱动循环的重启等待下限（秒）。有节奏的循环按自己声明的周期等，等待逐次翻倍、上限是该周期的 6 倍——这个倍数与停滞规则用的同一个。0 表示不重启：panic 与没有这个机制时一样致命。超预算的循环留死不再重启（进程不因此退出，退出会变成崩溃循环并把同进程其它循环一起拖垮），由 cogneva_loop_deaths_total 与停滞规则上报；每次重跑记在 cogneva_loop_restarts_total 上，规则 background_loop_restarted 会告警，所以「重启过了」不等于「没事了」。这两项是进程属性而不是某个循环的属性，启动时安装一次、对所有循环生效。",
         "stale_task_detector_poll_secs": 15,
         "tool_timeout_secs": 30,
         "shell_timeout_secs": 600,
@@ -138,6 +141,8 @@ data:
         "COGNEVA_SANDBOX_EXECUTOR_URL": "system.sandbox_executor_url",
         "COGNEVA_REQUIRE_TOOL_IDENTITY": "system.require_tool_identity",
         "COGNEVA_SKILL_HOT_RELOAD_INTERVAL_SECS": "system.skill_hot_reload_interval_secs",
+        "COGNEVA_LOOP_RESTART_MAX_CONSECUTIVE": "system.loop_restart_max_consecutive",
+        "COGNEVA_LOOP_RESTART_BACKOFF_FLOOR_SECS": "system.loop_restart_backoff_floor_secs",
         "COGNEVA_GRPC_RECONNECT_INTERVAL_SECS": "system.grpc_reconnect_interval_secs",
         "COGNEVA_PROBE_TIMEOUT_SECS": "system.probe_timeout_secs",
         "COGNEVA_HTTP_TIMEOUT_SECS": "system.http_timeout_secs",
@@ -956,7 +961,16 @@ data:
                 "greater_than": 0.0
               },
               "severity": "critical",
-              "summary": "a background loop ended {value} time(s) in this series while the process was still running and its shutdown had not been signalled: it returned early or panicked. Nothing restarts it in place, so it is gone until that process restarts, and every series it published stops being written -- from here on, the subsystem it watched reads exactly like one with nothing to report. Zero is published for every loop that has never done it, so a rising count is the only thing this rule reacts to, and it stays firing because the loop does not come back. Usual causes: a panic inside one iteration (the panic message is in that container's log at the same moment, since a task that no one awaits leaves no other trace), or an early return on a path the loop treats as ordinary such as a channel closing or a source that failed to initialize. The count is per process and resets when the process restarts, so a loop that died shortly before a restart is visible in the logs and no longer in this reading"
+              "summary": "a background loop ended {value} time(s) in this series while the process was still running and its shutdown had not been signalled, and it is not running now: it returned early, or it panicked again with its restart budget spent. A panic is run again in place up to that budget (background_loop_restarted reports each of those), so what reaches this rule is the end that stayed an end. It is gone until that process restarts, and every series it published stops being written -- from here on, the subsystem it watched reads exactly like one with nothing to report. Zero is published for every loop that has never done it, so a rising count is the only thing this rule reacts to, and it stays firing because the loop does not come back. Usual causes: a panic inside one iteration that outlived the budget (every panic message is in that container's log, the ones that were restarted and the last one alike, since a task that no one awaits leaves no other trace), or an early return on a path the loop treats as ordinary such as a channel closing or a source that failed to initialize -- a return is deliberately not restarted, because the loop chose to end and a supervisor that overrules that turns a clean exit into a panic loop. The process is deliberately not taken down with it: a loop that cannot come back does not become able to by crash-looping the workload that runs everything else. The count is per process and resets when the process restarts, so a loop that died shortly before a restart is visible in the logs and no longer in this reading"
+            },
+            {
+              "name": "background_loop_restarted",
+              "promql": "increase(cogneva_loop_restarts_total[1h])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "a background loop panicked and was run again {value} time(s) in the last hour, and is running now: a restart means the defect fired and the loop came back from it, not that the defect is gone. It is reported here rather than left to the panic line in the log because a repaired loop publishes all of its own series again, so from every other reading in this deployment it looks like a loop that never stopped -- the repair would be the reason the defect stayed quiet. Read the panic message in that container's log at the moment of the restart (the supervisor logs it with the loop name, the restart count within this run, and the wait it took before trying again). A restart that happens once around a deploy is usually a defect in the new code that the next attempt did not hit; the same loop restarted repeatedly is one the budget will eventually leave dead, which is what background_loop_died then reports. The count is per process: it resets when the process restarts, so a loop that panicked shortly before a restart is visible in the logs and no longer here"
             }
           ]
         },

@@ -328,6 +328,14 @@ fn default_env_mappings() -> HashMap<String, String> {
         "system.skill_hot_reload_interval_secs".into(),
     );
     m.insert(
+        "COGNEVA_LOOP_RESTART_MAX_CONSECUTIVE".into(),
+        "system.loop_restart_max_consecutive".into(),
+    );
+    m.insert(
+        "COGNEVA_LOOP_RESTART_BACKOFF_FLOOR_SECS".into(),
+        "system.loop_restart_backoff_floor_secs".into(),
+    );
+    m.insert(
         "COGNEVA_TOOL_TIMEOUT_SECS".into(),
         "system.tool_timeout_secs".into(),
     );

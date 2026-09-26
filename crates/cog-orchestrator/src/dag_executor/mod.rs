@@ -212,98 +212,127 @@ impl DagExecutorRuntime {
             let group = group_name.clone();
             let sweep_shutdown = shutdown.clone();
             let batch = self.config.result_claim_batch;
-            tokio::spawn(async move {
-                let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                let beat = cog_core::loop_health::register(
-                    RESULT_RECLAIM_LOOP,
-                    cog_core::loop_health::Cadence::Periodic(ticker.period()),
-                );
-                let _mortality = beat.watch_death(sweep_shutdown.clone());
-                loop {
-                    beat.beat();
-                    tokio::select! {
-                        biased;
-                        _ = sweep_shutdown.wait() => break,
-                        _ = ticker.tick() => {
-                            match sweeper
-                                .backend
-                                .claim_pending(&stream, &group, claim_idle_ms, batch)
-                                .await
-                            {
-                                Ok(claimed) => {
-                                    for (msg_id, bytes) in claimed {
-                                        tracing::warn!(
-                                            stream = %stream, msg_id = %msg_id,
-                                            "reclaimed a result message left pending by a consumer that never acked it"
-                                        );
-                                        sweeper
-                                            .handle_result_message(&stream, &group, &msg_id, &bytes)
-                                            .await;
+            // Detached: this sweeper's fate is not the caller's. The consumer
+            // loop below is awaited in place, and the two end together on the
+            // same shutdown signal.
+            drop(cog_core::loop_health::spawn(
+                RESULT_RECLAIM_LOOP,
+                cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(
+                    interval_secs,
+                )),
+                sweep_shutdown.clone(),
+                // Rebuilt per attempt, so everything the body consumes is cloned here.
+                move |beat| {
+                    let sweeper = sweeper.clone();
+                    let stream = stream.clone();
+                    let group = group.clone();
+                    let sweep_shutdown = sweep_shutdown.clone();
+                    async move {
+                        let mut ticker =
+                            tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                        loop {
+                            beat.beat();
+                            tokio::select! {
+                                biased;
+                                _ = sweep_shutdown.wait() => break,
+                                _ = ticker.tick() => {
+                                    match sweeper
+                                        .backend
+                                        .claim_pending(&stream, &group, claim_idle_ms, batch)
+                                        .await
+                                    {
+                                        Ok(claimed) => {
+                                            for (msg_id, bytes) in claimed {
+                                                tracing::warn!(
+                                                    stream = %stream, msg_id = %msg_id,
+                                                    "reclaimed a result message left pending by a consumer that never acked it"
+                                                );
+                                                sweeper
+                                                    .handle_result_message(&stream, &group, &msg_id, &bytes)
+                                                    .await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                stream = %stream,
+                                                "result pending claim sweep failed: {e}"
+                                            );
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        stream = %stream,
-                                        "result pending claim sweep failed: {e}"
-                                    );
                                 }
                             }
                         }
                     }
-                }
-            });
+                },
+            ));
         }
 
         // Resubscribe on stream failure/end: exiting the task would freeze the
         // consumer group until the next pod restart (a single transient error
-        // historically stalled groups for days).
-        let beat = cog_core::loop_health::register(
+        // historically stalled groups for days). The resubscription lives
+        // inside the body, so a restart resumes reading the same group.
+        //
+        // Awaited in place rather than detached: the caller of this function
+        // awaits until the loop stops, and its return is what says the stream
+        // is no longer served.
+        let this = self.clone();
+        let _ = cog_core::loop_health::spawn(
             TASK_CONSUMER_LOOP,
             cog_core::loop_health::Cadence::EventDriven,
-        );
-        let _mortality = beat.watch_death(shutdown.clone());
-        'subscribe: loop {
-            beat.beat();
-            let mut stream = match self.backend.subscribe(&result_stream, &group_name).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("result stream subscribe failed, retrying: {e}");
-                    tokio::select! {
-                        _ = shutdown.wait() => break 'subscribe,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
+            shutdown.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = this.clone();
+                let result_stream = result_stream.clone();
+                let group_name = group_name.clone();
+                let shutdown = shutdown.clone();
+                async move {
+                    'subscribe: loop {
+                        beat.beat();
+                        let mut stream =
+                            match this.backend.subscribe(&result_stream, &group_name).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::warn!("result stream subscribe failed, retrying: {e}");
+                                    tokio::select! {
+                                        _ = shutdown.wait() => break 'subscribe,
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
+                                    }
+                                }
+                            };
+
+                        loop {
+                            let next = tokio::select! {
+                                biased;
+                                _ = shutdown.wait() => break 'subscribe,
+                                msg = stream.next() => msg,
+                            };
+
+                            let (msg_id, bytes) = match next {
+                                Some(Ok(v)) => v,
+                                Some(Err(e)) => {
+                                    tracing::warn!("result stream error, resubscribing: {e}");
+                                    break;
+                                }
+                                None => {
+                                    tracing::warn!("result stream ended, resubscribing");
+                                    break;
+                                }
+                            };
+
+                            this.handle_result_message(&result_stream, &group_name, &msg_id, &bytes)
+                                .await;
+                        }
+
+                        tokio::select! {
+                            _ = shutdown.wait() => break 'subscribe,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        }
                     }
                 }
-            };
-
-            loop {
-                let next = tokio::select! {
-                    biased;
-                    _ = shutdown.wait() => break 'subscribe,
-                    msg = stream.next() => msg,
-                };
-
-                let (msg_id, bytes) = match next {
-                    Some(Ok(v)) => v,
-                    Some(Err(e)) => {
-                        tracing::warn!("result stream error, resubscribing: {e}");
-                        break;
-                    }
-                    None => {
-                        tracing::warn!("result stream ended, resubscribing");
-                        break;
-                    }
-                };
-
-                self.handle_result_message(&result_stream, &group_name, &msg_id, &bytes)
-                    .await;
-            }
-
-            tokio::select! {
-                _ = shutdown.wait() => break 'subscribe,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-            }
-        }
+            },
+        )
+        .await;
 
         Ok(())
     }
@@ -451,14 +480,24 @@ impl DagExecutorRuntime {
                 return Err(e);
             }
         }
-        let beat = cog_core::loop_health::register(
+        // Resubscription lives inside the body, so a restart resumes reading
+        // the same group. Awaited in place rather than detached: the caller of
+        // this function awaits until the loop stops.
+        let this = self.clone();
+        let _ = cog_core::loop_health::spawn(
             GOAL_CONSUMER_LOOP,
             cog_core::loop_health::Cadence::EventDriven,
-        );
-        let _mortality = beat.watch_death(shutdown.clone());
+            shutdown.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = this.clone();
+                let goal_stream = goal_stream.clone();
+                let group = group.clone();
+                let shutdown = shutdown.clone();
+                async move {
         'subscribe: loop {
             beat.beat();
-            let mut stream = match self.backend.subscribe(&goal_stream, &group).await {
+            let mut stream = match this.backend.subscribe(&goal_stream, &group).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!("goal stream subscribe failed, retrying: {e}");
@@ -492,7 +531,7 @@ impl DagExecutorRuntime {
                     Ok(g) => g,
                     Err(e) => {
                         tracing::warn!(msg_id = %msg_id, "Failed to deserialize GoalMessage: {e}");
-                        if let Err(e) = self
+                        if let Err(e) = this
                             .backend
                             .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
                             .await
@@ -515,7 +554,7 @@ impl DagExecutorRuntime {
                 //   - verified tasks  → inject directly into DagExecutor
                 //   - empty / unverified → decompose via collaboration
                 if let (Some(ref planner), Some(ref skill_registry)) =
-                    (&self.action_planner, &self.skill_registry)
+                    (&this.action_planner, &this.skill_registry)
                 {
                     let registry = skill_registry.read().await;
                     let tasks = goal.tasks;
@@ -541,17 +580,17 @@ impl DagExecutorRuntime {
                     }
                 } else {
                     // Fallback: direct DagExecutor submission when ActionPlanner unavailable.
-                    if let Err(e) = self.submit_goal(&goal.goal, goal.tasks).await {
+                    if let Err(e) = this.submit_goal(&goal.goal, goal.tasks).await {
                         tracing::warn!(goal_id = %goal.message_id, "submit_goal failed: {e}");
                         continue;
                     }
                 }
 
-                if let Err(e) = self.publish_ready_tasks().await {
+                if let Err(e) = this.publish_ready_tasks().await {
                     tracing::warn!(goal_id = %goal.message_id, "publish_ready_tasks after goal failed: {e}");
                     continue;
                 }
-                if let Err(e) = self
+                if let Err(e) = this
                     .backend
                     .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
                     .await
@@ -565,6 +604,10 @@ impl DagExecutorRuntime {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
             }
         }
+                }
+            },
+        )
+        .await;
 
         Ok(())
     }
@@ -602,59 +645,76 @@ impl DagExecutorRuntime {
             "decomposition orphan reconciler started"
         );
 
-        // Keys this watcher owns, with the earliest time the alert may resolve.
-        let mut firing: std::collections::HashMap<String, OrphanWatch> =
-            std::collections::HashMap::new();
         let dwell = chrono::Duration::seconds(dwell_secs as i64);
-        let mut adopted = false;
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        let beat = cog_core::loop_health::register(
+        let this = self.clone();
+        // Awaited in place rather than detached: the caller of this function
+        // awaits until the loop stops.
+        //
+        // The fired-key bookkeeping is built per attempt. Losing it to a panic
+        // costs nothing that is not recovered: the first tick of the next
+        // attempt re-adopts every active alert from the persistent store.
+        let _ = cog_core::loop_health::spawn(
             ORPHAN_RECONCILER_LOOP,
-            cog_core::loop_health::Cadence::Periodic(ticker.period()),
-        );
-        let _mortality = beat.watch_death(shutdown.clone());
-        loop {
-            beat.beat();
-            tokio::select! {
-                biased;
-                _ = shutdown.wait() => break,
-                _ = ticker.tick() => {
-                    if !adopted {
-                        adopted = true;
-                        if let Some(sink) = &sink {
-                            for alert in sink
-                                .list_active_persistent_alerts("decomposition_", 1000)
-                                .await
-                            {
-                                if let Some(parent) = alert
-                                    .labels
-                                    .get("parent_task_id")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty() && *s != "-")
-                                {
-                                    firing.insert(
-                                        alert.dedup_key.clone(),
-                                        OrphanWatch {
-                                            parent_id: parent.to_string(),
-                                            resolve_after: alert.fired_at + dwell,
-                                        },
-                                    );
+            cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(interval_secs)),
+            shutdown.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = this.clone();
+                let sink = sink.clone();
+                let shutdown = shutdown.clone();
+                async move {
+                    // Keys this watcher owns, with the earliest time the alert may resolve.
+                    let mut firing: std::collections::HashMap<String, OrphanWatch> =
+                        std::collections::HashMap::new();
+                    let mut adopted = false;
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                    loop {
+                        beat.beat();
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.wait() => break,
+                            _ = ticker.tick() => {
+                                if !adopted {
+                                    adopted = true;
+                                    if let Some(sink) = &sink {
+                                        for alert in sink
+                                            .list_active_persistent_alerts("decomposition_", 1000)
+                                            .await
+                                        {
+                                            if let Some(parent) = alert
+                                                .labels
+                                                .get("parent_task_id")
+                                                .and_then(|v| v.as_str())
+                                                .filter(|s| !s.is_empty() && *s != "-")
+                                            {
+                                                firing.insert(
+                                                    alert.dedup_key.clone(),
+                                                    OrphanWatch {
+                                                        parent_id: parent.to_string(),
+                                                        resolve_after: alert.fired_at + dwell,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
+                                let stall = chrono::Duration::seconds(stall_secs as i64);
+                                orphan_reconcile_tick(
+                                    &this.orchestrator,
+                                    sink.as_ref(),
+                                    &stall,
+                                    &dwell,
+                                    &mut firing,
+                                )
+                                .await;
                             }
                         }
                     }
-                    let stall = chrono::Duration::seconds(stall_secs as i64);
-                    orphan_reconcile_tick(
-                        &self.orchestrator,
-                        sink.as_ref(),
-                        &stall,
-                        &dwell,
-                        &mut firing,
-                    )
-                    .await;
                 }
-            }
-        }
+            },
+        )
+        .await;
     }
 }
 

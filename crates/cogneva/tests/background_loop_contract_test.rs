@@ -14,6 +14,12 @@
 //! that starts cadence-driven work either registers it, or appears below with a
 //! reason someone had to write down.
 //!
+//! The registration has to be the supervised shape ([`REGISTRATIONS`]): the point
+//! of the family is not only that a stopped loop is readable, but that a panicked
+//! one is run again and the restart is counted. A bare `register` gives the
+//! reading without the repair, and a loop that panics every hour with a healthy
+//! looking series is the failure this gate would otherwise bless.
+//!
 //! The exemption list is the backlog made countable. A stale entry — file gone,
 //! marker gone, or already registered — fails here rather than quietly widening
 //! the exemption, and an entry with no reason fails too.
@@ -32,11 +38,16 @@ use std::path::{Path, PathBuf};
 
 /// The call that starts cadence-driven work.
 const MARKER: &str = concat!("tokio::time::", "interval(");
-/// The calls that make such work watchable. `spawn` registers as well: it wraps
-/// the body and hands it a [`Beat`].
-const REGISTRATIONS: [&str; 2] = [
-    concat!("loop_health::", "register("),
+/// The calls that make such work watchable: the supervised shape only.
+///
+/// A bare `register` is not enough and is deliberately not listed. It hands back
+/// a beat and leaves the task to the caller, so a body that panics is never run
+/// again — the series it publishes make the loop look watched while the only
+/// thing that would report the panic, the restart counter, has nothing to count.
+const REGISTRATIONS: [&str; 3] = [
     concat!("loop_health::", "spawn("),
+    concat!("loop_health::", "spawn_unstoppable("),
+    concat!("loop_health::", "spawn_with_policy("),
 ];
 
 /// Cadence-driven work that is not registered yet, each with why.
@@ -182,12 +193,18 @@ fn the_scan_sees_the_work_and_the_registrations() {
         "interval(d); } }"
     ))));
     assert!(registers_a_loop(concat!(
-        "let beat = cog_core::loop_health::",
-        "register(NAME, Cadence::EventDriven);"
+        "cog_core::loop_health::",
+        "spawn(NAME, c, s, |beat| async move { beat.beat(); })"
     )));
     assert!(registers_a_loop(concat!(
         "cog_core::loop_health::",
-        "spawn(NAME, c, s, |beat| async move { beat.beat(); })"
+        "spawn_unstoppable(NAME, c, |beat| async move { beat.beat(); })"
+    )));
+    // The reading without the repair is not a registration: a bare `register`
+    // leaves a panicked body with nothing to run it again.
+    assert!(!registers_a_loop(concat!(
+        "let beat = cog_core::loop_health::",
+        "register(NAME, Cadence::EventDriven);"
     )));
     assert!(!registers_a_loop("let beat = register(NAME, cadence);"));
 
@@ -198,6 +215,8 @@ fn the_scan_sees_the_work_and_the_registrations() {
         "register(\n    SOME_LOOP,\n    Cadence::EventDriven,\n);"
     );
     let at = source.find("register(").expect("marker present");
+    // The parser is marker-independent: the name is the first argument of
+    // whichever registration call carries it.
     assert_eq!(registration_name(source, at), "SOME_LOOP");
 
     // The rule itself, against synthetic sources: a file that starts a loop
@@ -211,8 +230,8 @@ fn the_scan_sees_the_work_and_the_registrations() {
     assert!(!is_unobservable_work(
         "crates/x/src/y.rs",
         &format!(
-            "{unregistered}\nlet beat = cog_core::loop_health::{}",
-            "register(LOOP_NAME, cadence);"
+            "{unregistered}\ncog_core::loop_health::{}",
+            "spawn(LOOP_NAME, cadence, stop, |beat| async move { beat.beat(); });"
         )
     ));
     assert!(!is_unobservable_work(NOT_REGISTERED[0].0, unregistered));

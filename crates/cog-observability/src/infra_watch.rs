@@ -57,6 +57,7 @@ pub const INFRA_WATCH_LOOP: &str = "infra_watch";
 /// Outlets the watcher drives. Both are optional: with no store the watcher
 /// still notifies, with no notifier it still persists, with neither it does
 /// not run at all (the plugin decides).
+#[derive(Clone)]
 pub struct InfraWatchOutlets {
     pub store: Option<Arc<PostgresAlertStore>>,
     pub notifier: Option<Arc<AlertManager>>,
@@ -77,49 +78,64 @@ pub async fn run_infra_watch_loop(
     // Everything this loop reports is a judgement about other people's series, so
     // its death is the one failure it cannot report: the rules it evaluates go
     // quiet, and a rule that is quiet because nothing is wrong looks exactly like
-    // a rule that is quiet because nobody is evaluating it.
-    let beat = cog_core::loop_health::register(
+    // a rule that is quiet because nobody is evaluating it. It is therefore run
+    // under the supervisor rather than watched after the fact -- see
+    // `cog_core::loop_health` on what a restart does and what it does not.
+    // The join error is deliberately not reported: the ordinary way this fn's
+    // task ends is being aborted at shutdown, which is an error from the handle's
+    // point of view and not a fact about the loop.
+    let _ = cog_core::loop_health::spawn(
         INFRA_WATCH_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
-    );
-    let _mortality = beat.watch_death(shutdown.clone());
-    info!(
-        rules = config.rules.len(),
-        interval_secs = interval.as_secs(),
-        url = %config.prometheus_url,
-        "infra alert watcher started"
-    );
+        shutdown.clone(),
+        // Rebuilt per attempt, so every handle the body consumes is cloned here.
+        move |beat| {
+            let config = config.clone();
+            let outlets = outlets.clone();
+            let http = Arc::clone(&http);
+            let shutdown = shutdown.clone();
+            async move {
+                info!(
+                    rules = config.rules.len(),
+                    interval_secs = interval.as_secs(),
+                    url = %config.prometheus_url,
+                    "infra alert watcher started"
+                );
 
-    // dedup keys currently believed firing; adopted from the store on the
-    // first tick so a restart resolves rows it can no longer observe instead
-    // of stranding them. Eval-failure self-alerts live in their own set:
-    // they are keyed by rule name, not series identity, and must survive the
-    // series-resolution pass untouched.
-    let mut known_firing: HashSet<String> = HashSet::new();
-    let mut eval_failure_firing: HashSet<String> = HashSet::new();
-    let mut failure_streaks: HashMap<String, u32> = HashMap::new();
-    let mut adopted = false;
+                // dedup keys currently believed firing; adopted from the store on
+                // the first tick so a restart resolves rows it can no longer
+                // observe instead of stranding them. Eval-failure self-alerts live
+                // in their own set: they are keyed by rule name, not series
+                // identity, and must survive the series-resolution pass untouched.
+                let mut known_firing: HashSet<String> = HashSet::new();
+                let mut eval_failure_firing: HashSet<String> = HashSet::new();
+                let mut failure_streaks: HashMap<String, u32> = HashMap::new();
+                let mut adopted = false;
 
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        // Stamped once per cycle, on every cycle: a rule set that found nothing
-        // to fire is the ordinary state, and it must not read as a watcher that
-        // is not running.
-        beat.beat();
-        tokio::select! {
-            biased;
-            _ = shutdown.wait() => break,
-            _ = ticker.tick() => {
-                if !adopted {
-                    adopted = true;
-                    if let Some(store) = &outlets.store {
-                        adopt_active_alerts(store, &config, &mut known_firing, &mut eval_failure_firing).await;
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    // Stamped once per cycle, on every cycle: a rule set that found
+                    // nothing to fire is the ordinary state, and it must not read as
+                    // a watcher that is not running.
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = ticker.tick() => {
+                            if !adopted {
+                                adopted = true;
+                                if let Some(store) = &outlets.store {
+                                    adopt_active_alerts(store, &config, &mut known_firing, &mut eval_failure_firing).await;
+                                }
+                            }
+                            tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks).await;
+                        }
                     }
                 }
-                tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks).await;
             }
-        }
-    }
+        },
+    )
+    .await;
 }
 
 /// Seed `known_firing` with rows this watcher's rules raised before a

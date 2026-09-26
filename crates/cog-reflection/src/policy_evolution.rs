@@ -265,29 +265,38 @@ pub async fn run_policy_evolution_loop(
         min_trials = driver.config.min_trials,
         "artifact-level evolution driver started"
     );
-    let mut ticker = tokio::time::interval(interval);
     // Two of the three outcomes of a round change nothing, so the loop's own
-    // output cannot say whether it is running; its liveness comes from here.
-    let beat = cog_core::loop_health::register(
+    // output cannot say whether it is running; its liveness comes from here. The
+    // supervised shape is the other half: a round that panics is run again, and
+    // the restart is counted rather than leaving a quiet series behind.
+    let _ = cog_core::loop_health::spawn(
         POLICY_EVOLUTION_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
-    );
-    let _mortality = beat.watch_death(shutdown.clone());
-    loop {
-        beat.beat();
-        tokio::select! {
-            biased;
-            _ = shutdown.wait() => break,
-            // 每轮结果必须落在默认可见级别。这一环的三种结论里两种都不动手，
-            // 若只在 debug 留痕，"没有更优候选"与"循环根本没跑"在运维面上就是
-            // 同一片空白；而 `baseline_trials` 正是"决策结果是否在积累"的唯一
-            // 带内证据，代价是每小时一行。
-            _ = ticker.tick() => match driver.run_once().await {
-                Ok(outcome) => info!(?outcome, "artifact-level evolution round"),
-                Err(e) => warn!(error = %e, "artifact-level evolution round failed"),
-            },
-        }
-    }
+        shutdown.clone(),
+        move |beat| {
+            let driver = Arc::clone(&driver);
+            let shutdown = shutdown.clone();
+            async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        // 每轮结果必须落在默认可见级别。这一环的三种结论里两种都不动手，
+                        // 若只在 debug 留痕，"没有更优候选"与"循环根本没跑"在运维面上就是
+                        // 同一片空白；而 `baseline_trials` 正是"决策结果是否在积累"的唯一
+                        // 带内证据，代价是每小时一行。
+                        _ = ticker.tick() => match driver.run_once().await {
+                            Ok(outcome) => info!(?outcome, "artifact-level evolution round"),
+                            Err(e) => warn!(error = %e, "artifact-level evolution round failed"),
+                        },
+                    }
+                }
+            }
+        },
+    )
+    .await;
 }
 
 #[cfg(test)]

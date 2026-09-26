@@ -293,48 +293,59 @@ pub async fn run_data_volume_watch(
     let interval = Duration::from_secs(interval_secs.max(MIN_SCAN_INTERVAL_SECS));
     // The footprint gauge is this loop's own reading, so the loop being gone and
     // the walk having nothing to say would read the same: the liveness of the
-    // watcher has to come from a face that outlives it.
-    let beat = cog_core::loop_health::register(
+    // watcher has to come from a face that outlives it -- and a panic is run
+    // again in place, so the reading is not the only thing that survives it.
+    let _ = cog_core::loop_health::spawn(
         DATA_VOLUME_WATCH_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
-    );
-    let _mortality = beat.watch_death(shutdown.clone());
-    info!(
-        dir = %dir.display(),
-        claim = %observable.claim(),
-        excluded = exclude.len(),
-        interval_secs = interval.as_secs(),
-        metric = DATA_VOLUME_USED_METRIC,
-        "data volume footprint watcher started"
-    );
+        shutdown.clone(),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let dir = dir.clone();
+            let exclude = exclude.clone();
+            let observable = Arc::clone(&observable);
+            let shutdown = shutdown.clone();
+            async move {
+                info!(
+                    dir = %dir.display(),
+                    claim = %observable.claim(),
+                    excluded = exclude.len(),
+                    interval_secs = interval.as_secs(),
+                    metric = DATA_VOLUME_USED_METRIC,
+                    "data volume footprint watcher started"
+                );
 
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        // Stamped whether or not this pass found anything to measure: the age is
-        // a reading of the loop, and a loop that only stamps when it did
-        // something reports the state of the directory as its own liveness.
-        beat.beat();
-        tokio::select! {
-            biased;
-            _ = shutdown.wait() => break,
-            _ = ticker.tick() => {
-                let path = dir.clone();
-                let excluded = exclude.clone();
-                match tokio::task::spawn_blocking(move || dir_size_bytes(&path, &excluded)).await {
-                    Ok(Ok(bytes)) => observable.set_used_bytes(bytes),
-                    // A failed walk yields a number that is too small, which can
-                    // only silence the alert. Keep the last measurement rather
-                    // than publish a fictional low one, and say so.
-                    Ok(Err(e)) => warn!(
-                        error = %e,
-                        dir = %dir.display(),
-                        "data volume scan failed; keeping the last measurement"
-                    ),
-                    Err(e) => warn!(error = %e, "data volume scan task panicked"),
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    // Stamped whether or not this pass found anything to measure: the age is
+                    // a reading of the loop, and a loop that only stamps when it did
+                    // something reports the state of the directory as its own liveness.
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = ticker.tick() => {
+                            let path = dir.clone();
+                            let excluded = exclude.clone();
+                            match tokio::task::spawn_blocking(move || dir_size_bytes(&path, &excluded)).await {
+                                Ok(Ok(bytes)) => observable.set_used_bytes(bytes),
+                                // A failed walk yields a number that is too small, which can
+                                // only silence the alert. Keep the last measurement rather
+                                // than publish a fictional low one, and say so.
+                                Ok(Err(e)) => warn!(
+                                    error = %e,
+                                    dir = %dir.display(),
+                                    "data volume scan failed; keeping the last measurement"
+                                ),
+                                Err(e) => warn!(error = %e, "data volume scan task panicked"),
+                            }
+                        }
+                    }
                 }
             }
-        }
-    }
+        },
+    )
+    .await;
 }
 
 #[cfg(test)]

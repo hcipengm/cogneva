@@ -395,38 +395,45 @@ pub const MEMORY_SCHEMA_REPAIR_LOOP: &str = "memory_schema_repair";
 /// 的，有的是 upsert，重复执行也不会写坏。反过来用一个配置开关去指定属主会
 /// 指定错：拿执行器职责当开关，就会让握着归档的控制面跳过、让空手的执行器
 /// 白跑。
-pub async fn run_schema_repair_loop(
+pub fn spawn_schema_repair_loop(
     recorder: MemoryBackendRecorder,
     interval: std::time::Duration,
     shutdown: cog_core::ShutdownSignal,
-) {
-    let mut ticker = tokio::time::interval(interval);
+) -> tokio::task::JoinHandle<()> {
     // This loop repairs schemas for entries that were archived without one. A
     // loop that died leaves no trace of its own -- the repairs it would have made
     // are simply never made, and the archived entries stay unreachable.
-    let beat = cog_core::loop_health::register(
+    cog_core::loop_health::spawn(
         MEMORY_SCHEMA_REPAIR_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
-    );
-    let _mortality = beat.watch_death(shutdown.clone());
-    loop {
-        // Stamped on every cycle: most find nothing to repair, and that is the
-        // healthy state rather than evidence the loop stopped.
-        beat.beat();
-        tokio::select! {
-            _ = ticker.tick() => {}
-            _ = shutdown.wait() => return,
-        }
-        match recorder.repair_missing_schemas().await {
-            Ok(repair) if repair.found() > 0 => info!(
-                repaired = repair.repaired,
-                unrepairable = repair.unrepairable,
-                "rebuilt missing memory schemas from archived entries"
-            ),
-            Ok(_) => debug!("memory schema repair: no orphaned entries"),
-            Err(e) => warn!("memory schema repair failed: {}", e),
-        }
-    }
+        shutdown.clone(),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let recorder = recorder.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    // Stamped on every cycle: most find nothing to repair, and that is the
+                    // healthy state rather than evidence the loop stopped.
+                    beat.beat();
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = shutdown.wait() => return,
+                    }
+                    match recorder.repair_missing_schemas().await {
+                        Ok(repair) if repair.found() > 0 => info!(
+                            repaired = repair.repaired,
+                            unrepairable = repair.unrepairable,
+                            "rebuilt missing memory schemas from archived entries"
+                        ),
+                        Ok(_) => debug!("memory schema repair: no orphaned entries"),
+                        Err(e) => warn!("memory schema repair failed: {}", e),
+                    }
+                }
+            }
+        },
+    )
 }
 
 #[async_trait]

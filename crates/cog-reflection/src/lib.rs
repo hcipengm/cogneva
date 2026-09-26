@@ -124,7 +124,7 @@ pub use promotion_trend::PromotionTrendReporter;
 pub use recorder::{InMemoryRecorder, LearningRecorder, MemoryBackendRecorder};
 pub use reviewer::PeriodicReviewer;
 pub use sandbox::{enforce_sandbox_boundary, BoundaryDecision, SandboxKind, SandboxSignals};
-pub use signal_watcher::{run_signal_watcher_loop, SignalWatcherConfig};
+pub use signal_watcher::{spawn_signal_watcher_loop, SignalWatcherConfig};
 pub use squad::DefaultSquadReflection;
 pub use types::*;
 

@@ -22,29 +22,36 @@ pub fn spawn_timeout_checker(
         TIMEOUT_CHECKER_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
         shutdown,
-        move |beat| async move {
-            let mut interval = tokio::time::interval(interval);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                // 每轮盖一次，没超时也盖：一轮里没有任何任务到期是常态，不能读成循环停了。
-                beat.beat();
-                tokio::select! {
-                    biased;
-                    _ = stop.wait() => {
-                        info!("Task timeout checker shutting down");
-                        return;
+        // The body is rebuilt per attempt, so handles it consumes are cloned
+        // in the closure; see spawn_polling_loop in cog-github.
+        move |beat| {
+            let stop = stop.clone();
+            let state = Arc::clone(&state);
+            async move {
+                let mut interval = tokio::time::interval(interval);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    // Stamped every cycle, timeout or not: a round with nothing
+                    // due is the ordinary case and is not the loop having stopped.
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait() => {
+                            info!("Task timeout checker shutting down");
+                            return;
+                        }
+                        _ = interval.tick() => {}
                     }
-                    _ = interval.tick() => {}
-                }
-                let timed_out = state.orchestrator.check_timeouts().await;
-                if !timed_out.is_empty() {
-                    let ids: Vec<String> =
-                        timed_out.iter().map(|(id, _, _, _)| id.clone()).collect();
-                    warn!(
-                        "Task timeout checker detected {} expired task(s): {:?}",
-                        timed_out.len(),
-                        ids
-                    );
+                    let timed_out = state.orchestrator.check_timeouts().await;
+                    if !timed_out.is_empty() {
+                        let ids: Vec<String> =
+                            timed_out.iter().map(|(id, _, _, _)| id.clone()).collect();
+                        warn!(
+                            "Task timeout checker detected {} expired task(s): {:?}",
+                            timed_out.len(),
+                            ids
+                        );
+                    }
                 }
             }
         },
@@ -56,73 +63,89 @@ pub fn spawn_collaboration_listener(
     state: Arc<crate::GatewayState>,
     shutdown: cog_core::shutdown::ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
+    // The task below is the deployment gate, not the loop: it ends by starting
+    // the loop, so a caller must not read its completion as the loop's fate.
     tokio::spawn(async move {
         let Some(graph) = state.collaboration_graph.clone() else {
             // 没有协作图就没什么可听：这一支不是循环停了，而是这个部署根本没有
             // 这个循环。登记放它后面，「没起过」才不会读成「死了一次」。
             return;
         };
-        let beat = cog_core::loop_health::register(
+        // The receiver is subscribed once and shared across attempts: a restart
+        // that re-subscribed would land at the channel's current tail, and every
+        // link whose TaskCompleted/TaskFailed arrived while the loop was dead
+        // would never be added. This lock has one holder.
+        let task_event_rx = Arc::new(tokio::sync::Mutex::new(state.subscribe_task_events()));
+        drop(cog_core::loop_health::spawn(
             COLLABORATION_LISTENER_LOOP,
             // 只在任务事件到达时干活，所以没有周期可判：年龄照报，但不作为「卡住」的
             // 依据——队列空着等和在处理里卡住，从这个面看是一样的。
             cog_core::loop_health::Cadence::EventDriven,
-        );
-        let _mortality = beat.watch_death(shutdown.clone());
-        let mut task_event_rx = state.subscribe_task_events();
-        loop {
-            beat.beat();
-            tokio::select! {
-                biased;
-                _ = shutdown.wait() => return,
-                recv = task_event_rx.recv() => match recv {
-                    Ok(event) => match event {
-                        cog_core::TaskEvent::TaskCompleted { task_id, timestamp, .. } => {
-                            let dependents: Vec<String> = {
-                                state.orchestrator.get_dependents(&task_id).await
-                                    .map(|deps| deps.into_iter().map(|t| t.id.clone()).collect())
-                                    .unwrap_or_default()
-                            };
-                            for dependent in dependents {
-                                graph.add_link(crate::collaboration::CollaborationLink {
-                                    source_task_id: task_id.clone(),
-                                    target_task_id: dependent,
-                                    link_type: crate::collaboration::CollaborationLinkType::HandOff,
-                                    agent_id: None,
-                                    timestamp,
-                                }).await;
-                            }
+            shutdown.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let graph = graph.clone();
+                let state = Arc::clone(&state);
+                let task_event_rx = Arc::clone(&task_event_rx);
+                let shutdown = shutdown.clone();
+                async move {
+                    loop {
+                        beat.beat();
+                        let mut task_event_rx = task_event_rx.lock().await;
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.wait() => return,
+                            recv = task_event_rx.recv() => match recv {
+                                Ok(event) => match event {
+                                    cog_core::TaskEvent::TaskCompleted { task_id, timestamp, .. } => {
+                                        let dependents: Vec<String> = {
+                                            state.orchestrator.get_dependents(&task_id).await
+                                                .map(|deps| deps.into_iter().map(|t| t.id.clone()).collect())
+                                                .unwrap_or_default()
+                                        };
+                                        for dependent in dependents {
+                                            graph.add_link(crate::collaboration::CollaborationLink {
+                                                source_task_id: task_id.clone(),
+                                                target_task_id: dependent,
+                                                link_type: crate::collaboration::CollaborationLinkType::HandOff,
+                                                agent_id: None,
+                                                timestamp,
+                                            }).await;
+                                        }
+                                    }
+                                    cog_core::TaskEvent::TaskFailed { task_id, retried, timestamp, .. } => {
+                                        let link_type = if retried {
+                                            crate::collaboration::CollaborationLinkType::Retry
+                                        } else {
+                                            crate::collaboration::CollaborationLinkType::DeadLetter
+                                        };
+                                        graph.add_link(crate::collaboration::CollaborationLink {
+                                            source_task_id: task_id.clone(),
+                                            target_task_id: task_id.clone(),
+                                            link_type,
+                                            agent_id: None,
+                                            timestamp,
+                                        }).await;
+                                    }
+                                    _ => {}
+                                },
+                                // 落后说明这个消费者没跟上，不是它坏了：丢掉的几环补不回来，
+                                // 继续消费即可。让它静默卡在一条永不就绪的分支上，才是把
+                                // 「循环还在但事件丢了」变成看不出来的那种做法。
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(skipped, "collaboration listener fell behind on task events");
+                                }
+                                // 生产者没了：再等也等不到事件，这个循环的活干完了。
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    warn!("task event channel closed; collaboration listener exiting");
+                                    return;
+                                }
+                            },
                         }
-                        cog_core::TaskEvent::TaskFailed { task_id, retried, timestamp, .. } => {
-                            let link_type = if retried {
-                                crate::collaboration::CollaborationLinkType::Retry
-                            } else {
-                                crate::collaboration::CollaborationLinkType::DeadLetter
-                            };
-                            graph.add_link(crate::collaboration::CollaborationLink {
-                                source_task_id: task_id.clone(),
-                                target_task_id: task_id.clone(),
-                                link_type,
-                                agent_id: None,
-                                timestamp,
-                            }).await;
-                        }
-                        _ => {}
-                    },
-                    // 落后说明这个消费者没跟上，不是它坏了：丢掉的几环补不回来，
-                    // 继续消费即可。让它静默卡在一条永不就绪的分支上，才是把
-                    // 「循环还在但事件丢了」变成看不出来的那种做法。
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "collaboration listener fell behind on task events");
                     }
-                    // 生产者没了：再等也等不到事件，这个循环的活干完了。
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        warn!("task event channel closed; collaboration listener exiting");
-                        return;
-                    }
-                },
-            }
-        }
+                }
+            },
+        ));
     })
 }
 

@@ -562,12 +562,12 @@ pub const SIGNAL_WATCHER_LOOP: &str = "signal_watcher";
 
 /// Background loop; follows the same shutdown pattern as the baseline port
 /// trigger loop.
-pub async fn run_signal_watcher_loop(
+pub fn spawn_signal_watcher_loop(
     orchestrator: Arc<dyn OrchestratorControl>,
     config: SignalWatcherConfig,
     shutdown: cog_core::ShutdownSignal,
     alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let interval = Duration::from_secs(config.poll_interval_secs.max(60));
     info!(
         interval_secs = interval.as_secs(),
@@ -577,27 +577,36 @@ pub async fn run_signal_watcher_loop(
         alert_channel = alert_source.is_some() && config.alert_channel_enabled,
         "self-discovery signal watcher started"
     );
-    let mut ticker = tokio::time::interval(interval);
     // Self-discovery: if this loop stops, the system stops noticing its own
     // failures, and the signals it derives simply stop appearing -- which reads
     // the same as a system with nothing wrong.
-    let beat = cog_core::loop_health::register(
+    cog_core::loop_health::spawn(
         SIGNAL_WATCHER_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
-    );
-    let _mortality = beat.watch_death(shutdown.clone());
-    loop {
-        // Every cycle is stamped, including the many that find nothing to
-        // report: a quiet system is the ordinary case here.
-        beat.beat();
-        tokio::select! {
-            biased;
-            _ = shutdown.wait() => break,
-            _ = ticker.tick() => {
-                tick(&orchestrator, &config, alert_source.as_ref()).await;
+        shutdown.clone(),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let orchestrator = orchestrator.clone();
+            let config = config.clone();
+            let shutdown = shutdown.clone();
+            let alert_source = alert_source.clone();
+            async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    // Every cycle is stamped, including the many that find nothing to
+                    // report: a quiet system is the ordinary case here.
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = ticker.tick() => {
+                            tick(&orchestrator, &config, alert_source.as_ref()).await;
+                        }
+                    }
+                }
             }
-        }
-    }
+        },
+    )
 }
 
 #[cfg(test)]

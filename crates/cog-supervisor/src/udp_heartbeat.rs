@@ -89,62 +89,71 @@ impl UdpHeartbeatClient {
         // never came up is not a loop that is fine, so the early return below has
         // to read as the loop having ended.
         let loop_name = format!("supervisor_udp_heartbeat[{}]", self.agent_id);
-        tokio::spawn(async move {
-            let beat = cog_core::loop_health::register(
-                loop_name,
-                cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(
-                    interval_secs.max(1),
-                )),
-            );
-            let _mortality = beat.watch_death(cancel.clone());
-            let socket = match UdpSocket::bind("0.0.0.0:0").await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("udp client bind failed: {e}");
-                    return;
-                }
-            };
+        let server_addr = self.server_addr;
+        let agent_id = self.agent_id;
+        cog_core::loop_health::spawn(
+            loop_name,
+            cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(
+                interval_secs.max(1),
+            )),
+            cancel.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let server_addr = server_addr.clone();
+                let agent_id = agent_id.clone();
+                let cancel = cancel.clone();
+                async move {
+                    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("udp client bind failed: {e}");
+                            return;
+                        }
+                    };
 
-            if let Err(e) = socket.connect(&self.server_addr).await {
-                tracing::error!("udp client connect failed: {e}");
-                return;
-            }
+                    if let Err(e) = socket.connect(&server_addr).await {
+                        tracing::error!("udp client connect failed: {e}");
+                        return;
+                    }
 
-            let mut ticker =
-                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs.max(1)));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await;
+                    let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(
+                        interval_secs.max(1),
+                    ));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    ticker.tick().await;
 
-            loop {
-                beat.beat();
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let packet = HeartbeatPacket {
-                            agent_id: self.agent_id.clone(),
-                            ts: chrono::Utc::now().timestamp(),
-                        };
-                        let payload = match serde_json::to_vec(&packet) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::warn!("heartbeat serialization failed: {e}");
-                                continue;
-                            }
-                        };
-                        // Send 3 redundant packets with 10 ms spacing.
-                        for i in 0..3 {
-                            if i > 0 {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                            }
-                            if let Err(e) = socket.send(&payload).await {
-                                tracing::warn!("udp heartbeat send failed: {e}");
+                    loop {
+                        beat.beat();
+                        tokio::select! {
+                        _ = ticker.tick() => {
+                            let packet = HeartbeatPacket {
+                                agent_id: agent_id.clone(),
+                                ts: chrono::Utc::now().timestamp(),
+                            };
+                            let payload = match serde_json::to_vec(&packet) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::warn!("heartbeat serialization failed: {e}");
+                                    continue;
+                                }
+                            };
+                            // Send 3 redundant packets with 10 ms spacing.
+                            for i in 0..3 {
+                                if i > 0 {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                }
+                                if let Err(e) = socket.send(&payload).await {
+                                    tracing::warn!("udp heartbeat send failed: {e}");
+                                }
                             }
                         }
-                    }
-                    _ = cancel.wait() => {
-                        break;
+                        _ = cancel.wait() => {
+                            break;
+                        }
+                            }
                     }
                 }
-            }
-        })
+            },
+        )
     }
 }

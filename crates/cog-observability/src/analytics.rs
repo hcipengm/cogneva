@@ -720,52 +720,63 @@ impl ClickHouseEventBuffer {
         flush_interval: std::time::Duration,
         max_batch_size: usize,
     ) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AnalyticsEvent>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AnalyticsEvent>();
 
-        tokio::spawn(async move {
-            let mut buffer = Vec::with_capacity(max_batch_size);
-            let mut interval = tokio::time::interval(flush_interval);
-            // This loop has no shutdown path at all, so any exit is one nobody
-            // asked for. Its cadence is the flush interval: the tick branch
-            // guarantees an iteration at least that often even when no event
-            // arrives, which is what makes an idle buffer distinguishable from a
-            // task that is gone — and a task that is gone is buffered events
-            // nobody flushes.
-            let beat = cog_core::loop_health::register(
-                ANALYTICS_FLUSH_LOOP,
-                cog_core::loop_health::Cadence::Periodic(flush_interval),
-            );
-            let _mortality = beat.watch_death_unconditionally();
-
-            loop {
-                beat.beat();
-                tokio::select! {
-                    Some(event) = rx.recv() => {
-                        buffer.push(event);
-                        if buffer.len() >= max_batch_size {
-                            let batch = std::mem::replace(
-                                &mut buffer,
-                                Vec::with_capacity(max_batch_size),
-                            );
-                            if let Err(e) = backend.insert_batch(batch).await {
-                                tracing::warn!("ClickHouse background flush failed: {}", e);
+        // The receiver goes into a shared lock and survives a restart: a fresh
+        // receiver would drop the analytics events already queued on the
+        // channel. This lock has one holder.
+        let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
+        // This loop has no shutdown path at all, so any exit is one nobody
+        // asked for. Its cadence is the flush interval: the tick branch
+        // guarantees an iteration at least that often even when no event
+        // arrives, which is what makes an idle buffer distinguishable from a
+        // task that is gone — and a task that is gone is buffered events
+        // nobody flushes.
+        cog_core::loop_health::spawn_unstoppable(
+            ANALYTICS_FLUSH_LOOP,
+            cog_core::loop_health::Cadence::Periodic(flush_interval),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let backend = std::sync::Arc::clone(&backend);
+                let rx = std::sync::Arc::clone(&rx);
+                async move {
+                    // One batch per attempt: a panic loses the events in hand
+                    // that have not been flushed yet, not everything since that
+                    // moment (which is what a loop without restarts would lose).
+                    let mut buffer = Vec::with_capacity(max_batch_size);
+                    let mut interval = tokio::time::interval(flush_interval);
+                    loop {
+                        beat.beat();
+                        let mut rx = rx.lock().await;
+                        tokio::select! {
+                            Some(event) = rx.recv() => {
+                                buffer.push(event);
+                                if buffer.len() >= max_batch_size {
+                                    let batch = std::mem::replace(
+                                        &mut buffer,
+                                        Vec::with_capacity(max_batch_size),
+                                    );
+                                    if let Err(e) = backend.insert_batch(batch).await {
+                                        tracing::warn!("ClickHouse background flush failed: {}", e);
+                                    }
+                                }
                             }
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if !buffer.is_empty() {
-                            let batch = std::mem::replace(
-                                &mut buffer,
-                                Vec::with_capacity(max_batch_size),
-                            );
-                            if let Err(e) = backend.insert_batch(batch).await {
-                                tracing::warn!("ClickHouse background flush failed: {}", e);
+                            _ = interval.tick() => {
+                                if !buffer.is_empty() {
+                                    let batch = std::mem::replace(
+                                        &mut buffer,
+                                        Vec::with_capacity(max_batch_size),
+                                    );
+                                    if let Err(e) = backend.insert_batch(batch).await {
+                                        tracing::warn!("ClickHouse background flush failed: {}", e);
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
+            },
+        );
 
         Self { tx }
     }

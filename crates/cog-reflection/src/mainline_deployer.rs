@@ -2997,38 +2997,48 @@ pub async fn run_mainline_loop(
         pull_endpoint = %deployer.pull_endpoint(),
         "Mainline deployer loop started"
     );
-    let mut ticker = tokio::time::interval(interval);
     // 空闲心跳：SameRev 路径静默返回，靠周期性 INFO 摘要证明部署器存活。
     let heartbeat_every = Duration::from_secs(deployer.cfg.heartbeat_log_secs);
-    let mut last_heartbeat: Option<tokio::time::Instant> = None;
     // The heartbeat log exists to prove this loop is alive, and a log line is not
     // something a rule can read: without a stamp, a deployer that stopped looks
-    // exactly like a main that needs no work.
-    let beat = cog_core::loop_health::register(
+    // exactly like a main that needs no work. The supervised shape adds the other
+    // half — a body that panics is run again and the restart is counted.
+    let _ = cog_core::loop_health::spawn(
         MAINLINE_DEPLOYER_LOOP,
         cog_core::loop_health::Cadence::Periodic(interval),
-    );
-    let _mortality = beat.watch_death(shutdown.clone());
-    loop {
-        // Stamped every cycle, including the SameRev ones that return silently.
-        beat.beat();
-        tokio::select! {
-            biased;
-            _ = shutdown.wait() => break,
-            _ = ticker.tick() => {
-                if let Err(e) = deployer.poll_once().await {
-                    warn!(error = %e, "mainline deployer poll failed");
-                }
-                let due = last_heartbeat
-                    .map(|t| t.elapsed() >= heartbeat_every)
-                    .unwrap_or(true);
-                if due {
-                    deployer.log_heartbeat().await;
-                    last_heartbeat = Some(tokio::time::Instant::now());
+        shutdown.clone(),
+        move |beat| {
+            let deployer = std::sync::Arc::clone(&deployer);
+            let shutdown = shutdown.clone();
+            async move {
+                let mut ticker = tokio::time::interval(interval);
+                // Last heartbeat is per attempt: a restarted loop re-logs on its
+                // first tick, which is the honest reading of "the loop started".
+                let mut last_heartbeat: Option<tokio::time::Instant> = None;
+                loop {
+                    // Stamped every cycle, including the SameRev ones that return silently.
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break,
+                        _ = ticker.tick() => {
+                            if let Err(e) = deployer.poll_once().await {
+                                warn!(error = %e, "mainline deployer poll failed");
+                            }
+                            let due = last_heartbeat
+                                .map(|t| t.elapsed() >= heartbeat_every)
+                                .unwrap_or(true);
+                            if due {
+                                deployer.log_heartbeat().await;
+                                last_heartbeat = Some(tokio::time::Instant::now());
+                            }
+                        }
+                    }
                 }
             }
-        }
-    }
+        },
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------

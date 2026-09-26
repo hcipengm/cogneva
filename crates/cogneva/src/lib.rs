@@ -93,6 +93,17 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // it enabled.
     ctx.publish_observable(cog_core::loop_health::observable());
 
+    // The restart budget belongs to the process's loops rather than to any one of
+    // them, so it is installed once here, from the same document every plugin
+    // reads — a loop that panicked must not be judged differently depending on
+    // which plugin happened to start it. Installed before any plugin initialises,
+    // because a loop started by the first plugin has to be under the configured
+    // budget and not the built-in one.
+    cog_core::loop_health::install_restart_settings(cog_core::loop_health::RestartSettings {
+        max_consecutive: config.core.system.loop_restart_max_consecutive,
+        backoff_floor_secs: config.core.system.loop_restart_backoff_floor_secs,
+    });
+
     let (daemon, _pid_file) = assembly::infra::init_daemon_and_pidfile();
 
     let task_event_tx = tokio::sync::broadcast::channel::<cog_core::TaskEvent>(

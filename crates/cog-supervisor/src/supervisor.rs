@@ -448,23 +448,21 @@ impl Supervisor {
         .into_iter()
         .min()
         .unwrap_or(cfg.health_interval);
-        let beat = cog_core::loop_health::register(
-            SUPERVISOR_LOOP,
-            cog_core::loop_health::Cadence::Periodic(beat_period),
-        );
         // The caller's future is this loop's stop condition, so the exit it leads
-        // to is the intended one and must not be counted as a death.
+        // to is the intended one and must not be counted as a death. It is not
+        // Clone, so it cannot be rebuilt with the body; it is folded into a
+        // signal once, and every attempt shares that signal as its stop.
         let supervisor_stop = cog_core::ShutdownSignal::new();
-        let _mortality = beat.watch_death(supervisor_stop.clone());
+        let stop_from_caller = supervisor_stop.clone();
+        let waited = shutdown;
+        tokio::spawn(async move {
+            waited.await;
+            stop_from_caller.trigger();
+        });
 
-        let mut cycle: u64 = 0;
-        let shutdown = std::pin::pin!(shutdown);
-        let mut shutdown = shutdown;
-
-        // Take the optional config receiver so we can listen to hot-reloads.
-        let mut config_rx = self.config_rx.clone();
-
-        // Spawn autonomous event loop
+        // Spawn autonomous event loop. Outside the supervised body: it is a loop
+        // of its own, and rebuilding it per attempt would leave the previous one
+        // running with nothing holding its handle.
         let _autonomous_handle = tokio::spawn({
             let collaborator = Arc::clone(&self.autonomous);
             let rx = self.agent_event_rx.resubscribe();
@@ -477,6 +475,40 @@ impl Supervisor {
             "Supervisor starting (intervals: health={:?}, quota={:?}, rebalance={:?}, event={:?})",
             cfg.health_interval, cfg.quota_interval, cfg.rebalance_interval, cfg.event_window,
         );
+
+        let _ = cog_core::loop_health::spawn(
+            SUPERVISOR_LOOP,
+            cog_core::loop_health::Cadence::Periodic(beat_period),
+            supervisor_stop.clone(),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let this = Arc::clone(&self);
+                let cfg = cfg.clone();
+                let supervisor_stop = supervisor_stop.clone();
+                async move {
+                    let mut health = tokio::time::interval(cfg.health_interval);
+                    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut quota = tokio::time::interval(cfg.quota_interval);
+                    quota.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut rebalance = tokio::time::interval(cfg.rebalance_interval);
+                    rebalance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut events = tokio::time::interval(cfg.event_window);
+                    events.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut autonomous_tick = tokio::time::interval(Duration::from_secs(
+                        cfg.autonomous.decision_interval_secs,
+                    ));
+                    autonomous_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut control_plane_tick = tokio::time::interval(cfg.control_plane_interval);
+                    control_plane_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                    // Counting restarts at one per attempt: a cycle number is a
+                    // reading of this run of the loop, not of the process.
+                    let mut cycle: u64 = 0;
+
+                    // Take the optional config receiver so we can listen to hot-reloads.
+                    // Cloned per attempt from the same source: a watch receiver clone
+                    // carries the position its source had.
+                    let mut config_rx = this.config_rx.clone();
 
         loop {
             beat.beat();
@@ -496,8 +528,8 @@ impl Supervisor {
             tokio::select! {
                 _ = health.tick() => {
                     cycle = cycle.saturating_add(1);
-                    let _ = self.event_tx.send(SupervisorEvent::Tick { timestamp: Utc::now(), cycle });
-                    match self.run_health_pass().await {
+                    let _ = this.event_tx.send(SupervisorEvent::Tick { timestamp: Utc::now(), cycle });
+                    match this.run_health_pass().await {
                         Ok(report) => {
                             if !report.is_clean() {
                                 warn!(
@@ -514,36 +546,36 @@ impl Supervisor {
                     }
                 }
                 _ = quota.tick() => {
-                    if let Err(e) = self.run_quota_pass().await {
+                    if let Err(e) = this.run_quota_pass().await {
                         warn!("Supervisor quota pass failed: {}", e);
                     }
                 }
                 _ = rebalance.tick() => {
-                    if let Err(e) = self.run_rebalance_pass().await {
+                    if let Err(e) = this.run_rebalance_pass().await {
                         warn!("Supervisor rebalance pass failed: {}", e);
                     } else {
-                        *self.last_rebalance.lock().await = Some(Utc::now());
+                        *this.last_rebalance.lock().await = Some(Utc::now());
                     }
                 }
                 _ = events.tick() => {
-                    if let Err(e) = self.run_event_pass().await {
+                    if let Err(e) = this.run_event_pass().await {
                         warn!("Supervisor event pass failed: {}", e);
                     }
                 }
                 _ = autonomous_tick.tick() => {
-                    self.autonomous.run_decision_pass().await;
+                    this.autonomous.run_decision_pass().await;
                 }
                 _ = control_plane_tick.tick() => {
-                    if let Some(ref client) = self.control_plane {
-                        let report = match self.run_health_pass().await {
+                    if let Some(ref client) = this.control_plane {
+                        let report = match this.run_health_pass().await {
                             Ok(r) => r,
                             Err(e) => {
                                 warn!("Control plane tick: health pass failed: {}", e);
                                 crate::health_checker::HealthReport::default()
                             }
                         };
-                        let pending_handoffs = self.autonomous.pending_count().await;
-                        let last_rebalance = *self.last_rebalance.lock().await;
+                        let pending_handoffs = this.autonomous.pending_count().await;
+                        let last_rebalance = *this.last_rebalance.lock().await;
                         let status = SupervisorStatus {
                             cycle,
                             healthy_agents: report.healthy.len(),
@@ -572,7 +604,7 @@ impl Supervisor {
                         autonomous_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         control_plane_tick = tokio::time::interval(new_config.control_plane_interval);
                         control_plane_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        *self.config.write().unwrap_or_else(|e| e.into_inner()) = new_config.clone();
+                        *this.config.write().unwrap_or_else(|e| e.into_inner()) = new_config.clone();
                         info!("Supervisor config reloaded (intervals: health={:?}, quota={:?}, rebalance={:?}, event={:?})",
                             new_config.health_interval,
                             new_config.quota_interval,
@@ -581,13 +613,19 @@ impl Supervisor {
                         );
                     }
                 }
-                _ = &mut shutdown => {
-                    supervisor_stop.trigger();
+                _ = supervisor_stop.wait() => {
+                    // No need to trigger anything here: the death criterion the
+                    // supervisor holds is this very signal, it has fired, and an
+                    // exit now is not counted as a death.
                     info!("Supervisor shutdown signal received");
                     break;
                 }
             }
         }
+                }
+            },
+        )
+        .await;
     }
 }
 

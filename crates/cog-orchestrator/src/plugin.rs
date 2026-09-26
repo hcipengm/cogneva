@@ -278,34 +278,48 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             }
             if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
                 let orch = orch.clone();
-                let mut shutdown_rx = broadcast_tx.0.subscribe();
+                let shutdown_rx = broadcast_tx.0.subscribe();
                 let checkpoint_stop = cog_core::ShutdownSignal::new();
                 let checkpoint_guard = checkpoint_stop.clone();
-                tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    let beat = cog_core::loop_health::register(
-                        DAG_CHECKPOINT_LOOP,
-                        cog_core::loop_health::Cadence::Periodic(interval.period()),
-                    );
-                    let _mortality = beat.watch_death(checkpoint_guard);
-                    loop {
-                        beat.beat();
-                        tokio::select! {
-                            _ = interval.tick() => {
-                                orch.force_checkpoint().await;
-                                tracing::debug!("DagExecutor periodic checkpoint saved");
-                            }
-                            _ = shutdown_rx.recv() => {
-                                // The broadcast is this loop's own stop event, so
-                                // it must also mark the exit as intended.
-                                checkpoint_stop.trigger();
-                                tracing::info!("DagExecutor checkpoint task shutting down gracefully");
-                                break;
+                // The receiver is shared across attempts: a restart that
+                // re-subscribed could miss a shutdown that fired while the loop
+                // was dead, and would then keep checkpointing for a process on
+                // its way out. This lock has one holder.
+                let shutdown_rx = std::sync::Arc::new(tokio::sync::Mutex::new(shutdown_rx));
+                drop(cog_core::loop_health::spawn(
+                    DAG_CHECKPOINT_LOOP,
+                    cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(30)),
+                    checkpoint_guard,
+                    // Rebuilt per attempt, so everything the body consumes is cloned here.
+                    move |beat| {
+                        let orch = orch.clone();
+                        let shutdown_rx = std::sync::Arc::clone(&shutdown_rx);
+                        let checkpoint_stop = checkpoint_stop.clone();
+                        async move {
+                            let mut interval =
+                                tokio::time::interval(std::time::Duration::from_secs(30));
+                            interval
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            loop {
+                                beat.beat();
+                                let mut shutdown_rx = shutdown_rx.lock().await;
+                                tokio::select! {
+                                    _ = interval.tick() => {
+                                        orch.force_checkpoint().await;
+                                        tracing::debug!("DagExecutor periodic checkpoint saved");
+                                    }
+                                    _ = shutdown_rx.recv() => {
+                                        // The broadcast is this loop's own stop event, so
+                                        // it must also mark the exit as intended.
+                                        checkpoint_stop.trigger();
+                                        tracing::info!("DagExecutor checkpoint task shutting down gracefully");
+                                        break;
+                                    }
+                                }
                             }
                         }
-                    }
-                });
+                    },
+                ));
             }
         }
 
@@ -362,30 +376,40 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         // Periodic ready-task publisher.
                         let pub_shutdown = dag_shutdown.clone();
                         let publisher_runtime = runtime.clone();
-                        tokio::spawn(async move {
-                            let mut interval = tokio::time::interval(
+                        drop(cog_core::loop_health::spawn(
+                            READY_TASK_PUBLISHER_LOOP,
+                            cog_core::loop_health::Cadence::Periodic(
                                 std::time::Duration::from_secs(ready_task_poll_interval_secs),
-                            );
-                            interval
-                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            let beat = cog_core::loop_health::register(
-                                READY_TASK_PUBLISHER_LOOP,
-                                cog_core::loop_health::Cadence::Periodic(interval.period()),
-                            );
-                            let _mortality = beat.watch_death(pub_shutdown.clone());
-                            loop {
-                                beat.beat();
-                                tokio::select! {
-                                    _ = interval.tick() => {
-                                        if let Err(e) = publisher_runtime.publish_ready_tasks().await
-                                        {
-                                            tracing::warn!("publish_ready_tasks failed: {e}");
+                            ),
+                            pub_shutdown.clone(),
+                            // Rebuilt per attempt, so everything the body consumes is cloned here.
+                            move |beat| {
+                                let publisher_runtime = publisher_runtime.clone();
+                                let pub_shutdown = pub_shutdown.clone();
+                                async move {
+                                    let mut interval =
+                                        tokio::time::interval(std::time::Duration::from_secs(
+                                            ready_task_poll_interval_secs,
+                                        ));
+                                    interval.set_missed_tick_behavior(
+                                        tokio::time::MissedTickBehavior::Skip,
+                                    );
+                                    loop {
+                                        beat.beat();
+                                        tokio::select! {
+                                            _ = interval.tick() => {
+                                                if let Err(e) =
+                                                    publisher_runtime.publish_ready_tasks().await
+                                                {
+                                                    tracing::warn!("publish_ready_tasks failed: {e}");
+                                                }
+                                            }
+                                            _ = pub_shutdown.wait() => break,
                                         }
                                     }
-                                    _ = pub_shutdown.wait() => break,
                                 }
-                            }
-                        });
+                            },
+                        ));
 
                         // Lease renewer: every worker deployment claims tasks off
                         // the shared ready queue, so every one of them has to keep
@@ -400,29 +424,36 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             .clone()
                             .expect("shared orchestrator");
                         let renew_lease_secs = ctx.config().dag_executor.task_lease_secs;
-                        tokio::spawn(async move {
-                            let cadence =
-                                std::time::Duration::from_secs((renew_lease_secs / 3).max(1));
-                            let mut interval = tokio::time::interval(cadence);
-                            interval
-                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            let beat = cog_core::loop_health::register(
-                                TASK_LEASE_RENEWER_LOOP,
-                                cog_core::loop_health::Cadence::Periodic(interval.period()),
-                            );
-                            let _mortality = beat.watch_death(renew_shutdown.clone());
-                            loop {
-                                beat.beat();
-                                tokio::select! {
-                                    _ = interval.tick() => {
-                                        if let Err(e) = renew_orchestrator.renew_leases().await {
-                                            tracing::warn!("task lease renewal failed: {e}");
+                        let cadence = std::time::Duration::from_secs((renew_lease_secs / 3).max(1));
+                        drop(cog_core::loop_health::spawn(
+                            TASK_LEASE_RENEWER_LOOP,
+                            cog_core::loop_health::Cadence::Periodic(cadence),
+                            renew_shutdown.clone(),
+                            // Rebuilt per attempt, so everything the body consumes is cloned here.
+                            move |beat| {
+                                let renew_orchestrator = renew_orchestrator.clone();
+                                let renew_shutdown = renew_shutdown.clone();
+                                async move {
+                                    let mut interval = tokio::time::interval(cadence);
+                                    interval.set_missed_tick_behavior(
+                                        tokio::time::MissedTickBehavior::Skip,
+                                    );
+                                    loop {
+                                        beat.beat();
+                                        tokio::select! {
+                                            _ = interval.tick() => {
+                                                if let Err(e) =
+                                                    renew_orchestrator.renew_leases().await
+                                                {
+                                                    tracing::warn!("task lease renewal failed: {e}");
+                                                }
+                                            }
+                                            _ = renew_shutdown.wait() => break,
                                         }
                                     }
-                                    _ = renew_shutdown.wait() => break,
                                 }
-                            }
-                        });
+                            },
+                        ));
 
                         // Decomposition orphan reconciler.
                         let reconcile_shutdown = dag_shutdown.clone();
