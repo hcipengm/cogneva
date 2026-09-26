@@ -755,6 +755,15 @@
           "summary": "The allocatable {resource} of node {node} changed in the last six hours. That is not a fault by itself, but every number derived from the old capacity is now resting on a stale premise: the limits account above, how much build concurrency the host can take, and the probe and cache budgets that were sized against the old machine. Re-derive them; this clears on its own once the change ages out"
         },
         {
+          "name": "node_without_memory_reserve",
+          "promql": "sum by (node) (kube_node_status_capacity{resource=\"memory\"}) - sum by (node) (kube_node_status_allocatable{resource=\"memory\"})",
+          "condition": {
+            "less_than": 1.0
+          },
+          "severity": "warning",
+          "summary": "Node {node} holds back {value} bytes of memory for the work that runs outside the cluster, and kubelet derives allocatable as capacity minus kubeReserved, systemReserved and the hard eviction threshold, so a node whose allocatable equals its capacity has set none of the three. Two failures follow from that single equality. This host runs builds and the sandbox on itself and shares its memory with the pods, so with nothing reserved the kernel picks a process to page and OOM-kill rather than the kubelet evicting a pod by its own accounting, and nothing bounds that contest. And the same equality can only hold while the memory eviction threshold is zero too, which means the node has no memory.available signal at all: it never enters MemoryPressure however little memory is left, so no condition reaches anyone before the machine stops answering. Reserve a share derived from this node's own readings and restart the kubelet for it to take effect"
+        },
+        {
           "name": "change_funnel_never_lands",
           "promql": "sum by (intent) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0 and on(intent) (sum by (intent) (increase(cogneva_change_fate_total{fate=\"landed\"}[24h])) == 0)",
           "condition": {

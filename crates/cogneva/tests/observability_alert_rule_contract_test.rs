@@ -283,6 +283,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "cadvisor（kubelet 内置）",
     ),
     ("kube_node_status_allocatable", "kube-state-metrics"),
+    (
+        "kube_node_status_capacity",
+        "kube-state-metrics（与 allocatable 同源，相减即节点为非 Pod 工作留出的份额）",
+    ),
     ("kube_node_status_condition", "kube-state-metrics"),
     (
         "kube_persistentvolumeclaim_resource_requests_storage_bytes",
