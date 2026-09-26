@@ -68,6 +68,8 @@ pub struct GlobalAgentManager {
     skill_registry: Option<Arc<RwLock<cog_core::SkillRegistry>>>,
     event_bus: Option<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>,
     event_bus_sink: Option<crate::EventBusSink>,
+    /// Durable per-task token census sink handed to every spawned worker.
+    observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
 }
 
 impl GlobalAgentManager {
@@ -98,6 +100,7 @@ impl GlobalAgentManager {
             skill_registry: None,
             event_bus: None,
             event_bus_sink: None,
+            observability: None,
         }
     }
 
@@ -162,6 +165,13 @@ impl GlobalAgentManager {
         self
     }
 
+    /// Give every spawned worker the gateway its per-task token census is
+    /// written to.
+    pub fn with_observability(mut self, gateway: Arc<dyn cog_core::ObservabilityGateway>) -> Self {
+        self.observability = Some(gateway);
+        self
+    }
+
     /// Spawn a new worker agent, register it globally, and start its inbox consumer.
     /// # Arguments
     /// * `agent_id` — unique worker identifier
@@ -203,6 +213,9 @@ impl GlobalAgentManager {
             }
             if let Some(ref sink) = self.event_bus_sink {
                 a = a.with_event_bus_sink(sink.clone());
+            }
+            if let Some(ref ob) = self.observability {
+                a = a.with_observability(ob.clone());
             }
             a
         };
@@ -307,6 +320,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
             }
             if let Some(ref sink) = self.event_bus_sink {
                 a = a.with_event_bus_sink(sink.clone());
+            }
+            if let Some(ref ob) = self.observability {
+                a = a.with_observability(ob.clone());
             }
             a
         };

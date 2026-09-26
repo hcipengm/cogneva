@@ -223,6 +223,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // ── GlobalAgentManager ──
         let supervisor_state_backend = ctx.require_service::<dyn cog_core::StateBackend>()?;
         let external_skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
+        // Required, not optional: every worker's per-task token census is
+        // written through this gateway, and its absence is invisible at run
+        // time — the tasks still complete, the per-task metrics table just
+        // stays empty and its readers report a fleet that spends nothing.
+        let observability = ctx.require_service::<dyn cog_core::ObservabilityGateway>()?;
 
         let pool_backend: Arc<dyn cog_core::MessageBackend> = match shared_message_backend.clone() {
             Some(backend) => backend,
@@ -280,6 +285,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         if let Some(ref esr) = external_skill_registry {
             pool_builder = pool_builder.with_external_skill_registry(esr.clone());
         }
+        pool_builder = pool_builder.with_observability(observability);
         // 角色 → 技能：技能面里那个 max_iterations 在此之前是个死值——被装进
         // 注册表、被 extractor 校验、被 promoter 改写，运行时却没有任何读点。
         // 这里把它交到建 agent 的那一跳，技能预算才真的生效。

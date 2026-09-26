@@ -1338,6 +1338,11 @@ impl ObservabilityGateway for MemoryObservabilityGateway {
             .ok_or_else(|| SFError::Agent(format!("metrics not found for task {}", task_id)))
     }
 
+    async fn record_task_metrics(&self, metrics: TaskMetrics) -> SFResult<()> {
+        self.record_metrics(metrics);
+        Ok(())
+    }
+
     async fn get_task_logs(&self, task_id: &str, limit: usize) -> SFResult<Vec<LogEntry>> {
         let logs = self.logs.read().unwrap();
         match logs.get(task_id) {

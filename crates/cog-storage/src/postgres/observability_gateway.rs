@@ -408,6 +408,10 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
         }
     }
 
+    async fn record_task_metrics(&self, metrics: TaskMetrics) -> SFResult<()> {
+        self.record_metrics(&metrics).await
+    }
+
     async fn get_task_logs(&self, task_id: &str, limit: usize) -> SFResult<Vec<LogEntry>> {
         let rows: Vec<(DateTime<Utc>, String, String, String, serde_json::Value)> = sqlx::query_as(
             r#"

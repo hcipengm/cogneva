@@ -87,6 +87,8 @@ pub struct Agent {
     external_skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     /// Guardrail for automated safety checks on inputs/outputs/tool calls.
     guardrail: Option<Arc<dyn cog_core::Guardrail>>,
+    /// Where each finished run's token census is written, keyed by task.
+    observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
     /// Broadcast channel capacity for agent events.
     event_channel_capacity: usize,
     /// 持久事件总线投递口。装上之后 AgentEnd 只写总线（broadcast 由
@@ -151,6 +153,7 @@ impl Agent {
             plugin_registry: None,
             external_skill_registry: None,
             guardrail: None,
+            observability: None,
             event_channel_capacity,
             event_bus_sink: None,
             cmd_channel_capacity,
@@ -258,6 +261,14 @@ impl Agent {
         self
     }
 
+    /// Attach the observability gateway that receives this agent's per-task
+    /// token census. Without it the runs still complete; their token spend is
+    /// simply never recorded per task.
+    pub fn with_observability(mut self, gateway: Arc<dyn cog_core::ObservabilityGateway>) -> Self {
+        self.observability = Some(gateway);
+        self
+    }
+
     pub fn with_wal(mut self, wal: Arc<crate::wal::AgentWal>) -> Self {
         self.wal = Some(wal);
         self
@@ -337,6 +348,7 @@ impl Agent {
         let plugin_registry = self.plugin_registry.clone();
         let external_skill_registry = self.external_skill_registry.clone();
         let event_bus_sink = self.event_bus_sink.clone();
+        let observability = self.observability.clone();
 
         let loop_event_cap = self.loop_event_channel_capacity;
         let handle = tokio::spawn(async move {
@@ -365,6 +377,9 @@ impl Agent {
             }
             if let Some(ref cp) = checkpoint_store {
                 agent_loop = agent_loop.with_checkpoint_store(cp.clone());
+            }
+            if let Some(ref ob) = observability {
+                agent_loop = agent_loop.with_observability(ob.clone());
             }
 
             // Forward events from AgentRuntime mpsc to Agent broadcast
@@ -731,6 +746,7 @@ impl Agent {
         let sandbox_backend = self.sandbox_backend.clone();
         let plugin_registry = self.plugin_registry.clone();
         let event_bus_sink = self.event_bus_sink.clone();
+        let observability = self.observability.clone();
 
         let loop_event_cap = self.loop_event_channel_capacity;
         let handle = tokio::spawn(async move {
@@ -756,6 +772,9 @@ impl Agent {
             }
             if let Some(ref cp) = checkpoint_store {
                 agent_loop = agent_loop.with_checkpoint_store(cp.clone());
+            }
+            if let Some(ref ob) = observability {
+                agent_loop = agent_loop.with_observability(ob.clone());
             }
 
             // Restore state from snapshot before running

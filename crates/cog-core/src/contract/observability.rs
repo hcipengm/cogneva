@@ -401,6 +401,15 @@ pub trait ObservabilityGateway: Send + Sync {
 
     async fn get_task_metrics(&self, task_id: &str) -> SFResult<TaskMetrics>;
 
+    /// Persist the census of one finished run against its task — the write side
+    /// of [`Self::get_task_metrics`].
+    ///
+    /// Required, with no default: a default would compile into every backend
+    /// and quietly drop the reading, leaving the per-task readers (the panel,
+    /// the task metrics route, the cluster overview) deriving "no tokens were
+    /// spent" from a table nothing ever writes.
+    async fn record_task_metrics(&self, metrics: TaskMetrics) -> SFResult<()>;
+
     async fn get_task_logs(&self, task_id: &str, limit: usize) -> SFResult<Vec<LogEntry>>;
 
     async fn get_snapshot_url(&self, snapshot_id: &str) -> SFResult<String>;

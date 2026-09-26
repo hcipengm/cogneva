@@ -215,6 +215,51 @@ pub struct AgentRuntime {
     available_skills_cache: Option<Vec<cog_core::SkillMetadata>>,
     /// When the skill cache was last refreshed.
     skills_cache_instant: Option<std::time::Instant>,
+    /// Where the per-task token census of a finished run is written. Optional
+    /// like the other injected handles — the run does not depend on it — but a
+    /// missing gateway is the difference between a per-task reading and none,
+    /// so its absence is reported rather than assumed.
+    observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
+    /// What the run in flight has been billed for so far. Reset by every
+    /// [`Self::run_scoped`]; read when the run ends.
+    run_usage: RunUsage,
+    /// Turns the run in flight has actually started.
+    run_iterations: u32,
+}
+
+/// The token census of one run: every billed LLM call the run made, folded into
+/// running totals.
+///
+/// The totals live here rather than in the events stream because the response
+/// carrying them is consumed and dropped at the end of the streaming call — the
+/// assistant message handed back up has no token fields, so a run's spend was
+/// visible only to the process-wide counters, never to the task that paid it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    /// Billed calls, including the deliverable-reformat fallback.
+    pub llm_calls: u32,
+}
+
+impl RunUsage {
+    /// Fold one billed call into the totals.
+    ///
+    /// The total is the larger of what the upstream reported and the sum of the
+    /// halves. Upstreams differ here: some omit the total while reporting both
+    /// halves, others fold cached input into it, and a total smaller than its
+    /// own parts would make the per-task reading contradict itself.
+    fn add(&mut self, usage: &cog_core::Usage) {
+        let prompt = u64::from(usage.input);
+        let completion = u64::from(usage.output);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt);
+        self.completion_tokens = self.completion_tokens.saturating_add(completion);
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(u64::from(usage.total_tokens).max(prompt.saturating_add(completion)));
+        self.llm_calls = self.llm_calls.saturating_add(1);
+    }
 }
 
 /// Try to extract a JSON object or array from free-form text.
@@ -369,6 +414,9 @@ impl AgentRuntime {
             external_skill_registry: None,
             available_skills_cache: None,
             skills_cache_instant: None,
+            observability: None,
+            run_usage: RunUsage::default(),
+            run_iterations: 0,
         }
     }
 
@@ -403,6 +451,12 @@ impl AgentRuntime {
 
     pub fn with_raw_logger(mut self, logger: Arc<dyn cog_core::RawLogger>) -> Self {
         self.raw_logger = Some(logger);
+        self
+    }
+
+    /// Hand the loop the gateway its per-task token census is written to.
+    pub fn with_observability(mut self, gateway: Arc<dyn cog_core::ObservabilityGateway>) -> Self {
+        self.observability = Some(gateway);
         self
     }
 
@@ -718,6 +772,65 @@ impl AgentRuntime {
         llm: &dyn cog_core::LlmClient,
         run_task_id: Option<&str>,
     ) -> SFResult<serde_json::Value> {
+        // The census is a property of this run, so it starts here and is
+        // reported from exactly one place — the run's only exit. Doing it at
+        // the answer-recording site instead would leave every run that ended
+        // any other way (budget spent, upstream error, stall) unmeasured, and
+        // those are the runs a token investigation is about.
+        self.run_usage = RunUsage::default();
+        self.run_iterations = 0;
+        let started = std::time::Instant::now();
+        let outcome = self.run_turns(input, llm, run_task_id).await;
+        self.report_run_census(run_task_id, started.elapsed()).await;
+        outcome
+    }
+
+    /// Write this run's token census where the per-task readers look for it.
+    ///
+    /// Best-effort on purpose: a metrics write must not turn a delivered task
+    /// into a failed one. The loss is named rather than swallowed, because a
+    /// missing row is indistinguishable from a task that never ran.
+    async fn report_run_census(&self, run_task_id: Option<&str>, elapsed: std::time::Duration) {
+        let Some(task_id) = run_task_id else {
+            return;
+        };
+        let Some(gateway) = self.observability.as_ref() else {
+            tracing::warn!(
+                agent_id = %self.config.agent_id,
+                task_id,
+                total_tokens = self.run_usage.total_tokens,
+                "no observability gateway attached; this run's token census is not recorded"
+            );
+            return;
+        };
+        let metrics = cog_core::TaskMetrics {
+            task_id: task_id.to_string(),
+            total_tokens: self.run_usage.total_tokens,
+            prompt_tokens: self.run_usage.prompt_tokens,
+            completion_tokens: self.run_usage.completion_tokens,
+            tool_calls: self.steps.iter().map(|s| s.tool_calls.len()).sum::<usize>() as u32,
+            iterations: self.run_iterations,
+            duration_ms: elapsed.as_millis() as u64,
+            timestamp: chrono::Utc::now(),
+        };
+        if let Err(e) = gateway.record_task_metrics(metrics).await {
+            tracing::warn!(
+                agent_id = %self.config.agent_id,
+                task_id,
+                total_tokens = self.run_usage.total_tokens,
+                error = %e,
+                "run census write failed; this task's token metrics are missing"
+            );
+        }
+    }
+
+    /// The run itself, from the first turn to its answer.
+    async fn run_turns(
+        &mut self,
+        input: serde_json::Value,
+        llm: &dyn cog_core::LlmClient,
+        run_task_id: Option<&str>,
+    ) -> SFResult<serde_json::Value> {
         tracing::info!(agent_id = %self.config.agent_id, task_id = run_task_id.unwrap_or(""), "AgentRuntime::run started");
         self.state = RuntimeState::Idle;
         self.steps.clear();
@@ -737,6 +850,7 @@ impl AgentRuntime {
 
         for iteration in 0..self.config.max_iterations {
             tracing::info!(agent_id = %self.config.agent_id, iteration, "AgentRuntime::run iteration start");
+            self.run_iterations = iteration + 1;
             // --- Turn Start ---
             self.emit_event(AgentEvent::TurnStart {
                 agent_id: self.config.agent_id.clone(),
@@ -1336,6 +1450,10 @@ impl AgentRuntime {
                 return Err(err);
             }
         };
+        // Bill this call to the run before anything can drop the response: the
+        // assistant message built below carries no usage, so this line is the
+        // only place the run's spend is still readable.
+        self.run_usage.add(&response.usage);
 
         // Build the final message from response content
         let content = if !response.content.is_empty() {
@@ -1364,7 +1482,7 @@ impl AgentRuntime {
     }
 
     async fn build_result(
-        &self,
+        &mut self,
         thought: &str,
         llm: &dyn cog_core::LlmClient,
     ) -> SFResult<serde_json::Value> {
@@ -1415,6 +1533,10 @@ impl AgentRuntime {
         let reformat_timeout = Duration::from_secs(30);
         match tokio::time::timeout(reformat_timeout, llm.chat(&[user_msg], &options)).await {
             Ok(Ok(response)) => {
+                // The reformat is a billed call like any other turn; leaving it
+                // out would understate the runs that needed it, which are the
+                // ones whose answer came out of a fallback.
+                self.run_usage.add(&response.usage);
                 let text: String = response
                     .content
                     .iter()
@@ -2211,5 +2333,305 @@ mod tests {
             "test should actually outlast the stall window, took {:?}",
             started.elapsed()
         );
+    }
+
+    // ─── Per-task token census ───
+
+    /// Keeps the census rows written to it. The read methods are only there to
+    /// satisfy the contract — this path never reads, and stubbing them as
+    /// `unimplemented!()` keeps that a fact rather than an assumption.
+    #[derive(Default)]
+    struct CensusSpy {
+        rows: std::sync::Mutex<Vec<cog_core::TaskMetrics>>,
+    }
+
+    impl CensusSpy {
+        fn rows(&self) -> Vec<cog_core::TaskMetrics> {
+            self.rows.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::ObservabilityGateway for CensusSpy {
+        async fn subscribe_events(
+            &self,
+            _filter: cog_core::EventFilter,
+        ) -> SFResult<cog_core::observability::AgentEventStream> {
+            unimplemented!("the census path never reads")
+        }
+
+        async fn get_agent_state(&self, _agent_id: &str) -> SFResult<cog_core::AgentState> {
+            unimplemented!("the census path never reads")
+        }
+
+        async fn get_task_checkpoint(
+            &self,
+            _task_id: &str,
+        ) -> SFResult<Option<cog_core::TaskCheckpoint>> {
+            unimplemented!("the census path never reads")
+        }
+
+        async fn get_task_metrics(&self, _task_id: &str) -> SFResult<cog_core::TaskMetrics> {
+            unimplemented!("the census path never reads")
+        }
+
+        async fn record_task_metrics(&self, metrics: cog_core::TaskMetrics) -> SFResult<()> {
+            self.rows.lock().unwrap().push(metrics);
+            Ok(())
+        }
+
+        async fn get_task_logs(
+            &self,
+            _task_id: &str,
+            _limit: usize,
+        ) -> SFResult<Vec<cog_core::LogEntry>> {
+            unimplemented!("the census path never reads")
+        }
+
+        async fn get_snapshot_url(&self, _snapshot_id: &str) -> SFResult<String> {
+            unimplemented!("the census path never reads")
+        }
+
+        async fn get_raw_log_index(
+            &self,
+            _stream: &str,
+            _date: chrono::NaiveDate,
+        ) -> SFResult<Vec<cog_core::RawLogIndex>> {
+            unimplemented!("the census path never reads")
+        }
+
+        async fn get_cluster_overview(&self) -> SFResult<cog_core::ClusterOverview> {
+            unimplemented!("the census path never reads")
+        }
+
+        async fn get_squad_state(&self, _squad_id: &str) -> SFResult<cog_core::SquadState> {
+            unimplemented!("the census path never reads")
+        }
+
+        fn publish_event(&self, _event: AgentEvent) {}
+    }
+
+    fn usage(input: u32, output: u32, total_tokens: u32) -> cog_core::Usage {
+        cog_core::Usage {
+            input,
+            output,
+            total_tokens,
+            ..Default::default()
+        }
+    }
+
+    /// Answers every call with the same fixed usage figure. `text` is the
+    /// streamed draft: text that is not JSON sends the run through the
+    /// deliverable-reformat call, so both billed calls can be observed.
+    struct CensusLlm {
+        text: &'static str,
+        stream_usage: cog_core::Usage,
+        chat_usage: cog_core::Usage,
+        error: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for CensusLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            let text = self.text.to_string();
+            let stream_usage = self.stream_usage.clone();
+            let error = self.error;
+            tokio::spawn(async move {
+                let mut producer = producer;
+                if error {
+                    let _ = producer
+                        .push(AssistantMessageEvent::Error {
+                            reason: cog_core::StopReason::Error,
+                            error: Message::assistant_text("upstream said no"),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                    producer.end(cog_core::ChatResponse::default());
+                    return;
+                }
+                let _ = producer
+                    .push(AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: text.clone(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    content: vec![ContentBlock::Text {
+                        text,
+                        text_signature: None,
+                    }],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: stream_usage,
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            Ok(cog_core::ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: r#"{"result":"reformatted"}"#.into(),
+                    text_signature: None,
+                }],
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                response_id: None,
+                usage: self.chat_usage.clone(),
+                stop_reason: cog_core::StopReason::Stop,
+                error_message: None,
+                upstream_failure: None,
+                retry_after_secs: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn census_runtime(agent_id: &str) -> AgentRuntime {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: agent_id.into(),
+            max_iterations: 1,
+            think_stall_timeout_secs: 5,
+            ..Default::default()
+        };
+        AgentRuntime::new(config, tx)
+    }
+
+    /// Every billed call of a run lands in one row keyed by its task — both
+    /// halves, the total, and the turn count.
+    #[tokio::test]
+    async fn a_finished_run_reports_its_token_census_against_its_task() {
+        let spy = Arc::new(CensusSpy::default());
+        let llm = CensusLlm {
+            // Not JSON: the draft goes through the deliverable-reformat call,
+            // so a second billed call lands in the same row.
+            text: "the answer, in prose",
+            stream_usage: usage(300, 200, 500),
+            // No total reported, as some OpenAI-compatible upstreams do.
+            chat_usage: usage(100, 50, 0),
+            error: false,
+        };
+        let mut runtime = census_runtime("census-ok").with_observability(spy.clone());
+
+        runtime
+            .run_scoped(serde_json::json!({"task": "census"}), &llm, Some("task-1"))
+            .await
+            .expect("the run delivers");
+
+        let rows = spy.rows();
+        assert_eq!(rows.len(), 1, "exactly one row for one task");
+        let row = &rows[0];
+        assert_eq!(row.task_id, "task-1");
+        assert_eq!(row.prompt_tokens, 400);
+        assert_eq!(row.completion_tokens, 250);
+        assert_eq!(
+            row.total_tokens, 650,
+            "a call that reports only its halves still contributes its spend"
+        );
+        assert_eq!(row.iterations, 1);
+        assert_eq!(
+            runtime.run_usage.llm_calls, 2,
+            "the reformat fallback is a billed call and must be counted"
+        );
+    }
+
+    /// A run that fails still reports what it spent before it failed: the runs
+    /// worth investigating are the ones that burned tokens and produced
+    /// nothing, and those are exactly the ones that end on an error.
+    #[tokio::test]
+    async fn a_failed_run_still_reports_its_census() {
+        let spy = Arc::new(CensusSpy::default());
+        let llm = CensusLlm {
+            text: "",
+            stream_usage: cog_core::Usage::default(),
+            chat_usage: cog_core::Usage::default(),
+            error: true,
+        };
+        let mut runtime = census_runtime("census-fail").with_observability(spy.clone());
+
+        runtime
+            .run_scoped(serde_json::json!({"task": "census"}), &llm, Some("task-2"))
+            .await
+            .expect_err("the stream error propagates");
+
+        let rows = spy.rows();
+        assert_eq!(rows.len(), 1, "a failed run is not a missing run");
+        assert_eq!(rows[0].task_id, "task-2");
+        assert_eq!(rows[0].iterations, 1);
+    }
+
+    /// An unscoped run has no task to key a row under, and inventing one would
+    /// put a row in the per-task table that belongs to no task.
+    #[tokio::test]
+    async fn an_unscoped_run_writes_no_census_row() {
+        let spy = Arc::new(CensusSpy::default());
+        let llm = CensusLlm {
+            text: r#"{"result":"ok"}"#,
+            stream_usage: usage(10, 10, 20),
+            chat_usage: cog_core::Usage::default(),
+            error: false,
+        };
+        let mut runtime = census_runtime("census-unscoped").with_observability(spy.clone());
+
+        runtime
+            .run(serde_json::json!({"task": "census"}), &llm)
+            .await
+            .expect("the run delivers");
+
+        assert!(
+            spy.rows().is_empty(),
+            "a run with no task id must not write a task row"
+        );
+    }
+
+    /// The fold itself: the total never falls below its own parts, whichever
+    /// half the upstream omitted.
+    #[test]
+    fn the_census_total_never_falls_below_its_halves() {
+        let mut run_usage = RunUsage::default();
+        // Total only.
+        run_usage.add(&usage(0, 0, 1000));
+        assert_eq!(run_usage.total_tokens, 1000);
+        // Halves only: the total is derived, not left at zero beside them.
+        run_usage.add(&usage(300, 200, 0));
+        assert_eq!(run_usage.total_tokens, 1500);
+        // A total smaller than its own halves is not allowed to shrink the sum.
+        run_usage.add(&usage(100, 100, 50));
+        assert_eq!(run_usage.total_tokens, 1700);
+        assert_eq!(run_usage.prompt_tokens, 400);
+        assert_eq!(run_usage.completion_tokens, 300);
+        assert_eq!(run_usage.llm_calls, 3);
     }
 }
