@@ -14,7 +14,12 @@ use std::time::Duration;
 // 阈值的 pending 消息并重走完整执行管线。
 // 阈值必须大于最长任务执行时长，否则正在执行的长任务会被误判死亡
 // 而并发重投（at-least-once：下游 complete_task 需容忍重复）。
-const PENDING_IDLE_MS: u64 = 10 * 60 * 1000;
+// The threshold is shared with the publisher's stall threshold, which reads the
+// same window from the other side: a task still `Scheduled` after it is one
+// whose message this sweeper is no longer going to deliver. Defined once in
+// cog-core so the two cannot drift into a pair that publishes a duplicate while
+// the first copy is still on its way.
+const PENDING_IDLE_MS: u64 = cog_core::config::DEFAULT_READY_CLAIM_IDLE_SECS * 1000;
 const CLAIM_INTERVAL: Duration = Duration::from_secs(60);
 const CLAIM_BATCH: usize = 16;
 /// 认领消息的执行并发上限。tick 只负责认领和派发，不能在某条认领

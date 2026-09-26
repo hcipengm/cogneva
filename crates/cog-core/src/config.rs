@@ -198,6 +198,26 @@ pub struct DagExecutorConfig {
     pub retry_delay_ms: u64,
     #[serde(default = "default_ready_task_poll_interval_secs")]
     pub ready_task_poll_interval_secs: u64,
+    /// How long a task may sit in `Scheduled` before the publisher treats its
+    /// ready message as lost and puts the task back on the queue (seconds).
+    ///
+    /// `Scheduled` says one thing: a ready message carrying this task was
+    /// handed to the transport. The task's only way out of that state is that
+    /// message being consumed, so when the message is acked without the task
+    /// reaching `Running` — the consumer died between the two, or the ack
+    /// landed and the start did not — the durable row keeps a state that
+    /// nothing revisits: the publisher scans `Pending`, and the timeout
+    /// checker reclaims only `Running`. The work is then held forever without
+    /// ever being reported as lost.
+    ///
+    /// The value must not be shorter than the transport's own reclaim window
+    /// ([`DEFAULT_READY_CLAIM_IDLE_SECS`]). Below it, an unacknowledged
+    /// message is still claimable, so this would re-run work that is merely
+    /// slow — the cost paid twice to fix a task that was never stuck. At the
+    /// default the sweeper has already had its chance, so a task still
+    /// `Scheduled` is one whose message is gone.
+    #[serde(default = "default_scheduled_task_stall_secs")]
+    pub scheduled_task_stall_secs: u64,
     #[serde(default = "default_batch_persistence_enabled")]
     pub batch_persistence_enabled: bool,
     #[serde(default = "default_batch_persistence_max_changes")]
@@ -318,6 +338,18 @@ fn default_task_lease_secs() -> u64 {
     DEFAULT_TASK_LEASE_SECS
 }
 
+/// Ten minutes: how long one ready message may stay unacknowledged before the
+/// ready-stream sweeper claims it and re-runs it.
+///
+/// It lives here rather than next to that sweeper because a second reader
+/// needs the same number: a task still `Scheduled` after this long is one
+/// whose message is gone rather than one whose message is slow, and the
+/// publisher's stall threshold is that same window. Two copies of the value
+/// keep compiling when one is edited, and the pair would then disagree by
+/// exactly the amount that makes the publisher publish a duplicate while the
+/// sweeper is still about to deliver the first copy.
+pub const DEFAULT_READY_CLAIM_IDLE_SECS: u64 = 600;
+
 impl Default for DagExecutorConfig {
     fn default() -> Self {
         Self {
@@ -329,6 +361,7 @@ impl Default for DagExecutorConfig {
             max_retries: 3,
             retry_delay_ms: 1000,
             ready_task_poll_interval_secs: default_ready_task_poll_interval_secs(),
+            scheduled_task_stall_secs: default_scheduled_task_stall_secs(),
             batch_persistence_enabled: default_batch_persistence_enabled(),
             batch_persistence_max_changes: default_batch_persistence_max_changes(),
             batch_persistence_interval_secs: default_batch_persistence_interval_secs(),
@@ -484,6 +517,9 @@ fn default_request_timeout_secs() -> u64 {
 }
 fn default_ready_task_poll_interval_secs() -> u64 {
     0
+}
+fn default_scheduled_task_stall_secs() -> u64 {
+    DEFAULT_READY_CLAIM_IDLE_SECS
 }
 fn default_batch_persistence_enabled() -> bool {
     false

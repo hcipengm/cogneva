@@ -124,6 +124,17 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_data_volume_used_bytes",
         "crates/cog-observability/src/data_volume.rs",
     ),
+    // The DAG's own repair. `Scheduled` is the one task state whose exit is a
+    // message rather than a call the process makes on its own, so a task that
+    // leaves `Pending` and never reaches `Running` is a state nothing else
+    // revisits — the publisher scans `Pending`, the timeout checker reclaims
+    // `Running`, and a consumed message leaves no pending entry for the stream
+    // readings to report. This counter is the reclaim's own reading, and the
+    // rule is the only face on which the state is visible at all.
+    (
+        "cogneva_dag_stalled_scheduled_reclaimed_total",
+        "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
+    ),
     // The loop liveness family. The age is derived at scrape time from a stamp
     // the loop leaves behind — which is the point: a loop that died stops
     // stamping and its own series cannot report that, so the reading has to come

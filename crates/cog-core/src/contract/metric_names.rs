@@ -154,6 +154,9 @@ metric_names! {
     LLM_POOL_EVIDENCED_RECOVERY_UNIX => "llm_pool_evidenced_recovery_unix",
     LLM_POOL_NEXT_ATTEMPT_UNIX => "llm_pool_next_attempt_unix",
     LLM_POOL_QUOTA_WINDOW_SECS => "llm_pool_quota_window_secs",
+
+    // cog-orchestrator — task delivery.
+    DAG_STALLED_SCHEDULED_RECLAIMED => "cogneva_dag_stalled_scheduled_reclaimed_total",
 }
 
 /// Whether `name` is a series a build can still write.

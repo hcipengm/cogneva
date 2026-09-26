@@ -712,6 +712,15 @@ data:
               "summary": "Pending state for {stream} failed to be measured {value} time(s) in the last hour. The reclaim loop is running but cannot read the queue, so its last published figures are not evidence about the present"
             },
             {
+              "name": "dag_task_stalled_after_ready",
+              "promql": "increase(cogneva_dag_stalled_scheduled_reclaimed_total[1h])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The scheduler reclaimed {value} task(s) in the last hour that sat in Scheduled past the transport's own reclaim window without ever starting. Scheduled means one thing — a ready message carrying that task was handed to the bus — so a task still in it after the bus has had every chance to re-deliver is one whose message was consumed without a run. The queue reads clean while this happens: the message was acked, so there is no pending entry and no lag to notice, and the task is invisible from every other reading because the publisher scans Pending and the timeout checker reclaims Running. Each reclaim re-runs the work and charges the task's retry budget, so a recurring count is paying for the same tasks twice; a task out of budget fails and cancels its dependents. Read the task ids and the consumer's log around the time of the message, not the queue"
+            },
+            {
               "name": "runtime_asset_not_refreshed",
               "promql": "cogneva_runtime_asset_state{state=\"not_refreshed\"} > 0",
               "condition": {

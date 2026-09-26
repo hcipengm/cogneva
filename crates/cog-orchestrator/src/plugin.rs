@@ -272,6 +272,15 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         }
 
         if let Some(ref orch) = self.shared_orchestrator {
+            // Where the DAG's own repairs report themselves. Taken here rather
+            // than at init: the storage plugin's layer sits after this one, so
+            // the service table does not hold it yet during init. Absent, a
+            // repair is only a log line, which does not change what it repairs.
+            if let Some(metrics) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                orch.attach_metrics(metrics);
+            } else {
+                warn!("no MetricsBackend; DAG self-repairs report as log lines only");
+            }
             // Start archive background loop
             if ctx.config().dag_executor.archive_enabled {
                 orch.start_archive_loop();
@@ -374,6 +383,23 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         });
 
                         // Periodic ready-task publisher.
+                        //
+                        // It also reclaims tasks stalled in `Scheduled`, whose
+                        // one exit is the ready message the publisher handed to
+                        // the transport: when that message is consumed and the
+                        // task does not start, the publisher is the only scan
+                        // whose subject is exactly that state. A task cannot be
+                        // found stalled before it is older than the stall
+                        // window, so sweeping faster than that window can see
+                        // nothing the previous sweep missed — one sweep per
+                        // window is the whole resolution this reading has, and
+                        // it keeps the extra whole-table scan off the publish
+                        // cadence.
+                        let scheduled_task_stall_secs =
+                            ctx.config().dag_executor.scheduled_task_stall_secs;
+                        let reclaim_every_ticks = (scheduled_task_stall_secs
+                            / ready_task_poll_interval_secs.max(1))
+                        .max(1);
                         let pub_shutdown = dag_shutdown.clone();
                         let publisher_runtime = runtime.clone();
                         drop(cog_core::loop_health::spawn(
@@ -394,10 +420,30 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                     interval.set_missed_tick_behavior(
                                         tokio::time::MissedTickBehavior::Skip,
                                     );
+                                    // A lost tick only brings the next sweep
+                                    // forward, so nothing here has to survive a
+                                    // restart.
+                                    let mut ticks_since_reclaim = 0u64;
                                     loop {
                                         beat.beat();
                                         tokio::select! {
                                             _ = interval.tick() => {
+                                                ticks_since_reclaim += 1;
+                                                if ticks_since_reclaim >= reclaim_every_ticks {
+                                                    ticks_since_reclaim = 0;
+                                                    let reclaimed = publisher_runtime
+                                                        .orchestrator()
+                                                        .reclaim_stalled_scheduled(
+                                                            scheduled_task_stall_secs,
+                                                        )
+                                                        .await;
+                                                    if reclaimed > 0 {
+                                                        tracing::warn!(
+                                                            reclaimed,
+                                                            "reclaimed tasks stalled in Scheduled: their ready messages were consumed without starting them"
+                                                        );
+                                                    }
+                                                }
                                                 if let Err(e) =
                                                     publisher_runtime.publish_ready_tasks().await
                                                 {
