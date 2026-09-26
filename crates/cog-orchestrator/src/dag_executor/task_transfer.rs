@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 /// Default Redis stream name for task-transfer events.
 pub const TASK_TRANSFER_STREAM: &str = "orchestrator:events:task_transfer";
+const RECOVERY_PAGE_SIZE: usize = 1024;
 
 /// Loop name reported through the background-loop liveness family.
 pub const STALE_TASK_SWEEP_LOOP: &str = "orchestrator_stale_task_sweep";
@@ -134,16 +135,37 @@ impl TaskTransferCoordinator {
         };
 
         let event_offset = checkpoint.as_ref().map(|s| s.event_offset).unwrap_or(0);
-        let events = self
-            .state_backend
-            .get_events(task_id, event_offset, 1024)
-            .await?;
+        let events = self.replay_events(task_id, event_offset).await?;
 
         Ok(RecoveredTask {
             task_id: task_id.to_string(),
             checkpoint,
             events,
         })
+    }
+    async fn replay_events(&self, task_id: &str, event_offset: u64) -> SFResult<Vec<Event>> {
+        let mut events = Vec::new();
+        let mut offset = event_offset;
+
+        loop {
+            let page = self
+                .state_backend
+                .get_events(task_id, offset, RECOVERY_PAGE_SIZE)
+                .await?;
+
+            let page_len = page.len();
+            events.extend(page);
+
+            if page_len < RECOVERY_PAGE_SIZE {
+                break;
+            }
+
+            offset = offset.checked_add(page_len as u64).ok_or_else(|| {
+                SFError::Validation("event offset overflow during recovery".into())
+            })?;
+        }
+
+        Ok(events)
     }
 }
 

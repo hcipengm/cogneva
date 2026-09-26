@@ -89,6 +89,32 @@ async fn recover_loads_snapshot_and_replays_events() {
 }
 
 #[tokio::test]
+async fn recover_replays_more_than_one_page_of_events() {
+    let state = make_state();
+    let coordinator =
+        TaskTransferCoordinator::new(make_backend(), make_checkpoints(), state.clone());
+
+    // Persist 1025 events so recovery must fetch more than one page.
+    for i in 0..1025 {
+        let event = Event {
+            offset: i,
+            task_id: "t-1025".into(),
+            event_type: "step".into(),
+            payload: serde_json::json!({ "i": i }),
+            timestamp: chrono::Utc::now(),
+        };
+
+        state.append_event("t-1025", &event).await.unwrap();
+    }
+
+    let recovered = coordinator.recover("t-1025", None).await.unwrap();
+
+    assert_eq!(recovered.events.len(), 1025);
+    assert_eq!(recovered.events.first().unwrap().offset, 0);
+    assert_eq!(recovered.events.last().unwrap().offset, 1024);
+}
+
+#[tokio::test]
 async fn recover_without_snapshot_starts_from_zero() {
     let state = make_state();
     let coordinator =
