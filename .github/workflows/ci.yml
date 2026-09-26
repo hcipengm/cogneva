@@ -139,11 +139,13 @@ jobs:
       - run: |
           shellcheck -S warning \
             bootstrap.sh \
+            deploy/k3s/swap-image.sh \
             deploy/scripts/tests/bootstrap-entry.test.sh \
             deploy/scripts/tests/observability-install.test.sh \
             deploy/scripts/tests/oauth-app-secret-wiring.test.sh \
             deploy/scripts/tests/probe-budget.test.sh \
             deploy/scripts/tests/aof-repair-wiring.test.sh \
+            deploy/scripts/tests/swap-image-preflight.test.sh \
             deploy/k3s/observability/scripts/install.sh \
             deploy/k3s/observability/scripts/rotate-grafana-password.sh
       - name: Bootstrap entry criteria tests
@@ -156,6 +158,8 @@ jobs:
         run: bash deploy/scripts/tests/probe-budget.test.sh
       - name: Redis AOF repair wiring tests
         run: bash deploy/scripts/tests/aof-repair-wiring.test.sh
+      - name: Swap-image pre-flight judgment tests
+        run: bash deploy/scripts/tests/swap-image-preflight.test.sh
       - name: PowerShell parse check
         run: |
           pwsh -NoProfile -Command "\$errs = \$null; [void][System.Management.Automation.PSParser]::Tokenize((Get-Content -Raw bootstrap.ps1), [ref]\$errs); if (\$errs.Count -gt 0) { \$errs | ForEach-Object { Write-Error \$_ }; exit 1 }; 'bootstrap.ps1 parse OK'"

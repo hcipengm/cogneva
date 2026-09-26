@@ -4,7 +4,10 @@
 #
 # 用法：
 #   deploy/k3s/swap-image.sh [版本号] [--prev <基镜像tag>] [--web] [--no-deploy]
+#   [--check-only]
 #   版本号缺省取 Cargo.toml workspace version（镜像版本与代码版本单一同源）。
+#   --check-only：只跑启动前校验（registry 的 :local vs 线上运行镜像），
+#   不构建、不 apply——校验本身要能在不动线上时被单独读一次。
 #
 # 版本与标签不变式：
 #   - deploy yaml pin 的是集群内 registry 浮动签 localhost:30500/cogneva:local；
@@ -16,7 +19,12 @@
 #   - 叠层基镜像永远取"线上 Ready Pod 实际运行镜像"对应的不可变版本 tag，
 #     绝不基于 :local 叠层——:local 一旦与运行版本脱节，叠层会把错误镜像
 #     当基底自我放大（2026-09-04 :local 指向一个多月前老镜像的事故根因）。
-#     脚本启动即校验节点 :local 与运行镜像一致，脱节则拒绝执行并给止血命令。
+#     脚本启动即校验 registry 里的 :local 与运行镜像一致，脱节则拒绝执行并给
+#     止血命令。判据必须读 registry 那一份：四个部署 pin 的是
+#     localhost:30500/cogneva:local 且 imagePullPolicy: Always，kubelet 每次
+#     启动都从 registry 拉，节点本地 :local 只作暖缓存/离线回退，不在运行路径上
+#     ——按它判会把运行面已经对齐的换版拒掉，而印出的止血命令修的是那个不参与
+#     运行的面。故节点 :local 不一致只告警。
 #   - 镜像带 OCI LABEL（version/revision），二进制内嵌 git sha（--version），
 #     线上版本可直接追溯到 commit，不靠标签记忆。
 set -euo pipefail
@@ -28,13 +36,16 @@ NEW_TAG=""
 PREV_TAG=""
 BUILD_WEB=0
 DO_DEPLOY=1
+CHECK_ONLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --prev) PREV_TAG="$2"; shift 2 ;;
     --web) BUILD_WEB=1; shift ;;
     --no-deploy) DO_DEPLOY=0; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    --check-only) CHECK_ONLY=1; DO_DEPLOY=0; shift ;;
+    # 头部注释区块整体就是帮助文本：按内容取，不按行号取
+    -h|--help) awk 'NR>1 && /^set -euo/{exit} NR>1' "$0"; exit 0 ;;
     *) NEW_TAG="$1"; shift ;;
   esac
 done
@@ -112,9 +123,25 @@ print(json.load(sys.stdin)["config"]["digest"].rsplit(":",1)[-1])
   esac
 }
 
-# 校验浮动 :local 与线上运行镜像一致；脱节直接拒绝（叠层会把错误自我放大）
-verify_local_matches_running() {
-  local running_ref running_id local_id
+# registry 里某个 tag 的 config digest（与 resolve_config_digest / 滚动后校验同源折算）
+registry_config_digest() {
+  local tag="$1"
+  curl -sf -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "http://localhost:30500/v2/cogneva/manifests/${tag}" | python3 -c '
+import json,sys
+print(json.load(sys.stdin)["config"]["digest"].rsplit(":",1)[-1])
+'
+}
+
+# 启动前校验：registry 里的浮动 :local 与线上运行镜像一致；脱节直接拒绝
+# （apply/滚动会把线上打回旧版）。
+#
+# 判据面是 registry 那一份，不是节点本地 tag：四部署 pin localhost:30500/cogneva:local
+# 且 imagePullPolicy: Always，kubelet 每次启动都从 registry 拉。节点本地 :local 只作
+# 暖缓存/离线回退，与运行镜像不一致不影响运行时；拿它当判据的方向是误报脱节——
+# 运行面已经对齐也照样拒绝换版，而印出的止血命令修的是那个不参与运行的面。
+verify_the_pin_matches_running() {
+  local running_ref running_id registry_id node_id running_tag
   running_ref="$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=cogneva -o json | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
@@ -127,33 +154,47 @@ for p in d.get("items",[]):
   [ -n "$running_ref" ] || { echo "线上没有 Ready 的 cogneva Pod" >&2; return 1; }
   running_id="$(resolve_config_digest "$running_ref")"
   [ -n "$running_id" ] || { echo "运行镜像 $running_ref 折算 config digest 失败" >&2; return 1; }
-  local_id="$(k3s crictl inspecti "${IMAGE}:local" 2>/dev/null | python3 -c '
+  registry_id="$(registry_config_digest local || true)"
+  [ -n "$registry_id" ] || {
+    echo "registry 里读不到 localhost:30500/cogneva:local（registry 没起或没播种？）" >&2
+    return 1; }
+  if [ "$running_id" != "$registry_id" ]; then
+    # 运行版本 tag：优先用调用方给的 --prev（同一件事的显式说法），否则现场解析
+    running_tag="${PREV_TAG:-$(resolve_running_tag 2>/dev/null || true)}"
+    echo ":local 与线上运行镜像脱节！" >&2
+    echo "  运行中: ${running_id:0:12}（版本 tag: ${running_tag:-未知}）" >&2
+    echo "  registry :local: ${registry_id:0:12}" >&2
+    echo "四部署 pin 的是 localhost:30500/cogneva:local 且 imagePullPolicy: Always——" >&2
+    echo "此刻任何 apply/rollout 都会把线上打回旧版。" >&2
+    echo "止血后重跑本脚本：" >&2
+    echo "  buildah push --tls-verify=false ${IMAGE}:${running_tag:-<运行版本tag>} localhost:30500/cogneva:local" >&2
+    return 1
+  fi
+  echo "==> registry :local 与运行镜像一致（${registry_id:0:12}）"
+
+  # 节点本地 tag 只是暖缓存/离线回退：不同步是换版末尾 import + tag 自己会修的事。
+  # 它一旦被当成判据，就会拒绝一个运行面已经对齐的换版，故这里只告警不阻断。
+  node_id="$(k3s crictl inspecti "${IMAGE}:local" 2>/dev/null | python3 -c '
 import json,sys
 try:
     print(json.load(sys.stdin)["status"]["id"].rsplit(":",1)[-1])
 except Exception:
     pass
 ' || true)"
-  if [ -z "$local_id" ]; then
-    echo "集群 containerd 没有 ${IMAGE}:local 标签（首次部署？）" >&2
-    return 1
+  if [ -n "$node_id" ] && [ "$node_id" != "$running_id" ]; then
+    echo "==> 注意：节点本地 ${IMAGE}:local（${node_id:0:12}）与运行镜像不同；它只作暖缓存/离线回退，本趟末尾的 import + tag 会同步" >&2
   fi
-  if [ "$running_id" != "$local_id" ]; then
-    echo ":local 与线上运行镜像脱节！" >&2
-    echo "  运行中: ${running_id:0:12}（版本 tag: ${PREV_TAG:-未知}）" >&2
-    echo "  :local: ${local_id:0:12}" >&2
-    echo "此刻叠层会把旧镜像当基底；任何 apply/rollout 也会把线上打回旧版。" >&2
-    echo "止血后重跑本脚本：" >&2
-    echo "  k3s ctr -n k8s.io images tag --force ${IMAGE}:<运行版本tag> ${IMAGE}:local" >&2
-    echo "  k3s ctr -n k8s.io images push --plain-http localhost:30500/cogneva:local ${IMAGE}:local" >&2
-    return 1
-  fi
-  echo "==> :local 与运行镜像一致（${local_id:0:12}）"
 }
+
+if [ "$CHECK_ONLY" = 1 ]; then
+  verify_the_pin_matches_running
+  echo "==> 启动前校验通过（未构建、未 apply）"
+  exit 0
+fi
 
 if [ "$DO_DEPLOY" = 1 ]; then
   [ -n "$PREV_TAG" ] || PREV_TAG="$(resolve_running_tag)"
-  verify_local_matches_running
+  verify_the_pin_matches_running
 else
   [ -n "$PREV_TAG" ] || { echo "--no-deploy 模式必须显式 --prev <基镜像tag>" >&2; exit 1; }
 fi
