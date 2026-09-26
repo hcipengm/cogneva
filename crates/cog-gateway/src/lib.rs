@@ -1153,8 +1153,11 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "llm_upstream_healthy",
         "Whether each LLM upstream has no outstanding failure, 1 or 0. \
-         A backoff window expiring is not evidence of recovery, so only a call \
-         that actually succeeded clears it — the same rule the pool verdict uses",
+         Absent for an upstream this process has never sent a call to: \
+         'no record' is the shape a recovered upstream has too, so it is \
+         reported as no reading rather than as health. A backoff window \
+         expiring is not evidence of recovery either, so only a call that \
+         actually succeeded clears it — the same rule the pool verdict uses",
     ),
     (
         "llm_pool_available",

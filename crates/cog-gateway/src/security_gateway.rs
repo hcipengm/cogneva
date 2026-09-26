@@ -533,7 +533,18 @@ impl RecoveryBounds {
 #[derive(Debug, Clone)]
 struct UpstreamReading {
     key: String,
-    healthy: bool,
+    /// `Some(true)` when a call through this upstream actually succeeded and
+    /// nothing has failed since, `Some(false)` while an outstanding failure is
+    /// recorded, and `None` when this process has never seen a call through
+    /// the upstream succeed.
+    ///
+    /// The third case is not a shade of the other two: a pool member nothing
+    /// has been sent to yet is neither healthy nor unhealthy, and folding it
+    /// into `true` asserts a success that never happened — which is exactly the
+    /// shape a recovered upstream has in the verdict table, since a success
+    /// removes its entry. Callers that publish a reading must skip the `None`
+    /// case rather than print a value.
+    healthy: Option<bool>,
     consecutive_failures: u32,
     /// 上游给出的配额恢复时刻（unix 秒）。
     quota_reset_unix: Option<i64>,
@@ -567,6 +578,17 @@ fn unix_to_rfc3339(unix: i64) -> String {
 #[derive(Default)]
 struct LlmHealthTable {
     states: Mutex<std::collections::HashMap<String, UpstreamHealth>>,
+    /// Upstreams this process has seen a call through succeed at least once.
+    ///
+    /// The verdict table cannot carry this: a success removes the entry, which
+    /// is exactly what makes "recovered" and "never tried" the same shape
+    /// there. Keeping the marker separate lets the verdict keep its existing
+    /// semantics while the reading distinguishes the two.
+    ///
+    /// Only successes write it. A failure leaves its own entry behind, so the
+    /// verdict already answers for that case; adding failures here would only
+    /// grow the set and force this lock to be taken on the request path.
+    observed: Mutex<std::collections::HashSet<String>>,
 }
 
 impl LlmHealthTable {
@@ -628,6 +650,10 @@ impl LlmHealthTable {
 
     /// 记录一次成功：嫌疑态清除。返回此前是否处于嫌疑（调用方打恢复日志）。
     fn note_success(&self, u: &LlmUpstream) -> bool {
+        // Recorded before the entry is dropped: this success is evidence, and
+        // the reading has to remember it once the verdict table has no further
+        // use for the entry.
+        self.observed.lock().unwrap().insert(Self::key(u));
         let mut states = self.states.lock().unwrap();
         match states.remove(&Self::key(u)) {
             Some(h) => h.suspect_until.is_some(),
@@ -684,6 +710,11 @@ impl LlmHealthTable {
     /// 证据——若按"窗口未到期"报健康，同一个上游会在窗口到时的那一刻报 1，而池
     /// 因为锁存仍报 0，读图的人从两个面上得到相反的结论。
     fn snapshot(&self, upstreams: &[LlmUpstream]) -> Vec<UpstreamReading> {
+        let mut observed = self.observed.lock().unwrap();
+        // 配置换掉的上游在这里掉出去。留着它，一条可能很久以前、跨过一次配置
+        // 变更的成功会继续替它声称健康；回到"没有读数"是更保守的那个答案。
+        // 池的配置是这一面的产出方，所以界卡在这里，不卡在读的人那里。
+        observed.retain(|key| upstreams.iter().any(|u| Self::key(u) == *key));
         let states = self.states.lock().unwrap();
         upstreams
             .iter()
@@ -692,14 +723,14 @@ impl LlmHealthTable {
                 match states.get(&key) {
                     Some(h) => UpstreamReading {
                         key,
-                        healthy: false,
+                        healthy: Some(false),
                         consecutive_failures: h.consecutive_failures,
                         quota_reset_unix: h.quota_reset_unix,
                         quota_window_secs: h.quota_window_secs,
                     },
                     None => UpstreamReading {
-                        key,
-                        healthy: true,
+                        key: key.clone(),
+                        healthy: observed.contains(&key).then_some(true),
                         consecutive_failures: 0,
                         quota_reset_unix: None,
                         quota_window_secs: None,
@@ -1472,10 +1503,16 @@ async fn refresh_pool_state(state: &AppState) {
     let bounds = state.llm_health.recovery_bounds(upstreams);
 
     for reading in state.llm_health.snapshot(upstreams) {
+        // 本进程一次都没碰过的上游在这里出局：没有判定，也没有窗口长度或失败数
+        // 可报。Prometheus 的序列是懒建的，一条都不发就是这个介质上诚实的"没有
+        // 读数"；发 0 等于替这个上游声称了一个从没发生过的观测。
+        let Some(healthy) = reading.healthy else {
+            continue;
+        };
         record_gauge(
             state,
             cog_core::metric_names::LLM_UPSTREAM_HEALTHY,
-            if reading.healthy { 1.0 } else { 0.0 },
+            if healthy { 1.0 } else { 0.0 },
             &[("upstream", &reading.key)],
         )
         .await;
@@ -4559,7 +4596,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(after.is_suspect(&u));
         assert!(!after.due_for_probe(&u), "重启不把退避位置退回最短档");
         let reading = after.snapshot(&pool).remove(0);
-        assert!(!reading.healthy, "证据还在，就不该报健康");
+        assert_eq!(reading.healthy, Some(false), "证据还在，就不该报健康");
         assert_eq!(reading.consecutive_failures, 3);
         assert_eq!(reading.quota_reset_unix, Some(reset));
         assert_eq!(reading.quota_window_secs, Some(604_800));
@@ -4588,12 +4625,13 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             },
         ];
         assert_eq!(table.seed(&evidence, std::slice::from_ref(&kept)), (1, 1));
-        assert!(
+        assert_eq!(
             table
                 .snapshot(std::slice::from_ref(&gone))
                 .remove(0)
                 .healthy,
-            "被丢弃的上游不落表"
+            None,
+            "被丢弃的上游既不落表，本进程也没碰过它——两件事合起来是「没有读数」"
         );
         assert_eq!(
             table
@@ -4803,6 +4841,113 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(
             text.contains(&format!("llm_upstream_healthy{{upstream=\"{key}\"}} 1")),
             "{text}"
+        );
+    }
+
+    /// "这个上游本进程没碰过"与"这个上游恢复了"在判定表里同形——成功会把记录删掉。
+    /// 读数必须把两者分开：前者没有读数（序列根本不发），发 1 就是替它声称一次
+    /// 从没发生过的成功。
+    #[tokio::test]
+    async fn an_upstream_nothing_was_sent_to_reports_no_reading() {
+        let fresh = stub_upstream("https://fresh.example.com", "m1");
+        let tried = stub_upstream("https://tried.example.com", "m2");
+        let state = test_state(vec![fresh.clone(), tried.clone()]);
+        let fresh_key = LlmHealthTable::key(&fresh);
+        let tried_key = LlmHealthTable::key(&tried);
+
+        let readings = state.llm_health.snapshot(&state.config.llm_upstreams);
+        assert_eq!(
+            readings
+                .iter()
+                .find(|r| r.key == fresh_key)
+                .unwrap()
+                .healthy,
+            None,
+            "配置里有、却一次都没发过调用，就不该有判定"
+        );
+
+        state.llm_health.note_failure(&tried, 300, None, None);
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains(&format!(
+                "llm_upstream_healthy{{upstream=\"{tried_key}\"}} 0"
+            )),
+            "碰过的上游照常出读数: {text}"
+        );
+        assert!(
+            !text.contains(&format!("llm_upstream_healthy{{upstream=\"{fresh_key}\"}}")),
+            "没碰过的上游不许有序列: {text}"
+        );
+    }
+
+    /// 恢复的上游表里同样没有记录，但那是证据不是缺席。两条读数都得能同时表示，
+    /// 一条读的人才知道该信哪条。
+    #[tokio::test]
+    async fn a_recovered_upstream_reads_healthy_while_an_unobserved_one_stays_absent() {
+        let recovered = stub_upstream("https://recovered.example.com", "m1");
+        let untouched = stub_upstream("https://untouched.example.com", "m2");
+        let state = test_state(vec![recovered.clone(), untouched.clone()]);
+        let recovered_key = LlmHealthTable::key(&recovered);
+        let untouched_key = LlmHealthTable::key(&untouched);
+
+        state.llm_health.note_failure(&recovered, 300, None, None);
+        state.note_upstream_success(&recovered);
+
+        let readings = state.llm_health.snapshot(&state.config.llm_upstreams);
+        assert_eq!(
+            readings
+                .iter()
+                .find(|r| r.key == recovered_key)
+                .unwrap()
+                .healthy,
+            Some(true),
+            "实证成功是恢复的唯一证据"
+        );
+        assert_eq!(
+            readings
+                .iter()
+                .find(|r| r.key == untouched_key)
+                .unwrap()
+                .healthy,
+            None,
+            "没人碰过就是没人碰过，不跟着别人一起变健康"
+        );
+
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains(&format!(
+                "llm_upstream_healthy{{upstream=\"{recovered_key}\"}} 1"
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&format!(
+                "llm_upstream_healthy{{upstream=\"{untouched_key}\"}}"
+            )),
+            "{text}"
+        );
+    }
+
+    /// "曾经成功过"不跟着上游离开池子，也不跟着它回来。凭一次跨配置变更的旧成功
+    /// 继续声称健康，比"没有读数"更坏。
+    #[test]
+    fn a_success_marker_does_not_outlive_the_upstream_leaving_the_pool() {
+        let table = LlmHealthTable::default();
+        let old = stub_upstream("https://old.example.com", "m1");
+        let current = stub_upstream("https://current.example.com", "m2");
+        table.note_success(&old);
+        assert_eq!(
+            table.snapshot(std::slice::from_ref(&old)).remove(0).healthy,
+            Some(true)
+        );
+        // 池换过配置：这一拍扫的是新配置，old 不在里面。
+        table.snapshot(std::slice::from_ref(&current));
+        assert_eq!(
+            table.snapshot(std::slice::from_ref(&old)).remove(0).healthy,
+            None,
+            "后来又被配回来，也该从没有读数重新开始"
         );
     }
 
