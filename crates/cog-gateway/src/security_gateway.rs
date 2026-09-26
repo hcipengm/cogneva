@@ -559,8 +559,11 @@ fn unix_to_rfc3339(unix: i64) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// 池健康表：key = base_url|model（上游在池内的身份）。纯进程内状态，
-/// 重启即清零——代价只是每个坏上游多试一次，换来的是无持久化依赖。
+/// 池健康表：key = base_url|model（上游在池内的身份）。纯进程内状态，无本地
+/// 持久化依赖；但池判为不可用时，表里的证据会随判定写进跨进程载荷、并在启动时
+/// 从载荷恢复，所以重启不再把退避位置与"配额什么时候复位"清零——池已判定不可
+/// 用却没有证据时，读数会自相矛盾（池不可用、每条上游却都健康且没有复位时刻），
+/// 而退避位置退回最短档还会让已知坏掉的上游按最激进的节拍被试。
 #[derive(Default)]
 struct LlmHealthTable {
     states: Mutex<std::collections::HashMap<String, UpstreamHealth>>,
@@ -715,6 +718,76 @@ impl LlmHealthTable {
             .get(&Self::key(u))
             .and_then(|h| h.suspect_until)
             .is_some_and(|t| now >= t)
+    }
+
+    /// 逐上游证据：判定所依赖的那几个输入，做成可以跟着判定一起跨进程的值。
+    ///
+    /// 表里**每一条有记录的**上游都带走，不只是窗口未到期的那些：一条窗口已过期
+    /// 的记录仍然握着"连续失败了几次、上游说什么时候复位"这些数，而重启后正是
+    /// 靠它把退避位置接着往下走，而不是从最短的那一档重来。
+    fn evidence(&self, upstreams: &[LlmUpstream]) -> Vec<cog_core::LlmUpstreamEvidence> {
+        let now_instant = std::time::Instant::now();
+        let now_unix = Utc::now().timestamp();
+        let states = self.states.lock().unwrap();
+        upstreams
+            .iter()
+            .filter_map(|u| {
+                let key = Self::key(u);
+                states.get(&key).map(|h| cog_core::LlmUpstreamEvidence {
+                    identity: key,
+                    consecutive_failures: h.consecutive_failures,
+                    quota_reset_unix: h.quota_reset_unix.unwrap_or(0),
+                    quota_window_secs: h.quota_window_secs.unwrap_or(0),
+                    // 绝对时刻：载荷在 Redis 里放着的时候，"还剩几秒"会自己过期，
+                    // 而"到什么时候"不会。
+                    suspect_until_unix: h
+                        .suspect_until
+                        .map(|t| {
+                            let left = t.saturating_duration_since(now_instant).as_secs() as i64;
+                            now_unix.saturating_add(left)
+                        })
+                        .unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    /// 用跨进程证据恢复进程内健康表。返回 (恢复条数, 丢弃条数)。
+    ///
+    /// 只恢复仍在池内配置的上游：证据里那条可能是上次配置里的上游，塞进来只会
+    /// 留下一条谁也读不到的记录（`snapshot` 与 `due_for_probe` 都按配置遍历），
+    /// 而它在表里跟"配了还没探过"同形。丢弃条数要报出来——"池换过配置"与
+    /// "证据丢了"在读数上都是条数变少，不点数就分不出是哪种。
+    ///
+    /// 窗口已经过去的记录按"现在就该探"落表：到期只说明值得再试一次，把它落成
+    /// 没有窗口的记录会让 `due_for_probe` 永远为假，等于把这条上游从探测面上摘掉。
+    fn seed(
+        &self,
+        evidence: &[cog_core::LlmUpstreamEvidence],
+        upstreams: &[LlmUpstream],
+    ) -> (usize, usize) {
+        let now_instant = std::time::Instant::now();
+        let now_unix = Utc::now().timestamp();
+        let mut states = self.states.lock().unwrap();
+        let (mut restored, mut dropped) = (0usize, 0usize);
+        for e in evidence {
+            if !upstreams.iter().any(|u| Self::key(u) == e.identity) {
+                dropped += 1;
+                continue;
+            }
+            let remaining = e.suspect_until_unix.saturating_sub(now_unix).max(0) as u64;
+            states.insert(
+                e.identity.clone(),
+                UpstreamHealth {
+                    consecutive_failures: e.consecutive_failures,
+                    suspect_until: Some(now_instant + std::time::Duration::from_secs(remaining)),
+                    quota_reset_unix: (e.quota_reset_unix > 0).then_some(e.quota_reset_unix),
+                    quota_window_secs: (e.quota_window_secs > 0).then_some(e.quota_window_secs),
+                },
+            );
+            restored += 1;
+        }
+        (restored, dropped)
     }
 }
 
@@ -1277,6 +1350,9 @@ async fn publish_pool_signal(state: &AppState, down: bool, bounds: RecoveryBound
             evidenced_recovery_unix: bounds.evidenced_unix,
             next_attempt_unix: bounds.next_probe_unix,
             unavailable_upstreams: unavailable,
+            // 判定与它的输入同一条载荷、同一次写入：分开写就会有一段时间里
+            // 一边说池不可用、另一边说没有证据，读的人无从判断该信哪边。
+            upstream_evidence: state.llm_health.evidence(&state.config.llm_upstreams),
         };
         let payload = match serde_json::to_string(&status) {
             Ok(p) => p,
@@ -3754,12 +3830,18 @@ async fn build_pool_observability(
     )
 }
 
+/// 解析跨进程载荷。`None` = 没有信号，或载荷不可用。解析出的判定要同时用来
+/// 恢复它依赖的逐上游证据，因此这里返回判定本身而不是一个布尔值：两者必须出自
+/// 同一次解析，分别解析就有机会读到两份不同的载荷。
+fn parse_pool_status(raw: Option<&str>) -> Option<cog_core::LlmPoolStatus> {
+    raw.and_then(|s| serde_json::from_str(s).ok())
+}
+
 /// 重启后的池判定初值：进程内的健康表重启即清零，若只凭空表推导，每次重启都会
 /// 凭空把池判回"可用"。而上一条真实证据（Redis 里那条跨进程池状态）恰好说明池
 /// 不可用——所以启动时以它为期初值，之后再等探测或真实请求的成功实证解除。
-fn seed_pool_down(raw: Option<&str>) -> bool {
-    raw.and_then(|s| serde_json::from_str::<cog_core::LlmPoolStatus>(s).ok())
-        .is_some_and(|s| s.unavailable)
+fn seed_pool_down(status: Option<&cog_core::LlmPoolStatus>) -> bool {
+    status.is_some_and(|s| s.unavailable)
 }
 
 /// 出站请求的自我标识。
@@ -3801,7 +3883,7 @@ pub async fn run(
     init_gateway_logging(&config.observability, &http_client);
 
     let (pool_obs, redis) = build_pool_observability(&config, &http_client).await;
-    let pool_down = match redis.as_ref() {
+    let status = match redis.as_ref() {
         Some(conn) => {
             let mut conn = conn.clone();
             let raw: Option<String> = redis::cmd("GET")
@@ -3809,16 +3891,14 @@ pub async fn run(
                 .query_async(&mut conn)
                 .await
                 .unwrap_or(None);
-            let seeded = seed_pool_down(raw.as_deref());
-            if seeded {
-                tracing::warn!(
-                    "池不可用判定沿用上次跨进程信号（重启不凭空清零），待上游实证成功解除"
-                );
-            }
-            seeded
+            parse_pool_status(raw.as_deref())
         }
-        None => false,
+        None => None,
     };
+    let pool_down = seed_pool_down(status.as_ref());
+    if pool_down {
+        tracing::warn!("池不可用判定沿用上次跨进程信号（重启不凭空清零），待上游实证成功解除");
+    }
     let identity: Arc<str> = Arc::from(outbound_identity(build_revision).as_str());
     let identity_headers = identity_default_headers(&identity);
     tracing::info!(identity = %identity, "安全网关出站请求自我标识");
@@ -3845,6 +3925,21 @@ pub async fn run(
         pool_recovered: Arc::new(AtomicBool::new(false)),
         config: config.clone(),
     };
+    // 恢复逐上游证据必须发生在任何一拍探测之前：探测按表里的窗口决定谁该被试，
+    // 表是空的时候每一条上游都算"没有记录"，锁存态下一轮就会把池内全部上游各试
+    // 一遍，而我们刚从上一条载荷里读到它们各自的窗口还没到。
+    if let Some(status) = status.as_ref() {
+        let (restored, dropped) = state
+            .llm_health
+            .seed(&status.upstream_evidence, &state.config.llm_upstreams);
+        if restored > 0 || dropped > 0 {
+            tracing::info!(
+                restored,
+                dropped,
+                "已按上次跨进程信号恢复逐上游证据，退避位置与配额复位时刻不经重启清零"
+            );
+        }
+    }
     if state.github_app.is_some() {
         tracing::info!("安全网关：检测到 GitHub App 凭证，代码平台出口将以 App bot 身份发出");
     }
@@ -4427,6 +4522,114 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(!table.all_suspect(&pool));
     }
 
+    /// 重启续作：判定跨进程锁存了，它的输入就得跟着一起走。只锁判定不锁输入，
+    /// 新进程会拿着"池不可用"的结论和一张空表去推导——池报不可用，而每条上游
+    /// 都报健康、都没有复位时刻，退避位置还退回最短的那一档，于是已知坏掉的池
+    /// 被按最激进的节拍一遍遍试。这条钉住逐上游证据的往返。
+    #[test]
+    fn restart_resumes_the_backoff_position_from_the_payload() {
+        let before = LlmHealthTable::default();
+        let u = stub_upstream("https://a.example.com", "m1");
+        let pool = vec![u.clone()];
+        let reset = Utc::now().timestamp() + 7_200;
+        // 连续三次失败，每次之间把窗口推到过去（模拟"窗口到期后又被探了一次"）：
+        // 退避位置到 1200 秒上下，重启后必须接着往下走。
+        for _ in 0..3 {
+            let mut states = before.states.lock().unwrap();
+            if let Some(h) = states.get_mut(&LlmHealthTable::key(&u)) {
+                h.suspect_until =
+                    Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+            }
+            drop(states);
+            assert!(before
+                .note_failure(&u, 300, Some(reset), Some(604_800))
+                .is_some());
+        }
+
+        let evidence = before.evidence(&pool);
+        assert_eq!(evidence.len(), 1, "有记录的上游都要带走");
+        assert_eq!(evidence[0].identity, LlmHealthTable::key(&u));
+        assert_eq!(evidence[0].consecutive_failures, 3);
+        assert_eq!(evidence[0].quota_reset_unix, reset);
+        assert_eq!(evidence[0].quota_window_secs, 604_800);
+        assert!(evidence[0].suspect_until_unix > Utc::now().timestamp());
+
+        let after = LlmHealthTable::default();
+        assert_eq!(after.seed(&evidence, &pool), (1, 0));
+        assert!(after.is_suspect(&u));
+        assert!(!after.due_for_probe(&u), "重启不把退避位置退回最短档");
+        let reading = after.snapshot(&pool).remove(0);
+        assert!(!reading.healthy, "证据还在，就不该报健康");
+        assert_eq!(reading.consecutive_failures, 3);
+        assert_eq!(reading.quota_reset_unix, Some(reset));
+        assert_eq!(reading.quota_window_secs, Some(604_800));
+        assert_eq!(after.recovery_bounds(&pool).evidenced_unix, reset);
+    }
+
+    /// 池换过配置：载荷里那条上游已经不在池内了。它必须被丢掉而不是落表——
+    /// `snapshot` 与 `due_for_probe` 都按池内配置遍历，落进去就是一条谁也读不到
+    /// 的记录，在表里却跟"配了还没探过"同形。丢弃要计数上报，否则"换过配置"与
+    /// "证据丢了"在读数上分不开。
+    #[test]
+    fn evidence_for_an_upstream_no_longer_configured_is_dropped() {
+        let table = LlmHealthTable::default();
+        let gone = stub_upstream("https://gone.example.com", "m9");
+        let kept = stub_upstream("https://kept.example.com", "m1");
+        let evidence = vec![
+            cog_core::LlmUpstreamEvidence {
+                identity: LlmHealthTable::key(&gone),
+                consecutive_failures: 2,
+                ..Default::default()
+            },
+            cog_core::LlmUpstreamEvidence {
+                identity: LlmHealthTable::key(&kept),
+                consecutive_failures: 2,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(table.seed(&evidence, std::slice::from_ref(&kept)), (1, 1));
+        assert!(
+            table
+                .snapshot(std::slice::from_ref(&gone))
+                .remove(0)
+                .healthy,
+            "被丢弃的上游不落表"
+        );
+        assert_eq!(
+            table
+                .snapshot(std::slice::from_ref(&kept))
+                .remove(0)
+                .consecutive_failures,
+            2
+        );
+    }
+
+    /// 载荷里的窗口在恢复时已经过去了：它必须落成"现在就该探"，不能落成一条
+    /// 没有窗口的记录——`due_for_probe` 对没有窗口的记录恒为假，那等于把这条
+    /// 上游从探测面上摘掉，而它恰恰是唯一可能已经恢复的那一条。
+    #[test]
+    fn an_elapsed_window_in_the_payload_lands_as_due_now() {
+        let table = LlmHealthTable::default();
+        let u = stub_upstream("https://a.example.com", "m1");
+        let evidence = vec![cog_core::LlmUpstreamEvidence {
+            identity: LlmHealthTable::key(&u),
+            consecutive_failures: 7,
+            suspect_until_unix: Utc::now().timestamp() - 60,
+            ..Default::default()
+        }];
+        assert_eq!(table.seed(&evidence, std::slice::from_ref(&u)), (1, 0));
+        assert!(table.due_for_probe(&u));
+        assert!(!table.is_suspect(&u), "窗口已到期就不再算在嫌疑窗内");
+        assert_eq!(
+            table
+                .snapshot(std::slice::from_ref(&u))
+                .remove(0)
+                .consecutive_failures,
+            7,
+            "窗口过期不影响失败计数继续作为退避位置的输入"
+        );
+    }
+
     #[tokio::test]
     async fn circuit_breaks_whenever_no_upstream_can_serve() {
         let far = Utc::now().timestamp() + 3_600;
@@ -4610,17 +4813,29 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             evidenced_recovery_unix: Utc::now().timestamp() + 600,
             next_attempt_unix: Utc::now().timestamp() + 600,
             unavailable_upstreams: vec!["https://a.example.com|m1".into()],
+            ..Default::default()
         };
         let raw = serde_json::to_string(&down).unwrap();
-        assert!(seed_pool_down(Some(&raw)), "上次判不可用则重启沿用");
+        assert!(
+            seed_pool_down(parse_pool_status(Some(&raw)).as_ref()),
+            "上次判不可用则重启沿用"
+        );
 
         let up = cog_core::LlmPoolStatus {
             unavailable: false,
             ..down
         };
-        assert!(!seed_pool_down(Some(&serde_json::to_string(&up).unwrap())));
-        assert!(!seed_pool_down(None), "无信号时按乐观起手");
-        assert!(!seed_pool_down(Some("{not json")), "坏载荷不误判为不可用");
+        assert!(!seed_pool_down(
+            parse_pool_status(Some(&serde_json::to_string(&up).unwrap())).as_ref()
+        ));
+        assert!(
+            !seed_pool_down(parse_pool_status(None).as_ref()),
+            "无信号时按乐观起手"
+        );
+        assert!(
+            !seed_pool_down(parse_pool_status(Some("{not json")).as_ref()),
+            "坏载荷不误判为不可用"
+        );
     }
 
     #[test]

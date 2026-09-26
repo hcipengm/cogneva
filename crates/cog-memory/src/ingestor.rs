@@ -1736,6 +1736,7 @@ mod tests {
                 evidenced_recovery_unix: self.evidenced_recovery_unix,
                 next_attempt_unix: 0,
                 unavailable_upstreams: vec!["a|m".into()],
+                ..Default::default()
             })
         }
     }
@@ -2195,6 +2196,7 @@ mod tests {
                 evidenced_recovery_unix: now + 86_400 * 30,
                 next_attempt_unix: 0,
                 unavailable_upstreams: vec![],
+                ..Default::default()
             }),
             Duration::from_secs(1800),
             "a month-away recovery must be capped"
@@ -2205,6 +2207,7 @@ mod tests {
                 evidenced_recovery_unix: now - 60,
                 next_attempt_unix: 0,
                 unavailable_upstreams: vec![],
+                ..Default::default()
             }),
             Duration::from_secs(30),
             "an elapsed recovery time must re-check at the pool cadence"
@@ -2215,6 +2218,7 @@ mod tests {
                 evidenced_recovery_unix: 0,
                 next_attempt_unix: 0,
                 unavailable_upstreams: vec![],
+                ..Default::default()
             }),
             Duration::from_secs(30),
             "a snapshot carrying no recovery time must not be read as an imminent recovery"
@@ -2227,6 +2231,7 @@ mod tests {
                 evidenced_recovery_unix: 0,
                 next_attempt_unix: now + 120,
                 unavailable_upstreams: vec![],
+                ..Default::default()
             }),
             Duration::from_secs(120),
             "a retry-cadence bound still sets the wait, it is just not called a recovery"
@@ -2239,6 +2244,7 @@ mod tests {
                 evidenced_recovery_unix: now + 86_400 * 30,
                 next_attempt_unix: now + 120,
                 unavailable_upstreams: vec![],
+                ..Default::default()
             }),
             Duration::from_secs(120),
             "the nearer of the two bounds decides the wait"
@@ -2265,6 +2271,7 @@ mod tests {
                 evidenced_recovery_unix: 0,
                 next_attempt_unix: now + 120,
                 unavailable_upstreams: vec![],
+                ..Default::default()
             }),
             Duration::from_secs(420),
             "节拍到点之后还要等一个观察窗，不是到点就重开"
@@ -2277,6 +2284,7 @@ mod tests {
                 evidenced_recovery_unix: now + 120,
                 next_attempt_unix: now + 600,
                 unavailable_upstreams: vec![],
+                ..Default::default()
             }),
             Duration::from_secs(120),
             "自报时刻不加窗，取更近的那个"
@@ -2288,6 +2296,7 @@ mod tests {
                 evidenced_recovery_unix: 0,
                 next_attempt_unix: now + 1700,
                 unavailable_upstreams: vec![],
+                ..Default::default()
             }),
             Duration::from_secs(1800),
             "the cap holds after the window is added"

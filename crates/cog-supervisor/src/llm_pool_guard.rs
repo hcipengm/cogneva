@@ -197,6 +197,7 @@ mod tests {
             evidenced_recovery_unix: 1_800_000_000,
             next_attempt_unix: 1_799_999_400,
             unavailable_upstreams: vec!["a|m".into(), "b|m".into()],
+            ..Default::default()
         }
     }
 

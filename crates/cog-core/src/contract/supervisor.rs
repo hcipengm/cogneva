@@ -171,6 +171,46 @@ pub trait SchedulerGate: Send + Sync {
 /// scheduler open or closed forever.
 pub const LLM_POOL_STATUS_KEY: &str = "llm:pool:status";
 
+/// What one upstream told us the last time it was tried, as a value that can
+/// outlive the process that heard it.
+///
+/// The gateway's health table lives in process memory, so a rollout erases it.
+/// The verdict it produces is latched across restarts (see `LlmPoolStatus`),
+/// and a latched verdict whose inputs are gone is worse than either state
+/// alone: the pool reads as unavailable while every upstream reads as healthy
+/// with no reported reset time, and the backoff position restarts from the
+/// shortest window, so a known-dead pool gets retried on the most aggressive
+/// cadence we have and every consumer sees a snapshot contradicting the
+/// verdict. Carrying the inputs in the same payload as the verdict keeps them
+/// on one clock and in one write, so they cannot drift apart or be half-applied.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmUpstreamEvidence {
+    /// Upstream identity, `base_url|model`.
+    ///
+    /// Defaulted like every other field so that one malformed entry cannot fail
+    /// the whole payload: a rejected payload loses the verdict as well, and
+    /// losing the verdict is the failure this struct exists to prevent. An
+    /// entry that names no configured upstream is dropped when it is resumed.
+    #[serde(default)]
+    pub identity: String,
+    /// Failures counted since the last observed success. This is the exponent
+    /// of the probe window, so it is the number that must survive a restart.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// Reset instant the upstream stated, unix seconds; `0` when it stated
+    /// none. Only some responses carry one.
+    #[serde(default)]
+    pub quota_reset_unix: i64,
+    /// Quota window the upstream stated (seconds); `0` when it stated none.
+    #[serde(default)]
+    pub quota_window_secs: u64,
+    /// When this upstream may be probed again, unix seconds; `0` when the
+    /// record carries no window. Absolute rather than a remaining count so a
+    /// payload sitting in Redis keeps its meaning while it waits.
+    #[serde(default)]
+    pub suspect_until_unix: i64,
+}
+
 /// Cross-process snapshot of LLM upstream pool health.
 ///
 /// Two bounds travel side by side instead of being collapsed into one number,
@@ -181,6 +221,10 @@ pub const LLM_POOL_STATUS_KEY: &str = "llm:pool:status";
 /// an external system that nothing here has, and it understates a real outage:
 /// one upstream resets in six hours while the rest sit behind a sixty-second
 /// backoff, and the single number reports one minute.
+///
+/// The per-upstream inputs behind those bounds travel in the same payload, so
+/// that a process which restarts into a latched verdict can resume it with the
+/// evidence rather than re-deriving a rosier one from an empty table.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmPoolStatus {
     /// `true` when no configured upstream can currently serve a request.
@@ -202,6 +246,11 @@ pub struct LlmPoolStatus {
     pub next_attempt_unix: i64,
     /// Identity (`base_url|model`) of the unusable upstreams.
     pub unavailable_upstreams: Vec<String>,
+    /// Per-upstream inputs the bounds above were derived from. Empty in a
+    /// payload from a build that did not carry them, which reads as "no
+    /// evidence to resume with" — the same starting point as a first boot.
+    #[serde(default)]
+    pub upstream_evidence: Vec<LlmUpstreamEvidence>,
 }
 
 impl LlmPoolStatus {
@@ -498,6 +547,25 @@ impl SupervisorEvent {
 mod tests {
     use super::*;
 
+    /// A payload written before per-upstream evidence existed must still parse
+    /// into a usable verdict. Dropping the verdict because of an unknown-in-the-
+    /// other-direction field would re-open the pause the payload declares, which
+    /// is the one thing this key exists to prevent — and it would do it for the
+    /// length of a rollout, exactly when the pause still applies.
+    #[test]
+    fn a_payload_without_evidence_still_carries_its_verdict() {
+        let old = r#"{"unavailable":true,"evidenced_recovery_unix":1800000000,
+                      "next_attempt_unix":1799999400,
+                      "unavailable_upstreams":["https://a.example.com|m1"]}"#;
+        let status: LlmPoolStatus = serde_json::from_str(old).expect("old payload parses");
+        assert!(status.unavailable);
+        assert_eq!(status.evidenced_recovery_unix, 1_800_000_000);
+        assert!(
+            status.upstream_evidence.is_empty(),
+            "absent evidence reads as none held, not as an error"
+        );
+    }
+
     #[test]
     fn resume_wait_takes_the_nearer_future_bound() {
         let status = LlmPoolStatus {
@@ -505,6 +573,7 @@ mod tests {
             evidenced_recovery_unix: 1_000,
             next_attempt_unix: 400,
             unavailable_upstreams: vec![],
+            ..Default::default()
         };
         assert_eq!(
             status.resume_wait_secs(100, 0),
@@ -527,6 +596,7 @@ mod tests {
             evidenced_recovery_unix: 400,
             next_attempt_unix: 1_000,
             unavailable_upstreams: vec![],
+            ..Default::default()
         };
         assert_eq!(status.resume_wait_secs(100, 300), Some(300));
     }
@@ -541,6 +611,7 @@ mod tests {
             evidenced_recovery_unix: 0,
             next_attempt_unix: 0,
             unavailable_upstreams: vec![],
+            ..Default::default()
         };
         assert_eq!(status.resume_wait_secs(100, 300), None);
     }
@@ -552,6 +623,7 @@ mod tests {
             evidenced_recovery_unix: 50,
             next_attempt_unix: 0,
             unavailable_upstreams: vec![],
+            ..Default::default()
         };
         // A reset that has already elapsed is not a future opening: the upstream
         // named a time that came and went without a call succeeding.
