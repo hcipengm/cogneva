@@ -716,13 +716,22 @@ mod tests {
         assert_eq!(ok.outcome, HookOutcome::Success);
     }
 
+    /// A repeated event is suppressed while the window is open.
+    ///
+    /// The window is far wider than the dispatch between the two calls can
+    /// take, because that dispatch is what separates the arrivals: this test
+    /// waits for the first emit to finish before the second one starts, so the
+    /// window has to outlast an unbounded piece of work. With a window in the
+    /// hundreds of milliseconds a stall on a busy machine put the second
+    /// arrival outside it and the second emit dispatched, which reads as a
+    /// deduplication bug but is only the test's own clock.
     #[tokio::test]
     async fn deduplication_skips_duplicate_within_window() {
         let publisher = Arc::new(TestPublisher::new());
         let engine = Arc::new(HookEngine::with_config(
             publisher.clone(),
             HookEngineConfig {
-                dedup_window: Duration::from_millis(200),
+                dedup_window: Duration::from_secs(30),
                 ..Default::default()
             },
         ));
@@ -748,12 +757,47 @@ mod tests {
         assert_eq!(r1.len(), 1);
         assert_eq!(r2.len(), 1);
         assert_eq!(r2[0].outcome, HookOutcome::Deduplicated);
+    }
 
-        // Wait past the window and try again.
-        tokio::time::sleep(Duration::from_millis(220)).await;
-        let r3 = engine.emit(evt()).await;
-        assert_eq!(r3.len(), 1);
-        assert_eq!(r3[0].outcome, HookOutcome::Success);
+    /// Past the window the same event is dispatched again.
+    ///
+    /// The sleep here is the part that has to be long enough, and a stall only
+    /// makes it longer, so this direction cannot fail for a reason of its own:
+    /// a window short enough to expire during the sleep is the whole setup.
+    #[tokio::test]
+    async fn deduplication_releases_the_event_once_the_window_passes() {
+        let publisher = Arc::new(TestPublisher::new());
+        let engine = Arc::new(HookEngine::with_config(
+            publisher.clone(),
+            HookEngineConfig {
+                dedup_window: Duration::from_millis(30),
+                ..Default::default()
+            },
+        ));
+        engine
+            .register(make_def(
+                "log",
+                HookTrigger::OnAgentStart,
+                HookAction::Log {
+                    level: LogLevel::Info,
+                },
+            ))
+            .await;
+
+        let evt = || {
+            HookEvent::new(HookTrigger::OnAgentStart)
+                .with_agent_id("a-1")
+                .with_dedup_key("same")
+        };
+
+        let r1 = engine.emit(evt()).await;
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].outcome, HookOutcome::Success);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r2 = engine.emit(evt()).await;
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].outcome, HookOutcome::Success);
     }
 
     #[tokio::test]
