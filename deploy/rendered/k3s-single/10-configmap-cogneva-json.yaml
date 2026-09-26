@@ -971,6 +971,15 @@ data:
               },
               "severity": "warning",
               "summary": "a background loop panicked and was run again {value} time(s) in the last hour, and is running now: a restart means the defect fired and the loop came back from it, not that the defect is gone. It is reported here rather than left to the panic line in the log because a repaired loop publishes all of its own series again, so from every other reading in this deployment it looks like a loop that never stopped -- the repair would be the reason the defect stayed quiet. Read the panic message in that container's log at the moment of the restart (the supervisor logs it with the loop name, the restart count within this run, and the wait it took before trying again). A restart that happens once around a deploy is usually a defect in the new code that the next attempt did not hit; the same loop restarted repeatedly is one the budget will eventually leave dead, which is what background_loop_died then reports. The count is per process: it resets when the process restarts, so a loop that panicked shortly before a restart is visible in the logs and no longer here"
+            },
+            {
+              "name": "notification_delivery_failing",
+              "promql": "sum by (outlet, result, pod) (increase(cogneva_notification_delivery_total{result!=\"ok\"}[1h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "a notification outlet failed to deliver {value} time(s) in the last hour, on outlet {outlet}, failing at {result}. Nothing else in this deployment shows it: the caller sees the same thing whether the message reached a human or was dropped, so without this reading a broken outlet is visible only by reading one container's log -- and this is the path whose failure makes every other alert silent. The result separates causes that have different owners: unreachable is the network path to that outlet (the evolution pod's egress is an allow-list, so a robot host that is not named there is blocked before any HTTP happens), http_error is the receiver answering with something other than 2xx (a rotated or wrong token, a rate limit, an outage on their side), and envelope_error is the receiver answering 2xx while its own envelope code says the message was refused (a keyword filter, a failed signature) -- the one that reads as delivered everywhere except inside the platform. The count is per pod and resets with the process, and this rule reads a one-hour increase rather than the total, so an outlet that is fixed stops firing by itself. If every outlet fails at once, look for what they share: the gateway in front of them, or the pod's egress. A broadcast to WebSocket subscribers is deliberately not counted: having no subscriber is a legitimate state, not a delivery failure"
             }
           ]
         },

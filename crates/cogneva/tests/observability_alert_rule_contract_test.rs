@@ -264,6 +264,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_verification_timeouts_total",
         "crates/cog-reflection/src/verification_budget.rs",
     ),
+    // The notification outlets. A delivery that fails is invisible from
+    // outside this process -- the caller cannot tell "a human was paged" from
+    // "the message was dropped" -- so the per-outlet outcome counters are the
+    // only surface the rule can read.
+    (
+        "cogneva_notification_delivery_total",
+        "crates/cog-notification/src/delivery.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
