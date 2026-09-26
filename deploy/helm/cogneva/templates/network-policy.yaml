@@ -50,15 +50,16 @@ spec:
         # 集群内镜像仓库（5000）：publisher push 金丝雀 overlay / 主线 overlay 镜像
         - protocol: TCP
           port: 5000
-    {{- if and .Values.notification.egressCidr (gt (.Values.notification.egressPort | int) 0) }}
-    # 告警通知出口：本 Pod 的 egress 是白名单，出口地址在集群外时须显式放行，
-    # 否则通知被拦掉而 dispatch 只留下一行 warn——读起来像"没有告警"。
+    {{- range $host, $allow := .Values.notification.egress }}
+    # 告警通知出口 {{ $host }}：本 Pod 的 egress 是白名单，出口地址在集群外时须显式放行，
+    # 否则通知被拦掉而 dispatch 只留下一行 warn——读起来像"没有告警"。一个宿主一条规则：
+    # 同一条规则的 ports 对它的所有 to 生效，而各出口的端口可以不同。
     - to:
         - ipBlock:
-            cidr: {{ .Values.notification.egressCidr | quote }}
+            cidr: {{ $allow.cidr | quote }}
       ports:
         - protocol: TCP
-          port: {{ .Values.notification.egressPort | int }}
+          port: {{ $allow.port | int }}
     {{- end }}
     # 监控栈（9090）：infra_watch 按 PromQL 探测节点磁盘 / Pod OOM 等基础设施
     # 信号，查询跨命名空间落到监控命名空间的 Prometheus。podSelector:{} 只
