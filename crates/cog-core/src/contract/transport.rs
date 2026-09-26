@@ -248,13 +248,37 @@ pub fn rank_by_measurement(measurements: &[TransportMeasurement]) -> Option<Vec<
 /// 实测也不比策略表更高明的地方要说清楚：一次握手的延迟**不预测**大流量下的
 /// 吞吐（TLS 握手 200ms 的连接照样可能被限速到 20KB/s）。所以实测只决定
 /// "先用哪个"，失败回落次序照旧生效——判定归证据，不归一次性测量。
-pub fn resolve(measured: Option<Vec<Transport>>, policy: TransportPlan) -> TransportPlan {
-    match measured {
-        Some(order) if !order.is_empty() => TransportPlan {
-            order,
-            rationale: format!("实测排序（{}）", policy.rationale),
-        },
-        _ => policy,
+///
+/// 理由由**做出这个决定的读数**组成，不照抄策略表那一段：实测把首选换掉之后，
+/// 策略表的说法与最终次序正好相反（受限档的表写着"SSH 优先"，而实测里 HTTPS
+/// 可达、SSH 不通时，次序就是 `[Https, Ssh]`）。照抄会留下一句与 `order`
+/// 矛盾的"理由"——读日志的人按理由理解成走 SSH，实际走的是 HTTPS，而这句理由
+/// 恰恰是给人看的那一半。策略表那段仍带出来，但降为"表原本怎么排"的从属分句。
+pub fn resolve(measured: &[TransportMeasurement], policy: TransportPlan) -> TransportPlan {
+    let Some(order) = rank_by_measurement(measured) else {
+        // 一条都不通时实测没有信息量：退回策略表，此刻它的理由就是决策本身
+        return policy;
+    };
+    debug_assert!(!order.is_empty(), "rank_by_measurement 只在非空时给结论");
+    // plan() 对所有输入都返回非空次序（由本模块的全组合测试守着）
+    debug_assert!(!policy.order.is_empty(), "策略表次序为空");
+    let readings = measured
+        .iter()
+        .map(|m| {
+            if m.reachable {
+                format!("{:?} {}ms", m.transport, m.latency_ms)
+            } else {
+                format!("{:?} 不可达", m.transport)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("、");
+    TransportPlan {
+        rationale: format!(
+            "实测排序：首选 {:?}（实测 {}；策略表原本 {:?} 优先）",
+            order[0], readings, policy.order[0]
+        ),
+        order,
     }
 }
 
@@ -491,14 +515,24 @@ mod tests {
             NetworkProfile::Restricted,
             Credential::SshKey,
         );
-        let order = rank_by_measurement(&[
+        let measurements = [
             measured(Transport::Ssh, false, 0),
             measured(Transport::Https, true, 800),
-        ]);
-        let resolved = resolve(order, policy);
+        ];
+        let resolved = resolve(&measurements, policy);
         assert_eq!(resolved.primary(), Some(Transport::Https));
         // 不可达的 SSH 不被剔除：它还在次序里当兜底
         assert_eq!(resolved.order, vec![Transport::Https, Transport::Ssh]);
+        // 理由说的是**这次**的次序与读数，而不是策略表那句与次序相反的话：
+        // 照抄会让人按"SSH 优先"理解，而实际走的是 HTTPS
+        for want in [
+            "首选 Https",
+            "Https 800ms",
+            "Ssh 不可达",
+            "策略表原本 Ssh 优先",
+        ] {
+            assert!(resolved.rationale.contains(want), "{}", resolved.rationale);
+        }
     }
 
     #[test]
@@ -524,8 +558,23 @@ mod tests {
             NetworkProfile::Open,
             Credential::SshKey,
         );
-        let resolved = resolve(None, policy.clone());
+        let resolved = resolve(&[], policy.clone());
         assert_eq!(resolved, policy);
         assert!(resolved.rationale.contains("开放网络"));
+
+        // 实测与策略表一致时也走同一条渲染路径：理由里照样能看到读数
+        let resolved = resolve(
+            &[
+                measured(Transport::Https, true, 300),
+                measured(Transport::Ssh, true, 900),
+            ],
+            policy,
+        );
+        assert_eq!(resolved.order, vec![Transport::Https, Transport::Ssh]);
+        assert!(
+            resolved.rationale.contains("Https 300ms"),
+            "{}",
+            resolved.rationale
+        );
     }
 }

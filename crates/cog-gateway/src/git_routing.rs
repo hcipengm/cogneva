@@ -57,8 +57,10 @@ pub(crate) struct TransportRouting {
     stamped: Option<NetworkProfile>,
     /// 探针结论（带证据）。
     verdict: Mutex<Option<NetworkVerdict>>,
-    /// 实测次序（可达按延迟升序，不可达留在后面兜底）。
-    order: Mutex<Option<Vec<Transport>>>,
+    /// 两条通道的实测读数（**原始读数，不是排好的次序**：次序由契约里的纯函数
+    /// 合成，而理由要带上比较过的读数——只锁存次序就把数字丢了，理由便只剩
+    /// 一句抄自策略表的话）。
+    measurements: Mutex<Option<Vec<TransportMeasurement>>>,
     /// 上次实测时刻。
     measured_at: Mutex<Option<Instant>>,
     /// 上一次真正用出去的首选通道。选路是逐请求判的，但**只有换边才值得
@@ -74,7 +76,7 @@ impl TransportRouting {
         Self {
             stamped,
             verdict: Mutex::new(None),
-            order: Mutex::new(None),
+            measurements: Mutex::new(None),
             measured_at: Mutex::new(None),
             last_primary: Mutex::new(None),
             measuring: AtomicBool::new(false),
@@ -104,14 +106,21 @@ impl TransportRouting {
     /// 不存在的通道。
     pub(crate) fn plan_for(&self, op: Operation, cred: Credential) -> TransportPlan {
         let policy = policy_plan(op, Platform::GitHub, self.profile(), cred);
-        let usable = |t: &Transport| *t == Transport::Https || cred == Credential::SshKey;
+        // 不可用的通道在实测读数里就剔掉（没有部署密钥时 SSH 排第一也得删），
+        // 次序与理由由契约里的纯函数从**剩下的读数**一起合成
+        let usable = |m: &TransportMeasurement| {
+            m.transport == Transport::Https || cred == Credential::SshKey
+        };
         let measured = self
-            .order
+            .measurements
             .lock()
             .unwrap()
             .clone()
-            .map(|o| o.into_iter().filter(usable).collect::<Vec<Transport>>());
-        resolve_against_policy(measured, policy)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(usable)
+            .collect::<Vec<TransportMeasurement>>();
+        resolve_against_policy(&measured, policy)
     }
 
     /// 记下本轮真正用出去的首选通道，返回"是不是换边了"。
@@ -128,7 +137,7 @@ impl TransportRouting {
 
     /// 判定的可读证据：走的是策略表还是实测，受限时是哪几条信号不通。
     pub(crate) fn evidence(&self) -> String {
-        let by_measurement = self.order.lock().unwrap().is_some();
+        let by_measurement = self.measurements.lock().unwrap().is_some();
         let verdict = self.verdict.lock().unwrap().clone();
         match verdict {
             Some(v) => format!(
@@ -159,9 +168,13 @@ impl TransportRouting {
 
     /// 锁存一轮实测结果。次序与画像分开存：次序可能来自一次成功握手、画像可能
     /// 一条信号都没探到，两者独立成立，不该互相顶掉。
+    ///
+    /// 存的是原始读数（`measurements`）而不是排好的次序：次序是纯函数的产物，
+    /// 每次现算的代价可以忽略，而读数丢了就再也拼不出"为什么是它"。
+    /// 一条可达都没有时不存——那时实测没有结论，`evidence()` 也该说"策略表"。
     pub(crate) fn latch(&self, measurements: &[TransportMeasurement], probes: Vec<NetProbe>) {
-        if let Some(order) = rank_by_measurement(measurements) {
-            *self.order.lock().unwrap() = Some(order);
+        if rank_by_measurement(measurements).is_some() {
+            *self.measurements.lock().unwrap() = Some(measurements.to_vec());
         }
         let prev = self.verdict.lock().unwrap().clone();
         let merged = NetworkVerdict::resolve(prev.as_ref(), NetworkVerdict::from_probes(probes));
@@ -372,6 +385,31 @@ mod tests {
     }
 
     #[test]
+    fn the_reason_names_the_measurement_that_overrode_the_table() {
+        // 现场形态：画像盖章"受限"（表说 SSH 优先），实测里 HTTPS 通、SSH 不通。
+        // 次序由实测给出，理由也必须说这次的决定——照抄策略表会留下一句与
+        // `order` 相反的话，而理由正是给人看的那一半。
+        let r = TransportRouting::new(Some(NetworkProfile::Restricted));
+        r.latch(
+            &[
+                ms(Transport::Https, true, 800),
+                ms(Transport::Ssh, false, 0),
+            ],
+            vec![],
+        );
+        let plan = r.plan_for(Operation::GitFetch, Credential::SshKey);
+        assert_eq!(plan.order, vec![Transport::Https, Transport::Ssh]);
+        for want in [
+            "首选 Https",
+            "Https 800ms",
+            "Ssh 不可达",
+            "策略表原本 Ssh 优先",
+        ] {
+            assert!(plan.rationale.contains(want), "{}", plan.rationale);
+        }
+    }
+
+    #[test]
     fn ssh_is_dropped_when_there_is_no_deploy_key() {
         let r = routing_full();
         r.latch(
@@ -392,6 +430,8 @@ mod tests {
         let plan = r.plan_for(Operation::GitPush, Credential::SshKey);
         assert_eq!(plan.order, vec![Transport::Ssh, Transport::Https]);
         assert!(r.evidence().contains("部署期盖章受限"));
+        // 没有实测时策略表就是决策本身，它的理由原样成立
+        assert!(plan.rationale.contains("受限网络"), "{}", plan.rationale);
     }
 
     #[test]
