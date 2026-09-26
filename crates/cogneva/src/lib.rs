@@ -45,9 +45,15 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         config.core.app.version.as_str()
     };
+    // Both names, side by side, because they can disagree and that is the
+    // interesting case: `app_version` is what the deployment claims (the
+    // release its manifests were rendered from), the build label is what the
+    // code actually is. A deployment that claims a release it has moved 92
+    // commits past shows up here and nowhere else.
     tracing::info!(
-        "Cogneva v{} (rev {}) starting",
+        "Cogneva v{} (build {}, rev {}) starting",
         app_version,
+        env!("COGNEVA_VERSION_ID"),
         env!("COGNEVA_GIT_REVISION")
     );
     // 解析 secret://env|file|vault 引用（审计 3.3）。

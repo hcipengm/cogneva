@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use cog_core::contract::version::VersionId;
 use cog_core::{SFError, SFResult, ShutdownSignal};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -1449,6 +1450,54 @@ impl MainlineDeployer {
         self.run_cmd("git", args, Some(&workdir), 120).await
     }
 
+    /// 构建标签：声明版本 + 距最近 release 的提交数 + rev。
+    ///
+    /// 描述的是工作树而不是某个 commit-ish：`git describe` 不允许 `--dirty` 与
+    /// commit-ish 同时出现（实测 `fatal: option '--dirty' and commit-ishes cannot
+    /// be used together`），而工作树在 `ensure_source_at` 里刚被 `reset --hard`
+    /// 到目标 rev 并 `clean -ffdx`，描述的正是即将编译的那份源码。
+    ///
+    /// 参数与 `deploy/scripts/version-id.sh` 是同一套——那个脚本是 shell 侧三个
+    /// 生产者的唯一一份，这里是 Rust 侧唯一一份。参数不一致不会报错，只会让两边
+    /// 报出的名字悄悄不同，所以由门禁逐个核对（`--match` 尤其要紧：裸仓里还有
+    /// `promote/*` 这类本地 tag，漏了它会把它们当成最近的 release）。
+    ///
+    /// 描述到的 rev 不是要构建的那个就报 unknown：标签的全部用处就是区分代码状态，
+    /// 一个指向别的提交的名字比"未知"更坏。取不到 tag 同样退化成
+    /// `<声明版本>-unknown` 而不失败——这个标签是印章不是闸门，为它停掉整条主线是
+    /// 反向的。退化本身可见：读到的距离是"未知"，不是 0。
+    async fn git_version_id(&self, rev: &str) -> SFResult<String> {
+        let declared = env!("CARGO_PKG_VERSION");
+        let unknown = |why: &str| {
+            warn!(
+                rev = %rev12(rev),
+                "git describe {why}; the image will report its build label as unknown distance"
+            );
+            Ok(format!("v{declared}-unknown"))
+        };
+        let described = self
+            .git_src(&[
+                "describe", "--tags", "--long", "--dirty", "--match", "v[0-9]*",
+            ])
+            .await
+            .ok()
+            .map(|out| out.trim().to_string())
+            .filter(|id| !id.is_empty());
+        let Some(id) = described else {
+            return unknown("found no reachable release tag");
+        };
+        // 名字里的 rev 必须就是要构建的那个提交，否则它描述的是另一份源码。
+        match VersionId::parse(&id) {
+            Ok(parsed) if rev.starts_with(parsed.rev.as_str()) => Ok(id),
+            Ok(parsed) => unknown(&format!(
+                "described {} while {} is being built",
+                parsed.rev,
+                rev12(rev)
+            )),
+            Err(_) => unknown(&format!("output {id} is not a version id")),
+        }
+    }
+
     /// bare 仓库指定分支的完整 rev。
     pub(crate) async fn bare_main_rev(&self) -> SFResult<String> {
         let out = self
@@ -2232,6 +2281,7 @@ impl MainlineDeployer {
 
     async fn build_binary(&self, rev: &str) -> SFResult<()> {
         let jobs = self.cfg.cargo_build_jobs.to_string();
+        let version_id = self.git_version_id(rev).await?;
         let cmdline = format!("cargo build --release --bin cogneva (jobs={jobs})");
         // CARGO_HOME 换 PVC 后，镜像 /usr/local/cargo/config.toml 里的 sparse
         // 镜像配置（受限网络构建注入）不会自动继承；缺失会直连 crates.io，
@@ -2256,6 +2306,9 @@ impl MainlineDeployer {
             // build.rs 回退只嵌 7 位短 sha，叠层后的 --version 校验匹配 12
             // 位前缀会必败；显式注入完整 rev（与 swap-image 双保险同源）。
             .env("COGNEVA_GIT_REVISION", rev)
+            // 与 rev 同源注入：源码树在工作树里本来就有 .git，但这层显式注入让
+            // 镜像里的名字不依赖 build.rs 当场能否查到 tag。
+            .env("COGNEVA_VERSION_ID", &version_id)
             .kill_on_drop(true);
         let fut = cmd.output();
         let output = tokio::time::timeout(Duration::from_secs(self.cfg.build_timeout_secs), fut)

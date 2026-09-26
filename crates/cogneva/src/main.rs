@@ -34,9 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::Version => {
+            // The build label, not the declared version: the declared version is
+            // shared by every commit since the last release, so printing it here
+            // makes two different code states answer to one name.
             println!(
                 "cogneva {} (rev {})",
-                env!("CARGO_PKG_VERSION"),
+                env!("COGNEVA_VERSION_ID"),
                 env!("COGNEVA_GIT_REVISION")
             );
             Ok(())

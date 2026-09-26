@@ -82,6 +82,53 @@ fn main() {
     println!("cargo:rustc-env=COGNEVA_GIT_REVISION={revision}");
     println!("cargo:rerun-if-env-changed=COGNEVA_GIT_REVISION");
     println!("cargo:rerun-if-changed=.git/HEAD");
+    // HEAD 只在切分支时动，提交动的是 refs/heads 下那个文件；少了这一行，提交
+    // 之后重编译出来的印章还指着上一个 commit（实测：HEAD 已到 9a10a72，缓存
+    // 的 build script 输出仍写 890e4c0）。
+    println!("cargo:rerun-if-changed=.git/refs/heads");
+
+    // Name the code, not just the release it belongs to. The declared version
+    // alone is shared by every commit since the last release — measured once at
+    // 93 consecutive commits — so a report of "0.5.8" cannot be told apart from
+    // the released 0.5.8. git names the difference and computes it from the
+    // history alone, which is why every producer reaches the same string
+    // without agreeing on anything: the label is derived, not maintained.
+    // Injected by whoever builds into a tree without .git, exactly as the
+    // revision is; the fallback says the distance could not be read rather than
+    // claiming zero.
+    let version_id = std::env::var("COGNEVA_VERSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(git_version_id)
+        .unwrap_or_else(|| format!("v{}-unknown", env!("CARGO_PKG_VERSION")));
+    println!("cargo:rustc-env=COGNEVA_VERSION_ID={version_id}");
+    println!("cargo:rerun-if-env-changed=COGNEVA_VERSION_ID");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+}
+
+/// `git describe` output for HEAD, or `None` when git or the tags are missing.
+///
+/// `--long` keeps the distance in the output even at the release commit, so the
+/// shape never varies and a caller never has to guess whether a missing
+/// distance means "zero" or "unknown". `--match` keeps `promote/*` and `gen-*`
+/// tags, which the cluster writes, from ever being taken for releases.
+fn git_version_id() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "describe", "--tags", "--long", "--dirty", "--match", "v[0-9]*",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 fn git_revision() -> Option<String> {

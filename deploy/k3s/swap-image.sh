@@ -52,13 +52,16 @@ done
 
 cd "$REPO_ROOT"
 
-# 版本号单一源：Cargo.toml workspace.package.version
-WORKSPACE_VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+# 版本号单一源：Cargo.toml workspace.package.version，读法收在 declared-version.sh
+WORKSPACE_VERSION="$(bash "$REPO_ROOT/deploy/scripts/declared-version.sh")"
 [ -n "$NEW_TAG" ] || NEW_TAG="$WORKSPACE_VERSION"
 echo "==> 新版本 ${IMAGE}:${NEW_TAG}（workspace version ${WORKSPACE_VERSION}）"
 
 # git revision 注入二进制（build.rs 也会自查 git，显式传双保险）
 GIT_REVISION="$(git rev-parse --short HEAD)$(git status --porcelain | grep -q . && echo -dirty || true)"
+# 派生标签：声明版本 + 距最近 release 的提交数 + rev。与 rev 一起注入，缺了它
+# 新镜像只能报裸的声明版本，就分不出"发布版 0.5.8"和"0.5.8 之后第 93 个提交"。
+VERSION_ID="$(bash "$REPO_ROOT/deploy/scripts/version-id.sh")"
 
 # 输出线上 Ready 主 Pod 的 <name> <imageID>（完整 repo@sha256:manifest 引用），没有则空
 running_pod_info() {
@@ -213,7 +216,8 @@ if [ "$BUILD_WEB" = 1 ]; then
 fi
 
 echo "==> 增量构建 release 二进制（CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}）"
-COGNEVA_GIT_REVISION="$GIT_REVISION" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
+COGNEVA_GIT_REVISION="$GIT_REVISION" COGNEVA_VERSION_ID="$VERSION_ID" \
+  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
   cargo build --release --bin cogneva
 strip target/release/cogneva
 

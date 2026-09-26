@@ -41,4 +41,5 @@ pub mod system_plugin;
 pub mod task;
 pub mod tool;
 pub mod transport;
+pub mod version;
 pub mod wiki;

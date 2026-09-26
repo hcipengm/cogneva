@@ -18,6 +18,9 @@ ARG CARGO_BUILD_JOBS="default"
 # 让线上镜像能回答"我是哪个版本、哪个 commit"，不依赖浮动 tag :local 追溯。
 ARG VERSION=""
 ARG GIT_REVISION=""
+# 派生标签（git describe 语义）：声明版本 + 距该 release 的提交数 + rev。
+# 源码树在容器里没有 .git，与 GIT_REVISION 一样只能由构建方注入。
+ARG VERSION_ID=""
 
 # ------------------------------------------------------------------------------
 # Stage 1: Build
@@ -35,8 +38,10 @@ ARG CARGO_REGISTRY_SPARSE
 ARG APT_MIRROR_HOST
 ARG CARGO_BUILD_JOBS
 ARG GIT_REVISION
+ARG VERSION_ID
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
     COGNEVA_GIT_REVISION=${GIT_REVISION} \
+    COGNEVA_VERSION_ID=${VERSION_ID} \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
