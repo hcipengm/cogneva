@@ -1288,6 +1288,21 @@ pub struct MainlineDeployer {
     /// 最近一次上游跟踪的结论，心跳里明说。上游这条链最容易长成"看着在跟、
     /// 其实没跟"：没有它，只跟随 bare 的部署与跟踪坏掉的部署日志一模一样。
     upstream_note: std::sync::Mutex<String>,
+    /// 版本契约读数出口。为 None 时判据照跑、只写日志——判据的存在不依赖
+    /// 有没有人订阅它的读数。
+    metrics: Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
+}
+
+/// 版本契约的读数：与判据分开。
+///
+/// "离最近一次 release 多远"是读数而不是判据——卡阈值会把正常前进判成违规；
+/// 真正让人没法忽略它的是派生标签：距离变了，名字就变了，一个名字不会再覆盖
+/// 两个代码状态。
+struct VersionReadings {
+    /// 最近的 release tag 与它在 tracked main 上的首父提交数。
+    nearest_release: Option<(String, u64)>,
+    /// tracked main 声明的版本。
+    declared: Option<String>,
 }
 
 /// git 的 tree-ish 形式：`<rev>:<path>`，路径**不带前导斜杠**。
@@ -1310,7 +1325,14 @@ impl MainlineDeployer {
             cfg,
             workspaces,
             upstream_note: std::sync::Mutex::new("pending".to_string()),
+            metrics: None,
         }
+    }
+
+    /// Report the version contract's own readings.
+    pub fn with_metrics(mut self, metrics: std::sync::Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// 部署器工作树路径（稳定）。
@@ -1533,6 +1555,312 @@ impl MainlineDeployer {
             .unwrap_or(false)
     }
 
+    /// git 中一个 tag 解引用后的提交。
+    async fn tag_commit(&self, tag: &str) -> Option<String> {
+        self.run_cmd(
+            "git",
+            &["--git-dir", &self.cfg.bare_repo, "rev-list", "-n1", tag],
+            None,
+            30,
+        )
+        .await
+        .ok()
+        .map(|out| out.trim().to_string())
+        .filter(|rev| !rev.is_empty())
+    }
+
+    /// `rev` 处工作区声明的版本（`workspace.package.version`）。
+    async fn declared_version_at(&self, rev: &str) -> Option<String> {
+        let manifest = self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "show",
+                    &format!("{}:Cargo.toml", rev),
+                ],
+                None,
+                30,
+            )
+            .await
+            .ok()?;
+        cog_core::contract::version::declared_version(&manifest).map(|v| v.to_string())
+    }
+
+    /// 收集版本契约的证据，全部来自本进程已经在跟的那份历史。
+    ///
+    /// 声明链的完整性要一起收：走到尽头才能说"这个版本从未被声明"，没走到
+    /// 就只能是"读不到"。浅克隆的边界提交在"有没有父提交"上和根提交给出
+    /// 同一个答案，所以 completeness 由 `--is-shallow-repository` 判，而不是
+    /// 由"最老的声明提交是不是根提交"猜。
+    async fn version_evidence(
+        &self,
+        main: &str,
+    ) -> (cog_core::contract::version::Evidence, VersionReadings) {
+        use cog_core::contract::version::{DeclarationChange, Evidence, ReleaseTag, TagSet};
+
+        // Cargo.toml 只在被改动的提交上才有新版本值，所以沿这条路径取就够了。
+        let touching = self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "log",
+                    "--first-parent",
+                    "--format=%H",
+                    main,
+                    "--",
+                    "Cargo.toml",
+                ],
+                None,
+                120,
+            )
+            .await
+            .unwrap_or_default();
+
+        let mut revs: Vec<&str> = touching
+            .split_whitespace()
+            .filter(|r| !r.is_empty())
+            .collect();
+        // git 给的是新→旧；按历史顺序（旧→新）比较，才能把 from/to 说对。
+        revs.reverse();
+        let mut declarations = Vec::new();
+        let mut previous: Option<String> = None;
+        let mut current_version: Option<String> = None;
+        let mut chain_seen = 0usize;
+        for rev in revs {
+            chain_seen += 1;
+            let Some(version) = self.declared_version_at(rev).await else {
+                continue;
+            };
+            match &previous {
+                Some(before) if before != &version => declarations.push(DeclarationChange {
+                    rev: rev.to_string(),
+                    from: before.clone(),
+                    to: version.clone(),
+                }),
+                None => declarations.push(DeclarationChange {
+                    rev: rev.to_string(),
+                    from: version.clone(),
+                    to: version.clone(),
+                }),
+                _ => {}
+            }
+            previous = Some(version.clone());
+            current_version = Some(version);
+        }
+
+        let shallow = self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "rev-parse",
+                    "--is-shallow-repository",
+                ],
+                None,
+                30,
+            )
+            .await
+            .map(|out| out.trim() == "true")
+            .unwrap_or(true);
+        let chain_complete = !shallow && chain_seen > 0;
+
+        // 本仓 refs/tags 里的 release tag：判 tag 忠实与 release 落点。
+        let mut releases = Vec::new();
+        let mut reachable: Vec<(String, u64)> = Vec::new();
+        if let Ok(list) = self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "refs/tags/v*",
+                ],
+                None,
+                60,
+            )
+            .await
+        {
+            for tag in list.split_whitespace() {
+                let Some(commit) = self.tag_commit(tag).await else {
+                    continue;
+                };
+                let on_main = self.is_ancestor(&commit, main).await;
+                let declared = if on_main {
+                    self.declared_version_at(&commit).await.unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                if on_main {
+                    if let Ok(count) = self
+                        .run_cmd(
+                            "git",
+                            &[
+                                "--git-dir",
+                                &self.cfg.bare_repo,
+                                "rev-list",
+                                "--count",
+                                &format!("{}..{}", commit, main),
+                            ],
+                            None,
+                            60,
+                        )
+                        .await
+                    {
+                        if let Ok(n) = count.trim().parse::<u64>() {
+                            reachable.push((tag.to_string(), n));
+                        }
+                    }
+                }
+                releases.push(ReleaseTag {
+                    tag: tag.to_string(),
+                    rev: commit,
+                    on_tracked_main: on_main,
+                    declared_version: declared,
+                });
+            }
+        }
+
+        // 各平台自己能看到的 release tag：判各点的 tag 集合是否一致。
+        let mut tag_sets = Vec::new();
+        for up in &self.cfg.upstreams {
+            let slug = up.platform.slug();
+            let prefix = format!("refs/cogneva/tags/{}/", slug);
+            let pattern = format!("{}v*", prefix);
+            let Ok(list) = self
+                .run_cmd(
+                    "git",
+                    &[
+                        "--git-dir",
+                        &self.cfg.bare_repo,
+                        "for-each-ref",
+                        // 全名，不是 `:short`：`%(refname:short)` 只剥 refs/heads 与
+                        // refs/tags 这类众所周知的层级，本仓的 refs/cogneva/... 会
+                        // 原样留成 `cogneva/tags/<点>/v0.5.8`——拿完整前缀去剥一个都
+                        // 剥不掉，每个点的集合都是空的，而"两个点都空"在判据里读作
+                        // 一致。空的读数不能长得像一致的读数。
+                        "--format=%(refname)",
+                        &pattern,
+                    ],
+                    None,
+                    60,
+                )
+                .await
+            else {
+                continue;
+            };
+            let mut tags: Vec<String> = list
+                .split_whitespace()
+                .filter_map(|name| name.strip_prefix(prefix.as_str()).map(|s| s.to_string()))
+                .collect();
+            tags.sort();
+            tag_sets.push(TagSet {
+                point: slug.to_string(),
+                tags,
+            });
+        }
+
+        // `describe` 取的是最近的 tag（距离最小的那个），读数与它对齐，
+        // 免得同一个代码状态在名字里说 93、在读数里说别的。
+        let nearest = reachable.into_iter().min_by_key(|(_, distance)| *distance);
+        (
+            Evidence {
+                declarations,
+                chain_complete,
+                releases,
+                tag_sets,
+            },
+            VersionReadings {
+                nearest_release: nearest,
+                declared: current_version,
+            },
+        )
+    }
+
+    /// 版本契约：每轮都判、每轮都上报，判据不挂在任何一次推进上。
+    ///
+    /// 判在部署器里，是因为它持有本集群唯一那份会被推进的历史：三个生产者
+    /// 的 push 走三条不同的路（开发会话直推、进化闭环落地、贡献通道），唯一
+    /// 共同的汇聚面就是这份历史加 CI。判据挂在这里覆盖前两者，CI 侧跑同一份
+    /// 纯函数覆盖后者。
+    pub async fn report_version_contract(&self, main: &str) {
+        use cog_core::contract::version::{judge, Clause, Verdict};
+        use cog_core::metric_names::{
+            VERSION_COMMITS_SINCE_RELEASE, VERSION_CONTRACT_CHECKS_TOTAL,
+            VERSION_CONTRACT_VIOLATIONS, VERSION_DECLARED_INFO,
+        };
+
+        let (evidence, readings) = self.version_evidence(main).await;
+        let report = judge(&evidence);
+        let violations = report.violations();
+
+        if !report.holds() {
+            warn!(
+                main = %rev12(main),
+                clauses = %violations
+                    .iter()
+                    .map(|v| format!("{}: {} ({})", v.clause.as_str(), v.subject, v.detail))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                unreadable = %report
+                    .unreadable()
+                    .iter()
+                    .map(|(clause, why)| format!("{clause}: {why}"))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                "version contract does not hold"
+            );
+        } else {
+            info!(main = %rev12(main), "version contract holds");
+        }
+
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        for clause in Clause::ALL {
+            let verdict = report.verdict(clause);
+            let count = match verdict {
+                Verdict::Violated(vs) => vs.len(),
+                _ => 0,
+            };
+            let outcome = match verdict {
+                Verdict::Satisfied => "satisfied",
+                Verdict::Violated(_) => "violated",
+                Verdict::Unreadable(_) => "unreadable",
+            };
+            labels.clear();
+            labels.insert("clause".to_string(), clause.as_str().to_string());
+            let _ = metrics
+                .record_gauge(VERSION_CONTRACT_VIOLATIONS, count as f64, labels.clone())
+                .await;
+            labels.insert("outcome".to_string(), outcome.to_string());
+            let _ = metrics
+                .record_counter(VERSION_CONTRACT_CHECKS_TOTAL, 1.0, labels.clone())
+                .await;
+        }
+        if let Some((tag, distance)) = &readings.nearest_release {
+            let mut labels = std::collections::HashMap::new();
+            labels.insert("release".to_string(), tag.clone());
+            let _ = metrics
+                .record_gauge(VERSION_COMMITS_SINCE_RELEASE, *distance as f64, labels)
+                .await;
+        }
+        if let Some(declared) = &readings.declared {
+            let mut labels = std::collections::HashMap::new();
+            labels.insert("version".to_string(), declared.clone());
+            let _ = metrics
+                .record_gauge(VERSION_DECLARED_INFO, 1.0, labels)
+                .await;
+        }
+    }
+
     fn set_upstream_note(&self, note: &str) {
         if let Ok(mut slot) = self.upstream_note.lock() {
             *slot = note.to_string();
@@ -1568,6 +1896,22 @@ impl MainlineDeployer {
             let url = format!("{base}/{}/{repo}.git", up.platform.slug());
             let local = format!("refs/cogneva/upstream/{}", up.platform.slug());
             let refspec = format!("+refs/heads/{}:{local}", self.cfg.branch);
+            // Release tags are imported per platform as well as into
+            // `refs/tags`, because they answer two different questions: the
+            // per-platform refs are what the version contract compares between
+            // points, while `refs/tags` is what `git describe` -- and therefore
+            // every derived version label -- reads. Without this refspec the
+            // bare repo keeps only the tags it was seeded with, so the next
+            // release tag never arrives and describe keeps naming the previous
+            // release.
+            //
+            // `--no-tags` stays: it turns off the implicit following of tags,
+            // not explicit refspecs. `--prune-tags` must never be added here --
+            // the bare repo also holds `promote/*` and `gen-*` tags, and
+            // pruning would take the baseline-port chain with it.
+            let platform_tags =
+                format!("+refs/tags/v*:refs/cogneva/tags/{}/v*", up.platform.slug());
+            let release_tags = "+refs/tags/v*:refs/tags/v*";
             match self
                 .run_cmd(
                     "git",
@@ -1579,6 +1923,8 @@ impl MainlineDeployer {
                         "--force",
                         &url,
                         &refspec,
+                        &platform_tags,
+                        release_tags,
                     ],
                     None,
                     self.cfg.upstream_fetch_timeout_secs,
@@ -1995,6 +2341,10 @@ impl MainlineDeployer {
         if let Some(advanced) = self.refresh_upstream(&bare).await {
             bare = advanced;
         }
+        // 版本契约每轮都判，不挂在"这一轮有没有推进"上：一个只在推进时才跑
+        // 的判据，在主线停住的时候（恰恰是最需要知道版本分叉没有的时候）不
+        // 出声。判在早退之前，后面的 return 都绕不过它。
+        self.report_version_contract(&bare).await;
         let images = self.deployed_images().await?;
         let deployed = classify_deployed(&images);
 
@@ -11264,5 +11614,427 @@ exit 0
             checked.push((profile, dir));
         }
         assert_eq!(checked.len(), 3, "profile set changed: {checked:?}");
+    }
+
+    // --- 版本契约：判据跑在真实 git 上 ---
+
+    use cog_core::contract::version::{judge, Clause, DeclarationChange, Verdict};
+    use cog_core::metric_names::{
+        VERSION_COMMITS_SINCE_RELEASE, VERSION_CONTRACT_CHECKS_TOTAL, VERSION_CONTRACT_VIOLATIONS,
+        VERSION_DECLARED_INFO,
+    };
+    // 读回读数用的是 trait 上的查询方法，实现类型在，方法得靠 trait 进作用域。
+    use cog_core::MetricsBackend;
+
+    /// 造一段带版本声明史的历史：c1 首次声明 0.5.7，c2 只改别的文件，c3 声明
+    /// 0.5.8。c2 是拿来证伪「凡是提交就重读一遍版本」这类近似的：它既不该进
+    /// 声明链，也不能打断 c1 到 c3 的顺序。
+    ///
+    /// 返回 (bare, work, revs)，revs 按历史顺序。
+    async fn version_repo(root: &Path) -> (PathBuf, PathBuf, Vec<String>) {
+        let bare = root.join("bare.git");
+        let work = root.join("work");
+        real_git(root, &["init", "--bare", bare.to_str().unwrap()]).await;
+        real_git(
+            root,
+            &["clone", bare.to_str().unwrap(), work.to_str().unwrap()],
+        )
+        .await;
+        real_git(&work, &["config", "user.email", "t@t.com"]).await;
+        real_git(&work, &["config", "user.name", "T"]).await;
+
+        let mut revs = Vec::new();
+        let steps = [
+            (Some("0.5.7"), "a.txt"),
+            (None, "b.txt"),
+            (Some("0.5.8"), "c.txt"),
+        ];
+        for (declared, touched) in steps {
+            if let Some(version) = declared {
+                std::fs::write(
+                    work.join("Cargo.toml"),
+                    format!("[workspace.package]\nversion = \"{version}\"\n"),
+                )
+                .unwrap();
+            }
+            std::fs::write(work.join(touched), format!("{touched}\n")).unwrap();
+            real_git(&work, &["add", "."]).await;
+            real_git(&work, &["commit", "-m", touched]).await;
+            revs.push(real_git_stdout(&work, &["rev-parse", "HEAD"]).await);
+        }
+        real_git(&work, &["push", "origin", "HEAD:main"]).await;
+        real_git(&work, &["checkout", "-B", "main"]).await;
+        (bare, work, revs)
+    }
+
+    /// 在 bare 里打一个附注 release tag——真实 release 就是这个形状，读取要能
+    /// 穿过 tag 对象拿到它指的提交。
+    async fn tag_release(bare: &Path, tag: &str, rev: &str) {
+        real_git(
+            bare,
+            &[
+                "-c",
+                "user.email=t@t.com",
+                "-c",
+                "user.name=T",
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "tag",
+                "-a",
+                tag,
+                rev,
+                "-m",
+                tag,
+            ],
+        )
+        .await;
+    }
+
+    /// 某个上报点（平台）本地存下来的 release tag 引用，形状与上游跟踪时
+    /// 用的 refspec 一致。
+    async fn tag_at_point(bare: &Path, platform: &str, tag: &str, rev: &str) {
+        real_git(
+            bare,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "update-ref",
+                &format!("refs/cogneva/tags/{platform}/{tag}"),
+                rev,
+            ],
+        )
+        .await;
+    }
+
+    fn version_deployer(root: &Path, bare: &Path) -> MainlineDeployer {
+        MainlineDeployer::new(
+            test_config(root, bare, "buildah", "kubectl"),
+            test_workspaces(root, bare),
+        )
+    }
+
+    /// 断言某条判据判出违规，且违规对象只有 `subject` 一个。
+    fn assert_violation(verdict: &Verdict, subject: &str) {
+        match verdict {
+            Verdict::Violated(violations) => {
+                assert_eq!(violations.len(), 1, "not one violation: {violations:?}");
+                assert_eq!(violations[0].subject, subject);
+            }
+            other => panic!("expected a violation about {subject}, got {other:?}"),
+        }
+    }
+
+    /// 契约成立时：声明链只含真正改了声明的提交，读数与判据一致。
+    ///
+    /// 判据与读数是两个出口：卡住「离 release 多远」会把正常前进判成违规，所以
+    /// 距离只出现在读数里；这里同时断言两者，防止哪天有人把它挪回判据里。
+    #[tokio::test]
+    async fn the_version_contract_holds_when_every_release_is_declared_and_tagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, revs) = version_repo(root).await;
+        tag_release(&bare, "v0.5.7", &revs[0]).await;
+        tag_release(&bare, "v0.5.8", &revs[2]).await;
+
+        let (evidence, readings) = version_deployer(root, &bare).version_evidence("main").await;
+
+        assert!(evidence.chain_complete, "the bare repo was cloned in full");
+        assert_eq!(
+            evidence.declarations,
+            vec![
+                DeclarationChange {
+                    rev: revs[0].clone(),
+                    from: "0.5.7".into(),
+                    to: "0.5.7".into(),
+                },
+                DeclarationChange {
+                    rev: revs[2].clone(),
+                    from: "0.5.7".into(),
+                    to: "0.5.8".into(),
+                },
+            ],
+            "the commit that touches no declaration must not appear in the chain"
+        );
+        assert_eq!(readings.declared.as_deref(), Some("0.5.8"));
+        assert_eq!(readings.nearest_release, Some(("v0.5.8".to_string(), 0)));
+
+        let report = judge(&evidence);
+        for clause in [
+            Clause::DeclarationMonotone,
+            Clause::TagFidelity,
+            Clause::ReleasePoint,
+        ] {
+            assert_eq!(
+                *report.verdict(clause),
+                Verdict::Satisfied,
+                "{}",
+                clause.as_str()
+            );
+        }
+    }
+
+    /// 一条 tag 指着的提交不是 tracked main 上的 —— 从分叉或已重写的历史里推
+    /// 上来的 tag 就是这个形状。这是 tag 自己的事实，不是读数缺口，所以链读全
+    /// 了之后它必须判违规，而不是读不到。
+    #[tokio::test]
+    async fn a_release_tag_outside_the_tracked_main_is_a_violation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, revs) = version_repo(root).await;
+        tag_release(&bare, "v0.5.8", &revs[2]).await;
+
+        // 从 c2 拉一条侧支，声明更高的版本、打 tag、只推分支不并回 main。
+        real_git(&work, &["checkout", "-b", "side", &revs[1]]).await;
+        std::fs::write(
+            work.join("Cargo.toml"),
+            "[workspace.package]\nversion = \"0.5.9\"\n",
+        )
+        .unwrap();
+        real_git(&work, &["add", "."]).await;
+        real_git(&work, &["commit", "-m", "side"]).await;
+        real_git(&work, &["push", "origin", "side"]).await;
+        let side = real_git_stdout(&work, &["rev-parse", "HEAD"]).await;
+        real_git(&work, &["checkout", "main"]).await;
+        tag_release(&bare, "v0.5.9", &side).await;
+
+        let (evidence, _) = version_deployer(root, &bare).version_evidence("main").await;
+
+        let foreign = evidence
+            .releases
+            .iter()
+            .find(|r| r.tag == "v0.5.9")
+            .expect("the tag is visible in this repo");
+        assert!(!foreign.on_tracked_main, "the side branch is not on main");
+        assert!(evidence.chain_complete);
+        assert_violation(judge(&evidence).verdict(Clause::TagFidelity), "v0.5.9");
+    }
+
+    /// 一个版本被打了两次 release —— 两个生产者各自「合入 0.5.8」，就是这个
+    /// 形状。两条 tag 都忠实（各自指的提交都声明 0.5.8），所以只有 release 落
+    /// 点这条判据该响：同一个版本名不能盖住两个代码状态。
+    #[tokio::test]
+    async fn two_release_tags_for_one_version_are_a_release_point_violation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, revs) = version_repo(root).await;
+        tag_release(&bare, "v0.5.8", &revs[2]).await;
+        tag_release(&bare, "v0.5.8-hotfix", &revs[2]).await;
+
+        let (evidence, _) = version_deployer(root, &bare).version_evidence("main").await;
+        let report = judge(&evidence);
+
+        assert_eq!(*report.verdict(Clause::TagFidelity), Verdict::Satisfied);
+        assert_violation(report.verdict(Clause::ReleasePoint), "v0.5.8-hotfix");
+    }
+
+    /// 同一条 tag（指向 main 上的提交、名字里的版本这个历史从没声明过）在两种
+    /// 证据下应当有两种结论：链读全了 = 违规，链被截断 = 读不到。
+    ///
+    /// 截断在这里是浅克隆造的，不是摆出来的——浅克隆的边界提交在「有没有父提
+    /// 交」上和根提交给出同一个答案，正是它会把正常历史判成违规。
+    #[tokio::test]
+    async fn the_same_untag_reading_is_a_violation_only_when_the_chain_reaches_its_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, revs) = version_repo(root).await;
+        tag_release(&bare, "v0.5.8", &revs[2]).await;
+        tag_release(&bare, "v0.5.9", &revs[2]).await;
+
+        let full = root.join("full.git");
+        real_git(
+            root,
+            &[
+                "clone",
+                "--bare",
+                "-b",
+                "main",
+                &format!("file://{}", bare.display()),
+                full.to_str().unwrap(),
+            ],
+        )
+        .await;
+        // `--depth` 只在 file:// 传输下生效，本地路径克隆会静默地整份拷过来——
+        // 那样这条用例就变成「两条都是全量」而永远成立。
+        let shallow = root.join("shallow.git");
+        real_git(
+            root,
+            &[
+                "clone",
+                "--bare",
+                "-b",
+                "main",
+                "--depth",
+                "1",
+                &format!("file://{}", bare.display()),
+                shallow.to_str().unwrap(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            real_git_stdout(
+                root,
+                &[
+                    "--git-dir",
+                    shallow.to_str().unwrap(),
+                    "rev-parse",
+                    "--is-shallow-repository"
+                ]
+            )
+            .await,
+            "true",
+            "the depth-1 clone has to actually be shallow for this test to mean anything"
+        );
+
+        let (deep_evidence, _) = version_deployer(root, &full).version_evidence("main").await;
+        let (cut_evidence, _) = version_deployer(root, &shallow)
+            .version_evidence("main")
+            .await;
+
+        assert!(deep_evidence.chain_complete);
+        assert!(!cut_evidence.chain_complete);
+        // 判 tag 是否忠实只用被指提交自己那棵树，链断了也照样读得到——这一条
+        // 在两种证据下都该响，正好证明两种结论的差别来自链，而不是判据缺席。
+        assert_violation(judge(&deep_evidence).verdict(Clause::TagFidelity), "v0.5.9");
+        assert_violation(judge(&cut_evidence).verdict(Clause::TagFidelity), "v0.5.9");
+        assert_violation(
+            judge(&deep_evidence).verdict(Clause::ReleasePoint),
+            "v0.5.9",
+        );
+        assert!(
+            matches!(
+                judge(&cut_evidence).verdict(Clause::ReleasePoint),
+                Verdict::Unreadable(_)
+            ),
+            "a truncated chain cannot tell 'never declared' from its own blind spot"
+        );
+    }
+
+    /// 两个上报点看到的 release tag 必须一致。缺少 tag 的那个点不能靠「它也
+    /// 没多出什么」蒙混过去：镜像没同步到 tag，正是发布通道静默失效的样子。
+    #[tokio::test]
+    async fn a_reporting_point_missing_a_release_tag_is_a_tag_set_violation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, revs) = version_repo(root).await;
+        for tag in ["v0.5.7", "v0.5.8"] {
+            tag_at_point(&bare, "github", tag, &revs[2]).await;
+        }
+        tag_at_point(&bare, "gitee", "v0.5.7", &revs[2]).await;
+
+        let deployer =
+            MainlineDeployer::new(upstream_config(root, &bare), test_workspaces(root, &bare));
+        let (evidence, _) = deployer.version_evidence("main").await;
+        assert_eq!(
+            evidence.tag_sets.len(),
+            2,
+            "both configured points have to be read: {:?}",
+            evidence.tag_sets
+        );
+        // 违规对象是那条 tag，缺它的那个点写在详情里。
+        let report = judge(&evidence);
+        assert_violation(report.verdict(Clause::TagSetAgreement), "v0.5.8");
+        let Verdict::Violated(violations) = report.verdict(Clause::TagSetAgreement) else {
+            unreachable!("just asserted")
+        };
+        assert!(
+            violations[0].detail.contains("gitee"),
+            "the reading has to name the point that is missing the tag: {}",
+            violations[0].detail
+        );
+
+        // 对照：把 gitee 补上同一个 tag，同一条判据必须转绿——否则上一条断言
+        // 只是「这条判据总是响」，不成立
+        tag_at_point(&bare, "gitee", "v0.5.8", &revs[2]).await;
+        let (agreed, _) = deployer.version_evidence("main").await;
+        assert_eq!(
+            *judge(&agreed).verdict(Clause::TagSetAgreement),
+            Verdict::Satisfied
+        );
+    }
+
+    /// 判据的读数必须自成一路：每条判据一个 clause，判了几次与判出几次违规分
+    /// 开记。0 与「没报」在读数上要能分开，所以没违规的判据也要有读数。
+    #[tokio::test]
+    async fn the_version_contract_reports_its_own_readings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, revs) = version_repo(root).await;
+        tag_release(&bare, "v0.5.7", &revs[0]).await;
+        tag_release(&bare, "v0.5.8", &revs[2]).await;
+        tag_release(&bare, "v0.5.9", &revs[2]).await;
+
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        version_deployer(root, &bare)
+            .with_metrics(metrics.clone())
+            .report_version_contract("main")
+            .await;
+
+        let gauges = metrics
+            .query_gauge_latest(VERSION_CONTRACT_VIOLATIONS.as_str())
+            .await
+            .unwrap();
+        let expected = [
+            (Clause::DeclarationMonotone, 0.0),
+            (Clause::TagFidelity, 1.0),
+            (Clause::ReleasePoint, 1.0),
+            (Clause::TagSetAgreement, 0.0),
+        ];
+        for (clause, value) in expected {
+            let sample = gauges
+                .iter()
+                .find(|s| s.labels.get("clause").map(String::as_str) == Some(clause.as_str()))
+                .unwrap_or_else(|| panic!("no violations reading for {}", clause.as_str()));
+            assert_eq!(sample.value, value, "{}", clause.as_str());
+        }
+
+        let counters = metrics
+            .query_counter_totals(VERSION_CONTRACT_CHECKS_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert_eq!(counters.len(), Clause::ALL.len(), "one series per clause");
+        let outcome = |clause: &str| {
+            counters
+                .iter()
+                .find(|s| s.labels.get("clause").map(String::as_str) == Some(clause))
+                .unwrap_or_else(|| panic!("no checks reading for {clause}"))
+        };
+        for (clause, expected_outcome) in [
+            ("declaration_monotone", "satisfied"),
+            ("tag_fidelity", "violated"),
+            ("release_point", "violated"),
+            ("tag_set_agreement", "unreadable"),
+        ] {
+            let sample = outcome(clause);
+            assert_eq!(sample.value, 1.0, "{clause}");
+            assert_eq!(
+                sample.labels.get("outcome").map(String::as_str),
+                Some(expected_outcome),
+                "{clause}"
+            );
+        }
+
+        // 读数：最近一次 release 的距离与 main 声明的版本。距离不进判据，只在这
+        // 里出现；两个 tag 同距离时取 ref 顺序在前的那个（git 保证顺序）。
+        let gauges = metrics
+            .query_gauge_latest(VERSION_COMMITS_SINCE_RELEASE.as_str())
+            .await
+            .unwrap();
+        assert_eq!(gauges.len(), 1);
+        assert_eq!(
+            gauges[0].labels.get("release").map(String::as_str),
+            Some("v0.5.8")
+        );
+        assert_eq!(gauges[0].value, 0.0);
+
+        let declared = metrics
+            .query_gauge_latest(VERSION_DECLARED_INFO.as_str())
+            .await
+            .unwrap();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(
+            declared[0].labels.get("version").map(String::as_str),
+            Some("0.5.8")
+        );
+        assert_eq!(declared[0].value, 1.0);
     }
 }

@@ -171,9 +171,45 @@ impl VersionId {
     }
 }
 
+/// The declared workspace version, read from a `Cargo.toml` body.
+///
+/// Only the `[workspace.package]` table counts. The file names `version` in
+/// other tables too, and reading one of those would report a crate's version as
+/// the workspace's -- a value that looks right and answers the wrong question.
+/// `None` means the table declares no version, so a caller cannot mistake an
+/// unreadable file for a version.
+pub fn declared_version(cargo_toml: &str) -> Option<&str> {
+    let mut in_workspace_package = false;
+    for line in cargo_toml.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_workspace_package = line == "[workspace.package]";
+            continue;
+        }
+        if !in_workspace_package {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("version") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start().strip_prefix('"')?;
+        let end = rest.find('"')?;
+        return Some(&rest[..end]);
+    }
+    None
+}
+
 /// One commit that changed `workspace.package.version`, with the value before
 /// and after. Only commits that touch the declaration can change it, so these
 /// are the whole input needed to order the declarations along main.
+///
+/// The commit that first declares a version has no predecessor to compare
+/// against, and carries the same value on both sides; anything else would
+/// invent a version the file never held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationChange {
     pub rev: String,
@@ -190,6 +226,13 @@ pub struct DeclarationChange {
 pub struct ReleaseTag {
     pub tag: String,
     pub rev: String,
+    /// Where the tagged commit sits relative to the main being judged.
+    ///
+    /// A tag can name a commit this history does not contain -- a tag left over
+    /// from a rewritten history, or one a contributor pushed from a fork. That
+    /// is a fact about the tag, not a gap in the reading, so it is carried
+    /// rather than folded into a missing declaration.
+    pub on_tracked_main: bool,
     pub declared_version: String,
 }
 
@@ -207,13 +250,22 @@ pub enum Clause {
     DeclarationMonotone,
     /// A tag's commit declares the version the tag names.
     TagFidelity,
-    /// One tag per version, on the first commit that declares it.
+    /// One tag per version, and every tag names a version this history declares.
     ReleasePoint,
     /// Every reporting point sees the same release tags.
     TagSetAgreement,
 }
 
 impl Clause {
+    /// Every clause, so a reporter can cover all of them instead of the ones it
+    /// happened to remember.
+    pub const ALL: [Clause; 4] = [
+        Clause::DeclarationMonotone,
+        Clause::TagFidelity,
+        Clause::ReleasePoint,
+        Clause::TagSetAgreement,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Clause::DeclarationMonotone => "declaration_monotone",
@@ -292,6 +344,16 @@ impl ContractReport {
         .collect()
     }
 
+    /// The verdict for one clause, for callers that report per clause.
+    pub fn verdict(&self, clause: Clause) -> &Verdict {
+        match clause {
+            Clause::DeclarationMonotone => &self.declaration_monotone,
+            Clause::TagFidelity => &self.tag_fidelity,
+            Clause::ReleasePoint => &self.release_point,
+            Clause::TagSetAgreement => &self.tag_set_agreement,
+        }
+    }
+
     fn verdicts(&self) -> [&Verdict; 4] {
         [
             &self.declaration_monotone,
@@ -307,6 +369,15 @@ impl ContractReport {
 pub struct Evidence {
     /// Commits that changed the declaration, oldest first.
     pub declarations: Vec<DeclarationChange>,
+    /// Whether the declaration chain covers the whole history of the file.
+    ///
+    /// This is provenance about the other fields, and it decides what a missing
+    /// declaration means: a complete chain proves the tracked history never
+    /// declared a version, while a chain cut short (a shallow clone, a truncated
+    /// walk) cannot tell that apart from its own blind spot. Reporting the
+    /// second case as missing evidence is the difference between a judgement
+    /// and a guess.
+    pub chain_complete: bool,
     /// Release tags, with the declaration at the commit each points to.
     pub releases: Vec<ReleaseTag>,
     /// The release tags each reporting point can reach.
@@ -317,8 +388,12 @@ pub struct Evidence {
 pub fn judge(evidence: &Evidence) -> ContractReport {
     ContractReport {
         declaration_monotone: judge_declaration_monotone(&evidence.declarations),
-        tag_fidelity: judge_tag_fidelity(&evidence.releases),
-        release_point: judge_release_point(&evidence.releases, &evidence.declarations),
+        tag_fidelity: judge_tag_fidelity(&evidence.releases, evidence.chain_complete),
+        release_point: judge_release_point(
+            &evidence.releases,
+            &evidence.declarations,
+            evidence.chain_complete,
+        ),
         tag_set_agreement: judge_tag_set_agreement(&evidence.tag_sets),
     }
 }
@@ -352,7 +427,7 @@ fn judge_declaration_monotone(declarations: &[DeclarationChange]) -> Verdict {
     }
 }
 
-fn judge_tag_fidelity(releases: &[ReleaseTag]) -> Verdict {
+fn judge_tag_fidelity(releases: &[ReleaseTag], chain_complete: bool) -> Verdict {
     if releases.is_empty() {
         return Verdict::Unreadable("no release tag to check".to_string());
     }
@@ -361,6 +436,24 @@ fn judge_tag_fidelity(releases: &[ReleaseTag]) -> Verdict {
         let Some(tagged) = Version::parse(&release.tag) else {
             return Verdict::Unreadable(format!("{} is not a release tag", release.tag));
         };
+        if !release.on_tracked_main {
+            if !chain_complete {
+                return Verdict::Unreadable(format!(
+                    "{} points at {}, which the history read here does not contain, \
+                     and that history was not read to its root",
+                    release.tag, release.rev
+                ));
+            }
+            violations.push(Violation {
+                clause: Clause::TagFidelity,
+                subject: release.tag.clone(),
+                detail: format!(
+                    "{} points at {}, which is not on the tracked main",
+                    release.tag, release.rev
+                ),
+            });
+            continue;
+        }
         let Some(declared) = Version::parse(&release.declared_version) else {
             return Verdict::Unreadable(format!(
                 "the declaration at {} ({}), which {} points to, could not be read",
@@ -385,7 +478,11 @@ fn judge_tag_fidelity(releases: &[ReleaseTag]) -> Verdict {
     }
 }
 
-fn judge_release_point(releases: &[ReleaseTag], declarations: &[DeclarationChange]) -> Verdict {
+fn judge_release_point(
+    releases: &[ReleaseTag],
+    declarations: &[DeclarationChange],
+    chain_complete: bool,
+) -> Verdict {
     if releases.is_empty() {
         return Verdict::Unreadable("no release tag to check".to_string());
     }
@@ -404,35 +501,35 @@ fn judge_release_point(releases: &[ReleaseTag], declarations: &[DeclarationChang
             continue;
         }
         seen.push((tagged, release.tag.clone()));
-        // A release is the commit that first declares the version. Releasing a
-        // version that main had already left means the tag names a point that
-        // was not a release, and the version now names two code states: the
-        // tagged commit and (further along) whatever main carries today.
-        if !declarations.is_empty() {
-            let first = declarations.iter().position(|change| {
-                Version::parse(&change.to)
-                    .map(|v| v == tagged)
-                    .unwrap_or(false)
-            });
-            match first {
-                None => {
-                    return Verdict::Unreadable(format!(
-                        "{} declares {}, which no declaration change on main introduces",
-                        release.rev, release.declared_version
-                    ))
-                }
-                Some(index) if declarations[index].rev != release.rev => {
-                    violations.push(Violation {
-                        clause: Clause::ReleasePoint,
-                        subject: release.tag.clone(),
-                        detail: format!(
-                            "{} was declared first at {}, but the tag points at {}",
-                            tagged, declarations[index].rev, release.rev
-                        ),
-                    });
-                }
-                Some(_) => {}
+        if declarations.is_empty() {
+            continue;
+        }
+        // The tag has to name a version this history declares. How far past the
+        // declaration the tag sits is deliberately not judged: releasing means
+        // tagging main where it stands, and histories carry releases that are a
+        // few commits past the bump. That distance is a reading, and the derived
+        // label is what keeps it from making two code states share a name.
+        let declared_somewhere = declarations.iter().any(|change| {
+            Version::parse(&change.to)
+                .map(|v| v == tagged)
+                .unwrap_or(false)
+        });
+        if !declared_somewhere {
+            if !chain_complete {
+                return Verdict::Unreadable(format!(
+                    "{} names {tagged}, which no declaration in the history read here \
+                     introduces, and that history was not read to its root",
+                    release.tag
+                ));
             }
+            violations.push(Violation {
+                clause: Clause::ReleasePoint,
+                subject: release.tag.clone(),
+                detail: format!(
+                    "{} names {tagged}, which the tracked history never declared",
+                    release.tag
+                ),
+            });
         }
     }
     if violations.is_empty() {
@@ -447,6 +544,13 @@ fn judge_tag_set_agreement(tag_sets: &[TagSet]) -> Verdict {
         return Verdict::Unreadable(
             "fewer than two reporting points, so the tag sets cannot disagree".to_string(),
         );
+    }
+    // No tag anywhere is not agreement. Two empty sets agree only in the sense
+    // that neither says anything, and that is the shape a point takes when its
+    // tags were never imported -- the failure this clause exists to catch. The
+    // two clauses beside this one treat their empty evidence the same way.
+    if tag_sets.iter().all(|set| set.tags.is_empty()) {
+        return Verdict::Unreadable("no release tag read from any reporting point".to_string());
     }
     // The authority is the point that carries the most release tags: the
     // upstream platform is where release tags are created, and a local point
@@ -602,8 +706,42 @@ mod tests {
         ReleaseTag {
             tag: tag.to_string(),
             rev: rev.to_string(),
+            on_tracked_main: true,
             declared_version: declared.to_string(),
         }
+    }
+
+    /// A tag whose commit this history does not contain.
+    fn foreign_release(tag: &str, rev: &str) -> ReleaseTag {
+        ReleaseTag {
+            tag: tag.to_string(),
+            rev: rev.to_string(),
+            on_tracked_main: false,
+            declared_version: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_the_workspace_table_declares_the_release_version() {
+        // A crate's own version is not the release's: reading it would report a
+        // number that looks like an answer and is not one.
+        let cargo_toml = "[package]\nname = \"cog-x\"\nversion = \"1.2.3\"\n\n[workspace.package]\nversion = \"0.5.8\"\n";
+        assert_eq!(declared_version(cargo_toml), Some("0.5.8"));
+        assert_eq!(declared_version("[package]\nversion = \"1.2.3\"\n"), None);
+        assert_eq!(declared_version(""), None);
+    }
+
+    #[test]
+    fn a_version_key_that_is_not_an_assignment_is_not_a_declaration() {
+        // `version.workspace = true` inherits; it declares nothing here, and
+        // reading it as a version would put a boolean where a version goes.
+        let cargo_toml =
+            "[workspace.package]\nversion = \"0.5.8\"\n\n[package]\nversion.workspace = true\n";
+        assert_eq!(declared_version(cargo_toml), Some("0.5.8"));
+        assert_eq!(
+            declared_version("[package]\nversion.workspace = true\n"),
+            None
+        );
     }
 
     #[test]
@@ -649,7 +787,7 @@ mod tests {
 
     #[test]
     fn a_tag_pointing_at_a_commit_that_declares_another_version_is_a_violation() {
-        let verdict = judge_tag_fidelity(&[release("v0.5.8", "72c99e3", "0.5.9")]);
+        let verdict = judge_tag_fidelity(&[release("v0.5.8", "72c99e3", "0.5.9")], true);
         match verdict {
             Verdict::Violated(violations) => {
                 assert_eq!(violations[0].clause, Clause::TagFidelity);
@@ -662,16 +800,19 @@ mod tests {
     #[test]
     fn a_faithful_tag_is_satisfied() {
         assert_eq!(
-            judge_tag_fidelity(&[release("v0.5.8", "72c99e3", "0.5.8")]),
+            judge_tag_fidelity(&[release("v0.5.8", "72c99e3", "0.5.8")], true),
             Verdict::Satisfied
         );
     }
 
     #[test]
     fn every_clause_without_release_tags_is_unreadable() {
-        assert!(matches!(judge_tag_fidelity(&[]), Verdict::Unreadable(_)));
         assert!(matches!(
-            judge_release_point(&[], &[change("a", "0.5.7", "0.5.8")]),
+            judge_tag_fidelity(&[], true),
+            Verdict::Unreadable(_)
+        ));
+        assert!(matches!(
+            judge_release_point(&[], &[change("a", "0.5.7", "0.5.8")], true),
             Verdict::Unreadable(_)
         ));
     }
@@ -684,6 +825,7 @@ mod tests {
                 release("v0.5.8", "890e4c0", "0.5.8"),
             ],
             &[change("72c99e3", "0.5.7", "0.5.8")],
+            true,
         );
         match verdict {
             Verdict::Violated(violations) => {
@@ -696,23 +838,74 @@ mod tests {
     }
 
     #[test]
-    fn tagging_past_the_release_point_is_a_violation() {
-        // main declared 0.5.8 at `first`, then moved on; tagging a later commit
-        // releases a point that was not a release and leaves the version naming
-        // both the tagged commit and today's main.
+    fn a_tag_placed_past_the_declaration_is_satisfied() {
+        // Measured shape of the real history: 0.5.7 was declared at bf34767 and
+        // released at 8ed8e67, two commits later, because releasing tags main
+        // where it stands. Judging that distance would call three of the four
+        // releases in this repository violations, which is the kind of false
+        // positive that costs a reading its credibility. The distance is
+        // reported; the tag still has to name a declared version.
+        assert_eq!(
+            judge_release_point(
+                &[release("v0.5.7", "8ed8e67", "0.5.7")],
+                &[
+                    change("bf34767", "0.2.0", "0.5.7"),
+                    change("8ed8e67", "0.5.7", "0.5.7"),
+                ],
+                true,
+            ),
+            Verdict::Satisfied
+        );
+    }
+
+    #[test]
+    fn a_tag_naming_a_version_the_history_never_declared_is_a_violation() {
         let verdict = judge_release_point(
-            &[release("v0.5.8", "later", "0.5.8")],
-            &[
-                change("first", "0.5.7", "0.5.8"),
-                change("later", "0.5.8", "0.5.8"),
-            ],
+            &[release("v0.9.9", "deadbee", "0.5.8")],
+            &[change("72c99e3", "0.5.7", "0.5.8")],
+            true,
         );
         match verdict {
             Verdict::Violated(violations) => {
-                assert!(violations[0].detail.contains("declared first at first"));
+                assert!(violations[0].detail.contains("never declared"));
             }
             other => panic!("expected a violation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_same_missing_declaration_is_unreadable_when_the_chain_is_cut_short() {
+        // Without knowing the chain reached the root, "no declaration
+        // introduces it" cannot be told apart from a walk that stopped early --
+        // which is what a shallow clone does, and it would otherwise turn three
+        // normal release tags into violations.
+        assert!(matches!(
+            judge_release_point(
+                &[release("v0.9.9", "deadbee", "0.5.8")],
+                &[change("72c99e3", "0.5.7", "0.5.8")],
+                false,
+            ),
+            Verdict::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn a_tag_outside_the_tracked_history_is_a_violation() {
+        let verdict = judge_tag_fidelity(&[foreign_release("v0.1.20", "3161905")], true);
+        match verdict {
+            Verdict::Violated(violations) => {
+                assert!(violations[0].detail.contains("not on the tracked main"));
+            }
+            other => panic!("expected a violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tag_outside_the_visible_history_is_unreadable_when_the_chain_is_cut_short() {
+        assert!(matches!(
+            judge_tag_fidelity(&[foreign_release("v0.1.20", "3161905")], false),
+            Verdict::Unreadable(_)
+        ));
     }
 
     #[test]
@@ -721,6 +914,7 @@ mod tests {
             judge_release_point(
                 &[release("v0.5.8", "first", "0.5.8")],
                 &[change("first", "0.5.7", "0.5.8")],
+                true,
             ),
             Verdict::Satisfied
         );
@@ -750,28 +944,45 @@ mod tests {
 
     #[test]
     fn the_measured_shape_of_the_repo_is_satisfied_on_the_clauses_it_can_check() {
-        // Measured in the working tree on 2026-09-26: main's first-parent
-        // history starts at f9f1d02, whose Cargo.toml carries version 0.5.7 for
-        // the first time (there is no earlier declaration to compare against,
-        // so it is recorded as a no-op), and 72c99e3 is the one commit that
-        // bumped it to 0.5.8. The only release tag reachable here is v0.5.8, and
-        // it names 72c99e3 -- the very commit that first declared it. The 93
-        // commits that followed without a bump are not a violation: they are a
-        // distance, and the distance is what the reading reports instead.
+        // Measured on 2026-09-26 against the cluster bare repo, whose history is
+        // the full 604-commit main (the working tree here is a 156-commit
+        // shallow clone, so its walk stops early and cannot answer this). Four
+        // commits changed the declaration, each tag names the version declared
+        // at the commit it points at, and the two points that track the release
+        // tags see the same four. The tags sit 17, 5, 2 and 0 commits past their
+        // declarations -- a distance, not a violation.
         let evidence = Evidence {
             declarations: vec![
-                change("f9f1d02", "0.5.7", "0.5.7"),
+                change("3668417", "0.1.20", "0.1.20"),
+                change("9b1a361", "0.1.20", "0.2.0"),
+                change("bf34767", "0.2.0", "0.5.7"),
                 change("72c99e3", "0.5.7", "0.5.8"),
             ],
-            releases: vec![release("v0.5.8", "72c99e3", "0.5.8")],
+            chain_complete: true,
+            releases: vec![
+                release("v0.1.20", "3161905", "0.1.20"),
+                release("v0.2.0", "8635921", "0.2.0"),
+                release("v0.5.7", "8ed8e67", "0.5.7"),
+                release("v0.5.8", "72c99e3", "0.5.8"),
+            ],
             tag_sets: vec![
                 TagSet {
                     point: "github".to_string(),
-                    tags: vec!["v0.5.8".to_string()],
+                    tags: vec![
+                        "v0.1.20".to_string(),
+                        "v0.2.0".to_string(),
+                        "v0.5.7".to_string(),
+                        "v0.5.8".to_string(),
+                    ],
                 },
                 TagSet {
-                    point: "cluster-bare".to_string(),
-                    tags: vec!["v0.5.8".to_string()],
+                    point: "gitee".to_string(),
+                    tags: vec![
+                        "v0.1.20".to_string(),
+                        "v0.2.0".to_string(),
+                        "v0.5.7".to_string(),
+                        "v0.5.8".to_string(),
+                    ],
                 },
             ],
         };
@@ -787,6 +998,7 @@ mod tests {
     fn an_unreadable_clause_keeps_the_contract_from_holding() {
         let report = judge(&Evidence {
             declarations: vec![change("a", "0.5.8", "0.5.9")],
+            chain_complete: true,
             releases: vec![],
             tag_sets: vec![],
         });
@@ -808,5 +1020,45 @@ mod tests {
             tags: vec!["v0.5.8".to_string()],
         }]);
         assert!(matches!(verdict, Verdict::Unreadable(_)), "{verdict:?}");
+    }
+
+    /// Two points that both read no tag agree only in saying nothing --
+    /// which is what a point looks like when its tags were never imported.
+    #[test]
+    fn every_point_reading_no_tag_is_unreadable_not_agreement() {
+        let verdict = judge_tag_set_agreement(&[
+            TagSet {
+                point: "github".to_string(),
+                tags: vec![],
+            },
+            TagSet {
+                point: "gitee".to_string(),
+                tags: vec![],
+            },
+        ]);
+        assert!(matches!(verdict, Verdict::Unreadable(_)), "{verdict:?}");
+    }
+
+    /// A point that has released nothing yet, next to one that has, is a real
+    /// disagreement: the empty point's labels would name the wrong release.
+    #[test]
+    fn one_point_reading_no_tag_while_another_has_one_is_a_violation() {
+        let verdict = judge_tag_set_agreement(&[
+            TagSet {
+                point: "github".to_string(),
+                tags: vec!["v0.5.8".to_string()],
+            },
+            TagSet {
+                point: "gitee".to_string(),
+                tags: vec![],
+            },
+        ]);
+        match verdict {
+            Verdict::Violated(violations) => {
+                assert_eq!(violations.len(), 1);
+                assert_eq!(violations[0].subject, "v0.5.8");
+            }
+            other => panic!("expected a violation, got {other:?}"),
+        }
     }
 }

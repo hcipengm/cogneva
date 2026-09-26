@@ -73,6 +73,12 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "llm_upstream_failures_total",
         "Total LLM upstream failures, excluding rate limits",
     ),
+    (
+        "cogneva_version_contract_checks_total",
+        "Version contract judgements by clause and outcome. Read next to the \
+         violations: without it, a contract that holds and a judgement that has \
+         never run render the same",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].
@@ -145,6 +151,27 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "llm_pool_next_attempt_unix",
         "When the next pool probe is due, as a Unix timestamp",
+    ),
+    (
+        "cogneva_version_commits_since_release",
+        "First-parent commits between the tracked main and the newest release \
+         tag reachable from it. The published artifact is built from the tag, \
+         so this is how far the running code has moved past what was released. \
+         Absent when no release tag is reachable, which is not zero",
+    ),
+    (
+        "cogneva_version_declared_info",
+        "The version the tracked main declares, as a label on a constant 1: a \
+         label rather than a value because the declaration is an identity, not \
+         a measurement. Bounded by the number of releases, unlike the build \
+         label, which changes with every commit",
+    ),
+    (
+        "cogneva_version_contract_violations",
+        "Current violations of the version contract by clause. A standing count \
+         rather than a total, so a violation nobody fixed does not look like a \
+         rising rate of new ones. Reported for every clause, including the ones \
+         at zero, so an absent series means the clause was never judged",
     ),
 ];
 

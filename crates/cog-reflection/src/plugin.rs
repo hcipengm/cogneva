@@ -1087,8 +1087,15 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 warn!("mainline deployer enabled but workspace allocator missing; skipping");
                 return Ok(());
             };
-            let deployer =
-                std::sync::Arc::new(crate::MainlineDeployer::new(ml_config.clone(), workspaces));
+            let deployer = {
+                let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces);
+                // 版本契约的读数与其他判据分列：它答的是"跑的是哪个名字、
+                // 这个名字离发布点多远"，与构建/滚动的判据不是同一个问题。
+                match ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                    Some(metrics) => std::sync::Arc::new(deployer.with_metrics(metrics)),
+                    None => std::sync::Arc::new(deployer),
+                }
+            };
             let shutdown = cog_core::ShutdownSignal::new();
             if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
                 let shutdown = shutdown.clone();

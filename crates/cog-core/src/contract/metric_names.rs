@@ -128,6 +128,13 @@ metric_names! {
     EVOLUTION_GENERATED_CHANGE_HUNKS_TOTAL => "evolution_generated_change_hunks_total",
     EVOLUTION_GENERATED_CHANGE_HUNKS_FAITHFUL => "evolution_generated_change_hunks_faithful",
 
+    // cog-reflection — the version contract: what the tracked history says the
+    // code at the tracked main is, and whether the release tags still describe it.
+    VERSION_COMMITS_SINCE_RELEASE => "cogneva_version_commits_since_release",
+    VERSION_DECLARED_INFO => "cogneva_version_declared_info",
+    VERSION_CONTRACT_VIOLATIONS => "cogneva_version_contract_violations",
+    VERSION_CONTRACT_CHECKS_TOTAL => "cogneva_version_contract_checks_total",
+
     // cog-gateway — request accounting.
     HTTP_REQUESTS_TOTAL => "http_requests_total",
     HTTP_REQUEST_DURATION_MS => "http_request_duration_ms",
