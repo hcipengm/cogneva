@@ -30,33 +30,61 @@ pub struct GitHubPlugin {
         crate::config::GitHubIntegrationConfig,
         Arc<dyn CodePlatformProvider>,
     )>,
+    /// 本插件起的后台循环的停止信号（见 `new` 处的说明）。
+    shutdown: cog_core::shutdown::ShutdownSignal,
     loop_state: Mutex<Option<LoopState>>,
 }
 
 type SharedLoop = Arc<tokio::sync::Mutex<crate::discovery_loop::GitHubDiscoveryLoop>>;
+
+/// 循环名：由本插件启动的四个后台循环各一个。两个平台轮询是同一段代码的两个
+/// 实例，名字必须分开——共用一个名字会让死掉的那个躲在活着的那个的心跳后面。
+/// 取值集由此处的常量决定，不由流量决定。
+pub const GITHUB_DISCOVERY_POLL_LOOP: &str = "github_discovery_poll";
+/// 循环名，见 [`GITHUB_DISCOVERY_POLL_LOOP`] 的说明。
+pub const GITEE_DISCOVERY_POLL_LOOP: &str = "gitee_discovery_poll";
+/// 循环名，见 [`GITHUB_DISCOVERY_POLL_LOOP`] 的说明。
+pub const STAGED_CHANGE_DRAIN_LOOP: &str = "github_staged_change_drain";
+/// 循环名，见 [`GITHUB_DISCOVERY_POLL_LOOP`] 的说明。
+pub const LANDING_CI_WATCH_LOOP: &str = "github_landing_ci_watch";
 
 /// 平台轮询任务：间隔触发 run_once，shutdown 信号退出。
 fn spawn_polling_loop(
     platform: &'static str,
     shared: SharedLoop,
     interval_secs: u64,
-    mut rx: tokio::sync::watch::Receiver<bool>,
+    shutdown: cog_core::shutdown::ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(30));
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = rx.changed() => {
-                    info!(platform, "discovery polling loop shutting down");
-                    return;
+    let name = if platform == "gitee" {
+        GITEE_DISCOVERY_POLL_LOOP
+    } else {
+        GITHUB_DISCOVERY_POLL_LOOP
+    };
+    let stop = shutdown.clone();
+    cog_core::loop_health::spawn(
+        name,
+        cog_core::loop_health::Cadence::Periodic(interval),
+        shutdown,
+        move |beat| async move {
+            loop {
+                // 每轮盖一次，抓到没有都盖：这一轮的轮询没发现新东西是常态，
+                // 不能读成循环停了。
+                beat.beat();
+                tokio::select! {
+                    biased;
+                    _ = stop.wait() => {
+                        info!(platform, "discovery polling loop shutting down");
+                        return;
+                    }
+                    _ = tokio::time::sleep(interval) => {}
                 }
-                _ = tokio::time::sleep(interval) => {}
+                if let Err(e) = shared.lock().await.run_once().await {
+                    warn!(platform, error = %e, "discovery round failed");
+                }
             }
-            if let Err(e) = shared.lock().await.run_once().await {
-                warn!(platform, error = %e, "discovery round failed");
-            }
-        }
-    })
+        },
+    )
 }
 
 /// 后台周期补发暂存变更。初始化时的 drain 只覆盖"启动时通道已就绪"；向导在
@@ -66,26 +94,38 @@ fn spawn_polling_loop(
 fn spawn_staged_drain(
     channel: Arc<crate::landing::MainChannel>,
     controller: Arc<crate::contribution::ContributionController>,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        interval.tick().await; // 消费立即触发的首拍，让启动 drain 先跑
-        loop {
-            interval.tick().await;
-            // 策略门禁：ask 档等属主逐条确认（走 ContributionControl::flush_pending），
-            // local 档永不自动回流；两者都跳过自动补发。
-            if controller.should_stage() {
-                continue;
+    shutdown: cog_core::shutdown::ShutdownSignal,
+) -> tokio::task::JoinHandle<()> {
+    let stop = shutdown.clone();
+    cog_core::loop_health::spawn(
+        STAGED_CHANGE_DRAIN_LOOP,
+        cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(300)),
+        shutdown,
+        move |beat| async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            interval.tick().await; // 消费立即触发的首拍，让启动 drain 先跑
+            loop {
+                beat.beat();
+                tokio::select! {
+                    biased;
+                    _ = stop.wait() => return,
+                    _ = interval.tick() => {}
+                }
+                // 策略门禁：ask 档等属主逐条确认（走 ContributionControl::flush_pending），
+                // local 档永不自动回流；两者都跳过自动补发。
+                if controller.should_stage() {
+                    continue;
+                }
+                if crate::pending_changes::load_pending().await.is_empty() {
+                    continue;
+                }
+                let n = crate::pending_changes::drain_into(channel.as_ref()).await;
+                if n > 0 {
+                    info!(count = n, "staged changes flushed by background drain");
+                }
             }
-            if crate::pending_changes::load_pending().await.is_empty() {
-                continue;
-            }
-            let n = crate::pending_changes::drain_into(channel.as_ref()).await;
-            if n > 0 {
-                info!(count = n, "staged changes flushed by background drain");
-            }
-        }
-    });
+        },
+    )
 }
 
 /// 落地提交的 CI 监视循环：绿了收尾，红了撤销 + 重驱一次 + 记 reflection。
@@ -97,31 +137,39 @@ fn spawn_landing_watch(
     reflection: Option<Arc<dyn cog_core::ReflectionEngine>>,
     orchestrator: Option<Arc<dyn cog_core::OrchestratorControl>>,
     interval_secs: u64,
-    mut rx: tokio::sync::watch::Receiver<bool>,
+    shutdown: cog_core::shutdown::ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(30));
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        loop {
-            tokio::select! {
-                _ = rx.changed() => {
-                    info!("landing CI watch shutting down");
-                    return;
+    let stop = shutdown.clone();
+    cog_core::loop_health::spawn(
+        LANDING_CI_WATCH_LOOP,
+        cog_core::loop_health::Cadence::Periodic(interval),
+        shutdown,
+        move |beat| async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                beat.beat();
+                tokio::select! {
+                    biased;
+                    _ = stop.wait() => {
+                        info!("landing CI watch shutting down");
+                        return;
+                    }
+                    _ = ticker.tick() => {}
                 }
-                _ = ticker.tick() => {}
+                crate::landing::watch_landed(
+                    channel.as_ref(),
+                    reflection.as_deref(),
+                    orchestrator.as_deref(),
+                )
+                .await;
+                // The census rides this tick because the funnel only moves when a
+                // landing or a verdict does, and this is the one loop that runs
+                // whether or not change generation is producing anything.
+                channel.publish_funnel().await;
             }
-            crate::landing::watch_landed(
-                channel.as_ref(),
-                reflection.as_deref(),
-                orchestrator.as_deref(),
-            )
-            .await;
-            // The census rides this tick because the funnel only moves when a
-            // landing or a verdict does, and this is the one loop that runs
-            // whether or not change generation is producing anything.
-            channel.publish_funnel().await;
-        }
-    })
+        },
+    )
 }
 
 impl GitHubPlugin {
@@ -132,6 +180,13 @@ impl GitHubPlugin {
             provider: None,
             channel: None,
             gitee: None,
+            // Lives on the instance rather than in the loop state because one of
+            // the loops is spawned during `init`, before there is any state to
+            // store. The loops select on it and their death readings compare
+            // against it: a loop that ended because this plugin is going down is
+            // not a defect, and without the signal every clean shutdown would
+            // read as one death per loop.
+            shutdown: cog_core::shutdown::ShutdownSignal::new(),
             loop_state: Mutex::new(None),
         }
     }
@@ -244,7 +299,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     // 网关，本进程并不重启）时，上面的启动 drain 不会重跑；
                     // 后台周期补发让暂存变更在通道接通后的下一个周期被接管。
                     if let Some(channel) = self.channel.clone() {
-                        spawn_staged_drain(channel, controller.clone());
+                        spawn_staged_drain(channel, controller.clone(), self.shutdown.clone());
                     }
 
                     self.provider = Some(provider);
@@ -332,7 +387,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                 reflection.clone(),
                 orchestrator.clone(),
                 channel.ci_poll_interval_secs(),
-                rx.clone(),
+                self.shutdown.clone(),
             ));
             info!("landing CI watch started");
         }
@@ -399,7 +454,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     "github",
                     shared,
                     cfg.poll_interval_secs,
-                    rx.clone(),
+                    self.shutdown.clone(),
                 ));
                 info!("GitHub discovery polling loop started");
             }
@@ -409,7 +464,12 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     .as_ref()
                     .map(|(c, _)| c.poll_interval_secs)
                     .unwrap_or(300);
-                handles.push(spawn_polling_loop("gitee", shared, interval, rx.clone()));
+                handles.push(spawn_polling_loop(
+                    "gitee",
+                    shared,
+                    interval,
+                    self.shutdown.clone(),
+                ));
                 info!("Gitee discovery polling loop started");
             }
         }
@@ -491,6 +551,10 @@ impl cog_core::SystemPlugin for GitHubPlugin {
     }
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
+        // 先触发循环的停止信号，再停 HTTP 服务、再兜底 abort：顺序决定读数——
+        // 信号在后的话，被 abort 的循环先一步跑到 Drop，那次结束没有任何东西
+        // 能证明是"被要求停的"，于是每次干净关机都会给每个循环记一次死亡。
+        self.shutdown.trigger();
         if let Ok(mut guard) = self.loop_state.lock() {
             if let Some(state) = guard.take() {
                 let _ = state.shutdown_tx.send(true);

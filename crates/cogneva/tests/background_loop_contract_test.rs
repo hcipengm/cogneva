@@ -18,6 +18,13 @@
 //! marker gone, or already registered — fails here rather than quietly widening
 //! the exemption, and an entry with no reason fails too.
 //!
+//! The marker is a ticker, so this scans a subset of long-running work and a green
+//! run says nothing about the rest: a task that waits on `sleep` between rounds of
+//! its own work is not scanned, and neither is anything spawned where the loop is
+//! implicit. Those populations overlap with retries and backoff waits whose end is
+//! a return rather than a defect, so widening the marker means first writing the
+//! rule that tells the two apart — until then the narrower claim is the honest one.
+//!
 //! Note on the literals: they are assembled at compile time, so this file never
 //! contains the text it forbids (it is itself one of the sources scanned).
 
@@ -41,25 +48,11 @@ const REGISTRATIONS: [&str; 2] = [
 const NOT_REGISTERED: &[(&str, &str)] = &[
     (
         "crates/cog-agent/src/agent.rs",
-        "backlog: the registry heartbeat task is aborted on every stop/idle \
-         transition, so its task ending is usually intended; registering it needs \
-         those abort paths to trigger a stop signal, and there are several",
-    ),
-    (
-        "crates/cog-gateway/src/contribution_admin.rs",
-        "backlog: stops on a broadcast::Receiver<()> rather than a ShutdownSignal; \
-         registering it needs the broadcast's sender to trigger one",
-    ),
-    (
-        "crates/cog-gateway/src/executor.rs",
-        "backlog: stops on a broadcast::Receiver<()> rather than a ShutdownSignal; \
-         registering it needs the broadcast's sender to trigger one",
-    ),
-    (
-        "crates/cog-github/src/plugin.rs",
-        "backlog: both loops stop on the watch<bool> channel this plugin's own \
-         shutdown() publishes; registering them needs that sender to also trigger \
-         a ShutdownSignal",
+        "not-a-loop: the registry heartbeat is per agent instance, not per process — \
+         it starts and is aborted with the agent's own lifecycle, so its end is \
+         usually intended, and one series per agent would make the label unbounded. \
+         Whether the registration is alive is the registry's TTL to report, not this \
+         family's",
     ),
     (
         "crates/cog-observability/src/probes.rs",

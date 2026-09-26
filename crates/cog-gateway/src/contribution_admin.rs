@@ -66,6 +66,9 @@ const GITEE_TOKEN_URL: &str = "https://gitee.com/oauth/token";
 /// SSH public key (`write:public_key`).
 const GITHUB_DEVICE_SCOPE: &str = "repo write:public_key read:public_key";
 
+/// 循环名：Gitee OAuth token 刷新循环，报在 `cogneva_loop_*` 的 `loop` 标签上。
+pub const GITEE_TOKEN_REFRESHER_LOOP: &str = "gateway_gitee_token_refresher";
+
 /// Gitee OAuth states are single-use and expire quickly: the user is mid-flow
 /// in another tab, anything older than this is abandoned.
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -2052,7 +2055,7 @@ pub(crate) async fn is_contribution_secret_owner() -> bool {
 /// Spawned from the gateway plugin, which every deployment of the binary loads:
 /// only the process that can read the contribution secret runs the loop.
 pub fn spawn_gitee_token_refresher(
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    shutdown: cog_core::shutdown::ShutdownSignal,
     interval_secs: u64,
     refresh_threshold_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
@@ -2091,16 +2094,25 @@ pub fn spawn_gitee_token_refresher(
             refresh_threshold_secs,
             "gitee token refresher started: this process owns the contribution secret"
         );
+        // 登记在这一行之后：属主与轮换材料两道门都在前面，没过的进程不是「刷新
+        // 循环死了」，而是这个部署里本来就没有这个循环，上面那两行日志已经把它
+        // 为什么没有说清了。
+        let beat = cog_core::loop_health::register(
+            GITEE_TOKEN_REFRESHER_LOOP,
+            cog_core::loop_health::Cadence::Periodic(Duration::from_secs(interval_secs)),
+        );
+        let _mortality = beat.watch_death(shutdown.clone());
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.tick().await; // first tick is immediate; skip it
         loop {
+            beat.beat();
             tokio::select! {
-                _ = shutdown.recv() => break,
-                _ = interval.tick() => {
-                    if let Err(e) = gitee_refresh_tick(refresh_threshold_secs).await {
-                        tracing::warn!(error = %e, "gitee token refresh tick failed");
-                    }
-                }
+                biased;
+                _ = shutdown.wait() => return,
+                _ = interval.tick() => {}
+            }
+            if let Err(e) = gitee_refresh_tick(refresh_threshold_secs).await {
+                tracing::warn!(error = %e, "gitee token refresh tick failed");
             }
         }
     })

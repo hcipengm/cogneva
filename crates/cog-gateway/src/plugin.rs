@@ -309,29 +309,32 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         }
 
         // ── Collaboration listener + timeout checker ──
-        if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+        //
+        // 这几个后台循环都挂在进程的停机信号上，与它们在循环表里报的名字同源：
+        // 信号触发后它们退出，退出才不会被记成「循环死了」。
+        if let Some(shutdown_signal) = ctx.consume::<cog_core::ShutdownSignal>() {
             let state = self.state.clone().expect("gateway state not initialized");
             let _collab_handle = crate::executor::spawn_collaboration_listener(
                 state.clone(),
-                broadcast_tx.0.subscribe(),
+                (*shutdown_signal).clone(),
             );
             let _timeout_handle = crate::executor::spawn_timeout_checker(
                 state.clone(),
-                broadcast_tx.0.subscribe(),
+                (*shutdown_signal).clone(),
                 ctx.config().system.timeout_checker_interval_secs,
             );
             // Gitee OAuth token refresher: no-ops unless OAuth-mode material
             // is present in the Secret.
             let gateway_cfg = &ctx.config().gateway;
             let _gitee_refresh = crate::contribution_admin::spawn_gitee_token_refresher(
-                broadcast_tx.0.subscribe(),
+                (*shutdown_signal).clone(),
                 gateway_cfg.effective_contribution_oauth_refresh_interval_secs(),
                 gateway_cfg.effective_contribution_oauth_refresh_threshold_secs(),
             );
             // git 身份自举：网关自己得有上游身份，否则装完机没人给它配密钥。
             // 有 token 全自动登记部署密钥；没有则把公钥挂出来等 WebUI 收 token。
             let _git_identity =
-                crate::git_identity::spawn_git_identity_bootstrap(broadcast_tx.0.subscribe());
+                crate::git_identity::spawn_git_identity_bootstrap((*shutdown_signal).clone());
         }
 
         Ok(())

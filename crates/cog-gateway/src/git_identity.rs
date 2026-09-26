@@ -749,7 +749,7 @@ async fn register_deploy_key(token: &str, repo: &str, public_line: &str) -> Resu
 /// 停在"等人输入"时按 `retry_secs` 轮询，其它结论都收工——登记与晋级都已经
 /// 写进 Secret 且滚了网关，本进程即将被换掉，继续跑没有意义。
 pub fn spawn_git_identity_bootstrap(
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    shutdown: cog_core::shutdown::ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let config = IdentityConfig::from_env();
@@ -760,7 +760,7 @@ pub fn spawn_git_identity_bootstrap(
         loop {
             let outcome = tokio::select! {
                 outcome = ensure_git_identity(&config) => outcome,
-                _ = shutdown.recv() => {
+                _ = shutdown.wait() => {
                     info!("git 身份自举收到停机信号，退出");
                     return;
                 }
@@ -771,7 +771,7 @@ pub fn spawn_git_identity_bootstrap(
             }
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(config.retry_secs)) => {}
-                _ = shutdown.recv() => {
+                _ = shutdown.wait() => {
                     info!("git 身份自举收到停机信号，退出");
                     return;
                 }
