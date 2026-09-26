@@ -30,6 +30,9 @@ use tracing::{error, info, warn};
 /// Loop name reported through the background-loop liveness family.
 pub const WORKTREE_GC_LOOP: &str = "extension_worktree_gc";
 
+/// Loop name of the offline mirror refresh.
+pub const WORKTREE_FETCH_LOOP: &str = "extension_worktree_fetch";
+
 /// Loop name of the claim-footprint walk over this executor's own volumes.
 pub const VOLUME_FOOTPRINT_LOOP: &str = "extension_volume_footprint";
 
@@ -735,16 +738,32 @@ impl WorkdirRouter {
             ));
         }
         let fetch = Arc::clone(self);
-        tokio::spawn(async move {
-            // Refresh immediately in the background rather than on the startup
-            // critical path: a hung offline fetch must never delay the HTTP
-            // listener past the liveness grace window (which would crash-loop
-            // the pod). Failure only records a metric and retries next tick.
-            loop {
-                fetch.fetch_once().await;
-                tokio::time::sleep(fetch.cfg.fetch_interval).await;
-            }
-        });
+        let fetch_interval = fetch.cfg.fetch_interval;
+        drop(cog_core::loop_health::spawn_unstoppable(
+            WORKTREE_FETCH_LOOP,
+            cog_core::loop_health::Cadence::Periodic(fetch_interval),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let fetch = Arc::clone(&fetch);
+                async move {
+                    let mut ticker = tokio::time::interval(fetch_interval);
+                    // The first tick of a fresh interval completes at once, and it
+                    // is consumed here rather than in the loop: the refresh is the
+                    // one that is supposed to happen immediately.
+                    ticker.tick().await;
+                    loop {
+                        // Refresh immediately rather than on the startup critical
+                        // path: a hung offline fetch must never delay the HTTP
+                        // listener past the liveness grace window (which would
+                        // crash-loop the pod). Failure only records a metric and
+                        // retries next tick.
+                        beat.beat();
+                        fetch.fetch_once().await;
+                        ticker.tick().await;
+                    }
+                }
+            },
+        ));
     }
 
     // -- internals -------------------------------------------------------------
@@ -1212,6 +1231,38 @@ mod tests {
         let render = r.metrics().render();
         assert!(series_of(&render, "vol-a-pvc").unwrap().ends_with(" 1000"));
         assert!(series_of(&render, "vol-b-pvc").unwrap().ends_with(" 2000"));
+    }
+
+    /// Every loop this executor starts has to be in the census, or its exit is
+    /// silent: each of them keeps its last reading when it stops, which is what a
+    /// loop that is running and has nothing to do looks like too.
+    #[tokio::test]
+    async fn every_started_loop_is_registered_in_the_census() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let volume = tmp.path().join("vol");
+        std::fs::create_dir_all(&volume).unwrap();
+
+        // The registry is process-wide, so the negative half is asserted first,
+        // before anything in this test registers the volume walk.
+        router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK).spawn_maintenance();
+        assert!(
+            !cog_core::loop_health::registry()
+                .names()
+                .iter()
+                .any(|n| n == VOLUME_FOOTPRINT_LOOP),
+            "a pod with no declared volume must not carry a walk that measures nothing"
+        );
+
+        router_watching(tmp.path(), &bare, "cogneva-sandbox-pvc", &volume).spawn_maintenance();
+
+        let names = cog_core::loop_health::registry().names();
+        for expected in [WORKTREE_GC_LOOP, WORKTREE_FETCH_LOOP, VOLUME_FOOTPRINT_LOOP] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} is not in the census: {names:?}"
+            );
+        }
     }
 
     #[test]
