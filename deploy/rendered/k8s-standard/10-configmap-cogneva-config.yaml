@@ -50,6 +50,21 @@ data:
   COGNEVA_NOTIFICATION_FEISHU_URL: ""
   COGNEVA_NOTIFICATION_WECHAT_WORK_URL: ""
 
+  # 告警出口地址（Alertmanager 接收端 / 邮件 / Slack）。三类 dispatcher 都在
+  # cog-observability 里，缺的一直只是地址——地址就是开关，空串 = 不建出口。
+  # 中继口令不在这份清单里：它是凭证，由 Pod 侧那条 secretKeyRef 注入（见
+  # gateway.yaml / evolution.yaml），清单只送非凭证的那些键。
+  COGNEVA_ALERTMANAGER_WEBHOOK_URL: ""
+  COGNEVA_ALERTMANAGER_EMAIL_RECIPIENTS: ""
+  COGNEVA_ALERTMANAGER_EMAIL_SMTP_HOST: ""
+  COGNEVA_ALERTMANAGER_EMAIL_SMTP_PORT: "587"
+  COGNEVA_ALERTMANAGER_EMAIL_SMTP_USERNAME: ""
+  COGNEVA_ALERTMANAGER_EMAIL_FROM: "alerts@cogneva.local"
+  COGNEVA_ALERTMANAGER_EMAIL_USE_TLS: "true"
+  COGNEVA_ALERTMANAGER_EMAIL_SUBJECT_TEMPLATE: ""
+  COGNEVA_ALERTMANAGER_SLACK_WEBHOOK_URL: ""
+  COGNEVA_ALERTMANAGER_SLACK_CHANNEL: ""
+
   # raw_logger 段不在这里覆盖：与下面的 memory 段同理，同一件事在文件里写一份、
   # 在 env 里再写一份，读文件的人推不出 runtime 用的是哪份——文件里曾写着
   # enabled=false 与一个打不开的目录，实跑却是 true 与 raw-logs。要改改文件。

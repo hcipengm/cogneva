@@ -498,12 +498,48 @@ notification:
   #        地址，而平台的地址会轮换，写宽一段是运维对自己这份判断的声明；写错了也有
   #        兜底——投递读数的 result="unreachable" 会说这个出口根本没通。
   #   port 是这个宿主监听的端口（https 默认 443）。
+  # 这一份放行对**下面 alertmanager 段的出口同样生效**：两套出口都在进化 Pod 里发，
+  # 走同一个策略；门禁把两边的地址一起拿来配对（配了地址没放行、放行了没人用，两个
+  # 方向都报），所以别把告警出口的宿主记到别处去。
   # 默认空 = 一条都不放行（此时上面四个地址也应为空）。留空只影响进化 Pod，
   # 主应用侧照发。
   egress: {}
   #  oapi.dingtalk.com:
   #    cidr: "1.2.3.0/24"
   #    port: 443
+
+# 告警出口：supervisor 事件（LLM 上游池全灭等）、基础设施 PromQL 规则、以及
+# 「配置没下发」自检的告警从这里出去。与上面 notification 段同理——三类 dispatcher
+# （Alertmanager 接收端 / SMTP / Slack 入站 webhook）都在代码里，缺的一直只是地址，
+# 所以这里给地址不给开关：空地址 = 不建出口，与 cogneva.json 的
+# observability.alertmanager 默认值等价。两个段可以只配一个；它们的区别是发什么：
+# 上面那段发给人看的通知（审批、进化降级），这一段发 Alertmanager 报文形状的告警。
+# 主应用与进化 Pod 都跑这条桥，两者都从 cogneva-config 取这一份。
+alertmanager:
+  # 接收端 URL。本进程 POST 的报文是 Alertmanager **receiver** 收到的那种形状
+  # （{"version":"1","alerts":[...]}），不是 Alertmanager 自己的提交 API
+  # （/api/v1/alerts 收另一种报文，指过去会被拒）。
+  webhookUrl: ""
+  # 邮件出口。收件人与中继两个都要有才算一个出口——只有收件人没有中继，消息没有
+  # 地方交出去，而那种状态在运行期与「没配」长得一模一样（这正是这一段要修的坏法）。
+  email:
+    # 逗号分隔的收件人。
+    recipients: ""
+    smtpHost: ""
+    smtpPort: 587
+    smtpUsername: ""
+    fromAddress: "alerts@cogneva.local"
+    useTls: true
+    # 留空 = 用默认主题「Cogneva Alert — N event(s)」。
+    subjectTemplate: ""
+    # SMTP 口令**不在这里**：它是凭证，不进 values 也不进清单，只由集群侧写进
+    # Secret 键 cogneva-secrets/smtp-password（与可观测栈安装脚本写 clickhouse-password
+    # 同形；那个键不存在时不做鉴权，Pod 照起）。写入时别用 --from-literal：
+    # 口令会留进 shell 历史与进程参数。
+  # Slack 出口：入站 webhook URL（incoming webhook），频道可留空由 webhook 自己的默认决定。
+  slack:
+    webhookUrl: ""
+    channel: ""
 
 ingress:
   enabled: true

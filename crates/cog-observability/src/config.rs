@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use cog_core::alerts::{AlertChannel, SmtpConfig};
 use cog_core::{SFError, SFResult};
 
 /// The document this revision declares, compiled into the binary.
@@ -287,21 +288,208 @@ impl Default for ClickHouseConfig {
     }
 }
 
+/// Where an alert goes once one fires.
+///
+/// There is deliberately no enable flag: the address is the switch, the same
+/// rule the notification outlets follow. A flag on top of three addresses is
+/// four states for three facts, and the state it adds — addresses filled in
+/// while delivery is off — reads at runtime exactly like "nobody configured an
+/// alert address", which is the failure this section exists to avoid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AlertmanagerConfig {
-    pub enabled: bool,
+    /// Alertmanager-**receiver** URL: the dispatcher posts the receiver
+    /// payload shape (`{"version":"1","alerts":[…]}`), which Alertmanager's own
+    /// submission API does not accept. Empty means no such outlet.
     pub webhook_url: String,
     pub timeout_secs: u64,
+    pub email: AlertEmailConfig,
+    pub slack: AlertSlackConfig,
 }
 
 impl Default for AlertmanagerConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            webhook_url: "http://localhost:9093/api/v1/alerts".into(),
+            webhook_url: String::new(),
             timeout_secs: 10,
+            email: AlertEmailConfig::default(),
+            slack: AlertSlackConfig::default(),
         }
+    }
+}
+
+/// Email outlet. Addresses are the switches — see [`crate::config::AlertmanagerConfig`].
+///
+/// `recipients` is the string form of what the contract type carries as a list:
+/// the configuration surface is env-driven and an env value is a scalar, so a
+/// comma-separated field is the only shape a deployment can write. It is split
+/// at channel construction, where the contract type is built.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertEmailConfig {
+    /// Comma-separated recipients. Empty means no email outlet.
+    pub recipients: String,
+    /// SMTP relay host. Empty means no email outlet: a recipient list with
+    /// nowhere to hand it to is not an outlet, and treating it as one would
+    /// announce a receiver that cannot exist.
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    #[serde(default)]
+    pub smtp_password: String,
+    pub from_address: String,
+    pub use_tls: bool,
+    pub subject_template: String,
+}
+
+impl Default for AlertEmailConfig {
+    fn default() -> Self {
+        Self {
+            recipients: String::new(),
+            smtp_host: String::new(),
+            smtp_port: 587,
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+            from_address: "alerts@cogneva.local".into(),
+            use_tls: true,
+            subject_template: String::new(),
+        }
+    }
+}
+
+impl AlertEmailConfig {
+    /// Recipients as the contract's list form, empty entries dropped.
+    pub fn recipient_list(&self) -> Vec<String> {
+        self.recipients
+            .split(',')
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether this is an outlet: recipients to send to and a relay to send
+    /// through. Both halves are needed, so the predicate names both.
+    pub fn is_outlet(&self) -> bool {
+        !self.recipients.trim().is_empty() && !self.smtp_host.trim().is_empty()
+    }
+}
+
+/// Slack outlet: an incoming-webhook URL and the channel to post in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertSlackConfig {
+    /// Incoming-webhook URL. Empty means no Slack outlet.
+    pub webhook_url: String,
+    /// Channel override carried in the payload; empty lets the webhook's own
+    /// default apply.
+    pub channel: String,
+}
+
+impl AlertSlackConfig {
+    pub fn is_outlet(&self) -> bool {
+        !self.webhook_url.trim().is_empty()
+    }
+}
+
+/// The config path each alert channel reads its switch from, and the name it
+/// reports under.
+///
+/// This is the producer's own claim about where its addresses live, and it is
+/// the only place that claim exists: a deployment writes these paths and finds
+/// out nothing when one of them is wrong. A channel whose path no deployment
+/// can write is a dispatcher present in code that can never be built, and at
+/// runtime that is indistinguishable from "no address configured" — a
+/// legitimate state. Paths are relative to the `observability` section, which
+/// is where the environment overrides are applied.
+///
+/// A channel may need more than one path (email needs a relay *and*
+/// recipients); every path it cannot work without is listed.
+pub const ALERT_CHANNEL_CONFIG_PATHS: [(&str, &str); 4] = [
+    (ALERT_CHANNEL_WEBHOOK, "alertmanager.webhook_url"),
+    (ALERT_CHANNEL_EMAIL, "alertmanager.email.recipients"),
+    (ALERT_CHANNEL_EMAIL, "alertmanager.email.smtp_host"),
+    (ALERT_CHANNEL_SLACK, "alertmanager.slack.webhook_url"),
+];
+
+/// The one path whose value is a credential.
+///
+/// It is listed apart from the rest so the deploy-side gate can require a
+/// different delivery for it: everything else may be a plain value, this one
+/// must arrive through a Secret, and a values key or a ConfigMap entry for it
+/// would be a credential written into the repository's manifests.
+pub const ALERT_CHANNEL_CREDENTIAL_PATH: &str = "alertmanager.email.smtp_password";
+
+/// Channel names, in the order they are registered and announced.
+pub const ALERT_CHANNEL_WEBHOOK: &str = "webhook";
+pub const ALERT_CHANNEL_EMAIL: &str = "email";
+pub const ALERT_CHANNEL_SLACK: &str = "slack";
+
+/// Every channel name the dispatcher implements, in registration order.
+pub fn alert_channel_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = ALERT_CHANNEL_CONFIG_PATHS.iter().map(|(n, _)| *n).collect();
+    names.dedup();
+    names
+}
+
+impl AlertmanagerConfig {
+    /// The channels this configuration enables, in registration order.
+    ///
+    /// The one derivation of what leaves this process: the registration, the
+    /// announcement and the reachability test all read it, because two lists
+    /// of channels drift the moment one is added and then the process
+    /// announces an outlet it never registered.
+    pub fn channels(&self) -> Vec<AlertChannel> {
+        let mut channels = Vec::new();
+
+        if !self.webhook_url.trim().is_empty() {
+            channels.push(AlertChannel::Webhook {
+                url: self.webhook_url.trim().to_string(),
+                headers: std::collections::HashMap::new(),
+            });
+        }
+
+        if self.email.is_outlet() {
+            let optional = |value: &str| {
+                let value = value.trim();
+                (!value.is_empty()).then(|| value.to_string())
+            };
+            channels.push(AlertChannel::Email {
+                smtp_config: SmtpConfig {
+                    host: self.email.smtp_host.trim().to_string(),
+                    port: self.email.smtp_port,
+                    username: optional(&self.email.smtp_username),
+                    password: optional(&self.email.smtp_password),
+                    from_address: self.email.from_address.trim().to_string(),
+                    use_tls: self.email.use_tls,
+                },
+                to: self.email.recipient_list(),
+                subject_template: self.email.subject_template.clone(),
+            });
+        }
+
+        if self.slack.is_outlet() {
+            channels.push(AlertChannel::Slack {
+                webhook_url: self.slack.webhook_url.trim().to_string(),
+                channel: self.slack.channel.trim().to_string(),
+            });
+        }
+
+        channels
+    }
+
+    /// Names of the enabled channels, read off the channels themselves rather
+    /// than re-tested: the announcement and the registration cannot disagree
+    /// when one is the other's shadow.
+    pub fn channel_names(&self) -> Vec<&'static str> {
+        self.channels()
+            .iter()
+            .map(|channel| match channel {
+                AlertChannel::Webhook { .. } => ALERT_CHANNEL_WEBHOOK,
+                AlertChannel::Email { .. } => ALERT_CHANNEL_EMAIL,
+                AlertChannel::Slack { .. } => ALERT_CHANNEL_SLACK,
+            })
+            .collect()
     }
 }
 
@@ -340,7 +528,13 @@ impl Default for ElasticsearchConfig {
     }
 }
 
-const OBS_ENV: &[(&str, &str)] = &[
+/// The environment variable behind each setting of this section.
+///
+/// This table is the producer's claim about where its settings are written from,
+/// and the deployside reachability gate reads it as such: a key nothing renders
+/// is a knob the deployment cannot turn, and at runtime such a knob is
+/// indistinguishable from one nobody set.
+pub const OBS_ENV: &[(&str, &str)] = &[
     ("COGNEVA_LOKI_ENABLED", "loki.enabled"),
     ("COGNEVA_LOKI_ENDPOINT", "loki.endpoint"),
     ("COGNEVA_JAEGER_ENABLED", "jaeger.enabled"),
@@ -351,10 +545,49 @@ const OBS_ENV: &[(&str, &str)] = &[
     ("COGNEVA_CLICKHOUSE_TABLE", "clickhouse.table"),
     ("COGNEVA_CLICKHOUSE_USERNAME", "clickhouse.username"),
     ("COGNEVA_CLICKHOUSE_PASSWORD", "clickhouse.password"),
-    ("COGNEVA_ALERTMANAGER_ENABLED", "alertmanager.enabled"),
     (
         "COGNEVA_ALERTMANAGER_WEBHOOK_URL",
         "alertmanager.webhook_url",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_EMAIL_RECIPIENTS",
+        "alertmanager.email.recipients",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_EMAIL_SMTP_HOST",
+        "alertmanager.email.smtp_host",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_EMAIL_SMTP_PORT",
+        "alertmanager.email.smtp_port",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_EMAIL_SMTP_USERNAME",
+        "alertmanager.email.smtp_username",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_EMAIL_SMTP_PASSWORD",
+        "alertmanager.email.smtp_password",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_EMAIL_FROM",
+        "alertmanager.email.from_address",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_EMAIL_USE_TLS",
+        "alertmanager.email.use_tls",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_EMAIL_SUBJECT_TEMPLATE",
+        "alertmanager.email.subject_template",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_SLACK_WEBHOOK_URL",
+        "alertmanager.slack.webhook_url",
+    ),
+    (
+        "COGNEVA_ALERTMANAGER_SLACK_CHANNEL",
+        "alertmanager.slack.channel",
     ),
     ("COGNEVA_INFRA_WATCH_ENABLED", "infra_watch.enabled"),
     ("COGNEVA_INFRA_WATCH_URL", "infra_watch.prometheus_url"),
@@ -546,5 +779,119 @@ mod tests {
         let cfg: ObservabilityExportersConfig = serde_json::from_value(section).unwrap();
         assert_eq!(cfg.data_volume_watch.volumes.len(), 1);
         assert_eq!(cfg.data_volume_watch.volumes[0].claim, "from-file");
+    }
+
+    /// Nothing configured means nothing leaves the process — and that is what
+    /// the section's own default has to be, because the default document is
+    /// what every deployment that says nothing gets.
+    #[test]
+    fn the_default_document_builds_no_alert_channel() {
+        let cfg = AlertmanagerConfig::default();
+        assert!(cfg.channels().is_empty());
+        assert!(cfg.channel_names().is_empty());
+    }
+
+    /// An address rendered as an empty string is an absent address: manifests
+    /// render unset keys as `""`, and treating that as an outlet would claim a
+    /// receiver nobody configured.
+    #[test]
+    fn blank_addresses_are_not_channels() {
+        let mut cfg = AlertmanagerConfig {
+            webhook_url: "  ".into(),
+            ..AlertmanagerConfig::default()
+        };
+        cfg.slack.webhook_url = "".into();
+        cfg.email.recipients = "ops@example.invalid".into();
+        cfg.email.smtp_host = " ".into();
+        assert!(cfg.channels().is_empty(), "{:?}", cfg.channels());
+    }
+
+    /// A recipient list with no relay is not an email outlet: it cannot send
+    /// anywhere, and announcing it would name a receiver that does not exist.
+    #[test]
+    fn email_needs_both_a_relay_and_recipients() {
+        let mut cfg = AlertmanagerConfig::default();
+        cfg.email.smtp_host = "smtp.example.invalid".into();
+        assert!(cfg.channels().is_empty());
+
+        cfg.email.recipients = "ops@example.invalid, oncall@example.invalid".into();
+        assert_eq!(cfg.channel_names(), vec![ALERT_CHANNEL_EMAIL]);
+        match &cfg.channels()[0] {
+            AlertChannel::Email {
+                smtp_config, to, ..
+            } => {
+                assert_eq!(smtp_config.host, "smtp.example.invalid");
+                assert_eq!(to.len(), 2, "recipients split on commas: {to:?}");
+                assert_eq!(to[0], "ops@example.invalid");
+            }
+            other => panic!("expected an email channel, got {other:?}"),
+        }
+    }
+
+    /// The names are the channels, not a second list: each channel that gets
+    /// built is announced once, in registration order.
+    #[test]
+    fn the_announced_names_are_the_built_channels() {
+        let mut cfg = AlertmanagerConfig {
+            webhook_url: "https://receiver.example.invalid/alerts".into(),
+            ..AlertmanagerConfig::default()
+        };
+        cfg.slack.webhook_url = "https://hooks.example.invalid/T1".into();
+        cfg.email.recipients = "ops@example.invalid".into();
+        cfg.email.smtp_host = "smtp.example.invalid".into();
+        assert_eq!(
+            cfg.channel_names(),
+            vec![
+                ALERT_CHANNEL_WEBHOOK,
+                ALERT_CHANNEL_EMAIL,
+                ALERT_CHANNEL_SLACK
+            ]
+        );
+        assert_eq!(cfg.channels().len(), cfg.channel_names().len());
+    }
+
+    /// Every path in the producer's table, written through the loader's own
+    /// setter, has to enable the channel it is declared for. This is the tie
+    /// the table needs: the path a deployment's env map writes and the field
+    /// the predicate reads are two names for one thing, and a table checked
+    /// only against itself would keep agreeing with itself while the
+    /// deployment wrote somewhere nobody reads.
+    ///
+    /// Paths are section-relative because that is where the overrides land, so
+    /// the write goes through the same `apply_env_paths` shape the process uses.
+    #[test]
+    fn each_declared_path_enables_its_channel() {
+        for channel in alert_channel_names() {
+            let paths: Vec<&str> = ALERT_CHANNEL_CONFIG_PATHS
+                .iter()
+                .filter(|(name, _)| *name == channel)
+                .map(|(_, path)| *path)
+                .collect();
+            assert!(
+                !paths.is_empty(),
+                "{channel} 在表里没有任何配置路径，可达性检查会空转"
+            );
+
+            let mut value = serde_json::to_value(AlertmanagerConfig::default())
+                .expect("alert channels serialize");
+            for path in paths {
+                let relative = path
+                    .strip_prefix("alertmanager.")
+                    .unwrap_or_else(|| panic!("{path} 不在 alertmanager 段下"));
+                let sample = if relative.ends_with("webhook_url") {
+                    "https://hook.example.invalid/x"
+                } else {
+                    "ops@example.invalid"
+                };
+                cog_core::config::set_json_path(&mut value, relative, sample);
+            }
+            let cfg: AlertmanagerConfig =
+                serde_json::from_value(value).unwrap_or_else(|e| panic!("{channel}: {e}"));
+            assert!(
+                cfg.channel_names().contains(&channel),
+                "写入 {channel} 声明的路径没有建出这个出口：{:?}",
+                cfg.channel_names()
+            );
+        }
     }
 }

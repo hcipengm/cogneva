@@ -397,34 +397,49 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             ));
         }
 
-        // ── Alert bridge: notification outlet + persistent state machine ──
-        let alert_store = self.alert_store.clone();
-        let webhook =
-            if obs_cfg.alertmanager.enabled && !obs_cfg.alertmanager.webhook_url.is_empty() {
-                Some((
-                    obs_cfg.alertmanager.webhook_url.clone(),
-                    obs_cfg.alertmanager.timeout_secs,
-                ))
-            } else {
-                None
-            };
+        // ── Alert outlets: every channel this deployment can address ──
+        // One list drives the bridge, the two notifiers below and the
+        // announcement; a channel that is configured but whose address this
+        // process cannot read would otherwise be announced as if it were live.
+        let alert_channels = obs_cfg.alertmanager.channels();
+        let alert_timeout = obs_cfg.alertmanager.timeout_secs;
+        let alert_outlets = obs_cfg.alertmanager.channel_names();
+        if alert_outlets.is_empty() {
+            warn!(
+                "No alert outlet configured: firing alerts reach only the persisted alerts \
+                 table. Set alertmanager.webhook_url (COGNEVA_ALERTMANAGER_WEBHOOK_URL), \
+                 alertmanager.slack.webhook_url (COGNEVA_ALERTMANAGER_SLACK_WEBHOOK_URL) or \
+                 alertmanager.email.recipients + smtp_host (COGNEVA_ALERTMANAGER_EMAIL_*) to \
+                 give them a receiver"
+            );
+        } else {
+            info!(outlets = ?alert_outlets, "Alert outlets configured");
+        }
 
-        if alert_store.is_some() || webhook.is_some() {
+        // ── Alert bridge: notification outlets + persistent state machine ──
+        let alert_store = self.alert_store.clone();
+
+        if alert_store.is_some() || !alert_channels.is_empty() {
             match ctx.consume_service::<dyn cog_core::Supervisor>() {
                 Some(supervisor) => {
                     let http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
-                    if webhook.is_some() && http_client.is_none() {
-                        info!("webhook configured but no HttpClient; alerts persist only");
+                    if !alert_channels.is_empty() && http_client.is_none() {
+                        info!("alert outlets configured but no HttpClient; alerts persist only");
                     }
                     let persistent_store = alert_store.is_some();
-                    let bridged =
-                        spawn_alert_bridge(webhook.clone(), http_client, alert_store, &supervisor);
-                    // Report both outlets, not just the webhook one. With no
-                    // Alertmanager wired the bridge still runs and still
-                    // persists, so logging only on a live webhook left "is the
-                    // bridge running?" with no answer in the logs.
+                    let bridged = spawn_alert_bridge(
+                        alert_channels.clone(),
+                        alert_timeout,
+                        http_client,
+                        alert_store,
+                        &supervisor,
+                    );
+                    // Report both outlets, not just the HTTP ones. With no
+                    // outlet wired the bridge still runs and still persists, so
+                    // logging only on a live webhook left "is the bridge
+                    // running?" with no answer in the logs.
                     info!(
-                        webhook = bridged.is_some(),
+                        delivered = bridged.is_some(),
                         persistent_store,
                         "alert bridge started: supervisor events fan out to these outlets"
                     );
@@ -432,7 +447,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 None => info!("alert bridge skipped: no Supervisor available"),
             }
         } else {
-            info!("alert bridge disabled: no webhook and no PostgreSQL store");
+            info!("alert bridge disabled: no alert outlet and no PostgreSQL store");
         }
 
         // ── Delivered configuration document vs. this revision's ──
@@ -440,21 +455,12 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // report the document's own absence or lag; this judgement runs in code
         // instead, on the document this process read at start, against the copy
         // compiled into this binary.
-        let declaration_notifier =
-            match (&webhook, ctx.consume_service::<dyn cog_core::HttpClient>()) {
-                (Some((url, timeout_secs)), Some(http)) => Some(Arc::new(
-                    crate::alerts::AlertManager::new(
-                        Vec::new(),
-                        vec![AlertChannel::Webhook {
-                            url: url.clone(),
-                            headers: HashMap::new(),
-                        }],
-                    )
-                    .with_timeout(*timeout_secs)
-                    .with_client(http),
-                )),
-                _ => None,
-            };
+        let declaration_notifier = alert_manager(
+            Vec::new(),
+            &alert_channels,
+            alert_timeout,
+            ctx.consume_service::<dyn cog_core::HttpClient>(),
+        );
         tokio::spawn(crate::config_delivery::run_config_declaration_check(
             std::time::Duration::from_secs(
                 obs_cfg
@@ -474,35 +480,24 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         if infra.enabled && !infra.prometheus_url.is_empty() && !infra.rules.is_empty() {
             match ctx.consume_service::<dyn cog_core::HttpClient>() {
                 Some(http) => {
-                    let notifier = webhook.as_ref().map(|(url, timeout_secs)| {
-                        // Convert infra rules into AlertRule entries so
-                        // webhook payloads resolve rule summaries.
-                        let rules = infra
-                            .rules
-                            .iter()
-                            .map(|r| {
-                                cog_core::alerts::AlertRuleBuilder::new(
-                                    r.name.clone(),
-                                    r.promql.clone(),
-                                )
-                                .condition(r.condition)
-                                .severity(r.severity)
-                                .summary(r.summary.clone())
-                                .build()
-                            })
-                            .collect();
-                        Arc::new(
-                            crate::alerts::AlertManager::new(
-                                rules,
-                                vec![AlertChannel::Webhook {
-                                    url: url.clone(),
-                                    headers: HashMap::new(),
-                                }],
+                    // Convert infra rules into AlertRule entries so payloads
+                    // resolve rule summaries.
+                    let rules = infra
+                        .rules
+                        .iter()
+                        .map(|r| {
+                            cog_core::alerts::AlertRuleBuilder::new(
+                                r.name.clone(),
+                                r.promql.clone(),
                             )
-                            .with_timeout(*timeout_secs)
-                            .with_client(http.clone()),
-                        )
-                    });
+                            .condition(r.condition)
+                            .severity(r.severity)
+                            .summary(r.summary.clone())
+                            .build()
+                        })
+                        .collect();
+                    let notifier =
+                        alert_manager(rules, &alert_channels, alert_timeout, Some(http.clone()));
                     let shutdown = ctx
                         .consume::<cog_core::ShutdownSignal>()
                         .map(|s| (*s).clone())
@@ -805,30 +800,41 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
     }
 }
 
+/// The dispatcher for a set of channels, or `None` when there is nothing to
+/// deliver to.
+///
+/// A configured outlet without an HTTP client cannot deliver anything, and
+/// that is the caller's state to report rather than something to paper over:
+/// returning a manager here would make the bridge believe it has an outlet.
+fn alert_manager(
+    rules: Vec<cog_core::alerts::AlertRule>,
+    channels: &[AlertChannel],
+    timeout_secs: u64,
+    client: Option<Arc<dyn cog_core::HttpClient>>,
+) -> Option<Arc<crate::alerts::AlertManager>> {
+    if channels.is_empty() {
+        return None;
+    }
+    let client = client?;
+    Some(Arc::new(
+        crate::alerts::AlertManager::new(rules, channels.to_vec())
+            .with_timeout(timeout_secs)
+            .with_client(client),
+    ))
+}
+
 /// Spawn the alert bridge: subscribe to `SupervisorEvent`s, map each one once,
-/// and feed both outlets — the notification outlet (Alertmanager webhook) and
-/// the persistent state machine (PostgreSQL `alerts` table). One mapping result
-/// drives both, so what the notification says and what is stored agree.
+/// and feed both outlets — every configured alert channel and the persistent
+/// state machine (PostgreSQL `alerts` table). One mapping result drives both,
+/// so what the notification says and what is stored agree.
 fn spawn_alert_bridge(
-    webhook: Option<(String, u64)>,
+    channels: Vec<AlertChannel>,
+    timeout_secs: u64,
     http_client: Option<Arc<dyn cog_core::HttpClient>>,
     store: Option<Arc<PostgresAlertStore>>,
     supervisor: &Arc<dyn cog_core::Supervisor>,
 ) -> Option<Arc<crate::alerts::AlertManager>> {
-    let manager = match (webhook, http_client) {
-        (Some((url, timeout_secs)), Some(client)) => {
-            let channel = AlertChannel::Webhook {
-                url,
-                headers: HashMap::new(),
-            };
-            Some(Arc::new(
-                crate::alerts::AlertManager::new(vec![], vec![channel])
-                    .with_timeout(timeout_secs)
-                    .with_client(client),
-            ))
-        }
-        _ => None,
-    };
+    let manager = alert_manager(Vec::new(), &channels, timeout_secs, http_client);
     let mut alert_rx = supervisor.subscribe();
     let manager_for_task = manager.clone();
     tokio::spawn(async move {

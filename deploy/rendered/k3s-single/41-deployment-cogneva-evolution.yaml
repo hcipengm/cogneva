@@ -108,6 +108,14 @@ spec:
           env:
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
+            # 告警邮件出口的 SMTP 口令：凭证不进清单也不进 values，只认这个
+            # Secret 键，缺省即不做鉴权。主应用 Pod 也跑同一条告警桥，两处同源。
+            - name: COGNEVA_ALERTMANAGER_EMAIL_SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: smtp-password
+                  optional: true
             # 进化链 fail-closed：Shell 工具必须携带真实 DAG task 身份。
             - name: COGNEVA_REQUIRE_TOOL_IDENTITY
               value: "true"
