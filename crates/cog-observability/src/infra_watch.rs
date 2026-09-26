@@ -163,6 +163,55 @@ async fn adopt_active_alerts(
     }
 }
 
+/// What one rule's successful evaluation does to the rows it owns.
+///
+/// `report` holds indexes into the series this tick returned, not dedup keys:
+/// the sample is still needed to render the summary, and recomputing which
+/// series a key came from would be a second reading of the same labels.
+#[derive(Debug, PartialEq, Eq)]
+struct RulePlan {
+    report: Vec<usize>,
+    close: Vec<String>,
+}
+
+/// The plan for one rule that queried successfully.
+///
+/// Every sample whose condition holds is reported, every tick, whether or not
+/// the watcher already believes it is firing. The store keeps a clock of when
+/// a condition was last *seen* true, and it can only move when it is told:
+/// skipping the samples already believed firing freezes that clock at the
+/// firing edge for exactly the rules that stay broken, and a frozen clock is
+/// indistinguishable from a watcher that stopped looking. Whether a report is a
+/// transition worth notifying, or only a sighting that moves the clock, is the
+/// store's decision from the row it holds — not the watcher's from its memory.
+///
+/// Closing is the part the watcher's own memory does decide, and it is scoped
+/// to the keys this rule raised: a key belonging to another rule is not this
+/// rule's to close, and a rule that failed to query has no plan at all.
+fn plan_rule(
+    rule: &crate::config::InfraRule,
+    series: &[SeriesSample],
+    believed: &HashSet<String>,
+) -> RulePlan {
+    let report: Vec<usize> = series
+        .iter()
+        .enumerate()
+        .filter(|(_, sample)| rule.condition.evaluate(sample.value))
+        .map(|(i, _)| i)
+        .collect();
+    let reported: HashSet<String> = report
+        .iter()
+        .map(|&i| dedup_key(&rule.name, &series[i].labels))
+        .collect();
+    let own = format!("{}:", rule.name);
+    let close = believed
+        .iter()
+        .filter(|key| key.starts_with(own.as_str()) && !reported.contains(*key))
+        .cloned()
+        .collect();
+    RulePlan { report, close }
+}
+
 /// One evaluation pass over every configured rule.
 async fn tick(
     config: &InfraWatchConfig,
@@ -172,16 +221,14 @@ async fn tick(
     eval_failure_firing: &mut HashSet<String>,
     failure_streaks: &mut HashMap<String, u32>,
 ) {
-    let mut true_keys: HashSet<String> = HashSet::new();
-    let mut queried_prefixes: HashSet<String> = HashSet::new();
     for rule in &config.rules {
         let series = match query_prometheus(http, &config.prometheus_url, &rule.promql).await {
             Ok(series) => series,
             Err(e) => {
                 // A failed query must NOT resolve anything: absence of
-                // evidence is not evidence of health. The rule contributes
-                // no prefix to `queried_prefixes`, so its previously-firing
-                // rows survive this tick untouched.
+                // evidence is not evidence of health. No plan is built for
+                // this rule, so its previously-firing rows survive this tick
+                // untouched.
                 warn!(rule = %rule.name, error = %e, "infra watch: rule query failed");
                 let streak = failure_streaks.entry(rule.name.clone()).or_insert(0);
                 *streak = streak.saturating_add(1);
@@ -203,35 +250,17 @@ async fn tick(
         if eval_failure_firing.remove(&eval_key) {
             resolve(&eval_key, outlets).await;
         }
-        queried_prefixes.insert(format!("{}:", rule.name));
-        for sample in &series {
-            if !rule.condition.evaluate(sample.value) {
-                continue;
-            }
-            let key = dedup_key(&rule.name, &sample.labels);
-            true_keys.insert(key.clone());
-            if known_firing.contains(&key) {
-                continue;
-            }
-            known_firing.insert(key.clone());
-            fire(rule, sample, &key, outlets).await;
-        }
-    }
 
-    // Resolve previously-firing keys whose condition no longer holds or
-    // whose series vanished — but only for rules that actually queried
-    // successfully this tick.
-    let stale: Vec<String> = known_firing
-        .iter()
-        .filter(|key| {
-            !true_keys.contains(*key)
-                && queried_prefixes.iter().any(|p| key.starts_with(p.as_str()))
-        })
-        .cloned()
-        .collect();
-    for key in stale {
-        resolve(&key, outlets).await;
-        known_firing.remove(&key);
+        let plan = plan_rule(rule, &series, known_firing);
+        for &i in &plan.report {
+            let key = dedup_key(&rule.name, &series[i].labels);
+            known_firing.insert(key.clone());
+            report_sighting(rule, &series[i], &key, outlets).await;
+        }
+        for key in &plan.close {
+            resolve(key, outlets).await;
+            known_firing.remove(key);
+        }
     }
 }
 
@@ -397,8 +426,13 @@ fn dedup_key(rule_name: &str, labels: &BTreeMap<String, String>) -> String {
     format!("{rule_name}:{identity}")
 }
 
-/// Raise one alert: persist the state transition, notify on the edge.
-async fn fire(
+/// Report one sighting to the store and notify on the edge.
+///
+/// Called for every sample whose condition holds, on every tick, not only when
+/// the condition first holds: the store needs each sighting to move its
+/// liveness clock, and it is the store that decides from the row it holds
+/// whether this is a transition (notify) or a repeat (do not).
+async fn report_sighting(
     rule: &crate::config::InfraRule,
     sample: &SeriesSample,
     key: &str,
@@ -603,6 +637,88 @@ mod tests {
         let mut elsewhere = b.clone();
         elsewhere.insert("namespace".to_string(), "cogneva".to_string());
         assert_ne!(dedup_key("crash", &b), dedup_key("crash", &elsewhere));
+    }
+
+    fn sample(pairs: &[(&str, &str)], value: f64) -> SeriesSample {
+        SeriesSample {
+            labels: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            value,
+        }
+    }
+
+    /// The live reading this comes from: `aof_repair_reading_absent` has been
+    /// firing since 09-25 with `last_seen_at` frozen at its firing edge, while
+    /// the condition evaluated true on every tick in between. A row nobody
+    /// advances reads exactly like a watcher that stopped looking, which is the
+    /// one thing the sighting clock exists to tell apart.
+    #[test]
+    fn a_series_already_believed_firing_is_reported_again_every_tick() {
+        let rule = test_rule("disk");
+        let series = vec![sample(&[("node", "vm-1")], 1.0)];
+        let believed = HashSet::from([dedup_key("disk", &series[0].labels)]);
+
+        let plan = plan_rule(&rule, &series, &believed);
+        assert_eq!(
+            plan.report,
+            vec![0],
+            "a series whose condition still holds must be reported again: the \
+             store's sighting clock only moves when it is told"
+        );
+        assert!(plan.close.is_empty(), "nothing stopped holding");
+    }
+
+    #[test]
+    fn a_series_that_stopped_holding_is_closed_and_one_that_vanished_is_too() {
+        let rule = test_rule("disk");
+        let stopped = sample(&[("node", "vm-1")], 0.0);
+        let gone = sample(&[("node", "vm-2")], 1.0);
+        let believed = HashSet::from([
+            dedup_key("disk", &stopped.labels),
+            dedup_key("disk", &gone.labels),
+        ]);
+
+        // The first came back below its threshold, the second did not come back
+        // at all; both are rows this rule can no longer see holding.
+        let plan = plan_rule(&rule, std::slice::from_ref(&stopped), &believed);
+        assert!(plan.report.is_empty());
+        let mut closed = plan.close.clone();
+        closed.sort();
+        let mut expected = vec![
+            dedup_key("disk", &stopped.labels),
+            dedup_key("disk", &gone.labels),
+        ];
+        expected.sort();
+        assert_eq!(closed, expected);
+
+        let plan = plan_rule(&rule, &[], &believed);
+        assert!(plan.report.is_empty());
+        assert_eq!(
+            plan.close.len(),
+            2,
+            "an empty result closes everything it held"
+        );
+    }
+
+    /// Closing is scoped to the rows this rule raised. A key belonging to
+    /// another rule is not this rule's to close: the two would close each
+    /// other's rows and the alert would flap.
+    #[test]
+    fn one_rule_does_not_close_another_rules_rows() {
+        let rule = test_rule("disk");
+        let elsewhere = dedup_key(
+            "cpu",
+            &BTreeMap::from([("node".to_string(), "vm-1".to_string())]),
+        );
+        let believed = HashSet::from([elsewhere]);
+        let plan = plan_rule(&rule, &[], &believed);
+        assert!(plan.report.is_empty());
+        assert!(
+            plan.close.is_empty(),
+            "closed a row belonging to another rule: {plan:?}"
+        );
     }
 
     /// The live reading this comes from: an alert that fired with the summary
