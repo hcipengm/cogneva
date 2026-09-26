@@ -1638,6 +1638,51 @@ mod tests {
             .len()
     }
 
+    /// The census publishes its empty cells, so the fate counter has to seed
+    /// its empty classes too: a counter carries no series until its first
+    /// increment, which makes "nothing has ended this way since this process
+    /// started" and "this counter was never wired up" the same reading. The
+    /// fate is also the one reading the census cannot stand in for, because a
+    /// landing takes its record with it.
+    #[tokio::test]
+    async fn publishing_seeds_every_fate_before_anything_has_ended() {
+        let (chan, metrics) = measured_channel(Default::default());
+
+        chan.publish_funnel().await;
+
+        let fate_metric = crate::change_funnel::CHANGE_FATE_METRIC.as_str();
+        let totals = metrics.query_counter_totals(fate_metric).await.unwrap();
+        assert_eq!(
+            totals.len(),
+            cog_core::EvolutionIntent::ALL.len() * crate::change_funnel::FunnelFate::ALL.len()
+        );
+        assert!(
+            totals.iter().all(|s| s.value == 0.0),
+            "a seed moved a total: {totals:?}"
+        );
+
+        // A fate that did happen keeps its count through the next tick: the
+        // seed adds zero, it does not reset what is there.
+        chan.note_change_fate(
+            &change("c1", &diff_touching(&["crates/cog-github/src/lib.rs"])),
+            crate::change_funnel::FunnelFate::Landed,
+        )
+        .await;
+        chan.publish_funnel().await;
+
+        let landed = metrics
+            .query_counter_totals(fate_metric)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| {
+                s.labels.get("intent").map(String::as_str) == Some("ci_fix")
+                    && s.labels.get("fate").map(String::as_str) == Some("landed")
+            })
+            .expect("the landed class is seeded and carries its count");
+        assert_eq!(landed.value, 1.0);
+    }
+
     #[tokio::test]
     async fn an_oversized_change_is_counted_under_its_own_category() {
         let policy = crate::config::LandingPolicy {

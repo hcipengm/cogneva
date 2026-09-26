@@ -48,6 +48,12 @@ pub enum FunnelFate {
 }
 
 impl FunnelFate {
+    /// Every value. A producer that publishes one series per class needs the
+    /// classes it has none of as well, or an empty class reads exactly like a
+    /// class that was never wired up. The list is the enum, so adding a
+    /// variant cannot leave a reader silently short of a series.
+    pub const ALL: [FunnelFate; 2] = [FunnelFate::Landed, FunnelFate::Retired];
+
     /// The label spelling. These are the only values a change can end with
     /// here: every other stage is a place to wait, not a way to finish.
     pub fn as_str(self) -> &'static str {
@@ -149,6 +155,27 @@ pub fn census(records: &[LandingRecord], staged: &[GeneratedChange]) -> Vec<Funn
         .collect()
 }
 
+/// Every (entry point, fate) pair the fate counter can take.
+///
+/// A counter has no series until its first increment, so with nothing landed
+/// and nothing retired yet, "no change has ended this way since this process
+/// started" and "this counter was never wired up" are the same reading: both
+/// are the absence of a series. The publisher walks this list on its tick and
+/// records a zero for each pair, which is what creates the series — a
+/// counter's `inc_by(0)` adds nothing to the value and everything to the
+/// series. The census already publishes its empty cells for the same reason;
+/// this is the half the census cannot carry, because a landing takes its
+/// record with it when it succeeds.
+pub fn fate_domain() -> Vec<(EvolutionIntent, FunnelFate)> {
+    let mut domain = Vec::with_capacity(EvolutionIntent::ALL.len() * FunnelFate::ALL.len());
+    for intent in EvolutionIntent::ALL {
+        for fate in FunnelFate::ALL {
+            domain.push((intent, fate));
+        }
+    }
+    domain
+}
+
 /// Whether a landing is the one that counts, given the record already on
 /// disk.
 ///
@@ -196,7 +223,8 @@ impl crate::landing::MainChannel {
         }
     }
 
-    /// Publish the census, one gauge series per (entry point, stage).
+    /// Publish the census, one gauge series per (entry point, stage), and seed
+    /// the fate counter's whole domain.
     ///
     /// Called on the landing channel's own tick. Failures are logged and the
     /// pass is abandoned: the backend being unreachable is one fact, and
@@ -220,6 +248,22 @@ impl crate::landing::MainChannel {
                 .await
             {
                 tracing::warn!(error = %e, "cannot record the change funnel census");
+                return;
+            }
+        }
+        // The fate counter is seeded on the same tick, so a class nothing has
+        // reached yet is a zero rather than a missing series. Only the series
+        // is created here; the value each one already carries is untouched.
+        for (intent, fate) in fate_domain() {
+            let labels = HashMap::from([
+                ("intent".to_string(), intent.as_str().to_string()),
+                ("fate".to_string(), fate.as_str().to_string()),
+            ]);
+            if let Err(e) = metrics
+                .record_counter(CHANGE_FATE_METRIC, 0.0, labels)
+                .await
+            {
+                tracing::warn!(error = %e, "cannot seed the change fate counter");
                 return;
             }
         }
@@ -283,6 +327,32 @@ mod tests {
                 "{:?}/{:?} is not zero",
                 point.intent, point.stage
             );
+        }
+    }
+
+    /// The seed has to cover the same pairs the counter can take, and each of
+    /// them exactly once: a class left out of the domain is a series that
+    /// stays absent until it happens to fire, which is the reading the seed
+    /// exists to remove.
+    #[test]
+    fn the_fate_domain_is_every_pair_the_counter_can_take() {
+        let domain = fate_domain();
+        assert_eq!(
+            domain.len(),
+            EvolutionIntent::ALL.len() * FunnelFate::ALL.len()
+        );
+        for intent in EvolutionIntent::ALL {
+            for fate in FunnelFate::ALL {
+                assert!(
+                    domain.contains(&(intent, fate)),
+                    "{intent:?}/{fate:?} is not in the domain"
+                );
+            }
+        }
+        let mut seen: Vec<(EvolutionIntent, FunnelFate)> = Vec::new();
+        for pair in &domain {
+            assert!(!seen.contains(pair), "{pair:?} appears twice");
+            seen.push(*pair);
         }
     }
 

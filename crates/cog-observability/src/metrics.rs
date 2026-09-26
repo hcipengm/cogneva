@@ -526,6 +526,29 @@ mod tests {
         );
     }
 
+    /// A counter's zero increment still creates the series, and that is the
+    /// whole reason a publisher can seed a domain it has no events for: the
+    /// scrape then carries the class at zero instead of omitting it, and
+    /// "nothing has happened yet" stops reading like "never wired up".
+    #[tokio::test]
+    async fn a_zero_increment_puts_a_counter_on_the_scrape() {
+        let backend = PrometheusMetricsBackend::new("");
+        backend
+            .record_counter(
+                MetricName::for_tests_only("some_future_total"),
+                0.0,
+                HashMap::from([("fate".to_string(), "landed".to_string())]),
+            )
+            .await
+            .unwrap();
+
+        let body = String::from_utf8(backend.encode().unwrap()).unwrap();
+        assert!(
+            body.contains("some_future_total{fate=\"landed\"} 0"),
+            "a zero increment must still put the series on the scrape: {body}"
+        );
+    }
+
     /// 不带 `_ms` 的名字保留秒量级默认，免得给一个按秒记的序列套上毫秒桶界。
     #[test]
     fn a_series_that_declares_no_unit_keeps_the_seconds_scale_default() {
