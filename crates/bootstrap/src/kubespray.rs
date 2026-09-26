@@ -64,6 +64,22 @@ pub(crate) fn parse_node(name: impl Into<String>, target: &str) -> NodeSpec {
     }
 }
 
+/// The nodes a kubespray run is given, as (inventory alias, SSH target).
+///
+/// One source for the inventory and for the per-node `host_vars` files: a
+/// node's share is derived from its own readings, so an alias that disagreed
+/// between the two would put one machine's numbers on another.
+fn inventory_nodes(workers: &[String]) -> Vec<(String, String)> {
+    std::iter::once(("master-0".to_string(), "127.0.0.1".to_string()))
+        .chain(
+            workers
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("worker-{i}"), t.clone())),
+        )
+        .collect()
+}
+
 /// 渲染 kubespray inventory。
 ///
 /// 本机（master-0）始终是唯一 control-plane + stacked etcd；`workers` 里声明的
@@ -73,11 +89,9 @@ pub(crate) fn parse_node(name: impl Into<String>, target: &str) -> NodeSpec {
 pub(crate) fn render_inventory(workers: &[String]) -> String {
     let mut out = String::new();
     out.push_str("[all]\n");
-    out.push_str("master-0 ansible_host=127.0.0.1 ansible_user=root\n");
-    let specs: Vec<NodeSpec> = workers
-        .iter()
-        .enumerate()
-        .map(|(i, t)| parse_node(format!("worker-{i}"), t))
+    let specs: Vec<NodeSpec> = inventory_nodes(workers)
+        .into_iter()
+        .map(|(name, target)| parse_node(name, &target))
         .collect();
     for s in &specs {
         let mut line = format!("{} ansible_host={} ansible_user={}", s.name, s.host, s.user);
@@ -90,14 +104,14 @@ pub(crate) fn render_inventory(workers: &[String]) -> String {
     out.push_str("\n[kube_control_plane]\nmaster-0\n");
     out.push_str("\n[etcd]\nmaster-0\n");
     out.push_str("\n[kube_node]\n");
-    if specs.is_empty() {
-        // all-in-one：控制面同时承载工作负载。
+    // master-0 始终是 specs 的第一项：没有 worker 时它是唯一的 kube_node
+    // （all-in-one，控制面同时承载工作负载），有 worker 时它只作控制面。
+    if workers.is_empty() {
         out.push_str("master-0\n");
-    } else {
-        for s in &specs {
-            out.push_str(&s.name);
-            out.push('\n');
-        }
+    }
+    for s in specs.iter().skip(1) {
+        out.push_str(&s.name);
+        out.push('\n');
     }
     out.push_str("\n[k8s_cluster:children]\nkube_control_plane\nkube_node\n");
     out
@@ -214,6 +228,30 @@ pub(crate) async fn ensure_container_runner() -> Result<String> {
     Ok("podman".into())
 }
 
+/// The SSH invocation every remote call in this module shares: non-interactive
+/// (BatchMode, so a missing key fails instead of prompting), bounded by a
+/// connect timeout, and told to accept a host key it has not seen -- these are
+/// nodes the caller just declared, and a prompt here would hang a zero-touch
+/// install.
+fn ssh_args(target: &str, remote_cmd: &str) -> Vec<String> {
+    let spec = parse_node("target", target);
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+    ];
+    if let Some(p) = spec.port {
+        args.push("-p".into());
+        args.push(p.to_string());
+    }
+    args.push(format!("{}@{}", spec.user, spec.host));
+    args.push(remote_cmd.to_string());
+    args
+}
+
 /// 在目标上执行一条 shell 命令（本机 local，远端经 SSH 免密）。
 async fn sh_on(target: Option<&str>, remote_cmd: &str) -> Result<()> {
     match target {
@@ -229,21 +267,7 @@ async fn sh_on(target: Option<&str>, remote_cmd: &str) -> Result<()> {
             Ok(())
         }
         Some(node) => {
-            let spec = parse_node("target", node);
-            let mut args: Vec<String> = vec![
-                "-o".into(),
-                "BatchMode=yes".into(),
-                "-o".into(),
-                "ConnectTimeout=10".into(),
-                "-o".into(),
-                "StrictHostKeyChecking=accept-new".into(),
-            ];
-            if let Some(p) = spec.port {
-                args.push("-p".into());
-                args.push(p.to_string());
-            }
-            args.push(format!("{}@{}", spec.user, spec.host));
-            args.push(remote_cmd.to_string());
+            let args = ssh_args(node, remote_cmd);
             let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             run("ssh", &arg_refs)
                 .await
@@ -253,23 +277,29 @@ async fn sh_on(target: Option<&str>, remote_cmd: &str) -> Result<()> {
     }
 }
 
+/// 在目标上执行一条命令并取回它的标准输出。
+///
+/// 与 `sh_on` 同一套 SSH 选项：能跑通预检的节点，这里也应当可达。失败一律
+/// 归入 `None`——调用方要的是"读到 / 没读到"这个二值，读不到时该告警点名该
+/// 节点，而不是替它猜一个数。
+async fn sh_on_capture(target: &str, remote_cmd: &str) -> Option<String> {
+    let args = ssh_args(target, remote_cmd);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = Command::new("ssh")
+        .args(&arg_refs)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// 资源门禁用：检查某节点是否 SSH 免密可达（10s 超时，BatchMode 绝不交互）。
 pub(crate) async fn node_ssh_reachable(target: &str) -> bool {
-    let spec = parse_node("target", target);
-    let mut args: Vec<String> = vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ConnectTimeout=10".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
-    ];
-    if let Some(p) = spec.port {
-        args.push("-p".into());
-        args.push(p.to_string());
-    }
-    args.push(format!("{}@{}", spec.user, spec.host));
-    args.push("true".into());
+    let args = ssh_args(target, "true");
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     Command::new("ssh")
         .args(arg_refs)
@@ -361,6 +391,62 @@ async fn wire_kubeconfig() -> Result<()> {
     Ok(())
 }
 
+/// A node's own memory and CPU count, read over SSH.
+///
+/// The same two readings the K3s path takes from an agent before it first
+/// starts, taken here for every node in the inventory: a node's share must
+/// come from its own machine, not from the control plane's.
+async fn read_node_readings(target: &str) -> Option<cogneva_bootstrap::NodeReadings> {
+    // MemTotal is in kB; nproc is the CPU count the kubelet will see.
+    let out = sh_on_capture(
+        target,
+        "awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo; nproc",
+    )
+    .await?;
+    cogneva_bootstrap::parse_node_readings(&out)
+}
+
+/// Write each node's QoS account where kubespray will read it.
+///
+/// `host_vars/<alias>.yml` sits beside the inventory file the container
+/// mounts, so ansible resolves it per node. A node whose readings did not come
+/// back gets no file and a warning naming it: kubespray would then fall back to
+/// its own fixed reservation for that node, which is a smaller share than this
+/// node's table asks for, and silence would hide that.
+async fn write_node_host_vars(work: &Path, workers: &[String]) -> Result<()> {
+    let dir = work.join("host_vars");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .context("创建 host_vars 目录")?;
+    for (name, target) in inventory_nodes(workers) {
+        let Some(readings) = read_node_readings(&target).await else {
+            warn!(
+                "读不到 {name}（{target}）的内存 / 核数：该节点不会被写入 host_vars，\
+                 kubespray 会按它自己的固定值（100m/256Mi + 500m/512Mi）预留，\
+                 对大盘节点偏小"
+            );
+            continue;
+        };
+        let qos = cogneva_bootstrap::node_qos(readings.mem_total_mb, readings.cpu_cores);
+        tokio::fs::write(
+            dir.join(format!("{name}.yml")),
+            cogneva_bootstrap::kubespray_qos_host_vars(&qos),
+        )
+        .await
+        .with_context(|| format!("写 host_vars/{name}.yml"))?;
+        info!(
+            "节点 QoS（{name}: {}MiB / {} 核）：非 Pod 预留 cpu={}m / memory={}MiB，\
+             memory.available<{}MiB 触发驱逐",
+            readings.mem_total_mb,
+            readings.cpu_cores,
+            qos.reserved_cpu_milli,
+            qos.reserved_memory_mb,
+            qos.eviction_memory_mb
+        );
+    }
+    Ok(())
+}
+
 /// 供给标准 Kubernetes 集群：预检 → 渲染 inventory/group_vars → 跑 kubespray 容器
 /// → 接 kubeconfig。`workers` 为 `COGNEVA_CLUSTER_NODES` 声明的工作节点（空=单节点）。
 pub(crate) async fn run_kubespray(workers: &[String]) -> Result<()> {
@@ -401,6 +487,10 @@ pub(crate) async fn run_kubespray(workers: &[String]) -> Result<()> {
     )
     .await
     .context("写 group_vars")?;
+    // Before the container runs: these files are the input of the run, and a
+    // node provisioned without them keeps kubespray's fixed reservation until
+    // someone re-runs the playbook.
+    write_node_host_vars(&work, workers).await?;
 
     info!("运行 kubespray {KUBESPRAY_TAG}（CNI={cni}, CN={cn}）部署标准 Kubernetes ...");
     let work_str = work.to_string_lossy().to_string();
@@ -520,6 +610,34 @@ mod tests {
         );
         assert!(y.contains("- host: https://docker.1ms.run"));
         assert!(!y.contains("m.daocloud.io"), "换站后仍指向 daocloud");
+    }
+
+    /// `host_vars` 的文件名就是 inventory 里的别名，ansible 按别名找这两份文件：
+    /// 名字对不上时那份配置被静默忽略，节点照常起来、只是没有预留，没有任何
+    /// 一步会说这件事。
+    #[test]
+    fn host_var_names_match_the_inventory_aliases() {
+        let workers = vec![
+            "root@10.0.0.7:2200".to_string(),
+            "ubuntu@10.0.0.8".to_string(),
+        ];
+        let nodes = inventory_nodes(&workers);
+        assert_eq!(
+            nodes.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["master-0", "worker-0", "worker-1"]
+        );
+        let inv = render_inventory(&workers);
+        for (name, target) in &nodes {
+            let spec = parse_node(name, target);
+            assert!(
+                inv.contains(&format!("{name} ansible_host={} ", spec.host)),
+                "{name} 的别名 / 地址在 inventory 里对不上"
+            );
+        }
+        // 读回用的目标与 ansible 连的是同一个地址：master-0 走回环（容器
+        // --network=host 后即宿主），worker 走各自声明的地址。
+        assert_eq!(nodes[0].1, "127.0.0.1");
+        assert_eq!(nodes[1].1, "root@10.0.0.7:2200");
     }
 
     #[test]

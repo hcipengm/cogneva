@@ -357,6 +357,122 @@ pub fn k3s_qos_config_yaml(qos: &NodeQos) -> String {
     )
 }
 
+/// The same QoS settings stated as kubespray host variables.
+///
+/// A K3s node reads one file before its first start; a standard Kubernetes
+/// node is built by kubespray, which renders the kubelet configuration per
+/// node from inventory variables. So the same account is written in the other
+/// provisioner's language, and the names are the ones the pinned kubespray tag
+/// reads: its `roles/kubernetes/node/defaults/main.yml` declares
+/// `kube_*_reserved` / `system_*_reserved` and `eviction_hard`, and its
+/// kubelet-config template writes `kubeReserved` and `systemReserved` whether
+/// or not the cgroup toggles are on.
+///
+/// Leaving those variables unset does not leave the node empty: kubespray's
+/// fixed 100m/256Mi and 500m/512Mi would apply to every node whatever its
+/// size, which is the account this exists to replace. So both scopes are
+/// stated in full -- the share for work that is not a pod in the system scope,
+/// the same sentence the K3s path states with `system-reserved`, and zeros in
+/// the kube scope rather than an arbitrary constant. `system_reserved` itself
+/// stays false: the share comes off allocatable without a dedicated cgroup
+/// being enforced, exactly as on a K3s node.
+pub fn kubespray_qos_host_vars(qos: &NodeQos) -> String {
+    format!(
+        "---\n\
+         # Derived from this node's own /proc/meminfo and CPU count.\n\
+         kube_cpu_reserved: \"0m\"\n\
+         kube_memory_reserved: \"0Mi\"\n\
+         kube_ephemeral_storage_reserved: \"0Mi\"\n\
+         kube_pid_reserved: \"0\"\n\
+         system_cpu_reserved: \"{}m\"\n\
+         system_memory_reserved: \"{}Mi\"\n\
+         system_ephemeral_storage_reserved: \"0Mi\"\n\
+         system_pid_reserved: \"0\"\n\
+         # Every eviction signal is written together: kubelet replaces its own\n\
+         # default set with the one here, and a signal left out is silently\n\
+         # zero -- an imagefs with no threshold is a disk that fills up\n\
+         # without the kubelet noticing.\n\
+         eviction_hard:\n\
+         \x20 memory.available: \"{}Mi\"\n\
+         \x20 nodefs.available: \"5%\"\n\
+         \x20 imagefs.available: \"5%\"\n\
+         \x20 nodefs.inodesFree: \"5%\"\n\
+         \x20 imagefs.inodesFree: \"5%\"\n",
+        qos.reserved_cpu_milli, qos.reserved_memory_mb, qos.eviction_memory_mb
+    )
+}
+
+/// A node's memory and CPU count, as read from the node itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeReadings {
+    /// Total memory, in MiB.
+    pub mem_total_mb: u64,
+    pub cpu_cores: u32,
+}
+
+/// Read the two numbers the QoS account is derived from out of one command's
+/// output: total memory in MiB, then the CPU count. Anything else -- a
+/// truncated read, a node that answered with a shell error -- is not a
+/// reading, and a node whose readings are missing must not be given the share
+/// of another node.
+pub fn parse_node_readings(out: &str) -> Option<NodeReadings> {
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let mem_total_mb: u64 = lines.next()?.parse().ok()?;
+    let cpu_cores: u32 = lines.next()?.parse().ok()?;
+    if mem_total_mb == 0 || cpu_cores == 0 {
+        return None;
+    }
+    Some(NodeReadings {
+        mem_total_mb,
+        cpu_cores,
+    })
+}
+
+/// A node's memory account as the cluster reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeMemoryAccount {
+    pub node: String,
+    /// `status.capacity.memory`, in KiB.
+    pub capacity_kib: u64,
+    /// `status.allocatable.memory`, in KiB.
+    pub allocatable_kib: u64,
+}
+
+impl NodeMemoryAccount {
+    /// Kubelet derives allocatable as capacity minus kubeReserved,
+    /// systemReserved and the hard eviction threshold, so an equality here
+    /// says all three are unset: the node holds nothing back for the work
+    /// outside the cluster, and with no memory threshold it never reports
+    /// MemoryPressure either.
+    pub fn holds_back_nothing(&self) -> bool {
+        self.allocatable_kib == self.capacity_kib
+    }
+}
+
+/// Read `kubectl get nodes -o custom-columns=NAME,CAPACITY,ALLOCATABLE` back
+/// into accounts. Unreadable lines are skipped rather than kept as zeros: a
+/// node nobody could read is not a node holding nothing back.
+pub fn parse_node_memory_accounts(out: &str) -> Vec<NodeMemoryAccount> {
+    out.lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let node = cols.next()?.to_string();
+            let capacity_kib = parse_kib(cols.next()?)?;
+            let allocatable_kib = parse_kib(cols.next()?)?;
+            Some(NodeMemoryAccount {
+                node,
+                capacity_kib,
+                allocatable_kib,
+            })
+        })
+        .collect()
+}
+
+/// Kubelet reports memory as `65741456Ki`; any other unit is not this reading.
+fn parse_kib(value: &str) -> Option<u64> {
+    value.strip_suffix("Ki")?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +603,59 @@ mod tests {
         // the first start, so a stray key here is a node that never comes up.
         assert_eq!(yaml.lines().filter(|l| !l.starts_with("  - ")).count(), 1);
         assert!(yaml.starts_with("kubelet-arg:\n"));
+    }
+
+    #[test]
+    fn the_kubespray_host_vars_state_the_same_account_as_the_k3s_flag() {
+        let yaml = kubespray_qos_host_vars(&node_qos(64199, 24));
+        assert!(yaml.contains("system_cpu_reserved: \"140m\""));
+        assert!(yaml.contains("system_memory_reserved: \"6500Mi\""));
+        // The kube scope is stated at zero rather than left out: an unset
+        // kubespray variable is not an empty reservation, it is its own fixed
+        // 100m/256Mi for every node.
+        assert!(yaml.contains("kube_cpu_reserved: \"0m\""));
+        assert!(yaml.contains("kube_memory_reserved: \"0Mi\""));
+        // Same five signals as the K3s path, for the same reason.
+        for signal in [
+            "memory.available: \"3300Mi\"",
+            "nodefs.available: \"5%\"",
+            "imagefs.available: \"5%\"",
+            "nodefs.inodesFree: \"5%\"",
+            "imagefs.inodesFree: \"5%\"",
+        ] {
+            assert!(yaml.contains(signal), "missing {signal} in {yaml}");
+        }
+        assert!(yaml.starts_with("---\n"));
+    }
+
+    #[test]
+    fn node_readings_need_both_numbers() {
+        assert_eq!(
+            parse_node_readings("64199\n24\n"),
+            Some(NodeReadings {
+                mem_total_mb: 64199,
+                cpu_cores: 24
+            })
+        );
+        // A node that answered with nothing, or with a shell error, is not a
+        // node to derive a share for: the caller warns instead of guessing.
+        assert_eq!(parse_node_readings(""), None);
+        assert_eq!(parse_node_readings("64199\n"), None);
+        assert_eq!(parse_node_readings("sh: awk: not found\n24\n"), None);
+        assert_eq!(parse_node_readings("0\n0\n"), None);
+    }
+
+    #[test]
+    fn the_memory_account_is_read_back_from_the_api_units() {
+        let out = "cogneva   65741456Ki   65741456Ki\nworker-0   32870428Ki   31000000Ki\n";
+        let accounts = parse_node_memory_accounts(out);
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts[0].holds_back_nothing());
+        assert!(!accounts[1].holds_back_nothing());
+        assert_eq!(accounts[1].allocatable_kib, 31000000);
+        // A line in another unit is not the reading this parses; dropping it
+        // must not leave a zero-valued node that reads as "holds back nothing".
+        assert!(parse_node_memory_accounts("cogneva   65741456Mi   65741456Mi\n").is_empty());
     }
 
     #[test]

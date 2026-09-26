@@ -375,28 +375,64 @@ fn write_k3s_qos_config(mem_total_mb: u64, cpu_cores: usize) -> Result<()> {
     Ok(())
 }
 
-/// Report a cluster that is already running without the node QoS settings.
+/// Report the nodes whose allocatable memory equals their capacity.
 ///
-/// The settings are read once, at K3s' first start, so a cluster that was
-/// provisioned before this file existed keeps running with `allocatable ==
-/// capacity` and no memory eviction threshold -- nothing on the node stops a
-/// pod from taking the memory the host itself needs. Naming the gap is all
-/// this path can do: picking it up needs the service restarted.
-fn warn_if_qos_missing() {
-    if Path::new(K3S_CONFIG_PATH).exists() {
+/// Kubelet derives allocatable from capacity minus kubeReserved, systemReserved
+/// and the hard eviction threshold, so an equality says all three are unset:
+/// the node keeps nothing back for the work outside the cluster, and with no
+/// memory threshold it never reports MemoryPressure either -- nothing stops a
+/// pod from taking the memory the host itself needs, and the kernel is left to
+/// decide by paging. Read from the cluster rather than from the config file
+/// that was written: a file that exists says the settings were meant to apply,
+/// not that the kubelet ever read them (K3s reads its config once, at first
+/// start, and kubespray takes its numbers from the host_vars handed to the
+/// playbook). The same equality is what the `node_without_memory_reserve` rule
+/// watches from inside the cluster; this is the same reading taken at the one
+/// moment the installer can act on it.
+async fn warn_if_nodes_hold_back_nothing() {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "nodes",
+            "-o",
+            "custom-columns=NAME:.metadata.name,\
+             CAPACITY:.status.capacity.memory,\
+             ALLOCATABLE:.status.allocatable.memory",
+            "--no-headers",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    let accounts = match out {
+        Ok(o) if o.status.success() => {
+            cogneva_bootstrap::parse_node_memory_accounts(&String::from_utf8_lossy(&o.stdout))
+        }
+        _ => Vec::new(),
+    };
+    if accounts.is_empty() {
+        // No reading is not a clean reading: whoever reads this log should not
+        // take the silence for "every node holds memory back".
+        warn!(
+            "读不到任何节点的内存账（kubectl get nodes 未返回 capacity/allocatable）：\
+             节点是否有内存预留与 memory.available 驱逐阈值本次未被判定"
+        );
         return;
     }
-    warn!(
-        "现有集群从未写过 {K3S_CONFIG_PATH}：节点没有内存预留，也没有 memory.available \
-         驱逐阈值（allocatable 等于 capacity，即容器可以吃掉整机内存，内核只能换页）。\
-         写入后需重启 K3s 才生效，这一步不在元启动里自动做"
-    );
+    for account in accounts.iter().filter(|a| a.holds_back_nothing()) {
+        warn!(
+            "节点 {} 没有为非 Pod 进程预留任何内存（capacity == allocatable == {}Ki）：\
+             容器可以吃掉整机内存，且 memory.available 驱逐阈值不生效（内核只能换页，\
+             节点也不会进入 MemoryPressure）。写入配置后需重启 kubelet 才生效，\
+             这一步不在元启动里自动做",
+            account.node, account.allocatable_kib
+        );
+    }
 }
 
 async fn install_k3s(hw: &Hardware) -> Result<()> {
     if cluster_ready().await {
         info!("检测到可用集群，跳过 K3s 安装");
-        warn_if_qos_missing();
         return Ok(());
     }
     info!("安装 K3s（官方脚本）...");
@@ -712,11 +748,9 @@ async fn remote_qos_config(ssh_target: &str, port: Option<&String>) -> Option<St
         "awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo; nproc",
     )
     .await?;
-    let mut lines = out.lines().filter(|l| !l.trim().is_empty());
-    let mem_total_mb: u64 = lines.next()?.trim().parse().ok()?;
-    let cpu_cores: u32 = lines.next()?.trim().parse().ok()?;
+    let readings = cogneva_bootstrap::parse_node_readings(&out)?;
     Some(cogneva_bootstrap::k3s_qos_config_yaml(
-        &cogneva_bootstrap::node_qos(mem_total_mb, cpu_cores),
+        &cogneva_bootstrap::node_qos(readings.mem_total_mb, readings.cpu_cores),
     ))
 }
 
@@ -2858,6 +2892,10 @@ async fn main() -> Result<()> {
     seed_cluster_registry().await?;
     kick_image_pull_pending().await?;
     wait_ready().await?;
+    // After wait_ready: every node is registered and Running, so a node whose
+    // account cannot be read is a broken reading, not a node that has not
+    // joined yet.
+    warn_if_nodes_hold_back_nothing().await;
 
     let webui =
         std::env::var("COGNEVA_WEBUI_URL").unwrap_or_else(|_| "http://localhost:8080".into());
@@ -3260,5 +3298,48 @@ mod node_qos_wiring_tests {
                 "{path} 里 {write} 必须排在 {start} 之前（配置只在首启时被读一次）"
             );
         }
+    }
+
+    /// kubespray 的节点配置是那次运行的输入：`host_vars` 必须在容器跑
+    /// ansible-playbook 之前写好，事后写等于没写，节点会带着 kubespray 自己的
+    /// 固定预留起来，要重跑 playbook 才会变。
+    #[test]
+    fn the_kubespray_qos_host_vars_are_written_before_the_playbook_runs() {
+        let src = include_str!("kubespray.rs");
+        let body = src
+            .split("pub(crate) async fn run_kubespray(")
+            .nth(1)
+            .expect("run_kubespray 不在 kubespray.rs 里");
+        let write_at = body
+            .find("write_node_host_vars")
+            .expect("run_kubespray 没有调用 write_node_host_vars");
+        let run_at = body
+            .find("ansible-playbook")
+            .expect("run_kubespray 没有跑 ansible-playbook");
+        assert!(
+            write_at < run_at,
+            "host_vars 必须排在 ansible-playbook 之前（它是那次运行的输入）"
+        );
+    }
+
+    /// 读回节点的内存账要在集群起来之后：节点还没注册时读到的空集会被报成
+    /// "读不到"，而那是流程位置的问题，不是节点的——这样一条告警本身就是假的。
+    #[test]
+    fn the_memory_readback_runs_after_the_cluster_is_ready() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("async fn main()")
+            .nth(1)
+            .expect("main 不在 main.rs 里");
+        let read_at = body
+            .find("warn_if_nodes_hold_back_nothing().await")
+            .expect("main 没有读回节点的内存账");
+        let ready_at = body
+            .find("wait_ready().await")
+            .expect("main 没有等待工作负载就绪");
+        assert!(
+            ready_at < read_at,
+            "内存账的读回必须排在 wait_ready 之后（否则节点还没注册）"
+        );
     }
 }
