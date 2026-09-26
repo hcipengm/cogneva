@@ -12,6 +12,12 @@
 //! [`DocFate::Rbac`]）、创建 Namespace（集群级，属安装期）。这三样缺失时本轮
 //! 会给出结论说清楚是哪一样，而不是沉默。
 //!
+//! 漂移与否**先比后写**：逐文件把这一轮要交出去的字节交给 `kubectl diff`
+//! （只读）与现场比一遍，只见差异才 apply。判据不能用 `apply` 自己的逐资源
+//! 动词——它报的是「算出了一个补丁」，而「现场一致」这件事在某些对象上根本
+//! 读不出来，于是告警永远解除不了，理由也变成了工具内部的补丁算法。见
+//! [`DiffOutcome`]。
+//!
 //! 交付对象由 `git ls-tree` **枚举**，跳过与否由清单目录里那张处置表
 //! （`delivery-dispositions.txt`）说了算——安装脚本读同一张表。两处各留一份
 //! 名单必然分叉，分叉的样子是"装的时候跳过、收敛的时候照做"。
@@ -154,42 +160,68 @@ pub fn dangling_entries(entries: &[DispositionEntry], files: &[String]) -> Vec<S
         .collect()
 }
 
-/// `kubectl apply` 的逐资源结果。
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ApplyReport {
-    /// 被写进去的资源（新建或改动）——也就是现场与声明不一致的那些。
-    pub changed: Vec<String>,
-    /// 已经是声明态、这次没动的资源。
-    pub unchanged: Vec<String>,
-}
-
-impl ApplyReport {
-    pub fn total(&self) -> usize {
-        self.changed.len() + self.unchanged.len()
-    }
-}
-
-/// 从 `kubectl apply` 的输出读逐资源结果。
+/// 一次 `kubectl diff` 的读数。
 ///
-/// 交付与判据是同一次调用：apply 自己会说哪个资源这次被改了、哪个没动，
-/// 所以"漂移"不需要再单独比一遍现场。只认形如
-/// `configmap/cogneva-dashboards configured` 的行——其余（警告、提示）不当读数。
-pub fn classify_apply(stdout: &str) -> ApplyReport {
-    let mut report = ApplyReport::default();
-    for line in stdout.lines() {
-        let mut it = line.split_whitespace();
-        let Some(resource) = it.next() else { continue };
-        let Some(verb) = it.next() else { continue };
-        if !resource.contains('/') {
-            continue;
-        }
-        match verb {
-            "created" | "configured" => report.changed.push(resource.to_string()),
-            "unchanged" => report.unchanged.push(resource.to_string()),
-            _ => {}
+/// 漂移的判据是「现场与这一份字节有没有差异」，这条由 `kubectl diff` 回答。
+/// 曾经用的是 `kubectl apply` 自己的逐资源动词（`configured` = 漂移），**已
+/// 被现场否掉**：`configured` 报的是「算出了一个补丁」，不是「现场与声明不
+/// 一致」。StatefulSet 的 `volumeClaimTemplates` 在服务端被物化出清单里写不
+/// 出来的字段（`apiVersion`/`kind`/`status`），于是 `clickhouse` 与 `loki` 这两
+/// 个 StatefulSet 每一轮都被报成 `configured`——同一时刻 `kubectl diff` 读作
+/// 没有差异，而这两个对象的内容确实与声明逐字段相同。一个不可能读成「一致」
+/// 的读数不是判据：它让告警永远解除不了，并且把「有人在改集群」这个结论挂在
+/// 一个工具内部的补丁算法上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffOutcome {
+    /// 现场就是这份字节。
+    Clean,
+    /// 现场与这份字节有差异。
+    Differs,
+    /// 读不出来（跑不起来 / API 报错 / kind 解不出）。
+    Failed(String),
+}
+
+/// 退出码 + stderr → 一次 diff 的读数。
+///
+/// 退出码语义由 kubectl 定义（0 无差异、1 有差异、>1 出错），但**退出码 1 要
+/// 再看一眼 stderr**：连不上 API、kind 解不出这类失败也带着 1 回来，把它们读
+/// 成漂移会凭空报一个现场根本没有的不一致。警告行（`W…`）不算错误——对象在
+/// 比较期间被改过，kubectl 会留一行这样的警告，而那一轮照样比出了结果。
+pub fn classify_diff(exit_code: i32, stderr: &str) -> DiffOutcome {
+    let error = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("Error"));
+    match exit_code {
+        0 => DiffOutcome::Clean,
+        1 => match error {
+            Some(line) => DiffOutcome::Failed(line.to_string()),
+            None => DiffOutcome::Differs,
+        },
+        other => DiffOutcome::Failed(match error {
+            Some(line) => format!("退出码 {other}：{line}"),
+            None => format!("退出码 {other}：{}", first_error_line(stderr)),
+        }),
+    }
+}
+
+/// 逐文件读数 → 漂移清单。
+///
+/// 任何一个文件读不出来就让整轮没有结论，而不是只报读出来的那些：一个「与声明
+/// 不一致」的结论要么覆盖这一轮要交付的全部文件，要么不说——少报一个文件与多
+/// 报一个文件的代价不对称，而这里连「它是不是一致」都没读到。
+pub fn drifted_files(readings: &[(String, DiffOutcome)]) -> Result<Vec<String>, String> {
+    let mut drifted = Vec::new();
+    for (file, outcome) in readings {
+        match outcome {
+            DiffOutcome::Clean => {}
+            DiffOutcome::Differs => drifted.push(file.clone()),
+            DiffOutcome::Failed(detail) => {
+                return Err(format!("{file} 的 diff 读不出来：{detail}"));
+            }
         }
     }
-    report
+    Ok(drifted)
 }
 
 /// apply 没成的原因，按**能不能自己修**分组。
@@ -282,9 +314,10 @@ fn first_error_line(text: &str) -> String {
 /// 一轮收敛的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvergenceVerdict {
-    /// 现场本来就是声明态。
+    /// 现场本来就是声明态（这一轮没有任何文件与现场不一致，因此也没有写）。
     Converged { resources: usize },
-    /// 现场不是声明态，这一轮修回去了。要报：反复发生的修复说明有个东西在
+    /// 现场不是声明态，这一轮修回去了。点名的单位是**清单文件**：判据是逐文件
+    /// 比出来的，而处置动作也是按文件读的。要报：反复发生的修复说明有个东西在
     /// 改集群，或者上一次交付根本没跑到，而这两种都需要人看一眼。
     DriftRepaired { repaired: Vec<String> },
     /// 修不回去，原因是这个。
@@ -312,7 +345,7 @@ impl ConvergenceVerdict {
                 format!("可观测性栈与仓库声明一致（{resources} 个资源，rev {}）", rev12(rev))
             }
             ConvergenceVerdict::DriftRepaired { repaired } => format!(
-                "可观测性栈的现场与仓库声明不一致，已按 rev {} 修回：{}（不是第一次出现的修复说明有个东西在改集群，或者上一次交付没跑到）",
+                "可观测性栈的现场与仓库声明不一致，已按 rev {} 修回（与现场不一致的清单文件）：{}（不是第一次出现的修复说明有个东西在改集群，或者上一次交付没跑到）",
                 rev12(rev),
                 join_named(repaired, max_named)
             ),
@@ -332,6 +365,20 @@ impl ConvergenceVerdict {
 
 fn rev12(rev: &str) -> String {
     rev.chars().take(12).collect()
+}
+
+/// 日志里一段文本的字符上限。界挂在**字符数**上而不是行数上：一行可以很长，
+/// 按行截断等于没有上界（`kubectl diff` 的对象正文就是单行 JSON 拼出来的）。
+const DIFF_LOG_CHARS: usize = 2000;
+
+/// 截断到 `max` 个字符，截断时留一个尾巴让读的人知道后面还有。
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push_str("…[截断]");
+    out
 }
 
 fn join_named(names: &[String], max_named: usize) -> String {
@@ -437,8 +484,12 @@ impl StackConvergence {
             info!(file = %file, reason = %reason, "observability stack: not delivered this round");
         }
 
-        // 逐个文件取内容、拆文档、按 kind 归置。
+        // 逐个文件取内容、拆文档、按 kind 归置。逐文件留一份**这一轮真要交出去
+        // 的字节**：漂移判据与 apply 必须读同一份，从这份字节里再算一遍是另一
+        // 个读数，两者不同步时没人能说是谁错。
+        let mut per_file: Vec<(String, String)> = Vec::new();
         let mut deliverable = String::new();
+        let mut deliverable_docs = 0usize;
         let mut skipped_classes: Vec<String> = Vec::new();
         for file in &plan.deliver {
             let path = format!("{dir}/{file}");
@@ -454,6 +505,7 @@ impl StackConvergence {
                     return ConvergenceVerdict::Obstructed(Obstacle::Unusable(format!("{e}")))
                 }
             };
+            let mut file_body = String::new();
             for doc in docs {
                 let kind = doc.get("kind").and_then(|k| k.as_str()).unwrap_or("");
                 let name = doc
@@ -464,10 +516,11 @@ impl StackConvergence {
                 let ident = format!("{kind}/{name}");
                 match classify_doc(kind) {
                     DocFate::Deliver => {
-                        deliverable.push_str("---\n");
-                        deliverable.push_str(
+                        file_body.push_str("---\n");
+                        file_body.push_str(
                             &serde_yaml::to_string(&doc).unwrap_or_else(|_| String::new()),
                         );
+                        deliverable_docs += 1;
                     }
                     DocFate::ForbiddenSecret => {
                         return ConvergenceVerdict::Obstructed(Obstacle::SecretRefused(format!(
@@ -485,6 +538,10 @@ impl StackConvergence {
                         skipped_classes.push(format!("{file}:{ident}={class}"));
                     }
                 }
+            }
+            if !file_body.is_empty() {
+                deliverable.push_str(&file_body);
+                per_file.push((file.clone(), file_body));
             }
         }
         if !skipped_classes.is_empty() {
@@ -505,6 +562,51 @@ impl StackConvergence {
             ));
         }
 
+        // 判据先跑，而且**不改集群**：逐文件与现场比一遍，只见差异才写。
+        //
+        // 逐文件比要有总预算：每次调用各自的超时叠起来是「文件数 × 超时」，慢的
+        // API 会让一轮退化成几十分钟。预算取配置面已有的那一个（与 apply 共用
+        // 声明），用完就这一轮没有结论——不新造一个数。
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.cfg.apply_timeout_secs);
+        let mut readings: Vec<(String, DiffOutcome)> = Vec::with_capacity(per_file.len());
+        for (file, body) in &per_file {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return ConvergenceVerdict::NoEvidence(format!(
+                    "{file} 的 diff 没时间跑了：这一轮与集群打交道的预算（{} 秒）在一次比一遍里用完了",
+                    self.cfg.apply_timeout_secs
+                ));
+            }
+            let (code, diff, stderr) = match self
+                .deployer
+                .diff_capture(&self.cfg.namespace, body.as_bytes(), left.as_secs().max(1))
+                .await
+            {
+                Ok(out) => out,
+                Err(e) => return ConvergenceVerdict::NoEvidence(format!("{file} 的 diff: {e}")),
+            };
+            let outcome = classify_diff(code, &stderr);
+            if let DiffOutcome::Failed(_) = &outcome {
+                if let Some(obstacle) = classify_obstacle(&stderr, &self.cfg.namespace) {
+                    return ConvergenceVerdict::Obstructed(obstacle);
+                }
+            }
+            if !diff.trim().is_empty() {
+                info!(file = %file, diff = %clip(&diff, DIFF_LOG_CHARS), "observability stack: live state differs from the declared manifest");
+            }
+            readings.push((file.clone(), outcome));
+        }
+        let drifted = match drifted_files(&readings) {
+            Ok(drifted) => drifted,
+            Err(detail) => return ConvergenceVerdict::NoEvidence(detail),
+        };
+        if drifted.is_empty() {
+            return ConvergenceVerdict::Converged {
+                resources: deliverable_docs,
+            };
+        }
+
         let (ok, stdout, stderr) = match self
             .deployer
             .apply_capture(
@@ -517,7 +619,6 @@ impl StackConvergence {
             Ok(out) => out,
             Err(e) => return ConvergenceVerdict::NoEvidence(format!("apply 没能执行: {e}")),
         };
-        let report = classify_apply(&stdout);
         if !ok {
             if let Some(obstacle) = classify_obstacle(&stderr, &self.cfg.namespace) {
                 return ConvergenceVerdict::Obstructed(obstacle);
@@ -527,15 +628,13 @@ impl StackConvergence {
                 first_error_line(&stderr)
             ));
         }
-        if report.changed.is_empty() {
-            ConvergenceVerdict::Converged {
-                resources: report.total(),
-            }
-        } else {
-            ConvergenceVerdict::DriftRepaired {
-                repaired: report.changed,
-            }
-        }
+        // apply 自己的输出只当交付细节记一行：`configured` 不是漂移读数（见
+        // [`DiffOutcome`]），写在这里是为了出事时能看见它到底写了哪些对象。
+        info!(
+            applied = %clip(&stdout, DIFF_LOG_CHARS),
+            "observability stack: drifted manifests re-applied"
+        );
+        ConvergenceVerdict::DriftRepaired { repaired: drifted }
     }
 
     /// 把结论送进持久化告警面（恢复时同一调用解除）。
@@ -724,17 +823,70 @@ mod tests {
         assert_eq!(dangling_entries(&entries, &files), vec!["renamed.yaml"]);
     }
 
-    /// 交付与判据是同一次调用：apply 自己说哪个被改了。
+    /// 漂移读数读的是 kubectl 定义的退出码：0 一致、1 有差异。
     #[test]
-    fn the_apply_output_is_the_drift_reading() {
-        let out = "namespace/monitoring unchanged\n\
-                   configmap/cogneva-dashboards configured\n\
-                   servicemonitor.monitoring.coreos.com/cogneva unchanged\n\
-                   Warning: resource x is missing the kubectl.kubernetes.io/last-applied-configuration\n";
-        let report = classify_apply(out);
-        assert_eq!(report.changed, vec!["configmap/cogneva-dashboards"]);
-        assert_eq!(report.unchanged.len(), 2);
-        assert_eq!(report.total(), 3);
+    fn the_diff_exit_code_is_the_drift_reading() {
+        assert_eq!(classify_diff(0, ""), DiffOutcome::Clean);
+        assert_eq!(classify_diff(1, ""), DiffOutcome::Differs);
+    }
+
+    /// 退出码 1 也带着「跑不起来」回来，那种要读成读不出来而不是漂移——
+    /// 否则一次连不上 API 会被报成现场有一处不存在的不一致。
+    #[test]
+    fn a_failed_diff_is_not_a_drift_reading() {
+        let stderr =
+            "Error from server (NotFound): the server could not find the requested resource\n";
+        assert!(matches!(classify_diff(1, stderr), DiffOutcome::Failed(_)));
+        assert!(matches!(
+            classify_diff(2, "exit status 2"),
+            DiffOutcome::Failed(_)
+        ));
+    }
+
+    /// 警告不是错误：对象在比较期间被别人改过时 kubectl 会留一行 `W…`，
+    /// 而那一轮照样给出了「有差异」这个结果。
+    #[test]
+    fn a_warning_does_not_turn_a_diff_into_a_failure() {
+        let stderr = "W0927 04:58:42.717875 1662054 diff.go:723] Object (apps/v1, Kind=StatefulSet: loki) keeps changing, diffing without lock\n";
+        assert_eq!(classify_diff(1, stderr), DiffOutcome::Differs);
+    }
+
+    /// 逐文件读数折成漂移清单：干净的一轮必须是空清单——告警靠它解除。
+    #[test]
+    fn a_clean_round_names_nothing() {
+        let readings = vec![
+            ("09-clickhouse.yaml".to_string(), DiffOutcome::Clean),
+            ("10-loki.yaml".to_string(), DiffOutcome::Clean),
+        ];
+        assert!(drifted_files(&readings).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_drifted_file_is_named_by_file() {
+        let readings = vec![
+            ("09-clickhouse.yaml".to_string(), DiffOutcome::Differs),
+            ("10-loki.yaml".to_string(), DiffOutcome::Clean),
+        ];
+        assert_eq!(
+            drifted_files(&readings).unwrap(),
+            vec!["09-clickhouse.yaml"]
+        );
+    }
+
+    /// 有文件读不出来就整轮没有结论：部分清单不构成「现场与声明是否一致」这个
+    /// 结论，而少报一个文件的代价与多报一个不对称。
+    #[test]
+    fn one_unreadable_file_voids_the_round() {
+        let readings = vec![
+            ("09-clickhouse.yaml".to_string(), DiffOutcome::Clean),
+            (
+                "11-podmonitor-redis.yaml".to_string(),
+                DiffOutcome::Failed("退出码 2：exit status 2".into()),
+            ),
+        ];
+        let err = drifted_files(&readings).unwrap_err();
+        assert!(err.contains("11-podmonitor-redis.yaml"), "{err}");
+        assert!(err.contains("退出码 2"), "{err}");
     }
 
     #[test]
@@ -767,7 +919,7 @@ mod tests {
     #[test]
     fn repaired_drift_and_unfixable_state_are_different_verdicts() {
         let repaired = ConvergenceVerdict::DriftRepaired {
-            repaired: vec!["configmap/cogneva-dashboards".into()],
+            repaired: vec!["06-grafana-dashboard-configmap.yaml".into()],
         };
         assert!(repaired.is_firing());
         assert!(repaired
@@ -778,13 +930,13 @@ mod tests {
         assert!(converged.message("abcdef1234567890", 6).contains("一致"));
     }
 
-    /// 点名的资源数必须有界：集群可以漂移一百个资源，消息不能长到没人读。
+    /// 点名的文件数必须有界：目录里可以有二十个文件都漂移，消息不能长到没人读。
     #[test]
-    fn the_message_names_a_bounded_number_of_resources() {
-        let many: Vec<String> = (0..20).map(|i| format!("configmap/c{i}")).collect();
+    fn the_message_names_a_bounded_number_of_files() {
+        let many: Vec<String> = (0..20).map(|i| format!("{i:02}-manifest.yaml")).collect();
         let msg = ConvergenceVerdict::DriftRepaired { repaired: many }.message("rev", 6);
         assert!(msg.contains("+14 more"), "{msg}");
-        assert!(msg.matches("configmap/c").count() == 6, "{msg}");
+        assert!(msg.matches("-manifest.yaml").count() == 6, "{msg}");
     }
 
     /// 没有结论这件事本身要说出来，且要说清是"没读到"而不是"没问题"。

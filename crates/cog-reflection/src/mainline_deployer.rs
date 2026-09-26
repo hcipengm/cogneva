@@ -2891,6 +2891,47 @@ impl MainlineDeployer {
         ))
     }
 
+    /// 用 `kubectl diff` 把同一份字节与现场比一遍。**不改集群**：kubectl 走的是
+    /// 服务端 dry-run，所以比较本身不会产生差异，同一个对象可以被反复问。
+    ///
+    /// 返回值是进程退出码而不是 `success()`：这一族读的就是 kubectl 自己定义的
+    /// 退出码（0 无差异、1 有差异、>1 出错），把 1 折成 `false` 就把「有差异」
+    /// 和「跑不起来」压成了同一件事。
+    pub(crate) async fn diff_capture(
+        &self,
+        namespace: &str,
+        body: &[u8],
+        timeout_secs: u64,
+    ) -> SFResult<(i32, String, String)> {
+        let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
+            .args(["-n", namespace, "diff", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| SFError::IO(format!("spawn kubectl diff: {e}")))?;
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| SFError::IO("kubectl stdin unavailable".into()))?;
+            stdin.write_all(body).await?;
+            stdin.shutdown().await?;
+        }
+        let output =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+                .await
+                .map_err(|_| SFError::IO(format!("kubectl diff timed out after {timeout_secs}s")))?
+                .map_err(|e| SFError::IO(format!("kubectl diff: {e}")))?;
+        Ok((
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    }
+
     /// 读 rev 处的发布清单并组装清单包。image 必须是节点 pull 端点引用
     /// （kubelet 经 NodePort 拉取），与 set image 路径同一约束。
     ///
