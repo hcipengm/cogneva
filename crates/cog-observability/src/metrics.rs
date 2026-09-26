@@ -129,7 +129,16 @@ impl PrometheusMetricsBackend {
 
         if !store.contains_key(&key) {
             let counter_vec = CounterVec::new(
-                prometheus::Opts::new(self.full_name(name), format!("Counter for {}", name)),
+                prometheus::Opts::new(
+                    self.full_name(name),
+                    // The wording comes from the contract crate's registry, not
+                    // from this file: the same series is served on another
+                    // exposition too, and a `Counter for <name>` line here would
+                    // describe one series two ways — leaving the reader of this
+                    // body, which is the one a scrape actually reaches, with the
+                    // version that says nothing about the measurement.
+                    cog_core::metric_help_text(cog_core::MetricType::Counter, name),
+                ),
                 &sorted_keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )
             .map_err(|e| SFError::Agent(format!("prometheus counter init: {}", e)))?;
@@ -157,7 +166,10 @@ impl PrometheusMetricsBackend {
 
         if !store.contains_key(&key) {
             let gauge_vec = GaugeVec::new(
-                prometheus::Opts::new(self.full_name(name), format!("Gauge for {}", name)),
+                prometheus::Opts::new(
+                    self.full_name(name),
+                    cog_core::metric_help_text(cog_core::MetricType::Gauge, name),
+                ),
                 &sorted_keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )
             .map_err(|e| SFError::Agent(format!("prometheus gauge init: {}", e)))?;
@@ -196,8 +208,11 @@ impl PrometheusMetricsBackend {
 
         if !store.contains_key(&key) {
             let hist_vec = HistogramVec::new(
-                HistogramOpts::new(self.full_name(name), format!("Histogram for {}", name))
-                    .buckets(Self::histogram_buckets(name)),
+                HistogramOpts::new(
+                    self.full_name(name),
+                    cog_core::metric_help_text(cog_core::MetricType::Histogram, name),
+                )
+                .buckets(Self::histogram_buckets(name)),
                 &sorted_keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )
             .map_err(|e| SFError::Agent(format!("prometheus histogram init: {}", e)))?;
@@ -456,6 +471,58 @@ mod tests {
         assert!(
             finite.iter().any(|b| *b >= 256.0 && *b < 512.0),
             "300ms 量级的观测要有自己的桶界，否则 P95 被粗化成桶上界: {finite:?}"
+        );
+    }
+
+    /// 被抓取的那个面上，说明文本必须就是登记过的那句。
+    ///
+    /// 这条断的是**承载序列的那个载体**：池指标只出现在这条进程内导出面上，
+    /// 描述表若只喂给另一条按存储渲染的面，读者拿到的就是一句
+    /// `Gauge for llm_upstream_healthy`——名字重复一遍，不含任何信息，而
+    /// "序列缺席 = 从没被观测过" 这个语义恰好是读者最需要被告知的一条。
+    #[tokio::test]
+    async fn a_described_series_is_served_with_the_registered_wording() {
+        let backend = PrometheusMetricsBackend::new("");
+        backend
+            .record_gauge(
+                MetricName::for_tests_only(cog_core::metric_names::LLM_UPSTREAM_HEALTHY.as_str()),
+                0.0,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let body = String::from_utf8(backend.encode().unwrap()).unwrap();
+        let registered = cog_core::metric_description(
+            cog_core::MetricType::Gauge,
+            cog_core::metric_names::LLM_UPSTREAM_HEALTHY.as_str(),
+        )
+        .expect("这条序列在登记表里");
+        assert!(
+            body.contains(registered),
+            "导出面必须带登记过的那句说明，而不是 `Gauge for <name>`: {body}"
+        );
+    }
+
+    /// 没登记的名字仍要带一句能指出缺口的说明，而不是被丢掉：丢一条序列是
+    /// 拿掉一个测量，留下名字重复一遍只是少一句话。
+    #[tokio::test]
+    async fn an_undescribed_series_is_still_served_with_a_placeholder() {
+        let backend = PrometheusMetricsBackend::new("");
+        backend
+            .record_gauge(
+                MetricName::for_tests_only("some_future_gauge"),
+                7.0,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let body = String::from_utf8(backend.encode().unwrap()).unwrap();
+        assert!(body.contains("some_future_gauge 7"), "{body}");
+        assert!(
+            body.contains("Undocumented metric some_future_gauge"),
+            "无描述的序列要指出缺的是哪一步: {body}"
         );
     }
 

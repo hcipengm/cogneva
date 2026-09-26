@@ -1036,161 +1036,6 @@ fn metric_endpoint_label(matched: Option<&MatchedPath>) -> String {
 /// Label value for requests that matched no route.
 const UNMATCHED_ENDPOINT_LABEL: &str = "unmatched";
 
-/// Descriptions for the counter series. Not a list of what to serve — that
-/// comes from the backend, see [`listed_metric_names`]. What lives here is only
-/// what a name cannot say about itself.
-///
-/// The rule for membership: something in this codebase records the name. A
-/// series nothing produces is not an undocumented measurement, it is an absent
-/// one, and describing it here would assert a reading that never arrives. The
-/// `llm_` entries are recorded by the security gateway rather than by this
-/// process; they are described here so a reader comparing two expositions meets
-/// one wording.
-const COUNTER_HELP: &[(&str, &str)] = &[
-    (
-        "evolution_generated_change_hunks_total",
-        "Hunks carried by generated change artifacts, summed over rounds; \
-         the ratio against the faithful count in the same window is generation \
-         fidelity, and the unfaithful remainder is what the apply gate throws away",
-    ),
-    (
-        "evolution_generated_change_hunks_faithful",
-        "Subset of the above whose context was found in the target tree",
-    ),
-    (
-        "evolution_generated_change_files_total",
-        "Files touched by generated change artifacts, summed over rounds; a \
-         low faithful ratio here with a high hunk ratio means artifacts aimed \
-         at the wrong revision, not artifacts written wrong",
-    ),
-    (
-        "evolution_generated_change_files_faithful",
-        "Subset of the above whose whole file patch applied",
-    ),
-    (
-        "memory_operations_total",
-        "Total number of memory backend operations",
-    ),
-    (
-        "memory_operation_errors_total",
-        "Total number of failed memory backend operations",
-    ),
-    (
-        cog_core::metric_names::HTTP_REQUESTS_TOTAL.as_str(),
-        "Total number of HTTP requests",
-    ),
-    (
-        "tier_migration_total",
-        "Total number of storage tier migrations",
-    ),
-    (
-        "llm_calls_total",
-        "Total number of LLM upstream calls by result",
-    ),
-    (
-        "llm_tokens_total",
-        "Total LLM tokens consumed, split by input and output",
-    ),
-    (
-        "llm_upstream_client_errors_total",
-        "Total LLM upstream calls rejected as malformed requests",
-    ),
-    (
-        "llm_upstream_failures_total",
-        "Total LLM upstream failures, excluding rate limits",
-    ),
-];
-
-/// Descriptions for the histogram series. See [`COUNTER_HELP`].
-const HISTOGRAM_HELP: &[(&str, &str)] = &[
-    (
-        "memory_operation_latency_ms",
-        "Memory backend operation latency in milliseconds",
-    ),
-    (
-        cog_core::metric_names::HTTP_REQUEST_DURATION_MS.as_str(),
-        "HTTP request duration in milliseconds",
-    ),
-];
-
-/// Descriptions for the gauge series. See [`COUNTER_HELP`].
-const GAUGE_HELP: &[(&str, &str)] = &[
-    (
-        "memory_unextracted_raw",
-        "Archived raw sources still missing a summary, as last scanned",
-    ),
-    (
-        "memory_unextracted_raw_aged_out",
-        "Subset of the above that aged past the re-drive window; the system \
-         will not pick these up again without a budgeted backfill",
-    ),
-    (
-        "metrics_samples_rows",
-        "Rows currently held in the metrics sample log",
-    ),
-    (
-        "metrics_samples_budget_rows",
-        "Rows the metrics sample log is allowed to hold; the sweep deletes \
-         oldest-first past this, stopping at each gauge series' newest row",
-    ),
-    (
-        "metrics_samples_over_capacity",
-        "1 when the sample log is over its row budget and cannot be pruned \
-         further without deleting a gauge series' current value, 0 otherwise",
-    ),
-    (
-        "metrics_samples_bytes",
-        "On-disk bytes the metrics sample log occupies, including indexes. \
-         Lags the row count, since PostgreSQL frees deleted space only when it \
-         vacuums, so it is a reading and never the pruning criterion",
-    ),
-    (
-        "metrics_retired_rows_removed",
-        "Rows of retired metric names the last release pass deleted, labelled \
-         by the table they came from. Reported every pass, so a table whose \
-         reading stays non-zero is one the release is not draining",
-    ),
-    (
-        "llm_upstream_healthy",
-        "Whether each LLM upstream has no outstanding failure, 1 or 0. \
-         Absent for an upstream this process has never sent a call to: \
-         'no record' is the shape a recovered upstream has too, so it is \
-         reported as no reading rather than as health. A backoff window \
-         expiring is not evidence of recovery either, so only a call that \
-         actually succeeded clears it — the same rule the pool verdict uses",
-    ),
-    (
-        "llm_pool_available",
-        "Whether any LLM upstream is usable, 1 or 0",
-    ),
-    (
-        "llm_pool_evidenced_recovery_unix",
-        "Recovery instant an upstream itself reported, as a Unix timestamp; \
-         0 when no upstream has given one",
-    ),
-    (
-        "llm_pool_next_attempt_unix",
-        "When the next pool probe is due, as a Unix timestamp",
-    ),
-];
-
-/// Description for one series, from the table matching its kind.
-///
-/// A name the table does not cover is one somebody recorded and never
-/// documented. Serving it with a placeholder is still better than the two
-/// alternatives: dropping it loses the series entirely, and refusing to serve
-/// it turns a missing sentence into a missing measurement. The placeholder
-/// names the fix so the omission is actionable rather than merely visible.
-fn metric_help(help: &[(&str, &str)], name: &str) -> String {
-    match help.iter().find(|(known, _)| *known == name) {
-        Some((_, text)) => (*text).to_string(),
-        None => format!(
-            "Undocumented metric {name}: no description is registered for it in the \
-             exposition's help table"
-        ),
-    }
-}
-
 /// The names to serve for one kind, asked of the backend rather than written
 /// down here.
 ///
@@ -1207,6 +1052,11 @@ fn metric_help(help: &[(&str, &str)], name: &str) -> String {
 /// enumeration failure degrades to the old behaviour rather than to an empty
 /// exposition.
 ///
+/// The descriptions themselves live in the contract crate, because the same
+/// series is also served by the in-process exporter on its own endpoint: two
+/// copies of the wording would describe one series two ways, and a reader
+/// comparing the two bodies could not tell which one is the measurement.
+///
 /// Retired names are dropped from whatever the backend answers. Their rows are
 /// deleted too, but that pass runs on a cadence and needs a reachable store,
 /// while this is the step that decides what a scrape sees: filtering here makes
@@ -1221,7 +1071,6 @@ fn metric_help(help: &[(&str, &str)], name: &str) -> String {
 async fn listed_metric_names(
     backend: &dyn cog_core::MetricsBackend,
     metric_type: cog_core::MetricType,
-    help: &[(&str, &str)],
 ) -> (Vec<String>, bool) {
     match backend.list_metric_names(metric_type).await {
         Ok(mut names) => {
@@ -1237,7 +1086,9 @@ async fn listed_metric_names(
                 e
             );
             (
-                help.iter().map(|(name, _)| (*name).to_string()).collect(),
+                cog_core::documented_metric_names(metric_type)
+                    .map(|name| name.to_string())
+                    .collect(),
                 false,
             )
         }
@@ -1366,7 +1217,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     // scrape interval — and a window chosen here would be this exporter making
     // that decision for every reader at once.
     let (counter_names, counter_read) =
-        listed_metric_names(mb, cog_core::MetricType::Counter, COUNTER_HELP).await;
+        listed_metric_names(mb, cog_core::MetricType::Counter).await;
     read_ok &= counter_read;
     for name in counter_names {
         held.push(name.clone());
@@ -1374,7 +1225,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_counters(
                     &name,
-                    &metric_help(COUNTER_HELP, &name),
+                    &cog_core::metric_help_text(cog_core::MetricType::Counter, &name),
                     &samples,
                 ));
             }
@@ -1385,7 +1236,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     }
 
     let (histogram_names, histogram_read) =
-        listed_metric_names(mb, cog_core::MetricType::Histogram, HISTOGRAM_HELP).await;
+        listed_metric_names(mb, cog_core::MetricType::Histogram).await;
     read_ok &= histogram_read;
     for name in histogram_names {
         held.push(name.clone());
@@ -1393,7 +1244,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_histograms(
                     &name,
-                    &metric_help(HISTOGRAM_HELP, &name),
+                    &cog_core::metric_help_text(cog_core::MetricType::Histogram, &name),
                     &samples,
                 ));
             }
@@ -1403,8 +1254,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
         }
     }
 
-    let (gauge_names, gauge_read) =
-        listed_metric_names(mb, cog_core::MetricType::Gauge, GAUGE_HELP).await;
+    let (gauge_names, gauge_read) = listed_metric_names(mb, cog_core::MetricType::Gauge).await;
     read_ok &= gauge_read;
     for name in gauge_names {
         held.push(name.clone());
@@ -1412,7 +1262,7 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_gauges(
                     &name,
-                    &metric_help(GAUGE_HELP, &name),
+                    &cog_core::metric_help_text(cog_core::MetricType::Gauge, &name),
                     &samples,
                 ));
             }
@@ -2933,7 +2783,7 @@ mod metrics_exposition_tests {
         assert!(
             body.contains(&format!(
                 "# HELP some_future_gauge {}",
-                metric_help(GAUGE_HELP, "some_future_gauge")
+                cog_core::metric_help_text(cog_core::MetricType::Gauge, "some_future_gauge")
             )),
             "无描述的序列也要带 HELP，且要指出缺的是哪一步: {body}"
         );
@@ -2956,6 +2806,12 @@ mod metrics_exposition_tests {
         );
     }
 
+    /// 描述表里有没有这个名字。判定走的是渲染时同一个取值面
+    /// （`cog_core::metric_description`），不是这份测试自己的抄本。
+    fn described(kind: cog_core::MetricType, name: &str) -> bool {
+        cog_core::metric_description(kind, name).is_some()
+    }
+
     /// 描述表的覆盖面：产出侧真实存在、且名字不是自解释的那几个，必须有描述，
     /// 否则线上会看到一串"未登记"占位符。这条把"忘了写描述"从运行期搬到编译
     /// 期管不到的测试期。
@@ -2974,7 +2830,7 @@ mod metrics_exposition_tests {
             "llm_upstream_failures_total",
         ] {
             assert!(
-                !metric_help(COUNTER_HELP, name).starts_with("Undocumented"),
+                described(cog_core::MetricType::Counter, name),
                 "counter {name} 缺描述"
             );
         }
@@ -2983,7 +2839,7 @@ mod metrics_exposition_tests {
             cog_core::metric_names::HTTP_REQUEST_DURATION_MS.as_str(),
         ] {
             assert!(
-                !metric_help(HISTOGRAM_HELP, name).starts_with("Undocumented"),
+                described(cog_core::MetricType::Histogram, name),
                 "histogram {name} 缺描述"
             );
         }
@@ -3000,7 +2856,7 @@ mod metrics_exposition_tests {
             "llm_pool_next_attempt_unix",
         ] {
             assert!(
-                !metric_help(GAUGE_HELP, name).starts_with("Undocumented"),
+                described(cog_core::MetricType::Gauge, name),
                 "gauge {name} 缺描述"
             );
         }
@@ -3021,9 +2877,9 @@ mod metrics_exposition_tests {
             "tool_call_latency_ms",
         ] {
             assert!(
-                metric_help(COUNTER_HELP, name).starts_with("Undocumented")
-                    && metric_help(HISTOGRAM_HELP, name).starts_with("Undocumented")
-                    && metric_help(GAUGE_HELP, name).starts_with("Undocumented"),
+                !described(cog_core::MetricType::Counter, name)
+                    && !described(cog_core::MetricType::Histogram, name)
+                    && !described(cog_core::MetricType::Gauge, name),
                 "{name} 没有任何产出落点，不该被描述"
             );
         }
@@ -3036,9 +2892,9 @@ mod metrics_exposition_tests {
     fn retired_names_are_not_described() {
         for name in cog_core::RETIRED_METRIC_NAMES {
             assert!(
-                metric_help(COUNTER_HELP, name).starts_with("Undocumented")
-                    && metric_help(HISTOGRAM_HELP, name).starts_with("Undocumented")
-                    && metric_help(GAUGE_HELP, name).starts_with("Undocumented"),
+                !described(cog_core::MetricType::Counter, name)
+                    && !described(cog_core::MetricType::Histogram, name)
+                    && !described(cog_core::MetricType::Gauge, name),
                 "{name} 已退场，不该再被描述"
             );
         }
