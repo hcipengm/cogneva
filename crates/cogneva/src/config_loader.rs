@@ -1025,11 +1025,33 @@ mod tests {
         })
     }
 
+    /// Every config document that carries an override map, tagged for the
+    /// failure message.
+    ///
+    /// The shipped forms come from `shipped_documents()` rather than from a
+    /// path rebuilt here: what the cluster receives is the ConfigMap blob, and
+    /// the chart's copy is only assumed to be the same document — a gate that
+    /// reads the assumption instead of the blob checks something no pod may
+    /// ever see. The example is in the set because it is the document an
+    /// operator copies to start a deployment, so a mapping nothing reads there
+    /// is the same dead knob one step earlier.
+    fn documents_with_an_env_map() -> Vec<(&'static str, serde_json::Value)> {
+        let mut docs = shipped_documents();
+        let example_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("cogneva.example.json");
+        let raw = std::fs::read_to_string(&example_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", example_path.display()));
+        let example = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", example_path.display()));
+        docs.push(("example", example));
+        docs
+    }
+
     /// A loaded config file supplies the whole override map — `apply_env_overrides`
-    /// prefers `config.env` over the built-in fallback — so the shipped deploy
-    /// config's own map is the live one in every deployment. Nothing else
-    /// checks it: a mistyped path there is a knob the deployment believes it
-    /// turned.
+    /// prefers `config.env` over the built-in fallback — so the deploy config's
+    /// own map is the live one in every deployment. Nothing else checks it: a
+    /// mistyped path there is a knob the deployment believes it turned.
     ///
     /// An entry qualifies if the write reaches a field of the core config, or
     /// if the crate that owns its section applies that same name to that same
@@ -1043,67 +1065,74 @@ mod tests {
     /// the difference between that and a section the type does not have at all.
     #[test]
     fn every_deploy_env_mapping_is_honored_somewhere() {
-        let path = deploy_file("helm/cogneva/files/cogneva.json");
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let doc: serde_json::Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
-        let env = doc["env"]
-            .as_object()
-            .expect("deploy config carries an `env` map");
         let schema =
             serde_json::to_value(AppConfig::default()).expect("AppConfig serializes to JSON");
         let owned = crate_owned_env_tables();
+        let documents = documents_with_an_env_map();
+        // Named rather than counted: a count still passes when one form drops
+        // out and another takes its place, and the forms carry different maps.
+        for required in ["chart", "k3s configmap", "example"] {
+            assert!(
+                documents.iter().any(|(tag, _)| *tag == required),
+                "the `{required}` config document is not reaching this gate, so \
+                 the mappings only it carries are unchecked"
+            );
+        }
 
         let mut broken = Vec::new();
-        for (key, target) in env {
-            if !key.starts_with("COGNEVA_") {
-                continue;
-            }
-            let target = target
-                .as_str()
-                .unwrap_or_else(|| panic!("{key} maps to a non-string target: {target}"));
-            let honored_by_owner = target
-                .split_once('.')
-                .map(|(section, field)| {
-                    owned.iter().any(|(owner, table)| {
-                        *owner == section
-                            && table.iter().any(|(name, p)| name == key && *p == field)
-                    })
-                })
-                .unwrap_or(false);
-            let probed = value_at(&doc, target).and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                serde_json::Value::Bool(b) => Some(b.to_string()),
-                _ => None,
+        for (file, doc) in &documents {
+            let env = doc["env"].as_object().unwrap_or_else(|| {
+                panic!("{file} carries no `env` map, which is the live override table")
             });
-            // The document holds no scalar here for two very different reasons:
-            // the section is a `null` (`Option::None`), or the file simply does
-            // not set it. A sentinel tells them apart from "nothing landed" —
-            // it must not look like a number, because the writer parses digits
-            // into numbers and the check reads the tree back.
-            let probe = probed.clone().unwrap_or_else(|| "probe-sentinel".into());
-            // The writer's own contract, checked separately from what reads the
-            // value: a mapping whose write is dropped in the tree is decoration
-            // however well-formed the schema looks. This has to be its own
-            // conjunct because `holds_path` answers `true` for a path under a
-            // `null` parent (that is exactly the case it tolerates), so it can
-            // never distinguish "the type has this field" from "the write never
-            // happened" — which is how three robot-URL mappings first shipped
-            // writing nowhere at all.
-            let landed = write_lands_in_tree(target, &probe);
-            let reaches_core = holds_path(&schema, target)
-                || write_reaches_the_config(target, &probe)
-                || honored_by_owner;
-            if !landed || !reaches_core {
-                broken.push(format!("{key} -> {target}"));
+            for (key, target) in env {
+                if !key.starts_with("COGNEVA_") {
+                    continue;
+                }
+                let target = target
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{key} maps to a non-string target: {target}"));
+                let honored_by_owner = target
+                    .split_once('.')
+                    .map(|(section, field)| {
+                        owned.iter().any(|(owner, table)| {
+                            *owner == section
+                                && table.iter().any(|(name, p)| name == key && *p == field)
+                        })
+                    })
+                    .unwrap_or(false);
+                let probed = value_at(doc, target).and_then(|v| match v {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                });
+                // The document holds no scalar here for two very different reasons:
+                // the section is a `null` (`Option::None`), or the file simply does
+                // not set it. A sentinel tells them apart from "nothing landed" —
+                // it must not look like a number, because the writer parses digits
+                // into numbers and the check reads the tree back.
+                let probe = probed.clone().unwrap_or_else(|| "probe-sentinel".into());
+                // The writer's own contract, checked separately from what reads the
+                // value: a mapping whose write is dropped in the tree is decoration
+                // however well-formed the schema looks. This has to be its own
+                // conjunct because `holds_path` answers `true` for a path under a
+                // `null` parent (that is exactly the case it tolerates), so it can
+                // never distinguish "the type has this field" from "the write never
+                // happened" — which is how three robot-URL mappings first shipped
+                // writing nowhere at all.
+                let landed = write_lands_in_tree(target, &probe);
+                let reaches_core = holds_path(&schema, target)
+                    || write_reaches_the_config(target, &probe)
+                    || honored_by_owner;
+                if !landed || !reaches_core {
+                    broken.push(format!("{file}: {key} -> {target}"));
+                }
             }
         }
         assert!(
             broken.is_empty(),
-            "deploy env mappings nothing reads — the core loader drops the write \
-             and no crate applies the name: {broken:?}"
+            "env mappings nothing reads — the core loader drops the write and no \
+             crate applies the name: {broken:?}"
         );
     }
 

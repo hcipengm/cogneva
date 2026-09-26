@@ -6,7 +6,6 @@
     "shutdown_timeout_ms": 30000,
     "timeout_checker_interval_secs": 30,
     "stale_task_detector_poll_secs": 15,
-    "trace_migrator_interval_secs": 3600,
     "tool_timeout_secs": 30,
     "shell_timeout_secs": 600,
     "skill_hot_reload_interval_secs": 30,
@@ -57,11 +56,9 @@
     "COGNEVA_RAW_LOGGER_BASE_DIR": "raw_logger.base_dir",
     "COGNEVA_RAW_LOGGER_BUFFER_SIZE": "raw_logger.max_buffer_size",
     "COGNEVA_RAW_LOGGER_FLUSH_INTERVAL_SECS": "raw_logger.flush_interval_secs",
-    "COGNEVA_METRICS_SAMPLE_RETENTION_SECS": "metrics.sample_retention_secs",
-    "COGNEVA_METRICS_SAMPLE_RETENTION_SWEEP_INTERVAL_SECS": "metrics.sample_retention_sweep_interval_secs",
+    "COGNEVA_METRICS_SAMPLE_MAX_ROWS": "metrics.sample_max_rows",
     "COGNEVA_MEMORY_ENABLED": "memory.enabled",
     "COGNEVA_MEMORY_BACKEND_TYPE": "memory.backend_type",
-    "COGNEVA_MEMORY_BASE_DIR": "memory.base_dir",
     "COGNEVA_MEMORY_EMBEDDING_DIMENSION": "memory.embedding_dimension",
     "COGNEVA_MEMORY_AUTO_INGEST": "memory.auto_ingest",
     "COGNEVA_TIER_MIGRATOR_ENABLED": "tier_migrator.enabled",
@@ -80,9 +77,6 @@
     "COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE": "agent_loop.context_window_size",
     "COGNEVA_AGENT_LOOP_ROLE": "agent_loop.role",
     "COGNEVA_AGENT_LOOP_SKILL_CACHE_TTL_SECS": "agent_loop.skill_cache_ttl_secs",
-    "COGNEVA_SELF_REVIEW_ENABLED": "self_review.enabled",
-    "COGNEVA_SELF_REVIEW_MAX_ITERATIONS": "self_review.max_iterations",
-    "COGNEVA_SELF_REVIEW_QUALITY_THRESHOLD": "self_review.quality_threshold",
     "COGNEVA_SELF_EVOLUTION_ENABLED": "self_evolution.enabled",
     "COGNEVA_SELF_EVOLUTION_AUTO_APPLY": "self_evolution.auto_apply",
     "COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY": "self_evolution.auto_deploy",
@@ -259,11 +253,8 @@
   "metrics": {
     "enabled": true,
     "endpoint": "/metrics",
-    "interval_secs": 15,
-    "_comment_sample_retention_secs": "cog_metrics_samples 是只追加的观测样本日志，这条是它的保留窗（秒），0=永不清理。读侧全是短窗——抓取读直方图 300 秒、仪表 3600 秒，admin 接口默认 60 秒，而计数器本来就不读这张表（走 cog_metric_counter_totals），所以超出最宽读窗的行任何代码路径都取不回来，只占磁盘。默认一整天：比最宽读窗大一个数量级以上，又与摄取对账的回看窗同长，读指标窗和读摄取窗看的是同一段。",
-    "sample_retention_secs": 86400,
-    "_comment_sample_retention_sweep_interval_secs": "清理扫描间隔（秒）。每轮扫描同时重报这张表的大小，所以它必须显著小于抓取侧的仪表回看窗，",
-    "sample_retention_sweep_interval_secs": 600
+    "_comment_sample_max_rows": "cog_metrics_samples 是只追加的观测样本日志，这条是它的容量上限（行数），0=不清理。清理按最早的先删，直到回到上限为止，但每个 gauge series 的最新一行永不删——gauge 的值就是这张表里它最新那条。清理的判据是容量不是时间：流量可以在任何时间窗内塞进任意多行，而窗到期的清理照样会删掉正在读的行、留着没人要的行。设 0 的进程不参与清理（演化 Pod 就是这样，清理的属主是主应用）。",
+    "sample_max_rows": 200000
   },
   "raw_logger": {
     "_comment": "enabled=false 是给手工安装的安全默认；随 chart 发布的部署把它打开，值写在 chart 的 files/cogneva.json 与本文件同名段落里。base_dir 同时是 trace 存储的根（<base_dir>/traces），改它等于换 trace 落点。",
@@ -279,7 +270,6 @@
     "_comment": "Memory backend — enabled by default for self-evolution persistence.",
     "enabled": true,
     "backend_type": "memory",
-    "base_dir": "/var/lib/cogneva-data/memory",
     "embedding_dimension": 128,
     "auto_ingest": true
   },
