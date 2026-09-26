@@ -3524,6 +3524,80 @@ fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Val
     Ok(docs)
 }
 
+/// The repository part of an image reference: `localhost:30500/cogneva:local`
+/// becomes `localhost:30500/cogneva`, `redis:7-alpine` becomes `redis`, and
+/// `reg/x@sha256:...` becomes `reg/x`.
+///
+/// A digest reference carries no tag, so the repository ends at the `@`.
+/// Otherwise the tag separator is looked for in the *last path segment*: a
+/// registry host may carry a port, and `localhost:30500/cogneva` has no tag at
+/// all — treating that colon as a separator would report the repository as
+/// `localhost`.
+fn image_repository(reference: &str) -> &str {
+    if let Some((repo, _)) = reference.split_once('@') {
+        return repo;
+    }
+    let last = reference.rsplit('/').next().unwrap_or(reference);
+    match last.find(':') {
+        Some(i) => &reference[..reference.len() - last.len() + i],
+        None => reference,
+    }
+}
+
+/// Rewrite every container image in a document that belongs to *this*
+/// repository to the reference this rollout delivers, and report how many
+/// actually moved — a reference already carrying exactly this rollout's image
+/// is left alone, so the count is a reading of what changed rather than of how
+/// many places were looked at.
+///
+/// The judgement is on the value, not on a name: an image whose repository
+/// matches the rollout's is the same build, wherever it sits — a main
+/// container, an init container, a CronJob's job template. Writing down the
+/// objects instead ("these two deployments' main containers plus redis's repair
+/// init container") reads as tighter control, but it copies the *current shape
+/// of the delivery face* into a judgement: the day the producing side splits out
+/// one more reference — a new init container, a new CronJob — nobody remembers
+/// to come back and extend the list, and the reference that gets left out is
+/// exactly the one that stays on the floating tag and never picks up a new
+/// binary. Images from other repositories (redis, node-exporter, buildah) are
+/// left alone because their repository differs.
+fn pin_app_image_refs(v: &mut serde_yaml::Value, repo: &str, image: &str) -> usize {
+    const POD_LISTS: [&str; 2] = ["containers", "initContainers"];
+    match v {
+        serde_yaml::Value::Mapping(m) => {
+            let key = |k: &str| serde_yaml::Value::String(k.to_string());
+            let mut pinned = 0usize;
+            for list_name in POD_LISTS {
+                let Some(list) = m.get_mut(key(list_name)).and_then(|l| l.as_sequence_mut()) else {
+                    continue;
+                };
+                for c in list.iter_mut() {
+                    let Some(c) = c.as_mapping_mut() else {
+                        continue;
+                    };
+                    let ours = c
+                        .get(key("image"))
+                        .and_then(|i| i.as_str())
+                        .is_some_and(|i| image_repository(i) == repo && i != image);
+                    if ours {
+                        c.insert(key("image"), serde_yaml::Value::String(image.to_string()));
+                        pinned += 1;
+                    }
+                }
+            }
+            pinned
+                + m.values_mut()
+                    .map(|c| pin_app_image_refs(c, repo, image))
+                    .sum::<usize>()
+        }
+        serde_yaml::Value::Sequence(s) => s
+            .iter_mut()
+            .map(|c| pin_app_image_refs(c, repo, image))
+            .sum(),
+        _ => 0,
+    }
+}
+
 /// 改写单个 Deployment 文档里指定容器的 image。容器名显式校验且必须恰好
 /// 命中一个——错改比不改危险，宁可整个发布失败。
 fn patch_container_image(
@@ -3565,13 +3639,23 @@ fn patch_container_image(
     Ok(())
 }
 
-/// 把目标清单里指定容器的 image 改写为本次滚动引用。
+/// Rewrite a target manifest's images to the reference this rollout delivers.
 ///
-/// 目标清单允许多文档（如 Deployment + 配套 Service 同文件）：目标
-/// Deployment 必须恰好出现一个且名字精确匹配，其余命名空间级文档原样
-/// 随目标下发；与支撑包同一套红线——Secret 硬报错、集群级 kind、RBAC
-/// kind、治理 kind 与卷声明 kind 跳过。单文档 `from_str` 会在多文档文件上报错并卡死整条
-/// 发布链路（旧版二进制的实机事故形态），故按文档流解析。
+/// Two rewrites happen here. The named container is set unconditionally: it is
+/// the thing being rolled, and exactly one container of that name must exist —
+/// a wrong rewrite is worse than none, so a miss fails the whole release. Then
+/// every *other* reference to this repository in the same manifest is pinned
+/// too; see [`pin_app_image_refs`] for why that is a value judgement rather
+/// than a list of objects.
+///
+/// A target manifest may hold several documents (a Deployment with its Service
+/// beside it): exactly one Deployment of the expected name must appear, and the
+/// remaining namespace-level documents travel along unchanged, under the same
+/// red lines as the support bundle — a Secret is a hard error, cluster-scoped,
+/// RBAC, resource-governance and volume-claim kinds are skipped. Parsing is
+/// done document-wise: a single-document `from_str` errors out on a
+/// multi-document file and stalls the whole landing channel, which is what a
+/// live incident with an older binary looked like.
 fn patch_deployment_image(
     yaml_text: &str,
     origin: &str,
@@ -3621,6 +3705,16 @@ fn patch_deployment_image(
                 )));
             }
             patch_container_image(&mut v, origin, container, image)?;
+            // A target's own manifest carries more than the container being
+            // rolled: an init container that seeds the workload's volume runs
+            // the same build and has to travel with it. Pinning only the named
+            // container leaves that one on the floating tag until the node
+            // happens to drop its cached copy — which, for a workload that is
+            // never otherwise restarted, means never.
+            let also = pin_app_image_refs(&mut v, image_repository(image), image);
+            if also > 0 {
+                info!(origin = %origin, pinned = also, "target manifest: pinned every other reference to this build");
+            }
             deployments += 1;
         }
         out_docs.push(v);
@@ -3740,6 +3834,14 @@ fn is_manifest_file(name: &str) -> bool {
 /// 从发布资源集组装清单包。目标 deployment 的交付清单必须在集合里，缺文件 /
 /// 名字对不上都是硬错误——静默回落 set image 会掩盖发布集漂移，让拓扑滞后
 /// 悄悄回来。targets 输出保持调用方给的滚动顺序（与集合里的文件顺序无关）。
+///
+/// The pin set equals the roll set: every reference to this build's repository
+/// anywhere in the release set is rewritten to `image`, in the target manifests
+/// and in the support bundle alike (see [`pin_app_image_refs`]). What is
+/// delivered and what is converged must be the same set of objects — a pin that
+/// nothing rolls is a delivery that silently does not happen, and it reads as
+/// healthy from every angle except the one that matters: the workload keeps
+/// running whatever binary it started with.
 pub fn build_rollout_bundle(
     set: &ReleaseSet,
     targets: &[RolloutTargetConfig],
@@ -3760,6 +3862,7 @@ pub fn build_rollout_bundle(
         }
         claims.push((t, res));
     }
+    let repo = image_repository(image);
     let mut patched: BTreeMap<String, String> = BTreeMap::new();
     let mut support_docs: Vec<serde_yaml::Value> = Vec::new();
     for res in &set.resources {
@@ -3771,7 +3874,26 @@ pub fn build_rollout_bundle(
                     patch_deployment_image(content, res, &t.deployment, &t.container, image)?;
                 patched.insert(res.clone(), yaml);
             }
-            None => support_docs.extend(namespace_docs(content, res)?),
+            None => {
+                let mut docs = namespace_docs(content, res)?;
+                // Everything else that runs this build travels with the rollout
+                // as well — a StatefulSet's repair init container, a backup
+                // CronJob. The support face is applied on every revision, so a
+                // pinned reference converges there: the image change moves the
+                // workload's generation and the existing settle wait, which
+                // already knows both `deploy` and `statefulset`, picks it up.
+                // Left on the floating tag, such a reference only ever moves
+                // when the node happens to drop its cached layer, and the pod
+                // that owns it may never restart at all.
+                let mut pinned = 0usize;
+                for d in docs.iter_mut() {
+                    pinned += pin_app_image_refs(d, repo, image);
+                }
+                if pinned > 0 {
+                    info!(origin = %res, pinned, "support manifest: pinned every reference to this build");
+                }
+                support_docs.extend(docs);
+            }
         }
     }
     let mut target_manifests = Vec::new();
@@ -10745,6 +10867,149 @@ metadata:
         assert!(patch_deployment_image(no_spec, "d", "cogneva", "cogneva", "i").is_err());
     }
 
+    /// The tag separator is not "the last colon": a registry host carries a
+    /// port, and reading that colon as one would report the repository of
+    /// `localhost:30500/cogneva` as `localhost`, so nothing would ever match.
+    #[test]
+    fn image_repository_reads_past_a_registry_port() {
+        assert_eq!(
+            image_repository("localhost:30500/cogneva:local"),
+            "localhost:30500/cogneva"
+        );
+        assert_eq!(
+            image_repository("localhost:30500/cogneva"),
+            "localhost:30500/cogneva"
+        );
+        assert_eq!(image_repository("redis:7-alpine"), "redis");
+        assert_eq!(
+            image_repository("quay.io/prometheus/node-exporter:v1.12.1-distroless"),
+            "quay.io/prometheus/node-exporter"
+        );
+        assert_eq!(image_repository("reg/x@sha256:abc"), "reg/x");
+        assert_eq!(image_repository("img"), "img");
+    }
+
+    /// A reference to the rolled repository is pinned wherever it sits — an init
+    /// container beside the rolled one, a repair container in a StatefulSet, a
+    /// CronJob's job template — while images from other repositories are left
+    /// alone. Pinning only the named container leaves the rest on the floating
+    /// tag, and for a pod that is never otherwise restarted that means forever.
+    #[test]
+    fn every_reference_to_the_rolled_repository_is_pinned() {
+        let yaml = "\
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: aof-repair
+          image: reg/cogneva:local
+      containers:
+        - name: redis
+          image: redis:7-alpine
+        - name: exporter
+          image: quay.io/prometheus/node-exporter:v1
+";
+        let mut v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let repo = image_repository("reg/cogneva:main-x");
+        assert_eq!(pin_app_image_refs(&mut v, repo, "reg/cogneva:main-x"), 1);
+        let spec = v
+            .get("spec")
+            .unwrap()
+            .get("template")
+            .unwrap()
+            .get("spec")
+            .unwrap();
+        assert_eq!(
+            spec.get("initContainers").unwrap()[0]
+                .get("image")
+                .unwrap()
+                .as_str(),
+            Some("reg/cogneva:main-x")
+        );
+        assert_eq!(
+            spec.get("containers").unwrap()[0]
+                .get("image")
+                .unwrap()
+                .as_str(),
+            Some("redis:7-alpine")
+        );
+        assert_eq!(
+            spec.get("containers").unwrap()[1]
+                .get("image")
+                .unwrap()
+                .as_str(),
+            Some("quay.io/prometheus/node-exporter:v1")
+        );
+        // Idempotent: a second pass over the same document finds nothing left.
+        assert_eq!(pin_app_image_refs(&mut v, repo, "reg/cogneva:main-x"), 0);
+    }
+
+    /// A CronJob's pod template sits two maps deeper than a Deployment's, and
+    /// the backup job is the one nobody restarts: the daily run has to pick up
+    /// whatever was delivered, so the walk must reach into `jobTemplate`.
+    #[test]
+    fn a_cron_jobs_job_template_is_reached_too() {
+        let yaml = "\
+kind: CronJob
+metadata:
+  name: cogneva-backup
+spec:
+  schedule: \"17 3 * * *\"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: reg/cogneva:local
+";
+        let mut v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let repo = image_repository("reg/cogneva:main-x");
+        assert_eq!(pin_app_image_refs(&mut v, repo, "reg/cogneva:main-x"), 1);
+        assert!(serde_yaml::to_string(&v)
+            .unwrap()
+            .contains("image: reg/cogneva:main-x"));
+    }
+
+    /// Anything outside the four rolled Deployments that runs this build is
+    /// pinned by the same pass, and the support face is where the convergence
+    /// comes from: it is applied on every revision and the settle wait already
+    /// knows StatefulSets. Pinning it is what makes the delivery actually
+    /// happen rather than sit on the floating tag.
+    #[test]
+    fn build_rollout_bundle_pins_the_support_face_too() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "evolution-deployment.yaml".to_string(),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        );
+        files.insert(
+            "redis-deployment.yaml".to_string(),
+            "kind: StatefulSet\nmetadata:\n  name: redis\nspec:\n  template:\n    spec:\n      \
+             initContainers:\n        - name: aof-repair\n          image: reg/cogneva:local\n      \
+             containers:\n        - name: redis\n          image: redis:7-alpine\n"
+                .to_string(),
+        );
+        let set = ReleaseSet::from_flat_dir(files);
+        let bundle = build_rollout_bundle(&set, &bundle_targets(), "reg/cogneva:main-x").unwrap();
+        // Self-proving: a walk that reads nothing leaves `:local` in the
+        // support bundle and turns this red, so it cannot pass by standing
+        // still.
+        assert!(
+            bundle.support_yaml.contains("image: reg/cogneva:main-x"),
+            "support face kept the floating tag: {}",
+            bundle.support_yaml
+        );
+        assert!(bundle.support_yaml.contains("image: redis:7-alpine"));
+    }
+
     fn bundle_targets() -> Vec<RolloutTargetConfig> {
         vec![
             RolloutTargetConfig {
@@ -11211,6 +11476,46 @@ exit 0
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
+    /// The repository a delivered directory uses for this application, read off
+    /// a rollout target's own container in the release set rather than written
+    /// down here. Every other reference to the same repository in that
+    /// directory is the same build, and each of them has to travel with the
+    /// rollout — a directory that pins some of them and leaves others on the
+    /// floating tag ships a delivery that never lands.
+    fn delivered_app_repository(set: &ReleaseSet, targets: &[RolloutTargetConfig]) -> String {
+        for t in targets {
+            let Some(res) = resolve_target_manifest(set, t).expect("resolve target manifest")
+            else {
+                continue;
+            };
+            let text = set.content(&res).expect("manifest content");
+            for doc in serde_yaml::Deserializer::from_str(text) {
+                let Ok(v) = serde_yaml::Value::deserialize(doc) else {
+                    continue;
+                };
+                let Some(list) = v
+                    .get("spec")
+                    .and_then(|s| s.get("template"))
+                    .and_then(|spec| spec.get("spec"))
+                    .and_then(|s| s.get("containers"))
+                    .and_then(|c| c.as_sequence())
+                else {
+                    continue;
+                };
+                for c in list {
+                    if c.get("name").and_then(|n| n.as_str()) == Some(t.container.as_str()) {
+                        let image = c
+                            .get("image")
+                            .and_then(|i| i.as_str())
+                            .expect("target container has an image");
+                        return image_repository(image).to_string();
+                    }
+                }
+            }
+        }
+        panic!("no rollout target container found in the release set");
+    }
+
     /// 盘上的目录 → 平铺形态的发布资源集，与读 rev 的那条路共用同一个构造器。
     fn flat_set_from_disk(dir: &Path) -> ReleaseSet {
         let mut files = BTreeMap::new();
@@ -11441,12 +11746,48 @@ exit 0
                 flat_set_from_disk(&abs)
             };
             assert!(!set.is_empty(), "{profile}: {dir} carries no manifest");
-            let bundle = build_rollout_bundle(&set, &targets, "reg/cogneva:main-x")
+            let repo = delivered_app_repository(&set, &targets);
+            let image = format!("{repo}:main-x");
+            let bundle = build_rollout_bundle(&set, &targets, &image)
                 .unwrap_or_else(|e| panic!("{profile}: manifestDir {dir}: {e}"));
             assert_eq!(
                 bundle.targets.len(),
                 targets.len(),
                 "{profile}: {dir} does not deliver every rollout target"
+            );
+            // The delivery face must equal the roll face. More than those four
+            // rolled containers reference this repository — evolution's
+            // seed-source, sandbox-executor's seed-sandbox, redis's aof-repair,
+            // the backup CronJob — and whichever one is left out belongs to a
+            // pod that keeps running its old binary until something else
+            // restarts it. The judgement reads the repository off this very
+            // release set instead of a name list, so one more reference on the
+            // producing side is one more assertion here.
+            let mut delivered: Vec<(String, String)> =
+                vec![("support.yaml".to_string(), bundle.support_yaml.clone())];
+            for t in &bundle.targets {
+                delivered.push((t.key.clone(), t.yaml.clone()));
+            }
+            let needle = format!("{repo}:");
+            for (origin, text) in &delivered {
+                for (i, _) in text.match_indices(&needle) {
+                    assert!(
+                        text[i..].starts_with(&image),
+                        "{profile}: {dir}/{origin} delivers a reference to this build that the \
+                         rollout does not pin, so it never picks up a new binary: {}",
+                        text[i..]
+                            .chars()
+                            .take(needle.len() + 24)
+                            .collect::<String>()
+                    );
+                }
+            }
+            // The reverse has to hold too, or the walk above passes by reading
+            // nothing at all.
+            assert!(
+                bundle.support_yaml.contains(&needle),
+                "{profile}: {dir} — nothing outside the rolled containers references this \
+                 build, so this check read nothing"
             );
             checked.push((profile, dir));
         }
