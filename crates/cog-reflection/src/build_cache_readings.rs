@@ -746,26 +746,37 @@ mod tests {
         fs_size::dir_size_bytes(root, &[]).unwrap()
     }
 
-    /// Wait until the gate itself reports the slot as free.
+    /// Run a pass on a free slot, retrying while the gate refuses one.
     ///
-    /// Dropping a permit closes this process's handle, but a `flock` is held by the
-    /// open file description rather than by the handle: any child another test in
-    /// this binary forked while the permit was open carries a copy of that
-    /// description until it execs, so for that window the gate keeps refusing a slot
-    /// that no build holds. The refusal path is asserted where it belongs — the
-    /// first half of this test and the gate's own tests — while this test is about
-    /// what a free gate does, so it waits for the gate to say free instead of
-    /// trusting that releasing the handle released the lock.
-    async fn wait_until_the_slot_is_free(gate: &Arc<BuildGate>) {
+    /// Dropping a permit closes this process's handle, but a `flock` is held by
+    /// the open file description rather than by the handle: a child another test
+    /// in this binary forked while the permit was open carries a copy of that
+    /// description until it execs, so the gate keeps refusing a slot that no
+    /// build holds for as long as that child is around. A slot is therefore free
+    /// at an instant, and the only thing that can read the instant it needs is
+    /// the pass itself -- waiting for a free slot and then asking for one leaves
+    /// the window the wait opened between the two. Retrying is also what a
+    /// caller in a deployment does: a pass that finds the gate busy defers to
+    /// the next walk. A gate that refuses for ten seconds fails here by name and
+    /// count rather than as a byte total that did not move.
+    async fn run_a_pass_when_the_slot_is_free(
+        readings: &BuildCacheReadings,
+        files: &[FileEntry],
+        gate: &Arc<BuildGate>,
+    ) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if let Ok(permit) = gate.try_acquire("waiting for the slot to come back").await {
-                drop(permit);
+            let refused_before =
+                reading(readings, BUILD_TARGET_OVER_CAP_METRIC, Some(OUTCOME_BUSY)).await;
+            readings.enforce_cap(files, Some(gate)).await;
+            let refused_after =
+                reading(readings, BUILD_TARGET_OVER_CAP_METRIC, Some(OUTCOME_BUSY)).await;
+            if refused_after == refused_before {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the slot did not come back after the permit was dropped"
+                "the gate refused every pass for ten seconds: busy {refused_before:?} -> {refused_after:?}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -861,10 +872,16 @@ mod tests {
             "no pass ran, so there is no result to report"
         );
         drop(held);
-        wait_until_the_slot_is_free(&gate).await;
-
-        readings.enforce_cap(&files, Some(&gate)).await;
-        assert_eq!(on_disk(root.path()), 2000, "the next free pass does it");
+        run_a_pass_when_the_slot_is_free(&readings, &files, &gate).await;
+        // Named in the message because it is the other half of the reading: a
+        // pass that ran and freed nothing looks from the byte total alone like
+        // a pass that never ran.
+        let unmet = reading(&readings, BUILD_TARGET_UNMET_METRIC, None).await;
+        assert_eq!(
+            on_disk(root.path()),
+            2000,
+            "the next free pass does it (bytes over the cap after it: {unmet:?})"
+        );
         assert_eq!(
             reading(
                 &readings,

@@ -69,8 +69,13 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/cargo-test.log || {
-            grep -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
-              /tmp/cargo-test.log | head -30 | while IFS= read -r line; do
+            # The panic line names a place, not a cause: the message the
+            # assertion carried -- and for an assertion, the values it compared
+            # -- is on the lines after it. An annotation that stops at the line
+            # number says which test broke and leaves the branch it took
+            # unreadable, which is the shape a flake keeps.
+            grep --no-group-separator -A 4 -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
+              /tmp/cargo-test.log | grep -v '^[[:space:]]*$' | head -40 | while IFS= read -r line; do
                 printf '::error::%s\n' "$line"
               done
             exit 1
@@ -191,8 +196,13 @@ jobs:
         run: |
           set -o pipefail
           cargo llvm-cov --workspace --cobertura --output-path cobertura.xml --fail-under-lines 40 2>&1 | tee /tmp/coverage.log || {
-            grep -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
-              /tmp/coverage.log | head -30 | while IFS= read -r line; do
+            # The panic line names a place, not a cause: the message the
+            # assertion carried -- and for an assertion, the values it compared
+            # -- is on the lines after it. An annotation that stops at the line
+            # number says which test broke and leaves the branch it took
+            # unreadable, which is the shape a flake keeps.
+            grep --no-group-separator -A 4 -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
+              /tmp/coverage.log | grep -v '^[[:space:]]*$' | head -40 | while IFS= read -r line; do
                 printf '::error::%s\n' "$line"
               done
             exit 1
