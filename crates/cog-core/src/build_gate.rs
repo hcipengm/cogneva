@@ -700,6 +700,53 @@ mod tests {
         );
     }
 
+    /// A slot comes back when the last copy of its open file description goes, not
+    /// when the holder drops its handle.
+    ///
+    /// `flock` is owned by the open file description, so a second handle onto the same
+    /// description is another reference that keeps the slot taken after `BuildPermit`
+    /// is dropped. A `dup` is one way to get such a handle; the copy a fork leaves in
+    /// a child that has not exec'd yet is another, and that is the window a caller can
+    /// be refused in even though it just released its own permit — the gate reads what
+    /// the kernel reports, and while a copy is open the kernel is right to say taken.
+    ///
+    /// The copy below is a `dup` rather than a forked child, because a fork copies the
+    /// whole fd table: forked before it narrows that table, the child also holds what
+    /// every other test in this binary has open, and each of those is a reference on
+    /// somebody else's lock. This binary starts no processes, so the `dup` here is the
+    /// only second reference that exists while the test runs.
+    #[tokio::test]
+    async fn a_slot_comes_back_when_the_last_copy_of_the_lock_file_goes() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+
+        let permit = gate.try_acquire("the holding build").await.unwrap();
+        let held = permit
+            .held
+            .as_ref()
+            .expect("a taken slot holds its lock file");
+        // SAFETY: `held` is open for as long as `permit`, so its descriptor is valid,
+        // and the returned descriptor is this test's to close exactly once.
+        let duplicate = unsafe { libc::dup(held.as_raw_fd()) };
+        assert!(duplicate >= 0, "dup failed");
+        // SAFETY: `duplicate` is a fresh descriptor owned by nobody else.
+        let copy = unsafe { OwnedFd::from_raw_fd(duplicate) };
+
+        drop(permit);
+        assert!(
+            gate.try_acquire("the next build").await.is_err(),
+            "a second handle on the lock file keeps the slot taken"
+        );
+
+        drop(copy);
+        assert!(
+            gate.try_acquire("after the copy is gone").await.is_ok(),
+            "the slot comes back with the last copy of the description"
+        );
+    }
+
     /// A waiting build is a reading of its own: a gate at its bound with nothing
     /// queued and a gate whose queue is stuck look the same from the outside
     /// unless the waiters are counted.

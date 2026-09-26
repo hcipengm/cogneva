@@ -735,6 +735,31 @@ mod tests {
         fs_size::dir_size_bytes(root, &[]).unwrap()
     }
 
+    /// Wait until the gate itself reports the slot as free.
+    ///
+    /// Dropping a permit closes this process's handle, but a `flock` is held by the
+    /// open file description rather than by the handle: any child another test in
+    /// this binary forked while the permit was open carries a copy of that
+    /// description until it execs, so for that window the gate keeps refusing a slot
+    /// that no build holds. The refusal path is asserted where it belongs — the
+    /// first half of this test and the gate's own tests — while this test is about
+    /// what a free gate does, so it waits for the gate to say free instead of
+    /// trusting that releasing the handle released the lock.
+    async fn wait_until_the_slot_is_free(gate: &Arc<BuildGate>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(permit) = gate.try_acquire("waiting for the slot to come back").await {
+                drop(permit);
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slot did not come back after the permit was dropped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     async fn reading(
         readings: &BuildCacheReadings,
         metric: &str,
@@ -825,6 +850,7 @@ mod tests {
             "no pass ran, so there is no result to report"
         );
         drop(held);
+        wait_until_the_slot_is_free(&gate).await;
 
         readings.enforce_cap(&files, Some(&gate)).await;
         assert_eq!(on_disk(root.path()), 2000, "the next free pass does it");
