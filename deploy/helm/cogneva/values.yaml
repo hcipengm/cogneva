@@ -80,8 +80,15 @@ appData:
 # 策略覆盖，本备份覆盖重装/换机档（restore-from-package.sh 消费）。
 backup:
   enabled: true
-  # 每日 03:17：错峰，避开整点/半点的集群任务共振。
+  # 每日 03:17：错峰，避开整点/半点的集群任务共振。时刻按下面的 timeZone
+  # 解释，不跟随宿主 local。
   schedule: "17 3 * * *"
+  # 触发时刻所属的 IANA 时区。**必须显式给值**：CronJob 的 spec.timeZone 为空时
+  # 由 kube-controller-manager 所在节点的 local 解释，于是宿主时区一变（2026-09-26
+  # 本机由 Etc/UTC 改成 Asia/Shanghai），这个平时没人盯的每日作业就静默漂 8 小时，
+  # 而按 schedule 字面值做的任何核对都看不出这条漂移。备份的时点是我们自己定义的
+  # 运维约定，就该由这里定，不该被"这台机器现在几点"改写。
+  timeZone: "Etc/UTC"
   # 保留最新 N 份，更老的落盘即删。
   keepCount: 7
   storage: 10Gi

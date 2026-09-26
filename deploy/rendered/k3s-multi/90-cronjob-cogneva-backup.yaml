@@ -12,6 +12,7 @@ metadata:
     app.kubernetes.io/component: backup
 spec:
   schedule: "17 3 * * *"
+  timeZone: "Etc/UTC"
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 1800
   successfulJobsHistoryLimit: 2

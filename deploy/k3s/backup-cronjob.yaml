@@ -11,8 +11,11 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: backup
 spec:
-  # 每日 03:17：错峰，避开整点/半点的集群任务共振。
+  # 每日 03:17（按下面的 timeZone 解释）：错峰，避开整点/半点的集群任务共振。
   schedule: "17 3 * * *"
+  # 显式钉住时区，与 chart 的 backup.timeZone 同值：留空则由节点 local 解释，
+  # 宿主时区一变备份时点就静默漂移。
+  timeZone: "Etc/UTC"
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 1800
   successfulJobsHistoryLimit: 2
