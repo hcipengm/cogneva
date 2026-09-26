@@ -222,6 +222,18 @@ const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImagePullBackOff"
 /// 逐目标等待单独负责，这里的判据不覆盖它们。
 const SUPPORT_WORKLOAD_KINDS: &[&str] = &["deploy", "statefulset"];
 
+/// How many read-only pre-flight reads may each spend a whole wait budget
+/// retrying: the support-workload generations before the apply, the same
+/// reading after it, and the workloads' ConfigMap consumers.
+///
+/// All three are reads taken before anything changes, and all three are
+/// allowed to retry for the wait budget when the cluster does not answer (a
+/// single expired attempt is a stall, not a verdict). The Job's deadline is
+/// derived from this count as well as from the per-target budgets, because a
+/// Job killed by its deadline never runs its own rollback — that half-rolled
+/// cluster is what the deadline exists to prevent.
+const PREFLIGHT_RETRYING_READS: u64 = 3;
+
 /// 支撑工作负载"这次滚动可以往下走了"的读法：代数、观测到的代数、期望副本数、
 /// 就绪副本数。竖线显式占位，缺字段（omitempty）不能顶掉后面的位置。
 const SUPPORT_SETTLE_JSONPATH: &str =
@@ -2509,12 +2521,18 @@ impl MainlineDeployer {
                 // 宽限（到点即判败回滚），加上支撑工作负载等就绪的那一段（同为
                 // startup 预算）；Job 被 activeDeadlineSeconds 杀掉走不到 Job
                 // 自己的回滚，留短了会把集群停在半滚状态。
+                //
+                // The two support-snapshot reads are in the bound for the same
+                // reason: each may retry for a whole wait budget before the
+                // first target is touched, and a bound that ignores them is a
+                // bound that can expire mid-rollout.
                 "activeDeadlineSeconds": (self.cfg.startup_timeout_secs
                     + self.cfg.rollout_timeout_secs
                     + 15)
                     * self.cfg.targets.len().max(1) as u64
                     + self.cfg.soak_secs
                     + self.cfg.startup_timeout_secs
+                    + PREFLIGHT_RETRYING_READS * self.cfg.rollout_timeout_secs
                     + 15,
                 "ttlSecondsAfterFinished": 86400,
                 "template": {
@@ -3962,11 +3980,21 @@ impl RolloutExecutor {
     }
 
     /// 集群上每个工作负载读了哪些 ConfigMap。
+    ///
+    /// Like the support-workload snapshot this is a read taken before anything
+    /// changes, so it retries inside the wait budget instead of turning one
+    /// expired attempt into a rollout that never started: the same capped and
+    /// throttled kubectl child reads both, and both feed the same "no version
+    /// conclusion was reached" classification.
     async fn live_config_consumers(&self) -> SFResult<Vec<ConfigConsumer>> {
         let mut out = Vec::new();
         for kind in SUPPORT_WORKLOAD_KINDS {
             let readout = self
-                .run_kubectl(&["get", kind, "-o", CONFIG_CONSUMER_JSONPATH], 30)
+                .probe(
+                    &["get", kind, "-o", CONFIG_CONSUMER_JSONPATH],
+                    30,
+                    self.rollout_timeout_secs,
+                )
                 .await?;
             out.extend(config_consumers(&readout, kind));
         }
@@ -4076,8 +4104,20 @@ impl RolloutExecutor {
     async fn support_workloads(&self) -> SFResult<Vec<SupportWorkload>> {
         let mut out = Vec::new();
         for kind in SUPPORT_WORKLOAD_KINDS {
+            // The read goes through `probe` rather than straight to
+            // `run_kubectl`. This is the gate before anything changes, and it
+            // starts a kubectl child inside a container capped at 500m CPU:
+            // when the node is busy enough, one 30s attempt can be spent
+            // entirely on the child's cold start, and a single expired attempt
+            // is not evidence the cluster is unreachable. Five rollout Jobs
+            // died with a container lifetime of exactly 30s each and the
+            // signature `environment:support-snapshot::unreachable`, at the
+            // price of an hour of cooldown and a rollout that never started.
+            // A read-only query can be tried again for free, so the wait
+            // budget is the readiness allowance that already exists instead of
+            // a second "how long am I willing to wait" knob.
             let text = self
-                .run_kubectl(
+                .probe(
                     &[
                         "get",
                         kind,
@@ -4085,6 +4125,7 @@ impl RolloutExecutor {
                         "jsonpath={range .items[*]}{.metadata.name} {.metadata.generation}{\"\\n\"}{end}",
                     ],
                     30,
+                    self.rollout_timeout_secs,
                 )
                 .await?;
             for line in text.lines() {
@@ -4236,12 +4277,26 @@ impl RolloutExecutor {
     /// 明确的观测结果，不该被静默重试吞掉。
     async fn probe(&self, args: &[&str], timeout_secs: u64, budget_secs: u64) -> SFResult<String> {
         let deadline = std::time::Instant::now() + Duration::from_secs(budget_secs);
+        // The attempt count and the elapsed time go into the error because the
+        // reading has to outlive the process that produced it: one attempt that
+        // never got through is a stall (children starting cold, a throttled
+        // cgroup), while several spread over the whole budget is a cluster that
+        // is down for real. Both would otherwise be recorded as the same
+        // "unreachable", and whoever reads the ledger later cannot ask the Job
+        // anything — it is gone by then.
+        let started = std::time::Instant::now();
+        let mut attempts = 0u32;
         loop {
+            attempts += 1;
             match self.run_kubectl(args, timeout_secs).await {
                 Ok(out) => return Ok(out),
                 Err(e) if is_cluster_unreachable(&e.to_string()) => {
                     if std::time::Instant::now() >= deadline {
-                        return Err(SFError::IO(format!("{CLUSTER_UNREACHABLE_MARKER}: {e}")));
+                        return Err(SFError::IO(format!(
+                            "{CLUSTER_UNREACHABLE_MARKER}: {e} \
+                             (attempts={attempts} over {}s)",
+                            started.elapsed().as_secs()
+                        )));
                     }
                     tokio::time::sleep(Duration::from_secs(ROLLOUT_POLL_SECS)).await;
                 }
@@ -6603,6 +6658,39 @@ exit 0
         dir.join("fake-kubectl").to_string_lossy().to_string()
     }
 
+    /// fake kubectl：支撑工作负载的代数查询，前 `failures` 次 `get deploy` 以
+    /// 集群不可达的形状失败（真 kubectl 连不上 apiserver 时的 stderr），之后
+    /// 正常；statefulset 一直正常。失败次数落盘计数，所以「重试过没有」能从
+    /// 日志里读出来，而不用让替身睡够一个尝试超时。
+    fn fake_kubectl_failing_times(dir: &Path, failures: u32) -> String {
+        let log = dir.join("kubectl.log");
+        let count = dir.join("kubectl-failures");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get deploy"*)
+    n=0
+    [ -f '{count}' ] && n=$(cat '{count}')
+    if [ "$n" -lt {failures} ]; then
+      echo $((n + 1)) > '{count}'
+      echo "Unable to connect to the server: dial tcp 10.43.0.1:443: i/o timeout" >&2
+      exit 1
+    fi
+    echo "cogneva 3" ;;
+  *"get statefulset"*) echo "pg 7" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = count.display(),
+            failures = failures
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
     /// fake kubectl：按 deployment 名字分别返回镜像，用来构造"四部署镜像不一致"
     /// 的现场（清单被部分重下发 / 手工 set image）。名字后的空格是必要边界：
     /// `cogneva ` 不会匹配上 `cogneva-evolution `。
@@ -8298,6 +8386,67 @@ exit 0
         // 健康。
         std::fs::write(&pods_file, "0 true ").unwrap();
         assert!(executor.pods_healthy(&target).await.is_ok());
+    }
+
+    /// A support-workload read that hits an unreachable cluster is tried again
+    /// inside the wait budget instead of ending the rollout: one expired
+    /// attempt is a stall, not a verdict, and this read is the gate before
+    /// anything changes.
+    #[tokio::test]
+    async fn an_unreachable_snapshot_read_is_retried_before_any_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_failing_times(&bin_dir, 1);
+        // Budget 8s: the stall is absorbed within it, and the poll interval is
+        // the only real wait this test pays.
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 8, 900);
+
+        let workloads = executor.support_workloads().await.unwrap();
+        assert_eq!(workloads.len(), 2, "{workloads:?}");
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert_eq!(
+            calls.lines().filter(|l| l.contains("get deploy")).count(),
+            2,
+            "the read has to be tried again, not turned into a rollout failure: {calls}"
+        );
+    }
+
+    /// The ConfigMap-consumer read is the third pre-flight read taken before
+    /// anything changes, and it is retried for the same reason as the other
+    /// two: the failure it would otherwise report is "no conclusion was
+    /// reached", not "this version is bad".
+    #[tokio::test]
+    async fn an_unreachable_config_consumer_read_is_retried_before_any_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_failing_times(&bin_dir, 1);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 8, 900);
+
+        executor.live_config_consumers().await.unwrap();
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert_eq!(
+            calls.lines().filter(|l| l.contains("get deploy")).count(),
+            2,
+            "the read has to be tried again, not turned into a rollout failure: {calls}"
+        );
+    }
+
+    /// A cluster that never answers ends the read, and the error says how many
+    /// attempts were spent: "one attempt expired" and "starved for the whole
+    /// budget" are different situations, and the Job that produced this reading
+    /// is gone by the time anyone reads the ledger.
+    #[tokio::test]
+    async fn an_unreachable_reading_carries_the_attempt_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_failing_times(&bin_dir, u32::MAX);
+        // Budget 0: the first attempt is already at the deadline, so nothing
+        // sleeps and the count is pinned to one.
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 0, 900);
+
+        let err = executor.support_workloads().await.unwrap_err().to_string();
+        assert!(err.contains("cluster unreachable"), "{err}");
+        assert!(err.contains("(attempts=1 over "), "{err}");
     }
 
     fn support_workload(kind: &'static str, name: &str, generation: i64) -> SupportWorkload {
