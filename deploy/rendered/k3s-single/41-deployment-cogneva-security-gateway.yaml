@@ -109,6 +109,12 @@ spec:
               value: /var/lib/cogneva-git-mirror
             - name: COGNEVA_GATEWAY_GIT_MIRROR_ENABLED
               value: "true"
+            # 镜像卷的占用：唯一写它的是本进程，而目录型卷的"容量"是整个节点
+            # 文件系统，所以声明了多少、实际占了多少，除了本进程没人能对账。
+            # 关掉镜像时这张卷不挂，声明也就无从谈起。
+            - name: COGNEVA_DATA_VOLUME_MOUNTS
+              value: |
+                cogneva-git-mirror-pvc=/var/lib/cogneva-git-mirror
             - name: COGNEVA_GATEWAY_GIT_SSH_KEY
               value: /etc/cogneva/git-ssh/id_ed25519
             # 兜底传输的两条执行预算（秒）：静默多久判死、单次传输总上限。判据在

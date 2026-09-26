@@ -137,6 +137,13 @@ spec:
               value: "300"
             - name: SANDBOX_MAX_TASK_WORKSPACES
               value: "8"
+            # 本 Pod 的卷只有这一张，而它既装着工作树又装着构建缓存，是沙箱里
+            # 最可能先写满的卷；不声明就没人量它——同一个路径在本 Pod 里是这张
+            # claim，在别的 Pod 里不是。子挂载（宿主文档范围）由进程读自己的
+            # 挂载表排除，不在这里重复声明。
+            - name: COGNEVA_DATA_VOLUME_MOUNTS
+              value: |
+                cogneva-sandbox-pvc=/opt/cogneva/sandbox
           startupProbe:
             httpGet:
               path: /health/live

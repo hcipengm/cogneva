@@ -20,14 +20,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cog_core::claim_footprint::{ClaimFootprint, ClaimMount};
 use cog_core::{SFError, SFResult};
-use prometheus::{Counter, CounterVec, Encoder, Gauge, Opts, Registry, TextEncoder};
+use prometheus::{Counter, CounterVec, Encoder, Gauge, GaugeVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Loop name reported through the background-loop liveness family.
 pub const WORKTREE_GC_LOOP: &str = "extension_worktree_gc";
+
+/// Loop name of the claim-footprint walk over this executor's own volumes.
+pub const VOLUME_FOOTPRINT_LOOP: &str = "extension_volume_footprint";
 
 const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
 const DEFAULT_BARE_REPO: &str = "/opt/cogneva/sandbox/repo.git";
@@ -36,6 +40,14 @@ const DEFAULT_TTL_SECS: u64 = 21600;
 const DEFAULT_GC_INTERVAL_SECS: u64 = 600;
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
 const DEFAULT_MAX_WORKSPACES: usize = 8;
+
+/// How often the declared volumes are re-walked when nothing says otherwise.
+///
+/// The walk is metadata-only, but this volume holds every task worktree plus the
+/// build cache, so the file count is large and a cadence faster than this buys
+/// nothing: the reading exists to be compared against a declared size, and a
+/// volume does not cross that in a minute.
+const DEFAULT_DATA_VOLUME_INTERVAL_SECS: u64 = 300;
 
 const GIT_TIMEOUT_SECS: u64 = 120;
 const META_DIR_NAME: &str = ".meta";
@@ -60,6 +72,17 @@ pub struct WorkdirConfig {
     pub gc_interval: Duration,
     pub fetch_interval: Duration,
     pub max_workspaces: usize,
+    /// Claim-backed volumes this process measures the footprint of. Which claim
+    /// backs which directory is a fact only the deployment knows, so it comes
+    /// from there; what lies below a mount is not declared, because this process
+    /// reads its own mount table for that.
+    pub data_volumes: Vec<ClaimMount>,
+    /// Why the declared volume list could not be read, when it could not. Carried
+    /// rather than logged here so the router can report it on the surface that
+    /// outlives a log line.
+    pub data_volume_declaration_error: Option<String>,
+    /// How often each declared volume is re-walked.
+    pub data_volume_interval: Duration,
 }
 
 impl WorkdirConfig {
@@ -84,6 +107,30 @@ impl WorkdirConfig {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_WORKSPACES)
             .max(1);
+        let (data_volumes, data_volume_declaration_error) =
+            match std::env::var("COGNEVA_DATA_VOLUME_MOUNTS") {
+                Ok(raw) => match cog_core::claim_footprint::parse_claim_paths(&raw) {
+                    Ok(mounts) => (mounts, None),
+                    Err(e) => (Vec::new(), Some(e)),
+                },
+                Err(_) => (Vec::new(), None),
+            };
+        // The other variable of that pair names the claim behind the application
+        // data directory, which this process does not have: its directories are
+        // the executor's own. A deployment that sets it here gets no reading at
+        // all, and a switch that reads as set while measuring nothing is the
+        // failure this whole surface exists to end -- so it is refused out loud
+        // rather than ignored.
+        if std::env::var("COGNEVA_DATA_VOLUME_CLAIM")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            error!(
+                "COGNEVA_DATA_VOLUME_CLAIM is set on the sandbox executor, which has no \
+                 application data directory; declare this pod's volumes through \
+                 COGNEVA_DATA_VOLUME_MOUNTS instead"
+            );
+        }
         Self {
             workspaces_root: path("SANDBOX_WORKSPACES_ROOT", DEFAULT_WORKSPACES_ROOT),
             bare_repo: path("SANDBOX_BARE_REPO", DEFAULT_BARE_REPO),
@@ -111,6 +158,13 @@ impl WorkdirConfig {
                 30,
             ),
             max_workspaces: max,
+            data_volumes,
+            data_volume_declaration_error,
+            data_volume_interval: secs(
+                "COGNEVA_DATA_VOLUME_INTERVAL_SECS",
+                DEFAULT_DATA_VOLUME_INTERVAL_SECS,
+                cog_core::claim_footprint::MIN_SCAN_INTERVAL_SECS,
+            ),
         }
     }
 }
@@ -149,6 +203,11 @@ pub struct WorkdirMetrics {
     errors: CounterVec,
     disk_total_bytes: Gauge,
     disk_avail_bytes: Gauge,
+    /// Bytes held by each claim-backed volume of this pod. The same series a
+    /// deployment-wide reading publishes: one volume has one footprint, and a
+    /// second name for it would leave the rule that compares it against the
+    /// declared size reading only the half that happens to be spelled its way.
+    data_volume_used: GaugeVec,
 }
 
 impl WorkdirMetrics {
@@ -185,6 +244,17 @@ impl WorkdirMetrics {
             "sandbox_workspace_disk_avail_bytes",
             "Available bytes on the filesystem backing the executor workspaces",
         )?;
+        // Registered childless, and children are only ever created from a
+        // successful walk: a series that exists before anything was measured
+        // would read as a volume holding zero bytes, which is a claim about the
+        // volume rather than an absence of evidence.
+        let data_volume_used = GaugeVec::new(
+            Opts::new(
+                cog_core::claim_footprint::USED_METRIC,
+                "Measured bytes held by the claim-backed volumes of this workload",
+            ),
+            &[cog_core::claim_footprint::CLAIM_LABEL],
+        )?;
         registry.register(Box::new(workspaces.clone()))?;
         registry.register(Box::new(gc_reclaimed.clone()))?;
         registry.register(Box::new(fetch_failures.clone()))?;
@@ -192,6 +262,7 @@ impl WorkdirMetrics {
         registry.register(Box::new(errors.clone()))?;
         registry.register(Box::new(disk_total_bytes.clone()))?;
         registry.register(Box::new(disk_avail_bytes.clone()))?;
+        registry.register(Box::new(data_volume_used.clone()))?;
         Ok(Self {
             registry,
             workspaces,
@@ -201,6 +272,7 @@ impl WorkdirMetrics {
             errors,
             disk_total_bytes,
             disk_avail_bytes,
+            data_volume_used,
         })
     }
 
@@ -233,6 +305,10 @@ pub struct WorkdirRouter {
     /// The hot path for an existing tree takes no lock.
     create_lock: Mutex<()>,
     metrics: WorkdirMetrics,
+    /// One handle per declared claim-backed volume. Built here so the claim and
+    /// the directory it is measured against are fixed together for the life of
+    /// the process.
+    footprints: Vec<Arc<ClaimFootprint>>,
 }
 
 impl WorkdirRouter {
@@ -240,11 +316,32 @@ impl WorkdirRouter {
         let meta_dir = cfg.workspaces_root.join(META_DIR_NAME);
         let metrics =
             WorkdirMetrics::new().map_err(|e| SFError::IO(format!("workdir metrics init: {e}")))?;
+        if let Some(reason) = &cfg.data_volume_declaration_error {
+            // Nothing below this point can measure those volumes, so the loss is
+            // reported where it happens rather than left to be inferred from a
+            // series that never appears.
+            error!(
+                error = %reason,
+                variable = "COGNEVA_DATA_VOLUME_MOUNTS",
+                "declared volume footprints cannot be read; no volume of this executor is measured"
+            );
+        }
+        let footprints = cfg
+            .data_volumes
+            .iter()
+            .map(|mount| {
+                Arc::new(ClaimFootprint::for_mounted_volume(
+                    mount.claim.clone(),
+                    PathBuf::from(&mount.path),
+                ))
+            })
+            .collect();
         Ok(Arc::new(Self {
             cfg,
             meta_dir,
             create_lock: Mutex::new(()),
             metrics,
+            footprints,
         }))
     }
 
@@ -555,7 +652,35 @@ impl WorkdirRouter {
         }
     }
 
-    /// Spawn the GC and fetch background loops. Call once after [`Self::recover`].
+    /// Walk every declared volume once and publish what each holds.
+    ///
+    /// A walk that fails leaves the previous reading in place. The alternative —
+    /// publishing the partial total, or a zero — is a number smaller than the
+    /// truth that can only keep the comparison against the declared size quiet,
+    /// which is the state this reading exists to make visible.
+    pub async fn measure_volumes_once(&self) {
+        for footprint in &self.footprints {
+            match footprint.measure_blocking().await {
+                Ok(()) => {
+                    if let Some(bytes) = footprint.value() {
+                        self.metrics
+                            .data_volume_used
+                            .with_label_values(&[footprint.claim()])
+                            .set(bytes as f64);
+                    }
+                }
+                Err(e) => warn!(
+                    claim = %footprint.claim(),
+                    dir = %footprint.dir().display(),
+                    error = %e,
+                    "volume footprint scan failed; keeping the last measurement"
+                ),
+            }
+        }
+    }
+
+    /// Spawn the GC, footprint and fetch background loops. Call once after
+    /// [`Self::recover`].
     pub fn spawn_maintenance(self: &Arc<Self>) {
         let gc = Arc::clone(self);
         let gc_interval = gc.cfg.gc_interval;
@@ -580,6 +705,35 @@ impl WorkdirRouter {
                 }
             },
         ));
+        // A pod with no declared volumes gets no such loop: a walk registered to
+        // measure nothing publishes only its own liveness, and its name in the
+        // census would read as a reading being taken.
+        if !self.footprints.is_empty() {
+            let walker = Arc::clone(self);
+            let interval = walker.cfg.data_volume_interval;
+            // No stop signal and no exit of its own: ending means the volume
+            // stops being measured, and the deployment's comparison against its
+            // declared size goes back to having no reading behind it.
+            drop(cog_core::loop_health::spawn_unstoppable(
+                VOLUME_FOOTPRINT_LOOP,
+                cog_core::loop_health::Cadence::Periodic(interval),
+                // Rebuilt per attempt, so everything the body consumes is cloned here.
+                move |beat| {
+                    let walker = Arc::clone(&walker);
+                    async move {
+                        let mut ticker = tokio::time::interval(interval);
+                        loop {
+                            // The first tick of a fresh interval completes at
+                            // once, so the deployment has a reading from the
+                            // start rather than one scan interval later.
+                            beat.beat();
+                            ticker.tick().await;
+                            walker.measure_volumes_once().await;
+                        }
+                    }
+                },
+            ));
+        }
         let fetch = Arc::clone(self);
         tokio::spawn(async move {
             // Refresh immediately in the background rather than on the startup
@@ -884,6 +1038,7 @@ mod tests {
         std::env::set_var("SANDBOX_WORKSPACE_GC_INTERVAL_SECS", "1");
         std::env::set_var("SANDBOX_REPO_FETCH_INTERVAL_SECS", "1");
         std::env::set_var("SANDBOX_MAX_TASK_WORKSPACES", "0");
+        std::env::set_var("COGNEVA_DATA_VOLUME_INTERVAL_SECS", "1");
         std::env::set_var(
             "SANDBOX_REPO_SEED_URLS",
             "__GIT_SEED_URL__, https://gitee.com/o/r.git",
@@ -893,6 +1048,11 @@ mod tests {
         assert!(cfg.gc_interval >= Duration::from_secs(10));
         assert!(cfg.fetch_interval >= Duration::from_secs(30));
         assert_eq!(cfg.max_workspaces, 1);
+        assert_eq!(
+            cfg.data_volume_interval,
+            Duration::from_secs(cog_core::claim_footprint::MIN_SCAN_INTERVAL_SECS),
+            "a scan faster than the scrape interval only costs walk time"
+        );
         assert_eq!(
             cfg.seed_urls,
             vec!["https://gitee.com/o/r.git".to_string()],
@@ -904,9 +1064,154 @@ mod tests {
             "SANDBOX_REPO_FETCH_INTERVAL_SECS",
             "SANDBOX_MAX_TASK_WORKSPACES",
             "SANDBOX_REPO_SEED_URLS",
+            "COGNEVA_DATA_VOLUME_INTERVAL_SECS",
         ] {
             std::env::remove_var(key);
         }
+    }
+
+    /// The declared volumes are the deployment's statement about this pod, so a
+    /// list it cannot read has to be visible rather than quietly measuring
+    /// nothing: a volume nobody measures looks exactly like a volume that is
+    /// small enough.
+    #[test]
+    fn config_carries_a_broken_volume_declaration_instead_of_dropping_it() {
+        std::env::set_var(
+            "COGNEVA_DATA_VOLUME_MOUNTS",
+            "cogneva-sandbox-pvc=/opt/cogneva/sandbox\n/opt/cogneva/other\n",
+        );
+        let cfg = WorkdirConfig::from_env();
+        assert!(cfg.data_volumes.is_empty());
+        assert!(cfg.data_volume_declaration_error.is_some());
+
+        std::env::set_var(
+            "COGNEVA_DATA_VOLUME_MOUNTS",
+            "cogneva-sandbox-pvc = /opt/cogneva/sandbox/\n",
+        );
+        let cfg = WorkdirConfig::from_env();
+        assert!(cfg.data_volume_declaration_error.is_none());
+        assert_eq!(cfg.data_volumes.len(), 1);
+        assert_eq!(cfg.data_volumes[0].claim, "cogneva-sandbox-pvc");
+        assert_eq!(cfg.data_volumes[0].path, "/opt/cogneva/sandbox");
+        std::env::remove_var("COGNEVA_DATA_VOLUME_MOUNTS");
+    }
+
+    /// Build a router over `root` whose only declared volume is `claim` on
+    /// `dir`, so the footprint rules can be driven without a workload around
+    /// them.
+    fn router_watching(root: &Path, bare: &Path, claim: &str, dir: &Path) -> Arc<WorkdirRouter> {
+        let cfg = WorkdirConfig {
+            workspaces_root: root.join("workspaces"),
+            bare_repo: bare.to_path_buf(),
+            target_dir: root.join("src").join("target"),
+            seed_urls: Vec::new(),
+            ttl: DEFAULT_TTL_SECS_FALLBACK,
+            gc_interval: Duration::from_secs(600),
+            fetch_interval: Duration::from_secs(300),
+            max_workspaces: 8,
+            data_volumes: vec![ClaimMount {
+                claim: claim.to_string(),
+                path: dir.display().to_string(),
+            }],
+            data_volume_declaration_error: None,
+            data_volume_interval: Duration::from_secs(30),
+        };
+        WorkdirRouter::new(cfg).unwrap()
+    }
+
+    fn series_of(render: &str, claim: &str) -> Option<String> {
+        let wanted = format!(
+            "{}{{{}=\"{claim}\"}}",
+            cog_core::claim_footprint::USED_METRIC,
+            cog_core::claim_footprint::CLAIM_LABEL
+        );
+        render
+            .lines()
+            .find(|line| line.starts_with(&wanted))
+            .map(str::to_string)
+    }
+
+    /// The sandbox executor is the process that writes this volume, and it is
+    /// the only one that can measure what the volume holds: the kubelet's
+    /// per-volume numbers for a directory-backed volume describe the node's
+    /// filesystem, not the claim. Before the first successful walk nothing is
+    /// published, because a zero would be a claim that the volume is empty.
+    #[tokio::test]
+    async fn declared_volume_is_measured_and_published_under_its_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let volume = tmp.path().join("sandbox-volume");
+        std::fs::create_dir_all(volume.join("workspaces")).unwrap();
+        std::fs::write(volume.join("f.bin"), vec![0u8; 4096]).unwrap();
+        std::fs::write(volume.join("workspaces/g.bin"), vec![0u8; 100]).unwrap();
+
+        let r = router_watching(tmp.path(), &bare, "cogneva-sandbox-pvc", &volume);
+        assert!(
+            series_of(&r.metrics().render(), "cogneva-sandbox-pvc").is_none(),
+            "a series before the first walk claims the volume is empty"
+        );
+
+        r.measure_volumes_once().await;
+        assert_eq!(
+            series_of(&r.metrics().render(), "cogneva-sandbox-pvc"),
+            Some(format!(
+                "{}{{{}=\"cogneva-sandbox-pvc\"}} 4196",
+                cog_core::claim_footprint::USED_METRIC,
+                cog_core::claim_footprint::CLAIM_LABEL
+            ))
+        );
+
+        // A walk that cannot read the volume keeps the last reading: a smaller
+        // number can only silence the comparison against the declared size.
+        std::fs::remove_dir_all(&volume).unwrap();
+        r.measure_volumes_once().await;
+        assert!(r.metrics().render().contains(
+            "cogneva_data_volume_used_bytes{persistentvolumeclaim=\"cogneva-sandbox-pvc\"} 4196"
+        ));
+    }
+
+    /// Two volumes are two readings, each joined against its own declaration:
+    /// one number covering both would hide an overrun on the volume that
+    /// overran behind the one that did not.
+    #[tokio::test]
+    async fn each_declared_volume_keeps_its_own_series() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let first = tmp.path().join("vol-a");
+        let second = tmp.path().join("vol-b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("a.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::write(second.join("b.bin"), vec![0u8; 2000]).unwrap();
+
+        let cfg = WorkdirConfig {
+            workspaces_root: tmp.path().join("workspaces"),
+            bare_repo: bare.clone(),
+            target_dir: tmp.path().join("src").join("target"),
+            seed_urls: Vec::new(),
+            ttl: DEFAULT_TTL_SECS_FALLBACK,
+            gc_interval: Duration::from_secs(600),
+            fetch_interval: Duration::from_secs(300),
+            max_workspaces: 8,
+            data_volumes: vec![
+                ClaimMount {
+                    claim: "vol-a-pvc".into(),
+                    path: first.display().to_string(),
+                },
+                ClaimMount {
+                    claim: "vol-b-pvc".into(),
+                    path: second.display().to_string(),
+                },
+            ],
+            data_volume_declaration_error: None,
+            data_volume_interval: Duration::from_secs(30),
+        };
+        let r = WorkdirRouter::new(cfg).unwrap();
+        r.measure_volumes_once().await;
+
+        let render = r.metrics().render();
+        assert!(series_of(&render, "vol-a-pvc").unwrap().ends_with(" 1000"));
+        assert!(series_of(&render, "vol-b-pvc").unwrap().ends_with(" 2000"));
     }
 
     #[test]
@@ -1049,6 +1354,9 @@ mod tests {
             gc_interval: Duration::from_secs(600),
             fetch_interval: Duration::from_secs(300),
             max_workspaces: max,
+            data_volumes: Vec::new(),
+            data_volume_declaration_error: None,
+            data_volume_interval: Duration::from_secs(30),
         };
         WorkdirRouter::new(cfg).unwrap()
     }

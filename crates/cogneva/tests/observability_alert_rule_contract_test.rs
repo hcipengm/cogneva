@@ -120,9 +120,17 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_change_funnel",
         "crates/cog-github/src/change_funnel.rs",
     ),
+    // The footprint of a claim-backed volume, published by whichever process
+    // writes that volume: the main application for its data directory, the
+    // sandbox executor for the volume its workspaces and build cache live on.
+    // One volume therefore has one number, and the name it travels under is
+    // stated once — the two publishers read it from there rather than each
+    // spelling it, since a second spelling would leave the rule below reading
+    // whichever half happened to match. Each publisher is pinned to that name by
+    // its own test, which renders the series and compares it.
     (
         "cogneva_data_volume_used_bytes",
-        "crates/cog-observability/src/data_volume.rs",
+        "crates/cog-core/src/claim_footprint.rs",
     ),
     // The DAG's own repair. `Scheduled` is the one task state whose exit is a
     // message rather than a call the process makes on its own, so a task that

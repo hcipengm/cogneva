@@ -212,3 +212,4 @@ pub mod orchestrator_control {
 pub use chrono::{DateTime, Utc};
 pub use serde_json;
 pub use uuid::Uuid;
+pub mod claim_footprint;

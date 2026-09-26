@@ -25,11 +25,10 @@ pub struct ObservabilityPlugin {
     /// to the collection task in `start`.
     trace_buffer_max_bytes: usize,
     /// Footprint gauge per claim-backed directory, created in `init` and
-    /// scanned by one task each in `start`.
-    data_volume: Vec<(
-        crate::data_volume::WatchedTarget,
-        Arc<crate::data_volume::DataVolumeObservable>,
-    )>,
+    /// scanned by one task each in `start`. Each observable carries the claim
+    /// and the directory it belongs to, so a scan cannot be pointed at a
+    /// directory other than the one its series is attributed to.
+    data_volume: Vec<Arc<crate::data_volume::DataVolumeObservable>>,
 }
 
 impl ObservabilityPlugin {
@@ -273,17 +272,14 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             warn!(reason = %reason, "watched volume not measured");
         }
         for target in targets {
-            let volume = Arc::new(crate::data_volume::DataVolumeObservable::new(
-                target.claim.clone(),
-            ));
+            let volume = Arc::new(crate::data_volume::DataVolumeObservable::new(target));
             ctx.publish_observable(volume.clone());
             info!(
-                claim = %target.claim,
-                dir = %target.dir.display(),
-                excluded = target.exclude.len(),
+                claim = %volume.claim(),
+                dir = %volume.dir().display(),
                 "ObservabilityPlugin data volume footprint published"
             );
-            self.data_volume.push((target, volume));
+            self.data_volume.push(volume);
         }
 
         // ── Orphaned processes adopted as PID 1 ──
@@ -384,13 +380,12 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
 
         // ── Data directory footprint ──
         let obs_cfg = crate::ObservabilityExportersConfig::load()?;
-        for (target, volume) in &self.data_volume {
+        for volume in &self.data_volume {
             let shutdown = ctx
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
             tokio::spawn(crate::data_volume::run_data_volume_watch(
-                target.clone(),
                 volume.clone(),
                 obs_cfg.data_volume_watch.interval_secs,
                 shutdown,

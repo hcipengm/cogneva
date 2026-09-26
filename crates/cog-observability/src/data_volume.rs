@@ -1,4 +1,4 @@
-//! Reports how many bytes the application data directory actually occupies.
+//! Reports how many bytes the claim-backed directories of this deployment occupy.
 //!
 //! A persistent volume's declared size is a claim, not a measurement. Nothing
 //! reconciles the two: the request is admission-time arithmetic, and for a
@@ -6,9 +6,13 @@
 //! per-volume capacity the kubelet reports is not the volume's. The only party
 //! that can measure what a volume holds is the process writing to it, so it
 //! publishes the number and the deployment compares it against the declaration.
+//!
+//! Which directories those are is decided here; the measurement itself and the
+//! series it is published under belong to
+//! [`cog_core::claim_footprint`], because a second process measures a volume of
+//! its own and the two cannot disagree about what a reading means.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,14 +23,14 @@ use tracing::{info, warn};
 
 /// Gauge carrying the measured footprint, labelled with the claim backing the
 /// directory so it can be joined against the claim's declared size.
-pub const DATA_VOLUME_USED_METRIC: &str = "cogneva_data_volume_used_bytes";
+pub use cog_core::claim_footprint::USED_METRIC as DATA_VOLUME_USED_METRIC;
 
 /// Name of the rule that consumes the gauge, so the pairing can be asserted.
 pub const DATA_VOLUME_USED_METRIC_RULE: &str = "data_volume_over_declared_size";
 
 /// Fastest cadence the directory may be re-walked at. The walk is metadata-only
 /// and cheap, but it holds no value being fresher than the scrape interval.
-pub const MIN_SCAN_INTERVAL_SECS: u64 = 30;
+pub use cog_core::claim_footprint::MIN_SCAN_INTERVAL_SECS;
 
 /// This loop's name in the liveness census.
 pub const DATA_VOLUME_WATCH_LOOP: &str = "data_volume_watch";
@@ -42,30 +46,19 @@ pub struct WatchedTarget {
 
 /// Parse the deployment's `claim=path` list, one entry per line.
 ///
-/// A malformed entry is returned as a reason, never skipped: a mount the
-/// operator declared and the process silently dropped looks exactly like a
-/// volume that is small, which is the blindness this exists to end.
+/// The format is shared with the other process that measures a volume of its own
+/// — the sandbox executor states its pairing through the same variable — so the
+/// grammar and its error messages live with the footprint reading itself. A
+/// second parser would accept a slightly different subset, and the two would
+/// disagree about a declaration nobody wrote down twice.
 pub fn parse_mounts(raw: &str) -> Result<Vec<crate::config::WatchedVolumeConfig>, String> {
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((claim, path)) = line.split_once('=') else {
-            return Err(format!("entry `{line}` is not `claim=path`"));
-        };
-        let claim = claim.trim();
-        let path = path.trim();
-        if claim.is_empty() || path.is_empty() {
-            return Err(format!("entry `{line}` leaves the claim or the path empty"));
-        }
-        out.push(crate::config::WatchedVolumeConfig {
-            claim: claim.to_string(),
-            path: path.to_string(),
-        });
-    }
-    Ok(out)
+    Ok(cog_core::claim_footprint::parse_claim_paths(raw)?
+        .into_iter()
+        .map(|mount| crate::config::WatchedVolumeConfig {
+            claim: mount.claim,
+            path: mount.path,
+        })
+        .collect())
 }
 
 /// The directories a deployment should measure, and why any listed mount
@@ -119,65 +112,12 @@ pub fn watched_targets(
 
 /// Give every target the nested mounts its own walk must leave out.
 ///
-/// A directory below a mount point holds bytes of another volume only because
-/// something is mounted there, so the process's own mount table is the
-/// authoritative list of what to leave out. Reading it beats restating the
-/// list in configuration: a hand-kept list cannot tell when a mount has moved,
-/// and a stale entry fails silently in both directions — one that names a
-/// mount which no longer exists inflates the parent, one that omits a mount
-/// that now exists hands the child's bytes to the parent.
+/// What counts as a nested mount is the footprint reading's own rule, since the
+/// other process measuring a volume of its own applies the same one.
 pub fn derive_exclusions(targets: &mut [WatchedTarget], mounts: &[PathBuf]) {
     for target in targets.iter_mut() {
-        target.exclude = mounts
-            .iter()
-            .filter(|mount| mount.as_path() != target.dir && mount.starts_with(&target.dir))
-            .cloned()
-            .collect();
+        target.exclude = cog_core::claim_footprint::nested_mounts_under(&target.dir, mounts);
     }
-}
-
-/// Mount points of this process's own mount namespace, unreadable ones
-/// omitted.
-///
-/// Empty is a real answer — a container with no submounts under its volumes,
-/// or a platform where the table cannot be read. It degrades towards
-/// over-counting rather than blindness: a parent that absorbs a nested volume
-/// reports a number that is too large, which is visible, whereas leaving out a
-/// mount that should have been counted would report a volume as smaller than it
-/// is and silence its alert.
-fn current_mounts() -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|line| {
-            // `<id> <parent> <maj:min> <root> <mount point> <opts> [more] - <fstype> <src> <super opts>`
-            let head = line.split(" - ").next()?;
-            let field = head.split_whitespace().nth(4)?;
-            Some(PathBuf::from(unescape_mount_field(field)))
-        })
-        .collect()
-}
-
-/// Undo the octal escaping the kernel applies to spaces, tabs, newlines and
-/// backslashes in a mount point.
-fn unescape_mount_field(field: &str) -> String {
-    let raw = field.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        if raw[i] == b'\\' && i + 3 < raw.len() {
-            let digits = std::str::from_utf8(&raw[i + 1..i + 4]).unwrap_or("");
-            if let Ok(byte) = u8::from_str_radix(digits, 8) {
-                out.push(byte);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(raw[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Resolve the configured targets against this process's own mount table.
@@ -189,7 +129,7 @@ pub fn resolve_targets(
     app_data_dir: &Path,
 ) -> (Vec<WatchedTarget>, Vec<String>) {
     let (mut targets, rejected) = watched_targets(cfg, app_data_dir);
-    let mounts = current_mounts();
+    let mounts = cog_core::claim_footprint::current_mounts();
     if mounts.is_empty() {
         warn!("mount table unreadable; a nested mount will be counted into its parent");
     }
@@ -199,30 +139,40 @@ pub fn resolve_targets(
 
 /// Footprint gauge for one claim-backed directory.
 ///
-/// The measurement is written by the scan loop and read by the metrics pull,
-/// which are different tasks, hence the atomics rather than a lock.
+/// The measurement itself is [`cog_core::claim_footprint::ClaimFootprint`], which
+/// the other process measuring a volume of its own also holds: the number, the
+/// label it is published under and the meaning of "not measured yet" have to be
+/// the same in both, or the same volume would be described two ways.
 pub struct DataVolumeObservable {
-    claim: String,
-    used_bytes: AtomicU64,
-    measured: AtomicBool,
+    footprint: Arc<cog_core::claim_footprint::ClaimFootprint>,
 }
 
 impl DataVolumeObservable {
-    pub fn new(claim: impl Into<String>) -> Self {
+    pub fn new(target: WatchedTarget) -> Self {
         Self {
-            claim: claim.into(),
-            used_bytes: AtomicU64::new(0),
-            measured: AtomicBool::new(false),
+            footprint: Arc::new(cog_core::claim_footprint::ClaimFootprint::new(
+                target.claim,
+                target.dir,
+                target.exclude,
+            )),
         }
     }
 
     pub fn claim(&self) -> &str {
-        &self.claim
+        self.footprint.claim()
+    }
+
+    pub fn dir(&self) -> &Path {
+        self.footprint.dir()
     }
 
     pub fn set_used_bytes(&self, bytes: u64) {
-        self.used_bytes.store(bytes, Ordering::Relaxed);
-        self.measured.store(true, Ordering::Release);
+        self.footprint.set_used_bytes(bytes);
+    }
+
+    /// Walk the directory on the blocking pool and record what it holds.
+    pub async fn measure_blocking(self: &Arc<Self>) -> std::io::Result<()> {
+        self.footprint.measure_blocking().await
     }
 
     /// The last successful measurement, or `None` before one has happened.
@@ -232,9 +182,7 @@ impl DataVolumeObservable {
     /// absence of evidence, and it is the exact confusion this gauge exists to
     /// end.
     pub fn used_bytes(&self) -> Option<u64> {
-        self.measured
-            .load(Ordering::Acquire)
-            .then(|| self.used_bytes.load(Ordering::Relaxed))
+        self.footprint.value()
     }
 }
 
@@ -248,7 +196,7 @@ impl Observable for DataVolumeObservable {
             .used_bytes()
             .map(|bytes| {
                 vec![RawMetric::new(DATA_VOLUME_USED_METRIC, bytes as f64)
-                    .with_label("persistentvolumeclaim", &self.claim)]
+                    .with_label(cog_core::claim_footprint::CLAIM_LABEL, self.claim())]
             })
             .unwrap_or_default())
     }
@@ -265,31 +213,16 @@ impl Observable for DataVolumeObservable {
     }
 }
 
-/// Walk `dir` and total the size of every regular file below it, skipping any
-/// entry whose path is listed in `exclude`.
+/// Re-measure the observable's directory on a timer and publish the result.
 ///
-/// The walk itself lives in [`cog_core::fs_size`], shared with the build cache
-/// reading: two walkers would each have their own idea of symlinks, of apparent
-/// size and of what an exclusion covers, and one directory would then have two
-/// sizes with nothing to explain the difference.
-///
-/// An excluded path is neither counted nor descended into, and the exclusion is
-/// on the named directory alone rather than on its contents: a mount inside
-/// this volume is the work of a different claim, and its bytes would otherwise
-/// be reported against both.
-fn dir_size_bytes(dir: &Path, exclude: &[PathBuf]) -> std::io::Result<u64> {
-    cog_core::fs_size::dir_size_bytes(dir, exclude)
-}
-
-/// Re-measure the target's directory on a timer and publish the result on
-/// `observable`.
+/// The directory to walk is the observable's own: the number and the claim it is
+/// attributed to have to travel together, so the loop cannot be handed a
+/// directory belonging to a different identity than the series it feeds.
 pub async fn run_data_volume_watch(
-    target: WatchedTarget,
     observable: Arc<DataVolumeObservable>,
     interval_secs: u64,
     shutdown: ShutdownSignal,
 ) {
-    let WatchedTarget { dir, exclude, .. } = target;
     let interval = Duration::from_secs(interval_secs.max(MIN_SCAN_INTERVAL_SECS));
     // The footprint gauge is this loop's own reading, so the loop being gone and
     // the walk having nothing to say would read the same: the liveness of the
@@ -301,15 +234,12 @@ pub async fn run_data_volume_watch(
         shutdown.clone(),
         // Rebuilt per attempt, so everything the body consumes is cloned here.
         move |beat| {
-            let dir = dir.clone();
-            let exclude = exclude.clone();
             let observable = Arc::clone(&observable);
             let shutdown = shutdown.clone();
             async move {
                 info!(
-                    dir = %dir.display(),
+                    dir = %observable.dir().display(),
                     claim = %observable.claim(),
-                    excluded = exclude.len(),
                     interval_secs = interval.as_secs(),
                     metric = DATA_VOLUME_USED_METRIC,
                     "data volume footprint watcher started"
@@ -325,19 +255,16 @@ pub async fn run_data_volume_watch(
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            let path = dir.clone();
-                            let excluded = exclude.clone();
-                            match tokio::task::spawn_blocking(move || dir_size_bytes(&path, &excluded)).await {
-                                Ok(Ok(bytes)) => observable.set_used_bytes(bytes),
-                                // A failed walk yields a number that is too small, which can
-                                // only silence the alert. Keep the last measurement rather
-                                // than publish a fictional low one, and say so.
-                                Ok(Err(e)) => warn!(
+                            // A failed walk yields a number that is too small, which can
+                            // only silence the alert. The footprint keeps the last
+                            // measurement rather than publish a fictional low one, and
+                            // the failure is still said out loud here.
+                            if let Err(e) = observable.measure_blocking().await {
+                                warn!(
                                     error = %e,
-                                    dir = %dir.display(),
+                                    dir = %observable.dir().display(),
                                     "data volume scan failed; keeping the last measurement"
-                                ),
-                                Err(e) => warn!(error = %e, "data volume scan task panicked"),
+                                );
                             }
                         }
                     }
@@ -358,62 +285,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn sums_nested_regular_files() {
-        let root = scratch("sum");
-        fs::create_dir_all(root.join("a/b")).unwrap();
-        fs::write(root.join("top.bin"), vec![0u8; 1000]).unwrap();
-        fs::write(root.join("a/mid.bin"), vec![0u8; 2000]).unwrap();
-        fs::write(root.join("a/b/deep.bin"), vec![0u8; 3000]).unwrap();
-        assert_eq!(dir_size_bytes(&root, &[]).unwrap(), 6000);
-        fs::remove_dir_all(&root).ok();
-    }
-
-    /// A mount nested inside this volume belongs to a different claim, so its
-    /// bytes must leave this reading entirely: counting them here reports the
-    /// same data against two claims, which invents an overrun on one volume and
-    /// hides a real one on the other.
-    #[test]
-    fn excluded_subdirectory_is_neither_counted_nor_descended_into() {
-        let root = scratch("exclude");
-        let nested = root.join("src");
-        fs::create_dir_all(nested.join("deep")).unwrap();
-        fs::write(root.join("own.bin"), vec![0u8; 1000]).unwrap();
-        fs::write(nested.join("other.bin"), vec![0u8; 7000]).unwrap();
-        fs::write(nested.join("deep/x.bin"), vec![0u8; 9000]).unwrap();
-
-        assert_eq!(dir_size_bytes(&root, &[]).unwrap(), 17_000);
-        assert_eq!(
-            dir_size_bytes(&root, std::slice::from_ref(&nested)).unwrap(),
-            1000
-        );
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn empty_directory_is_zero_and_missing_directory_is_an_error() {
-        let root = scratch("empty");
-        assert_eq!(dir_size_bytes(&root, &[]).unwrap(), 0);
-        fs::remove_dir_all(&root).ok();
-        // 空目录给 0，读不到目录给错误：两者不能都塌成 0，否则"没量到"会被
-        // 发布成"用量为零"。
-        assert!(dir_size_bytes(&root, &[]).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_is_not_followed() {
-        let root = scratch("symlink");
-        let outside = scratch("symlink-target");
-        fs::write(outside.join("huge.bin"), vec![0u8; 5000]).unwrap();
-        fs::write(root.join("inside.bin"), vec![0u8; 7]).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        // 链到卷外的东西不算这个卷的占用，否则链接一次就把别人的字节记进来。
-        assert_eq!(dir_size_bytes(&root, &[]).unwrap(), 7);
-        fs::remove_dir_all(&root).ok();
-        fs::remove_dir_all(&outside).ok();
     }
 
     fn watch_cfg(
@@ -575,34 +446,19 @@ mod tests {
         assert_eq!(targets[1].exclude, Vec::<PathBuf>::new());
     }
 
-    #[test]
-    fn mount_field_escaping_is_undone() {
-        assert_eq!(unescape_mount_field("/a\\040b"), "/a b");
-        assert_eq!(unescape_mount_field("/a\\134b"), "/a\\b");
-        assert_eq!(unescape_mount_field("/plain"), "/plain");
-        // 非转义的孤立反斜杠照原样保留，不能被当成转义前缀吃掉后一个字符。
-        assert_eq!(unescape_mount_field("/a\\b"), "/a\\b");
-    }
-
-    /// The two facts the exclusion needs — that a mount exists and where —
-    /// come from the kernel, and the parser has to read the real table rather
-    /// than a shape invented for the test.
-    #[test]
-    fn current_mounts_reads_this_processes_own_table() {
-        let mounts = current_mounts();
-        assert!(
-            mounts.iter().any(|m| m == Path::new("/")),
-            "the root mount is always present, got {mounts:?}"
-        );
-        assert!(
-            !mounts.iter().any(|m| m.as_os_str().is_empty()),
-            "an unparsed line yields an empty path that would match nothing"
-        );
+    /// A target whose directory is never walked: only the publication rules are
+    /// under test.
+    fn unmeasured(claim: &str) -> DataVolumeObservable {
+        DataVolumeObservable::new(WatchedTarget {
+            claim: claim.to_string(),
+            dir: PathBuf::from("/var/lib/cogneva-data"),
+            exclude: Vec::new(),
+        })
     }
 
     #[tokio::test]
     async fn gauge_carries_the_claim_regardless_of_dimension() {
-        let obs = DataVolumeObservable::new("cogneva-data-pvc");
+        let obs = unmeasured("cogneva-data-pvc");
         // 还没量过就不该有这条序列：先报一个 0 等于替卷宣称"它是空的"。
         assert!(obs.collect_metrics("D8").await.unwrap().is_empty());
         obs.set_used_bytes(18_000_000_000);
@@ -698,19 +554,18 @@ mod tests {
     async fn scan_publishes_the_measured_bytes() {
         let root = scratch("loop");
         fs::write(root.join("f.bin"), vec![0u8; 4096]).unwrap();
-        let obs = Arc::new(DataVolumeObservable::new("claim"));
+        let obs = Arc::new(DataVolumeObservable::new(WatchedTarget {
+            claim: "claim".into(),
+            dir: root.clone(),
+            exclude: Vec::new(),
+        }));
         assert_eq!(obs.used_bytes(), None);
 
         let shutdown = ShutdownSignal::new();
         let handle = {
             let obs = obs.clone();
-            let target = WatchedTarget {
-                claim: "claim".into(),
-                dir: root.clone(),
-                exclude: Vec::new(),
-            };
             tokio::spawn(async move {
-                run_data_volume_watch(target, obs, 1, shutdown.clone()).await;
+                run_data_volume_watch(obs, 1, shutdown.clone()).await;
             })
         };
 

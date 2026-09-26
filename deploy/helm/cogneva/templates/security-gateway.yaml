@@ -1,4 +1,7 @@
 {{- if .Values.securityGateway.enabled }}
+{{- /* 兜底镜像卷的挂载点。三处必须逐字相同——挂载点、进程认的根路径、占用读数
+       的声明——所以只写一次，其余引用它。 */}}
+{{- $gitMirrorRoot := "/var/lib/cogneva-git-mirror" }}
 # 独立安全网关：代持全部敏感凭证（LLM API Key 等），沙盒 Pod 零凭证。
 apiVersion: apps/v1
 kind: Deployment
@@ -100,9 +103,17 @@ spec:
             # 只会说 smart HTTP，SSH 只发生在网关到 GitHub 之间。
             # 路径写死在这里而不是 values：它同时是卷的挂载点，两处分开配就会漂移。
             - name: COGNEVA_GATEWAY_GIT_MIRROR_ROOT
-              value: /var/lib/cogneva-git-mirror
+              value: {{ $gitMirrorRoot }}
             - name: COGNEVA_GATEWAY_GIT_MIRROR_ENABLED
               value: {{ .Values.securityGateway.gitMirror.enabled | quote }}
+            # 镜像卷的占用：唯一写它的是本进程，而目录型卷的"容量"是整个节点
+            # 文件系统，所以声明了多少、实际占了多少，除了本进程没人能对账。
+            # 关掉镜像时这张卷不挂，声明也就无从谈起。
+            {{- if .Values.securityGateway.gitMirror.enabled }}
+            - name: COGNEVA_DATA_VOLUME_MOUNTS
+              value: |
+                cogneva-git-mirror-pvc={{ $gitMirrorRoot }}
+            {{- end }}
             - name: COGNEVA_GATEWAY_GIT_SSH_KEY
               value: /etc/cogneva/git-ssh/id_ed25519
             # 兜底传输的两条执行预算（秒）：静默多久判死、单次传输总上限。判据在
@@ -238,7 +249,7 @@ spec:
           {{- if .Values.securityGateway.gitMirror.enabled }}
           volumeMounts:
             - name: git-mirror
-              mountPath: /var/lib/cogneva-git-mirror
+              mountPath: {{ $gitMirrorRoot }}
             # 私钥挂成固定文件名：git 读的是路径，不是 Secret 的键名。
             - name: git-ssh-key
               mountPath: /etc/cogneva/git-ssh
