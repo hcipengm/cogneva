@@ -20,6 +20,7 @@ use axum::{
 use cog_core::{CommandEvent, SFError, SandboxPayload};
 use futures::StreamExt;
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::hostdocs::{HostDocOp, HostDocPlan, HostDocs};
 use crate::workdir::{self, WorkdirRouter};
@@ -202,6 +203,15 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
     // only worth rendering where something can move them.
     if let Some(hostdocs) = state.hostdocs.as_ref() {
         body.push_str(&hostdocs.metrics());
+    }
+    // The background loops of this process live outside the workdir registry, and
+    // nothing else publishes them: worktree GC, the offline fetch and the volume
+    // footprint walk would each stop silently, and the reading each one produces
+    // would keep its last value, which is what a healthy quiet loop looks like.
+    let loops = cog_core::loop_health::observable();
+    match loops.collect_metrics("").await {
+        Ok(readings) => body.push_str(&cog_core::observability_text::render_raw_metrics(&readings)),
+        Err(e) => warn!(error = %e, "background loop readings unavailable this scrape"),
     }
     Response::builder()
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
@@ -628,5 +638,44 @@ mod tests {
             "before"
         );
         assert!(!root.join("archive").exists());
+    }
+
+    /// The loops this process runs are invisible unless this endpoint publishes
+    /// them: the worktree GC, the offline fetch and the volume footprint walk
+    /// each keep their last reading when they stop, and that is exactly what a
+    /// healthy quiet loop looks like. The census is the only face that says
+    /// whether one is still there.
+    #[tokio::test]
+    async fn metrics_endpoint_carries_the_background_loop_census() {
+        // The registry is process-wide, so the probe uses a name of its own and
+        // asserts on that rather than on the absence of anything else.
+        let probe = format!("census_probe_{}", std::process::id());
+        drop(cog_core::loop_health::register(
+            probe.clone(),
+            cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(30)),
+        ));
+
+        let addr = spawn_server().await;
+        let body = reqwest::Client::new()
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert!(
+            body.contains(&format!("cogneva_loop_registered{{loop=\"{probe}\"}} 1\n")),
+            "the loop census is missing from the scrape: {body}"
+        );
+        // The period is what an alert compares the age against, so a census
+        // without it says a loop exists but not whether it is on time.
+        assert!(
+            body.contains(&format!(
+                "cogneva_loop_period_seconds{{loop=\"{probe}\"}} 30\n"
+            )),
+            "the loop period is missing from the scrape: {body}"
+        );
     }
 }

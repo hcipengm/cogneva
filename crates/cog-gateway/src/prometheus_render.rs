@@ -193,66 +193,15 @@ fn render_observed_timestamps(name: &str, series: &[(String, i64)]) -> String {
 }
 
 /// Render raw observable metrics (D5/D8 pulls) in Prometheus text format.
-/// Metrics are grouped by name; names ending in `_total` render as counters,
-/// everything else as gauges. One sample per distinct label set.
-pub fn render_raw_metrics(metrics: &[cog_core::RawMetric]) -> String {
-    if metrics.is_empty() {
-        return String::new();
-    }
+///
+/// The rendering itself lives in [`cog_core::observability_text`]: this process
+/// is not the only one that publishes readings of its own on a `/metrics`
+/// endpoint, and the type a series is spelled with has to be the same in all of
+/// them.
+pub use cog_core::observability_text::render_raw_metrics;
 
-    let mut by_name: HashMap<&str, Vec<&cog_core::RawMetric>> = HashMap::new();
-    for m in metrics {
-        by_name.entry(m.name.as_str()).or_default().push(m);
-    }
-
-    let mut names: Vec<&str> = by_name.keys().copied().collect();
-    names.sort_unstable();
-
-    let mut out = String::new();
-    for name in names {
-        let kind = if name.ends_with("_total") {
-            "counter"
-        } else {
-            "gauge"
-        };
-        out.push_str(&format!("# TYPE {name} {kind}\n"));
-        for m in &by_name[name] {
-            let labels = format_labels(&m.labels);
-            if labels.is_empty() {
-                out.push_str(&format!("{name} {}\n", m.value));
-            } else {
-                out.push_str(&format!("{name}{{{labels}}} {}\n", m.value));
-            }
-        }
-    }
-
-    out
-}
-
-/// Render a label set in a canonical form. The order must be derived from the
-/// label names, not from the map's iteration order: the same logical series
-/// arrives as a fresh `HashMap` per sample, so an iteration-ordered rendering
-/// splits one series into as many series as there are label permutations, each
-/// carrying a fraction of the total. Downstream, those fragments look like
-/// distinct series and every per-series aggregate is wrong.
-fn format_labels(labels: &HashMap<String, String>) -> String {
-    if labels.is_empty() {
-        return String::new();
-    }
-    let mut names: Vec<&String> = labels.keys().collect();
-    names.sort_unstable();
-    let pairs: Vec<String> = names
-        .into_iter()
-        .map(|k| format!("{k}=\"{}\"", escape_label_value(&labels[k])))
-        .collect();
-    pairs.join(",")
-}
-
-fn escape_label_value(v: &str) -> String {
-    v.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-}
+/// Render a label set in a canonical form.
+pub use cog_core::observability_text::format_labels;
 
 #[cfg(test)]
 mod tests {
@@ -319,22 +268,6 @@ mod tests {
                 "http_requests_total_observed_timestamp_seconds{{job=\"a\"}} {newest_ts}\n"
             )),
             "累加是求和，时间是取最新，不能把时间也加起来: {out}"
-        );
-    }
-
-    #[test]
-    fn labels_render_in_canonical_name_order() {
-        let labels: HashMap<String, String> = [
-            ("status", "200"),
-            ("endpoint", "/metrics"),
-            ("method", "GET"),
-        ]
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-        assert_eq!(
-            format_labels(&labels),
-            "endpoint=\"/metrics\",method=\"GET\",status=\"200\""
         );
     }
 
@@ -436,24 +369,5 @@ mod tests {
     #[test]
     fn empty_gauge_renders_nothing() {
         assert!(render_gauges("memory_unextracted_raw", "help", &[]).is_empty());
-    }
-
-    #[test]
-    fn render_raw_metrics_groups_by_name_and_labels() {
-        let metrics = vec![
-            cog_core::RawMetric::new("ralph_terminations_total", 2.0)
-                .with_label("reason", "stagnated"),
-            cog_core::RawMetric::new("collaboration_success_rate", 0.5),
-        ];
-        let out = render_raw_metrics(&metrics);
-        assert!(out.contains("# TYPE ralph_terminations_total counter\n"));
-        assert!(out.contains("ralph_terminations_total{reason=\"stagnated\"} 2\n"));
-        assert!(out.contains("# TYPE collaboration_success_rate gauge\n"));
-        assert!(out.contains("collaboration_success_rate 0.5\n"));
-    }
-
-    #[test]
-    fn render_raw_metrics_empty_is_empty() {
-        assert!(render_raw_metrics(&[]).is_empty());
     }
 }

@@ -1,11 +1,13 @@
 pub mod audit;
 pub mod build_gate;
+pub mod claim_footprint;
 pub mod config;
 pub mod config_sections;
 pub mod contract;
 pub mod error;
 pub mod fs_size;
 pub mod loop_health;
+pub mod observability_text;
 pub mod secrets;
 pub mod types;
 
@@ -212,4 +214,3 @@ pub mod orchestrator_control {
 pub use chrono::{DateTime, Utc};
 pub use serde_json;
 pub use uuid::Uuid;
-pub mod claim_footprint;
