@@ -599,9 +599,9 @@ pub const OBS_ENV: &[(&str, &str)] = &[
         "COGNEVA_TRACE_BUFFER_MAX_BYTES",
         "trace_collector.buffer_max_bytes",
     ),
-    ("COGNEVA_DATA_VOLUME_CLAIM", "data_volume_watch.claim"),
+    (crate::data_volume::CLAIM_ENV, "data_volume_watch.claim"),
     (
-        "COGNEVA_DATA_VOLUME_INTERVAL_SECS",
+        crate::data_volume::INTERVAL_ENV,
         "data_volume_watch.interval_secs",
     ),
     (
@@ -633,7 +633,7 @@ impl ObservabilityExportersConfig {
         cog_core::config::apply_env_paths(&mut section, OBS_ENV);
         // 挂载清单是一个列表，而上面的标量映射会把每个 env 值都变成字符串，
         // 所以它单走一条路：解析失败响亮报错，不能让 Pod 起来却什么都不量。
-        if let Ok(raw) = std::env::var("COGNEVA_DATA_VOLUME_MOUNTS") {
+        if let Ok(raw) = std::env::var(crate::data_volume::MOUNTS_ENV) {
             apply_mount_list(&mut section, &raw)?;
         }
         serde_json::from_value(section)
@@ -644,7 +644,7 @@ impl ObservabilityExportersConfig {
 /// Overwrite the watched-mount list from the `claim=path` env value.
 fn apply_mount_list(section: &mut serde_json::Value, raw: &str) -> SFResult<()> {
     let volumes = crate::data_volume::parse_mounts(raw)
-        .map_err(|e| SFError::Config(format!("COGNEVA_DATA_VOLUME_MOUNTS: {e}")))?;
+        .map_err(|e| SFError::Config(format!("{}: {e}", crate::data_volume::MOUNTS_ENV)))?;
     if volumes.is_empty() {
         return Ok(());
     }

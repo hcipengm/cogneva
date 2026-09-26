@@ -43,6 +43,35 @@ pub const CLAIM_LABEL: &str = "persistentvolumeclaim";
 /// a knob that reads as "how wrong the setting was".
 pub const MIN_SCAN_INTERVAL_SECS: u64 = 30;
 
+/// Cadence a process re-walks its volumes at when nothing states one.
+///
+/// Every process that measures a volume has to pick this, and a reading is only
+/// comparable across volumes when they are all as fresh as each other: a walker
+/// on a one-minute cadence would report a volume as holding less than a walker
+/// on a ten-minute one for the same workload. It sits beside the floor because
+/// the two are read together — a deployment's own cadence is clamped by the
+/// floor and falls back to this.
+pub const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
+
+/// Deployment variable stating the `claim=path` mounts a pod measures.
+///
+/// The name is part of the contract for the same reason the series name is: the
+/// deployment states the pairing with it and the process reads the pairing from
+/// it, and the two are written in different files. A producer that spells the
+/// variable its own way publishes nothing while the manifest that set it reads
+/// as a pod whose volumes are measured.
+pub const MOUNTS_ENV: &str = "COGNEVA_DATA_VOLUME_MOUNTS";
+
+/// Deployment variable naming the claim behind the application data directory.
+///
+/// Only a process that has that directory can act on it; the standalone entries
+/// have none, and a declaration there is a misdirected one rather than a
+/// setting.
+pub const CLAIM_ENV: &str = "COGNEVA_DATA_VOLUME_CLAIM";
+
+/// Deployment variable overriding [`DEFAULT_SCAN_INTERVAL_SECS`].
+pub const INTERVAL_ENV: &str = "COGNEVA_DATA_VOLUME_INTERVAL_SECS";
+
 /// One declaration from a deployment's `claim=path` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimMount {

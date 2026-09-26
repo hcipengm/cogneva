@@ -2004,6 +2004,7 @@ dependencies = [
  "sd-notify",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sqlx",
  "tar",
  "tempfile",

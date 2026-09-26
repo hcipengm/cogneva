@@ -76,3 +76,6 @@ cog-redis = { workspace = true }
 tempfile = "3"
 filetime = "0.2"
 async-trait = "0.1"
+# The delivery-manifest contract test reads workloads, containers and volume
+# mounts out of the manifests as objects, not as text.
+serde_yaml = "0.9"

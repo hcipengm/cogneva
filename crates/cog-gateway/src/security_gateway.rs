@@ -905,6 +905,13 @@ struct AppState {
     pool_down: Arc<AtomicBool>,
     /// 自上次池判定以来是否出现过上游实证成功（清除 `pool_down` 的唯一凭据）。
     pool_recovered: Arc<AtomicBool>,
+    /// Footprint of the volumes this pod alone can measure (the git mirror).
+    ///
+    /// For a directory-backed volume the per-volume capacity the kubelet reports
+    /// is the node's filesystem, so the process writing it is the only one that
+    /// can say what it holds. Empty when the deployment declares none, and then
+    /// /metrics carries exactly no series of that family.
+    volume_footprint: Vec<Arc<cog_observability::data_volume::DataVolumeObservable>>,
 }
 
 impl AppState {
@@ -3573,6 +3580,20 @@ async fn metrics_handler(State(state): State<AppState>) -> axum::response::Respo
         Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
         Err(e) => tracing::warn!(error = %e, "background loop readings unavailable this scrape"),
     }
+    // The volumes this pod writes are readable from nowhere else — the kubelet's
+    // per-volume number for a directory-backed volume is the node's filesystem —
+    // so a scrape of this process is the only place the deployment can find out
+    // what its own mirror volume holds.
+    for observable in &state.volume_footprint {
+        match cog_core::Observable::collect_metrics(observable.as_ref(), "").await {
+            Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
+            Err(e) => tracing::warn!(
+                claim = %observable.claim(),
+                error = %e,
+                "volume footprint unavailable this scrape"
+            ),
+        }
+    }
     axum::response::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
@@ -3939,6 +3960,14 @@ pub async fn run(
     let identity: Arc<str> = Arc::from(outbound_identity(build_revision).as_str());
     let identity_headers = identity_default_headers(&identity);
     tracing::info!(identity = %identity, "安全网关出站请求自我标识");
+    // A declaration this process cannot act on is said out loud: a variable set
+    // in the deployment and a pod that started look exactly like a volume whose
+    // footprint is being measured, and the difference is only ever in a log.
+    let (volume_footprint, volume_declaration_problems) =
+        cog_observability::data_volume::observables_from_env();
+    for problem in &volume_declaration_problems {
+        tracing::error!(problem = %problem, "volume footprint declaration became no reading");
+    }
     let state = AppState {
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -3960,6 +3989,7 @@ pub async fn run(
         redis,
         pool_down: Arc::new(AtomicBool::new(pool_down)),
         pool_recovered: Arc::new(AtomicBool::new(false)),
+        volume_footprint,
         config: config.clone(),
     };
     // 恢复逐上游证据必须发生在任何一拍探测之前：探测按表里的窗口决定谁该被试，
@@ -3982,6 +4012,16 @@ pub async fn run(
     }
     drop(spawn_llm_health_prober(state.clone()));
     drop(spawn_pool_state_publisher(state.clone()));
+    // Nothing hands these a stop signal either: the reading belongs to the pod,
+    // and a walker that stopped would leave its last measurement in place, which
+    // is what a volume that is not growing looks like too. A declaration that
+    // yielded no observable starts no loop, so the census does not list a walker
+    // that would measure nothing.
+    cog_observability::data_volume::spawn_watchers(
+        &state.volume_footprint,
+        cog_observability::data_volume::scan_interval_from_env(),
+        cog_core::ShutdownSignal::default(),
+    );
     // 选路的实测在启动时就发起一次，不等第一个 git 请求：判据要先于请求落地，
     // 否则首批请求只能按策略表猜——受限网络下那意味着先撞一次已知会挂的 HTTPS。
     // 探测目标取身份仓库（`COGNEVA_GATEWAY_GIT_IDENTITY_REPO`）：它就是这条通道
@@ -5443,6 +5483,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             redis: None,
             pool_down: Arc::new(AtomicBool::new(false)),
             pool_recovered: Arc::new(AtomicBool::new(false)),
+            volume_footprint: Vec::new(),
             config: SecurityGatewayConfig {
                 llm_upstreams: upstreams,
                 ..cfg(&[], &[])
@@ -5654,6 +5695,61 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 "{uri} 不应出现在观测通道上"
             );
         }
+    }
+
+    /// A declared volume reaches /metrics, and one never walked publishes nothing.
+    ///
+    /// This reading is producible here and nowhere else — for a directory-backed
+    /// volume the kubelet's number is the node's filesystem — so both "declared
+    /// and measured" and "declared and not measured" are only visible from this
+    /// process: the first as the family appearing, the second as its absence
+    /// rather than as a zero nobody can reconcile.
+    #[tokio::test]
+    async fn declared_volume_footprints_reach_the_metrics_channel() {
+        use tower::ServiceExt;
+        fn observable(claim: &str) -> Arc<cog_observability::data_volume::DataVolumeObservable> {
+            Arc::new(cog_observability::data_volume::DataVolumeObservable::new(
+                cog_observability::data_volume::WatchedTarget {
+                    claim: claim.into(),
+                    dir: std::path::PathBuf::from("/tmp/cogneva-gateway-volume-test"),
+                    exclude: Vec::new(),
+                },
+            ))
+        }
+
+        let measured = observable("cogneva-git-mirror-pvc");
+        measured.set_used_bytes(4096);
+        let unmeasured = observable("cogneva-never-walked-pvc");
+
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.volume_footprint = vec![measured, unmeasured];
+        let app = metrics_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/metrics")
+                    .method("GET")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            body.contains("cogneva_data_volume_used_bytes")
+                && body.contains(r#"persistentvolumeclaim="cogneva-git-mirror-pvc""#),
+            "已量过的卷必须出现在 /metrics 上：{body}"
+        );
+        assert!(
+            !body.contains("cogneva-never-walked-pvc"),
+            "还没走查过的卷不许报数（0 是对卷的断言，不是'还没量'）：{body}"
+        );
     }
 
     /// 把 tracing 事件收进内存缓冲，供"这行日志有没有出现"这类断言使用。

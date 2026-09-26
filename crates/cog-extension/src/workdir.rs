@@ -44,14 +44,6 @@ const DEFAULT_GC_INTERVAL_SECS: u64 = 600;
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
 const DEFAULT_MAX_WORKSPACES: usize = 8;
 
-/// How often the declared volumes are re-walked when nothing says otherwise.
-///
-/// The walk is metadata-only, but this volume holds every task worktree plus the
-/// build cache, so the file count is large and a cadence faster than this buys
-/// nothing: the reading exists to be compared against a declared size, and a
-/// volume does not cross that in a minute.
-const DEFAULT_DATA_VOLUME_INTERVAL_SECS: u64 = 300;
-
 const GIT_TIMEOUT_SECS: u64 = 120;
 const META_DIR_NAME: &str = ".meta";
 
@@ -111,7 +103,7 @@ impl WorkdirConfig {
             .unwrap_or(DEFAULT_MAX_WORKSPACES)
             .max(1);
         let (data_volumes, data_volume_declaration_error) =
-            match std::env::var("COGNEVA_DATA_VOLUME_MOUNTS") {
+            match std::env::var(cog_core::claim_footprint::MOUNTS_ENV) {
                 Ok(raw) => match cog_core::claim_footprint::parse_claim_paths(&raw) {
                     Ok(mounts) => (mounts, None),
                     Err(e) => (Vec::new(), Some(e)),
@@ -124,14 +116,15 @@ impl WorkdirConfig {
         // all, and a switch that reads as set while measuring nothing is the
         // failure this whole surface exists to end -- so it is refused out loud
         // rather than ignored.
-        if std::env::var("COGNEVA_DATA_VOLUME_CLAIM")
+        if std::env::var(cog_core::claim_footprint::CLAIM_ENV)
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false)
         {
             error!(
-                "COGNEVA_DATA_VOLUME_CLAIM is set on the sandbox executor, which has no \
-                 application data directory; declare this pod's volumes through \
-                 COGNEVA_DATA_VOLUME_MOUNTS instead"
+                "{} is set on the sandbox executor, which has no application data \
+                 directory; declare this pod's volumes through {} instead",
+                cog_core::claim_footprint::CLAIM_ENV,
+                cog_core::claim_footprint::MOUNTS_ENV
             );
         }
         Self {
@@ -164,8 +157,8 @@ impl WorkdirConfig {
             data_volumes,
             data_volume_declaration_error,
             data_volume_interval: secs(
-                "COGNEVA_DATA_VOLUME_INTERVAL_SECS",
-                DEFAULT_DATA_VOLUME_INTERVAL_SECS,
+                cog_core::claim_footprint::INTERVAL_ENV,
+                cog_core::claim_footprint::DEFAULT_SCAN_INTERVAL_SECS,
                 cog_core::claim_footprint::MIN_SCAN_INTERVAL_SECS,
             ),
         }
@@ -325,7 +318,7 @@ impl WorkdirRouter {
             // series that never appears.
             error!(
                 error = %reason,
-                variable = "COGNEVA_DATA_VOLUME_MOUNTS",
+                variable = cog_core::claim_footprint::MOUNTS_ENV,
                 "declared volume footprints cannot be read; no volume of this executor is measured"
             );
         }

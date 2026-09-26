@@ -32,8 +32,19 @@ pub const DATA_VOLUME_USED_METRIC_RULE: &str = "data_volume_over_declared_size";
 /// and cheap, but it holds no value being fresher than the scrape interval.
 pub use cog_core::claim_footprint::MIN_SCAN_INTERVAL_SECS;
 
-/// This loop's name in the liveness census.
+/// Prefix of this loop's name in the liveness census.
+///
+/// The census names one series per loop instance and a name shared by two
+/// instances lets a dead one hide behind the beats of its live sibling, so the
+/// prefix is completed with the claim each instance walks. The value set is
+/// bounded by the declaration — one watcher per declared volume — which is what
+/// a loop label has to be built from.
 pub const DATA_VOLUME_WATCH_LOOP: &str = "data_volume_watch";
+
+/// The census name of the watcher that walks one claim's directory.
+fn watcher_loop_name(claim: &str) -> String {
+    format!("{DATA_VOLUME_WATCH_LOOP}:{claim}")
+}
 
 /// One directory to measure: the claim that backs it, the directory itself,
 /// and any nested directories below it that belong to a different claim.
@@ -224,12 +235,18 @@ pub async fn run_data_volume_watch(
     shutdown: ShutdownSignal,
 ) {
     let interval = Duration::from_secs(interval_secs.max(MIN_SCAN_INTERVAL_SECS));
+    // Per claim rather than per process: a process watches every volume it was
+    // told about, and one name for all of them would let a walker that stopped
+    // stay invisible behind the beats of the others. A stalled walk and a volume
+    // that stopped growing read the same from the gauge, so the census has to
+    // separate them per volume.
+    let loop_name = watcher_loop_name(observable.claim());
     // The footprint gauge is this loop's own reading, so the loop being gone and
     // the walk having nothing to say would read the same: the liveness of the
     // watcher has to come from a face that outlives it -- and a panic is run
     // again in place, so the reading is not the only thing that survives it.
     let _ = cog_core::loop_health::spawn(
-        DATA_VOLUME_WATCH_LOOP,
+        loop_name,
         cog_core::loop_health::Cadence::Periodic(interval),
         shutdown.clone(),
         // Rebuilt per attempt, so everything the body consumes is cloned here.
@@ -273,6 +290,99 @@ pub async fn run_data_volume_watch(
         },
     )
     .await;
+}
+
+/// Deployment variables this reading is declared through.
+///
+/// Re-exported from the shared contract rather than restated: the deployment
+/// writes the declaration with these names and a producer that spells one
+/// differently publishes nothing while the manifest that set it still reads as
+/// a pod whose volumes are measured.
+pub use cog_core::claim_footprint::{
+    CLAIM_ENV, DEFAULT_SCAN_INTERVAL_SECS, INTERVAL_ENV, MOUNTS_ENV,
+};
+
+/// Turn one process's declaration into the observables it must publish.
+///
+/// For a process with no application data directory of its own — the standalone
+/// entries, whose pod has no such directory — the only applicable declaration is
+/// the `claim=path` list, and a claim variable there would name a directory this
+/// pod does not have. Both are reported rather than ignored: a declaration that
+/// reads as set while measuring nothing is the failure this whole surface exists
+/// to end, and it is invisible from the deployment, which sees only a variable
+/// it set and a pod that started.
+pub fn observables_from_declaration(
+    claim: Option<&str>,
+    mounts: Option<&str>,
+) -> (Vec<Arc<DataVolumeObservable>>, Vec<String>) {
+    let mut problems = Vec::new();
+    if claim.is_some_and(|value| !value.trim().is_empty()) {
+        problems.push(format!(
+            "{CLAIM_ENV} names the claim behind an application data directory and this process \
+             has none; declare this pod's own volumes through {MOUNTS_ENV}"
+        ));
+    }
+
+    let Some(raw) = mounts.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return (Vec::new(), problems);
+    };
+    let parsed = match cog_core::claim_footprint::parse_claim_paths(raw) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            problems.push(format!("{MOUNTS_ENV}: {e}"));
+            return (Vec::new(), problems);
+        }
+    };
+
+    let mut targets: Vec<WatchedTarget> = parsed
+        .into_iter()
+        .map(|mount| WatchedTarget {
+            claim: mount.claim,
+            dir: PathBuf::from(mount.path.trim().trim_end_matches('/')),
+            exclude: Vec::new(),
+        })
+        .collect();
+    derive_exclusions(&mut targets, &cog_core::claim_footprint::current_mounts());
+    let observables = targets
+        .into_iter()
+        .map(|target| Arc::new(DataVolumeObservable::new(target)))
+        .collect();
+    (observables, problems)
+}
+
+/// The same declaration, read from this process's environment.
+pub fn observables_from_env() -> (Vec<Arc<DataVolumeObservable>>, Vec<String>) {
+    let read = |key: &str| std::env::var(key).ok();
+    observables_from_declaration(read(CLAIM_ENV).as_deref(), read(MOUNTS_ENV).as_deref())
+}
+
+/// Re-walk cadence the deployment states, floored at the shared minimum.
+pub fn scan_interval_from_env() -> u64 {
+    std::env::var(INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SCAN_INTERVAL_SECS)
+        .max(MIN_SCAN_INTERVAL_SECS)
+}
+
+/// Start one watcher per observable.
+///
+/// A process that measures its own volumes has nothing else to stop them with:
+/// the reading lives as long as the pod does, and a walker that stopped would
+/// leave its last measurement in place — which is what a volume that is not
+/// growing looks like too.
+pub fn spawn_watchers(
+    observables: &[Arc<DataVolumeObservable>],
+    interval_secs: u64,
+    shutdown: ShutdownSignal,
+) {
+    for observable in observables {
+        tokio::spawn(run_data_volume_watch(
+            Arc::clone(observable),
+            interval_secs,
+            shutdown.clone(),
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +429,58 @@ mod tests {
             }]
         );
         assert!(rejected.is_empty());
+    }
+
+    /// A standalone process turns its declaration into one observable per mount.
+    ///
+    /// This is the whole of what its deployment states: the pod measures the
+    /// volumes named here and nothing else, so a declaration that produced no
+    /// observable would leave the manifest looking like a measured volume.
+    #[test]
+    fn a_standalone_process_measures_exactly_what_its_declaration_names() {
+        let (observables, problems) = observables_from_declaration(
+            None,
+            Some("  cogneva-git-mirror-pvc=/var/lib/cogneva-git-mirror \n"),
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(observables.len(), 1);
+        assert_eq!(observables[0].claim(), "cogneva-git-mirror-pvc");
+        assert_eq!(
+            observables[0].dir(),
+            Path::new("/var/lib/cogneva-git-mirror")
+        );
+
+        let (observables, problems) = observables_from_declaration(None, None);
+        assert!(observables.is_empty());
+        assert!(problems.is_empty(), "没声明不是问题：{problems:?}");
+
+        let (observables, problems) = observables_from_declaration(None, Some("   \n"));
+        assert!(observables.is_empty());
+        assert!(problems.is_empty(), "空声明不是问题：{problems:?}");
+    }
+
+    /// The claim variable names a directory this process does not have, and a
+    /// broken list measures nothing: both are reported, never skipped.
+    ///
+    /// A skipped entry reads as a volume that is being measured, because the
+    /// deployment only sees the variable it set and the pod that started.
+    #[test]
+    fn a_declaration_that_becomes_no_reading_is_reported() {
+        let (observables, problems) = observables_from_declaration(Some("cogneva-data-pvc"), None);
+        assert!(observables.is_empty());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains(CLAIM_ENV), "{problems:?}");
+
+        let (observables, problems) = observables_from_declaration(
+            None,
+            Some("cogneva-git-mirror-pvc=/var/lib/cogneva-git-mirror\nno-equals-sign"),
+        );
+        assert!(
+            observables.is_empty(),
+            "一份坏声明不许一半生效：只量一半比不量更难发现"
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("no-equals-sign"), "{problems:?}");
     }
 
     /// Every claim gets its own reading. Collapsing them into one number, or
@@ -579,5 +741,43 @@ mod tests {
         assert_eq!(obs.used_bytes(), Some(4096));
         handle.abort();
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// One process watching two volumes runs two loops, and the census says so.
+    ///
+    /// Under one shared name a walker that stopped would keep reading alive:
+    /// its sibling beats for it, and both gauges freeze the same way a volume
+    /// that stopped growing does. The census is the only face that separates
+    /// those, so the separation has to survive the loop registration itself.
+    #[tokio::test]
+    async fn each_watched_volume_is_its_own_loop_in_the_census() {
+        let watched = [
+            Arc::new(unmeasured("claim-one")),
+            Arc::new(unmeasured("claim-two")),
+        ];
+        spawn_watchers(&watched, 300, ShutdownSignal::new());
+
+        let expected = ["data_volume_watch:claim-one", "data_volume_watch:claim-two"];
+        let mut names = Vec::new();
+        // The registration happens inside the spawned task, so it is not there
+        // yet when this returns.
+        for _ in 0..100 {
+            names = cog_core::loop_health::registry().names();
+            if expected.iter().all(|e| names.iter().any(|n| n == e)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for name in expected {
+            assert!(
+                names.iter().any(|n| n == name),
+                "the census does not carry {name}: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == DATA_VOLUME_WATCH_LOOP),
+            "the watchers report under one shared name, so a stopped walker would hide \
+             behind the beats of the others: {names:?}"
+        );
     }
 }
