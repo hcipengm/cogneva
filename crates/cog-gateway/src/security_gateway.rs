@@ -1746,6 +1746,80 @@ async fn chat_handler(
     result
 }
 
+/// The request fields the real upstream does not take, removed or renamed.
+///
+/// This is the one place in a deployment that can apply vendor compatibility:
+/// every caller reaches the model through a single in-cluster URL whose host
+/// says nothing about the vendor behind it, so the compatibility probe on the
+/// caller's side resolves to "assume the latest OpenAI shape" no matter which
+/// upstream answers. The caller therefore sends `store`, `reasoning_effort`,
+/// `strict` and `max_completion_tokens` to vendors that take none of them —
+/// and cannot know it is doing so. The gateway does know: it holds the pool,
+/// and the pool holds each real upstream URL. The vendor profiles it consults
+/// here are `cog_llm`'s, not a second copy, because a table written twice
+/// drifts and the drift is invisible in both copies.
+///
+/// Only adjustments that rename or drop a field belong here. What the same
+/// profiles also describe — a tool result that has to carry a `name`, an
+/// assistant turn inserted between a tool result and the next user turn,
+/// thinking blocks rewritten as text — changes what the conversation means
+/// rather than how a field is spelled, and guessing at that here would be the
+/// gateway inventing turns the caller never sent.
+///
+/// Returns the caller's names of the fields that were touched, so the rewrite
+/// leaves a reading. A silent rewrite is the same defect as no rewrite: the
+/// caller keeps believing it set something.
+fn adapt_request_body(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    compat: &cog_llm::utils::compat::OpenAICompat,
+) -> Vec<&'static str> {
+    use cog_llm::utils::compat::MaxTokensField;
+    let mut adapted = Vec::new();
+
+    // The output cap under its other name. Both spellings carry the same
+    // number, and a vendor that does not know the one it was sent reads the
+    // request as having no cap at all.
+    let (wanted, sent) = match compat.max_tokens_field {
+        MaxTokensField::MaxTokens => ("max_tokens", "max_completion_tokens"),
+        MaxTokensField::MaxCompletionTokens => ("max_completion_tokens", "max_tokens"),
+    };
+    if let Some(value) = obj.remove(sent) {
+        if !obj.contains_key(wanted) {
+            obj.insert(wanted.to_string(), value);
+        }
+        adapted.push(sent);
+    }
+
+    for (supported, field) in [
+        (compat.supports_store, "store"),
+        (compat.supports_reasoning_effort, "reasoning_effort"),
+        // 调用方带它的前提是"这个上游会在流里报用量"，而它按兜底画像以为
+        // 所有上游都会报。不报用量的上游收到一个不认识的字段，代价从被忽略
+        // 到整次 400 都有可能，而它本来也不会回用量。
+        (compat.supports_usage_in_streaming, "stream_options"),
+    ] {
+        if !supported && obj.remove(field).is_some() {
+            adapted.push(field);
+        }
+    }
+
+    if !compat.supports_strict_mode {
+        if let Some(serde_json::Value::Array(tools)) = obj.get_mut("tools") {
+            for tool in tools.iter_mut() {
+                if tool
+                    .get_mut("function")
+                    .and_then(|f| f.as_object_mut())
+                    .is_some_and(|f| f.remove("strict").is_some())
+                {
+                    adapted.push("strict");
+                }
+            }
+        }
+    }
+
+    adapted
+}
+
 /// OpenAI 兼容透传端点：沙盒内完整的 cogneva 实例（PGE/RoutingProvider）讲
 /// OpenAI streaming 协议，本端点逐字节转发，凭证由网关代持注入。
 /// 不做意图封装、不强制系统提示词、不做凭证扫描——沙盒本身零凭证，
@@ -1885,6 +1959,8 @@ async fn stream_forward(
             _ => format!("{base}/chat/completions"),
         };
         let mut clamped_temperature = false;
+        // Field names this attempt reshaped for the upstream, for the reading.
+        let mut adapted_fields: Vec<&'static str> = Vec::new();
         let body = match &parsed {
             Some(v) => {
                 let mut v = v.clone();
@@ -1895,7 +1971,9 @@ async fn stream_forward(
                     );
                     // 调用方按最新 OpenAI 约定可能把 system 写成 developer，
                     // 部分上游（Kimi coding 等）不认该角色直接 400。网关是
-                    // 协议适配点，统一回退为 system，保护所有调用方。
+                    // 协议适配点，统一回退为 system，保护所有调用方。这条不
+                    // 按兼容表判断：表里没登记的厂商取兜底画像（"支持"），
+                    // 而这里判错的代价是整次调用 400，方向只能是无条件回退。
                     if let Some(serde_json::Value::Array(msgs)) = obj.get_mut("messages") {
                         for m in msgs.iter_mut() {
                             if m.get("role").and_then(|r| r.as_str()) == Some("developer") {
@@ -1903,15 +1981,27 @@ async fn stream_forward(
                             }
                         }
                     }
-                    // 有的推理模型只接受 temperature=1，别的值直接 400。调用
-                    // 方判定不了这件事：它连的是网关，base URL 里没有厂商身份，
-                    // 客户端侧按 vendor 域名做的兼容探测在部署形态下永远不命中。
-                    // 网关是唯一知道真实上游的地方，也是既有的协议适配点。
-                    if upstream.requires_temperature_one == Some(true) {
-                        if let Some(t) = obj.get_mut("temperature") {
-                            if t.as_f64() != Some(1.0) {
-                                *t = serde_json::json!(1.0);
-                                clamped_temperature = true;
+                    // 其余按字段形状做的兼容调整只对 OpenAI 形状的体有意义：
+                    // anthropic 形状的 `max_tokens` 是必填字段，改名会把它弄坏。
+                    if style != "anthropic" {
+                        let compat = cog_llm::utils::compat::detect_compat(base);
+                        adapted_fields = adapt_request_body(obj, &compat);
+                        // 有的推理模型只接受 temperature=1，别的值直接 400。调
+                        // 用方判定不了这件事：它连的是网关，base URL 里没有厂商
+                        // 身份，客户端侧按 vendor 域名做的兼容探测在部署形态下
+                        // 永远不命中。网关是唯一知道真实上游的地方。
+                        // 实证优先：准入探测对这台上游直接问过就是证据，只有它
+                        // 没给出结论（老条目/探测无果）时才用厂商画像兜底。
+                        let requires_one = match upstream.requires_temperature_one {
+                            Some(verdict) => verdict,
+                            None => compat.requires_temperature_one,
+                        };
+                        if requires_one {
+                            if let Some(t) = obj.get_mut("temperature") {
+                                if t.as_f64() != Some(1.0) {
+                                    *t = serde_json::json!(1.0);
+                                    clamped_temperature = true;
+                                }
                             }
                         }
                     }
@@ -1920,14 +2010,24 @@ async fn stream_forward(
             }
             None => body.to_vec(),
         };
-        if clamped_temperature {
+        if clamped_temperature || !adapted_fields.is_empty() {
             let upstream_key = LlmHealthTable::key(upstream);
-            record_counter(
-                &state,
-                cog_core::metric_names::LLM_REQUEST_PARAM_CLAMPED_TOTAL,
-                &[("field", "temperature"), ("upstream", &upstream_key)],
-            )
-            .await;
+            if clamped_temperature {
+                record_counter(
+                    &state,
+                    cog_core::metric_names::LLM_REQUEST_PARAM_CLAMPED_TOTAL,
+                    &[("field", "temperature"), ("upstream", &upstream_key)],
+                )
+                .await;
+            }
+            for field in &adapted_fields {
+                record_counter(
+                    &state,
+                    cog_core::metric_names::LLM_REQUEST_PARAM_CLAMPED_TOTAL,
+                    &[("field", field), ("upstream", &upstream_key)],
+                )
+                .await;
+            }
         }
 
         let start = std::time::Instant::now();
@@ -4778,6 +4878,140 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(!state.llm_health.is_suspect(&u));
     }
 
+    /// 字段形状的兼容调整：厂商画像说了什么，体里就少什么、改名成什么。
+    /// 对照组是同一个函数在"厂商未知"的画像下——什么都不动。
+    #[test]
+    fn the_request_body_is_reshaped_for_the_upstream_that_will_read_it() {
+        use cog_llm::utils::compat::detect_compat;
+
+        let body_json = || {
+            serde_json::json!({
+                "model": "placeholder",
+                "max_completion_tokens": 4096,
+                "temperature": 0.2,
+                "store": true,
+                "reasoning_effort": "high",
+                "stream_options": {"include_usage": true},
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "f", "strict": true, "parameters": {} }
+                }],
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+        };
+
+        // Kimi 画像：输出上限那个字段叫 max_tokens，store / reasoning_effort /
+        // strict 一概不认。这四件事调用方一件都判不出来——它连的是网关。
+        let kimi = detect_compat("https://api.kimi.com/v1");
+        let mut body = body_json();
+        let mut adapted = adapt_request_body(body.as_object_mut().unwrap(), &kimi);
+        adapted.sort_unstable();
+        assert_eq!(
+            adapted,
+            vec![
+                "max_completion_tokens",
+                "reasoning_effort",
+                "store",
+                "stream_options",
+                "strict"
+            ]
+        );
+        assert_eq!(body["max_tokens"], serde_json::json!(4096));
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("store").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("stream_options").is_none());
+        assert!(body["tools"][0]["function"].get("strict").is_none());
+        // 温度是准入探测的地盘（实证问过这台上游），这个函数不碰它。
+        assert_eq!(body["temperature"], serde_json::json!(0.2));
+        // 认得的字段一个不许动：多改等于替厂商猜。
+        assert_eq!(body["model"], serde_json::json!("placeholder"));
+        assert_eq!(body["tools"][0]["function"]["name"], serde_json::json!("f"));
+
+        // 反方向也一样：新形状的厂商拿到的是 max_completion_tokens。
+        let modern = detect_compat("http://127.0.0.1:9999/v1");
+        let mut body = body_json();
+        body.as_object_mut()
+            .unwrap()
+            .remove("max_completion_tokens");
+        body["max_tokens"] = serde_json::json!(1024);
+        adapt_request_body(body.as_object_mut().unwrap(), &modern);
+        assert_eq!(body["max_completion_tokens"], serde_json::json!(1024));
+        assert!(body.get("max_tokens").is_none());
+
+        // 对照组：厂商未知 = 兜底画像说"全都支持"，体里一个字符都不该变。
+        // 没有这一条，"改得对"与"对所有上游都乱改"在测试里长得一样。
+        let mut body = body_json();
+        let before = body.to_string();
+        let adapted = adapt_request_body(body.as_object_mut().unwrap(), &modern);
+        assert!(adapted.is_empty(), "未知厂商不该被改写: {adapted:?}");
+        assert_eq!(body.to_string(), before);
+    }
+
+    /// 端到端：调用方发一份"最新 OpenAI 形状"的体，网关按真实上游画像改写，
+    /// 上游收到的就是它认的那一份，且这次改写有读数。
+    #[tokio::test]
+    async fn passthrough_shapes_the_body_for_the_vendor_behind_the_gateway() {
+        let vendor_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let vendor_stub = spawn_capturing_upstream(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            vendor_seen.clone(),
+        )
+        .await;
+        // base URL 里带上厂商身份（真实上游的 URL 常常也带路径），请求仍然
+        // 落在本机桩上。
+        let vendor = stub_upstream(&format!("{vendor_stub}/api.kimi.com"), "m1");
+        let state = test_state(vec![vendor]);
+        let req_body = r#"{"model":"placeholder","max_completion_tokens":4096,"store":true,
+            "messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = chat_completions_passthrough(State(state.clone()), json_request(req_body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let got: serde_json::Value = serde_json::from_str(&vendor_seen.lock().unwrap()[0]).unwrap();
+        assert_eq!(got["max_tokens"], serde_json::json!(4096));
+        assert!(got.get("max_completion_tokens").is_none());
+        assert!(got.get("store").is_none());
+        // 网关改了调用方发的东西，这件事本身要有读数，否则调用方一直以为
+        // 自己设了的字段生效了。
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains(cog_core::metric_names::LLM_REQUEST_PARAM_CLAMPED_TOTAL.as_str()),
+            "改写必须留痕: {text}"
+        );
+        assert!(
+            text.contains("max_completion_tokens"),
+            "读数要指出是哪个字段: {text}"
+        );
+    }
+
+    /// 对照组：厂商未知的上游收到的体与调用方发的逐字节相同，且不产生读数。
+    #[tokio::test]
+    async fn passthrough_leaves_an_unknown_vendor_body_alone() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stub = spawn_capturing_upstream(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            seen.clone(),
+        )
+        .await;
+        let state = test_state(vec![stub_upstream(&stub, "m1")]);
+        let req_body = r#"{"model":"placeholder","max_completion_tokens":4096,"store":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = chat_completions_passthrough(State(state.clone()), json_request(req_body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let got: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+        assert_eq!(got["max_completion_tokens"], serde_json::json!(4096));
+        assert_eq!(got["store"], serde_json::json!(true));
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            !text.contains(cog_core::metric_names::LLM_REQUEST_PARAM_CLAMPED_TOTAL.as_str()),
+            "没改过就不该有这个读数: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn prober_extends_window_on_repeated_failure() {
         // 探测器语义：复测仍失败 → 指数加窗（不刷屏、不烧配额）。
@@ -4907,6 +5141,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
     /// 同上，外加把上游实际收到的请求体记下来——"网关到底改写了什么"只有看
     /// 上游收到的那一份才算数。
+    ///
+    /// 通配路由让 base URL 能带一段路径前缀：兼容画像按 URL 子串认厂商，而
+    /// 真实上游的 URL 也常常带路径（`https://host/v1`），所以调用方可以把桩
+    /// 造成某个厂商的样子，同时请求仍然落在本机。
     async fn spawn_capturing_upstream(
         status: u16,
         body: &'static str,
@@ -4915,20 +5153,20 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         use axum::http::header;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move |payload: String| {
-                let seen = seen.clone();
-                async move {
-                    seen.lock().unwrap().push(payload);
-                    (
-                        StatusCode::from_u16(status).unwrap(),
-                        [(header::CONTENT_TYPE, "application/json")],
-                        body,
-                    )
-                }
-            }),
-        );
+        let capture = move |payload: String| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(payload);
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(capture.clone()))
+            .route("/{*rest}", post(capture));
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });

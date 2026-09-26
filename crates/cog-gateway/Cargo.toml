@@ -9,6 +9,10 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
+# 厂商兼容画像（`detect_compat`）单源：调用方连的是网关，base URL 里没有
+# 厂商身份，只有网关知道真实上游。这里复用 cog-llm 的同一张表，而不是在网关
+# 另写一份按域名的映射——两份定义必然漂移，且两边都看不出来。
+cog-llm = { workspace = true }
 cog-redis = { workspace = true }
 cog-storage = { workspace = true }
 # 横切关注点：网关是上游池健康的唯一掌握者，指标/日志/时序/告警四类
