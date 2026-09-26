@@ -3837,7 +3837,7 @@ fn is_manifest_file(name: &str) -> bool {
 ///
 /// The pin set equals the roll set: every reference to this build's repository
 /// anywhere in the release set is rewritten to `image`, in the target manifests
-/// and in the support bundle alike (see [`pin_app_image_refs`]). What is
+/// and in the support bundle alike. What is
 /// delivered and what is converged must be the same set of objects — a pin that
 /// nothing rolls is a delivery that silently does not happen, and it reads as
 /// healthy from every angle except the one that matters: the workload keeps
