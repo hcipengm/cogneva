@@ -69,6 +69,7 @@ pub mod signal_watcher;
 pub mod squad;
 pub mod types;
 pub mod verification_budget;
+pub mod version_contract;
 pub mod workspace;
 
 #[cfg(test)]

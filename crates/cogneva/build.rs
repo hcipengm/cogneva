@@ -82,9 +82,10 @@ fn main() {
     println!("cargo:rustc-env=COGNEVA_GIT_REVISION={revision}");
     println!("cargo:rerun-if-env-changed=COGNEVA_GIT_REVISION");
     println!("cargo:rerun-if-changed=.git/HEAD");
-    // HEAD 只在切分支时动，提交动的是 refs/heads 下那个文件；少了这一行，提交
-    // 之后重编译出来的印章还指着上一个 commit（实测：HEAD 已到 9a10a72，缓存
-    // 的 build script 输出仍写 890e4c0）。
+    // HEAD only moves when switching branches; a commit moves the file under
+    // refs/heads. Without this line the stamp recompiled after a commit still
+    // points at the previous commit (measured: HEAD had reached 9a10a72 while the
+    // cached build script output still wrote 890e4c0).
     println!("cargo:rerun-if-changed=.git/refs/heads");
 
     // Name the code, not just the release it belongs to. The declared version

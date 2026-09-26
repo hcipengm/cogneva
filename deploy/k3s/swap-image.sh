@@ -52,15 +52,18 @@ done
 
 cd "$REPO_ROOT"
 
-# 版本号单一源：Cargo.toml workspace.package.version，读法收在 declared-version.sh
+# One source for the version: Cargo.toml's workspace.package.version, read only
+# through declared-version.sh
 WORKSPACE_VERSION="$(bash "$REPO_ROOT/deploy/scripts/declared-version.sh")"
 [ -n "$NEW_TAG" ] || NEW_TAG="$WORKSPACE_VERSION"
 echo "==> 新版本 ${IMAGE}:${NEW_TAG}（workspace version ${WORKSPACE_VERSION}）"
 
 # git revision 注入二进制（build.rs 也会自查 git，显式传双保险）
 GIT_REVISION="$(git rev-parse --short HEAD)$(git status --porcelain | grep -q . && echo -dirty || true)"
-# 派生标签：声明版本 + 距最近 release 的提交数 + rev。与 rev 一起注入，缺了它
-# 新镜像只能报裸的声明版本，就分不出"发布版 0.5.8"和"0.5.8 之后第 93 个提交"。
+# The derived label: declared version plus commits since the nearest release plus
+# the rev. Injected alongside the rev; without it a new image can only report the
+# bare declared version and cannot tell "the 0.5.8 release" from "the 93rd commit
+# after 0.5.8".
 VERSION_ID="$(bash "$REPO_ROOT/deploy/scripts/version-id.sh")"
 
 # 输出线上 Ready 主 Pod 的 <name> <imageID>（完整 repo@sha256:manifest 引用），没有则空

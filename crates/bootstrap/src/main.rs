@@ -1563,10 +1563,13 @@ async fn build_image_locally(image: &str) -> Result<()> {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "source".into());
-    // 派生标签与 rev 一样从这棵源码树查，取不到就明说距离未知——声明版本本身
-    // 会覆盖几十个提交，报成裸版本号等于把两个代码状态混成一个名字。
-    // --dirty 只在描述工作树时可用（带上 commit-ish 时 git 直接 fatal），本地
-    // 引导构建的源码树本来就可能带未提交改动，标签必须说出来。
+    // The derived label is read from this source tree the same way the rev is,
+    // and a failure to read it says the distance is unknown rather than inventing
+    // one: the declared version alone covers dozens of commits, so reporting a
+    // bare version number merges two code states into one name.
+    // --dirty only works when describing the working tree (git fails outright
+    // when given a commit-ish too), and a locally bootstrapped tree may well
+    // carry uncommitted changes, which the label has to say.
     let version_id = std::process::Command::new("git")
         .args([
             "describe", "--tags", "--long", "--dirty", "--match", "v[0-9]*",

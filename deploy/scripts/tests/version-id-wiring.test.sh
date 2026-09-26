@@ -61,7 +61,8 @@ check_pair crates/bootstrap/src/main.rs \
   'GIT_REVISION={revision}' 'VERSION_ID={version_id}'
 check_pair crates/cog-reflection/src/mainline_deployer.rs \
   '.env("COGNEVA_GIT_REVISION"' '.env("COGNEVA_VERSION_ID"'
-# 容器内没有 .git，标签与 revision 一样只能自外部进入编译期环境。
+# No .git inside the container, so the label, like the revision, can only reach
+# the compile-time environment from outside.
 grep -q '^ARG VERSION_ID' Dockerfile || fail "Dockerfile 没有声明 ARG VERSION_ID"
 grep -q 'COGNEVA_VERSION_ID=${VERSION_ID}' Dockerfile \
   || fail "Dockerfile 声明了 ARG VERSION_ID 却没有传进编译期环境"
@@ -142,7 +143,8 @@ if git describe --tags --match 'v[0-9]*' --abbrev=0 >/dev/null 2>&1; then
     "v${version}-"*) ;;
     *) fail "本检出上有可达 release tag，算出的标签却是 ${out}" ;;
   esac
-  # 有 tag 就必须真的读出距离：读不到只能是因为没有 tag，不能两者都占。
+  # With a tag present the distance has to be read for real: unreadable can only
+  # mean there is no tag, and the two cannot both hold.
   case "${out}" in
     *-unknown) fail "本检出上有可达 release tag，标签却把距离报成未知（${out}）" ;;
   esac
@@ -153,8 +155,9 @@ else
   esac
 fi
 # A checkout with no tags must report an unknown distance, never a zero one: a
-# zero would claim the commit is the release. 这段在 CI 的浅检出上也要成立，
-# 所以用一棵临时仓库而不是依赖本检出有没有 tag。
+# zero would claim the commit is the release. This has to hold on CI's shallow
+# checkout too, so it uses a scratch repository rather than depending on whether
+# this checkout has a tag.
 mkdir -p "${work}/bare/deploy/scripts"
 cp deploy/scripts/version-id.sh deploy/scripts/declared-version.sh "${work}/bare/deploy/scripts/"
 cp Cargo.toml "${work}/bare/Cargo.toml"
@@ -166,8 +169,9 @@ case "${fallback}" in
 esac
 
 # --- 5) the declared version has one reading ---------------------------------
-# 镜像 tag、chart appVersion、清单 version label、release 标签全部派生自它，
-# 每多一份读法就多一个答案，而漂移在制品里只表现为一个字符串。
+# The image tag, the chart's appVersion, the manifests' version label and the
+# release tag all derive from it; every extra reading is another answer, and the
+# drift shows up in the artifacts as nothing but a string.
 for f in deploy/scripts/version-id.sh deploy/scripts/build-release-image.sh \
          deploy/k3s/swap-image.sh .github/workflows/ci.yml; do
   grep -q -F 'declared-version.sh' "${f}" \

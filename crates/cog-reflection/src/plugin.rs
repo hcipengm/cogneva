@@ -1089,8 +1089,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             };
             let deployer = {
                 let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces);
-                // 版本契约的读数与其他判据分列：它答的是"跑的是哪个名字、
-                // 这个名字离发布点多远"，与构建/滚动的判据不是同一个问题。
+                // The version contract's readings are recorded apart from the
+                // other judgements: they answer "which name is running, and how
+                // far that name sits past a release", which is not the question
+                // the build and rollout judgements ask.
                 match ctx.consume_service::<dyn cog_core::MetricsBackend>() {
                     Some(metrics) => std::sync::Arc::new(deployer.with_metrics(metrics)),
                     None => std::sync::Arc::new(deployer),

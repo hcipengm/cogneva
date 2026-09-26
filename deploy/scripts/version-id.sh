@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# 一个检出的构建标签：它继承自哪个 release、距那个 release 多少提交、以及自己的
-# rev。空格无法表达的是"同一个声明版本下的两个代码状态"——0.5.8 曾经覆盖 93 个
-# 连续提交，而唯一的 release tag 停在第一个上，于是"0.5.8"同时指 93 个代码状态。
-# 这个标签由历史派生，所以任何生产者在同一检出上跑都得到同一个字符串，不需要
-# 事先约定任何东西。
+# The build label of a checkout: which release it descends from, how many commits
+# past that release it sits, and its own rev. What a bare version cannot express is
+# two code states under one declaration -- 0.5.8 once covered 93 consecutive
+# commits while the only release tag stayed on the first of them, so "0.5.8" named
+# 93 code states at once. This label is derived from history, so every producer
+# running it on the same checkout gets the same string without agreeing on
+# anything beforehand.
 #
-# 语法归 git（describe 的格式即契约），本脚本只负责一件事：把那次调用连同它的
-# 参数收在一处。参数是有讲究的——
-#   --long   即使正好在 release 提交上也带上 "-0-"，形状不随位置变化，调用方
-#            不必猜"没有距离"是零还是读不到；
-#   --match  只认 v<数字> 开头的 tag。集群里还有 promote/*、gen-* 等本地 tag，
-#            漏了这个参数会把它们当成最近的 release，静默地报出一个错的名字。
+# The syntax belongs to git (the describe format is the contract); this script does
+# one thing, keeping that call and its arguments in one place. The arguments
+# matter:
+#   --long   carries "-0-" even on the release commit itself, so the shape does not
+#            change with position and callers need not guess whether no distance
+#            means zero or unreadable;
+#   --match  accepts only tags starting with v<digit>. The cluster also carries
+#            local tags like promote/* and gen-*, and without this argument they
+#            read as the nearest release and quietly produce a wrong name.
 #
-# 读不到就明说读不到：没有 .git 或没有可达 tag 时输出 v<声明版本>-unknown，
-# 而不是假装距离是零。
+# Failing to read says so: with no .git or no reachable tag it prints
+# v<declared>-unknown rather than pretending the distance is zero.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -18,8 +18,9 @@ ARG CARGO_BUILD_JOBS="default"
 # 让线上镜像能回答"我是哪个版本、哪个 commit"，不依赖浮动 tag :local 追溯。
 ARG VERSION=""
 ARG GIT_REVISION=""
-# 派生标签（git describe 语义）：声明版本 + 距该 release 的提交数 + rev。
-# 源码树在容器里没有 .git，与 GIT_REVISION 一样只能由构建方注入。
+# The derived label (git describe semantics): declared version plus commits since
+# that release plus the rev. The source tree has no .git inside the container, so
+# like GIT_REVISION this can only be injected by the builder.
 ARG VERSION_ID=""
 
 # ------------------------------------------------------------------------------

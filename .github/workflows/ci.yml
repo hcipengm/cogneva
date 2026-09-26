@@ -144,15 +144,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-      # 清单是派生的，不是手抄的：手抄的名字清单会在新增脚本时静默漏跑（实测：
-      # 一个已提交的门禁没进这张清单，CI 一直没跑过它）。
+      # The list is derived, not hand-written: a hand-written list of names goes
+      # quiet when a script is added (measured: a committed gate was missing from
+      # this list and CI never ran it).
       - name: Shell lint
         run: |
           mapfile -t scripts < <(git ls-files '*.sh')
           printf 'checking %d scripts\n' "${#scripts[@]}"
           shellcheck -S warning "${scripts[@]}"
-      # 图表类用例要 helm。版本从引导器的 HELM_VERSION 读，不在这里另抄一份：
-      # 渲染块标量的尾随空白随版本不同，各自取版本会让门禁在与代码无关处红。
+      # The chart cases need helm. The version is read from the bootstrapper's
+      # HELM_VERSION rather than copied here: trailing whitespace in rendered
+      # block scalars differs between helm versions, and two sides picking their
+      # own version turns the gate red somewhere unrelated to the change.
       - name: Resolve pinned Helm version
         id: helmver
         run: |
@@ -284,6 +287,29 @@ jobs:
       # 本矩阵证明它在三平台都能通过编译（cfg 门控无遗漏）
       - run: cargo check -p cogneva-bootstrap
 
+  # The version contract judged on the checkout, with the same reader, the same
+  # clauses and the same gate the cluster's deployer runs. It covers the producer
+  # the deployer cannot: a change judged here is judged before it lands, while the
+  # deployer only ever sees what already arrived. Full history and tags are what
+  # the reading is made of -- the declared version over the commits that changed
+  # it, and the release tags with the declaration at the commit each points to --
+  # and a shallow checkout answers from a history that stops mid-way, so the gate
+  # requires depth 0 and fails when the history was not read to its root.
+  version-contract:
+    name: Version Contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Judge the version contract
+        run: |
+          cargo run -p cog-reflection --example version_contract -- --repo .git --rev HEAD
+
   # 发版门禁：只有上面所有检查全绿，才允许把 workspace 版本打成 tag。
   # tag 推送级联触发 release.yml（编译 + GitHub release + GHCR 镜像）；
   # 任一检查失败则本 job 不调度、不打 tag、不发版。tag 已存在时幂等跳过，
@@ -299,13 +325,16 @@ jobs:
       - coverage
       - deploy-parity
       - bootstrap-cross-platform
+      - version-contract
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      # 要算"当前 main 距最近 release 多少个提交"就得有完整历史与 tag，
-      # 默认的浅检出取不到，判据会退化成读不到而不是报出距离。
+      # Counting how many commits main sits past the nearest release needs the
+      # full history and tags, which the default shallow checkout does not have:
+      # the judgement then degrades to unreadable instead of reporting a
+      # distance.
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -324,9 +353,11 @@ jobs:
           TAG="${{ steps.ver.outputs.tag }}"
           if git ls-remote --exit-code --tags https://github.com/${{ github.repository }}.git "$TAG" >/dev/null 2>&1; then
             echo "exists=yes" >> "$GITHUB_OUTPUT"
-            # tag 已存在不等于版本是新的：声明版本由人写，tag 打在它第一次出现的
-            # 那个提交上，之后 main 会继续往前跑。只报"已存在"的话，一个落后几十个
-            # 提交的 release 与一个刚发布的 release 在这里长得一模一样。
+            # An existing tag does not mean the version is new: the declaration is
+            # written by hand, the tag goes on the commit where it first appeared,
+            # and main keeps moving afterwards. Reporting only "already exists"
+            # makes a release dozens of commits behind look exactly like one just
+            # published.
             label="$(bash deploy/scripts/version-id.sh)"
             echo "Tag $TAG already exists; main is at ${label}"
             case "${label}" in

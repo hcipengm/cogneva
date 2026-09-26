@@ -42,9 +42,11 @@ VERSION_ID="$(bash "$REPO_ROOT/deploy/scripts/version-id.sh")"
 
 echo "==> 版本一致性门禁（VERSION=$VERSION, rev=$GIT_REVISION, 标签=$VERSION_ID）"
 fail() { echo "版本漂移: $1" >&2; exit 1; }
-# 派生标签里的声明版本必须就是 Cargo.toml 的版本。二者由不同来源给出：前者来自
-# 最近的 release tag，后者来自工作树。它们不一致意味着 tag 打在了别的版本上，
-# 镜像里的名字会指向另一个 release，而这在构建日志里只表现为一个字符串。
+# The declared version inside the derived label has to be the version in
+# Cargo.toml. The two come from different places: the label from the nearest
+# release tag, the version from the working tree. Disagreement means the tag was
+# placed on another version, so the name inside the image points at a different
+# release -- which shows up in the build log as nothing but a string.
 case "$VERSION_ID" in
     "v${VERSION}-"*) ;;
     "v${VERSION}-unknown") fail "检出里没有可达的 release tag，标签退化成 $VERSION_ID" ;;
@@ -78,8 +80,9 @@ bash deploy/scripts/render-deploy.sh --check
 
 BUILD_ARGS=(build -t "$IMAGE" -t "$VERSIONED_IMAGE" -f "$REPO_ROOT/Dockerfile")
 BUILD_ARGS+=(--build-arg "VERSION=${VERSION}" --build-arg "GIT_REVISION=${GIT_REVISION}")
-# 源码树在容器里没有 .git，派生标签与 rev 一样只能从外部注入；漏了它镜像就会
-# 只能报裸的声明版本，两处代码状态又会共用一个名字。
+# The source tree has no .git inside the container, so the derived label, like the
+# rev, can only be injected from outside; without it the image can only report the
+# bare declared version, and two code states share one name again.
 BUILD_ARGS+=(--build-arg "VERSION_ID=${VERSION_ID}")
 BUILD_ARGS+=(--build-arg "CARGO_BUILD_JOBS=${JOBS:-default}")
 if [ "${CN_MIRROR:-0}" = "1" ]; then

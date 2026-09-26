@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# 声明版本（Cargo.toml 的 workspace.package.version）的唯一一份读法。
+# The one way to read the declared version (Cargo.toml's
+# workspace.package.version).
 #
-# 镜像 tag、chart appVersion、清单 version label、release 标签都派生自这一个值。
-# 每个消费面各抄一份 grep 迟早会有一处读到别的值，而那种漂移在制品里只表现为
-# 一个字符串——所以读法收在这里，谁要就调这里。
+# The image tag, the chart's appVersion, the manifests' version label and the
+# release tag all derive from this one value. A grep copied per consumer would
+# eventually read something else somewhere, and that drift shows up in the
+# artifacts as nothing but a string -- so the reading lives here and whoever needs
+# it calls here.
 #
-# 只认 [workspace.package] 段里的 version：文件里别处出现 version = 时不该被当成
-# 声明版本，读不到就显式失败而不是吐一个空值（空值会一路变成空 tag）。
+# Only the version inside the [workspace.package] section counts: a `version =`
+# elsewhere in the file must not read as the declared version, and a failed read
+# fails outright rather than printing an empty value (an empty value becomes an
+# empty tag all the way down).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
