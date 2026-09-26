@@ -324,7 +324,7 @@ impl EvolutionIntent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
@@ -333,6 +333,98 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl TaskStatus {
+    /// Every variant, so a gate can cover the whole enum instead of the
+    /// subset someone happened to remember.
+    pub const ALL: [TaskStatus; 6] = [
+        TaskStatus::Pending,
+        TaskStatus::Scheduled,
+        TaskStatus::Running,
+        TaskStatus::Completed,
+        TaskStatus::Failed,
+        TaskStatus::Cancelled,
+    ];
+
+    /// The spelling stored in a task-state table's `status` column.
+    ///
+    /// The single place a variant becomes a string. Writers, readers and any
+    /// query over the resulting rows go through it, so a status cannot mean
+    /// one thing in a row and another in a count over those rows.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskStatus::Pending => "pending",
+            TaskStatus::Scheduled => "scheduled",
+            TaskStatus::Running => "running",
+            TaskStatus::Completed => "completed",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Cancelled => "cancelled",
+        }
+    }
+
+    /// Read back what [`Self::as_str`] wrote.
+    ///
+    /// `None` for a string this version does not know: the caller has to
+    /// decide what an unrecognised status means, and quietly filing it under a
+    /// default would hide a producer and a consumer that no longer share a
+    /// vocabulary — the rows would keep counting while their states stopped
+    /// being told apart.
+    pub fn parse(status: &str) -> Option<Self> {
+        match status {
+            "pending" => Some(TaskStatus::Pending),
+            "scheduled" => Some(TaskStatus::Scheduled),
+            "running" => Some(TaskStatus::Running),
+            "completed" => Some(TaskStatus::Completed),
+            "failed" => Some(TaskStatus::Failed),
+            "cancelled" => Some(TaskStatus::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// How the tasks a store holds distribute over the states the cluster
+/// overview reports.
+///
+/// Three buckets plus the total; terminal non-failing states (completed,
+/// cancelled) carry no counter of their own and show up in `total` only,
+/// because the overview has no field for them and inventing one here would
+/// put a reading in a place nobody asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStatusCounts {
+    /// Every task the store holds, in any state.
+    pub total: usize,
+    /// Tasks a worker is executing right now.
+    pub active: usize,
+    /// Tasks waiting for a worker: never started, or published to the ready
+    /// stream and not yet claimed.
+    pub queued: usize,
+    /// Tasks that ended in failure.
+    pub failed: usize,
+}
+
+impl TaskStatusCounts {
+    /// Count a bag of statuses.
+    pub fn of<'a>(statuses: impl IntoIterator<Item = &'a TaskStatus>) -> Self {
+        let mut counts = Self::default();
+        for status in statuses {
+            counts.add(status, 1);
+        }
+        counts
+    }
+
+    /// Fold `count` tasks in `status` into the counts.
+    pub fn add(&mut self, status: &TaskStatus, count: usize) {
+        self.total = self.total.saturating_add(count);
+        match status {
+            TaskStatus::Running => self.active = self.active.saturating_add(count),
+            TaskStatus::Pending | TaskStatus::Scheduled => {
+                self.queued = self.queued.saturating_add(count)
+            }
+            TaskStatus::Failed => self.failed = self.failed.saturating_add(count),
+            TaskStatus::Completed | TaskStatus::Cancelled => {}
+        }
+    }
 }
 
 /// DAG 任务图
@@ -533,6 +625,90 @@ impl Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 状态字符串必须双向可逆：写进 `status` 列的那套拼写，是所有按状态数行
+    /// 的查询唯一的依据，往一个方向漂了就会去数另一套拼写写下的行——计数看着
+    /// 有值，实际一条都对不上。
+    #[test]
+    fn every_status_round_trips_through_its_stored_spelling() {
+        for status in TaskStatus::ALL {
+            let spelling = status.as_str();
+            assert_eq!(
+                TaskStatus::parse(spelling),
+                Some(status),
+                "{status:?} does not survive as_str -> parse"
+            );
+        }
+    }
+
+    /// 认不出的拼写不许被猜成某个状态：那样一行来历不明的状态会混进某个计数，
+    /// 而"产出方与消费方已经不同语"这件事就再也看不见了。
+    #[test]
+    fn an_unknown_status_spelling_is_not_guessed() {
+        assert_eq!(TaskStatus::parse("suspended"), None);
+        assert_eq!(TaskStatus::parse("Running"), None);
+        assert_eq!(TaskStatus::parse(""), None);
+    }
+
+    /// 每个状态对总数的贡献恰好是一，且落在三个具名桶里至多一个。
+    ///
+    /// 三个具名桶不覆盖整个枚举：跑完与取消的任务既不在跑、也不在等、也不算
+    /// 失败，只进总数。要守的不是"桶加起来等于几"，而是"没有状态被数两遍、也没
+    /// 有状态整个丢掉"——总数与三个桶放在一起自相矛盾时，读的人分不清集群真的
+    /// 有这么多任务，还是某个状态被重复计入。
+    #[test]
+    fn every_status_is_counted_once_and_lands_in_at_most_one_bucket() {
+        for status in TaskStatus::ALL {
+            let mut counts = TaskStatusCounts::default();
+            counts.add(&status, 1);
+
+            assert_eq!(counts.total, 1, "{status:?} must move the total by one");
+            let bucketed = counts.active + counts.queued + counts.failed;
+            assert!(
+                bucketed <= 1,
+                "{status:?} landed in {bucketed} named buckets at once"
+            );
+            assert!(
+                bucketed == 1 || matches!(status, TaskStatus::Completed | TaskStatus::Cancelled),
+                "{status:?} reached no named bucket and is not a closed state"
+            );
+        }
+    }
+
+    /// 全体状态各来一次：总数六个，三个具名桶合起来四个，差的正是跑完与取消。
+    /// 四个数字因此互相可推——余数不是被吞掉，而是由总数减出来。
+    #[test]
+    fn the_named_buckets_leave_the_closed_states_in_the_total_only() {
+        let counts = TaskStatusCounts::of(TaskStatus::ALL.iter());
+        assert_eq!(counts.total, TaskStatus::ALL.len());
+        assert_eq!(counts.active, 1, "running is the only active state");
+        assert_eq!(counts.queued, 2, "pending and scheduled are both waiting");
+        assert_eq!(counts.failed, 1);
+        assert_eq!(
+            counts.total - (counts.active + counts.queued + counts.failed),
+            2,
+            "completed and cancelled are the remainder"
+        );
+    }
+
+    /// 计数是可加的，且按状态而不是按调用次数累计。
+    #[test]
+    fn counts_accumulate_by_status() {
+        let counts = TaskStatusCounts::of([
+            &TaskStatus::Running,
+            &TaskStatus::Running,
+            &TaskStatus::Failed,
+        ]);
+        assert_eq!(
+            counts,
+            TaskStatusCounts {
+                total: 3,
+                active: 2,
+                queued: 0,
+                failed: 1
+            }
+        );
+    }
 
     /// 失败的类型必须能过桥：任务记录与失败消息都要带着它往返，且没有这个
     /// 字段的老发布者发的消息仍要能被读成"没有类型"。

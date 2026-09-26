@@ -2080,7 +2080,7 @@ mod tests {
             TaskStatus::Running,
         ] {
             assert_eq!(
-                intent_task_action(Some(&intent_task(status.clone(), None))),
+                intent_task_action(Some(&intent_task(status, None))),
                 IntentTaskAction::InHand,
                 "{status:?} is a live attempt"
             );

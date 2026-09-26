@@ -338,29 +338,32 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> AlertRecord {
 }
 
 /// Self-discovery consumes firing alerts through this core-contract view,
-/// keeping cog-reflection free of any storage-crate dependency. Read errors
-/// degrade to an empty list: a watcher tick must never panic on a transient
-/// database hiccup, and the next tick retries.
+/// keeping cog-reflection free of any storage-crate dependency. A read error
+/// is reported as `None` rather than an empty list: a caller that treats
+/// absence as a verdict would otherwise read a database hiccup as "nothing is
+/// firing" and declare the cluster healthy on the strength of a failed query.
 #[async_trait::async_trait]
 impl cog_core::ActiveAlertSource for PostgresAlertStore {
-    async fn list_active_alerts(&self, limit: i64) -> Vec<cog_core::PersistedAlert> {
+    async fn list_active_alerts(&self, limit: i64) -> Option<Vec<cog_core::PersistedAlert>> {
         match self.list_active(limit).await {
-            Ok(records) => records
-                .into_iter()
-                .map(|r| cog_core::PersistedAlert {
-                    rule: r.rule,
-                    dedup_key: r.dedup_key,
-                    severity: r.severity,
-                    state: r.state,
-                    message: r.message,
-                    labels: r.labels,
-                    fired_at: r.fired_at,
-                    last_seen_at: r.last_seen_at,
-                })
-                .collect(),
+            Ok(records) => Some(
+                records
+                    .into_iter()
+                    .map(|r| cog_core::PersistedAlert {
+                        rule: r.rule,
+                        dedup_key: r.dedup_key,
+                        severity: r.severity,
+                        state: r.state,
+                        message: r.message,
+                        labels: r.labels,
+                        fired_at: r.fired_at,
+                        last_seen_at: r.last_seen_at,
+                    })
+                    .collect(),
+            ),
             Err(e) => {
                 tracing::warn!(error = %e, "listing active alerts failed");
-                Vec::new()
+                None
             }
         }
     }
@@ -542,5 +545,30 @@ mod tests {
         let writes = no_change_writes(&open, &alert(POOL_MESSAGE, 1_789_749_020, "critical"));
         assert!(writes.advance_last_seen);
         assert!(writes.rewrite_payload);
+    }
+
+    /// A lookup that failed must not arrive as a lookup that found nothing.
+    ///
+    /// This is the producer side of the verdict that reads these alerts: the
+    /// consumers turn an empty answer into "nothing is wrong" (a healthy
+    /// cluster) or into "no recovery work to do", so a query error collapsing
+    /// to an empty list would manufacture both conclusions out of a failure.
+    ///
+    /// A port nothing listens on gives a real connection failure without a
+    /// database to run against; the pool reports it well within a second, and
+    /// the short acquire timeout keeps the retry from stretching the test.
+    #[tokio::test]
+    async fn a_lookup_that_failed_answers_none_and_not_an_empty_list() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("building a pool must not require a reachable server");
+        let store = PostgresAlertStore::new(pool);
+
+        let answer = cog_core::ActiveAlertSource::list_active_alerts(&store, 1).await;
+        assert!(
+            answer.is_none(),
+            "a failed read reached the caller as an answer: {answer:?}"
+        );
     }
 }

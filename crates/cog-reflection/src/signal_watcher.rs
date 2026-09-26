@@ -526,28 +526,33 @@ async fn tick(
     // so the fix work is tracked and cooled down like any other signal.
     if config.alert_channel_enabled {
         if let Some(source) = alert_source {
-            let alerts = source.list_active_alerts(100).await;
-            let selected = select_alerts(
-                &alerts,
-                &state,
-                config.alert_channel_max_per_tick,
-                config.report_cooldown_secs,
-                now,
-            );
-            for alert in selected {
-                let key = format!("alert:{}", alert.dedup_key);
-                dirty = true;
-                let hash = short_hash(&key);
-                let (goal, detail) = alert_intent(alert, config.alert_label_max_chars);
-                let outcome = submit_intent(
-                    orch,
-                    format!("self-signal-alert-{hash}"),
-                    "self_signal",
-                    goal,
-                    detail,
-                )
-                .await;
-                report_outcome(&mut state, &key, outcome, now);
+            // A failed read yields no intents for this tick, and the cooldown
+            // bookkeeping is left untouched so the next tick retries with the
+            // same slate. It also must not be read as "the alerts cleared":
+            // nothing here concludes anything from absence.
+            if let Some(alerts) = source.list_active_alerts(100).await {
+                let selected = select_alerts(
+                    &alerts,
+                    &state,
+                    config.alert_channel_max_per_tick,
+                    config.report_cooldown_secs,
+                    now,
+                );
+                for alert in selected {
+                    let key = format!("alert:{}", alert.dedup_key);
+                    dirty = true;
+                    let hash = short_hash(&key);
+                    let (goal, detail) = alert_intent(alert, config.alert_label_max_chars);
+                    let outcome = submit_intent(
+                        orch,
+                        format!("self-signal-alert-{hash}"),
+                        "self_signal",
+                        goal,
+                        detail,
+                    )
+                    .await;
+                    report_outcome(&mut state, &key, outcome, now);
+                }
             }
         }
     }

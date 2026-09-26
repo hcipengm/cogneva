@@ -1,14 +1,34 @@
 use chrono::{NaiveDate, Utc};
 use cog_core::{
     AgentEvent, EventFilter, LogEntry, ObservabilityGateway, RawLogIndex, SquadState, SquadStatus,
-    TaskMetrics,
+    StateBackend, TaskMetrics,
 };
 use cog_storage::{MemoryObservabilityGateway, MemoryStateBackend};
 use futures::StreamExt;
 use std::sync::Arc;
 
+mod common;
+
+use common::mocks::MockStateBackend;
+
 fn mk_gateway() -> MemoryObservabilityGateway {
     MemoryObservabilityGateway::new(Arc::new(MemoryStateBackend::new()))
+}
+
+/// A gateway over a task-state store the test also holds, so it can put tasks
+/// in and then read what the overview makes of them.
+fn mk_gateway_over(state: Arc<MemoryStateBackend>) -> MemoryObservabilityGateway {
+    MemoryObservabilityGateway::new(state)
+}
+
+fn task(id: &str, status: cog_core::TaskStatus) -> cog_core::Task {
+    let mut task = cog_core::Task::new(
+        id.to_string(),
+        cog_core::TaskType::Custom("overview-census".into()),
+        serde_json::json!({}),
+    );
+    task.status = status;
+    task
 }
 
 #[tokio::test]
@@ -117,8 +137,10 @@ async fn test_gateway_cluster_overview() {
     });
 
     let overview = gw.get_cluster_overview().await.unwrap();
-    assert_eq!(overview.total_tasks, 1);
-    assert_eq!(overview.avg_task_duration_ms, 1000);
+    // 记账一次运行 ≠ 多出一个任务：任务数来自任务状态面，不是运行账本。
+    assert_eq!(overview.total_tasks, Some(0));
+    assert_eq!(overview.avg_task_duration_ms, Some(1000));
+    assert_eq!(overview.cluster_health, "unknown");
 }
 
 #[tokio::test]
@@ -209,7 +231,55 @@ async fn test_gateway_cluster_overview_with_squads() {
     );
 
     let overview = gw.get_cluster_overview().await.unwrap();
-    assert_eq!(overview.total_tasks, 1);
-    assert_eq!(overview.total_squads, 1);
-    assert_eq!(overview.active_squads, 1);
+    assert_eq!(overview.total_tasks, Some(0));
+    assert_eq!(overview.total_squads, Some(1));
+    assert_eq!(overview.active_squads, Some(1));
+}
+
+/// 四个任务计数来自任务状态面，且按状态分桶：跑着的算 active，等着派发的
+/// （pending / scheduled）算 queued，失败的算 failed。
+#[tokio::test]
+async fn test_gateway_cluster_overview_counts_tasks_by_state() {
+    let state = Arc::new(MemoryStateBackend::new());
+    let gw = mk_gateway_over(state.clone());
+    for (id, status) in [
+        ("t-1", cog_core::TaskStatus::Running),
+        ("t-2", cog_core::TaskStatus::Running),
+        ("t-3", cog_core::TaskStatus::Pending),
+        ("t-4", cog_core::TaskStatus::Scheduled),
+        ("t-5", cog_core::TaskStatus::Failed),
+        ("t-6", cog_core::TaskStatus::Completed),
+        ("t-7", cog_core::TaskStatus::Cancelled),
+    ] {
+        state
+            .dag_set_task("ws-1", id, &task(id, status))
+            .await
+            .unwrap();
+    }
+    // 另一个工作区：计数是集群口径的，不能只看一个工作区。
+    state
+        .dag_set_task("ws-2", "t-8", &task("t-8", cog_core::TaskStatus::Running))
+        .await
+        .unwrap();
+
+    let overview = gw.get_cluster_overview().await.unwrap();
+    assert_eq!(overview.total_tasks, Some(8));
+    assert_eq!(overview.active_tasks, Some(3));
+    assert_eq!(overview.queued_tasks, Some(2));
+    assert_eq!(overview.failed_tasks, Some(1));
+}
+
+/// 「回答不了」不能长得像「零」：一个不实现任务计数的状态后端必须让这四个
+/// 数字是 None，否则读的人分不清空集群和没看过。
+#[tokio::test]
+async fn a_state_backend_that_cannot_count_reports_no_reading_not_zero() {
+    let gw = MemoryObservabilityGateway::new(Arc::new(MockStateBackend::new()));
+    let overview = gw.get_cluster_overview().await.unwrap();
+
+    assert_eq!(overview.total_tasks, None);
+    assert_eq!(overview.active_tasks, None);
+    assert_eq!(overview.queued_tasks, None);
+    assert_eq!(overview.failed_tasks, None);
+    // 没跑过任何运行时均值也没有读数，不能是 0ms。
+    assert_eq!(overview.avg_task_duration_ms, None);
 }

@@ -619,6 +619,17 @@ pub trait StateBackend: Send + Sync {
         Ok(tasks)
     }
 
+    /// Counts of the tasks this backend holds, by state, across every
+    /// workspace it knows about.
+    ///
+    /// `None` means this backend cannot answer — it holds no enumerable task
+    /// inventory — and that is deliberately not the same statement as a zero:
+    /// a caller rendering "no reading" as "no tasks" reports a fleet it never
+    /// looked at, and the reading looks exactly like a real one.
+    async fn task_status_counts(&self) -> SFResult<Option<crate::TaskStatusCounts>> {
+        Ok(None)
+    }
+
     /// Get dependency list (task IDs this task is blocked by).
     /// Derived from the stored task's `blocked_by`.
     async fn dag_get_dependencies(

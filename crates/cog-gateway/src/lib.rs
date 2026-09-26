@@ -2220,15 +2220,28 @@ async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Respon
     // faults — orphaned decompositions, killed pods, over-declared volumes —
     // are persisted by their producers instead, and would never reach a
     // human asking this endpoint what is currently firing.
-    if let Some(ref source) = state.active_alert_source {
-        alerts = merge_active_alerts(alerts, source.list_active_alerts(100).await);
-    }
+    //
+    // The durable half can also fail to load. Serving the process-local rows
+    // alone would show a shorter list that reads as "those cleared", so the
+    // response carries the outcome: `true`/`false` for a read that answered or
+    // failed, and `null` when this deployment has no durable source at all.
+    let durable_alerts_read: Option<bool> = match state.active_alert_source {
+        Some(ref source) => match source.list_active_alerts(100).await {
+            Some(durable) => {
+                alerts = merge_active_alerts(alerts, durable);
+                Some(true)
+            }
+            None => Some(false),
+        },
+        None => None,
+    };
 
     (
         StatusCode::OK,
         Json(json!({
             "alerts": alerts,
             "count": alerts.len(),
+            "durable_alerts_read": durable_alerts_read,
         })),
     )
         .into_response()

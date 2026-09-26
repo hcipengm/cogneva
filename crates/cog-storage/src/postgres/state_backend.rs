@@ -228,16 +228,11 @@ impl PostgresStateBackend {
     }
 }
 
-/// TaskStatus 的 DB 文本形式（与 serde snake_case 一致）。
+/// TaskStatus 的 DB 文本形式：定义在 `cog_core::TaskStatus::as_str`，这里只做
+/// 借用转换——写列与读列的字符串必须来自同一处，否则计数查询会按一套拼写
+/// 去数另一套拼写写下的行。
 fn status_str(status: &cog_core::TaskStatus) -> &'static str {
-    match status {
-        cog_core::TaskStatus::Pending => "pending",
-        cog_core::TaskStatus::Scheduled => "scheduled",
-        cog_core::TaskStatus::Running => "running",
-        cog_core::TaskStatus::Completed => "completed",
-        cog_core::TaskStatus::Failed => "failed",
-        cog_core::TaskStatus::Cancelled => "cancelled",
-    }
+    status.as_str()
 }
 
 #[async_trait]
@@ -683,6 +678,43 @@ impl StateBackend for PostgresStateBackend {
         rows.into_iter()
             .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
             .collect()
+    }
+
+    /// Count the stored tasks by state across every workspace.
+    ///
+    /// Grouped in SQL rather than listed and counted here: the overview asks
+    /// for a handful of numbers and the row count is unbounded, so shipping
+    /// every task over the wire to produce four integers would make the
+    /// overview's cost follow the cluster's history.
+    async fn task_status_counts(&self) -> SFResult<Option<cog_core::TaskStatusCounts>> {
+        let rows: Vec<(String, i64)> = self
+            .retry(|| async {
+                sqlx::query_as("SELECT status, COUNT(*)::bigint FROM cog_dag_tasks GROUP BY status")
+                    .fetch_all(&self.pool)
+                    .await
+            })
+            .await?;
+
+        let mut counts = cog_core::TaskStatusCounts::default();
+        for (status, n) in rows {
+            let n = n.max(0) as usize;
+            match cog_core::TaskStatus::parse(&status) {
+                Some(status) => counts.add(&status, n),
+                // A status this build cannot name is still a stored task: it
+                // stays in the total (the row exists) and is left out of every
+                // bucket, so the mismatch is visible as a total that exceeds
+                // the buckets instead of being quietly filed somewhere.
+                None => {
+                    tracing::warn!(
+                        status = %status,
+                        count = n,
+                        "task row carries a status this build does not know; counted in the total only"
+                    );
+                    counts.total = counts.total.saturating_add(n);
+                }
+            }
+        }
+        Ok(Some(counts))
     }
 
     async fn dag_get_dependencies(

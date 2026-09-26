@@ -58,19 +58,30 @@ pub struct RawLogIndex {
 }
 
 /// Cluster-wide observability overview.
+///
+/// Every count here is `Option`: `None` means the backend could not produce
+/// that reading, and it must stay distinguishable from a zero. A field that
+/// silently reports 0 for "I did not look" is worse than a missing one — the
+/// consumer cannot tell an idle cluster from a broken reader, and the number
+/// arrives in exactly the shape of a real one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClusterOverview {
-    pub total_agents: usize,
-    pub active_agents: usize,
-    pub total_tasks: usize,
-    pub active_tasks: usize,
-    pub queued_tasks: usize,
-    pub failed_tasks: usize,
-    pub avg_task_duration_ms: u64,
+    pub total_agents: Option<usize>,
+    pub active_agents: Option<usize>,
+    pub total_tasks: Option<usize>,
+    pub active_tasks: Option<usize>,
+    pub queued_tasks: Option<usize>,
+    pub failed_tasks: Option<usize>,
+    pub avg_task_duration_ms: Option<u64>,
+    /// Verdict over the alert面: `degraded` while anything is firing,
+    /// `healthy` when the source answered and nothing was, `unknown` when no
+    /// source answered at all. The scope is exactly that evidence — a
+    /// "healthy" here claims nothing is firing, not that every component was
+    /// verified working.
     pub cluster_health: String,
     pub timestamp: DateTime<Utc>,
-    pub total_squads: usize,
-    pub active_squads: usize,
+    pub total_squads: Option<usize>,
+    pub active_squads: Option<usize>,
 }
 
 /// Squad lifecycle status.

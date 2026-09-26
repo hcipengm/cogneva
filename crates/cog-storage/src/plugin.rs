@@ -420,7 +420,12 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 let gateway = crate::PostgresObservabilityGateway::new(pool.clone())
                     .with_event_channel_capacity(
                         ctx.config().system.observability_event_channel_capacity,
-                    );
+                    )
+                    // The overview reports task counts, and the task-state
+                    // surface is the thing that has them: hand over the store
+                    // this process writes DAG state to, so both the counts and
+                    // the tasks they describe come from one place.
+                    .with_state_backend(state_backend.clone());
                 match gateway.init_schema().await {
                     Ok(()) => {
                         info!("PostgresObservabilityGateway initialized");

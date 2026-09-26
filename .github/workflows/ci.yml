@@ -105,6 +105,14 @@ jobs:
         run: cargo test -p cog-storage --test platform_identity -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The status census is one GROUP BY plus a branch that decides what a
+      # status string this build cannot name does to the total; neither is
+      # visible without a server. It runs last because it empties the task
+      # table on entry and exit.
+      - name: Live-DB task status census
+        run: cargo test -p cog-storage --test task_status_counts -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
 
   fmt:
     name: Format

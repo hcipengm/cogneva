@@ -63,22 +63,42 @@ fn test_raw_log_index_serialization() {
 #[test]
 fn test_cluster_overview_serialization() {
     let o = ClusterOverview {
-        total_agents: 10,
-        active_agents: 7,
-        total_tasks: 100,
-        active_tasks: 20,
-        queued_tasks: 5,
-        failed_tasks: 2,
-        avg_task_duration_ms: 1500,
+        total_agents: Some(10),
+        active_agents: Some(7),
+        total_tasks: Some(100),
+        active_tasks: Some(20),
+        queued_tasks: Some(5),
+        failed_tasks: Some(2),
+        avg_task_duration_ms: Some(1500),
         cluster_health: "healthy".into(),
         timestamp: Utc::now(),
-        total_squads: 6,
-        active_squads: 4,
+        total_squads: Some(6),
+        active_squads: Some(4),
     };
     let json = serde_json::to_string(&o).unwrap();
     assert!(json.contains("healthy"));
     let recovered: ClusterOverview = serde_json::from_str(&json).unwrap();
-    assert_eq!(recovered.active_tasks, 20);
-    assert_eq!(recovered.total_squads, 6);
-    assert_eq!(recovered.active_squads, 4);
+    assert_eq!(recovered.active_tasks, Some(20));
+    assert_eq!(recovered.total_squads, Some(6));
+    assert_eq!(recovered.active_squads, Some(4));
+
+    // 「没有读数」必须能穿过序列化，不能被折叠成 0。
+    let unknown = ClusterOverview {
+        total_agents: None,
+        active_agents: None,
+        total_tasks: None,
+        active_tasks: None,
+        queued_tasks: None,
+        failed_tasks: None,
+        avg_task_duration_ms: None,
+        cluster_health: "unknown".into(),
+        timestamp: Utc::now(),
+        total_squads: None,
+        active_squads: None,
+    };
+    let recovered: ClusterOverview =
+        serde_json::from_str(&serde_json::to_string(&unknown).unwrap()).unwrap();
+    assert_eq!(recovered.total_tasks, None);
+    assert_eq!(recovered.avg_task_duration_ms, None);
+    assert_ne!(recovered.total_tasks, Some(0));
 }

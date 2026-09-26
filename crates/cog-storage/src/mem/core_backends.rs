@@ -51,6 +51,21 @@ impl Default for MemoryStateBackend {
 
 #[async_trait]
 impl StateBackend for MemoryStateBackend {
+    /// Count the stored tasks by state across every workspace in the store.
+    async fn task_status_counts(&self) -> SFResult<Option<cog_core::TaskStatusCounts>> {
+        let store = self
+            .store
+            .read()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        Ok(Some(cog_core::TaskStatusCounts::of(
+            store
+                .dag_tasks
+                .values()
+                .flat_map(|tasks| tasks.values())
+                .map(|task| &task.status),
+        )))
+    }
+
     async fn get_agent_state(&self, agent_id: &str) -> SFResult<Option<AgentState>> {
         let store = self
             .store
@@ -1372,14 +1387,18 @@ impl ObservabilityGateway for MemoryObservabilityGateway {
     }
 
     async fn get_cluster_overview(&self) -> SFResult<ClusterOverview> {
+        // Task counts come from the task-state store this gateway was built
+        // with — the run census holds only finished runs and no status, so it
+        // cannot say how many tasks are queued or running.
+        let counts = self.state_backend.task_status_counts().await?;
+
         let metrics = self.metrics.read().unwrap();
-        let total_tasks = metrics.len();
-        let active_tasks = metrics.values().filter(|m| m.iterations > 0).count();
-        let avg_duration = if total_tasks > 0 {
-            metrics.values().map(|m| m.duration_ms).sum::<u64>() / total_tasks as u64
+        let avg_duration = if metrics.is_empty() {
+            None
         } else {
-            0
+            Some(metrics.values().map(|m| m.duration_ms).sum::<u64>() / metrics.len() as u64)
         };
+        drop(metrics);
 
         let squads = self.squads.read().unwrap();
         let total_squads = squads.len();
@@ -1396,20 +1415,19 @@ impl ObservabilityGateway for MemoryObservabilityGateway {
             .count();
 
         Ok(ClusterOverview {
-            total_agents,
-            active_agents,
-            total_tasks,
-            active_tasks,
-            queued_tasks: 0,
-            failed_tasks: metrics
-                .values()
-                .filter(|m| m.tool_calls == 0 && m.iterations == 0)
-                .count(),
+            total_agents: Some(total_agents),
+            active_agents: Some(active_agents),
+            total_tasks: counts.map(|c| c.total),
+            active_tasks: counts.map(|c| c.active),
+            queued_tasks: counts.map(|c| c.queued),
+            failed_tasks: counts.map(|c| c.failed),
             avg_task_duration_ms: avg_duration,
-            cluster_health: "healthy".into(),
+            // No alert evidence lives here; the surface that has it fills this
+            // in before delivery.
+            cluster_health: "unknown".into(),
             timestamp: Utc::now(),
-            total_squads,
-            active_squads,
+            total_squads: Some(total_squads),
+            active_squads: Some(active_squads),
         })
     }
 

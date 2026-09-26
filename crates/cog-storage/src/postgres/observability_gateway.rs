@@ -3,6 +3,7 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use sqlx::PgPool;
 
 use futures::StreamExt;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use cog_core::{
@@ -96,6 +97,12 @@ pub struct PostgresObservabilityGateway {
     pool: PgPool,
     event_tx: broadcast::Sender<AgentEvent>,
     event_channel_capacity: usize,
+    /// The task-state store this process actually uses, so the overview's task
+    /// counts come from the rows the DAG writes rather than from a second
+    /// reading of the same database taken here. Absent, the counts stay
+    /// `None` — the census lives on the task-state surface, and this gateway
+    /// has no way to answer it alone.
+    state_backend: Option<Arc<dyn cog_core::StateBackend>>,
 }
 
 impl PostgresObservabilityGateway {
@@ -105,12 +112,33 @@ impl PostgresObservabilityGateway {
             pool,
             event_tx,
             event_channel_capacity: 256,
+            state_backend: None,
         }
     }
 
     pub fn with_event_channel_capacity(mut self, capacity: usize) -> Self {
         self.event_channel_capacity = capacity;
         self
+    }
+
+    /// Hand over the task-state store so the overview can report task counts.
+    pub fn with_state_backend(mut self, backend: Arc<dyn cog_core::StateBackend>) -> Self {
+        self.state_backend = Some(backend);
+        self
+    }
+
+    /// A count query whose failure is a missing reading, not a zero.
+    ///
+    /// Returning 0 for a failed query would report an empty cluster in exactly
+    /// the shape of a real reading — the one thing a reader cannot tell apart.
+    async fn count_or_none(&self, sql: &str) -> Option<usize> {
+        match sqlx::query_as::<_, (i64,)>(sql).fetch_one(&self.pool).await {
+            Ok((n,)) => Some(n.max(0) as usize),
+            Err(e) => {
+                tracing::warn!(error = %e, query = %sql, "cluster overview count unavailable");
+                None
+            }
+        }
     }
 
     /// Apply the observability schema. Safe to call repeatedly.
@@ -487,22 +515,18 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     }
 
     async fn get_cluster_overview(&self) -> SFResult<ClusterOverview> {
-        let total_tasks: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cog_observability_metrics")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                SFError::Database(format!("get_cluster_overview metrics count failed: {}", e))
-            })?;
+        // Task counts come from the task-state surface: the run census holds
+        // only finished runs and carries no status, so it cannot say how many
+        // tasks are queued or running — it can only say how many have run.
+        let counts = match self.state_backend.as_ref() {
+            Some(backend) => backend.task_status_counts().await?,
+            None => None,
+        };
 
-        let active_tasks: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM cog_observability_metrics WHERE iterations > 0")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| {
-                    SFError::Database(format!("get_cluster_overview active tasks failed: {}", e))
-                })?;
-
-        let avg_duration: Option<(i64,)> =
+        // Average over the runs that were accounted for. Only a finished run
+        // has a duration, so the denominator is the census, not the task
+        // inventory; NULL from AVG (no rows) stays None rather than 0.
+        let avg_duration: Option<(Option<i64>,)> =
             sqlx::query_as("SELECT AVG(duration_ms)::bigint FROM cog_observability_metrics")
                 .fetch_optional(&self.pool)
                 .await
@@ -510,45 +534,37 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
                     SFError::Database(format!("get_cluster_overview avg duration failed: {}", e))
                 })?;
 
-        let total_squads: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cog_observability_squads")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                SFError::Database(format!("get_cluster_overview squads count failed: {}", e))
-            })?;
+        // No production writer exists for the squad table (only tests call
+        // `update_squad_state`), so a count over it would be a zero nothing
+        // produced. `None` says that; the day something writes squads, this
+        // becomes a reading.
+        let total_squads = None;
+        let active_squads = None;
 
-        let active_squads: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM cog_observability_squads WHERE status = 'running'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            SFError::Database(format!("get_cluster_overview active squads failed: {}", e))
-        })?;
-
-        let total_agents: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cog_agent_states")
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or((0,));
-
-        let active_agents: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM cog_agent_states WHERE state = 'active'")
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or((0,));
+        let total_agents = self
+            .count_or_none("SELECT COUNT(*) FROM cog_agent_states")
+            .await;
+        let active_agents = self
+            .count_or_none("SELECT COUNT(*) FROM cog_agent_states WHERE state = 'active'")
+            .await;
 
         Ok(ClusterOverview {
-            total_agents: total_agents.0 as usize,
-            active_agents: active_agents.0 as usize,
-            total_tasks: total_tasks.0 as usize,
-            active_tasks: active_tasks.0 as usize,
-            queued_tasks: 0,
-            failed_tasks: 0,
-            avg_task_duration_ms: avg_duration.map(|d| d.0 as u64).unwrap_or(0),
-            cluster_health: "healthy".into(),
+            total_agents,
+            active_agents,
+            total_tasks: counts.map(|c| c.total),
+            active_tasks: counts.map(|c| c.active),
+            queued_tasks: counts.map(|c| c.queued),
+            failed_tasks: counts.map(|c| c.failed),
+            avg_task_duration_ms: avg_duration
+                .and_then(|row| row.0)
+                .and_then(|d| u64::try_from(d).ok()),
+            // The storage layer holds no alert evidence, so it cannot answer.
+            // The surface that can — the process holding the alert source —
+            // fills this in before delivering the overview.
+            cluster_health: "unknown".into(),
             timestamp: Utc::now(),
-            total_squads: total_squads.0 as usize,
-            active_squads: active_squads.0 as usize,
+            total_squads,
+            active_squads,
         })
     }
 

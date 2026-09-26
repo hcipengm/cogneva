@@ -306,8 +306,15 @@ pub struct PersistedAlert {
 /// alert persistence so other crates can turn firing alerts into work.
 #[async_trait::async_trait]
 pub trait ActiveAlertSource: Send + Sync {
-    /// Alerts currently in the `firing` state, newest first.
-    async fn list_active_alerts(&self, limit: i64) -> Vec<PersistedAlert>;
+    /// Alerts currently in the `firing` state, newest first, or `None` when the
+    /// lookup itself failed.
+    ///
+    /// The two outcomes are not interchangeable: callers act on absence to
+    /// conclude that a component is healthy or that recovery work is no longer
+    /// needed, and "the database did not answer" must not arrive as "nothing is
+    /// firing". A source that answers `Some(vec![])` has looked and found
+    /// nothing.
+    async fn list_active_alerts(&self, limit: i64) -> Option<Vec<PersistedAlert>>;
 }
 
 /// Rule name for alerts raised when goal decomposition ends without any

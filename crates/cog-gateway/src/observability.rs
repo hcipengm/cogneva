@@ -34,6 +34,45 @@ fn default_limit() -> usize {
 
 // ─── Cluster Overview ───
 
+/// How many firing alerts to fetch when all the verdict needs is whether any
+/// exist. The question is boolean, so one row settles it and the read stays
+/// bounded no matter how much is firing.
+const FIRING_PROBE_LIMIT: i64 = 1;
+
+/// Verdict over the firing alerts an evidence source reported.
+///
+/// The scope is exactly that evidence: `healthy` means the source answered and
+/// nothing was firing, not that every component was verified working. Severity
+/// plays no part — the alert vocabulary spends `info` on resolutions, so any
+/// row still firing is a claim that something is wrong.
+fn cluster_health_of(firing: &[cog_core::PersistedAlert]) -> &'static str {
+    if firing.is_empty() {
+        "healthy"
+    } else {
+        "degraded"
+    }
+}
+
+/// Fill the overview's verdict from whichever alert source this process has.
+///
+/// The storage layer holds no alert evidence, so it answers `unknown`; only a
+/// surface that can actually read the alerts may replace that word. The verdict
+/// stays `unknown` both when there is no source and when the source's read
+/// failed — "I did not look" and "nothing is firing" must not arrive as the
+/// same string, and a query that errored is not evidence of quiet.
+async fn apply_alert_verdict(
+    overview: &mut cog_core::observability::ClusterOverview,
+    source: Option<&Arc<dyn cog_core::ActiveAlertSource>>,
+) {
+    let Some(source) = source else {
+        return;
+    };
+    let Some(firing) = source.list_active_alerts(FIRING_PROBE_LIMIT).await else {
+        return;
+    };
+    overview.cluster_health = cluster_health_of(&firing).to_string();
+}
+
 pub async fn cluster_overview_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<cog_core::observability::ClusterOverview>, ApiError> {
@@ -41,10 +80,11 @@ pub async fn cluster_overview_handler(
         .observability_gateway
         .as_ref()
         .ok_or_else(|| ApiError::internal("observability gateway not configured"))?;
-    let overview = gateway
+    let mut overview = gateway
         .get_cluster_overview()
         .await
         .map_err(|e| ApiError::internal(format!("failed to get cluster overview: {e}")))?;
+    apply_alert_verdict(&mut overview, state.active_alert_source.as_ref()).await;
     Ok(Json(overview))
 }
 
@@ -396,4 +436,98 @@ pub async fn search_handler(
         "index": query.index,
         "results": results,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::{ActiveAlertSource, PersistedAlert};
+
+    fn firing(severity: &str) -> PersistedAlert {
+        PersistedAlert {
+            rule: "llm_upstream_pool_down".into(),
+            dedup_key: "llm_upstream_pool_down".into(),
+            severity: severity.into(),
+            state: "firing".into(),
+            message: "pool down".into(),
+            labels: serde_json::json!({}),
+            fired_at: chrono::Utc::now(),
+            last_seen_at: None,
+        }
+    }
+
+    fn overview(health: &str) -> cog_core::observability::ClusterOverview {
+        cog_core::observability::ClusterOverview {
+            total_agents: None,
+            active_agents: None,
+            total_tasks: None,
+            active_tasks: None,
+            queued_tasks: None,
+            failed_tasks: None,
+            avg_task_duration_ms: None,
+            cluster_health: health.into(),
+            timestamp: chrono::Utc::now(),
+            total_squads: None,
+            active_squads: None,
+        }
+    }
+
+    /// Answers with a fixed row set, or with a failed read when `firing` is
+    /// `None`.
+    struct StubSource {
+        firing: Option<Vec<PersistedAlert>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ActiveAlertSource for StubSource {
+        async fn list_active_alerts(&self, _limit: i64) -> Option<Vec<PersistedAlert>> {
+            self.firing.clone()
+        }
+    }
+
+    // An empty answer and a failed read must stay apart: only a source that
+    // looked and found nothing earns `healthy`.
+    #[tokio::test]
+    async fn a_source_that_answered_with_nothing_reads_healthy() {
+        let source: Arc<dyn ActiveAlertSource> = Arc::new(StubSource {
+            firing: Some(vec![]),
+        });
+        let mut o = overview("unknown");
+        apply_alert_verdict(&mut o, Some(&source)).await;
+        assert_eq!(o.cluster_health, "healthy");
+    }
+
+    // A firing row is the claim that something is wrong, whatever its severity
+    // — `info` is the resolution vocabulary and does not appear in firing rows.
+    #[tokio::test]
+    async fn anything_firing_reads_degraded_whatever_its_severity() {
+        for severity in ["critical", "warning"] {
+            let source: Arc<dyn ActiveAlertSource> = Arc::new(StubSource {
+                firing: Some(vec![firing(severity)]),
+            });
+            let mut o = overview("unknown");
+            apply_alert_verdict(&mut o, Some(&source)).await;
+            assert_eq!(o.cluster_health, "degraded", "severity {severity}");
+        }
+    }
+
+    // No source is no evidence: it must not be promoted to `healthy`, or
+    // "never looked" and "looked, all clear" arrive as the same string.
+    #[tokio::test]
+    async fn without_a_source_the_verdict_stays_unknown() {
+        let mut o = overview("unknown");
+        apply_alert_verdict(&mut o, None).await;
+        assert_eq!(o.cluster_health, "unknown");
+    }
+
+    // A source whose query errored is not evidence of quiet either. This is the
+    // path that makes the difference observable: the only production source
+    // reports a failed lookup as `None`.
+    #[tokio::test]
+    async fn a_source_that_could_not_read_leaves_the_verdict_unknown() {
+        let source: Arc<dyn ActiveAlertSource> = Arc::new(StubSource { firing: None });
+        let mut o = overview("unknown");
+        apply_alert_verdict(&mut o, Some(&source)).await;
+        assert_eq!(o.cluster_health, "unknown");
+    }
 }
