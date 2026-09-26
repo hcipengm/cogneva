@@ -2694,20 +2694,55 @@ impl MainlineDeployer {
 
     /// 读 rev 处的发布清单并组装清单包。image 必须是节点 pull 端点引用
     /// （kubelet 经 NodePort 拉取），与 set image 路径同一约束。
+    ///
+    /// 目录形态按目录里**有什么**判，不按配置猜：有 `kustomization.yaml` 就是
+    /// 发布集目录，否则按平铺的预渲染目录读。两种形态都必须能消费，因为
+    /// `manifest_dir` 是配置面，而有的 profile 的权威面就是它自己的预渲染目录
+    /// ——`deploy/k3s` 装的是单节点 K3s 的形态，指给标准 K8s 会把 K3s 的宿主
+    /// 路径与套接字一并下发。
     async fn build_bundle_at(&self, rev: &str, image: &str) -> SFResult<RolloutBundle> {
         let dir = self.cfg.manifest_dir.trim_end_matches('/');
-        let kustomization = self
-            .git_show(rev, &format!("{dir}/kustomization.yaml"))
-            .await?;
-        let resources = parse_kustomization_resources(&kustomization)?;
-        let mut files = BTreeMap::new();
-        for res in &resources {
-            let content = self.git_show(rev, &format!("{dir}/{res}")).await?;
-            files.insert(res.clone(), content);
+        // 列不出来（目录在这个 rev 下不存在、rev 本身不可解）与"目录存在但读不出
+        // 发布面"是两件事，读数要说清是哪一件，并把底层那条 git 报错带上。
+        let names = self.git_ls_dir(rev, dir).await.map_err(|e| {
+            SFError::Config(format!(
+                "cannot read the release set at {dir} in {}: {e}; expected either a \
+                 {KUSTOMIZATION_FILE} listing resources or a flat directory of manifests",
+                rev12(rev)
+            ))
+        })?;
+        let set = if names.iter().any(|n| n == KUSTOMIZATION_FILE) {
+            let kustomization = self
+                .git_show(rev, &format!("{dir}/{KUSTOMIZATION_FILE}"))
+                .await?;
+            let resources = parse_kustomization_resources(&kustomization)?;
+            let mut files = BTreeMap::new();
+            for res in &resources {
+                let content = self.git_show(rev, &format!("{dir}/{res}")).await?;
+                files.insert(res.clone(), content);
+            }
+            ReleaseSet::from_kustomization(files, resources)?
+        } else {
+            let mut files = BTreeMap::new();
+            for name in names.iter().filter(|n| is_manifest_file(n)) {
+                let content = self.git_show(rev, &format!("{dir}/{name}")).await?;
+                files.insert(name.clone(), content);
+            }
+            ReleaseSet::from_flat_dir(files)
+        };
+        if set.is_empty() {
+            return Err(SFError::Config(format!(
+                "{dir} holds no manifest at {}: neither a {KUSTOMIZATION_FILE} listing \
+                 resources nor a flat directory of manifests",
+                rev12(rev)
+            )));
         }
-        let bundle = build_rollout_bundle(&files, &kustomization, &self.cfg.targets, image)?;
+        let bundle = build_rollout_bundle(&set, &self.cfg.targets, image)?;
         info!(
             rev = %rev12(rev),
+            dir = %dir,
+            shape = set.shape(),
+            resources = set.len(),
             support_bytes = bundle.support_yaml.len(),
             target_manifests = bundle.targets.len(),
             "manifest bundle assembled"
@@ -3111,14 +3146,18 @@ fn is_cluster_scoped_kind(kind: &str) -> bool {
     CLUSTER_SCOPED_KINDS.contains(&kind)
 }
 
+/// 发布集目录的形态判据：目录里有它，就按 `resources` 列表读；没有，就按
+/// 平铺的预渲染目录读。
+const KUSTOMIZATION_FILE: &str = "kustomization.yaml";
+
 /// 解析 kustomization.yaml 的 resources 列表——发布集的权威定义。
 fn parse_kustomization_resources(text: &str) -> SFResult<Vec<String>> {
     let v: serde_yaml::Value = serde_yaml::from_str(text)
-        .map_err(|e| SFError::Config(format!("parse kustomization.yaml: {e}")))?;
+        .map_err(|e| SFError::Config(format!("parse {KUSTOMIZATION_FILE}: {e}")))?;
     let resources = v
         .get("resources")
         .and_then(|r| r.as_sequence())
-        .ok_or_else(|| SFError::Config("kustomization.yaml has no resources list".into()))?;
+        .ok_or_else(|| SFError::Config(format!("{KUSTOMIZATION_FILE} has no resources list")))?;
     resources
         .iter()
         .map(|r| {
@@ -3363,56 +3402,143 @@ fn patch_deployment_image(
     Ok(out)
 }
 
-/// 从发布集文件内容（kustomization resources 里的相对路径 → 文件文本）
-/// 组装清单包。目标 deployment 的清单必须在发布集里，缺文件 / 名字对不上
-/// 都是硬错误——静默回落 set image 会掩盖发布集漂移，让拓扑滞后悄悄回来。
-/// targets 输出保持调用方给的滚动顺序（与 kustomization 里的文件顺序无关）。
+/// 一次滚动的发布资源集：有序的文件名 + 文件内容。
+///
+/// 两种目录形态都归到这里，消费侧因此不必知道清单来自哪一种。发布集目录用
+/// `kustomization.yaml` 的 `resources` 列表；预渲染目录是平铺清单，文件名前缀
+/// 是渲染序号，字典序即渲染顺序。差别只在这一层——文件名叫什么由产出侧决定，
+/// 所以消费侧不许拿一份手写的「目标 → 文件名」映射去对：渲染器改一次命名，
+/// 手写映射就静默失效。
+pub struct ReleaseSet {
+    resources: Vec<String>,
+    files: BTreeMap<String, String>,
+    shape: ReleaseSetShape,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReleaseSetShape {
+    /// 发布集目录：`kustomization.yaml` 的 `resources` 是权威顺序。
+    Kustomization,
+    /// 预渲染目录：平铺清单，目录里的每一项都在发布面内。
+    FlatDir,
+}
+
+impl ReleaseSetShape {
+    /// 读数用的形状名（日志里说清这一轮消费的是哪种目录）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReleaseSetShape::Kustomization => "kustomization",
+            ReleaseSetShape::FlatDir => "flat",
+        }
+    }
+}
+
+impl ReleaseSet {
+    /// 发布集目录形态。`resources` 来自 `kustomization.yaml`；重复条目在这里
+    /// 拦下——重复会让后一个目标的清单被前一个吃掉（详见本文件同名测试）。
+    pub fn from_kustomization(
+        files: BTreeMap<String, String>,
+        resources: Vec<String>,
+    ) -> SFResult<Self> {
+        if let Some(dup) = duplicate_resources(&resources) {
+            return Err(SFError::Config(format!(
+                "duplicate resource {dup} in kustomization resources"
+            )));
+        }
+        Ok(Self {
+            resources,
+            files,
+            shape: ReleaseSetShape::Kustomization,
+        })
+    }
+
+    /// 预渲染目录形态：目录里的清单文件全部入发布面，按文件名排序（前缀是
+    /// 渲染序号，字典序即渲染顺序）。非清单文件（渲染脚本与说明文档可能同放
+    /// 一个目录）不在发布面内。
+    pub fn from_flat_dir(files: BTreeMap<String, String>) -> Self {
+        let resources = files
+            .keys()
+            .filter(|n| is_manifest_file(n))
+            .cloned()
+            .collect();
+        Self {
+            resources,
+            files,
+            shape: ReleaseSetShape::FlatDir,
+        }
+    }
+
+    pub fn shape(&self) -> &'static str {
+        self.shape.as_str()
+    }
+
+    pub fn len(&self) -> usize {
+        self.resources.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.resources.is_empty()
+    }
+
+    /// 发布集列出但包里没有的文件。发布集目录形态的 `resources` 是人写的，
+    /// 缺文件必须当场报出来，不能静默少发一份。
+    fn content(&self, res: &str) -> SFResult<&str> {
+        self.files.get(res).map(String::as_str).ok_or_else(|| {
+            SFError::Config(format!(
+                "{res} is listed in the release set but missing from bundle files"
+            ))
+        })
+    }
+}
+
+/// 发布面内的文件名。预渲染目录里只有清单，但同一个目录也是人读的地方，
+/// 拿后缀划界比拿一份白名单稳。
+fn is_manifest_file(name: &str) -> bool {
+    name.ends_with(".yaml") || name.ends_with(".yml")
+}
+
+/// 从发布资源集组装清单包。目标 deployment 的交付清单必须在集合里，缺文件 /
+/// 名字对不上都是硬错误——静默回落 set image 会掩盖发布集漂移，让拓扑滞后
+/// 悄悄回来。targets 输出保持调用方给的滚动顺序（与集合里的文件顺序无关）。
 pub fn build_rollout_bundle(
-    files: &BTreeMap<String, String>,
-    kustomization: &str,
+    set: &ReleaseSet,
     targets: &[RolloutTargetConfig],
     image: &str,
 ) -> SFResult<RolloutBundle> {
-    let resources = parse_kustomization_resources(kustomization)?;
-    if let Some(dup) = duplicate_resources(&resources) {
-        return Err(SFError::Config(format!(
-            "duplicate resource {dup} in kustomization resources"
-        )));
-    }
-    let mut patched: BTreeMap<String, String> = BTreeMap::new();
-    let mut support_docs: Vec<serde_yaml::Value> = Vec::new();
-    for res in &resources {
-        let content = files.get(res).ok_or_else(|| {
-            SFError::Config(format!(
-                "kustomization resource {res} missing from bundle files"
-            ))
-        })?;
-        reject_dialect_dependent_scalars(content, res)?;
-        if let Some(t) = targets
-            .iter()
-            .find(|t| t.manifest.as_deref() == Some(res.as_str()))
-        {
-            let yaml = patch_deployment_image(content, res, &t.deployment, &t.container, image)?;
-            patched.insert(res.clone(), yaml);
-        } else {
-            support_docs.extend(namespace_docs(content, res)?);
-        }
-    }
-    let mut target_manifests = Vec::new();
+    let mut claims: Vec<(&RolloutTargetConfig, String)> = Vec::new();
     for t in targets {
-        let Some(m) = t.manifest.as_deref() else {
+        let Some(res) = resolve_target_manifest(set, t)? else {
             // 未声明清单的目标由滚动侧回落 set image（版本偏差兼容路径）。
             continue;
         };
-        if !resources.iter().any(|r| r == m) {
+        if let Some((other, _)) = claims.iter().find(|(_, r)| *r == res) {
             return Err(SFError::Config(format!(
-                "manifest {m} of rollout target {} is not in kustomization resources",
-                t.deployment
+                "rollout targets {} and {} are both delivered by the manifest {res}; \
+                 one file cannot carry two rollouts",
+                other.deployment, t.deployment
             )));
         }
-        let yaml = patched.remove(m).ok_or_else(|| {
+        claims.push((t, res));
+    }
+    let mut patched: BTreeMap<String, String> = BTreeMap::new();
+    let mut support_docs: Vec<serde_yaml::Value> = Vec::new();
+    for res in &set.resources {
+        let content = set.content(res)?;
+        reject_dialect_dependent_scalars(content, res)?;
+        match claims.iter().find(|(_, r)| r == res) {
+            Some((t, _)) => {
+                let yaml =
+                    patch_deployment_image(content, res, &t.deployment, &t.container, image)?;
+                patched.insert(res.clone(), yaml);
+            }
+            None => support_docs.extend(namespace_docs(content, res)?),
+        }
+    }
+    let mut target_manifests = Vec::new();
+    for (t, res) in &claims {
+        let yaml = patched.remove(res).ok_or_else(|| {
             SFError::Config(format!(
-                "manifest {m} of target {} was not patched",
+                "manifest {res} of target {} was not patched",
                 t.deployment
             ))
         })?;
@@ -3422,13 +3548,63 @@ pub fn build_rollout_bundle(
             yaml,
         });
     }
-    // 声明了清单的目标之间不允许共用同一文件：patched 里同名条目会被
-    // remove 吃掉，第二个目标报"was not patched"硬错误，不会静默错配。
     let support_yaml = render_docs(&support_docs)?;
     Ok(RolloutBundle {
         support_yaml,
         targets: target_manifests,
     })
+}
+
+/// 目标 deployment 由发布集里的哪份清单交付；`None` 表示该目标没声明清单。
+///
+/// 先按声明名精确匹配——`manifest` 是部署面的声明，确定性判据排在推导之前。
+/// 声明名不在集合里时，按清单自己的身份（`kind: Deployment` 加
+/// `metadata.name`）反查：预渲染目录的文件名由渲染器生成
+/// （`41-deployment-cogneva.yaml`），而滚动目标的身份是集群里的对象名，
+/// 后者才是两侧共用的那一半。反查命中多于一份同样是硬错误——那意味着这份
+/// 发布集里有两个同名的 Deployment，滚谁都是错的。
+fn resolve_target_manifest(
+    set: &ReleaseSet,
+    target: &RolloutTargetConfig,
+) -> SFResult<Option<String>> {
+    let Some(declared) = target.manifest.as_deref() else {
+        return Ok(None);
+    };
+    if set.resources.iter().any(|r| r == declared) {
+        return Ok(Some(declared.to_string()));
+    }
+    let mut delivers: Vec<String> = Vec::new();
+    for res in &set.resources {
+        if carries_deployment(set.content(res)?, res, &target.deployment)? {
+            delivers.push(res.clone());
+        }
+    }
+    match delivers.len() {
+        1 => Ok(Some(delivers.remove(0))),
+        0 => Err(SFError::Config(format!(
+            "no manifest in the release set delivers Deployment {}: target declared \
+             {declared}, and none of the {} resources is a Deployment by that name",
+            target.deployment,
+            set.resources.len()
+        ))),
+        n => Err(SFError::Config(format!(
+            "{n} manifests in the release set deliver Deployment {} ({delivers:?}); \
+             a rollout target must be delivered by exactly one",
+            target.deployment
+        ))),
+    }
+}
+
+/// 这份清单里是否有一个名为 `deployment` 的 Deployment 文档。多文档文件按
+/// 文档逐个判：预渲染目录里一个文件一份清单，但发布集目录形态没有这个约束。
+fn carries_deployment(yaml_text: &str, origin: &str, deployment: &str) -> SFResult<bool> {
+    Ok(split_docs(yaml_text, origin)?.iter().any(|v| {
+        v.get("kind").and_then(|k| k.as_str()) == Some("Deployment")
+            && v.get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+                == Some(deployment)
+    }))
 }
 
 /// 一组文档 → 多文档 YAML（`---` 分隔）。组包与消费侧复核共用同一份序列化。
@@ -10024,7 +10200,12 @@ exit 0
             "kind: ConfigMap\nmetadata:\n  name: c\ndata:\n  k: v\n".to_string(),
         );
         let kustomization = "resources:\n  - resource-quota.yaml\n  - configmap.yaml\n  - deployment.yaml\n  - evolution-deployment.yaml\n";
-        let bundle = build_rollout_bundle(&files, kustomization, &bundle_targets(), "img").unwrap();
+        let bundle = build_rollout_bundle(
+            &set_from_kustomization(files, kustomization),
+            &bundle_targets(),
+            "img",
+        )
+        .unwrap();
         assert!(bundle.support_yaml.contains("kind: ConfigMap"));
         assert!(
             !bundle.support_yaml.contains("ResourceQuota"),
@@ -10063,7 +10244,12 @@ exit 0
             "kind: ConfigMap\nmetadata:\n  name: c\ndata:\n  k: v\n".to_string(),
         );
         let kustomization = "resources:\n  - app-data-pvc.yaml\n  - configmap.yaml\n  - deployment.yaml\n  - evolution-deployment.yaml\n";
-        let bundle = build_rollout_bundle(&files, kustomization, &bundle_targets(), "img").unwrap();
+        let bundle = build_rollout_bundle(
+            &set_from_kustomization(files, kustomization),
+            &bundle_targets(),
+            "img",
+        )
+        .unwrap();
         assert!(bundle.support_yaml.contains("kind: ConfigMap"));
         assert!(
             !bundle.support_yaml.contains("PersistentVolumeClaim"),
@@ -10338,6 +10524,15 @@ metadata:
         ]
     }
 
+    /// 发布集目录形态的发布资源集。解析与去重都归包内函数，测试只提供文本。
+    fn set_from_kustomization(files: BTreeMap<String, String>, kustomization: &str) -> ReleaseSet {
+        ReleaseSet::from_kustomization(
+            files,
+            parse_kustomization_resources(kustomization).expect("kustomization resources parse"),
+        )
+        .expect("release set")
+    }
+
     fn deployment_yaml(name: &str, container: &str) -> String {
         format!(
             "kind: Deployment\nmetadata:\n  name: {name}\nspec:\n  template:\n    spec:\n      containers:\n        - name: {container}\n          image: placeholder\n"
@@ -10367,8 +10562,7 @@ metadata:
         let kustomization =
             "resources:\n  - namespace.yaml\n  - evolution-deployment.yaml\n  - configmap.yaml\n  - deployment.yaml\n";
         let bundle = build_rollout_bundle(
-            &files,
-            kustomization,
+            &set_from_kustomization(files, kustomization),
             &bundle_targets(),
             "reg/cogneva:main-x",
         )
@@ -10395,18 +10589,29 @@ metadata:
             "evolution-deployment.yaml".to_string(),
             deployment_yaml("cogneva-evolution", "cogneva"),
         );
-        // kustomization 缺 evolution-deployment.yaml：目标声明了清单却不在发布集，硬错误。
+        // 发布集里没有交付 evolution 目标的清单（`evolution-deployment.yaml` 不在
+        // resources 里，也没有第二个同名 Deployment 可反查）：硬错误，不回落到 set image。
         let partial = "resources:\n  - deployment.yaml\n";
-        let err = build_rollout_bundle(&files, partial, &bundle_targets(), "img").unwrap_err();
+        let err = build_rollout_bundle(
+            &set_from_kustomization(files.clone(), partial),
+            &bundle_targets(),
+            "img",
+        )
+        .unwrap_err();
         assert!(
-            err.to_string().contains("not in kustomization resources"),
+            err.to_string()
+                .contains("no manifest in the release set delivers Deployment cogneva-evolution"),
             "{err}"
         );
         // kustomization 引用了 files 里不存在的资源：硬错误。
         let kustomization =
             "resources:\n  - deployment.yaml\n  - evolution-deployment.yaml\n  - missing.yaml\n";
-        let err =
-            build_rollout_bundle(&files, kustomization, &bundle_targets(), "img").unwrap_err();
+        let err = build_rollout_bundle(
+            &set_from_kustomization(files, kustomization),
+            &bundle_targets(),
+            "img",
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("missing from bundle files"),
             "{err}"
@@ -10430,8 +10635,12 @@ metadata:
         );
         let kustomization =
             "resources:\n  - deployment.yaml\n  - evolution-deployment.yaml\n  - secret.yaml\n";
-        let err =
-            build_rollout_bundle(&files, kustomization, &bundle_targets(), "img").unwrap_err();
+        let err = build_rollout_bundle(
+            &set_from_kustomization(files, kustomization),
+            &bundle_targets(),
+            "img",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("forbidden"), "{err}");
     }
 
@@ -10453,9 +10662,12 @@ metadata:
             ),
         );
         let kustomization = "resources:\n  - deployment.yaml\n  - evolution-deployment.yaml\n";
-        let bundle =
-            build_rollout_bundle(&files, kustomization, &bundle_targets(), "reg/img:main-x")
-                .unwrap();
+        let bundle = build_rollout_bundle(
+            &set_from_kustomization(files, kustomization),
+            &bundle_targets(),
+            "reg/img:main-x",
+        )
+        .unwrap();
         let target = bundle
             .targets
             .iter()
@@ -10745,8 +10957,259 @@ exit 0
         let mut targets = bundle_targets();
         targets[1].manifest = None;
         let kustomization = "resources:\n  - deployment.yaml\n";
-        let bundle = build_rollout_bundle(&files, kustomization, &targets, "img").unwrap();
+        let bundle = build_rollout_bundle(
+            &set_from_kustomization(files, kustomization),
+            &targets,
+            "img",
+        )
+        .unwrap();
         assert_eq!(bundle.targets.len(), 1);
         assert_eq!(bundle.targets[0].deployment, "cogneva");
+    }
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// 盘上的目录 → 平铺形态的发布资源集，与读 rev 的那条路共用同一个构造器。
+    fn flat_set_from_disk(dir: &Path) -> ReleaseSet {
+        let mut files = BTreeMap::new();
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            if !is_manifest_file(&name) {
+                continue;
+            }
+            let text = std::fs::read_to_string(dir.join(&name))
+                .unwrap_or_else(|e| panic!("read {name}: {e}"));
+            files.insert(name, text);
+        }
+        ReleaseSet::from_flat_dir(files)
+    }
+
+    /// 发布集目录形态的盘上读法（`kustomization.yaml` 的 resources 是权威顺序）。
+    fn kustomization_set_from_disk(dir: &Path) -> ReleaseSet {
+        let kustomization = std::fs::read_to_string(dir.join(KUSTOMIZATION_FILE))
+            .unwrap_or_else(|e| panic!("read kustomization in {}: {e}", dir.display()));
+        let resources = parse_kustomization_resources(&kustomization).expect("resources parse");
+        let mut files = BTreeMap::new();
+        for res in &resources {
+            files.insert(
+                res.clone(),
+                std::fs::read_to_string(dir.join(res))
+                    .unwrap_or_else(|e| panic!("read {res}: {e}")),
+            );
+        }
+        ReleaseSet::from_kustomization(files, resources).expect("release set")
+    }
+
+    /// 平铺的预渲染目录必须真的能被消费。渲染产物的文件名由渲染器生成
+    /// （`41-deployment-cogneva.yaml`），与滚动目标声明的清单名
+    /// （`deployment.yaml`）对不上——名字对不上就整体停下，正是这条能力缺位时
+    /// 的样子：配置面把 `manifest_dir` 指向渲染目录，落地通道在组包这一步
+    /// 一次都跑不到。
+    #[test]
+    fn a_rendered_profile_directory_delivers_every_rollout_target() {
+        let root = repo_root();
+        let targets = MainlineDeployerConfig::default().targets;
+        assert_eq!(
+            targets.len(),
+            4,
+            "the default rollout set changed; this test walks all of it"
+        );
+        for profile in ["k3s-single", "k3s-multi", "k8s-standard"] {
+            let dir = root.join("deploy/rendered").join(profile);
+            let set = flat_set_from_disk(&dir);
+            // 发布面就是目录自己的清单文件：产出侧新加一份，消费侧自动带上，
+            // 不靠任何手写清单。
+            let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|n| is_manifest_file(n))
+                .collect();
+            on_disk.sort();
+            assert_eq!(
+                set.resources, on_disk,
+                "{profile}: release set != directory"
+            );
+            assert_eq!(set.shape(), "flat", "{profile}: shape reading");
+            let bundle = build_rollout_bundle(&set, &targets, "reg/cogneva:main-x")
+                .unwrap_or_else(|e| panic!("{profile}: {e}"));
+            assert_eq!(
+                bundle.targets.len(),
+                targets.len(),
+                "{profile}: every target must travel with its manifest"
+            );
+            for t in &bundle.targets {
+                assert!(
+                    t.yaml.contains("image: reg/cogneva:main-x"),
+                    "{profile}: {} was not rewritten: {}",
+                    t.deployment,
+                    t.yaml
+                );
+            }
+            // 支撑面来自这个目录自己的清单（有内容、且不带 Secret）。
+            assert!(
+                bundle.support_yaml.contains("kind: ConfigMap"),
+                "{profile}: support face is empty"
+            );
+            assert!(
+                !bundle.support_yaml.contains("kind: Secret"),
+                "{profile}: secrets never travel through manifests"
+            );
+            // 判据自证：目录里那 4 个 Deployment 的清单名确实不是目标声明的名字，
+            // 所以上面走的是身份反查这条路，不是名字恰好撞上。
+            for t in &targets {
+                let declared = t
+                    .manifest
+                    .as_deref()
+                    .expect("default targets declare a manifest");
+                assert!(
+                    !set.resources.iter().any(|r| r.as_str() == declared),
+                    "{profile}: {declared} unexpectedly exists; this test would not exercise the identity lookup"
+                );
+            }
+        }
+    }
+
+    /// 目标声明的文件名不在集合里、集合里也没有交付它的 Deployment：硬错误，
+    /// 报错要带上是哪个 Deployment 与声明的是哪个文件。
+    #[test]
+    fn a_target_nothing_delivers_is_refused() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "41-deployment-cogneva.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        let set = ReleaseSet::from_flat_dir(files);
+        let targets = bundle_targets();
+        let err = build_rollout_bundle(&set, &targets, "img").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no manifest in the release set delivers Deployment cogneva-evolution"),
+            "{msg}"
+        );
+        assert!(msg.contains("evolution-deployment.yaml"), "{msg}");
+        assert!(msg.contains("1 resources"), "{msg}");
+    }
+
+    /// 集合里有两份同名 Deployment：滚谁都可能是错的，硬错误。
+    #[test]
+    fn two_manifests_delivering_one_deployment_are_refused() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "41-deployment-cogneva.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "90-deployment-cogneva-copy.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "41-deployment-cogneva-evolution.yaml".to_string(),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        );
+        let set = ReleaseSet::from_flat_dir(files);
+        let err = build_rollout_bundle(&set, &bundle_targets(), "img").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2 manifests in the release set deliver Deployment cogneva"),
+            "{msg}"
+        );
+    }
+
+    /// 两个目标声明同一个名字（在平铺形态下即反查到同一份清单）：一份文件不能
+    /// 承载两次滚动，硬错误并点名两个目标。
+    #[test]
+    fn two_targets_delivered_by_one_manifest_are_refused() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "41-deployment-cogneva.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        let mut targets = bundle_targets();
+        targets[0].manifest = Some("41-deployment-cogneva.yaml".to_string());
+        targets[1].manifest = Some("41-deployment-cogneva.yaml".to_string());
+        let set = ReleaseSet::from_flat_dir(files);
+        let err = build_rollout_bundle(&set, &targets, "img").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("are both delivered by the manifest"), "{msg}");
+        assert!(msg.contains("cogneva and cogneva-evolution"), "{msg}");
+    }
+
+    /// 部署面的两个度必须相互成立：每份 profile 的 `mainlineDeployer.manifestDir`
+    /// 指向的目录，部署器要真能消费（发布集目录或平铺的预渲染目录），且四个目标
+    /// 都能落到清单上。取值与消费分成两个文件写，漂了只有上线那一步才会发现
+    /// ——而那时停的是落地通道。
+    #[test]
+    fn every_profile_points_its_manifest_dir_at_a_consumable_directory() {
+        let root = repo_root();
+        let chart = root.join("deploy/helm/cogneva");
+        let base: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(chart.join("values.yaml")).expect("read values.yaml"),
+        )
+        .expect("parse values.yaml");
+        let default_dir = base
+            .get("mainlineDeployer")
+            .and_then(|v| v.get("manifestDir"))
+            .and_then(|v| v.as_str())
+            .expect("values.yaml has mainlineDeployer.manifestDir")
+            .to_string();
+        let targets = MainlineDeployerConfig::default().targets;
+        let mut checked: Vec<(String, String)> = Vec::new();
+        let mut profiles: Vec<PathBuf> = std::fs::read_dir(chart.join("profiles"))
+            .expect("profiles dir")
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
+            .collect();
+        profiles.sort();
+        for path in profiles {
+            let profile = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let values: serde_yaml::Value =
+                serde_yaml::from_str(&std::fs::read_to_string(&path).expect("read profile values"))
+                    .expect("parse profile values");
+            // 只覆盖这一个度：其余键沿用 chart 基础 values。
+            let dir = values
+                .get("mainlineDeployer")
+                .and_then(|v| v.get("manifestDir"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&default_dir)
+                .to_string();
+            let abs = root.join(&dir);
+            assert!(abs.is_dir(), "{profile}: manifestDir {dir} does not exist");
+            // 发布面不能跨拓扑：这个部署的清单目录要么是它自己的预渲染目录，
+            // 要么是与它逐字段对齐的静态基线（`deploy/k3s` 对 k3s-single，两级
+            // 对齐由 parity 门禁守）。别的 profile 的目录指过来就是把另一个拓扑的
+            // 宿主路径与套接字形态下发上去——那不报错，只是把集群改成另一个样子。
+            let expected = if profile == "k3s-single" {
+                "deploy/k3s".to_string()
+            } else {
+                format!("deploy/rendered/{profile}")
+            };
+            assert_eq!(
+                dir, expected,
+                "{profile}: the release face moved to another topology's directory"
+            );
+            let set = if abs.join(KUSTOMIZATION_FILE).exists() {
+                kustomization_set_from_disk(&abs)
+            } else {
+                flat_set_from_disk(&abs)
+            };
+            assert!(!set.is_empty(), "{profile}: {dir} carries no manifest");
+            let bundle = build_rollout_bundle(&set, &targets, "reg/cogneva:main-x")
+                .unwrap_or_else(|e| panic!("{profile}: manifestDir {dir}: {e}"));
+            assert_eq!(
+                bundle.targets.len(),
+                targets.len(),
+                "{profile}: {dir} does not deliver every rollout target"
+            );
+            checked.push((profile, dir));
+        }
+        assert_eq!(checked.len(), 3, "profile set changed: {checked:?}");
     }
 }

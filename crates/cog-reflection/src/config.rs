@@ -386,6 +386,9 @@ pub struct RolloutTargetConfig {
     /// 该 Deployment 在清单目录内的文件名。滚版时 Job 以 apply 这份清单
     /// （镜像改写为目标不可变 tag）交付完整 Pod spec——env/卷/挂载的变更
     /// 因此随镜像一起到达集群；None 时该目标退回 set image 旧路径。
+    /// 文件名对不上时按清单自己的 `kind` + `metadata.name` 反查（预渲染目录的
+    /// 文件名带渲染序号，与这里的名字不同），所以这个度声明的是"目标有没有
+    /// 随镜像下发的清单"，不是"文件在产出侧叫什么"。
     #[serde(default)]
     pub manifest: Option<String>,
 }
@@ -499,10 +502,12 @@ pub struct MainlineDeployerConfig {
     /// 状态摘要（bare HEAD / last_good / in_flight / 失败计数）。0 表示
     /// 每轮轮询都打。
     pub heartbeat_log_secs: u64,
-    /// 清单目录（仓库内相对路径）。目录里的 `kustomization.yaml` resources
-    /// 列表是发布资源集的权威清单：滚动 Job 按它 apply 支撑资源（configmap/
-    /// service/RBAC/基础设施负载），集群级资源（Namespace/StorageClass 等）
-    /// 属安装期产物、自动跳过，Secret 按设计不入清单、出现即拒绝。
+    /// 清单目录（仓库内相对路径）。两种形态都消费：目录里有
+    /// `kustomization.yaml` 就按它的 resources 列表读（这才是发布资源集的权威
+    /// 顺序），否则按平铺的预渲染目录读（文件名前缀是渲染序号，字典序即渲染
+    /// 顺序）。滚动 Job 按结果 apply 支撑资源（configmap/service/RBAC/基础设施
+    /// 负载），集群级资源（Namespace/StorageClass 等）属安装期产物、自动跳过，
+    /// Secret 按设计不入清单、出现即拒绝。
     pub manifest_dir: String,
     /// 是否让滚动 Job 以 apply 仓库清单交付完整 spec。false 时退回纯
     /// set image 旧路径（清单变更不随镜像下发）。

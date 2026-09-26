@@ -45,5 +45,11 @@ gitops:
   kubectlBin:
     enabled: false
 
+mainlineDeployer:
+  # 发布清单目录跟着 profile 走：这个部署的权威面是它自己的预渲染目录。指到
+  # deploy/k3s 会把单节点 K3s 的宿主路径与套接字形态下发到标准 K8s 集群上
+  # （那些字段是 k3s profile 的环境差异，正是本文件开头列的那几条）。
+  manifestDir: "deploy/rendered/k8s-standard"
+
 buildah:
   containerdSocket: /run/containerd

@@ -31,5 +31,12 @@ gitops:
     enabled: true
     hostPath: /usr/local/bin/k3s
 
+mainlineDeployer:
+  # 发布清单目录跟着 profile 走：这个部署的权威面是它自己的预渲染目录，而不是
+  # 单节点 K3s 的静态基线 deploy/k3s——后者装的是单节点的宿主路径与 k3s 形态，
+  # 指过来会把那些形态一并下发。k3s-single 不写这一条，它的权威面就是
+  # deploy/k3s（两者逐字段对齐，parity 门禁守）。
+  manifestDir: "deploy/rendered/k3s-multi"
+
 buildah:
   containerdSocket: /run/k3s/containerd
