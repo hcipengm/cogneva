@@ -2756,6 +2756,9 @@ mod tests {
 
     #[tokio::test]
     async fn clear_issue_submits_task() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
         let provider = Arc::new(MockProvider {
             issues: vec![issue(
                 1,
@@ -2789,10 +2792,15 @@ mod tests {
             types.iter().any(|t| t == "platform_issue_fix"),
             "a fix verdict should submit the platform_issue_fix task; got {types:?}"
         );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[tokio::test]
     async fn assess_clarify_verdict_posts_question_and_no_fix() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
         // The semantic assessor (mocked) judges a terse issue as still unclear:
         // the loop posts the assessor's question once and must not submit a fix.
         let provider = Arc::new(MockProvider {
@@ -2835,10 +2843,15 @@ mod tests {
             !types.iter().any(|t| t == "platform_issue_fix"),
             "a clarify verdict must not submit a fix task; got {types:?}"
         );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[tokio::test]
     async fn backoff_due_issue_is_refetched_past_watermark() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
         // Terminal backoff promises a retry once its window expires, but the
         // scan watermark has already advanced past the issue's updated_at, so
         // a plain scan round can never surface it again. The loop must fetch
@@ -2889,10 +2902,15 @@ mod tests {
             !loop_.terminal_backoff.contains_key("issue:77"),
             "successful retry should clear the backoff entry"
         );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[tokio::test]
     async fn assess_failure_falls_back_to_heuristic_fix() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
         // When the assess task fails, the loop degrades to the local text
         // heuristic: a clear, reproducible body is still fixed autonomously.
         let provider = Arc::new(MockProvider {
@@ -2923,6 +2941,8 @@ mod tests {
             types.iter().any(|t| t == "platform_issue_fix"),
             "heuristic fallback should still submit a fix for a clear issue; got {types:?}"
         );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     /// A terminal assess failure must not be answered with the keyword
@@ -2934,6 +2954,9 @@ mod tests {
     /// re-judged once the window expires.
     #[tokio::test]
     async fn a_terminal_assess_failure_defers_the_intent_instead_of_guessing() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
         // Deliberately the same clear, reproducible body as the heuristic
         // fallback case below: the heuristic would confidently submit a fix for
         // it, which is exactly the guess that must not be acted on.
@@ -2979,10 +3002,15 @@ mod tests {
             loop_.terminal_backoff.contains_key("issue:9"),
             "the intent must be armed for a retry once the upstream is back"
         );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[tokio::test]
     async fn unclear_issue_posts_clarification() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
         let provider = Arc::new(MockProvider {
             issues: vec![issue(2, "too short")],
             comments: Mutex::new(vec![]),
@@ -3004,10 +3032,15 @@ mod tests {
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].0, 2);
         assert!(comments[0].1.contains("— Cogneva Bot"));
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[tokio::test]
     async fn unclear_issue_asks_only_once_across_repeated_triggers() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
         // 同一 issue 被重复触发（webhook + 轮询，或自己发的评论事件在读到
         // 之前就到达——mock 默认不回传已发评论）时，只能问一次。
         let provider = Arc::new(MockProvider {
@@ -3035,6 +3068,8 @@ mod tests {
             "bot must ask only once, posted {comments:?}"
         );
         assert_eq!(comments[0].0, 20);
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[test]
@@ -3199,6 +3234,9 @@ mod tests {
 
     #[tokio::test]
     async fn ci_polling_adopts_existing_failures_on_first_round() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
         let provider = Arc::new(MockProvider {
             issues: vec![],
             comments: Mutex::new(vec![]),
@@ -3219,6 +3257,8 @@ mod tests {
 
         loop_.run_once().await.unwrap();
         assert!(orchestrator.goals.lock().unwrap().is_empty());
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[tokio::test]
@@ -3464,6 +3504,9 @@ mod tests {
 
     #[tokio::test]
     async fn cross_validation_dormant_without_orchestrator_or_workdir() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
         let (_workdir_tmp, workdir) = git_workdir_with_pr_branch();
 
         // No orchestrator: the loop must stay quiet and not panic.
@@ -3506,6 +3549,8 @@ mod tests {
                 .any(|t| t == crate::cross_validation::CROSS_VALIDATE_TASK_KIND),
             "cross-validation must stay dormant without a configured workdir"
         );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[tokio::test]
