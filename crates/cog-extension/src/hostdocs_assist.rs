@@ -71,19 +71,27 @@ const ACTOR: &str = "sandbox-document-organizer";
 /// - `read_refused`: at least one candidate body could not be obtained. Nothing was asked,
 ///   for the same reason as the previous cell -- and which body and why is on the read
 ///   counter, so this cell stays a decision about this station.
-/// - `request_failed`: the channel refused, was unreachable, timed out, or answered with
-///   something that is not a completion. The action is to look at the channel.
+/// - `refused_by_channel`: the channel judged this request and refused it, and said under
+///   which of its own cells. The action is to look at the document (or at the switch), not
+///   at the network -- which the log line names, because the channel's cell is logged
+///   rather than mapped into a second table here. Telling this cell apart from
+///   `request_failed` is why the channel names its refusals on the response: the status is
+///   a 403 either way, so the status alone would fold "a security decision was made" into
+///   "the network is unhappy".
+/// - `request_failed`: nothing judged the request -- unreachable, timed out, or answered
+///   with something that is not a completion. The action is to look at the channel.
 /// - `unparsed`: the completion arrived but did not contain a JSON object of path →
 ///   bucket. The action is to look at the model (or at the prompt), not at the channel.
 /// - `answered`: a mapping came back. It may still be empty -- a model can answer "none of
 ///   these belong to any of those folders", which is a legitimate answer and reads as
 ///   `moved_model` staying at zero.
-pub const ASSIST_OUTCOMES: [&str; 8] = [
+pub const ASSIST_OUTCOMES: [&str; 9] = [
     "switch_off",
     "unconfigured",
     "no_candidates",
     "over_candidates",
     "read_refused",
+    "refused_by_channel",
     "request_failed",
     "unparsed",
     "answered",
@@ -130,6 +138,14 @@ impl AuditedChannel {
                 "request_failed"
             })?;
         let status = response.status();
+        // Read the channel's cell before the body, because reading the body consumes the
+        // response. Its absence is itself information: nothing named a reason, so nothing
+        // judged the request and this is not the channel's refusal to explain.
+        let channel_cell = response
+            .headers()
+            .get(cog_core::host_documents::AUDIT_CELL_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let raw = response.text().await.map_err(|e| {
             warn!(error = %e, "the audited channel answer could not be read");
             "request_failed"
@@ -137,8 +153,20 @@ impl AuditedChannel {
         if !status.is_success() {
             // The body is logged, not returned: it is the upstream's error text, which is
             // what an operator needs to see, and it is not something a caller can act on.
-            warn!(status = %status, body = %truncate_for_log(&raw), "the audited channel refused");
-            return Err("request_failed");
+            // The channel's cell is logged rather than translated: this side would need a
+            // table of the other side's vocabulary to translate it, and a stale copy of
+            // that table reads as a confident wrong answer.
+            let Some(cell) = channel_cell else {
+                warn!(status = %status, body = %truncate_for_log(&raw), "the audited channel call failed without a judgement");
+                return Err("request_failed");
+            };
+            warn!(
+                status = %status,
+                channel_cell = %cell,
+                body = %truncate_for_log(&raw),
+                "the audited channel refused this request"
+            );
+            return Err("refused_by_channel");
         }
         let content = extract_content(&raw).ok_or("unparsed")?;
         parse_mapping(&content).ok_or("unparsed")

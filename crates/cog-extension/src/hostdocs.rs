@@ -3423,6 +3423,35 @@ mod tests {
         (format!("http://{addr}/v1/chat/completions"), seen)
     }
 
+    /// A stand-in for the gateway refusing the call: the same 403 in both of the shapes the
+    /// caller has to tell apart -- one carrying the cell the channel judged the request
+    /// under, one carrying nothing, which is what a refusal from something that is not the
+    /// audited channel looks like.
+    ///
+    /// Both shapes matter: the first is a decision about the document, the second is not a
+    /// decision at all, and a caller that keys off the status alone reads them the same.
+    async fn spawn_refusing_channel(cell: Option<&'static str>) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |_body: String| async move {
+                let mut builder =
+                    axum::http::Response::builder().status(axum::http::StatusCode::FORBIDDEN);
+                if let Some(cell) = cell {
+                    builder = builder.header(cog_core::host_documents::AUDIT_CELL_HEADER, cell);
+                }
+                builder
+                    .body(axum::body::Body::from("document body egress refused"))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/v1/chat/completions")
+    }
+
     /// A scope with two files the table places and one it cannot: the shape of folder that
     /// makes this station's question exist.
     fn mix(cfg: &HostDocsConfig) -> PathBuf {
@@ -3732,6 +3761,36 @@ mod tests {
             "request_failed"
         );
 
+        // refused_by_channel: the channel judged this request and refused it, naming the
+        // cell it recorded the refusal under. The name is the channel's and is logged, not
+        // translated -- what this side keeps is the single cell that says "something
+        // decided, and it was not the network".
+        let (_d9, cfg9) = temp_scope();
+        std::fs::write(scope_root(&cfg9).join("unknown"), b"x").unwrap();
+        let judged_url = spawn_refusing_channel(Some("refused_by_audit")).await;
+        let mut judged_cfg = reading(&cfg9);
+        judged_cfg.audited_llm_url = Some(judged_url);
+        let judged = open_docs(&judged_cfg);
+        assert_eq!(
+            judged.organize("alice").await.unwrap().assist,
+            "refused_by_channel"
+        );
+
+        // The control for the cell above: the same 403 without the channel's name is *not*
+        // that cell. Without this, a caller that counted every 403 as a judgement would
+        // pass the previous assert, and a refusal from anything else in the path -- a proxy,
+        // a misrouted port -- would read as "look at the document".
+        let (_d10, cfg10) = temp_scope();
+        std::fs::write(scope_root(&cfg10).join("unknown"), b"x").unwrap();
+        let anonymous_url = spawn_refusing_channel(None).await;
+        let mut anonymous_cfg = reading(&cfg10);
+        anonymous_cfg.audited_llm_url = Some(anonymous_url);
+        let anonymous = open_docs(&anonymous_cfg);
+        assert_eq!(
+            anonymous.organize("alice").await.unwrap().assist,
+            "request_failed"
+        );
+
         // unparsed: a completion whose text holds no JSON object.
         let (_d7, cfg7) = temp_scope();
         std::fs::write(scope_root(&cfg7).join("unknown"), b"x").unwrap();
@@ -3756,6 +3815,8 @@ mod tests {
             placed.metrics(),
             over.metrics(),
             refusing.metrics(),
+            judged.metrics(),
+            anonymous.metrics(),
             dead_docs.metrics(),
             prose.metrics(),
             answered.metrics(),
@@ -3774,8 +3835,8 @@ mod tests {
         // The organize vocabulary is walked here too, since this is the only test that
         // produces all three of its cells: a run that staged a plan, a run with nothing to
         // do, and a run that was refused (an unknown scope).
-        let (_d9, cfg9) = temp_scope();
-        let nothing = open_docs(&cfg9);
+        let (_d11, cfg11) = temp_scope();
+        let nothing = open_docs(&cfg11);
         assert_eq!(
             nothing.organize("alice").await.unwrap().outcome,
             "nothing_to_do"

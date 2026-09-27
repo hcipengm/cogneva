@@ -16,6 +16,21 @@
 /// Whether document bodies may leave the cluster. Absent means no.
 pub const BODY_EGRESS_ENV: &str = "HOST_DOCS_BODY_EGRESS_ENABLED";
 
+/// The response header a refusal from the audited channel carries: the name of
+/// the cell the channel recorded it under.
+///
+/// A refusal is a 403 either way, so the status alone cannot say *which*
+/// refusal it was, and the caller would then have exactly one word for all of
+/// them -- "the call failed" -- and go looking at the network while the channel
+/// was saying to look at the document. The cell name travels rather than a
+/// boolean because the two sides already share the vocabulary: the channel
+/// publishes these names, and the caller logs the one it was handed without
+/// keeping a table of its own that could go stale.
+///
+/// It is here and not next to either side for the same reason as the switch:
+/// the name is a fact about the pair, so a second spelling of it is a defect.
+pub const AUDIT_CELL_HEADER: &str = "x-cogneva-audited-cell";
+
 /// Whether the switch is on.
 ///
 /// Only an explicit truthy spelling opens it. Absent, empty, misspelled and

@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use cog_core::{MetricName, MetricsBackend};
@@ -93,6 +93,7 @@ pub const AUDITED_REQUESTS: MetricName = cog_core::metric_names::AUDITED_LLM_REQ
 /// enforced where it is made. The executor reads it merely to avoid sending
 /// requests that are certain to be refused; the asymmetry is deliberate.
 pub use cog_core::host_documents::switch_enabled;
+pub use cog_core::host_documents::AUDIT_CELL_HEADER;
 pub use cog_core::host_documents::BODY_EGRESS_ENV;
 
 /// Variable name of the auditable request-body bound
@@ -232,6 +233,27 @@ impl AuditedGate {
     }
 }
 
+/// A refusal, carrying the cell it was recorded under.
+///
+/// The cell goes in a header as well as into the counter and the log, because a
+/// refusal is a 403 either way: without it the caller has one word for all of
+/// them and reads "the channel refused this body" as "the call failed", which
+/// points at the network instead of at the document.
+fn refusal(cell: &'static str, message: String) -> Response {
+    let mut response = (StatusCode::FORBIDDEN, message).into_response();
+    match HeaderValue::from_str(cell) {
+        Ok(value) => {
+            response.headers_mut().insert(AUDIT_CELL_HEADER, value);
+        }
+        // Unreachable for a cell name, and staying silent about it would make a
+        // typo'd name look like a caller that was told nothing.
+        Err(e) => {
+            tracing::warn!(cell, error = %e, "audited channel: cell name would not go in a header")
+        }
+    }
+    response
+}
+
 /// The audited channel's middleware: switch -> read body -> audit -> release.
 ///
 /// The order is deliberate: the switch is outermost. With it closed the body need
@@ -245,13 +267,12 @@ pub async fn enforce(State(gate): State<AuditedGate>, req: Request<Body>, next: 
             path = %req.uri().path(),
             "audited channel closed: a request carrying a document body stopped at the switch"
         );
-        return (
-            StatusCode::FORBIDDEN,
+        return refusal(
+            "blocked_by_switch",
             format!(
                 "audited channel not enabled: {BODY_EGRESS_ENV} is off, so document bodies do not leave the cluster"
             ),
-        )
-            .into_response();
+        );
     }
 
     let (parts, body) = req.into_parts();
@@ -265,11 +286,10 @@ pub async fn enforce(State(gate): State<AuditedGate>, req: Request<Body>, next: 
                 path = %parts.uri.path(),
                 "audited channel: request body over the auditable bound, refused"
             );
-            return (
-                StatusCode::FORBIDDEN,
+            return refusal(
+                "refused_over_bound",
                 format!("request body over the auditable bound ({limit} bytes), refused"),
-            )
-                .into_response();
+            );
         }
         BodyRead::Failed(e) => {
             gate.record("refused_unreadable", 1.0).await;
@@ -278,20 +298,20 @@ pub async fn enforce(State(gate): State<AuditedGate>, req: Request<Body>, next: 
                 path = %parts.uri.path(),
                 "audited channel: request body not read to the end, refused (an unread body cannot be audited)"
             );
-            return (
-                StatusCode::FORBIDDEN,
-                "request body not read to the end, refused (what cannot be audited is not released)",
-            )
-                .into_response();
+            return refusal(
+                "refused_unreadable",
+                "request body not read to the end, refused (what cannot be audited is not released)"
+                    .to_string(),
+            );
         }
     };
 
-    if let Err(refusal) = audit_body(&bytes) {
+    if let Err(audit_refusal) = audit_body(&bytes) {
         // A match names the shape and a non-text body says which kind it is, but
         // **neither echoes the body**: the matched run of bytes is the suspected
         // credential, and copying it into a log or a response stores the very
         // thing this is meant to keep out.
-        let (cell, reason) = match refusal {
+        let (cell, reason) = match audit_refusal {
             AuditRefusal::NotText => ("refused_not_text", "is not UTF-8 text".to_string()),
             AuditRefusal::Credential(kind) => (
                 "refused_by_audit",
@@ -305,11 +325,7 @@ pub async fn enforce(State(gate): State<AuditedGate>, req: Request<Body>, next: 
             path = %parts.uri.path(),
             "audited channel: request body refused by the audit (not scrubbed)"
         );
-        return (
-            StatusCode::FORBIDDEN,
-            format!("request body {reason}, refused"),
-        )
-            .into_response();
+        return refusal(cell, format!("request body {reason}, refused"));
     }
 
     // The release cell is recorded on **the gate's own decision**, not on the
@@ -447,6 +463,14 @@ mod tests {
         }
 
         async fn call_with(app: Router, body: Body) -> (StatusCode, String) {
+            let (status, _named, body) = call_with_cell(app, body).await;
+            (status, body)
+        }
+
+        /// One call, keeping the name the channel put on the response: the only thing a
+        /// caller has to tell a judgement apart from a transport failure, since a refusal
+        /// is a 403 either way.
+        async fn call_with_cell(app: Router, body: Body) -> (StatusCode, Option<String>, String) {
             let resp = app
                 .oneshot(
                     Request::builder()
@@ -459,10 +483,15 @@ mod tests {
                 .await
                 .expect("router is callable");
             let status = resp.status();
+            let named = resp
+                .headers()
+                .get(AUDIT_CELL_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .expect("response body is readable");
-            (status, String::from_utf8_lossy(&bytes).to_string())
+            (status, named, String::from_utf8_lossy(&bytes).to_string())
         }
 
         async fn call(app: Router, body: &str) -> (StatusCode, String) {
@@ -644,6 +673,31 @@ mod tests {
             Body::from_stream(broken)
         }
 
+        /// One scenario end to end: the cell the request was counted under, and the name
+        /// the same request put on its response.
+        async fn scenario(
+            gate: AuditedGate,
+            metrics: &Arc<cog_storage::mem::MemoryMetricsBackend>,
+            body: Body,
+        ) -> (String, Option<String>) {
+            let (_status, named, _body) = call_with_cell(app(gate), body).await;
+            (sole_nonzero_cell(metrics).await, named)
+        }
+
+        /// The counted name and the travelled name are the same word.
+        ///
+        /// The caller logs one and the operator reads the other. If they can differ, the
+        /// log line that a person acts on cannot be checked against any reading on the
+        /// channel -- and the two would be read as one refusal until somebody compares
+        /// them by hand.
+        fn assert_named(counted: &str, named: Option<String>) {
+            assert_eq!(
+                named.as_deref(),
+                Some(counted),
+                "a refusal has to travel named: counted under {counted}, the response said {named:?}"
+            );
+        }
+
         /// Every cell of the vocabulary has to be actually reachable.
         ///
         /// A judgement surface narrower than the set of causes reads two causes the
@@ -652,6 +706,11 @@ mod tests {
         /// produces. This walks all six cells and collects each one's **measured**
         /// landing cell (not a hard-coded expectation), so a missing one is reported
         /// as a missing one.
+        ///
+        /// The walk also pins the other half of every refusal: the name that travels
+        /// back on the response is the name the request was counted under, and the one
+        /// outcome that is not a refusal carries no name at all. A caller cannot
+        /// separate "a judgement was made" from "the transport failed" without it.
         #[tokio::test]
         async fn every_published_outcome_is_reachable() {
             let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -659,43 +718,66 @@ mod tests {
             // Closed: the switch stops it
             let (gate, metrics) = audited_gate(false);
             gate.publish_vocabulary().await;
-            call(app(gate), "{}").await;
-            seen.insert(sole_nonzero_cell(&metrics).await);
+            let (counted, named) = scenario(gate, &metrics, Body::from("{}")).await;
+            assert_named(&counted, named);
+            seen.insert(counted);
 
-            // Open + an ordinary body: released
+            // Open + an ordinary body: released -- and named by nobody, because nothing
+            // refused it and a name here would make the caller report a judgement that
+            // never happened.
             let (gate, metrics) = audited_gate(true);
             gate.publish_vocabulary().await;
-            call(app(gate), r#"{"messages":[{"content":"ordinary body"}]}"#).await;
-            seen.insert(sole_nonzero_cell(&metrics).await);
+            let (counted, named) = scenario(
+                gate,
+                &metrics,
+                Body::from(r#"{"messages":[{"content":"ordinary body"}]}"#),
+            )
+            .await;
+            assert_eq!(counted, "released");
+            assert!(
+                named.is_none(),
+                "a released request must not be labelled as a refusal: {named:?}"
+            );
+            seen.insert(counted);
 
             // Open + a credential shape: the judge hit
             let (gate, metrics) = audited_gate(true);
             gate.publish_vocabulary().await;
-            call(app(gate), r#"{"content":"ghp_abcdefghijklmnopqrstuvwx"}"#).await;
-            seen.insert(sole_nonzero_cell(&metrics).await);
+            let (counted, named) = scenario(
+                gate,
+                &metrics,
+                Body::from(r#"{"content":"ghp_abcdefghijklmnopqrstuvwx"}"#),
+            )
+            .await;
+            assert_named(&counted, named);
+            seen.insert(counted);
 
             // Open + not text
             let (gate, metrics) = audited_gate(true);
             gate.publish_vocabulary().await;
-            call_with(app(gate), Body::from(vec![0xffu8, 0xfe])).await;
-            seen.insert(sole_nonzero_cell(&metrics).await);
+            let (counted, named) = scenario(gate, &metrics, Body::from(vec![0xffu8, 0xfe])).await;
+            assert_named(&counted, named);
+            seen.insert(counted);
 
             // Open + over the bound (turned down to 4 bytes)
             let metrics = Arc::new(cog_storage::mem::MemoryMetricsBackend::new());
             let gate = AuditedGate::new(true, 4, metrics.clone());
             gate.publish_vocabulary().await;
-            call(
-                app(gate),
-                r#"{"a":"this string is longer than four bytes"}"#,
+            let (counted, named) = scenario(
+                gate,
+                &metrics,
+                Body::from(r#"{"a":"this string is longer than four bytes"}"#),
             )
             .await;
-            seen.insert(sole_nonzero_cell(&metrics).await);
+            assert_named(&counted, named);
+            seen.insert(counted);
 
             // Open + a failed read
             let (gate, metrics) = audited_gate(true);
             gate.publish_vocabulary().await;
-            call_with(app(gate), broken_body()).await;
-            seen.insert(sole_nonzero_cell(&metrics).await);
+            let (counted, named) = scenario(gate, &metrics, broken_body()).await;
+            assert_named(&counted, named);
+            seen.insert(counted);
 
             let expected: BTreeSet<String> =
                 AUDITED_OUTCOMES.iter().map(|c| c.to_string()).collect();
