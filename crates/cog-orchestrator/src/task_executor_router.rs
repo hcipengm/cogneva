@@ -387,6 +387,13 @@ impl TaskExecutorRouter {
         // Notify orchestrator that task is now running.
         if let Some(ref orch) = self.orchestrator {
             if let Err(e) = orch.start_task(&task.id).await {
+                // start_task 是 Scheduled→Running 的唯一转移：它失败了而消
+                // 息继续被执行并 ack，任务就永久留在 Scheduled——消息已被
+                // 消费、执行也跑了，complete 却因状态非 Running 落不了库，
+                // 队列读数干净，publisher 只扫 Pending、超时检查器只收
+                // Running，谁也看不见它，直到 stalled-Scheduled 清扫为它再
+                // 付一次重试预算。这就是 dag_task_stalled_after_ready 的根。
+                //
                 // 领域拒绝（TaskFailed：任务不存在/已在跑/已终态）说明这条
                 // ready 消息是历史残留或重复投递——执行无意义，结果也无法
                 // 落库（complete 要求 Running），ack 后直接丢弃，避免白跑
@@ -407,7 +414,13 @@ impl TaskExecutorRouter {
                     }
                     return;
                 }
-                tracing::warn!(task_id = %task.id, "Failed to start task via orchestrator: {e}");
+                // 基础设施抖动：不执行、不 ack。消息留在 PEL，超过 idle 阈
+                // 值后由清扫器重新认领并完整重走管线——重投时要么 start_task
+                // 成功，要么任务已被 stalled-Scheduled 清扫收回而落入上面的
+                // 领域拒绝分支。传输层的重投窗口先于调度层的 reclaim 窗口，
+                // 抖动在烧重试预算之前就被总线自己补上了。
+                tracing::warn!(task_id = %task.id, msg_id = %msg_id, "start_task failed transiently ({e}); leaving the ready message unacked for transport redelivery");
+                return;
             }
         }
 
@@ -496,6 +509,13 @@ struct ReadyPipeline {
     ready_stream: String,
     group: String,
     workspace_id: String,
+}
+
+/// start_task 失败的处置边界：领域拒绝（任务不存在/已在跑/已终态）说明这
+/// 条 ready 消息是残留，ack 丢弃；其余都是基础设施抖动，消息必须留在
+/// PEL 交给清扫器重投，绝不能在 DAG 不知情的情况下继续执行。
+fn start_failure_is_stale(e: &SFError) -> bool {
+    matches!(e, cog_core::SFError::TaskFailed { .. })
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -787,6 +807,17 @@ mod ready_pipeline_tests {
         assert!(matches!(msg, DagMessage::TaskComplete { .. }));
         let acks = backend.acks.lock().await;
         assert_eq!(acks[0].2, vec!["m-ok".to_string()]);
+    }
+
+    #[test]
+    fn transient_start_failure_is_not_treated_as_stale() {
+        // 回归：start_task 的非领域失败曾被「继续执行」处理——消息随后被
+        // ack，任务留在 Scheduled，直到 stalled-Scheduled 清扫为它再付一次
+        // 重试预算（dag_task_stalled_after_ready）。只有领域拒绝才算残留可
+        // 丢弃；基础设施抖动必须留给传输层重投。
+        assert!(!start_failure_is_stale(&SFError::Agent(
+            "state backend blip".into()
+        )));
     }
 
     struct QueueBackend {
