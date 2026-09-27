@@ -551,7 +551,17 @@ impl ReflectionEngine {
         }
 
         let is_code_related = matches!(l.category, cog_core::LearningCategory::Correction);
-        if is_code_related && l.recurrence_count >= self.change_recurrence_threshold {
+        // Two ways to be mature enough to generate for, because the two kinds of
+        // record are not the same kind of thing. A self-review pattern has to be
+        // seen `change_recurrence_threshold` times before it is a defect rather
+        // than a coincidence. A refusal was already a verdict on one artifact
+        // the system chose to submit, and its evidence was a full test run: the
+        // first one is worth acting on, and holding it until the count matured
+        // is how the same defect got generated, refused and generated again.
+        let refused_by_a_gate = matches!(l.source, cog_core::LearningSource::ChangeRefusal);
+        if is_code_related
+            && (refused_by_a_gate || l.recurrence_count >= self.change_recurrence_threshold)
+        {
             let change_key = format!(
                 "change:{}:{:?}",
                 l.pattern_key.as_deref().unwrap_or("unknown"),
@@ -559,7 +569,15 @@ impl ReflectionEngine {
             );
             if self.check_evolution_cooldown(&change_key).await {
                 if let Some(ref evolution) = self.evolution {
-                    let module_description = format!("{:?} module", l.area);
+                    // The refused files are the requirement when they are known:
+                    // they are what the gate said was wrong, and naming them is
+                    // the difference between a next attempt that can find the
+                    // defect and one that searches a whole crate for it.
+                    let module_description = if l.related_files.is_empty() {
+                        format!("{:?} module", l.area)
+                    } else {
+                        format!("Fix the defect in: {}", l.related_files.join(", "))
+                    };
                     let learning_context = format!(
                         "Recurring {:?} ({}x): {}. Suggested fix: {}",
                         l.category, l.recurrence_count, l.details, l.suggested_action
@@ -567,7 +585,8 @@ impl ReflectionEngine {
                     tracing::info!(
                         learning_id = %l.id,
                         recurrence = l.recurrence_count,
-                        "Triggering generate_code_change for recurring code defect"
+                        refused_by_a_gate,
+                        "Triggering generate_code_change for a code defect"
                     );
                     if let Err(e) = evolution
                         .generate_code_change(&module_description, &learning_context)
@@ -903,10 +922,21 @@ impl ReflectionEngine {
                 "Read what the {} check reported before generating for this again",
                 cause.as_str()
             ),
-            cog_core::LearningSource::SelfReview,
+            cog_core::LearningSource::ChangeRefusal,
         );
         learning.pattern_key = Some(refusal_pattern_key(cause, files));
         learning.rejection_cause = Some(cause);
+        // The refused files travel as data, not only inside the prose of
+        // `details`, because they are the target of the generation this record
+        // may trigger: a requirement that says "Backend module" sends the next
+        // attempt looking for the defect anywhere in a crate when the gate
+        // named the file. Sorted and deduplicated the way the pattern key
+        // spells them, so one refusal is one target set.
+        learning.related_files = named_files(files)
+            .split(',')
+            .filter(|file| !file.is_empty())
+            .map(str::to_string)
+            .collect();
         learning.related_tasks.push(change_id.to_string());
         self.recorder.record_learning(learning.clone()).await?;
         self.matcher.update_recurrence(&mut learning).await?;
@@ -1177,8 +1207,30 @@ mod tests {
 
     /// A fake LLM that counts chat_stream invocations and returns a minimal
     /// valid JSON payload so EvolutionEngine methods do not panic.
+    ///
+    /// It also keeps the prompts when given somewhere to keep them. A test that
+    /// only counts calls can say a generation happened but not that it was
+    /// asked for the right thing, and "what the requirement named" is the whole
+    /// question when a refusal decides what the next attempt is told to fix.
     struct CountingLlm {
         calls: Arc<tokio::sync::Mutex<u32>>,
+        prompts: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+    }
+
+    impl CountingLlm {
+        async fn note(&self, messages: &[cog_core::Message]) {
+            let mut calls = self.calls.lock().await;
+            *calls += 1;
+            drop(calls);
+            if let Some(prompts) = &self.prompts {
+                let rendered = messages
+                    .iter()
+                    .map(|message| message.content())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                prompts.lock().await.push(rendered);
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1188,9 +1240,7 @@ mod tests {
             _messages: &[cog_core::Message],
             _options: &cog_core::ChatOptions,
         ) -> cog_core::SFResult<cog_core::ChatResponse> {
-            let mut calls = self.calls.lock().await;
-            *calls += 1;
-            drop(calls);
+            self.note(_messages).await;
             Ok(cog_core::ChatResponse {
                 content: vec![cog_core::ContentBlock::text(
                     r#"{"name":"auto_tool","description":"auto","parameters":{"type":"object"}}"#,
@@ -1213,9 +1263,7 @@ mod tests {
             _messages: &[cog_core::Message],
             _options: &cog_core::ChatOptions,
         ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            let mut calls = self.calls.lock().await;
-            *calls += 1;
-            drop(calls);
+            self.note(_messages).await;
             fake_stream_from_text(
                 r#"{"name":"auto_tool","description":"auto","parameters":{"type":"object"}}"#,
             )
@@ -1241,6 +1289,7 @@ mod tests {
         let calls = Arc::new(tokio::sync::Mutex::new(0u32));
         let llm: Arc<dyn cog_core::LlmClient> = Arc::new(CountingLlm {
             calls: calls.clone(),
+            prompts: None,
         });
         engine.evolution = Some(Arc::new(EvolutionEngine::new(
             llm,
@@ -1298,6 +1347,7 @@ mod tests {
         let calls = Arc::new(tokio::sync::Mutex::new(0u32));
         let llm: Arc<dyn cog_core::LlmClient> = Arc::new(CountingLlm {
             calls: calls.clone(),
+            prompts: None,
         });
         engine.evolution = Some(Arc::new(EvolutionEngine::new(llm, registry, None)));
         // Lower thresholds.
@@ -1675,15 +1725,14 @@ mod tests {
         assert_eq!(listed[0].status, EvolutionStatus::Generated);
     }
 
-    /// A refusal is recorded in order to be acted on, and the chain that acts
-    /// on learnings — recurrence over the threshold, then generation — was
-    /// reachable from self-review and from context but not from a refused
-    /// change, which ends at the recorder. The whole point of the record is
-    /// that the second refusal of the same defect is worth a generation.
+    /// A refusal is a verdict, not a pattern, so the first one is worth acting
+    /// on. Waiting for the count to mature is what left the diagnosis undelivered
+    /// — the observed recurrence was one or two refusals, and the threshold is
+    /// five — while the same intent was regenerated from scratch by a path that
+    /// knew nothing about the refusal.
     #[tokio::test]
-    async fn a_repeated_refusal_reaches_generation() {
-        let (mut engine, calls) = engine_that_counts_generation();
-        engine.change_recurrence_threshold = 2;
+    async fn a_refusal_reaches_generation_on_the_first_one() {
+        let (mut engine, calls, prompts) = engine_that_records_generation();
         engine.set_cooldown_secs(0);
 
         let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
@@ -1693,9 +1742,83 @@ mod tests {
             .unwrap();
         assert_eq!(
             *calls.lock().await,
-            0,
-            "one refusal is not a recurrence worth generating for"
+            1,
+            "the first refusal is the one that carries evidence nothing else has"
         );
+
+        let asked = prompts.lock().await.join("\n");
+        assert!(
+            asked.contains("crates/x/src/lib.rs"),
+            "the requirement has to name the file the gate refused on, not just \
+             the area it lives in; got:\n{asked}"
+        );
+    }
+
+    /// The control for the test above: the threshold has not gone away, it just
+    /// no longer applies to a verdict. A self-review pattern still has to be
+    /// seen often enough to be a defect rather than a coincidence, and this is
+    /// what stops "generate on the first record" from becoming "generate on
+    /// every record".
+    #[tokio::test]
+    async fn a_self_review_pattern_still_waits_for_its_threshold() {
+        let (mut engine, calls, _) = engine_that_records_generation();
+        engine.change_recurrence_threshold = 5;
+        // The hook trigger shares this path and fires from three occurrences, so
+        // it is pushed out of the way: this test is about the change threshold,
+        // and a call it did not cause would read as one it did.
+        engine.hook_recurrence_threshold = 99;
+        engine.set_cooldown_secs(0);
+
+        let mut learning = cog_core::Learning::new(
+            cog_core::LearningCategory::Correction,
+            cog_core::Priority::High,
+            cog_core::Area::Backend,
+            "a pattern",
+            "seen once",
+            "look at it",
+            cog_core::LearningSource::SelfReview,
+        );
+        learning.pattern_key = Some("change:a-pattern:Backend".into());
+
+        for seen in 1..5 {
+            learning.recurrence_count = seen;
+            engine
+                .maybe_trigger_evolution_from_learning(&learning)
+                .await;
+            assert_eq!(
+                *calls.lock().await,
+                0,
+                "a self-review pattern seen {seen} times is still below its threshold of 5"
+            );
+        }
+
+        learning.recurrence_count = 5;
+        engine
+            .maybe_trigger_evolution_from_learning(&learning)
+            .await;
+        assert_eq!(
+            *calls.lock().await,
+            1,
+            "at the threshold it generates, as it always did"
+        );
+    }
+
+    /// Two refusals of different criteria are different defects, and the
+    /// cooldown that keeps one defect from being regenerated every cycle must
+    /// not swallow the other. The key that separates them is the criterion plus
+    /// the files, so this is also the test that the key is what the cooldown
+    /// reads.
+    #[tokio::test]
+    async fn one_criterion_s_cooldown_does_not_swallow_another() {
+        let (mut engine, calls, _) = engine_that_records_generation();
+        engine.set_cooldown_secs(3600);
+
+        let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
+        engine
+            .record_change_refusal("c-1", cog_core::RejectionCause::TestsFailed, &files, "boom")
+            .await
+            .unwrap();
+        assert_eq!(*calls.lock().await, 1, "the first refusal generates");
 
         engine
             .record_change_refusal("c-2", cog_core::RejectionCause::TestsFailed, &files, "boom")
@@ -1704,29 +1827,12 @@ mod tests {
         assert_eq!(
             *calls.lock().await,
             1,
-            "the same criterion failing again on the same file is the recurrence \
-             the generation trigger exists for"
+            "the same defect again inside the cooldown is not regenerated"
         );
-    }
 
-    /// The other half: two refusals of different criteria are not each other's
-    /// recurrence, however alike the prose they carry. Merged, they would mature
-    /// twice as fast and the generation they trigger would be aimed at a check
-    /// that only one of them actually failed.
-    #[tokio::test]
-    async fn a_different_criterion_is_not_the_same_recurrence() {
-        let (mut engine, calls) = engine_that_counts_generation();
-        engine.change_recurrence_threshold = 2;
-        engine.set_cooldown_secs(0);
-
-        let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
-        engine
-            .record_change_refusal("c-1", cog_core::RejectionCause::TestsFailed, &files, "boom")
-            .await
-            .unwrap();
         engine
             .record_change_refusal(
-                "c-2",
+                "c-3",
                 cog_core::RejectionCause::MalformedDiff,
                 &files,
                 "boom",
@@ -1735,8 +1841,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             *calls.lock().await,
-            0,
-            "a refusal by one check did not recur as a refusal by another"
+            2,
+            "a refusal by a different check is a different defect, and the first \
+             one's cooldown does not silence it"
         );
     }
 
@@ -1779,19 +1886,30 @@ mod tests {
         );
     }
 
-    /// An engine whose generation attempts are counted rather than performed.
-    fn engine_that_counts_generation() -> (ReflectionEngine, Arc<tokio::sync::Mutex<u32>>) {
+    /// An engine whose generation attempts are counted rather than performed,
+    /// and whose prompts are kept.
+    ///
+    /// A count can say a generation happened; only the prompt can say what it
+    /// was asked to fix, which is the question a refusal is supposed to answer.
+    #[allow(clippy::type_complexity)]
+    fn engine_that_records_generation() -> (
+        ReflectionEngine,
+        Arc<tokio::sync::Mutex<u32>>,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) {
         let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
         let mut engine = ReflectionEngine::new_in_memory(registry);
         let calls = Arc::new(tokio::sync::Mutex::new(0u32));
+        let prompts = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let llm: Arc<dyn cog_core::LlmClient> = Arc::new(CountingLlm {
             calls: calls.clone(),
+            prompts: Some(prompts.clone()),
         });
         engine.evolution = Some(Arc::new(EvolutionEngine::new(
             llm,
             Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
             None,
         )));
-        (engine, calls)
+        (engine, calls, prompts)
     }
 }

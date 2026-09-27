@@ -1349,6 +1349,19 @@ pub enum LearningSource {
     Error,
     UserFeedback,
     SelfReview,
+    /// A deterministic gate criterion refused an artifact this system produced.
+    ///
+    /// Its own variant because the downstream decision it feeds is a different
+    /// kind of decision. Every other source is a *pattern* — an observation that
+    /// only means something once it has been seen often enough to be worth
+    /// acting on, which is what a recurrence threshold is for. A refusal is a
+    /// *verdict*: one artifact, submitted on purpose, read by a check that needs
+    /// no judgement, and it says which files it was refused on. Its evidence is
+    /// already paid for, so the first one is worth acting on, and counting it
+    /// before telling anyone is what let the same defect be generated, refused
+    /// and generated again. The count stays as a reading of how often a defect
+    /// comes back; it is not the price of being told about the first one.
+    ChangeRefusal,
 }
 
 /// How a learning entry was resolved.
