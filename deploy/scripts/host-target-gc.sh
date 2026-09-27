@@ -18,6 +18,11 @@
 #   profile     the profile directory itself: this is the full-rebuild tier and
 #               is why it is last
 #
+# COGNEVA_TARGET_GC_DRY_RUN=1 prints the plan and releases nothing. It answers
+# the same way at any water level -- a plan is a question about what a run would
+# do, not about whether today is the day -- and it reports `planned` rather than
+# `released`, because a reading that cannot tell those apart is worse than none.
+#
 # What it refuses to do, each refusal a reading rather than a guess:
 #   - deletes only directories carrying cargo's own cache tag, so a directory
 #     that merely is named `target` is never a candidate;
@@ -222,7 +227,10 @@ find_candidates() {
 tier_stale() {
     local minutes=$((stale_days * 24 * 60))
     if [ "${dry_run}" = 1 ]; then
-        find "$1" -type f -mmin "+${minutes}" -printf '%s\t%p\n' 2>/dev/null || true
+        local count size
+        read -r count size < <(find "$1" -type f -mmin "+${minutes}" -printf '%s\n' 2>/dev/null |
+            awk '{ n++; s += $1 } END { print n + 0, s + 0 }')
+        log "dry run would release ${count} stale file(s) under $1 ($(human_kb "${size}"))"
         return 0
     fi
     find "$1" -type f -mmin "+${minutes}" -delete 2>/dev/null || true
@@ -304,9 +312,15 @@ work_fs="$(fs_identity "${work_root}")"
 [ -n "${work_fs}" ] || die "cannot read which filesystem ${work_root} is on"
 
 if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
-    log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}%"
-    report below_trigger 0 0 0 0
-    exit 0
+    # A dry run is a question about what the plan would be, not about whether
+    # today is the day: it answers the same way at 33% as at 80%. A real run
+    # below the trigger has nothing to say, so it says only that.
+    if [ "${dry_run}" != 1 ]; then
+        log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}%"
+        report below_trigger 0 0 0 0
+        exit 0
+    fi
+    log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}% -- this is a dry run, so the plan below is what a run would do on the day the trigger is reached"
 fi
 
 mapfile -t candidates < <(find_candidates)
@@ -349,7 +363,12 @@ for tier in ${TIERS}; do
 
     progressed=0
     for target in "${candidates[@]}"; do
-        [ "${disk_pct}" -gt "${floor_pct}" ] || break
+        # A dry run releases nothing, so the reading never moves and the floor
+        # can never be reached: it walks every tier and every candidate, which
+        # is what makes it a plan rather than a first step.
+        if [ "${dry_run}" != 1 ]; then
+            [ "${disk_pct}" -gt "${floor_pct}" ] || break
+        fi
         if [ "$(fs_identity "${target}")" != "${work_fs}" ]; then
             continue
         fi
@@ -364,6 +383,9 @@ for tier in ${TIERS}; do
         read_disk "${work_root}"
     done
 
+    if [ "${dry_run}" = 1 ]; then
+        continue
+    fi
     if [ "${disk_pct}" -le "${floor_pct}" ]; then
         outcome="released"
         break
@@ -377,7 +399,11 @@ released_kb=$((before_used_kb - disk_used_kb))
 [ "${released_kb}" -gt 0 ] || released_kb=0
 
 if [ "${outcome}" != probe_failed ]; then
-    if [ "${disk_pct}" -le "${floor_pct}" ]; then
+    if [ "${dry_run}" = 1 ]; then
+        # Nothing was released, so "released" and "floor_unreachable" would both
+        # be statements about a run that did not happen: the plan is the reading.
+        outcome="planned"
+    elif [ "${disk_pct}" -le "${floor_pct}" ]; then
         outcome="released"
     elif [ "${any_progress:-0}" = 1 ]; then
         outcome="floor_unreachable"
@@ -392,5 +418,8 @@ printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% rel
     "$(human_kb "${released_kb}")" "${gap}" "${covered}" "${skipped}" "${unreadable:-0}"
 if [ "${outcome}" = floor_unreachable ]; then
     log "still above the trigger after every tier: the build cache is not what is filling this filesystem (gap ${gap} points)"
+fi
+if [ "${outcome}" = planned ]; then
+    log "dry run: nothing was released, so this plan is what a run would do today, not what happened"
 fi
 write_state "${outcome}" "${released_kb}" "${gap}" "${covered}" "${skipped}" "${unreadable:-0}"

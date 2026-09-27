@@ -199,13 +199,39 @@ grep -q 'outcome=floor_unreachable' <<<"${out}" \
 grep -q 'cache is not what is filling' <<<"${out}" \
   || fail "够不到地板时没有把「缓存不是原因」说出来：${out}"
 
-# --- 8) the run leaves its own reading ---------------------------------------
+# --- 8) a dry run is a plan, at any water level ------------------------------
+# The plan is what an operator asks for while deciding, and the asking does not
+# wait for the day the disk is above the trigger. So a dry run answers below the
+# trigger too, walks every tier (nothing it does can move the reading, so the
+# floor never ends the pass), and reports `planned` -- not `released`, which
+# would be a statement about a run that did not happen.
+dry_tree="$(new_tree dryrun "${signature}")"
+cat >"${work}/reader-below" <<'EOF'
+#!/usr/bin/env bash
+echo '400000 40'
+EOF
+chmod +x "${work}/reader-below"
+out="$(env COGNEVA_HOST_WORK_ROOT="$work/host" COGNEVA_TARGET_GC_STATE="$work/state-dry.json" \
+  COGNEVA_TARGET_GC_DISK_READER="${work}/reader-below" COGNEVA_TARGET_GC_DRY_RUN=1 \
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50 bash "${gc}" 2>&1)"
+grep -q 'outcome=planned' <<<"${out}" || fail "dry run 没有报 planned：${out}"
+grep -q 'below trigger' <<<"${out}" \
+  || fail "dry run 在触发线以下没有说明它给的仍然是计划：${out}"
+grep -q 'stale file(s) under' <<<"${out}" \
+  || fail "dry run 没有报第一档会释放多少：${out}"
+grep -q 'full rebuild of this tree' <<<"${out}" \
+  || fail "dry run 没有走到最深的档；计划不等于只走第一步：${out}"
+[ -f "${dry_tree}/debug/deps/libstale.rlib" ] || fail "dry run 删了过期产物"
+[ -d "${dry_tree}/debug/incremental" ] || fail "dry run 删了增量缓存"
+[ -d "${dry_tree}/llvm-cov-target" ] || fail "dry run 删了覆盖率目录"
+
+# --- 9) the run leaves its own reading ---------------------------------------
 state="$(cat "$work/state.json")"
 for key in outcome used_pct_before used_pct_after released_bytes gap_pct; do
   grep -q "\"${key}\":" <<<"${state}" || fail "状态文件里没有 ${key}：${state}"
 done
 
-# --- 9) the carrier: a timer, wired from computed paths ----------------------
+# --- 10) the carrier: a timer, wired from computed paths ---------------------
 # The reclaimer is only worth anything if something runs it. The unit is
 # generated rather than kept as a file, because a unit file with a path in it is
 # a path someone has to keep true by hand; systemctl is stubbed here so that
@@ -256,4 +282,4 @@ for bad in "relative/root" "${work}/not-there"; do
   fi
 done
 
-echo "PASS: 工作根不猜、低于触发线不动手、四档按序升级并在地板停手、名字不够格不当候选、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、每次运行都留下自己的读数、载体是算出来的定时器且启用后回读排期"
+echo "PASS: 工作根不猜、低于触发线不动手、四档按序升级并在地板停手、名字不够格不当候选、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、dry run 在任何水位都给计划且不删、每次运行都留下自己的读数、载体是算出来的定时器且启用后回读排期"
