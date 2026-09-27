@@ -32,6 +32,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::hostdocs_assist::{
+    build_prompt, truncate_body, AuditedChannel, ASSIST_MAX_BODY_BYTES_ENV,
+    ASSIST_MAX_CANDIDATES_ENV, ASSIST_OUTCOMES, DEFAULT_ASSIST_MAX_BODY_BYTES,
+    DEFAULT_ASSIST_MAX_CANDIDATES, URL_ENV as AUDITED_LLM_URL_ENV,
+};
+use crate::hostdocs_organizer::{
+    propose, OrganizeProposal, OrganizeRules, CLASSIFIED_OUTCOMES, DEFAULT_RULES, ORGANIZE_OUTCOMES,
+};
 use cog_core::host_documents::{switch_enabled_env, BODY_EGRESS_ENV};
 use cog_core::{SFError, SFResult};
 use prometheus::{CounterVec, Encoder, Gauge, Opts, Registry, TextEncoder};
@@ -96,6 +104,16 @@ fn env_positive(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Read a URL from the environment. Blank or absent means "not configured" rather than an
+/// empty string: a URL that is present but empty would be a request sent nowhere, which
+/// reads as a channel that is up and answering nothing.
+fn env_url(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Read a duration in seconds from the environment, with a floor: a value under the
 /// floor takes effect as the floor.
 ///
@@ -127,6 +145,19 @@ pub struct HostDocsConfig {
     pub max_list_entries: usize,
     pub approval_ttl_secs: u64,
     pub max_plan_bytes: usize,
+    /// What name-based classification makes of a file. A table rather than a
+    /// constant because the shape of someone's documents is theirs; see
+    /// [`crate::hostdocs_organizer`].
+    pub classify_rules: OrganizeRules,
+    /// Where the audited channel lives. `None` means the model station is not wired up, and
+    /// a run then does what the rules alone can do -- which is also what happens while the
+    /// egress switch is off, and both states are readable on the assist counter.
+    pub audited_llm_url: Option<String>,
+    /// How many bytes of one body the question carries, and how many files one question
+    /// covers. Both are "do less" bounds: past either of them no question is asked at all
+    /// rather than a partial one.
+    pub assist_max_body_bytes: usize,
+    pub assist_max_candidates: usize,
 }
 
 impl HostDocsConfig {
@@ -151,6 +182,12 @@ impl HostDocsConfig {
             MIN_APPROVAL_TTL_SECS,
         );
         cfg.max_plan_bytes = env_positive(MAX_PLAN_BYTES_ENV, DEFAULT_MAX_PLAN_BYTES);
+        cfg.classify_rules = OrganizeRules::from_env();
+        cfg.audited_llm_url = env_url(AUDITED_LLM_URL_ENV);
+        cfg.assist_max_body_bytes =
+            env_positive(ASSIST_MAX_BODY_BYTES_ENV, DEFAULT_ASSIST_MAX_BODY_BYTES);
+        cfg.assist_max_candidates =
+            env_positive(ASSIST_MAX_CANDIDATES_ENV, DEFAULT_ASSIST_MAX_CANDIDATES);
         cfg
     }
 
@@ -198,6 +235,13 @@ impl HostDocsConfig {
             max_list_entries: DEFAULT_MAX_LIST_ENTRIES,
             approval_ttl_secs: DEFAULT_APPROVAL_TTL_SECS,
             max_plan_bytes: DEFAULT_MAX_PLAN_BYTES,
+            classify_rules: OrganizeRules::parse(DEFAULT_RULES),
+            // Off unless a deployment says where the channel is: the switch that decides
+            // whether bodies may leave is a separate reading, and a URL alone does not
+            // open it.
+            audited_llm_url: None,
+            assist_max_body_bytes: DEFAULT_ASSIST_MAX_BODY_BYTES,
+            assist_max_candidates: DEFAULT_ASSIST_MAX_CANDIDATES,
         }
     }
 
@@ -233,7 +277,7 @@ impl HostDocOp {
 
     /// The relative locations this operation names, in the order the paths
     /// matter (source before destination).
-    fn rel_paths(&self) -> Vec<&String> {
+    pub(crate) fn rel_paths(&self) -> Vec<&String> {
         match self {
             Self::Mkdir { path } => vec![path],
             Self::Rename { from, to } => vec![from, to],
@@ -478,6 +522,38 @@ pub const APPLY_OUTCOMES: [&str; 8] = [
     "released",
 ];
 
+/// What one organize run did, in the same words its counter uses. Kept next to the
+/// apply vocabulary rather than inside the organizer because the run also includes the
+/// staging this process performs afterwards -- the organizer only decides.
+///
+/// The counters here are the two halves a caller has to keep apart: `staged` says the
+/// plan went somewhere a person can look at it, while `nothing_to_do` says the rules
+/// and the folder together proposed no change at all. Both are successes, and an
+/// operator reading only "did it work" cannot tell a folder already in order from a
+/// table that matches nothing in it -- that split is in the classification counts.
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDocOrganize {
+    pub scope: String,
+    /// From [`ORGANIZE_OUTCOMES`].
+    pub outcome: &'static str,
+    /// One entry per cell in [`CLASSIFIED_OUTCOMES`], zeros included. This is the
+    /// answer to "why did nothing move": the run's own outcome cannot say it.
+    pub counts: BTreeMap<&'static str, usize>,
+    /// What the model station did, from [`ASSIST_OUTCOMES`], and how many files it was
+    /// asked about. Both travel with the answer because `moved_model` alone cannot say
+    /// whether the station was skipped, refused or answered with nothing.
+    pub assist: &'static str,
+    pub assist_candidates: usize,
+    /// How many of those bodies were cut to fit the question. The answer was about their
+    /// beginnings, and whoever compares the plan against the files is entitled to know.
+    pub assist_bodies_truncated: usize,
+    pub proposal: OrganizeProposal,
+    /// Present exactly when `outcome` is `staged`. It carries the plan hash and the
+    /// staging id, so the answer is the handle a person approves -- organizing is not a
+    /// licence to move files without review, it is the step that produces the plan.
+    pub staged: Option<StagedPlanView>,
+}
+
 /// One staged plan awaiting approval, together with what has happened to it.
 ///
 /// The state **is not stored in a separate field**: it is derived from the times and the
@@ -630,6 +706,28 @@ impl StagedLoad {
     }
 }
 
+/// What the model station decided about one run: the cell to count, the hints it produced
+/// (none, on every refusal), and what it took to ask.
+struct AskOutcome {
+    outcome: &'static str,
+    hints: BTreeMap<String, String>,
+    /// How many bodies went into the question. Zero on every refusal, which is the point:
+    /// the cell says nothing left, not "nothing was learned".
+    candidates: usize,
+    truncated: usize,
+}
+
+impl AskOutcome {
+    fn refused(outcome: &'static str) -> Self {
+        Self {
+            outcome,
+            hints: BTreeMap::new(),
+            candidates: 0,
+            truncated: 0,
+        }
+    }
+}
+
 struct HostDocsMetrics {
     registry: Registry,
     ops: CounterVec,
@@ -637,6 +735,9 @@ struct HostDocsMetrics {
     lists: CounterVec,
     reads: CounterVec,
     gates: CounterVec,
+    organized: CounterVec,
+    classified: CounterVec,
+    assist: CounterVec,
 }
 
 impl HostDocsMetrics {
@@ -681,12 +782,40 @@ impl HostDocsMetrics {
             ),
             &["outcome"],
         )?;
+        let organized = CounterVec::new(
+            Opts::new(
+                "sandbox_host_docs_organize_total",
+                "Host document organize runs by what they ended as",
+            ),
+            &["outcome"],
+        )?;
+        // The classification face is separate from the run's outcome on purpose: "nothing
+        // to do" is what a directory whose files all have no rule looks like, and it is
+        // also what an empty directory looks like. Only the per-reason split separates
+        // "the table covers this folder" from "the table does not".
+        let classified = CounterVec::new(
+            Opts::new(
+                "sandbox_host_docs_classified_total",
+                "Host document entries by what classification decided about them",
+            ),
+            &["outcome"],
+        )?;
         registry.register(Box::new(scopes.clone()))?;
         registry.register(Box::new(ops.clone()))?;
         registry.register(Box::new(rollbacks.clone()))?;
         registry.register(Box::new(lists.clone()))?;
         registry.register(Box::new(reads.clone()))?;
         registry.register(Box::new(gates.clone()))?;
+        let assist = CounterVec::new(
+            Opts::new(
+                "sandbox_host_docs_assist_total",
+                "Document classification questions put to the audited channel, by what the station did",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(organized.clone()))?;
+        registry.register(Box::new(classified.clone()))?;
+        registry.register(Box::new(assist.clone()))?;
         // The scope count is a configuration fact, not a moving reading: it is
         // published once so an operator can see whether the capability is on
         // at all without reading the pod's env.
@@ -704,6 +833,15 @@ impl HostDocsMetrics {
         for outcome in APPLY_OUTCOMES {
             gates.with_label_values(&[outcome]).inc_by(0.0);
         }
+        for outcome in ORGANIZE_OUTCOMES {
+            organized.with_label_values(&[outcome]).inc_by(0.0);
+        }
+        for outcome in CLASSIFIED_OUTCOMES {
+            classified.with_label_values(&[outcome]).inc_by(0.0);
+        }
+        for outcome in ASSIST_OUTCOMES {
+            assist.with_label_values(&[outcome]).inc_by(0.0);
+        }
         Ok(Self {
             registry,
             ops,
@@ -711,6 +849,9 @@ impl HostDocsMetrics {
             lists,
             reads,
             gates,
+            organized,
+            classified,
+            assist,
         })
     }
 
@@ -745,11 +886,28 @@ impl HostDocsMetrics {
     fn count_apply(&self, outcome: &str) {
         self.gates.with_label_values(&[outcome]).inc();
     }
+
+    fn count_organize(&self, outcome: &str) {
+        self.organized.with_label_values(&[outcome]).inc();
+    }
+
+    fn count_classified(&self, counts: &BTreeMap<&'static str, usize>) {
+        for (cell, n) in counts {
+            self.classified.with_label_values(&[cell]).inc_by(*n as f64);
+        }
+    }
+
+    fn count_assist(&self, outcome: &str) {
+        self.assist.with_label_values(&[outcome]).inc();
+    }
 }
 
 pub struct HostDocs {
     cfg: HostDocsConfig,
     metrics: HostDocsMetrics,
+    /// The model station's client, when a channel URL is configured. Built once: it holds
+    /// no state beyond the URL and the connection pool.
+    assist: Option<AuditedChannel>,
     /// Serializes applies so two plans cannot interleave their journals and
     /// perform decisions.
     apply_lock: Mutex<()>,
@@ -769,9 +927,11 @@ impl HostDocs {
             max_doc_bytes = cfg.max_doc_bytes,
             "host document scopes configured"
         );
+        let assist = cfg.audited_llm_url.clone().map(AuditedChannel::new);
         Ok(Arc::new(Self {
             cfg,
             metrics,
+            assist,
             apply_lock: Mutex::new(()),
             id_seq: AtomicU64::new(0),
         }))
@@ -946,6 +1106,161 @@ impl HostDocs {
             skipped_unnamed,
             truncated,
         })
+    }
+
+    /// The caller-side pipeline: list the scope, classify by name, ask the audited channel
+    /// about what the names could not settle, and stage the plan that comes out.
+    ///
+    /// The order is the design's -- name rules first, then whatever a local ranker can
+    /// settle, and only for what is left the audited channel -- and it is an order rather
+    /// than a choice because each station is cheaper and exposes less than the next. A
+    /// station that answers nothing leaves the file exactly where it was, which is the
+    /// fail-safe direction: an unclassified file in place is one that can be classified
+    /// later, while a file moved on a guess is not obviously wrong to anyone looking at the
+    /// folder afterwards.
+    ///
+    /// The answer carries the counters **and** the plan, and the plan goes to staging
+    /// rather than being applied: this call produces something a person approves, and it
+    /// has no path that moves a file by itself.
+    pub async fn organize(&self, scope: &str) -> SFResult<HostDocOrganize> {
+        let listing = self.list(scope, None).inspect_err(|_| {
+            self.metrics.count_organize("refused");
+        })?;
+        // First pass with no hints: the rules place what they can, and what is left is
+        // exactly the question the next station is asked -- a rule that places a file costs
+        // nothing and cannot be talked out of it, so it is never worth asking about one.
+        let first =
+            propose(&listing, &self.cfg.classify_rules, &BTreeMap::new()).inspect_err(|_| {
+                self.metrics.count_organize("refused");
+            })?;
+        let candidates = first
+            .skipped
+            .get("no_rule")
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let asked = self.ask_model(scope, candidates).await;
+        self.metrics.count_assist(asked.outcome);
+        // The hinted pass replaces the first rather than patching it: one function decides
+        // what a listing plus a set of answers makes of a folder, so there is no second
+        // place where "a hint can override a rule" could be decided differently.
+        let proposal = if asked.hints.is_empty() {
+            first
+        } else {
+            propose(&listing, &self.cfg.classify_rules, &asked.hints).inspect_err(|_| {
+                self.metrics.count_organize("refused");
+            })?
+        };
+        let counts = proposal.counts();
+        self.metrics.count_classified(&counts);
+        let assist = asked.outcome;
+        let assist_candidates = asked.candidates;
+        let assist_bodies_truncated = asked.truncated;
+        if proposal.is_empty() {
+            // Both halves matter: every file may have been decided against, or there may
+            // have been nothing to decide. `counts` is what tells them apart, which is why
+            // it is returned even when nothing happens.
+            self.metrics.count_organize("nothing_to_do");
+            return Ok(HostDocOrganize {
+                scope: scope.to_string(),
+                outcome: "nothing_to_do",
+                counts,
+                assist,
+                assist_candidates,
+                assist_bodies_truncated,
+                proposal,
+                staged: None,
+            });
+        }
+        let staged = self.stage(scope, &proposal.ops).await.inspect_err(|_| {
+            self.metrics.count_organize("refused");
+        })?;
+        self.metrics.count_organize("staged");
+        Ok(HostDocOrganize {
+            scope: scope.to_string(),
+            outcome: "staged",
+            counts,
+            assist,
+            assist_candidates,
+            assist_bodies_truncated,
+            proposal,
+            staged: Some(staged),
+        })
+    }
+
+    /// Ask the audited channel about the files the rules could not place.
+    ///
+    /// Every refusal returns no hints, so the plan is then what the rules alone made: the
+    /// station failing is a folder that stays as it is, never a folder sorted on a partial
+    /// question. That is why a candidate set too large to ask about **in full** is not
+    /// asked about at all -- a partial answer would make the plan depend on which files
+    /// happened to fit.
+    ///
+    /// The switch is checked before any body is read, and the read would refuse anyway
+    /// (`disabled`); doing it here is what keeps the assist counter's `switch_off` cell
+    /// from being an inference someone has to make from the read counter instead.
+    async fn ask_model(&self, scope: &str, candidates: &[String]) -> AskOutcome {
+        if candidates.is_empty() {
+            // Judged before the switch, and deliberately: a run that needed no question is
+            // not evidence about the switch in either direction, and this cell is the one
+            // that says the rule table fits the folder.
+            return AskOutcome::refused("no_candidates");
+        }
+        if !self.cfg.body_egress {
+            return AskOutcome::refused("switch_off");
+        }
+        let Some(channel) = self.assist.as_ref() else {
+            return AskOutcome::refused("unconfigured");
+        };
+        if candidates.len() > self.cfg.assist_max_candidates {
+            warn!(
+                scope = %scope,
+                candidates = candidates.len(),
+                ceiling = self.cfg.assist_max_candidates,
+                "more unclassified files than one question covers; asking about none of them"
+            );
+            return AskOutcome::refused("over_candidates");
+        }
+        let mut bodies = Vec::with_capacity(candidates.len());
+        let mut truncated = 0;
+        for path in candidates {
+            match self.read(scope, path) {
+                Ok(read) => {
+                    let (text, cut) = truncate_body(&read.content, self.cfg.assist_max_body_bytes);
+                    if cut {
+                        truncated += 1;
+                    }
+                    bodies.push((path.clone(), read.bytes as usize, text.to_string()));
+                }
+                Err(refusal) => {
+                    warn!(
+                        scope = %scope,
+                        path = %path,
+                        outcome = %refusal.outcome,
+                        "a candidate body could not be read; asking about none of them"
+                    );
+                    return AskOutcome::refused("read_refused");
+                }
+            }
+        }
+        let buckets: Vec<String> = self
+            .cfg
+            .classify_rules
+            .buckets()
+            .map(str::to_string)
+            .collect();
+        let prompt = build_prompt(&buckets, &bodies);
+        match channel.ask(&prompt).await {
+            Ok(hints) => AskOutcome {
+                outcome: "answered",
+                hints,
+                candidates: bodies.len(),
+                truncated,
+            },
+            Err(cell) => {
+                warn!(scope = %scope, outcome = %cell, "the model station decided nothing");
+                AskOutcome::refused(cell)
+            }
+        }
     }
 
     /// Read one body. **Subject to the egress switch**: while it is off, this refuses
@@ -3072,5 +3387,411 @@ mod tests {
             "measured landing cells do not match the vocabulary: a missing cell can never be read, and an extra one is read by nobody"
         );
         chmod(&locked, 0o755);
+    }
+
+    // --- the caller-side pipeline: rules, then the audited channel, then staging ---
+
+    /// What the fake audited channel saw, and what it answers.
+    type ChannelLog = Arc<tokio::sync::Mutex<Vec<String>>>;
+
+    /// A stand-in for the gateway's audited channel: it records every request body and
+    /// answers with one completion envelope carrying `answer`.
+    ///
+    /// What a test needs from this station is not a model but the two facts a model would
+    /// decide: **what was sent** (the bodies, and only the bodies it was asked about) and
+    /// **what comes back**. A fake is the only way to hold either still.
+    async fn spawn_channel(answer: &'static str) -> (String, ChannelLog) {
+        let seen: ChannelLog = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: String| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().await.push(body);
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": answer}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1/chat/completions"), seen)
+    }
+
+    /// A scope with two files the table places and one it cannot: the shape of folder that
+    /// makes this station's question exist.
+    fn mix(cfg: &HostDocsConfig) -> PathBuf {
+        let root = scope_root(cfg);
+        std::fs::write(root.join("notes.md"), b"# notes about the trip").unwrap();
+        std::fs::write(root.join("photo.JPG"), b"jpeg").unwrap();
+        std::fs::write(root.join("IMG_0421"), b"a photo of a harbour at dusk").unwrap();
+        root
+    }
+
+    fn assist(rendered: &str, outcome: &str) -> f64 {
+        cell(rendered, "sandbox_host_docs_assist_total", outcome)
+    }
+
+    fn classified(rendered: &str, outcome: &str) -> f64 {
+        cell(rendered, "sandbox_host_docs_classified_total", outcome)
+    }
+
+    /// The default configuration: rules only, and the plan they make is a real one.
+    ///
+    /// The switch being off here is the point of the whole round -- the pipeline that
+    /// tidies a folder by name works with **nothing leaving the process at all**.
+    #[tokio::test]
+    async fn a_folder_is_sorted_by_name_without_asking_anyone() {
+        let (_d, cfg) = temp_scope();
+        let root = mix(&cfg);
+        let docs = open_docs(&cfg);
+        let organized = docs.organize("alice").await.expect("organize");
+
+        assert_eq!(organized.outcome, "staged");
+        assert_eq!(organized.assist, "switch_off");
+        assert_eq!(organized.assist_candidates, 0);
+        assert_eq!(organized.counts["moved_rule"], 2);
+        assert_eq!(organized.counts["skipped_no_rule"], 1);
+        // The unplaceable file is named in the answer, not silently dropped.
+        assert_eq!(
+            organized.proposal.skipped["no_rule"],
+            vec!["IMG_0421".to_string()]
+        );
+        // Nothing has moved: organizing produces something to approve.
+        assert!(root.join("notes.md").exists());
+        assert!(!root.join("documents").exists());
+
+        let staged = organized.staged.expect("a plan was staged");
+        assert_eq!(staged.state, StagedState::Pending);
+        docs.approve(&staged.staged_id, "ops").await.unwrap();
+        let review = docs.staged_plan(&staged.staged_id).await.unwrap();
+        let applied = docs.apply(&review.plan, &staged.staged_id).await.unwrap();
+        assert_eq!(applied.applied.len(), staged.op_count);
+        // The plan was a working plan: the approved moves really happen.
+        assert!(root.join("documents/notes.md").exists());
+        assert!(root.join("images/photo.JPG").exists());
+        assert!(root.join("IMG_0421").exists());
+
+        let rendered = docs.metrics();
+        assert_eq!(assist(&rendered, "switch_off"), 1.0);
+        assert_eq!(assist(&rendered, "no_candidates"), 0.0);
+        assert_eq!(classified(&rendered, "moved_rule"), 2.0);
+        assert_eq!(classified(&rendered, "skipped_no_rule"), 1.0);
+    }
+
+    /// A folder the table already covers is the healthy reading: the station is skipped
+    /// because there was nothing to ask, not because something went wrong.
+    #[tokio::test]
+    async fn a_folder_the_table_covers_asks_nothing() {
+        let (_d, cfg) = temp_scope();
+        let root = scope_root(&cfg);
+        std::fs::write(root.join("notes.md"), b"x").unwrap();
+        let docs = open_docs(&reading(&cfg));
+        let organized = docs.organize("alice").await.unwrap();
+        assert_eq!(organized.assist, "no_candidates");
+        assert_eq!(organized.counts["skipped_no_rule"], 0);
+        // Nothing to do, and the answer says which kind of nothing: an empty folder lands
+        // in the same cell, and the counts are what separate them.
+        assert_eq!(organized.outcome, "staged");
+        let empty = temp_scope();
+        let empty_docs = open_docs(&reading(&empty.1));
+        let nothing = empty_docs.organize("alice").await.unwrap();
+        assert_eq!(nothing.outcome, "nothing_to_do");
+        assert_eq!(nothing.assist, "no_candidates");
+    }
+
+    /// The switch being on but no channel configured is a deployment gap, and it has to
+    /// read as its own cell: the action is a deployment change, not a switch.
+    #[tokio::test]
+    async fn a_channel_that_was_never_configured_asks_nothing() {
+        let (_d, cfg) = temp_scope();
+        mix(&cfg);
+        let docs = open_docs(&reading(&cfg));
+        let organized = docs.organize("alice").await.unwrap();
+        assert_eq!(organized.assist, "unconfigured");
+        assert_eq!(organized.counts["moved_rule"], 2);
+        assert_eq!(
+            assist(&docs.metrics(), "unconfigured"),
+            1.0,
+            "the cell has to be published, not inferred"
+        );
+    }
+
+    /// The station's whole input is the bodies of the files the rules could not place -- and
+    /// the assertion is on the wire, not on the call graph: a body the table had already
+    /// placed must not appear in the request, and the paths the model is asked about must
+    /// be exactly the unplaced ones.
+    #[tokio::test]
+    async fn only_the_unplaced_bodies_are_sent_and_a_bucket_comes_back() {
+        let (_d, cfg) = temp_scope();
+        let root = mix(&cfg);
+        let (url, seen) = spawn_channel(r#"{"IMG_0421":"images"}"#).await;
+        let mut on = reading(&cfg);
+        on.audited_llm_url = Some(url);
+        let docs = open_docs(&on);
+        let organized = docs.organize("alice").await.unwrap();
+
+        assert_eq!(organized.assist, "answered");
+        assert_eq!(organized.assist_candidates, 1);
+        assert_eq!(organized.counts["moved_model"], 1);
+        assert_eq!(organized.counts["moved_rule"], 2);
+        // The model's answer goes through the same validation as everything else: the
+        // bucket is one the table has, so the file lands in `images/`.
+        assert_eq!(
+            organized.proposal.moved[0].to,
+            "images/IMG_0421".to_string()
+        );
+        assert_eq!(organized.proposal.moved[0].reason, "model");
+
+        let sent = seen.lock().await;
+        assert_eq!(sent.len(), 1, "one question per run");
+        let request: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        let prompt = request["messages"][0]["content"].as_str().unwrap();
+        assert!(prompt.contains("a photo of a harbour at dusk"));
+        assert!(prompt.contains("--- IMG_0421"));
+        assert!(
+            !prompt.contains("# notes about the trip"),
+            "a file the table placed was sent anyway: {prompt}"
+        );
+        assert!(!prompt.contains("photo.JPG"));
+        // No credentials and no upstream: the model field is the placeholder the gateway
+        // rewrites, and the actor is what makes the tokens attributable.
+        assert_eq!(request["model"], "document-organizer");
+        assert!(root.join("IMG_0421").exists());
+
+        let rendered = docs.metrics();
+        assert_eq!(assist(&rendered, "answered"), 1.0);
+        assert_eq!(classified(&rendered, "moved_model"), 1.0);
+    }
+
+    /// A bucket the table does not have is refused rather than sanitized: the writable path
+    /// set is a configuration fact, and the model does not get to extend it.
+    #[tokio::test]
+    async fn a_bucket_outside_the_table_is_refused_and_the_file_stays() {
+        let (_d, cfg) = temp_scope();
+        let root = mix(&cfg);
+        let (url, _seen) = spawn_channel(r#"{"IMG_0421":"../outside"}"#).await;
+        let mut on = reading(&cfg);
+        on.audited_llm_url = Some(url);
+        let docs = open_docs(&on);
+        let organized = docs.organize("alice").await.unwrap();
+        assert_eq!(organized.assist, "answered");
+        assert_eq!(organized.counts["moved_model"], 0);
+        assert_eq!(organized.counts["skipped_hint_invalid"], 1);
+        assert!(root.join("IMG_0421").exists());
+        assert!(!organized
+            .proposal
+            .ops
+            .iter()
+            .any(|op| op.rel_paths().iter().any(|p| p.starts_with(".."))));
+    }
+
+    /// Any refusal on the station's side leaves the plan as the rules made it -- and the
+    /// strongest form of that is a channel that is never called at all.
+    #[tokio::test]
+    async fn a_question_that_would_be_partial_is_not_asked() {
+        // A body that cannot be read: `IMG_0421` gets invalid UTF-8, so one of the two
+        // candidates is unreadable.
+        let (_d, cfg) = temp_scope();
+        let root = scope_root(&cfg);
+        std::fs::write(root.join("notes.md"), b"notes").unwrap();
+        std::fs::write(root.join("broken"), b"\xff\xfe\x00binary").unwrap();
+        std::fs::write(root.join("IMG_0421"), b"a harbour").unwrap();
+        let (url, seen) = spawn_channel(r#"{"broken":"images","IMG_0421":"images"}"#).await;
+        let mut on = reading(&cfg);
+        on.audited_llm_url = Some(url);
+        let docs = open_docs(&on);
+        let organized = docs.organize("alice").await.unwrap();
+        assert_eq!(organized.assist, "read_refused");
+        assert_eq!(organized.counts["moved_model"], 0);
+        assert_eq!(organized.counts["moved_rule"], 1);
+        assert!(seen.lock().await.is_empty(), "a partial question was sent");
+        // The read's own counter says why that body could not be read: this station's cell
+        // says only that it did not ask.
+        assert_eq!(reads(&docs.metrics(), "not_text"), 1.0);
+        assert!(root.join("IMG_0421").exists());
+
+        // More unclassified files than one question covers: also nothing is asked, and for
+        // the same reason -- the answer would depend on which files happened to fit.
+        let (_d2, cfg2) = temp_scope();
+        mix(&cfg2);
+        let (url2, seen2) = spawn_channel(r#"{"IMG_0421":"images"}"#).await;
+        let mut capped = reading(&cfg2);
+        capped.audited_llm_url = Some(url2);
+        capped.assist_max_candidates = 1;
+        std::fs::write(scope_root(&capped).join("another"), b"unknown").unwrap();
+        let capped_docs = open_docs(&capped);
+        let over = capped_docs.organize("alice").await.unwrap();
+        assert_eq!(over.assist, "over_candidates");
+        assert_eq!(over.counts["moved_model"], 0);
+        assert_eq!(over.counts["skipped_no_rule"], 2);
+        assert_eq!(over.counts["moved_rule"], 2);
+        assert!(seen2.lock().await.is_empty(), "a partial question was sent");
+    }
+
+    /// A channel that is not there, and one that answers with prose: two different cells,
+    /// because the side that has to change is different.
+    #[tokio::test]
+    async fn a_missing_channel_and_an_unparseable_answer_are_two_readings() {
+        let (_d, cfg) = temp_scope();
+        mix(&cfg);
+        // A port that was bound and released: the connection is refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = listener.local_addr().unwrap();
+        drop(listener);
+        let mut on = reading(&cfg);
+        on.audited_llm_url = Some(format!("http://{dead}/v1/chat/completions"));
+        let docs = open_docs(&on);
+        let organized = docs.organize("alice").await.unwrap();
+        assert_eq!(organized.assist, "request_failed");
+        // The failure costs the folder nothing that the rules had already decided.
+        assert_eq!(organized.counts["moved_rule"], 2);
+        assert_eq!(organized.outcome, "staged");
+
+        let (_d2, cfg2) = temp_scope();
+        mix(&cfg2);
+        let (url, _seen) = spawn_channel("I am not going to answer that.").await;
+        let mut on2 = reading(&cfg2);
+        on2.audited_llm_url = Some(url);
+        let docs2 = open_docs(&on2);
+        let organized2 = docs2.organize("alice").await.unwrap();
+        assert_eq!(organized2.assist, "unparsed");
+        assert_eq!(organized2.counts["moved_model"], 0);
+    }
+
+    /// Every published cell has to be reachable: a cell nothing can produce is a reading
+    /// nobody can ever act on, and it looks exactly like a calm system.
+    #[tokio::test]
+    async fn every_published_assist_outcome_is_reachable() {
+        // switch_off: the default switch, with candidates waiting.
+        let (_d, cfg) = temp_scope();
+        mix(&cfg);
+        let off = open_docs(&cfg);
+        assert_eq!(off.organize("alice").await.unwrap().assist, "switch_off");
+
+        // unconfigured: the switch on, no URL.
+        let (_d2, cfg2) = temp_scope();
+        mix(&cfg2);
+        let unconfigured = open_docs(&reading(&cfg2));
+        assert_eq!(
+            unconfigured.organize("alice").await.unwrap().assist,
+            "unconfigured"
+        );
+
+        // no_candidates: the rules placed everything.
+        let (_d3, cfg3) = temp_scope();
+        std::fs::write(scope_root(&cfg3).join("notes.md"), b"x").unwrap();
+        let placed = open_docs(&reading(&cfg3));
+        assert_eq!(
+            placed.organize("alice").await.unwrap().assist,
+            "no_candidates"
+        );
+
+        // over_candidates: more unplaced files than one question covers.
+        let (_d4, cfg4) = temp_scope();
+        mix(&cfg4);
+        std::fs::write(scope_root(&cfg4).join("another"), b"x").unwrap();
+        let (url4, _seen4) = spawn_channel(r#"{}"#).await;
+        let mut over_cfg = reading(&cfg4);
+        over_cfg.audited_llm_url = Some(url4);
+        over_cfg.assist_max_candidates = 1;
+        let over = open_docs(&over_cfg);
+        assert_eq!(
+            over.organize("alice").await.unwrap().assist,
+            "over_candidates"
+        );
+
+        // read_refused: a candidate whose body cannot be read.
+        let (_d5, cfg5) = temp_scope();
+        std::fs::write(scope_root(&cfg5).join("broken"), b"\xff\xfe").unwrap();
+        let (url5, _seen5) = spawn_channel(r#"{}"#).await;
+        let mut refuse_cfg = reading(&cfg5);
+        refuse_cfg.audited_llm_url = Some(url5);
+        let refusing = open_docs(&refuse_cfg);
+        assert_eq!(
+            refusing.organize("alice").await.unwrap().assist,
+            "read_refused"
+        );
+
+        // request_failed: nothing listening.
+        let (_d6, cfg6) = temp_scope();
+        std::fs::write(scope_root(&cfg6).join("unknown"), b"x").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = listener.local_addr().unwrap();
+        drop(listener);
+        let mut dead_cfg = reading(&cfg6);
+        dead_cfg.audited_llm_url = Some(format!("http://{dead}/v1/chat/completions"));
+        let dead_docs = open_docs(&dead_cfg);
+        assert_eq!(
+            dead_docs.organize("alice").await.unwrap().assist,
+            "request_failed"
+        );
+
+        // unparsed: a completion whose text holds no JSON object.
+        let (_d7, cfg7) = temp_scope();
+        std::fs::write(scope_root(&cfg7).join("unknown"), b"x").unwrap();
+        let (url7, _seen7) = spawn_channel("no idea, sorry").await;
+        let mut prose_cfg = reading(&cfg7);
+        prose_cfg.audited_llm_url = Some(url7);
+        let prose = open_docs(&prose_cfg);
+        assert_eq!(prose.organize("alice").await.unwrap().assist, "unparsed");
+
+        // answered: a mapping came back.
+        let (_d8, cfg8) = temp_scope();
+        std::fs::write(scope_root(&cfg8).join("unknown"), b"x").unwrap();
+        let (url8, _seen8) = spawn_channel(r#"{"unknown":"images"}"#).await;
+        let mut answered_cfg = reading(&cfg8);
+        answered_cfg.audited_llm_url = Some(url8);
+        let answered = open_docs(&answered_cfg);
+        assert_eq!(answered.organize("alice").await.unwrap().assist, "answered");
+
+        let rendered = [
+            off.metrics(),
+            unconfigured.metrics(),
+            placed.metrics(),
+            over.metrics(),
+            refusing.metrics(),
+            dead_docs.metrics(),
+            prose.metrics(),
+            answered.metrics(),
+        ];
+        let observed = observed_outcomes(
+            &rendered,
+            "sandbox_host_docs_assist_total",
+            &ASSIST_OUTCOMES,
+        );
+        let expected: Vec<String> = ASSIST_OUTCOMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            observed, expected,
+            "measured landing cells do not match the vocabulary: a missing cell can never be read, and an extra one is read by nobody"
+        );
+
+        // The organize vocabulary is walked here too, since this is the only test that
+        // produces all three of its cells: a run that staged a plan, a run with nothing to
+        // do, and a run that was refused (an unknown scope).
+        let (_d9, cfg9) = temp_scope();
+        let nothing = open_docs(&cfg9);
+        assert_eq!(
+            nothing.organize("alice").await.unwrap().outcome,
+            "nothing_to_do"
+        );
+        assert!(off.organize("nobody").await.is_err());
+        let organized = [off.metrics(), nothing.metrics()];
+        let observed = observed_outcomes(
+            &organized,
+            "sandbox_host_docs_organize_total",
+            &ORGANIZE_OUTCOMES,
+        );
+        let expected: Vec<String> = ORGANIZE_OUTCOMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            observed, expected,
+            "measured landing cells do not match the vocabulary: a missing cell can never be read, and an extra one is read by nobody"
+        );
+        assert_eq!(observed.len(), 3);
     }
 }

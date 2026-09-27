@@ -71,10 +71,17 @@ grep -q "hostDocuments.scopes.alice has no host path" <<<"${out}" \
 
 # --- 4) the executor reads every key the template sets --------------------
 executor_rs="${repo}/crates/cog-extension/src/hostdocs.rs"
+assist_rs="${repo}/crates/cog-extension/src/hostdocs_assist.rs"
 [ -f "${executor_rs}" ] || fail "cannot find ${executor_rs}"
+[ -f "${assist_rs}" ] || fail "cannot find ${assist_rs} (the model station's request shape)"
 for env_name in HOST_DOCS_SCOPES HOST_DOCS_JOURNAL_DIR HOST_DOCS_MAX_WRITE_BYTES \
-  HOST_DOCS_MAX_READ_BYTES HOST_DOCS_APPROVAL_TTL_SECS HOST_DOCS_MAX_PLAN_BYTES; do
-  grep -q "\"${env_name}\"" "${executor_rs}" \
+  HOST_DOCS_MAX_READ_BYTES HOST_DOCS_APPROVAL_TTL_SECS HOST_DOCS_MAX_PLAN_BYTES \
+  HOST_DOCS_CLASSIFY_RULES HOST_DOCS_AUDITED_LLM_URL HOST_DOCS_ASSIST_BODY_BYTES \
+  HOST_DOCS_ASSIST_MAX_CANDIDATES; do
+  # The whole crate, not two files: the reading lives wherever the reading lives, and a
+  # fixed file list goes stale the moment the capability is split across one more module
+  # -- which is exactly how a dead knob would then pass this check.
+  grep -rqh "\"${env_name}\"" "${repo}/crates/cog-extension/src/" \
     || fail "${env_name} is carried by the template but the executor never reads it (dead knob)"
 done
 # The journal has to outlive the process that wrote it, otherwise a rollback
@@ -167,6 +174,23 @@ got="$(env_value "${work}/scopes.yaml" cogneva-sandbox-executor sandbox-executor
 case "${got}" in
   ''|*[!0-9]*) fail "HOST_DOCS_APPROVAL_TTL_SECS reads '${got}'; it must be a decimal integer second count" ;;
 esac
+for bound_env in HOST_DOCS_ASSIST_BODY_BYTES HOST_DOCS_ASSIST_MAX_CANDIDATES; do
+  got="$(env_value "${work}/scopes.yaml" cogneva-sandbox-executor sandbox-executor "${bound_env}")"
+  case "${got}" in
+    ''|*[!0-9]*) fail "${bound_env} reads '${got}'; it must be a decimal integer count" ;;
+  esac
+done
+# The classification table is a deployment value with a code default, so the default
+# render must **not** carry one: a copy of the built-in table here is a second thing to
+# keep in step, and its drift reads as a folder that is never sorted.
+got="$(env_value "${work}/scopes.yaml" cogneva-sandbox-executor sandbox-executor HOST_DOCS_CLASSIFY_RULES)"
+[ -z "${got}" ] \
+  || fail "the render carries HOST_DOCS_CLASSIFY_RULES ('${got}') with no deployment-set table; the built-in table is the default"
+# Negative control: set one, and the same reading has to appear.
+render --set hostDocuments.scopes.alice=/srv/alice/Documents \
+  --set-string 'hostDocuments.classifyRules=notes:md\,txt' > "${work}/rules.yaml"
+got="$(env_value "${work}/rules.yaml" cogneva-sandbox-executor sandbox-executor HOST_DOCS_CLASSIFY_RULES)"
+[ "${got}" = "notes:md,txt" ] || fail "self-check failed: a configured table reads '${got:-missing}'"
 
 # --- 6) reachability: the audited port reaches exactly one workload ----------
 # The whole reason this channel is a separate port is that its reachable surface
@@ -232,4 +256,83 @@ print("\n".join(fail))
 sys.exit(1 if fail else 0)
 PYEOF
 
-echo "PASS: document scopes mount by identity, default off, every template-set key has a reader, and the audited channel admits the executor only"
+# --- 7) the model station's address is the audited one, and it is reachable ---
+# The station exists to put bodies through the audited channel. Three ways to get
+# that wrong are invisible in the code and each has its own symptom:
+#   - a URL naming the shared Service: that one serves the passthrough port, the
+#     port that audits nothing, and the mistake is exactly the one the audited
+#     channel was built to prevent;
+#   - a port this pod's own egress policy does not allow: the station then fails at
+#     runtime as `request_failed`, which reads like an upstream problem;
+#   - a path the channel does not serve: the same reading, one layer further out.
+# All three are checked against other parts of the same render (the Service, the
+# NetworkPolicy) and of the gateway source (its route table) rather than against
+# numbers or paths written here.
+python3 - "${work}/scopes.yaml" "${gateway_rs}" <<'PYEOF' || exit 1
+import re, sys, yaml
+from urllib.parse import urlparse
+
+render, gateway_src = sys.argv[1], sys.argv[2]
+docs = [d for d in yaml.safe_load_all(open(render)) if d and d.get('kind')]
+by_name = {(d['kind'], d['metadata']['name']): d for d in docs}
+fail = []
+
+
+def env_value(workload, container, name):
+    d = by_name.get(('Deployment', workload))
+    if d is None:
+        fail.append(f"no Deployment {workload}")
+        return None
+    for c in d['spec']['template']['spec']['containers']:
+        if c['name'] != container:
+            continue
+        for e in c.get('env', []):
+            if e['name'] == name:
+                return e.get('value', '')
+    return None
+
+
+url = env_value('cogneva-sandbox-executor', 'sandbox-executor', 'HOST_DOCS_AUDITED_LLM_URL')
+if not url:
+    fail.append("the executor has no HOST_DOCS_AUDITED_LLM_URL: the model station is wired to nowhere")
+else:
+    parsed = urlparse(url)
+    if parsed.hostname != 'cogneva-security-gateway-audited':
+        fail.append(f"the station's address is {parsed.hostname}, not the audited Service")
+    service = by_name.get(('Service', 'cogneva-security-gateway-audited'))
+    if service is None:
+        fail.append("the address names an audited Service that the render does not contain")
+    else:
+        ports = [p['port'] for p in service['spec']['ports']]
+        if parsed.port not in ports:
+            fail.append(f"the address uses port {parsed.port}; the audited Service serves {ports}")
+    # The pod's own egress face: the address has to be inside it, or the station is
+    # configured against a door this pod does not have.
+    policy = by_name.get(('NetworkPolicy', 'cogneva-sandbox-executor-egress'))
+    if policy is None:
+        fail.append("the executor has no egress policy; the audited channel is then not a boundary")
+    else:
+        allowed = []
+        for rule in policy['spec'].get('egress', []):
+            for target in rule.get('to', []):
+                labels = target.get('podSelector', {}).get('matchLabels', {})
+                if labels.get('app.kubernetes.io/component') == 'security-gateway':
+                    allowed += [p.get('port') for p in rule.get('ports', [])]
+        if parsed.port not in allowed:
+            fail.append(f"the address uses port {parsed.port}, which this pod's egress policy does not allow ({allowed})")
+    # And the path has to be one the audited channel actually serves: read from the
+    # router definition rather than repeated here.
+    source = open(gateway_src).read()
+    block = re.search(r"fn llm_channel_router\(\) -> Router<AppState> \{(.*?)\n\}", source, re.S)
+    if block is None:
+        fail.append("cannot find llm_channel_router in the gateway source: this check read nothing")
+    else:
+        routes = re.findall(r'\.route\("([^"]+)"', block.group(1))
+        if parsed.path not in routes:
+            fail.append(f"the address path {parsed.path} is not one of the audited routes {routes}")
+
+print("\n".join(fail))
+sys.exit(1 if fail else 0)
+PYEOF
+
+echo "PASS: document scopes mount by identity, default off, every template-set key has a reader, the model station speaks only to the audited channel, and the audited channel admits the executor only"

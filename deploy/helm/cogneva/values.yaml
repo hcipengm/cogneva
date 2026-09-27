@@ -355,6 +355,17 @@ hostDocuments:
   # a plan carrying more text than a single write may carry would make "approved" mean
   # something other than what it says.
   maxPlanBytes: 8388608
+  # The name-based classification table, `bucket:ext,ext;bucket:ext`. **Empty means the
+  # table built into the process**, which is the default on purpose: a second copy of that
+  # table here would be a second thing to keep in step, and its drift shows up as a folder
+  # that is silently never sorted.
+  classifyRules: ""
+  # How many bytes of one body a classification question carries, and how many files one
+  # question may cover. Both are "do less" bounds: past either of them the question is not
+  # asked at all rather than asked about part of the folder -- a partial answer would make
+  # the plan depend on which files happened to fit.
+  assistBodyBytes: 2048
+  assistMaxCandidates: 50
 
 # 节点镜像构建（buildah DaemonSet）：每节点提供 buildah 能力，产物导入节点
 # containerd 作暖缓存；工作负载运行时镜像权威走集群内 registry（见 image.repository）。

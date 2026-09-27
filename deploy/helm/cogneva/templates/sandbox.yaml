@@ -194,6 +194,23 @@ spec:
               value: {{ .Values.hostDocuments.approvalTtlSecs | int64 | quote }}
             - name: HOST_DOCS_MAX_PLAN_BYTES
               value: {{ .Values.hostDocuments.maxPlanBytes | int64 | quote }}
+            # 分类规则表只在部署面自己写了一张时才下发：内置那张表是默认值，在这里
+            # 复述一遍等于多一份要同步的东西，而它漂移的表现是"某个目录永远整理不
+            # 出来"——没人会去看一份看起来正常的清单。
+            {{- if .Values.hostDocuments.classifyRules }}
+            - name: HOST_DOCS_CLASSIFY_RULES
+              value: {{ .Values.hostDocuments.classifyRules | quote }}
+            {{- end }}
+            # 受审通道。地址按**服务名**指向 audited 那一个（`-audited` 后缀），不是
+            # 透传口：本 Pod 的 NetworkPolicy 只放行这一个入命名空间端口，而"这次走
+            # 受审口"如果只写在调用方代码里就又是一个可以写错的判断——写在这里，它
+            # 与放行面是同一个事实。
+            - name: HOST_DOCS_AUDITED_LLM_URL
+              value: "http://cogneva-security-gateway-audited:{{ .Values.securityGateway.auditedLlmPort }}/v1/chat/completions"
+            - name: HOST_DOCS_ASSIST_BODY_BYTES
+              value: {{ .Values.hostDocuments.assistBodyBytes | int64 | quote }}
+            - name: HOST_DOCS_ASSIST_MAX_CANDIDATES
+              value: {{ .Values.hostDocuments.assistMaxCandidates | int64 | quote }}
             {{- end }}
           startupProbe:
             httpGet:

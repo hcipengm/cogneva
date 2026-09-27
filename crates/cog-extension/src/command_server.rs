@@ -253,6 +253,7 @@ fn app_router(state: AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/execute", post(execute_handler))
         .route("/documents/list", post(documents_list_handler))
+        .route("/documents/organize", post(documents_organize_handler))
         .route("/documents/read", post(documents_read_handler))
         .route("/documents/plan", post(documents_plan_handler))
         .route("/documents/stage", post(documents_stage_handler))
@@ -288,6 +289,15 @@ struct DocumentsReadRequest {
 #[derive(Deserialize)]
 struct DocumentsRollbackRequest {
     journal_id: String,
+}
+
+/// Organize one scope. It carries the scope and nothing else: which files belong in
+/// which bucket is a configuration fact on this side (`HOST_DOCS_CLASSIFY_RULES`), and
+/// letting the caller send its own table would put the writable path set under the
+/// caller's control -- which is exactly what the model station must not have.
+#[derive(Deserialize)]
+struct DocumentsOrganizeRequest {
+    scope: String,
 }
 
 #[derive(Deserialize)]
@@ -379,6 +389,28 @@ async fn documents_read_handler(
             error_response(StatusCode::FORBIDDEN, refusal.error.to_string())
         }
         Err(refusal) => documents_error(refusal.error),
+    }
+}
+
+/// The caller-side pipeline in one call: list, classify by name, stage. **Not gated by
+/// the egress switch** -- today it consults no model, so nothing leaves the process, and
+/// the switch exists to bound document bodies going out, not names being sorted. The
+/// station that does read bodies takes the gate with it when it arrives, and it will be
+/// the read that refuses, one step before any request could be built.
+///
+/// It stages rather than applies: the answer is a plan and an id, and a person still has
+/// to approve it. That keeps "the model tidied up my files" from being a thing this
+/// endpoint can do at all.
+async fn documents_organize_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DocumentsOrganizeRequest>,
+) -> Response {
+    let Some(hostdocs) = state.hostdocs.as_ref() else {
+        return documents_disabled();
+    };
+    match hostdocs.organize(&req.scope).await {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(e) => documents_error(e),
     }
 }
 
@@ -720,6 +752,7 @@ mod tests {
                 "/documents/plan",
                 serde_json::json!({"scope": "alice", "ops": []}),
             ),
+            ("/documents/organize", serde_json::json!({"scope": "alice"})),
             (
                 "/documents/stage",
                 serde_json::json!({"scope": "alice", "ops": []}),
@@ -898,6 +931,98 @@ mod tests {
             "before"
         );
         assert!(!root.join("archive").exists());
+    }
+
+    /// The caller-side pipeline over HTTP, end to end: the folder is classified by name,
+    /// the plan is staged, and a person approves and applies it.
+    ///
+    /// The egress switch is off in this harness, and the run working anyway is the point:
+    /// sorting by name reads no bodies, so the switch that bounds bodies leaving the
+    /// cluster has nothing to say about it. What it does gate is one step earlier than
+    /// this test goes.
+    #[tokio::test]
+    async fn document_organize_stages_a_plan_that_a_person_then_approves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, root) = spawn_server_with_hostdocs(&dir).await;
+        std::fs::write(root.join("notes.md"), b"# notes").unwrap();
+        std::fs::write(root.join("photo.JPG"), b"jpeg").unwrap();
+        // Nothing in its name says what it is, so it stays where it is -- and the answer
+        // has to say so rather than fold it in with the moved files.
+        std::fs::write(root.join("IMG_0421"), b"a harbour at dusk").unwrap();
+        let client = reqwest::Client::new();
+
+        let organized: serde_json::Value = client
+            .post(format!("http://{}/documents/organize", addr))
+            .json(&serde_json::json!({"scope": "alice"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(organized["outcome"], "staged");
+        assert_eq!(organized["assist"], "switch_off");
+        assert_eq!(organized["counts"]["moved_rule"], 2);
+        assert_eq!(organized["counts"]["skipped_no_rule"], 1);
+        assert_eq!(organized["proposal"]["skipped"]["no_rule"][0], "IMG_0421");
+        assert_eq!(organized["staged"]["state"], "pending");
+        // Two directories and two moves.
+        assert_eq!(organized["staged"]["op_count"], 4);
+        // Staging is not doing: the folder is untouched until someone approves.
+        assert!(root.join("notes.md").exists());
+        assert!(!root.join("documents").exists());
+
+        let refused = client
+            .post(format!("http://{}/documents/apply", addr))
+            .json(&serde_json::json!({
+                "plan": {"scope": "alice", "plan_hash": "x", "ops": []},
+                "approval_id": organized["staged"]["staged_id"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400);
+
+        let reviewed: serde_json::Value = client
+            .post(format!("http://{}/documents/review", addr))
+            .json(&serde_json::json!({"staged_id": organized["staged"]["staged_id"]}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let plan = reviewed["plan"].clone();
+        assert_eq!(plan["ops"].as_array().unwrap().len(), 4);
+
+        client
+            .post(format!("http://{}/documents/approve", addr))
+            .json(&serde_json::json!({
+                "staged_id": organized["staged"]["staged_id"],
+                "approver": "ops",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let applied: serde_json::Value = client
+            .post(format!("http://{}/documents/apply", addr))
+            .json(&serde_json::json!({
+                "plan": plan,
+                "approval_id": organized["staged"]["staged_id"],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(applied["applied"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            std::fs::read_to_string(root.join("documents/notes.md")).unwrap(),
+            "# notes"
+        );
+        assert!(root.join("images/photo.JPG").exists());
+        assert!(root.join("IMG_0421").exists());
     }
 
     /// The loops this process runs are invisible unless this endpoint publishes
