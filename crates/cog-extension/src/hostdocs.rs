@@ -542,6 +542,11 @@ pub struct HostDocOrganize {
     /// What the model station did, from [`ASSIST_OUTCOMES`], and how many files it was
     /// asked about. Both travel with the answer because `moved_model` alone cannot say
     /// whether the station was skipped, refused or answered with nothing.
+    ///
+    /// [`Self::assist_candidates`] counts the bodies that went into a question, so it is
+    /// the reading of how much text left this process on this run -- and it stays non-zero
+    /// when the channel refused the question, because a refusal from the channel is a
+    /// judgement about bodies it had already received.
     pub assist: &'static str,
     pub assist_candidates: usize,
     /// How many of those bodies were cut to fit the question. The answer was about their
@@ -711,19 +716,37 @@ impl StagedLoad {
 struct AskOutcome {
     outcome: &'static str,
     hints: BTreeMap<String, String>,
-    /// How many bodies went into the question. Zero on every refusal, which is the point:
-    /// the cell says nothing left, not "nothing was learned".
+    /// How many bodies went into the question.
+    ///
+    /// Zero when no question was built -- which is every refusal decided **before** the
+    /// bodies were read. It is deliberately not zero on a refusal that came back about a
+    /// question already asked: those bodies were read and sent, and how much left this
+    /// process is the reading an operator wants on exactly that path -- the channel saw
+    /// them and refused, which is the moment the question "how much went out?" is asked.
     candidates: usize,
     truncated: usize,
 }
 
 impl AskOutcome {
+    /// A refusal decided before any body was read: nothing left this process.
     fn refused(outcome: &'static str) -> Self {
         Self {
             outcome,
             hints: BTreeMap::new(),
             candidates: 0,
             truncated: 0,
+        }
+    }
+
+    /// A refusal that came back about a question already asked. The bodies that were sent
+    /// travel with it, so the answer cannot say "nothing was covered" about a call the
+    /// channel judged the contents of.
+    fn refused_after_question(outcome: &'static str, candidates: usize, truncated: usize) -> Self {
+        Self {
+            outcome,
+            hints: BTreeMap::new(),
+            candidates,
+            truncated,
         }
     }
 }
@@ -1257,8 +1280,13 @@ impl HostDocs {
                 truncated,
             },
             Err(cell) => {
-                warn!(scope = %scope, outcome = %cell, "the model station decided nothing");
-                AskOutcome::refused(cell)
+                warn!(
+                    scope = %scope,
+                    outcome = %cell,
+                    bodies = bodies.len(),
+                    "the model station decided nothing about a question that had already been sent"
+                );
+                AskOutcome::refused_after_question(cell, bodies.len(), truncated)
             }
         }
     }
@@ -3771,9 +3799,13 @@ mod tests {
         let mut judged_cfg = reading(&cfg9);
         judged_cfg.audited_llm_url = Some(judged_url);
         let judged = open_docs(&judged_cfg);
+        let judged_run = judged.organize("alice").await.unwrap();
+        assert_eq!(judged_run.assist, "refused_by_channel");
         assert_eq!(
-            judged.organize("alice").await.unwrap().assist,
-            "refused_by_channel"
+            judged_run.assist_candidates, 1,
+            "the body was read and sent: a refusal that came back about a question already asked \
+             must not report that no file was covered, or the one path where the channel read \
+             the document under-reports how much left the process"
         );
 
         // The control for the cell above: the same 403 without the channel's name is *not*
@@ -3786,10 +3818,9 @@ mod tests {
         let mut anonymous_cfg = reading(&cfg10);
         anonymous_cfg.audited_llm_url = Some(anonymous_url);
         let anonymous = open_docs(&anonymous_cfg);
-        assert_eq!(
-            anonymous.organize("alice").await.unwrap().assist,
-            "request_failed"
-        );
+        let anonymous_run = anonymous.organize("alice").await.unwrap();
+        assert_eq!(anonymous_run.assist, "request_failed");
+        assert_eq!(anonymous_run.assist_candidates, 1);
 
         // unparsed: a completion whose text holds no JSON object.
         let (_d7, cfg7) = temp_scope();
