@@ -49,6 +49,20 @@ pub struct LlmUpstream {
     /// `Some(true)` = 透传时把调用方的 temperature 钳到 1（否则上游直接 400，
     /// 调用方那一次请求白烧，还要多走一轮池内故障转移）。
     pub requires_temperature_one: Option<bool>,
+    /// 准入探测实证的「会在流里报用量」。`None` = 未知，按厂商画像兜底；
+    /// `Some(true)` = 透传时保留调用方的 `stream_options.include_usage`，
+    /// 于是网关的用量扫描器有尾帧可读；`Some(false)` = 上游要么拒这个字段、
+    /// 要么收了也不报，剥掉它（剥与不剥都不会有用量，剥掉少一个未知字段）。
+    ///
+    /// 这一条为什么必须是实测的：这个字段的取值面就是"流里有没有 usage"，
+    /// 而流里会不会出现 usage 取决于我们发不发 `stream_options`——按画像
+    /// 猜着剥，就把"它本来会不会报"变成了不可观测，判错也无法在带内发现。
+    ///
+    /// 这个判决本身的读数在**池条目的键存在性**上（键不在 = 没结论、键在且为
+    /// `false` = 实测说不支持），**不在指标上**：`llm_request_param_clamped_total`
+    /// 只数剥了几次，不区分"按实测剥"还是"按画像兜底剥"，因为它数的是一件
+    /// 已经发生的事，而判决住在配置里。别去指标面找一条答这个问题的序列。
+    pub supports_usage_in_streaming: Option<bool>,
 }
 
 impl std::fmt::Debug for LlmUpstream {
@@ -258,6 +272,9 @@ fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
                 supports_tool_calls: v.get("supports_tool_calls").and_then(|x| x.as_bool()),
                 requires_temperature_one: v
                     .get("requires_temperature_one")
+                    .and_then(|x| x.as_bool()),
+                supports_usage_in_streaming: v
+                    .get("supports_usage_in_streaming")
                     .and_then(|x| x.as_bool()),
             };
             if upstream.base_url.is_empty()
@@ -1933,6 +1950,7 @@ async fn chat_handler(
 fn adapt_request_body(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     compat: &cog_llm::utils::compat::OpenAICompat,
+    usage_verdict: Option<bool>,
 ) -> Vec<&'static str> {
     use cog_llm::utils::compat::MaxTokensField;
     let mut adapted = Vec::new();
@@ -1954,14 +1972,21 @@ fn adapt_request_body(
     for (supported, field) in [
         (compat.supports_store, "store"),
         (compat.supports_reasoning_effort, "reasoning_effort"),
-        // 调用方带它的前提是"这个上游会在流里报用量"，而它按兜底画像以为
-        // 所有上游都会报。不报用量的上游收到一个不认识的字段，代价从被忽略
-        // 到整次 400 都有可能，而它本来也不会回用量。
-        (compat.supports_usage_in_streaming, "stream_options"),
     ] {
         if !supported && obj.remove(field).is_some() {
             adapted.push(field);
         }
+    }
+
+    // 调用方带 `stream_options` 的前提是"这个上游会在流里报用量"，而它按兜底
+    // 画像以为所有上游都会报。这一条与上面两条不同：它的取值面就是"流里有没有
+    // usage"，而流里会不会出现 usage 取决于我们发不发这个字段——按画像猜着剥，
+    // 等于把要观测的那件事自己关掉，判错也不会有读数能发现。所以实证优先：
+    // 准入探测对这台上游问过就用它的结论，只有没问出结论（老条目/探测无果）
+    // 时才回落画像。剥错的代价不对称：下游读数恒零，而零与"上游就是不报"同形。
+    let reports_usage = usage_verdict.unwrap_or(compat.supports_usage_in_streaming);
+    if !reports_usage && obj.remove("stream_options").is_some() {
+        adapted.push("stream_options");
     }
 
     if !compat.supports_strict_mode {
@@ -2146,7 +2171,8 @@ async fn stream_forward(
                     // anthropic 形状的 `max_tokens` 是必填字段，改名会把它弄坏。
                     if style != "anthropic" {
                         let compat = cog_llm::utils::compat::detect_compat(base);
-                        adapted_fields = adapt_request_body(obj, &compat);
+                        adapted_fields =
+                            adapt_request_body(obj, &compat, upstream.supports_usage_in_streaming);
                         // 有的推理模型只接受 temperature=1，别的值直接 400。调
                         // 用方判定不了这件事：它连的是网关，base URL 里没有厂商
                         // 身份，客户端侧按 vendor 域名做的兼容探测在部署形态下
@@ -4167,6 +4193,7 @@ mod tests {
             api_key: "k".into(),
             supports_tool_calls: None,
             requires_temperature_one: None,
+            supports_usage_in_streaming: None,
         }
     }
 
@@ -4497,6 +4524,23 @@ mod tests {
     }
 
     #[test]
+    fn upstreams_usage_in_stream_capability_parsed() {
+        let list = parse_upstreams(
+            r#"[
+                {"api_style": "openai", "base_url": "https://a.example.com", "model": "m1", "api_key": "k1", "supports_usage_in_streaming": true},
+                {"api_style": "openai", "base_url": "https://b.example.com", "model": "m2", "api_key": "k2", "supports_usage_in_streaming": false},
+                {"api_style": "openai", "base_url": "https://c.example.com", "model": "m3", "api_key": "k3"}
+            ]"#,
+        );
+        assert_eq!(list[0].supports_usage_in_streaming, Some(true));
+        assert_eq!(list[1].supports_usage_in_streaming, Some(false));
+        // 键不在 = 没结论（老条目，或那次探测无果）。它和 `Some(false)` 是
+        // 两种不同的形状：前者回落厂商画像，后者是实测说不报。这个区别只活在
+        // 键存在性上，指标面不区分，所以这里必须钉住。
+        assert_eq!(list[2].supports_usage_in_streaming, None);
+    }
+
+    #[test]
     fn suspect_backoff_exponential_and_capped() {
         // 窗口 = 探测间隔 × 2^(n-1)，封顶 6h；间隔有 30s 下限防呆。
         assert_eq!(suspect_backoff_secs(1, 300), 300);
@@ -4516,6 +4560,7 @@ mod tests {
             api_key: "k".into(),
             supports_tool_calls: None,
             requires_temperature_one: None,
+            supports_usage_in_streaming: None,
         };
         assert!(!table.is_suspect(&u));
         // 首次失败开新窗：返回计数供调用方打 WARN。
@@ -4621,6 +4666,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             api_key: "k".into(),
             supports_tool_calls: None,
             requires_temperature_one: None,
+            supports_usage_in_streaming: None,
         };
         let pool = vec![u.clone()];
         assert_eq!(
@@ -4652,6 +4698,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             api_key: "k".into(),
             supports_tool_calls: None,
             requires_temperature_one: None,
+            supports_usage_in_streaming: None,
         };
         let a = mk("https://a");
         let b = mk("https://b");
@@ -5133,6 +5180,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             api_key: "k".into(),
             supports_tool_calls: None,
             requires_temperature_one: None,
+            supports_usage_in_streaming: None,
         };
         let a = mk("https://a");
         let b = mk("https://b");
@@ -5394,7 +5442,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // strict 一概不认。这四件事调用方一件都判不出来——它连的是网关。
         let kimi = detect_compat("https://api.kimi.com/v1");
         let mut body = body_json();
-        let mut adapted = adapt_request_body(body.as_object_mut().unwrap(), &kimi);
+        let mut adapted = adapt_request_body(body.as_object_mut().unwrap(), &kimi, None);
         adapted.sort_unstable();
         assert_eq!(
             adapted,
@@ -5425,7 +5473,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .unwrap()
             .remove("max_completion_tokens");
         body["max_tokens"] = serde_json::json!(1024);
-        adapt_request_body(body.as_object_mut().unwrap(), &modern);
+        adapt_request_body(body.as_object_mut().unwrap(), &modern, None);
         assert_eq!(body["max_completion_tokens"], serde_json::json!(1024));
         assert!(body.get("max_tokens").is_none());
 
@@ -5433,9 +5481,61 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 没有这一条，"改得对"与"对所有上游都乱改"在测试里长得一样。
         let mut body = body_json();
         let before = body.to_string();
-        let adapted = adapt_request_body(body.as_object_mut().unwrap(), &modern);
+        let adapted = adapt_request_body(body.as_object_mut().unwrap(), &modern, None);
         assert!(adapted.is_empty(), "未知厂商不该被改写: {adapted:?}");
         assert_eq!(body.to_string(), before);
+    }
+
+    /// `stream_options` 的去留由准入探测的实测结论决定，画像只在实测没结论时兜底。
+    ///
+    /// 两个方向都要钉住，因为两个方向的错法不同：实测说"会报用量"却按画像剥掉，
+    /// 就把全系统的 token 计量打成恒零（读数是零，看不出是被剥的还是上游不报）；
+    /// 实测说"不会报"却按画像留着，则是每次调用都带一个上游可能不认的字段。
+    #[test]
+    fn the_measured_usage_verdict_beats_the_vendor_profile() {
+        use cog_llm::utils::compat::detect_compat;
+
+        // 画像说"不报用量"（这条正是 kimi 的画像）；实测说"会报" ⇒ 必须保留。
+        let says_no = detect_compat("https://api.kimi.com/v1");
+        let mut body = serde_json::json!({
+            "model": "placeholder",
+            "temperature": 0.2,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let adapted = adapt_request_body(body.as_object_mut().unwrap(), &says_no, Some(true));
+        assert!(
+            !adapted.contains(&"stream_options"),
+            "实测说会报用量，就不该按画像剥掉: {adapted:?}"
+        );
+        assert_eq!(
+            body["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+
+        // 同一条画像，实测说"不报" ⇒ 剥掉。
+        let mut body = serde_json::json!({
+            "model": "placeholder",
+            "temperature": 0.2,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let adapted = adapt_request_body(body.as_object_mut().unwrap(), &says_no, Some(false));
+        assert!(adapted.contains(&"stream_options"));
+        assert!(body.get("stream_options").is_none());
+
+        // 反方向：画像说"会报"（未知厂商的兜底画像），实测说"不报" ⇒ 也剥掉。
+        // 没有这一条，实测就只是"在画像之外多一条加宽的规则"，而不是判定本身。
+        let says_yes = detect_compat("http://127.0.0.1:9999/v1");
+        let mut body = serde_json::json!({
+            "model": "placeholder",
+            "temperature": 0.2,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let adapted = adapt_request_body(body.as_object_mut().unwrap(), &says_yes, Some(false));
+        assert!(adapted.contains(&"stream_options"));
+        assert!(body.get("stream_options").is_none());
     }
 
     /// 端到端：调用方发一份"最新 OpenAI 形状"的体，网关按真实上游画像改写，
@@ -5533,6 +5633,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             api_key: "stub-key".into(),
             supports_tool_calls: None,
             requires_temperature_one: None,
+            supports_usage_in_streaming: None,
         }
     }
 

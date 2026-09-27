@@ -326,6 +326,22 @@ async fn resolve_upstream(
                 );
             }
         }
+        // usage 准入探测：这台上游会不会在流里报用量。调用方判断不了（它连的是
+        // 网关，客户端侧的厂商画像按域名匹配永远落兜底），而全系统的 token 计量
+        // 都建在"流里有 usage 尾帧"上，所以这个判定必须问过上游而不是照抄画像。
+        // 探测不成（配额/鉴权/网络）不写字段，回落画像。
+        match detect_usage_in_streaming(base_url, model, api_key).await {
+            Some(reports_usage) => {
+                entry["supports_usage_in_streaming"] = json!(reports_usage);
+            }
+            None => {
+                tracing::warn!(
+                    base_url = %base_url,
+                    model = %model,
+                    "usage-in-stream probe inconclusive; capability left to the vendor profile"
+                );
+            }
+        }
     }
 
     Ok((entry, unverified))
@@ -371,6 +387,57 @@ async fn detect_temperature_constraint(base_url: &str, model: &str, api_key: &st
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
     classify_temperature_probe(status, &body)
+}
+
+/// 把一次 usage 探测的响应归成能力判定：`Some(true)` = 上游在流里报了用量
+/// （字段被认，且尾帧有 usage）；`Some(false)` = 不会报（要么明确拒这个字段，
+/// 要么收了却不报——两种情形下"剥掉"都不会丢掉任何能拿到的用量）；`None` =
+/// 说不清（配额/鉴权/网络/与这个字段无关的 4xx），不写字段、回落画像。
+///
+/// 判 `Some(false)` 的方向是安全的：它只会让网关继续剥这个字段，即现状。
+/// 反过来把"配额 403"读成"支持"会让每次调用都带一个上游可能不认的字段。
+fn classify_usage_probe(status: u16, body: &str) -> Option<bool> {
+    if (200..300).contains(&status) {
+        return Some(body.contains("\"usage\""));
+    }
+    let lowered = body.to_lowercase();
+    if lowered.contains("stream_options") || lowered.contains("include_usage") {
+        return Some(false);
+    }
+    None
+}
+
+/// usage 准入探测：发一个带 `stream_options.include_usage` 的最小流式请求，
+/// 看这台上游认不认、认了会不会在流里报用量。
+///
+/// 为什么这一条要单独问：`supports_usage_in_streaming` 的取值面就是"流里有没有
+/// usage"，而 usage 出不出现取决于我们发不发这个字段。按厂商画像硬编码着剥，
+/// 就把"它本来会不会报"变成了不可观测——两种解释在同一份读数上完全同形，判错
+/// 也永远拿不到反证。问过这台上游，判定就不再有这个问题。
+async fn detect_usage_in_streaming(base_url: &str, model: &str, api_key: &str) -> Option<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+    let resp = client
+        .post(format!(
+            "{}/chat/completions",
+            base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": model,
+            "max_tokens": 8,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "ping"}]
+        }))
+        .send()
+        .await
+        .ok()?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    classify_usage_probe(status, &body)
 }
 
 /// function-calling 实证探测：发一个带 tools 的最小 chat 请求，强制模型
@@ -717,7 +784,8 @@ impl KubeClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        apiserver_denies_ownership, classify_probe, classify_temperature_probe, ProbeOutcome,
+        apiserver_denies_ownership, classify_probe, classify_temperature_probe,
+        classify_usage_probe, ProbeOutcome,
     };
 
     #[test]
@@ -786,6 +854,65 @@ mod tests {
         );
         assert_eq!(
             classify_temperature_probe(400, r#"{"error":{"message":"invalid request body"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn usage_probe_reads_whether_the_stream_carries_a_usage_tail() {
+        // 2xx 且流里出现 usage 尾帧：这台上游认这个字段、也确实报用量。
+        assert_eq!(
+            classify_usage_probe(
+                200,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                 data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n\
+                 data: [DONE]\n\n"
+            ),
+            Some(true)
+        );
+        // 2xx 但流里没有 usage：字段被接受、却换不回来用量。这时剥与不剥都不
+        // 会有用量，判"不会报"是安全方向——它只会让网关保持现状。
+        assert_eq!(
+            classify_usage_probe(
+                200,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+            ),
+            Some(false)
+        );
+        // 上游明确点名这个字段拒绝：剥掉它是保护性的。
+        assert_eq!(
+            classify_usage_probe(
+                400,
+                r#"{"error":{"message":"unknown field stream_options","type":"invalid_request_error"}}"#
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            classify_usage_probe(
+                400,
+                r#"{"error":{"message":"include_usage is not supported"}}"#
+            ),
+            Some(false)
+        );
+        // 与这个字段无关的拒服一律不写结论：读成"支持"会让每次调用都带一个
+        // 上游可能不认的字段；读成"不支持"则会把"其实支持"永久钉死。
+        assert_eq!(
+            classify_usage_probe(
+                429,
+                r#"{"error":{"code":"AccountQuotaExceeded","message":"monthly quota"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            classify_usage_probe(403, r#"{"error":{"type":"access_terminated_error"}}"#),
+            None
+        );
+        assert_eq!(
+            classify_usage_probe(401, r#"{"error":{"message":"invalid api key"}}"#),
+            None
+        );
+        assert_eq!(
+            classify_usage_probe(400, r#"{"error":{"message":"invalid request body"}}"#),
             None
         );
     }
