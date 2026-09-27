@@ -3059,14 +3059,132 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// Set in the re-entrant run, so the process that has to carry the verdict knows it is
+    /// the one, and the one that spawned it cannot re-enter forever.
+    const UNPRIVILEGED_RERUN: &str = "COGNEVA_HOSTDOCS_UNPRIVILEGED_RERUN";
+
+    /// Printed by the re-entrant run alone, so the run that spawned it can tell "the
+    /// unprivileged run passed" from "the filter matched nothing and nothing ran at all".
+    const UNPRIVILEGED_MARKER: &str = "hostdocs: this is the unprivileged run";
+
+    /// `nobody`. Every system has this uid even when it has no name for it, and no process
+    /// is given it, so the permission bits apply to it wherever this runs.
+    const UNPRIVILEGED_UID: u32 = 65534;
+
+    /// The uid the permission bits are applied to.
+    ///
+    /// Read as the owner of this process's `/proc` entry: the kernel stamps it with the
+    /// **effective** uid, which is the one the check consults, and reading it this way costs
+    /// no dependency on `libc`.
+    fn effective_uid() -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self")
+            .expect("this process has a /proc entry")
+            .uid()
+    }
+
+    /// The name libtest knows a test in this module by (no crate name in front).
+    ///
+    /// Built from `module_path!()` rather than written out, because a name that stopped
+    /// matching would not fail loudly: the filter would match nothing, no test would run,
+    /// and the empty run would read as a pass. The marker below is what makes that a
+    /// failure instead, and this is what keeps the two in step.
+    fn test_name_here(test: &str) -> String {
+        let path = module_path!();
+        let without_crate = path.split_once("::").map_or(path, |(_, rest)| rest);
+        format!("{without_crate}::{test}")
+    }
+
+    /// The verdict-carrying run of this test, in a process the permission bits apply to.
+    ///
+    /// Re-entering the test binary is the only way to get such a process while still running
+    /// **this** code: the code under test lives in this library, so any other helper would
+    /// measure a different program. The binary's own path is tried first, and if the drop is
+    /// refused the same inode is linked into a directory every uid can walk -- the exec is
+    /// what fails there, before this code is reached, and on a developer machine that is the
+    /// normal case (the home directory is 0700). Linking costs no copy of a binary this
+    /// size. `Err` carries what refused, so the caller can say it rather than leave the cell
+    /// unproven.
+    fn unprivileged_verdict(test: &str) -> Result<std::process::Output, String> {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let spawn = |path: &Path| {
+            std::process::Command::new(path)
+                .args(["--exact", &test_name_here(test), "--nocapture"])
+                .env(UNPRIVILEGED_RERUN, "1")
+                .uid(UNPRIVILEGED_UID)
+                .output()
+        };
+        let refusal = match spawn(&exe) {
+            Ok(out) => return Ok(out),
+            Err(e) => e.to_string(),
+        };
+        let dir = tempfile::tempdir().map_err(|e| format!("{refusal}; {e}"))?;
+        // `tempfile` hands out 0700, which an unprivileged uid cannot walk into either.
+        chmod(dir.path(), 0o755);
+        let link = dir.path().join("rerun");
+        std::fs::hard_link(&exe, &link).map_err(|e| format!("{refusal}; {e}"))?;
+        spawn(&link).map_err(|e| format!("{refusal}; {e}"))
+    }
+
+    /// Move this test into a process the permission bits apply to, if this one is not.
+    ///
+    /// Call at the top of a test whose subject includes a denial built out of permissions,
+    /// as `if moved_to_a_process_that_can_be_denied("<this test's own name>") { return; }`.
+    /// Such a denial only exists for a process without `CAP_DAC_OVERRIDE`: the kernel lets a
+    /// privileged one read a 0o000 directory exactly as if it were 0o755, so under root the
+    /// probe would find the cell reachable for a reason the cell does not claim and
+    /// `expect_err` would panic on a run that has nothing to do with the change being
+    /// judged. Moving the whole test -- rather than skipping the cell -- keeps it covered in
+    /// the environment that gates changes, which is the privileged one.
+    ///
+    /// Returns `true` in a privileged run that has handed the verdict to its unprivileged
+    /// re-entry: that run has asserted what it can and is finished.
+    fn moved_to_a_process_that_can_be_denied(test: &str) -> bool {
+        // The re-entry is asked about first, and by its own variable: the run that carries
+        // the verdict is recognised by how it was started, not by what uid it ended up with.
+        // A drop that silently did not happen would otherwise read as "this process can be
+        // denied", which is the one thing the run exists to rule out.
+        if std::env::var_os(UNPRIVILEGED_RERUN).is_some() {
+            assert_ne!(
+                effective_uid(),
+                0,
+                "the re-entrant run has to be a process the permission bits apply to, and it is still uid 0"
+            );
+            println!("{UNPRIVILEGED_MARKER}");
+            return false;
+        }
+        if effective_uid() != 0 {
+            return false;
+        }
+
+        let out = unprivileged_verdict(test).unwrap_or_else(|refusal| {
+            panic!(
+                "this run is uid 0, so a 0o000 directory is listable here, and the test has to \
+                 re-enter itself as an unprivileged process -- which this environment will not let \
+                 it do: {refusal}. The cell is not optional: fix what refuses the drop (the \
+                 capability to setuid, a reachable path to the test binary, or an unprivileged uid \
+                 for the test run) rather than the judgement"
+            )
+        });
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(UNPRIVILEGED_MARKER),
+            "the unprivileged run carries the verdict for this test, so it has to pass and to have \
+             run at all: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        true
+    }
+
     /// A scope this process cannot read: directory 0o000, and a file under it 0o000.
     ///
     /// Building `unreadable` with it is deliberate: that cell's cause is "this process
     /// cannot read it", which is neither "it does not exist" nor "it is not text", and only
-    /// the permission bits can produce it reliably in a test. Running the tests as root,
-    /// root ignores the permission bits and that step cannot reach this cell -- so the test
-    /// carries its own self-check saying plainly "this environment cannot produce it" rather
-    /// than skipping silently.
+    /// the permission bits can produce it reliably in a test. What the bits deny depends on
+    /// who asks -- see `moved_to_a_process_that_can_be_denied`, which the tests using this
+    /// run through first so that "this process" is one the bits actually apply to.
     fn locked_scope(dir: &Path) -> PathBuf {
         let root = dir.join("locked");
         std::fs::create_dir_all(&root).unwrap();
@@ -3252,6 +3370,9 @@ mod tests {
 
     #[test]
     fn every_published_listing_outcome_is_reachable() {
+        if moved_to_a_process_that_can_be_denied("every_published_listing_outcome_is_reachable") {
+            return;
+        }
         let (dir, cfg) = temp_scope();
         populate(&cfg);
         let docs = open_docs(&cfg);
@@ -3359,6 +3480,9 @@ mod tests {
 
     #[test]
     fn every_published_read_outcome_is_reachable() {
+        if moved_to_a_process_that_can_be_denied("every_published_read_outcome_is_reachable") {
+            return;
+        }
         let (dir, cfg) = temp_scope();
         let root = populate(&cfg);
         std::fs::write(root.join("big.txt"), vec![b'x'; 64]).unwrap();
