@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use cog_core::{HistogramTotals, MetricSample};
@@ -75,12 +76,51 @@ pub fn render_histograms(name: &str, help: &str, series: &[HistogramTotals]) -> 
 
     let mut out = format!("# HELP {name} {help}\n# TYPE {name} histogram\n");
 
-    let mut ordered: Vec<&HistogramTotals> = series.iter().collect();
-    ordered.sort_by_key(|s| format_labels(&s.labels));
-
-    let mut observed: Vec<(String, i64)> = Vec::with_capacity(ordered.len());
-    for totals in ordered {
+    // One rendered series per label set, however many entries arrive for it. A
+    // histogram's input is already accumulated, so unlike a counter's there is
+    // normally nothing left to add up — but "one entry per series" is the
+    // caller's promise, and a caller that breaks it (keying series on the label
+    // map rather than on its content, say) hands over the halves of one series
+    // as several entries. Rendered as they come, those are two lines with the
+    // same name and labels: a scrape reports them as duplicates and keeps one,
+    // so the buckets, the `_sum` and the `_count` a reader sees are drawn from
+    // whichever half happened to win, and `histogram_quantile` interpolates
+    // from a fragment. Adding entries that share a label set is exact when they
+    // are complementary halves and is what a reader means by the series either
+    // way.
+    let mut merged: HashMap<String, HistogramTotals> = HashMap::new();
+    for totals in series {
         let key = format_labels(&totals.labels);
+        match merged.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(totals.clone());
+            }
+            Entry::Occupied(mut slot) => {
+                let accumulated = slot.get_mut();
+                for (index, (bound, observations)) in totals.buckets.iter().enumerate() {
+                    match accumulated.buckets.get_mut(index) {
+                        Some(bucket) => bucket.1 += observations,
+                        // A longer entry's extra bounds are kept rather than
+                        // dropped: their observations belong above the shorter
+                        // entry's top bound, and discarding them would move
+                        // them into `+Inf` silently.
+                        None => accumulated.buckets.push((*bound, *observations)),
+                    }
+                }
+                accumulated.overflow += totals.overflow;
+                accumulated.count += totals.count;
+                accumulated.sum += totals.sum;
+                accumulated.updated_at = accumulated.updated_at.max(totals.updated_at);
+            }
+        }
+    }
+
+    let mut keys: Vec<String> = merged.keys().cloned().collect();
+    keys.sort_unstable();
+
+    let mut observed: Vec<(String, i64)> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let totals = &merged[&key];
         for (bound, count) in totals.cumulative_buckets() {
             let mut with_bound = totals.labels.clone();
             with_bound.insert("le".into(), format_bound(bound));
@@ -369,5 +409,92 @@ mod tests {
     #[test]
     fn empty_gauge_renders_nothing() {
         assert!(render_gauges("memory_unextracted_raw", "help", &[]).is_empty());
+    }
+
+    /// 一个序列的每个分片都可能来自后端的一次独立分组：只要那些分组不是按标签内容
+    /// 做的，同一个序列就会分成几份交到这里。多份合起来才是这个序列，分开渲染就是
+    /// 同名同标签的多行——抓取端按重复丢掉其中一条，留下的那半份给出的是错的桶、
+    /// 错的 `_sum`、错的 `_count`，`histogram_quantile` 再从这半份里插值。
+    #[test]
+    fn one_logical_series_is_not_rendered_as_several() {
+        let labels: HashMap<String, String> = [("endpoint", "/api/v1/tasks"), ("method", "GET")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let at = |minutes: i64| chrono::Utc::now() - chrono::Duration::minutes(minutes);
+        let totals = |buckets: Vec<(f64, u64)>, overflow, count, sum, minutes| HistogramTotals {
+            labels: labels.clone(),
+            buckets,
+            overflow,
+            count,
+            sum,
+            updated_at: at(minutes),
+        };
+
+        // 三份：桶分在两段里，`_sum` 单独一份，没有一份自己是对的。
+        let split = vec![
+            totals(vec![(1.0, 4), (2.0, 0)], 0, 4, 0.0, 30),
+            totals(vec![(1.0, 0), (2.0, 6)], 3, 9, 0.0, 20),
+            totals(vec![(1.0, 0), (2.0, 0)], 0, 0, 42.5, 10),
+        ];
+        let newest = split[2].updated_at.timestamp();
+
+        let out = render_histograms("http_request_duration_ms", "help", &split);
+
+        let body = |prefix: &str| {
+            out.lines()
+                .filter(|l| l.starts_with(prefix))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            body("http_request_duration_ms_sum{").len(),
+            1,
+            "一个序列只能有一条 _sum：{out}"
+        );
+        assert_eq!(body("http_request_duration_ms_count{").len(), 1, "{out}");
+        assert_eq!(body("http_request_duration_ms_bucket{").len(), 3, "{out}");
+        assert_eq!(
+            body("http_request_duration_ms_observed_timestamp_seconds{").len(),
+            1,
+            "{out}"
+        );
+        // 桶是累积的，观测总数回到 `+Inf` 上；三份加起来才是这个序列。
+        assert!(
+            out.contains(
+                "http_request_duration_ms_bucket{endpoint=\"/api/v1/tasks\",le=\"1\",method=\"GET\"} 4\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "http_request_duration_ms_bucket{endpoint=\"/api/v1/tasks\",le=\"2\",method=\"GET\"} 10\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "http_request_duration_ms_bucket{endpoint=\"/api/v1/tasks\",le=\"+Inf\",method=\"GET\"} 13\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "http_request_duration_ms_sum{endpoint=\"/api/v1/tasks\",method=\"GET\"} 42.5\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "http_request_duration_ms_count{endpoint=\"/api/v1/tasks\",method=\"GET\"} 13\n"
+            ),
+            "{out}"
+        );
+        // 时间是「最近一次观测」，合并后要取最新的那份，不是某一份的。
+        assert!(
+            out.contains(&format!(
+                "http_request_duration_ms_observed_timestamp_seconds{{endpoint=\"/api/v1/tasks\",method=\"GET\"}} {newest}\n"
+            )),
+            "{out}"
+        );
     }
 }

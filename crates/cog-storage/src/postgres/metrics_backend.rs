@@ -9,6 +9,20 @@ use cog_core::{
     SFError, SFResult,
 };
 
+/// The identity of one series, from the only thing that identifies it.
+///
+/// A row per series comes back from the store, but each row's labels are read
+/// into their own `HashMap`, and a map's iteration order is drawn per instance
+/// rather than from its contents. Keying on the map — or on serializing it —
+/// therefore splits one series across as many keys as the map has orders, and
+/// redraws the split on every scrape, because the maps are rebuilt each time.
+/// The canonical label-set form is a function of the contents alone, and it is
+/// the same one the render side groups by, so the two ends cannot come to
+/// different conclusions about what one series is.
+fn series_key(labels: &HashMap<String, String>) -> String {
+    cog_core::observability_text::format_labels(labels)
+}
+
 /// PostgreSQL-backed metrics backend.
 pub struct PostgresMetricsBackend {
     pool: PgPool,
@@ -404,16 +418,12 @@ impl MetricsBackend for PostgresMetricsBackend {
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
 
-        // Keyed on the serialized labels rather than on a `HashMap` of them:
-        // the JSONB text is what the primary key compares, so grouping on it
-        // keeps two rows in one series exactly when the database considers them
-        // one series.
         let mut series: HashMap<String, HistogramTotals> = HashMap::new();
 
         for (labels_json, sum, updated_at) in sum_rows {
             let labels: HashMap<String, String> =
                 serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
-            let key = serde_json::to_string(&labels).map_err(SFError::Serialization)?;
+            let key = series_key(&labels);
             series.insert(
                 key,
                 HistogramTotals {
@@ -430,7 +440,7 @@ impl MetricsBackend for PostgresMetricsBackend {
         for (labels_json, bucket, observations) in bucket_rows {
             let labels: HashMap<String, String> =
                 serde_json::from_value(labels_json).map_err(SFError::Serialization)?;
-            let key = serde_json::to_string(&labels).map_err(SFError::Serialization)?;
+            let key = series_key(&labels);
             let observations = observations.max(0) as u64;
             let totals = series.entry(key).or_insert_with(|| HistogramTotals {
                 labels,
@@ -504,5 +514,43 @@ impl MetricsBackend for PostgresMetricsBackend {
             .await
             .map_err(|e| SFError::Database(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一个标签集的每一行都由它自己那份 map 承载，而迭代顺序是按实例取的，
+    /// 与内容无关。键若取自 map 本身（或它的序列化文本），同一个序列就会按
+    /// 排列数碎成多份，且每次抓取的碎法都不同——渲染端于是拿到半个序列的桶，
+    /// 与另一个键下的 `_sum`，两边都对不上。内容相同必须得出同一个键。
+    #[test]
+    fn one_label_set_is_one_series_key_however_their_maps_iterate() {
+        let mut keys = std::collections::HashSet::new();
+        for _ in 0..32 {
+            // 每轮重建一份 map：内容一样，迭代顺序各不同。
+            let labels: HashMap<String, String> = [
+                ("endpoint", "/api/v1/tasks"),
+                ("method", "GET"),
+                ("status", "200"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            keys.insert(series_key(&labels));
+        }
+        assert_eq!(keys.len(), 1, "一个标签集只能有一个键：{keys:?}")
+    }
+
+    /// 分键用的是渲染端分组用的那个形式：两端若各有一套身份，「一个序列」在
+    /// 存储端和抓取端就会是不同的东西。
+    #[test]
+    fn the_series_key_is_the_form_the_render_side_groups_by() {
+        let labels: HashMap<String, String> = [("b", "2"), ("a", "1")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(series_key(&labels), "a=\"1\",b=\"2\"");
     }
 }
