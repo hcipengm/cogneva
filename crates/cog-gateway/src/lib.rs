@@ -31,6 +31,7 @@ pub mod cluster;
 pub mod collaboration;
 pub mod contribution_admin;
 pub mod dashboard;
+pub mod document_egress;
 pub mod error;
 pub mod evolution;
 pub mod executor;

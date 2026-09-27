@@ -43,7 +43,28 @@ struct WriteSite {
 /// The calls that reach `PolicyStore::save_new_version`, the one thing that
 /// actually appends a version. `ArtifactEvolution::approve` and `::evolve` are
 /// the two doors in front of it, so calling either is writing.
-const WRITE_API: [&str; 3] = ["save_new_version(", ".evolve(", ".approve("];
+///
+/// Split in two because the three tokens are not equally specific. Only one API
+/// in the workspace is called `save_new_version`, so matching it is the call.
+/// `.approve(` and `.evolve(` are ordinary verbs: any other subsystem may name a
+/// method the same way, and then this gate reads that subsystem's call as a
+/// version write and asks its author to declare a trigger that does not exist.
+/// The disambiguation is the type: reaching those two doors requires holding an
+/// `ArtifactEvolution` (which holds the `PolicyStore`), so a real write path
+/// always names one of them, while a same-named method on another type does not.
+const WRITE_API_UNIQUE: [&str; 1] = ["save_new_version("];
+const WRITE_API_VERBS: [&str; 2] = [".evolve(", ".approve("];
+const ARTIFACT_TYPES: [&str; 2] = ["ArtifactEvolution", "PolicyStore"];
+
+/// Does this production source (not tests) write a versioned artifact?
+///
+/// A pure function so both directions can be pinned by test: a lone `.approve(`
+/// must not be read as a write, and a real door call must be.
+fn calls_the_write_api(production: &str) -> bool {
+    WRITE_API_UNIQUE.iter().any(|api| production.contains(api))
+        || (WRITE_API_VERBS.iter().any(|api| production.contains(api))
+            && ARTIFACT_TYPES.iter().any(|t| production.contains(t)))
+}
 
 const WRITE_SITES: &[WriteSite] = &[
     WriteSite {
@@ -121,10 +142,7 @@ fn files_calling_the_write_api() -> BTreeSet<String> {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if WRITE_API
-                .iter()
-                .any(|api| production_source(&text).contains(api))
-            {
+            if calls_the_write_api(production_source(&text)) {
                 let relative = path
                     .strip_prefix(&root)
                     .expect("scanned path is under the workspace root")
@@ -170,6 +188,26 @@ fn every_versioned_artifact_write_site_is_classified() {
             site.evidence,
         );
     }
+}
+
+#[test]
+fn a_same_named_method_on_another_type_is_not_a_write() {
+    // The false positive this narrowing exists for: a document-approval handler
+    // calls `docs.approve(id, who)`. It writes a staged plan, not a version, and
+    // it names no artifact type — so it must not be collected.
+    assert!(!calls_the_write_api(
+        "fn approve_document(&self) { self.docs.approve(&id, who) }"
+    ));
+    // The other direction, or the narrowing above would be a blindfold: a real
+    // door call names the type it goes through.
+    assert!(calls_the_write_api(
+        "fn stage(&self) { self.evolution.approve(candidate, &store) } // ArtifactEvolution"
+    ));
+    // And the unique token stands on its own: a file that only calls the store
+    // may hold its type through an alias.
+    assert!(calls_the_write_api(
+        "fn save(&self) { self.store.save_new_version(next) }"
+    ));
 }
 
 #[test]

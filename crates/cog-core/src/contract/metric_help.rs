@@ -74,6 +74,15 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "Total LLM upstream failures, excluding rate limits",
     ),
     (
+        crate::metric_names::AUDITED_LLM_REQUESTS_TOTAL.as_str(),
+        "Requests offered to the audited document channel, by outcome. Every \
+         cell is published at zero on purpose: without the zero, a channel the \
+         switch closed and a channel nobody calls render the same. Read it \
+         before looking for a missing document — `blocked_by_switch` says the \
+         channel is shut by configuration, while `refused_by_audit` climbing is \
+         a security event and not a caller mistake",
+    ),
+    (
         "cogneva_version_contract_checks_total",
         "Version contract judgements by clause and outcome. Read next to the \
          violations: without it, a contract that holds and a judgement that has \

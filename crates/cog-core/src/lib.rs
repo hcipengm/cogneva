@@ -26,6 +26,7 @@ pub use contract::evolution_admin::*;
 pub use contract::fault::*;
 pub use contract::guardrail::*;
 pub use contract::hook::*;
+pub use contract::host_documents;
 pub use contract::knowledge::*;
 pub use contract::llm::*;
 pub use contract::media::*;

@@ -109,6 +109,23 @@ pub struct SecurityGatewayConfig {
     /// 放行等于把凭证代持能力交给监控侧；观测通道不含任何代理路由，
     /// 可以只对它放行监控命名空间。
     pub metrics_port: u16,
+    /// Audited LLM channel listen port (the fifth channel,
+    /// `COGNEVA_SG_AUDITED_LLM_PORT`).
+    ///
+    /// It carries the same routes as the LLM passthrough, and what it adds is a
+    /// per-request audit plus a very small reachable surface (the NetworkPolicy
+    /// admits only the document-organising workload). A separate listener rather
+    /// than adding the LLM routes to 8080: 8080 is already admitted by the sandbox
+    /// pods' egress allowlist, so putting the model routes there would hand them
+    /// the ability to reach the upstream directly along the way.
+    pub audited_llm_port: u16,
+    /// Whether host document bodies may leave the cluster
+    /// (`HOST_DOCS_BODY_EGRESS_ENABLED`, off by default). The judgement sits in
+    /// this process: it is the only place that can refuse such a request.
+    pub host_docs_body_egress: bool,
+    /// Largest request body the audited channel will audit
+    /// (`COGNEVA_SG_AUDITED_MAX_BODY_BYTES`).
+    pub audited_max_body_bytes: usize,
     /// GitHub webhook HMAC-SHA256 验签 secret（COGNEVA_GITHUB_WEBHOOK_SECRET）。
     /// 未配置时 /webhooks/github 一律 503（fail-closed）。
     pub github_webhook_secret: Option<String>,
@@ -183,6 +200,16 @@ impl SecurityGatewayConfig {
             github_oauth_client_secret: token("COGNEVA_GITHUB_OAUTH_CLIENT_SECRET"),
             webhook_port: env_u16("COGNEVA_SG_WEBHOOK_PORT", 8082),
             metrics_port: env_u16("COGNEVA_SG_METRICS_PORT", 9090),
+            audited_llm_port: env_u16("COGNEVA_SG_AUDITED_LLM_PORT", 8083),
+            host_docs_body_egress: crate::document_egress::switch_enabled(
+                std::env::var(crate::document_egress::BODY_EGRESS_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+            audited_max_body_bytes: env_usize(
+                crate::document_egress::MAX_BODY_BYTES_ENV,
+                crate::document_egress::DEFAULT_MAX_AUDITED_BODY_BYTES,
+            ),
             github_webhook_secret: token("COGNEVA_GITHUB_WEBHOOK_SECRET"),
             gitee_webhook_token: token("COGNEVA_GITEE_WEBHOOK_TOKEN"),
             webhook_internal_secret: token("COGNEVA_WEBHOOK_INTERNAL_SECRET"),
@@ -261,6 +288,13 @@ fn env_u16(key: &str, default: u16) -> u16 {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1636,35 +1670,42 @@ fn spawn_pool_state_publisher(state: AppState) -> tokio::task::JoinHandle<()> {
     )
 }
 
-/// 凭证泄露模式：命中即拦截并记日志。
-fn secret_patterns() -> Vec<regex::Regex> {
+/// Credential-leak patterns and the name each one reports. A hit is blocked and
+/// logged.
+///
+/// **The order is the judgement**: specific shapes come before generic ones. The
+/// `sk-` row's character class accepts `-`, so it also matches text beginning with
+/// `sk-ant-`; whichever row comes first is the name that gets reported, and that
+/// name is what an operator goes and rotates -- naming the wrong vendor points at
+/// the wrong place. Each name sits on the same line as its pattern instead of in a
+/// second table aligned by index: that kind of table gets edited in one place and
+/// forgotten in the other, and the failure it produces is exactly "the reported
+/// name and the matched pattern are not the same row".
+fn secret_patterns() -> Vec<(regex::Regex, &'static str)> {
     [
-        r"sk-[A-Za-z0-9_\-]{20,}",        // OpenAI
-        r"sk-ant-[A-Za-z0-9_\-]{20,}",    // Anthropic
-        r"gh[pousr]_[A-Za-z0-9]{20,}",    // GitHub tokens
-        r"AKIA[0-9A-Z]{16}",              // AWS access key
-        r"xox[baprs]-[A-Za-z0-9\-]{10,}", // Slack
-        r#"(?i)(api[_-]?key|secret|password|token)["'\s:=]+[A-Za-z0-9_\-]{16,}"#,
+        (r"sk-ant-[A-Za-z0-9_\-]{20,}", "anthropic_api_key"),
+        (r"sk-[A-Za-z0-9_\-]{20,}", "openai_api_key"),
+        (r"gh[pousr]_[A-Za-z0-9]{20,}", "github_token"),
+        (r"AKIA[0-9A-Z]{16}", "aws_access_key"),
+        (r"xox[baprs]-[A-Za-z0-9\-]{10,}", "slack_token"),
+        (
+            r#"(?i)(api[_-]?key|secret|password|token)["'\s:=]+[A-Za-z0-9_\-]{16,}"#,
+            "generic_credential",
+        ),
     ]
     .iter()
-    .map(|p| regex::Regex::new(p).expect("valid regex"))
+    .map(|(pattern, name)| (regex::Regex::new(pattern).expect("valid regex"), *name))
     .collect()
 }
 
-fn contains_secret(text: &str) -> Option<&'static str> {
-    for (i, re) in secret_patterns().iter().enumerate() {
-        if re.is_match(text) {
-            return Some(match i {
-                0 => "openai_api_key",
-                1 => "anthropic_api_key",
-                2 => "github_token",
-                3 => "aws_access_key",
-                4 => "slack_token",
-                _ => "generic_credential",
-            });
-        }
-    }
-    None
+/// The credential-shape judge for outbound request bodies. The egress proxy and the
+/// audited LLM channel share one table: two catalogues drift apart, and the
+/// direction they drift in is "the audited channel ends up looser than the proxy".
+pub(crate) fn contains_secret(text: &str) -> Option<&'static str> {
+    secret_patterns()
+        .iter()
+        .find(|(re, _)| re.is_match(text))
+        .map(|(_, name)| *name)
 }
 
 fn domain_allowed(config: &SecurityGatewayConfig, host: &str) -> bool {
@@ -3717,6 +3758,24 @@ fn router(state: AppState, llm_channel: bool) -> Router {
     r.with_state(state)
 }
 
+/// The audited LLM channel's routes: the same routes as the LLM passthrough with a
+/// per-request audit and the switch wrapped around them.
+///
+/// It serves `/health/live` only (following the webhook channel) and carries no
+/// `/metrics`: metrics come out on the observability channel alone, and a second
+/// exit for them would expose the same reading over a second reachable surface --
+/// and a small reachable surface is the entire reason this channel exists.
+fn audited_router(state: AppState, gate: crate::document_egress::AuditedGate) -> Router {
+    let routes = llm_channel_router().layer(axum::middleware::from_fn_with_state(
+        gate,
+        crate::document_egress::enforce,
+    ));
+    Router::new()
+        .route("/health/live", get(health_live))
+        .merge(routes)
+        .with_state(state)
+}
+
 /// webhook 入口通道路由（面向集群外平台回调，验签后转发主应用）。
 fn webhook_router(state: AppState) -> Router {
     // 转发主应用失败的 502/503 此前只回给平台、网关自己不留痕。
@@ -4037,15 +4096,36 @@ pub async fn run(
     let llm_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.llm_port));
     let webhook_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.webhook_port));
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.metrics_port));
+    let audited_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.audited_llm_port));
+    // The audited channel's gate is built at startup and publishes its vocabulary at
+    // zero: "the channel is up and nobody has called it yet" has to be distinguishable
+    // in the reading from "the channel was never wired up" -- and a closed switch is
+    // exactly when the latter is easiest to mistake for the truth.
+    let audited_gate = crate::document_egress::AuditedGate::new(
+        config.host_docs_body_egress,
+        config.audited_max_body_bytes,
+        state.pool_obs.metrics.clone(),
+    );
+    audited_gate.publish_vocabulary().await;
     tracing::info!(
         egress = %egress_addr,
         llm = %llm_addr,
         webhook = %webhook_addr,
         metrics = %metrics_addr,
+        audited_llm = %audited_addr,
+        body_egress = audited_gate.enabled(),
+        switch = crate::document_egress::BODY_EGRESS_ENV,
         allowlist = ?config.domain_allowlist,
         denylist = ?config.domain_denylist,
         "安全网关启动（凭证仅存在本进程内存）"
     );
+    if !audited_gate.enabled() {
+        tracing::info!(
+            switch = crate::document_egress::BODY_EGRESS_ENV,
+            "audited channel is in place but closed: document bodies are all stopped at \
+             the switch, and the refusals are counted in the blocked_by_switch cell"
+        );
+    }
     let egress = axum::serve(
         tokio::net::TcpListener::bind(egress_addr).await?,
         router(state.clone(), false),
@@ -4060,9 +4140,13 @@ pub async fn run(
     );
     let metrics = axum::serve(
         tokio::net::TcpListener::bind(metrics_addr).await?,
-        metrics_router(state),
+        metrics_router(state.clone()),
     );
-    tokio::try_join!(egress, llm, webhook, metrics)?;
+    let audited = axum::serve(
+        tokio::net::TcpListener::bind(audited_addr).await?,
+        audited_router(state, audited_gate),
+    );
+    tokio::try_join!(egress, llm, webhook, metrics, audited)?;
     Ok(())
 }
 
@@ -4239,6 +4323,12 @@ mod tests {
             gitee_webhook_token: None,
             webhook_internal_secret: None,
             webhook_forward_url: "http://cogneva:9091".into(),
+            // The audited channel's settings take the same values as the deployment
+            // defaults here: switch off, default bound. Off is the safe side, and the
+            // value "off" itself is proven by its own test (the audited port refuses).
+            audited_llm_port: 8083,
+            host_docs_body_egress: false,
+            audited_max_body_bytes: crate::document_egress::DEFAULT_MAX_AUDITED_BODY_BYTES,
             pool_check_secs: 30,
             database_url: None,
             redis_url: None,

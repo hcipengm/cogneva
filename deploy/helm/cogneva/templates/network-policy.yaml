@@ -168,6 +168,21 @@ spec:
           port: 8080
         - protocol: TCP
           port: 8081
+    # Audited LLM channel: the `podSelector: {}` rule above means "anyone in this
+    # namespace may call", while this port exists entirely because its reachable set
+    # is small -- document bodies leave through it, and it carries upstream
+    # credentials without a domain allowlist. So the source pod is pinned to one:
+    # the sandbox executor (the owner of the host-document capability).
+    # The rule is written on the gateway rather than as an executor egress allowlist
+    # on purpose: the judgement lands on the side that holds the credentials, so a
+    # caller-side coding mistake cannot widen it.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: sandbox-executor
+      ports:
+        - protocol: TCP
+          port: {{ .Values.securityGateway.auditedLlmPort }}
     # webhook 入口（8082）：NodePort 面向集群外平台回调，源 IP 经 SNAT 为节点
     # 地址，无法用 podSelector 限定；平台签名验签在网关完成（未配置 secret 时
     # 一律 503，fail-closed），故可对集群外开放。
@@ -191,4 +206,70 @@ spec:
           port: {{ .Values.securityGateway.metricsPort }}
   egress:
     - {}
+---
+# The sandbox executor's egress face: turn "document bodies go through the audited
+# channel only" from a line of code into a **network fact**.
+#
+# The executor holds no credentials, so it cannot reach the upstream LLM -- but today
+# it can reach the security gateway's **passthrough port** (8081), and that port does
+# not look at one byte of the request body. If "this request uses the audited channel"
+# were written in caller code only, nothing would stop a mistake; once the reachable
+# set is narrowed the passthrough port is not on this pod at all, so **the judgement
+# does not exist and therefore cannot be written wrong**.
+#
+# The port list is not copied from a neighbouring policy: it is this instance's real
+# egress face (measured connections 2026-09-27 + code review).
+#   - DNS 53: resolving github.com / gitee.com is how the seed repositories are fetched.
+#   - 0.0.0.0/0:443: seed repository https fetches (SANDBOX_REPO_SEED_URLS, once every
+#     repoFetchIntervalSecs) plus the git/cargo fetches a task performs; the image's
+#     cargo source is rsproxy and npm is npmmirror, both on 443. This port covers no
+#     in-namespace service -- a ClusterIP service port is never 443.
+#   - the audited LLM channel: the only in-namespace port allowed through.
+#   - 8080/8081/8082 and the data plane are not listed: the executor's env carries local
+#     paths only (workspace, bare repo, cargo home, document scopes), no data-plane URL,
+#     and the code has no qdrant / apiserver client. So this is not "removing a
+#     capability in use" but reclaiming a path nobody uses -- one that, if used, would
+#     send bodies out.
+#   - Egress only: the inbound face (the main app submitting tasks, monitoring scraping
+#     9090) is outside this reasoning; narrowing it too would drag unrelated paths in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cogneva-sandbox-executor-egress
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-executor
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: sandbox-executor
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: security-gateway
+      ports:
+        - protocol: TCP
+          port: {{ .Values.securityGateway.auditedLlmPort }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: "0.0.0.0/0"
+      ports:
+        - protocol: TCP
+          port: 443
 {{- end }}

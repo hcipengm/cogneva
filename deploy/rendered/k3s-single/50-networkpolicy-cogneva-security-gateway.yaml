@@ -28,6 +28,21 @@ spec:
           port: 8080
         - protocol: TCP
           port: 8081
+    # Audited LLM channel: the `podSelector: {}` rule above means "anyone in this
+    # namespace may call", while this port exists entirely because its reachable set
+    # is small -- document bodies leave through it, and it carries upstream
+    # credentials without a domain allowlist. So the source pod is pinned to one:
+    # the sandbox executor (the owner of the host-document capability).
+    # The rule is written on the gateway rather than as an executor egress allowlist
+    # on purpose: the judgement lands on the side that holds the credentials, so a
+    # caller-side coding mistake cannot widen it.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: sandbox-executor
+      ports:
+        - protocol: TCP
+          port: 8083
     # webhook 入口（8082）：NodePort 面向集群外平台回调，源 IP 经 SNAT 为节点
     # 地址，无法用 podSelector 限定；平台签名验签在网关完成（未配置 secret 时
     # 一律 503，fail-closed），故可对集群外开放。

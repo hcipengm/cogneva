@@ -176,7 +176,24 @@ spec:
             - name: HOST_DOCS_JOURNAL_DIR
               value: {{ .Values.hostDocuments.journalDir | quote }}
             - name: HOST_DOCS_MAX_WRITE_BYTES
-              value: {{ .Values.hostDocuments.maxWriteBytes | quote }}
+              # `| int64` cannot be dropped: chart numbers are parsed as float64, so a plain
+              # quote of 8388608 renders "8.388608e+06", which the executor cannot parse and
+              # silently replaces with its default -- the setting looks applied and is not, and
+              # the two bounds then differ (writes at 8 MiB, egress at whatever was configured)
+              # with nothing saying so.
+              value: {{ .Values.hostDocuments.maxWriteBytes | int64 | quote }}
+            # Reads and writes carry separate bounds, for the reason given above: one limits
+            # bytes taken into memory, the other bytes written down, and tying them together
+            # drags one side when the other is adjusted.
+            - name: HOST_DOCS_MAX_READ_BYTES
+              value: {{ .Values.hostDocuments.maxReadBytes | int64 | quote }}
+            # The staged plan's window and cap: without them the approval gate either never
+            # expires or accepts a plan larger than a single write -- either way approving
+            # means nothing.
+            - name: HOST_DOCS_APPROVAL_TTL_SECS
+              value: {{ .Values.hostDocuments.approvalTtlSecs | int64 | quote }}
+            - name: HOST_DOCS_MAX_PLAN_BYTES
+              value: {{ .Values.hostDocuments.maxPlanBytes | int64 | quote }}
             {{- end }}
           startupProbe:
             httpGet:

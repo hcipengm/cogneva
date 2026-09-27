@@ -252,7 +252,14 @@ fn app_router(state: AppState) -> Router {
         .route("/health/ready", get(health))
         .route("/metrics", get(metrics_handler))
         .route("/execute", post(execute_handler))
+        .route("/documents/list", post(documents_list_handler))
+        .route("/documents/read", post(documents_read_handler))
         .route("/documents/plan", post(documents_plan_handler))
+        .route("/documents/stage", post(documents_stage_handler))
+        .route("/documents/approve", post(documents_approve_handler))
+        .route("/documents/reject", post(documents_reject_handler))
+        .route("/documents/staged", get(documents_staged_handler))
+        .route("/documents/review", post(documents_review_handler))
         .route("/documents/apply", post(documents_apply_handler))
         .route("/documents/rollback", post(documents_rollback_handler))
         .with_state(state)
@@ -265,8 +272,59 @@ struct DocumentsPlanRequest {
 }
 
 #[derive(Deserialize)]
+struct DocumentsListRequest {
+    scope: String,
+    /// Only entries under this relative path. Absent means the whole scope.
+    #[serde(default)]
+    prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DocumentsReadRequest {
+    scope: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct DocumentsRollbackRequest {
     journal_id: String,
+}
+
+#[derive(Deserialize)]
+struct DocumentsStageRequest {
+    scope: String,
+    ops: Vec<HostDocOp>,
+}
+
+#[derive(Deserialize)]
+struct DocumentsApproveRequest {
+    staged_id: String,
+    /// Who approved it. The executor **cannot verify** this name (this pod
+    /// deliberately holds no credentials); it is recorded so the approval can be
+    /// looked up later -- an empty approver is no record at all.
+    approver: String,
+}
+
+#[derive(Deserialize)]
+struct DocumentsRejectRequest {
+    staged_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DocumentsReviewRequest {
+    staged_id: String,
+}
+
+/// Apply an already-approved plan. The plan travels in the request body together
+/// with its approval id: the approval id is part of what this call means, and
+/// hiding it in a header or query string would keep "who approved this" out of
+/// the parts of the call that get logged.
+#[derive(Deserialize)]
+struct DocumentsApplyRequest {
+    plan: HostDocPlan,
+    approval_id: String,
 }
 
 /// A refused operation is the caller's to fix (a path outside the scope, an
@@ -286,6 +344,44 @@ fn documents_disabled() -> Response {
     )
 }
 
+/// List a scope's metadata. **Not gated by the egress switch**: the answer is file
+/// names and timestamps, not bodies. Gating this step as well would leave a
+/// deployment that never turned the switch on unable to see which files exist at
+/// all, which is the whole capability off by default.
+async fn documents_list_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DocumentsListRequest>,
+) -> Response {
+    let Some(hostdocs) = state.hostdocs.as_ref() else {
+        return documents_disabled();
+    };
+    match hostdocs.list(&req.scope, req.prefix.as_deref()) {
+        Ok(listing) => Json(listing).into_response(),
+        Err(e) => documents_error(e),
+    }
+}
+
+async fn documents_read_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DocumentsReadRequest>,
+) -> Response {
+    let Some(hostdocs) = state.hostdocs.as_ref() else {
+        return documents_disabled();
+    };
+    match hostdocs.read(&req.scope, &req.path) {
+        Ok(read) => Json(read).into_response(),
+        // A closed switch means "this is not being done today" (403), not "you sent a
+        // bad request" (400). The caller's next move is opposite in the two cases --
+        // turn the switch on, or change the request -- so the codes differ too; the
+        // verdict (which cell) and the message come from one value, so this does not
+        // re-judge it here.
+        Err(refusal) if refusal.outcome == "disabled" => {
+            error_response(StatusCode::FORBIDDEN, refusal.error.to_string())
+        }
+        Err(refusal) => documents_error(refusal.error),
+    }
+}
+
 async fn documents_plan_handler(
     State(state): State<AppState>,
     Json(req): Json<DocumentsPlanRequest>,
@@ -299,14 +395,89 @@ async fn documents_plan_handler(
     }
 }
 
-async fn documents_apply_handler(
+/// Stage a plan for approval and return its id. **Not gated by the egress switch**:
+/// what is stored is a description of the intended change, and no body has moved
+/// yet (the same reasoning as listing).
+async fn documents_stage_handler(
     State(state): State<AppState>,
-    Json(plan): Json<HostDocPlan>,
+    Json(req): Json<DocumentsStageRequest>,
 ) -> Response {
     let Some(hostdocs) = state.hostdocs.as_ref() else {
         return documents_disabled();
     };
-    match hostdocs.apply(&plan).await {
+    match hostdocs.stage(&req.scope, &req.ops).await {
+        Ok(staged) => Json(staged).into_response(),
+        Err(e) => documents_error(e),
+    }
+}
+
+/// The approval face. What defines it is **who calls it**: the caller side (the
+/// model path) is meant to produce plans and stage them, while approving and
+/// rejecting are human actions. The executor cannot verify identity (a
+/// zero-credential deployment), so this boundary rests on reachability and on who
+/// is calling -- a convention, not cryptography. Which side can reach it is stated
+/// in the design; this does not pretend to hold a wall it does not have.
+async fn documents_approve_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DocumentsApproveRequest>,
+) -> Response {
+    let Some(hostdocs) = state.hostdocs.as_ref() else {
+        return documents_disabled();
+    };
+    match hostdocs.approve(&req.staged_id, &req.approver).await {
+        Ok(approved) => Json(approved).into_response(),
+        Err(e) => documents_error(e),
+    }
+}
+
+async fn documents_reject_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DocumentsRejectRequest>,
+) -> Response {
+    let Some(hostdocs) = state.hostdocs.as_ref() else {
+        return documents_disabled();
+    };
+    match hostdocs.reject(&req.staged_id, req.reason.as_deref()).await {
+        Ok(rejected) => Json(rejected).into_response(),
+        Err(e) => documents_error(e),
+    }
+}
+
+/// The pending list: what a reviewer sees is waiting. It carries **no plan body**;
+/// the body goes through `/documents/review`.
+async fn documents_staged_handler(State(state): State<AppState>) -> Response {
+    let Some(hostdocs) = state.hostdocs.as_ref() else {
+        return documents_disabled();
+    };
+    match hostdocs.staged_plans().await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => documents_error(e),
+    }
+}
+
+/// One staged plan in full, with every operation and its effect: the reviewer
+/// decides from this whether to approve.
+async fn documents_review_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DocumentsReviewRequest>,
+) -> Response {
+    let Some(hostdocs) = state.hostdocs.as_ref() else {
+        return documents_disabled();
+    };
+    match hostdocs.staged_plan(&req.staged_id).await {
+        Ok(record) => Json(record).into_response(),
+        Err(e) => documents_error(e),
+    }
+}
+
+async fn documents_apply_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DocumentsApplyRequest>,
+) -> Response {
+    let Some(hostdocs) = state.hostdocs.as_ref() else {
+        return documents_disabled();
+    };
+    match hostdocs.apply(&req.plan, &req.approval_id).await {
         Ok(applied) => Json(applied).into_response(),
         Err(e) => documents_error(e),
     }
@@ -550,8 +721,21 @@ mod tests {
                 serde_json::json!({"scope": "alice", "ops": []}),
             ),
             (
+                "/documents/stage",
+                serde_json::json!({"scope": "alice", "ops": []}),
+            ),
+            (
+                "/documents/approve",
+                serde_json::json!({"staged_id": "x", "approver": "y"}),
+            ),
+            ("/documents/reject", serde_json::json!({"staged_id": "x"})),
+            ("/documents/review", serde_json::json!({"staged_id": "x"})),
+            (
                 "/documents/apply",
-                serde_json::json!({"scope": "alice", "plan_hash": "x", "ops": []}),
+                serde_json::json!({
+                    "plan": {"scope": "alice", "plan_hash": "x", "ops": []},
+                    "approval_id": "x",
+                }),
             ),
             (
                 "/documents/rollback",
@@ -568,6 +752,15 @@ mod tests {
             assert_eq!(response.status(), 409, "{path}");
             assert!(response.text().await.unwrap().contains("not configured"));
         }
+        // The pending list is a bodyless GET, walked separately: it too has to say
+        // something clear while the capability is off.
+        let listed = reqwest::Client::new()
+            .get(format!("http://{}/documents/staged", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), 409);
+        assert!(listed.text().await.unwrap().contains("not configured"));
     }
 
     /// The whole path over HTTP: plan, apply what was planned, then roll back
@@ -608,9 +801,76 @@ mod tests {
             .json()
             .await
             .unwrap();
+        // Apply before approving: this gate has to really block on the HTTP surface,
+        // not only inside the module's unit tests.
+        let unapproved = client
+            .post(format!("http://{}/documents/apply", addr))
+            .json(&serde_json::json!({"plan": plan.clone(), "approval_id": "1700000000000-0-aaaaaaaaaaaa"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unapproved.status(), 400);
+        assert!(unapproved.text().await.unwrap().contains("no staged plan"));
+
+        let staged: serde_json::Value = client
+            .post(format!("http://{}/documents/stage", addr))
+            .json(&serde_json::json!({
+                "scope": "alice",
+                "ops": [
+                    {"op": "mkdir", "path": "archive"},
+                    {"op": "rename", "from": "notes.txt", "to": "archive/notes.txt"},
+                    {"op": "write", "path": "archive/notes.txt", "content": "after"},
+                ],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(staged["state"], "pending");
+        // The reviewer can see which plan is being approved (every operation is
+        // there, one by one).
+        let reviewed: serde_json::Value = client
+            .post(format!("http://{}/documents/review", addr))
+            .json(&serde_json::json!({"staged_id": staged["staged_id"]}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reviewed["plan"]["ops"].as_array().unwrap().len(), 3);
+        // The listing carries metadata, not bodies.
+        let listed: serde_json::Value = client
+            .get(format!("http://{}/documents/staged", addr))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["plans"].as_array().unwrap().len(), 1);
+        assert!(listed["plans"][0].get("plan").is_none());
+
+        let approved: serde_json::Value = client
+            .post(format!("http://{}/documents/approve", addr))
+            .json(&serde_json::json!({"staged_id": staged["staged_id"], "approver": "ops"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(approved["state"], "approved");
+        assert_eq!(approved["approver"], "ops");
+
         let applied: serde_json::Value = client
             .post(format!("http://{}/documents/apply", addr))
-            .json(&plan)
+            .json(&serde_json::json!({
+                "plan": plan,
+                "approval_id": staged["staged_id"],
+            }))
             .send()
             .await
             .unwrap()

@@ -13,6 +13,7 @@ pub mod evolution_admin;
 pub mod fault;
 pub mod guardrail;
 pub mod hook;
+pub mod host_documents;
 pub mod knowledge;
 pub mod llm;
 pub mod media;

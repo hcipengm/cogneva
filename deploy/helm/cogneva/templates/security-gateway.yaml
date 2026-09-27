@@ -51,6 +51,13 @@ spec:
             - name: metrics
               containerPort: {{ .Values.securityGateway.metricsPort }}
               protocol: TCP
+            # Audited LLM channel: the same LLM routes, but every request's body is audited
+            # and the reachable set admits the sandbox executor only (see the NetworkPolicy).
+            # The port comes from values: it appears in the Deployment, the Service and the
+            # NetworkPolicy alike, so a literal here would drift.
+            - name: audited-llm
+              containerPort: {{ .Values.securityGateway.auditedLlmPort }}
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: cogneva-config
@@ -225,6 +232,26 @@ spec:
             # 观测通道监听端口；与容器端口同源 values，避免两处漂移。
             - name: COGNEVA_SG_METRICS_PORT
               value: {{ .Values.securityGateway.metricsPort | quote }}
+            # The audited channel's listen port and audit bound; both come from the same
+            # values as the container port and the policy.
+            - name: COGNEVA_SG_AUDITED_LLM_PORT
+              value: {{ .Values.securityGateway.auditedLlmPort | quote }}
+            - name: COGNEVA_SG_AUDITED_MAX_BODY_BYTES
+              # `| int64` cannot be dropped: chart numbers are parsed as float64, so a plain
+              # quote of 8388608 renders "8.388608e+06", which reaches the env as a byte count
+              # nothing can parse -- and an unparseable value falls back to the default, so the
+              # setting looks applied and is not.
+              value: {{ .Values.securityGateway.auditedLlmMaxBodyBytes | int64 | quote }}
+            # Whether host document bodies may leave the cluster. Putting the switch on the
+            # gateway is deliberate: the judgement belongs to the only process that can refuse
+            # the request, while the caller side (the executor) reads the same variable only to
+            # avoid sending a request bound to be refused. Off by default; while it is off the
+            # audited channel refuses explicitly and counts those separately in the
+            # `blocked_by_switch` cell -- "nobody called" and "the switch stopped it" have to
+            # stay distinguishable, and each reading cell carries one cause (a rule hit, over
+            # bound, a failed read and not being text are all different).
+            - name: HOST_DOCS_BODY_EGRESS_ENABLED
+              value: {{ .Values.hostDocuments.bodyEgress | quote }}
           # 探测挂在 8080：那是本进程唯一的常驻 HTTP 面（8081/8082 只在被调用时
           # 有动静），/health/live 与 /health/ready 由网关自己答，不对上游发请求。
           # 没有 liveness 时一个卡死的网关会一直被 Service 指向并持续吞掉全部
@@ -315,6 +342,34 @@ spec:
     - name: metrics
       port: {{ .Values.securityGateway.metricsPort }}
       targetPort: metrics
+      protocol: TCP
+---
+# The audited LLM channel gets a Service of its own, not merged into the one above.
+#
+# Any pod in the cluster can resolve a ClusterIP, so "small reachable set" is not
+# achieved by hiding behind DNS -- it comes from the gateway's own NetworkPolicy,
+# which judges this port by **source pod**, and only the sandbox executor gets
+# through. Keeping it separate means nothing else picks it up in passing: a shared
+# Service's port list travels whole into Ingresses, ServiceMonitors and other
+# references, and once this port is carried off that way, its reason to exist (the
+# only credentialed, per-request-audited egress) is gone.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-security-gateway-audited
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: security-gateway
+  ports:
+    - name: audited-llm
+      port: {{ .Values.securityGateway.auditedLlmPort }}
+      targetPort: audited-llm
       protocol: TCP
 {{- if .Values.securityGateway.gitMirror.enabled }}
 ---

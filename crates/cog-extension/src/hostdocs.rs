@@ -32,12 +32,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use cog_core::host_documents::{switch_enabled_env, BODY_EGRESS_ENV};
 use cog_core::{SFError, SFResult};
 use prometheus::{CounterVec, Encoder, Gauge, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use walkdir::WalkDir;
 
 /// Scope map: `name=container_path` entries, comma separated.
 pub const SCOPES_ENV: &str = "HOST_DOCS_SCOPES";
@@ -47,9 +49,67 @@ pub const JOURNAL_DIR_ENV: &str = "HOST_DOCS_JOURNAL_DIR";
 /// Largest document this module will rewrite (and therefore keep a rollback
 /// copy of). Bounds one operation, and with it one journal, to a known size.
 pub const MAX_DOC_BYTES_ENV: &str = "HOST_DOCS_MAX_WRITE_BYTES";
+/// Largest body one read brings into this process.
+pub const MAX_READ_BYTES_ENV: &str = "HOST_DOCS_MAX_READ_BYTES";
+/// Largest listing one call returns. Bounds the output, not the walk.
+pub const MAX_LIST_ENTRIES_ENV: &str = "HOST_DOCS_MAX_LIST_ENTRIES";
+/// How long a staged plan stays approvable.
+pub const APPROVAL_TTL_SECS_ENV: &str = "HOST_DOCS_APPROVAL_TTL_SECS";
+/// Largest plan this module will stage for approval.
+pub const MAX_PLAN_BYTES_ENV: &str = "HOST_DOCS_MAX_PLAN_BYTES";
 
 const DEFAULT_JOURNAL_DIR: &str = "/opt/cogneva/sandbox/host-docs-journal";
 const DEFAULT_MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
+/// A full-size body. **Deliberately not tied to the audited channel's bound**: that one
+/// is another process's quantity, bounding the text one request sends out, while this
+/// one bounds the bytes this process reads into memory. That the two values are close
+/// is a coincidence, and coupling them would let either side drag the other whenever it
+/// is adjusted -- while the smaller side is observable (`over_ceiling` carries both
+/// numbers) rather than silently lost.
+const DEFAULT_MAX_READ_BYTES: usize = 8 * 1024 * 1024;
+/// A listing is for a person to read and for a model to read; past a few thousand
+/// entries, both sides are only paying for it.
+const DEFAULT_MAX_LIST_ENTRIES: usize = 5_000;
+/// A day. This gate is a person reading one plan, and a plan left unread for more than
+/// a working day is no longer the plan about to be read -- approving it then is
+/// approving something nobody looked at.
+const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
+/// A window shorter than this is not a window: the plan could expire between being
+/// displayed and being clicked.
+const MIN_APPROVAL_TTL_SECS: u64 = 60;
+/// The same order of magnitude as a body: if a plan carries more text than one write is
+/// allowed to carry, then approving it does not mean what it says on the tin.
+const DEFAULT_MAX_PLAN_BYTES: usize = DEFAULT_MAX_READ_BYTES;
+
+/// Read a positive integer from the environment; unparseable, or zero, falls back to
+/// the default.
+///
+/// Zero counting as "unreadable" is deliberate: with either bound at zero, every call
+/// lands in the "over the ceiling" cell, and the reading then merely looks like "the
+/// caller keeps sending things that are too big".
+fn env_positive(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+/// Read a duration in seconds from the environment, with a floor: a value under the
+/// floor takes effect as the floor.
+///
+/// Clamp rather than refuse: a value far under the floor is almost certainly a unit
+/// mistake, and letting it take effect reads the same as "nobody reviews anything at
+/// all" -- every plan expires before anyone opens it.
+fn env_secs_at_least(key: &str, default: u64, floor: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+        .max(floor)
+}
 
 #[derive(Debug, Clone)]
 pub struct HostDocsConfig {
@@ -57,6 +117,16 @@ pub struct HostDocsConfig {
     pub scopes: BTreeMap<String, PathBuf>,
     pub journal_dir: PathBuf,
     pub max_doc_bytes: usize,
+    /// Whether document bodies may leave the cluster. The same switch the gateway reads
+    /// (`cog_core::host_documents`): while it is off, body reads are refused outright --
+    /// the read is the first station a body reaches on the caller side, so refusing here
+    /// is one step earlier than refusing at the audited channel, and both sides say the
+    /// same sentence.
+    pub body_egress: bool,
+    pub max_read_bytes: usize,
+    pub max_list_entries: usize,
+    pub approval_ttl_secs: u64,
+    pub max_plan_bytes: usize,
 }
 
 impl HostDocsConfig {
@@ -66,15 +136,22 @@ impl HostDocsConfig {
             .filter(|v| !v.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_JOURNAL_DIR));
-        let max_doc_bytes = std::env::var(MAX_DOC_BYTES_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MAX_DOC_BYTES);
-        Self::from_spec(
+        let max_doc_bytes = env_positive(MAX_DOC_BYTES_ENV, DEFAULT_MAX_DOC_BYTES);
+        let mut cfg = Self::from_spec(
             std::env::var(SCOPES_ENV).ok().as_deref(),
             journal_dir,
             max_doc_bytes,
-        )
+        );
+        cfg.body_egress = switch_enabled_env();
+        cfg.max_read_bytes = env_positive(MAX_READ_BYTES_ENV, DEFAULT_MAX_READ_BYTES);
+        cfg.max_list_entries = env_positive(MAX_LIST_ENTRIES_ENV, DEFAULT_MAX_LIST_ENTRIES);
+        cfg.approval_ttl_secs = env_secs_at_least(
+            APPROVAL_TTL_SECS_ENV,
+            DEFAULT_APPROVAL_TTL_SECS,
+            MIN_APPROVAL_TTL_SECS,
+        );
+        cfg.max_plan_bytes = env_positive(MAX_PLAN_BYTES_ENV, DEFAULT_MAX_PLAN_BYTES);
+        cfg
     }
 
     /// Parse the scope map. An entry that is malformed, duplicated or not an
@@ -112,6 +189,15 @@ impl HostDocsConfig {
             scopes,
             journal_dir,
             max_doc_bytes,
+            // Pure construction: the values are read in `from_env`, and a test wanting
+            // another bound changes the field directly. The defaults are all "capability
+            // off, bounds at their defaults", in the same direction as the deployment
+            // defaults.
+            body_egress: false,
+            max_read_bytes: DEFAULT_MAX_READ_BYTES,
+            max_list_entries: DEFAULT_MAX_LIST_ENTRIES,
+            approval_ttl_secs: DEFAULT_APPROVAL_TTL_SECS,
+            max_plan_bytes: DEFAULT_MAX_PLAN_BYTES,
         }
     }
 
@@ -206,6 +292,77 @@ pub struct HostDocRollback {
     pub restored: usize,
 }
 
+/// What an entry in a listing is.
+///
+/// `Other` exists so that a socket, fifo or device node is *named* rather than
+/// dropped: a listing that silently omits something is read as "this is all
+/// there is", which is the one thing a listing must never be wrong about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    File,
+    Dir,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostDocEntry {
+    /// Relative to the scope root, `/`-joined.
+    pub path: String,
+    pub kind: EntryKind,
+    /// Zero for anything that is not a file.
+    pub bytes: u64,
+    /// `None` when the filesystem does not answer. Not zero: zero is 1970, a
+    /// real timestamp, and a reader that sees it would take it for one.
+    pub modified_unix: Option<u64>,
+}
+
+/// What is in a scope, as metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostDocListing {
+    pub scope: String,
+    /// The prefix the walk started from, as the caller wrote it.
+    pub prefix: Option<String>,
+    pub entries: Vec<HostDocEntry>,
+    /// Symbolic links seen and not followed. They are absent from `entries` by
+    /// design, so this is the count of what the listing left out: without it,
+    /// "these are all the entries" and "these are the entries I can name" read
+    /// the same.
+    pub skipped_symlinks: usize,
+    /// Entries whose name is not valid UTF-8, likewise left out and counted.
+    pub skipped_unnamed: usize,
+    /// The walk stopped at the entry ceiling. A truncated listing looks exactly
+    /// like a small directory — and the caller's next move is usually to
+    /// organize what it was shown — so the ceiling has to be visible in the
+    /// answer, not only in the configuration.
+    pub truncated: bool,
+}
+
+/// Why a body read was refused, as the caller sees it and as the counter
+/// recorded it.
+///
+/// One value carrying both, because the two must not be able to disagree: a
+/// refusal answered with a status derived separately from the cell it was
+/// counted under would only ever disagree on one branch, which is exactly the
+/// shape a reader cannot find by looking at the metric.
+#[derive(Debug)]
+pub struct ReadRefusal {
+    /// The `outcome` label this refusal was counted under, from
+    /// [`READ_OUTCOMES`].
+    pub outcome: &'static str,
+    pub error: SFError,
+}
+
+/// One document body, read into this process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostDocRead {
+    pub scope: String,
+    pub path: String,
+    pub bytes: u64,
+    pub content: String,
+    pub modified_unix: Option<u64>,
+}
+
 /// A journal entry: what was done, and what it takes to undo it.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -230,10 +387,256 @@ enum JournalRecord {
     },
 }
 
+/// The closed set of listing outcomes; every one is published, zeros included.
+///
+/// Cells are cut by **cause**, not by error type: each cell implies a different
+/// action.
+/// - `unknown_scope`: the scope name the caller used is not in the configuration. The
+///   action is to fix the caller, or to add the configuration for that identity.
+/// - `refused_path`: the prefix is absolute, carries a `..`, or has a symlink as one of
+///   its segments. **This cell is an out-of-bounds attempt**, and it has to stay
+///   distinguishable from the previous one (a typo).
+/// - `not_found`: the scope has no such prefix. The action is to fix the caller -- it is
+///   a different thing from "the directory is empty", which is why the latter goes to
+///   `listed` instead of here.
+/// - `unreadable`: this process cannot read it (permissions, the volume, IO). The action
+///   is to check this pod's mount and volume, not the caller.
+/// - `listed`: it was listed (possibly truncated by a ceiling, and a truncation is
+///   stated by the response's own `truncated`).
+pub const LIST_OUTCOMES: [&str; 5] = [
+    "unknown_scope",
+    "refused_path",
+    "not_found",
+    "unreadable",
+    "listed",
+];
+
+/// The closed set of read outcomes; every one is published, zeros included. The order is
+/// the order of judgement: the switch outermost, then the scope name, the path, the entry
+/// kind, the size, the encoding, and only then the content.
+///
+/// - `disabled`: the egress switch is off. The action is to turn it on (or to accept that
+///   this is not being done today), not to inspect the caller. **Without this cell, "the
+///   switch is off" and "nobody came to read" would look the same.**
+/// - `unknown_scope` / `refused_path`: as in the listing.
+/// - `over_ceiling`: the entry is larger than the readable ceiling. The action is to
+///   adjust the bound, or to stop the caller reading something that big; it once looked
+///   the same as the next cell (both read as "cannot read it"), and it is separate because
+///   the side that has to change is a different one.
+/// - `not_text`: there is no text body to return at that path -- it is not a regular file
+///   (a directory, a fifo), or the bytes are not UTF-8. **Deliberately one cell**: for
+///   whoever reads this number, "read something else" is the same action, and which of the
+///   two it was is stated in the error message (with the path and the reason), not in the
+///   cell name.
+/// - `not_found`: the scope has no such path. The action is to fix the caller.
+/// - `unreadable`: this process cannot read it. The action is to check the mount and the
+///   volume.
+/// - `read`: the body was obtained.
+pub const READ_OUTCOMES: [&str; 8] = [
+    "disabled",
+    "unknown_scope",
+    "refused_path",
+    "over_ceiling",
+    "not_text",
+    "not_found",
+    "unreadable",
+    "read",
+];
+
+/// The closed set of outcomes of this apply gate; every one is published, zeros included.
+/// The order is the order of judgement: first whether this record exists, then which state
+/// it is in, and finally whether what it approved is the plan in hand.
+///
+/// - `released`: the record exists, is inside its window, and approves exactly this plan,
+///   so the gate lets it through. **It counts before execution**: the gate judges "this is
+///   allowed", which is a different thing from "it worked", and the latter is said
+///   operation by operation by the ops counters.
+/// - `refused_no_record`: no such record on disk. The action is to fix the caller (a
+///   mistyped id, or nothing was ever staged).
+/// - `refused_unreadable_record`: the record is on disk but this process cannot read it
+///   (permissions, the volume, corrupt content). The action is to inspect this pod's
+///   volume -- it must stay apart from the previous cell: that one is the caller's to fix,
+///   this one is the operator's.
+/// - `refused_not_approved`: the record exists and nobody approved it. **This cell is the
+///   reason the gate exists**: unapproved means not done, not "wait and see".
+/// - `refused_expired`: the window has passed (approved-but-expired included). The action
+///   is to produce a new plan and approve it again.
+/// - `refused_rejected`: it was rejected. The action is to ask why it was rejected.
+/// - `refused_already_applied`: this approval has already been used once. What it guards
+///   against is one approval being executed twice.
+/// - `refused_hash_mismatch`: the record approves a different plan. **This cell is a
+///   security event**: the plan in hand does not match the approval record, which means
+///   someone touched the plan after it was approved.
+pub const APPLY_OUTCOMES: [&str; 8] = [
+    "refused_no_record",
+    "refused_unreadable_record",
+    "refused_not_approved",
+    "refused_expired",
+    "refused_rejected",
+    "refused_already_applied",
+    "refused_hash_mismatch",
+    "released",
+];
+
+/// One staged plan awaiting approval, together with what has happened to it.
+///
+/// The state **is not stored in a separate field**: it is derived from the times and the
+/// three optional records. Storing a state guarantees a moment where the stored one and
+/// the computed one differ, and the place they would differ is exactly "was it approved"
+/// -- the one thing that must not be ambiguous.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedPlan {
+    pub staged_id: String,
+    pub plan: HostDocPlan,
+    pub staged_at_unix: u64,
+    /// The end of the window. Past it this plan can be neither approved nor applied --
+    /// **approved or not**: the window says "this plan is still fresh and still
+    /// remembered", and a plan left around long enough to approve and then execute is one
+    /// nobody is watching any more.
+    pub expires_at_unix: u64,
+    pub approval: Option<HostDocApproval>,
+    pub rejection: Option<HostDocRejection>,
+    pub applied: Option<HostDocApplied>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostDocApproval {
+    /// Who approved it. **This is a recorded claim, not an identity this process
+    /// verified**: the executor holds no credentials (the deployment deliberately mounts
+    /// no Secret), so there is no credential surface against which an approver could be
+    /// verified. What this field is for is being looked up afterwards -- who, when, and
+    /// which hash they approved.
+    pub approver: String,
+    pub approved_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostDocRejection {
+    pub reason: Option<String>,
+    pub rejected_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostDocApplied {
+    pub journal_id: String,
+    pub applied_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagedState {
+    Pending,
+    Approved,
+    Rejected,
+    Applied,
+    Expired,
+}
+
+impl StagedState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Applied => "applied",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+impl StagedPlan {
+    /// Which state this record is in right now.
+    ///
+    /// What has already happened outranks the clock: applied means applied and rejected
+    /// means rejected -- the window governs "can this still be done", not "what has been
+    /// done". Expiry in turn outranks approval: an approval is not a permanent pass.
+    pub fn state(&self, now_unix: u64) -> StagedState {
+        if self.applied.is_some() {
+            StagedState::Applied
+        } else if self.rejection.is_some() {
+            StagedState::Rejected
+        } else if now_unix >= self.expires_at_unix {
+            StagedState::Expired
+        } else if self.approval.is_some() {
+            StagedState::Approved
+        } else {
+            StagedState::Pending
+        }
+    }
+
+    pub fn view(&self, now_unix: u64) -> StagedPlanView {
+        StagedPlanView {
+            staged_id: self.staged_id.clone(),
+            scope: self.plan.scope.clone(),
+            plan_hash: self.plan.plan_hash.clone(),
+            op_count: self.plan.ops.len(),
+            staged_at_unix: self.staged_at_unix,
+            expires_at_unix: self.expires_at_unix,
+            state: self.state(now_unix),
+            approver: self.approval.as_ref().map(|a| a.approver.clone()),
+            rejected_reason: self.rejection.as_ref().and_then(|r| r.reason.clone()),
+            journal_id: self.applied.as_ref().map(|a| a.journal_id.clone()),
+        }
+    }
+}
+
+/// One entry in the pending list. **It carries no plan body**: a list may hold dozens of
+/// entries, and stuffing the bodies in would turn the review face itself into a heavy
+/// path, while whoever wants to see a body is looking at one entry anyway. The body comes
+/// from `staged_plan`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedPlanView {
+    pub staged_id: String,
+    pub scope: String,
+    pub plan_hash: String,
+    pub op_count: usize,
+    pub staged_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub state: StagedState,
+    pub approver: Option<String>,
+    pub rejected_reason: Option<String>,
+    pub journal_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedPlanList {
+    pub plans: Vec<StagedPlanView>,
+    /// How many records in the directory could not be read. **Unreadable and absent are not
+    /// the same thing**: folding this into "zero pending" would make a broken record look
+    /// like nobody ever submitted a plan.
+    pub unreadable_records: usize,
+}
+
+/// The two reasons a staged record could not be read. They are separate because **the
+/// action differs**: the former is the caller's to fix (a mistyped id), the latter means
+/// inspecting this pod's volume.
+enum StagedLoad {
+    NoRecord(SFError),
+    Unreadable(SFError),
+}
+
+impl StagedLoad {
+    fn outcome(&self) -> &'static str {
+        match self {
+            Self::NoRecord(_) => "refused_no_record",
+            Self::Unreadable(_) => "refused_unreadable_record",
+        }
+    }
+
+    fn into_error(self) -> SFError {
+        match self {
+            Self::NoRecord(e) | Self::Unreadable(e) => e,
+        }
+    }
+}
+
 struct HostDocsMetrics {
     registry: Registry,
     ops: CounterVec,
     rollbacks: CounterVec,
+    lists: CounterVec,
+    reads: CounterVec,
+    gates: CounterVec,
 }
 
 impl HostDocsMetrics {
@@ -257,17 +660,57 @@ impl HostDocsMetrics {
             ),
             &["outcome"],
         )?;
+        let lists = CounterVec::new(
+            Opts::new(
+                "sandbox_host_docs_lists_total",
+                "Host document listings by outcome",
+            ),
+            &["outcome"],
+        )?;
+        let reads = CounterVec::new(
+            Opts::new(
+                "sandbox_host_docs_reads_total",
+                "Host document body reads by outcome",
+            ),
+            &["outcome"],
+        )?;
+        let gates = CounterVec::new(
+            Opts::new(
+                "sandbox_host_docs_apply_total",
+                "Host document applies by what the approval gate decided",
+            ),
+            &["outcome"],
+        )?;
         registry.register(Box::new(scopes.clone()))?;
         registry.register(Box::new(ops.clone()))?;
         registry.register(Box::new(rollbacks.clone()))?;
+        registry.register(Box::new(lists.clone()))?;
+        registry.register(Box::new(reads.clone()))?;
+        registry.register(Box::new(gates.clone()))?;
         // The scope count is a configuration fact, not a moving reading: it is
         // published once so an operator can see whether the capability is on
         // at all without reading the pod's env.
         scopes.set(scope_count as f64);
+        // Both vocabularies are published at zero: **absent and zero are two different
+        // things**. That goes especially for the read face -- what a closed switch most
+        // looks like is "no reading at all", which is exactly what a channel that was
+        // never wired up looks like.
+        for outcome in LIST_OUTCOMES {
+            lists.with_label_values(&[outcome]).inc_by(0.0);
+        }
+        for outcome in READ_OUTCOMES {
+            reads.with_label_values(&[outcome]).inc_by(0.0);
+        }
+        for outcome in APPLY_OUTCOMES {
+            gates.with_label_values(&[outcome]).inc_by(0.0);
+        }
         Ok(Self {
             registry,
             ops,
             rollbacks,
+            lists,
+            reads,
+            gates,
         })
     }
 
@@ -290,6 +733,18 @@ impl HostDocsMetrics {
     fn count_rollback(&self, outcome: &str) {
         self.rollbacks.with_label_values(&[outcome]).inc();
     }
+
+    fn count_list(&self, outcome: &str) {
+        self.lists.with_label_values(&[outcome]).inc();
+    }
+
+    fn count_read(&self, outcome: &str) {
+        self.reads.with_label_values(&[outcome]).inc();
+    }
+
+    fn count_apply(&self, outcome: &str) {
+        self.gates.with_label_values(&[outcome]).inc();
+    }
 }
 
 pub struct HostDocs {
@@ -298,7 +753,9 @@ pub struct HostDocs {
     /// Serializes applies so two plans cannot interleave their journals and
     /// perform decisions.
     apply_lock: Mutex<()>,
-    journal_seq: AtomicU64,
+    /// A serial shared by the rollback journal and staged records; it exists only to make
+    /// two ids in the same millisecond differ.
+    id_seq: AtomicU64,
 }
 
 impl HostDocs {
@@ -316,7 +773,7 @@ impl HostDocs {
             cfg,
             metrics,
             apply_lock: Mutex::new(()),
-            journal_seq: AtomicU64::new(0),
+            id_seq: AtomicU64::new(0),
         }))
     }
 
@@ -385,10 +842,534 @@ impl HostDocs {
         Ok(planned)
     }
 
+    /// List the entries in a scope, metadata only: relative path, kind, byte count,
+    /// mtime.
+    ///
+    /// **Not subject to the egress switch**, deliberately: the switch governs bodies
+    /// leaving the cluster, while a listing returns file names and timestamps. Gating the
+    /// listing too would leave a deployment at its defaults unable to see even which files
+    /// exist -- that is not "bodies stay in", it is the capability off. What needs the
+    /// switch is the next step: reading a body.
+    ///
+    /// A prefix that does not exist is an **error**, not an empty listing: an empty
+    /// directory and a mistyped path have to be distinguishable at the caller, otherwise
+    /// the organiser would take "this scope is empty" as a conclusion.
+    pub fn list(&self, scope: &str, prefix: Option<&str>) -> SFResult<HostDocListing> {
+        let root = match self.scope_root(scope) {
+            Ok(root) => root,
+            Err(e) => {
+                self.metrics.count_list("unknown_scope");
+                return Err(e);
+            }
+        };
+        let prefix = prefix.map(str::trim).filter(|p| !p.is_empty() && *p != ".");
+        let start = match prefix {
+            None => root.to_path_buf(),
+            Some(rel) => match resolve_within_scope(root, rel) {
+                Ok(path) => path,
+                Err(e) => {
+                    self.metrics.count_list("refused_path");
+                    return Err(e);
+                }
+            },
+        };
+        let start_is_dir = match std::fs::symlink_metadata(&start) {
+            Ok(meta) => meta.is_dir(),
+            Err(_) => {
+                self.metrics.count_list("not_found");
+                return Err(SFError::Validation(format!(
+                    "scope {scope:?} has no such prefix {start:?}; an empty directory and a path that does not exist have to be distinguishable at the caller"
+                )));
+            }
+        };
+
+        let mut entries = Vec::new();
+        let mut skipped_symlinks = 0usize;
+        let mut skipped_unnamed = 0usize;
+        let mut truncated = false;
+        // Symlinks are not followed: what is in the listing must not depend on files
+        // outside the scope. Under `follow_links(false)`, walkdir hands the link itself to
+        // the caller as an entry (so it can be counted), and it does not descend into the
+        // directory the link points at.
+        for entry in WalkDir::new(&start).follow_links(false).sort_by_file_name() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    self.metrics.count_list("unreadable");
+                    return Err(SFError::Config(format!(
+                        "cannot list {}: {e} (this process cannot read it -- not the caller's problem; check the mount and the volume)",
+                        start.display()
+                    )));
+                }
+            };
+            // A prefix naming a directory lists what is under it (the directory itself is
+            // not the thing being organised); a prefix naming a file makes that one file
+            // the answer. The two paths cannot be merged into one: skipping the start
+            // unconditionally would make asking by file name list nothing, and an empty
+            // listing reads downstream as "there is nothing here".
+            if entry.path() == start && start_is_dir {
+                continue;
+            }
+            if entry.file_type().is_symlink() {
+                skipped_symlinks += 1;
+                continue;
+            }
+            if entries.len() >= self.cfg.max_list_entries {
+                truncated = true;
+                break;
+            }
+            let Some(rel) = entry.path().strip_prefix(root).ok().and_then(posix_rel) else {
+                skipped_unnamed += 1;
+                continue;
+            };
+            let (kind, bytes, modified_unix) = match entry_facts(entry.path()) {
+                Ok(facts) => facts,
+                Err(e) => {
+                    self.metrics.count_list("unreadable");
+                    return Err(e);
+                }
+            };
+            entries.push(HostDocEntry {
+                path: rel,
+                kind,
+                bytes,
+                modified_unix,
+            });
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        self.metrics.count_list("listed");
+        Ok(HostDocListing {
+            scope: scope.to_string(),
+            prefix: prefix.map(str::to_string),
+            entries,
+            skipped_symlinks,
+            skipped_unnamed,
+            truncated,
+        })
+    }
+
+    /// Read one body. **Subject to the egress switch**: while it is off, this refuses
+    /// outright rather than returning empty content.
+    ///
+    /// Empty content and "nothing was read" have to be distinguishable at the caller --
+    /// the organiser will faithfully take an empty string as "this file is empty" and
+    /// write back from that conclusion. So off means refuse, and it lands in the
+    /// `disabled` cell so that it stays apart from "nobody came to read".
+    ///
+    /// Returns [`ReadRefusal`] rather than a bare error: the cell that gets recorded and
+    /// the error shown to the caller come from **one judgement**. Written in two places,
+    /// they would produce combinations like "the reading says this cell while the status
+    /// code answers from another", and such a combination is visible only on one branch.
+    pub fn read(&self, scope: &str, rel: &str) -> Result<HostDocRead, ReadRefusal> {
+        // The switch is outermost: while it is off, not even the path is looked at. It is
+        // "this is not done today", not "your path is bad" -- the two imply opposite next
+        // moves (turn the switch on vs. change the request), so the cells stay separate as
+        // well.
+        if !self.cfg.body_egress {
+            return Err(self.refuse_read(
+                "disabled",
+                SFError::Validation(format!(
+                    "host document body reads are not enabled ({BODY_EGRESS_ENV} is off): what comes \
+                     back here is a refusal, not empty content; an empty file and a failed read \
+                     have to stay distinguishable at the caller"
+                )),
+            ));
+        }
+        let root = match self.scope_root(scope) {
+            Ok(root) => root,
+            Err(e) => return Err(self.refuse_read("unknown_scope", e)),
+        };
+        let path = match resolve_within_scope(root, rel) {
+            Ok(path) => path,
+            Err(e) => return Err(self.refuse_read("refused_path", e)),
+        };
+        let md = match std::fs::symlink_metadata(&path) {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(self.refuse_read(
+                    "not_found",
+                    SFError::Validation(format!(
+                        "scope {scope:?} has no such file {rel:?}; an empty file and a file that does not exist have to be distinguishable at the caller"
+                    )),
+                ))
+            }
+            Err(e) => {
+                return Err(self.refuse_read(
+                    "unreadable",
+                    SFError::Config(format!("cannot read metadata for {}: {e}", path.display())),
+                ))
+            }
+        };
+        if !md.file_type().is_file() {
+            return Err(self.refuse_read(
+                "not_text",
+                SFError::Validation(format!(
+                    "{} is not a regular file ({:?}); this face reads text bodies only",
+                    path.display(),
+                    md.file_type()
+                )),
+            ));
+        }
+        if md.len() > self.cfg.max_read_bytes as u64 {
+            return Err(self.refuse_read(
+                "over_ceiling",
+                SFError::Validation(format!(
+                    "{} is {} bytes, over the readable ceiling of {} bytes",
+                    path.display(),
+                    md.len(),
+                    self.cfg.max_read_bytes
+                )),
+            ));
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Err(self.refuse_read(
+                    "unreadable",
+                    SFError::Config(format!("cannot read {}: {e}", path.display())),
+                ))
+            }
+        };
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(e) => {
+                return Err(self.refuse_read(
+                    "not_text",
+                    SFError::Validation(format!(
+                        "{} is not UTF-8 text at byte {}; the text judgement yields no verdict for it, and the side that yields no verdict is refuse",
+                        path.display(),
+                        e.utf8_error().valid_up_to()
+                    )),
+                ))
+            }
+        };
+        match path.strip_prefix(root).ok().and_then(posix_rel) {
+            Some(resolved) => {
+                self.metrics.count_read("read");
+                Ok(HostDocRead {
+                    scope: scope.to_string(),
+                    path: resolved,
+                    bytes: content.len() as u64,
+                    content,
+                    modified_unix: md.modified().ok().and_then(system_time_secs),
+                })
+            }
+            None => Err(self.refuse_read(
+                "unreadable",
+                SFError::Config(format!("{} is not inside the scope root", path.display())),
+            )),
+        }
+    }
+
+    /// One way of reading a refusal: which cell the reading lands in, and what the caller
+    /// gets to see.
+    ///
+    /// `outcome` is the very cell recorded into `sandbox_host_docs_reads_total` -- so the
+    /// response and the reading cannot tell two different stories.
+    fn refuse_read(&self, outcome: &'static str, error: SFError) -> ReadRefusal {
+        self.metrics.count_read(outcome);
+        ReadRefusal { outcome, error }
+    }
+
+    /// Staged records and the rollback journal share one volume: **an approval has to
+    /// survive a process restart**, otherwise "approved, but not recognised after a
+    /// restart" turns this gate into a matter of mood -- and its whole value is that
+    /// someone approves every time.
+    fn staged_dir(&self) -> PathBuf {
+        self.cfg.journal_dir.join("staged")
+    }
+
+    /// Stage a plan for approval, returning its id and state.
+    ///
+    /// **Not governed by the egress switch**: what is staged is a description of the
+    /// intended change and no body has moved yet (same as `list`). The switch governs
+    /// bodies leaving the cluster, and no body has even been read here.
+    pub async fn stage(&self, scope: &str, ops: &[HostDocOp]) -> SFResult<StagedPlanView> {
+        let plan = self.plan(scope, ops)?;
+        let body = serde_json::to_vec(&plan)
+            .map_err(|e| SFError::Config(format!("cannot serialize a plan: {e}")))?;
+        if body.len() > self.cfg.max_plan_bytes {
+            self.metrics.count("stage", "refused_over_plan_ceiling");
+            return Err(SFError::Validation(format!(
+                "plan is {} bytes, over the {} byte ceiling for a reviewable plan; split it",
+                body.len(),
+                self.cfg.max_plan_bytes
+            )));
+        }
+        let now = now_unix();
+        let record = StagedPlan {
+            staged_id: self.new_record_id(&plan.plan_hash),
+            plan,
+            staged_at_unix: now,
+            expires_at_unix: now.saturating_add(self.cfg.approval_ttl_secs),
+            approval: None,
+            rejection: None,
+            applied: None,
+        };
+        self.save_staged(&record).await?;
+        self.metrics.count("stage", "staged");
+        self.prune_staged(now).await;
+        Ok(record.view(now))
+    }
+
+    /// Approve a staged plan. **It executes nothing**: approving only writes a record, and
+    /// acting is a separate call (apply, carrying this id). Two steps because that keeps
+    /// "I agree" and "it has happened" apart in the record -- a single record meaning both
+    /// would leave no way to say afterwards which of the two came first.
+    pub async fn approve(&self, staged_id: &str, approver: &str) -> SFResult<StagedPlanView> {
+        let approver = approver.trim();
+        if approver.is_empty() {
+            self.metrics.count("approve", "refused_no_approver");
+            return Err(SFError::Validation(
+                "an approval must name who approved it; an anonymous approval is not one".into(),
+            ));
+        }
+        let mut record = match self.load_staged(staged_id).await {
+            Ok(record) => record,
+            Err(load) => {
+                self.metrics.count("approve", load.outcome());
+                return Err(load.into_error());
+            }
+        };
+        let now = now_unix();
+        let state = record.state(now);
+        if state != StagedState::Pending {
+            self.metrics
+                .count("approve", &format!("refused_{}", state.as_str()));
+            return Err(SFError::Validation(format!(
+                "the staged plan {staged_id} is {}; only a pending plan can be approved",
+                state.as_str()
+            )));
+        }
+        record.approval = Some(HostDocApproval {
+            approver: approver.to_string(),
+            approved_at_unix: now,
+        });
+        self.save_staged(&record).await?;
+        self.metrics.count("approve", "approved");
+        info!(
+            staged_id = %staged_id,
+            scope = %record.plan.scope,
+            ops = record.plan.ops.len(),
+            approver = %approver,
+            "host document plan approved"
+        );
+        Ok(record.view(now))
+    }
+
+    /// Reject a plan that has not been executed.
+    ///
+    /// A plan already applied does not come through here: that is `rollback`'s business --
+    /// something that has happened cannot be undone by rejecting it, only by another
+    /// happening, and the records of the two are entirely different.
+    pub async fn reject(&self, staged_id: &str, reason: Option<&str>) -> SFResult<StagedPlanView> {
+        let mut record = match self.load_staged(staged_id).await {
+            Ok(record) => record,
+            Err(load) => {
+                self.metrics.count("reject", load.outcome());
+                return Err(load.into_error());
+            }
+        };
+        let now = now_unix();
+        let state = record.state(now);
+        if state != StagedState::Pending {
+            self.metrics
+                .count("reject", &format!("refused_{}", state.as_str()));
+            return Err(SFError::Validation(format!(
+                "the staged plan {staged_id} is {}; only a pending plan can be rejected",
+                state.as_str()
+            )));
+        }
+        let reason = reason
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string);
+        record.rejection = Some(HostDocRejection {
+            reason: reason.clone(),
+            rejected_at_unix: now,
+        });
+        self.save_staged(&record).await?;
+        self.metrics.count("reject", "rejected");
+        info!(staged_id = %staged_id, reason = ?reason, "host document plan rejected");
+        Ok(record.view(now))
+    }
+
+    /// The staged records in the directory, each with the state it is in now.
+    ///
+    /// **Records that reached a terminal state are listed too**: a record already applied,
+    /// already rejected, already expired is exactly the one that gets asked about -- making
+    /// it disappear while still fresh leaves "where did it go" with no answer.
+    pub async fn staged_plans(&self) -> SFResult<StagedPlanList> {
+        let dir = self.staged_dir();
+        let now = now_unix();
+        self.prune_staged(now).await;
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            // The directory does not exist until something is staged; that is a normal state,
+            // not a fault.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StagedPlanList {
+                    plans: Vec::new(),
+                    unreadable_records: 0,
+                })
+            }
+            Err(e) => {
+                return Err(SFError::Config(format!(
+                    "cannot read the staged plan directory at {}: {e}",
+                    dir.display()
+                )))
+            }
+        };
+        let mut plans = Vec::new();
+        let mut unreadable_records = 0usize;
+        loop {
+            let entry = entries.next_entry().await.map_err(|e| {
+                SFError::Config(format!(
+                    "cannot read the staged plan directory at {}: {e}",
+                    dir.display()
+                ))
+            })?;
+            let Some(entry) = entry else { break };
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            match self.load_staged(id).await {
+                Ok(record) => plans.push(record.view(now)),
+                Err(load) => {
+                    unreadable_records += 1;
+                    warn!(record = %id, error = %load.into_error(), "a staged plan record could not be read");
+                }
+            }
+        }
+        plans.sort_by(|a, b| a.staged_id.cmp(&b.staged_id));
+        Ok(StagedPlanList {
+            plans,
+            unreadable_records,
+        })
+    }
+
+    /// One staged record in full, for a reviewer: it carries the plan body (the operations
+    /// and their effects).
+    pub async fn staged_plan(&self, staged_id: &str) -> SFResult<StagedPlan> {
+        self.load_staged(staged_id)
+            .await
+            .map_err(StagedLoad::into_error)
+    }
+
+    /// Read one staged record, keeping the two reasons for "could not read it" apart.
+    async fn load_staged(&self, staged_id: &str) -> Result<StagedPlan, StagedLoad> {
+        if let Err(e) = validate_staged_id(staged_id) {
+            return Err(StagedLoad::NoRecord(e));
+        }
+        let path = self.staged_dir().join(format!("{staged_id}.json"));
+        let body = match tokio::fs::read(&path).await {
+            Ok(body) => body,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StagedLoad::NoRecord(SFError::Validation(format!(
+                    "no staged plan {staged_id:?}; stage a plan and have it approved before applying it"
+                ))))
+            }
+            Err(e) => {
+                return Err(StagedLoad::Unreadable(SFError::Config(format!(
+                    "cannot read the staged plan at {}: {e}",
+                    path.display()
+                ))))
+            }
+        };
+        serde_json::from_slice(&body).map_err(|e| {
+            StagedLoad::Unreadable(SFError::Config(format!(
+                "the staged plan at {} is unreadable: {e}",
+                path.display()
+            )))
+        })
+    }
+
+    /// Records are written by "write a temp file, then rename": the review face lists the
+    /// directory by name, and a half-written record would be read as a broken one -- which
+    /// looks exactly like a broken volume.
+    async fn save_staged(&self, record: &StagedPlan) -> SFResult<()> {
+        let dir = self.staged_dir();
+        tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+            SFError::Config(format!(
+                "cannot open the staged plan directory at {}: {e}",
+                dir.display()
+            ))
+        })?;
+        let body = serde_json::to_vec_pretty(record)
+            .map_err(|e| SFError::Config(format!("cannot serialize a staged plan: {e}")))?;
+        let published = dir.join(format!("{}.json", record.staged_id));
+        let tmp = dir.join(format!("{}.json.tmp", record.staged_id));
+        tokio::fs::write(&tmp, body).await.map_err(|e| {
+            SFError::Config(format!(
+                "cannot write the staged plan at {}: {e}",
+                tmp.display()
+            ))
+        })?;
+        tokio::fs::rename(&tmp, &published).await.map_err(|e| {
+            SFError::Config(format!(
+                "cannot publish the staged plan at {}: {e}",
+                published.display()
+            ))
+        })
+    }
+
+    /// Clean up expired records. **Only ones that reached a terminal state, or that have
+    /// been expired for a full window**: a plan still waiting for approval and one that
+    /// just expired are both left alone -- the latter is the one most likely to be asked
+    /// about.
+    ///
+    /// An action that deletes things has to leave its own reading (`prune`/`pruned`):
+    /// without it an operator cannot see where a plan they submitted went, and can only
+    /// guess.
+    async fn prune_staged(&self, now: u64) {
+        let dir = self.staged_dir();
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                warn!(dir = %dir.display(), error = %e, "cannot read the staged plan directory to prune it");
+                return;
+            }
+        };
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(dir = %dir.display(), error = %e, "cannot walk the staged plan directory to prune it");
+                    break;
+                }
+            };
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            let Ok(record) = self.load_staged(id).await else {
+                continue;
+            };
+            if !prune_due(&record, now, self.cfg.approval_ttl_secs) {
+                continue;
+            }
+            if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+                warn!(record = %id, error = %e, "cannot prune an expired staged plan");
+                continue;
+            }
+            self.metrics.count("prune", "pruned");
+            info!(staged_id = %id, "pruned a staged plan record");
+        }
+    }
+
     /// Execute a reviewed plan. The operation set must hash to the plan the
     /// caller was given, and every effect must still hold; the first operation
     /// that fails rolls back the ones already applied.
-    pub async fn apply(&self, plan: &HostDocPlan) -> SFResult<HostDocApply> {
+    ///
+    /// `approval_id` is the id given at staging time: this gate **does not look at what
+    /// the caller says**, only at the record on disk -- the record exists, is inside its
+    /// window, and approves exactly this hash, and only then does it act. Each kind of
+    /// refusal is published separately into `sandbox_host_docs_apply_total`, because they
+    /// ask different things of a person (see `APPLY_OUTCOMES`).
+    pub async fn apply(&self, plan: &HostDocPlan, approval_id: &str) -> SFResult<HostDocApply> {
         let ops: Vec<HostDocOp> = plan.ops.iter().map(|p| p.op.clone()).collect();
         let expected = plan_hash(&plan.scope, &ops);
         if expected != plan.plan_hash {
@@ -397,6 +1378,58 @@ impl HostDocs {
                     .into(),
             ));
         }
+        let record = match self.load_staged(approval_id).await {
+            Ok(record) => record,
+            Err(load) => {
+                self.metrics.count_apply(load.outcome());
+                return Err(load.into_error());
+            }
+        };
+        // The name avoids the `for (planned, now) in ...` below: the gate's own instant is
+        // read once outside the loop and fixed there, and must not be shadowed by that
+        // `now`.
+        let gate_now = now_unix();
+        let state = record.state(gate_now);
+        if state != StagedState::Approved {
+            // Each state implies a different action, so each state gets its own sentence:
+            // a pending one needs someone to read it, an expired one needs a new plan, and
+            // an applied one says this approval has already been used once.
+            let outcome = match state {
+                StagedState::Pending => "refused_not_approved",
+                StagedState::Expired => "refused_expired",
+                StagedState::Rejected => "refused_rejected",
+                StagedState::Applied => "refused_already_applied",
+                StagedState::Approved => unreachable!("handled above"),
+            };
+            self.metrics.count_apply(outcome);
+            let detail = match state {
+                StagedState::Pending => {
+                    "nothing has approved it; someone has to read the plan and approve it"
+                }
+                StagedState::Expired => {
+                    "its approval window has passed; stage the plan again and have it approved again"
+                }
+                StagedState::Rejected => {
+                    "it was rejected; find out why instead of applying it anyway"
+                }
+                StagedState::Applied => {
+                    "it was already applied once; an approval is not a licence to run twice"
+                }
+                StagedState::Approved => unreachable!("handled above"),
+            };
+            return Err(SFError::Validation(format!(
+                "the staged plan {approval_id} is {}: {detail}",
+                state.as_str()
+            )));
+        }
+        if record.plan.plan_hash != plan.plan_hash {
+            self.metrics.count_apply("refused_hash_mismatch");
+            return Err(SFError::Validation(format!(
+                "approval {approval_id} is for plan {} but this plan hashes to {}; the plan changed after it was reviewed",
+                record.plan.plan_hash, plan.plan_hash
+            )));
+        }
+        self.metrics.count_apply("released");
         let _guard = self.apply_lock.lock().await;
         let recomputed = self.plan_ops(&plan.scope, &ops)?;
         for (planned, now) in plan.ops.iter().zip(recomputed.iter()) {
@@ -410,7 +1443,7 @@ impl HostDocs {
             }
         }
 
-        let journal_id = self.new_journal_id(&plan.plan_hash);
+        let journal_id = self.new_record_id(&plan.plan_hash);
         let dir = self.cfg.journal_dir.join(&journal_id);
         tokio::fs::create_dir_all(dir.join("orig"))
             .await
@@ -461,6 +1494,25 @@ impl HostDocs {
             }
         }
         write_journal(&dir, &records).await?;
+        // The approval is consumed: one approval cannot be executed twice
+        // (`refused_already_applied`). This is written after the log -- first let "what was
+        // done" land, then let "what is allowed" lapse; the reverse order means that if
+        // this step fails, the approval is still unused while the change has already been
+        // made.
+        //
+        // The path that fails midway and rolls back does not come through here: the scope
+        // is restored as it was and the plan is unchanged, so retrying the same operation
+        // set under the same approval is still inside what was approved.
+        let mut consumed = record;
+        consumed.applied = Some(HostDocApplied {
+            journal_id: journal_id.clone(),
+            applied_at_unix: now_unix(),
+        });
+        if let Err(e) = self.save_staged(&consumed).await {
+            return Err(SFError::Agent(format!(
+                "{e}; the plan was applied (journal {journal_id}) but the approval record could not be updated, so that approval could still be replayed and needs a manual look"
+            )));
+        }
         info!(journal = %journal_id, scope = %plan.scope, applied = applied.len(), "host document plan applied");
         Ok(HostDocApply {
             journal_id,
@@ -625,12 +1677,15 @@ impl HostDocs {
         })
     }
 
-    fn new_journal_id(&self, plan_hash: &str) -> String {
+    /// A new record id. Milliseconds first, a serial in the middle, the head of the plan
+    /// hash last: sorting by name sorts by time, and those hash characters make "which
+    /// plan is this record for" visible from the directory listing itself.
+    fn new_record_id(&self, plan_hash: &str) -> String {
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let seq = self.journal_seq.fetch_add(1, Ordering::Relaxed);
+        let seq = self.id_seq.fetch_add(1, Ordering::Relaxed);
         let digest = &plan_hash[..plan_hash.len().min(12)];
         format!("{millis}-{seq}-{digest}")
     }
@@ -745,6 +1800,55 @@ fn resolve_within_scope(root: &Path, rel: &str) -> SFResult<PathBuf> {
     Ok(current)
 }
 
+/// One entry's own facts: kind, byte count, mtime.
+///
+/// `symlink_metadata` rather than `metadata`: what is wanted here is **the entry itself**,
+/// not where it points. Following links would make "what is in the listing" depend on
+/// files outside the scope, and would let a link report the size of a body it is not.
+fn entry_facts(path: &Path) -> SFResult<(EntryKind, u64, Option<u64>)> {
+    let md = std::fs::symlink_metadata(path).map_err(|e| {
+        SFError::Config(format!(
+            "cannot read metadata for {}: {e} (this process cannot read it -- not the caller's problem)",
+            path.display()
+        ))
+    })?;
+    let file_type = md.file_type();
+    let kind = if file_type.is_dir() {
+        EntryKind::Dir
+    } else if file_type.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Other
+    };
+    let bytes = if file_type.is_file() { md.len() } else { 0 };
+    Ok((kind, bytes, md.modified().ok().and_then(system_time_secs)))
+}
+
+/// The `/`-joined form of a relative path; `None` when a name is not UTF-8.
+///
+/// Not `to_string_lossy`: two different names would be written as one, and the listing
+/// would report A as B -- from which the caller may well rename and move things next.
+/// Failing to list it (and counting that) is better than listing it wrong.
+fn posix_rel(rel: &Path) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => parts.push(name.to_str()?),
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+fn system_time_secs(time: std::time::SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
 /// A symlink anywhere along the path — including a dangling one, whose target
 /// would otherwise be created by a write — is refused rather than followed.
 fn refuse_symlink(root: &Path, path: &Path) -> SFResult<()> {
@@ -758,7 +1862,10 @@ fn refuse_symlink(root: &Path, path: &Path) -> SFResult<()> {
     }
 }
 
-fn validate_journal_id(id: &str) -> SFResult<()> {
+/// An id usable as a file name: non-empty, not absolute, a single segment. The rollback
+/// journal and staged records both use it -- both are **strings the caller supplies**, and
+/// pasting one straight into a path is a way out of the volume.
+fn validate_plain_name(id: &str) -> SFResult<()> {
     let path = Path::new(id);
     let mut components = path.components();
     let plain = !id.trim().is_empty()
@@ -768,9 +1875,44 @@ fn validate_journal_id(id: &str) -> SFResult<()> {
     if plain {
         Ok(())
     } else {
-        Err(SFError::Validation(format!(
+        Err(SFError::Validation(format!("{id:?} is not a plain name")))
+    }
+}
+
+fn validate_journal_id(id: &str) -> SFResult<()> {
+    validate_plain_name(id).map_err(|_| {
+        SFError::Validation(format!(
             "invalid journal id {id:?}; expected the id returned by an apply"
-        )))
+        ))
+    })
+}
+
+fn validate_staged_id(id: &str) -> SFResult<()> {
+    validate_plain_name(id).map_err(|_| {
+        SFError::Validation(format!(
+            "invalid staged plan id {id:?}; expected the id returned by a stage"
+        ))
+    })
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether this record should be cleaned up now.
+///
+/// A terminal state (applied, rejected) is cleaned once its window passes -- it has said
+/// everything it has to say, and keeping it only takes up room. One that merely expired
+/// without reaching a terminal state is kept for one more window: that is the one "where
+/// did the plan I submitted go" will ask about.
+fn prune_due(record: &StagedPlan, now_unix: u64, ttl_secs: u64) -> bool {
+    match record.state(now_unix) {
+        StagedState::Applied | StagedState::Rejected => now_unix >= record.expires_at_unix,
+        StagedState::Expired => now_unix >= record.expires_at_unix.saturating_add(ttl_secs),
+        StagedState::Pending | StagedState::Approved => false,
     }
 }
 
@@ -851,7 +1993,7 @@ mod tests {
         (dir, cfg)
     }
 
-    fn docs(cfg: &HostDocsConfig) -> Arc<HostDocs> {
+    fn open_docs(cfg: &HostDocsConfig) -> Arc<HostDocs> {
         HostDocs::new(cfg.clone()).expect("host docs")
     }
 
@@ -878,7 +2020,7 @@ mod tests {
     fn absent_spec_means_the_capability_is_off() {
         let cfg = HostDocsConfig::from_spec(None, PathBuf::from("/tmp/j"), DEFAULT_MAX_DOC_BYTES);
         assert!(!cfg.is_enabled());
-        let docs = docs(&cfg);
+        let docs = open_docs(&cfg);
         let err = docs
             .plan("alice", &[HostDocOp::Mkdir { path: "a".into() }])
             .unwrap_err();
@@ -891,7 +2033,7 @@ mod tests {
     #[test]
     fn absolute_paths_and_parent_components_are_refused_with_a_reason() {
         let (_d, cfg) = temp_scope();
-        let docs = docs(&cfg);
+        let docs = open_docs(&cfg);
         for (path, needle) in [
             ("/etc/passwd", "absolute path refused"),
             ("../../etc/passwd", "contains `..`"),
@@ -909,7 +2051,7 @@ mod tests {
     fn a_symlink_inside_the_scope_is_refused_not_followed() {
         let (_d, cfg) = temp_scope();
         let root = scope_root(&cfg);
-        let docs = docs(&cfg);
+        let docs = open_docs(&cfg);
         // A link out of the scope: even though the mount hides the host, this
         // container's own /etc is real, so following it would escape.
         std::os::unix::fs::symlink("/etc", root.join("elsewhere")).unwrap();
@@ -944,7 +2086,7 @@ mod tests {
         let root = scope_root(&cfg);
         std::fs::write(root.join("old.txt"), b"before").unwrap();
         std::fs::create_dir(root.join("keep")).unwrap();
-        let docs = docs(&cfg);
+        let docs = open_docs(&cfg);
         let ops = vec![
             HostDocOp::Mkdir {
                 path: "archive".into(),
@@ -961,7 +2103,7 @@ mod tests {
                 path: "keep".into(),
             },
         ];
-        let plan = docs.plan("alice", &ops).unwrap();
+        let (plan, approval) = approved_plan(&docs, "alice", &ops).await;
         assert_eq!(
             plan.ops.iter().map(|p| p.effect).collect::<Vec<_>>(),
             vec![
@@ -971,7 +2113,7 @@ mod tests {
                 Effect::Present
             ]
         );
-        let applied = docs.apply(&plan).await.unwrap();
+        let applied = docs.apply(&plan, &approval).await.unwrap();
         assert_eq!(applied.applied.len(), 4);
         assert!(root.join("archive/old.txt").exists());
         assert!(!root.join("old.txt").exists());
@@ -995,21 +2137,23 @@ mod tests {
     #[tokio::test]
     async fn apply_refuses_a_plan_whose_operations_were_edited() {
         let (_d, cfg) = temp_scope();
-        let docs = docs(&cfg);
-        let mut plan = docs
-            .plan(
-                "alice",
-                &[HostDocOp::Write {
-                    path: "a.txt".into(),
-                    content: "one".into(),
-                }],
-            )
-            .unwrap();
+        let docs = open_docs(&cfg);
+        // The approval happens before the edit: what is changed is **the plan that was
+        // already approved**, which is exactly what this check is there to stop.
+        let (mut plan, approval) = approved_plan(
+            &docs,
+            "alice",
+            &[HostDocOp::Write {
+                path: "a.txt".into(),
+                content: "one".into(),
+            }],
+        )
+        .await;
         plan.ops[0].op = HostDocOp::Write {
             path: "a.txt".into(),
             content: "two".into(),
         };
-        let err = docs.apply(&plan).await.unwrap_err();
+        let err = docs.apply(&plan, &approval).await.unwrap_err();
         assert!(err.to_string().contains("plan hash"), "{err}");
     }
 
@@ -1017,20 +2161,20 @@ mod tests {
     async fn apply_refuses_when_the_scope_changed_since_the_plan() {
         let (_d, cfg) = temp_scope();
         let root = scope_root(&cfg);
-        let docs = docs(&cfg);
-        let plan = docs
-            .plan(
-                "alice",
-                &[HostDocOp::Write {
-                    path: "a.txt".into(),
-                    content: "one".into(),
-                }],
-            )
-            .unwrap();
+        let docs = open_docs(&cfg);
+        let (plan, approval) = approved_plan(
+            &docs,
+            "alice",
+            &[HostDocOp::Write {
+                path: "a.txt".into(),
+                content: "one".into(),
+            }],
+        )
+        .await;
         assert_eq!(plan.ops[0].effect, Effect::Create);
         // Something appears at the planned location between review and apply.
         std::fs::write(root.join("a.txt"), b"somebody else's work").unwrap();
-        let err = docs.apply(&plan).await.unwrap_err();
+        let err = docs.apply(&plan, &approval).await.unwrap_err();
         assert!(
             err.to_string().contains("the scope changed since the plan"),
             "{err}"
@@ -1048,30 +2192,30 @@ mod tests {
         let root = scope_root(&cfg);
         std::fs::write(root.join("notes.txt"), b"original contents").unwrap();
         std::fs::create_dir(root.join("keep")).unwrap();
-        let docs = docs(&cfg);
-        let plan = docs
-            .plan(
-                "alice",
-                &[
-                    HostDocOp::Mkdir {
-                        path: "archive".into(),
-                    },
-                    HostDocOp::Rename {
-                        from: "notes.txt".into(),
-                        to: "archive/notes.txt".into(),
-                    },
-                    HostDocOp::Write {
-                        path: "archive/notes.txt".into(),
-                        content: "rewritten".into(),
-                    },
-                    HostDocOp::Write {
-                        path: "new.md".into(),
-                        content: "created".into(),
-                    },
-                ],
-            )
-            .unwrap();
-        let applied = docs.apply(&plan).await.unwrap();
+        let docs = open_docs(&cfg);
+        let (plan, approval) = approved_plan(
+            &docs,
+            "alice",
+            &[
+                HostDocOp::Mkdir {
+                    path: "archive".into(),
+                },
+                HostDocOp::Rename {
+                    from: "notes.txt".into(),
+                    to: "archive/notes.txt".into(),
+                },
+                HostDocOp::Write {
+                    path: "archive/notes.txt".into(),
+                    content: "rewritten".into(),
+                },
+                HostDocOp::Write {
+                    path: "new.md".into(),
+                    content: "created".into(),
+                },
+            ],
+        )
+        .await;
+        let applied = docs.apply(&plan, &approval).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("archive/notes.txt")).unwrap(),
             "rewritten"
@@ -1095,7 +2239,7 @@ mod tests {
         let (_d, cfg) = temp_scope();
         let root = scope_root(&cfg);
         std::fs::create_dir(root.join("dir")).unwrap();
-        let docs = docs(&cfg);
+        let docs = open_docs(&cfg);
         let ops = vec![
             HostDocOp::Write {
                 path: "kept.txt".into(),
@@ -1110,9 +2254,9 @@ mod tests {
                 content: "two".into(),
             },
         ];
-        let plan = docs.plan("alice", &ops).unwrap();
+        let (plan, approval) = approved_plan(&docs, "alice", &ops).await;
         std::fs::remove_dir(root.join("dir")).unwrap();
-        let err = docs.apply(&plan).await.unwrap_err();
+        let err = docs.apply(&plan, &approval).await.unwrap_err();
         assert!(err.to_string().contains("rolled back"), "{err}");
         assert!(
             !root.join("kept.txt").exists(),
@@ -1130,7 +2274,7 @@ mod tests {
             dir.path().join("journal"),
             16,
         );
-        let docs = docs(&cfg);
+        let docs = open_docs(&cfg);
         let err = docs
             .plan(
                 "alice",
@@ -1149,7 +2293,7 @@ mod tests {
         let root = scope_root(&cfg);
         std::fs::write(root.join("a.txt"), b"a").unwrap();
         std::fs::write(root.join("b.txt"), b"b").unwrap();
-        let docs = docs(&cfg);
+        let docs = open_docs(&cfg);
         let err = docs
             .plan(
                 "alice",
@@ -1166,7 +2310,7 @@ mod tests {
     #[tokio::test]
     async fn a_journal_id_that_is_not_a_name_is_refused() {
         let (_d, cfg) = temp_scope();
-        let docs = docs(&cfg);
+        let docs = open_docs(&cfg);
         for id in ["../escape", "/absolute", "a/b", ""] {
             let err = docs.rollback(id).await.unwrap_err();
             assert!(
@@ -1174,5 +2318,759 @@ mod tests {
                 "{id}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn the_apply_vocabulary_is_published_at_zero() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+        let rendered = docs.metrics();
+        for outcome in APPLY_OUTCOMES {
+            assert_eq!(
+                gates(&rendered, outcome),
+                0.0,
+                "every cell of the apply gate has to be published at zero: without the zero, 'nobody approved' and 'this gate has no reading at all' look the same"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unapproved_plan_is_not_applied_and_the_refusal_names_what_is_missing() {
+        let (_d, cfg) = temp_scope();
+        let root = scope_root(&cfg);
+        let docs = open_docs(&cfg);
+        // Note that the capability here is built with the egress switch off (`from_spec`
+        // default): producing a plan and staging it move no body, so they have to work with
+        // the switch off as well -- which is the measured form of "the switch governs
+        // bodies, not organising".
+        assert!(!cfg.body_egress);
+        let ops = vec![write("a.txt", "one")];
+        let plan = docs.plan("alice", &ops).unwrap();
+        let staged = docs.stage("alice", &ops).await.unwrap();
+        assert_eq!(staged.state, StagedState::Pending);
+
+        let err = docs.apply(&plan, &staged.staged_id).await.unwrap_err();
+        assert!(err.to_string().contains("nothing has approved it"), "{err}");
+        assert!(
+            !root.join("a.txt").exists(),
+            "not one character of an unapproved plan may land on disk"
+        );
+
+        // Only after the approval does the same plan become actionable -- which in turn
+        // proves that the refusal above said "nobody approved it".
+        docs.approve(&staged.staged_id, "alice").await.unwrap();
+        docs.apply(&plan, &staged.staged_id).await.unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one");
+    }
+
+    #[tokio::test]
+    async fn an_approval_covers_one_plan_and_is_used_once() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+        let (plan, approval) = approved_plan(&docs, "alice", &[write("a.txt", "one")]).await;
+        docs.apply(&plan, &approval).await.unwrap();
+
+        // One approval cannot be executed twice: 'already applied' and 'nobody approved it'
+        // ask a person for different things.
+        let err = docs.apply(&plan, &approval).await.unwrap_err();
+        assert!(err.to_string().contains("already applied"), "{err}");
+        assert!(err.to_string().contains("run twice"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_approval_is_for_one_plan_not_another() {
+        let (_d, cfg) = temp_scope();
+        let root = scope_root(&cfg);
+        let docs = open_docs(&cfg);
+        let staged = docs.stage("alice", &[write("a.txt", "one")]).await.unwrap();
+        docs.approve(&staged.staged_id, "alice").await.unwrap();
+        // A different plan, self-consistent in its own hash, arrives holding this
+        // approval.
+        let other = docs.plan("alice", &[write("b.txt", "two")]).unwrap();
+        let err = docs.apply(&other, &staged.staged_id).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("changed after it was reviewed"), "{text}");
+        // The refusal has to carry both values the judgement used: given only "they do not
+        // match", there is nothing to look up which of the two hashes is the odd one.
+        assert!(
+            text.contains(&staged.plan_hash),
+            "the missing approval record hash: {text}"
+        );
+        assert!(
+            text.contains(&other.plan_hash),
+            "the missing plan-in-hand hash: {text}"
+        );
+        assert!(
+            !root.join("b.txt").exists(),
+            "a plan that does not match must not be acted on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_sticks_and_carries_its_reason() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+        let staged = docs.stage("alice", &[write("a.txt", "one")]).await.unwrap();
+        let rejected = docs
+            .reject(&staged.staged_id, Some("  not the tidy-up I asked for  "))
+            .await
+            .unwrap();
+        assert_eq!(rejected.state, StagedState::Rejected);
+        assert_eq!(
+            rejected.rejected_reason.as_deref(),
+            Some("not the tidy-up I asked for")
+        );
+        // After the rejection it cannot be approved: otherwise "rejected" is only a comment.
+        let err = docs.approve(&staged.staged_id, "alice").await.unwrap_err();
+        assert!(err.to_string().contains("rejected"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_approval_must_name_who_and_the_record_keeps_the_name() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+        let staged = docs.stage("alice", &[write("a.txt", "one")]).await.unwrap();
+        let err = docs.approve(&staged.staged_id, "   ").await.unwrap_err();
+        assert!(err.to_string().contains("name who approved"), "{err}");
+        // Self-check: after the rejection the record is still pending, with no half-written
+        // approval left behind.
+        let list = docs.staged_plans().await.unwrap();
+        assert_eq!(list.plans[0].state, StagedState::Pending);
+        let approved = docs.approve(&staged.staged_id, "  ops  ").await.unwrap();
+        assert_eq!(
+            approved.approver.as_deref(),
+            Some("ops"),
+            "whitespace at both ends of the name has to be trimmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_staged_plan_shows_its_state_and_the_reviewer_can_read_it_in_full() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+        let staged = docs.stage("alice", &[write("a.txt", "one")]).await.unwrap();
+        assert_eq!(staged.state, StagedState::Pending);
+        assert_eq!(staged.scope, "alice");
+        assert_eq!(staged.op_count, 1);
+        assert!(
+            staged.expires_at_unix > staged.staged_at_unix,
+            "the window has to have length, otherwise every plan expires before anyone opens it"
+        );
+        // The reviewer has to see the plan itself, not just how large it is.
+        let record = docs.staged_plan(&staged.staged_id).await.unwrap();
+        assert_eq!(record.staged_id, staged.staged_id);
+        assert_eq!(record.plan.ops.len(), 1);
+        assert_eq!(record.plan.ops[0].effect, Effect::Create);
+        assert!(record.approval.is_none());
+
+        let approved = docs.approve(&staged.staged_id, "ops").await.unwrap();
+        assert_eq!(approved.state, StagedState::Approved);
+        assert_eq!(approved.approver.as_deref(), Some("ops"));
+        // The listing still holds one entry of metadata only: the body comes out only when
+        // it is fetched by id.
+        let list = docs.staged_plans().await.unwrap();
+        assert_eq!(list.plans.len(), 1);
+        assert_eq!(list.unreadable_records, 0);
+    }
+
+    #[tokio::test]
+    async fn an_expired_plan_stays_visible_instead_of_disappearing() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+        let staged = docs.stage("alice", &[write("a.txt", "one")]).await.unwrap();
+        docs.approve(&staged.staged_id, "ops").await.unwrap();
+        // Time can only be waited for, not configured, so the window is moved to just past:
+        // this cell measures the window judgement, not whether the machine is fast enough.
+        let now = now_unix();
+        rewrite_record(&docs, &staged.staged_id, |r| {
+            r.expires_at_unix = now.saturating_sub(1)
+        });
+        let list = docs.staged_plans().await.unwrap();
+        let mine = list
+            .plans
+            .iter()
+            .find(|p| p.staged_id == staged.staged_id)
+            .expect("an expired record still has to be listed");
+        assert_eq!(mine.state, StagedState::Expired);
+        assert_eq!(
+            mine.approver.as_deref(),
+            Some("ops"),
+            "an approved-but-expired record has to show whether it was executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_takes_terminal_records_and_leaves_the_just_expired_ones() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+        let rejected = docs
+            .stage("alice", &[write("gone.txt", "x")])
+            .await
+            .unwrap();
+        docs.reject(&rejected.staged_id, Some("calling the whole thing off"))
+            .await
+            .unwrap();
+        let expired = docs
+            .stage("alice", &[write("kept.txt", "x")])
+            .await
+            .unwrap();
+        let fresh = docs
+            .stage("alice", &[write("fresh.txt", "x")])
+            .await
+            .unwrap();
+        let now = now_unix();
+        for id in [&rejected.staged_id, &expired.staged_id] {
+            rewrite_record(&docs, id, |r| r.expires_at_unix = now.saturating_sub(1));
+        }
+
+        // The next stage does maintenance along the way; every record it removes has to
+        // leave a reading behind.
+        docs.stage("alice", &[write("trigger.txt", "x")])
+            .await
+            .unwrap();
+        let list = docs.staged_plans().await.unwrap();
+        let ids: Vec<&str> = list.plans.iter().map(|p| p.staged_id.as_str()).collect();
+        assert!(
+            !ids.contains(&rejected.staged_id.as_str()),
+            "a record that reached a terminal state and then passed its window should be removed"
+        );
+        assert!(
+            ids.contains(&expired.staged_id.as_str()),
+            "the one that just expired has to stay -- that is the one that gets asked about"
+        );
+        assert!(
+            ids.contains(&fresh.staged_id.as_str()),
+            "a plan still waiting for approval must not be touched"
+        );
+        assert_eq!(
+            ops_cell(&docs.metrics(), "prune", "pruned"),
+            1.0,
+            "the cleanup deleted something, so it has to leave its own reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_over_the_review_ceiling_is_refused_before_it_is_stored() {
+        let (_d, mut cfg) = temp_scope();
+        cfg.max_plan_bytes = 200;
+        let docs = open_docs(&cfg);
+        let err = docs
+            .stage("alice", &[write("a.txt", &"x".repeat(400))])
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("ceiling"), "{text}");
+        assert!(
+            text.contains("200"),
+            "the refusal has to carry the value the judgement used, otherwise whoever adjusts the bound does not know in which direction: {text}"
+        );
+        assert!(
+            docs.staged_plans().await.unwrap().plans.is_empty(),
+            "the refusal happens before anything lands: no half-written record may appear in the directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_published_apply_outcome_is_reachable() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+
+        // released: an approved plan applied once.
+        let (plan, approval) = approved_plan(&docs, "alice", &[write("a.txt", "one")]).await;
+        docs.apply(&plan, &approval).await.unwrap();
+        // refused_already_applied: the same approval, once more.
+        assert!(docs.apply(&plan, &approval).await.is_err());
+
+        // refused_no_record: no such record on disk.
+        assert!(docs
+            .apply(&plan, "1700000000000-0-aaaaaaaaaaaa")
+            .await
+            .is_err());
+
+        // refused_unreadable_record: the record is on disk but cannot be read. The
+        // difference from the previous cell is exactly the difference between "fix the
+        // caller" and "inspect this volume", so a broken record really has to be built.
+        let corrupt = "1700000000001-0-bbbbbbbbbbbb";
+        std::fs::create_dir_all(docs.staged_dir()).unwrap();
+        std::fs::write(
+            docs.staged_dir().join(format!("{corrupt}.json")),
+            b"{ not json",
+        )
+        .unwrap();
+        assert!(docs.apply(&plan, corrupt).await.is_err());
+
+        // refused_not_approved: staged, but nobody approved it.
+        let staged = docs.stage("alice", &[write("b.txt", "two")]).await.unwrap();
+        let unapproved = docs.plan("alice", &[write("b.txt", "two")]).unwrap();
+        assert!(docs.apply(&unapproved, &staged.staged_id).await.is_err());
+
+        // refused_hash_mismatch: what was approved is a different plan.
+        let staged_c = docs
+            .stage("alice", &[write("c.txt", "three")])
+            .await
+            .unwrap();
+        docs.approve(&staged_c.staged_id, "ops").await.unwrap();
+        let plan_d = docs.plan("alice", &[write("d.txt", "four")]).unwrap();
+        assert!(docs.apply(&plan_d, &staged_c.staged_id).await.is_err());
+
+        // refused_rejected: it was rejected.
+        let staged_e = docs
+            .stage("alice", &[write("e.txt", "five")])
+            .await
+            .unwrap();
+        docs.reject(&staged_e.staged_id, None).await.unwrap();
+        let plan_e = docs.plan("alice", &[write("e.txt", "five")]).unwrap();
+        assert!(docs.apply(&plan_e, &staged_e.staged_id).await.is_err());
+
+        // refused_expired: the window has passed (which also proves here that
+        // approved-but-expired is no help).
+        let staged_f = docs.stage("alice", &[write("f.txt", "six")]).await.unwrap();
+        docs.approve(&staged_f.staged_id, "ops").await.unwrap();
+        rewrite_record(&docs, &staged_f.staged_id, |r| r.expires_at_unix = 1);
+        let plan_f = docs.plan("alice", &[write("f.txt", "six")]).unwrap();
+        assert!(docs.apply(&plan_f, &staged_f.staged_id).await.is_err());
+
+        let rendered = docs.metrics();
+        let observed = observed_outcomes(
+            &[rendered],
+            "sandbox_host_docs_apply_total",
+            &APPLY_OUTCOMES,
+        );
+        let expected: Vec<String> = APPLY_OUTCOMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            observed, expected,
+            "measured landing cells do not match the vocabulary: a missing cell can never be read, and an extra one is read by nobody"
+        );
+    }
+
+    /// One cell of the reading, taken from the **rendered** text.
+    ///
+    /// Rendered output rather than the in-memory counter: this is the same text an operator
+    /// sees on `/metrics`, so "this cell is published" is said about the real reading
+    /// surface.
+    fn cell(rendered: &str, series: &str, outcome: &str) -> f64 {
+        let needle = format!("{series}{{outcome=\"{outcome}\"}} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&needle))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| {
+                panic!("no {series}{{outcome=\"{outcome}\"}} in the reading:\n{rendered}")
+            })
+    }
+
+    fn reads(rendered: &str, outcome: &str) -> f64 {
+        cell(rendered, "sandbox_host_docs_reads_total", outcome)
+    }
+
+    fn lists(rendered: &str, outcome: &str) -> f64 {
+        cell(rendered, "sandbox_host_docs_lists_total", outcome)
+    }
+
+    fn gates(rendered: &str, outcome: &str) -> f64 {
+        cell(rendered, "sandbox_host_docs_apply_total", outcome)
+    }
+
+    /// The `ops` counter is two-dimensional, so a value needs a kind as well: labels sort by
+    /// name, so in the needle the kind comes first and the outcome second, matching the line
+    /// as rendered.
+    fn ops_cell(rendered: &str, kind: &str, outcome: &str) -> f64 {
+        let needle =
+            format!("sandbox_host_docs_ops_total{{kind=\"{kind}\",outcome=\"{outcome}\"}} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&needle))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| {
+                panic!("no sandbox_host_docs_ops_total{{kind=\"{kind}\",outcome=\"{outcome}\"}} in the reading")
+            })
+    }
+
+    fn write(path: &str, content: &str) -> HostDocOp {
+        HostDocOp::Write {
+            path: path.into(),
+            content: content.into(),
+        }
+    }
+
+    /// Collect the cells that **actually** appeared across several readings (a value above
+    /// zero counts).
+    ///
+    /// Measured cells rather than hard-coded expectations: a hard-coded expectation passes
+    /// just as well when not one line ran. Several readings because one cell is reachable
+    /// only **on another instance** -- a switch has one value per process.
+    fn observed_outcomes(rendered: &[String], series: &str, vocabulary: &[&str]) -> Vec<String> {
+        vocabulary
+            .iter()
+            .filter(|outcome| {
+                rendered
+                    .iter()
+                    .any(|text| cell(text, series, outcome) >= 1.0)
+            })
+            .map(|outcome| outcome.to_string())
+            .collect()
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A scope this process cannot read: directory 0o000, and a file under it 0o000.
+    ///
+    /// Building `unreadable` with it is deliberate: that cell's cause is "this process
+    /// cannot read it", which is neither "it does not exist" nor "it is not text", and only
+    /// the permission bits can produce it reliably in a test. Running the tests as root,
+    /// root ignores the permission bits and that step cannot reach this cell -- so the test
+    /// carries its own self-check saying plainly "this environment cannot produce it" rather
+    /// than skipping silently.
+    fn locked_scope(dir: &Path) -> PathBuf {
+        let root = dir.join("locked");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("secret.txt"), b"secret").unwrap();
+        chmod(&root.join("secret.txt"), 0o000);
+        chmod(&root, 0o000);
+        root
+    }
+
+    /// Fill a scope: `notes.txt`, the subdirectory `archive/`, and the symlink `link`
+    /// (pointing outside the scope).
+    fn populate(cfg: &HostDocsConfig) -> PathBuf {
+        let root = scope_root(cfg);
+        std::fs::write(root.join("notes.txt"), b"hello").unwrap();
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        std::fs::write(root.join("archive/old.txt"), b"old").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("link")).unwrap();
+        root
+    }
+
+    /// A configuration with the egress switch on: with it off, the read face only ever
+    /// answers one refusal and nothing else is reachable.
+    fn reading(cfg: &HostDocsConfig) -> HostDocsConfig {
+        let mut on = cfg.clone();
+        on.body_egress = true;
+        on
+    }
+
+    /// Walk the approval face once: plan, stage, approve, returning the plan and its
+    /// approval id.
+    ///
+    /// These tests are about what applying gets right, and applying now requires an
+    /// approval record on disk -- so every step really is walked, rather than leaving apply a
+    /// test-only back door: with a back door in place, a passing test says nothing about
+    /// whether this gate is connected.
+    async fn approved_plan(
+        docs: &HostDocs,
+        scope: &str,
+        ops: &[HostDocOp],
+    ) -> (HostDocPlan, String) {
+        let plan = docs.plan(scope, ops).unwrap();
+        let staged = docs.stage(scope, ops).await.unwrap();
+        assert_eq!(
+            staged.plan_hash, plan.plan_hash,
+            "self-check: the staged plan is not the plan in hand, so the approval that follows would approve the wrong thing"
+        );
+        docs.approve(&staged.staged_id, "test").await.unwrap();
+        (plan, staged.staged_id)
+    }
+
+    /// Rewrite a staged record directly to the given contents, to produce "time has passed",
+    /// a state that can only be waited for and not configured.
+    fn rewrite_record(docs: &HostDocs, staged_id: &str, patch: impl FnOnce(&mut StagedPlan)) {
+        let path = docs.staged_dir().join(format!("{staged_id}.json"));
+        let mut record: StagedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        patch(&mut record);
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_listing_carries_metadata_and_counts_what_it_left_out() {
+        let (_d, cfg) = temp_scope();
+        let root = populate(&cfg);
+        let docs = open_docs(&cfg);
+        let listing = docs.list("alice", None).expect("listing");
+        let paths: Vec<&str> = listing.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["archive", "archive/old.txt", "notes.txt"],
+            "the listing should hold only entries that really exist, ordered by path"
+        );
+        let notes = listing
+            .entries
+            .iter()
+            .find(|e| e.path == "notes.txt")
+            .expect("notes.txt");
+        assert_eq!(notes.kind, EntryKind::File);
+        assert_eq!(notes.bytes, 5);
+        assert!(
+            notes.modified_unix.is_some(),
+            "the mtime should be readable"
+        );
+        let archive = listing
+            .entries
+            .iter()
+            .find(|e| e.path == "archive")
+            .expect("archive");
+        assert_eq!(archive.kind, EntryKind::Dir);
+        assert_eq!(archive.bytes, 0, "a directory has no byte count");
+        // A symlink outside the scope is neither in the listing (not followed) nor "never
+        // there": the count has to say so, otherwise "that is all of them" and "there are
+        // more I did not list" read exactly the same.
+        assert_eq!(listing.skipped_symlinks, 1);
+        assert_eq!(listing.skipped_unnamed, 0);
+        assert!(!listing.truncated);
+        assert!(
+            root.join("link").exists(),
+            "self-check: the link really is on disk"
+        );
+    }
+
+    #[test]
+    fn a_listing_that_hit_its_ceiling_says_so() {
+        let (_d, mut cfg) = temp_scope();
+        let root = scope_root(&cfg);
+        for i in 0..5 {
+            std::fs::write(root.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        cfg.max_list_entries = 2;
+        let docs = open_docs(&cfg);
+        let listing = docs.list("alice", None).expect("listing");
+        assert_eq!(
+            listing.entries.len(),
+            2,
+            "the ceiling bounds the produced side"
+        );
+        assert!(
+            listing.truncated,
+            "a truncated listing looks just like a small directory, and the caller will typically organise from it"
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_is_not_there_is_refused_rather_than_listed_empty() {
+        let (_d, cfg) = temp_scope();
+        populate(&cfg);
+        let docs = open_docs(&cfg);
+        let err = docs.list("alice", Some("nope")).unwrap_err();
+        assert!(err.to_string().contains("has no such prefix"), "{err}");
+        // The other direction: a directory that really is empty goes down the success path,
+        // not the error path -- so the two are distinguishable.
+        std::fs::create_dir_all(scope_root(&cfg).join("empty")).unwrap();
+        let listing = docs
+            .list("alice", Some("empty"))
+            .expect("an empty directory");
+        assert!(listing.entries.is_empty());
+        assert_eq!(listing.prefix.as_deref(), Some("empty"));
+        // When the prefix names a file, that one entry is the answer.
+        let one = docs
+            .list("alice", Some("notes.txt"))
+            .expect("a file prefix");
+        assert_eq!(one.entries.len(), 1);
+        assert_eq!(one.entries[0].path, "notes.txt");
+    }
+
+    #[test]
+    fn a_prefix_that_leaves_the_scope_is_refused() {
+        let (_d, cfg) = temp_scope();
+        populate(&cfg);
+        let docs = open_docs(&cfg);
+        // One case per kind of out-of-bounds path, checking **the reason for the refusal**:
+        // saying only "it failed" lets the judgement be swapped for another cause and still
+        // pass.
+        for (prefix, expected) in [
+            ("../etc", "`..`"),
+            ("/etc", "absolute path refused"),
+            ("archive/../../etc", "`..`"),
+            ("link", "symbolic link"),
+        ] {
+            let err = docs.list("alice", Some(prefix)).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "{prefix} was refused for a reason that is not {expected}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_listing_vocabulary_is_published_at_zero() {
+        let (_d, cfg) = temp_scope();
+        let docs = open_docs(&cfg);
+        let rendered = docs.metrics();
+        for outcome in LIST_OUTCOMES {
+            assert_eq!(
+                lists(&rendered, outcome),
+                0.0,
+                "\"nobody came to list\" and \"it was listed\" have to be distinguishable, \
+                 so the {outcome} cell has to be there first, and at zero"
+            );
+        }
+    }
+
+    #[test]
+    fn every_published_listing_outcome_is_reachable() {
+        let (dir, cfg) = temp_scope();
+        populate(&cfg);
+        let docs = open_docs(&cfg);
+
+        docs.list("alice", None).expect("listed");
+        docs.list("nobody", None).expect_err("unknown_scope");
+        docs.list("alice", Some("../etc"))
+            .expect_err("refused_path");
+        docs.list("alice", Some("nope")).expect_err("not_found");
+
+        let locked = locked_scope(dir.path());
+        let mut hard = cfg.clone();
+        hard.scopes.insert("locked".into(), locked.clone());
+        let hard_docs = open_docs(&hard);
+        let locked_err = hard_docs
+            .list("locked", None)
+            .expect_err("a 0o000 directory should not be listable");
+        assert!(
+            locked_err.to_string().contains("cannot list"),
+            "self-check: this cell wants \"cannot read it\" (this process's problem), not another cause: {locked_err}"
+        );
+
+        let rendered = [docs.metrics(), hard_docs.metrics()];
+        let observed =
+            observed_outcomes(&rendered, "sandbox_host_docs_lists_total", &LIST_OUTCOMES);
+        let expected: Vec<String> = LIST_OUTCOMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            observed, expected,
+            "measured landing cells do not match the vocabulary: a missing cell can never be read, and an extra one is read by nobody"
+        );
+        chmod(&locked, 0o755);
+    }
+
+    #[test]
+    fn reading_with_the_switch_off_is_a_refusal_not_an_empty_body() {
+        let (_d, cfg) = temp_scope();
+        populate(&cfg);
+        let docs = open_docs(&cfg);
+        assert!(!cfg.body_egress, "the default has to be off");
+        let refusal = docs.read("alice", "notes.txt").unwrap_err();
+        assert_eq!(refusal.outcome, "disabled");
+        assert!(
+            refusal
+                .error
+                .to_string()
+                .contains("refusal, not empty content"),
+            "with the switch off it has to be an outright refusal: {}",
+            refusal.error
+        );
+        assert_eq!(reads(&docs.metrics(), "disabled"), 1.0);
+        // The other direction: with the switch on, the same read returns content. Without
+        // this, "always refuse" would pass the assertion above as well.
+        let on_docs = open_docs(&reading(&cfg));
+        let read = on_docs
+            .read("alice", "notes.txt")
+            .expect("with the switch on it should read");
+        assert_eq!(read.content, "hello");
+        assert_eq!(read.bytes, 5);
+        assert_eq!(read.path, "notes.txt");
+        assert!(read.modified_unix.is_some());
+    }
+
+    #[test]
+    fn reading_refuses_a_body_over_the_ceiling_naming_both_numbers() {
+        let (_d, cfg) = temp_scope();
+        let root = scope_root(&cfg);
+        std::fs::write(root.join("big.txt"), vec![b'x'; 64]).unwrap();
+        let mut on = reading(&cfg);
+        on.max_read_bytes = 16;
+        let docs = open_docs(&on);
+        let refusal = docs.read("alice", "big.txt").unwrap_err();
+        assert_eq!(refusal.outcome, "over_ceiling");
+        let text = refusal.error.to_string();
+        assert!(
+            text.contains("64") && text.contains("16"),
+            "both numbers have to be there (how big a thing hit how small a bound): {text}"
+        );
+    }
+
+    #[test]
+    fn reading_refuses_a_directory_and_non_utf8_bytes_as_not_text() {
+        let (_d, cfg) = temp_scope();
+        let root = populate(&cfg);
+        std::fs::write(root.join("blob.bin"), [0xff, 0xfe, 0x00]).unwrap();
+        let docs = open_docs(&reading(&cfg));
+        for path in ["archive", "blob.bin"] {
+            let refusal = docs.read("alice", path).unwrap_err();
+            assert_eq!(refusal.outcome, "not_text", "{path}");
+        }
+        // The binary cell has to say at which byte it cannot go on, otherwise there is
+        // nothing to act on in "it is not text".
+        let refusal = docs.read("alice", "blob.bin").unwrap_err();
+        assert!(
+            refusal.error.to_string().contains("UTF-8"),
+            "{:?}",
+            refusal.error
+        );
+        // A symlink and an out-of-bounds path share one cell: content read through a link
+        // belongs outside the scope, so it is not "read".
+        assert_eq!(
+            docs.read("alice", "link").unwrap_err().outcome,
+            "refused_path"
+        );
+    }
+
+    #[test]
+    fn every_published_read_outcome_is_reachable() {
+        let (dir, cfg) = temp_scope();
+        let root = populate(&cfg);
+        std::fs::write(root.join("big.txt"), vec![b'x'; 64]).unwrap();
+        std::fs::write(root.join("blob.bin"), [0xff, 0xfe]).unwrap();
+        let mut on = reading(&cfg);
+        on.max_read_bytes = 16;
+        let docs = open_docs(&on);
+
+        assert!(docs.read("alice", "notes.txt").is_ok(), "read");
+        for (path, expected) in [
+            ("../etc/passwd", "refused_path"),
+            ("link", "refused_path"),
+            ("nope.txt", "not_found"),
+            ("big.txt", "over_ceiling"),
+            ("blob.bin", "not_text"),
+            ("archive", "not_text"),
+        ] {
+            let refusal = docs.read("alice", path).unwrap_err();
+            assert_eq!(refusal.outcome, expected, "{path}");
+        }
+        assert_eq!(
+            docs.read("nobody", "x").unwrap_err().outcome,
+            "unknown_scope"
+        );
+
+        // The switch-off cell is reachable only on another instance: a switch has one value
+        // per process.
+        let off_docs = open_docs(&cfg);
+        assert_eq!(
+            off_docs.read("alice", "notes.txt").unwrap_err().outcome,
+            "disabled"
+        );
+
+        let locked = locked_scope(dir.path());
+        let mut hard = cfg.clone();
+        hard.body_egress = true;
+        hard.scopes.insert("locked".into(), locked.clone());
+        let hard_docs = open_docs(&hard);
+        let locked_err = hard_docs
+            .read("locked", "secret.txt")
+            .expect_err("a 0o000 file should not be readable");
+        assert_eq!(
+            locked_err.outcome, "unreadable",
+            "self-check: this cell wants \"cannot read it\": {:?}",
+            locked_err.error
+        );
+
+        let rendered = [docs.metrics(), off_docs.metrics(), hard_docs.metrics()];
+        let observed =
+            observed_outcomes(&rendered, "sandbox_host_docs_reads_total", &READ_OUTCOMES);
+        let expected: Vec<String> = READ_OUTCOMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            observed, expected,
+            "measured landing cells do not match the vocabulary: a missing cell can never be read, and an extra one is read by nobody"
+        );
+        chmod(&locked, 0o755);
     }
 }

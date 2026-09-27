@@ -179,6 +179,22 @@ metric_names! {
     LLM_POOL_NEXT_ATTEMPT_UNIX => "llm_pool_next_attempt_unix",
     LLM_POOL_QUOTA_WINDOW_SECS => "llm_pool_quota_window_secs",
 
+    // cog-gateway — the audited LLM channel.
+    //
+    // The one outbound mouth where a request body that may hold host document
+    // text is looked at before it leaves. Labelled by `outcome` because the
+    // ways a request can end here are different defects that call for opposite
+    // fixes, and one counter would report them all as "the channel is not
+    // working": a body that carried credential-shaped text is a security
+    // event, a body over the auditable bound says the bound or the caller is
+    // wrong, and a body rejected by the switch says the channel is closed by
+    // configuration. That last one especially has to be readable on its own:
+    // otherwise a channel nobody calls and a channel closed by configuration
+    // look the same, which is how a switch that was never set (or set the
+    // wrong way round) stays invisible. The cell vocabulary is declared next
+    // to the producer, not here.
+    AUDITED_LLM_REQUESTS_TOTAL => "audited_llm_requests_total",
+
     // cog-orchestrator — task delivery.
     DAG_STALLED_SCHEDULED_RECLAIMED => "cogneva_dag_stalled_scheduled_reclaimed_total",
 

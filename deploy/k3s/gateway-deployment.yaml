@@ -1,8 +1,11 @@
-# 独立安全网关：代持全部敏感凭证（LLM API Key、代码平台 token、webhook secret），
-# 沙盒 Pod 零凭证。三个通道：8080 外网代理（脱敏审查后出站）、8081 LLM 与
-# 代码平台/git 透传（凭证出口注入）、8082 webhook 入口（验平台签名后附内部
-# HMAC 转发主应用）。
-# 依赖：主程序需以 security-gateway 模式运行。
+# Standalone security gateway: it holds every sensitive credential (LLM API keys, code
+# platform tokens, webhook secrets) so that sandbox pods hold none. Four channels: 8080
+# the external proxy (outbound after redaction review), 8081 the LLM and
+# code-platform/git passthrough (credentials injected at the egress), 8082 the webhook
+# entry (platform signature verified, then forwarded to the main app with an internal
+# HMAC), 8083 the audited LLM channel (upstream credentials *and* per-request audit,
+# with its reachable set limited to the sandbox executor).
+# Dependency: the main program has to run in security-gateway mode.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -53,6 +56,11 @@ spec:
               protocol: TCP
             - name: metrics
               containerPort: 9090
+              protocol: TCP
+            # Audited LLM channel: the same LLM routes, but every request's body is audited
+            # and the reachable set admits the sandbox executor only (see network-policy.yaml).
+            - name: audited-llm
+              containerPort: 8083
               protocol: TCP
           envFrom:
             - configMapRef:
@@ -231,6 +239,22 @@ spec:
             # 观测通道监听端口；与容器端口同源，避免两处漂移。
             - name: COGNEVA_SG_METRICS_PORT
               value: "9090"
+            # The audited channel's listen port and audit bound; both come from the same
+            # source as the container port and the policy.
+            - name: COGNEVA_SG_AUDITED_LLM_PORT
+              value: "8083"
+            - name: COGNEVA_SG_AUDITED_MAX_BODY_BYTES
+              value: "8388608"
+            # Whether host document bodies may leave the cluster. Putting the switch on the
+            # gateway is deliberate: the judgement belongs to the only process that can refuse
+            # the request, while the caller side (the executor) reads the same variable only to
+            # avoid sending a request bound to be refused. Off by default; while it is off the
+            # audited channel refuses explicitly and counts those separately in the
+            # `blocked_by_switch` cell -- "nobody called" and "the switch stopped it" have to
+            # stay distinguishable, and each reading cell carries one cause (a rule hit, over
+            # bound, a failed read and not being text are all different).
+            - name: HOST_DOCS_BODY_EGRESS_ENABLED
+              value: "false"
           startupProbe:
             httpGet:
               path: /health/live

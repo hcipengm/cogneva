@@ -153,6 +153,20 @@ securityGateway:
   metricsPort: 9090
   metricsAllowedNamespaces:
     - monitoring
+  # Audited LLM channel port: the same routes as 8081, plus per-request content audit,
+  # upstream credential injection, and a reachable set that admits the sandbox executor
+  # only. It exists for the design line "document bodies go through the audited channel
+  # only": 8081 does not look at one byte of the request body, 8080 holds no upstream
+  # credentials, and only this port has both. A port of its own rather than folded into
+  # 8080/8081: those two are reachable by any pod in the namespace, while this channel's
+  # whole value is its small reachable set.
+  auditedLlmPort: 8083
+  # The largest request body the audited channel can audit in one call (bytes). Above it
+  # nothing is audited, and what cannot be audited is refused -- so this states how much
+  # document text may leave in one request, not a throughput figure. Deliberately not
+  # shared with the document write bound: that one limits bytes written to disk
+  # (storage), this one limits text entering a model (context).
+  auditedLlmMaxBodyBytes: 8388608
   # git 传输的 SSH 兜底（HTTPS 快路径 + SSH 兜底，实现在 cog-gateway 的
   # git_mirror 模块）。GitHub 的 HTTPS 通道实测是高方差 + 偶发黑洞：好时 0.5s、
   # 坏时直冲超时，而黑洞期一来主线 deployer 拉不到基线、landing 推不上去，整条
@@ -317,6 +331,30 @@ hostDocuments:
   # 单份文档的重写上限（字节）。回滚要留一份原文副本，这个上限同时界住了
   # 一次操作与一份日志的大小。
   maxWriteBytes: 8388608
+  # The largest single read (bytes). **Deliberately not tied to the audited channel's
+  # bound**: that one is a gateway-process quantity limiting how much text leaves, this
+  # one limits the bytes the executor reads into memory at once. The two values being
+  # close is a coincidence; tying them together would silently drag one side when the
+  # other is adjusted.
+  maxReadBytes: 8388608
+  # Whether document bodies may leave the cluster (the switch on the audited channel),
+  # off by default. While it is off, organising uses metadata plus the local
+  # embedding/reranker only (the in-memory side already has configuration for both);
+  # with it on, bodies may enter a model through the audited channel. The judgement sits
+  # in the gateway process -- the only place that can refuse the request; the executor
+  # reads the same variable only to avoid sending a request bound to be refused.
+  bodyEgress: false
+  # How long a staged plan stays approvable (seconds). **It is also the validity of an
+  # approval**: past the window, an approved plan no longer executes -- approving
+  # something nobody has looked at for a long time is no different from acting
+  # unattended in the middle of the night.
+  # A floor of 60s (the executor clamps anything smaller): a value far below the floor is
+  # almost certainly a unit mistake.
+  approvalTtlSecs: 86400
+  # The largest plan that may be staged for approval (bytes). Same order as a single read:
+  # a plan carrying more text than a single write may carry would make "approved" mean
+  # something other than what it says.
+  maxPlanBytes: 8388608
 
 # 节点镜像构建（buildah DaemonSet）：每节点提供 buildah 能力，产物导入节点
 # containerd 作暖缓存；工作负载运行时镜像权威走集群内 registry（见 image.repository）。
