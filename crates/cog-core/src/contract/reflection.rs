@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// A detected pattern that groups related learnings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1538,6 +1539,89 @@ pub trait MetaLearning: Send + Sync + std::fmt::Debug {
     ) -> crate::SFResult<()>;
 }
 
+/// The tests a `cargo test` transcript names as failing, each qualified by the
+/// test binary that ran it.
+///
+/// Cargo prints `test <name> ... FAILED` under the `Running ...` line of the
+/// binary it is running, and a name alone does not identify a test: two crates
+/// in one workspace can both declare `hostdocs::tests::reachable`. Keying by
+/// `<binary>/<name>` is what lets two transcripts be compared as sets and have
+/// the comparison mean what it says.
+///
+/// The binary name comes from the path cargo prints with its trailing
+/// `-<metadata hash>` removed, because that hash is part of a file name and
+/// moves whenever the compiler's metadata moves; keeping it would make the same
+/// test look like a different test from one run to the next, and every
+/// comparison would come out empty.
+pub fn failing_tests(output: &str) -> BTreeSet<String> {
+    let mut binary = String::from("<unknown>");
+    let mut failing = BTreeSet::new();
+
+    for line in output.lines() {
+        let line = line.trim_end();
+        if let Some(name) = test_binary_of(line) {
+            binary = name;
+            continue;
+        }
+        // Only the run's own line carries the marker. The `failures:` summary
+        // lists the same names indented and without it, so reading both would
+        // count every failure twice and attribute none of them to a binary.
+        if let Some(rest) = line.strip_prefix("test ") {
+            if !line.ends_with("FAILED") {
+                continue;
+            }
+            if let Some((name, _)) = rest.split_once(" ... ") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    failing.insert(format!("{binary}/{name}"));
+                }
+            }
+        }
+    }
+
+    failing
+}
+
+/// The test binary cargo is about to run, from the line it announces it with.
+///
+/// Three shapes reach here: `Running unittests src/lib.rs (<path>)`,
+/// `Running tests/foo.rs (<path>)` and `Doc-tests <crate> (<path>)`. All of
+/// them end with the path in parentheses, which is the part that carries the
+/// name; the words before it differ by target kind and are not read.
+fn test_binary_of(line: &str) -> Option<String> {
+    let line = line.trim_start();
+    if !line.starts_with("Running ") && !line.starts_with("Doc-tests ") {
+        return None;
+    }
+    let (_, path) = line.rsplit_once('(')?;
+    let stem = path
+        .trim_end()
+        .trim_end_matches(')')
+        .trim()
+        .rsplit('/')
+        .next()?;
+    Some(without_metadata_hash(stem))
+}
+
+/// `cog_extension-3f2a1b4c5d6e7f80` -> `cog_extension`.
+///
+/// A binary name that happens to end in a hyphenated run of hex digits of the
+/// wrong length is left alone: a name cargo did not decorate is better kept
+/// intact than truncated on a guess.
+fn without_metadata_hash(stem: &str) -> String {
+    const HASH_LEN: usize = 16;
+    match stem.rsplit_once('-') {
+        Some((name, hash))
+            if !name.is_empty()
+                && hash.len() == HASH_LEN
+                && hash.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            name.to_string()
+        }
+        _ => stem.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2146,5 +2230,111 @@ mod tests {
         assert!(!mentions_name("the README.md is stale", "README"));
         assert!(!mentions_name("readmore about it", "readme"));
         assert!(!mentions_name("anything at all", ""));
+    }
+
+    /// The transcript below is the shape `cargo test --workspace --no-fail-fast`
+    /// prints: a `Running` line per binary, then that binary's failures, then
+    /// the same names again in its summary. Reading only the run lines is what
+    /// keeps the summary from counting every failure a second time, and the
+    /// binary is what keeps two crates' same-named test apart.
+    const FAILING_TRANSCRIPT: &str = "\
+     Running unittests src/lib.rs (target/debug/deps/cog_extension-3f2a1b4c5d6e7f80)\n\
+\n\
+running 2 tests\n\
+test hostdocs::tests::every_published_read_outcome_is_reachable ... FAILED\n\
+test hostdocs::tests::another ... ok\n\
+\n\
+failures:\n\
+\n\
+---- hostdocs::tests::every_published_read_outcome_is_reachable stdout ----\n\
+a 0o000 directory should not be listable\n\
+\n\
+failures:\n\
+    hostdocs::tests::every_published_read_outcome_is_reachable\n\
+\n\
+test result: FAILED. 1 passed; 1 failed; 0 ignored\n\
+\n\
+     Running unittests src/lib.rs (target/debug/deps/cog_auth-0a1b2c3d4e5f6071)\n\
+\n\
+running 1 test\n\
+test hostdocs::tests::every_published_read_outcome_is_reachable ... FAILED\n\
+\n\
+test result: FAILED. 0 passed; 1 failed; 0 ignored\n";
+
+    #[test]
+    fn a_failing_test_is_read_once_and_carries_the_binary_that_ran_it() {
+        let failing = failing_tests(FAILING_TRANSCRIPT);
+        assert_eq!(
+            failing.into_iter().collect::<Vec<_>>(),
+            vec![
+                "cog_auth/hostdocs::tests::every_published_read_outcome_is_reachable",
+                "cog_extension/hostdocs::tests::every_published_read_outcome_is_reachable",
+            ],
+            "same-named tests in two crates have to stay two entries, and the \
+             summary must not add a third"
+        );
+    }
+
+    /// The metadata hash is part of the binary's file name, so it moves when the
+    /// compiler's metadata moves. Two runs of an unchanged test must read as the
+    /// same test or a comparison between them is always empty and every failure
+    /// looks like the change's own.
+    #[test]
+    fn the_metadata_hash_does_not_enter_the_identity() {
+        let run = |hash: &str| {
+            let output = format!(
+                "     Running unittests src/lib.rs (target/debug/deps/cog_core-{hash})\n\
+                 \n\
+                 test a::b ... FAILED\n"
+            );
+            failing_tests(&output)
+        };
+        assert_eq!(run("1111111111111111"), run("2222222222222222"));
+        assert!(run("1111111111111111").contains("cog_core/a::b"));
+    }
+
+    #[test]
+    fn a_doc_test_failure_belongs_to_its_crate() {
+        let output = "   Doc-tests cog_core (target/debug/deps/cog_core-abcdef0123456789)\n\
+                      \n\
+                      test src/lib.rs - read (line 12) ... FAILED\n";
+        assert!(failing_tests(output).contains("cog_core/src/lib.rs - read (line 12)"));
+    }
+
+    /// A run that failed without naming a test did not fail a test: it failed
+    /// to build one, or the harness died. The empty set is what the caller
+    /// reads as "nothing here can be blamed on the tree's own state".
+    #[test]
+    fn a_build_failure_names_no_test() {
+        let output = "   Compiling cog-auth v0.5.8\n\
+                      error[E0308]: mismatched types\n\
+                      error: could not compile `cog-auth` (lib) due to 1 previous error\n";
+        assert!(failing_tests(output).is_empty());
+    }
+
+    /// Only a trailing run of sixteen hex digits is the metadata hash. Anything
+    /// else that happens to follow a hyphen is part of the name and is kept:
+    /// truncating on a guess would merge two binaries into one identity, which
+    /// is the failure this whole key exists to avoid.
+    #[test]
+    fn a_name_that_is_not_hash_decorated_is_kept() {
+        let decorated = |binary: &str| {
+            let output = format!(
+                "     Running tests/foo.rs (target/debug/deps/{binary})\n\n\
+                 test x ... FAILED\n"
+            );
+            failing_tests(&output).into_iter().next().unwrap()
+        };
+        assert_eq!(decorated("foo_bar-1234567890abcdef"), "foo_bar/x");
+        assert_eq!(
+            decorated("foo_bar-1234567890abcde"),
+            "foo_bar-1234567890abcde/x",
+            "fifteen hex digits is not the hash cargo writes"
+        );
+        assert_eq!(
+            decorated("foo_bar-zzzzzzzzzzzzzzzz"),
+            "foo_bar-zzzzzzzzzzzzzzzz/x",
+            "a suffix that is not hex at all is part of the name"
+        );
     }
 }

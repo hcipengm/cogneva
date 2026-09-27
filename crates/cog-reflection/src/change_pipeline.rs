@@ -8,6 +8,7 @@
 //!   and roll back on failure.
 //! - Report results by updating the evolution status.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -132,6 +133,30 @@ pub struct ApplyResult {
     pub new_status: EvolutionStatus,
 }
 
+/// Who a failed verification run's failures belong to.
+///
+/// The distinction is the whole point of reading the tree's own baseline: a
+/// test that fails with and without the change says nothing about the change,
+/// and convicting the change of it costs a generation that was already paid
+/// for — and, on a tree that is red, convicts every change, including the one
+/// that would turn it green.
+#[derive(Debug)]
+enum FailureAttribution {
+    /// Every failing test fails on the untouched tree too.
+    PreExisting(Vec<String>),
+    /// These tests fail only once the change is applied.
+    Introduced(Vec<String>),
+    /// The run failed without naming a test — a build failure, or a harness
+    /// that died. There is nothing to compare against the baseline, and the
+    /// change is the only difference from it.
+    NotATestFailure,
+}
+
+/// Which tests a revision fails with no change applied, and the revision they
+/// were read at. Named because the pair travels through a lock and three
+/// methods, and spelling it out each time hides which part is the reading.
+type BaselineFailures = Option<(String, BTreeSet<String>)>;
+
 /// Pipeline that turns validated code changes into tested source changes.
 #[derive(Debug, Clone)]
 pub struct ChangePipeline {
@@ -157,6 +182,16 @@ pub struct ChangePipeline {
     /// service build their own — and an absent sink reports nothing rather than
     /// reporting a budget nobody enforced.
     budget: Option<Arc<crate::verification_budget::VerificationBudget>>,
+    /// Which tests fail on this workdir's revision with no change applied,
+    /// keyed by the revision they were read at.
+    ///
+    /// Telling "this change broke a test" from "this test was already broken"
+    /// takes a second run of the same suite on the untouched tree. That reading
+    /// is a property of the tree, not of any one change, so it is kept until
+    /// the revision moves: a tree that is already red costs one extra run, not
+    /// one per change. Losing it to a restart costs time and nothing else —
+    /// it is recomputed from the same tree.
+    baseline_failures: Arc<tokio::sync::Mutex<BaselineFailures>>,
 }
 
 impl ChangePipeline {
@@ -174,6 +209,7 @@ impl ChangePipeline {
             promotion_policy: None,
             target_dir: None,
             budget: None,
+            baseline_failures: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -469,18 +505,25 @@ impl ChangePipeline {
 
         // Formatted before it is compiled, and rolled back either way: a change
         // refused here must leave the tree as it found it, or the next run would
-        // be verifying this one's leftovers.
+        // be verifying this one's leftovers. The formatter is applied rather
+        // than only consulted, so the tree a `false` comes back on is one the
+        // formatter itself would not settle — not merely one the change arrived
+        // on unformatted.
         match self.run_cargo_fmt(workdir).await {
             Ok((true, _)) => {}
             Ok((false, output)) => {
-                warn!(change_id = %change.artifact_id, "Change is not formatted; rolling back");
+                warn!(
+                    change_id = %change.artifact_id,
+                    "Change is still not what the formatter produces after rewriting it; rolling back"
+                );
                 let _ = self.git_reset_hard(workdir).await;
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::FormattingDiffers),
                     test_output: format!(
-                        "Change is not what this workspace's formatter produces:\n{output}"
+                        "The change could not be brought to what this workspace's formatter \
+                         produces:\n{output}"
                     ),
                     new_status: EvolutionStatus::ValidationFailed,
                 });
@@ -522,6 +565,66 @@ impl ChangePipeline {
                 });
             }
         };
+
+        let mut test_passed = test_passed;
+        let mut test_output = test_output;
+        let mut pre_existing: Vec<String> = Vec::new();
+
+        if !test_passed {
+            match self
+                .failures_beyond_baseline(workdir, &change.content, &test_output)
+                .await
+            {
+                Ok(FailureAttribution::PreExisting(already)) => {
+                    // The tree is already red in exactly these places. The change
+                    // neither causes that nor makes it worse, and refusing here
+                    // would mean a tree that is red can never accept the change
+                    // that turns it green — which is the one change it most
+                    // needs to accept.
+                    warn!(
+                        change_id = %change.artifact_id,
+                        count = already.len(),
+                        "Change tests failed, but this revision fails every one of them without it"
+                    );
+                    pre_existing = already;
+                    test_passed = true;
+                }
+                Ok(FailureAttribution::Introduced(introduced)) => {
+                    warn!(
+                        change_id = %change.artifact_id,
+                        count = introduced.len(),
+                        "Change tests failed on tests this revision passed without it"
+                    );
+                    test_output = format!(
+                        "The change fails tests that this revision passed before it was \
+                         applied:\n  {}\n\n{test_output}",
+                        introduced.join("\n  ")
+                    );
+                }
+                // The run failed without naming a test, so there is nothing to
+                // attribute and the captured output is the whole reading.
+                Ok(FailureAttribution::NotATestFailure) => {}
+                Err(e) => {
+                    warn!(
+                        change_id = %change.artifact_id,
+                        error = %e,
+                        "Could not tell the change's test failures from this revision's own"
+                    );
+                    let _ = self.git_reset_hard(workdir).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        if test_passed && !pre_existing.is_empty() {
+            // `Passed` leaves the tree holding the change, so the reading has to
+            // carry why a run that failed is not being read as a verdict on it.
+            test_output = format!(
+                "The change adds no failure: this revision fails these with or without \
+                 it:\n  {}\n\n{test_output}",
+                pre_existing.join("\n  ")
+            );
+        }
 
         let new_status = if test_passed {
             if self.auto_apply {
@@ -984,15 +1087,26 @@ impl ChangePipeline {
         Ok((output.status.success(), format!("{}{}", stdout, stderr)))
     }
 
-    /// Run `cargo fmt --all -- --check` and return (clean, combined_output).
+    /// Run `cargo fmt --all -- --check`; if the tree is not what the formatter
+    /// produces, rewrite it in place and check again. Returns
+    /// (clean, combined_output).
     ///
-    /// A file the formatter would rewrite is refused here rather than landed,
+    /// A file the formatter would rewrite must not be landed as it stands,
     /// because the commit it lands as fails CI's format check: the deployer
     /// reads that, resets the commit, and the change ends up retired with
-    /// nothing having judged what it does. The check is deterministic, so the
-    /// cost of refusing is one reformat by whoever generated the change, while
-    /// the cost of letting it through is a whole landing-and-rollback cycle —
-    /// which is how this gate came to exist.
+    /// nothing having judged what it does.
+    ///
+    /// What was wrong was the remedy, not the gate. Refusing an unformatted
+    /// change was justified as costing "one reformat by whoever generated the
+    /// change" — an account that had never been measured. Measured on
+    /// 2026-09-27, the actual cost was a whole PGE generation spent again on the
+    /// next discovery round, arriving at the same unformatted line a second time
+    /// and being refused for it again: the generator is never told why, so
+    /// nothing about the next attempt differs. Formatting is a mechanical
+    /// rewrite that cannot change what the code means, so the pipeline performs
+    /// it here rather than asking a model to reconstruct rustfmt's line
+    /// breaking — and the `warn` it leaves behind is the reading that says how
+    /// often the generator hands over a tree the formatter would rewrite.
     ///
     /// Two questions rather than one, because a single exit code cannot answer
     /// both. `cargo fmt --check` exits 1 for a file it would rewrite — and exits
@@ -1005,9 +1119,10 @@ impl ChangePipeline {
     /// that does a nonzero exit mean the tree is what the formatter rewrites.
     ///
     /// Runs before the test run and takes no build slot: the check parses the
-    /// workspace without compiling any of it, so it is both the cheapest way a
-    /// change can be sent back and no competition for the host while a real
-    /// build is in flight.
+    /// workspace without compiling any of it, so it is no competition for the
+    /// host while a real build is in flight. The rewrite only happens on the
+    /// path where the check already failed, so a change that arrives formatted
+    /// pays for exactly one check, as it did before.
     async fn run_cargo_fmt(&self, workdir: &Path) -> SFResult<(bool, String)> {
         let (available, why) = self
             .run_cargo_fmt_cmd(workdir, &["fmt", "--version"])
@@ -1018,6 +1133,23 @@ impl ChangePipeline {
             )));
         }
         info!("Running cargo fmt --all -- --check");
+        let (clean, check_output) = self
+            .run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
+            .await?;
+        if clean {
+            return Ok((true, check_output));
+        }
+
+        warn!(
+            "the change is not what the formatter produces; rewriting it in place \
+             instead of sending it back for another generation"
+        );
+        let (rewritten, rewrite_output) =
+            self.run_cargo_fmt_cmd(workdir, &["fmt", "--all"]).await?;
+        if !rewritten {
+            return Ok((false, format!("{check_output}{rewrite_output}")));
+        }
+        info!("Running cargo fmt --all -- --check after rewriting");
         self.run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
             .await
     }
@@ -1071,6 +1203,84 @@ impl ChangePipeline {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}{}", stdout, stderr);
         Ok((output.status.success(), combined))
+    }
+
+    /// Which failures in `output` the change is answerable for.
+    async fn failures_beyond_baseline(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+        output: &str,
+    ) -> SFResult<FailureAttribution> {
+        let failing = cog_core::contract::reflection::failing_tests(output);
+        // A run that failed without naming a test did not fail a test: it failed
+        // to build one, or the harness died before reaching them. Nothing there
+        // can be held against the tree's own state, and the change is the only
+        // difference from it.
+        if failing.is_empty() {
+            return Ok(FailureAttribution::NotATestFailure);
+        }
+
+        let baseline = self.baseline_failing_tests(workdir, change_content).await?;
+        let introduced: Vec<String> = failing.difference(&baseline).cloned().collect();
+        if introduced.is_empty() {
+            Ok(FailureAttribution::PreExisting(
+                failing.into_iter().collect(),
+            ))
+        } else {
+            Ok(FailureAttribution::Introduced(introduced))
+        }
+    }
+
+    /// The tests that already fail on this workdir's revision, with no change
+    /// applied.
+    ///
+    /// The change is in the tree when this is called, so the tree is reset to
+    /// read the baseline and the change is put back afterwards: this path can
+    /// still end in `Passed`, and `Passed` leaves the tree holding the change
+    /// for the commit that follows. A failure to put it back is returned as an
+    /// error rather than as a verdict — the tree is then in a state this
+    /// pipeline did not choose, which is the one thing it must not judge from.
+    async fn baseline_failing_tests(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+    ) -> SFResult<BTreeSet<String>> {
+        let rev = self.workspace_rev(workdir).await?;
+        if let Some((cached_rev, tests)) = self.baseline_failures.lock().await.as_ref() {
+            if *cached_rev == rev {
+                return Ok(tests.clone());
+            }
+        }
+
+        self.git_reset_hard(workdir).await?;
+        let (_, baseline_output) = self.run_cargo_test(workdir).await?;
+        if let Err(e) = self.git_apply(workdir, change_content).await {
+            return Err(SFError::IO(format!(
+                "could not put the change back after reading the tree's own test failures: {e}"
+            )));
+        }
+
+        let tests = cog_core::contract::reflection::failing_tests(&baseline_output);
+        info!(
+            rev = %rev,
+            count = tests.len(),
+            "Read the tests this revision fails before any change is applied"
+        );
+        *self.baseline_failures.lock().await = Some((rev, tests.clone()));
+        Ok(tests)
+    }
+
+    /// The revision the workdir is on.
+    async fn workspace_rev(&self, workdir: &Path) -> SFResult<String> {
+        self.git_try(workdir, &["rev-parse", "HEAD"])
+            .await
+            .ok_or_else(|| {
+                SFError::IO(format!(
+                    "could not read the revision of the workspace at {}",
+                    workdir.display()
+                ))
+            })
     }
 }
 
@@ -2024,6 +2234,11 @@ index 1111111..2222222 100644
     /// The suite ran and the change broke it — the one refusal whose evidence
     /// is the failing run itself rather than a check that can be re-read from
     /// the artifact alone.
+    ///
+    /// The seed is green on purpose, and it is the seed that makes the refusal
+    /// attributable: a test the change breaks can only be told from a test the
+    /// tree was already failing by the tree having been passing it. The two
+    /// tests after this one are the other two corners of that comparison.
     #[tokio::test]
     async fn a_change_that_breaks_the_suite_is_refused_for_the_tests() {
         let root = tempfile::tempdir().unwrap();
@@ -2041,7 +2256,7 @@ index 1111111..2222222 100644
             .unwrap();
         tokio::fs::write(
             root.path().join("src/lib.rs"),
-            "pub fn answer() -> i32 {\n    41\n}\n\n#[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
+            "pub fn answer() -> i32 {\n    42\n}\n\n#[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
         )
         .await
         .unwrap();
@@ -2058,7 +2273,7 @@ index 1111111..2222222 100644
                       +++ b/src/lib.rs\n\
                       @@ -1,3 +1,3 @@\n\
                       \x20pub fn answer() -> i32 {\n\
-                      -    41\n\
+                      -    42\n\
                       +    40\n\
                       \x20}\n"
                 .into(),
@@ -2087,6 +2302,130 @@ index 1111111..2222222 100644
         );
     }
 
+    /// The other direction, and the reason the comparison exists at all: a tree
+    /// that is already red still has to be able to accept a change. Refusing
+    /// every change here is what leaves a red tree unable to accept the one
+    /// change that would turn it green — the change most worth accepting — and
+    /// retires every other change for a failure none of them caused.
+    #[tokio::test]
+    async fn a_change_is_not_refused_for_failures_the_tree_already_had() {
+        let root = answer_probe_workspace(41, &[42]).await;
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+
+        let result = pipeline
+            .apply_and_test_in(&a_change_setting_answer(41, 40), root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Passed,
+            "a change that adds no failing test was refused for the tree's own: {:?}",
+            result.verdict
+        );
+        assert!(
+            reading_names_only(&result.test_output).contains("answer_is_42"),
+            "the reading has to name the failures it set aside, or a passed change on \
+             a red tree is indistinguishable from one on a green tree: {}",
+            result.test_output
+        );
+    }
+
+    /// The corner that keeps the comparison from being a blanket excuse: on that
+    /// same red tree, a test the tree was *passing* that the change breaks is
+    /// still the change's failure, and the refusal has to name that one rather
+    /// than the one it inherited.
+    #[tokio::test]
+    async fn a_change_is_refused_when_it_breaks_a_test_the_tree_was_passing() {
+        let root = answer_probe_workspace(41, &[41, 42]).await;
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+
+        let result = pipeline
+            .apply_and_test_in(&a_change_setting_answer(41, 40), root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed),
+            "a test the tree was passing broke, and only the tree's other failure \
+             was excused"
+        );
+        let named = reading_names_only(&result.test_output);
+        assert!(
+            named.contains("answer_is_41") && !named.contains("answer_is_42"),
+            "the refusal names the test the change broke, and not the one it \
+             inherited: {named}"
+        );
+    }
+
+    /// The part of a refusal's reading that names tests, as opposed to the raw
+    /// transcript appended under it — which lists every failure of the run and
+    /// therefore cannot tell the two kinds apart.
+    fn reading_names_only(test_output: &str) -> String {
+        test_output
+            .split("\n\n")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A crate whose `answer()` returns `answer` and which carries one test per
+    /// entry of `asserted`, named `answer_is_<n>`.
+    ///
+    /// Written so a caller can seed a tree that is already red in exactly the
+    /// places it chooses: which failures a change is answerable for is only
+    /// readable against a tree whose own failures are known.
+    async fn answer_probe_workspace(answer: i32, asserted: &[i32]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+        let mut source = format!("pub fn answer() -> i32 {{\n    {answer}\n}}\n");
+        for expected in asserted {
+            source.push_str(&format!(
+                "\n#[test]\nfn answer_is_{expected}() {{\n    assert_eq!(answer(), {expected});\n}}\n"
+            ));
+        }
+        tokio::fs::write(root.path().join("src/lib.rs"), source)
+            .await
+            .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+        root
+    }
+
+    /// A change that rewrites `answer()` from `from` to `to`.
+    fn a_change_setting_answer(from: i32, to: i32) -> EvolutionResult {
+        EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: format!("answer-{from}-to-{to}"),
+            description: "修正这个取值的计算".into(),
+            content: format!(
+                "diff --git a/src/lib.rs b/src/lib.rs\n\
+                 --- a/src/lib.rs\n\
+                 +++ b/src/lib.rs\n\
+                 @@ -1,3 +1,3 @@\n\
+                 \x20pub fn answer() -> i32 {{\n\
+                 -    {from}\n\
+                 +    {to}\n\
+                 \x20}}\n"
+            ),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        }
+    }
+
     /// A change the formatter would rewrite is refused before anything compiles
     /// it, and the tree is left as it was found.
     ///
@@ -2099,11 +2438,21 @@ index 1111111..2222222 100644
     /// could not use this check to blame a change.
     ///
     /// The change compiles and its tests would pass — `41+1` is valid Rust that
-    /// `rustfmt` spells `41 + 1`. That is deliberate: it keeps the refusal
-    /// attributable to the formatting alone.
+    /// `rustfmt` spells `41 + 1`. That is deliberate: it keeps what the test
+    /// shows attributable to the formatting alone.
+    ///
+    /// The change is rewritten, not sent back. Sending it back was justified as
+    /// costing one reformat by the generator; measured on 2026-09-27 it cost a
+    /// whole regeneration that arrived at the same line unformatted again, since
+    /// the next attempt is told nothing about why the last one was refused.
     #[tokio::test]
-    async fn a_change_that_is_not_formatted_is_refused_before_it_is_compiled() {
+    async fn a_change_the_formatter_would_rewrite_is_rewritten_rather_than_refused() {
         let (root, pipeline) = formatted_probe_workspace().await;
+        // `auto_apply` is what leaves the tree holding the change after a
+        // `Passed` verdict; without it the pipeline rolls back even on success,
+        // and the text the formatter produced is not there to be read. It
+        // changes nothing about the verdict, which is the other assertion.
+        let pipeline = pipeline.with_auto_apply(true);
         let change = EvolutionResult {
             kind: EvolutionKind::CodeChange,
             artifact_id: "unformatted-1".into(),
@@ -2129,20 +2478,16 @@ index 1111111..2222222 100644
 
         assert_eq!(
             result.verdict,
-            ChangeVerdict::Refused(cog_core::RejectionCause::FormattingDiffers)
-        );
-        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
-        assert!(
-            result.test_output.contains("src/lib.rs"),
-            "the evidence has to name what the formatter would rewrite: {}",
-            result.test_output
+            ChangeVerdict::Passed,
+            "an unformatted change reached a verdict instead of being sent back: {:?}",
+            result.verdict
         );
         assert_eq!(
             tokio::fs::read_to_string(root.path().join("src/lib.rs"))
                 .await
                 .unwrap(),
-            FORMATTED_PROBE_SOURCE,
-            "a refused change must not leave its own text behind for the next run to judge"
+            "pub fn answer() -> i32 {\n    41 + 1\n}\n",
+            "what the pipeline carries forward is the formatter's text, not the one that arrived"
         );
     }
 
