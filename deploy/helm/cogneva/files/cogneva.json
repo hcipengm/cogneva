@@ -1024,6 +1024,24 @@
           },
           "severity": "warning",
           "summary": "The walk over the registry store failed {value} time(s) in the last hour. That walk is the only producer of what the store is holding (referenced bytes, tag count, scan age), and the same tag listing feeds the retention round that removes tags when the claim fills -- so while it fails, those readings are last-known rather than current and nothing is being removed, and the pair is invisible without this count: the bytes keep the value of the last successful walk, and a process that never walked once publishes none of the three at all, which is exactly what a process that measures no registry publishes. A walk failing from the first scrape after a restart is the shape to look for first, and the walk's own error in that container's log is where the cause is (a store that answered with something the reader could not frame, an unreachable endpoint, a manifest the registry would not serve). This rule reads the increase, so a walk that starts working stops firing by itself; the count resets with the process, so compare it against the container's uptime before reading it as a rate"
+        },
+        {
+          "name": "registry_maintenance_round_incomplete",
+          "promql": "increase(cogneva_registry_maintenance_runs_total[1h]) > 0 and (time() - cogneva_registry_maintenance_reading_unix) > 3600",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "A reclamation round over the registry store ran {value} time(s) in the last hour and none of them finished. The round counts itself when it starts and stamps the reading only after it has walked the store, so a run count rising against a timestamp that does not move is the reading for a round that started and did not finish; neither half says it alone, because a completed round with nothing left to remove also leaves a run and a zero removal count, and a store that is under the size the round acts on also leaves a stale timestamp with no runs at all. An hour is a bound on the round and not on the reclamation cadence: the round is a tag listing and a few manifest reads, and it stamps within seconds of starting, while the cadence is hours. The cause is in that container's log, where the round returns on the line naming the step it could not do, and the effect is that nothing was removed while the store kept whatever it is holding. A round that cannot finish re-fires this once per cadence rather than continuously, and every firing is the same unresolved round -- so treat a repeat as the same alert, not a new one"
+        },
+        {
+          "name": "registry_tag_deletion_refused",
+          "promql": "increase(cogneva_registry_prune_failures_total[1h]) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The registry store refused {value} tag deletion(s) in the last hour. Deletion is how the volume is held down, and the round otherwise reports itself as having run, so a refusal is the one shape where reclamation happens on paper and the store keeps growing. The refusal is the store answering something the round cannot act on: a registry that answers the listing but not the delete (a read-only or garbage-collecting one, a token whose scope stopped covering deletes, a 5xx on the delete path), so the cause is in that container's log and in the registry's own -- each refused tag is named there with the store's answer. This rule reads the increase, so a round whose deletions succeed stops firing by itself"
         }
       ]
     },

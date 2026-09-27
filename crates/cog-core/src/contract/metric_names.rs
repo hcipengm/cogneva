@@ -151,6 +151,14 @@ metric_names! {
     // are monotonic, and a process that died leaves them frozen -- which reads
     // exactly like a store that needs nothing. The timestamp is what tells those
     // apart, the same way the rollout readings carry one.
+    //
+    // A round that ran and could not read the store counts as a run and leaves
+    // the timestamp where it was, because that is what happened: it ran, and it
+    // did not finish. Neither reading says that on its own -- a run with a
+    // removal count of zero is also a completed round with nothing to remove,
+    // and a frozen timestamp is also a store that was never due -- so the run
+    // count rising against a timestamp that does not move is the reading for
+    // that third shape.
     REGISTRY_MAINTENANCE_RUNS_TOTAL => "cogneva_registry_maintenance_runs_total",
     REGISTRY_PRUNED_TAGS_TOTAL => "cogneva_registry_pruned_tags_total",
     REGISTRY_PRUNE_FAILURES_TOTAL => "cogneva_registry_prune_failures_total",

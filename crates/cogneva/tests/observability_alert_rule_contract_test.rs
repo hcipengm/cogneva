@@ -329,6 +329,25 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_registry_walk_failures_total",
         "crates/cog-reflection/src/registry_footprint.rs",
     ),
+    // The reclamation round's own readings, and the pair is what gets read. A
+    // round that ran and could not read the store counts as a run and
+    // deliberately does not advance the completion stamp, which is what
+    // separates it from a completed round with nothing to remove (a run too,
+    // but the stamp moves) and from a store that was never due (neither moves).
+    // The refusals are the third reading of the same round: deletions the store
+    // would not carry out.
+    (
+        "cogneva_registry_maintenance_runs_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
+    (
+        "cogneva_registry_maintenance_reading_unix",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
+    (
+        "cogneva_registry_prune_failures_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.

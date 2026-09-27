@@ -2915,6 +2915,10 @@ impl MainlineDeployer {
             Ok(tags) => tags,
             Err(e) => {
                 warn!(error = %e, "registry tag walk failed; no tag was removed this round");
+                // 这一轮**跑过了**：冷却已消耗、状态已落盘，只是没走到"删"那一步。所以
+                // 它按"跑过一轮"记账，而完成时刻有意不动：两条合起来才是这一轮的读数，
+                // 只记时刻的话它与"压根没跑"同形，只记计数的话它与"跑完了一个都没删"同形。
+                self.record_maintenance_round(0.0, 0.0, None).await;
                 return;
             }
         };
@@ -2947,30 +2951,59 @@ impl MainlineDeployer {
             failures,
             "registry maintenance round finished"
         );
-        // 回收自己的读数。三件事分开计数：跑过几轮、删掉几个、几个被拒——"跑了但
-        // 一个都没删"与"压根没跑"必须能从读数上分开，这也是它自己的读数而不是
-        // 卷读数的原因（卷读数变与不变还有另外一半原因）。
-        if let Some(metrics) = &self.metrics {
-            use cog_core::metric_names::{
-                REGISTRY_MAINTENANCE_READING_UNIX, REGISTRY_MAINTENANCE_RUNS_TOTAL,
-                REGISTRY_PRUNED_TAGS_TOTAL, REGISTRY_PRUNE_FAILURES_TOTAL,
-            };
-            let no_labels = std::collections::HashMap::new();
+        self.record_maintenance_round(removed, failures, Some(now))
+            .await;
+    }
+
+    /// 回收轮自己的读数，两条路径共用一个出处。
+    ///
+    /// 跑过一轮就记一次计数（失败的轮也要记），删掉几个、被拒几个各记各的，而完成
+    /// 时刻**只在一轮真走完时**推进——`completed_at` 传 `None` 的那一路是"开始了但
+    /// 没走完"。"跑过但没删成"与"压根没跑"必须是两件能从读数上分开的事：前者是机制
+    /// 在动、只是这一轮没结果，后者是这个进程根本没做这件事，而两者的对策不同。
+    async fn record_maintenance_round(
+        &self,
+        pruned: f64,
+        failures: f64,
+        completed_at: Option<i64>,
+    ) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        use cog_core::metric_names;
+        let no_labels = std::collections::HashMap::new();
+        let _ = metrics
+            .record_counter(
+                metric_names::REGISTRY_MAINTENANCE_RUNS_TOTAL,
+                1.0,
+                no_labels.clone(),
+            )
+            .await;
+        if pruned > 0.0 {
             let _ = metrics
-                .record_counter(REGISTRY_MAINTENANCE_RUNS_TOTAL, 1.0, no_labels.clone())
+                .record_counter(
+                    metric_names::REGISTRY_PRUNED_TAGS_TOTAL,
+                    pruned,
+                    no_labels.clone(),
+                )
                 .await;
-            if removed > 0.0 {
-                let _ = metrics
-                    .record_counter(REGISTRY_PRUNED_TAGS_TOTAL, removed, no_labels.clone())
-                    .await;
-            }
-            if failures > 0.0 {
-                let _ = metrics
-                    .record_counter(REGISTRY_PRUNE_FAILURES_TOTAL, failures, no_labels.clone())
-                    .await;
-            }
+        }
+        if failures > 0.0 {
             let _ = metrics
-                .record_gauge(REGISTRY_MAINTENANCE_READING_UNIX, now as f64, no_labels)
+                .record_counter(
+                    metric_names::REGISTRY_PRUNE_FAILURES_TOTAL,
+                    failures,
+                    no_labels.clone(),
+                )
+                .await;
+        }
+        if let Some(completed) = completed_at {
+            let _ = metrics
+                .record_gauge(
+                    metric_names::REGISTRY_MAINTENANCE_READING_UNIX,
+                    completed as f64,
+                    no_labels,
+                )
                 .await;
         }
     }
@@ -9798,6 +9831,67 @@ exit 0
         assert!(
             !calls.contains("rollout restart"),
             "连删都没删，重启一次 registry 是无谓的动作: {calls}"
+        );
+    }
+
+    /// 一轮"跑过但没走完"必须留下跑过的痕迹：失败路径记计数而**不动**完成时刻。
+    /// 两条合起来才是这一轮的读数——只记计数的话它与"跑完了、一个都没删"同形，只记
+    /// 时刻的话它与"压根没跑"同形。
+    #[tokio::test]
+    async fn a_round_that_cannot_walk_the_store_still_reads_as_a_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi");
+        // 走查边车报 90% 的占用：这一轮到期，真的会开跑。
+        let (walker, _) = routed_registry(vec![(
+            "GET",
+            "/metrics".to_string(),
+            http_200(&walker_metrics("cogneva-registry-pvc", 9_000_000_000)),
+        )])
+        .await;
+        let walker_port: u16 = walker.rsplit(':').next().unwrap().parse().unwrap();
+        // registry 那边没有任何路由（桩对没匹配上的路由回 404）：tag 列表这一步就断。
+        let (registry, registry_log) = routed_registry(Vec::new()).await;
+
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", &kubectl);
+        cfg.registry = registry;
+        cfg.registry_claim = "cogneva-registry-pvc".into();
+        cfg.registry_walker_port = walker_port;
+        cfg.registry_retention = 1;
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        let mut state = MainlineState::default();
+        deployer
+            .registry_maintenance_round("000000000001", &[], &mut state)
+            .await;
+
+        let runs = metrics
+            .query_counter_totals(cog_core::metric_names::REGISTRY_MAINTENANCE_RUNS_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1, "跑过一轮就要有一次计数: {runs:?}");
+        assert_eq!(runs[0].value, 1.0);
+        let completed = metrics
+            .query_gauge_latest(cog_core::metric_names::REGISTRY_MAINTENANCE_READING_UNIX.as_str())
+            .await
+            .unwrap();
+        assert!(
+            completed.is_empty(),
+            "没走完的一轮不许推进完成时刻，否则它与'跑完了一个都没删'同形: {completed:?}"
+        );
+        assert!(
+            !requests_seen(&registry_log)
+                .iter()
+                .any(|r| r.starts_with("DELETE ")),
+            "没走到删除那一步，一个 DELETE 都不该发出去"
+        );
+        assert!(
+            state.registry_maintenance_unix > 0,
+            "冷却照样消耗：这一轮确实开了跑，不落盘下一轮立刻重来"
         );
     }
 
