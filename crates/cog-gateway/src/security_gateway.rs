@@ -1208,18 +1208,27 @@ fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
 }
 
 /// What reading a finished response found, as the cells of
-/// [`USAGE_OUTCOMES`]. One cause per cell, because the three call for different
-/// actions.
+/// [`USAGE_OUTCOMES`]. One cause per cell, because each calls for a different
+/// action — and the two that both read as "no number arrived" differ in who owns
+/// the fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageOutcome {
     /// A usage frame was parsed, so the token counts recorded for this call are
     /// the upstream's own numbers.
     Read,
-    /// The response body finished and carried no usage frame at all. The counts
-    /// recorded beside it are zeros because the upstream never said, which is a
-    /// different fact from an upstream that said zero — and the one that says
-    /// the meter is blind while the call itself succeeded.
+    /// The response body finished and carried no usage frame at all, on a call
+    /// that did ask the upstream to report usage. The counts recorded beside it
+    /// are zeros because the upstream never said, which is a different fact from
+    /// an upstream that said zero — and the one that says the meter is blind
+    /// while the call itself succeeded.
     Absent,
+    /// No usage frame arrived because none was asked for: the request we sent
+    /// carried no `stream_options`, so the upstream was never told to report
+    /// usage in the stream. Kept apart from [`Self::Absent`] because the two
+    /// name different owners of the same missing number — this one is our own
+    /// request, and the fix is to start asking, whereas `absent` is the
+    /// upstream's answer and no change on our side can move it.
+    NotAsked,
     /// The response never finished, so there was nothing to read. A call-level
     /// fault rather than a metering one, and kept apart so a stream that dies
     /// mid-flight cannot be read as an upstream that answers without usage.
@@ -1231,6 +1240,7 @@ impl UsageOutcome {
         match self {
             UsageOutcome::Read => "read",
             UsageOutcome::Absent => "absent",
+            UsageOutcome::NotAsked => "not_asked",
             UsageOutcome::Interrupted => "interrupted",
         }
     }
@@ -1249,16 +1259,22 @@ struct UsageReading {
 
 impl UsageReading {
     /// For a body that was read to the end in one piece: an upstream that named
-    /// neither count said nothing about usage, which is `Absent` and not a
-    /// reading of zero.
-    fn from_usage((input, output): (Option<u64>, Option<u64>)) -> Self {
+    /// neither count said nothing about usage, which is not a reading of zero.
+    ///
+    /// `asked` says whether this call told the upstream to report usage at all.
+    /// A call that never asked cannot have been ignored, so its silence is
+    /// `NotAsked`; only a call that did ask leaves the silence on the upstream's
+    /// side, which is `Absent`.
+    fn from_usage((input, output): (Option<u64>, Option<u64>), asked: bool) -> Self {
         Self {
             input: input.unwrap_or(0),
             output: output.unwrap_or(0),
-            outcome: if input.is_none() && output.is_none() {
+            outcome: if input.is_some() || output.is_some() {
+                UsageOutcome::Read
+            } else if asked {
                 UsageOutcome::Absent
             } else {
-                UsageOutcome::Read
+                UsageOutcome::NotAsked
             },
         }
     }
@@ -1267,9 +1283,10 @@ impl UsageReading {
 /// The cells `llm_usage_readings_total` can carry. Declared next to the
 /// producer rather than in the registry, so a new outcome cannot be recorded
 /// without appearing here.
-const USAGE_OUTCOMES: [UsageOutcome; 3] = [
+const USAGE_OUTCOMES: [UsageOutcome; 4] = [
     UsageOutcome::Read,
     UsageOutcome::Absent,
+    UsageOutcome::NotAsked,
     UsageOutcome::Interrupted,
 ];
 
@@ -1365,8 +1382,13 @@ async fn record_llm_tokens(
 /// 兼容两个协议面：OpenAI 尾帧的 `usage{prompt_tokens,completion_tokens}`；
 /// Anthropic 的 `message_start`（input_tokens）与 `message_delta`
 /// （output_tokens，累计值，最后一帧为准）。认不出就 None，调用方按零记。
+/// The two counts an upstream named in one frame, as `Option`s that have to stay
+/// apart from the counts themselves: `Some(0)` means the upstream said zero and
+/// `None` means it said nothing. Filtering the zeros out here would erase the
+/// difference before any caller could read it, and an upstream that answers
+/// "none was used" would be recorded as one that never answered.
 fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
-    let as_u64 = |v: &serde_json::Value| v.as_u64().filter(|n| *n > 0);
+    let as_u64 = |v: &serde_json::Value| v.as_u64();
     match json.get("type").and_then(|t| t.as_str()) {
         Some("message_start") => {
             let input = json.pointer("/message/usage/input_tokens").and_then(as_u64);
@@ -1401,6 +1423,14 @@ struct UsageScanner {
     /// ended" and "the body was cut off" produce the same zero counts, and only
     /// the second one means the call itself failed.
     saw_error: bool,
+    /// Set when a usage frame parsed, whatever numbers it carried. The counts
+    /// cannot stand in for this: an upstream that reports `{0, 0}` has spoken
+    /// and one that says nothing has not, and both leave the counts at zero.
+    saw_usage: bool,
+    /// Whether the request this response belongs to told the upstream to report
+    /// usage. Read off the outgoing body rather than the vendor profile: the
+    /// profile is what we believe, the body is what we sent.
+    asked: bool,
 }
 
 impl UsageScanner {
@@ -1422,12 +1452,7 @@ impl UsageScanner {
             }
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                 let (input, output) = extract_usage(&json);
-                if let Some(n) = input {
-                    self.tokens_input = n;
-                }
-                if let Some(n) = output {
-                    self.tokens_output = n;
-                }
+                self.absorb(input, output);
             }
         }
     }
@@ -1435,25 +1460,50 @@ impl UsageScanner {
     /// Which cell this scan belongs in once the body is done.
     ///
     /// The cut outranks whatever was parsed: a body that did not finish is not a
-    /// complete reading, however many frames arrived before it stopped.
+    /// complete reading, however many frames arrived before it stopped. Below
+    /// that, the order is what each cell would have an operator do: a frame that
+    /// arrived is `Read` whatever it held, a silence on a call that asked is the
+    /// upstream's `Absent`, and a silence on a call that never asked is ours.
     fn outcome(&self) -> UsageOutcome {
         if self.saw_error {
             UsageOutcome::Interrupted
-        } else if self.tokens_input > 0 || self.tokens_output > 0 {
+        } else if self.saw_usage {
             UsageOutcome::Read
-        } else {
+        } else if self.asked {
             UsageOutcome::Absent
+        } else {
+            UsageOutcome::NotAsked
+        }
+    }
+
+    /// 把一帧里报出的用量并进读数。两件事分开记：**帧到过没有**（决定归哪一格）
+    /// 与**计数取多少**（决定记多少 token）。上游报一个 0 表示"没用量"，那和
+    /// "没开口"是两回事，所以这两件事不能共用一个判据。
+    fn absorb(&mut self, input: Option<u64>, output: Option<u64>) {
+        if input.is_some() || output.is_some() {
+            self.saw_usage = true;
+        }
+        // 计数却只在真拿到正数时改写：有的上游在中间帧里带一个 usage:0 当占位，
+        // 拿它覆盖前面已经报过的真值，就把读数弄丢了。
+        if let Some(n) = input.filter(|n| *n > 0) {
+            self.tokens_input = n;
+        }
+        if let Some(n) = output.filter(|n| *n > 0) {
+            self.tokens_output = n;
         }
     }
 
     /// 流结束时兜底：SSE 行扫描一无所获时按整体 JSON 解析一次
     /// （非流式透传响应的 body 就是一整块 JSON）。
     fn finish(&mut self) {
-        if self.tokens_input > 0 || self.tokens_output > 0 {
+        if self.saw_usage {
             return;
         }
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&self.raw) {
             let (input, output) = extract_usage(&json);
+            if input.is_some() || output.is_some() {
+                self.saw_usage = true;
+            }
             if let Some(n) = input {
                 self.tokens_input = n;
             }
@@ -1473,9 +1523,13 @@ fn wrap_usage_scan(
     stream: impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + 'static,
     start: std::time::Instant,
     actor: String,
+    asked: bool,
 ) -> impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send {
     use futures::StreamExt;
-    let scanner = Arc::new(Mutex::new(UsageScanner::default()));
+    let scanner = Arc::new(Mutex::new(UsageScanner {
+        asked,
+        ..UsageScanner::default()
+    }));
     let scan = scanner.clone();
     let scanned = stream.map(move |item| {
         match &item {
@@ -2271,6 +2325,12 @@ async fn stream_forward(
         let mut clamped_temperature = false;
         // Field names this attempt reshaped for the upstream, for the reading.
         let mut adapted_fields: Vec<&'static str> = Vec::new();
+        // 这次调用有没有向上游【要过】流里的用量。只有"这次是要流的、而发出去的
+        // body 里没有 stream_options"才算没要——非流式响应本来就带用量，用不着
+        // 要；anthropic 形体的流自带用量帧，不经过 stream_options 这个开关。判据
+        // 是 body 自己而不是厂商画像：画像是我们相信什么，body 是我们真发了什么。
+        // 透传解析不出的 body 判不了，算"要过"——不冤枉上游。
+        let mut asked_for_usage = true;
         let body = match &parsed {
             Some(v) => {
                 let mut v = v.clone();
@@ -2316,6 +2376,11 @@ async fn stream_forward(
                             }
                         }
                     }
+                    // 流式请求没带 stream_options，就是我们从没让上游在流里报用量。
+                    // 非流式响应本身就带 usage，用不着要；anthropic 的流自带用量帧。
+                    let streaming = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+                    asked_for_usage =
+                        style == "anthropic" || !streaming || obj.contains_key("stream_options");
                 }
                 serde_json::to_vec(&v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
             }
@@ -2447,6 +2512,7 @@ async fn stream_forward(
             resp.bytes_stream(),
             start,
             actor.clone(),
+            asked_for_usage,
         );
         return Ok(axum::response::Response::builder()
             .status(status)
@@ -2785,7 +2851,9 @@ async fn call_one_upstream(
             .json()
             .await
             .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None, None))?;
-        let reading = UsageReading::from_usage(extract_usage(&v));
+        // 这条是非流式调用：响应的 usage 在 body 里本来就该有，不需要我们开口要，
+        // 所以它缺席是上游的账（absent），不是我们没问。
+        let reading = UsageReading::from_usage(extract_usage(&v), true);
         record_llm_tokens(
             state,
             upstream,
@@ -2836,7 +2904,9 @@ async fn call_one_upstream(
         .json()
         .await
         .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None, None))?;
-    let reading = UsageReading::from_usage(extract_usage(&v));
+    // 这条是非流式调用：响应的 usage 在 body 里本来就该有，不需要我们开口要，
+    // 所以它缺席是上游的账（absent），不是我们没问。
+    let reading = UsageReading::from_usage(extract_usage(&v), true);
     record_llm_tokens(
         state,
         upstream,
@@ -4413,6 +4483,20 @@ mod tests {
         assert_eq!(extract_usage(&json), (None, None));
     }
 
+    /// A named zero is presence, not absence. The two only look alike once the
+    /// counts are read as numbers; at this layer they must stay apart, or the
+    /// cell that decides where the fix goes loses its input.
+    #[test]
+    fn usage_extract_keeps_a_named_zero_apart_from_silence() {
+        let zeroed = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+        });
+        assert_eq!(extract_usage(&zeroed), (Some(0), Some(0)));
+        let absent = serde_json::json!({"choices": [], "usage": null});
+        assert_eq!(extract_usage(&absent), (None, None));
+    }
+
     #[test]
     fn scanner_reads_openai_sse_tail() {
         let mut s = UsageScanner::default();
@@ -4461,7 +4545,10 @@ mod tests {
     /// upstream rather than a reading of the traffic.
     #[test]
     fn a_body_that_never_named_usage_lands_in_absent() {
-        let mut s = UsageScanner::default();
+        let mut s = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
         s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n");
         s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n");
         s.feed(b"data: [DONE]\n\n");
@@ -4469,6 +4556,64 @@ mod tests {
         assert_eq!(s.tokens_input, 0);
         assert_eq!(s.tokens_output, 0);
         assert_eq!(s.outcome(), UsageOutcome::Absent);
+    }
+
+    /// The same silent body on a call that never asked is not the same reading:
+    /// nothing was ignored, because nothing was requested. Reading it as
+    /// `absent` would put a fix on the upstream that belongs to our own request.
+    #[test]
+    fn the_same_silence_on_a_call_that_never_asked_is_not_absent() {
+        let mut s = UsageScanner::default();
+        s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        s.feed(b"data: [DONE]\n\n");
+        s.finish();
+        assert_eq!(s.tokens_input, 0);
+        assert_eq!(s.outcome(), UsageOutcome::NotAsked);
+    }
+
+    /// A usage frame that says zero is the upstream speaking. The counts cannot
+    /// tell it apart from silence, so the cell must be decided on the frame
+    /// rather than on the numbers -- otherwise an upstream that answers "none"
+    /// is recorded as one that answered nothing.
+    #[test]
+    fn a_usage_frame_of_zero_is_a_reading_not_a_silence() {
+        let mut s = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
+        s.feed(b"data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n");
+        s.finish();
+        assert_eq!((s.tokens_input, s.tokens_output), (0, 0));
+        assert_eq!(s.outcome(), UsageOutcome::Read);
+    }
+
+    /// The whole-body fallback answers to the same three causes as the SSE scan:
+    /// a non-streaming response that carries usage is a reading, one that stays
+    /// silent on a call that asked is the upstream's, and a cut body outranks
+    /// both.
+    #[test]
+    fn the_whole_body_fallback_keeps_the_same_distinctions() {
+        let mut read = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
+        read.feed(b"{\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":9}}");
+        read.finish();
+        assert_eq!(read.outcome(), UsageOutcome::Read);
+        assert_eq!((read.tokens_input, read.tokens_output), (4, 9));
+
+        let mut silent_but_asked = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
+        silent_but_asked.feed(b"{\"model\":\"m\",\"choices\":[]}");
+        silent_but_asked.finish();
+        assert_eq!(silent_but_asked.outcome(), UsageOutcome::Absent);
+
+        let mut never_asked = UsageScanner::default();
+        never_asked.feed(b"{\"model\":\"m\",\"choices\":[]}");
+        never_asked.finish();
+        assert_eq!(never_asked.outcome(), UsageOutcome::NotAsked);
     }
 
     /// A cut body is not a quiet upstream. Even when frames arrived first, the
@@ -4488,13 +4633,23 @@ mod tests {
         s.feed(b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n");
         s.finish();
         assert_eq!(s.outcome(), UsageOutcome::Read);
-        let silent = UsageReading::from_usage((None, None));
+        let silent = UsageReading::from_usage((None, None), true);
         assert_eq!(silent.outcome, UsageOutcome::Absent);
         assert_eq!((silent.input, silent.output), (0, 0));
         assert_eq!(
-            UsageReading::from_usage((Some(0), None)).outcome,
+            UsageReading::from_usage((None, None), false).outcome,
+            UsageOutcome::NotAsked,
+            "a call that never asked cannot have been ignored"
+        );
+        assert_eq!(
+            UsageReading::from_usage((Some(0), None), true).outcome,
             UsageOutcome::Read,
             "a named count of zero is still the upstream speaking"
+        );
+        assert_eq!(
+            UsageReading::from_usage((Some(3), Some(1)), false).outcome,
+            UsageOutcome::Read,
+            "usage that arrived outranks whether we asked for it"
         );
     }
 
@@ -4509,6 +4664,7 @@ mod tests {
         let nameable: std::collections::BTreeSet<&str> = [
             UsageOutcome::Read,
             UsageOutcome::Absent,
+            UsageOutcome::NotAsked,
             UsageOutcome::Interrupted,
         ]
         .iter()

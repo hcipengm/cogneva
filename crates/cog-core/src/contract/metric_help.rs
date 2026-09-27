@@ -70,13 +70,18 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     (
         crate::metric_names::LLM_USAGE_READINGS_TOTAL.as_str(),
         "What the read of each finished LLM response found, by upstream and \
-         outcome. `absent` is the cell to read first: it says the upstream sent \
-         no usage frame at all, so the token counts recorded beside that call \
-         are zeros because nothing was said, not because nothing was used -- \
-         while it climbs, every token total on that upstream is blind, and the \
-         fix is on the request side rather than the reader's. `interrupted` is \
-         a response that never finished, kept apart so an upstream that dies \
-         mid-stream cannot be read as one that answers quietly",
+         outcome. `absent` and `not_asked` both mean no number arrived, and \
+         they are split by whose silence it is. `absent` is a call that did ask \
+         and got no usage frame back: the token counts recorded beside that \
+         call are zeros because the upstream said nothing, not because nothing \
+         was used, and while it climbs every token total on that upstream is \
+         blind. `not_asked` is a call that never asked -- the request went out \
+         with no stream_options, so no usage frame was ever due and nothing was \
+         ignored; the fix there is on our own request side, and it is the cell \
+         to read before blaming an upstream. `read` is an upstream that spoke, \
+         including one that reported zero. `interrupted` is a response that \
+         never finished, kept apart so an upstream that dies mid-stream cannot \
+         be read as one that answers quietly",
     ),
     (
         "llm_upstream_client_errors_total",
