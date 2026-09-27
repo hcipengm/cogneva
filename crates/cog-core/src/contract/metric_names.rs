@@ -135,6 +135,30 @@ metric_names! {
     VERSION_CONTRACT_VIOLATIONS => "cogneva_version_contract_violations",
     VERSION_CONTRACT_CHECKS_TOTAL => "cogneva_version_contract_checks_total",
 
+    // cog-reflection — the rollout judgement's own resource readings.
+    //
+    // The judgement runs in a short-lived Job pod, which is born, works for a
+    // few minutes and disappears. Both generic resource rules sample over
+    // windows that such a container leaves before it finished, and the pod is
+    // gone from cadvisor's view by the time anyone could ask. The only place
+    // "what the manifest declared" and "what this run used" are known at once
+    // is the process itself, so it reads its own cgroup at the end of the run
+    // and the deployer — which wrote the declared amounts into the manifest —
+    // publishes the comparison.
+    //
+    // A ratio rather than the two sides separately: the levels differ per run
+    // and mean nothing alone, and the two sides are already joined at the
+    // source. No labels, because the reading is about the newest run only — a
+    // label per revision would leave one row per revision forever for a value
+    // that only ever describes one of them.
+    ROLLOUT_JOB_CPU_THROTTLED_RATIO => "cogneva_rollout_job_cpu_throttled_ratio",
+    ROLLOUT_JOB_MEMORY_PEAK_RATIO => "cogneva_rollout_job_memory_peak_ratio",
+    // When the run took the reading, from the run's own clock. Carried so a
+    // reader can tell a reading of the run it just watched from the one the
+    // previous run left standing — the way these two go stale is by a run that
+    // died before it could report.
+    ROLLOUT_JOB_READING_UNIX => "cogneva_rollout_job_reading_unix",
+
     // cog-gateway — request accounting.
     HTTP_REQUESTS_TOTAL => "http_requests_total",
     HTTP_REQUEST_DURATION_MS => "http_request_duration_ms",

@@ -173,6 +173,34 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          rising rate of new ones. Reported for every clause, including the ones \
          at zero, so an absent series means the clause was never judged",
     ),
+    (
+        "cogneva_rollout_job_cpu_throttled_ratio",
+        "Share of the CFS periods of the newest rollout judgement run in which \
+         the run was throttled by its own CPU limit, read by the run from its \
+         own cgroup. The judgement lives in a short-lived Job pod, so no \
+         sampling rule over the pod ever sees a whole run: this is the reading \
+         of the run that just finished. Absent when that run reported no \
+         reading — a run that was killed before it could look at itself, or a \
+         node with no cgroup this process can read — which is not a ratio of 0",
+    ),
+    (
+        "cogneva_rollout_job_memory_peak_ratio",
+        "The newest rollout judgement run's peak memory against the limit its \
+         manifest declared, read by the run from its own cgroup. Read as a peak \
+         rather than a sample because the run is short: what matters is how \
+         close it came to being killed, and that instant is the one a scrape \
+         would have to be lucky to catch. Absent when the run left no reading, \
+         or when the limit was declared as unlimited, which is not a ratio of 0",
+    ),
+    (
+        "cogneva_rollout_job_reading_unix",
+        "When the newest rollout judgement run took its resource reading, from \
+         the run's own clock, as a Unix timestamp. The other two series are \
+         written only by a run that got far enough to report, so a run that \
+         died on the way leaves the previous run's values standing: this is how \
+         a reader ties them to the run it actually watched, and a timestamp \
+         that does not advance across a completed run is that silence",
+    ),
 ];
 
 /// The description registered for one series, if it has one.

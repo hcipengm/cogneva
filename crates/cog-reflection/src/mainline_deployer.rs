@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::config::{CodePlatform, MainlineDeployerConfig, RolloutTargetConfig};
+use crate::rollout_resources::{self, RolloutResourceReading};
 use crate::version_contract::VersionReadings;
 
 /// buildah 存储库放 sandbox PVC：与金丝雀 publisher 共享基镜像层缓存，
@@ -2233,6 +2234,11 @@ impl MainlineDeployer {
         if let Some(inflight) = state.in_flight.clone() {
             match &deployed {
                 DeployedState::Main(d) if rev12(d) == rev12(&inflight.rev) => {
+                    // 这一轮判定跑完了（成功收敛）：把它自己量的资源读数收下来。成功尤其
+                    // 要看——"跑通了但一直被限流"正是额度声明的问题所在，而它不留任何
+                    // 失败证据。
+                    self.report_rollout_resources(&job_name(&inflight.rev))
+                        .await;
                     info!(rev = %rev12(&inflight.rev), "mainline rollout converged");
                     // 浮动签只在收敛后前移，失败回滚的坏镜像绝不进 :local。
                     self.promote_local_tag(&inflight.rev).await?;
@@ -2252,6 +2258,9 @@ impl MainlineDeployer {
             if inflight.phase == Phase::Dispatched {
                 match self.job_status(&job_name(&inflight.rev)).await? {
                     JobStatus::Complete => {
+                        // 判定的进程活着跑完了：收下它自己的资源读数。
+                        self.report_rollout_resources(&job_name(&inflight.rev))
+                            .await;
                         // Job 成功退出意味着滚动要么收敛、要么已回滚（回滚是非零
                         // 退出，记 Failed）。这里镜像仍不是目标 tag，只可能是
                         // Job 跑完后被外部 apply/GitOps 打回：kubectl apply 同名
@@ -2272,6 +2281,10 @@ impl MainlineDeployer {
                         return Ok(());
                     }
                     JobStatus::Failed => {
+                        // 失败的那一轮也要它的资源读数：被杀（OOM、到点）这一档正是
+                        // 额度声明不足的典型下场，读数不在的话这一轮只剩一个退出码。
+                        self.report_rollout_resources(&job_name(&inflight.rev))
+                            .await;
                         // 类别取自 Job 的终止码、落点取自它的终止消息（环境类不回滚
                         // 也不构成版本结论），不是从 Job 日志里找字符串。
                         let failure = self.job_failure(&job_name(&inflight.rev)).await;
@@ -3289,6 +3302,85 @@ impl MainlineDeployer {
         } else {
             Some(text.to_string())
         }
+    }
+
+    /// 把这一轮判定的资源读数报到观测面。
+    ///
+    /// 两侧的对照在这里合起来：**声明的量**是部署器自己写进 Job 清单的，**用掉的量**是判定
+    /// 进程自己读的——合起来才是"同一次运行"，任一单独都不说明什么。取不到读数时什么都不报，
+    /// 也不拿上一轮的值顶：那一轮要么被杀得没来得及看自己，要么节点上没有一个能自读的
+    /// cgroup，两种都不是"这一轮没超限"。
+    async fn report_rollout_resources(&self, name: &str) {
+        use cog_core::metric_names::{
+            ROLLOUT_JOB_CPU_THROTTLED_RATIO, ROLLOUT_JOB_MEMORY_PEAK_RATIO,
+            ROLLOUT_JOB_READING_UNIX,
+        };
+
+        let Some(reading) = self.job_resource_reading(name).await else {
+            warn!(
+                job = %name,
+                "the rollout judgement left no resource reading: either it died before it could look at itself, or this node has no cgroup it can read"
+            );
+            return;
+        };
+        info!(job = %name, reading = %reading, "the rollout judgement's own resource reading");
+
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        for (metric, value) in [
+            (
+                ROLLOUT_JOB_CPU_THROTTLED_RATIO,
+                reading.cpu_throttled_period_ratio(),
+            ),
+            (ROLLOUT_JOB_MEMORY_PEAK_RATIO, reading.memory_peak_ratio()),
+            (
+                ROLLOUT_JOB_READING_UNIX,
+                reading.at_unix.map(|at| at as f64),
+            ),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            if let Err(e) = metrics
+                .record_gauge(metric, value, std::collections::HashMap::new())
+                .await
+            {
+                warn!(job = %name, metric = %metric, error = %e, "could not record a rollout resource reading");
+            }
+        }
+    }
+
+    /// 判定进程自己写下的一行读数，从 Job 的 Pod 终止消息里读回。
+    ///
+    /// 这条通道与失败落点共用，所以这里不认位置只认形状：落点那一行不是读数，跳过即可；
+    /// 反过来，落点读回端只认第一行，读数的增删动不到它。
+    async fn job_resource_reading(&self, name: &str) -> Option<RolloutResourceReading> {
+        let out = match self
+            .kubectl(
+                &[
+                    "get",
+                    "pods",
+                    "-l",
+                    &format!("job-name={name}"),
+                    "-o",
+                    "jsonpath={range .items[*]}{.status.containerStatuses[0].state.terminated.message}{\"\\n\"}{end}",
+                ],
+                30,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(
+                    job = %name,
+                    error = %e,
+                    "could not read the rollout job's terminated message; this run's resource reading is unknown"
+                );
+                return None;
+            }
+        };
+        out.lines().find_map(RolloutResourceReading::from_line)
     }
 }
 
@@ -5903,14 +5995,19 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         startup_timeout,
     );
     match executor.run(&plan).await {
-        Ok(()) => Ok(()),
+        // 成功也留下读数：这一轮跑得离上限有多近，只有跑完的这一刻在同一个进程里
+        // 对照得出来（上限写在 Job 清单里，用掉的量在这个容器自己的 cgroup 里）。
+        Ok(()) => {
+            report_termination_message(None);
+            Ok(())
+        }
         // 失败分两条通道过 Job 边界：类别走退出码（环境类用独立的 75，让部署器
         // 知道这次失败说不出新版本的好坏），落点走进程的终止消息——类别只有两档，
         // 而"坏在哪一处"是把两个值都塞进退出码塞不下的东西。终止消息是 k8s 给
         // "这个容器为什么死"留的窄通道，读出端按结构化字段取，不解析日志。
         // `process::exit` 不走返回路径，因为 Box<dyn Error> 出去一律是 1。
         Err(f) => {
-            report_failure_signature(&f.signature);
+            report_termination_message(Some(&f.signature));
             if f.class == FailureClass::Environment {
                 tracing::error!(error = %f, exit_code = ROLLOUT_EXIT_ENVIRONMENT, "mainline rollout failed for environment reasons");
                 std::process::exit(ROLLOUT_EXIT_ENVIRONMENT);
@@ -5920,26 +6017,60 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// 容器终止消息文件（kubelet 的 `terminationMessagePath` 默认值）。失败落点写在
-/// 这里，部署器从 Pod 的 `state.terminated.message` 读回。
+/// 容器终止消息文件（kubelet 的 `terminationMessagePath` 默认值）。失败落点与资源读数
+/// 都写在这里，部署器从 Pod 的 `state.terminated.message` 读回。
 const TERMINATION_LOG: &str = "/dev/termination-log";
 
-/// 尽力把失败签名写进终止消息。写不进去不能影响失败本身的交付：类别还走退出码，
-/// 签名没了只是让部署器少一份证据（它会往"停下"的一侧取，不会因此多滚一轮）。
-fn report_failure_signature(signature: &str) {
-    if let Err(e) = write_failure_signature(Path::new(TERMINATION_LOG), signature) {
+/// 尽力把这一轮的结果写进终止消息：落点（若失败）一行，自己的资源读数一行。
+///
+/// 写不进去不能影响失败本身的交付：类别还走退出码，落点没了只是让部署器少一份证据
+/// （它会往"停下"的一侧取，不会因此多滚一轮）。读数同理由：它是这一轮跑得怎么样的一份
+/// 证据，不是这一轮成败的判据。
+fn report_termination_message(signature: Option<&str>) {
+    let reading = RolloutResourceReading::read_from(
+        Path::new(rollout_resources::CGROUP_ROOT),
+        chrono::Utc::now().timestamp().max(0) as u64,
+    );
+    match reading.as_ref() {
+        Some(reading) => tracing::info!(reading = %reading, "rollout resource reading"),
+        None => tracing::warn!(
+            path = rollout_resources::CGROUP_ROOT,
+            "no cgroup to read this run's resource use from; the deployer will see this run without a resource reading"
+        ),
+    }
+    if let Err(e) =
+        write_termination_message(Path::new(TERMINATION_LOG), signature, reading.as_ref())
+    {
         tracing::warn!(
             path = TERMINATION_LOG,
             error = %e,
-            signature,
-            "could not record the rollout failure signature; the deployer will see this failure without evidence of its locus"
+            signature = signature.unwrap_or("none"),
+            "could not record this rollout run's outcome; the deployer will see its result without the evidence it left"
         );
     }
 }
 
-/// 终止消息只该带一行：kubelet 按 4KiB 截断，多行内容在后端 jsonpath 里也读不利索。
-fn write_failure_signature(path: &Path, signature: &str) -> std::io::Result<()> {
-    std::fs::write(path, format!("{signature}\n"))
+/// 终止消息的行布局：**落点必须在第一行**。
+///
+/// 部署器读落点时只认第一行（`parse_failure_signature` 取 `lines().next()`）：这条通道
+/// 上可能有别的进程写过东西，位置固定才谈得上"这是我们写的形状"。读数排在后面，于是它
+/// 的增删永远不动落点的位置——反过来放，第一行就会变成一段陌生文本，那一轮失败从此判不出
+/// 落点。kubelet 按 4KiB 截断，两行远在截断线之内。
+fn write_termination_message(
+    path: &Path,
+    signature: Option<&str>,
+    reading: Option<&RolloutResourceReading>,
+) -> std::io::Result<()> {
+    let mut body = String::new();
+    if let Some(signature) = signature {
+        body.push_str(signature);
+        body.push('\n');
+    }
+    if let Some(reading) = reading {
+        body.push_str(&reading.to_line());
+        body.push('\n');
+    }
+    std::fs::write(path, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -12468,5 +12599,153 @@ exit 0
             Some("0.5.8")
         );
         assert_eq!(declared[0].value, 1.0);
+    }
+
+    // --- 判定进程自己的资源读数：产出侧的行布局与消费侧的读回 ---
+
+    fn a_reading() -> RolloutResourceReading {
+        RolloutResourceReading {
+            at_unix: Some(1_700_000_000),
+            cpu_quota_us: Some(200_000),
+            cpu_period_us: Some(100_000),
+            cpu_periods: Some(263),
+            cpu_throttled_periods: Some(7),
+            memory_max_bytes: Some(2_147_483_648),
+            memory_peak_bytes: Some(1_073_741_824),
+        }
+    }
+
+    /// 读数与失败落点共用一条终止消息。落点必须还在第一行：读落点的那一端只认第一行
+    /// （`parse_failure_signature` 取 `lines().next()`），读数排在它后面，于是读数的增删
+    /// 永远动不到落点的位置。反过来，只有读数的那一行不能被当成一条落点。
+    #[test]
+    fn the_reading_never_displaces_the_locus_on_the_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("termination-log");
+        let reading = a_reading();
+
+        write_termination_message(
+            &path,
+            Some("version:wait:cogneva-web:observed"),
+            Some(&reading),
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            parse_failure_signature(&body).as_deref(),
+            Some("version:wait:cogneva-web:observed"),
+            "落点不在第一行，这一轮失败就再也判不出坏在哪一处"
+        );
+        assert_eq!(
+            body.lines()
+                .nth(1)
+                .and_then(RolloutResourceReading::from_line),
+            Some(reading.clone()),
+            "读数写在落点之后，两行各读各的"
+        );
+
+        // 成功那一轮没有落点，只有读数：那段文本不能被读成一条签名。
+        write_termination_message(&path, None, Some(&reading)).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert_eq!(parse_failure_signature(&body), None);
+        assert_eq!(RolloutResourceReading::from_line(&body), Some(reading));
+
+        // 进程被杀得连读数都没读到：空消息，不是一行空文本。
+        write_termination_message(&path, None, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    /// 部署器把判定进程自己量到的读数收回来，按三个口径上报：两个比值加一个取样时刻。
+    /// 读数写在终止消息里，读回端按形状认行——同一份消息里那条落点要走开。
+    #[tokio::test]
+    async fn the_deployer_publishes_the_reading_the_run_took_of_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // 真实布局：kubelet 把整个终止消息塞进一个字段，内嵌换行原样带出来。
+        write_fake_bin(
+            &bin_dir,
+            "kread",
+            "#!/bin/sh\nprintf 'version:wait:cogneva-web:observed\\nrollout-resources:v1:at=1700000000:cpu_quota_us=200000:cpu_period_us=100000:cpu_periods=263:cpu_throttled_periods=7:memory_max=2147483648:memory_peak=1073741824\\n'\nexit 0\n",
+        );
+        let cfg = test_config(
+            root,
+            Path::new("/nonexistent"),
+            "noop",
+            &bin_dir.join("kread").to_string_lossy(),
+        );
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        deployer.report_rollout_resources("j").await;
+
+        let gauge = |metric: cog_core::MetricName| {
+            let metrics = metrics.clone();
+            async move {
+                let samples = metrics
+                    .query_gauge_latest(metric.as_str())
+                    .await
+                    .expect("the gauge store answers");
+                assert_eq!(samples.len(), 1, "{metric} 没有被上报");
+                samples[0].value
+            }
+        };
+        assert_eq!(
+            gauge(cog_core::metric_names::ROLLOUT_JOB_CPU_THROTTLED_RATIO).await,
+            7.0 / 263.0
+        );
+        assert_eq!(
+            gauge(cog_core::metric_names::ROLLOUT_JOB_MEMORY_PEAK_RATIO).await,
+            0.5
+        );
+        assert_eq!(
+            gauge(cog_core::metric_names::ROLLOUT_JOB_READING_UNIX).await,
+            1_700_000_000.0
+        );
+    }
+
+    /// 判定进程没留下读数时什么都不报，而不是报一个 0：那一轮要么被杀得没来得及看自己，
+    /// 要么节点上没有一个能自读的 cgroup——两种都不是"这一轮没被限流"。
+    #[tokio::test]
+    async fn a_run_that_left_no_reading_reports_no_ratio_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // 被杀的那一轮：终止消息里只有部署器代写的落点，没有读数。
+        write_fake_bin(
+            &bin_dir,
+            "kdead",
+            "#!/bin/sh\nprintf 'version:job:rollout:oom\\n'\nexit 0\n",
+        );
+        let cfg = test_config(
+            root,
+            Path::new("/nonexistent"),
+            "noop",
+            &bin_dir.join("kdead").to_string_lossy(),
+        );
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        deployer.report_rollout_resources("j").await;
+
+        for metric in [
+            cog_core::metric_names::ROLLOUT_JOB_CPU_THROTTLED_RATIO,
+            cog_core::metric_names::ROLLOUT_JOB_MEMORY_PEAK_RATIO,
+            cog_core::metric_names::ROLLOUT_JOB_READING_UNIX,
+        ] {
+            assert!(
+                metrics
+                    .query_gauge_latest(metric.as_str())
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{metric} 在没有读数的一轮里被写了个值"
+            );
+        }
     }
 }
