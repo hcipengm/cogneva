@@ -287,12 +287,37 @@ mod tests {
             "rule {PROCESS_ZOMBIES_METRIC_RULE} must query {PROCESS_ZOMBIES_METRIC}, got: {promql}"
         );
         // A single sweep leaves a fresh orphan in place for one interval, so the
-        // rule has to require the reading to *persist*; comparing it to itself an
-        // interval or more back is what separates a stalled reaper from a sweep
-        // that is simply between ticks.
+        // rule has to require the reading to *persist* -- and persisting is a
+        // property of a whole window, which only a range aggregate reads. Two
+        // samples that happen to be equal are not a duration: the producer here
+        // is periodic (one orphan per upstream refresh, collected by the next
+        // sweep), so a comparison against the same series `offset 30m` matches
+        // whenever the two samples fall on the same phase. That shape fired 45
+        // times over three days on a reaper that was working, every firing
+        // lasting one poll interval while its summary claimed half an hour.
+        // `min_over_time` is the aggregate that answers "was it non-zero
+        // throughout" -- `max_over_time` would be satisfied by one sighting.
         assert!(
-            promql.contains("offset"),
-            "rule {PROCESS_ZOMBIES_METRIC_RULE} must require a persistent reading, got: {promql}"
+            promql.contains("min_over_time(") && promql.contains("[30m]"),
+            "rule {PROCESS_ZOMBIES_METRIC_RULE} must read the whole window rather than \
+             compare two samples, got: {promql}"
+        );
+        // And the window has to have been *observed*, which a range aggregate
+        // does not require by itself: it reads the samples that exist in it, so
+        // a pod whose first scrape showed a zombie satisfied the half-hour claim
+        // thirty seconds into its life. A count over a wider window is what turns
+        // coverage into a fact; without it this rule fires once per pod start.
+        assert!(
+            promql.contains("count_over_time(") && promql.contains("[1h]"),
+            "rule {PROCESS_ZOMBIES_METRIC_RULE} must require the 30m window to be covered \
+             rather than read whatever samples it happens to hold, got: {promql}"
+        );
+        // The window is what the sentence says it is; a summary promising half an
+        // hour over a five-minute reading is the same defect one size smaller.
+        let summary = rule["summary"].as_str().expect("summary is a string");
+        assert!(
+            summary.contains("30m"),
+            "rule {PROCESS_ZOMBIES_METRIC_RULE} reads 30m but its summary does not say so: {summary}"
         );
     }
 }

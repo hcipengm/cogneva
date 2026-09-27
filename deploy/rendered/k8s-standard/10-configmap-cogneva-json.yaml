@@ -633,7 +633,7 @@ data:
             },
             {
               "name": "cogneva_workload_metrics_unscraped",
-              "promql": "avg_over_time((count(kube_pod_container_info{namespace=\"cogneva\", image=~\".*cogneva.*\"} and on(pod) kube_pod_status_phase{namespace=\"cogneva\", phase=\"Running\"} == 1 unless on(pod) kube_pod_owner{namespace=\"cogneva\", owner_kind=\"Job\"}) - count(up{namespace=\"cogneva\"}))[15m:1m])",
+              "promql": "avg_over_time((count(kube_pod_container_info{namespace=\"cogneva\", image=~\".*cogneva.*\"} and on(pod) kube_pod_status_phase{namespace=\"cogneva\", phase=\"Running\"} == 1 unless on(pod) kube_pod_owner{namespace=\"cogneva\", owner_kind=\"Job\"}) - count(up{namespace=\"cogneva\"}))[15m:1m]) and on() (count_over_time(up{namespace=\"cogneva\"}[30m]) > count_over_time(up{namespace=\"cogneva\"}[15m]))",
               "condition": {
                 "greater_than": 0.5
               },
@@ -651,21 +651,21 @@ data:
             },
             {
               "name": "orphans_unreaped",
-              "promql": "(cogneva_process_zombies > 0) and (cogneva_process_zombies == (cogneva_process_zombies offset 30m))",
+              "promql": "(min_over_time(cogneva_process_zombies[30m]) > 0) and (count_over_time(cogneva_process_zombies[1h]) > count_over_time(cogneva_process_zombies[30m]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "PID 1 has held {value} uncollected child process(es) for 30m: the container entrypoint is the only process the kernel reparents orphans to, so a process that outlives its parent stays a zombie for the life of the container unless the entrypoint collects it. Sweeps leave a fresh orphan in place for one interval, so a reading that persists this long means collection stopped, not that a sweep is between ticks"
+              "summary": "PID 1 has held at least {value} uncollected child process(es) at every scrape for 30m: the container entrypoint is the only process the kernel reparents orphans to, so a process that outlives its parent stays a zombie for the life of the container unless the entrypoint collects it. The sweep collects a fresh orphan within two intervals, so a count that never reaches zero across the whole window means collection stopped, not that a sweep is between ticks"
             },
             {
               "name": "trace_tier_demotion_stalled",
-              "promql": "(cogneva_trace_tier_overdue > 0) and (cogneva_trace_tier_overdue == (cogneva_trace_tier_overdue offset 3h))",
+              "promql": "(min_over_time(cogneva_trace_tier_overdue[3h]) > 0) and (count_over_time(cogneva_trace_tier_overdue[6h]) > count_over_time(cogneva_trace_tier_overdue[3h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "Traces past their tier's age number {value} on tier {tier}, exactly as they did 3h ago: the demotion chain is not moving them, so the hot tier keeps growing. Any non-zero count that does not come down over three scans is a move that fails every pass, not a backlog being worked through. Nothing deletes traces, so this chain is the only thing standing between a permanent trace store and the node filesystem"
+              "summary": "Traces past their tier's age number have not dropped to zero on tier {tier} at any scrape for 3h, {value} being the fewest seen: the demotion chain is not moving them, so the hot tier keeps growing. A backlog being worked through empties at some point in three hours; a count that never does is a move that fails every pass. Nothing deletes traces, so this chain is the only thing standing between a permanent trace store and the node filesystem"
             },
             {
               "name": "trace_tier_migration_stale",
@@ -930,7 +930,7 @@ data:
             },
             {
               "name": "build_gate_not_in_force",
-              "promql": "min_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m])",
+              "promql": "min_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m]) and (count_over_time(cogneva_build_gate_slots{role=\"builder\"}[10m]) > count_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m]))",
               "condition": {
                 "less_than": 1.0
               },
@@ -975,7 +975,7 @@ data:
             },
             {
               "name": "evolution_queue_has_no_executor",
-              "promql": "avg_over_time((sum(cogneva_evolution_change_queue_owner) < bool 1)[15m:1m])",
+              "promql": "avg_over_time((sum(cogneva_evolution_change_queue_owner) < bool 1)[15m:1m]) and on() (count_over_time(cogneva_evolution_change_queue_owner[30m]) > count_over_time(cogneva_evolution_change_queue_owner[15m]))",
               "condition": {
                 "greater_than": 0.5
               },

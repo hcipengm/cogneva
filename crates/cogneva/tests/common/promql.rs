@@ -387,6 +387,243 @@ pub fn shape_complaints(expr: &str) -> Vec<String> {
     out
 }
 
+/// Whether a byte can be part of an identifier token.
+fn token_char(b: u8) -> bool {
+    let c = b as char;
+    c.is_ascii_alphanumeric() || c == '_' || c == ':'
+}
+
+/// How many times `word` occurs in `s` as a whole identifier token.
+fn count_token(s: &str, word: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut n = 0;
+    let mut i = 0;
+    while i + word.len() <= bytes.len() {
+        if s.is_char_boundary(i)
+            && s[i..].starts_with(word)
+            && (i == 0 || !token_char(bytes[i - 1]))
+            && (i + word.len() == bytes.len() || !token_char(bytes[i + word.len()]))
+        {
+            n += 1;
+            i += word.len();
+            continue;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// The `[` (or `{`) that opens the group closed at `close_at`.
+fn matching_open(s: &str, close_at: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut j = close_at;
+    loop {
+        let b = *bytes.get(j)?;
+        if b == close {
+            depth += 1;
+        } else if b == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(j);
+            }
+        }
+        j = j.checked_sub(1)?;
+    }
+}
+
+/// The series a bare `offset` reads, given the position of the keyword.
+///
+/// `a offset 1h`, `a{x="y"} offset 1h` and `a[5m] offset 1h` all read `a`. An
+/// expression whose selector is parenthesized (`(a + b)[5m] offset 1h`) is not
+/// classified — this feeds a positive finding, so a shape it does not classify
+/// is a weaker gate, not a wrong one.
+fn series_before_offset(s: &str, offset_at: usize) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    let mut end = skip_ws(offset_at);
+    if end > 0 && bytes[end - 1] == b']' {
+        end = skip_ws(matching_open(s, end - 1, b'[', b']')?);
+    }
+    if end > 0 && bytes[end - 1] == b'}' {
+        end = skip_ws(matching_open(s, end - 1, b'{', b'}')?);
+    }
+    let start = s[..end]
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let name = &s[start..end];
+    if name.is_empty() || !name.bytes().all(token_char) {
+        return None;
+    }
+    Some(name)
+}
+
+/// Series names read through a lagging selector: the identifier a bare `offset`
+/// applies to.
+fn names_read_at_an_offset(s: &str) -> Vec<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + "offset".len() <= bytes.len() {
+        if s.is_char_boundary(i)
+            && s[i..].starts_with("offset")
+            && (i == 0 || !token_char(bytes[i - 1]))
+            && (i + "offset".len() == bytes.len() || !token_char(bytes[i + "offset".len()]))
+        {
+            if let Some(name) = series_before_offset(s, i) {
+                if !NOT_SERIES.contains(&name) {
+                    out.push(name.to_string());
+                }
+            }
+            i += "offset".len();
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Expressions that measure persistence by comparing a series to its own value
+/// at an offset.
+///
+/// `A == (A offset 30m)` reads as "nothing has changed for half an hour" and is
+/// not that: it is the equality of two samples. Whenever the producer is
+/// periodic, two samples one period apart land on the same phase on a schedule,
+/// so the expression holds on a healthy system — the deployed
+/// `orphans_unreaped` rule, which ships in exactly this shape, fired 45 times
+/// over three days against a reaper that was working, every firing lasting one
+/// poll interval while its summary claimed half an hour. A duration is a
+/// property of *every* sample in the window; that is what a range aggregate
+/// reads and what a point comparison cannot.
+///
+/// The ceiling, stated the way the rest of this module states it: only `==` is
+/// reported (comparing a series to its lagged self with `<` or `>` claims a
+/// *change*, which is a different and legitimate reading), a parenthesized
+/// selector is not classified, and the shape is matched rather than parsed — so
+/// a rule that reads one name twice, once lagged, without comparing them is
+/// reported too, and has to say in its own words why that is not this.
+pub fn lagged_equality_complaints(expr: &str) -> Vec<String> {
+    let stripped = strip_braces(&strip_quoted(expr));
+    // `==` cannot appear inside an identifier, and quoted spans are blanked, so
+    // this is the operator and not a label value.
+    if !stripped.contains("==") {
+        return Vec::new();
+    }
+    names_read_at_an_offset(&stripped)
+        .into_iter()
+        .filter(|name| count_token(&stripped, name) > 1)
+        .map(|name| {
+            format!(
+                "`{name}` 与它自己 offset 之后的采样判相等：两个采样点的值相同不是「持续」。\
+                 产出方只要有周期，相隔该时长的两个采样就会周期性地落到同一相位，\
+                 于是这条判据在没有持续现象时也成立。要测持续就用区间聚合\
+                 （`min_over_time({name}[30m]) > 0`）"
+            )
+        })
+        .collect()
+}
+
+/// Seconds in a PromQL duration literal (`30s`, `5m`, `3h`, `2d`, `1w`).
+pub fn duration_seconds(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let scale = match &text[digits.len()..] {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => return None,
+    };
+    Some(digits.parse::<u64>().ok()? * scale)
+}
+
+/// The window of every call to `func` in `expr`, in seconds.
+///
+/// `func` includes its opening paren, and the window taken is the first `[...]`
+/// after it — the argument's own range selector. A call with no range selector
+/// contributes nothing, which is how a `min_over_time` over an instant vector is
+/// left alone.
+fn call_windows(expr: &str, func: &str) -> Vec<u64> {
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = expr[from..].find(func) {
+        let at = from + rel;
+        from = at + func.len();
+        if at > 0 && token_char(bytes[at - 1]) {
+            continue;
+        }
+        let Some(open) = expr[from..].find('[').map(|p| from + p) else {
+            continue;
+        };
+        let Some(close) = expr[open..].find(']').map(|p| open + p) else {
+            continue;
+        };
+        // A subquery carries a step after the window (`[15m:1m]`); the window is
+        // what precedes the colon.
+        let window = expr[open + 1..close].split(':').next().unwrap_or("");
+        if let Some(seconds) = duration_seconds(window) {
+            out.push(seconds);
+        }
+    }
+    out
+}
+
+/// Rules that certify a window they may not have been able to see.
+///
+/// `min_over_time(x[30m]) > 0` reads as "at every scrape in the last half hour",
+/// and what a range aggregate actually reads is the samples that *exist* in the
+/// window. A series younger than the window has fewer of them, so a pod whose
+/// first scrape showed one zombie satisfied the half-hour claim thirty seconds
+/// into its life: replayed against six hours of the deployment's own series, the
+/// guarded form of the `orphans_unreaped` rule is silent and the unguarded one
+/// fires five times, once per pod start, every firing inside the pod's first
+/// minute.
+///
+/// The fix is a second count over a wider window, which turns the window's
+/// coverage into a fact rather than an assumption:
+///
+/// ```text
+/// min_over_time(x[30m]) > 0
+///   and count_over_time(x[1h]) > count_over_time(x[30m])
+/// ```
+///
+/// Only `min_over_time` and `avg_over_time` are reported: those are the
+/// aggregates whose value is a statement about the whole window.
+/// `max_over_time` and `last_over_time` answer their question from whatever
+/// samples exist, so a partial window weakens the reading rather than falsifying
+/// it. The check is a presence test — some `count_over_time` in the same
+/// expression whose window is at least twice the certified one — because tying
+/// the count to the aggregate's own argument would need that argument's text,
+/// which is to say a parser.
+pub fn uncovered_window_complaints(expr: &str) -> Vec<String> {
+    let stripped = strip_braces(&strip_quoted(expr));
+    let counts = call_windows(&stripped, "count_over_time(");
+    let mut out = Vec::new();
+    for func in ["min_over_time(", "avg_over_time("] {
+        for window in call_windows(&stripped, func) {
+            if counts.iter().any(|w| *w >= window * 2) {
+                continue;
+            }
+            out.push(format!(
+                "`{agg}` 的值是对整个窗口的判断，而窗口里有多少采样由数据决定——序列比窗口年轻时\
+                 （进程刚起）这个聚合读到的是那一个采样本身。要这句话成立就得再要求窗口被铺满：\
+                 `count_over_time(<同一个东西>[{wide}s]) > count_over_time(<同一个东西>[{window}s])`",
+                agg = func.trim_end_matches('('),
+                wide = window * 2,
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +718,136 @@ mod tests {
         let complaints = shape_complaints("on(pod) (a)");
         assert_eq!(complaints.len(), 1, "{complaints:?}");
         assert!(complaints[0].contains("表达式开头"), "{}", complaints[0]);
+    }
+
+    /// The shape both rules shipped with: a series compared to its own value at
+    /// an offset, which is two samples being equal and not a duration.
+    #[test]
+    fn a_series_compared_to_its_lagged_self_is_reported() {
+        for expr in [
+            "(cogneva_process_zombies > 0) and (cogneva_process_zombies == (cogneva_process_zombies offset 30m))",
+            "(cogneva_trace_tier_overdue > 0) and (cogneva_trace_tier_overdue == (cogneva_trace_tier_overdue offset 3h))",
+            r#"sum(rate(a{b="c"}[5m])) == sum(rate(a{b="c"}[5m] offset 1h))"#,
+        ] {
+            let complaints = lagged_equality_complaints(expr);
+            assert_eq!(complaints.len(), 1, "{expr}: {complaints:?}");
+            assert!(complaints[0].contains("相位"), "{}", complaints[0]);
+        }
+    }
+
+    /// The readings a duration claim is legitimately built from, and the
+    /// neighbouring edits this has to stay silent on.
+    #[test]
+    fn a_window_aggregate_and_a_change_comparison_are_not_reported() {
+        for expr in [
+            // The fix: the whole window has to stay above zero.
+            "min_over_time(cogneva_process_zombies[30m]) > 0",
+            // A change, not a duration: comparing to a lagged self with an
+            // inequality is a legitimate reading, so the detector stays out of it.
+            "node_filesystem_avail_bytes < (node_filesystem_avail_bytes offset 1h) - 1e9",
+            "rate(a[5m]) != rate(a[5m] offset 1h)",
+            // An offset and an equality that never read the same series twice.
+            "(a offset 30m) == 0",
+            "(a > 0) and (b == (b offset 30m) and c == 1)",
+            // A range selector with an offset, read once: nothing is compared to
+            // its lagged self here either.
+            "(a[5m] offset 1h) == 0",
+        ] {
+            let complaints = lagged_equality_complaints(expr);
+            // `b` is the only name read twice with one of them lagged, and it is
+            // not the one the equality compares.
+            assert!(
+                complaints.iter().all(|c| c.contains("`b`")),
+                "{expr}: {complaints:?}"
+            );
+        }
+    }
+
+    /// A lagged read behind a range selector or a label list names the series
+    /// just as plainly as a bare one, so all three are classified — the shape the
+    /// detector is for does not care which selector form it arrives in.
+    #[test]
+    fn a_lagging_selector_is_seen_through_its_brackets_and_labels() {
+        for expr in [
+            r#"sum(rate(a{b="c"}[5m])) == sum(rate(a{b="c"}[5m] offset 1h))"#,
+            "(a > 0) and (a == (a[5m] offset 30m))",
+            "(a > 0) and (a == (a{b=\"c\"} offset 30m))",
+        ] {
+            let complaints = lagged_equality_complaints(expr);
+            assert_eq!(complaints.len(), 1, "{expr}: {complaints:?}");
+            assert!(complaints[0].contains("`a`"), "{}", complaints[0]);
+        }
+    }
+
+    /// Both ceilings this detector has, asserted rather than assumed: the shape
+    /// is matched, not parsed, and an unclassified selector is not guessed at.
+    #[test]
+    fn the_two_ceilings_are_what_they_say_they_are() {
+        // Reported even though the equality is about `sum(a)` and the lagged
+        // read of `a` sits on the other side of an `and`: the rule's author gets
+        // the complaint and says why, which is the intended direction to fail in.
+        let reported = lagged_equality_complaints("sum(a) == 1 and (a offset 5m) > 0");
+        assert_eq!(reported.len(), 1, "{reported:?}");
+
+        // Not reported: the selector is a parenthesized expression, and naming
+        // what it reads would mean parsing it. The expression is not claimed to
+        // be clean, only unclassified.
+        assert!(
+            lagged_equality_complaints("(a > 0) and (a == ((a + b)[5m] offset 30m))").is_empty()
+        );
+    }
+
+    /// The aggregate that claims the whole window has to require the window to
+    /// have been observed; the one that answers from whatever samples exist does
+    /// not.
+    #[test]
+    fn an_uncovered_window_aggregate_is_reported_and_a_covered_one_is_not() {
+        for expr in [
+            "min_over_time(cogneva_process_zombies[30m]) > 0",
+            "avg_over_time(cogneva_trace_tier_overdue[15m:1m]) > 0.5",
+            // Only half a window of coverage: a count the aggregate can satisfy
+            // with a window no older than the one it certifies is not coverage.
+            "min_over_time(a[30m]) > 0 and count_over_time(a[30m]) > 0",
+        ] {
+            let complaints = uncovered_window_complaints(expr);
+            assert_eq!(complaints.len(), 1, "{expr}: {complaints:?}");
+            assert!(complaints[0].contains("铺满"), "{}", complaints[0]);
+        }
+
+        assert!(uncovered_window_complaints(
+            "min_over_time(cogneva_process_zombies[30m]) > 0 \
+                 and count_over_time(cogneva_process_zombies[1h]) \
+                 > count_over_time(cogneva_process_zombies[30m])"
+        )
+        .is_empty());
+        assert!(uncovered_window_complaints(
+            "min_over_time(cogneva_trace_tier_overdue[3h]) > 0 \
+                 and count_over_time(cogneva_trace_tier_overdue[6h]) \
+                 > count_over_time(cogneva_trace_tier_overdue[3h])"
+        )
+        .is_empty());
+        // Whatever samples exist answer this one, so a partial window is a
+        // weaker reading rather than a false claim.
+        assert!(uncovered_window_complaints("max_over_time(a[30m]) > 0").is_empty());
+        // The other ceiling: the count is matched by shape, so a count over the
+        // *wrong* series satisfies the check. Asserted rather than assumed, so
+        // that the sentence above about parsers stays honest.
+        assert!(uncovered_window_complaints(
+            "min_over_time(a[30m]) > 0 and count_over_time(b[1h]) > 0"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn durations_are_read_in_the_units_prometheus_writes_them() {
+        assert_eq!(duration_seconds("30s"), Some(30));
+        assert_eq!(duration_seconds("5m"), Some(300));
+        assert_eq!(duration_seconds("3h"), Some(10_800));
+        assert_eq!(duration_seconds("2d"), Some(172_800));
+        assert_eq!(duration_seconds("1w"), Some(604_800));
+        // Not a duration this reads: an unreadable window must not become a
+        // certificate that the window is covered.
+        assert_eq!(duration_seconds("1y"), None);
+        assert_eq!(duration_seconds(""), None);
     }
 }

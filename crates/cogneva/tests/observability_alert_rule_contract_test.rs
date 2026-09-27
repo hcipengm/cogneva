@@ -25,7 +25,9 @@ mod producer;
 mod promql;
 
 use producer::carries_the_producer;
-use promql::{metric_names_in, shape_complaints};
+use promql::{
+    lagged_equality_complaints, metric_names_in, shape_complaints, uncovered_window_complaints,
+};
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 
@@ -466,6 +468,60 @@ fn every_expression_a_rule_writes_is_one_prometheus_can_parse() {
     assert!(
         complaints.is_empty(),
         "告警规则的表达式 Prometheus 解析不了，这条规则永远不会触发:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// A rule that promises a duration has to read one. Comparing a series against
+/// its own value `offset` a window back is a comparison of two samples, and two
+/// samples that agree are not a duration -- least of all when the producer is
+/// periodic, because then the two land on the same phase whenever the period
+/// divides the offset.
+///
+/// The rule this was written for read a reaper's zombie count that way with a
+/// 30m offset over a 15-second producer sampled every minute: it fired 45 times
+/// in three days on a reaper that was working, each firing one poll interval
+/// long, while its summary claimed PID 1 had held those children "for 30m". The
+/// shipped text now reads `min_over_time(...[30m]) > 0`, which is the aggregate
+/// that answers "non-zero throughout" -- and the same edit is owed by any rule
+/// that reaches for the offset-equality shape to mean "persisted".
+#[test]
+fn a_rule_that_promises_a_duration_reads_a_window_not_two_samples() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        for complaint in lagged_equality_complaints(&promql) {
+            complaints.push(format!("{rule}: {complaint}\n    {promql}"));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "告警规则用一个采样点和它 offset 之后的自己判「持续」，周期性的产出方会让它在健康系统上反复触发:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The other half of the same promise: a rule that certifies a window has to
+/// require the window to have been observed.
+///
+/// `min_over_time(x[30m]) > 0` reads the samples that exist in the window, so
+/// for a series younger than the window it is a statement about whatever
+/// samples are there -- the pod-start case, where one scrape of a fresh process
+/// satisfies a half-hour claim. Replayed over six hours of the deployment's own
+/// series, the shipped `orphans_unreaped` rule fires five times without its
+/// coverage term, once per pod start, and not at all with it.
+#[test]
+fn a_rule_that_certifies_a_window_requires_the_window_to_be_covered() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        for complaint in uncovered_window_complaints(&promql) {
+            complaints.push(format!("{rule}: {complaint}\n    {promql}"));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "告警规则用一个区间聚合判断整个窗口，却没有要求窗口被铺满——序列比窗口年轻时这句话是假的:\n{}",
         complaints.join("\n")
     );
 }
@@ -976,7 +1032,9 @@ fn filters_the_written_rules_use_are_not_reported() {
             C::GreaterThan(0.0),
         ),
         (
-            "(cogneva_process_zombies > 0) and (cogneva_process_zombies == (cogneva_process_zombies offset 30m))",
+            "(min_over_time(cogneva_process_zombies[30m]) > 0) \
+             and (count_over_time(cogneva_process_zombies[1h]) \
+             > count_over_time(cogneva_process_zombies[30m]))",
             C::GreaterThan(0.0),
         ),
         (
