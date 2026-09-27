@@ -594,6 +594,57 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
 
 无论哪种形态，部署出的能力**完全对齐**：都含主应用、安全网关、进化 Pod、沙箱执行器、buildah 与完整数据面。仓库与配置**不携带任何可用密码**：内部密钥（PostgreSQL / Redis / 内部签名）安装时自动随机生成（重跑或升级不覆盖已有值）。平台 token、LLM 上游等带外凭证不随部署下发，首次打开 WebUI 经配置向导写入，且只注入安全网关——主应用与沙盒零持有。
 
+### 🧰 本地开发环境依赖
+
+要在本地从源码构建 Cogneva，请先准备好以下工具链与系统依赖。
+
+**Rust 工具链**
+
+- **Rust 1.85+**（即 workspace 的 `rust-version`），edition 2021，stable 通道——推荐使用 [rustup](https://rustup.rs/) 安装：
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup component add clippy rustfmt
+```
+
+**系统构建工具**
+
+- `protoc`（Protocol Buffers 编译器）——构建期由 `prost-build` / `tonic-build` 调用
+- `pkg-config` 与 C 链接器（Debian/Ubuntu 安装 `build-essential`，macOS 安装 Xcode Command Line Tools）
+- **无需** OpenSSL：`reqwest` 使用 `rustls-tls`
+
+Debian/Ubuntu 一行安装：
+
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential pkg-config protobuf-compiler
+```
+
+**关键依赖版本**（摘自 `Cargo.toml` 的 `[workspace.dependencies]`）：
+
+| Crate | 版本 | 用途 |
+|-------|------|------|
+| tokio | 1.43 | 异步运行时 |
+| axum | 0.8 | Web 框架 |
+| reqwest | 0.12 | HTTP 客户端（rustls-tls） |
+| sqlx | 0.8 | 关系型数据库访问 |
+| redis | 0.29 | Redis 客户端 |
+| async-nats | 0.40 | NATS JetStream 客户端 |
+| qdrant-client | 1.13 | 向量数据库客户端 |
+| tonic / prost | 0.12 / 0.13 | gRPC / Protobuf |
+| serde / serde_json | 1.0 | 序列化 |
+| tracing / tracing-subscriber | 0.1 / 0.3 | 日志与链路追踪 |
+
+**可选运行时服务**——仅在本地完整运行系统时需要（编译与单元测试不依赖它们）：PostgreSQL、Redis、Qdrant、NATS JetStream、Meilisearch 以及兼容 S3 的对象存储。它们均被抽象在 `cog-core` 的 Backend Trait 之后，可替换为其他实现。
+
+**验证环境**
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
+```
+
 ### 🔧 传统手动部署
 
 手动编译：`cargo build --release`。容器镜像见 `Dockerfile`，K3s/K8s 部署清单见 `deploy/`。

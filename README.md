@@ -598,6 +598,57 @@ Both deliveries sit on the **same Helm chart and the same profile values** (`k3s
 
 Every form deploys the **same capabilities**: main app, security gateway, evolution pods, sandbox executor, buildah, and the full data plane. The repository and its configs **carry no usable password**: internal secrets (PostgreSQL / Redis / internal signing) are randomized at install time (re-runs and upgrades never overwrite existing values). Out-of-band credentials such as platform tokens and LLM upstreams are never shipped with the deployment — they are written through the WebUI setup wizard on first launch and injected only into the security gateway, leaving the main app and sandboxes with zero credentials.
 
+### 🧰 Local development dependencies
+
+To build Cogneva from source locally, make sure the following toolchain and system dependencies are in place.
+
+**Rust toolchain**
+
+- **Rust 1.85+** (the workspace `rust-version`), edition 2021, stable channel — install via [rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup component add clippy rustfmt
+```
+
+**System build tools**
+
+- `protoc` (Protocol Buffers compiler) — required by `prost-build` / `tonic-build` at build time
+- `pkg-config` and a C linker (`build-essential` on Debian/Ubuntu, Xcode Command Line Tools on macOS)
+- OpenSSL is **not** required: `reqwest` uses `rustls-tls`
+
+Debian/Ubuntu one-liner:
+
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential pkg-config protobuf-compiler
+```
+
+**Key dependency versions** (from `[workspace.dependencies]` in `Cargo.toml`):
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| tokio | 1.43 | Async runtime |
+| axum | 0.8 | Web framework |
+| reqwest | 0.12 | HTTP client (rustls-tls) |
+| sqlx | 0.8 | Relational database access |
+| redis | 0.29 | Redis client |
+| async-nats | 0.40 | NATS JetStream client |
+| qdrant-client | 1.13 | Vector database client |
+| tonic / prost | 0.12 / 0.13 | gRPC / Protobuf |
+| serde / serde_json | 1.0 | Serialization |
+| tracing / tracing-subscriber | 0.1 / 0.3 | Logging & tracing |
+
+**Optional runtime services** — only needed for a full local run (building and unit tests work without them): PostgreSQL, Redis, Qdrant, NATS JetStream, Meilisearch, and S3-compatible object storage. Each is abstracted behind a `cog-core` Backend Trait and can be swapped for another implementation.
+
+**Verify your setup**
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
+```
+
 ### 🔧 Traditional manual deployment
 
 For manual compilation: `cargo build --release`. Container image: see `Dockerfile`. K3s/K8s manifests: see `deploy/`.
