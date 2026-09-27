@@ -9,7 +9,7 @@ pub mod user_store;
 
 pub use audit_recorder::PostgresAuditRecorder;
 pub use hook_archive::{HookArchiveRow, PostgresHookArchive};
-pub use metrics_backend::PostgresMetricsBackend;
+pub use metrics_backend::{PostgresMetricsBackend, GAUGE_LATEST_SQL};
 pub use observability_gateway::PostgresObservabilityGateway;
 pub use raw_log_index_store::PostgresRawLogIndexStore;
 pub use snapshot_store::PostgresSnapshotStore;

@@ -23,6 +23,20 @@ fn series_key(labels: &HashMap<String, String>) -> String {
     cog_core::observability_text::format_labels(labels)
 }
 
+/// The read a scrape makes of one gauge: its newest sample per label set.
+///
+/// Public because it is half of a pair with the index that carries it (see
+/// `idx_cog_metrics_latest_series` in [`PostgresMetricsBackend::init_schema`]),
+/// and the gate that holds the two together has to explain the statement the
+/// backend actually runs rather than a copy of it. One hand-written copy of a
+/// statement is how a gate comes to certify something else.
+pub const GAUGE_LATEST_SQL: &str = r#"
+            SELECT DISTINCT ON (labels) value, labels, timestamp
+            FROM cog_metrics_samples
+            WHERE metric_type = 'gauge' AND name = $1
+            ORDER BY labels, timestamp DESC
+            "#;
+
 /// PostgreSQL-backed metrics backend.
 pub struct PostgresMetricsBackend {
     pool: PgPool,
@@ -63,6 +77,27 @@ impl PostgresMetricsBackend {
         sqlx::query(
             r#"
             CREATE INDEX IF NOT EXISTS idx_cog_metrics_timestamp ON cog_metrics_samples(timestamp)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        // The other half of the counter-totals decision below: gauges do read
+        // their current value out of this log, because a gauge's newest sample
+        // *is* its value, so the per-series read is on the same path a scrape
+        // endpoint hits continuously. `(name, metric_type)` alone cannot order
+        // that read the way `DISTINCT ON` needs, so the planner sorted every
+        // sample of the series -- measured at 124,631 rows returning 32, external
+        // merge of 8 MB to a temporary file, 1.7 s -- to answer a question whose
+        // answer is one row per series. With labels and the descending timestamp
+        // after the equality columns the walk is in group order and the sort is
+        // gone; `value` rides along so the walk never visits the heap at all.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_cog_metrics_latest_series
+                ON cog_metrics_samples(name, metric_type, labels, timestamp DESC)
+                INCLUDE (value)
             "#,
         )
         .execute(&self.pool)
@@ -320,19 +355,14 @@ impl MetricsBackend for PostgresMetricsBackend {
     async fn query_gauge_latest(&self, name: &str) -> SFResult<Vec<MetricSample>> {
         // `DISTINCT ON` with a matching leading sort key gives the newest row
         // per label set in one pass; ordering timestamps descending inside the
-        // group is what makes the first row the current value.
-        let rows: Vec<(f64, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
-            r#"
-            SELECT DISTINCT ON (labels) value, labels, timestamp
-            FROM cog_metrics_samples
-            WHERE metric_type = 'gauge' AND name = $1
-            ORDER BY labels, timestamp DESC
-            "#,
-        )
-        .bind(name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
+        // group is what makes the first row the current value. The index that
+        // makes that a walk instead of a sort is created in `init_schema`, and
+        // `GAUGE_LATEST_SQL` is the statement the two are held together by.
+        let rows: Vec<(f64, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(GAUGE_LATEST_SQL)
+            .bind(name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
 
         let mut samples = Vec::with_capacity(rows.len());
         for (value, labels_json, timestamp) in rows {
