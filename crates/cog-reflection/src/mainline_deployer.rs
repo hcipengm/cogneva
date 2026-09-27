@@ -459,6 +459,19 @@ const PREFLIGHT_RETRYING_READS: u64 = 3;
 const SUPPORT_SETTLE_JSONPATH: &str =
     "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.readyReplicas}";
 
+/// 支撑工作负载等不到就绪时，贴在判词后面的现场读数与主判词之间的分隔。**判据
+/// 只读它前面那一段**（见 [`primary_message`]）：分隔之后的内容来自集群（Pod 的
+/// `waiting.message`、调度器的 message、kubectl 自己的 stderr），里面出现
+/// `connection refused`、`cannot list resource` 这类词是集群在描述自己的现象，
+/// 不是这次失败的性质——辅助读数能让主判据换个落点，等于让病因自己决定归谁管。
+const SUPPORT_CAUSE_SEPARATOR: &str = "; why it has not come up: ";
+
+/// 现场读数带病因，但长度不能由集群里的内容决定：它进日志、进终止消息、进失败
+/// 记录。Pod 数、每个 Pod 的容器数、单条消息的字符数各设一个界，超界显式写出来。
+const SUPPORT_CAUSE_POD_LIMIT: usize = 3;
+const SUPPORT_CAUSE_CONTAINER_LIMIT: usize = 4;
+const SUPPORT_CAUSE_MESSAGE_CHARS: usize = 200;
+
 /// 每个工作负载读了哪些 ConfigMap 的读法：名字，然后四个消费面各一段，竖线分段。
 /// 卷、projected 里的 ConfigMap 源、envFrom、env.valueFrom（容器与 initContainer
 /// 各两段）。竖线显式占位：一个没有卷的工作负载整段是空的，不能让缺字段把后面的
@@ -977,9 +990,24 @@ impl FailureLocus {
     }
 }
 
+/// 判词里我们自己写下、判据要读的那一段：附在分隔符之前的正文。
+///
+/// 分隔符之后是判死那一刻贴上的现场读数，内容来自集群。主判据与被判的对象之间
+/// 不能夹一层集群自己写的文本：一次读不到就让落点变成「不可达」，Pod 里一句
+/// `cannot list resource` 就能让落点变成「授权拒绝」，而这两者都按环境类处置、
+/// 不记账——一个真坏的版本会因此永远不被记下。正文由我们自己拼、不含分隔符，附着
+/// 的那一段倒可能含（它就是集群文本），所以取第一次出现的位置即可把整段一次剥掉。
+fn primary_message(msg: &str) -> &str {
+    match msg.split_once(SUPPORT_CAUSE_SEPARATOR) {
+        Some((primary, _)) => primary,
+        None => msg,
+    }
+}
+
 /// 镜像一次都还没动时的落点。快照阶段只有这四类非版本失败会出现——调度器判决
 /// 得等新 Pod 出现，这里还没有新 Pod。
 fn locate_before_any_change(msg: &str) -> FailureLocus {
+    let msg = primary_message(msg);
     if is_cluster_unreachable(msg) {
         FailureLocus::Unreachable
     } else if is_observation_tool_failure(msg) {
@@ -5172,6 +5200,252 @@ fn support_settled(readout: &str) -> Option<bool> {
     Some(observed >= generation && ready >= want)
 }
 
+/// 一个还没就绪的支撑工作负载，它现在那批 Pod 说了什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupportCause {
+    /// 读到了：每个 Pod 一段，逐容器写出它此刻的状态。
+    Read(String),
+    /// 一个 Pod 都没有。这不是「起不来」：副本数读作 0，或这一版还没被控制器
+    /// 创建出来。两种情况下「就绪」这个判据眼下问不出东西，读数得如实这么说。
+    NoPods,
+    /// 读不到（对象读不到、选择器表达不出来、Pod 列表解析不了）。读不到不等于
+    /// 没起来，两者处置不同。
+    Unreadable(String),
+}
+
+/// 列一个工作负载自己那批 Pod 用的标签选择器，取自它的 `spec.selector.matchLabels`
+/// （`k=v,k=v`，按 key 排序）。
+///
+/// 支撑工作负载没有目标部署那样现成的 name/component 标签可以拼，只有对象自己
+/// 声明的选择器是权威。`matchExpressions` 非空时返回 None——那种选择器表达不成
+/// `k=v`，拼一个漏掉条件的出来会把别的 Pod 的病因当成它的报，读不到比读错强。
+fn support_pod_selector(workload_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(workload_json).ok()?;
+    let selector = value.get("spec")?.get("selector")?;
+    if selector
+        .get("matchExpressions")
+        .and_then(|e| e.as_array())
+        .is_some_and(|e| !e.is_empty())
+    {
+        return None;
+    }
+    let labels = selector.get("matchLabels")?.as_object()?;
+    let mut pairs: Vec<String> = Vec::with_capacity(labels.len());
+    for (key, value) in labels {
+        pairs.push(format!("{key}={}", value.as_str()?));
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    pairs.sort();
+    Some(pairs.join(","))
+}
+
+/// 把一个工作负载当前那批 Pod 的 JSON 折成「为什么没起来」。
+///
+/// 判死那一刻的四种病因在读数落地之前同形：容器崩（`CrashLoopBackOff`）、镜像
+/// 拉不下来（`ImagePullBackOff`）、起来了但探针一直不过（`running not-ready`）、
+/// 根本排不上队（Pod 一直 Pending、一个容器状态都没有）。四种的处置各不相同，
+/// 而 900s 的等待里它们都只报「没就绪」，事后要回集群去猜，那时事件窗口早过了。
+fn support_pod_causes(pods_json: &str) -> SupportCause {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(pods_json) else {
+        return SupportCause::Unreadable("the pod list is not JSON".to_string());
+    };
+    let Some(items) = value.get("items").and_then(|i| i.as_array()) else {
+        return SupportCause::Unreadable("the pod list carries no items".to_string());
+    };
+    if items.is_empty() {
+        return SupportCause::NoPods;
+    }
+    let mut named: Vec<(String, &serde_json::Value)> =
+        items.iter().map(|pod| (pod_name(pod), pod)).collect();
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    let total = named.len();
+    let mut lines: Vec<String> = named
+        .iter()
+        .take(SUPPORT_CAUSE_POD_LIMIT)
+        .map(|(_, pod)| pod_cause(pod))
+        .collect();
+    if total > SUPPORT_CAUSE_POD_LIMIT {
+        lines.push(format!("(+{} more pods)", total - SUPPORT_CAUSE_POD_LIMIT));
+    }
+    SupportCause::Read(lines.join("; "))
+}
+
+fn pod_name(pod: &serde_json::Value) -> String {
+    pod.pointer("/metadata/name")
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("<unnamed pod>")
+        .to_string()
+}
+
+/// 一个 Pod 一段：相位，加上**逐容器**的状态。
+///
+/// 多容器 Pod 的「没就绪」不含信息——整 Pod 的就绪是全部容器的与，哪个容器挡住了
+/// 它是全部问题。线上实测过一次：主容器一直就绪，边车因为清单里没写子命令而反复
+/// 退出，Pod 永远不就绪，而在只读主容器的读数里这看起来像「起来了只是探针不过」。
+/// 容器名因此必须进读数。
+fn pod_cause(pod: &serde_json::Value) -> String {
+    let phase = pod
+        .pointer("/status/phase")
+        .and_then(|p| p.as_str())
+        .filter(|p| !p.is_empty())
+        .unwrap_or("<no phase>");
+    let mut seg = format!("{} {phase}", pod_name(pod));
+    if let Some(reason) = unschedulable_reason(pod) {
+        seg.push_str(&format!(", unschedulable: {reason}"));
+    }
+    let mut containers: Vec<String> = Vec::new();
+    for (list, prefix) in [
+        ("/status/initContainerStatuses", "init "),
+        ("/status/containerStatuses", ""),
+    ] {
+        let Some(statuses) = pod.pointer(list).and_then(|s| s.as_array()) else {
+            continue;
+        };
+        for status in statuses {
+            let name = status
+                .get("name")
+                .and_then(|n| n.as_str())
+                .filter(|n| !n.is_empty())
+                .unwrap_or("<unnamed container>");
+            containers.push(format!("{prefix}{}", container_cause(name, status)));
+        }
+    }
+    let total = containers.len();
+    let shown: Vec<String> = containers
+        .into_iter()
+        .take(SUPPORT_CAUSE_CONTAINER_LIMIT)
+        .collect();
+    if shown.is_empty() {
+        // kubelet 还没报容器状态（刚创建、还没轮到它）。这是「没有这个信号」，
+        // 不是「容器都正常」。
+        seg.push_str(", no container status reported yet");
+    } else {
+        seg.push_str(&format!(", {}", shown.join(", ")));
+        if total > SUPPORT_CAUSE_CONTAINER_LIMIT {
+            seg.push_str(&format!(
+                " (+{} more containers)",
+                total - SUPPORT_CAUSE_CONTAINER_LIMIT
+            ));
+        }
+    }
+    seg
+}
+
+/// 一个容器此刻的状态。等待态写原因，终止态写原因与**退出码**。
+///
+/// 等待态的原因只说"kubelet 停在哪一步"，退出码说的是"怎么死的"：`1` = 进程自己
+/// 非零退出（入口跑错、装配失败），`137` = 被杀（多为超上限），`143` = 被优雅
+/// 终止。`CrashLoopBackOff` 尤其如此——它只说"在退避"，真正的死法在 `lastState`
+/// 里，所以重启次数与上一次的终止原因/退出码一起写出来。
+fn container_cause(name: &str, status: &serde_json::Value) -> String {
+    let mut seg = format!("{name}=");
+    if let Some(waiting) = status.pointer("/state/waiting") {
+        seg.push_str(&format!(
+            "waiting {}",
+            field(waiting, "reason", "<no reason>")
+        ));
+        if let Some(message) = waiting
+            .get("message")
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.is_empty())
+        {
+            seg.push_str(&format!(
+                " ({})",
+                bounded(message, SUPPORT_CAUSE_MESSAGE_CHARS)
+            ));
+        }
+    } else if let Some(terminated) = status.pointer("/state/terminated") {
+        seg.push_str(&format!(
+            "terminated {} exit {}",
+            field(terminated, "reason", "<no reason>"),
+            exit_code(terminated)
+        ));
+    } else if status.pointer("/state/running").is_some() {
+        seg.push_str(
+            if status
+                .get("ready")
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false)
+            {
+                "running ready"
+            } else {
+                // 容器起来了却一直不就绪：探针没过（或还没过）。与"进程起不来"是两种
+                // 病因，判词里必须分得开。
+                "running not-ready"
+            },
+        );
+    } else {
+        seg.push_str("no state reported");
+    }
+    let restarts = status
+        .get("restartCount")
+        .and_then(|r| r.as_u64())
+        .unwrap_or(0);
+    if restarts > 0 {
+        seg.push_str(&format!(" restarts={restarts}"));
+    }
+    if let Some(last) = status.pointer("/lastState/terminated") {
+        seg.push_str(&format!(
+            " last {} exit {}",
+            field(last, "reason", "<no reason>"),
+            exit_code(last)
+        ));
+    }
+    seg
+}
+
+/// 调度器写在 Pod 条件上的判决。排不上队的 Pod 一个容器状态都没有，病因只在这里
+/// （`Insufficient cpu`、节点亲和不满足、污点未容忍）。没有这一条，一个 Pending
+/// 的 Pod 在读数里只剩「Pending」。
+fn unschedulable_reason(pod: &serde_json::Value) -> Option<String> {
+    let conditions = pod.pointer("/status/conditions")?.as_array()?;
+    for condition in conditions {
+        if condition.get("type").and_then(|t| t.as_str()) != Some("PodScheduled") {
+            continue;
+        }
+        if condition.get("status").and_then(|s| s.as_str()) != Some("False") {
+            continue;
+        }
+        let reason = field(condition, "reason", "");
+        let message = field(condition, "message", "");
+        let text = if message.is_empty() { reason } else { message };
+        if text.is_empty() {
+            return Some("no message".to_string());
+        }
+        return Some(bounded(text, SUPPORT_CAUSE_MESSAGE_CHARS));
+    }
+    None
+}
+
+fn field<'a>(value: &'a serde_json::Value, key: &str, absent: &'a str) -> &'a str {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .unwrap_or(absent)
+}
+
+/// 退出码读不到就写「读不到」，不写 0：0 是"正常退出"，那是另一个意思。
+fn exit_code(terminated: &serde_json::Value) -> String {
+    match terminated.get("exitCode").and_then(|c| c.as_i64()) {
+        Some(code) => code.to_string(),
+        None => "unreadable".to_string(),
+    }
+}
+
+/// 截断一段来自集群的文本。截断了要显式说明：读数看起来完整而其实被切过，比明说
+/// 截断更坏——人会照着半句话下结论。
+fn bounded(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!("{head}... (truncated)")
+}
+
 /// 一个工作负载读了哪些 ConfigMap。消费形态取自 Pod 模板本身（卷、projected
 /// 卷里的 ConfigMap 源、`envFrom`、`env.valueFrom`，容器与 initContainer 都算），
 /// 不写名单：新加一个消费点不需要谁记得来这里补一行。
@@ -5608,14 +5882,57 @@ impl RolloutExecutor {
                 break;
             }
             if std::time::Instant::now() >= deadline {
+                let mut causes: Vec<String> = Vec::new();
+                for w in &pending {
+                    causes.push(self.support_workload_cause(w).await);
+                }
                 return Err(SFError::Agent(format!(
-                    "support workload this rollout restarted did not become ready within {}s: {last}",
-                    self.startup_timeout_secs
+                    "support workload this rollout restarted did not become ready within {}s: \
+                     {last}{SUPPORT_CAUSE_SEPARATOR}{}",
+                    self.startup_timeout_secs,
+                    causes.join("; ")
                 )));
             }
             tokio::time::sleep(Duration::from_secs(ROLLOUT_POLL_SECS)).await;
         }
         Ok(())
+    }
+
+    /// 判死那一刻，一个还没就绪的支撑工作负载的现场。
+    ///
+    /// 只在这条路径上读：正常滚动每轮多两次 kubectl 是白花的，而病因只有判死时
+    /// 才需要写进记录。读数贴进判词的分隔符之后，**不进判据**（见
+    /// [`primary_message`]）。
+    ///
+    /// 读不到就如实报读不到：这一段是附加证据，读失败既不能盖掉「没就绪」这个主
+    /// 判据，也不能折成「没起来」。
+    async fn support_workload_cause(&self, w: &SupportWorkload) -> String {
+        let object = match self
+            .run_kubectl(&["get", w.kind, &w.name, "-o", "json"], 30)
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => return format!("{}: cause unreadable ({e})", w.display()),
+        };
+        let Some(selector) = support_pod_selector(&object) else {
+            return format!(
+                "{}: cause unreadable (no label selector to list its pods by)",
+                w.display()
+            );
+        };
+        let pods = match self
+            .run_kubectl(&["get", "pods", "-l", &selector, "-o", "json"], 30)
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => return format!("{}: cause unreadable ({e})", w.display()),
+        };
+        let reading = match support_pod_causes(&pods) {
+            SupportCause::Read(text) => text,
+            SupportCause::NoPods => "no pod exists".to_string(),
+            SupportCause::Unreadable(why) => format!("cause unreadable ({why})"),
+        };
+        format!("{}: {reading}", w.display())
     }
 
     /// 清单交付前，先把集群对象上"已被清单的 `valueFrom` 取代"的 env `value` 摘掉。
@@ -10820,6 +11137,172 @@ exit 0
         assert_eq!(support_settled("|2|1|1|"), None);
     }
 
+    fn causes_of(pods_json: &str) -> String {
+        match support_pod_causes(pods_json) {
+            SupportCause::Read(text) => text,
+            other => panic!("expected a reading, got {other:?}"),
+        }
+    }
+
+    /// 判死读数必须分得开四种病因：四种在「没就绪」这个结论里同形，处置却相反
+    /// ——崩容器要看这一版，拉不下镜像要看镜像源，探针不过要看探针，排不上队要看
+    /// 节点。四份夹具一份一个病因，断言四份读数互不相同、各自带自己的判据。
+    #[test]
+    fn a_settle_timeout_says_which_of_the_four_causes_it_was() {
+        // 主容器好、边车崩：只读主容器的读数会让它看起来像"起来了只是探针不过"。
+        let crashloop = causes_of(
+            r#"{"items":[{"metadata":{"name":"cogneva-registry-57bb6bd886-ndccz"},
+              "status":{"phase":"Running","containerStatuses":[
+                {"name":"registry","ready":true,"restartCount":0,
+                 "state":{"running":{"startedAt":"2026-09-27T18:00:00Z"}}},
+                {"name":"volume-walker","ready":false,"restartCount":13,
+                 "state":{"waiting":{"reason":"CrashLoopBackOff",
+                   "message":"back-off 5m0s restarting failed container=volume-walker"}},
+                 "lastState":{"terminated":{"reason":"Error","exitCode":1}}}]}}]}"#,
+        );
+        assert!(
+            crashloop.contains("volume-walker=waiting CrashLoopBackOff"),
+            "{crashloop}"
+        );
+        assert!(crashloop.contains("restarts=13"), "{crashloop}");
+        assert!(crashloop.contains("last Error exit 1"), "{crashloop}");
+        assert!(crashloop.contains("registry=running ready"), "{crashloop}");
+
+        let pulling = causes_of(
+            r#"{"items":[{"metadata":{"name":"cogneva-registry-6f9c-x7kq2"},
+              "status":{"phase":"Pending","containerStatuses":[
+                {"name":"registry","ready":false,"restartCount":0,
+                 "state":{"waiting":{"reason":"ImagePullBackOff",
+                   "message":"Back-off pulling image \"localhost:30500/cogneva:main-new\""}}}]}}]}"#,
+        );
+        assert!(
+            pulling.contains("registry=waiting ImagePullBackOff"),
+            "{pulling}"
+        );
+
+        let probing = causes_of(
+            r#"{"items":[{"metadata":{"name":"cogneva-web-7d4b9c-zz9pl"},
+              "status":{"phase":"Running","containerStatuses":[
+                {"name":"cogneva-web","ready":false,"restartCount":0,
+                 "state":{"running":{"startedAt":"2026-09-27T18:00:00Z"}}}]}}]}"#,
+        );
+        assert!(
+            probing.contains("cogneva-web=running not-ready"),
+            "{probing}"
+        );
+
+        let unscheduled = causes_of(
+            r#"{"items":[{"metadata":{"name":"cogneva-registry-57bb6bd886-q4m7t"},
+              "status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False",
+                "reason":"Unschedulable",
+                "message":"0/1 nodes are available: 1 Insufficient cpu, 1 Insufficient memory."}]}}]}"#,
+        );
+        assert!(unscheduled.contains("unschedulable:"), "{unscheduled}");
+        assert!(unscheduled.contains("Insufficient cpu"), "{unscheduled}");
+        assert!(
+            unscheduled.contains("no container status reported yet"),
+            "{unscheduled}"
+        );
+
+        // 四份读数两两不同：任何两份拼成同一句话，判词就退回到"没就绪"。
+        let all = [&crashloop, &pulling, &probing, &unscheduled];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two of the four causes render the same reading");
+            }
+        }
+    }
+
+    /// 「读不到」「一个 Pod 都没有」与「读到了一批起不来的 Pod」是三件事，读数
+    /// 必须分得开：把读不到折成"没起来"，人会去查一个不存在的病因。
+    #[test]
+    fn a_settle_cause_separates_unreadable_from_no_pods() {
+        assert!(matches!(
+            support_pod_causes("error: the server could not find the requested resource"),
+            SupportCause::Unreadable(_)
+        ));
+        assert!(matches!(
+            support_pod_causes(r#"{"kind":"PodList"}"#),
+            SupportCause::Unreadable(_)
+        ));
+        assert_eq!(support_pod_causes(r#"{"items":[]}"#), SupportCause::NoPods);
+        // 读到的 Pod 一个界都能顶住：Pod 数、容器数、单条消息的字符数。
+        let many: String = (0..SUPPORT_CAUSE_POD_LIMIT + 2)
+            .map(|i| format!(r#"{{"metadata":{{"name":"p-{i}"}},"status":{{"phase":"Pending"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let text = causes_of(&format!(r#"{{"items":[{many}]}}"#));
+        assert!(text.contains("(+2 more pods)"), "{text}");
+        let long = "x".repeat(SUPPORT_CAUSE_MESSAGE_CHARS + 40);
+        let text = causes_of(&format!(
+            r#"{{"items":[{{"metadata":{{"name":"p"}},"status":{{"phase":"Pending",
+              "conditions":[{{"type":"PodScheduled","status":"False","message":"{long}"}}]}}}}]}}"#
+        ));
+        assert!(text.contains("(truncated)"), "{text}");
+    }
+
+    /// 现场读数不进判据：它来自集群，集群文本里出现「连接被拒」「没权限」这类词
+    /// 是在描述现象，不是这次失败的性质。没有这条，一句 Pod 里的 stderr 就能把
+    /// 一个真坏的版本的落点改成环境类，于是它永远不被记账。
+    #[test]
+    fn a_settle_cause_cannot_change_the_locus_of_the_failure() {
+        let primary = "support workload this rollout restarted did not become ready within 900s: \
+                       deploy/cogneva-registry generation|observed|want|ready=2|2|1|0";
+        // 正文本该判"观测到的版本缺陷"。
+        assert_eq!(locate_before_any_change(primary), FailureLocus::Observed);
+        // 附着的那一段里三种环境类措辞都出现，落点仍只看正文。
+        let with_cause = format!(
+            "{primary}{SUPPORT_CAUSE_SEPARATOR}deploy/cogneva-registry: cogneva-registry-0 Pending, \
+             unschedulable: dial tcp 10.0.0.1:443: connect: connection refused; \
+             deploy/nats: cause unreadable (Error from server (Forbidden): pods is forbidden: \
+             User \"system:serviceaccount:cogneva:deployer\" cannot list resource \"pods\"; \
+             exceeded quota: cogneva-quota)"
+        );
+        assert_eq!(
+            locate_before_any_change(&with_cause),
+            FailureLocus::Observed
+        );
+        // 附着的那一段里出现我们自己的分隔符也不影响：正文由我们自己拼。
+        let doubled = format!("{primary}{SUPPORT_CAUSE_SEPARATOR}a{SUPPORT_CAUSE_SEPARATOR}b");
+        assert_eq!(primary_message(&doubled), primary);
+        // 正文自己坏（读集群就失败）时照旧按环境类走。
+        assert_eq!(
+            locate_before_any_change("kubectl get deploy timed out after 30s"),
+            FailureLocus::Unreachable
+        );
+    }
+
+    /// 支撑工作负载的选择器取自对象自己声明的那一份：它没有目标部署那样现成的
+    /// 标签可以拼，而 `matchExpressions` 表达不成 `k=v`——拼不出就报读不到，
+    /// 不拿一个漏掉条件的去列 Pod。
+    #[test]
+    fn a_support_selector_comes_from_the_workload_itself() {
+        assert_eq!(
+            support_pod_selector(
+                r#"{"spec":{"selector":{"matchLabels":{"app":"cogneva-registry","tier":"backend"}}}}"#
+            )
+            .as_deref(),
+            Some("app=cogneva-registry,tier=backend")
+        );
+        // 单标签。
+        assert_eq!(
+            support_pod_selector(r#"{"spec":{"selector":{"matchLabels":{"app":"nats"}}}}"#)
+                .as_deref(),
+            Some("app=nats")
+        );
+        // 表达不出来的一律报读不到。
+        assert_eq!(
+            support_pod_selector(
+                r#"{"spec":{"selector":{"matchLabels":{"app":"nats"},
+                   "matchExpressions":[{"key":"tier","operator":"In","values":["backend"]}]}}}"#
+            ),
+            None
+        );
+        assert_eq!(support_pod_selector(r#"{"spec":{"selector":{}}}"#), None);
+        assert_eq!(support_pod_selector(r#"{"spec":{}}"#), None);
+        assert_eq!(support_pod_selector("not json"), None);
+    }
+
     /// 支撑清单 apply 会连带重启后端与集群内 registry：目标部署的镜像要从这个
     /// registry 拉、启动要连这些后端，所以必须等它们回到就绪再滚目标。
     ///
@@ -10829,7 +11312,7 @@ exit 0
     async fn rollout_waits_for_the_support_workloads_its_own_apply_restarted() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
-        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, 2);
+        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, 2, true);
 
         let executor = RolloutExecutor::new(
             bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
@@ -10872,7 +11355,7 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         // 采样永远落后一代：这个支撑工作负载不会就绪。
-        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, 999);
+        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, 999, true);
 
         let executor = RolloutExecutor::new(
             bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
@@ -10894,8 +11377,19 @@ exit 0
                 .contains("support workload this rollout restarted did not become ready"),
             "{err}"
         );
+        // 判词里带病因：哪个容器、什么状态、上一次怎么死的。少了这一段，900s 的
+        // 等待只留下一句"没就绪"，而事件窗口一小时就过期，病因只能靠人回集群猜。
+        let msg = err.to_string();
+        assert!(msg.contains(SUPPORT_CAUSE_SEPARATOR), "{msg}");
+        assert!(
+            msg.contains("volume-walker=waiting CrashLoopBackOff"),
+            "{msg}"
+        );
+        assert!(msg.contains("last Error exit 1"), "{msg}");
+        assert!(msg.contains("restarts=13"), "{msg}");
         // 这条失败有自己的签名：与目标滚动失败是不同的落点，部署器据此判"同 rev
-        // 反复失败是不是同一处坏"。
+        // 反复失败是不是同一处坏"。现场读数贴进来之后签名不变——它来自集群，不该
+        // 改这次失败的性质。
         assert_eq!(err.signature, "version:support-settle::observed");
 
         let calls = std::fs::read_to_string(&log).unwrap();
@@ -10905,9 +11399,52 @@ exit 0
         );
     }
 
+    /// 现场读数读不到（这里是 apiserver 拒绝：选择器读不出来）时，判词如实写"读不到"，
+    /// 而**判据不变**：拒绝原文里的 `cannot get resource` 正是授权拒绝的措辞，若它
+    /// 参与判决，一个真坏的版本会被记成环境类、不记账、无限重滚。
+    #[tokio::test]
+    async fn an_unreadable_settle_cause_still_blames_the_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) = fake_kubectl_support_settle(&bin_dir, 999, false);
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            1,
+        );
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        let err = executor.run(&plan).await.unwrap_err();
+        assert_eq!(err.class, FailureClass::Version, "{err:?}");
+        assert_eq!(err.signature, "version:support-settle::observed");
+        let msg = err.to_string();
+        // 读不到就写读不到，而不是折成「没起来」。
+        assert!(msg.contains("cause unreadable"), "{msg}");
+        assert!(
+            msg.contains("did not become ready within 1s"),
+            "the primary verdict has to survive the failed reading: {msg}"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("set image "), "{calls}");
+    }
+
     /// 假 kubectl：支撑清单里 registry 被 apply 改了 spec（代数前进），`set image`
-    /// 在它回到就绪之前一律硬失败。`settle_at` 是第几次采样才报就绪。
-    fn fake_kubectl_support_settle(dir: &Path, settle_at: u32) -> (PathBuf, PathBuf) {
+    /// 在它回到就绪之前一律硬失败。`settle_at` 是第几次采样才报就绪；
+    /// `cause_readable` 说判死那一刻的现场读数能不能读到（读不到时返回 apiserver
+    /// 自己的拒绝原文——那句措辞正是"读不到"不该改判据的理由）。
+    fn fake_kubectl_support_settle(
+        dir: &Path,
+        settle_at: u32,
+        cause_readable: bool,
+    ) -> (PathBuf, PathBuf) {
         let manifests = dir.join("manifests");
         std::fs::create_dir_all(&manifests).unwrap();
         std::fs::write(
@@ -10920,6 +11457,11 @@ exit 0
         let applied = dir.join("applied.marker");
         let settled = dir.join("settled.marker");
         let count = dir.join("settle.count");
+        // 判死那一刻的现场：主容器好、走查边车反复退出（这正是 2026-09-27 那两轮
+        // 滚动被判失败的形状）。`-o json` 是这套读数用的打印机，与 jsonpath 一样
+        // 是真实 kubectl 支持的那一种。
+        let workload_json = r#"{"spec":{"selector":{"matchLabels":{"app":"cogneva-registry"}}}}"#;
+        let pods_json = r#"{"items":[{"metadata":{"name":"cogneva-registry-57bb6bd886-ndccz"},"status":{"phase":"Running","containerStatuses":[{"name":"registry","ready":true,"restartCount":0,"state":{"running":{"startedAt":"2026-09-27T18:00:00Z"}}},{"name":"volume-walker","ready":false,"restartCount":13,"state":{"waiting":{"reason":"CrashLoopBackOff","message":"back-off 5m0s restarting failed container=volume-walker"}},"lastState":{"terminated":{"reason":"Error","exitCode":1}}}]}}]}"#;
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
@@ -10927,7 +11469,7 @@ prev=""
 for a in "$@"; do
   if [ "$prev" = "-o" ]; then
     case "$a" in
-      jsonpath=*) ;;
+      jsonpath=*|json) ;;
       *) echo "error: unable to match a printer" >&2; exit 2 ;;
     esac
   fi
@@ -10943,6 +11485,18 @@ case "$*" in
     echo "meilisearch 1"
     ;;
   *"get statefulset -o"*) ;;
+  # 判死读数：工作负载对象给出它自己的选择器，Pod 列表给出逐容器的病因。模式尾不
+  # 带通配：`-o json` 是等就绪那次读的 `-o jsonpath=...` 的前缀，带着通配会把两次
+  # 读混成一次。
+  *"get deploy cogneva-registry -o json")
+    if [ '{cause_readable}' = "yes" ]; then
+      printf '%s\n' '{workload_json}'
+    else
+      echo 'Error from server (Forbidden): deployments.apps "cogneva-registry" is forbidden: User "system:serviceaccount:cogneva:deployer" cannot get resource "deployments" in API group "apps"' >&2
+      exit 1
+    fi
+    ;;
+  *"get pods -l app=cogneva-registry -o json") printf '%s\n' '{pods_json}' ;;
   # 等就绪：第 settle_at 次采样才就绪，之前一直落后一代。
   *"get deploy cogneva-registry -o"*)
     n=$(cat '{count}' 2>/dev/null || echo 0)
@@ -10970,7 +11524,8 @@ exit 0
             applied = applied.display(),
             settled = settled.display(),
             count = count.display(),
-            settle_at = settle_at
+            settle_at = settle_at,
+            cause_readable = if cause_readable { "yes" } else { "no" }
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         (manifests, log)
