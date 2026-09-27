@@ -18,7 +18,6 @@ pub mod orchestrator;
 pub mod retry_matrix;
 pub mod task_checkpoint;
 pub mod task_phase;
-pub mod task_transfer;
 
 pub use circuit_registry::CircuitBreakerRegistry;
 pub use orchestrator::DagExecutor;
@@ -27,10 +26,6 @@ pub use task_checkpoint::{
     checkpoint_task, CheckpointAgents, CheckpointRound, LiveCheckpointAgents,
 };
 pub use task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
-pub use task_transfer::{
-    RecoveredTask, StaleTaskDetector, TaskTransferCoordinator, TaskTransferEvent, TransferReason,
-    TASK_TRANSFER_STREAM,
-};
 
 /// DagExecutor 配置。
 #[derive(Debug, Clone)]

@@ -623,51 +623,6 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             }
         }
 
-        // ── StaleTaskDetector ──
-        if let Some(agent_registry) = ctx.consume_service::<dyn cog_core::AgentRegistry>() {
-            let snapshot_store = ctx.consume_service::<dyn cog_core::CheckpointStore>();
-            let state_backend = ctx.consume_service::<dyn cog_core::StateBackend>();
-            if let (Some(snapshot_store), Some(state_backend)) = (snapshot_store, state_backend) {
-                let config = ctx.config();
-                let _redis_url = config.dag_executor.redis_url.clone();
-                let poll_secs = config.system.stale_task_detector_poll_secs;
-
-                let transfer_backend: Arc<dyn cog_core::MessageBackend> =
-                    match ctx.consume_service::<dyn cog_core::MessageBackend>() {
-                        Some(b) => b,
-                        None => {
-                            warn!("No MessageBackend available for StaleTaskDetector. Skipping.");
-                            return Ok(());
-                        }
-                    };
-                let transfer_coordinator = Arc::new(crate::TaskTransferCoordinator::new(
-                    transfer_backend.clone(),
-                    snapshot_store,
-                    state_backend,
-                ));
-                if let Err(e) = transfer_backend
-                    .create_consumer_group(transfer_coordinator.stream_name(), "cogneva-transfer")
-                    .await
-                {
-                    if !e.to_string().contains("BUSYGROUP") {
-                        warn!(
-                            "create_consumer_group({}) failed: {}",
-                            transfer_coordinator.stream_name(),
-                            e
-                        );
-                    }
-                }
-                let stale_detector = Arc::new(
-                    crate::StaleTaskDetector::new(agent_registry, transfer_coordinator)
-                        .with_poll_interval(std::time::Duration::from_secs(poll_secs)),
-                );
-                if let Some(shutdown_signal) = ctx.consume::<cog_core::ShutdownSignal>() {
-                    let _stale_handle = stale_detector.clone().spawn((*shutdown_signal).clone());
-                    info!("StaleTaskDetector started");
-                }
-            }
-        }
-
         Ok(())
     }
 

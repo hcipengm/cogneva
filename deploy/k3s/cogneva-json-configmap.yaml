@@ -18,7 +18,6 @@ data:
         "loop_restart_max_consecutive": 3,
         "loop_restart_backoff_floor_secs": 5,
         "_comment_loop_restart": "后台循环 panic 后原地重跑的次数上限（连续计），以及事件驱动循环的重启等待下限（秒）。有节奏的循环按自己声明的周期等，等待逐次翻倍、上限是该周期的 6 倍——这个倍数与停滞规则用的同一个。0 表示不重启：panic 与没有这个机制时一样致命。超预算的循环留死不再重启（进程不因此退出，退出会变成崩溃循环并把同进程其它循环一起拖垮），由 cogneva_loop_deaths_total 与停滞规则上报；每次重跑记在 cogneva_loop_restarts_total 上，规则 background_loop_restarted 会告警，所以「重启过了」不等于「没事了」。这两项是进程属性而不是某个循环的属性，启动时安装一次、对所有循环生效。",
-        "stale_task_detector_poll_secs": 15,
         "tool_timeout_secs": 30,
         "shell_timeout_secs": 600,
         "sandbox_executor_url": "http://cogneva-sandbox-executor:9090",

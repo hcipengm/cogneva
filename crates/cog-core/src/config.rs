@@ -840,8 +840,6 @@ pub struct SystemConfig {
     /// have no period and take this floor. The wait doubles per attempt and
     /// is capped at six times this value.
     pub loop_restart_backoff_floor_secs: u64,
-    /// Stale-task detector poll interval (seconds).
-    pub stale_task_detector_poll_secs: u64,
     /// Interval between monthly-partition maintenance rounds (seconds).
     pub partition_maintenance_interval_secs: u64,
     /// WASM tool execution timeout (seconds).
@@ -915,7 +913,6 @@ impl Default for SystemConfig {
             timeout_checker_interval_secs: 30,
             loop_restart_max_consecutive: 3,
             loop_restart_backoff_floor_secs: 5,
-            stale_task_detector_poll_secs: 15,
             partition_maintenance_interval_secs: 3600,
             tool_timeout_secs: 30,
             shell_timeout_secs: 600,

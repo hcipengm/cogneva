@@ -5,7 +5,6 @@
     "task_event_channel_capacity": 256,
     "shutdown_timeout_ms": 30000,
     "timeout_checker_interval_secs": 30,
-    "stale_task_detector_poll_secs": 15,
     "tool_timeout_secs": 30,
     "shell_timeout_secs": 600,
     "skill_hot_reload_interval_secs": 30,

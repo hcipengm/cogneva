@@ -11,8 +11,7 @@ pub use dag_executor::task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTas
 pub use dag_executor::{
     BackoffStrategy, CheckpointAgents, CheckpointRound, CircuitBreakerConfig,
     CircuitBreakerRegistry, DagExecutor, DagExecutorConfig, DagExecutorRuntime,
-    LiveCheckpointAgents, RetryConfig, RetryMatrix, StaleTaskDetector, TaskTransferCoordinator,
-    TaskTransferEvent, TransferReason, TASK_TRANSFER_STREAM,
+    LiveCheckpointAgents, RetryConfig, RetryMatrix,
 };
 pub use observable::OrchestratorObservable;
 pub use orchestrator_control_impl::OrchestratorControlImpl;
