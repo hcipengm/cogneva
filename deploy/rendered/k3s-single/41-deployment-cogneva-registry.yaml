@@ -27,6 +27,37 @@ spec:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: cluster-registry
     spec:
+      initContainers:
+        # 回收。`garbage-collect -m` 删的是"没有任何 tag 指向的 manifest 及其独占层"，
+        # 而这种东西正随每次收敛累积：浮动 `:local` 每次前移都留下一个孤儿 manifest，
+        # 被中断的构建也会。2026-09-27 实测（dry-run）：416 个 blob 里 150 个、50 个
+        # manifest 可删，合计 3.7 GiB —— 占这张卷的一半；不带 -m 时是 0，孤儿全挂在
+        # 无 tag 的 manifest 上。
+        #
+        # 放在 initContainer 而不是定时任务，是因为它**天生无竞态**：唯一接受上传的
+        # 进程就是同 Pod 的 registry，init 阶段它还没起来，标记-清扫不可能删到一个正在
+        # 上传、尚未被任何 manifest 引用的 blob（定时任务在 registry 运行时跑就有这个
+        # 窗口）。代价是它只在 Pod 启动时跑一次，所以它回收的是"上次启动以来"的孤儿；
+        # 定时触发是另一件事（见任务树 C31），不该用定时任务直接跑 GC 换来这个窗口。
+        - name: registry-gc
+          image: registry:2
+          imagePullPolicy: IfNotPresent
+          command:
+            - registry
+            - garbage-collect
+            - -m
+            - /etc/docker/registry/config.yml
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 20m
+              memory: 32Mi
+          volumeMounts:
+            # 与 registry 容器同一份挂载（GC 要删），根目录一处声明。
+            - name: data
+              mountPath: /var/lib/registry
       containers:
         - name: registry
           image: registry:2
