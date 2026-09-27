@@ -571,6 +571,24 @@ mod tests {
         )
     }
 
+    /// The same 200 the registry sends for a body it streams: hex chunk-size lines,
+    /// no Content-Length. `step` splits the body so a walk cannot be right by
+    /// accident on a single chunk.
+    fn http_200_chunked(body: &str, step: usize) -> String {
+        let mut out = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        for piece in body.as_bytes().chunks(step.max(1)) {
+            out.push_str(&format!(
+                "{:x}\r\n{}\r\n",
+                piece.len(),
+                std::str::from_utf8(piece).unwrap()
+            ));
+        }
+        out.push_str("0\r\n\r\n");
+        out
+    }
+
     fn layer(digest: &str, size: u64) -> String {
         format!(
             r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{digest}","size":{size}}}"#
@@ -612,6 +630,40 @@ mod tests {
         let footprint = RegistryFootprint::new(endpoint, "cogneva-registry-pvc");
         assert_eq!(footprint.measure().await.unwrap(), 5_800);
         assert_eq!(footprint.value(), Some(5_800));
+        assert_eq!(footprint.tags(), Some(2));
+    }
+
+    /// The store serves this list with `Transfer-Encoding: chunked` once it grows
+    /// past the server's write buffer, which is a property of the server and not of
+    /// the walk: the same reading has to come out either way. 2026-09-27 the tag
+    /// list crossed it (2043 bytes with Content-Length at 102 tags, 2063 bytes
+    /// chunked at 103) and every walk failed from then on, so this is the shape the
+    /// walk meets on a real store rather than an exotic one.
+    #[tokio::test]
+    async fn a_chunked_tag_list_reads_like_a_buffered_one() {
+        let shared = layer("sha256:base", 5_000);
+        let (endpoint, _handle) = stub_registry(routes(vec![
+            (
+                tags_path(),
+                http_200_chunked(&tags_body(&["local", "main-a"]), 7),
+            ),
+            (
+                tag_manifest_path("local"),
+                http_200(&manifest(std::slice::from_ref(&shared))),
+            ),
+            (
+                tag_manifest_path("main-a"),
+                http_200(&manifest(std::slice::from_ref(&shared))),
+            ),
+        ]))
+        .await;
+
+        // 5_000 shared layer + 100 config blob, counted once for both tags; the
+        // buffered sibling below asserts the same shape, so the framing is the
+        // only thing this test varies.
+        let footprint = RegistryFootprint::new(endpoint, "cogneva-registry-pvc");
+        assert_eq!(footprint.measure().await.unwrap(), 5_100);
+        assert_eq!(footprint.value(), Some(5_100));
         assert_eq!(footprint.tags(), Some(2));
     }
 

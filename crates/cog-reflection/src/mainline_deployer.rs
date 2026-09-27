@@ -225,8 +225,14 @@ fn created_of_config_blob(blob: &serde_json::Value) -> Option<i64> {
         .map(|t| t.timestamp())
 }
 
-/// 从裸 HTTP 响应里切出状态码与 body（按 `Content-Length` 截断；缺失则取
-/// 剩余全部）。registry 的 JSON 响应永远带 Content-Length。
+/// 从裸 HTTP 响应里切出状态码与 body：`Transfer-Encoding: chunked` 按分块解码，
+/// 否则按 `Content-Length` 截断（缺失则取剩余全部）。
+///
+/// **不能只认 `Content-Length`**：Go 的 HTTP 服务端在响应体超过自己的 2 KiB 写缓冲
+/// 时改用分块，而 registry 是 Go 写的——tag 列表长过那条线那天，body 前面多出的
+/// `<十六进制长度>\r\n` 就成了 JSON 的开头（2026-09-27 实测：102 个 tag 的响应
+/// 2043 字节还带 Content-Length，103 个 tag 的 2063 字节已经分块，读侧从那一刻起
+/// 每次 walk 都失败）。
 pub(crate) fn parse_http_response(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
     let (status, _, body) = parse_http_response_parts(raw)?;
     Some((status, body))
@@ -252,12 +258,54 @@ pub(crate) fn parse_http_response_parts(raw: &[u8]) -> Option<HttpResponseParts>
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.parse::<usize>().ok());
+    let chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding")
+            && v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+    });
     let body = &raw[split + 4..];
-    let body = match len {
-        Some(n) if n <= body.len() => &body[..n],
-        _ => body,
+    // 分块优先：两者同时出现是 RFC 不允许的组合，而长度域在那种响应里本来就不该
+    // 被信——信了它就是在 body 中间截一刀。
+    let body = if chunked {
+        decode_chunked(body)?
+    } else {
+        match len {
+            Some(n) if n <= body.len() => body[..n].to_vec(),
+            _ => body.to_vec(),
+        }
     };
-    Some((status, headers, body.to_vec()))
+    Some((status, headers, body))
+}
+
+/// 分块传输的解码（RFC 7230 §4.1）：`<十六进制长度>[;扩展]\r\n<数据>\r\n`，长度 0
+/// 的块结束整个 body，其后的 trailer 不属于 body。
+///
+/// 任何不符合的地方都返 `None`，不"尽量拼一点"：残缺的 body 与空 body 折成一个，
+/// 就是按引用字节判「这个卷满没满」的那条读数少算——隐藏满盘的那个方向。
+fn decode_chunked(body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    loop {
+        let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&rest[..line_end])
+                .ok()?
+                .split(';')
+                .next()?
+                .trim(),
+            16,
+        )
+        .ok()?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return Some(out);
+        }
+        if rest.len() < size + 2 || &rest[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
+    }
 }
 
 /// registry API 里本仓库的路径前缀。仓库名只此一处：tag 写入、tag 读取、容量
@@ -7943,6 +7991,44 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let (status, body) = parse_http_response(raw).unwrap();
         assert_eq!(status, 404);
         assert_eq!(body, b"nope");
+    }
+
+    #[test]
+    fn chunked_response_body_is_decoded() {
+        // 两个块 + 结束块 + trailer：body 是数据的拼接，长度行与 trailer 都不进 body。
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    5\r\n{\"a\":\r\n8\r\n\"hello\"}\r\n0\r\nX-Trailer: 1\r\n\r\n";
+        let (status, body) = parse_http_response(raw).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, br#"{"a":"hello"}"#);
+
+        // 块扩展属于块头；大小写与逗号分隔的 TE 列表都算分块。
+        let raw = b"HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, chunked\r\n\r\n1;foo=bar\r\nx\r\n0\r\n\r\n";
+        let (_, body) = parse_http_response(raw).unwrap();
+        assert_eq!(body, b"x");
+    }
+
+    #[test]
+    fn malformed_chunked_body_is_not_a_reading() {
+        // 块头声称 16 字节、实际只有 4：残缺的 body 会让引用字节少算，所以这里
+        // 是 `None` 而不是那个残缺的 body。
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabcd";
+        assert!(parse_http_response(raw).is_none());
+        // 块数据后面没有 CRLF：分块边界不可信，整条不读。
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd";
+        assert!(parse_http_response(raw).is_none());
+        // 没有结束块。
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n";
+        assert!(parse_http_response(raw).is_none());
+    }
+
+    #[test]
+    fn chunked_wins_over_a_content_length_that_contradicts_it() {
+        // 两个头同时出现（RFC 不该有的组合）：按 TE 解码；信 Content-Length
+        // 会在这里把 body 截成 3 个字节。
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let (_, body) = parse_http_response(raw).unwrap();
+        assert_eq!(body, b"hello");
     }
 
     #[test]
