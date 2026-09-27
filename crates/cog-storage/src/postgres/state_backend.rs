@@ -9,6 +9,22 @@ use cog_core::{
     UpstreamFailure,
 };
 
+/// The read of one task's event sequence from a position onward.
+///
+/// Named as a constant because the statement is the thing that has to hold for
+/// the read to be a page rather than a sort of the task's whole history: the
+/// `(task_id, offset_num)` index `init_schema` creates answers both conditions
+/// and already delivers the rows in the order asked for, so the database does
+/// no sort. A statement written inline is one nobody measures; this one is
+/// explained by a test.
+pub const EVENTS_PAGE_SQL: &str = r#"
+    SELECT event_type, payload, offset_num, created_at
+    FROM cog_events
+    WHERE task_id = $1 AND offset_num >= $2
+    ORDER BY offset_num ASC
+    LIMIT $3
+"#;
+
 /// PostgreSQL-backed state backend.
 pub struct PostgresStateBackend {
     pool: PgPool,
@@ -95,6 +111,34 @@ impl PostgresStateBackend {
         sqlx::query(
             r#"
             CREATE INDEX IF NOT EXISTS idx_cog_events_task_id ON cog_events(task_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        // The offset is the backend's own assignment -- the sequence position a
+        // reader resumes from -- so two events of one task may not share one.
+        // Uniqueness has to be a property of the table rather than of nobody
+        // appending at the same time: a task's owner is reclaimed on a lease,
+        // which presumes the previous holder stopped rather than stopping it,
+        // and the two writers only meet here. The sibling Redis backend gets
+        // this for free (the offset is what its append returns), so without the
+        // constraint Postgres alone can hand two readers the same position, and
+        // a reader that resumes from a position would miss the second event for
+        // good.
+        //
+        // The same index answers the page read: `task_id` and `offset_num` in
+        // one btree, in the order `EVENTS_PAGE_SQL` asks for, so the read is an
+        // index scan instead of a filter-then-sort. It leaves
+        // `idx_cog_events_task_id` redundant (it is this index's prefix); it is
+        // kept because removing it buys nothing measurable at one event per
+        // iteration, and a second change of purpose here would want its own
+        // reading.
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cog_events_task_offset
+                ON cog_events(task_id, offset_num)
             "#,
         )
         .execute(&self.pool)
@@ -365,53 +409,59 @@ impl StateBackend for PostgresStateBackend {
         let payload = serde_json::to_value(event)?;
         let event_type = event.event_type.clone();
 
-        let count: (i64,) = self
+        // The next position is one past the last the task holds, and a task's
+        // writers take turns reading it: `MAX` reads a snapshot that a
+        // concurrent writer's uncommitted row is not part of, so two writers
+        // would compute one position for two events -- and the sequence's
+        // constraint would refuse the second, dropping the event. Retrying is
+        // not a substitute: the appends keep pace with each other, and what
+        // comes out is an append that failed rather than an event that landed.
+        // The lock is per task (its key is the task id, so appends to different
+        // tasks do not queue) and is released by the transaction that took it.
+        //
+        // The position is read back from the inserted row rather than echoed
+        // from what was computed: the number a caller stores as its resume
+        // point has to be the one the sequence holds.
+        let offset: i64 = self
             .retry(|| async {
-                sqlx::query_as("SELECT COUNT(*) FROM cog_events WHERE task_id = $1")
+                let mut tx = self.pool.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
                     .bind(task_id)
-                    .fetch_one(&self.pool)
-                    .await
+                    .execute(&mut *tx)
+                    .await?;
+
+                let offset: i64 = sqlx::query_scalar(
+                    r#"
+                    INSERT INTO cog_events (task_id, event_type, payload, offset_num, created_at)
+                    SELECT $1, $2, $3, COALESCE(MAX(offset_num), 0) + 1, NOW()
+                    FROM cog_events
+                    WHERE task_id = $1
+                    RETURNING offset_num
+                    "#,
+                )
+                .bind(task_id)
+                .bind(event_type.clone())
+                .bind(payload.clone())
+                .fetch_one(&mut *tx)
+                .await?;
+
+                tx.commit().await?;
+                Ok(offset)
             })
             .await?;
 
-        let offset_num = count.0 + 1;
-
-        self.retry(|| async {
-            sqlx::query(
-                r#"
-                INSERT INTO cog_events (task_id, event_type, payload, offset_num, created_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                "#,
-            )
-            .bind(task_id)
-            .bind(event_type.clone())
-            .bind(payload.clone())
-            .bind(offset_num)
-            .execute(&self.pool)
-            .await
-        })
-        .await?;
-
-        Ok(offset_num as u64)
+        Ok(offset as u64)
     }
 
     async fn get_events(&self, task_id: &str, offset: u64, limit: usize) -> SFResult<Vec<Event>> {
         let rows: Vec<(String, serde_json::Value, i64, chrono::DateTime<Utc>)> = self
             .retry(|| async {
-                sqlx::query_as(
-                    r#"
-                    SELECT event_type, payload, offset_num, created_at
-                    FROM cog_events
-                    WHERE task_id = $1 AND offset_num >= $2
-                    ORDER BY offset_num ASC
-                    LIMIT $3
-                    "#,
-                )
-                .bind(task_id)
-                .bind(offset as i64)
-                .bind(limit as i64)
-                .fetch_all(&self.pool)
-                .await
+                sqlx::query_as(EVENTS_PAGE_SQL)
+                    .bind(task_id)
+                    .bind(offset as i64)
+                    .bind(limit as i64)
+                    .fetch_all(&self.pool)
+                    .await
             })
             .await?;
 

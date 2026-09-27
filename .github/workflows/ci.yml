@@ -110,6 +110,16 @@ jobs:
         run: cargo test -p cog-storage --test metrics_latest_reading -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # A task's event offsets are the backend's to assign, and Postgres derives
+      # them from a count two writers can read before either has inserted --
+      # while a reclaimed lease presumes the previous holder stopped rather than
+      # stopping it. Whether the table refuses a position it already gave out,
+      # and whether a page follows the position or the task's whole history, are
+      # both questions only a server answers.
+      - name: Live-DB event offset sequence
+        run: cargo test -p cog-storage --test events_offset_sequence -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - name: Live-DB retires a metrics name
         run: cargo test -p cog-storage --test metrics_retirement -- --ignored
         env:

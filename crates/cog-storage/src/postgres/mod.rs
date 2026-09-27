@@ -13,5 +13,5 @@ pub use metrics_backend::{PostgresMetricsBackend, GAUGE_LATEST_SQL};
 pub use observability_gateway::PostgresObservabilityGateway;
 pub use raw_log_index_store::PostgresRawLogIndexStore;
 pub use snapshot_store::PostgresSnapshotStore;
-pub use state_backend::PostgresStateBackend;
+pub use state_backend::{PostgresStateBackend, EVENTS_PAGE_SQL};
 pub use user_store::PostgresUserStore;
