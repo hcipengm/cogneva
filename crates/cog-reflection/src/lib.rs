@@ -157,6 +157,14 @@ pub fn refusal_pattern_key(
     format!("change:refused:{}:{}", cause.as_str(), named_files(files))
 }
 
+/// How much of a refusal's evidence a learning can carry.
+///
+/// The record is read by a generator, not by a person, so this is a token
+/// budget rather than a storage limit: whatever is dropped here is a thing the
+/// next attempt cannot know. The spend is what matters, not the size — see
+/// `failure_digest`, which puts the diagnosis inside it.
+const REFUSAL_DETAIL_BUDGET: usize = 2000;
+
 /// The files a refusal names, spelled the one way the key and the record both
 /// use them: sorted, deduplicated, comma-joined, empty when the refusal never
 /// got as far as naming one.
@@ -870,11 +878,11 @@ impl ReflectionEngine {
         files: &[std::path::PathBuf],
         detail: &str,
     ) -> cog_core::SFResult<()> {
-        let truncated = if detail.len() > 2000 {
-            &detail[..2000]
-        } else {
-            detail
-        };
+        // Spend the budget on the diagnosis rather than on the head of the
+        // transcript: a `--workspace` run puts its failing tests hundreds of
+        // lines in, so a head-truncated dump hands generation the passing tests
+        // and withholds the symptom. See `failure_digest`.
+        let digest = cog_core::contract::reflection::failure_digest(detail, REFUSAL_DETAIL_BUDGET);
         let mut learning = cog_core::Learning::new(
             cog_core::LearningCategory::Correction,
             cog_core::Priority::High,
@@ -887,7 +895,7 @@ impl ReflectionEngine {
             format!(
                 "Refused on: {}\nEvidence: {}",
                 refusal_subject(cause, files),
-                truncated
+                digest
             ),
             format!(
                 "Read what the {} check reported before generating for this again",

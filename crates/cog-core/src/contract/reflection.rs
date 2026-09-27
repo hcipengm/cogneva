@@ -1622,6 +1622,86 @@ fn without_metadata_hash(stem: &str) -> String {
     }
 }
 
+/// What a failing run actually reported, in the budget a record can afford.
+///
+/// A `cargo test --workspace` transcript is a few hundred kilobytes and the
+/// diagnosis is at the far end of it: measured on the cluster's own refusals,
+/// the first `FAILED` line sat at line 923 of 4568 while the head of the file
+/// was 464 lines of `... ok`. Truncating such a dump to its first 2000 bytes
+/// therefore keeps the noise and discards the symptom, and the learning that
+/// reaches generation says "read what the test check reported" beside a report
+/// with nothing in it. The same defect is then generated again, because nothing
+/// in the second attempt knows anything the first did not.
+///
+/// So the failing test names lead, the panic sites follow, and the raw output
+/// fills whatever budget is left -- from its tail, which is where cargo prints
+/// the per-test failure detail and the `failures:` summary.
+///
+/// A dump with no failing test named gets its head instead. That case is a
+/// formatter diff or a compile error, and both are identified by their opening
+/// lines (`Diff in ...`, the first error block) rather than by their end.
+///
+/// The budget counts characters, not bytes: a byte slice of a transcript panics
+/// when it lands inside a multi-byte character, and test names are not required
+/// to be ASCII.
+pub fn failure_digest(output: &str, budget: usize) -> String {
+    let failing = failing_tests(output);
+    if failing.is_empty() {
+        return take_head(output, budget);
+    }
+
+    let mut digest = String::from("Failing tests:\n");
+    for test in &failing {
+        digest.push_str("  ");
+        digest.push_str(test);
+        digest.push('\n');
+    }
+
+    let panics: Vec<&str> = output
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| line.contains("panicked at "))
+        .take(PANIC_LINES)
+        .collect();
+    if !panics.is_empty() {
+        digest.push_str("Panics:\n");
+        for line in panics {
+            digest.push_str("  ");
+            digest.push_str(line);
+            digest.push('\n');
+        }
+    }
+
+    let spent = digest.chars().count();
+    if spent >= budget {
+        return take_head(&digest, budget);
+    }
+    // The separator is only worth its characters when the tail it introduces
+    // survives the budget; an empty tail would leave a dangling heading.
+    let tail = take_tail(output, budget - spent - 1);
+    if !tail.is_empty() {
+        digest.push('\n');
+        digest.push_str(&tail);
+    }
+    digest
+}
+
+/// How many panic sites a digest names. A run can panic in every test it has;
+/// the first few name the places to look, and the rest is repetition that would
+/// spend the budget the failing-test list needs.
+const PANIC_LINES: usize = 8;
+
+/// At most `budget` characters from the front.
+fn take_head(text: &str, budget: usize) -> String {
+    text.chars().take(budget).collect()
+}
+
+/// At most `budget` characters from the back.
+fn take_tail(text: &str, budget: usize) -> String {
+    let total = text.chars().count();
+    text.chars().skip(total.saturating_sub(budget)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2310,6 +2390,70 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored\n";
                       error[E0308]: mismatched types\n\
                       error: could not compile `cog-auth` (lib) due to 1 previous error\n";
         assert!(failing_tests(output).is_empty());
+    }
+
+    /// The reading that set the budget: on the cluster's own refusals the first
+    /// `FAILED` line sat at line 923 of 4568, so a 2000-character window taken
+    /// from the front held 464 lines of `... ok` and stopped short of the one
+    /// line that said what broke.
+    #[test]
+    fn the_diagnosis_survives_a_transcript_that_buries_it() {
+        let mut output = String::from(
+            "     Running unittests src/lib.rs (target/debug/deps/cog_extension-3f2a1b4c5d6e7f80)\n\
+             \n\
+             running 1000 tests\n",
+        );
+        for case in 0..900 {
+            output.push_str(&format!("test hostdocs::tests::case_{case} ... ok\n"));
+        }
+        output.push_str(
+            "test hostdocs::tests::every_published_read_outcome_is_reachable ... FAILED\n\
+             \n\
+             ---- hostdocs::tests::every_published_read_outcome_is_reachable stdout ----\n\
+             thread 'main' panicked at crates/cog-extension/src/hostdocs.rs:3271:14:\n\
+             a 0o000 directory should not be listable\n",
+        );
+
+        let digest = failure_digest(&output, 2000);
+        assert!(
+            digest.chars().count() <= 2000,
+            "the budget is a budget, not a suggestion"
+        );
+        assert!(
+            digest.contains(
+                "cog_extension/hostdocs::tests::every_published_read_outcome_is_reachable"
+            ),
+            "the digest has to name the test the run failed; got:\n{digest}"
+        );
+        assert!(
+            digest.contains("hostdocs.rs:3271"),
+            "the panic site is the other half of the diagnosis; got:\n{digest}"
+        );
+        assert!(
+            !digest.starts_with("test hostdocs::tests::case_"),
+            "the passing tests are what the budget was being spent on"
+        );
+    }
+
+    /// A refusal that names no failing test is a formatter diff or a compile
+    /// error, and both say what they are in their opening lines. Taking the tail
+    /// of one would drop the `Diff in <file>:<line>:` header that locates it.
+    #[test]
+    fn a_refusal_with_no_failing_test_keeps_its_head() {
+        let output = "Change is not what this workspace's formatter produces:\n\
+                      Diff in crates/cog-gateway/src/chat.rs:156:\n\
+                      -    if !claims.permissions.contains(&cog_core::Permission::AgentWrite) {\n";
+        assert_eq!(failure_digest(output, 2000), output);
+    }
+
+    /// The budget used to be spent as a byte slice, which panics when the cut
+    /// lands inside a multi-byte character. A panic here would take down the
+    /// recorder whose whole job is to keep the refusal.
+    #[test]
+    fn a_budget_that_lands_inside_a_character_does_not_panic() {
+        let output = "test a::b ... FAILED\né".repeat(200);
+        let digest = failure_digest(&output, 17);
+        assert!(digest.chars().count() <= 17, "got {digest:?}");
     }
 
     /// Only a trailing run of sixteen hex digits is the metadata hash. Anything
