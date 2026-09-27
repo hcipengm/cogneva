@@ -1,0 +1,244 @@
+//! Every job CI treats as gating has an answer in the pre-land verification.
+//!
+//! The verification stage runs before a change is committed, and its whole
+//! purpose is to be the last place a defective change can still be refused for
+//! free. It carries its own list of what to check — and that list is a
+//! transcription of *some* of what CI checks. Nothing makes the two move
+//! together, so each time CI grows a gating job the transcription falls one
+//! behind, and the gap is invisible from both ends: CI is green for everything
+//! that reaches it, and a change that fails only the new job passes verification
+//! and is committed.
+//!
+//! What it costs is not the refusal — it is that the refusal arrives after the
+//! change has been committed, built in release, and landed. On 2026-09-28 that
+//! happened with `clippy`: `cargo clippy --workspace -- -D warnings` reported
+//! `function start_failure_is_stale is never used`, which is rustc's own
+//! `dead_code` promoted by `-D warnings`. The verification stage compiles the
+//! same crate with the default lint level, where that is a warning, so the
+//! change passed, landed, and was reverted eleven minutes later.
+//!
+//! The same hole had already appeared as `fmt`, and it was closed the same way
+//! this test is trying not to be: by adding the one missing check to the
+//! verification stage. That fixes the instance and leaves the carrier, which is
+//! the transcription itself.
+//!
+//! So the contract is read from CI, not restated: `release-tag.needs` is the set
+//! of jobs the workflow itself declares as "all green before a release", so a
+//! new gating job changes that declaration first and this test goes red on the
+//! next run — unless someone comes here and answers for it, one line per job,
+//! with the reason it is or is not enforced before the commit.
+//!
+//! A job that is answered below but not actually enforced is a decision someone
+//! made and can be reviewed. A job that is missing is a decision nobody made.
+//! Those are different failures, and only the second one is silent.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+/// The workflow whose `release-tag` job declares the gating set.
+const WORKFLOW: &str = ".github/workflows/ci.yml";
+
+/// The job whose `needs` is the declaration. Named rather than searched for:
+/// a passing test has to read the list it claims to judge, and finding it by
+/// pattern would let a renamed job turn this into a test that judges nothing.
+const DECLARING_JOB: &str = "release-tag";
+
+/// Gating jobs the verification stage enforces before the change is committed,
+/// each with the CI command it answers.
+///
+/// The command is spelled out so that the entry is checkable against the
+/// workflow: an entry here whose command no longer appears in the job of the
+/// same name fails the test below, rather than quietly licensing a check that
+/// was renamed out of existence.
+const ENFORCED: &[(&str, &str)] = &[
+    // The formatter runs on the tree before the verdict is reached, and a tree
+    // the formatter can settle is conformed rather than refused.
+    ("fmt", "cargo fmt --all -- --check"),
+    // The main suite, with `--no-fail-fast` so the refusal names every failure
+    // rather than the first crate to give up. This is also the compile pass the
+    // change is judged on, which is why adding a lint to it costs nothing.
+    ("test", "cargo test --workspace --no-fail-fast"),
+];
+
+/// Gating jobs the verification stage does not enforce, and why.
+///
+/// Every entry here is a change that passed verification and could still be
+/// reverted after the release build. They are listed rather than omitted so
+/// that the list reads as a decision, and so that closing one is a one-line
+/// edit rather than an archaeology.
+const NOT_ENFORCED: &[(&str, &str)] = &[
+    (
+        "check",
+        "cargo check --workspace is a strictly narrower criterion than the \
+         `test` job's compile, which the stage already runs: anything check \
+         rejects, the test compile rejects too, and it is the same compile.",
+    ),
+    (
+        "clippy",
+        "The observed failure of 2026-09-28. A whole-workspace clippy is a \
+         criterion about the tree, not about the change, so it cannot be added \
+         to the stage as it stands: on a tree that already carries a lint it \
+         would refuse every change, including the one that would clear it — the \
+         same trap the test baseline was added to remove. It belongs here once \
+         the stage can read the tree's own lint set per revision and refuse \
+         only on lints the change introduces.",
+    ),
+    (
+        "coverage",
+        "cargo llvm-cov --fail-under-lines 40 judges the whole workspace's \
+         line coverage, not the change's, and needs its own instrumented \
+         rebuild. Same shape as clippy: a tree-level criterion that would need \
+         a baseline before it could judge a change.",
+    ),
+    (
+        "entry-scripts",
+        "shellcheck over every tracked *.sh, the deploy script tests, and the \
+         PowerShell bootstrap's syntax. Deterministic, and reachable from the \
+         stage — but it is a different toolchain on a different surface, so it \
+         is not covered by any compile the stage already runs. A change that \
+         touches a script passes verification and dies here.",
+    ),
+    (
+        "deploy-parity",
+        "check-deploy-parity.sh, render-deploy.sh --check and the git identity \
+         wiring check all read deploy/ and the chart. Reachable from the stage \
+         for the same cost as any other shell step, and nothing in the Cargo \
+         workspace covers it. A change that touches deploy/ passes verification \
+         and dies here.",
+    ),
+    (
+        "bootstrap-cross-platform",
+        "cargo check -p cogneva-bootstrap. Narrower than the `test` job's \
+         compile of the same crate, on the same host toolchain — the cross \
+         platform part is the runner, not the criterion.",
+    ),
+    (
+        "version-contract",
+        "Runs the version_contract example against the repository's own git \
+         history and tags. It judges the tag and the workspace version, neither \
+         of which a change can move by being applied — a change that trips it \
+         is one that edited the version declaration, and that is what the \
+         example is for.",
+    ),
+];
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// The job names `DECLARING_JOB` needs, read from the workflow.
+///
+/// Returns them unparsed-but-checked: callers assert on the set, and the
+/// function itself refuses to return an empty one, because an empty set would
+/// make every assertion below pass for the wrong reason.
+fn gating_jobs(workflow: &str) -> BTreeSet<String> {
+    let body = workflow
+        .split_once(&format!("  {DECLARING_JOB}:"))
+        .unwrap_or_else(|| panic!("{WORKFLOW} has no `{DECLARING_JOB}` job; it is the declaration this contract reads"))
+        .1;
+
+    let mut lines = body.lines().skip_while(|l| l.trim() != "needs:");
+    assert!(
+        lines.next().is_some(),
+        "the `{DECLARING_JOB}` job declares no `needs:` list; with nothing to read, \
+         this test would judge an empty set and pass while covering nothing"
+    );
+
+    let jobs: BTreeSet<String> = lines
+        .take_while(|l| l.trim_start().starts_with("- "))
+        .map(|l| l.trim().trim_start_matches("- ").to_string())
+        .collect();
+
+    assert!(
+        jobs.len() > 1,
+        "read {} gating job(s) from `{DECLARING_JOB}.needs`, which cannot be the \
+         whole declaration; a parse that silently under-reads turns this contract \
+         into a test that judges nothing",
+        jobs.len()
+    );
+    jobs
+}
+
+/// The workflow, or a failure naming why it could not be read.
+///
+/// Missing the file is not a pass: a contract that reads nothing agrees with
+/// everything.
+fn workflow() -> String {
+    let path = workspace_root().join(WORKFLOW);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
+}
+
+#[test]
+fn every_gating_job_is_answered_before_the_commit() {
+    let workflow = workflow();
+    let declared = gating_jobs(&workflow);
+
+    let enforced: BTreeSet<&str> = ENFORCED.iter().map(|(job, _)| *job).collect();
+    let not_enforced: BTreeSet<&str> = NOT_ENFORCED.iter().map(|(job, _)| *job).collect();
+
+    let unanswered: Vec<&str> = declared
+        .iter()
+        .map(String::as_str)
+        .filter(|job| !enforced.contains(job) && !not_enforced.contains(job))
+        .collect();
+    assert!(
+        unanswered.is_empty(),
+        "CI gates on {unanswered:?}, and the pre-land verification stage has no \
+         answer for them. A change that fails only these passes verification, is \
+         committed, built in release, and lands — the refusal arrives after the \
+         work it was supposed to save. Add each to ENFORCED or to NOT_ENFORCED \
+         with the reason: an unanswered job is a decision nobody made, which is \
+         the only failure mode here that is silent."
+    );
+
+    for job in declared.iter().map(String::as_str) {
+        if let Some((_, reason)) = ENFORCED.iter().find(|(j, _)| *j == job) {
+            assert!(
+                !reason.trim().is_empty(),
+                "`{job}` is listed as enforced in {WORKFLOW} but its entry names \
+                 no command; an entry with nothing to check cannot be checked"
+            );
+        } else if let Some((_, reason)) = NOT_ENFORCED.iter().find(|(j, _)| *j == job) {
+            assert!(
+                !reason.trim().is_empty(),
+                "`{job}` is listed as not enforced but carries no reason. \"Not \
+                 enforced\" with no reason is indistinguishable from \"forgotten\"."
+            );
+        }
+    }
+}
+
+/// A job name that appears in both tables means the two lists disagree about
+/// it, and whichever one the reader consults first decides the answer.
+#[test]
+fn no_gating_job_is_answered_twice() {
+    let enforced: BTreeSet<&str> = ENFORCED.iter().map(|(job, _)| *job).collect();
+    let not_enforced: BTreeSet<&str> = NOT_ENFORCED.iter().map(|(job, _)| *job).collect();
+    let both: Vec<&&str> = enforced.intersection(&not_enforced).collect();
+    assert!(
+        both.is_empty(),
+        "{both:?} appear in both ENFORCED and NOT_ENFORCED; the two tables have \
+         to agree about what the verification stage does"
+    );
+}
+
+/// The job a table entry names has to exist in the workflow at all — otherwise
+/// a renamed CI job leaves a stale answer behind that the parity test above
+/// would happily keep counting as coverage.
+#[test]
+fn no_answer_names_a_job_that_no_longer_gates() {
+    let workflow = workflow();
+    let declared = gating_jobs(&workflow);
+    let stale: Vec<&str> = ENFORCED
+        .iter()
+        .chain(NOT_ENFORCED.iter())
+        .map(|(job, _)| *job)
+        .filter(|job| !declared.contains(*job))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "{stale:?} are answered here but no longer gate anything in {WORKFLOW}. \
+         A renamed or dropped job leaves the old answer looking like coverage."
+    );
+}
