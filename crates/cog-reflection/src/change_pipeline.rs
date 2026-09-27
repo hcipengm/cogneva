@@ -8,6 +8,7 @@
 //!   and roll back on failure.
 //! - Report results by updating the evolution status.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -136,7 +137,42 @@ pub struct ApplyResult {
     /// is a fact about the producer, and text meant to be read by a person is
     /// not a reading a counter can be derived from.
     pub reformatted: bool,
+    /// How many tests this revision was already failing when the change was let
+    /// through despite a failing run.
+    ///
+    /// Zero for every ordinary verdict, including a refused one: this counts
+    /// only the runs where the suite failed and none of the failures belonged
+    /// to the change. It is carried here for the same reason `reformatted` is —
+    /// it is the count of a thing that happened, and a count read out of the
+    /// failure text would be a number nobody could alert on. A run of changes
+    /// with this above zero is the reading that a mainline is red, which is
+    /// otherwise invisible: each change looks fine on its own.
+    pub pre_existing_failures: usize,
 }
+
+/// What a failing whole-suite run says about the change that was applied.
+///
+/// The distinction is the whole point of reading the tree's own baseline: a
+/// test that fails with and without the change says nothing about the change,
+/// and convicting the change of it costs a generation that was already paid
+/// for — and, on a tree that is red, convicts every change, including the one
+/// that would turn it green.
+#[derive(Debug)]
+enum FailureAttribution {
+    /// Every failing test fails on the untouched tree too.
+    PreExisting(Vec<String>),
+    /// These tests fail only once the change is applied.
+    Introduced(Vec<String>),
+    /// The run failed without naming a test — a build failure, or a harness
+    /// that died. There is nothing to compare against the baseline, and the
+    /// change is the only difference from it.
+    NotATestFailure,
+}
+
+/// Which tests a revision fails with no change applied, and the revision they
+/// were read at. Named because the pair travels through a lock and three
+/// methods, and spelling it out each time hides which part is the reading.
+type BaselineFailures = Option<(String, BTreeSet<String>)>;
 
 /// Pipeline that turns validated code changes into tested source changes.
 #[derive(Debug, Clone)]
@@ -163,6 +199,16 @@ pub struct ChangePipeline {
     /// service build their own — and an absent sink reports nothing rather than
     /// reporting a budget nobody enforced.
     budget: Option<Arc<crate::verification_budget::VerificationBudget>>,
+    /// Which tests fail on this workdir's revision with no change applied,
+    /// keyed by the revision they were read at.
+    ///
+    /// Telling "this change broke a test" from "this test was already broken"
+    /// takes a second run of the same suite on the untouched tree. That reading
+    /// is a property of the tree, not of any one change, so it is kept until
+    /// the revision moves: a tree that is already red costs one extra run, not
+    /// one per change. Losing it to a restart costs time and nothing else —
+    /// it is recomputed from the same tree.
+    baseline_failures: Arc<tokio::sync::Mutex<BaselineFailures>>,
 }
 
 impl ChangePipeline {
@@ -180,6 +226,7 @@ impl ChangePipeline {
             promotion_policy: None,
             target_dir: None,
             budget: None,
+            baseline_failures: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -386,6 +433,7 @@ impl ChangePipeline {
                     change_id: change.artifact_id.clone(),
                     files_changed: Vec::new(),
                     reformatted: false,
+                    pre_existing_failures: 0,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::MalformedDiff),
                     test_output: format!("Change is not a usable diff: {e}"),
                     new_status: EvolutionStatus::ValidationFailed,
@@ -414,6 +462,7 @@ impl ChangePipeline {
                     change_id: change.artifact_id.clone(),
                     files_changed,
                     reformatted: false,
+                    pre_existing_failures: 0,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::PromotionGateRefused),
                     test_output: format!("Promotion gate rejected: {reason}"),
                     new_status: EvolutionStatus::Rejected,
@@ -429,6 +478,7 @@ impl ChangePipeline {
                     change_id: change.artifact_id.clone(),
                     files_changed,
                     reformatted: false,
+                    pre_existing_failures: 0,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ForbiddenPath),
                     test_output: format!("Change touches a forbidden or missing path: {e}"),
                     new_status: EvolutionStatus::ValidationFailed,
@@ -449,6 +499,7 @@ impl ChangePipeline {
                 change_id: change.artifact_id.clone(),
                 files_changed,
                 reformatted: false,
+                pre_existing_failures: 0,
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::IntentMismatch),
                 test_output: format!("Change does not answer its goal: {reason}"),
                 new_status: EvolutionStatus::ValidationFailed,
@@ -462,6 +513,7 @@ impl ChangePipeline {
                 change_id: change.artifact_id.clone(),
                 files_changed,
                 reformatted: false,
+                pre_existing_failures: 0,
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ContextDoesNotApply),
                 test_output: format!("Change pre-check failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
@@ -473,6 +525,7 @@ impl ChangePipeline {
                 change_id: change.artifact_id.clone(),
                 files_changed,
                 reformatted: false,
+                pre_existing_failures: 0,
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ApplyFailed),
                 test_output: format!("Change application failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
@@ -494,6 +547,7 @@ impl ChangePipeline {
                     change_id: change.artifact_id.clone(),
                     files_changed,
                     reformatted: false,
+                    pre_existing_failures: 0,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::FormattingDiffers),
                     test_output: format!(
                         "The formatter could not make this tree what it produces:\n{output}"
@@ -508,6 +562,7 @@ impl ChangePipeline {
                     change_id: change.artifact_id.clone(),
                     files_changed,
                     reformatted: false,
+                    pre_existing_failures: 0,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
                     test_output: format!("Failed to execute cargo fmt: {}", e),
                     new_status: EvolutionStatus::ValidationFailed,
@@ -534,12 +589,70 @@ impl ChangePipeline {
                     change_id: change.artifact_id.clone(),
                     files_changed,
                     reformatted: false,
+                    pre_existing_failures: 0,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
                     test_output: format!("Failed to execute cargo test: {}", e),
                     new_status: EvolutionStatus::ValidationFailed,
                 });
             }
         };
+
+        // A whole-suite run also fails for reasons this revision was already
+        // carrying, and those are not the change's doing. Only read the tree's
+        // own baseline when the run failed with tests named, so a green tree
+        // never pays for it and the cost lands on the runs that need the
+        // distinction.
+        let mut test_passed = test_passed;
+        let mut test_output = test_output;
+        let mut pre_existing_failures = 0usize;
+        if !test_passed {
+            match self
+                .failures_beyond_baseline(workdir, &change.content, &test_output)
+                .await
+            {
+                Ok(FailureAttribution::PreExisting(already)) => {
+                    warn!(
+                        change_id = %change.artifact_id,
+                        count = already.len(),
+                        "Change adds no failure: this revision fails these with or without it"
+                    );
+                    pre_existing_failures = already.len();
+                    test_output = format!(
+                        "The change adds no failure: this revision fails these with or without it:\n  {}\n\n{test_output}",
+                        already.join("\n  ")
+                    );
+                    test_passed = true;
+                }
+                Ok(FailureAttribution::Introduced(introduced)) => {
+                    warn!(
+                        change_id = %change.artifact_id,
+                        count = introduced.len(),
+                        "Change fails tests this revision was passing before it was applied"
+                    );
+                    test_output = format!(
+                        "The change fails tests that this revision passed before it was applied:\n  {}\n\n{test_output}",
+                        introduced.join("\n  ")
+                    );
+                }
+                // Nothing to attribute: the change stays the only difference
+                // from the baseline, so the refusal stands as it did before.
+                Ok(FailureAttribution::NotATestFailure) => {}
+                Err(e) => {
+                    // The baseline run took the change off the tree and could
+                    // not put it back, so there is no tree left to judge and no
+                    // verdict to reach. An `Err` keeps the change for a later
+                    // attempt; a `Refused` would retire it over a failure to
+                    // read something that was not about the change at all.
+                    warn!(
+                        change_id = %change.artifact_id,
+                        error = %e,
+                        "Could not read the tests this revision fails on its own; reaching no verdict"
+                    );
+                    let _ = self.git_reset_hard(workdir).await;
+                    return Err(e);
+                }
+            }
+        }
 
         let new_status = if test_passed {
             if self.auto_apply {
@@ -569,6 +682,7 @@ impl ChangePipeline {
             test_output,
             new_status,
             reformatted,
+            pre_existing_failures,
         })
     }
 
@@ -1113,6 +1227,106 @@ impl ChangePipeline {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}{}", stdout, stderr);
         Ok((output.status.success(), combined))
+    }
+
+    /// Split a failing run's tests into the ones this revision was already
+    /// failing and the ones it was passing.
+    ///
+    /// Only the second group is evidence about the change. The first is
+    /// evidence about the tree, and it is what a red mainline looks like from
+    /// inside one change's verification: every change inherits the same
+    /// failures, so convicting on them retires every change and the chain
+    /// stops — including the change that would have repaired the tree.
+    async fn failures_beyond_baseline(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+        output: &str,
+    ) -> SFResult<FailureAttribution> {
+        let failing = cog_core::contract::reflection::failing_tests(output);
+        // A run can fail without naming a test — a compile error, a dead
+        // harness. There is no baseline that names tests to compare against,
+        // and the change is the only difference from the tree the baseline was
+        // read on, so it stays the change's to answer for.
+        if failing.is_empty() {
+            return Ok(FailureAttribution::NotATestFailure);
+        }
+        let baseline = self.baseline_failing_tests(workdir, change_content).await?;
+        let introduced: Vec<String> = failing.difference(&baseline).cloned().collect();
+        if introduced.is_empty() {
+            Ok(FailureAttribution::PreExisting(
+                failing.into_iter().collect(),
+            ))
+        } else {
+            Ok(FailureAttribution::Introduced(introduced))
+        }
+    }
+
+    /// The tests this workdir's revision fails with no change applied.
+    ///
+    /// Read on the same tree, at the same revision, with the change taken back
+    /// off — not from the base revision the change was generated against. The
+    /// question is what *this* tree does on its own, and the tree is what the
+    /// change is about to be committed onto.
+    ///
+    /// The change is put back exactly as this run found it, formatter and all:
+    /// the tree being judged is the conformed one, and re-applying the raw
+    /// content would silently undo the formatting this same run just applied
+    /// and commit a tree the format check rejects.
+    async fn baseline_failing_tests(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+    ) -> SFResult<BTreeSet<String>> {
+        let rev = self.workspace_rev(workdir).await?;
+        if let Some((cached_rev, tests)) = self.baseline_failures.lock().await.as_ref() {
+            if *cached_rev == rev {
+                return Ok(tests.clone());
+            }
+        }
+
+        self.git_reset_hard(workdir).await?;
+        let (_, baseline_output) = self.run_cargo_test(workdir).await?;
+
+        self.git_apply(workdir, change_content).await.map_err(|e| {
+            SFError::IO(format!(
+                "could not put the change back after reading the tree's own test failures: {e}"
+            ))
+        })?;
+        match self.run_cargo_fmt(workdir).await {
+            Ok((true, _, _)) => {}
+            Ok((false, _, output)) => {
+                return Err(SFError::IO(format!(
+                    "could not conform the change to the formatter after reading the tree's own test failures:\n{output}"
+                )));
+            }
+            Err(e) => {
+                return Err(SFError::IO(format!(
+                    "could not run the formatter after reading the tree's own test failures: {e}"
+                )));
+            }
+        }
+
+        let tests = cog_core::contract::reflection::failing_tests(&baseline_output);
+        info!(
+            rev = %rev,
+            count = tests.len(),
+            "Read the tests this revision fails before any change is applied"
+        );
+        *self.baseline_failures.lock().await = Some((rev, tests.clone()));
+        Ok(tests)
+    }
+
+    /// The revision of the workspace being verified.
+    async fn workspace_rev(&self, workdir: &Path) -> SFResult<String> {
+        self.git_try(workdir, &["rev-parse", "HEAD"])
+            .await
+            .ok_or_else(|| {
+                SFError::IO(format!(
+                    "could not read the revision of the workspace at {}",
+                    workdir.display()
+                ))
+            })
     }
 }
 
@@ -2086,9 +2300,14 @@ index 1111111..2222222 100644
         tokio::fs::create_dir_all(root.path().join("src"))
             .await
             .unwrap();
+        // The seed matches what the test asserts, so this tree is green before
+        // the change is applied. It has to be: the refusal this test is about
+        // is "the change broke a test", and that is only answerable against a
+        // tree that was passing it — a red seed would make the change's failure
+        // indistinguishable from the tree's own.
         tokio::fs::write(
             root.path().join("src/lib.rs"),
-            "pub fn answer() -> i32 {\n    41\n}\n\n#[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
+            "pub fn answer() -> i32 {\n    42\n}\n\n#[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
         )
         .await
         .unwrap();
@@ -2105,7 +2324,7 @@ index 1111111..2222222 100644
                       +++ b/src/lib.rs\n\
                       @@ -1,3 +1,3 @@\n\
                       \x20pub fn answer() -> i32 {\n\
-                      -    41\n\
+                      -    42\n\
                       +    40\n\
                       \x20}\n"
                 .into(),
@@ -2510,6 +2729,206 @@ index 1111111..2222222 100644
                 "CARGO_TARGET_DIR".to_string(),
                 "/var/cache/cogneva-target".to_string()
             )]
+        );
+    }
+
+    /// A crate with two tests that fail independently of each other, each
+    /// asserting a value its own function returns.
+    ///
+    /// The two functions are what makes the baseline readable: a test can be
+    /// made red or green by choosing a seed, without the change under test
+    /// having anything to do with it. One test could not tell "the tree was
+    /// already failing" from "the change broke the only test there is".
+    fn two_answer_probe_source(answer: i32, other: i32) -> String {
+        format!(
+            "pub fn answer() -> i32 {{\n    {answer}\n}}\n\n\
+             pub fn other() -> i32 {{\n    {other}\n}}\n\n\
+             #[test]\nfn answer_is_42() {{\n    assert_eq!(answer(), 42);\n}}\n\n\
+             #[test]\nfn other_is_7() {{\n    assert_eq!(other(), 7);\n}}\n"
+        )
+    }
+
+    /// A change that rewrites the single seed line under `context`.
+    ///
+    /// The hunk is located by the line above it rather than by a count, so a
+    /// test says which function it is moving and the two functions' bodies
+    /// (`41` and `7`, both one line) stay indistinguishable to the diff.
+    fn a_seed_moving(start: usize, context: &str, from: i32, to: i32) -> String {
+        format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n\
+             --- a/src/lib.rs\n\
+             +++ b/src/lib.rs\n\
+             @@ -{start},3 +{start},3 @@\n\
+             \x20{context}\n\
+             -    {from}\n\
+             +    {to}\n\
+             \x20}}\n"
+        )
+    }
+
+    fn a_change_moving_seeds(artifact_id: &str, content: String) -> EvolutionResult {
+        EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: artifact_id.into(),
+            description: "修正这个取值的计算".into(),
+            content,
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        }
+    }
+
+    /// A workspace whose tree is red or green before anything is applied,
+    /// decided by the seeds.
+    async fn two_answer_probe_workspace(
+        answer: i32,
+        other: i32,
+    ) -> (tempfile::TempDir, ChangePipeline) {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"answer-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join("src/lib.rs"),
+            two_answer_probe_source(answer, other),
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), true);
+        (root, pipeline)
+    }
+
+    /// The test names the verdict says it is convicting the change of, read
+    /// from the prefix the verdict writes and not from the suite's own output.
+    fn blamed_by_the_verdict(test_output: &str) -> String {
+        test_output
+            .split("\n\n")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A tree that is already red must not convict every change that passes
+    /// through it.
+    ///
+    /// A mainline can be red for reasons no change in the queue had anything to
+    /// do with — a merge, a dependency, a test that only fails on this
+    /// hardware. Reading the failure as the change's would retire every change
+    /// in the queue, and the change that repairs the tree is one of them: the
+    /// gate would be refusing the one change that tree most needs to accept.
+    /// So the run that fails is compared against the same tree without the
+    /// change, and only the difference is the change's to answer for.
+    #[tokio::test]
+    async fn a_change_is_not_refused_for_failures_the_tree_already_had() {
+        // `answer` is 41 while its test demands 42: the tree is red before
+        // anything is applied.
+        let (root, pipeline) = two_answer_probe_workspace(41, 7).await;
+        let change = a_change_moving_seeds(
+            "already-red-1",
+            a_seed_moving(1, "pub fn answer() -> i32 {", 41, 40),
+        );
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Passed,
+            "the change introduces no failure, so nothing about it was refused: {}",
+            result.test_output
+        );
+        assert_eq!(
+            result.pre_existing_failures, 1,
+            "the verdict has to say how many failures it did not blame on the change, \
+             or a red mainline is invisible: {}",
+            result.test_output
+        );
+        let blamed = blamed_by_the_verdict(&result.test_output);
+        assert!(
+            blamed.contains("answer_is_42"),
+            "the reading has to name the test it is not blaming the change for: {blamed}"
+        );
+    }
+
+    /// The other side of the same rule, and the reason it is a difference
+    /// rather than a count: a change that breaks a test the tree was passing is
+    /// still refused, and the refusal names that test.
+    #[tokio::test]
+    async fn a_change_is_refused_when_it_breaks_a_test_the_tree_was_passing() {
+        // Both seeds match their assertions: the tree is green.
+        let (root, pipeline) = two_answer_probe_workspace(42, 7).await;
+        let change = a_change_moving_seeds(
+            "breaks-one-1",
+            a_seed_moving(1, "pub fn answer() -> i32 {", 42, 40),
+        );
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed),
+            "the change is what broke this test: {}",
+            result.test_output
+        );
+        assert_eq!(
+            result.pre_existing_failures, 0,
+            "nothing here was failing before the change: {}",
+            result.test_output
+        );
+        let blamed = blamed_by_the_verdict(&result.test_output);
+        assert!(
+            blamed.contains("answer_is_42"),
+            "the reading has to name the test it is convicting the change of: {blamed}"
+        );
+    }
+
+    /// The two functions make the sharpest case available: one test is red
+    /// before the change and one is green, and the change breaks only the green
+    /// one — so a gate that read the run as a whole, or the tree as a whole,
+    /// would get this wrong in one direction or the other.
+    #[tokio::test]
+    async fn only_the_failure_the_change_introduced_is_convicted() {
+        // `answer_is_42` is red, `other_is_7` is green.
+        let (root, pipeline) = two_answer_probe_workspace(41, 7).await;
+        let change =
+            a_change_moving_seeds("mixed-1", a_seed_moving(5, "pub fn other() -> i32 {", 7, 6));
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::TestsFailed),
+            "the change broke a test this tree was passing: {}",
+            result.test_output
+        );
+        let blamed = blamed_by_the_verdict(&result.test_output);
+        assert!(
+            blamed.contains("other_is_7"),
+            "the test the change broke has to be the one it is convicted of: {blamed}"
+        );
+        assert!(
+            !blamed.contains("answer_is_42"),
+            "the test that was already failing must not be in the conviction: {blamed}"
         );
     }
 }
