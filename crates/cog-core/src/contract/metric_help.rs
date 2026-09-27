@@ -195,11 +195,16 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "cogneva_rollout_job_memory_peak_ratio",
         "The newest rollout judgement run's peak memory against the limit its \
-         manifest declared, read by the run from its own cgroup. Read as a peak \
-         rather than a sample because the run is short: what matters is how \
-         close it came to being killed, and that instant is the one a scrape \
-         would have to be lucky to catch. Absent when the run left no reading, \
-         or when the limit was declared as unlimited, which is not a ratio of 0",
+         manifest declared, read by the run from its own cgroup. The cgroup \
+         peak counts page cache, which the kernel reclaims instead of dying \
+         for, so a healthy run reads near the top of a narrow band of its own \
+         however much headroom it really had: this is a ceiling the run \
+         touched, not the headroom it kept, and a run actually killed by this \
+         limit shows up as its own failure locus rather than here. Read as a \
+         peak rather than a sample because the run is short: the instant it \
+         came closest is the one a scrape would have to be lucky to catch. \
+         Absent when the run left no reading, or when the limit was declared \
+         as unlimited, which is not a ratio of 0",
     ),
     (
         "cogneva_rollout_job_reading_unix",
