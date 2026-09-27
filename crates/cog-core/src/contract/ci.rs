@@ -8,6 +8,11 @@
 //! （网络不可达、仓库无权限、检查还没跑完）时两个消费面都必须按缺证据
 //! 处理——落地侧等下一轮，部署侧照常推进：把读不到当成失败会让一次上游
 //! API 抖动停掉整条主线跟踪。
+//!
+//! **但「有检查还在跑」与「什么都没读到」不是同一种缺证据**，两者的不对称
+//! 方向相反：还在跑时，**已经给出的失败是终局读数**，它不会被后来跑完的检查
+//! 撤回，所以不能拿"等其余的"把它一起压住——那不是等待，是放行一个已经确定
+//! 的坏结果。等只该挡「宣布通过」这一边。见 [`fold_ci_signals`]。
 
 /// 代码平台 API 基址的 env 名。业务进程零 token，基址指向安全网关的透传
 /// 端点。「CI 结论从哪里读」是落地通道与主线部署器共用的事实，两处各写
@@ -28,16 +33,25 @@ pub fn ci_conclusion_passes(conclusion: &str) -> bool {
 /// 把收集到的检查信号折成一个结论；`None` 表示没有证据。
 ///
 /// - 一条检查都没看到：没有证据（仓库没开 CI，或查询失败）；
-/// - 还有检查在跑：没有证据（此刻下结论等于拿半个结果判死刑）；
+/// - 已经有一条判死了：失败，**不等其余的**；
+/// - 还有检查在跑（且没有判死的）：没有证据（此刻宣布通过等于拿半个结果下结论）；
 /// - 否则：全部通过才算通过。
+///
+/// 判死的检查排在 `pending` 之前，是这条判据唯一的非对称处：`pending` 挡的是
+/// 「拿半个结果宣布**通过**」，那半边确实要等；而一条已经给出的失败是终局读数，
+/// 剩下的检查无论跑出什么都不会把它撤回。把它一起压住，等于让每个"最后一项还在跑"
+/// 的窗口里，一条已经红了的检查失去作用——而那正是刚落地不久的 rev 唯一会出现的形状。
 pub fn fold_ci_signals(saw_signal: bool, pending: bool, conclusions: &[String]) -> Option<bool> {
     if !saw_signal {
         return None;
     }
+    if conclusions.iter().any(|c| !ci_conclusion_passes(c)) {
+        return Some(false);
+    }
     if pending {
         return None;
     }
-    Some(conclusions.iter().all(|c| ci_conclusion_passes(c)))
+    Some(true)
 }
 
 #[cfg(test)]
@@ -53,6 +67,26 @@ mod tests {
     fn a_running_check_withholds_the_verdict() {
         assert_eq!(fold_ci_signals(true, true, &[]), None);
         assert_eq!(fold_ci_signals(true, true, &["success".into()]), None);
+    }
+
+    /// 还在跑的检查只压得住「通过」，压不住已经给出的失败。
+    ///
+    /// 判据的形状取自实测：`05c39aa` 落地后 8 分半，`Clippy` 已经判 failure
+    /// （17:28:43Z），而最后一个 `Test` 要到 17:37:21Z 才跑完。部署器恰在这
+    /// 个窗口里读了结论（17:36:17Z），读到的却是"还在跑"——于是它把一条判了
+    /// 七分半的红检查当没看见，编译、推镜像、把那个 rev 滚上了集群。
+    /// 那不是等待，是放行一个已经确定的坏结果。
+    #[test]
+    fn a_concluded_failure_is_not_withheld_by_a_running_check() {
+        let mixed = ["success".to_string(), "failure".to_string()];
+        assert_eq!(fold_ci_signals(true, true, &mixed), Some(false));
+        // 只判死一条、其余一条都还没报，同样成立。
+        assert_eq!(
+            fold_ci_signals(true, true, &["failure".to_string()]),
+            Some(false)
+        );
+        // 反向对照：还在跑但没判死的，仍然没有证据——这一半的不对称要留住。
+        assert_eq!(fold_ci_signals(true, true, &["success".to_string()]), None);
     }
 
     #[test]
