@@ -1904,6 +1904,39 @@ async fn fail_and_retire_change(
     }
 }
 
+/// Take a landed change out of the pending queue.
+///
+/// The retirement above is what makes "this change cannot be applied" terminal,
+/// and it runs on the refusal path only. Landing is at least as terminal, and
+/// had no such step: once the push succeeds the change is on the base branch,
+/// and everything that follows it -- the release build, the promotion, the
+/// deployer that ships revisions -- reads the base branch rather than this
+/// directory. The entry is a leftover from that moment on.
+///
+/// A leftover is not inert. The next cycle finds the `.diff` in the queue,
+/// cannot tell it from a change nobody has looked at yet, and verifies it from
+/// scratch: apply, test, release build. That build takes the host's build slot,
+/// and the slot is a single one shared with the deployer -- so the deployment
+/// advancing past the revision the change just landed waits on the build of
+/// the change it already has. On 2026-09-27 a change landed at 04:07, was still
+/// the queue's only entry two hours later, and the deployer was refused the
+/// build slot three times in twenty minutes by that change's own release build.
+///
+/// The entry is retired rather than deleted, so what was in the queue stays
+/// readable after the fact.
+async fn retire_landed_change(pipeline: &crate::ChangePipeline, change_id: &str) {
+    if let Err(e) = pipeline
+        .retire_change(change_id, "landed on the base branch")
+        .await
+    {
+        warn!(
+            change_id = %change_id,
+            error = %e,
+            "Change landed but could not be retired from the pending queue; it will be verified again next cycle"
+        );
+    }
+}
+
 /// Run one pass of the self-evolution auto-deploy pipeline.
 ///
 /// 每轮演进独占一棵工作树（轮内多个变更串行复用），轮首刷新回基线：任何检出
@@ -2172,11 +2205,14 @@ async fn run_evolution_cycle_in(
                     rev: artifact.commit_hash.clone(),
                 };
                 match landing.land(&landed, Some(&source)).await {
-                    Ok(rev) => info!(
-                        change_id = %artifact.change_id,
-                        rev = %rev,
-                        "Change landed on the base branch"
-                    ),
+                    Ok(rev) => {
+                        info!(
+                            change_id = %artifact.change_id,
+                            rev = %rev,
+                            "Change landed on the base branch"
+                        );
+                        retire_landed_change(pipeline, &artifact.change_id).await;
+                    }
                     Err(e) => {
                         warn!(
                             change_id = %artifact.change_id,
@@ -2469,6 +2505,46 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].artifact_id, "chg-1");
         assert!(recorded.is_empty());
+    }
+
+    /// A change that lands leaves the pending queue.
+    ///
+    /// Retirement was written for the refusal path alone, so a change that
+    /// reached the base branch stayed in the queue and was read as untouched
+    /// work on the next cycle: applied, tested, and release-built again, on the
+    /// build slot the deployer advancing past that very revision also needs.
+    ///
+    /// The judgement is in two halves and neither is enough on its own. The
+    /// first says the queue really does offer this change, so the empty set
+    /// afterwards cannot be a probe that never reached the file; the second
+    /// says it stops offering it once the change has landed.
+    #[tokio::test]
+    async fn a_landed_change_leaves_the_pending_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        tokio::fs::write(
+            change_dir.join("chg-1.diff"),
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .await
+        .unwrap();
+        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+
+        assert_eq!(
+            pipeline.pending_changes(None).await.unwrap().len(),
+            1,
+            "the queue has to be offering this change, or the assertion below proves nothing"
+        );
+
+        retire_landed_change(&pipeline, "chg-1").await;
+
+        assert!(
+            pipeline.pending_changes(None).await.unwrap().is_empty(),
+            "a landed change must not be offered for verification again"
+        );
+        // Retired rather than deleted: what was in the queue stays readable.
+        assert!(change_dir.join("retired/chg-1.diff").exists());
     }
 
     #[tokio::test]
