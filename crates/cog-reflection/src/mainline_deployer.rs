@@ -2954,102 +2954,120 @@ impl MainlineDeployer {
 
         // 在飞任务收敛/终态处理。
         if let Some(inflight) = state.in_flight.clone() {
-            match &deployed {
-                DeployedState::Main(d) if rev12(d) == rev12(&inflight.rev) => {
-                    // 这一轮判定跑完了（成功收敛）：把它自己量的资源读数收下来。成功尤其
-                    // 要看——"跑通了但一直被限流"正是额度声明的问题所在，而它不留任何
-                    // 失败证据。
-                    self.report_rollout_resources(&job_name(&inflight.rev))
-                        .await;
-                    info!(rev = %rev12(&inflight.rev), "mainline rollout converged");
-                    // 浮动签只在收敛后前移，失败回滚的坏镜像绝不进 :local。
-                    self.promote_local_tag(&inflight.rev).await?;
-                    state.last_good_rev = Some(inflight.rev.clone());
-                    state.last_good_tag = Some(main_image(&self.pull_endpoint(), &inflight.rev));
+            let job = job_name(&inflight.rev);
+            // 判定者的结论先取：它既是"这一版算不算收敛"的前提，也是资源读数能不能
+            // 读到的前提——读数由判定进程在退出前写进终止消息，判定还在跑时那条通道
+            // 还是空的（实测：镜像到位比 Job 退出早约两分半，成功那一支的读数就是
+            // 这样一次都没被收上来过）。
+            let judge = if inflight.phase == Phase::Dispatched {
+                Some(self.job_status(&job).await?)
+            } else {
+                None
+            };
+            let on_target = matches!(
+                &deployed,
+                DeployedState::Main(d) if rev12(d) == rev12(&inflight.rev)
+            );
+            // 收敛 = 镜像都在目标 rev 上，**且判定者已经跑完并给出结论**。判定者还在
+            // 跑时不算收敛：那正是"把还没给出的结论当成结论"——soak 与就绪走查都还在
+            // 它里面跑着。判定者说失败时更不算，它归下面的失败分支。
+            let judged_ok = matches!(
+                judge,
+                None | Some(JobStatus::Complete) | Some(JobStatus::NotFound)
+            );
+            if on_target && judged_ok {
+                // 判定者活着跑完了（或这一轮还没有判定者）：把它自己量的资源读数收下来。
+                // 成功尤其要看——"跑通了但一直被限流"正是额度声明的问题所在，而它不留
+                // 任何失败证据。
+                self.report_rollout_resources(&job).await;
+                info!(rev = %rev12(&inflight.rev), "mainline rollout converged");
+                // 浮动签只在收敛后前移，失败回滚的坏镜像绝不进 :local。
+                self.promote_local_tag(&inflight.rev).await?;
+                state.last_good_rev = Some(inflight.rev.clone());
+                state.last_good_tag = Some(main_image(&self.pull_endpoint(), &inflight.rev));
+                state.in_flight = None;
+                state.failed_rev = None;
+                state.failed_signatures.clear();
+                state.failed_repeated = false;
+                state.failed_class = FailureClass::default();
+                state.failed_cooldown_until = 0;
+                self.save_state(&state)?;
+                return Ok(());
+            }
+            match judge {
+                // 镜像到位而判定者还没退出：这一版还没判完。等的这一段正是 soak 与就绪
+                // 走查在里面跑的时候——它们是"收敛"与"判了个空"的分界。
+                Some(JobStatus::Running) => {
+                    info!(
+                        rev = %rev12(&inflight.rev),
+                        job = %job,
+                        "rollout images are on the target revision; waiting for the judgement to finish"
+                    );
+                    return Ok(());
+                }
+                // 判定者不在（被清理）而镜像又没到位：维持原判据，等下一轮。
+                Some(JobStatus::NotFound) => {
+                    warn!(
+                        rev = %rev12(&inflight.rev),
+                        job = %job,
+                        "the dispatched rollout job is gone and the deployments are not on its revision; nothing to judge"
+                    );
+                    return Ok(());
+                }
+                Some(JobStatus::Complete) => {
+                    // 判定者活着跑完并判通过，但镜像不在它的 rev 上（否则上面已经收敛
+                    // 了）：只可能是 Job 跑完后被外部 apply/GitOps 打回。kubectl apply
+                    // 同名 Job 是 no-op 不会重跑，必须删掉重新派发，否则永久卡"等待
+                    // 收敛"。这一轮的读数仍然收下来——它描述的是刚跑完的那一次判定。
+                    self.report_rollout_resources(&job).await;
+                    let target_tag = main_image(&self.pull_endpoint(), &inflight.rev);
+                    warn!(rev = %rev12(&inflight.rev), "rollout job complete but deployments not on target tag (reverted by an apply?); redispatching");
+                    self.dispatch_job(&inflight.rev, &target_tag).await?;
+                    return Ok(());
+                }
+                Some(JobStatus::Failed) => {
+                    // 失败的那一轮也要它的资源读数：被杀（OOM、到点）这一档正是
+                    // 额度声明不足的典型下场，读数不在的话这一轮只剩一个退出码。
+                    self.report_rollout_resources(&job).await;
+                    // 类别取自 Job 的终止码、落点取自它的终止消息（环境类不回滚
+                    // 也不构成版本结论），不是从 Job 日志里找字符串。
+                    let failure = self.job_failure(&job_name(&inflight.rev)).await;
+                    let class = failure.class;
+                    let same_rev = state.failed_rev.as_deref() == Some(inflight.rev.as_str());
+                    if !same_rev {
+                        // 换 rev 就是换了一份待验的东西：上一份的证据不能拿
+                        // 过来用（同一个落点在两个 rev 上不是同一处坏）。
+                        state.failed_signatures.clear();
+                        state.failed_repeated = false;
+                    }
+                    if class == FailureClass::Version {
+                        // 同一处坏第二次出现 → 可复现的确定性失败。证据取不到
+                        // （None）时不做区分：读不出落点的失败恰是"判不准"，
+                        // 它不排除"和上次同因"，按同因记。
+                        if failure_repeats(&state.failed_signatures, failure.signature.as_deref()) {
+                            state.failed_repeated = true;
+                        } else {
+                            state.failed_repeated = false;
+                            state.failed_signatures.push(failure.signature.clone());
+                        }
+                    }
+                    warn!(
+                        rev = %rev12(&inflight.rev),
+                        class = class.as_str(),
+                        signature = failure.signature.as_deref().unwrap_or("unknown"),
+                        killed = failure.killed.map(|k| k.as_str()).unwrap_or("no"),
+                        repeats = state.failed_repeated,
+                        "mainline rollout job failed (rollback, if any, handled by the job itself)"
+                    );
+                    state.failed_rev = Some(inflight.rev.clone());
+                    state.failed_class = class;
+                    state.failed_cooldown_until =
+                        chrono::Utc::now().timestamp() + self.cfg.failure_cooldown_secs as i64;
                     state.in_flight = None;
-                    state.failed_rev = None;
-                    state.failed_signatures.clear();
-                    state.failed_repeated = false;
-                    state.failed_class = FailureClass::default();
-                    state.failed_cooldown_until = 0;
                     self.save_state(&state)?;
                     return Ok(());
                 }
-                _ => {}
-            }
-            if inflight.phase == Phase::Dispatched {
-                match self.job_status(&job_name(&inflight.rev)).await? {
-                    JobStatus::Complete => {
-                        // 判定的进程活着跑完了：收下它自己的资源读数。
-                        self.report_rollout_resources(&job_name(&inflight.rev))
-                            .await;
-                        // Job 成功退出意味着滚动要么收敛、要么已回滚（回滚是非零
-                        // 退出，记 Failed）。这里镜像仍不是目标 tag，只可能是
-                        // Job 跑完后被外部 apply/GitOps 打回：kubectl apply 同名
-                        // Job 是 no-op 不会重跑，必须删掉重新派发，否则永久卡
-                        // "等待收敛"。镜像已是目标 tag 则只是收敛尾巴，下轮再判。
-                        let target_tag = main_image(&self.pull_endpoint(), &inflight.rev);
-                        let all_on_target = self
-                            .deployed_images()
-                            .await?
-                            .iter()
-                            .all(|i| i == &target_tag);
-                        if all_on_target {
-                            info!(rev = %rev12(&inflight.rev), "rollout job complete; awaiting deployment convergence");
-                            return Ok(());
-                        }
-                        warn!(rev = %rev12(&inflight.rev), "rollout job complete but deployments not on target tag (reverted by an apply?); redispatching");
-                        self.dispatch_job(&inflight.rev, &target_tag).await?;
-                        return Ok(());
-                    }
-                    JobStatus::Failed => {
-                        // 失败的那一轮也要它的资源读数：被杀（OOM、到点）这一档正是
-                        // 额度声明不足的典型下场，读数不在的话这一轮只剩一个退出码。
-                        self.report_rollout_resources(&job_name(&inflight.rev))
-                            .await;
-                        // 类别取自 Job 的终止码、落点取自它的终止消息（环境类不回滚
-                        // 也不构成版本结论），不是从 Job 日志里找字符串。
-                        let failure = self.job_failure(&job_name(&inflight.rev)).await;
-                        let class = failure.class;
-                        let same_rev = state.failed_rev.as_deref() == Some(inflight.rev.as_str());
-                        if !same_rev {
-                            // 换 rev 就是换了一份待验的东西：上一份的证据不能拿
-                            // 过来用（同一个落点在两个 rev 上不是同一处坏）。
-                            state.failed_signatures.clear();
-                            state.failed_repeated = false;
-                        }
-                        if class == FailureClass::Version {
-                            // 同一处坏第二次出现 → 可复现的确定性失败。证据取不到
-                            // （None）时不做区分：读不出落点的失败恰是"判不准"，
-                            // 它不排除"和上次同因"，按同因记。
-                            if failure_repeats(
-                                &state.failed_signatures,
-                                failure.signature.as_deref(),
-                            ) {
-                                state.failed_repeated = true;
-                            } else {
-                                state.failed_repeated = false;
-                                state.failed_signatures.push(failure.signature.clone());
-                            }
-                        }
-                        warn!(
-                            rev = %rev12(&inflight.rev),
-                            class = class.as_str(),
-                            signature = failure.signature.as_deref().unwrap_or("unknown"),
-                            killed = failure.killed.map(|k| k.as_str()).unwrap_or("no"),
-                            repeats = state.failed_repeated,
-                            "mainline rollout job failed (rollback, if any, handled by the job itself)"
-                        );
-                        state.failed_rev = Some(inflight.rev.clone());
-                        state.failed_class = class;
-                        state.failed_cooldown_until =
-                            chrono::Utc::now().timestamp() + self.cfg.failure_cooldown_secs as i64;
-                        state.in_flight = None;
-                        self.save_state(&state)?;
-                        return Ok(());
-                    }
-                    JobStatus::Running | JobStatus::NotFound => return Ok(()),
-                }
+                None => {}
             }
             // phase < Dispatched：上轮在构建中途重启，落到下方构建流程
             // 幂等重跑（同 tag buildah/push 可重复）。
@@ -10224,6 +10242,37 @@ exit 0
         );
     }
 
+    /// fake kubectl：四部署已经在目标 rev 上，而判定者（Job）处在给定状态。
+    /// `job_fields` 是 `job_status` 读的那三段 `succeeded|failed|active`，`message`
+    /// 是 Job Pod 的终止消息（`get pods -l job-name=…` 读到的那份）。
+    fn fake_kubectl_with_judge(
+        dir: &Path,
+        deployed_image: &str,
+        job_fields: &str,
+        message: &str,
+    ) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get deployment"*) echo "{deployed_image}" ;;
+  *"job-name="*) printf '{message}' ;;
+  *"get job"*) echo "{job_fields}" ;;
+  *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            deployed_image = deployed_image,
+            job_fields = job_fields,
+            message = message
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
     #[tokio::test]
     async fn convergence_promotes_floating_local_tag() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10232,9 +10281,9 @@ exit 0
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let buildah = fake_buildah(&bin_dir, "");
-        // 四部署已经在目标 main tag 上：收敛分支优先于 Job 状态判定。
+        // 四部署已经在目标 main tag 上，判定者也已经判过并通过（succeeded=1）。
         let deployed = main_image("localhost:30500", &rev_b);
-        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let kubectl = fake_kubectl_with_judge(&bin_dir, &deployed, "1||", "");
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
@@ -10276,6 +10325,144 @@ exit 0
             state.last_good_tag.as_deref(),
             Some(main_image("localhost:30500", &rev_b).as_str())
         );
+    }
+
+    /// 判定者还在跑时不算收敛。镜像到位比 Job 退出早，是因为 Job 在 apply 之后还要
+    /// 走完 soak 与就绪走查——把这一段当成"已经收敛"，等于把还没给出的结论当成结论。
+    #[tokio::test]
+    async fn a_rollout_waits_for_the_judge_before_it_converges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_b);
+        // active=1：镜像都到位了，判定者还在跑（soak 里）。
+        let kubectl = fake_kubectl_with_judge(&bin_dir, &deployed, "||1", "");
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+        let state_path = seed_state(
+            root,
+            MainlineState {
+                in_flight: Some(InFlight {
+                    rev: rev_b.clone(),
+                    phase: Phase::Dispatched,
+                }),
+                ..Default::default()
+            },
+        );
+
+        deployer.poll_once().await.unwrap();
+
+        assert!(
+            !bin_dir.join("buildah.log").exists(),
+            "判定者没跑完就不该推进浮动签"
+        );
+        let state = read_state(&state_path);
+        assert_eq!(
+            state.in_flight.map(|f| f.rev),
+            Some(rev_b.clone()),
+            "判定者还在跑，这一版仍在飞"
+        );
+        assert_eq!(state.last_good_rev, None, "判完之前没有 last_good");
+    }
+
+    /// 判定者在镜像到位之后才判失败（soak 的健康走查抓到问题），这一版仍然是失败的：
+    /// 过去"镜像到位"会先把收敛走完（推进浮动签、记 last_good），判定者随后给出的
+    /// 结论没有人再看——一个被判失败的 rev 就这样成了 last_good。
+    #[tokio::test]
+    async fn a_judge_that_fails_after_the_images_landed_is_still_a_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_b);
+        // failed=1：Job 判了失败（它自己会回滚，部署器只管记账）。
+        let kubectl = fake_kubectl_with_judge(
+            &bin_dir,
+            &deployed,
+            "|1|",
+            "version:support-settle::observed\\n",
+        );
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+        let state_path = seed_state(
+            root,
+            MainlineState {
+                in_flight: Some(InFlight {
+                    rev: rev_b.clone(),
+                    phase: Phase::Dispatched,
+                }),
+                ..Default::default()
+            },
+        );
+
+        deployer.poll_once().await.unwrap();
+
+        assert!(
+            !bin_dir.join("buildah.log").exists(),
+            "判失败的这一版不能推进浮动签"
+        );
+        let state = read_state(&state_path);
+        assert!(state.in_flight.is_none());
+        assert_eq!(state.failed_rev.as_deref(), Some(rev_b.as_str()));
+        assert_eq!(state.last_good_rev, None, "失败的 rev 不能成为 last_good");
+    }
+
+    /// 成功那一支也要收下判定者自己量的资源读数：读数写在它的终止消息里，而那条消息
+    /// 只在它退出时才存在——收敛判据要是先于判定者退出就成立，这条读数一次都收不上来。
+    #[tokio::test]
+    async fn the_success_path_collects_the_reading_the_judge_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_b);
+        let kubectl = fake_kubectl_with_judge(
+            &bin_dir,
+            &deployed,
+            "1||",
+            "version:wait:cogneva-web:observed\\nrollout-resources:v1:at=1700000000:cpu_quota_us=200000:cpu_period_us=100000:cpu_periods=263:cpu_throttled_periods=7:memory_max=2147483648:memory_peak=1073741824\\n",
+        );
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
+        let state_path = seed_state(
+            root,
+            MainlineState {
+                in_flight: Some(InFlight {
+                    rev: rev_b.clone(),
+                    phase: Phase::Dispatched,
+                }),
+                ..Default::default()
+            },
+        );
+
+        deployer.poll_once().await.unwrap();
+
+        let samples = metrics
+            .query_gauge_latest(cog_core::metric_names::ROLLOUT_JOB_READING_UNIX.as_str())
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1, "成功那一支的读数没有被收上来");
+        assert_eq!(samples[0].value, 1_700_000_000.0);
+        let cpu = metrics
+            .query_gauge_latest(cog_core::metric_names::ROLLOUT_JOB_CPU_THROTTLED_RATIO.as_str())
+            .await
+            .unwrap();
+        assert_eq!(cpu[0].value, 7.0 / 263.0);
+        let state = read_state(&state_path);
+        assert!(state.in_flight.is_none());
+        assert_eq!(state.last_good_rev.as_deref(), Some(rev_b.as_str()));
     }
 
     #[tokio::test]
