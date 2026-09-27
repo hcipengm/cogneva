@@ -1625,13 +1625,24 @@ mod tests {
         p
     }
 
-    /// 假 git 的 exec 在并行测试里会撞上一个微秒级竞态：刚写完的脚本此刻还被
-    /// 别的测试 fork 出来的进程持着一个写 fd（CLOEXEC 要等它自己 exec 才关），
-    /// 内核就回 `Text file busy`。这和被测的判据无关，重试一次。
+    /// 假 git 的 exec 会撞上一个与判据无关的竞态：刚写完的脚本此刻还被别的测试
+    /// fork 出来的进程持着一个写 fd（CLOEXEC 要等它自己 exec 才关），内核就回
+    /// `Text file busy`。
+    const TEXT_BUSY_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// 等这个竞态让开再跑。**重试一次是不够的**：机器被压满时那个 fork 出来的
+    /// 进程要排到调度才 exec，窗口从微秒拉长到毫秒级，紧接着重试会再撞上——实测
+    /// 拿到的报错正是**重试之后**那一条，且只在全量并行的满负载下出现、单跑全绿。
+    /// 按"等的是别人的动作"定界（与看门狗那两处同一个道理），界内等到它让开为止。
     async fn refresh_retrying_text_busy(t: &GitTransport) -> Result<(), String> {
-        match t.refresh("local/repo", true).await {
-            Err(e) if e.contains("Text file busy") => t.refresh("local/repo", true).await,
-            other => other,
+        let deadline = std::time::Instant::now() + TEXT_BUSY_SETTLE;
+        loop {
+            match t.refresh("local/repo", true).await {
+                Err(e) if e.contains("Text file busy") && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                other => return other,
+            }
         }
     }
 
