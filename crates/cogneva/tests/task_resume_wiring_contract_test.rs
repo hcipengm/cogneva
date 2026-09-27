@@ -25,6 +25,8 @@ const RESUME_CONSUMER: &str = "crates/cog-collaboration/src/resume.rs";
 const CHECKPOINT_PRODUCER: &str = "crates/cog-orchestrator/src/dag_executor/task_checkpoint.rs";
 /// Where the producer's own reading is recorded (the counter, not the logic).
 const PRODUCER_READING: &str = "crates/cog-orchestrator/src/dag_executor/orchestrator.rs";
+/// Where the producer's loop is registered and its vocabulary is published.
+const PRODUCER_LOOP_FILE: &str = "crates/cog-orchestrator/src/plugin.rs";
 const AGENT_MANAGER: &str = "crates/cog-agent/src/runtime/manager.rs";
 const ID_VOCABULARY: &str = "crates/cog-core/src/types/agent_state.rs";
 
@@ -184,5 +186,33 @@ fn the_chain_has_a_reading_on_both_ends() {
         observable.contains("RESUME_OUTCOMES"),
         "the consumer's outcomes are not published as a closed set, so the surface cannot say \
          whether any resume ever happened"
+    );
+}
+
+/// The producer's reading has to exist before the deployment has any work.
+///
+/// A process holding no running task writes nothing, so a producer that only
+/// ever records outcomes it observed leaves no series at all in an idle
+/// deployment — and "wired, nothing to save" then reads exactly like "never
+/// wired", which is the shape this whole chain fails in. The vocabulary is
+/// published as a closed set, and the loop is where it lands: a loop switched
+/// off by configuration must not leave a series behind reading zero.
+#[test]
+fn the_producer_publishes_its_vocabulary_before_it_has_work() {
+    let producer = production_source(&read(CHECKPOINT_PRODUCER)).to_string();
+    assert!(
+        producer.contains("CHECKPOINT_OUTCOMES"),
+        "the producer's outcomes are not a closed set, so nothing can publish them at zero"
+    );
+    let reading = production_source(&read(PRODUCER_READING)).to_string();
+    assert!(
+        reading.contains("CHECKPOINT_OUTCOMES"),
+        "the producer's reading side does not publish the outcomes it never observed"
+    );
+    let loop_source = read(PRODUCER_LOOP_FILE);
+    assert!(
+        loop_source.contains("publish_checkpoint_outcomes"),
+        "the checkpoint loop never publishes the vocabulary, so an idle deployment shows no \
+         producer reading at all"
     );
 }

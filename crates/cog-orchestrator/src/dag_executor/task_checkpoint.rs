@@ -247,7 +247,27 @@ pub async fn checkpoint_task(
     round
 }
 
+/// 产出侧的结局闭集，六个都发布——零也发布。
+///
+/// 有值的格与「整条不在」是两件事，而产出侧的计数只在真有任务在跑时才会加：一个
+/// 手上没有在跑任务的部署里（比如上游配额耗尽、主流程整段停着），这个计数器整条
+/// 都查不到，于是「产出侧接上了、此刻没有工作」与「产出侧从来没接上」在读数上
+/// 同形——那正是这条链失败时的形状。恢复端对同一件事就是这样办的（两个结局都
+/// 发布，见 `cog-collaboration` 的 `RESUME_OUTCOMES`），这里照同一套：词表先落地
+/// 一次，值再由每一轮去加。
+pub const CHECKPOINT_OUTCOMES: [&str; 6] = [
+    "saved",
+    "unpersisted",
+    "failed",
+    "superseded",
+    "unsuperseded",
+    "no_agents",
+];
+
 /// 账上每个量对应的读数标签，产出侧按它记录计数器。
+///
+/// 键必须与 [`CHECKPOINT_OUTCOMES`] 逐字相同：一个是发布用的词表，一个是每轮的
+/// 取值表，分叉的样子是「某个结局永远没人发布」，门禁按表比对。
 pub fn outcome_counts(round: &CheckpointRound) -> HashMap<&'static str, f64> {
     HashMap::from([
         ("saved", round.saved as f64),
@@ -646,6 +666,18 @@ mod tests {
         let counts = outcome_counts(&busy);
         assert_eq!(counts.get("no_agents"), Some(&0.0));
         assert_eq!(counts.get("saved"), Some(&2.0));
+    }
+
+    #[test]
+    fn the_published_vocabulary_and_the_counts_agree() {
+        use std::collections::BTreeSet;
+
+        // 两边分叉的样子是「某个结局永远没人发布」：词表里多一个，那一格发布出去
+        // 恒为零（读者读成「没发生过」）；取值表里多一个，那一格永远不落地。
+        let counts = outcome_counts(&CheckpointRound::default());
+        let published: BTreeSet<&str> = CHECKPOINT_OUTCOMES.iter().copied().collect();
+        let counted: BTreeSet<&str> = counts.keys().copied().collect();
+        assert_eq!(published, counted);
     }
 
     #[tokio::test]

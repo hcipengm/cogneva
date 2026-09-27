@@ -170,6 +170,18 @@ impl DagExecutor {
         *self.metrics.write().unwrap_or_else(|e| e.into_inner()) = Some(metrics);
     }
 
+    /// The metrics backend this executor reports through, if one was attached.
+    ///
+    /// One way to reach the handle: a reader that takes the lock itself gets a
+    /// snapshot of a different moment than its neighbours, and the three
+    /// readings below all have to be answers about the same attachment.
+    fn metrics_backend(&self) -> Option<Arc<dyn cog_core::MetricsBackend>> {
+        self.metrics
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Record that `count` tasks stalled in `Scheduled` were reclaimed.
     ///
     /// This is the repair's own reading, and it has to be a counter rather than
@@ -181,12 +193,7 @@ impl DagExecutor {
         if count == 0 {
             return;
         }
-        let backend = self
-            .metrics
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let Some(backend) = backend else {
+        let Some(backend) = self.metrics_backend() else {
             tracing::debug!(
                 count,
                 "reclaimed stalled scheduled tasks; no metrics backend attached"
@@ -2201,11 +2208,7 @@ impl DagExecutor {
     async fn record_task_checkpoint(&self, round: &CheckpointRound) {
         // 静默轮也记：「这一轮没有要写的」与「这个任务没有产出方」是两件事，
         // 只在有 agent 时计数的话，第二种情况在读数上不存在。
-        let backend = self
-            .metrics
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let backend = self.metrics_backend();
         let Some(backend) = backend else {
             tracing::debug!(
                 saved = round.saved,
@@ -2219,13 +2222,42 @@ impl DagExecutor {
             if value == 0.0 {
                 continue;
             }
-            let labels = HashMap::from([("outcome".to_string(), outcome.to_string())]);
-            if let Err(e) = backend
-                .record_counter(cog_core::metric_names::TASK_CHECKPOINT, value, labels)
-                .await
-            {
-                tracing::warn!(error = %e, outcome, "cannot record the task checkpoint count");
-            }
+            self.write_checkpoint_outcome(&backend, outcome, value)
+                .await;
+        }
+    }
+
+    /// 把产出侧的结局词表按零发布一遍。
+    ///
+    /// 产出侧的格子只在真有任务在跑时才会有值：一个手上没有在跑任务的进程，每一轮
+    /// 什么都不写，于是这个计数器**整条**都查不到——「产出侧接上了、此刻没有工作」
+    /// 与「产出侧从来没接上」在读数上同形，而这条链失败的样子正是这样（任务从头
+    /// 跑，没有错误、没有日志、没有规则）。恢复端对同一件事就是这么办的：两个结局
+    /// 都发布、零也发布（见 `cog-collaboration` 的 `RESUME_OUTCOMES`）。这里照同一
+    /// 套，且只在循环起手时做一次：词表落地，值由各轮去加。
+    pub async fn publish_checkpoint_outcomes(&self) {
+        let Some(backend) = self.metrics_backend() else {
+            tracing::debug!("task checkpoint outcomes have no metrics backend to land on");
+            return;
+        };
+        for outcome in task_checkpoint::CHECKPOINT_OUTCOMES {
+            self.write_checkpoint_outcome(&backend, outcome, 0.0).await;
+        }
+    }
+
+    /// 产出侧读数的一格：一个计数器，一格一个 `outcome`。
+    async fn write_checkpoint_outcome(
+        &self,
+        backend: &Arc<dyn cog_core::MetricsBackend>,
+        outcome: &str,
+        value: f64,
+    ) {
+        let labels = HashMap::from([("outcome".to_string(), outcome.to_string())]);
+        if let Err(e) = backend
+            .record_counter(cog_core::metric_names::TASK_CHECKPOINT, value, labels)
+            .await
+        {
+            tracing::warn!(error = %e, outcome, "cannot record the task checkpoint count");
         }
     }
 
@@ -2603,7 +2635,9 @@ impl cog_core::DagExecutor for DagExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::{AgentState, ContextBoard, Event, StateBackend, TaskCheckpoint, TaskType};
+    use cog_core::{
+        AgentState, ContextBoard, Event, MetricsBackend, StateBackend, TaskCheckpoint, TaskType,
+    };
 
     /// 只实现 DAG 快照存取的最小 StateBackend，模拟两个 pod 共享的存储。
     #[derive(Default)]
@@ -3721,5 +3755,45 @@ mod tests {
             "the second sweep finds the task already claimed and leaves its budget alone"
         );
         assert_eq!(pod_b.get_task("t-fg").await.unwrap().retry_count, 1);
+    }
+
+    /// 产出侧的词表必须在没有任何任务时也落到指标面上。
+    ///
+    /// 这是「链接上了、只是没活干」唯一能被读到的形状：产出侧的格子只在真有任务
+    /// 在跑时才加值，没有任务的部署里整条计数器查不到——而那与「产出侧从没接上」
+    /// 同形，正是这条链失败时的样子。
+    #[tokio::test]
+    async fn the_producer_publishes_its_outcome_vocabulary_before_any_work_arrives() {
+        use std::collections::BTreeSet;
+
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let executor = DagExecutor::new("ws-vocabulary".to_string());
+        executor.attach_metrics(metrics.clone());
+
+        executor.publish_checkpoint_outcomes().await;
+
+        let totals = metrics
+            .query_counter_totals(cog_core::metric_names::TASK_CHECKPOINT.as_str())
+            .await
+            .expect("the published counter totals");
+        let published: BTreeSet<&str> = totals
+            .iter()
+            .map(|sample| {
+                sample
+                    .labels
+                    .get("outcome")
+                    .map(String::as_str)
+                    .unwrap_or("")
+            })
+            .collect();
+        let expected: BTreeSet<&str> = task_checkpoint::CHECKPOINT_OUTCOMES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(published, expected, "each outcome is a series of its own");
+        assert!(
+            totals.iter().all(|sample| sample.value == 0.0),
+            "the vocabulary lands at zero; the rounds add the values"
+        );
     }
 }

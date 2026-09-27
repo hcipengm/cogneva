@@ -543,6 +543,14 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                             interval.set_missed_tick_behavior(
                                                 tokio::time::MissedTickBehavior::Skip,
                                             );
+                                            // 词表先落地：这一格只在真有任务在跑时才会
+                                            // 加值，没有任务的部署里整条计数器都查不到，
+                                            // 而那与「产出侧没接上」同形。发布在这里而
+                                            // 不是启动处，是因为它就该随循环的启用与否
+                                            // 出现——循环关掉时不该留下一条恒为 0 的读数。
+                                            checkpoint_orchestrator
+                                                .publish_checkpoint_outcomes()
+                                                .await;
                                             loop {
                                                 beat.beat();
                                                 tokio::select! {
