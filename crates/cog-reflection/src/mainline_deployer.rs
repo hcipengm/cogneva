@@ -673,19 +673,53 @@ enum FailureLocus {
     AuthDenied,
     /// 镜像源没供上镜像：新副本卡在拉取上，一次都没跑起来。
     ImageSource,
+    /// 判定进程没走到自己的判定就被杀了：它既没写签名也没选类别，这一档由**读
+    /// 的那一侧**（部署器）从 Pod 状态里读出来。三种杀法在退出码上是同一个 137，
+    /// 只在 Pod 状态里分得开，所以原因跟着落点走，而不是折成一个"被杀"。
+    Killed(KilledReason),
     /// 其余按"观测到的版本缺陷"论，含回滚过的那一支。
     Observed,
 }
 
+/// 判定进程是怎么被杀的。分档而不是并成一档：并起来之后，「上限太小」与「节点在
+/// 挤」会拼出同一个签名，于是两次不同原因的死被读成同一处坏而复现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KilledReason {
+    /// 容器自己超过了声明的上限（`state.terminated.reason: OOMKilled`）。
+    Oom,
+    /// 节点在挤，Pod 被驱逐（Pod 状态里的 `Evicted`）。
+    Evicted,
+    /// Job 自己的期限到点（`DeadlineExceeded`），判定进程没跑完。
+    Deadline,
+    /// 读得到"被杀"（信号终止码）、读不到为什么。是一档而不是没有证据：它比
+    /// 别的杀法弱，但比"不知道"强。
+    Unreadable,
+}
+
+impl KilledReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            KilledReason::Oom => "killed-oom",
+            KilledReason::Evicted => "killed-evicted",
+            KilledReason::Deadline => "killed-deadline",
+            KilledReason::Unreadable => "killed",
+        }
+    }
+}
+
 impl FailureLocus {
     /// 全部落点，供读回签名时校验值域用。
-    const ALL: [FailureLocus; 7] = [
+    const ALL: [FailureLocus; 11] = [
         FailureLocus::Unreachable,
         FailureLocus::Admission,
         FailureLocus::Placement,
         FailureLocus::Tool,
         FailureLocus::AuthDenied,
         FailureLocus::ImageSource,
+        FailureLocus::Killed(KilledReason::Oom),
+        FailureLocus::Killed(KilledReason::Evicted),
+        FailureLocus::Killed(KilledReason::Deadline),
+        FailureLocus::Killed(KilledReason::Unreadable),
         FailureLocus::Observed,
     ];
 
@@ -697,6 +731,7 @@ impl FailureLocus {
             FailureLocus::Tool => "tool",
             FailureLocus::AuthDenied => "auth",
             FailureLocus::ImageSource => "image-source",
+            FailureLocus::Killed(reason) => reason.as_str(),
             FailureLocus::Observed => "observed",
         }
     }
@@ -710,9 +745,14 @@ impl FailureLocus {
     /// 配额"那一支也读成环境类，那一个真坏的版本就再也等不到回滚。
     ///
     /// 镜像源同理属环境：它说的是"新版本一次都没跑起来"，不是版本好坏。
+    ///
+    /// 被杀这一档**两个阶段都按版本类**，尽管它同样是"说不出新版本好坏"。理由是
+    /// 上限里装的可能是新版本自己的二进制：容器吃爆上限时，说不清是上限太小还是
+    /// 这一版吃得多，而代价不对称——判不准就往停下的一侧取，误停只是等一个新 rev。
+    /// 它的可读部分因此不放在类别上，放在落点里（原因跟落点走，见 [`KilledReason`]）。
     fn class(self, before_any_change: bool) -> FailureClass {
         let environment = if before_any_change {
-            self != FailureLocus::Observed
+            self != FailureLocus::Observed && !matches!(self, FailureLocus::Killed(_))
         } else {
             matches!(
                 self,
@@ -797,13 +837,45 @@ fn parse_failure_signature(msg: &str) -> Option<String> {
     }
 }
 
+/// 判定进程被杀时，部署器替它写的那条签名里的位置。被杀是**整轮运行**的事实，不是
+/// 某一步的事实——进程没能说出自己在哪一步——所以位置用固定标记，不假装知道。
+const KILLED_SIGNATURE_POSITION: (&str, &str) = ("job", "rollout");
+
+/// 判定进程是怎么死的。退出码只分得出「非零」，Pod 状态分得出三种杀法；两个来源
+/// 合起来读，是因为任何一个单独都不够：`OOMKilled` 这类原因读不到时，信号终止码
+/// 仍说明"进程没走到自己的判定"。
+///
+/// 认的终止码是信号那两档（128+sig）：这个容器的正常出口只有 1（版本类）与 75
+/// （环境类），所以 137/143 只可能是被杀，不可能是它自己选的类别。
+fn killed_reason(
+    pod_reason: &str,
+    term_reason: &str,
+    exit_code: Option<i32>,
+) -> Option<KilledReason> {
+    let named = match (term_reason, pod_reason) {
+        ("OOMKilled", _) | (_, "OOMKilled") => Some(KilledReason::Oom),
+        ("Evicted", _) | (_, "Evicted") => Some(KilledReason::Evicted),
+        ("DeadlineExceeded", _) | (_, "DeadlineExceeded") => Some(KilledReason::Deadline),
+        _ => None,
+    };
+    if named.is_some() {
+        return named;
+    }
+    match exit_code {
+        Some(137) | Some(143) => Some(KilledReason::Unreadable),
+        _ => None,
+    }
+}
+
 /// 滚动 Job 的进程退出码里「环境类失败」那一档。Job 内的判定进程按这个码告诉
 /// 部署器：这次失败说不出新版本的好坏。取值沿用 sysexits 的 EX_TEMPFAIL——
 /// 语义正是"此刻不成、换个时刻可能就成了"，与"任何非零即失败"（版本类走 1）不
 /// 冲突。部署器只在 Job 已失败时读一次终止码，正常路径不多花一次 kubectl。
 ///
 /// 只认这一个确切的码：137/143 这类信号终止码同时对应 OOM、驱逐与
-/// `activeDeadlineSeconds` 到点，判不出类别，按版本类靠。
+/// `activeDeadlineSeconds` 到点，**在退出码上**判不出类别，按版本类靠。三种杀法
+/// 本身在 Pod 状态里是可分的（`state.terminated.reason` 与 Pod 的 `status.reason`），
+/// 所以那一侧的原因不丢：落点里的 [`KilledReason`] 就是它。
 const ROLLOUT_EXIT_ENVIRONMENT: i32 = 75;
 
 /// 滚动失败的类别。分的是**这次失败说不说得出新版本的问题**：版本类是这份
@@ -876,6 +948,9 @@ struct JobFailure {
     class: FailureClass,
     /// 读不到就是 `None`：没有区分力的证据，不是一种新的失败。
     signature: Option<String>,
+    /// 判定进程是被杀死的时，它是怎么死的。判类别的口径不变（口径由退出码给），
+    /// 这一项只是把 Pod 状态里本来就分得开的原因带出来给读数用。
+    killed: Option<KilledReason>,
 }
 
 /// 把部署 `.spec` 归一化成可逐字节比较的「放置面」。
@@ -2226,6 +2301,7 @@ impl MainlineDeployer {
                             rev = %rev12(&inflight.rev),
                             class = class.as_str(),
                             signature = failure.signature.as_deref().unwrap_or("unknown"),
+                            killed = failure.killed.map(|k| k.as_str()).unwrap_or("no"),
                             repeats = state.failed_repeated,
                             "mainline rollout job failed (rollback, if any, handled by the job itself)"
                         );
@@ -3102,10 +3178,15 @@ impl MainlineDeployer {
     /// 类别判不准时，把环境类误记成版本类只是多一轮零成本的等待，反过来则是一个
     /// 真坏的版本被无限重试、永不停下——代价不对称，往停下的一侧取。签名同理，
     /// 读不到就返回 `None`（部署器按"没有区分力"处理）。
+    ///
+    /// 被判定的进程自己被杀死是唯一读不出签名的失败**却有原因可读**的一档：它没能
+    /// 写下自己的签名，但 Pod 状态里留着怎么死的。这一档的签名由部署器代写（位置用
+    /// 固定标记），原因进落点，于是"上限太小"与"节点在挤"不会拼成同一处坏。
     async fn job_failure(&self, name: &str) -> JobFailure {
         let missing = JobFailure {
             class: FailureClass::Version,
             signature: None,
+            killed: None,
         };
         let out = match self
             .kubectl(
@@ -3115,7 +3196,7 @@ impl MainlineDeployer {
                     "-l",
                     &format!("job-name={name}"),
                     "-o",
-                    "jsonpath={range .items[*]}{.status.containerStatuses[0].state.terminated.exitCode}{\"|\"}{.status.containerStatuses[0].state.terminated.message}{\"\\n\"}{end}",
+                    "jsonpath={range .items[*]}{.status.reason}{\"|\"}{.status.containerStatuses[0].state.terminated.exitCode}{\"|\"}{.status.containerStatuses[0].state.terminated.reason}{\"|\"}{.status.containerStatuses[0].state.terminated.message}{\"\\n\"}{end}",
                 ],
                 30,
             )
@@ -3133,20 +3214,38 @@ impl MainlineDeployer {
         };
         let mut class = None;
         let mut signature = None;
+        let mut killed = None;
         for line in out.lines() {
-            let mut parts = line.splitn(2, '|');
+            // 自由文本（终止消息）放最后一段：它可能含分隔符，前面的字段不含。
+            let mut parts = line.splitn(4, '|');
+            let pod_reason = parts.next().unwrap_or("").trim();
             let code = parts.next().unwrap_or("").trim().parse::<i32>().ok();
+            let term_reason = parts.next().unwrap_or("").trim();
+            let message = parts.next().unwrap_or("");
+            if let Some(reason) = killed_reason(pod_reason, term_reason, code) {
+                let (stage, target) = KILLED_SIGNATURE_POSITION;
+                let locus = FailureLocus::Killed(reason);
+                class = Some(locus.class(false));
+                signature = Some(failure_signature(locus.class(false), stage, target, locus));
+                killed = Some(reason);
+                continue;
+            }
             if let Some(code) = code {
                 class = Some(if code == ROLLOUT_EXIT_ENVIRONMENT {
                     FailureClass::Environment
                 } else {
                     FailureClass::Version
                 });
-                signature = parts.next().and_then(parse_failure_signature);
+                signature = parse_failure_signature(message);
+                killed = None;
             }
         }
         if let Some(class) = class {
-            return JobFailure { class, signature };
+            return JobFailure {
+                class,
+                signature,
+                killed,
+            };
         }
         let reason = self.job_failed_condition(name).await.unwrap_or_default();
         if is_cluster_unreachable(&reason)
@@ -3162,6 +3261,7 @@ impl MainlineDeployer {
             return JobFailure {
                 class: FailureClass::Environment,
                 signature: None,
+                killed: None,
             };
         }
         missing
@@ -6514,6 +6614,52 @@ COPY ["prompts", "/opt/cogneva/prompts"]
         assert_eq!(FailureLocus::ImageSource.as_str(), "image-source");
     }
 
+    /// 判定进程被杀这一档：类别口径**不变**（两个阶段都按版本类靠——容器里装的
+    /// 可能是新版本自己的二进制，说不清是上限太小还是这一版吃得多），变的是原因
+    /// 不再跟着丢掉，且三种杀法在签名上互不相同。
+    #[test]
+    fn being_killed_is_its_own_locus_with_the_cause_readable() {
+        for reason in [
+            KilledReason::Oom,
+            KilledReason::Evicted,
+            KilledReason::Deadline,
+            KilledReason::Unreadable,
+        ] {
+            let locus = FailureLocus::Killed(reason);
+            assert_eq!(locus.class(true), FailureClass::Version);
+            assert_eq!(locus.class(false), FailureClass::Version);
+            assert!(locus.as_str().starts_with("killed"));
+            assert!(FailureLocus::ALL.contains(&locus));
+        }
+        assert_eq!(
+            FailureLocus::Killed(KilledReason::Oom).as_str(),
+            "killed-oom"
+        );
+        // 退出码那一侧读不出原因时，落点退到"被杀"这一档，而不是折成"没有证据"：
+        // 它比别的杀法弱，但比"不知道"强。
+        assert_eq!(
+            killed_reason("", "", Some(137)),
+            Some(KilledReason::Unreadable)
+        );
+        assert_eq!(
+            killed_reason("", "", Some(143)),
+            Some(KilledReason::Unreadable)
+        );
+        // 正常出口（1 与 75）不是被杀：这两个码是这个容器自己选的类别。
+        assert_eq!(killed_reason("", "", Some(1)), None);
+        assert_eq!(killed_reason("", "", Some(75)), None);
+        assert_eq!(killed_reason("", "", None), None);
+        // Pod 状态里的原因优先于退出码：驱逐的容器终止码同样是 137。
+        assert_eq!(
+            killed_reason("Evicted", "", Some(137)),
+            Some(KilledReason::Evicted)
+        );
+        assert_eq!(
+            killed_reason("", "DeadlineExceeded", Some(137)),
+            Some(KilledReason::Deadline)
+        );
+    }
+
     /// 观测工具起不来是第三类，谁也不许借走它的判定：它既不是"看不到集群"
     /// （那一类会按轮询节拍重试，而工具起不来重试多少次都一样），也不是版本结论。
     #[test]
@@ -8397,15 +8543,16 @@ exit 0
         assert_eq!(state.in_flight.unwrap().phase, Phase::Dispatched);
     }
 
-    /// fake kubectl：四部署停在 old_image，同 rev 的滚动 Job 报失败，其 Pod 的
-    /// 终止码按参数给（部署器据此定类别）。
-    fn fake_kubectl_failed_job(dir: &Path, old_image: &str, exit_code: &str) -> String {
+    /// fake kubectl：四部署停在 old_image，同 rev 的滚动 Job 报失败，其 Pod 状态
+    /// 那一行按参数给（部署器据此定类别与落点）。形状与部署器读的 jsonpath 一致：
+    /// `Pod 的 reason|终止码|终止原因|终止消息`——只有最后一段是自由文本。
+    fn fake_kubectl_failed_job(dir: &Path, old_image: &str, pod_state: &str) -> String {
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
 case "$*" in
-  *"job-name="*) echo "{exit_code}" ;;
+  *"job-name="*) echo "{pod_state}" ;;
   *"get job"*) echo "|1|" ;;
   *"get deployment"*) echo "{old_image}" ;;
   *"delete"*) echo 'job.batch "x" deleted' ;;
@@ -8458,23 +8605,26 @@ exit 0
             }
         };
         assert_eq!(
-            failure_of("k75", "#!/bin/sh\necho 75\nexit 0\n")
+            failure_of("k75", "#!/bin/sh\necho '|75||'\nexit 0\n")
                 .await
                 .class,
             FailureClass::Environment
         );
-        // 1（版本类退出）、空（Pod 还没终止）、137（信号终止：OOM / 驱逐 / 到点
-        // 被杀都长这样，类别判不出）一律按版本类靠：判不准就往记账侧取。
+        // 1（版本类退出）、空（Pod 还没终止）一律按版本类靠：判不准就往记账侧取。
         assert_eq!(
-            failure_of("k1", "#!/bin/sh\necho 1\nexit 0\n").await.class,
+            failure_of("k1", "#!/bin/sh\necho '|1||'\nexit 0\n")
+                .await
+                .class,
             FailureClass::Version
         );
         assert_eq!(
             failure_of("kempty", "#!/bin/sh\nexit 0\n").await.class,
             FailureClass::Version
         );
+        // 137（信号终止：OOM / 驱逐 / 到点被杀都长这样）同样按版本类靠——类别口径
+        // 不变；变的是原因不再跟着丢掉，见下面那几条。
         assert_eq!(
-            failure_of("k137", "#!/bin/sh\necho 137\nexit 0\n")
+            failure_of("k137", "#!/bin/sh\necho '|137||'\nexit 0\n")
                 .await
                 .class,
             FailureClass::Version
@@ -8511,7 +8661,7 @@ exit 0
         // 1（版本类退出）带上终止消息里的落点：签名原样读回，类别仍来自退出码。
         let f = failure_of(
             "ksig",
-            "#!/bin/sh\necho '1|version:wait:cogneva-web:observed'\nexit 0\n",
+            "#!/bin/sh\necho '|1||version:wait:cogneva-web:observed'\nexit 0\n",
         )
         .await;
         assert_eq!(f.class, FailureClass::Version);
@@ -8520,9 +8670,76 @@ exit 0
             Some("version:wait:cogneva-web:observed")
         );
         // 落点不合形状（陌生文本）时签名读成"没有证据"，而不是当成一种新失败。
-        let f = failure_of("kjunk", "#!/bin/sh\necho '1|boom'\nexit 0\n").await;
+        let f = failure_of("kjunk", "#!/bin/sh\necho '|1||boom'\nexit 0\n").await;
         assert_eq!(f.class, FailureClass::Version);
         assert_eq!(f.signature, None);
+
+        // 判定进程被杀：它没能写下签名，原因由部署器从 Pod 状态里读出来。三种杀法
+        // 在退出码上是同一个 137，所以这里读的全是 Pod 状态那一侧。
+        let f = failure_of(
+            "koom",
+            &format!("#!/bin/sh\necho '{}'\nexit 0\n", "|137|OOMKilled|"),
+        )
+        .await;
+        assert_eq!(f.class, FailureClass::Version);
+        assert_eq!(f.killed, Some(KilledReason::Oom));
+        assert_eq!(
+            f.signature.as_deref(),
+            Some("version:job:rollout:killed-oom")
+        );
+        let f = failure_of(
+            "kevicted",
+            &format!("#!/bin/sh\necho '{}'", "Evicted|137||"),
+        )
+        .await;
+        assert_eq!(f.killed, Some(KilledReason::Evicted));
+        assert_eq!(
+            f.signature.as_deref(),
+            Some("version:job:rollout:killed-evicted")
+        );
+        let deadline_line = "|137|DeadlineExceeded|";
+        let f = failure_of("kdeadline", &format!("#!/bin/sh\necho '{deadline_line}'")).await;
+        assert_eq!(f.killed, Some(KilledReason::Deadline));
+        // 读得到"被杀"、读不到为什么：仍是一档落点，不是"没有证据"。
+        let f = failure_of("k137only", "#!/bin/sh\necho '|137||'\nexit 0\n").await;
+        assert_eq!(f.killed, Some(KilledReason::Unreadable));
+        assert_eq!(f.signature.as_deref(), Some("version:job:rollout:killed"));
+        // 三种杀法拼出的签名互不相同：并成一档会把"上限太小"与"节点在挤"读成
+        // 同一处坏，第二次就误判成复现。
+        let oom = failure_of("koom2", "#!/bin/sh\necho '|137|OOMKilled|'\nexit 0\n").await;
+        let evicted = failure_of("kevicted2", "#!/bin/sh\necho '|137|Evicted|'\nexit 0\n").await;
+        assert_ne!(oom.signature, evicted.signature);
+        assert!(!failure_repeats(
+            std::slice::from_ref(&oom.signature),
+            evicted.signature.as_deref()
+        ));
+        // 被杀与「观测到的版本缺陷」也不是同一处坏。
+        assert!(!failure_repeats(
+            &[Some("version:wait:cogneva-web:observed".to_string())],
+            oom.signature.as_deref()
+        ));
+        // 落点词汇表与产出侧同形：每一种拼法都要能原样读回（签名是给"同不同一处"
+        // 判的，拼法漂一格就静默变成"没有证据"）。
+        for locus in FailureLocus::ALL {
+            let sig = failure_signature(
+                locus.class(false),
+                KILLED_SIGNATURE_POSITION.0,
+                KILLED_SIGNATURE_POSITION.1,
+                locus,
+            );
+            assert_eq!(
+                parse_failure_signature(&format!("{sig}\n")).as_deref(),
+                Some(sig.as_str()),
+                "locus spelling must round-trip: {}",
+                locus.as_str()
+            );
+        }
+        // 表里没有两种落点共用一个拼法（共用会让两个落点在签名上等价）。
+        let mut spellings: Vec<&str> = FailureLocus::ALL.iter().map(|l| l.as_str()).collect();
+        spellings.sort_unstable();
+        let before = spellings.len();
+        spellings.dedup();
+        assert_eq!(spellings.len(), before, "locus spellings must be unique");
     }
 
     /// 环境类失败不是版本结论：它不推翻本 rev 已有的版本证据，也不设复现结论，
@@ -8537,7 +8754,7 @@ exit 0
         let kubectl = fake_kubectl_failed_job(
             &bin_dir,
             &main_image("localhost:30500", &rev_a),
-            &ROLLOUT_EXIT_ENVIRONMENT.to_string(),
+            &format!("|{ROLLOUT_EXIT_ENVIRONMENT}||"),
         );
         let buildah = fake_buildah(&bin_dir, "");
         let cfg = test_config(root, &bare, &buildah, &kubectl);
@@ -8594,7 +8811,7 @@ exit 0
         let kubectl = fake_kubectl_failed_job(
             &bin_dir,
             &main_image("localhost:30500", &rev_a),
-            "1|version:wait:cogneva-web:observed",
+            "|1||version:wait:cogneva-web:observed",
         );
         let buildah = fake_buildah(&bin_dir, "");
         let cfg = test_config(root, &bare, &buildah, &kubectl);
@@ -8641,7 +8858,7 @@ exit 0
         let kubectl = fake_kubectl_failed_job(
             &bin_dir,
             &main_image("localhost:30500", &rev_a),
-            "1|version:soak:cogneva-web:observed",
+            "|1||version:soak:cogneva-web:observed",
         );
         let buildah = fake_buildah(&bin_dir, "");
         let cfg = test_config(root, &bare, &buildah, &kubectl);
@@ -8681,7 +8898,7 @@ exit 0
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let kubectl =
-            fake_kubectl_failed_job(&bin_dir, &main_image("localhost:30500", &rev_a), "1");
+            fake_kubectl_failed_job(&bin_dir, &main_image("localhost:30500", &rev_a), "|1||");
         // 版本号写全 rev：把复用条件改坏时构建会真的跑起来，让"没有重建"这条
         // 断言（而不是构建本身的报错）成为红灯。
         let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
