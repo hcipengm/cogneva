@@ -1,0 +1,70 @@
+# 把 scope 目录挂进沙箱执行器。要改的只有两处：
+#   1. scope 名——下面 HOST_DOCS_SCOPES 每一项 `名字=容器内挂载点` 的左侧，以及
+#      host-docs-<名字> 卷名与挂载点里的 <名字>。名字就是文档属主的身份，模型只
+#      产出相对路径，"能碰到谁的文件"由此在部署面上定死；
+#   2. 该 scope 在**宿主**上的目录——hostPath.path。
+# 多个 scope 就按这两处的形状重复：env 里每一项逗号相连，卷与挂载各多一条。
+#
+# 容器内挂载点固定 <mountPath>/<名字>（chart 的 hostDocuments.mountPath 默认
+# /opt/cogneva/host-docs），`hostPath.type: Directory`（不是 DirectoryOrCreate）：
+# 宿主上路径不对就让 Pod 起不来，而不是替运维在宿主上建一个空目录——那会把
+# "配置写错了"变成"整理出了一个空文件夹"。执行器以 uid 1001 运行，宿主目录要对该
+# uid 可写，否则第一次写入会以明确错误失败。
+#
+# 这里的环境变量与 chart 在 scopes 非空时渲染的**逐字段一致**，取值即
+# values.yaml 里 hostDocuments 的缺省值——不是随手写的常量：任何一处对不上
+# deploy/scripts/tests/host-documents-wiring.test.sh 就红。唯一刻意不写的是
+# HOST_DOCS_CLASSIFY_RULES：它的缺省值是进程内置的那张表，在这里复述一遍等于多
+# 一份要同步的东西，而它漂移的表现是"某个目录永远整理不出来"（没人会去看一份
+# 看起来正常的清单）。
+#
+# 正文出网是**另一个开关**，本文件不碰：网关侧的 HOST_DOCS_BODY_EGRESS_ENABLED
+# 在 gateway-deployment.yaml 里，执行器这份只是为了避免发出注定被拒的请求、必须
+# 与网关读到同一个值（只翻一侧＝功能整体不工作而两边读数各自自洽）。要放正文出
+# 集群时，两处一起改。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cogneva-sandbox-executor
+  namespace: cogneva
+spec:
+  template:
+    spec:
+      containers:
+        - name: sandbox-executor
+          env:
+            - name: HOST_DOCS_SCOPES
+              value: "alice=/opt/cogneva/host-docs/alice"
+            # 回滚日志落在执行器自己的持久卷上：日志随进程一起消失的部署，等于没有回滚。
+            - name: HOST_DOCS_JOURNAL_DIR
+              value: "/opt/cogneva/sandbox/host-docs-journal"
+            # 单份文档的重写上限（字节）。回滚要留一份原文副本，这个上限同时界住了一次操作与一份日志的大小。
+            - name: HOST_DOCS_MAX_WRITE_BYTES
+              value: "8388608"
+            # 单次读取上限（字节）。与上面那个**故意不联动**：一个界住写下去的字节，一个界住读进内存的字节。
+            - name: HOST_DOCS_MAX_READ_BYTES
+              value: "8388608"
+            # 暂存计划的窗口，同时也是"批准"的有效期：过期之后批过的计划照拒。
+            - name: HOST_DOCS_APPROVAL_TTL_SECS
+              value: "86400"
+            # 可暂存计划的大小上限，与单次写入同量级：带更多正文的计划会让"已批准"名不副实。
+            - name: HOST_DOCS_MAX_PLAN_BYTES
+              value: "8388608"
+            # 与网关侧同一个值（见文件头）；地址按服务名指向 audited 那一个，不是透传口。
+            - name: HOST_DOCS_BODY_EGRESS_ENABLED
+              value: "false"
+            - name: HOST_DOCS_AUDITED_LLM_URL
+              value: "http://cogneva-security-gateway-audited:8083/v1/chat/completions"
+            # 一次提问带多少正文、最多带几份文件。两条都是"少做"的界：越过就整问都不问，而不是问一部分。
+            - name: HOST_DOCS_ASSIST_BODY_BYTES
+              value: "2048"
+            - name: HOST_DOCS_ASSIST_MAX_CANDIDATES
+              value: "50"
+          volumeMounts:
+            - name: host-docs-alice
+              mountPath: /opt/cogneva/host-docs/alice
+      volumes:
+        - name: host-docs-alice
+          hostPath:
+            path: "/srv/alice/Documents"
+            type: Directory

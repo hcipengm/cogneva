@@ -22,6 +22,7 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 | **`rendered/<profile>/`** | chart 的 **CI 预渲染产物**（38/39/38 个 standalone YAML），由 `scripts/render-deploy.sh` 生成、随仓库提交 | 元启动 **apply 投递**消费；CI 新鲜度门禁防漂移；**不要手改** |
 | **`k3s/`** | **K3s 静态清单**：完整应用拓扑的静态 YAML + `observability/` 监控栈（Prometheus/Grafana/Loki/Jaeger 的 helm values 与装卸脚本）+ `examples/`、`swap-image.sh`、`sync-git-remote.sh` | **不是权威源**：是 chart k3s profile 的 **parity 基线**，兼集群内自进化 GitOps 拉取端的**运行时消费物**（cog-reflection 运行时 apply 克隆仓库里的这些文件）；由 `scripts/check-deploy-parity.sh` 字段级门禁对齐 |
 | **`k8s/`** | **标准 K8s 的基础设施参考清单**（不是应用拓扑）：`longhorn`/`argocd`/`cert-manager`/`ingress-nginx`/`metallb`/`velero`/`monitoring/` 集群级组件按需单独 apply；`image-distributor.yaml` 多节点镜像分发器（**元启动 `include_str!` 内嵌模板**）；`meilisearch.yaml` 可选搜索参考；`cogneva.service` systemd 参考副本 | 标准 K8s 的**应用拓扑不在这里**——走 chart 的 `k8s-standard` profile（渲染在 `rendered/k8s-standard/`）；本目录只有集群周边设施 |
+| **`site-overlays/`** | **安装期私有事实的 kustomize overlay**（当前一处：`host-documents/`——宿主文档整理的 scope 挂载）。scope 的宿主路径是某台机器自己的事实，而 `k3s/` 会被集群内 GitOps 循环 apply 到每台机器上、挂载又是 `type: Directory`（路径不对 Pod 起不来），所以它不能待在基座里；与已删除的 `deploy/kustomize/`（按环境复制拓扑）不同，这里不复制拓扑，只有一条无处可写的私有事实 | 运维按需 `kubectl kustomize deploy/site-overlays/host-documents \| kubectl apply -f -`；与 chart 的字段级对齐由 `scripts/tests/host-documents-wiring.test.sh` 断言 |
 | **`scripts/`** | 部署工具脚本（见下表） | CI 与元启动调用 |
 | **`systemd/`** | **Linux 裸机（不用 K8s）传统部署**的 systemd unit，直接把二进制跑成宿主服务 | 非容器路线 |
 | **`launchd/`** | **macOS 裸机传统部署**的 launchd plist | 非容器路线（Windows 服务用 `sc.exe`，命令见后文，无独立文件夹） |

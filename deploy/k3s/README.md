@@ -42,6 +42,20 @@ bash deploy/scripts/check-deploy-parity.sh
   `helm/kube-prometheus-stack-values-small.yaml` 已在本机部署，商用全量版同目录保留）
   与配套清单；`scripts/install.sh` 支持 `PROFILE=small|full` 双档。
   loki/jaeger 本轮未部署，生产档再上。
+- **安装期私有事实在 `deploy/site-overlays/`**：当前一处——宿主文档整理的 scope
+  挂载（`host-documents/`，指向本目录的 kustomize overlay）。它不能写在本目录里，
+  原因有两个且各自足够：本目录会被集群内 GitOps 循环 apply 到每台机器上，而
+  一个 scope 的宿主路径只在一台机器上成立；挂载是 `type: Directory`（不是
+  DirectoryOrCreate），路径不对 Pod 就起不来。用前改 patch 里的 scope 名与宿主
+  路径，然后
+
+  ```bash
+  kubectl kustomize deploy/site-overlays/host-documents | kubectl apply -f -
+  ```
+
+  与 chart 的字段级对齐、以及"基座自己长不出挂载"由
+  `deploy/scripts/tests/host-documents-wiring.test.sh` 断言（overlay 与 chart 同
+  scope 的渲染逐字段相等、开关的两个读者同值、受审通道在静态路径上同样可达）。
 
 ## 集群入口
 

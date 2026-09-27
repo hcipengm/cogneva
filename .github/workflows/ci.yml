@@ -187,6 +187,11 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: ${{ steps.helmver.outputs.version }}
+      # Four of the script tests read manifests through `kubectl kustomize`. The
+      # runner image happens to carry a kubectl, which is the same as not having
+      # one managed: the day the image drops it, the failure lands inside a test
+      # named for something else. Asked for here, the dependency is a step.
+      - uses: azure/setup-kubectl@v4
       - name: Script tests
         run: |
           for t in deploy/scripts/tests/*.test.sh; do

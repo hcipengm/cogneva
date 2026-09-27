@@ -301,71 +301,166 @@ PYEOF
 # All three are checked against other parts of the same render (the Service, the
 # NetworkPolicy) and of the gateway source (its route table) rather than against
 # numbers or paths written here.
-python3 - "${work}/scopes.yaml" "${gateway_rs}" <<'PYEOF' || exit 1
-import re, sys, yaml
+cat > "${work}/reachability.py" <<'PYEOF'
+import os, re, sys, yaml
 from urllib.parse import urlparse
 
-render, gateway_src = sys.argv[1], sys.argv[2]
-docs = [d for d in yaml.safe_load_all(open(render)) if d and d.get('kind')]
-by_name = {(d['kind'], d['metadata']['name']): d for d in docs}
-fail = []
+# Takes the renders to judge, then the gateway source. Judging more than one
+# render at a time is the point: the same station has to be reachable from every
+# apply path that can produce it, and a check that ever only saw one of them
+# would report the capability as wired while the other path's executor points at
+# a door its own policy does not open.
+gateway_src = sys.argv[-1]
+source = open(gateway_src).read()
+block = re.search(r"fn llm_channel_router\(\) -> Router<AppState> \{(.*?)\n\}", source, re.S)
 
+failed = False
+for render in sys.argv[1:-1]:
+    label = os.path.basename(render)
+    docs = [d for d in yaml.safe_load_all(open(render)) if d and d.get('kind')]
+    by_name = {(d['kind'], d['metadata']['name']): d for d in docs}
+    fail = []
 
-def env_value(workload, container, name):
-    d = by_name.get(('Deployment', workload))
-    if d is None:
-        fail.append(f"no Deployment {workload}")
+    def env_value(workload, container, name):
+        d = by_name.get(('Deployment', workload))
+        if d is None:
+            fail.append(f"no Deployment {workload}")
+            return None
+        for c in d['spec']['template']['spec']['containers']:
+            if c['name'] != container:
+                continue
+            for e in c.get('env', []):
+                if e['name'] == name:
+                    return e.get('value', '')
         return None
-    for c in d['spec']['template']['spec']['containers']:
-        if c['name'] != container:
-            continue
-        for e in c.get('env', []):
-            if e['name'] == name:
-                return e.get('value', '')
-    return None
 
+    url = env_value('cogneva-sandbox-executor', 'sandbox-executor', 'HOST_DOCS_AUDITED_LLM_URL')
+    if not url:
+        fail.append("the executor has no HOST_DOCS_AUDITED_LLM_URL: the model station is wired to nowhere")
+    else:
+        parsed = urlparse(url)
+        if parsed.hostname != 'cogneva-security-gateway-audited':
+            fail.append(f"the station's address is {parsed.hostname}, not the audited Service")
+        service = by_name.get(('Service', 'cogneva-security-gateway-audited'))
+        if service is None:
+            fail.append("the address names an audited Service that the render does not contain")
+        else:
+            ports = [p['port'] for p in service['spec']['ports']]
+            if parsed.port not in ports:
+                fail.append(f"the address uses port {parsed.port}; the audited Service serves {ports}")
+        # The pod's own egress face: the address has to be inside it, or the station
+        # is configured against a door this pod does not have.
+        policy = by_name.get(('NetworkPolicy', 'cogneva-sandbox-executor-egress'))
+        if policy is None:
+            fail.append("the executor has no egress policy; the audited channel is then not a boundary")
+        else:
+            allowed = []
+            for rule in policy['spec'].get('egress', []):
+                for target in rule.get('to', []):
+                    labels = target.get('podSelector', {}).get('matchLabels', {})
+                    if labels.get('app.kubernetes.io/component') == 'security-gateway':
+                        allowed += [p.get('port') for p in rule.get('ports', [])]
+            if parsed.port not in allowed:
+                fail.append(f"the address uses port {parsed.port}, which this pod's egress policy does not allow ({allowed})")
+        # And the path has to be one the audited channel actually serves: read from
+        # the router definition rather than repeated here.
+        if block is None:
+            fail.append("cannot find llm_channel_router in the gateway source: this check read nothing")
+        else:
+            routes = re.findall(r'\.route\("([^"]+)"', block.group(1))
+            if parsed.path not in routes:
+                fail.append(f"the address path {parsed.path} is not one of the audited routes {routes}")
 
-url = env_value('cogneva-sandbox-executor', 'sandbox-executor', 'HOST_DOCS_AUDITED_LLM_URL')
-if not url:
-    fail.append("the executor has no HOST_DOCS_AUDITED_LLM_URL: the model station is wired to nowhere")
-else:
-    parsed = urlparse(url)
-    if parsed.hostname != 'cogneva-security-gateway-audited':
-        fail.append(f"the station's address is {parsed.hostname}, not the audited Service")
-    service = by_name.get(('Service', 'cogneva-security-gateway-audited'))
-    if service is None:
-        fail.append("the address names an audited Service that the render does not contain")
-    else:
-        ports = [p['port'] for p in service['spec']['ports']]
-        if parsed.port not in ports:
-            fail.append(f"the address uses port {parsed.port}; the audited Service serves {ports}")
-    # The pod's own egress face: the address has to be inside it, or the station is
-    # configured against a door this pod does not have.
-    policy = by_name.get(('NetworkPolicy', 'cogneva-sandbox-executor-egress'))
-    if policy is None:
-        fail.append("the executor has no egress policy; the audited channel is then not a boundary")
-    else:
-        allowed = []
-        for rule in policy['spec'].get('egress', []):
-            for target in rule.get('to', []):
-                labels = target.get('podSelector', {}).get('matchLabels', {})
-                if labels.get('app.kubernetes.io/component') == 'security-gateway':
-                    allowed += [p.get('port') for p in rule.get('ports', [])]
-        if parsed.port not in allowed:
-            fail.append(f"the address uses port {parsed.port}, which this pod's egress policy does not allow ({allowed})")
-    # And the path has to be one the audited channel actually serves: read from the
-    # router definition rather than repeated here.
-    source = open(gateway_src).read()
-    block = re.search(r"fn llm_channel_router\(\) -> Router<AppState> \{(.*?)\n\}", source, re.S)
-    if block is None:
-        fail.append("cannot find llm_channel_router in the gateway source: this check read nothing")
-    else:
-        routes = re.findall(r'\.route\("([^"]+)"', block.group(1))
-        if parsed.path not in routes:
-            fail.append(f"the address path {parsed.path} is not one of the audited routes {routes}")
+    for message in fail:
+        print(f"{label}: {message}")
+    failed = failed or bool(fail)
 
-print("\n".join(fail))
-sys.exit(1 if fail else 0)
+sys.exit(1 if failed else 0)
 PYEOF
 
-echo "PASS: document scopes mount by identity, default off, every template-set key has a reader, the model station speaks only to the audited channel, and the audited channel admits the executor only"
+# The chart's render with a scope configured: the station exists there, so this
+# pass has something to judge. The static path's render is judged in section 8,
+# where the overlay producing it is also aligned against this same render.
+python3 "${work}/reachability.py" "${work}/scopes.yaml" "${gateway_rs}" || exit 1
+
+# --- 8) the static path: same capability, carried by a site overlay ---------
+# `deploy/k3s/` is the other apply path. It carries the audited Service, the
+# gateway's switch and the executor's egress face, but nothing that can mount a
+# host directory: HOST_DOCS_SCOPES had no carrier there, so on that path the
+# capability was unreachable -- every half was present except the one that says
+# which host directory may be reached.
+#
+# That carrier cannot live in the base: a scope's host path is one installation's
+# private fact, and the base is applied to every machine by the in-cluster GitOps
+# loop, while the mount is `type: Directory` (a path that is not there keeps the
+# pod from starting). So it is a site overlay, and what is asserted here is that
+# (1) the committed base grows nothing on its own, (2) the overlay's render
+# agrees with the chart's, fact for fact -- an overlay that drifts is a second
+# topology, and its drift shows up as a mount the executor was never told about
+# -- and (3) both apply paths leave the switch's two readers holding one value.
+kubectl kustomize "${repo}/deploy/k3s" > "${work}/static-base.yaml"
+kubectl kustomize "${repo}/deploy/site-overlays/host-documents" > "${work}/static-scopes.yaml"
+
+# Every fact this capability consists of in one render: the executor's
+# HOST_DOCS_* values, its host-docs mounts and the host paths behind them.
+# Sorted lines, so "the two sides agree" is two strings being equal.
+host_docs_facts() {
+  python3 - "$1" <<'PYEOF'
+import sys, yaml
+facts = []
+for doc in yaml.safe_load_all(open(sys.argv[1])):
+    if not doc or doc.get('kind') != 'Deployment' or doc['metadata']['name'] != 'cogneva-sandbox-executor':
+        continue
+    spec = doc['spec']['template']['spec']
+    for c in spec['containers']:
+        if c['name'] != 'sandbox-executor':
+            continue
+        for e in c.get('env', []):
+            if e['name'].startswith('HOST_DOCS_'):
+                facts.append(f"env {e['name']}={e.get('value', '')}")
+        for m in c.get('volumeMounts', []):
+            if m['name'].startswith('host-docs-'):
+                facts.append(f"mount {m['name']}={m['mountPath']}")
+    for v in spec.get('volumes', []):
+        if v['name'].startswith('host-docs-'):
+            hp = v.get('hostPath', {})
+            facts.append(f"volume {v['name']}={hp.get('path')}:{hp.get('type')}")
+print("\n".join(sorted(facts)))
+PYEOF
+}
+
+# Self-check: the extractor is reading a real render of the base. Without this
+# the "the base grows nothing" line below would also pass on an empty file.
+grep -q "HOST_DOCS_BODY_EGRESS_ENABLED" "${work}/static-base.yaml" \
+  || fail "the static base render carries no host-document wiring at all; the checks below are reading nothing"
+[ -z "$(host_docs_facts "${work}/static-base.yaml")" ] \
+  || fail "the committed static manifests grow a host document mount by themselves; the capability must stay off until an operator opts in: $(host_docs_facts "${work}/static-base.yaml" | tr '\n' ' ')"
+
+render --set hostDocuments.scopes.alice=/srv/alice/Documents > "${work}/helm-scopes.yaml"
+helm_facts="$(host_docs_facts "${work}/helm-scopes.yaml")"
+static_facts="$(host_docs_facts "${work}/static-scopes.yaml")"
+[ -n "${static_facts}" ] \
+  || fail "self-check failed: the overlay renders no host document wiring; the comparison below would pass on nothing"
+grep -qx 'env HOST_DOCS_SCOPES=alice=/opt/cogneva/host-docs/alice' <<<"${static_facts}" \
+  || fail "the overlay does not bind the scope name to its mount point: ${static_facts}"
+[ "${static_facts}" = "${helm_facts}" ] \
+  || fail "the static overlay and the chart disagree about host document access:
+$(diff <(echo "${helm_facts}") <(echo "${static_facts}") || true)"
+
+# The switch has two readers on this path too, and the base carries only the
+# gateway's copy: an overlay that turns body egress on without the executor
+# hearing it leaves the caller refusing on its own default while the gateway lets
+# the call through -- each side's reading self-consistent, the capability off.
+gw_switch_static="$(env_value "${work}/static-scopes.yaml" cogneva-security-gateway security-gateway HOST_DOCS_BODY_EGRESS_ENABLED)"
+exec_switch_static="$(env_value "${work}/static-scopes.yaml" cogneva-sandbox-executor sandbox-executor HOST_DOCS_BODY_EGRESS_ENABLED)"
+[ -n "${gw_switch_static}" ] \
+  || fail "the static gateway carries no HOST_DOCS_BODY_EGRESS_ENABLED reading"
+[ "${exec_switch_static}" = "${gw_switch_static}" ] \
+  || fail "one switch, two readers, one value: on the static path the gateway reads ${gw_switch_static} and the executor reads ${exec_switch_static:-missing}"
+
+# And the station the overlay wires has to be reachable there as well: the
+# audited Service, this pod's egress face and the route table are all facts of
+# the base, and an overlay can be perfect while the door it aims at is not open.
+python3 "${work}/reachability.py" "${work}/static-scopes.yaml" "${gateway_rs}" || exit 1
+
+echo "PASS: document scopes mount by identity, default off, every template-set key has a reader, the model station speaks only to the audited channel, the audited channel admits the executor only, and the static path reaches it through a site overlay that matches the chart fact for fact"

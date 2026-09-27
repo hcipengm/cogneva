@@ -1,0 +1,39 @@
+# 静态清单路径上「宿主文档整理」的载体：一个指向 deploy/k3s 基座的 kustomize
+# overlay，只把这一项能力长出来。
+#
+# 为什么需要它：chart 侧的 scopes 由 values 提供，而 deploy/k3s/ 是手写基座、
+# 拉不到 chart values，于是这条路径上 HOST_DOCS_SCOPES **没有生产方**——受审
+# 通道、网关那侧的开关、执行器出网面全都已经在基座里（见
+# gateway-deployment.yaml、gateway-audited-service.yaml、network-policy.yaml），
+# 唯独"能挂哪个宿主目录"这一项无处声明，能力在这条路径上不可达。此处补的就是
+# 它。
+#
+# 为什么**不在** deploy/k3s/ 里（两个原因，任一个都足够）：
+#   - 那个目录是集群内 GitOps 拉取端的运行时消费物（values 的
+#     `gitops.manifestDir`），仓库里写什么就会被自进化循环 apply 到每台机器上。
+#     而 scope 的宿主路径是**某台安装机自己的事实**，挂载又是
+#     `type: Directory`（路径不对 Pod 起不来）：把它放进基座等于让每台机器都去
+#     挂一份只在一台机器上存在的目录。
+#   - kustomize 也不允许 overlay 落在被引用的基座目录内（cycle detected）。
+# 于是它与 examples/secret.yaml 同一性质：仓库只提供结构，私有事实由运维带外填。
+#
+# 与已删除的 `deploy/kustomize/`（base + dev/prod overlays）不是一回事：那一份按环境
+# 复制拓扑，与"环境差异只在 chart values 维护一份"冲突；这里只有一条私有事实（某个
+# scope 在宿主上的路径），它既进不了 chart values（静态路径读不到），也进不了预渲染
+# 产物（那份是提交进仓库的、每台机器一样）。
+#
+# 用法（先改 patch-sandbox-executor.yaml 里的 scope 名与宿主路径）：
+#   kubectl kustomize deploy/site-overlays/host-documents | kubectl apply -f -
+#
+# 两侧对齐由门禁把住，不靠人比对：
+#   bash deploy/scripts/tests/host-documents-wiring.test.sh
+# 它断言基座自己长不出任何宿主文档挂载、overlay 的渲染与 chart 同 scope 的渲染
+# **逐字段相等**、执行器与网关读到的是同一个开关值，并把受审通道的可达性检查
+# 同样跑在 overlay 上。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: cogneva
+resources:
+  - ../../k3s
+patches:
+  - path: patch-sandbox-executor.yaml
