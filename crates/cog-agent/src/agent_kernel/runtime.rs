@@ -1409,6 +1409,7 @@ impl AgentRuntime {
         .await?;
 
         let mut final_message = Message::assistant(Vec::new());
+        let mut stream_error: Option<String> = None;
 
         // Iterate over the streaming events. Each await is stall-guarded: an
         // event arriving resets the clock, so long generations survive while a
@@ -1424,10 +1425,17 @@ impl AgentRuntime {
                 }
             };
             if let AssistantMessageEvent::Error { error, .. } = &event {
-                return Err(SFError::Agent(format!(
-                    "LLM stream error: {}",
-                    error.content()
-                )));
+                // The reply is over, but keep reading instead of returning from
+                // this arm. This event holds only the wording of the failure;
+                // the *type* of it -- which refusal the upstream gave, and how
+                // long that upstream said to wait -- is on the stream's final
+                // response, and this is the one place every agent call passes
+                // through. Returning here is how a quota outage looks to every
+                // consumer above like a transient blip worth re-buying on the
+                // next tick, since a sentence is all they get to read. Reading
+                // on is also what drains the producer, so `result()` resolves.
+                stream_error = Some(error.content());
+                continue;
             }
             event.apply(&mut final_message);
 
@@ -1452,8 +1460,28 @@ impl AgentRuntime {
         };
         // Bill this call to the run before anything can drop the response: the
         // assistant message built below carries no usage, so this line is the
-        // only place the run's spend is still readable.
+        // only place the run's spend is still readable. A refused call is
+        // billed too -- it consumed the tokens it consumed, and the error path
+        // returns from here before anything else could count them.
         self.run_usage.add(&response.usage);
+
+        if let Some(error) = stream_error {
+            // A provider that classified the refusal (HTTP status -> a typed
+            // refusal, plus the wait the upstream stated in its headers) already
+            // said what this failure is, and the type is what the layer above
+            // decides with: a terminal refusal must not be re-bought, and a
+            // stated wait must reach the delay rather than be re-derived. The
+            // sentence is kept as the message's text either way, so the wording
+            // readers already have does not change.
+            return Err(match response.upstream_failure {
+                Some(cause) => SFError::upstream_refused_after(
+                    cause,
+                    format!("LLM stream error: {error}"),
+                    response.retry_after_secs,
+                ),
+                None => SFError::Agent(format!("LLM stream error: {error}")),
+            });
+        }
 
         // Build the final message from response content
         let content = if !response.content.is_empty() {
@@ -2333,6 +2361,121 @@ mod tests {
             "test should actually outlast the stall window, took {:?}",
             started.elapsed()
         );
+    }
+
+    /// Refuses a call the way a real provider does: an error event carrying the
+    /// wording, then a final response carrying the refusal the provider
+    /// classified out of the HTTP status and the wait the upstream stated in
+    /// its headers. The two halves are what the kernel has to join back up.
+    struct RefusedStreamLlm {
+        wording: String,
+        cause: Option<cog_core::UpstreamFailure>,
+        wait: Option<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for RefusedStreamLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, mut producer) = cog_core::EventStream::with_capacity(8);
+            let wording = self.wording.clone();
+            let (cause, wait) = (self.cause, self.wait);
+            tokio::spawn(async move {
+                let _ = producer
+                    .push(AssistantMessageEvent::Error {
+                        reason: cog_core::StopReason::Error,
+                        error: Message::assistant_text(wording.clone()),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    error_message: Some(wording),
+                    stop_reason: cog_core::StopReason::Error,
+                    upstream_failure: cause,
+                    retry_after_secs: wait,
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    ..cog_core::ChatResponse::default()
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// A refusal's type and the wait its upstream stated are the provider's,
+    /// not the sentence's, and the kernel is the only place they can be handed
+    /// up: the event is what it walked past, the response is where they were
+    /// written. Re-derived from the wording, a quota refusal arrives upstairs
+    /// as an untyped failure and is re-bought next tick.
+    #[tokio::test]
+    async fn a_refused_stream_error_carries_its_type_and_the_stated_wait() {
+        let llm = RefusedStreamLlm {
+            wording: "API error (HTTP 503): upstreams unavailable".into(),
+            cause: Some(cog_core::UpstreamFailure::QuotaExhausted),
+            wait: Some(5578),
+        };
+        let mut runtime = stall_test_runtime("refused-typed");
+        let err = runtime
+            .think_stream(&llm)
+            .await
+            .expect_err("a refused stream must fail the call");
+        assert_eq!(
+            err.upstream_failure(),
+            Some(cog_core::UpstreamFailure::QuotaExhausted)
+        );
+        assert_eq!(err.retry_after_secs(), Some(5578));
+        assert!(err.is_terminal_upstream_failure());
+        assert!(
+            err.to_string().contains("LLM stream error")
+                && err.to_string().contains("upstreams unavailable"),
+            "the wording readers already have must survive, got: {err}"
+        );
+    }
+
+    /// A stream that ends in an error the provider never classified stays
+    /// untyped. Inventing a type here would turn every unclassified failure
+    /// terminal, which is the opposite defect: a stream that dies mid-reply
+    /// would stop being retried at all.
+    #[tokio::test]
+    async fn an_unclassified_stream_error_stays_untyped() {
+        let llm = RefusedStreamLlm {
+            wording: "stream ended without a reply".into(),
+            cause: None,
+            wait: None,
+        };
+        let mut runtime = stall_test_runtime("refused-untyped");
+        let err = runtime
+            .think_stream(&llm)
+            .await
+            .expect_err("an errored stream must fail the call");
+        assert_eq!(err.upstream_failure(), None);
+        assert_eq!(err.retry_after_secs(), None);
+        assert!(!err.is_terminal_upstream_failure());
+        assert!(err.to_string().contains("stream ended without a reply"));
     }
 
     // ─── Per-task token census ───
