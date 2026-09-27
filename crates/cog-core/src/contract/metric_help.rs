@@ -63,7 +63,20 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         "llm_tokens_total",
-        "Total LLM tokens consumed, split by input and output",
+        "Total LLM tokens consumed, split by input and output. Published at \
+         zero too: a missing cell says the metering path never ran for that \
+         upstream and actor, a cell holding zero says it ran and found nothing",
+    ),
+    (
+        crate::metric_names::LLM_USAGE_READINGS_TOTAL.as_str(),
+        "What the read of each finished LLM response found, by upstream and \
+         outcome. `absent` is the cell to read first: it says the upstream sent \
+         no usage frame at all, so the token counts recorded beside that call \
+         are zeros because nothing was said, not because nothing was used -- \
+         while it climbs, every token total on that upstream is blind, and the \
+         fix is on the request side rather than the reader's. `interrupted` is \
+         a response that never finished, kept apart so an upstream that dies \
+         mid-stream cannot be read as one that answers quietly",
     ),
     (
         "llm_upstream_client_errors_total",

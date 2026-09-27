@@ -187,7 +187,20 @@ metric_names! {
     // cog-gateway — LLM pool and upstream health.
     LLM_CALLS_TOTAL => "llm_calls_total",
     LLM_CALL_LATENCY_MS => "llm_call_latency_ms",
+    // Published at zero as well as at a value. An absent cell says the metering
+    // path never ran for that upstream and actor, while a cell holding zero says
+    // it ran and had nothing to add -- and an upstream that sends no usage frame
+    // produces the second, not the first, so without the zero the two read the
+    // same.
     LLM_TOKENS_TOTAL => "llm_tokens_total",
+    // What the read of each finished response found, by `upstream` and
+    // `outcome`. A series of its own rather than more labels on the counts
+    // above, because it answers a different question: the counts say how much,
+    // this says whether the upstream said anything at all. A zero on the counts
+    // cannot tell those apart, which is how a meter that is blind looks exactly
+    // like a workload that used nothing. The cell vocabulary is declared next to
+    // the producer.
+    LLM_USAGE_READINGS_TOTAL => "llm_usage_readings_total",
     LLM_REQUEST_PARAM_CLAMPED_TOTAL => "llm_request_param_clamped_total",
     LLM_UPSTREAM_CLIENT_ERRORS_TOTAL => "llm_upstream_client_errors_total",
     LLM_UPSTREAM_FAILURES_TOTAL => "llm_upstream_failures_total",

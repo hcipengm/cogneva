@@ -2827,6 +2827,7 @@ mod metrics_exposition_tests {
             "tier_migration_total",
             "llm_calls_total",
             "llm_tokens_total",
+            "llm_usage_readings_total",
             "llm_upstream_client_errors_total",
             "llm_upstream_failures_total",
         ] {

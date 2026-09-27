@@ -1207,6 +1207,93 @@ fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
     });
 }
 
+/// What reading a finished response found, as the cells of
+/// [`USAGE_OUTCOMES`]. One cause per cell, because the three call for different
+/// actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageOutcome {
+    /// A usage frame was parsed, so the token counts recorded for this call are
+    /// the upstream's own numbers.
+    Read,
+    /// The response body finished and carried no usage frame at all. The counts
+    /// recorded beside it are zeros because the upstream never said, which is a
+    /// different fact from an upstream that said zero — and the one that says
+    /// the meter is blind while the call itself succeeded.
+    Absent,
+    /// The response never finished, so there was nothing to read. A call-level
+    /// fault rather than a metering one, and kept apart so a stream that dies
+    /// mid-flight cannot be read as an upstream that answers without usage.
+    Interrupted,
+}
+
+impl UsageOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            UsageOutcome::Read => "read",
+            UsageOutcome::Absent => "absent",
+            UsageOutcome::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// One call's usage reading: the two counts and what the read found.
+///
+/// They travel as one value because the outcome is a statement *about* these
+/// counts. Split across separate arguments a caller could pair one call's
+/// numbers with another's verdict, and nothing in the signature would notice.
+struct UsageReading {
+    input: u64,
+    output: u64,
+    outcome: UsageOutcome,
+}
+
+impl UsageReading {
+    /// For a body that was read to the end in one piece: an upstream that named
+    /// neither count said nothing about usage, which is `Absent` and not a
+    /// reading of zero.
+    fn from_usage((input, output): (Option<u64>, Option<u64>)) -> Self {
+        Self {
+            input: input.unwrap_or(0),
+            output: output.unwrap_or(0),
+            outcome: if input.is_none() && output.is_none() {
+                UsageOutcome::Absent
+            } else {
+                UsageOutcome::Read
+            },
+        }
+    }
+}
+
+/// The cells `llm_usage_readings_total` can carry. Declared next to the
+/// producer rather than in the registry, so a new outcome cannot be recorded
+/// without appearing here.
+const USAGE_OUTCOMES: [UsageOutcome; 3] = [
+    UsageOutcome::Read,
+    UsageOutcome::Absent,
+    UsageOutcome::Interrupted,
+];
+
+/// Publish the usage vocabulary at zero, for every configured upstream.
+///
+/// "The upstream was never called" and "it was called and never sent usage"
+/// are the two readings that have to stay apart, and they differ only by
+/// whether the cells exist. Publishing them at startup makes the second one a
+/// count that climbs rather than a cell that appears out of nowhere.
+async fn publish_usage_vocabulary(state: &AppState) {
+    for upstream in &state.config.llm_upstreams {
+        let key = LlmHealthTable::key(upstream);
+        for outcome in USAGE_OUTCOMES {
+            record_counter_add(
+                state,
+                cog_core::metric_names::LLM_USAGE_READINGS_TOTAL,
+                0.0,
+                &[("upstream", &key), ("outcome", outcome.as_str())],
+            )
+            .await;
+        }
+    }
+}
+
 /// 一次调用的 token 计量落点（三处同写）：Prometheus counter、ClickHouse 明细、
 /// PG 台账。只在拿到真实 usage 或确知为零时调用；任何落点失败只降级为
 /// warn/debug，绝不影响请求路径——计量是观测，不是业务。
@@ -1214,30 +1301,40 @@ async fn record_llm_tokens(
     state: &AppState,
     upstream: &LlmUpstream,
     result: &str,
-    tokens_input: u64,
-    tokens_output: u64,
+    reading: UsageReading,
     latency_ms: u64,
     actor: &str,
 ) {
     let key = LlmHealthTable::key(upstream);
-    if tokens_input > 0 {
-        record_counter_add(
-            state,
-            cog_core::metric_names::LLM_TOKENS_TOTAL,
-            tokens_input as f64,
-            &[("upstream", &key), ("kind", "input"), ("actor", actor)],
-        )
-        .await;
-    }
-    if tokens_output > 0 {
-        record_counter_add(
-            state,
-            cog_core::metric_names::LLM_TOKENS_TOTAL,
-            tokens_output as f64,
-            &[("upstream", &key), ("kind", "output"), ("actor", actor)],
-        )
-        .await;
-    }
+    // Zero is recorded, not skipped: the two cells answer "has this metering
+    // path ever run for this upstream and actor", and a skipped zero leaves
+    // that question with no reading at all. What the counts cannot say — whether
+    // the upstream said nothing — is on the readings series below.
+    record_counter_add(
+        state,
+        cog_core::metric_names::LLM_TOKENS_TOTAL,
+        reading.input as f64,
+        &[("upstream", &key), ("kind", "input"), ("actor", actor)],
+    )
+    .await;
+    record_counter_add(
+        state,
+        cog_core::metric_names::LLM_TOKENS_TOTAL,
+        reading.output as f64,
+        &[("upstream", &key), ("kind", "output"), ("actor", actor)],
+    )
+    .await;
+    // No actor here on purpose: whether an upstream speaks usage at all is
+    // settled by the upstream and its compat profile, not by who called it, so
+    // splitting by caller would multiply one answer across every caller and
+    // leave the reader to add them back up.
+    record_counter_add(
+        state,
+        cog_core::metric_names::LLM_USAGE_READINGS_TOTAL,
+        1.0,
+        &[("upstream", &key), ("outcome", reading.outcome.as_str())],
+    )
+    .await;
     record_event(
         state,
         AnalyticsEvent::new("llm_usage")
@@ -1245,8 +1342,8 @@ async fn record_llm_tokens(
             .property("model", serde_json::json!(upstream.model))
             .property("result", serde_json::json!(result))
             .property("actor", serde_json::json!(actor))
-            .property("tokens_in", serde_json::json!(tokens_input))
-            .property("tokens_out", serde_json::json!(tokens_output))
+            .property("tokens_in", serde_json::json!(reading.input))
+            .property("tokens_out", serde_json::json!(reading.output))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
     land_usage_record(
@@ -1257,8 +1354,8 @@ async fn record_llm_tokens(
             model: upstream.model.clone(),
             result: result.to_string(),
             actor: actor.to_string(),
-            tokens_input,
-            tokens_output,
+            tokens_input: reading.input,
+            tokens_output: reading.output,
             latency_ms,
         },
     );
@@ -1300,6 +1397,10 @@ struct UsageScanner {
     raw: Vec<u8>,
     tokens_input: u64,
     tokens_output: u64,
+    /// Set when the response stream yielded an error. Kept because "the body
+    /// ended" and "the body was cut off" produce the same zero counts, and only
+    /// the second one means the call itself failed.
+    saw_error: bool,
 }
 
 impl UsageScanner {
@@ -1328,6 +1429,20 @@ impl UsageScanner {
                     self.tokens_output = n;
                 }
             }
+        }
+    }
+
+    /// Which cell this scan belongs in once the body is done.
+    ///
+    /// The cut outranks whatever was parsed: a body that did not finish is not a
+    /// complete reading, however many frames arrived before it stopped.
+    fn outcome(&self) -> UsageOutcome {
+        if self.saw_error {
+            UsageOutcome::Interrupted
+        } else if self.tokens_input > 0 || self.tokens_output > 0 {
+            UsageOutcome::Read
+        } else {
+            UsageOutcome::Absent
         }
     }
 
@@ -1363,24 +1478,33 @@ fn wrap_usage_scan(
     let scanner = Arc::new(Mutex::new(UsageScanner::default()));
     let scan = scanner.clone();
     let scanned = stream.map(move |item| {
-        if let Ok(bytes) = &item {
-            let mut s = scan.lock().unwrap();
-            s.feed(bytes);
+        match &item {
+            Ok(bytes) => {
+                let mut s = scan.lock().unwrap();
+                s.feed(bytes);
+            }
+            Err(_) => {
+                let mut s = scan.lock().unwrap();
+                s.saw_error = true;
+            }
         }
         item
     });
     let finalize = futures::stream::once(async move {
-        let (input, output) = {
+        let reading = {
             let mut s = scanner.lock().unwrap();
             s.finish();
-            (s.tokens_input, s.tokens_output)
+            UsageReading {
+                input: s.tokens_input,
+                output: s.tokens_output,
+                outcome: s.outcome(),
+            }
         };
         record_llm_tokens(
             &state,
             &upstream,
             "ok",
-            input,
-            output,
+            reading,
             start.elapsed().as_millis() as u64,
             &actor,
         )
@@ -2661,13 +2785,12 @@ async fn call_one_upstream(
             .json()
             .await
             .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None, None))?;
-        let (usage_in, usage_out) = extract_usage(&v);
+        let reading = UsageReading::from_usage(extract_usage(&v));
         record_llm_tokens(
             state,
             upstream,
             "ok",
-            usage_in.unwrap_or(0),
-            usage_out.unwrap_or(0),
+            reading,
             start.elapsed().as_millis() as u64,
             actor,
         )
@@ -2713,13 +2836,12 @@ async fn call_one_upstream(
         .json()
         .await
         .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None, None))?;
-    let (usage_in, usage_out) = extract_usage(&v);
+    let reading = UsageReading::from_usage(extract_usage(&v));
     record_llm_tokens(
         state,
         upstream,
         "ok",
-        usage_in.unwrap_or(0),
-        usage_out.unwrap_or(0),
+        reading,
         start.elapsed().as_millis() as u64,
         actor,
     )
@@ -4133,6 +4255,10 @@ pub async fn run(
         state.pool_obs.metrics.clone(),
     );
     audited_gate.publish_vocabulary().await;
+    // The same shape for the usage readings: the cells exist from startup, so an
+    // upstream that answers without usage reads as a count that climbs rather
+    // than as a series nobody can tell from one that was never called.
+    publish_usage_vocabulary(&state).await;
     tracing::info!(
         egress = %egress_addr,
         llm = %llm_addr,
@@ -4328,6 +4454,109 @@ mod tests {
         s.finish();
         assert_eq!(s.tokens_input, 9);
         assert_eq!(s.tokens_output, 3);
+    }
+
+    /// The cell the whole change exists for: a call that succeeded, spoke
+    /// nothing about usage, and therefore lands a zero that is a fact about the
+    /// upstream rather than a reading of the traffic.
+    #[test]
+    fn a_body_that_never_named_usage_lands_in_absent() {
+        let mut s = UsageScanner::default();
+        s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n");
+        s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n");
+        s.feed(b"data: [DONE]\n\n");
+        s.finish();
+        assert_eq!(s.tokens_input, 0);
+        assert_eq!(s.tokens_output, 0);
+        assert_eq!(s.outcome(), UsageOutcome::Absent);
+    }
+
+    /// A cut body is not a quiet upstream. Even when frames arrived first, the
+    /// reading is incomplete and has to say so.
+    #[test]
+    fn a_body_that_was_cut_off_lands_in_interrupted() {
+        let mut s = UsageScanner::default();
+        s.feed(b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1}}\n\n");
+        s.saw_error = true;
+        s.finish();
+        assert_eq!(s.outcome(), UsageOutcome::Interrupted);
+    }
+
+    #[test]
+    fn a_body_that_named_usage_lands_in_read() {
+        let mut s = UsageScanner::default();
+        s.feed(b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n");
+        s.finish();
+        assert_eq!(s.outcome(), UsageOutcome::Read);
+        let silent = UsageReading::from_usage((None, None));
+        assert_eq!(silent.outcome, UsageOutcome::Absent);
+        assert_eq!((silent.input, silent.output), (0, 0));
+        assert_eq!(
+            UsageReading::from_usage((Some(0), None)).outcome,
+            UsageOutcome::Read,
+            "a named count of zero is still the upstream speaking"
+        );
+    }
+
+    /// The declared vocabulary and the cells the producer can name are one set.
+    /// A cell added to the enum and forgotten here would be recorded but never
+    /// published at zero, and a stale name here would publish a cell nothing
+    /// ever increments.
+    #[test]
+    fn the_usage_vocabulary_is_every_cell_the_producer_can_name() {
+        let declared: std::collections::BTreeSet<&str> =
+            USAGE_OUTCOMES.iter().map(|o| o.as_str()).collect();
+        let nameable: std::collections::BTreeSet<&str> = [
+            UsageOutcome::Read,
+            UsageOutcome::Absent,
+            UsageOutcome::Interrupted,
+        ]
+        .iter()
+        .map(|o| o.as_str())
+        .collect();
+        assert_eq!(declared, nameable);
+    }
+
+    /// Every configured upstream gets every cell before it is ever called, so
+    /// "never called" stays distinguishable from "called and always silent".
+    #[tokio::test]
+    async fn the_usage_vocabulary_is_published_at_zero_for_every_upstream() {
+        let a = test_upstream();
+        let mut b = test_upstream();
+        b.base_url = "https://other.example/v1".into();
+        let upstreams = vec![a, b];
+        let state = test_state(upstreams.clone());
+        publish_usage_vocabulary(&state).await;
+
+        let totals = state
+            .pool_obs
+            .metrics
+            .query_counter_totals(cog_core::metric_names::LLM_USAGE_READINGS_TOTAL.as_str())
+            .await
+            .expect("published counter reading");
+        let published: std::collections::BTreeSet<(String, String)> = totals
+            .iter()
+            .map(|s| {
+                (
+                    s.labels.get("upstream").cloned().unwrap_or_default(),
+                    s.labels.get("outcome").cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let expected: std::collections::BTreeSet<(String, String)> = upstreams
+            .iter()
+            .flat_map(|u| {
+                let key = LlmHealthTable::key(u);
+                USAGE_OUTCOMES
+                    .iter()
+                    .map(move |o| (key.clone(), o.as_str().to_string()))
+            })
+            .collect();
+        assert_eq!(published, expected, "每个上游的每一格都在");
+        assert!(
+            totals.iter().all(|s| s.value == 0.0),
+            "the vocabulary lands at zero; calls are what add to it"
+        );
     }
 
     fn cfg(allow: &[&str], deny: &[&str]) -> SecurityGatewayConfig {
