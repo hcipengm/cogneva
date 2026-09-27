@@ -629,7 +629,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 .with_build_readings(build_readings.clone())
                 .with_target_dir(&self_evolution.workspaces.target_dir);
 
-                ctx.publish_observable(budget);
+                // Published by clone: the flight readings below take the test
+                // budget off this object rather than re-deriving it from the
+                // configuration document, so the wall a flight is judged against
+                // is the one it is actually killed by.
+                ctx.publish_observable(budget.clone());
                 ctx.publish_observable(build_readings);
 
                 let binary_switcher = ctx.consume_service::<dyn cog_core::BinarySwitcher>();
@@ -673,6 +677,38 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     ),
                 );
                 ctx.publish_observable(queue_readings.clone());
+
+                // The apply/test flight publishes itself while it runs, because
+                // everything else about it is derived after it ends: a change
+                // forty minutes into a healthy verification and a cycle stopped
+                // at the verification had the same face, and the reading that
+                // separates them is the age of the flight in progress.
+                //
+                // The wall it is judged against is the sum of the bounds of its
+                // two slowest steps, taken from the objects that enforce them:
+                // the verification budget the pipeline holds, and the build
+                // gate's configured wait -- the same value `install_for` below
+                // hands the gate this process runs under. A gate that turns out
+                // not to be in force (disabled, or a slot directory it could not
+                // create) makes this wall larger than the flight's true bound,
+                // which delays a rule rather than firing one on a healthy
+                // flight. Only the process that runs flights publishes any of
+                // it: the role is the same `executor_enabled` the queue readings
+                // publish, and a second flag here could drift out of step with
+                // that one.
+                let flight_wall_secs = budget.timeout_secs(crate::verification_budget::KIND_TEST)
+                    + self_evolution.build_gate.wait_secs;
+                let flight = Arc::new(if executor_enabled {
+                    crate::evolution_flight_readings::EvolutionFlightReadings::new(
+                        self_evolution.change_dir.clone(),
+                        flight_wall_secs,
+                    )
+                } else {
+                    crate::evolution_flight_readings::EvolutionFlightReadings::none(
+                        self_evolution.change_dir.clone(),
+                    )
+                });
+                ctx.publish_observable(flight.clone());
 
                 // 自动晋级运行时一键暂停开关：admin API 与 AutoPromoter
                 // 共享同一实例，暂停立即对排队晋级生效。
@@ -937,6 +973,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             let promoter = promoter.clone();
                             let cycle_workspaces = cycle_workspaces.clone();
                             let landing = landing.clone();
+                            let flight = flight.clone();
                             let cycle_instance = cycle_instance.clone();
                             let cycle_version = cycle_version.clone();
                             async move {
@@ -957,6 +994,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                         promoter: promoter.as_ref(),
                                         workspaces: &cycle_workspaces,
                                         landing: landing.as_ref(),
+                                        flight: &flight,
                                     };
                                     if let Err(e) =
                                         run_evolution_cycle(deps, &cycle_instance, &cycle_version)
@@ -1748,6 +1786,9 @@ struct CycleDeps<'a> {
     /// 变更上游通道：沙盒验收过的提交经它落到主分支。缺席时只做本地
     /// 构建部署，不做上游落地。
     landing: Option<&'a Arc<dyn cog_core::ChangeLanding>>,
+    /// 本进程的 apply/test 飞行读数：起飞打戳、落地由守卫清除，年龄在抓取期
+    /// 现算。变更在这段里不产出任何别的读数，因而"在飞"与"卡住"要靠它分开。
+    flight: &'a Arc<crate::evolution_flight_readings::EvolutionFlightReadings>,
 }
 
 /// 把两条输入通道汇合成本轮要验证的变更集合。
@@ -1976,6 +2017,7 @@ async fn run_evolution_cycle_in(
         promoter,
         workspaces,
         landing,
+        flight,
     } = deps;
     let Some(evo_engine) = engine.evolution.as_ref() else {
         return Ok(());
@@ -2005,7 +2047,16 @@ async fn run_evolution_cycle_in(
     for change in changes {
         let mut refused: Option<cog_core::RejectionCause> = None;
 
-        let result = match pipeline.apply_and_test_in(&change, workdir).await {
+        // The flight is the apply/test run and nothing after it: the commit, the
+        // release build and the landing that follow each produce readings of
+        // their own, and an age that covered them would report a state the
+        // change is no longer in. The guard ends the reading on the way out of
+        // every path -- a refusal, an error, a panic -- so the only way it can
+        // read as still in flight is for the process to be inside it.
+        let result = match flight
+            .cover(pipeline.apply_and_test_in(&change, workdir))
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 // `Err` 意味着管线没能对这个变更做出判定（工作树脏、git 起不来），

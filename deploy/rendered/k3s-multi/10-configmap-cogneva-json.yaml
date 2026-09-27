@@ -992,6 +992,15 @@ data:
               "summary": "a change has been waiting {value} second(s) in the queue, more than six of the cycles this deployment consumes it on, and the depth says it is still there. A cycle retires a change it cannot apply, so an entry surviving six of them is not a change the pipeline keeps failing to apply -- it is a queue nothing is reading, which the depth alone cannot distinguish from an idle one. Usual causes: the executor is up but its cycle is not running (a build slot held for the whole window, a workspace allocator that never returned), or the entry keeps failing on a path the retire step does not cover. This rule is silent when the executor process itself is gone: its series went with it, and evolution_queue_has_no_executor is the rule for that state"
             },
             {
+              "name": "evolution_change_flight_over_budget",
+              "promql": "(max by (dir) (cogneva_evolution_change_flight_seconds) > max by (dir) (cogneva_evolution_change_flight_budget_seconds))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "a change has been inside its apply-and-test flight for {value} second(s), longer than the two bounded steps of that flight added together. Those steps are the wait for a build slot, bounded by the build gate's own wait budget, and the test run, bounded by the verification budget; both numbers are published next to this reading on the same axis, so the wall compared here is this deployment's own rather than a constant that goes stale when a budget is configured differently. Everything the flight does outside those two -- git apply, the format check, a rollback after a refusal -- takes seconds to a minute, so a flight past their sum is one whose bounded steps can no longer still be running: the process is stopped somewhere inside the flight, or a bound it believes it is enforcing is not being enforced. This is the reading that tells a healthy-but-slow verification from a cycle that has stopped, which no other series can: every other reading about the work is derived after it ends. It cannot fire on a process whose flights publish nothing, so read cogneva_evolution_change_queue_owner before repairing -- a deployment with no executor at all is that rule's state, not this one's"
+            },
+            {
               "name": "background_loop_stalled",
               "promql": "(cogneva_loop_tick_age_seconds > 6 * cogneva_loop_period_seconds) and (cogneva_loop_period_seconds > 0)",
               "condition": {

@@ -186,7 +186,12 @@ fn oldest_age_secs<'a>(dir: &Path, ids: impl Iterator<Item = &'a str>) -> Option
 /// as one, so the reference point is this process's working directory. Reported
 /// resolved so a reader does not have to know which process is answering to know
 /// which directory was read.
-fn resolve_change_dir(dir: &Path) -> PathBuf {
+///
+/// Shared with the flight readings, which label their series with the same
+/// value: a reader joins the two families by this label, and two resolutions of
+/// the same configuration path could disagree about which queue a reading
+/// belongs to.
+pub(crate) fn resolve_change_dir(dir: &Path) -> PathBuf {
     if dir.is_absolute() {
         return dir.to_path_buf();
     }

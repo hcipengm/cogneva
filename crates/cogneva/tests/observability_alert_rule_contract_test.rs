@@ -108,6 +108,20 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_evolution_change_queue_poll_interval_seconds",
         "crates/cog-reflection/src/evolution_queue_readings.rs",
     ),
+    // The apply/test flight. Neither of these is published by a task: the age is
+    // derived from a stamp the flight leaves behind when the scrape arrives, and
+    // the wall is a property of the process. The pair is what tells a
+    // healthy-but-slow verification from a cycle that has stopped at the flight,
+    // which nothing else could -- every other reading about that work is written
+    // after it ends.
+    (
+        "cogneva_evolution_change_flight_seconds",
+        "crates/cog-reflection/src/evolution_flight_readings.rs",
+    ),
+    (
+        "cogneva_evolution_change_flight_budget_seconds",
+        "crates/cog-reflection/src/evolution_flight_readings.rs",
+    ),
     (
         "cogneva_evolution_build_outcomes_total",
         "crates/cog-reflection/src/evolution_build_readings.rs",
