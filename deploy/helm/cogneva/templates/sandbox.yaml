@@ -201,6 +201,13 @@ spec:
             - name: HOST_DOCS_CLASSIFY_RULES
               value: {{ .Values.hostDocuments.classifyRules | quote }}
             {{- end }}
+            # 出网开关必须**两边都下发**，值取自同一个旋钮：网关那份决定"能不能出"，
+            # 执行器这份决定"要不要读正文、要不要发这一趟"。只给网关会让开关打开后
+            # 执行器仍按缺省（关）自己把自己挡住——功能整体不工作，而两边的读数各说
+            # 各话（调用侧说"开关关着"，运维侧说他打开了），这类分歧只在默认配置下
+            # 显形。两个进程各读一次同一个变量名，是这条不变式的全部内容。
+            - name: HOST_DOCS_BODY_EGRESS_ENABLED
+              value: {{ .Values.hostDocuments.bodyEgress | quote }}
             # 受审通道。地址按**服务名**指向 audited 那一个（`-audited` 后缀），不是
             # 透传口：本 Pod 的 NetworkPolicy 只放行这一个入命名空间端口，而"这次走
             # 受审口"如果只写在调用方代码里就又是一个可以写错的判断——写在这里，它

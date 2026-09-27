@@ -132,6 +132,37 @@ render --set hostDocuments.bodyEgress=true > "${work}/on.yaml"
 got="$(env_value "${work}/on.yaml" cogneva-security-gateway security-gateway HOST_DOCS_BODY_EGRESS_ENABLED)"
 [ "${got}" = "true" ] || fail "self-check failed: hostDocuments.bodyEgress=true still reads ${got:-missing}"
 
+# The switch has two readers, and a deployment where only one of them hears the
+# value is worse than one where neither does: the operator turns it on, the
+# gateway agrees, and the caller -- which never got the value -- refuses on its
+# own default and reports "the switch is off". Nothing works, and the two
+# readings contradict each other. So what is asserted here is not that the
+# executor carries the switch, but that the two readers arrive together:
+# wherever the executor is wired to the audited channel, it carries the switch
+# with the value the gateway has.
+render --set hostDocuments.scopes.alice=/srv/alice/Documents > "${work}/switch_both.yaml"
+read_exec() {
+  env_value "${work}/switch_both.yaml" cogneva-sandbox-executor sandbox-executor "$1"
+}
+exec_url="$(read_exec HOST_DOCS_AUDITED_LLM_URL)"
+# Without this the pairing check below is satisfied by two empty strings.
+[ -n "${exec_url}" ] \
+  || fail "self-check failed: no audited URL on the executor in this render; the pairing check would pass on nothing"
+exec_switch="$(read_exec HOST_DOCS_BODY_EGRESS_ENABLED)"
+[ -n "${exec_switch}" ] \
+  || fail "the executor is wired to the audited channel but carries no HOST_DOCS_BODY_EGRESS_ENABLED: with the switch on it still refuses on its own default while the gateway lets the call through"
+gw_switch="$(env_value "${work}/switch_both.yaml" cogneva-security-gateway security-gateway HOST_DOCS_BODY_EGRESS_ENABLED)"
+[ "${exec_switch}" = "${gw_switch}" ] \
+  || fail "one switch, two readers, one value: the gateway reads ${gw_switch:-missing} and the executor reads ${exec_switch}"
+# And the executor's reading has to track the knob rather than a literal: a
+# template that wrote "false" would satisfy the pairing check whenever the
+# gateway also reads false.
+render --set hostDocuments.scopes.alice=/srv/alice/Documents --set hostDocuments.bodyEgress=true \
+  > "${work}/switch_both_on.yaml"
+got="$(env_value "${work}/switch_both_on.yaml" cogneva-sandbox-executor sandbox-executor HOST_DOCS_BODY_EGRESS_ENABLED)"
+[ "${got}" = "true" ] \
+  || fail "self-check failed: with bodyEgress=true the executor still reads ${got:-missing}"
+
 # The switch's name and reading live once, in the shared contract module: the
 # gateway refuses on it and the executor gates its body reads on it, so a second
 # definition would drift into "one side open, the other closed" — a state each
@@ -146,6 +177,8 @@ grep -q "cog_core::host_documents" "${egress_rs}" \
   || fail "the gateway does not reference the shared contract's switch definition; a second copy drifts into one side open, the other closed"
 grep -q "cog_core::host_documents" "${executor_rs}" \
   || fail "the executor does not reference the shared contract's switch definition; its read path would then judge separately from the audited channel"
+grep -q "switch_enabled_env()" "${executor_rs}" \
+  || fail "the executor carries the switch but never reads it (dead knob on the caller side)"
 # And neither side may carry a second declaration of that name.
 for side in "${egress_rs}" "${executor_rs}"; do
   if grep -q "const BODY_EGRESS_ENV" "${side}"; then
