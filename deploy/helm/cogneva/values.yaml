@@ -615,14 +615,38 @@ mainlineDeployer:
   # 滚动就绪阶段的上界（秒）：init 全部结束后，单个 deployment 收敛的预算。
   # 默认值不改（300s），只把上界变成可调。
   rolloutTimeoutSecs: 300
-  # 滚动判定 Job 容器的资源面：不声明时 QoS 落回 BestEffort，而它是决定
-  # "回滚不回滚"的判定进程，被驱逐会让一次观测中断被记成一次版本失败。
-  # requests 按该容器实测常驻量给（轮询等待态 0m/5Mi），不常年锁调度额度。
+  # Resource face of the rollout Job's container: without it the QoS falls back
+  # to BestEffort, and this is the process that decides whether to roll back --
+  # evicting it turns an interrupted observation into a version failure.
+  #
+  # Sized from the container's own history rather than from its idle state. The
+  # earlier values came from the polling wait (0m/5Mi) and missed the phases
+  # that matter: across the last six rollouts it averaged 0.07-0.12 cores per
+  # run (26.1 cpu-s over 218 s in the newest) with a busiest minute of 0.37
+  # cores, and 63-92% of its CFS periods were throttled at a 500m cap -- its
+  # kubectl children burst past half a core. Its three preflight reads run
+  # before anything is changed, so a read squeezed by contention burns the
+  # budget and gets recorded as `environment:...:unreachable`.
+  #
+  # `cpuRequest` is both an admission claim and, through it, the container's CFS
+  # weight: at 10m the weight is the minimum, so under node pressure this
+  # container is treated as if it were idle while it is doing the one job that
+  # must not stall. It was the lowest claim in the namespace by an order of
+  # magnitude (peers sit at 100m-500m). 200m is below the busiest-minute average
+  # and far above the per-run average.
+  #
+  # `cpuLimit` is 1 core: the smallest limit that cannot throttle a burst that
+  # is not itself parallel, which is the shape measured here.
+  #
+  # `memoryLimit` is 512Mi against a measured working-set peak of 243MiB
+  # (95% of the previous 256Mi) -- the old value left the rollback decider one
+  # step from an OOM kill, and Go's GC thrashes as the heap nears the cap. The
+  # request covers the resident heap between kubectl bursts.
   rolloutJob:
-    cpuRequest: 10m
-    memoryRequest: 32Mi
-    cpuLimit: 500m
-    memoryLimit: 256Mi
+    cpuRequest: 200m
+    memoryRequest: 64Mi
+    cpuLimit: "1"
+    memoryLimit: 512Mi
   # 可观测性栈清单（deploy/k3s/observability/manifests/**）的周期收敛：按仓库
   # 当前 rev 的内容 apply，把现场修回声明态。那些清单此前只有安装脚本一条交付
   # 路径，装完一次之后仓库与现场各走各的，而「清单没生效」这件事没有判据。

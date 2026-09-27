@@ -489,10 +489,19 @@ pub struct MainlineDeployerConfig {
     /// 回滚。此值是启动阶段自己的上界：init 真卡死时不能无限等，否则拿不到
     /// 干净回滚。
     pub startup_timeout_secs: u64,
-    /// 滚动判定 Job 容器的资源面（requests/limits，K8s 量纲字符串）。
-    /// 缺任何一项都会让该容器的 QoS 落回 BestEffort。默认 requests 按容器
-    /// 实测常驻量给（轮询等待态 0m / 5Mi），limits 承接 kubectl 子进程尖峰；
-    /// 为什么不能让这个容器是 BestEffort 见 Job 清单处的注释。
+    /// Resource face of the rollout Job's container (requests/limits, K8s
+    /// quantity strings). Missing any of them drops that container's QoS back
+    /// to BestEffort; why it must not be BestEffort is argued at the Job
+    /// manifest. The default is sized from the container's own history instead
+    /// of its idle state: a run averages 0.07-0.12 cores with a busiest minute
+    /// of 0.37, 63-92% of CFS periods are throttled at a 500m cap, and the
+    /// working-set peak reaches 243MiB. `cpu_request` is also this container's
+    /// CFS weight, so a request of a few millicores -- the lowest claim in the
+    /// namespace by an order of magnitude -- makes it the first to be squeezed
+    /// while its preflight reads run; `cpu_limit` is one core, the smallest
+    /// limit that cannot throttle a burst that is not itself parallel;
+    /// `memory_limit` is twice the measured peak, since the GC thrashes as the
+    /// heap nears the cap and this process decides whether to roll back.
     pub job_cpu_request: String,
     pub job_memory_request: String,
     pub job_cpu_limit: String,
@@ -542,10 +551,10 @@ impl Default for MainlineDeployerConfig {
             failure_cooldown_secs: 3600,
             rollout_timeout_secs: 300,
             startup_timeout_secs: 900,
-            job_cpu_request: "10m".into(),
-            job_memory_request: "32Mi".into(),
-            job_cpu_limit: "500m".into(),
-            job_memory_limit: "256Mi".into(),
+            job_cpu_request: "200m".into(),
+            job_memory_request: "64Mi".into(),
+            job_cpu_limit: "1".into(),
+            job_memory_limit: "512Mi".into(),
             heartbeat_log_secs: 3600,
             manifest_dir: "deploy/k3s".into(),
             deliver_manifests: true,
