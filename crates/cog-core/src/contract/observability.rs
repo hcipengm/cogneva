@@ -462,6 +462,23 @@ pub trait EvolutionMetrics: Send + Sync {
     /// absent series reads as "nothing was refused", which is the failure this
     /// axis exists to expose.
     async fn record_change_rejected(&self, cause: crate::RejectionCause);
+
+    /// Record one change the formatter had to rewrite before it could be
+    /// judged.
+    ///
+    /// The verification conforms a change the formatter rewrites, because
+    /// returning it costs a whole generation round while the rewrite is
+    /// deterministic and instant — and the file that lands is the one the tests
+    /// ran against, whichever way the change reaches the base branch. What that
+    /// leaves unread is the producer: a generator whose output never needs a
+    /// rewrite and one that always does both commit clean code, and without
+    /// this count the second reads as the first. Beside
+    /// [`Self::record_change_rejected`], not in place of it: a change that was
+    /// conformed did not fail anything, and counting it as refused would make
+    /// the criterion axis report failures that never happened.
+    ///
+    /// Required, with no default, for the same reason as the criterion axis.
+    async fn record_change_reformatted(&self);
 }
 
 // ─── Infrastructure vs business traffic ────────────────────────────────────

@@ -338,6 +338,12 @@ impl EvolutionAdminService {
         }
     }
 
+    async fn record_change_reformatted(&self) {
+        if let Some(ref m) = self.evolution_metrics {
+            m.record_change_reformatted().await;
+        }
+    }
+
     /// 取一棵 admin 临时工作树；未接分配器时返回 None（调用方用进程工作目录）。
     /// 操作结束必须 [`EvolutionAdminService::release_admin_workspace`] 归还。
     async fn acquire_admin_workspace(&self) -> SFResult<Option<crate::workspace::Workspace>> {
@@ -468,6 +474,14 @@ impl EvolutionAdminService {
             evo.update_status(change_id, result.new_status).await;
         }
 
+        if result.reformatted {
+            // Conformed before it was judged, which is a fact about the
+            // generator rather than about this change: the change passed, and
+            // only this count keeps a generator that never writes the
+            // formatter's spelling from reading like one that always does.
+            self.record_change_reformatted().await;
+        }
+
         if let Some(cause) = result.verdict.cause() {
             self.record_event(true).await;
             self.record_change_failed().await;
@@ -482,6 +496,7 @@ impl EvolutionAdminService {
                 "test_passed": result.verdict.passed(),
                 "rejection_cause": result.verdict.cause().map(|c| c.as_str()),
                 "new_status": format!("{:?}", result.new_status).to_lowercase(),
+                "reformatted": result.reformatted,
             }),
         )
         .await;

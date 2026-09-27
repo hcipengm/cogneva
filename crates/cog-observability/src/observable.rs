@@ -30,6 +30,7 @@ pub struct ObservabilityObservable {
     evolution_event_failed_total: AtomicU64,
     evolution_change_applied_total: AtomicU64,
     evolution_change_failed_total: AtomicU64,
+    evolution_change_reformatted_total: AtomicU64,
     /// One slot per [`cog_core::RejectionCause`], addressed by `slot()` so the
     /// axis has no second hand-written ordering to drift from.
     evolution_change_rejected_total: [AtomicU64; REJECTION_CAUSES],
@@ -45,6 +46,7 @@ impl Default for ObservabilityObservable {
             evolution_event_failed_total: AtomicU64::new(0),
             evolution_change_applied_total: AtomicU64::new(0),
             evolution_change_failed_total: AtomicU64::new(0),
+            evolution_change_reformatted_total: AtomicU64::new(0),
             evolution_change_rejected_total: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -82,6 +84,11 @@ impl ObservabilityObservable {
 
     pub fn record_evolution_change_failed(&self) {
         self.evolution_change_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_evolution_change_reformatted(&self) {
+        self.evolution_change_reformatted_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -141,6 +148,11 @@ impl Observable for ObservabilityObservable {
                 "evolution_change_failed_total",
                 self.evolution_change_failed_total.load(Ordering::Relaxed) as f64,
             ));
+            metrics.push(RawMetric::new(
+                "evolution_change_reformatted_total",
+                self.evolution_change_reformatted_total
+                    .load(Ordering::Relaxed) as f64,
+            ));
             for (cause, count) in self.evolution_change_rejected() {
                 metrics.push(
                     RawMetric::new("evolution_change_rejected_total", count as f64)
@@ -176,6 +188,10 @@ impl cog_core::EvolutionMetrics for ObservabilityObservable {
 
     async fn record_change_rejected(&self, cause: cog_core::RejectionCause) {
         self.record_evolution_change_rejected(cause);
+    }
+
+    async fn record_change_reformatted(&self) {
+        self.record_evolution_change_reformatted();
     }
 }
 
@@ -243,5 +259,27 @@ mod rejection_counter_tests {
         let aggregate = published(&observable, "evolution_change_failed_total").await;
         assert_eq!(aggregate.len(), 1);
         assert_eq!(aggregate[0].1, 0.0);
+    }
+
+    /// A conformed change moves the rewrite count and nothing else. It is the
+    /// reading that says whether the generator's output needed conforming at
+    /// all, so a change that was rewritten must not read as a refusal — that
+    /// axis answers which criterion a change died on, and this one did not die.
+    #[tokio::test]
+    async fn a_rewrite_is_counted_apart_from_every_criterion() {
+        let observable = ObservabilityObservable::new();
+
+        let before = published(&observable, "evolution_change_reformatted_total").await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1, 0.0, "a fresh observable rewrote nothing");
+
+        observable.record_evolution_change_reformatted();
+
+        let after = published(&observable, "evolution_change_reformatted_total").await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].1, 1.0);
+        for (label, value) in published(&observable, "evolution_change_rejected_total").await {
+            assert_eq!(value, 0.0, "{label} was moved by a rewrite");
+        }
     }
 }

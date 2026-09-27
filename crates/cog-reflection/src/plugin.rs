@@ -2116,6 +2116,21 @@ async fn run_evolution_cycle_in(
             .update_status(&result.change_id, result.new_status)
             .await;
 
+        if result.reformatted {
+            // The change was conformed to this workspace's formatting and then
+            // judged on what it does. Not a refusal and not a failure: the
+            // count exists because the gate no longer returns such a change, so
+            // without it a generator whose output never needs conforming and
+            // one whose output always does read the same.
+            info!(
+                change_id = %result.change_id,
+                "Change was conformed to the workspace's formatting before it was judged"
+            );
+            if let Some(m) = evolution_metrics {
+                m.record_change_reformatted().await;
+            }
+        }
+
         if let Some(cause) = result.verdict.cause() {
             // The reason is already in the result; carrying it into the log is
             // what makes a rejection diagnosable without digging the artifact

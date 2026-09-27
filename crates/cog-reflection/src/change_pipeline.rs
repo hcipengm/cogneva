@@ -130,6 +130,12 @@ pub struct ApplyResult {
     pub verdict: ChangeVerdict,
     pub test_output: String,
     pub new_status: EvolutionStatus,
+    /// Whether the formatter had to rewrite this tree before the verdict was
+    /// reached. Read from the verdict's own result rather than inferred from
+    /// the evidence: it is the count of changes that arrived unformatted, which
+    /// is a fact about the producer, and text meant to be read by a person is
+    /// not a reading a counter can be derived from.
+    pub reformatted: bool,
 }
 
 /// Pipeline that turns validated code changes into tested source changes.
@@ -379,6 +385,7 @@ impl ChangePipeline {
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed: Vec::new(),
+                    reformatted: false,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::MalformedDiff),
                     test_output: format!("Change is not a usable diff: {e}"),
                     new_status: EvolutionStatus::ValidationFailed,
@@ -406,6 +413,7 @@ impl ChangePipeline {
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
+                    reformatted: false,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::PromotionGateRefused),
                     test_output: format!("Promotion gate rejected: {reason}"),
                     new_status: EvolutionStatus::Rejected,
@@ -420,6 +428,7 @@ impl ChangePipeline {
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
+                    reformatted: false,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ForbiddenPath),
                     test_output: format!("Change touches a forbidden or missing path: {e}"),
                     new_status: EvolutionStatus::ValidationFailed,
@@ -439,6 +448,7 @@ impl ChangePipeline {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
+                reformatted: false,
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::IntentMismatch),
                 test_output: format!("Change does not answer its goal: {reason}"),
                 new_status: EvolutionStatus::ValidationFailed,
@@ -451,6 +461,7 @@ impl ChangePipeline {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
+                reformatted: false,
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ContextDoesNotApply),
                 test_output: format!("Change pre-check failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
@@ -461,26 +472,31 @@ impl ChangePipeline {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
+                reformatted: false,
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ApplyFailed),
                 test_output: format!("Change application failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
             });
         }
 
-        // Formatted before it is compiled, and rolled back either way: a change
+        // Conformed before it is compiled, and rolled back either way: a change
         // refused here must leave the tree as it found it, or the next run would
         // be verifying this one's leftovers.
-        match self.run_cargo_fmt(workdir).await {
-            Ok((true, _)) => {}
-            Ok((false, output)) => {
-                warn!(change_id = %change.artifact_id, "Change is not formatted; rolling back");
+        let reformatted = match self.run_cargo_fmt(workdir).await {
+            Ok((true, reformatted, _)) => reformatted,
+            Ok((false, _, output)) => {
+                warn!(
+                    change_id = %change.artifact_id,
+                    "Change is not what this workspace's formatter produces, and conforming it did not settle that; rolling back"
+                );
                 let _ = self.git_reset_hard(workdir).await;
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
+                    reformatted: false,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::FormattingDiffers),
                     test_output: format!(
-                        "Change is not what this workspace's formatter produces:\n{output}"
+                        "The formatter could not make this tree what it produces:\n{output}"
                     ),
                     new_status: EvolutionStatus::ValidationFailed,
                 });
@@ -491,12 +507,13 @@ impl ChangePipeline {
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
+                    reformatted: false,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
                     test_output: format!("Failed to execute cargo fmt: {}", e),
                     new_status: EvolutionStatus::ValidationFailed,
                 });
             }
-        }
+        };
 
         let (test_passed, test_output) = match self.run_cargo_test(workdir).await {
             Ok(result) => result,
@@ -516,6 +533,7 @@ impl ChangePipeline {
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
+                    reformatted: false,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
                     test_output: format!("Failed to execute cargo test: {}", e),
                     new_status: EvolutionStatus::ValidationFailed,
@@ -550,6 +568,7 @@ impl ChangePipeline {
             verdict,
             test_output,
             new_status,
+            reformatted,
         })
     }
 
@@ -984,31 +1003,35 @@ impl ChangePipeline {
         Ok((output.status.success(), format!("{}{}", stdout, stderr)))
     }
 
-    /// Run `cargo fmt --all -- --check` and return (clean, combined_output).
+    /// Judge this tree's formatting, conforming it when the formatter would
+    /// rewrite it: returns (judgeable, rewritten, combined_output).
     ///
-    /// A file the formatter would rewrite is refused here rather than landed,
-    /// because the commit it lands as fails CI's format check: the deployer
-    /// reads that, resets the commit, and the change ends up retired with
-    /// nothing having judged what it does. The check is deterministic, so the
-    /// cost of refusing is one reformat by whoever generated the change, while
-    /// the cost of letting it through is a whole landing-and-rollback cycle —
-    /// which is how this gate came to exist.
+    /// A file the formatter rewrites is rewritten here rather than sent back.
+    /// The commit a change lands as is the tree the tests ran against, so
+    /// conforming it first is what keeps CI's format check green — and the
+    /// alternative costs a whole generation round rather than one reformat:
+    /// the producer is a generator that does not carry the formatter's rules,
+    /// so an unformatted change returned to it comes back unformatted. The
+    /// rewrite is deterministic, parses without compiling, and takes no build
+    /// slot, so paying it here is cheaper than any round it saves.
     ///
-    /// Two questions rather than one, because a single exit code cannot answer
-    /// both. `cargo fmt --check` exits 1 for a file it would rewrite — and exits
-    /// 1 just as well when the toolchain it was told to use is not installed,
-    /// which is reachable here: `RUSTUP_TOOLCHAIN` is in the passthrough set.
-    /// Reading those as one answer would refuse every change that a deployment
-    /// whose toolchain had moved was asked to verify, which is a change refused
-    /// for being unverifiable rather than for being wrong. So the probe goes
-    /// first and settles whether there is a formatter to ask at all; only after
-    /// that does a nonzero exit mean the tree is what the formatter rewrites.
+    /// A rewrite is not a way to land anything: the check runs again after it,
+    /// and a tree the formatter still rewrites is refused. That is the state a
+    /// change with a syntax error produces, and it is a different fact from one
+    /// that merely arrived unformatted — the second is what the rewrite exists
+    /// for, and only the first is a defect in the change.
     ///
-    /// Runs before the test run and takes no build slot: the check parses the
-    /// workspace without compiling any of it, so it is both the cheapest way a
-    /// change can be sent back and no competition for the host while a real
-    /// build is in flight.
-    async fn run_cargo_fmt(&self, workdir: &Path) -> SFResult<(bool, String)> {
+    /// Two questions before the first check, because a single exit code cannot
+    /// answer both. `cargo fmt --check` exits 1 for a file it would rewrite — and
+    /// exits 1 just as well when the toolchain it was told to use is not
+    /// installed, which is reachable here: `RUSTUP_TOOLCHAIN` is in the
+    /// passthrough set. Reading those as one answer would leave every change a
+    /// formatter-less deployment was asked to verify unrewritten and refused,
+    /// which is a change refused for being unverifiable rather than for being
+    /// wrong. So the probe goes first and settles whether there is a formatter
+    /// to ask at all; only after that does a nonzero exit mean the tree is what
+    /// the formatter rewrites.
+    async fn run_cargo_fmt(&self, workdir: &Path) -> SFResult<(bool, bool, String)> {
         let (available, why) = self
             .run_cargo_fmt_cmd(workdir, &["fmt", "--version"])
             .await?;
@@ -1018,8 +1041,27 @@ impl ChangePipeline {
             )));
         }
         info!("Running cargo fmt --all -- --check");
-        self.run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
-            .await
+        let (clean, checked) = self
+            .run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
+            .await?;
+        if clean {
+            return Ok((true, false, checked));
+        }
+        info!("Conforming the change to what this workspace's formatter produces");
+        let (ran, rewrite_output) = self.run_cargo_fmt_cmd(workdir, &["fmt", "--all"]).await?;
+        let evidence = format!("{checked}\n{rewrite_output}");
+        if !ran {
+            return Ok((false, false, evidence));
+        }
+        let (conformed, rechecked) = self
+            .run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
+            .await?;
+        let evidence = format!("{evidence}\n{rechecked}");
+        Ok(if conformed {
+            (true, true, evidence)
+        } else {
+            (false, false, evidence)
+        })
     }
 
     /// Run `cargo test --workspace` and return (success, combined_output).
@@ -1197,6 +1239,11 @@ mod tests {
     /// The seeded source of the formatting fixtures: line 2 is the line the two
     /// tests change, so they differ in nothing else.
     const FORMATTED_PROBE_SOURCE: &str = "pub fn answer() -> i32 {\n    41\n}\n";
+
+    /// The same file with the unformatted change applied and conformed: what the
+    /// commitment carries when the gate rewrites `41+1` into the formatter's
+    /// spelling.
+    const CONFORMED_PROBE_SOURCE: &str = "pub fn answer() -> i32 {\n    41 + 1\n}\n";
 
     /// A crate whose only test sleeps, so a run against it is slow for a reason
     /// the budget can measure rather than one that depends on how warm this
@@ -2087,23 +2134,25 @@ index 1111111..2222222 100644
         );
     }
 
-    /// A change the formatter would rewrite is refused before anything compiles
-    /// it, and the tree is left as it was found.
+    /// A change the formatter would rewrite is conformed to it and then judged
+    /// on what it does, and what would land is the conformed text.
     ///
-    /// The refusal exists because the commit this would land as fails CI's
-    /// format check, and the answer to that is to reset the commit — so the
-    /// change gets retired without anything having judged what it does. Note
-    /// what the fixture has to get right for a whole-tree check to mean
-    /// anything: the seeded tree is already formatted, so the diff is the only
-    /// thing this refusal can be about. A tree that was not clean to begin with
-    /// could not use this check to blame a change.
+    /// The commitment is the text the tests ran against, so conforming before
+    /// the tests is what keeps CI's format check green without spending a
+    /// generation: the producer is a generator that does not carry the
+    /// formatter's spelling, so returning this change sends it back to a
+    /// generator that would write it the same way again. Note what the fixture
+    /// has to get right for a whole-tree rewrite to mean anything: the seeded
+    /// tree is already formatted, so the change is the only thing there is to
+    /// rewrite. A tree that was not clean to begin with could not show which of
+    /// the two the gate answered.
     ///
-    /// The change compiles and its tests would pass — `41+1` is valid Rust that
-    /// `rustfmt` spells `41 + 1`. That is deliberate: it keeps the refusal
-    /// attributable to the formatting alone.
+    /// The change compiles and its tests pass — `41+1` is valid Rust that
+    /// `rustfmt` spells `41 + 1` — so the verdict is `Passed` and the file on
+    /// disk is the formatter's spelling, not the change's.
     #[tokio::test]
-    async fn a_change_that_is_not_formatted_is_refused_before_it_is_compiled() {
-        let (root, pipeline) = formatted_probe_workspace().await;
+    async fn a_change_that_is_not_formatted_is_conformed_and_then_judged() {
+        let (root, pipeline) = formatted_probe_workspace(true).await;
         let change = EvolutionResult {
             kind: EvolutionKind::CodeChange,
             artifact_id: "unformatted-1".into(),
@@ -2129,14 +2178,60 @@ index 1111111..2222222 100644
 
         assert_eq!(
             result.verdict,
-            ChangeVerdict::Refused(cog_core::RejectionCause::FormattingDiffers)
+            ChangeVerdict::Passed,
+            "a change that was conformed reached a verdict: {:?}",
+            result.verdict
         );
-        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
         assert!(
-            result.test_output.contains("src/lib.rs"),
-            "the evidence has to name what the formatter would rewrite: {}",
-            result.test_output
+            result.reformatted,
+            "the verdict has to say the formatter rewrote this tree, or the count of changes that arrived unformatted cannot be read off it"
         );
+        assert_eq!(
+            tokio::fs::read_to_string(root.path().join("src/lib.rs"))
+                .await
+                .unwrap(),
+            CONFORMED_PROBE_SOURCE,
+            "what would land is the conformed text, not the text the change carried"
+        );
+    }
+
+    /// A change the formatter cannot make conform is still refused, and the tree
+    /// is left as it was found. The rewrite is not a way to land anything: it is
+    /// run and then the check runs again, and this is the arm where it did not
+    /// come out clean — the shape a change with a syntax error arrives in.
+    #[tokio::test]
+    async fn a_change_the_formatter_cannot_conform_is_refused() {
+        let (root, pipeline) = formatted_probe_workspace(false).await;
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "unparsable-1".into(),
+            description: "修正这个取值的计算".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -1,3 +1,3 @@\n\
+                      \x20pub fn answer() -> i32 {\n\
+                      -    41\n\
+                      +    41 +\n\
+                      \x20}\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::FormattingDiffers),
+            "a tree the formatter cannot make conform is a refusal: {:?}",
+            result.verdict
+        );
+        assert!(!result.reformatted);
         assert_eq!(
             tokio::fs::read_to_string(root.path().join("src/lib.rs"))
                 .await
@@ -2146,13 +2241,15 @@ index 1111111..2222222 100644
         );
     }
 
-    /// The other side: a change that is formatted is not refused for it. A gate
-    /// is only worth having if it can be told apart from one that always fires,
-    /// and a false refusal here is the more expensive mistake — it retires a
-    /// change that was fine and spends a generation to get it back.
+    /// The other side: a change that is already what the formatter produces is
+    /// neither refused nor rewritten. A gate is only worth having if it can be
+    /// told apart from one that always fires, and both mistakes here are
+    /// expensive: a false refusal retires a change that was fine, and a false
+    /// rewrite mangles text nobody asked it to touch — and would count a
+    /// generator that writes clean code as one that does not.
     #[tokio::test]
-    async fn a_formatted_change_is_not_refused_for_its_formatting() {
-        let (root, pipeline) = formatted_probe_workspace().await;
+    async fn a_formatted_change_is_neither_refused_nor_rewritten() {
+        let (root, pipeline) = formatted_probe_workspace(false).await;
         let change = EvolutionResult {
             kind: EvolutionKind::CodeChange,
             artifact_id: "formatted-1".into(),
@@ -2182,15 +2279,22 @@ index 1111111..2222222 100644
             "a formatted change reached a verdict: {:?}",
             result.verdict
         );
+        assert!(
+            !result.reformatted,
+            "nothing was rewritten, so nothing may be counted as rewritten"
+        );
     }
 
     /// A crate that is formatted to begin with, and a pipeline over it.
     ///
-    /// Shared by the two formatting tests so that the only thing between them is
-    /// the line the change writes: one of them has to be refused and the other
-    /// must not be, and a fixture that differed in any other way could not show
-    /// which of the two the gate is answering.
-    async fn formatted_probe_workspace() -> (tempfile::TempDir, ChangePipeline) {
+    /// Shared by the formatting tests so that the only thing between them is the
+    /// line the change writes: one of them has to come out conformed, one
+    /// untouched and one refused, and a fixture that differed in any other way
+    /// could not show which of the three the gate is answering.
+    ///
+    /// `auto_apply` decides whether the tree is left standing after a pass,
+    /// which is what lets the conforming test read what would land.
+    async fn formatted_probe_workspace(auto_apply: bool) -> (tempfile::TempDir, ChangePipeline) {
         let root = tempfile::tempdir().unwrap();
         git_ok(root.path(), &["init", "-q"]).await;
         git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
@@ -2210,7 +2314,7 @@ index 1111111..2222222 100644
         git_ok(root.path(), &["add", "."]).await;
         git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
 
-        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), auto_apply);
         (root, pipeline)
     }
 
