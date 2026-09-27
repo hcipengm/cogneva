@@ -56,6 +56,10 @@ pub struct ReflectionPlugin {
     /// start(). Only the deployment that runs builds has a cache of its own, so
     /// every other one holds None here.
     build_cache: Option<Arc<crate::build_cache_readings::BuildCacheReadings>>,
+    /// The in-cluster registry store's footprint, published in init and measured
+    /// from start() by the process that pushes to it. A deployment with an
+    /// external registry, or one that runs no deployer, holds None here.
+    registry_footprint: Option<Arc<crate::registry_footprint::RegistryFootprint>>,
 }
 
 impl ReflectionPlugin {
@@ -69,6 +73,7 @@ impl ReflectionPlugin {
             meta_learning: None,
             artifact_evolution: None,
             build_cache: None,
+            registry_footprint: None,
         }
     }
 }
@@ -109,7 +114,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
 
         // 工作区分配器：全插件唯一实例，部署器与各进化消费者共用。裸仓库取自
         // 部署器配置（默认 /host-git，与 GitOps 推送端同源）。
-        let bare_repo = crate::MainlineDeployerConfig::load()?.bare_repo;
+        // 这份配置在 init 里读一次并留到下面：registry 占用读数的声明要取它的
+        // 端点与命名空间——同一条部署器配置，不另开一份 env，免得两条通道各写
+        // 一个端点。
+        let ml_config = crate::MainlineDeployerConfig::load()?;
+        let bare_repo = ml_config.bare_repo.clone();
         let ws_cfg = &ctx.config().self_evolution.workspaces;
         // 索引健康度的采样去处。在这里取一次而不是各消费者各取一次：分配器是
         // 单例，采样点在它内部，调用方不该为了上报再去问一遍服务表。
@@ -879,6 +888,26 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 ctx.publish_observable(build_cache.clone());
                 self.build_cache = executor_enabled.then_some(build_cache);
 
+                // 集群内 registry 的占用。那个 store 的唯一写者就是本进程的
+                // 部署器（buildah push），但它自己不会报尺寸，走查也不在它的
+                // 挂载表里；kubelet 那条 per-volume 序列对目录型卷报的是节点
+                // 盘（本集群实测 12 块卷全读 689GB，10Gi 的声明量在里面）。
+                // 读数因此从 registry 自己的 API 取，按声明挂到那张卷上。
+                let (registry_footprint, footprint_problems) = crate::registry_footprint::from_env(
+                    &ml_config.registry,
+                    &ml_config.namespace,
+                    std::env::var(crate::registry_footprint::CLAIM_ENV)
+                        .ok()
+                        .as_deref(),
+                );
+                for problem in &footprint_problems {
+                    warn!(problem = %problem, "registry footprint declaration is unusable");
+                }
+                if let Some(footprint) = registry_footprint {
+                    ctx.publish_observable(footprint.clone());
+                    self.registry_footprint = Some(footprint);
+                }
+
                 if executor_enabled {
                     let poll_interval =
                         std::time::Duration::from_secs(self_evolution.poll_interval_secs);
@@ -1138,6 +1167,16 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 tokio::spawn(stack.run(shutdown.clone()));
             } else {
                 info!("observability stack convergence disabled by config");
+            }
+            // 占用读数与"谁在推镜像"绑在同一个进程：registry 的唯一写者就是
+            // 上面这条部署器循环，读它的进程因此与它同生共死。声明缺席时这里
+            // 什么也不起——没有那张卷要量。
+            if let Some(footprint) = self.registry_footprint.clone() {
+                drop(crate::registry_footprint::spawn_watch(
+                    footprint,
+                    crate::registry_footprint::scan_interval_from_env(),
+                    shutdown.clone(),
+                ));
             }
             tokio::spawn(crate::run_mainline_loop(deployer, shutdown));
         } else {

@@ -1040,6 +1040,107 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 28,
+          "title": "Registry Store Against Its Declaration",
+          "description": "Bytes the cluster's image registry store holds, against the size its claim declares, over 6h. This reading comes from the store's own API rather than from a walk: the store is written by the registry image, so no process of ours can walk it, and the only writer here is the deployer pod, which asks the registry which blobs its tags reference and dedupes them by digest. What is measured is therefore tag-referenced blob bytes -- store metadata and blobs no tag points at are not in the number, so a store whose tags were pruned reads smaller here before the bytes are actually freed. The declaration is drawn beside it because it is not a ceiling: nothing enforces a PVC's requests.storage, and when this line crosses that one the alert fires. The growth is one layer set per revision, because each image is built from the previous revision's image, so every earlier tag keeps the whole chain alive -- which is why dropping old tags alone reclaims almost nothing until a build stops chaining off the last revision. Delete is disabled on the store, so nothing reclaims by itself.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 112
+          },
+          "targets": [
+            {
+              "expr": "max by (persistentvolumeclaim) (cogneva_data_volume_used_bytes{persistentvolumeclaim=~\"cogneva-.*\"})",
+              "legendFormat": "{{persistentvolumeclaim}} measured by its owner",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (persistentvolumeclaim) (kube_persistentvolumeclaim_resource_requests_storage_bytes{persistentvolumeclaim=~\"cogneva-.*\"})",
+              "legendFormat": "{{persistentvolumeclaim}} declared",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 29,
+          "title": "Registry Store Tag Accumulation",
+          "description": "How many tags the cluster's image registry store holds, over 6h. Every promotion leaves a main-* tag behind and the floating local tag is rewritten in place, so this line rises once per revision deployed and is the driver of the panel beside it: the store holds a layer set per tag while the images keep chaining off one another. A tag count that keeps rising with the bytes flat is the shape a re-base would make -- new tags whose layers are mostly shared with the seed rather than with the previous revision -- and a tag count that stops rising while the bytes keep rising is the reverse, tags being reused with new content under them. Nothing prunes this store today, so neither shape has been observed yet and this line is what would tell them apart.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 112
+          },
+          "targets": [
+            {
+              "expr": "cogneva_registry_tag_count",
+              "legendFormat": "tags in the store (one per promoted revision plus the floating tag)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 30,
+          "title": "Registry Store Measurement Age",
+          "description": "How long ago the registry store was measured, over 6h. A walk that fails -- the registry restarting, a manifest the API refuses to serve -- keeps the last reading rather than publishing a smaller one, because a smaller number would read as a store that shrank; so the size alone cannot tell a store nothing writes to from a probe that stopped asking. This series is what separates them: a flat size with a rising age is an unmeasured store, and the same flat size with the age staying near the scan interval is a store that is idle but watched. No threshold is drawn, as elsewhere: what counts as stale is the interval the deployment configured, which a panel cannot read.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 120
+          },
+          "targets": [
+            {
+              "expr": "cogneva_registry_scan_age_seconds",
+              "legendFormat": "seconds since the store was last measured",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

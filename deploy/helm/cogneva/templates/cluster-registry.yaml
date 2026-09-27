@@ -9,7 +9,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: cogneva-registry-pvc
+  name: {{ .Values.clusterRegistry.claimName }}
   namespace: {{ include "cogneva.namespace" . }}
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
@@ -81,7 +81,7 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: cogneva-registry-pvc
+            claimName: {{ .Values.clusterRegistry.claimName }}
 ---
 apiVersion: v1
 kind: Service

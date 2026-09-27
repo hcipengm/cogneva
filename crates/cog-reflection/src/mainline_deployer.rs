@@ -85,18 +85,30 @@ fn rev12(rev: &str) -> &str {
     }
 }
 
+/// The repository the deployer builds into and reads back.
+///
+/// One name for the place images are pushed: the tag writer, the tag reader that
+/// measures the store, and the rollout's image references all name the same
+/// repository, and a second spelling would silently point at an empty one.
+pub const IMAGE_REPOSITORY: &str = "cogneva";
+
 /// 不可变主线镜像引用：`<registry>/cogneva:main-<rev12>`。
 pub fn main_image(registry: &str, rev: &str) -> String {
     format!(
-        "{}/cogneva:main-{}",
+        "{}/{}:main-{}",
         registry.trim_end_matches('/'),
+        IMAGE_REPOSITORY,
         rev12(rev)
     )
 }
 
 /// 浮动签镜像引用：`<registry>/cogneva:local`。
 pub fn local_image(registry: &str) -> String {
-    format!("{}/cogneva:local", registry.trim_end_matches('/'))
+    format!(
+        "{}/{}:local",
+        registry.trim_end_matches('/'),
+        IMAGE_REPOSITORY
+    )
 }
 
 /// 从镜像引用解析 `main-<rev>` 的 rev 片段；非主线 tag（:local、promote-*、
@@ -113,7 +125,7 @@ pub fn job_name(rev: &str) -> String {
 
 /// `host:port` 端点拆成 (host, port)。buildah 强制 registry 端点带端口，
 /// 集群内 registry 因此永远可解析。
-fn endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
+pub(crate) fn endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
     let (host, port) = endpoint.trim_end_matches('/').rsplit_once(':')?;
     Some((host, port.parse().ok()?))
 }
@@ -167,7 +179,7 @@ fn revision_of_config_blob(blob: &serde_json::Value) -> Option<String> {
 
 /// 从裸 HTTP 响应里切出状态码与 body（按 `Content-Length` 截断；缺失则取
 /// 剩余全部）。registry 的 JSON 响应永远带 Content-Length。
-fn parse_http_response(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
+pub(crate) fn parse_http_response(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&raw[..split]).ok()?;
     let mut lines = head.lines();

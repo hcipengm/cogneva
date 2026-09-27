@@ -136,6 +136,12 @@ spec:
               value: |
                 cogneva-evolution-pvc=/opt/cogneva/sandbox
                 cogneva-evolution-source-pvc=/opt/cogneva/sandbox/src
+            # 集群内 registry 的卷不归本 Pod 写，走查也不在它的挂载表里：那个
+            # store 只有仓库进程自己知道装了多少。本 Pod 的部署器是它唯一的写者
+            # （buildah push），读数因此从 registry 自己的 API 取（见
+            # registry_footprint），按这里的声明挂到那张卷的声明量上。
+            - name: COGNEVA_REGISTRY_CLAIM
+              value: "cogneva-registry-pvc"
             # 本 Pod 自己的 JWT 签名密钥，与主应用那份**不同源**：本 Pod 持有
             # 主线部署器（推 registry、滚四部署），并入用户会话的鉴权域等于让
             # 一枚 WebUI token 够到部署器。取不到时进程退化为一次性随机密钥，

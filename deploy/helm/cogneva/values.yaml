@@ -354,6 +354,11 @@ clusterRegistry:
   enabled: true
   image: registry:2
   nodePort: 30500
+  # 这张卷的名字声明一次，PVC 与"谁去量它"两处都从这里取：占用读数由进化 Pod
+  # 的部署器读 registry 自己的 API（那个 store 的唯一写者就是它），量出来的数
+  # 按这个名字挂到声明量上。两处各写一份名字时改名会静默失配——量到的数挂到
+  # 一张不存在的卷上，声明量的规则对它永远看不见。
+  claimName: cogneva-registry-pvc
   # 金丝雀 overlay 逐 rev 累积，实测已 7.4Gi，取 10Gi。
   storage: 10Gi
   resources:

@@ -293,6 +293,29 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["loop"],
         "crates/cog-core/src/loop_health.rs",
     ),
+    // How much of a volume its owner says is in use. One series serves both
+    // kinds of owner -- the process that walks a mount, and the process that
+    // asks a store's API -- because the claim label is what the alert rule
+    // divides by the declared size, and two series would be two joins.
+    (
+        "cogneva_data_volume_used_bytes",
+        &["persistentvolumeclaim"],
+        "crates/cog-core/src/claim_footprint.rs",
+    ),
+    // The registry store's own pair: what it holds and how long ago it was
+    // measured. The age carries no labels and neither does the count -- there
+    // is one store per cluster, so which store is Prometheus's own instance
+    // label rather than a legend this panel could name.
+    (
+        "cogneva_registry_tag_count",
+        &[],
+        "crates/cog-reflection/src/registry_footprint.rs",
+    ),
+    (
+        "cogneva_registry_scan_age_seconds",
+        &[],
+        "crates/cog-reflection/src/registry_footprint.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the
@@ -314,6 +337,15 @@ const FOREIGN: &[(&str, &str)] = &[
         "kube-state-metrics",
     ),
     ("ALERTS", "Prometheus 由告警规则合成的序列"),
+    // The declared size of a claim: no process of ours publishes it, because
+    // the number lives in the PVC object, and kube-state-metrics is the only
+    // thing that reads it. Drawn beside the measured bytes rather than summed
+    // into them, since a volume over its declaration is a judgement about the
+    // two together.
+    (
+        "kube_persistentvolumeclaim_resource_requests_storage_bytes",
+        "kube-state-metrics",
+    ),
 ];
 
 fn dashboard_text() -> String {

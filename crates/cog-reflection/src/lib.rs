@@ -62,6 +62,7 @@ pub mod promotion_gate;
 pub mod promotion_switch;
 pub mod promotion_trend;
 pub mod recorder;
+pub mod registry_footprint;
 pub mod reviewer;
 pub mod runtime_assets;
 pub mod sandbox;

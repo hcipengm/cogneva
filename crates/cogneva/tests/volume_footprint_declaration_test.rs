@@ -25,6 +25,16 @@
 //! entry has to be a mount of that very claim inside the container that declares
 //! it, because a reading walks a directory, and a directory that is not the
 //! claim's measures something else and publishes it under the claim's name.
+//!
+//! A claim whose store belongs to someone else's process cannot be walked, so
+//! its producer measures it through that store's own API and the declaring
+//! container does not mount it at all. Those declarations are keyed separately
+//! ([`API_MEASURED`]) and get their own judgement, which is written to be at
+//! least as strong as the mount pairing it replaces: the claim such a
+//! declaration names has to be a claim the delivery declares as an object and
+//! that some container in that delivery mounts, and it may not also be declared
+//! as a walkable mount, which would publish the same volume twice under one
+//! name.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -85,8 +95,25 @@ const PRODUCERS: [(&str, &str, &str); 4] = [
     ),
 ];
 
+/// A claim measured through its store's API rather than by walking a mount.
+///
+/// Same shape as [`PRODUCERS`] — workload, the file whose call builds the
+/// producer, the call — because the evidence for "something measures it" is the
+/// same kind of evidence. What differs is where the bytes come from: the store
+/// is written by an image from outside this repository, so no process here can
+/// walk it, and the reading asks the store instead.
+const API_MEASURED: [(&str, &str, &str); 1] = [(
+    // The cluster registry's store is written by the registry image; the only
+    // writer from this repository is the mainline deployer in this pod, which
+    // measures it through the registry's own API.
+    "cogneva-evolution",
+    "crates/cog-reflection/src/registry_footprint.rs",
+    "RegistryFootprint::new(",
+)];
+
 const MOUNTS_ENV: &str = "COGNEVA_DATA_VOLUME_MOUNTS";
 const CLAIM_ENV: &str = "COGNEVA_DATA_VOLUME_CLAIM";
+const API_CLAIM_ENV: &str = "COGNEVA_REGISTRY_CLAIM";
 
 /// One container that declares volumes to be measured.
 #[derive(Debug)]
@@ -377,6 +404,187 @@ fn the_scan_covers_every_delivered_directory() {
         assert!(
             declared.iter().any(|(d, _)| d.dir == dir),
             "{dir} declares no volume footprint anywhere, so this gate read nothing there"
+        );
+    }
+}
+
+/// What one delivered directory says about claims, gathered in one pass.
+#[derive(Default)]
+struct DeliveryFacts {
+    /// Claims the delivery declares as objects, so a name in a variable has
+    /// something to point at.
+    declared: BTreeSet<String>,
+    /// Claims some container mounts, whoever declared them.
+    mounted: BTreeSet<String>,
+    /// Claims declared as walkable mounts anywhere in the delivery.
+    walked: BTreeSet<String>,
+    /// `(workload, container, claim)` for every API-measured declaration.
+    measured: Vec<(String, String, String)>,
+}
+
+fn delivery_facts() -> BTreeMap<&'static str, DeliveryFacts> {
+    let mut facts = BTreeMap::new();
+    for dir in DELIVERED {
+        let mut entry = DeliveryFacts::default();
+        let manifest_dir = repo_root().join(dir);
+        let entries = match std::fs::read_dir(&manifest_dir) {
+            Ok(entries) => entries,
+            Err(e) => panic!("{} unreadable: {e}", manifest_dir.display()),
+        };
+        for file_entry in entries {
+            let file = file_entry.expect("delivered manifest entry").path();
+            if !matches!(
+                file.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("yml")
+            ) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("delivered manifest readable");
+            for document in serde_yaml::Deserializer::from_str(&text) {
+                let value = serde_yaml::Value::deserialize(document)
+                    .unwrap_or_else(|e| panic!("{} is not YAML: {e}", file.display()));
+                if value.get("kind").and_then(|k| k.as_str()) == Some("PersistentVolumeClaim") {
+                    if let Some(name) = value
+                        .get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(|n| n.as_str())
+                    {
+                        entry.declared.insert(name.to_string());
+                    }
+                }
+                let Some(workload) = value
+                    .get("metadata")
+                    .and_then(|m| m.get("name"))
+                    .and_then(|n| n.as_str())
+                else {
+                    continue;
+                };
+                let mut pods = Vec::new();
+                pod_specs(&value, &mut pods);
+                for pod in pods {
+                    for list in ["containers", "initContainers"] {
+                        let Some(containers) = pod.get(list).and_then(|c| c.as_sequence()) else {
+                            continue;
+                        };
+                        for container in containers {
+                            let Some(container) = container.as_mapping() else {
+                                continue;
+                            };
+                            entry
+                                .mounted
+                                .extend(mounted_claims(pod, container).into_values());
+                            for line in env_value(container, MOUNTS_ENV).unwrap_or_default().lines()
+                            {
+                                if let Some((claim, _)) = line.split_once('=') {
+                                    entry.walked.insert(claim.trim().to_string());
+                                }
+                            }
+                            let measured = env_value(container, API_CLAIM_ENV)
+                                .map(|c| c.trim().to_string())
+                                .filter(|c| !c.is_empty());
+                            if let Some(claim) = measured {
+                                entry.measured.push((
+                                    workload.to_string(),
+                                    container
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("<unnamed>")
+                                        .to_string(),
+                                    claim,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        facts.insert(dir, entry);
+    }
+    facts
+}
+
+/// An API-measured claim has to be a real volume of that delivery.
+///
+/// The mount pairing cannot apply here — the declaring container deliberately
+/// does not mount the claim — so this judgement stands in for it against the
+/// same manifest: the name has to match a claim object the delivery declares and
+/// that some container mounts, and the same claim may not also be declared as a
+/// walkable mount, which would publish one volume twice under one name. Every
+/// row is also required to be exercised somewhere, so a row cannot outlive the
+/// layout it describes.
+#[test]
+fn every_api_measured_claim_is_a_volume_that_delivery_declares_and_mounts() {
+    let facts = delivery_facts();
+    let known: BTreeSet<&str> = API_MEASURED.iter().map(|(name, ..)| *name).collect();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    for dir in DELIVERED {
+        let Some(facts) = facts.get(dir) else {
+            panic!("{dir} was not scanned");
+        };
+        assert!(
+            !facts.measured.is_empty(),
+            "{dir} declares no {API_CLAIM_ENV} anywhere, so this gate read nothing there: either \
+             the declaration was dropped from that profile's pod, or the store it names is no \
+             longer delivered and the reading it feeds is unproduced"
+        );
+        for (workload, container, claim) in &facts.measured {
+            assert!(
+                known.contains(workload.as_str()),
+                "{dir}/{workload} (container {container}): this workload declares an API-measured \
+                 claim and no producer row covers it — add it to API_MEASURED with the call that \
+                 builds its producer"
+            );
+            assert!(
+                facts.declared.contains(claim),
+                "{dir}/{workload} (container {container}): {API_CLAIM_ENV} names {claim}, and this \
+                 delivery declares no PersistentVolumeClaim with that name, so the reading is \
+                 published against a claim nothing backs"
+            );
+            assert!(
+                facts.mounted.contains(claim),
+                "{dir}/{workload} (container {container}): {API_CLAIM_ENV} names {claim}, and no \
+                 container in this delivery mounts it: the declaration outlived the volume it \
+                 names"
+            );
+            assert!(
+                !facts.walked.contains(claim),
+                "{dir}/{workload} (container {container}): {claim} is declared both as an \
+                 API-measured claim and in {MOUNTS_ENV}, which publishes one volume's bytes twice \
+                 under the same claim name"
+            );
+            seen.insert(workload.clone());
+        }
+    }
+
+    for row in &known {
+        assert!(
+            seen.contains(*row),
+            "API_MEASURED lists {row}, which no delivered manifest declares any more: the row \
+             describes a layout that is gone and would otherwise licence the next gap"
+        );
+    }
+}
+
+/// The API-measured row's evidence must still be in the file it names.
+///
+/// Both ends are pinned to one spelling: the manifests this gate reads carry the
+/// name in [`API_CLAIM_ENV`], and the producer reads the same name from its own
+/// constant, so a rename on either side has to break something here rather than
+/// silently stop the reading.
+#[test]
+fn every_api_measured_row_still_names_the_call_that_builds_the_producer() {
+    for (workload, file, marker) in API_MEASURED {
+        let source = read(file);
+        assert!(
+            source.contains(marker),
+            "{workload}: {file} no longer contains {marker:?}, so the producer this row stands for \
+             was renamed, moved, or dropped"
+        );
+        assert!(
+            source.contains(API_CLAIM_ENV),
+            "{workload}: {file} no longer reads {API_CLAIM_ENV}, so the delivered declaration \
+             reaches nothing"
         );
     }
 }
