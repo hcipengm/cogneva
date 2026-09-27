@@ -240,44 +240,36 @@ impl SampleLogCap {
     /// every row that happens to share that instant, so a series written as one
     /// burst under a single timestamp could not be pruned at all — the sweep
     /// would report itself over capacity while fifty deletable rows sat there.
-    /// Ranking asks the question actually meant — "is this the newest row of
-    /// its series" — and answers it with one row per series, ties broken by
-    /// id so the answer does not depend on which of two equal rows the planner
-    /// happens to visit first.
+    /// The rank question — "is this the newest row of its series" — is asked of
+    /// one candidate row at a time, with ties broken by id so the answer does
+    /// not depend on which of two equal rows the planner happens to visit
+    /// first.
     ///
     /// The predicate names the kind because the exemption is not about rows at
     /// all: it is about which kinds are read through the log. A gauge is, a
     /// counter and a histogram are read from their accumulation tables, so their
-    /// log rows are history and fall to the sweep at their ordinary rank — the
-    /// rank comparison is computed for them anyway, and every row of theirs is
-    /// deletable.
+    /// log rows are history and fall to the sweep at their ordinary rank — every
+    /// row of theirs is deletable, and the rank question is never asked about
+    /// them.
     ///
-    /// The statement takes exactly as much work as the overshoot it is
-    /// correcting: the cap it is enforcing is the batch size, so there is no
-    /// second number deciding how much a single statement may hold locks over.
+    /// Asking it per row rather than ranking the table first is what keeps a
+    /// pass' cost following the overshoot instead of the log. Computing
+    /// `row_number() OVER (PARTITION BY metric_type, name, labels ...)` for the
+    /// whole table reads every row of the log to delete a batch of it: measured
+    /// at limit 50 over 200,200 rows, a `WindowAgg` over all 200,200 rows, an
+    /// external merge sort of 15 MB, and 1.7 s. The correlated form walks rows
+    /// in `(timestamp, id)` order, stops inside `LIMIT`, and answers each
+    /// candidate with one probe of the newest-per-series index — measured at the
+    /// same limit, 1.1 ms and 209 buffers over 200,200 rows against 1.3 ms and
+    /// 156 buffers over 5,000, so the same batch costs the same either way. That
+    /// index is why the per-row question is cheap, and the correlated subquery
+    /// names `name`, `labels` and `timestamp` in the order the index holds them.
     ///
-    /// Every column the filter reads is projected by the ranking subquery, and
-    /// that is load-bearing rather than tidy: a column the subquery leaves out
-    /// does not fail to compile, it resolves against the delete's own table and
-    /// turns the subquery into a correlated one — a pass over the whole table for
-    /// each row of it.
+    /// The batch size is the only number bounding a single statement's work and
+    /// the locks it holds: the `LIMIT` is the cap being enforced, not a second
+    /// knob, so a pass' reach and its cost are the same number.
     async fn delete_surplus(&self, limit: i64) -> SFResult<u64> {
-        let sql = format!(
-            "DELETE FROM {table} WHERE id IN (
-                 SELECT id FROM (
-                     SELECT id, metric_type, timestamp,
-                            row_number() OVER (
-                                PARTITION BY metric_type, name, labels
-                                ORDER BY timestamp DESC, id DESC
-                            ) AS newest_rank
-                     FROM {table}
-                 ) ranked
-                 WHERE metric_type <> 'gauge' OR newest_rank > 1
-                 ORDER BY timestamp, id
-                 LIMIT $1
-             )",
-            table = crate::partition_maintainer::quote_ident(&self.table),
-        );
+        let sql = delete_surplus_sql(&self.table);
         Ok(sqlx::query(&sql)
             .bind(limit.max(1))
             .execute(&self.pool)
@@ -362,6 +354,34 @@ impl SampleLogCap {
             .await
             .map_err(|e| SFError::Database(e.to_string()))
     }
+}
+
+/// The statement a pass runs, with the table already quoted.
+///
+/// Exported rather than inlined at the call site so what a test explains is the
+/// text the sweep executes rather than a copy of it: the costs that matter here
+/// are properties of the plan this text produces, and a copy goes on being
+/// explained happily after the statement beside it has been rewritten.
+///
+/// `$1` is the batch size. Rows go oldest first, and a gauge row is skipped when
+/// it is the newest row of its own series — the one row every reader of that
+/// series reaches it through.
+pub fn delete_surplus_sql(table: &str) -> String {
+    format!(
+        "DELETE FROM {table} WHERE id IN (
+             SELECT c.id FROM {table} c
+             WHERE c.metric_type <> 'gauge'
+                OR c.id <> (SELECT g.id FROM {table} g
+                            WHERE g.metric_type = 'gauge'
+                              AND g.name = c.name
+                              AND g.labels = c.labels
+                            ORDER BY g.timestamp DESC, g.id DESC
+                            LIMIT 1)
+             ORDER BY c.timestamp, c.id
+             LIMIT $1
+         )",
+        table = crate::partition_maintainer::quote_ident(table),
+    )
 }
 
 /// How long to wait before the next pass.
@@ -501,6 +521,46 @@ mod tests {
         assert_eq!(
             next_period(None, &outcome(10, Some(2000), false)),
             MIN_SWEEP_PERIOD
+        );
+    }
+
+    /// The batch has to be what bounds the statement's work, and the shape that
+    /// broke that is a ranking over the whole table: `row_number() OVER (...)`
+    /// reads every row of the log to delete a batch of it. Only a live plan can
+    /// show the cost, but this pins the shape, so the rewrite cannot be undone
+    /// and go on passing everything that never runs a plan.
+    #[test]
+    fn the_delete_asks_about_one_row_at_a_time() {
+        let sql = delete_surplus_sql("cog_metrics_samples");
+        assert!(
+            !sql.contains("row_number()"),
+            "the delete ranks the whole table again: {sql}"
+        );
+        assert!(
+            sql.contains("c.id <> (SELECT g.id"),
+            "the delete no longer answers the rank question per row: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY g.timestamp DESC, g.id DESC"),
+            "the per-row answer is not the newest row of the series: {sql}"
+        );
+        assert!(
+            sql.contains("LIMIT $1"),
+            "the batch is not the bound the statement is given: {sql}"
+        );
+    }
+
+    /// The table name is an identifier, so it is quoted everywhere it lands —
+    /// the delete's own table and the two scans the subquery is built from.
+    /// Forgetting one leaves the statement erroring out or, worse, resolving to
+    /// a different table.
+    #[test]
+    fn every_place_the_table_is_named_is_quoted() {
+        let sql = delete_surplus_sql(r#"odd"name"#);
+        assert_eq!(
+            sql.matches(r#""odd""name""#).count(),
+            3,
+            "the table is not quoted everywhere it is named: {sql}"
         );
     }
 }

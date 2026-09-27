@@ -91,7 +91,7 @@ pub use migrate::{
 
 pub use dlq::MemoryDeadLetterQueue;
 pub use metrics_retirement::{MetricsRetirement, RetirementOutcome, RetirementPass};
-pub use metrics_sample_cap::{SampleLogCap, SweepOutcome};
+pub use metrics_sample_cap::{delete_surplus_sql, SampleLogCap, SweepOutcome};
 pub use partition_maintainer::PartitionMaintainer;
 
 pub mod plugin;

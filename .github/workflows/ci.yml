@@ -93,6 +93,27 @@ jobs:
         run: cargo test -p cog-storage --test metrics_sample_cap -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # What a single pruning statement costs, and which rows it takes. The
+      # rank question is a plan question: ranking every row of the log first
+      # answers it for the whole table, which is a cost no reading of the
+      # statement's text shows.
+      - name: Live-DB metrics surplus-delete statement
+        run: cargo test -p cog-storage --test metrics_surplus_delete -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The gauge read and the retirement pass were written as live tests and
+      # then never named by any gate, which is the same as not having them: a
+      # scrape pays for the newest-sample read continuously, and the retirement
+      # has to reach every table a retired name is stored in. Both run here so
+      # the claim is checked rather than asserted.
+      - name: Live-DB metrics latest-sample read
+        run: cargo test -p cog-storage --test metrics_latest_reading -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - name: Live-DB retires a metrics name
+        run: cargo test -p cog-storage --test metrics_retirement -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - name: Live-DB backup/restore round trip
         run: cargo test -p cogneva --test backup_pg -- --ignored
         env:
