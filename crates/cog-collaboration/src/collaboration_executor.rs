@@ -362,6 +362,7 @@ impl CollaborationExecutor {
         use futures::StreamExt;
         let mut stream = stream;
         let mut text = String::new();
+        let mut stream_error: Option<String> = None;
         while let Some(event) = stream.next().await {
             match event {
                 cog_core::AssistantMessageEvent::TextDelta { delta, .. } => {
@@ -374,13 +375,35 @@ impl CollaborationExecutor {
                     }
                 }
                 cog_core::AssistantMessageEvent::Error { error, .. } => {
-                    return Err(SFError::Agent(format!(
-                        "intent assess stream error: {}",
-                        error.content()
-                    )));
+                    // The reply is over, but keep reading rather than returning
+                    // from this arm. The event carries only the wording of the
+                    // failure; the *type* of it — which refusal the upstream
+                    // gave, and how long it said to wait — is on the stream's
+                    // final response. Returning here throws that away, and every
+                    // consumer above can then only read the sentence to guess
+                    // whether re-running could ever succeed. Reading to the end
+                    // is also what drains the producer, so `result()` resolves.
+                    stream_error = Some(error.content());
                 }
                 _ => {}
             }
+        }
+
+        if let Some(error) = stream_error {
+            let response = stream.result().await;
+            // A provider that classified the refusal (HTTP status -> a typed
+            // refusal, plus the wait the upstream stated in its headers) already
+            // said what this failure is. Re-stating it as a sentence here is how
+            // a quota outage is retried every poll as if it were a transient
+            // blip, so the type is carried out the way it arrived.
+            return Err(match response.upstream_failure {
+                Some(cause) => SFError::upstream_refused_after(
+                    cause,
+                    format!("intent assess stream error: {error}"),
+                    response.retry_after_secs,
+                ),
+                None => SFError::Agent(format!("intent assess stream error: {error}")),
+            });
         }
 
         let verdict = Self::parse_intent_verdict(&text)?;
@@ -1340,6 +1363,284 @@ mod tests {
         assert_ne!(
             CollaborationExecutor::change_id_for("github-pr-58", "diff A"),
             CollaborationExecutor::change_id_for("github-pr-58", "diff A fixed")
+        );
+    }
+
+    /// An agent whose assess call ends the way a real refused call does: an
+    /// error event carrying the wording, and a final response carrying the
+    /// classified refusal the provider built out of the HTTP status.
+    struct RefusingStreamAgent {
+        error_text: String,
+        cause: Option<cog_core::UpstreamFailure>,
+        wait: Option<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::Agent for RefusingStreamAgent {
+        async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn start(&self) {}
+
+        async fn snapshot(
+            &self,
+            _task_id: String,
+        ) -> cog_core::SFResult<cog_core::AgentCheckpoint> {
+            Ok(cog_core::AgentCheckpoint {
+                checkpoint_id: String::new(),
+                task_id: String::new(),
+                agent_state: serde_json::Value::Null,
+                context_window: Vec::new(),
+                event_offset: 0,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
+        async fn restore(&self, _snapshot: &cog_core::AgentCheckpoint) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn continue_(
+            &self,
+            _input: serde_json::Value,
+        ) -> cog_core::SFResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn steer(&self, _instruction: String) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn abort(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn reset(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
+            Ok(cog_core::AgentState::Idle)
+        }
+
+        async fn wait_for_idle(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn restore_from_id(&self, _checkpoint_id: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<cog_core::AgentEvent> {
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            rx
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(8);
+            let _ = producer
+                .push(cog_core::AssistantMessageEvent::Start {
+                    timestamp: chrono::Utc::now(),
+                })
+                .await;
+            let _ = producer
+                .push(cog_core::AssistantMessageEvent::Error {
+                    reason: cog_core::StopReason::Error,
+                    error: cog_core::Message::assistant_text(self.error_text.clone()),
+                    timestamp: chrono::Utc::now(),
+                })
+                .await;
+            // The typed refusal rides the final response, exactly as the
+            // providers leave it: the event above has the wording only.
+            producer.end(cog_core::ChatResponse {
+                error_message: Some(self.error_text.clone()),
+                stop_reason: cog_core::StopReason::Error,
+                upstream_failure: self.cause,
+                retry_after_secs: self.wait,
+                ..cog_core::ChatResponse::default()
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            self.chat_stream(&[], &cog_core::ChatOptions::default())
+                .await
+        }
+
+        async fn read_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+        ) -> cog_core::SFResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn write_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn receive_message(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    struct OneAgentManager {
+        agent: std::sync::Arc<dyn cog_core::Agent>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::AgentManager for OneAgentManager {
+        async fn create_agent(
+            &self,
+            _agent_id: &str,
+            _role: &str,
+            _llm: std::sync::Arc<dyn cog_core::LlmClient>,
+        ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
+            Ok(std::sync::Arc::clone(&self.agent))
+        }
+
+        async fn dispatch(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn list_workers(&self) -> cog_core::SFResult<Vec<cog_core::WorkerInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn shutdown(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn get_agent(
+            &self,
+            _agent_id: &str,
+        ) -> cog_core::SFResult<Option<std::sync::Arc<dyn cog_core::Agent>>> {
+            Ok(None)
+        }
+    }
+
+    struct UnusedLlm;
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for UnusedLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(1);
+            producer.end(cog_core::ChatResponse::default());
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            self.chat_stream(&[], &cog_core::ChatOptions::default())
+                .await
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::ChatResponse> {
+            Ok(cog_core::ChatResponse::default())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn assess_task() -> cog_core::Task {
+        cog_core::Task::new(
+            "github-issue-56",
+            cog_core::TaskType::Custom("platform_intent_assess".into()),
+            serde_json::json!({
+                "kind": "issue",
+                "number": 56,
+                "title": "something is off",
+                "body": "details",
+            }),
+        )
+    }
+
+    async fn assessed(
+        error_text: &str,
+        cause: Option<cog_core::UpstreamFailure>,
+        wait: Option<u64>,
+    ) -> cog_core::SFError {
+        let agent = std::sync::Arc::new(RefusingStreamAgent {
+            error_text: error_text.to_string(),
+            cause,
+            wait,
+        });
+        let executor = CollaborationExecutor::new()
+            .with_llm_provider(std::sync::Arc::new(UnusedLlm))
+            .with_agent_manager(std::sync::Arc::new(OneAgentManager { agent }));
+        executor
+            .execute_intent_assess(&assess_task())
+            .await
+            .expect_err("a stream that ends in an error must not yield a verdict")
+    }
+
+    /// The refusal's type reaches the caller instead of being flattened into a
+    /// sentence. Provenance: assess tasks were failing against a refused
+    /// upstream with no typed cause recorded and were re-bought on every poll,
+    /// because the consumer could only read the wording.
+    #[tokio::test]
+    async fn an_assess_refusal_carries_its_type_and_the_stated_wait() {
+        let error = assessed(
+            "API error (HTTP 503): upstreams unavailable",
+            Some(cog_core::UpstreamFailure::QuotaExhausted),
+            Some(5578),
+        )
+        .await;
+
+        assert_eq!(
+            error.upstream_failure(),
+            Some(cog_core::UpstreamFailure::QuotaExhausted)
+        );
+        assert_eq!(error.retry_after_secs(), Some(5578));
+        assert!(
+            error.to_string().contains("intent assess stream error"),
+            "the wording still has to reach the log: {error}"
+        );
+        assert!(
+            error.is_terminal_upstream_failure(),
+            "an exhausted quota cannot clear by re-running on the next poll: {error}"
+        );
+    }
+
+    /// The other side: a stream error the provider did not classify stays what
+    /// it was. Inventing a type for it would make every unclassified stream
+    /// failure look terminal.
+    #[tokio::test]
+    async fn an_unclassified_stream_error_stays_untyped() {
+        let error = assessed("stream ended without a reply", None, None).await;
+
+        assert_eq!(error.upstream_failure(), None);
+        assert_eq!(error.retry_after_secs(), None);
+        assert!(
+            error.to_string().contains("stream ended without a reply"),
+            "the wording is the only evidence there is: {error}"
         );
     }
 }
