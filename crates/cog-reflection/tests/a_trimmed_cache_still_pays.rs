@@ -8,11 +8,14 @@
 //! falls under the cap, and what the cap did not require stays exactly where it
 //! was.
 //!
-//! Two passes, because "trimmed" covers two outcomes that must not be read as
-//! one:
+//! Three passes, because "trimmed" covers three outcomes that must not be read
+//! as one:
 //!
 //! - a pass that pays from the layers whose loss costs time leaves the workspace
 //!   up to date, which is the whole point of ordering the layers that way;
+//! - a pass that has to pay out of the compiled results takes the bytes whose
+//!   loss costs a link before the ones whose loss costs a compile, so the
+//!   dependency the next build would otherwise recompile is still there;
 //! - a cap the cache cannot be brought under is reported as unmet, and the
 //!   workspace still builds and runs afterwards.
 
@@ -28,11 +31,16 @@ use cog_reflection::build_cache_readings::{
     BuildCacheReadings, BUILD_TARGET_OVER_CAP_METRIC, BUILD_TARGET_UNMET_METRIC, CACHE_LAYER_DEPTH,
     OUTCOME_LABEL, OUTCOME_RECLAIMED,
 };
-use cog_reflection::build_cache_reclaim::{plan_reclaim, DISCARDABLE_LEAVES};
+use cog_reflection::build_cache_reclaim::{plan_reclaim, DISCARDABLE_LEAVES, RESULT_LEAVES};
 
 /// A two-crate workspace with one path dependency: enough for cargo to hold a
 /// compiled result it can reuse and an incremental state it can keep, and small
 /// enough that a test can build it from cold in about a second.
+///
+/// The names are not decoration. Under a plan that falls back to the alphabet,
+/// a cache whose artifacts sort before the ones that depend on them is the
+/// shape that loses the reusable half, so the dependency here is named to sort
+/// first and the binary that uses it to sort last.
 fn write_fixture(root: &Path) {
     std::fs::create_dir_all(root.join("lib/src")).unwrap();
     std::fs::create_dir_all(root.join("app/src")).unwrap();
@@ -43,7 +51,7 @@ fn write_fixture(root: &Path) {
     .unwrap();
     std::fs::write(
         root.join("lib/Cargo.toml"),
-        "[package]\nname = \"fixture-lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "[package]\nname = \"aardvark-lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -53,15 +61,30 @@ fn write_fixture(root: &Path) {
     .unwrap();
     std::fs::write(
         root.join("app/Cargo.toml"),
-        "[package]\nname = \"fixture-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-         [dependencies]\nfixture-lib = { path = \"../lib\" }\n",
+        "[package]\nname = \"zebra-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\naardvark-lib = { path = \"../lib\" }\n",
     )
     .unwrap();
     std::fs::write(
         root.join("app/src/main.rs"),
-        "fn main() {\n    println!(\"{}\", fixture_lib::add(1, 2));\n}\n",
+        "fn main() {\n    println!(\"{}\", aardvark_lib::add(1, 2));\n}\n",
     )
     .unwrap();
+}
+
+/// The layer a planned path sits in, by its last component, so a claim about
+/// where a plan took its bytes from can be read off the walk.
+fn layer_of(files: &[fs_size::FileEntry], path: &Path) -> String {
+    let entry = files
+        .iter()
+        .find(|f| f.path == path)
+        .expect("a plan may only name files the walk saw");
+    entry
+        .layer
+        .rsplit('/')
+        .next()
+        .unwrap_or(entry.layer.as_str())
+        .to_string()
 }
 
 /// Build the fixture with cargo, in a target directory and an environment of the
@@ -141,10 +164,17 @@ async fn a_pass_that_pays_from_the_speed_layers_leaves_the_workspace_up_to_date(
     let root = tempfile::tempdir().unwrap();
     let (target, files, total) = warm_cache(root.path());
 
-    // One byte over: the plan owes one file, and which file it picks is the
-    // whole question this test asks.
+    // One byte over: the plan owes one byte, and where it takes it from is the
+    // whole question this test asks. One file with bytes in it covers that, so
+    // exactly one of them is named -- cargo leaves zero-length files (lock
+    // files) behind, and naming one of those costs the plan a choice without
+    // buying it a byte.
     let plan = plan_reclaim(&files, total, total - 1);
-    assert_eq!(plan.delete.len(), 1, "{plan:?}");
+    assert_eq!(
+        plan.delete.iter().filter(|group| group.len > 0).count(),
+        1,
+        "{plan:?}"
+    );
     let removed = plan.delete[0].paths.clone();
     for path in &removed {
         let entry = files
@@ -261,9 +291,85 @@ async fn a_cap_under_the_floor_is_reported_and_the_cache_still_builds() {
     );
 
     // Still a cache root, and still a workspace: cargo heals whatever the pass
-    // took and the program runs. What it costs in rebuilds is the cap's price
-    // and is not asserted here: which artifacts the floor kept is cargo's
-    // write order, not something a test should read a verdict off.
+    // took and the program runs. What it costs in rebuilds is not asserted
+    // here: a cap this far below what the floor keeps is not a cache being
+    // trimmed, it is a cache being emptied.
     let run = build(&target, root.path(), &["run", "-q"]);
     assert!(run.contains('3'), "{run}");
+}
+
+/// A pass that has to reach past the layers whose loss costs time still takes
+/// the cheapest thing the compiled results hold: a sidecar, whose absence costs
+/// nothing at all, and the workspace the pass leaves behind is still up to date.
+///
+/// This is the shape of a real pass, and the reason it is asserted against
+/// cargo rather than against a plan: a plan that reached for the alphabet
+/// instead would take the fingerprint layer first -- its name sorts ahead of
+/// `deps` -- and a workspace whose fingerprints are gone is dirty whatever its
+/// compiled results still hold.
+#[tokio::test]
+async fn a_pass_that_reaches_the_compiled_results_still_leaves_the_workspace_warm() {
+    let root = tempfile::tempdir().unwrap();
+    let (target, files, total) = warm_cache(root.path());
+
+    // The cut this test is about is the shallowest one that reaches the
+    // compiled results: everything the layers whose loss costs time can pay,
+    // and then one byte. Both halves are read off the plan rather than assumed
+    // -- which is also where the floor drops out of the arithmetic, since a
+    // group the floor keeps is one the plan never names.
+    let drained = plan_reclaim(&files, total, 0);
+    let among_results = |path: &Path| RESULT_LEAVES.contains(&layer_of(&files, path).as_str());
+    assert!(
+        drained
+            .delete
+            .iter()
+            .any(|group| group.paths.iter().any(|p| among_results(p))),
+        "the fixture has to have compiled results the plan may reach: {drained:?}"
+    );
+    let payable: u64 = drained
+        .delete
+        .iter()
+        .take_while(|group| !group.paths.iter().any(|p| among_results(p)))
+        .map(|group| group.len)
+        .sum();
+
+    let cap = total - payable - 1;
+    let plan = plan_reclaim(&files, total, cap);
+
+    let lock = tempfile::tempdir().unwrap();
+    let readings = BuildCacheReadings::new(&target).with_cap(cap, 300);
+    readings.enforce_cap(&files, Some(&gate(lock.path()))).await;
+    let after = fs_size::dir_size_bytes(&target, &[]).unwrap();
+    assert_eq!(
+        after,
+        total - plan.delete_bytes,
+        "the cap's excess is all that may go"
+    );
+    assert!(after <= cap, "{after} is still over the cap {cap}");
+
+    // What the ordering is for, read off the tool that would have to do the
+    // work: the pass reached the compiled results and cost the workspace
+    // nothing, because what it took first was the one kind of file there whose
+    // absence is not a rebuild.
+    let warm = build(&target, root.path(), &["build", "-v"]);
+    assert_eq!(
+        warm.matches("Compiling").count(),
+        0,
+        "reaching the compiled results cost a rebuild, which is the outcome the \
+         ordering exists to prevent: {warm}"
+    );
+
+    // Asserted last so that a plan which never reached the compiled results
+    // fails above, on what it cost, rather than here on what it was about.
+    let planned: Vec<String> = plan
+        .delete
+        .iter()
+        .flat_map(|group| group.paths.iter())
+        .map(|path| layer_of(&files, path))
+        .collect();
+    assert!(
+        planned.iter().any(|layer| layer == "deps"),
+        "the cut has to land in the compiled results, or nothing above was \
+         about them: {planned:?}"
+    );
 }
