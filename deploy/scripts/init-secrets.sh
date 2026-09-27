@@ -55,11 +55,70 @@ ensure_random() {
 # machine-id，指纹素材只剩 Pod 主机名与 veth MAC（每轮重启都变），所以身份
 # 不能靠容器内推导——这里生成一次并永久保留，重装/换机器带上同一个 Secret
 # 就是同一个实例。64 位十六进制，与机器指纹同形。
+#
+# A copy is kept on the host as well. A reinstall takes the namespace and the
+# Secret down together -- that is what happened on 2026-09-23 -- and the Secret
+# is the identity's only normative source, so once it is gone nothing on the
+# cluster can say what the last instance was called. The host copy does not go
+# with it, so every install writes one and a missing Secret is restored from it
+# first. Losing it is not losing a configuration value: the fingerprint picks
+# the name, the name is the git author, so the next revision is committed under
+# a name nobody has seen and everyone tracing self-authored changes by author
+# finds none of them.
+HOST_STATE_DIR="${COGNEVA_HOST_STATE_DIR:-$HOME/.cogneva-ops}"
+HOST_FINGERPRINT_FILE="${COGNEVA_HOST_FINGERPRINT_FILE:-$HOST_STATE_DIR/instance-fingerprint}"
+
+# The shape a fingerprint has. A copy only counts if it has that shape: content
+# that is non-empty but not 64 hex digits is a damaged file or something else
+# written there, and it can be neither used as the identity (that would restore
+# an instance nothing has ever seen) nor treated as absent (that is the silent
+# rename this exists to prevent).
+FINGERPRINT_RE='^[0-9a-fA-F]{64}$'
+
+# Write the (0600) host copy. A write failure only warns: the identity itself
+# is still valid, there is just nothing to carry into the next reinstall.
+keep_host_fingerprint() {
+  local val="$1"
+  if [ ! -d "$HOST_STATE_DIR" ]; then
+    mkdir -p "$HOST_STATE_DIR" 2>/dev/null || true
+    chmod 700 "$HOST_STATE_DIR" 2>/dev/null || true
+  fi
+  if ! (umask 077 && printf '%s\n' "$val" > "$HOST_FINGERPRINT_FILE"); then
+    echo "  instance-fingerprint: 警告：宿主保留副本 ${HOST_FINGERPRINT_FILE} 写不进去；" >&2
+    echo "        下次重装若 Secret 一并丢失，实例会换名。" >&2
+    return
+  fi
+  chmod 600 "$HOST_FINGERPRINT_FILE" 2>/dev/null || true
+}
+
 ensure_fingerprint() {
   local key=instance-fingerprint cur val b64
   cur="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null || true)"
   if [ -n "$cur" ]; then
     echo "  ${key}: 已存在，保留不动"
+    # Backfill the host copy: this Secret may predate the copy, in which case
+    # its next reinstall would rename the instance as before. Writing it now
+    # changes nothing about the identity in use, only about the next reinstall.
+    val="$(printf '%s' "$cur" | base64 -d 2>/dev/null || true)"
+    if [ -n "$val" ]; then
+      keep_host_fingerprint "$val"
+    fi
+    return
+  fi
+  # Nothing on the cluster. The host copy decides: restoring it is the same
+  # instance, so the author name does not change hands.
+  if [ -f "$HOST_FINGERPRINT_FILE" ]; then
+    val="$(tr -d '[:space:]' < "$HOST_FINGERPRINT_FILE")"
+    if ! printf '%s' "$val" | grep -qE "$FINGERPRINT_RE"; then
+      echo "错误：宿主保留副本 ${HOST_FINGERPRINT_FILE} 的内容不是一个指纹（64 位十六进制），" >&2
+      echo "      本次拒绝新建身份。新建会静默换掉实例署名，而按旧署名在仓库里追踪自产" >&2
+      echo "      变更的人会再也找不到它们。修好这个文件，或清空它并重跑，表示确认换新身份。" >&2
+      exit 1
+    fi
+    b64="$(printf '%s' "$val" | base64 | tr -d '\n')"
+    kubectl -n "$NS" patch secret "$SECRET" --type=merge \
+      -p="{\"data\":{\"${key}\":\"${b64}\"}}" >/dev/null
+    echo "  ${key}: 已从宿主保留副本恢复（与上次安装是同一个实例）"
     return
   fi
   if command -v openssl >/dev/null 2>&1; then
@@ -73,7 +132,9 @@ ensure_fingerprint() {
   # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
   kubectl -n "$NS" patch secret "$SECRET" --type=merge \
     -p="{\"data\":{\"${key}\":\"${b64}\"}}" >/dev/null
-  echo "  ${key}: 已生成随机指纹"
+  keep_host_fingerprint "$val"
+  echo "  ${key}: 生成了新实例指纹，并留了一份在 ${HOST_FINGERPRINT_FILE}"
+  echo "        本机此前没有这个实例的保留副本：这是第一次安装，或宿主副本被清掉了。"
 }
 
 # 读 Secret 中某个键的明文值（空则输出空）。
