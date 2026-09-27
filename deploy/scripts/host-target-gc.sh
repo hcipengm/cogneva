@@ -25,17 +25,28 @@
 #
 # What it refuses to do, each refusal a reading rather than a guess:
 #   - deletes only directories carrying cargo's own cache tag, so a directory
-#     that merely is named `target` is never a candidate;
-#   - deletes only inside the configured work root, and only on the filesystem
-#     the trigger was read from (freeing another filesystem would not move the
-#     reading that fired, and the run would escalate for nothing);
+#     that merely is named `target` is never a candidate -- and never deletes the
+#     tag itself, which is the tree's identity rather than cache data. Cargo
+#     writes that file once, when it makes the tree, and never writes it again:
+#     a run that removed it would leave a cache no later run can judge and no
+#     rebuild repairs. A tree that looks like a cache and has no tag is named in
+#     the reading, never guessed at -- the tag is the evidence, and a blind spot
+#     is a thing the reader has to be able to see;
+#   - deletes only on the filesystem the trigger was read from, and only inside
+#     a directory carrying that tag: freeing another filesystem would not move
+#     the reading that fired, and the tag is what makes a directory cargo's
+#     rather than someone's. The configured root names the filesystem to judge,
+#     not the set of caches to judge -- a cache it does not happen to sit above
+#     is still a cache on that disk. A run may be narrowed to one subtree, and a
+#     narrowed run says so: otherwise "no cache here" and "a cache here that
+#     this run was not allowed to reach" read the same;
 #   - deletes nothing at all while a build may be writing into a tree. A process
-#     that builds is recognised by its name and by its owner (the work root is
-#     ours; a process of another uid cannot be writing it), and the tree it
-#     writes is resolved from CARGO_TARGET_DIR, --target-dir or <cwd>/target;
-#     any process of ours with a working directory or an open file descriptor
-#     inside a tree counts as well. A process of ours whose files cannot be read
-#     is not evidence of absence: it fails the whole run closed.
+#     that builds is recognised by its name and by its owner (the judged caches
+#     are ours; a process of another uid cannot be writing them), and the tree
+#     it writes is resolved from CARGO_TARGET_DIR, --target-dir or
+#     <cwd>/target; any process of ours with a working directory or an open file
+#     descriptor inside a tree counts as well. A process of ours whose files
+#     cannot be read is not evidence of absence: it fails the whole run closed.
 #   - deletes nothing unless the file about to run is exactly the committed
 #     version of it. The unit points straight at the checkout, which is what
 #     keeps the script from ever going stale -- and the same property means an
@@ -51,6 +62,7 @@ readonly CARGO_CACHE_TAG_SIGNATURE='Signature: 8a477f597d28d172789f06886806bc55'
 readonly TIERS='stale incremental coverage profile'
 
 work_root="${COGNEVA_HOST_WORK_ROOT:-}"
+delete_under="${COGNEVA_TARGET_GC_DELETE_UNDER:-}"
 trigger_pct="${COGNEVA_TARGET_GC_TRIGGER_PCT:-70}"
 floor_pct="${COGNEVA_TARGET_GC_FLOOR_PCT:-50}"
 stale_days="${COGNEVA_TARGET_GC_STALE_DAYS:-3}"
@@ -110,7 +122,7 @@ script_identity() {
 
 # --- configuration -----------------------------------------------------------
 
-[ -n "${work_root}" ] || die "COGNEVA_HOST_WORK_ROOT is unset: this script never guesses where the worktrees are"
+[ -n "${work_root}" ] || die "COGNEVA_HOST_WORK_ROOT is unset: this script never guesses which filesystem to judge"
 [ -d "${work_root}" ] || die "COGNEVA_HOST_WORK_ROOT=${work_root} is not a directory"
 # Resolve once so that paths read out of /proc compare against it textually.
 work_root="$(cd "${work_root}" && pwd -P)"
@@ -159,6 +171,23 @@ fs_identity() {
     df -P -- "$1" 2>/dev/null | awk 'NR == 2 { print $1 "|" $6 }'
 }
 
+# The mount point out of a `source|mountpoint` identity.
+fs_mount_point() {
+    printf '%s\n' "${1#*|}"
+}
+
+# How many path components a path has below one of its ancestors. Used to keep
+# the scan's reach equal to what it was when it started somewhere else.
+depth_below() { # ancestor, path
+    local rel="${2#"${1}"}"
+    rel="${rel#/}"
+    [ -n "${rel}" ] || {
+        printf '0\n'
+        return 0
+    }
+    printf '%s\n' "$(($(printf '%s' "${rel}" | tr -cd '/' | wc -c) + 1))"
+}
+
 # The paths a live process of ours sits in or holds open: the working directory
 # and every open file descriptor, resolved. `(deleted)` marks a file that is
 # already unlinked; the path before it is still the tree it belonged to.
@@ -199,9 +228,16 @@ build_dir_of() {
 # Every reason to leave a tree alone, as `path<TAB>pid<TAB>reason`. A process of
 # ours whose own files cannot be read goes to the second file: that is a failure
 # to attribute, which is not the same reading as "nobody is writing there".
+#
+# The held-open leg is not filtered to any set of directories before it is
+# written: the caches are enumerated from the judged filesystem, so which trees
+# matter is not known until then, and the membership test is the one
+# `busy_reason` performs -- per tree, at the moment it decides. A filter here
+# would be a second copy of that test, and a second copy is one that can
+# disagree with the first.
 collect_process_views() {
     local busy="$1" unattributable="$2"
-    local pid cwd dir name
+    local pid cwd dir name state
     local -a writers=()
     read -r -a writers <<<"${writer_processes}"
     : >"${busy}"
@@ -214,6 +250,21 @@ collect_process_views() {
             # failure to attribute.
             [ -d "/proc/${pid}" ] || continue
             if ! cwd="$(readlink "/proc/${pid}/cwd" 2>/dev/null)"; then
+                # A process that ended while this pass was reading it is not a
+                # failure to attribute. The kernel tears down the address space
+                # before the pid is reaped, so `/proc/<pid>/cwd` stops being
+                # readable a moment before `/proc/<pid>` disappears -- and a
+                # build is processes ending constantly, so an abort here would
+                # fire on ordinary churn, on exactly the runs where the disk is
+                # full enough to act. The state line is what tells the two
+                # apart: `Z` is a process that has ended and is not yet reaped,
+                # and a stat line that is gone too is one already reaped. A
+                # process that is still there and still unreadable stays a
+                # failure, because that is a tree this run cannot attribute.
+                state="$(sed -n 's/^[^)]*) \(.\).*/\1/p' "/proc/${pid}/stat" 2>/dev/null || true)"
+                if [ -z "${state}" ] || [ "${state}" = Z ]; then
+                    continue
+                fi
                 printf '%s\t%s\tcwd of %s is unreadable\n' "${pid}" "${name}" "${name}" >>"${unattributable}"
                 continue
             fi
@@ -223,14 +274,12 @@ collect_process_views() {
     done
 
     process_paths |
-        awk -F'\t' -v root="${work_root}/" -v bare="${work_root}" '
+        awk -F'\t' '
             {
                 path = $2
                 sub(/ \(deleted\)$/, "", path)
-                if (path == bare || index(path, root) == 1) {
-                    split($1, part, "/")
-                    printf "%s\t%s\tholds it open\n", path, part[3]
-                }
+                split($1, part, "/")
+                printf "%s\t%s\tholds it open\n", path, part[3]
             }' >>"${busy}"
 }
 
@@ -259,31 +308,87 @@ is_cargo_cache() {
     [ "${signature}" = "${CARGO_CACHE_TAG_SIGNATURE}" ]
 }
 
-find_candidates() {
-    # Depth 5 reaches a worktree nested inside a repository (its own worktrees).
+# A tree cargo made and did not label. Its own layout file is what says so; the
+# tag is missing. This is a reading and never a candidate: accepting another file
+# in place of the tag would be judging by evidence this script picked rather than
+# by cargo's own statement, and the deletion path is not the place to widen that.
+# What it is for is naming the trees no run can reach -- a labelled tree that
+# lost its tag stays invisible to every later run, so the only way it can be
+# acted on is if a reading says it is there.
+looks_like_cargo_cache() {
+    [ -f "$1/.rustc_info.json" ]
+}
+
+find_candidates() { # file to list the cache-like trees that carry no tag
+    # Every cargo cache on the filesystem the trigger was read from, not only
+    # the ones under one configured directory. A second checkout is a checkout:
+    # one living under $HOME rather than beside this one grew to 146 GiB without
+    # a single reading naming it, because the enumeration started at a directory
+    # someone had named rather than at the file system the water level was read
+    # from. Which caches exist is a fact about the disk; which ones someone
+    # remembered to configure is not.
+    #
+    # `${scan_depth}` is the reach this enumeration always had -- a worktree
+    # nested inside a repository -- measured from where it now starts, so
+    # widening the start did not narrow the reach. `-xdev` keeps the scan on the
+    # judged filesystem: a cache on another one cannot move the reading that
+    # fired, and freeing it would escalate for nothing.
+    #
     # Sorted, because the order decides which trees are reached before the floor
     # ends the pass, and readdir order is a property of the filesystem rather
     # than of any decision: two machines in the same state would release
     # different files. The locale is pinned with it so the order is the bytes.
-    find "${work_root}" -maxdepth 5 -type d -name target -prune -print 2>/dev/null |
+    find "${scan_root}" -xdev -maxdepth "${scan_depth}" -type d -name target -prune -print 2>/dev/null |
         LC_ALL=C sort |
         while IFS= read -r dir; do
-            is_cargo_cache "${dir}" && printf '%s\n' "${dir}"
+            if [ -n "${bound}" ]; then
+                case "${dir}" in
+                "${bound}" | "${bound}"/*) ;;
+                *) continue ;;
+                esac
+            fi
+            if is_cargo_cache "${dir}"; then
+                printf '%s\n' "${dir}"
+            elif looks_like_cargo_cache "${dir}"; then
+                # Off the candidate list and onto a side channel: the list is
+                # this function's stdout, and a path that is not a candidate
+                # must never be read as one.
+                printf '%s\t%s\n' "${dir}" \
+                    "$(human_kb "$(du -sk -- "${dir}" 2>/dev/null | cut -f1)")" >>"$1"
+            fi
         done
 }
 
 # --- release -----------------------------------------------------------------
 
-tier_stale() {
+# What a stale pass finds, in one place because the plan and the run have to
+# agree on it: a second hand-written copy of the predicate is how the reading a
+# plan prints stops being the reading a run produces.
+#
+# The cache tag is excluded, and that is the whole reason this exists as a
+# function rather than as the one-line find it used to be. The tag is written
+# once, when cargo makes the tree, so it is the oldest file in every tree and
+# the first thing an age filter matches -- deleting it takes the tree off the
+# candidate list for good, since cargo does not rewrite a missing tag and no
+# rebuild restores it. The cheapest tier would otherwise be the one that blinds
+# the mechanism: measured on a fixture, the tag was gone after the first run and
+# the tree was invisible to every run after it.
+stale_files() { # target, find action...
+    local target="$1"
+    shift
     local minutes=$((stale_days * 24 * 60))
+    find "${target}" -type f ! -name CACHEDIR.TAG -mmin "+${minutes}" "$@"
+}
+
+tier_stale() {
     if [ "${dry_run}" = 1 ]; then
         local count size
-        read -r count size < <(find "$1" -type f -mmin "+${minutes}" -printf '%s\n' 2>/dev/null |
+        read -r count size < <(stale_files "$1" -printf '%s\n' 2>/dev/null |
             awk '{ n++; s += $1 } END { print n + 0, s + 0 }')
         log "dry run would release ${count} stale file(s) under $1 ($(human_kb "${size}"))"
         return 0
     fi
-    find "$1" -type f -mmin "+${minutes}" -delete 2>/dev/null || true
+    stale_files "$1" -delete 2>/dev/null || true
     find "$1" -depth -type d -empty -delete 2>/dev/null || true
 }
 
@@ -325,12 +430,12 @@ release_tier() { # tier, target
     esac
 }
 
-write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable
+write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable, unlabelled
     mkdir -p -- "$(dirname -- "${state_file}")"
     local tmp
     tmp="$(mktemp "${state_file}.XXXXXX")"
     cat >"${tmp}" <<EOF
-{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
+{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"unlabelled":$7,"dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
 EOF
     mv -f -- "${tmp}" "${state_file}"
 }
@@ -339,14 +444,14 @@ EOF
 # how much was released, where the filesystem ended up, how far from the floor it
 # stopped, and which version of this file produced the reading -- the last one is
 # what makes any of the others reviewable later.
-report() { # outcome, released_kb, covered, skipped, unreadable
+report() { # outcome, released_kb, covered, skipped, unreadable, unlabelled
     local gap=0
     [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
-    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unreadable=%s rev=%s rev_state=%s script=%s\n' \
+    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unlabelled=%s unreadable=%s rev=%s rev_state=%s script=%s\n' \
         "$1" "${trigger_pct}" "${floor_pct}" "${before_pct}" "${disk_pct}" \
-        "$(human_kb "$2")" "${gap}" "$3" "$4" "$5" \
+        "$(human_kb "$2")" "${gap}" "$3" "$4" "$6" "$5" \
         "${script_rev}" "${script_state}" "${script_sha}"
-    write_state "$1" "$2" "${gap}" "$3" "$4" "$5"
+    write_state "$1" "$2" "${gap}" "$3" "$4" "$5" "$6"
 }
 
 # --- run ---------------------------------------------------------------------
@@ -362,6 +467,38 @@ before_used_kb="${disk_used_kb}"
 readonly before_pct before_used_kb
 work_fs="$(fs_identity "${work_root}")"
 [ -n "${work_fs}" ] || die "cannot read which filesystem ${work_root} is on"
+# The configured root still says which filesystem to judge -- the water level is
+# read from it -- but it no longer says where to look for caches. The scan
+# starts at that filesystem's mount point and reaches as deep as it did when it
+# started at the root, so no cache on the judged disk is out of reach.
+scan_root="$(fs_mount_point "${work_fs}")"
+[ -n "${scan_root}" ] || die "cannot read the mount point of ${work_root}"
+scan_depth="$((5 + $(depth_below "${scan_root}" "${work_root}")))"
+readonly scan_root scan_depth
+
+# What this run may release. Unset -- the shape a production unit runs in -- it
+# is every cargo cache on the judged filesystem, because which caches exist is a
+# fact about the disk and a list of directories only ever covers the ones
+# somebody remembered to name. Set, it narrows the run to one subtree, and a
+# narrowed run says so out loud: a bound that applied silently would make "there
+# is no cache here" and "there is one, and this run was not allowed to reach it"
+# the same reading.
+bound=""
+if [ -n "${delete_under}" ]; then
+    [ -d "${delete_under}" ] ||
+        die "COGNEVA_TARGET_GC_DELETE_UNDER=${delete_under} is not a directory"
+    bound="$(cd "${delete_under}" && pwd -P)"
+    [ "$(fs_identity "${bound}")" = "${work_fs}" ] ||
+        die "COGNEVA_TARGET_GC_DELETE_UNDER=${bound} is not on the filesystem holding ${work_root}"
+fi
+readonly bound
+[ -z "${bound}" ] || log "warning: this run releases only under ${bound}; a cargo cache anywhere else on the judged filesystem is left alone, and an empty result below is a statement about ${bound} rather than about the disk"
+if [ -n "${bound}" ]; then
+    searched="${bound}"
+else
+    searched="the filesystem holding ${work_root}"
+fi
+readonly searched
 
 identity="$(script_identity)"
 script_rev="${identity%% *}"
@@ -369,18 +506,6 @@ script_state="${identity##* }"
 script_sha="$(sha256sum -- "${script_path}" 2>/dev/null | cut -c1-12)"
 [ -n "${script_sha}" ] || script_sha="unreadable"
 readonly script_rev script_state script_sha
-
-if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
-    # A dry run is a question about what the plan would be, not about whether
-    # today is the day: it answers the same way at 33% as at 80%. A real run
-    # below the trigger has nothing to say, so it says only that.
-    if [ "${dry_run}" != 1 ]; then
-        log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}%"
-        report below_trigger 0 0 0 0
-        exit 0
-    fi
-    log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}% -- this is a dry run, so the plan below is what a run would do on the day the trigger is reached"
-fi
 
 # Nothing is deleted unless the file that would delete it is the committed one.
 # The check sits before the candidates are enumerated: a tree edit that broke the
@@ -390,11 +515,23 @@ fi
 # the reading it prints carries the same rev_state for whoever reads the plan.
 if [ "${script_state}" != committed ] && [ "${dry_run}" != 1 ]; then
     log "the script about to delete is not the version in the commit (rev=${script_rev} rev_state=${script_state}); releasing nothing in this run"
-    report script_unverified 0 0 0 0
+    report script_unverified 0 0 0 0 0
     exit 0
 fi
 
-mapfile -t candidates < <(find_candidates)
+# The unlabelled trees are listed by the enumeration, so the scratch has to exist
+# before it runs -- and the process views are written here later.
+released_dir="$(mktemp -d)"
+trap 'rm -rf -- "${released_dir}"' EXIT
+
+# The candidates are enumerated before the trigger is consulted, so `caches=` is a
+# reading on every run instead of a zero written by the runs that never looked.
+# "This mechanism can see no cache" and "this mechanism did not look" are two
+# different findings about the disk, and the below-trigger runs are most of the
+# runs there are: a count that only exists on the days the disk is full cannot
+# show a tree that stopped being visible, which is how a cache drifts out of
+# reach without anyone noticing.
+mapfile -t candidates < <(find_candidates "${released_dir}/unlabelled")
 skipped=0
 covered=0
 for target in "${candidates[@]}"; do
@@ -406,21 +543,49 @@ for target in "${candidates[@]}"; do
     covered=$((covered + 1))
 done
 
+unlabelled=0
+if [ -s "${released_dir}/unlabelled" ]; then
+    unlabelled="$(wc -l <"${released_dir}/unlabelled")"
+    log "${unlabelled} tree(s) under ${searched} look like cargo caches and carry no CACHEDIR.TAG, so no run can judge them:"
+    # The listing is capped and the cap is named, following the busy listing: a
+    # count that quietly stops is a wrong count, but an unbounded list is not a
+    # reading either.
+    head -n 5 "${released_dir}/unlabelled" |
+        while IFS=$'\t' read -r path size; do
+            log "  ${path}: ${size} on disk, cargo's .rustc_info.json present, no cache tag"
+        done
+    [ "${unlabelled}" -le 5 ] || log "  (+$((unlabelled - 5)) more)"
+fi
+
+if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
+    # A dry run is a question about what the plan would be, not about whether
+    # today is the day: it answers the same way at 33% as at 80%. A real run
+    # below the trigger releases nothing, so what it has to say is what it can
+    # see -- the inventory above is the reading, and it is the same one the
+    # triggered runs report.
+    if [ "${dry_run}" != 1 ]; then
+        log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}%"
+        report below_trigger 0 "${covered}" "${skipped}" 0 "${unlabelled}"
+        exit 0
+    fi
+    log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}% -- this is a dry run, so the plan below is what a run would do on the day the trigger is reached"
+fi
+
 if [ "${covered}" -eq 0 ]; then
-    log "nothing to release: ${disk_pct}% used, trigger ${trigger_pct}%, no cargo cache under ${work_root} -- the cache is not what is filling this filesystem"
-    report floor_unreachable 0 "${#candidates[@]}" "${skipped}" 0
+    log "nothing to release: ${disk_pct}% used, trigger ${trigger_pct}%, no cargo cache under ${searched} -- the cache is not what is filling this filesystem$(
+        [ "${unlabelled}" -eq 0 ] || printf ', and %s tree(s) that look like caches cannot be judged at all' "${unlabelled}"
+    )"
+    report floor_unreachable 0 "${#candidates[@]}" "${skipped}" 0 "${unlabelled}"
     exit 0
 fi
 
 if [ "${dry_run}" = 1 ]; then
-    log "dry run: ${covered} cache(s) under ${work_root}, ${disk_pct}% used, trigger ${trigger_pct}%, floor ${floor_pct}% -- nothing is released, so the plan runs to the deepest tier a real run would reach"
+    log "dry run: ${covered} cache(s) under ${searched}, ${disk_pct}% used, trigger ${trigger_pct}%, floor ${floor_pct}% -- nothing is released, so the plan runs to the deepest tier a real run would reach"
     for target in "${candidates[@]}"; do
         log "candidate ${target}: $(human_kb "$(du -sk -- "${target}" 2>/dev/null | cut -f1)") on disk"
     done
 fi
 
-released_dir="$(mktemp -d)"
-trap 'rm -rf -- "${released_dir}"' EXIT
 outcome="floor_unreachable"
 for tier in ${TIERS}; do
     collect_process_views "${released_dir}/busy" "${released_dir}/unattributable"
@@ -468,6 +633,12 @@ done
 
 released_kb=$((before_used_kb - disk_used_kb))
 [ "${released_kb}" -gt 0 ] || released_kb=0
+if [ "${dry_run}" = 1 ]; then
+    # A dry run releases nothing, so the difference between the two disk readings
+    # is the rest of the machine writing, not this run. Reporting it as released
+    # bytes would put a number next to a plan that is somebody else's traffic.
+    released_kb=0
+fi
 
 if [ "${outcome}" != probe_failed ]; then
     if [ "${dry_run}" = 1 ]; then
@@ -485,11 +656,13 @@ gap=0
 [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
 
 if [ "${outcome}" = floor_unreachable ]; then
-    log "still above the trigger after every tier: the build cache is not what is filling this filesystem (gap ${gap} points)"
+    log "still above the trigger after every tier: the build cache is not what is filling this filesystem (gap ${gap} points)$(
+        [ "${unlabelled}" -eq 0 ] || printf ', and %s cache-like tree(s) no run can judge were never in reach' "${unlabelled}"
+    )"
 fi
 if [ "${outcome}" = planned ]; then
     log "dry run: nothing was released, so this plan is what a run would do today, not what happened"
 fi
 # One site prints the reading and writes the state: two of them would be two
 # chances for a field to exist in one and not the other.
-report "${outcome}" "${released_kb}" "${covered}" "${skipped}" "${unreadable:-0}"
+report "${outcome}" "${released_kb}" "${covered}" "${skipped}" "${unreadable:-0}" "${unlabelled}"
