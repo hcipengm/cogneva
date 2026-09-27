@@ -82,16 +82,28 @@ grep -q 'outcome=below_trigger' <<<"${out}" || fail "触发线以下没动作时
   || fail "低于触发线时仍删了文件；判定门没关住"
 
 # --- 3) the first tier releases what is stale and stops at the floor ---------
-# The reading starts above the trigger and comes back below the floor, which is
-# the whole point of the tiers: the run must stop, not carry on to the tier that
-# costs a full rebuild of the tree.
+# The reading starts above the trigger and comes back below the floor as soon as
+# the first stale artifact is gone, which is the whole point of the tiers: the
+# run must stop, not carry on to the tier that costs a full rebuild of the tree.
+# Which tree that first artifact belonged to is not part of the contract: the
+# enumeration order decides it. The reclaimer sorts its candidates precisely so
+# that order is a property of the decision rather than of the filesystem, and
+# the assertions below are written to survive either order anyway -- an earlier
+# version asserted that every tree gets its turn before the floor is reached,
+# which is the opposite of the property under test and passed or failed by
+# readdir order alone (it passed here and failed in CI).
+# The release that ends the pass is the one that leaves the count at one, and
+# what that rules out is the run sweeping every tree regardless of the floor.
 reader="${work}/reader"
 cat >"${reader}" <<EOF
 #!/usr/bin/env bash
-# Above the trigger while the stale artifact is still there, below the floor
-# once the first tier has taken it: the run has to release it everywhere and
-# then stop, not carry on to the tier that costs a full rebuild.
-if [ -e "${tagged}/debug/deps/libstale.rlib" ]; then echo '800000 80'; else echo '400000 40'; fi
+# Above the trigger while both trees still carry their stale artifact, below the
+# floor as soon as one of them has lost it.
+n=0
+for tree in "${tagged}" "${byname}"; do
+  if [ -e "\${tree}/debug/deps/libstale.rlib" ]; then n=\$((n + 1)); fi
+done
+if [ "\${n}" -ge 2 ]; then echo '800000 80'; else echo '400000 40'; fi
 EOF
 chmod +x "${reader}"
 out="$(run_gc COGNEVA_TARGET_GC_DISK_READER="${reader}" \
@@ -100,14 +112,19 @@ grep -q 'outcome=released' <<<"${out}" || fail "够到地板后没有报 release
 grep -q 'after=40%' <<<"${out}" || fail "释放后的读数是注入的 40%，没有如实报出来：${out}"
 grep -q 'not from the filesystem' <<<"${out}" \
   || fail "换过读数来源没有说明；用替代读数做的判定会和真读数长得一样：${out}"
-[ -f "${tagged}/debug/deps/libstale.rlib" ] && fail "第一档没有删掉过期的产物"
-[ -f "${byname}/debug/deps/libstale.rlib" ] \
-  || fail "第一档只作用到了排在最前的那棵树；够到地板之前每一棵都要轮到"
-[ -f "${tagged}/debug/deps/libfresh.rlib" ] \
-  || fail "第一档删掉了刚写过的产物；这会把下一次构建变成全量重编"
-[ -d "${tagged}/debug/incremental" ] \
-  || fail "够到地板后还是动了第二档；分级释放的意义就在于停手"
-[ -d "${tagged}/llvm-cov-target" ] || fail "够到地板后还是动了第三档"
+remaining=0
+for tree in "${tagged}" "${byname}"; do
+  if [ -f "${tree}/debug/deps/libstale.rlib" ]; then remaining=$((remaining + 1)); fi
+done
+[ "${remaining}" -eq 1 ] \
+  || fail "两棵树里剩 ${remaining} 份过期产物，应为 1：够到地板后还在往下删，或者第一档一份都没删掉"
+for tree in "${tagged}" "${byname}"; do
+  [ -f "${tree}/debug/deps/libfresh.rlib" ] \
+    || fail "第一档删掉了刚写过的产物（${tree}）；这会把下一次构建变成全量重编"
+  [ -d "${tree}/debug/incremental" ] \
+    || fail "够到地板后还是动了第二档（${tree}）；分级释放的意义就在于停手"
+  [ -d "${tree}/llvm-cov-target" ] || fail "够到地板后还是动了第三档（${tree}）"
+done
 
 # --- 4) a directory named target without cargo's tag is not a candidate ------
 [ -d "${untagged}/debug/deps" ] \

@@ -206,7 +206,12 @@ is_cargo_cache() {
 
 find_candidates() {
     # Depth 5 reaches a worktree nested inside a repository (its own worktrees).
+    # Sorted, because the order decides which trees are reached before the floor
+    # ends the pass, and readdir order is a property of the filesystem rather
+    # than of any decision: two machines in the same state would release
+    # different files. The locale is pinned with it so the order is the bytes.
     find "${work_root}" -maxdepth 5 -type d -name target -prune -print 2>/dev/null |
+        LC_ALL=C sort |
         while IFS= read -r dir; do
             is_cargo_cache "${dir}" && printf '%s\n' "${dir}"
         done
