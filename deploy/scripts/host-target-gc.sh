@@ -36,6 +36,15 @@
 #     any process of ours with a working directory or an open file descriptor
 #     inside a tree counts as well. A process of ours whose files cannot be read
 #     is not evidence of absence: it fails the whole run closed.
+#   - deletes nothing unless the file about to run is exactly the committed
+#     version of it. The unit points straight at the checkout, which is what
+#     keeps the script from ever going stale -- and the same property means an
+#     edit in progress is the code that runs, on the day the disk is full enough
+#     to delete. So an identity that cannot be established is a reason not to
+#     act: the disk waits for a commit, which is minutes, while a deletion
+#     cannot be undone at all. Every run reports the version it ran either way,
+#     including the ones that release nothing, because a reading that cannot be
+#     tied to a version cannot be reviewed afterwards.
 set -euo pipefail
 
 readonly CARGO_CACHE_TAG_SIGNATURE='Signature: 8a477f597d28d172789f06886806bc55'
@@ -54,9 +63,50 @@ writer_processes="${COGNEVA_TARGET_GC_WRITER_PROCESSES:-cargo rustc rustdoc cc g
 # that decided on the disk.
 disk_reader="${COGNEVA_TARGET_GC_DISK_READER:-}"
 state_file="${COGNEVA_TARGET_GC_STATE:-${XDG_STATE_HOME:-${HOME:?}/.local/state}/cogneva/target-gc.json}"
+# This file is the code that deletes, so it is also the thing whose identity the
+# readings carry. Not configured: a path that is passed in could disagree with
+# the path that was executed, which is the one fact this has to be right about.
+script_path="${BASH_SOURCE[0]}"
 
 log() { printf 'target-gc: %s\n' "$*"; }
 die() { printf 'target-gc: %s\n' "$*" >&2; exit 1; }
+
+# The version of the file being executed, as two words: the commit it came from
+# (`none` when that cannot be read) and whether the file is exactly that commit's
+# version of it (`committed`, or the reason it cannot be said). Run against a
+# clean checkout the answer is `<sha> committed`; against an edit in progress it
+# is `<sha> modified`. Both are readings; only the first is allowed to delete.
+script_identity() {
+    local here dir top head rel blob
+    if ! here="$(realpath -- "${script_path}" 2>/dev/null)"; then
+        printf 'none unreadable\n'
+        return 0
+    fi
+    dir="$(dirname -- "${here}")"
+    if ! command -v git >/dev/null 2>&1; then
+        printf 'none nogit\n'
+        return 0
+    fi
+    if ! top="$(git -C "${dir}" rev-parse --show-toplevel 2>/dev/null)"; then
+        printf 'none norepo\n'
+        return 0
+    fi
+    if ! head="$(git -C "${top}" rev-parse HEAD 2>/dev/null)"; then
+        printf 'none nohead\n'
+        return 0
+    fi
+    head="${head:0:12}"
+    rel="${here#"${top}"/}"
+    if ! blob="$(git -C "${top}" rev-parse "HEAD:${rel}" 2>/dev/null)"; then
+        printf '%s notracked\n' "${head}"
+        return 0
+    fi
+    if [ "$(git -C "${top}" hash-object -- "${here}" 2>/dev/null)" = "${blob}" ]; then
+        printf '%s committed\n' "${head}"
+    else
+        printf '%s modified\n' "${head}"
+    fi
+}
 
 # --- configuration -----------------------------------------------------------
 
@@ -280,20 +330,22 @@ write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable
     local tmp
     tmp="$(mktemp "${state_file}.XXXXXX")"
     cat >"${tmp}" <<EOF
-{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"dry_run":${dry_run}}
+{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
 EOF
     mv -f -- "${tmp}" "${state_file}"
 }
 
-# One reading per run, whatever it decided: the three quantities an operator
-# needs are how much was released, where the filesystem ended up, and how far
-# from the floor it stopped.
+# One reading per run, whatever it decided: the quantities an operator needs are
+# how much was released, where the filesystem ended up, how far from the floor it
+# stopped, and which version of this file produced the reading -- the last one is
+# what makes any of the others reviewable later.
 report() { # outcome, released_kb, covered, skipped, unreadable
     local gap=0
     [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
-    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unreadable=%s\n' \
+    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unreadable=%s rev=%s rev_state=%s script=%s\n' \
         "$1" "${trigger_pct}" "${floor_pct}" "${before_pct}" "${disk_pct}" \
-        "$(human_kb "$2")" "${gap}" "$3" "$4" "$5"
+        "$(human_kb "$2")" "${gap}" "$3" "$4" "$5" \
+        "${script_rev}" "${script_state}" "${script_sha}"
     write_state "$1" "$2" "${gap}" "$3" "$4" "$5"
 }
 
@@ -311,6 +363,13 @@ readonly before_pct before_used_kb
 work_fs="$(fs_identity "${work_root}")"
 [ -n "${work_fs}" ] || die "cannot read which filesystem ${work_root} is on"
 
+identity="$(script_identity)"
+script_rev="${identity%% *}"
+script_state="${identity##* }"
+script_sha="$(sha256sum -- "${script_path}" 2>/dev/null | cut -c1-12)"
+[ -n "${script_sha}" ] || script_sha="unreadable"
+readonly script_rev script_state script_sha
+
 if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
     # A dry run is a question about what the plan would be, not about whether
     # today is the day: it answers the same way at 33% as at 80%. A real run
@@ -321,6 +380,18 @@ if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
         exit 0
     fi
     log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}% -- this is a dry run, so the plan below is what a run would do on the day the trigger is reached"
+fi
+
+# Nothing is deleted unless the file that would delete it is the committed one.
+# The check sits before the candidates are enumerated: a tree edit that broke the
+# enumeration itself would otherwise be reported as "the cache is not what is
+# filling this filesystem", which reads like a finding about the disk and is
+# really a finding about the code. A dry run passes -- it releases nothing, and
+# the reading it prints carries the same rev_state for whoever reads the plan.
+if [ "${script_state}" != committed ] && [ "${dry_run}" != 1 ]; then
+    log "the script about to delete is not the version in the commit (rev=${script_rev} rev_state=${script_state}); releasing nothing in this run"
+    report script_unverified 0 0 0 0
+    exit 0
 fi
 
 mapfile -t candidates < <(find_candidates)
@@ -413,13 +484,12 @@ fi
 gap=0
 [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
 
-printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unreadable=%s\n' \
-    "${outcome}" "${trigger_pct}" "${floor_pct}" "${before_pct}" "${disk_pct}" \
-    "$(human_kb "${released_kb}")" "${gap}" "${covered}" "${skipped}" "${unreadable:-0}"
 if [ "${outcome}" = floor_unreachable ]; then
     log "still above the trigger after every tier: the build cache is not what is filling this filesystem (gap ${gap} points)"
 fi
 if [ "${outcome}" = planned ]; then
     log "dry run: nothing was released, so this plan is what a run would do today, not what happened"
 fi
-write_state "${outcome}" "${released_kb}" "${gap}" "${covered}" "${skipped}" "${unreadable:-0}"
+# One site prints the reading and writes the state: two of them would be two
+# chances for a field to exist in one and not the other.
+report "${outcome}" "${released_kb}" "${covered}" "${skipped}" "${unreadable:-0}"

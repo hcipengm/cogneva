@@ -18,6 +18,15 @@
 # fixture: a process of ours is readable by us by construction, so it can only
 # arise from hidepid or a race. It is exercised by hand instead, and asserted
 # here only to the extent that the run reports the count.
+#
+# The suite runs a copy of the script from a throwaway repo rather than the
+# checkout in place, and that is a consequence of one of the judgements under
+# test: the deletion path refuses to run anything but the committed version of
+# the file, so a checkout with an edit in progress -- which is exactly the state
+# a suite is run in -- would refuse every run. The copy is asserted byte-equal to
+# the checkout's file, so what is exercised is still the code under test; what
+# moves is only the version identity, which the fixture has to control to be able
+# to test the refusal at all.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,6 +41,18 @@ cleanup() {
   rm -rf "${work}"
 }
 trap cleanup EXIT
+
+fixture_repo="${work}/repo"
+mkdir -p "${fixture_repo}/scripts"
+cp "${gc}" "${fixture_repo}/scripts/host-target-gc.sh"
+cmp -s "${gc}" "${fixture_repo}/scripts/host-target-gc.sh" \
+  || fail "副本与检出里的脚本不一致；那测的就不是被测的代码"
+git -C "${fixture_repo}" init -q
+git -C "${fixture_repo}" -c user.email=gate@example.invalid -c user.name=gate \
+  add scripts/host-target-gc.sh
+git -C "${fixture_repo}" -c user.email=gate@example.invalid -c user.name=gate \
+  commit -qm 'the reclaimer under test'
+gc_run="${fixture_repo}/scripts/host-target-gc.sh"
 
 readonly signature='Signature: 8a477f597d28d172789f06886806bc55'
 
@@ -59,11 +80,11 @@ byopen="$(new_tree byopen "${signature}")"
 run_gc() { # env assignments as arguments
   env "${@}" COGNEVA_HOST_WORK_ROOT="$work/host" \
     COGNEVA_TARGET_GC_STATE="$work/state.json" \
-    bash "${gc}" 2>&1
+    bash "${gc_run}" 2>&1
 }
 
 # --- 1) it refuses to guess --------------------------------------------------
-if env -u COGNEVA_HOST_WORK_ROOT bash "${gc}" >"${work}/out" 2>&1; then
+if env -u COGNEVA_HOST_WORK_ROOT bash "${gc_run}" >"${work}/out" 2>&1; then
   fail "工作根没设时仍然跑完了；它会去猜一个目录，而猜错的那次是删文件"
 fi
 grep -q 'COGNEVA_HOST_WORK_ROOT is unset' "${work}/out" \
@@ -193,7 +214,7 @@ EOF
 chmod +x "${work}/reader-full"
 out="$(env COGNEVA_HOST_WORK_ROOT="${empty}" COGNEVA_TARGET_GC_STATE="$work/state-empty.json" \
   COGNEVA_TARGET_GC_DISK_READER="${work}/reader-full" \
-  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50 bash "${gc}" 2>&1)"
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50 bash "${gc_run}" 2>&1)"
 grep -q 'outcome=floor_unreachable' <<<"${out}" \
   || fail "没有候选时没有报 floor_unreachable：${out}"
 grep -q 'cache is not what is filling' <<<"${out}" \
@@ -213,7 +234,7 @@ EOF
 chmod +x "${work}/reader-below"
 out="$(env COGNEVA_HOST_WORK_ROOT="$work/host" COGNEVA_TARGET_GC_STATE="$work/state-dry.json" \
   COGNEVA_TARGET_GC_DISK_READER="${work}/reader-below" COGNEVA_TARGET_GC_DRY_RUN=1 \
-  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50 bash "${gc}" 2>&1)"
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50 bash "${gc_run}" 2>&1)"
 grep -q 'outcome=planned' <<<"${out}" || fail "dry run 没有报 planned：${out}"
 grep -q 'below trigger' <<<"${out}" \
   || fail "dry run 在触发线以下没有说明它给的仍然是计划：${out}"
@@ -227,7 +248,7 @@ grep -q 'full rebuild of this tree' <<<"${out}" \
 
 # --- 9) the run leaves its own reading ---------------------------------------
 state="$(cat "$work/state.json")"
-for key in outcome used_pct_before used_pct_after released_bytes gap_pct; do
+for key in outcome used_pct_before used_pct_after released_bytes gap_pct rev rev_state script; do
   grep -q "\"${key}\":" <<<"${state}" || fail "状态文件里没有 ${key}：${state}"
 done
 
@@ -282,4 +303,61 @@ for bad in "relative/root" "${work}/not-there"; do
   fi
 done
 
-echo "PASS: 工作根不猜、低于触发线不动手、四档按序升级并在地板停手、名字不够格不当候选、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、dry run 在任何水位都给计划且不删、每次运行都留下自己的读数、载体是算出来的定时器且启用后回读排期"
+# --- 11) only the committed version of this file may delete -------------------
+# The unit runs the file straight out of the checkout, so an edit in progress is
+# the code that runs -- on the day the disk is full enough to delete. Two cases
+# are asserted with the same tree: committed, the run releases; one line appended
+# to the copy, the run releases nothing and says why. The third case is a copy
+# with no repo around it: it cannot say which version it is, and "cannot tell" is
+# not "trusted".
+gate_tree="$(new_tree gate "${signature}")"
+gate_reader="${work}/gate-reader"
+cat >"${gate_reader}" <<EOF
+#!/usr/bin/env bash
+# Above the trigger while the stale artifact is there, below the floor once a
+# run has removed it -- so "the reading moved" is this fixture's evidence that
+# something was actually released.
+if [ -e "${gate_tree}/debug/deps/libstale.rlib" ]; then echo '900000 90'; else echo '400000 40'; fi
+EOF
+chmod +x "${gate_reader}"
+
+out="$(run_gc COGNEVA_TARGET_GC_DISK_READER="${gate_reader}" \
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50)"
+grep -q 'outcome=released' <<<"${out}" || fail "提交过的版本没有动手：${out}"
+grep -q 'rev_state=committed' <<<"${out}" || fail "读数里没有说这是提交过的版本：${out}"
+grep -q 'rev=[0-9a-f]\{12\}' <<<"${out}" || fail "读数里没有版本号：${out}"
+grep -q 'script=[0-9a-f]\{12\}' <<<"${out}" || fail "读数里没有脚本自身的哈希：${out}"
+[ -f "${gate_tree}/debug/deps/libstale.rlib" ] \
+  && fail "报 released 但过期产物还在；读数与动作不一致"
+
+gate_tree="$(new_tree gate "${signature}")"
+printf '\n# an edit nobody committed\n' >>"${gc_run}"
+out="$(run_gc COGNEVA_TARGET_GC_DISK_READER="${gate_reader}" \
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50)"
+grep -q 'outcome=script_unverified' <<<"${out}" \
+  || fail "改过还没提交的脚本仍然动手了：${out}"
+grep -q 'rev_state=modified' <<<"${out}" || fail "没有说明它为什么不动手：${out}"
+[ -f "${gate_tree}/debug/deps/libstale.rlib" ] \
+  || fail "改过的脚本删了文件；删除路径必须只跑提交过的版本"
+[ -f "${gate_tree}/debug/incremental/x/dep-graph.bin" ] \
+  || fail "改过的脚本动了第二档"
+# A dry run releases nothing, so it still answers with the plan -- and the plan
+# carries the version it would run under.
+out="$(run_gc COGNEVA_TARGET_GC_DRY_RUN=1 COGNEVA_TARGET_GC_DISK_READER="${gate_reader}" \
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50)"
+grep -q 'outcome=planned' <<<"${out}" || fail "dry run 被身份门挡掉了：${out}"
+grep -q 'rev_state=modified' <<<"${out}" || fail "dry run 的计划没有带上版本身份：${out}"
+
+plain="${work}/plain"
+mkdir -p "${plain}"
+cp "${gc}" "${plain}/host-target-gc.sh"
+out="$(env COGNEVA_HOST_WORK_ROOT="$work/host" COGNEVA_TARGET_GC_STATE="$work/state.json" \
+  COGNEVA_TARGET_GC_DISK_READER="${gate_reader}" COGNEVA_TARGET_GC_TRIGGER_PCT=70 \
+  COGNEVA_TARGET_GC_FLOOR_PCT=50 bash "${plain}/host-target-gc.sh" 2>&1)"
+grep -q 'outcome=script_unverified' <<<"${out}" \
+  || fail "读不出身份的脚本仍然动手了；读不到不等于可信：${out}"
+grep -q 'rev_state=norepo' <<<"${out}" || fail "没有说出读不出身份的原因：${out}"
+[ -f "${gate_tree}/debug/deps/libstale.rlib" ] \
+  || fail "读不出身份的脚本删了文件"
+
+echo "PASS: 工作根不猜、低于触发线不动手、四档按序升级并在地板停手、名字不够格不当候选、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、dry run 在任何水位都给计划且不删、每次运行都留下自己的读数、只有提交过的版本才动手（改过的与读不出身份的都不删）、载体是算出来的定时器且启用后回读排期"
