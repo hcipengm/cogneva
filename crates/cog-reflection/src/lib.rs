@@ -157,13 +157,14 @@ pub fn refusal_pattern_key(
     format!("change:refused:{}:{}", cause.as_str(), named_files(files))
 }
 
-/// How much of a refusal's evidence a learning can carry.
+/// How much of a change's outcome evidence a learning can carry.
 ///
-/// The record is read by a generator, not by a person, so this is a token
-/// budget rather than a storage limit: whatever is dropped here is a thing the
-/// next attempt cannot know. The spend is what matters, not the size — see
-/// `failure_digest`, which puts the diagnosis inside it.
-const REFUSAL_DETAIL_BUDGET: usize = 2000;
+/// The record is read by a generator, not by a person, so this is a budget
+/// rather than a storage limit: whatever is dropped here is a thing the next
+/// attempt cannot know. The spend is what matters, not the size — see
+/// `failure_digest`, which puts the diagnosis inside it. Shared by the refusal
+/// path and the general outcome path so one number governs both.
+const CHANGE_EVIDENCE_BUDGET: usize = 2000;
 
 /// The files a refusal names, spelled the one way the key and the record both
 /// use them: sorted, deduplicated, comma-joined, empty when the refusal never
@@ -821,12 +822,13 @@ impl ReflectionEngine {
                 "failed during apply/test/build/deploy"
             }
         );
-        let truncated = if test_output.len() > 2000 {
-            &test_output[..2000]
-        } else {
-            test_output
-        };
-        let details = format!("Test output summary: {}", truncated);
+        // Same spend as a refusal's evidence, and the same reason it is a spend
+        // rather than a cut: see `failure_digest`. Slicing at a byte offset also
+        // panicked here when the cut landed inside a multi-byte character, which
+        // a transcript carrying one localised assertion message will do.
+        let digest =
+            cog_core::contract::reflection::failure_digest(test_output, CHANGE_EVIDENCE_BUDGET);
+        let details = format!("Test output summary: {}", digest);
         let mut learning = cog_core::Learning::new(
             category,
             priority,
@@ -882,7 +884,7 @@ impl ReflectionEngine {
         // transcript: a `--workspace` run puts its failing tests hundreds of
         // lines in, so a head-truncated dump hands generation the passing tests
         // and withholds the symptom. See `failure_digest`.
-        let digest = cog_core::contract::reflection::failure_digest(detail, REFUSAL_DETAIL_BUDGET);
+        let digest = cog_core::contract::reflection::failure_digest(detail, CHANGE_EVIDENCE_BUDGET);
         let mut learning = cog_core::Learning::new(
             cog_core::LearningCategory::Correction,
             cog_core::Priority::High,
