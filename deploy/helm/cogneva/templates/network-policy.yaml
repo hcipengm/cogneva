@@ -50,6 +50,12 @@ spec:
         # 集群内镜像仓库（5000）：publisher push 金丝雀 overlay / 主线 overlay 镜像
         - protocol: TCP
           port: 5000
+        # 同一张卷的走查读数（{{ .Values.clusterRegistry.walkerPort }}）：容量回收判的是
+        # 盘上占用，而量这个数的是 registry Pod 里的边车。挡住它不等于"不回收"这一
+        # 种退法——回收的判据是"没读到就不动"，读不到会让它变成永远不动的空转，
+        # 而空转与"不需要回收"从外面看一样。
+        - protocol: TCP
+          port: {{ .Values.clusterRegistry.walkerPort }}
     {{- range $host, $allow := .Values.notification.egress }}
     # 告警通知出口 {{ $host }}：本 Pod 的 egress 是白名单，出口地址在集群外时须显式放行，
     # 否则通知被拦掉而 dispatch 只留下一行 warn——读起来像"没有告警"。一个宿主一条规则：

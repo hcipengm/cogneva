@@ -52,6 +52,12 @@ spec:
         # 集群内镜像仓库（5000）：publisher push 金丝雀 / 主线 overlay 镜像
         - protocol: TCP
           port: 5000
+        # 同一张卷的走查读数（9100）：容量回收判的是盘上占用，而量这个数的是
+        # registry Pod 里的边车。挡住它不等于"不回收"这一种退法——回收的判据是
+        # "没读到就不动"，读不到会让它变成永远不动的空转，而空转与"不需要回收"
+        # 从外面看一样。
+        - protocol: TCP
+          port: 9100
     # 监控栈（9090）：infra_watch 按 PromQL 探测节点磁盘 / Pod OOM 等基础设施
     # 信号，查询跨命名空间落到 monitoring 命名空间的 Prometheus。
     # podSelector:{} 只匹配本命名空间，必须显式 namespaceSelector。

@@ -115,6 +115,72 @@ pub fn parse_claim_paths(raw: &str) -> Result<Vec<ClaimMount>, String> {
     Ok(out)
 }
 
+/// Bytes a Kubernetes quantity string denotes, `None` if it is not one.
+///
+/// A declaration and a measurement are compared in one unit, and both sides are
+/// written as quantity strings: the claim declares `10Gi`, the API speaks either
+/// that spelling or the byte count it normalizes to, and the walker counts
+/// bytes. Parsing them in one place keeps the sides from disagreeing about a
+/// suffix — a parser reading `Gi` as `10^9` makes every volume look larger than
+/// its declaration, and one reading a bare number as zero makes them all look
+/// empty. Decimal suffixes are powers of a thousand, binary ones powers of 1024,
+/// and `m` is a thousandth. Text that is not a quantity is `None`, never zero: an
+/// unreadable declaration is not a declaration of nothing.
+pub fn quantity_bytes(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let digits_end = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (num, suffix) = text.split_at(digits_end);
+    let value: f64 = num.parse().ok()?;
+    let factor = match suffix {
+        "" => 1.0,
+        "m" => 1e-3,
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        "P" => 1e15,
+        "E" => 1e18,
+        "Ki" => 1024.0,
+        "Mi" => 1024f64.powi(2),
+        "Gi" => 1024f64.powi(3),
+        "Ti" => 1024f64.powi(4),
+        "Pi" => 1024f64.powi(5),
+        "Ei" => 1024f64.powi(6),
+        _ => return None,
+    };
+    Some(value * factor)
+}
+
+/// The footprint of one claim, read back out of a `/metrics` page.
+///
+/// The consumer side of the same contract as [`ClaimFootprint`]: the series
+/// names the quantity and the label says which volume it belongs to, so both
+/// have to match before a number is used. Matching the name alone would hand one
+/// volume's reading to another, and returning zero when nothing matches would
+/// read as an empty volume — the reading's whole purpose is to tell "nothing
+/// measured yet" apart from "nothing there".
+pub fn used_bytes_from_exposition(text: &str, claim: &str) -> Option<u64> {
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|line| {
+            let (head, value) = line.rsplit_once(' ')?;
+            let rest = head.strip_prefix(USED_METRIC)?;
+            let labels = rest.strip_prefix('{')?.strip_suffix('}')?;
+            let matched = labels.split(',').any(|pair| {
+                let Some((k, v)) = pair.split_once('=') else {
+                    return false;
+                };
+                k.trim() == CLAIM_LABEL && v.trim().trim_matches('"') == claim
+            });
+            if !matched {
+                return None;
+            }
+            value.trim().parse::<u64>().ok()
+        })
+}
+
 /// Mount points of this process's own mount namespace, unreadable ones omitted.
 ///
 /// Empty is a real answer — a container with no submounts under its volumes, or
@@ -292,6 +358,38 @@ mod tests {
         assert!(parse_claim_paths("= /opt/cogneva/sandbox").is_err());
         assert!(parse_claim_paths("cogneva-pvc=").is_err());
         assert!(parse_claim_paths("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn quantities_parse_in_one_unit_and_the_rest_is_not_a_size() {
+        assert_eq!(quantity_bytes("1"), Some(1.0));
+        assert_eq!(quantity_bytes("10Gi"), Some(10.0 * 1024f64.powi(3)));
+        assert_eq!(quantity_bytes(" 512Mi "), Some(512.0 * 1024f64.powi(2)));
+        // Decimal suffixes mean powers of a thousand; reading `G` as `Gi` makes a
+        // 300G request look like 322 GB and hides a real overrun.
+        assert_eq!(quantity_bytes("300G"), Some(300e9));
+        assert_eq!(quantity_bytes("500m"), Some(0.5));
+        assert_eq!(quantity_bytes("1Ti"), Some(1024f64.powi(4)));
+        // An unreadable declaration is not a declaration of zero: the caller has
+        // to see "no number" rather than compare everything against 0.
+        assert_eq!(quantity_bytes("abc"), None);
+        assert_eq!(quantity_bytes(""), None);
+        assert_eq!(quantity_bytes("5Zi"), None);
+    }
+
+    #[test]
+    fn the_reading_is_matched_by_claim_and_absence_is_not_zero() {
+        let page = "# HELP cogneva_data_volume_used_bytes ...\n\
+                    cogneva_data_volume_used_bytes{persistentvolumeclaim=\"other\",namespace=\"cogneva\"} 7\n\
+                    cogneva_data_volume_used_bytes{persistentvolumeclaim=\"registry-pvc\",namespace=\"cogneva\"} 4096\n";
+        assert_eq!(used_bytes_from_exposition(page, "registry-pvc"), Some(4096));
+        // Another volume's number is not this volume's: the label is the whole
+        // reason the reading is attributed at all.
+        assert_eq!(used_bytes_from_exposition(page, "absent-pvc"), None);
+        assert_eq!(used_bytes_from_exposition("", "registry-pvc"), None);
+        // A page whose value cannot be read is not a small volume.
+        let bad = "cogneva_data_volume_used_bytes{persistentvolumeclaim=\"p\"} NaN\n";
+        assert_eq!(used_bytes_from_exposition(bad, "p"), None);
     }
 
     #[test]

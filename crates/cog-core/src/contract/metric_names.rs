@@ -135,6 +135,27 @@ metric_names! {
     VERSION_CONTRACT_VIOLATIONS => "cogneva_version_contract_violations",
     VERSION_CONTRACT_CHECKS_TOTAL => "cogneva_version_contract_checks_total",
 
+    // cog-reflection — the registry store's capacity reclamation, read by the
+    // process that reclaims it.
+    //
+    // Four readings rather than one, because "the store is full" and "something
+    // was removed" and "the removal was refused" are three different facts and a
+    // single counter of bytes freed would answer none of them: a round that found
+    // nothing to remove and a round that never ran look identical through it. The
+    // times the round ran, how many tags it removed and how many deletions were
+    // refused are separate counters so a growing store with a flat removal count
+    // says which of the two is happening.
+    //
+    // The deletion is the one destructive thing this process does to a store
+    // nobody else writes, so it also carries when it last happened: the counters
+    // are monotonic, and a process that died leaves them frozen -- which reads
+    // exactly like a store that needs nothing. The timestamp is what tells those
+    // apart, the same way the rollout readings carry one.
+    REGISTRY_MAINTENANCE_RUNS_TOTAL => "cogneva_registry_maintenance_runs_total",
+    REGISTRY_PRUNED_TAGS_TOTAL => "cogneva_registry_pruned_tags_total",
+    REGISTRY_PRUNE_FAILURES_TOTAL => "cogneva_registry_prune_failures_total",
+    REGISTRY_MAINTENANCE_READING_UNIX => "cogneva_registry_maintenance_reading_unix",
+
     // cog-reflection — the rollout judgement's own resource readings.
     //
     // The judgement runs in a short-lived Job pod, which is born, works for a

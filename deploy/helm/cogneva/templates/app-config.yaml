@@ -116,6 +116,13 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: {{ .Values.mainlineDeployer.soakSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: {{ .Values.mainlineDeployer.failureCooldownSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: {{ .Values.mainlineDeployer.cargoBuildJobs | int | quote }}
+  # 集群内 registry 那张卷的容量回收。声明量只有一个来源（PVC 自己的 spec），所以
+  # 这里不配"卷有多大"；这里配的是判据与保留策略，占用读数取自 registry Pod 里只读
+  # 走查那张卷的边车（Service 的 http 端点，端口与 registry 清单同源）。
+  COGNEVA_MAINLINE_DEPLOYER_REGISTRY_WALKER_PORT: {{ .Values.clusterRegistry.walkerPort | int | quote }}
+  COGNEVA_MAINLINE_DEPLOYER_REGISTRY_RETENTION: {{ .Values.mainlineDeployer.registryMaintenance.retention | int | quote }}
+  COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_THRESHOLD: {{ .Values.mainlineDeployer.registryMaintenance.threshold | quote }}
+  COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_COOLDOWN_SECS: {{ .Values.mainlineDeployer.registryMaintenance.cooldownSecs | int | quote }}
   # 从裸仓库的哪个目录读清单。默认与代码默认值同源（deploy/k3s），暴露它是为了
   # 让"清单目录"成为可配置的部署面，而不是散在代码里的常量。
   COGNEVA_MAINLINE_DEPLOYER_MANIFEST_DIR: {{ .Values.mainlineDeployer.manifestDir | quote }}

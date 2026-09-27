@@ -529,6 +529,26 @@ pub struct MainlineDeployerConfig {
     pub observability_stack: ObservabilityStackConfig,
     /// 滚动目标，顺序即滚动顺序。默认：网关代理面先行，进化宿主最后。
     pub targets: Vec<RolloutTargetConfig>,
+    /// registry 走查边车发布容量读数的端口（Service 的 `http` 端点）。它挂在
+    /// push 端点那个 Service 上，所以这里只声明端口：主机名与要重启的
+    /// Deployment 名都是同一个对象，取 `registry` 端点的主机部分（见
+    /// `MainlineDeployer::registry_name`）。
+    pub registry_walker_port: u16,
+    /// 走查覆盖的 claim 名：容量读数按这个标签取值，与卷上的声明量同一个对象。
+    ///
+    /// 与卷走查共用一个声明（`COGNEVA_REGISTRY_CLAIM`，见 registry_footprint）：
+    /// 同一个进程里两个消费面问的是同一张卷，两个名字只会漂移成一个问 A、一个
+    /// 问 B。空 = 没有声明 = 本进程不回收这张卷。
+    pub registry_claim: String,
+    /// 保留多少个 `main-<rev>` 镜像 tag。回收的**释放**发生在叠层基底稳定
+    /// 之后：一个 rev 一层，删掉老 tag 才会让那层失去引用（见 ensure_base_seed）。
+    pub registry_retention: usize,
+    /// 卷占用达到声明的这个比例就做一轮回收（0～1，比例而非绝对量：声明量
+    /// 改了不用跟着改这里）。
+    pub registry_maintenance_threshold: f64,
+    /// 两轮回收之间的最短间隔（秒）。回收只把占用降到"还引用着的那些"，
+    /// 读数若仍高于阈值，没有它就会变成每个轮询都重启一次 registry。
+    pub registry_maintenance_cooldown_secs: u64,
 }
 
 impl Default for MainlineDeployerConfig {
@@ -563,6 +583,18 @@ impl Default for MainlineDeployerConfig {
             manifest_dir: "deploy/k3s".into(),
             deliver_manifests: true,
             observability_stack: ObservabilityStackConfig::default(),
+            registry_walker_port: 9100,
+            // 由 `COGNEVA_REGISTRY_CLAIM` 填（走查边车那条声明）；没声明就是不回收。
+            registry_claim: String::new(),
+            // 20 个 rev ≈ 20 次滚动的回退面，按每 rev 一层的叠层增量算约
+            // 0.8 GB；比值本身不构成约束（10Gi 的卷装得下），定它的是"回退
+            // 面要有多深"。真正的下界是 keep 集：在飞、上一版好、当前部署、
+            // 仍被 Job 钉住的 rev 一律不删，与这个数无关。
+            registry_retention: 20,
+            // 声明量的一半：规则 data_volume_over_declared_size 在 1.0 开火，
+            // 回收在它之前把占用压回叠层基底的大小，中间留出一倍余量。
+            registry_maintenance_threshold: 0.5,
+            registry_maintenance_cooldown_secs: 21600,
             targets: vec![
                 RolloutTargetConfig {
                     deployment: "cogneva-security-gateway".into(),
@@ -857,6 +889,30 @@ impl MainlineDeployerConfig {
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_KUBECTL_HOST_PATH") {
             self.kubectl_host_path = v;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_WALKER_PORT") {
+            self.registry_walker_port =
+                parse("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_WALKER_PORT", &v)?;
+        }
+        // 卷族的声明，不是本节的声明：走查边车照着它量，回收照着它判，两个
+        // 消费面在同一份 env 上取同一个名字。
+        if let Some(v) = get(crate::registry_footprint::CLAIM_ENV) {
+            self.registry_claim = v;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_RETENTION") {
+            self.registry_retention = parse("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_RETENTION", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_THRESHOLD") {
+            self.registry_maintenance_threshold = parse(
+                "COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_THRESHOLD",
+                &v,
+            )?;
+        }
+        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_COOLDOWN_SECS") {
+            self.registry_maintenance_cooldown_secs = parse(
+                "COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_COOLDOWN_SECS",
+                &v,
+            )?;
         }
         Ok(())
     }

@@ -80,6 +80,12 @@ spec:
           env:
             - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
               value: {{ .Values.clusterRegistry.rootDir }}
+            # 删除通道。registry 默认拒绝 DELETE manifest（回 405），而主线部署器的
+            # 容量回收正是靠删掉保留窗之外的老 tag 才放得出空间——删不动时它唯一的
+            # 表现是一个被拒的删除读数，卷继续满下去。让谁删、留多少个由部署器按
+            # 保留策略决定，这里只把门打开。
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
           ports:
             - name: registry
               containerPort: 5000

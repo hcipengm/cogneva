@@ -66,6 +66,7 @@ fn materialize_assets() -> Result<PathBuf> {
 }
 
 use anyhow::{bail, Context, Result};
+use cog_core::claim_footprint::quantity_bytes;
 use cogneva_bootstrap::{cli, Distro};
 use download::{curl_to_file, curl_to_string, pick_alive, probe as probe_alive, LARGE, MANDATORY};
 use serde::{Deserialize, Serialize};
@@ -2079,7 +2080,7 @@ async fn retain_existing_claims(rendered: &Path) -> Result<usize> {
         let Some(live) = live_claim_storage(&name).await else {
             continue;
         };
-        if quantity_bytes(declared.as_deref()) != quantity_bytes(Some(&live)) {
+        if declared.as_deref().and_then(quantity_bytes) != quantity_bytes(&live) {
             warn!(
                 claim = %name,
                 declared = declared.as_deref().unwrap_or("<none>"),
@@ -2249,35 +2250,6 @@ async fn live_claim_storage(name: &str) -> Option<String> {
     } else {
         Some(v)
     }
-}
-
-/// K8s 数量串 → 字节数，只认十进制与二进制后缀。两位声明量比"不同"时用它，
-/// 免得 `5Gi` 与 API 规范化后的 `5368709120` 被读成差异。认不出返回 None。
-fn quantity_bytes(text: Option<&str>) -> Option<f64> {
-    let text = text?.trim();
-    let digits_end = text
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(text.len());
-    let (num, suffix) = text.split_at(digits_end);
-    let value: f64 = num.parse().ok()?;
-    let factor = match suffix {
-        "" => 1.0,
-        "m" => 1e-3,
-        "k" => 1e3,
-        "M" => 1e6,
-        "G" => 1e9,
-        "T" => 1e12,
-        "P" => 1e15,
-        "E" => 1e18,
-        "Ki" => 1024.0,
-        "Mi" => 1024f64.powi(2),
-        "Gi" => 1024f64.powi(3),
-        "Ti" => 1024f64.powi(4),
-        "Pi" => 1024f64.powi(5),
-        "Ei" => 1024f64.powi(6),
-        _ => return None,
-    };
-    Some(value * factor)
 }
 
 /// helm 投递：chart + 同一套 profile values。profile 为渲染 apply 固化了
@@ -3035,7 +3007,8 @@ mod profile_tests {
 
 #[cfg(test)]
 mod install_claim_tests {
-    use super::{claim_declaration, quantity_bytes};
+    use super::claim_declaration;
+    use cog_core::claim_footprint::quantity_bytes;
 
     #[test]
     fn claim_declaration_only_matches_volume_claims() {
@@ -3053,33 +3026,18 @@ mod install_claim_tests {
         assert_eq!(claim_declaration("kind: [unclosed"), None);
     }
 
-    #[test]
-    fn quantity_bytes_reads_decimal_and_binary_suffixes() {
-        assert_eq!(quantity_bytes(Some("1")), Some(1.0));
-        assert_eq!(quantity_bytes(Some("5Gi")), Some(5.0 * 1024f64.powi(3)));
-        assert_eq!(quantity_bytes(Some("64Mi")), Some(64.0 * 1024f64.powi(2)));
-        assert_eq!(quantity_bytes(Some("300G")), Some(300e9));
-        assert_eq!(quantity_bytes(Some("500m")), Some(0.5));
-        // 认不出的量返回 None（拿去比"不同"时只会多报不会漏报）
-        assert_eq!(quantity_bytes(Some("abc")), None);
-        assert_eq!(quantity_bytes(Some("5Zi")), None);
-        assert_eq!(quantity_bytes(None), None);
-    }
-
     /// 安装期报差异的判据：API 规范化后的等价值不算差异，声明量真的不同才算。
     #[test]
     fn claim_size_comparison_ignores_representation_and_keeps_real_diffs() {
         // 同一份量的两种写法（清单写 5Gi、API 规范化成字节数）不算差异
-        assert_eq!(
-            quantity_bytes(Some("5Gi")),
-            quantity_bytes(Some("5368709120"))
-        );
-        assert_eq!(quantity_bytes(Some("24Gi")), quantity_bytes(Some("24Gi")));
+        assert_eq!(quantity_bytes("5Gi"), quantity_bytes("5368709120"));
+        assert_eq!(quantity_bytes("24Gi"), quantity_bytes("24Gi"));
         // 真实事故形态：声明比在用值小（源码卷 10Gi vs 在用 57Gi）与大（72Gi vs 10Gi）
-        assert_ne!(quantity_bytes(Some("10Gi")), quantity_bytes(Some("57Gi")));
-        assert_ne!(quantity_bytes(Some("72Gi")), quantity_bytes(Some("10Gi")));
-        // 清单没声明量而在用有量 → 算差异，不能当成一致
-        assert_ne!(quantity_bytes(None), quantity_bytes(Some("10Gi")));
+        assert_ne!(quantity_bytes("10Gi"), quantity_bytes("57Gi"));
+        assert_ne!(quantity_bytes("72Gi"), quantity_bytes("10Gi"));
+        // 清单没声明量而在用有量 → 算差异，不能当成一致。这里比的是调用点那一步：
+        // 声明侧先落成 `Option<f64>`，缺声明落成 `None`，与"在用有量"必然不等。
+        assert_ne!(None.and_then(quantity_bytes), quantity_bytes("10Gi"));
     }
 }
 

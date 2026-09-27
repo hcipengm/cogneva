@@ -709,6 +709,23 @@ mainlineDeployer:
     memoryRequest: 64Mi
     cpuLimit: "2"
     memoryLimit: 512Mi
+  # 集群内 registry 那张卷的容量回收（见 MainlineDeployer::registry_maintenance_round）。
+  # 卷由 registry 自己写，本 Pod 是它唯一的推入方；回收就是把保留窗之外的老 rev 删掉，
+  # 再让 registry 重启一次把孤儿 blob 从盘上放掉。
+  #
+  # 判据是这张卷的**占用**读数（走查边车量的盘上字节），读不到就什么都不做——没有证据
+  # 时重启 registry 是有代价的动作。占用与声明量的比达到阈值、且距上次回收超过冷却窗
+  # 才动手；冷却窗给的是"回收后仍高于阈值"这种情况（常驻底座本身大时，没有它就会变成
+  # 每个轮询重启一次 registry）。
+  registryMaintenance:
+    threshold: 0.5
+    cooldownSecs: 21600
+    # 保留多少个最新 rev。按产出侧实测算：最近 20 个 rev 跨 13h26m（≈42 分钟一个、
+    # ≈34 个/天），所以 20 个约合 14 小时——够覆盖"回滚到上一个好版本"和"人在看上一轮
+    # 发生了什么"这两种回溯，又不至于让老链的层长期钉在盘上。删掉的只是保留窗外
+    # **且**不在保留集里的：在飞、上一版好、四部署当前钉着的 rev 一个都不删
+    # （见 prunable_tags）。
+    retention: 20
   # 可观测性栈清单（deploy/k3s/observability/manifests/**）的周期收敛：按仓库
   # 当前 rev 的内容 apply，把现场修回声明态。那些清单此前只有安装脚本一条交付
   # 路径，装完一次之后仓库与现场各走各的，而「清单没生效」这件事没有判据。

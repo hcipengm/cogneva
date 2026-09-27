@@ -96,10 +96,10 @@ pub const IMAGE_REPOSITORY: &str = "cogneva";
 /// 不可变主线镜像引用：`<registry>/cogneva:main-<rev12>`。
 pub fn main_image(registry: &str, rev: &str) -> String {
     format!(
-        "{}/{}:main-{}",
+        "{}/{}:{}",
         registry.trim_end_matches('/'),
         IMAGE_REPOSITORY,
-        rev12(rev)
+        main_tag(rev)
     )
 }
 
@@ -112,11 +112,47 @@ pub fn local_image(registry: &str) -> String {
     )
 }
 
+/// 稳定叠层基底的 tag 名。
+const SEED_TAG: &str = "seed";
+
+/// 不可变主线 tag 的前缀（`main-<rev12>`）。带 `main-` 的才是本仓库按 rev 一一
+/// 对应写下的名字，`tag_rev` 与 `main_tag` 两端都取它。
+const MAIN_TAG_PREFIX: &str = "main-";
+
+/// 稳定叠层基底的 tag：`<registry>/cogneva:seed`。
+///
+/// overlay 的基底不该是"上一个 rev 的镜像"。基于它时每张新镜像都**包含着
+/// 上一张的全部层**，于是线上最新那个 tag 一个人就把历史上每个 rev 的二进制
+/// 层都钉活着——删老 tag 只删 manifest，一个字节都放不出来（实测：89 个 tag
+/// 引用 90 层 4.09 GB，而唯一的最新 tag 就引用其中 80 层）。基底回到一个稳定
+/// 镜像后，每个 rev 的镜像 = 基底 + 它自己那一层，"删老 tag 释放空间"才成立。
+///
+/// 锚定目标是链根（全量构建出来的那类镜像，实测 3 层 609 MB），不是线上镜像
+/// 本身：锚到链根，新镜像只带链根 + 一层；锚到链上任意一点，那一点之前的
+/// 全部层都会变成新镜像的常驻底座。
+fn seed_image(registry: &str) -> String {
+    format!(
+        "{}/{}:{SEED_TAG}",
+        registry.trim_end_matches('/'),
+        IMAGE_REPOSITORY
+    )
+}
+
 /// 从镜像引用解析 `main-<rev>` 的 rev 片段；非主线 tag（:local、promote-*、
 /// 节点 localhost/cogneva:local 等）返回 None。
 fn parse_main_rev(image: &str) -> Option<&str> {
     let tag = image.rsplit(':').next()?;
-    tag.strip_prefix("main-")
+    tag.strip_prefix(MAIN_TAG_PREFIX)
+}
+
+/// 不可变主线 tag 名（只是 tag，不含 registry）：`main-<rev12>`。
+///
+/// 单列这一条是因为两个面要的不是同一样东西：镜像引用给 buildah 和 kubelet，
+/// manifest 路径要的是 tag。把引用塞进 `/v2/<repo>/manifests/` 后面，注册表收到
+/// 的 tag 名里就带着 registry 主机和冒号——那是一个谁都没有的 tag，于是"问一下在
+/// 不在"永远答不在，快路静默失效。
+fn main_tag(rev: &str) -> String {
+    format!("{MAIN_TAG_PREFIX}{}", rev12(rev))
 }
 
 /// 滚动 Job 名（含 rev，天然幂等键）。
@@ -178,23 +214,64 @@ fn revision_of_config_blob(blob: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// 从 image config blob 里取镜像自己的创建时间（unix 秒）。
+///
+/// 保留窗要按"谁更新"排序，读不到就没有顺序可言——调用方按"这个 tag 不是候选"
+/// 处理，而不是给它一个默认值：默认值会把它放到某一端，而那一端先被删。
+fn created_of_config_blob(blob: &serde_json::Value) -> Option<i64> {
+    let created = blob.get("created")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(created)
+        .ok()
+        .map(|t| t.timestamp())
+}
+
 /// 从裸 HTTP 响应里切出状态码与 body（按 `Content-Length` 截断；缺失则取
 /// 剩余全部）。registry 的 JSON 响应永远带 Content-Length。
 pub(crate) fn parse_http_response(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let (status, _, body) = parse_http_response_parts(raw)?;
+    Some((status, body))
+}
+
+/// 一次 registry 读的三样东西：状态码、响应头、响应体。
+pub(crate) type HttpResponseParts = (u16, Vec<(String, String)>, Vec<u8>);
+
+/// 状态码、响应头、响应体。头要单独取出来，是因为 manifest 的中转（复制一个
+/// tag 的镜像内容到另一个 tag）必须原样带回它的 media type：registry 按
+/// Content-Type 校验并在 PUT 时据此解析，换一个（比如一律发 OCI 类型）会被
+/// 直接拒绝或存成另一种解释。
+pub(crate) fn parse_http_response_parts(raw: &[u8]) -> Option<HttpResponseParts> {
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&raw[..split]).ok()?;
     let mut lines = head.lines();
     let status = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
-    let len = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    let len = headers
+        .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse::<usize>().ok());
+        .and_then(|(_, v)| v.parse::<usize>().ok());
     let body = &raw[split + 4..];
     let body = match len {
         Some(n) if n <= body.len() => &body[..n],
         _ => body,
     };
-    Some((status, body.to_vec()))
+    Some((status, headers, body.to_vec()))
+}
+
+/// registry API 里本仓库的路径前缀。仓库名只此一处：tag 写入、tag 读取、容量
+/// 回收走的都是这条路径，第二个拼法会让某一条静默指向一个空仓库。
+fn repo_path(rest: &str) -> String {
+    format!("/v2/{IMAGE_REPOSITORY}/{rest}")
+}
+
+/// 响应头里取值（名字大小写不敏感）。
+pub(crate) fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
 }
 
 /// 这些 tag 的镜像内容与 rev 一一对应（不可变），其余（浮动签）不能由
@@ -203,12 +280,140 @@ fn tag_is_immutable_for_rev(tag: &str) -> bool {
     tag.starts_with("main-")
 }
 
+/// 取 manifest 时声明的 media type 集合，四种都要。
+///
+/// registry 按 Accept 决定给不给：store 里存的是 OCI 的那两种（实测 buildah
+/// 推上去的就是 `application/vnd.oci.image.manifest.v1+json`），只声明 docker
+/// 那两种时每一次取都回 404——"这个 tag 在不在"的答案于是恒为"不在"，快路
+/// 静默失效、每次都从头重建一遍。声明集合是这条判据的输入，收窄它就是把
+/// 答案改成"没有"。
+const MANIFEST_ACCEPT: &[&str] = &[
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+];
+
 /// 浮动签是否就是目标 rev：仅当 registry 上该 tag 的镜像当前确实构建自
 /// `bare_rev` 时才成立。只看清单里的 tag 字符串会把"标签还在、内容已被
 /// 重新播种成旧二进制"当成已收敛，浮动签随即前移，旧二进制被固化成
 /// 静态清单 apply 的回退锚点。
 fn floating_pin_is_converged(declared_rev: Option<&str>, bare_rev: &str) -> bool {
     matches!(declared_rev, Some(r) if rev12(r) == rev12(bare_rev))
+}
+
+/// registry 上一个 tag 在 API 上的形状。
+#[derive(Debug, Clone)]
+struct TagShape {
+    /// tag 指向的 manifest digest（多平台时是 index 的），删 tag 与按 digest
+    /// 中转它都要用。
+    digest: String,
+    /// 层集（多平台 index 取第一个子 manifest 的）。
+    layers: Vec<String>,
+    /// config blob digest：rev 标签与创建时间都在里面。
+    config: String,
+}
+
+/// registry 上一个 tag 的读数。
+#[derive(Debug, Clone)]
+struct RegistryTag {
+    tag: String,
+    created_unix: i64,
+    /// manifest digest：删除与按 digest 建基底都要它。
+    digest: String,
+    /// 层集（子 manifest 的层；多平台 index 取第一个子 manifest）。
+    layers: Vec<String>,
+}
+
+/// 裸 tag 名 → rev 片段（只有 `main-<rev>` 是）。
+fn tag_rev(tag: &str) -> Option<&str> {
+    tag.strip_prefix(MAIN_TAG_PREFIX)
+}
+
+/// 保留策略：这一轮该删哪些 tag。
+///
+/// 可删的名字是**闭集**：只有 `main-<rev>` 是本仓库按 rev 一一对应写下的；
+/// `:local`、`:seed`、金丝雀的 `promote-*` 以及将来任何别的名字都不在判据里
+/// ——回收走的是"删"这个方向，名单漏一项就是静默删错，所以不认识的一律不动。
+/// 保留集是白名单方向：`keep` 里的 rev（在飞、上一版好、当前部署、仍被 Job
+/// 钉住的）加上最新的 `retention` 个，其余可删。
+fn prunable_tags(
+    tags: &[RegistryTag],
+    retention: usize,
+    keep: &HashSet<String>,
+) -> Vec<RegistryTag> {
+    let mut main: Vec<&RegistryTag> = tags.iter().filter(|t| tag_rev(&t.tag).is_some()).collect();
+    main.sort_by(|a, b| b.created_unix.cmp(&a.created_unix).then(b.tag.cmp(&a.tag)));
+    let mut kept: HashSet<String> = keep.iter().map(|r| rev12(r).to_string()).collect();
+    for t in main.iter().take(retention) {
+        if let Some(rev) = tag_rev(&t.tag) {
+            kept.insert(rev.to_string());
+        }
+    }
+    main.into_iter()
+        .filter(|t| !tag_rev(&t.tag).is_some_and(|rev| kept.contains(rev)))
+        .cloned()
+        .collect()
+}
+
+/// 叠层基底的发现：链根。
+///
+/// 判据是**层集子集**加"层数最少"，不是"层数最少"本身：一个刚全量构建出来
+/// 的镜像可能层数很少却与线上这条链毫无关系，拿它当基底会连线上镜像里 overlay
+/// 刷不了的那部分内容一起换掉（前端产物由镜像的 node 阶段构建，overlay 内没有
+/// node 工具链）。层 digest 是内容哈希，子集意味着那些层原样都在线上镜像里。
+///
+/// 找不到严格祖先时返回 None，调用方退回线上镜像本身——多一点常驻底座，
+/// 但不丢内容。挑错候选的后果也不会静默：基底的 ENV/ENTRYPOINT 会被继承，
+/// 起不来的新镜像在滚动 Job 里直接判败回滚。
+/// 层集的包含关系：`inner` 的每一层是否都在 `outer` 里。
+///
+/// 层 digest 是内容哈希，所以这个包含关系说的正是"内容都在"：换基底时这点
+/// 是硬要求——`/opt/cogneva/web` 由镜像的 node 阶段构建，overlay 内没有 node
+/// 工具链，换掉它就没有任何东西能再生成它。
+fn layers_are_contained(inner: &[String], outer: &[String]) -> bool {
+    !inner.is_empty() && inner.iter().all(|l| outer.contains(l))
+}
+
+fn lineage_root<'a>(
+    deployed_layers: &[String],
+    candidates: &'a [RegistryTag],
+) -> Option<&'a RegistryTag> {
+    candidates
+        .iter()
+        .filter(|c| layers_are_contained(&c.layers, deployed_layers))
+        .min_by(|a, b| {
+            a.layers
+                .len()
+                .cmp(&b.layers.len())
+                .then(a.created_unix.cmp(&b.created_unix))
+        })
+}
+
+/// 容量回收是否到期。
+///
+/// 读数取不到一律不动：走查边车没起来时"没有读数"不是"占用是 0"，而回收要
+/// 重启 registry，是个有代价的动作，不能在没证据时做。冷却窗给的是"回收后
+/// 仍高于阈值"这种情况——回收只能把占用降到"还引用着的那些"，若常驻底座本身
+/// 就大，没有冷却窗会变成每轮轮询重启一次。
+fn maintenance_due(
+    used: Option<u64>,
+    declared: Option<f64>,
+    last_run_unix: i64,
+    now_unix: i64,
+    threshold: f64,
+    cooldown_secs: u64,
+) -> bool {
+    let (Some(used), Some(declared)) = (used, declared) else {
+        return false;
+    };
+    if declared <= 0.0 {
+        return false;
+    }
+    if now_unix.saturating_sub(last_run_unix) < cooldown_secs as i64 {
+        return false;
+    }
+    used as f64 / declared >= threshold
 }
 
 /// 命中即无自救可能的 Pod 等待态：镜像引用非法、挂载/配置错误、容器反复
@@ -1363,6 +1568,10 @@ struct MainlineState {
     /// 与"没有新 rev 可滚"在心跳上完全同形。
     #[serde(default)]
     ci_hold_rev: Option<String>,
+    /// 上一次容量回收是什么时候（unix 秒，0 = 从没做过）。冷却窗挂在内存里的话，
+    /// 进程重启一次就少一道闸，而重启这个进程正是它自己会做的事。
+    #[serde(default)]
+    registry_maintenance_unix: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1976,43 +2185,85 @@ impl MainlineDeployer {
         Ok(images)
     }
 
-    /// 集群内 registry 的最小只读客户端：明文 HTTP、同命名空间 DNS、
-    /// 无凭证（insecure registry，buildah 走的就是这条通道）。
-    async fn registry_get(&self, path: &str, accept: &[&str]) -> SFResult<Vec<u8>> {
+    /// 集群内 HTTP 的一次往返：明文、无凭证，registry 与走查边车共用同一条
+    /// 通道（buildah 走的就是这条）。返回状态码、响应头与响应体。
+    async fn plain_http(
+        &self,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        accept: &[&str],
+        body: Option<(&str, &[u8])>,
+    ) -> SFResult<HttpResponseParts> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let endpoint = self.push_endpoint();
-        let (host, port) = endpoint_host_port(&endpoint).ok_or_else(|| {
-            SFError::Agent(format!("registry endpoint {endpoint:?} is not host:port"))
-        })?;
         let accepted = if accept.is_empty() {
             String::new()
         } else {
             format!("Accept: {}\r\n", accept.join(", "))
         };
-        let req =
-            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{accepted}Connection: close\r\n\r\n");
+        let (typed, payload) = match body {
+            Some((content_type, bytes)) => (
+                format!(
+                    "Content-Type: {content_type}\r\nContent-Length: {}\r\n",
+                    bytes.len()
+                ),
+                bytes,
+            ),
+            None => (String::new(), &[][..]),
+        };
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{accepted}{typed}Connection: close\r\n\r\n"
+        );
         let mut stream = tokio::time::timeout(
             Duration::from_secs(30),
             tokio::net::TcpStream::connect((host, port)),
         )
         .await
-        .map_err(|_| SFError::IO(format!("registry {endpoint} connect timed out")))?
-        .map_err(|e| SFError::IO(format!("registry {endpoint} connect failed: {e}")))?;
+        .map_err(|_| SFError::IO(format!("{host}:{port} connect timed out")))?
+        .map_err(|e| SFError::IO(format!("{host}:{port} connect failed: {e}")))?;
         stream
             .write_all(req.as_bytes())
             .await
-            .map_err(|e| SFError::IO(format!("registry request write failed: {e}")))?;
+            .map_err(|e| SFError::IO(format!("{host}:{port} request write failed: {e}")))?;
+        if !payload.is_empty() {
+            stream
+                .write_all(payload)
+                .await
+                .map_err(|e| SFError::IO(format!("{host}:{port} body write failed: {e}")))?;
+        }
         let mut raw = Vec::new();
         tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut raw))
             .await
-            .map_err(|_| SFError::IO("registry read timed out".into()))?
-            .map_err(|e| SFError::IO(format!("registry read failed: {e}")))?;
-        let (status, body) = parse_http_response(&raw)
-            .ok_or_else(|| SFError::IO("registry returned a malformed HTTP response".into()))?;
+            .map_err(|_| SFError::IO(format!("{host}:{port} read timed out")))?
+            .map_err(|e| SFError::IO(format!("{host}:{port} read failed: {e}")))?;
+        parse_http_response_parts(&raw)
+            .ok_or_else(|| SFError::IO(format!("{host}:{port} returned a malformed HTTP response")))
+    }
+
+    /// 集群内 registry 的读：明文 HTTP、同命名空间 DNS、无凭证。
+    async fn registry_get(&self, path: &str, accept: &[&str]) -> SFResult<Vec<u8>> {
+        let (status, _, body) = self.registry_request("GET", path, accept, None).await?;
         if status != 200 {
             return Err(SFError::IO(format!("registry GET {path} -> {status}")));
         }
         Ok(body)
+    }
+
+    /// registry 的一次请求，带响应头（manifest 中转要带回它的 media type）。
+    async fn registry_request(
+        &self,
+        method: &str,
+        path: &str,
+        accept: &[&str],
+        body: Option<(&str, &[u8])>,
+    ) -> SFResult<HttpResponseParts> {
+        let endpoint = self.push_endpoint();
+        let (host, port) = endpoint_host_port(&endpoint).ok_or_else(|| {
+            SFError::Agent(format!("registry endpoint {endpoint:?} is not host:port"))
+        })?;
+        self.plain_http(host, port, method, path, accept, body)
+            .await
     }
 
     /// 平台 API 的只读 GET：明文 HTTP 打到安全网关的透传端点（凭证由网关在
@@ -2125,34 +2376,18 @@ impl MainlineDeployer {
     /// `org.opencontainers.image.revision` 标签。多平台 index 多一跳，先下
     /// 第一个子 manifest 取它的 config digest（各平台同 rev，标签一致）。
     async fn registry_tag_revision(&self, tag: &str) -> SFResult<Option<String>> {
-        const MANIFEST_ACCEPT: &[&str] = &[
-            "application/vnd.oci.image.manifest.v1+json",
-            "application/vnd.oci.image.index.v1+json",
-            "application/vnd.docker.distribution.manifest.v2+json",
-            "application/vnd.docker.distribution.manifest.list.v2+json",
-        ];
-        let manifest = self.registry_manifest(tag, MANIFEST_ACCEPT).await?;
-        let config_digest = match config_digest_of(&manifest) {
-            Some(d) => d,
-            None => {
-                let Some(child) = first_manifest_digest(&manifest) else {
-                    return Ok(None);
-                };
-                let child_manifest = self.registry_manifest(&child, MANIFEST_ACCEPT).await?;
-                let Some(d) = config_digest_of(&child_manifest) else {
-                    return Ok(None);
-                };
-                d
-            }
+        let Some(shape) = self.tag_shape(tag).await? else {
+            return Ok(None);
         };
         let blob: serde_json::Value = serde_json::from_slice(
             &self
-                .registry_get(&format!("/v2/cogneva/blobs/{config_digest}"), &[])
+                .registry_get(&repo_path(&format!("blobs/{}", shape.config)), &[])
                 .await?,
         )
         .map_err(|e| {
             SFError::IO(format!(
-                "registry config blob {config_digest} is not JSON: {e}"
+                "registry config blob {} is not JSON: {e}",
+                shape.config
             ))
         })?;
         Ok(revision_of_config_blob(&blob))
@@ -2166,21 +2401,256 @@ impl MainlineDeployer {
     ) -> SFResult<serde_json::Value> {
         serde_json::from_slice(
             &self
-                .registry_get(&format!("/v2/cogneva/manifests/{reference}"), accept)
+                .registry_get(&repo_path(&format!("manifests/{reference}")), accept)
                 .await?,
         )
         .map_err(|e| SFError::IO(format!("registry manifest {reference} is not JSON: {e}")))
     }
 
+    /// 某 tag 在 registry 上的形状：它指向的 manifest digest、镜像层集、config
+    /// blob digest。多平台 index 多一跳：digest 取 tag 自己那份（删 tag 要它），
+    /// 层集与 config 取第一个子 manifest 的（同一次构建各平台一致）。
+    async fn tag_shape(&self, tag: &str) -> SFResult<Option<TagShape>> {
+        let path = repo_path(&format!("manifests/{tag}"));
+        let (status, headers, body) = self
+            .registry_request("GET", &path, MANIFEST_ACCEPT, None)
+            .await?;
+        if status != 200 {
+            return Ok(None);
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| SFError::IO(format!("registry manifest {tag} is not JSON: {e}")))?;
+        let digest = header_value(&headers, "docker-content-digest").unwrap_or_default();
+        let (source, digest) = if manifest.get("manifests").is_some() {
+            let Some(child) = first_manifest_digest(&manifest) else {
+                return Ok(None);
+            };
+            let child_manifest = self.registry_manifest(&child, MANIFEST_ACCEPT).await?;
+            (child_manifest, digest)
+        } else {
+            (manifest, digest)
+        };
+        let Some(config) = config_digest_of(&source) else {
+            return Ok(None);
+        };
+        let Some(layers) = source.get("layers").and_then(|l| l.as_array()) else {
+            return Ok(None);
+        };
+        let layers: Vec<String> = layers
+            .iter()
+            .filter_map(|l| l.get("digest").and_then(|d| d.as_str()))
+            .map(str::to_string)
+            .collect();
+        Ok(Some(TagShape {
+            digest,
+            layers,
+            config,
+        }))
+    }
+
     /// registry 上某 tag 是否存在（manifest 可取）。用于"不重建也能修"的
     /// 快路：不可变 tag 内容与 rev 一一对应，存在即可直接滚动。
+    ///
+    /// 判据的输入是上面那组 Accept：store 里是 OCI manifest，只声明 docker
+    /// 类型时 registry 一律回 404，于是答案恒为"不在"——快路静默失效，每次都
+    /// 从头重建一遍。
     async fn registry_tag_exists(&self, tag: &str) -> bool {
-        self.registry_get(
-            &format!("/v2/cogneva/manifests/{tag}"),
-            &["application/vnd.docker.distribution.manifest.v2+json"],
+        self.registry_get(&repo_path(&format!("manifests/{tag}")), MANIFEST_ACCEPT)
+            .await
+            .is_ok()
+    }
+
+    /// 一个 tag 的读数：manifest digest、层集、镜像自己的创建时间。读不全一律
+    /// `None`——回收走的是"删"这个方向，"没读到"不能授权删除，也不能参与
+    /// "谁更新"的排序（那一端先被删）。
+    ///
+    /// 创建时间取 config blob 的 `created`：它由构建写在镜像上，描述的是这个
+    /// 镜像（实测同一基底上各 rev 各不相同，同一个镜像的两个 tag 相同），而
+    /// manifest 本身的时间只有一个"这个 tag 什么时候被写的"语义。
+    async fn registry_tag_reading(&self, tag: &str) -> SFResult<Option<RegistryTag>> {
+        let Some(shape) = self.tag_shape(tag).await? else {
+            return Ok(None);
+        };
+        if shape.digest.is_empty() || shape.layers.is_empty() {
+            return Ok(None);
+        }
+        let blob: serde_json::Value = serde_json::from_slice(
+            &self
+                .registry_get(&repo_path(&format!("blobs/{}", shape.config)), &[])
+                .await?,
         )
-        .await
-        .is_ok()
+        .map_err(|e| {
+            SFError::IO(format!(
+                "registry config blob {} is not JSON: {e}",
+                shape.config
+            ))
+        })?;
+        let Some(created_unix) = created_of_config_blob(&blob) else {
+            return Ok(None);
+        };
+        Ok(Some(RegistryTag {
+            tag: tag.to_string(),
+            created_unix,
+            digest: shape.digest,
+            layers: shape.layers,
+        }))
+    }
+
+    /// registry 上的全部 tag 名。
+    async fn registry_tag_names(&self) -> SFResult<Vec<String>> {
+        let body = self.registry_get(&repo_path("tags/list"), &[]).await?;
+        let doc: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| SFError::IO(format!("registry tag list is not JSON: {e}")))?;
+        match doc.get("tags") {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|t| {
+                    t.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| SFError::IO("registry tag list holds a non-string".into()))
+                })
+                .collect(),
+            Some(_) => Err(SFError::IO("registry tag list is not an array".into())),
+        }
+    }
+
+    /// 全部 tag 的读数。单个 tag 读不出来只是它自己不进结果集（既不是删除候选，
+    /// 也不参与层集比对），不影响这一轮判别的其余部分。
+    async fn registry_tags_with_readings(&self) -> SFResult<Vec<RegistryTag>> {
+        let mut out = Vec::new();
+        for tag in self.registry_tag_names().await? {
+            match self.registry_tag_reading(&tag).await {
+                Ok(Some(reading)) => out.push(reading),
+                Ok(None) => {
+                    info!(tag = %tag, "registry tag has no readable manifest; leaving it alone")
+                }
+                Err(e) => {
+                    warn!(tag = %tag, error = %e, "registry tag reading failed; leaving it alone")
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 把 digest 指向的 manifest 原地挂到另一个 tag 下：纯 tag 中转，不复制任何
+    /// blob、也不重新打包任何层。
+    ///
+    /// media type 必须原样带回（registry 按 Content-Type 校验解析），body 也
+    /// 原样透传：digest 是内容寻址的，重新序列化一遍就是换了一份内容。
+    async fn registry_copy_manifest(&self, digest: &str, tag: &str) -> SFResult<()> {
+        let path = repo_path(&format!("manifests/{digest}"));
+        let (status, headers, body) = self
+            .registry_request("GET", &path, MANIFEST_ACCEPT, None)
+            .await?;
+        if status != 200 {
+            return Err(SFError::IO(format!(
+                "registry GET manifest {digest} -> {status}"
+            )));
+        }
+        let media_type = header_value(&headers, "content-type")
+            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+        let target = repo_path(&format!("manifests/{tag}"));
+        let (status, _, body) = self
+            .registry_request(
+                "PUT",
+                &target,
+                MANIFEST_ACCEPT,
+                Some((media_type.as_str(), &body)),
+            )
+            .await?;
+        if status != 201 {
+            return Err(SFError::IO(format!(
+                "registry PUT {tag} -> {status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        Ok(())
+    }
+
+    /// 删掉一个 manifest（按 digest，tag 引用在部分 registry 版本上不被接受）。
+    /// 删的只是"还引用着谁"这件事：层留在盘上，直到 GC 跑一次。
+    async fn registry_delete_manifest(&self, digest: &str) -> SFResult<()> {
+        let path = repo_path(&format!("manifests/{digest}"));
+        let (status, _, body) = self
+            .registry_request("DELETE", &path, MANIFEST_ACCEPT, None)
+            .await?;
+        if status != 202 {
+            return Err(SFError::IO(format!(
+                "registry DELETE {digest} -> {status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        Ok(())
+    }
+
+    /// 集群内 registry 的对象名：Service 与 Deployment 同名（同一份清单里一处
+    /// 声明），而 push 端点的主机部分就是那个 Service。不再单独声明一次——
+    /// 回收要重启的 Deployment 与读数要抓的 Service 必须是同一个东西，第二个
+    /// 名字只会漂移。
+    fn registry_name(&self) -> Option<String> {
+        let endpoint = self.push_endpoint();
+        let (host, _) = endpoint_host_port(&endpoint)?;
+        Some(host.to_string())
+    }
+
+    /// registry 那张卷的占用读数（走查边车，Service 的 `http` 端点）。
+    ///
+    /// 取的是**盘上全部字节**：没有 tag 引用的孤儿层它也看得见，而 registry 自己
+    /// 的 API 只报"活 tag 引用的层"（实测同一时刻 3.74 GiB 对 7.4 GiB）。声明量
+    /// 比的、告警规则比的、回收该判的都是前者。读不到就是 `None`，不是 0。
+    async fn registry_volume_used_bytes(&self) -> Option<u64> {
+        let endpoint = self.push_endpoint();
+        let (host, _) = endpoint_host_port(&endpoint)?;
+        let port = self.cfg.registry_walker_port;
+        let (status, _, body) = self
+            .plain_http(host, port, "GET", "/metrics", &[], None)
+            .await
+            .ok()?;
+        if status != 200 {
+            return None;
+        }
+        cog_core::claim_footprint::used_bytes_from_exposition(
+            &String::from_utf8_lossy(&body),
+            &self.cfg.registry_claim,
+        )
+    }
+
+    /// registry 那张卷声明的容量，取自 PVC 自己的声明（与告警规则的
+    /// `kube_persistentvolumeclaim_resource_requests_storage_bytes` 同一处
+    /// 事实）：再声明一次"卷有多大"就会有两个会漂移的数。
+    async fn registry_declared_bytes(&self) -> Option<f64> {
+        if self.cfg.registry_claim.trim().is_empty() {
+            return None;
+        }
+        let out = self
+            .kubectl(
+                &[
+                    "get",
+                    "pvc",
+                    self.cfg.registry_claim.trim(),
+                    "-o",
+                    "jsonpath={.spec.resources.requests.storage}",
+                ],
+                30,
+            )
+            .await
+            .ok()?;
+        cog_core::claim_footprint::quantity_bytes(out.trim())
+    }
+
+    /// 让 registry 重启一次。它的 initContainer 就是 `garbage-collect`，只在
+    /// Pod 启动时跑——所以"跑一次 GC"在这里就是重启那个 Deployment（单副本、
+    /// Recreate，几秒）。放在 initContainer 是既有选择：唯一会写这个 store 的
+    /// 进程就是同 Pod 的 registry，init 阶段它还没起来，标记-清扫不可能删到一个
+    /// 正在上传、尚未被任何 manifest 引用的 blob。
+    async fn restart_registry(&self) -> SFResult<()> {
+        let name = self
+            .registry_name()
+            .ok_or_else(|| SFError::Config("registry endpoint is not host:port".into()))?;
+        self.kubectl(&["rollout", "restart", &format!("deployment/{name}")], 60)
+            .await
+            .map(|_| ())
     }
 
     /// 四部署当前声明的镜像对应哪个 rev。不可变 `main-<rev>` 由 tag 直接
@@ -2211,6 +2681,224 @@ impl MainlineDeployer {
         }
     }
 
+    /// 叠层基底改用一个稳定不变的祖先镜像，返回 buildah `from` 的引用。
+    ///
+    /// `resolve_base` 那个基底（上一个 rev / 浮动签）满足"内容都在"，不满足
+    /// "稳定"：新镜像包含上一张的全部层，于是最新那个 tag 一个人就把历史上每个
+    /// rev 的层都钉活着，删老 tag 只删 manifest、一个字节都放不出来（实测：89 个
+    /// tag 引用 90 层 4.09 GB，最新那个 tag 引用其中 80 层）。`:seed` 一旦锚到
+    /// 链根（实测 3 层 609 MB）就永远有效——之后每张镜像都是它加一层——所以这里
+    /// 先看它还成不成立，只有不成立时才重新找一个。
+    ///
+    /// 判据两条，都得有证据：
+    /// - **祖先**：候选的层集是线上镜像层集的子集。层 digest 是内容哈希，子集就是
+    ///   "那些层原样都在线上镜像里"，于是换基底不换内容——`/opt/cogneva/web` 由
+    ///   镜像的 node 阶段构建、overlay 内没有 node 工具链，换错基底就再也生成不出
+    ///   它（见 OVERLAY_UNREFRESHABLE）。
+    /// - **稳定**：候选不随线上镜像一起长，也就是层数最少的那个严格祖先。
+    ///
+    /// 找不到这样的镜像时退回 `resolve_base`：常驻底座大一点，但不丢内容，也不会
+    /// 比今天更差。这个函数不返回错误——它只在"该用哪个基底"上做选择，任何读不到
+    /// 都退到那个已知可用的答案，而不是把这一轮推进整条停掉。
+    async fn ensure_base_seed(&self, deployed: &DeployedState) -> String {
+        let endpoint = self.push_endpoint();
+        let fallback = self.resolve_base(deployed);
+        let Some(tag) = fallback.rsplit(':').next().filter(|t| !t.is_empty()) else {
+            return fallback;
+        };
+        let deployed_shape = match self.tag_shape(tag).await {
+            Ok(Some(shape)) => shape,
+            Ok(None) => {
+                warn!(tag = %tag, base = %fallback, "the deployed image is not in the registry; overlaying on it");
+                return fallback;
+            }
+            Err(e) => {
+                warn!(tag = %tag, error = %e, base = %fallback, "could not read the deployed image from the registry; overlaying on it");
+                return fallback;
+            }
+        };
+        match self.registry_tag_reading(SEED_TAG).await {
+            Ok(Some(existing))
+                if layers_are_contained(&existing.layers, &deployed_shape.layers) =>
+            {
+                return seed_image(&endpoint);
+            }
+            Ok(Some(existing)) => info!(
+                seed_layers = existing.layers.len(),
+                deployed_layers = deployed_shape.layers.len(),
+                "the seed image is no longer an ancestor of the deployed image; re-anchoring it"
+            ),
+            Ok(None) => info!("no seed image in the registry yet; anchoring one"),
+            Err(e) => warn!(error = %e, "could not read the seed image; re-anchoring it"),
+        }
+        let tags = match self.registry_tags_with_readings().await {
+            Ok(tags) => tags,
+            Err(e) => {
+                warn!(error = %e, base = %fallback, "registry tag walk failed; overlaying on the deployed image");
+                return fallback;
+            }
+        };
+        let Some(root) = lineage_root(&deployed_shape.layers, &tags) else {
+            warn!(
+                base = %fallback,
+                "no full build in the registry is an ancestor of the deployed image; overlaying on the deployed image (every layer it inherits stays pinned as long as its tag lives)"
+            );
+            return fallback;
+        };
+        match self.registry_copy_manifest(&root.digest, SEED_TAG).await {
+            Ok(()) => {
+                info!(
+                    seed = %seed_image(&endpoint),
+                    root = %root.tag,
+                    layers = root.layers.len(),
+                    "anchored the overlay base to the chain root"
+                );
+                seed_image(&endpoint)
+            }
+            Err(e) => {
+                warn!(error = %e, root = %root.tag, base = %fallback, "could not anchor the overlay base; overlaying on the deployed image");
+                fallback
+            }
+        }
+    }
+
+    /// 一轮容量回收：把保留窗之外的老 rev 删掉，再重启 registry 让 GC 真正把
+    /// 那些 blob 从盘上放掉。
+    ///
+    /// 三件事必须一起做，缺一件都等于没做：**基底回到稳定镜像**（否则最新那个
+    /// tag 一个人钉着历史上每一层，见 `ensure_base_seed`）、**删老 tag**（光换
+    /// 基底一个字节也不放）、**跑一次 GC**（registry 只在 Pod 启动时扫，删掉的
+    /// 东西否则一直占着盘）。
+    ///
+    /// 判据是卷的**占用**读数（走查边车量的是盘上全部字节），不是 registry 自己
+    /// 报的"活 tag 引用的层"：后者看不见孤儿层，实测同一时刻 3.74 GiB 对
+    /// 7.4 GiB。两个读数缺一个就不动——没有证据时重启 registry 是有代价的动作。
+    ///
+    /// 在飞滚动时不做：重启 registry 会让正在拉镜像的新副本 ErrImagePull，而那正是
+    /// 判据把它归成环境类、不回滚的那种失败。晚一轮没有代价。
+    async fn registry_maintenance_round(
+        &self,
+        bare: &str,
+        images: &[String],
+        state: &mut MainlineState,
+    ) {
+        if state.in_flight.is_some() {
+            return;
+        }
+        // 没有卷的声明就没有这件事：量的是哪张卷、阈值的分母取谁，都从
+        // `COGNEVA_REGISTRY_CLAIM` 来（与走查边车同一个名字）。没声明时读也白读——
+        // 量出来的占用无从比较，所以连读都不读，不是读了之后判否。
+        if self.cfg.registry_claim.trim().is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        let used = self.registry_volume_used_bytes().await;
+        let declared = self.registry_declared_bytes().await;
+        if !maintenance_due(
+            used,
+            declared,
+            state.registry_maintenance_unix,
+            now,
+            self.cfg.registry_maintenance_threshold,
+            self.cfg.registry_maintenance_cooldown_secs,
+        ) {
+            return;
+        }
+        // 回收要重启 registry，而构建正是往这个 registry 推镜像的动作：不拿宿主
+        // 构建闸就动手，等于在别人推到一半时把服务端换掉。拿不到就下一轮再看。
+        let _slot = match cog_core::build_gate::try_acquire("registry maintenance").await {
+            Ok(slot) => slot,
+            Err(e) => {
+                info!(error = %e, "host is building; deferring registry maintenance to the next cycle");
+                return;
+            }
+        };
+        // 先记账再动手：一轮回收做到一半进程就没了的时候，"做过"必须已经落盘，
+        // 否则下一轮立刻又重启一次 registry。
+        state.registry_maintenance_unix = now;
+        if let Err(e) = self.save_state(state) {
+            warn!(error = %e, "could not record the maintenance run; the next cycle may repeat it");
+        }
+        info!(used = ?used, declared = ?declared, "registry maintenance: pruning old revs and reclaiming");
+        // 保留集是白名单：认得的、这一轮还要用的 rev 一个都不能删。名单漏一项就是
+        // 静默删错（`prunable_tags` 那一侧是闭集，只管 `main-<rev>`）。
+        let mut keep: HashSet<String> = HashSet::new();
+        keep.insert(bare.to_string());
+        if let Some(rev) = &state.last_good_rev {
+            keep.insert(rev.clone());
+        }
+        if let Some(inflight) = &state.in_flight {
+            keep.insert(inflight.rev.clone());
+        }
+        for image in images {
+            if let Some(rev) = parse_main_rev(image) {
+                keep.insert(rev.to_string());
+            }
+        }
+        let tags = match self.registry_tags_with_readings().await {
+            Ok(tags) => tags,
+            Err(e) => {
+                warn!(error = %e, "registry tag walk failed; no tag was removed this round");
+                return;
+            }
+        };
+        let doomed = prunable_tags(&tags, self.cfg.registry_retention, &keep);
+        let mut removed = 0.0f64;
+        let mut failures = 0.0f64;
+        for tag in &doomed {
+            match self.registry_delete_manifest(&tag.digest).await {
+                Ok(()) => {
+                    removed += 1.0;
+                    info!(tag = %tag.tag, digest = %tag.digest, "registry tag removed; its blobs go when the next GC runs")
+                }
+                Err(e) => {
+                    failures += 1.0;
+                    warn!(tag = %tag.tag, error = %e, "could not remove a registry tag")
+                }
+            }
+        }
+        // 删掉的只是 manifest 上的引用：层还在盘上，直到 GC 跑一次。GC 是 registry
+        // Pod 的 initContainer，所以"跑一次 GC"就是让那个 Deployment 重启一次。
+        if removed > 0.0 {
+            if let Err(e) = self.restart_registry().await {
+                warn!(error = %e, "could not restart the registry to reclaim; the removed tags stay on disk until it restarts");
+            }
+        }
+        info!(
+            tags = tags.len(),
+            candidates = doomed.len(),
+            removed,
+            failures,
+            "registry maintenance round finished"
+        );
+        // 回收自己的读数。三件事分开计数：跑过几轮、删掉几个、几个被拒——"跑了但
+        // 一个都没删"与"压根没跑"必须能从读数上分开，这也是它自己的读数而不是
+        // 卷读数的原因（卷读数变与不变还有另外一半原因）。
+        if let Some(metrics) = &self.metrics {
+            use cog_core::metric_names::{
+                REGISTRY_MAINTENANCE_READING_UNIX, REGISTRY_MAINTENANCE_RUNS_TOTAL,
+                REGISTRY_PRUNED_TAGS_TOTAL, REGISTRY_PRUNE_FAILURES_TOTAL,
+            };
+            let no_labels = std::collections::HashMap::new();
+            let _ = metrics
+                .record_counter(REGISTRY_MAINTENANCE_RUNS_TOTAL, 1.0, no_labels.clone())
+                .await;
+            if removed > 0.0 {
+                let _ = metrics
+                    .record_counter(REGISTRY_PRUNED_TAGS_TOTAL, removed, no_labels.clone())
+                    .await;
+            }
+            if failures > 0.0 {
+                let _ = metrics
+                    .record_counter(REGISTRY_PRUNE_FAILURES_TOTAL, failures, no_labels.clone())
+                    .await;
+            }
+            let _ = metrics
+                .record_gauge(REGISTRY_MAINTENANCE_READING_UNIX, now as f64, no_labels)
+                .await;
+        }
+    }
+
     /// 一轮轮询。
     pub async fn poll_once(&self) -> SFResult<()> {
         let mut state = self.load_state();
@@ -2229,6 +2917,12 @@ impl MainlineDeployer {
         self.report_version_contract(&bare).await;
         let images = self.deployed_images().await?;
         let deployed = classify_deployed(&images);
+
+        // 容量回收。放在这里（四部署读数之后、所有早退之前）：它判的是 registry
+        // 那张卷，与"这一轮推不推进"无关，任何一条早退都不该把它跳过——被跳过
+        // 的表现是卷满了而回收从没跑过，与"不需要回收"读起来一样。
+        self.registry_maintenance_round(&bare, &images, &mut state)
+            .await;
 
         // 在飞任务收敛/终态处理。
         if let Some(inflight) = state.in_flight.clone() {
@@ -2440,7 +3134,6 @@ impl MainlineDeployer {
         // Job manifest 与 set image 走节点 NodePort（kubelet 不解析集群 DNS）。
         let push_tag = main_image(&self.push_endpoint(), &bare);
         let pull_tag = main_image(&self.pull_endpoint(), &bare);
-        let base_tag = self.resolve_base(&deployed);
 
         // 不可变 tag 与 rev 一一对应：registry 上已有 `main-<rev>` 就说明
         // 该 rev 早已构建过（清单被重下发打回浮动签后，四部署只是需要重新
@@ -2450,7 +3143,7 @@ impl MainlineDeployer {
         // 那一支的构建与推送都成功了（卡住的是调度），重试复用同一个 tag 是
         // 对的，也免得在本来就排不进 Pod 的节点上再跑一遍全程构建。
         if (!retry_of_failed_rev || state.failed_class == FailureClass::Environment)
-            && self.registry_tag_exists(&push_tag).await
+            && self.registry_tag_exists(&main_tag(&bare)).await
         {
             info!(rev = %rev12(&bare), tag = %push_tag, "immutable image already in registry; re-pinning without a rebuild");
             state.in_flight = Some(InFlight {
@@ -2467,6 +3160,9 @@ impl MainlineDeployer {
             return Ok(());
         }
 
+        // 叠层基底在这里才定：上面那条快路不需要它（不重建），而它自己要读 registry
+        // 并可能改一个 tag，是"真要构建"才付的代价。
+        let base_tag = self.ensure_base_seed(&deployed).await;
         info!(rev = %rev12(&bare), base = %base_tag, "mainline advance: building");
 
         state.in_flight = Some(InFlight {
@@ -6977,6 +7673,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_repeated: false,
             failed_class: FailureClass::Version,
             ci_hold_rev: Some("deadbeef0011".into()),
+            registry_maintenance_unix: 0,
         };
         let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date(aabbccddeeff)", 1000);
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
@@ -7322,6 +8019,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_repeated: true,
             failed_class: FailureClass::Environment,
             ci_hold_rev: None,
+            registry_maintenance_unix: 0,
         };
         let text = serde_json::to_string(&state).unwrap();
         let back: MainlineState = serde_json::from_str(&text).unwrap();
@@ -7625,6 +8323,13 @@ exit 0
             upstream_fetch_timeout_secs: 30,
             // 测试夹具仓库没有 deploy/k3s 清单树；这些用例走 set image 旧路径。
             deliver_manifests: false,
+            // 容量回收默认关（没有声明就没有回收）：它要读走查边车与 PVC，
+            // 夹具里两样都没有。回收自己的用例在下面单独配。
+            registry_claim: String::new(),
+            registry_walker_port: 9100,
+            registry_retention: 20,
+            registry_maintenance_threshold: 0.5,
+            registry_maintenance_cooldown_secs: 21600,
             targets: MainlineDeployerConfig::default().targets,
         }
     }
@@ -8300,7 +9005,7 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let (endpoint, handle) = fake_registry(vec![
-            http_200(r#"{"schemaVersion":2,"config":{"digest":"sha256:cfg1"}}"#),
+            http_manifest("sha256:m1", &oci_manifest("sha256:cfg1", &["L1"])),
             http_200(
                 r#"{"config":{"Labels":{"org.opencontainers.image.revision":"deadbeefcafe"}}}"#,
             ),
@@ -8333,8 +9038,11 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let (endpoint, handle) = fake_registry(vec![
-            http_200(r#"{"schemaVersion":2,"manifests":[{"digest":"sha256:plat"}]}"#),
-            http_200(r#"{"config":{"digest":"sha256:cfg2"}}"#),
+            http_manifest(
+                "sha256:idx",
+                r#"{"schemaVersion":2,"manifests":[{"digest":"sha256:plat"}]}"#,
+            ),
+            http_manifest("sha256:plat", &oci_manifest("sha256:cfg2", &["L1"])),
             http_200(
                 r#"{"config":{"Labels":{"org.opencontainers.image.revision":"cafebabe0011"}}}"#,
             ),
@@ -8356,6 +9064,675 @@ exit 0
             reqs[2].contains("/v2/cogneva/blobs/sha256:cfg2"),
             "{:?}",
             reqs[2]
+        );
+    }
+
+    /// 按方法+路径路由的假 registry，收到的请求记在一份共享账上。
+    ///
+    /// 一轮回收里请求的条数与顺序都由判据决定（先列 tag、再逐个取 manifest 与
+    /// config、再按 digest 删、最后 PUT 基底），所以这里用路由表而不是应答序列。
+    /// 请求要读全（含 body），否则 PUT 那一侧断言不成立——探针得先自证跑到了被
+    /// 检的那条路径。
+    ///
+    /// 账放在共享 vec 而不是任务返回值上：这个服务是对外接活的，永远不会自己
+    /// 结束，等它的返回值就是等一个不会到的时刻。
+    async fn routed_registry(
+        routes: Vec<(&str, String, String)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let routes: Vec<(String, String, String)> = routes
+            .into_iter()
+            .map(|(m, p, r)| (m.to_string(), p.to_string(), r))
+            .collect();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let log = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut raw = Vec::new();
+                let mut want: Option<usize> = None;
+                loop {
+                    let mut buf = vec![0u8; 65536];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    let Some(head_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    if want.is_none() {
+                        want = Some(
+                            text[..head_end]
+                                .lines()
+                                .filter_map(|l| l.split_once(':'))
+                                .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, v)| v.trim().parse().ok())
+                                .unwrap_or(0),
+                        );
+                    }
+                    if raw.len() >= head_end + 4 + want.unwrap_or(0) {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&raw).to_string();
+                let mut parts = req.lines().next().unwrap_or("").split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("").to_string();
+                log.lock().unwrap().push(req);
+                let resp = routes
+                    .iter()
+                    .find(|(m, p, _)| *m == method && *p == target)
+                    .map(|(_, _, r)| r.clone())
+                    .unwrap_or_else(|| HTTP_404.to_string());
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("127.0.0.1:{port}"), seen)
+    }
+
+    /// 假 registry 收到过的请求（快照）。
+    fn requests_seen(log: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    fn http_status(status: u16, reason: &str) -> String {
+        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n")
+    }
+
+    /// 带 `Docker-Content-Digest` 的 manifest 应答：tag 的 digest 就是删除与按
+    /// digest 中转要用的那个引用。
+    fn http_manifest(digest: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\nDocker-Content-Digest: {digest}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn oci_manifest(config: &str, layers: &[&str]) -> String {
+        let layers: Vec<String> = layers
+            .iter()
+            .map(|d| format!(r#"{{"digest":"{d}","size":10}}"#))
+            .collect();
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"digest":"{config}","size":10}},"layers":[{}]}}"#,
+            layers.join(",")
+        )
+    }
+
+    fn oci_config(rev: &str, created: &str) -> String {
+        format!(
+            r#"{{"created":"{created}","config":{{"Labels":{{"org.opencontainers.image.revision":"{rev}"}}}}}}"#
+        )
+    }
+
+    fn tags_json(tags: &[&str]) -> String {
+        let listed: Vec<String> = tags.iter().map(|t| format!("\"{t}\"")).collect();
+        format!(r#"{{"name":"cogneva","tags":[{}]}}"#, listed.join(","))
+    }
+
+    /// 走查边车的 /metrics：一条按 claim 取值的占用读数。
+    fn walker_metrics(claim: &str, bytes: u64) -> String {
+        format!("cogneva_data_volume_used_bytes{{persistentvolumeclaim=\"{claim}\"}} {bytes}\n")
+    }
+
+    /// 回收用例的 kubectl 桩：PVC 的声明量按真读法回一个量，其余调用记账。
+    fn fake_kubectl_pvc(dir: &Path, storage: &str) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "$@" >> '{log}'
+case "$*" in
+  *"rollout restart"*) echo "deployment.apps/x restarted" ;;
+  *) printf '%s' '{storage}' ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            storage = storage
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 一个 tag 读全所需的全部路由：manifest（带 digest 与层集）与 config blob
+    /// （带 rev 标签与创建时间）。两个读者都在这份 blob 上取数——rev 给"这个 tag
+    /// 构建自哪个 rev"，created 给保留窗的排序——所以一份应答同时喂两边。
+    fn tag_routes(
+        tag: &str,
+        digest: &str,
+        config: &str,
+        layers: &[&str],
+        rev: &str,
+        created: &str,
+    ) -> Vec<(&'static str, String, String)> {
+        vec![
+            (
+                "GET",
+                format!("/v2/cogneva/manifests/{tag}"),
+                http_manifest(digest, &oci_manifest(config, layers)),
+            ),
+            (
+                "GET",
+                format!("/v2/cogneva/blobs/{config}"),
+                http_200(&oci_config(rev, created)),
+            ),
+            (
+                "DELETE",
+                format!("/v2/cogneva/manifests/{digest}"),
+                http_status(202, "Accepted"),
+            ),
+        ]
+    }
+
+    /// 回收只删保留窗之外、且不在保留集里的 rev：窗内两个不动，浮动签与基底不
+    /// 动（闭集），正在跑的部署不动（白名单）。删完让 registry 重启一次——它的
+    /// initContainer 才是 GC。
+    #[tokio::test]
+    async fn maintenance_removes_only_the_revs_outside_the_window_and_keeps_a_whitelist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi");
+        let claim = "cogneva-registry-pvc";
+
+        let tags = [
+            "local",
+            "seed",
+            "main-000000000001",
+            "main-000000000002",
+            "main-000000000003",
+            "main-000000000004",
+        ];
+        let mut routes = vec![(
+            "GET",
+            "/v2/cogneva/tags/list".to_string(),
+            http_200(&tags_json(&tags)),
+        )];
+        // 四个 rev 各自一层、创建时间递增：保留两个的话，窗是 04 与 03，窗外的
+        // 是 02 与 01。
+        for (i, tag) in tags.iter().filter(|t| t.starts_with("main-")).enumerate() {
+            routes.extend(tag_routes(
+                tag,
+                &format!("sha256:m{i}"),
+                &format!("sha256:c{i}"),
+                &[&format!("L{i}")],
+                &format!("rev{i}"),
+                &format!("2026-09-2{}T00:00:00Z", i + 1),
+            ));
+        }
+        routes.extend(tag_routes(
+            "local",
+            "sha256:local",
+            "sha256:cl",
+            &["L9"],
+            "deadbeefcafe",
+            "2026-09-26T00:00:00Z",
+        ));
+        routes.extend(tag_routes(
+            "seed",
+            "sha256:seed",
+            "sha256:cs",
+            &["L0"],
+            "deadbeefcafe",
+            "2026-09-26T00:00:00Z",
+        ));
+        let (registry, registry_log) = routed_registry(routes).await;
+        let (walker, _walker_log) = routed_registry(vec![(
+            "GET",
+            "/metrics".to_string(),
+            http_200(&walker_metrics(claim, 9_000_000_000)),
+        )])
+        .await;
+        let walker_port: u16 = walker.rsplit(':').next().unwrap().parse().unwrap();
+
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", &kubectl);
+        cfg.registry = registry;
+        cfg.registry_claim = claim.into();
+        cfg.registry_walker_port = walker_port;
+        cfg.registry_retention = 2;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let mut state = MainlineState::default();
+        // 部署钉在最老那个 rev 上：它在窗外，但正在跑，一个都不能删——保留集比
+        // 保留窗更宽的那一侧正是白名单。
+        let images = vec!["localhost:30500/cogneva:main-000000000001".to_string()];
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+
+        let reqs = requests_seen(&registry_log);
+        let deletes: Vec<String> = reqs
+            .iter()
+            .filter_map(|r| r.lines().next())
+            .filter(|l| l.starts_with("DELETE "))
+            .map(|l| l.trim_end_matches(" HTTP/1.1").to_string())
+            .collect();
+        assert_eq!(
+            deletes,
+            vec!["DELETE /v2/cogneva/manifests/sha256:m1"],
+            "窗外两个：正在跑的那个被白名单保住，剩下 02 一个该删；窗内两个、浮动签与基底都不动: {deletes:?}"
+        );
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            calls.contains("rollout restart"),
+            "删完必须让 GC 跑一次，而 GC 是 registry 的 initContainer: {calls}"
+        );
+        assert!(
+            calls.contains("get pvc"),
+            "声明量取自 PVC 自己的声明，不是第二处声明: {calls}"
+        );
+        assert!(
+            state.registry_maintenance_unix > 0,
+            "做过一轮必须落盘，否则重启之后又立刻重启一次 registry"
+        );
+    }
+
+    /// 没有占用读数就不动：体积读数取不到（走查边车没起来）不是"占用是 0"，而
+    /// 回收要重启 registry，是个有代价的动作。
+    #[tokio::test]
+    async fn maintenance_needs_a_reading_before_it_touches_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi");
+        let (registry, registry_log) = routed_registry(vec![(
+            "GET",
+            "/v2/cogneva/tags/list".to_string(),
+            http_200(&tags_json(&[
+                "main-000000000001",
+                "main-000000000002",
+                "main-000000000003",
+            ])),
+        )])
+        .await;
+        // 走查边车没应答（端点上没有 /metrics）。
+        let (walker, _) = routed_registry(Vec::new()).await;
+        let walker_port: u16 = walker.rsplit(':').next().unwrap().parse().unwrap();
+
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", &kubectl);
+        cfg.registry = registry;
+        cfg.registry_claim = "cogneva-registry-pvc".into();
+        cfg.registry_walker_port = walker_port;
+        cfg.registry_retention = 1;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let mut state = MainlineState::default();
+        deployer
+            .registry_maintenance_round("000000000003", &[], &mut state)
+            .await;
+
+        let reqs = requests_seen(&registry_log);
+        assert!(
+            !reqs.iter().any(|r| r.starts_with("DELETE ")),
+            "没有证据时一个 tag 都不该删: {reqs:?}"
+        );
+        assert_eq!(state.registry_maintenance_unix, 0, "没做过就别记成做过");
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        assert!(
+            !calls.contains("rollout restart"),
+            "连删都没删，重启一次 registry 是无谓的动作: {calls}"
+        );
+    }
+
+    /// 被拒的删除是错误而不是"删好了"：delete 没开、权限不够都长这样，静默当作
+    /// 成功会让整条回收永远空转（每轮都以为删过了，盘上一点没少）。
+    #[tokio::test]
+    async fn a_refused_deletion_is_an_error_not_a_silent_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, log) = routed_registry(vec![(
+            "DELETE",
+            "/v2/cogneva/manifests/sha256:gone".to_string(),
+            http_status(405, "Method Not Allowed"),
+        )])
+        .await;
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        cfg.registry = endpoint;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+        assert!(deployer
+            .registry_delete_manifest("sha256:gone")
+            .await
+            .is_err());
+        assert!(
+            requests_seen(&log).iter().any(|r| r.starts_with("DELETE ")),
+            "被拒的那次删除确实发出去了（拒的是删除本身，不是没删）"
+        );
+    }
+
+    /// 基底锚到链根：删老 tag 才可能放出空间（否则最新那个 tag 一个人钉着历史上
+    /// 每一层）。锚定是纯中转：不复制 blob，media type 原样带回。
+    #[tokio::test]
+    async fn the_overlay_base_is_anchored_to_the_chain_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut routes = vec![(
+            "GET",
+            "/v2/cogneva/tags/list".to_string(),
+            http_200(&tags_json(&[
+                "local",
+                "main-root",
+                "main-mid",
+                "main-ahead",
+            ])),
+        )];
+        routes.extend(tag_routes(
+            "local",
+            "sha256:local",
+            "sha256:cl",
+            &["L1", "L2", "L3"],
+            "deadbeefcafe",
+            "2026-09-27T00:00:00Z",
+        ));
+        routes.extend(tag_routes(
+            "main-root",
+            "sha256:root",
+            "sha256:cr",
+            &["L1"],
+            "0000000000000001",
+            "2026-09-20T00:00:00Z",
+        ));
+        routes.extend(tag_routes(
+            "main-mid",
+            "sha256:mid",
+            "sha256:cm",
+            &["L1", "L2"],
+            "0000000000000002",
+            "2026-09-21T00:00:00Z",
+        ));
+        // 层集不是子集：多出来的那层线上没有，拿它当基底会换掉内容。
+        routes.extend(tag_routes(
+            "main-ahead",
+            "sha256:ahead",
+            "sha256:ca",
+            &["L1", "L2", "L3", "L4"],
+            "0000000000000003",
+            "2026-09-22T00:00:00Z",
+        ));
+        // 中转要按 digest 把源 manifest 原样取回来（tag 只是指向它的名字）。
+        routes.push((
+            "GET",
+            "/v2/cogneva/manifests/sha256:root".to_string(),
+            http_manifest("sha256:root", &oci_manifest("sha256:cr", &["L1"])),
+        ));
+        routes.push((
+            "PUT",
+            "/v2/cogneva/manifests/seed".to_string(),
+            http_status(201, "Created"),
+        ));
+        let (endpoint, registry_log) = routed_registry(routes).await;
+
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        cfg.registry = endpoint.clone();
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let base = deployer.ensure_base_seed(&DeployedState::Legacy).await;
+        assert_eq!(base, seed_image(&endpoint));
+        let reqs = requests_seen(&registry_log);
+        let put = reqs
+            .iter()
+            .find(|r| r.starts_with("PUT "))
+            .expect("锚定要 PUT 一个 tag");
+        assert!(
+            put.contains("/v2/cogneva/manifests/seed"),
+            "锚定落在 `:seed` 上: {put}"
+        );
+        assert!(
+            put.contains("Content-Type: application/vnd.oci.image.manifest.v1+json"),
+            "media type 必须原样带回，registry 按它解析: {put}"
+        );
+        assert!(
+            put.contains(r#""digest":"sha256:cr""#),
+            "挂上去的必须是链根那份 manifest（纯中转，不重新打包）: {put}"
+        );
+    }
+
+    /// 已经成立的基底不再动它：`:seed` 是线上镜像的祖先就一直用——每张镜像都是
+    /// 它加一层，这是"删老 tag 能放空间"的前提，也是不再多花请求的理由。
+    #[tokio::test]
+    async fn an_existing_seed_that_is_still_an_ancestor_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut routes = vec![
+            (
+                "GET",
+                "/v2/cogneva/tags/list".to_string(),
+                http_200(&tags_json(&["local", "seed"])),
+            ),
+            (
+                "GET",
+                "/v2/cogneva/manifests/seed".to_string(),
+                http_manifest("sha256:seed", &oci_manifest("sha256:cs", &["L1", "L2"])),
+            ),
+            (
+                "GET",
+                "/v2/cogneva/blobs/sha256:cs".to_string(),
+                http_200(&oci_config("deadbeefcafe", "2026-09-26T00:00:00Z")),
+            ),
+            (
+                "PUT",
+                "/v2/cogneva/manifests/seed".to_string(),
+                http_status(201, "Created"),
+            ),
+        ];
+        routes.extend(tag_routes(
+            "local",
+            "sha256:local",
+            "sha256:cl",
+            &["L1", "L2", "L3", "L4"],
+            "deadbeefcafe",
+            "2026-09-27T00:00:00Z",
+        ));
+        let (endpoint, registry_log) = routed_registry(routes).await;
+
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        cfg.registry = endpoint.clone();
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        assert_eq!(
+            deployer.ensure_base_seed(&DeployedState::Legacy).await,
+            seed_image(&endpoint)
+        );
+        let reqs = requests_seen(&registry_log);
+        assert!(
+            !reqs.iter().any(|r| r.starts_with("PUT ")),
+            "基底还有效就不该重写: {reqs:?}"
+        );
+        assert!(
+            !reqs.iter().any(|r| r.contains("tags/list")),
+            "连 tag 列表都不必走: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_tag_exists_asks_for_the_media_types_the_store_holds() {
+        // 实测过的缺陷：只声明 docker 那两种时 registry 对 store 里的 OCI manifest
+        // 一律回 404，"这个 tag 在不在"于是恒为"不在"，快路静默失效。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![http_200("{}")]).await;
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        cfg.registry = endpoint;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        assert!(deployer.registry_tag_exists("main-aabbccddeeff").await);
+        let reqs = handle.await.unwrap();
+        assert!(
+            reqs[0].contains("application/vnd.oci.image.manifest.v1+json"),
+            "Accept 少了 store 里实际的类型，答案就会恒为\"不在\": {:?}",
+            reqs[0]
+        );
+    }
+
+    #[test]
+    fn the_registry_object_name_comes_from_the_endpoint() {
+        // Service 与 Deployment 同名，而 push 端点的主机部分就是那个 Service：
+        // 回收要重启的对象与它读数的来源必须是同一个名字，不能各声明一次。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+        assert_eq!(deployer.registry_name().as_deref(), Some("reg.local"));
+        assert_eq!(seed_image("reg.local:5000"), "reg.local:5000/cogneva:seed");
+    }
+
+    #[test]
+    fn retention_never_names_a_tag_this_repository_does_not_write_by_rev() {
+        let tag = |name: &str, created: i64| RegistryTag {
+            tag: name.into(),
+            created_unix: created,
+            digest: format!("sha256:{name}"),
+            layers: vec![format!("L{name}")],
+        };
+        let tags = vec![
+            tag("main-000000000001", 100),
+            tag("main-000000000002", 200),
+            tag("main-000000000003", 300),
+            tag("local", 400),
+            tag("seed", 400),
+            tag("promote-000000000004", 500),
+        ];
+        let keep: HashSet<String> = HashSet::new();
+        let doomed = prunable_tags(&tags, 1, &keep);
+        // 可删的名字是闭集：只有 `main-<rev>` 是本仓库按 rev 一一对应写下的。浮动
+        // 签、基底、金丝雀的 promote-* 不认识就一律不动——回收是"删"这个方向，
+        // 名单漏一项就是静默删错。
+        assert_eq!(
+            doomed.iter().map(|t| t.tag.as_str()).collect::<Vec<_>>(),
+            vec!["main-000000000002", "main-000000000001"]
+        );
+
+        // 保留集是白名单方向：窗外的 rev 被点名保留就不再是候选——回收是"删"这个
+        // 方向，判错的代价是删掉还可能要用的东西。
+        let keep: HashSet<String> = ["000000000002".to_string()].into_iter().collect();
+        let doomed = prunable_tags(&tags, 1, &keep);
+        assert_eq!(
+            doomed.iter().map(|t| t.tag.as_str()).collect::<Vec<_>>(),
+            vec!["main-000000000001"],
+            "窗是 03，02 被点名保留，候选只剩 01"
+        );
+        // 白名单只加不减：点名保留窗外的 rev 不会让窗内的变成候选。
+        let keep: HashSet<String> = ["000000000001".to_string()].into_iter().collect();
+        assert!(
+            prunable_tags(&tags, 2, &keep).is_empty(),
+            "窗是 03 与 02，再加点名保留的 01，没有候选"
+        );
+
+        // 空输入与 retention=0 都不该凭空造出候选。
+        assert!(prunable_tags(&[], 3, &keep).is_empty());
+        assert_eq!(prunable_tags(&tags, 0, &HashSet::new()).len(), 3);
+    }
+
+    #[test]
+    fn the_overlay_base_candidate_has_to_be_a_pure_ancestor() {
+        let tag = |name: &str, layers: &[&str], created: i64| RegistryTag {
+            tag: name.into(),
+            created_unix: created,
+            digest: format!("sha256:{name}"),
+            layers: layers.iter().map(|l| l.to_string()).collect(),
+        };
+        let deployed: Vec<String> = ["L1", "L2", "L3"].iter().map(|l| l.to_string()).collect();
+        let tags = vec![
+            // 层数最少但不是祖先：拿它当基底会换掉线上镜像里的内容。
+            tag("main-unrelated", &["X1"], 10),
+            // 是祖先但更浅，且更早建：链根。
+            tag("main-root", &["L1"], 20),
+            tag("main-mid", &["L1", "L2"], 30),
+            // 层集不是子集：多出来的那层线上没有。
+            tag("main-ahead", &["L1", "L2", "L3", "L4"], 40),
+        ];
+        assert_eq!(
+            lineage_root(&deployed, &tags).map(|t| t.tag.as_str()),
+            Some("main-root")
+        );
+        // 平手按创建时间取更早的：两个都只有 L1 时，先出现的那个才是链根。
+        let ties = vec![
+            tag("main-late", &["L1"], 90),
+            tag("main-early", &["L1"], 10),
+        ];
+        assert_eq!(
+            lineage_root(&deployed, &ties).map(|t| t.tag.as_str()),
+            Some("main-early")
+        );
+        // 没有严格祖先时返回 None，调用方退回线上镜像本身。
+        assert!(lineage_root(
+            &deployed,
+            &[tag("main-ahead", &["L1", "L2", "L3", "L4"], 1)]
+        )
+        .is_none());
+        assert!(lineage_root(&deployed, &[]).is_none());
+    }
+
+    #[test]
+    fn reclamation_needs_both_readings_and_respects_the_cooldown() {
+        let hour: i64 = 3600;
+        // 读数取不到时不动：走查边车没起来不是"占用是 0"，而回收要重启 registry。
+        assert!(!maintenance_due(None, Some(10.0), 0, hour, 0.5, 0));
+        assert!(!maintenance_due(Some(6_000), None, 0, hour, 0.5, 0));
+        assert!(!maintenance_due(Some(6_000), Some(0.0), 0, hour, 0.5, 0));
+        // 阈值以下是"还不用回收"。
+        assert!(!maintenance_due(
+            Some(4_999),
+            Some(10_000.0),
+            0,
+            hour,
+            0.5,
+            0
+        ));
+        assert!(maintenance_due(
+            Some(5_000),
+            Some(10_000.0),
+            0,
+            hour,
+            0.5,
+            0
+        ));
+        assert!(maintenance_due(
+            Some(9_000),
+            Some(10_000.0),
+            0,
+            hour,
+            0.5,
+            0
+        ));
+        // 冷却窗：回收只把占用降到"还引用着的那些"，底座本身大时没有它就会每轮
+        // 轮询重启一次 registry。
+        assert!(!maintenance_due(
+            Some(9_000),
+            Some(10_000.0),
+            hour - 60,
+            hour,
+            0.5,
+            6 * hour as u64
+        ));
+        assert!(maintenance_due(
+            Some(9_000),
+            Some(10_000.0),
+            hour - 6 * hour,
+            hour,
+            0.5,
+            6 * hour as u64
+        ));
+    }
+
+    #[test]
+    fn the_created_time_is_read_from_the_image_config() {
+        assert_eq!(
+            created_of_config_blob(
+                &serde_json::from_str(r#"{"created":"2026-09-27T06:56:25.958109998Z"}"#).unwrap()
+            ),
+            Some(1_790_492_185)
+        );
+        // 读不到就是读不到：不能让调用方拿一个默认值排序，那一端先被删。
+        assert_eq!(created_of_config_blob(&serde_json::json!({})), None);
+        assert_eq!(
+            created_of_config_blob(&serde_json::json!({"created": "yesterday"})),
+            None
         );
     }
 
@@ -8397,15 +9774,17 @@ exit 0
         fake_cargo(&bin_dir, ws.target_dir());
         fake_strip(&bin_dir);
 
-        // 三次 registry 命中：读 :local 的 manifest、读其 config blob（rev 是
-        // 别的值）、查 main-<rev> 是否存在（不存在 → 必须真重建）。
-        let (endpoint, handle) = fake_registry(vec![
-            http_200(r#"{"schemaVersion":2,"config":{"digest":"sha256:cfg2"}}"#),
-            http_200(
-                r#"{"config":{"Labels":{"org.opencontainers.image.revision":"000000000000abcd"}}}"#,
-            ),
-            HTTP_404.to_string(),
-        ])
+        // 按路径路由而不是按次序应答：这一轮 registry 被问几次、依什么次序问，
+        // 由判据决定（读浮动签的 rev、确认不可变 tag 在不在、叠层基底再读一次）。
+        // 浮动签的 rev 是别的值，`main-<rev>` 那条路由故意不给——它必须真重建。
+        let (endpoint, registry_log) = routed_registry(tag_routes(
+            "local",
+            "sha256:local",
+            "sha256:cfg2",
+            &["L1"],
+            "000000000000abcd",
+            "2026-09-26T00:00:00Z",
+        ))
         .await;
         let mut cfg = test_config(root, &bare, &buildah, &kubectl);
         cfg.registry = endpoint;
@@ -8428,7 +9807,12 @@ exit 0
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
 
-        handle.await.unwrap();
+        assert!(
+            requests_seen(&registry_log)
+                .iter()
+                .any(|r| r.contains("/v2/cogneva/manifests/local")),
+            "判据是先读浮动签的内容再谈收敛，不读就无所谓漂移"
+        );
         let buildah_calls = std::fs::read_to_string(bin_dir.join("buildah.log"))
             .expect("drift must not take the no-op shortcut");
         assert!(
@@ -8455,15 +9839,28 @@ exit 0
         fake_cargo(&bin_dir, ws.target_dir());
         fake_strip(&bin_dir);
 
-        let (endpoint, handle) = fake_registry(vec![
-            http_200(r#"{"schemaVersion":2,"config":{"digest":"sha256:cfg3"}}"#),
-            http_200(
-                r#"{"config":{"Labels":{"org.opencontainers.image.revision":"000000000000abcd"}}}"#,
-            ),
-            // main-<rev> 已存在：直接复用。
+        // 不可变 tag 的期望名只取决于 rev，与监听端口无关，所以路由能先建好。
+        let immutable_tag = main_image("x:1", &rev_b)
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_string();
+        let mut routes = tag_routes(
+            "local",
+            "sha256:local",
+            "sha256:cfg3",
+            &["L1"],
+            "000000000000abcd",
+            "2026-09-26T00:00:00Z",
+        );
+        // main-<rev> 已存在：直接复用，不重建。
+        routes.push((
+            "GET",
+            format!("/v2/cogneva/manifests/{immutable_tag}"),
             http_200("{}"),
-        ])
-        .await;
+        ));
+        let (endpoint, registry_log) = routed_registry(routes).await;
+
         let mut cfg = test_config(root, &bare, &buildah, &kubectl);
         cfg.registry = endpoint;
         let deployer = MainlineDeployer::new(cfg, ws);
@@ -8485,7 +9882,19 @@ exit 0
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
 
-        handle.await.unwrap();
+        // 快路问的是 tag，不是整条镜像引用：把引用塞进 manifest 路径后面，注册表
+        // 收到的 tag 名里就带着 registry 主机，那是一个谁都没有的 tag，快路永远失效
+        // ——而它的失效长得像"这个 rev 没构建过"，只多花一次全程构建，不报错。
+        assert!(
+            requests_seen(&registry_log)
+                .iter()
+                .any(|r| r.starts_with(&format!("GET /v2/cogneva/manifests/{immutable_tag} "))),
+            "复用的前提是问过这个 tag 在不在: {:?}",
+            requests_seen(&registry_log)
+                .iter()
+                .filter_map(|r| r.lines().next())
+                .collect::<Vec<_>>()
+        );
         assert!(
             !bin_dir.join("buildah.log").exists(),
             "an image already in the registry must be reused, not rebuilt"
@@ -8563,12 +9972,14 @@ exit 0
         // 外部 apply 把四部署打回静态清单 pin：registry 浮动签 :local。
         let kubectl = fake_kubectl(&bin_dir, "localhost:30500/cogneva:local");
         // registry 上 :local 的内容确实构建自当前 mainline rev：这才叫收敛。
-        let (endpoint, handle) = fake_registry(vec![
-            http_200(r#"{"schemaVersion":2,"config":{"digest":"sha256:cfg1"}}"#),
-            http_200(&format!(
-                r#"{{"config":{{"Labels":{{"org.opencontainers.image.revision":"{rev_b}"}}}}}}"#
-            )),
-        ])
+        let (endpoint, registry_log) = routed_registry(tag_routes(
+            "local",
+            "sha256:local",
+            "sha256:cfg1",
+            &["L1"],
+            &rev_b,
+            "2026-09-26T00:00:00Z",
+        ))
         .await;
 
         let mut cfg = test_config(root, &bare, &buildah, &kubectl);
@@ -8588,8 +9999,13 @@ exit 0
         .unwrap();
 
         deployer.poll_once().await.unwrap();
-        handle.await.unwrap();
 
+        assert!(
+            requests_seen(&registry_log)
+                .iter()
+                .any(|r| r.contains("/v2/cogneva/manifests/local")),
+            "浮动签的 rev 只能从 registry 上的内容读出来，读都没读就谈不上收敛"
+        );
         assert!(
             !bin_dir.join("buildah.log").exists(),
             "apply pin to current :local must not trigger rebuild"
@@ -9034,7 +10450,6 @@ exit 0
         // 断言（而不是构建本身的报错）成为红灯。
         let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
         let (endpoint, handle) = fake_registry(vec![http_200("{}")]).await;
-        let push_tag = main_image(&endpoint, &rev_b);
         let mut cfg = test_config(root, &bare, &buildah, &kubectl);
         cfg.registry = endpoint;
         let ws = test_workspaces(root, &bare);
@@ -9074,8 +10489,10 @@ exit 0
         // 假 registry 只被问了一次：就是"这个 tag 在不在"。
         let reqs = handle.await.unwrap();
         assert_eq!(reqs.len(), 1);
+        // 问的是 tag，不是整条镜像引用：引用里带着 registry 主机，塞进 manifest
+        // 路径就是一个谁都没有的 tag 名，探针永远答"不在"。
         assert!(
-            reqs[0].contains(&format!("/v2/cogneva/manifests/{push_tag}")),
+            reqs[0].starts_with(&format!("GET /v2/cogneva/manifests/{} ", main_tag(&rev_b))),
             "the one registry read must be the tag-presence probe: {:?}",
             reqs[0]
         );
