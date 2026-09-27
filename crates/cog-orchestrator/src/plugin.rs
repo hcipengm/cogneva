@@ -9,6 +9,8 @@ pub const DAG_CHECKPOINT_LOOP: &str = "orchestrator_dag_checkpoint";
 pub const READY_TASK_PUBLISHER_LOOP: &str = "orchestrator_ready_task_publisher";
 /// Loop name reported through the background-loop liveness family.
 pub const TASK_LEASE_RENEWER_LOOP: &str = "orchestrator_task_lease_renewer";
+/// Loop name reported through the background-loop liveness family.
+pub const TASK_CHECKPOINT_LOOP: &str = "orchestrator_task_checkpoint";
 
 /// Orchestrator plugin that self-assembles the DAG executor and related services.
 pub struct OrchestratorPlugin {
@@ -501,6 +503,79 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             },
                         ));
 
+                        // Task checkpoint producer: the write side of the resume
+                        // chain. A task knows its progress only while it runs, so
+                        // the checkpoint has to be written on a cadence — the
+                        // moment a task is killed or its version is rolled over
+                        // there is no time left to save anything. Every process
+                        // writes checkpoints for the tasks it holds; a process
+                        // holding none (the idle replica, the control-plane pod)
+                        // enumerates nothing and the round is a no-op query.
+                        let checkpoint_store =
+                            ctx.consume_service::<dyn cog_core::CheckpointStore>();
+                        let checkpoint_manager =
+                            ctx.consume_service::<dyn cog_core::AgentManager>();
+                        let checkpoint_interval_secs =
+                            ctx.config().dag_executor.task_checkpoint_interval_secs;
+                        match (checkpoint_store, checkpoint_manager) {
+                            (Some(store), Some(manager)) if checkpoint_interval_secs > 0 => {
+                                let agents =
+                                    Arc::new(crate::LiveCheckpointAgents::new(manager, store));
+                                let checkpoint_shutdown = dag_shutdown.clone();
+                                let checkpoint_orchestrator = self
+                                    .shared_orchestrator
+                                    .clone()
+                                    .expect("shared orchestrator");
+                                let cadence =
+                                    std::time::Duration::from_secs(checkpoint_interval_secs);
+                                drop(cog_core::loop_health::spawn(
+                                    TASK_CHECKPOINT_LOOP,
+                                    cog_core::loop_health::Cadence::Periodic(cadence),
+                                    checkpoint_shutdown.clone(),
+                                    // Rebuilt per attempt, so everything the body consumes is cloned here.
+                                    move |beat| {
+                                        let agents = agents.clone();
+                                        let checkpoint_orchestrator =
+                                            checkpoint_orchestrator.clone();
+                                        let checkpoint_shutdown = checkpoint_shutdown.clone();
+                                        async move {
+                                            let mut interval = tokio::time::interval(cadence);
+                                            interval.set_missed_tick_behavior(
+                                                tokio::time::MissedTickBehavior::Skip,
+                                            );
+                                            loop {
+                                                beat.beat();
+                                                tokio::select! {
+                                                    _ = interval.tick() => {
+                                                        let saved = checkpoint_orchestrator
+                                                            .checkpoint_owned_tasks(agents.as_ref())
+                                                            .await;
+                                                        if saved > 0 {
+                                                            tracing::debug!(
+                                                                saved,
+                                                                "task checkpoint producer wrote resume points"
+                                                            );
+                                                        }
+                                                    }
+                                                    _ = checkpoint_shutdown.wait() => break,
+                                                }
+                                            }
+                                        }
+                                    },
+                                ));
+                            }
+                            // 0 关掉它：不登记一个永远不会做事的循环——「空转」与
+                            // 「这条链在工作」在读数上同形，那正是本链当初的病。
+                            (_, _) if checkpoint_interval_secs == 0 => {
+                                info!("task checkpoint producer disabled by config");
+                            }
+                            _ => {
+                                warn!(
+                                    "task checkpoint producer not started: the agent manager or the checkpoint store is unavailable, so a checkpoint could not be taken or read back"
+                                );
+                            }
+                        }
+
                         // Decomposition orphan reconciler.
                         let reconcile_shutdown = dag_shutdown.clone();
                         let reconcile_runtime = runtime.clone();
@@ -605,7 +680,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "orchestrator",
-    requires: &["storage"],
+    // `agent` is a strong edge because the checkpoint producer reads the agent
+    // manager while this plugin's `init` wires it up: only `requires` orders
+    // `init` in this framework, and a soft edge would leave that read racing the
+    // pool's publish — losing the race does not fail, it silently leaves the
+    // resume chain without its write side, which is the state this edge exists
+    // to end.
+    requires: &["storage", "agent"],
     optional_requires: &["llm", "stream", "collaboration", "extension"],
     factory: || Box::new(OrchestratorPlugin::new()),
 };

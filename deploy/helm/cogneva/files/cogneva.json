@@ -63,6 +63,7 @@
     "COGNEVA_RESULT_CLAIM_BATCH": "dag_executor.result_claim_batch",
     "COGNEVA_DAG_SELF_EVOLUTION_TIMEOUT_SECS": "dag_executor.self_evolution_timeout_secs",
     "COGNEVA_DAG_TASK_LEASE_SECS": "dag_executor.task_lease_secs",
+    "COGNEVA_DAG_TASK_CHECKPOINT_INTERVAL_SECS": "dag_executor.task_checkpoint_interval_secs",
     "COGNEVA_HTTP_PORT": "gateway.http_port",
     "COGNEVA_WS_PORT": "gateway.ws_port",
     "COGNEVA_METRICS_PORT": "gateway.metrics_port",
@@ -275,7 +276,8 @@
     "result_claim_batch": 16,
     "_comment_task_lease_secs": "任务租约时长（秒）：执行者拿到任务时写下「我持有它到此刻」，之后按这一时长的三分之一心跳续期。持有者的进程被换掉后心跳就停，租约到期即判为可回收，任务回到重试而不是卡在 Running 到不了任何终态。取值要大于 system.timeout_checker_interval_secs，否则一次扫描还没到就已被判过期；也不宜太短，比单次任务正常时长还短会误伤正在跑的活。",
     "self_evolution_timeout_secs": 3600,
-    "task_lease_secs": 120
+    "task_lease_secs": 120,
+    "task_checkpoint_interval_secs": 30
   },
   "gateway": {
     "http_port": 8080,
@@ -699,6 +701,33 @@
           },
           "severity": "warning",
           "summary": "The scheduler reclaimed {value} task(s) in the last hour that sat in Scheduled past the transport's own reclaim window without ever starting. Scheduled means one thing — a ready message carrying that task was handed to the bus — so a task still in it after the bus has had every chance to re-deliver is one whose message was consumed without a run. The queue reads clean while this happens: the message was acked, so there is no pending entry and no lag to notice, and the task is invisible from every other reading because the publisher scans Pending and the timeout checker reclaims Running. Each reclaim re-runs the work and charges the task's retry budget, so a recurring count is paying for the same tasks twice; a task out of budget fails and cancels its dependents. Read the task ids and the consumer's log around the time of the message, not the queue"
+        },
+        {
+          "name": "task_checkpoint_not_persisted",
+          "promql": "increase(cogneva_task_checkpoint_total{outcome=\"unpersisted\"}[6h])",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "Agents took {value} snapshot(s) in the last six hours that are not in the checkpoint store, so no resume point was recorded for the tasks they belonged to. An agent without a store still builds a snapshot, emits the event, and returns it; only the save is skipped, and it is skipped silently. The resume pointer is withheld in exactly that case — writing it would name a checkpoint nobody can load — so what is left to read is a task with no resume point, which is the shape of a first run. This is a configuration state rather than a run failure: the agent pool was built without the store, or the store's writes are failing. The tasks themselves lose nothing; they simply cannot be handed over, so a rollout or an eviction re-runs them from the beginning."
+        },
+        {
+          "name": "task_checkpoint_not_superseded",
+          "promql": "increase(cogneva_task_checkpoint_total{outcome=\"unsuperseded\"}[6h])",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "{value} checkpoint(s) could not be deleted after being replaced. The store is meant to hold one checkpoint per agent — each new one deletes the one it replaces, which is what bounds it by the live set instead of by uptime. A delete that fails leaves the old copy behind with no reader: the resume chain still works, nothing else logs anything, and the only symptom is a table growing with every tick until it fills the volume it shares with the task data. Read the delete failure from the checkpoint loop's log line and check the store's disk and connection."
+        },
+        {
+          "name": "task_resume_point_unusable",
+          "promql": "increase(collab_task_resume_total{outcome=\"failed\"}[6h])",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "A task was handed a resume point it could not restore {value} time(s) in the last six hours, so that run started from the beginning. The pointer on the task board names a checkpoint that is gone or unreadable — the store was cleared, a row was deleted while still referenced, or the store is failing reads. A task with no resume point at all is the ordinary first run and is not counted here; this counter is the one reading on which a chain that exists and is broken differs from a chain that was never needed. Read the task and checkpoint ids from the log and check those rows in the store."
         },
         {
           "name": "runtime_asset_not_refreshed",

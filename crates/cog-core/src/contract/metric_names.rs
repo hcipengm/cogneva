@@ -157,6 +157,17 @@ metric_names! {
 
     // cog-orchestrator — task delivery.
     DAG_STALLED_SCHEDULED_RECLAIMED => "cogneva_dag_stalled_scheduled_reclaimed_total",
+
+    // cog-orchestrator — keeping a running task's progress resumable.
+    //
+    // The write side of the resume chain: a task that loses its process (a
+    // version rollout, a killed pod) can only continue from progress that was
+    // already on disk before it died. Labelled by `outcome` because the ways
+    // this fails are not the same defect — a snapshot that never reached the
+    // store is a deployment with no checkpoint store configured, while a failed
+    // call is a run-time fault — and a single counter would report them as one
+    // "checkpointing is broken".
+    TASK_CHECKPOINT => "cogneva_task_checkpoint_total",
 }
 
 /// Whether `name` is a series a build can still write.

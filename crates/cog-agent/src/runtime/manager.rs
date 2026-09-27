@@ -70,6 +70,16 @@ pub struct GlobalAgentManager {
     event_bus_sink: Option<crate::EventBusSink>,
     /// Durable per-task token census sink handed to every spawned worker.
     observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
+    /// Where a worker's checkpoint is persisted when something asks for a
+    /// snapshot.
+    ///
+    /// An agent with no store still answers `snapshot`: it builds the
+    /// checkpoint, emits the event, and returns it. Only the save is skipped,
+    /// and it is skipped silently. Whoever takes that snapshot as evidence of a
+    /// resumable task is then holding an id that resolves to nothing — the
+    /// pointer is written, the read comes back empty, and the run starts over
+    /// exactly as if nothing had ever been checkpointed.
+    checkpoint_store: Option<Arc<dyn cog_core::CheckpointStore>>,
 }
 
 impl GlobalAgentManager {
@@ -101,6 +111,7 @@ impl GlobalAgentManager {
             event_bus: None,
             event_bus_sink: None,
             observability: None,
+            checkpoint_store: None,
         }
     }
 
@@ -172,6 +183,12 @@ impl GlobalAgentManager {
         self
     }
 
+    /// Give every spawned worker the store its snapshots are persisted to.
+    pub fn with_checkpoint_store(mut self, store: Arc<dyn cog_core::CheckpointStore>) -> Self {
+        self.checkpoint_store = Some(store);
+        self
+    }
+
     /// Spawn a new worker agent, register it globally, and start its inbox consumer.
     /// # Arguments
     /// * `agent_id` — unique worker identifier
@@ -216,6 +233,9 @@ impl GlobalAgentManager {
             }
             if let Some(ref ob) = self.observability {
                 a = a.with_observability(ob.clone());
+            }
+            if let Some(ref cp) = self.checkpoint_store {
+                a = a.with_checkpoint_store(cp.clone());
             }
             a
         };
@@ -323,6 +343,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
             }
             if let Some(ref ob) = self.observability {
                 a = a.with_observability(ob.clone());
+            }
+            if let Some(ref cp) = self.checkpoint_store {
+                a = a.with_checkpoint_store(cp.clone());
             }
             a
         };

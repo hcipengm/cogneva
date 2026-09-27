@@ -149,6 +149,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_DAG_TASK_LEASE_SECS".into(),
         "dag_executor.task_lease_secs".into(),
     );
+    m.insert(
+        "COGNEVA_DAG_TASK_CHECKPOINT_INTERVAL_SECS".into(),
+        "dag_executor.task_checkpoint_interval_secs".into(),
+    );
     m.insert("COGNEVA_HTTP_PORT".into(), "gateway.http_port".into());
     m.insert("COGNEVA_WS_PORT".into(), "gateway.ws_port".into());
     m.insert("COGNEVA_METRICS_PORT".into(), "gateway.metrics_port".into());

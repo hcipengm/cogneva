@@ -198,6 +198,17 @@ pub struct DagExecutorConfig {
     pub retry_delay_ms: u64,
     #[serde(default = "default_ready_task_poll_interval_secs")]
     pub ready_task_poll_interval_secs: u64,
+    /// How often the process holding a task writes a checkpoint of that task's
+    /// progress (seconds), so a task that loses its process can be resumed
+    /// instead of re-run from the start.
+    ///
+    /// The write has to happen while the task runs: what a task is killed by —
+    /// a version rollout, an evicted pod, a spent memory limit — never leaves
+    /// time for a last write on the way out. This interval is therefore the
+    /// bound on how much progress a handover loses, and it is paid for by a
+    /// snapshot command per agent per tick.
+    #[serde(default = "default_task_checkpoint_interval_secs")]
+    pub task_checkpoint_interval_secs: u64,
     /// How long a task may sit in `Scheduled` before the publisher treats its
     /// ready message as lost and puts the task back on the queue (seconds).
     ///
@@ -361,6 +372,7 @@ impl Default for DagExecutorConfig {
             max_retries: 3,
             retry_delay_ms: 1000,
             ready_task_poll_interval_secs: default_ready_task_poll_interval_secs(),
+            task_checkpoint_interval_secs: default_task_checkpoint_interval_secs(),
             scheduled_task_stall_secs: default_scheduled_task_stall_secs(),
             batch_persistence_enabled: default_batch_persistence_enabled(),
             batch_persistence_max_changes: default_batch_persistence_max_changes(),
@@ -517,6 +529,14 @@ fn default_request_timeout_secs() -> u64 {
 }
 fn default_ready_task_poll_interval_secs() -> u64 {
     0
+}
+/// 检查点节拍：进度最多丢这么久。
+///
+/// 取值不是拍脑袋的：它是「一次检查点的开销」与「可接受的重跑时长」之间的
+/// 取舍，而重跑的上界由任务自己的预算决定——30s 意味着一次换版最多让每个在跑
+/// 任务白跑半分钟，代价小于更密的快照对 agent 命令通道的占用。
+fn default_task_checkpoint_interval_secs() -> u64 {
+    30
 }
 fn default_scheduled_task_stall_secs() -> u64 {
     DEFAULT_READY_CLAIM_IDLE_SECS

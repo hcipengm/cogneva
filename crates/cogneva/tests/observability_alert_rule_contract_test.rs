@@ -143,6 +143,21 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_dag_stalled_scheduled_reclaimed_total",
         "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
     ),
+    // Keeping a running task resumable, read on both ends. The producer's four
+    // outcomes are separate cells because the two failures they describe are
+    // different incidents: a snapshot that never reached the store means no
+    // resume point was recorded at all (the chain's write side is not there),
+    // while one that could not be deleted means the store grows by one row per
+    // agent per tick. The consumer's outcome is the only reading that tells a
+    // resume point which could not be used from a task that never had one.
+    (
+        "cogneva_task_checkpoint_total",
+        "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
+    ),
+    (
+        "collab_task_resume_total",
+        "crates/cog-collaboration/src/observable.rs",
+    ),
     // The loop liveness family. The age is derived at scrape time from a stamp
     // the loop leaves behind — which is the point: a loop that died stops
     // stamping and its own series cannot report that, so the reading has to come

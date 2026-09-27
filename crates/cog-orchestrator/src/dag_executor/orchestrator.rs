@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use super::circuit_registry::CircuitBreakerRegistry;
 use super::retry_matrix::RetryMatrix;
+use super::task_checkpoint::{self, checkpoint_task, CheckpointAgents, CheckpointRound};
 use super::task_phase::PhasedTask;
 use cog_core::{DeadLetterEntry, DeadLetterQueue, RetryAttempt, SuggestedAction};
 
@@ -2140,6 +2141,92 @@ impl DagExecutor {
             }
         }
         Ok(renewed)
+    }
+
+    /// 为本进程持有的在跑任务落检查点，并把续跑指针挂到各自的板上。
+    ///
+    /// 枚举面与续期同源（租约在本进程名下的 `Running` 任务）：续期证明「这些任务
+    /// 是我的」，而检查点写的是同一批任务——两处对「我的」的定义必须是同一个，
+    /// 否则会给别人的任务写续跑点。
+    ///
+    /// 返回本轮真正写下的续跑点数。
+    pub async fn checkpoint_owned_tasks(&self, agents: &dyn CheckpointAgents) -> usize {
+        let Some(state) = self.state_backend.clone() else {
+            tracing::debug!(
+                "no state backend attached: a checkpoint would have nowhere to hang its resume pointer"
+            );
+            return 0;
+        };
+        let mut saved = 0usize;
+        for task_id in self.owned_running_tasks().await {
+            let round = checkpoint_task(&task_id, agents, &state).await;
+            saved += round.saved;
+            self.record_task_checkpoint(&round).await;
+        }
+        saved
+    }
+
+    /// 本进程持有的在跑任务 id。
+    ///
+    /// 持有者就是本进程的运行身份（`run_id`），没有第二份注册表：进程消亡时它
+    /// 随之失效，这正是「这一份进度已经没人管了」可以被读出来的方式。
+    async fn owned_running_tasks(&self) -> Vec<String> {
+        let owner = self.run_id.as_str();
+        let ours = |task: &Task| {
+            task.status == TaskStatus::Running && task.lease_owner.as_deref() == Some(owner)
+        };
+        if let Some(be) = self.fg() {
+            return be
+                .dag_get_all_tasks(&self.workspace_id)
+                .await
+                .map(|all| {
+                    all.iter()
+                        .filter(|t| ours(t))
+                        .map(|t| t.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        let inner = self.inner.read().await;
+        inner
+            .tasks
+            .values()
+            .filter(|t| ours(t))
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// 产出侧自己的读数。四个量各记各的（标签 `outcome`），失败不与成功共用
+    /// 同一个计数器——那正是「修好了」与「没修好」分不开的方式。
+    async fn record_task_checkpoint(&self, round: &CheckpointRound) {
+        // 静默轮也记：「这一轮没有要写的」与「这个任务没有产出方」是两件事，
+        // 只在有 agent 时计数的话，第二种情况在读数上不存在。
+        let backend = self
+            .metrics
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(backend) = backend else {
+            tracing::debug!(
+                saved = round.saved,
+                unpersisted = round.unpersisted,
+                failed = round.failed,
+                "task checkpoints written; no metrics backend attached"
+            );
+            return;
+        };
+        for (outcome, value) in task_checkpoint::outcome_counts(round) {
+            if value == 0.0 {
+                continue;
+            }
+            let labels = HashMap::from([("outcome".to_string(), outcome.to_string())]);
+            if let Err(e) = backend
+                .record_counter(cog_core::metric_names::TASK_CHECKPOINT, value, labels)
+                .await
+            {
+                tracing::warn!(error = %e, outcome, "cannot record the task checkpoint count");
+            }
+        }
     }
 
     fn emit_reclaim(&self, task: &Task, cause: &ReclaimCause) {

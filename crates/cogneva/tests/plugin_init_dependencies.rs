@@ -40,6 +40,12 @@ const INIT_CONSUMES: &[(&str, &str)] = &[
     // the "wired but ineffective" state the binding exists to end.
     // SkillRegistry
     ("agent", "skill"),
+    // AgentManager — the pool is resolved inside init to wire the checkpoint
+    // producer's roster lookup. Read earlier than the producer's first tick on
+    // purpose: an edge that resolved lazily would look the same as a pool that
+    // never published, and the failure would be a resume chain with no write
+    // side rather than a startup diagnostic.
+    ("orchestrator", "agent"),
 ];
 
 /// Every plugin `name` transitively depends on.

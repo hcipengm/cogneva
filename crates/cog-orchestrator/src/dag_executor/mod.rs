@@ -16,12 +16,16 @@ pub const ORPHAN_RECONCILER_LOOP: &str = "orchestrator_orphan_reconciler";
 pub mod circuit_registry;
 pub mod orchestrator;
 pub mod retry_matrix;
+pub mod task_checkpoint;
 pub mod task_phase;
 pub mod task_transfer;
 
 pub use circuit_registry::CircuitBreakerRegistry;
 pub use orchestrator::DagExecutor;
 pub use retry_matrix::{BackoffStrategy, CircuitBreakerConfig, RetryConfig, RetryMatrix};
+pub use task_checkpoint::{
+    checkpoint_task, CheckpointAgents, CheckpointRound, LiveCheckpointAgents,
+};
 pub use task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 pub use task_transfer::{
     RecoveredTask, StaleTaskDetector, TaskTransferCoordinator, TaskTransferEvent, TransferReason,

@@ -74,6 +74,12 @@ pub struct CollaborationObservable {
     /// along; when one stops, the rows still come back and only this face says
     /// they now name the run instead of the work.
     goal_class_sources: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Resume outcomes, over the closed set in [`crate::resume::RESUME_OUTCOMES`].
+    /// The chain whose absence this measures is silent by construction: a task
+    /// whose progress was never resumed simply starts again, which is what a
+    /// first run looks like. Both cells are published so "no resume ever
+    /// happened" and "nothing needed resuming" stay different readings.
+    resume_outcomes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -122,6 +128,17 @@ impl CollaborationObservable {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry((stage.to_string(), mode.to_string()))
             .or_insert(0) += 1;
+    }
+
+    /// Record one resume outcome. A synchronous lock: this counter is the only
+    /// evidence that a resumed task was resumed at all, so a dropped count
+    /// would read as a chain that never ran.
+    pub fn record_resume(&self, outcome: &str) {
+        let mut map = self
+            .resume_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(outcome.to_string()).or_insert(0) += 1;
     }
 
     /// Record one declared scale, counted by tier name. The tiers published for
@@ -283,6 +300,20 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("collab_goal_class_source_total", count as f64)
                         .with_label("source", source.as_str()),
+                );
+            }
+
+            // 续跑链的恢复端：每个结局都发布，零也发布。
+            let resumes = self
+                .resume_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for outcome in crate::resume::RESUME_OUTCOMES {
+                let count = resumes.get(outcome).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("collab_task_resume_total", count as f64)
+                        .with_label("outcome", outcome),
                 );
             }
 

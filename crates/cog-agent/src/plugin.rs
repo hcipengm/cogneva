@@ -286,6 +286,22 @@ impl cog_core::SystemPlugin for AgentPlugin {
             pool_builder = pool_builder.with_external_skill_registry(esr.clone());
         }
         pool_builder = pool_builder.with_observability(observability);
+        // 检查点存储：把快照交给 agent 的落盘那一半。缺了它，快照照样返回、
+        // 事件照样发、日志照样绿，只有 save 那一步不存在——于是「可续跑的
+        // 进度」这个说法在生产里没有任何一份实物，而所有面看起来都装好了。
+        // 存储插件一定发布它（Postgres 或文件），所以这里是硬要求，不是可选。
+        match ctx.require_service::<dyn cog_core::CheckpointStore>() {
+            Ok(store) => {
+                pool_builder = pool_builder.with_checkpoint_store(store);
+                info!("AgentPlugin agent pool attached to the checkpoint store");
+            }
+            Err(e) => {
+                if ctx.config().system.strict_persistence {
+                    return Err(e);
+                }
+                warn!(error = %e, "checkpoint store unavailable; snapshots are taken but not persisted");
+            }
+        }
         // 角色 → 技能：技能面里那个 max_iterations 在此之前是个死值——被装进
         // 注册表、被 extractor 校验、被 promoter 改写，运行时却没有任何读点。
         // 这里把它交到建 agent 的那一跳，技能预算才真的生效。

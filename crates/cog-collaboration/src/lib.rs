@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod meta_features;
 pub mod observable;
 pub mod profile;
+pub mod resume;
 pub mod squad;
 
 pub use actors::{ModeratorDecision, ModeratorOutput};

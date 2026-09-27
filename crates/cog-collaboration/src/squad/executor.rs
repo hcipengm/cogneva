@@ -390,9 +390,14 @@ impl SquadExecutor {
                     history: Vec::new(),
                 };
             };
-            let planner = match manager
-                .create_agent(&format!("{}-planner", squad.id), "planner", llm.clone())
-                .await
+            let planner = match crate::resume::create_role_agent(
+                manager,
+                llm,
+                deps.state_backend.as_ref(),
+                &squad.task_id,
+                "planner",
+            )
+            .await
             {
                 Ok(agent) => agent,
                 Err(e) => {
@@ -437,9 +442,14 @@ impl SquadExecutor {
                     history: Vec::new(),
                 };
             };
-            let generator = match manager
-                .create_agent(&format!("{}-generator", squad.id), "generator", llm.clone())
-                .await
+            let generator = match crate::resume::create_role_agent(
+                manager,
+                llm,
+                deps.state_backend.as_ref(),
+                &squad.task_id,
+                "generator",
+            )
+            .await
             {
                 Ok(agent) => agent,
                 Err(e) => {
@@ -451,9 +461,14 @@ impl SquadExecutor {
                     };
                 }
             };
-            let evaluator = match manager
-                .create_agent(&format!("{}-evaluator", squad.id), "evaluator", llm.clone())
-                .await
+            let evaluator = match crate::resume::create_role_agent(
+                manager,
+                llm,
+                deps.state_backend.as_ref(),
+                &squad.task_id,
+                "evaluator",
+            )
+            .await
             {
                 Ok(agent) => agent,
                 Err(e) => {
@@ -519,25 +534,41 @@ impl SquadExecutor {
 
         let (planner, generator, evaluator, moderator) = match (agent_manager, llm_provider) {
             (Some(manager), Some(llm)) => {
-                let planner_id = format!("{}-planner", squad.id);
-                let generator_id = format!("{}-generator", squad.id);
-                let evaluator_id = format!("{}-evaluator", squad.id);
-                let moderator_id = format!("{}-moderator", squad.id);
-
-                let planner = manager
-                    .create_agent(&planner_id, "planner", llm.clone())
-                    .await;
-                let generator = manager
-                    .create_agent(&generator_id, "generator", llm.clone())
-                    .await;
-                let evaluator = manager
-                    .create_agent(&evaluator_id, "evaluator", llm.clone())
-                    .await;
+                let state = deps.state_backend.as_ref();
+                let planner = crate::resume::create_role_agent(
+                    manager,
+                    llm,
+                    state,
+                    &squad.task_id,
+                    "planner",
+                )
+                .await;
+                let generator = crate::resume::create_role_agent(
+                    manager,
+                    llm,
+                    state,
+                    &squad.task_id,
+                    "generator",
+                )
+                .await;
+                let evaluator = crate::resume::create_role_agent(
+                    manager,
+                    llm,
+                    state,
+                    &squad.task_id,
+                    "evaluator",
+                )
+                .await;
                 // Moderator is optional — failure to create it is non-fatal.
-                let moderator = manager
-                    .create_agent(&moderator_id, "moderator", llm.clone())
-                    .await
-                    .ok();
+                let moderator = crate::resume::create_role_agent(
+                    manager,
+                    llm,
+                    state,
+                    &squad.task_id,
+                    "moderator",
+                )
+                .await
+                .ok();
 
                 match (planner, generator, evaluator) {
                     (Ok(p), Ok(g), Ok(e)) => (Some(p), Some(g), Some(e), moderator),
@@ -658,10 +689,14 @@ impl SquadExecutor {
                         if let (Some(manager), Some(llm)) =
                             (agent_manager.as_ref(), llm_provider.as_ref())
                         {
-                            let merger_id = format!("{}-merger", squad.id);
-                            match manager
-                                .create_agent(&merger_id, "merger", llm.clone())
-                                .await
+                            match crate::resume::create_role_agent(
+                                manager,
+                                llm,
+                                deps.state_backend.as_ref(),
+                                &squad.task_id,
+                                "merger",
+                            )
+                            .await
                             {
                                 Ok(agent) => {
                                     let mut merger_actor = crate::actors::MergerActor::new(agent);
