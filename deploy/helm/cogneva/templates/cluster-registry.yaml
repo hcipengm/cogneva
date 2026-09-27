@@ -117,6 +117,12 @@ spec:
         # 量要比的量，只能由挂载着这张卷的进程走查出来。
         - name: volume-walker
           image: {{ include "cogneva.image" . }}
+          # 子命令是这里的全部内容：不带它，镜像入口跑的是完整应用，而这个 Pod 里
+          # 没有 Redis 也没有配置面，进程在装配阶段就退——边车 CrashLoop，卷占用这条
+          # 序列永远不会出现。清单和二进制是两份可以分开到达的东西，所以"跑的是走查
+          # 模式"只能由命令行说出来，不能靠镜像默认。
+          command: ["/opt/cogneva/cogneva"]
+          args: ["volume-walker"]
           # 这里不用 .Values.image.pullPolicy（浮动签取 Always）：本 Pod 的另一个
           # 容器就是那个 registry，Always 等于让这个 Pod 起来之前先向自己拉镜像
           # ——Recreate 时旧 Pod 已删，拉取必然失败，Pod 永远起不来，整条镜像分发
