@@ -132,13 +132,62 @@ fn terminal_backoff_delay(consecutive: u32, base_secs: u64) -> std::time::Durati
     std::time::Duration::from_secs(secs)
 }
 
-/// Per-intent backoff state after terminal upstream failures. In-memory
-/// only: a pod restart costs at most one fresh failed probe per intent
-/// before the window re-establishes.
+/// Per-intent backoff state after terminal upstream failures. The window
+/// itself is in-memory; the streak and the moment it ends are written to the
+/// guard file, because this process restarts on every rollout and the cost of
+/// forgetting is a fresh probe per intent per restart — a rate that follows
+/// the deployment cadence rather than anything about the intents.
 #[derive(Debug)]
 struct TerminalBackoff {
     consecutive: u32,
     skip_until: std::time::Instant,
+}
+
+/// A window in the form a file can hold. `Instant` only means something inside
+/// one boot, so what is written down is the absolute moment the window ends;
+/// the window is rebuilt from the distance to it, which is what actually
+/// mattered.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedBackoff {
+    consecutive: u32,
+    #[serde(default)]
+    skip_until_unix: u64,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl TerminalBackoff {
+    fn persisted(&self) -> PersistedBackoff {
+        PersistedBackoff {
+            consecutive: self.consecutive,
+            skip_until_unix: now_unix()
+                + self
+                    .skip_until
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs(),
+        }
+    }
+
+    /// Rebuild a window written by a previous boot. A window that ended while
+    /// this process was not running is not resurrected (it restores to zero
+    /// remaining), and the remaining distance is capped like any other window:
+    /// a clock that jumped, or a file someone edited, must not park an intent
+    /// for longer than the backoff itself is allowed to run.
+    fn restored(p: &PersistedBackoff) -> Self {
+        let remaining = p
+            .skip_until_unix
+            .saturating_sub(now_unix())
+            .min(TERMINAL_BACKOFF_CAP_SECS);
+        TerminalBackoff {
+            consecutive: p.consecutive,
+            skip_until: std::time::Instant::now() + std::time::Duration::from_secs(remaining),
+        }
+    }
 }
 
 /// The autonomous GitHub sensor loop.
@@ -219,6 +268,14 @@ struct DiscoveryGuardState {
     awaiting_clarification: std::collections::HashSet<String>,
     #[serde(default)]
     ci_submitted: std::collections::HashSet<u64>,
+    /// Backoff windows in force when the file was written. Carried across
+    /// restarts for the same reason the verdicts are: the process that
+    /// restarted is not a different system, and a window that was open is
+    /// still open.
+    #[serde(default)]
+    terminal_backoff: HashMap<String, PersistedBackoff>,
+    #[serde(default)]
+    redrive_backoff: HashMap<String, PersistedBackoff>,
 }
 
 fn discovery_guard_state_path() -> std::path::PathBuf {
@@ -546,6 +603,20 @@ impl GitHubDiscoveryLoop {
                 self.awaiting_clarification
                     .extend(state.awaiting_clarification);
                 self.ci_submitted.extend(state.ci_submitted);
+                // A window already open in this process wins: this load runs
+                // once, before any round, so an entry here can only be one
+                // this process set — and re-restoring it from the file would
+                // move its end backwards.
+                for (key, b) in state.terminal_backoff {
+                    self.terminal_backoff
+                        .entry(key)
+                        .or_insert_with(|| TerminalBackoff::restored(&b));
+                }
+                for (key, b) in state.redrive_backoff {
+                    self.redrive_backoff
+                        .entry(key)
+                        .or_insert_with(|| TerminalBackoff::restored(&b));
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "discovery guard state corrupt; starting fresh")
@@ -553,14 +624,25 @@ impl GitHubDiscoveryLoop {
         }
     }
 
-    /// Best-effort persist of the intent guards. A write failure only means
-    /// the next restart may re-see handled intents; the platform-side comment
-    /// scan remains the backstop against double-posting.
+    /// Best-effort persist of the intent guards and the open backoff windows.
+    /// A write failure only means the next restart may re-see handled intents
+    /// and re-probe the ones it was backing off; the platform-side comment scan
+    /// remains the backstop against double-posting.
     async fn persist_guards(&self) {
         let state = DiscoveryGuardState {
             submitted: self.submitted.clone(),
             awaiting_clarification: self.awaiting_clarification.clone(),
             ci_submitted: self.ci_submitted.clone(),
+            terminal_backoff: self
+                .terminal_backoff
+                .iter()
+                .map(|(k, v)| (k.clone(), v.persisted()))
+                .collect(),
+            redrive_backoff: self
+                .redrive_backoff
+                .iter()
+                .map(|(k, v)| (k.clone(), v.persisted()))
+                .collect(),
         };
         let Ok(json) = serde_json::to_string_pretty(&state) else {
             return;
@@ -2161,6 +2243,100 @@ mod tests {
         assert!(!is_terminal_failure(&CogGitHubError::Provider(
             String::new()
         )));
+    }
+
+    /// A backoff window is a fact about the intent, not about this process, so
+    /// it has to outlive the process. This one restarts on every rollout, and
+    /// a window that forgets means every intent that was backing off is probed
+    /// again immediately — a rate set by the deployment cadence rather than by
+    /// anything the intents did.
+    #[tokio::test]
+    async fn open_backoff_windows_survive_a_restart() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+
+        let quota = CogGitHubError::Upstream(SFError::upstream_refused(
+            UpstreamFailure::QuotaExhausted,
+            "weekly limit",
+        ));
+        let build = || {
+            GitHubDiscoveryLoop::new(
+                Arc::new(MockProvider {
+                    issues: vec![],
+                    comments: Mutex::new(vec![]),
+                    ci_logs: vec![],
+                    ci_runs: Mutex::new(vec![]),
+                    prs: vec![],
+                    pr_details: HashMap::new(),
+                }),
+                IssueTriage::rules_only(),
+                config(),
+                Some(Arc::new(MockOrchestrator::new())),
+                None,
+            )
+        };
+
+        let mut first = build();
+        first.note_processing_failure("issue:7", "issue", 7, &quota);
+        first.note_redrive("issue:7");
+        assert!(first.in_terminal_backoff("issue:7"));
+        assert!(first.in_redrive_backoff("issue:7"));
+        first.persist_guards().await;
+
+        let mut second = build();
+        second.load_guards_once().await;
+        assert!(
+            second.in_terminal_backoff("issue:7"),
+            "an open terminal window must still be open after a restart"
+        );
+        assert!(
+            second.in_redrive_backoff("issue:7"),
+            "an open re-drive window must still be open after a restart"
+        );
+        // The streak is what makes the next window longer; losing it would
+        // restart the schedule at the base delay on every rollout.
+        assert_eq!(second.terminal_backoff["issue:7"].consecutive, 1);
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// The other direction, so the first test cannot pass by restoring every
+    /// entry it is handed: a window whose end has passed is not resurrected by
+    /// loading it. Without this, a stale file would park an intent that the
+    /// backoff itself had already released.
+    #[tokio::test]
+    async fn an_expired_backoff_window_is_not_resurrected() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let stale = serde_json::json!({
+            "terminal_backoff": {"issue:9": {"consecutive": 4, "skip_until_unix": 1}},
+            "redrive_backoff": {"issue:9": {"consecutive": 4, "skip_until_unix": 1}},
+        });
+        tokio::fs::write(discovery_guard_state_path(), stale.to_string())
+            .await
+            .unwrap();
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(Arc::new(MockOrchestrator::new())),
+            None,
+        );
+        loop_.load_guards_once().await;
+        assert!(!loop_.in_terminal_backoff("issue:9"));
+        assert!(!loop_.in_redrive_backoff("issue:9"));
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     /// 任务失败的类型从记录原样回到错误对象上，判定因此按类型走。没有类型的
