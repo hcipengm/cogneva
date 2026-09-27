@@ -1043,7 +1043,7 @@ data:
           "buffer_max_bytes": 16777216
         },
         "data_volume_watch": {
-          "_comment": "应用数据目录的占用量由写它的进程自己量成 gauge cogneva_data_volume_used_bytes 并带上卷名，规则拿它除以 kube-state-metrics 报的 requests.storage。同一份 cogneva.json 挂给多个 Pod，各自挂的卷不是同一张，所以卷名由各部署用自己的 env 指名（COGNEVA_DATA_VOLUME_CLAIM），不写在这里；claim 为空即整个观测关闭。",
+          "_comment": "应用数据目录的占用量由写它的进程自己量成 gauge cogneva_data_volume_used_bytes 并带上卷名，规则拿它除以 kube-state-metrics 报的 requests.storage。同一份 cogneva.json 挂给多个 Pod，各自挂的卷不是同一张，所以卷名由各部署用自己的 env 指名（COGNEVA_DATA_VOLUME_CLAIM），不写在这里；claim 为空即整个观测关闭。没有应用数据目录、只有挂载表的进程（独立子命令与边车）用 COGNEVA_DATA_VOLUME_MOUNTS 的 claim=路径 列表声明，卷名就在那一行里；这条序列只能由挂载着该卷的进程走查产出——问得出来的那份是另一个量（引用字节），不是盘上占用。",
           "interval_secs": 300
         }
       },

@@ -87,6 +87,61 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/registry
+        # 只读走查这张卷的边车：第三方 registry 进程不发布任何指标，而占满这张卷
+        # 的是盘上全部字节（它 API 报的"活 tag 引用的层"看不见孤儿层）。盘上那份
+        # 是声明量要比的量，只能由挂载着这张卷的进程走查出来。
+        - name: volume-walker
+          image: localhost:30500/cogneva:local
+          # 不用 Always（浮动签的默认策略）：本 Pod 的另一个容器就是那个 registry，
+          # Always 等于让这个 Pod 起来之前先向自己拉镜像——Recreate 时旧 Pod 已删，
+          # 拉取必然失败，Pod 永远起不来，整条镜像分发通道跟着断。节点缓存由分发面
+          # 保证（元启动播种 + 每节点 importer），而这份清单只会由正在运行新 rev 的
+          # 进化 Pod 应用，那一刻节点已持有该镜像。
+          imagePullPolicy: IfNotPresent
+          env:
+            # 声明照卷族既有格式写（`claim=路径`），量出来的数挂在同名卷上，
+            # 与其它工作负载自量挂载产出的是同一条序列。
+            - name: COGNEVA_DATA_VOLUME_MOUNTS
+              value: "cogneva-registry-pvc=/var/lib/registry"
+            - name: COGNEVA_VOLUME_WALKER_PORT
+              value: "9100"
+          ports:
+            - name: http
+              containerPort: 9100
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            # 只读：走查不需要写权，挂成只读让"量一下"这件事不可能改到 store。
+            - name: data
+              mountPath: /var/lib/registry
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -102,6 +157,15 @@ metadata:
     app.kubernetes.io/component: cluster-registry
 spec:
   type: NodePort
+  # 端点不看就绪：这个 Service 分发的是节点要拉取的镜像，而 Pod 的就绪还取决于
+  # 走查边车那个容器。边车要跑的是"带 volume-walker 子命令的二进制"，而清单可能
+  # 先于节点缓存到达（部署器先推进裸仓、再滚四部署，GitOps 拉取端在这中间就会
+  # apply 本文件），此刻它只能拿到旧二进制、起来就退，Pod 因此 NotReady——没有
+  # 端点，节点拉不到新层，而新层正是让边车能起来的那份，分发通道被自己的边缘
+  # 卡死。放开这一个字段，边车起不来只是"读数暂时没有"：registry 照常服务，
+  # 节点缓存被 importer 推进后，边车下一次重试就拿到新二进制。就绪与否仍照常
+  # 记在 Deployment 上，容器在 CrashLoop，问题没有被藏起来。
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: cluster-registry
@@ -110,4 +174,10 @@ spec:
       port: 5000
       targetPort: registry
       nodePort: 30500
+      protocol: TCP
+    # 监控抓取面。端点名 `http` 就是发现规则：ServiceMonitor 按端口名选端点，
+    # 换个名字等于这条抓取配置不存在，而"没有告警"和"没人在抓"在这里长得一样。
+    - name: http
+      port: 9100
+      targetPort: http
       protocol: TCP

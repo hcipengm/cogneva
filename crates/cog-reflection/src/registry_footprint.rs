@@ -8,21 +8,25 @@
 //! node's filesystem, which reads 689 GB for every volume in this cluster,
 //! a 10 GiB claim among them.
 //!
-//! The party that does know is the store itself. Every tag the registry serves
-//! resolves to a manifest naming the config and layer blobs it references, each
-//! with its size, and the bytes those blobs occupy are what the volume is
-//! holding. So this reading is taken from the owner through the registry's own
-//! API rather than from a neighbouring filesystem, and it is published under the
-//! volume family's series and label: one wall per claim, compared against the
-//! declared size by the same rule as every other volume.
+//! The party that does know what the store is *holding by reference* is the store
+//! itself. Every tag the registry serves resolves to a manifest naming the config
+//! and layer blobs it references, each with its size, so a walk over the tag list
+//! adds those up without touching the filesystem. That is what this module
+//! publishes, and it is not the same quantity as the volume's occupancy: a blob no
+//! tag references any more is invisible here and still occupies the disk. The
+//! volume family's series -- the one the declared-size rule divides -- is
+//! therefore published by a walker inside the registry pod, where the whole store
+//! is visible, rather than from this number.
 //!
-//! Two quantities it deliberately leaves out, both because the API does not
-//! expose them: the store's own metadata (manifests and upload bookkeeping --
-//! megabytes against the gigabytes that matter) and blobs no tag references any
-//! more. The second is why reclaiming bytes belongs to the code that knows which
-//! tags it removed rather than to a watcher of this number: after a deletion the
-//! blobs stay on disk until something unlinks them, and this reading would go on
-//! counting the volume as full, which is right.
+//! Two things it deliberately leaves out, both because the API does not expose
+//! them: the store's own metadata (manifests and upload bookkeeping -- megabytes
+//! against the gigabytes that matter) and the unreferenced blobs above. The second
+//! is why reclaiming bytes belongs to the code that knows which tags it removed
+//! rather than to a watcher of this number: after a deletion the blobs stay on
+//! disk until something unlinks them, and this reading would go on counting the
+//! volume as full, which is right -- but the volume is genuinely full meanwhile,
+//! and the gap between the two readings is exactly the mass nothing has
+//! reclaimed.
 //!
 //! Who measures, and why it is the same process that pushes: the deployer's
 //! `buildah push` is the registry's only writer. One writer reading its own
@@ -44,7 +48,24 @@ use tracing::{info, warn};
 
 use crate::mainline_deployer::{endpoint_host_port, parse_http_response, IMAGE_REPOSITORY};
 
-pub use cog_core::claim_footprint::USED_METRIC;
+/// Bytes the store's tags reference, published under its own name.
+///
+/// It is deliberately *not* the volume family's series. That family answers "how
+/// much of this claim is in use", which is what the rule comparing it against the
+/// declared size decides on, and this number answers a narrower question: what the
+/// store says it is holding. The two are not the same quantity and the difference
+/// is not rounding -- a blob no tag references any more stays on disk and this
+/// walk cannot see it at all, so on 2026-09-27 this reading was 3.74 GiB while
+/// the same volume occupied 7.4 GiB of a 10 GiB claim. Publishing that under the
+/// volume family's name made the rule for that claim read 37% on a volume that was
+/// 74% full, and it reads further and further low as tags accumulate.
+///
+/// The occupancy reading for that claim comes from a walker in the registry pod,
+/// which is the only place the whole store is visible. What this series is for is
+/// the gap between the two: bytes on disk minus bytes referenced is what no
+/// deletion has reclaimed, which is the quantity a retention policy has to drive
+/// down and had no reading for.
+pub const REFERENCED_BYTES_METRIC: &str = "cogneva_registry_referenced_bytes";
 
 /// How many tags the repository serves, published beside the bytes.
 ///
@@ -344,8 +365,8 @@ impl Observable for RegistryFootprint {
         let Some(bytes) = self.value() else {
             return Ok(Vec::new());
         };
-        let mut out =
-            vec![RawMetric::new(USED_METRIC, bytes as f64).with_label(CLAIM_LABEL, self.claim())];
+        let mut out = vec![RawMetric::new(REFERENCED_BYTES_METRIC, bytes as f64)
+            .with_label(CLAIM_LABEL, self.claim())];
         if let Some(tags) = self.tags() {
             out.push(RawMetric::new(TAG_COUNT_METRIC, tags as f64));
         }
@@ -391,7 +412,7 @@ pub fn spawn_watch(
                     endpoint = %footprint.endpoint(),
                     claim = %footprint.claim(),
                     interval_secs = interval.as_secs(),
-                    metric = USED_METRIC,
+                    metric = REFERENCED_BYTES_METRIC,
                     "registry footprint watcher started"
                 );
                 let mut ticker = tokio::time::interval(interval);
@@ -407,7 +428,7 @@ pub fn spawn_watch(
                                 Ok(bytes) => info!(
                                     bytes,
                                     tags = footprint.tags().unwrap_or(0),
-                                    metric = USED_METRIC,
+                                    metric = REFERENCED_BYTES_METRIC,
                                     "registry footprint measured"
                                 ),
                                 // The last reading stands and its age grows, which is
@@ -703,7 +724,7 @@ mod tests {
         let metrics = footprint.collect_metrics("").await.unwrap();
         let used = metrics
             .iter()
-            .find(|m| m.name == USED_METRIC)
+            .find(|m| m.name == REFERENCED_BYTES_METRIC)
             .expect("the footprint series");
         assert_eq!(
             used.labels.get(CLAIM_LABEL).map(String::as_str),

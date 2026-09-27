@@ -69,6 +69,63 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/registry
+        # 只读走查这张卷的边车。它存在的理由只有一条：这张卷的写者是一个第三方
+        # registry 进程，它不发布任何指标，也没有我们自己的进程在这个 Pod 里量
+        # 挂载——而占满这张卷的是盘上全部字节，registry 的 API 报的是"活 tag 引用
+        # 的层"，孤儿层它看不见（实测同一时刻 3.74GiB vs 7.4GiB）。盘上那份是声明
+        # 量要比的量，只能由挂载着这张卷的进程走查出来。
+        - name: volume-walker
+          image: localhost:30500/cogneva:local
+          # 这里不用 .Values.image.pullPolicy（浮动签取 Always）：本 Pod 的另一个
+          # 容器就是那个 registry，Always 等于让这个 Pod 起来之前先向自己拉镜像
+          # ——Recreate 时旧 Pod 已删，拉取必然失败，Pod 永远起不来，整条镜像分发
+          # 通道跟着断。节点缓存由分发面保证（元启动播种 + 每节点 importer），而
+          # 这份清单只会由正在运行新 rev 的进化 Pod 应用，那一刻节点已持有该镜像。
+          imagePullPolicy: IfNotPresent
+          env:
+            # 声明照卷族既有格式写（`claim=路径`），量出来的数就挂在同名卷上，
+            # 与其它工作负载自量挂载产出的是同一条序列。
+            - name: COGNEVA_DATA_VOLUME_MOUNTS
+              value: "cogneva-registry-pvc=/var/lib/registry"
+            - name: COGNEVA_VOLUME_WALKER_PORT
+              value: "9100"
+          ports:
+            - name: http
+              containerPort: 9100
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            failureThreshold: 6
+            periodSeconds: 20
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            failureThreshold: 6
+            periodSeconds: 10
+            timeoutSeconds: 10
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 20m
+              memory: 64Mi
+          volumeMounts:
+            # 只读：走查不需要写权，挂成只读让"量一下"这件事不可能改到 store。
+            - name: data
+              mountPath: /var/lib/registry
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:

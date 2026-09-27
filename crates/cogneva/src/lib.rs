@@ -17,6 +17,7 @@ pub mod platform;
 pub mod plugin_registry;
 pub mod shutdown_coordinator;
 pub mod validate_config;
+pub mod volume_walker;
 
 #[cfg(windows)]
 pub mod windows_service;

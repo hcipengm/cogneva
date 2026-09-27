@@ -15,6 +15,15 @@ metadata:
     app.kubernetes.io/component: cluster-registry
 spec:
   type: NodePort
+  # 端点不看就绪：这个 Service 分发的是节点要拉取的镜像，而 Pod 的就绪还取决于
+  # 走查边车那个容器。边车要跑的是"带 volume-walker 子命令的二进制"，而清单可能
+  # 先于节点缓存到达（部署器先推进裸仓、再滚四部署，GitOps 拉取端在这中间就会
+  # apply 本文件），此刻它只能拿到旧二进制、起来就退，Pod 因此 NotReady——没有
+  # 端点，节点拉不到新层，而新层正是让边车能起来的那份，分发通道被自己的边缘
+  # 卡死。放开这一个字段，边车起不来只是"读数暂时没有"：registry 照常服务，
+  # 节点缓存被 importer 推进后，边车下一次重试就拿到新二进制。就绪与否仍照常
+  # 记在 Deployment 上，容器在 CrashLoop，问题没有被藏起来。
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: cluster-registry
@@ -23,4 +32,10 @@ spec:
       port: 5000
       targetPort: registry
       nodePort: 30500
+      protocol: TCP
+    # 监控抓取面。端点名 `http` 就是发现规则：ServiceMonitor 按端口名选端点，
+    # 换个名字等于这条抓取配置不存在，而"没有告警"和"没人在抓"在这里长得一样。
+    - name: http
+      port: 9100
+      targetPort: http
       protocol: TCP

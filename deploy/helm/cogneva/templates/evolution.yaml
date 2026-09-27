@@ -260,10 +260,12 @@ spec:
                 cogneva-evolution-pvc=/opt/cogneva/sandbox
                 cogneva-evolution-source-pvc=/opt/cogneva/sandbox/src
             {{- if .Values.clusterRegistry.enabled }}
-            # 集群内 registry 的卷不归本 Pod 写，走查也不在它的挂载表里：那个
-            # store 只有仓库进程自己知道装了多少。本 Pod 的部署器是它唯一的写者
-            # （buildah push），读数因此从 registry 自己的 API 取（见
-            # registry_footprint），按这里的声明挂到那张卷的声明量上。
+            # 集群内 registry 的卷不归本 Pod 写，走查也不在它的挂载表里：本 Pod 的
+            # 部署器是它唯一的写者（buildah push），从这里能问到的只有 registry
+            # API 报的"活 tag 引用的层"，那是另一个量（cogneva_registry_referenced_
+            # bytes：孤儿层它看不见），留给保留策略读。那张卷的盘上占用由 registry
+            # Pod 里只读走查该卷的边车产出，声明量比的必须是那一份，所以这里不再
+            # 往卷族序列上挂——一个序列名只能有一个含义。
             - name: COGNEVA_REGISTRY_CLAIM
               value: {{ .Values.clusterRegistry.claimName | quote }}
             {{- end }}

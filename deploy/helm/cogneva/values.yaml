@@ -392,17 +392,34 @@ clusterRegistry:
   enabled: true
   image: registry:2
   nodePort: 30500
-  # 这张卷的名字声明一次，PVC 与"谁去量它"两处都从这里取：占用读数由进化 Pod
-  # 的部署器读 registry 自己的 API（那个 store 的唯一写者就是它），量出来的数
-  # 按这个名字挂到声明量上。两处各写一份名字时改名会静默失配——量到的数挂到
-  # 一张不存在的卷上，声明量的规则对它永远看不见。
+  # 这张卷的名字声明一次，PVC 与"谁去量它"两处都从这里取：盘上占用由本 Pod 里
+  # 那个只读走查边车量（第三方 registry 进程不发布指标，而它是这张卷唯一的写者），
+  # 量出来的数按这个名字挂到声明量上。两处各写一份名字时改名会静默失配——量到的
+  # 数挂到一张不存在的卷上，声明量的规则对它永远看不见。
+  #
+  # registry 自己的 API 报的是"活 tag 引用的层"，那是另一个量：孤儿层看不见，同一
+  # 时刻实测 3.74GiB vs 盘上 7.4GiB。它留在自己的序列名（cogneva_registry_referenced
+  # _bytes）下，由问 API 的进程发布，供保留策略读；声明量比的必须是盘上那份。
   claimName: cogneva-registry-pvc
+  # registry 写这张卷的根目录。一处声明：registry 的存储根、边车要量的路径、
+  # 两个容器的挂载点都取它，任一处改单边都会让走查量到空目录（读数变成 0）。
+  rootDir: /var/lib/registry
+  # 走查边车对外服务的端口。Service 端点名 http 指向它，监控按那个名字发现。
+  walkerPort: 9100
   # 金丝雀 overlay 逐 rev 累积，实测已 7.4Gi，取 10Gi。
   storage: 10Gi
   resources:
     requests:
       cpu: 20m
       memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+  # 走查是 readdir+stat，不吃 CPU；内存按目录树规模取，10Gi 的 store 远在这以内。
+  walkerResources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
     limits:
       cpu: 200m
       memory: 256Mi

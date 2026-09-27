@@ -26,15 +26,20 @@
 //! it, because a reading walks a directory, and a directory that is not the
 //! claim's measures something else and publishes it under the claim's name.
 //!
-//! A claim whose store belongs to someone else's process cannot be walked, so
-//! its producer measures it through that store's own API and the declaring
-//! container does not mount it at all. Those declarations are keyed separately
-//! ([`API_MEASURED`]) and get their own judgement, which is written to be at
-//! least as strong as the mount pairing it replaces: the claim such a
-//! declaration names has to be a claim the delivery declares as an object and
-//! that some container in that delivery mounts, and it may not also be declared
-//! as a walkable mount, which would publish the same volume twice under one
-//! name.
+//! A claim whose store belongs to someone else's process is also measured
+//! through that store's own API: the declaring container does not mount it at
+//! all, so this reading comes from outside the pod that writes it. Those
+//! declarations are keyed separately ([`API_MEASURED`]) and get their own
+//! judgement, which is written to be at least as strong as the mount pairing it
+//! replaces: the claim such a declaration names has to be a claim the delivery
+//! declares as an object, that some container in that delivery mounts, and that
+//! is **also walked** by a producer here. Asking the store is not an alternative
+//! to walking it: the store answers what its live tags reference, which is not
+//! what occupies the disk — a blob no tag points at any more is invisible to it.
+//! So a claim whose only reading comes from an API has a number for a different
+//! quantity, and the rule that divides that number by the declared size reads a
+//! volume that cannot fill up. The claim also may not be walked *twice*, which
+//! would publish two different byte counts under one claim name.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -65,7 +70,7 @@ const DELIVERED: [&str; 4] = [
 /// silently skip the workloads it cannot read. The marker is the call that
 /// constructs the producer on that workload's own entry path, not the name of
 /// the constant it passes.
-const PRODUCERS: [(&str, &str, &str); 4] = [
+const PRODUCERS: [(&str, &str, &str); 5] = [
     (
         // The full application: the observability plugin builds one observable
         // per declared volume and starts its watcher.
@@ -93,19 +98,32 @@ const PRODUCERS: [(&str, &str, &str); 4] = [
         "crates/cog-gateway/src/security_gateway.rs",
         "data_volume::spawn_watchers(",
     ),
+    (
+        // The registry's store is written by an image from outside this
+        // repository, so its pod gets a second container that does nothing but
+        // walk the mounted claim — same standalone entry shape as the gateway,
+        // mounted on the volume the registry writes.
+        "cogneva-registry",
+        "crates/cogneva/src/volume_walker.rs",
+        "data_volume::spawn_watchers(",
+    ),
 ];
 
-/// A claim measured through its store's API rather than by walking a mount.
+/// A claim measured through its store's API, whose writer is not this code.
 ///
 /// Same shape as [`PRODUCERS`] — workload, the file whose call builds the
 /// producer, the call — because the evidence for "something measures it" is the
-/// same kind of evidence. What differs is where the bytes come from: the store
-/// is written by an image from outside this repository, so no process here can
-/// walk it, and the reading asks the store instead.
+/// same kind of evidence. What differs is the quantity: the store is written by
+/// an image from outside this repository, and the bytes it can report are the
+/// ones it still references, not the ones on the disk. That is a reading in its
+/// own right (it is what a retention policy can still reclaim), and it is
+/// deliberately *not* the volume family's series — which is why a row here does
+/// not stand in for a walker and the judgement below requires both.
 const API_MEASURED: [(&str, &str, &str); 1] = [(
     // The cluster registry's store is written by the registry image; the only
     // writer from this repository is the mainline deployer in this pod, which
-    // measures it through the registry's own API.
+    // measures it through the registry's own API. The volume's occupancy comes
+    // from the walker the registry's own deployment runs.
     "cogneva-evolution",
     "crates/cog-reflection/src/registry_footprint.rs",
     "RegistryFootprint::new(",
@@ -416,8 +434,9 @@ struct DeliveryFacts {
     declared: BTreeSet<String>,
     /// Claims some container mounts, whoever declared them.
     mounted: BTreeSet<String>,
-    /// Claims declared as walkable mounts anywhere in the delivery.
-    walked: BTreeSet<String>,
+    /// Claims declared as walkable mounts anywhere in the delivery, each mapped
+    /// to the `<workload>/<container>` that walks it.
+    walked: BTreeMap<String, BTreeSet<String>>,
     /// `(workload, container, claim)` for every API-measured declaration.
     measured: Vec<(String, String, String)>,
 }
@@ -473,10 +492,22 @@ fn delivery_facts() -> BTreeMap<&'static str, DeliveryFacts> {
                             entry
                                 .mounted
                                 .extend(mounted_claims(pod, container).into_values());
+                            let walker = format!(
+                                "{}/{}",
+                                workload,
+                                container
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("<unnamed>")
+                            );
                             for line in env_value(container, MOUNTS_ENV).unwrap_or_default().lines()
                             {
                                 if let Some((claim, _)) = line.split_once('=') {
-                                    entry.walked.insert(claim.trim().to_string());
+                                    entry
+                                        .walked
+                                        .entry(claim.trim().to_string())
+                                        .or_default()
+                                        .insert(walker.clone());
                                 }
                             }
                             let measured = env_value(container, API_CLAIM_ENV)
@@ -503,17 +534,21 @@ fn delivery_facts() -> BTreeMap<&'static str, DeliveryFacts> {
     facts
 }
 
-/// An API-measured claim has to be a real volume of that delivery.
+/// An API-measured claim has to be a real volume of that delivery, and one that
+/// is walked as well.
 ///
 /// The mount pairing cannot apply here — the declaring container deliberately
 /// does not mount the claim — so this judgement stands in for it against the
 /// same manifest: the name has to match a claim object the delivery declares and
-/// that some container mounts, and the same claim may not also be declared as a
-/// walkable mount, which would publish one volume twice under one name. Every
-/// row is also required to be exercised somewhere, so a row cannot outlive the
-/// layout it describes.
+/// that some container in it mounts. On top of that the claim has to be walked
+/// by exactly one container of this delivery: the API answers a different
+/// quantity (what the store still references, not what occupies the disk), so a
+/// claim measured only that way has no reading of the size it is compared
+/// against, and two walkers of one claim publish two byte counts under one name.
+/// Every row is also required to be exercised somewhere, so a row cannot outlive
+/// the layout it describes.
 #[test]
-fn every_api_measured_claim_is_a_volume_that_delivery_declares_and_mounts() {
+fn every_api_measured_claim_is_a_volume_that_delivery_declares_mounts_and_walks() {
     let facts = delivery_facts();
     let known: BTreeSet<&str> = API_MEASURED.iter().map(|(name, ..)| *name).collect();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -547,11 +582,15 @@ fn every_api_measured_claim_is_a_volume_that_delivery_declares_and_mounts() {
                  container in this delivery mounts it: the declaration outlived the volume it \
                  names"
             );
-            assert!(
-                !facts.walked.contains(claim),
-                "{dir}/{workload} (container {container}): {claim} is declared both as an \
-                 API-measured claim and in {MOUNTS_ENV}, which publishes one volume's bytes twice \
-                 under the same claim name"
+            let walkers = facts.walked.get(claim).cloned().unwrap_or_default();
+            assert_eq!(
+                walkers.len(),
+                1,
+                "{dir}/{workload} (container {container}): {claim} is measured through its store's \
+                 API and walked by {walkers:?} — the API reports the bytes the store still \
+                 references, not the ones on the disk, so a claim asking its writer is not a \
+                 reading of its own size; exactly one container has to walk the mount (and two \
+                 would publish two byte counts under one claim name)"
             );
             seen.insert(workload.clone());
         }
@@ -585,6 +624,18 @@ fn every_api_measured_row_still_names_the_call_that_builds_the_producer() {
             source.contains(API_CLAIM_ENV),
             "{workload}: {file} no longer reads {API_CLAIM_ENV}, so the delivered declaration \
              reaches nothing"
+        );
+        // The other half of "one name means one thing": this producer answers a
+        // narrower question than the volume family asks, and the rule that divides
+        // a claim's bytes by its declared size reads only the family's name. A
+        // series name is a claim about what the number is, so the narrower number
+        // published under it makes that rule read a volume that cannot fill up.
+        let family = cog_core::claim_footprint::USED_METRIC;
+        assert!(
+            !source.contains(family),
+            "{workload}: {file} publishes {family}, which is the volume family's series — this \
+             producer reports what the store still references, not what occupies the disk, and the \
+             declared-size rule divides the family's name"
         );
     }
 }

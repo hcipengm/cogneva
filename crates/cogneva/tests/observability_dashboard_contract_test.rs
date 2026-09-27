@@ -293,14 +293,26 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["loop"],
         "crates/cog-core/src/loop_health.rs",
     ),
-    // How much of a volume its owner says is in use. One series serves both
-    // kinds of owner -- the process that walks a mount, and the process that
-    // asks a store's API -- because the claim label is what the alert rule
-    // divides by the declared size, and two series would be two joins.
+    // How much of a volume is in use: the claim label is what the alert rule
+    // divides by the declared size. Every producer of it walks the volume, so the
+    // panel is one wall per claim rather than one wall per kind of reader. A
+    // process that can only ask a store's API cannot answer this -- it sees what
+    // the store references, not what occupies the disk -- and publishing that
+    // narrower number here is how the claim read 37% while it was 74% full.
     (
         "cogneva_data_volume_used_bytes",
         &["persistentvolumeclaim"],
         "crates/cog-core/src/claim_footprint.rs",
+    ),
+    // The other half of that comparison: what the registry's tags reference. No
+    // panel draws it yet -- it is published so the gap to the series above has a
+    // reading at all, which is what a retention policy has to drive down, and it
+    // is recorded here so its name and its producer stay pinned together until
+    // something does draw it.
+    (
+        "cogneva_registry_referenced_bytes",
+        &["persistentvolumeclaim"],
+        "crates/cog-reflection/src/registry_footprint.rs",
     ),
     // The registry store's own pair: what it holds and how long ago it was
     // measured. The age carries no labels and neither does the count -- there
