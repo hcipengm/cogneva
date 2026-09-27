@@ -107,9 +107,13 @@ data:
   # limit. The request also sets this container's CFS weight, so 10m -- the
   # lowest claim in the namespace by an order of magnitude -- made it the first
   # to be squeezed exactly while its preflight reads were running.
+  # CPU limit 2, not 1: the first rollout under a one-core limit read its own
+  # cgroup at `cpu.max` 100000/100000 with 261 of 509 active CFS periods
+  # throttled -- 4.85s of CPU time clipped from a 36.3s run whose 30-second
+  # peak was 0.41 cores, which is why an average cannot size this container.
   COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_REQUEST: "200m"
   COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_REQUEST: "64Mi"
-  COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT: "1"
+  COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT: "2"
   COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT: "512Mi"
   # 滚动 Job Pod 挂载宿主 k3s 多调用二进制作为 kubectl（镜像不内置 kubectl）。
   COGNEVA_MAINLINE_DEPLOYER_KUBECTL_HOST_PATH: "/usr/local/bin/k3s"

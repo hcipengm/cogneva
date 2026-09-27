@@ -498,8 +498,12 @@ pub struct MainlineDeployerConfig {
     /// working-set peak reaches 243MiB. `cpu_request` is also this container's
     /// CFS weight, so a request of a few millicores -- the lowest claim in the
     /// namespace by an order of magnitude -- makes it the first to be squeezed
-    /// while its preflight reads run; `cpu_limit` is one core, the smallest
-    /// limit that cannot throttle a burst that is not itself parallel;
+    /// while its preflight reads run. `cpu_limit` was one core, on the theory
+    /// that a burst which is not itself parallel cannot be throttled by one;
+    /// the container's own cgroup under that value read `cpu.max`
+    /// 100000/100000 with 261 of 509 active periods throttled and 4.85s of CPU
+    /// time clipped from a 36.3s run whose 30-second peak was 0.41 cores, so
+    /// the theory was wrong and the limit is re-measured upward instead.
     /// `memory_limit` is twice the measured peak, since the GC thrashes as the
     /// heap nears the cap and this process decides whether to roll back.
     pub job_cpu_request: String,
@@ -553,7 +557,7 @@ impl Default for MainlineDeployerConfig {
             startup_timeout_secs: 900,
             job_cpu_request: "200m".into(),
             job_memory_request: "64Mi".into(),
-            job_cpu_limit: "1".into(),
+            job_cpu_limit: "2".into(),
             job_memory_limit: "512Mi".into(),
             heartbeat_log_secs: 3600,
             manifest_dir: "deploy/k3s".into(),

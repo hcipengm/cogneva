@@ -635,8 +635,15 @@ mainlineDeployer:
   # magnitude (peers sit at 100m-500m). 200m is below the busiest-minute average
   # and far above the per-run average.
   #
-  # `cpuLimit` is 1 core: the smallest limit that cannot throttle a burst that
-  # is not itself parallel, which is the shape measured here.
+  # `cpuLimit` was 1 core, on the theory that a burst which is not itself
+  # parallel cannot be throttled by one. The first rollout under that value
+  # disproved it from the container's own cgroup: `cpu.max` 100000/100000 with
+  # nr_periods 509 against nr_throttled 261 -- half its active CFS periods hit
+  # the quota -- and 4.85 s of CPU time clipped out of a 36.3 s run whose
+  # 30-second peak was only 0.41 cores. The shape is parallel after all
+  # (kubectl children beside the Go runtime's own workers), and a rate average
+  # cannot see it. 2 cores is the next step up, to be re-measured from the same
+  # file rather than argued from an average.
   #
   # `memoryLimit` is 512Mi against a measured working-set peak of 243MiB
   # (95% of the previous 256Mi) -- the old value left the rollback decider one
@@ -645,7 +652,7 @@ mainlineDeployer:
   rolloutJob:
     cpuRequest: 200m
     memoryRequest: 64Mi
-    cpuLimit: "1"
+    cpuLimit: "2"
     memoryLimit: 512Mi
   # 可观测性栈清单（deploy/k3s/observability/manifests/**）的周期收敛：按仓库
   # 当前 rev 的内容 apply，把现场修回声明态。那些清单此前只有安装脚本一条交付
