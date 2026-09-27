@@ -30,6 +30,19 @@
 //!   A one-shot build has nowhere to come back to, so a refusal there is a real
 //!   outcome, and it must not be reported as the change having failed.
 //!
+//! And two kinds of holder, which want different things from the gate. A build
+//! wants one slot: it is one of the things the bound bounds. The two callers
+//! that are not builds — restarting the registry a build is pushing to, and
+//! removing cache files from under a build that would then fail for a reason
+//! that has nothing to do with it — want *every* slot, because what they are
+//! excluding is builds rather than taking their turn among them. A single slot
+//! is not that guarantee: it excludes the others only while the gate permits
+//! one build, so those two held a promise that was a property of configuration
+//! rather than of the call, and turning `max_concurrent` up would have disarmed
+//! both without moving a single reading. [`BuildGate::try_acquire_exclusive`]
+//! is that promise made explicit, and what such a hold counts as is therefore
+//! its own reading rather than a build's.
+//!
 //! What the gate cannot do is tell whether the builders it excludes are on this
 //! host or not — that depends on the slot directory being one directory for
 //! every process on the machine. If two deployments point at different
@@ -76,6 +89,17 @@ use crate::{SFError, SFResult};
 
 /// Builds holding a slot in this process, as a gauge.
 pub const BUILD_GATE_IN_FLIGHT: &str = "cogneva_build_gate_in_flight";
+/// Holders that are not builds and hold every slot to keep them out, as a gauge:
+/// 1 while such a caller is excluding builds, 0 otherwise.
+///
+/// Its own series because it answers the question a refusal raises — "who took
+/// the slot, a build or something else?" — and every other reading here answers
+/// it wrongly: the in-flight gauge and the held readings count builds, so
+/// folding a cache sweep or a registry restart into them would report it as a
+/// build that occupied the host for as long as it ran, and would leave a refusal
+/// it caused pointing at a build that does not exist. What the exclusion
+/// *achieves* is counted by its own callers, at the work being deferred.
+pub const BUILD_GATE_EXCLUDED: &str = "cogneva_build_gate_excluded";
 /// Builds waiting for a slot in this process, as a gauge.
 pub const BUILD_GATE_WAITING: &str = "cogneva_build_gate_waiting";
 /// Slots this gate permits, as a gauge; 0 when the gate is not in force.
@@ -227,6 +251,7 @@ impl Observable for InactiveBuildGate {
 #[derive(Default)]
 struct Counters {
     in_flight: u64,
+    excluded: u64,
     waiting: u64,
     acquired: u64,
     refused: u64,
@@ -253,6 +278,7 @@ fn readings(
     vec![
         label(RawMetric::new(BUILD_GATE_SLOTS, slots as f64)),
         label(RawMetric::new(BUILD_GATE_IN_FLIGHT, c.in_flight as f64)),
+        label(RawMetric::new(BUILD_GATE_EXCLUDED, c.excluded as f64)),
         label(RawMetric::new(BUILD_GATE_WAITING, c.waiting as f64)),
         label(RawMetric::new(BUILD_GATE_ACQUIRED_TOTAL, c.acquired as f64)),
         label(RawMetric::new(BUILD_GATE_REFUSED_TOTAL, c.refused as f64)),
@@ -296,6 +322,22 @@ pub async fn try_acquire(what: &str) -> SFResult<Option<BuildPermit>> {
     }
 }
 
+/// Takes every slot for work that must not overlap a build, refusing at once
+/// when any slot is taken.
+///
+/// For a caller that is not a build and whose exclusion is the point of the
+/// work: while the permit is held no build can start, and the ones already
+/// running have finished. `Ok(None)` means no gate is in force here, so there
+/// is nothing to exclude builds from — the caller proceeds, as it does for
+/// [`try_acquire`], since a deployment that bounds no builds has no bound to
+/// take a turn on either.
+pub async fn try_acquire_exclusive(what: &str) -> SFResult<Option<BuildPermit>> {
+    match global() {
+        Some(gate) => gate.try_acquire_exclusive(what).await.map(Some),
+        None => Ok(None),
+    }
+}
+
 /// How a slot request ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
@@ -332,6 +374,7 @@ pub struct BuildGate {
     wait: Duration,
     installed: bool,
     in_flight: AtomicU64,
+    excluded: AtomicU64,
     waiting: AtomicU64,
     acquired: AtomicU64,
     refused: AtomicU64,
@@ -370,6 +413,7 @@ impl BuildGate {
             installed,
             dir,
             in_flight: AtomicU64::new(0),
+            excluded: AtomicU64::new(0),
             waiting: AtomicU64::new(0),
             acquired: AtomicU64::new(0),
             refused: AtomicU64::new(0),
@@ -389,6 +433,7 @@ impl BuildGate {
     fn counters(&self) -> Counters {
         Counters {
             in_flight: self.in_flight.load(Ordering::Relaxed),
+            excluded: self.excluded.load(Ordering::Relaxed),
             waiting: self.waiting.load(Ordering::Relaxed),
             acquired: self.acquired.load(Ordering::Relaxed),
             refused: self.refused.load(Ordering::Relaxed),
@@ -449,6 +494,72 @@ impl BuildGate {
         self.acquire_within(what, Duration::ZERO).await
     }
 
+    /// Takes every slot at once, or none, refusing at once when a build holds
+    /// one.
+    ///
+    /// Every slot rather than one, because one slot is a share of the bound and
+    /// not an exclusion from it: the gate permits `max_concurrent` builds, so a
+    /// holder of one slot keeps the others out only while that count is one. A
+    /// caller whose whole point is "no build is running, and none starts while I
+    /// work" is asking for the other side of the gate, and that is what this
+    /// takes.
+    ///
+    /// A refusal takes nothing at all: what was taken on the way is released
+    /// before returning. A partial hold would be the one outcome that is neither
+    /// excluded nor not excluded — it would turn a build away for as long as it
+    /// lasted, while the work it was taken for did not run at all.
+    pub async fn try_acquire_exclusive(self: &Arc<Self>, what: &str) -> SFResult<BuildPermit> {
+        if !self.in_force() {
+            // Nothing bounds builds here, so nothing can be excluded from them.
+            return Ok(self.permit(what, Vec::new(), HoldKind::Excluding));
+        }
+        let mut held = Vec::with_capacity(self.slots);
+        for slot in 0..self.slots {
+            match lock_slot(&self.dir, slot) {
+                Some(file) => held.push(file),
+                None => {
+                    drop(held);
+                    let reason = format!(
+                        "a build holds one of the {} slots, so builds cannot be excluded",
+                        self.slots
+                    );
+                    tracing::warn!(
+                        what,
+                        slots = self.slots,
+                        dir = %self.dir.display(),
+                        identity = %self.identity(),
+                        "{reason}"
+                    );
+                    // Deliberately not counted as a refusal: the refusal counter
+                    // is read as "a build was refused a slot", and nothing was
+                    // refused here. What this call achieved is counted by its
+                    // caller, at the work that did not run.
+                    return Err(SFError::ResourceExhausted(format!(
+                        "build gate could not exclude builds for {what}: {reason}"
+                    )));
+                }
+            }
+        }
+        self.excluded.fetch_add(1, Ordering::Relaxed);
+        Ok(self.permit(what, held, HoldKind::Excluding))
+    }
+
+    /// A permit with the accounting of one kind of hold.
+    fn permit(
+        self: &Arc<Self>,
+        what: &str,
+        held: Vec<std::fs::File>,
+        kind: HoldKind,
+    ) -> BuildPermit {
+        BuildPermit {
+            gate: Arc::clone(self),
+            held,
+            taken_at: None,
+            what: what.to_string(),
+            kind,
+        }
+    }
+
     async fn acquire_within(
         self: &Arc<Self>,
         what: &str,
@@ -457,12 +568,7 @@ impl BuildGate {
         if !self.in_force() {
             // No bound to enforce: hand back a permit that holds nothing, so the
             // caller's shape does not depend on whether the gate is installed.
-            return Ok(BuildPermit {
-                gate: Arc::clone(self),
-                held: None,
-                taken_at: None,
-                what: what.to_string(),
-            });
+            return Ok(self.permit(what, Vec::new(), HoldKind::Building));
         }
         let waiting = self.waiting.fetch_add(1, Ordering::Relaxed) + 1;
         if waiting > 1 {
@@ -491,9 +597,10 @@ impl BuildGate {
                     tracing::debug!(what, slot, total, "build took a slot");
                     return Ok(BuildPermit {
                         gate: Arc::clone(self),
-                        held: Some(file),
+                        held: vec![file],
                         taken_at: Some(taken_at),
                         what: what.to_string(),
+                        kind: HoldKind::Building,
                     });
                 }
             }
@@ -524,34 +631,63 @@ impl BuildGate {
     }
 }
 
-/// A held slot. Dropping it releases the slot to the next builder.
+/// What a permit's holder is doing with the host, which decides what it counts
+/// as.
+///
+/// The two are accounted separately because they answer different questions: a
+/// build's hold is a reading of how long the host is busy building, and an
+/// exclusion is a reading of why a build that asked just then got nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldKind {
+    /// A build: holds one slot, and counts in every build reading.
+    Building,
+    /// Work that is not a build and holds every slot. Counts in
+    /// [`BUILD_GATE_EXCLUDED`] alone, because it is not a build that ran and it
+    /// did not occupy the host for as long as a build does.
+    Excluding,
+}
+
+/// A held slot, or every slot. Dropping it releases them to the next builder.
 #[derive(Debug)]
 pub struct BuildPermit {
     gate: Arc<BuildGate>,
-    /// The locked file, when a slot was actually taken. Closing it -- which drop
-    /// does -- is what releases the lock.
-    held: Option<std::fs::File>,
-    /// When the slot was taken, set with `held` and read only where `held` is
-    /// set: a permit that holds nothing was never counted as a build that ran,
+    /// The locked files, when slots were actually taken. Closing them -- which
+    /// drop does -- is what releases the locks. Empty for one of two reasons,
+    /// told apart by `taken_at`: the gate is not in force, or the permit is an
+    /// exclusion over a gate that bounds nothing.
+    held: Vec<std::fs::File>,
+    /// When the slot was taken, set for a build that took one and read only
+    /// there: a permit that holds nothing was never counted as a build that ran,
     /// so it contributes no hold to the readings either.
     taken_at: Option<Instant>,
     what: String,
+    kind: HoldKind,
 }
 
 impl BuildPermit {
-    /// Whether this permit holds a slot.
+    /// Whether this permit holds anything.
     pub fn held(&self) -> bool {
-        self.held.is_some()
+        !self.held.is_empty()
     }
 }
 
 impl Drop for BuildPermit {
     fn drop(&mut self) {
-        if let (Some(_), Some(taken_at)) = (&self.held, self.taken_at) {
-            self.gate.in_flight.fetch_sub(1, Ordering::Relaxed);
-            self.gate.slot_released(taken_at.elapsed());
-            tracing::debug!(what = %self.what, "build released its slot");
+        if self.held.is_empty() {
+            return;
         }
+        match self.kind {
+            HoldKind::Building => {
+                self.gate.in_flight.fetch_sub(1, Ordering::Relaxed);
+                if let Some(taken_at) = self.taken_at {
+                    self.gate.slot_released(taken_at.elapsed());
+                }
+            }
+            HoldKind::Excluding => {
+                self.gate.excluded.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        tracing::debug!(what = %self.what, kind = ?self.kind, "held slots released");
     }
 }
 
@@ -677,6 +813,106 @@ mod tests {
         assert!(third.held(), "dropping a permit frees its slot");
     }
 
+    /// An exclusion has to exclude *builds*, and one slot does not do that: the
+    /// gate admits as many builds as it has slots, so a holder of one keeps the
+    /// others out only while that count happens to be one. This is the promise
+    /// the two callers that take the gate to keep builds away were relying on
+    /// without saying so, and it is why it takes every slot.
+    #[tokio::test]
+    async fn an_exclusion_keeps_every_build_out_even_where_several_may_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 3, 0);
+
+        let excluding = gate
+            .try_acquire_exclusive("sweeping the build cache")
+            .await
+            .unwrap();
+        assert!(excluding.held(), "an exclusion holds its slots");
+        for name in ["a build that starts now", "and another"] {
+            assert!(
+                gate.try_acquire(name).await.is_err(),
+                "{name} must not start while builds are excluded"
+            );
+        }
+        assert_eq!(
+            reading(&gate, BUILD_GATE_EXCLUDED).await,
+            1.0,
+            "the exclusion is readable while it lasts"
+        );
+
+        drop(excluding);
+        assert_eq!(
+            reading(&gate, BUILD_GATE_EXCLUDED).await,
+            0.0,
+            "it stops being an exclusion when it is released"
+        );
+        assert!(
+            gate.try_acquire("after the sweep").await.is_ok(),
+            "every slot comes back"
+        );
+    }
+
+    /// An exclusion is not a build, so it must not be counted as one. The
+    /// in-flight gauge and the held readings answer "how busy is this host
+    /// building", and a sweep or a registry restart folded into them would read
+    /// as a build that occupied the host for as long as it ran — which is the
+    /// reading the bound itself is sized from.
+    #[tokio::test]
+    async fn an_exclusion_is_not_counted_as_a_build_that_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 2, 0);
+
+        let excluding = gate
+            .try_acquire_exclusive("restarting the registry")
+            .await
+            .unwrap();
+        assert_eq!(
+            reading(&gate, BUILD_GATE_IN_FLIGHT).await,
+            0.0,
+            "no build is running while a sweep holds every slot"
+        );
+        drop(excluding);
+        assert_eq!(
+            reading(&gate, BUILD_GATE_ACQUIRED_TOTAL).await,
+            0.0,
+            "the exclusion did not take a slot as a build"
+        );
+        assert_eq!(
+            reading(&gate, BUILD_GATE_HELD_MS_TOTAL).await,
+            0.0,
+            "and it did not hold the host the way a build does"
+        );
+    }
+
+    /// A refusal has to take nothing. A partial hold is the one outcome that is
+    /// neither excluded nor not excluded: it would turn a build away for as long
+    /// as it lasted, while the work it was taken for did not run at all.
+    #[tokio::test]
+    async fn an_exclusion_that_cannot_take_every_slot_takes_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 3, 0);
+        // The first slot is free and a later one is taken, so a take that walked
+        // the slots and gave up on the taken one would come back holding one.
+        let held = lock_slot(dir.path(), 1).expect("the second slot can be held");
+
+        let refused = gate.try_acquire_exclusive("sweeping the build cache").await;
+        assert!(
+            refused.is_err(),
+            "a build holds a slot, so builds cannot be excluded"
+        );
+        assert_eq!(reading(&gate, BUILD_GATE_EXCLUDED).await, 0.0);
+        assert_eq!(
+            reading(&gate, BUILD_GATE_REFUSED_TOTAL).await,
+            0.0,
+            "no build was refused a slot here: an exclusion that could not be taken is not a build turned away"
+        );
+        assert!(
+            lock_slot(dir.path(), 0).is_some(),
+            "the slot taken on the way has to be released again"
+        );
+        drop(held);
+    }
+
     /// The bound is a property of the directory, not of the gate instance: two
     /// builders in different processes share nothing but the slot files, so if
     /// the bound were per instance every process would enforce its own and the
@@ -725,7 +961,7 @@ mod tests {
         let permit = gate.try_acquire("the holding build").await.unwrap();
         let held = permit
             .held
-            .as_ref()
+            .first()
             .expect("a taken slot holds its lock file");
         // SAFETY: `held` is open for as long as `permit`, so its descriptor is valid,
         // and the returned descriptor is this test's to close exactly once.
@@ -1036,6 +1272,7 @@ mod tests {
             vec![
                 BUILD_GATE_SLOTS,
                 BUILD_GATE_IN_FLIGHT,
+                BUILD_GATE_EXCLUDED,
                 BUILD_GATE_WAITING,
                 BUILD_GATE_ACQUIRED_TOTAL,
                 BUILD_GATE_REFUSED_TOTAL,

@@ -328,10 +328,13 @@ impl BuildCacheReadings {
             );
             return;
         };
-        let permit = match gate.try_acquire("build-cache-reclaim").await {
+        // Every slot, not one: this pass deletes files a build is writing, and
+        // "no build is running" has to hold for *all* the builds the gate admits
+        // rather than for the ones that would have taken a different slot.
+        let permit = match gate.try_acquire_exclusive("build-cache-reclaim").await {
             Ok(permit) => permit,
             Err(_) => {
-                // A build holds the slot. Not a failure: the cache is over its
+                // A build holds a slot. Not a failure: the cache is over its
                 // cap while the host is busy building into it, and the next walk
                 // will try again. It is counted separately because a cache that
                 // is *never* reclaimed and one that cannot be reclaimed call for
@@ -340,7 +343,7 @@ impl BuildCacheReadings {
                 info!(
                     dir = %self.dir.display(),
                     over_limit_bytes = excess,
-                    "build cache is over its cap; a build holds the slot, so the pass waits for the next walk"
+                    "build cache is over its cap; a build holds a slot, so the pass waits for the next walk"
                 );
                 return;
             }

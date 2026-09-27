@@ -2882,7 +2882,11 @@ impl MainlineDeployer {
         }
         // 回收要重启 registry，而构建正是往这个 registry 推镜像的动作：不拿宿主
         // 构建闸就动手，等于在别人推到一半时把服务端换掉。拿不到就下一轮再看。
-        let _slot = match cog_core::build_gate::try_acquire("registry maintenance").await {
+        // 排他要拿**每一个**槽（不是"拿一个"）：闸门允许的构建条数是配置项，
+        // 拿一个只在这个条数恰好是 1 时才排掉别的构建——那条不变式必须是调用的
+        // 性质，不是配置的性质。见 `BuildGate::try_acquire_exclusive`。
+        let _slot = match cog_core::build_gate::try_acquire_exclusive("registry maintenance").await
+        {
             Ok(slot) => slot,
             Err(e) => {
                 info!(error = %e, "host is building; deferring registry maintenance to the next cycle");
@@ -3243,20 +3247,6 @@ impl MainlineDeployer {
             None => return Ok(()),
         };
 
-        // The host build gate as well as the cycle lock, because they bound
-        // different things: this lock keeps one deployer's advance from racing
-        // its own state file, the gate keeps this advance's compile and image
-        // build from landing on top of another builder's. Refusing here rather
-        // than waiting is right for a polling cycle -- it never touched state
-        // yet, and it comes back on its own.
-        let _build_slot = match cog_core::build_gate::try_acquire("mainline advance").await {
-            Ok(slot) => slot,
-            Err(e) => {
-                info!(error = %e, "host is building; deferring the advance to the next cycle");
-                return Ok(());
-            }
-        };
-
         // 同一镜像两个引用端点：buildah 在 Pod 内走集群 DNS push/from；
         // Job manifest 与 set image 走节点 NodePort（kubelet 不解析集群 DNS）。
         let push_tag = main_image(&self.push_endpoint(), &bare);
@@ -3287,8 +3277,24 @@ impl MainlineDeployer {
             return Ok(());
         }
 
+        // 宿主构建闸只界**真要构建**的那一段，所以它在这里才拿，并且在镜像推完
+        // 就放（见下面那次 drop）：上面那条"registry 里已有这个 rev"的快路一次
+        // 构建都不做，最后那次派 Job 是读 git 与 apply 清单，两者都不是构建。
+        // 罩着整段推进的话，`cogneva_build_gate_held_ms_*` 量到的就不再是"一个
+        // 构建占住宿主多久"，别的构建者也在这两段里被拒、而拒因读起来像"宿主在
+        // 构建"。拿不到就什么都不做地回下一轮：这时状态还没写。
+        let build_slot = match cog_core::build_gate::try_acquire("mainline advance").await {
+            Ok(slot) => slot,
+            Err(e) => {
+                info!(error = %e, "host is building; deferring the advance to the next cycle");
+                return Ok(());
+            }
+        };
+
         // 叠层基底在这里才定：上面那条快路不需要它（不重建），而它自己要读 registry
-        // 并可能改一个 tag，是"真要构建"才付的代价。
+        // 并可能改一个 tag，是"真要构建"才付的代价。它要留在槽里：基底 tag 由这
+        // 一段定下、由推镜像那一段取用，中间被回收轮的 registry 重启插进来的话，
+        // 取用的那一端会从一个正在重启的服务端拉。
         let base_tag = self.ensure_base_seed(&deployed).await;
         info!(rev = %rev12(&bare), base = %base_tag, "mainline advance: building");
 
@@ -3316,6 +3322,10 @@ impl MainlineDeployer {
             phase: Phase::Pushed,
         });
         self.save_state(&state)?;
+
+        // 构建到此为止：镜像已经在 registry 里，后面只剩派 Job。闸到这里就还回
+        // 去，谁想构建谁拿——构建者等的是宿主的编译资源，而派 Job 一个字节都不编。
+        drop(build_slot);
 
         // 4. 派滚动 Job（explosion radius 外；新镜像 smoke test）。Job 启动后
         // 自己快照各部署当前镜像作为回滚目标，无需部署器推导 prev。
