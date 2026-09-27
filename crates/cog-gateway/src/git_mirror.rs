@@ -1661,6 +1661,39 @@ mod tests {
             != Some("Z")
     }
 
+    /// 判死等待的界：等的是**别的进程**的动作，不是被测性质本身。
+    ///
+    /// 被等的孙进程本该活 300 秒，所以任何远小于 300 秒的界都照样能判出"它没被
+    /// 一起带走"——按乐观值定界（原来这里是 5 秒、另一处根本没等），只会把
+    /// "机器被压满时调度慢"读成"缺陷"：实测全量并行跑会红、单独跑 6/6 绿。
+    const GROUP_SETTLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// 等假 git 写下孙进程的 pid 并读回来。文件是另一个进程写的，所以这里必须
+    /// 等到它出现，不能假定它已经在了。
+    async fn read_grandchild_pid(pidfile: &std::path::Path) -> i32 {
+        let deadline = std::time::Instant::now() + GROUP_SETTLE;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(pidfile) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "假 git 应在 {GROUP_SETTLE:?} 内写下孙进程 pid"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 等一个进程消失。
+    async fn wait_until_gone(pid: i32) {
+        let deadline = std::time::Instant::now() + GROUP_SETTLE;
+        while process_alive(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
     async fn silent_transfer_is_killed_along_with_its_whole_process_group() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1691,15 +1724,8 @@ mod tests {
         );
 
         // 只杀组长会留下还在写镜像的孙进程——线上那次 index-pack 就活了十几分钟。
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("假 git 应写下孙进程 pid")
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while process_alive(pid) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        let pid = read_grandchild_pid(&pidfile).await;
+        wait_until_gone(pid).await;
         assert!(!process_alive(pid), "孙进程 {pid} 必须一起被杀掉");
     }
 
@@ -1777,24 +1803,13 @@ mod tests {
         let exec = t.exec.clone();
 
         let task = tokio::spawn(async move { exec.capture(&["ls-remote", "x"], None).await });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !pidfile.exists() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("假 git 应写下孙进程 pid")
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = read_grandchild_pid(&pidfile).await;
         assert!(process_alive(pid), "孙进程应当先真的起来");
 
         task.abort();
         let _ = task.await;
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while process_alive(pid) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        wait_until_gone(pid).await;
         assert!(
             !process_alive(pid),
             "调用者的 future 没了，孙进程 {pid} 也必须一起走——只杀组长会把它留下"
