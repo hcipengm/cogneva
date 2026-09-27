@@ -42,6 +42,11 @@ const CHANGE_ID_TRAILER: &str = "Change-Id";
 /// same from outside. The category is the only part of the failure that
 /// aggregates: the message names a file and a hunk, the category says whether
 /// the branch moved under the change or the change itself is the problem.
+///
+/// This is also where "refused once" and "refused for good" are told apart: a
+/// `path` refusal is terminal, so the caller takes the change out of the queue
+/// on the first one, while every other category is retried and shows up here
+/// once per attempt.
 pub use cog_core::metric_names::LANDING_FAILURES_TOTAL as LANDING_FAILURES_METRIC;
 
 /// Why a landing call failed, as a closed set the metric labels.
@@ -122,6 +127,29 @@ impl From<CogGitHubError> for LandingError {
 impl From<std::io::Error> for LandingError {
     fn from(error: std::io::Error) -> Self {
         Self::from(CogGitHubError::from(error))
+    }
+}
+
+/// Carry a landing failure's category across the trait boundary.
+///
+/// A path refusal leaves as [`SFError::Validation`], the type for an input
+/// that cannot pass; everything else stays the internal error an unclassified
+/// failure has always been. The split is the whole reason the category exists
+/// one layer down: the caller is the only layer that can take the change out
+/// of the queue, and one flattened variant leaves it unable to tell
+/// "re-driving repeats this refusal" from "try again once the host is free".
+/// On 2026-09-27 that flattening cost a change the whitelist had already
+/// refused twelve release builds in six hours, each holding the single build
+/// slot the deployer needed to advance.
+///
+/// A size refusal is deliberately *not* on that side even though it is just as
+/// much a property of the change: the cap is the one gate owner approval
+/// waives, so a caller acting on it would retire a change the owner could
+/// still land. The path rules are the ones approval does not lift.
+fn refusal_error(error: LandingError) -> SFError {
+    match error.category {
+        LandingCategory::Path => SFError::Validation(error.to_string()),
+        _ => SFError::Internal(error.to_string()),
     }
 }
 
@@ -338,7 +366,12 @@ impl MainChannel {
         change: &GeneratedChange,
         source: Option<&LandedSource>,
     ) -> Result<String> {
-        self.land_inner(change, source, false).await
+        // The category is dropped here rather than at `land_inner`: this is a
+        // public signature, and `LandingError` is crate-private. Whoever needs
+        // the category calls `land_inner` -- the trait boundary below does.
+        self.land_inner(change, source, false)
+            .await
+            .map_err(|failure| failure.error)
     }
 
     /// Land a change the owner approved explicitly.
@@ -348,7 +381,9 @@ impl MainChannel {
     /// them. The safety gates (whitelist, forbidden paths) still do: approving
     /// a contribution is not the same as approving writing to `deploy/`.
     pub async fn land_approved(&self, change: &GeneratedChange) -> Result<String> {
-        self.land_inner(change, None, true).await
+        self.land_inner(change, None, true)
+            .await
+            .map_err(|failure| failure.error)
     }
 
     async fn land_inner(
@@ -356,12 +391,15 @@ impl MainChannel {
         change: &GeneratedChange,
         source: Option<&LandedSource>,
         owner_approved: bool,
-    ) -> Result<String> {
+    ) -> std::result::Result<String, LandingError> {
         match self.land_attempt(change, source, owner_approved).await {
             Ok(rev) => Ok(rev),
             Err(failure) => {
+                // Counted here, once, and the pair travels on: the caller that
+                // can act on the category is a layer above, and it can only do
+                // so if this does not flatten the failure on its way out.
                 self.note_landing_failure(failure.category).await;
-                Err(failure.error)
+                Err(failure)
             }
         }
     }
@@ -814,9 +852,9 @@ impl cog_core::ChangeLanding for MainChannel {
         change: &GeneratedChange,
         source: Option<&LandedSource>,
     ) -> SFResult<String> {
-        MainChannel::land(self, change, source)
+        self.land_inner(change, source, false)
             .await
-            .map_err(|e| SFError::Internal(e.to_string()))
+            .map_err(refusal_error)
     }
 
     async fn record_unverified(&self, change: &GeneratedChange) -> SFResult<()> {
@@ -1597,6 +1635,74 @@ mod tests {
         };
         let err = channel(policy).check_policy(&ch, false).unwrap_err();
         assert!(err.to_string().contains("forbidden path"), "{err}");
+    }
+
+    /// Which categories the caller may treat as terminal, written as an
+    /// exhaustive match: a new category cannot be added without answering the
+    /// question here, because this stops compiling.
+    ///
+    /// The answer has to be no for every category but the paths. The boundary
+    /// carries one type, and the caller reads a terminal failure off that type
+    /// alone, so a category that arrives looking terminal gets acted on as if
+    /// it were -- retiring a change a later attempt, a branch that moved back,
+    /// or the owner's approval could still land.
+    fn refused_for_good(category: LandingCategory) -> bool {
+        match category {
+            // The rules owner approval does not lift, including a diff that
+            // cannot be read far enough to say which paths it touches.
+            LandingCategory::Path => true,
+            // Size is a property of the change too, but not a terminal one:
+            // owner approval waives the cap, so a caller retiring on it would
+            // take that decision away from the owner.
+            LandingCategory::Oversized
+            // The branch moved under the change; another commit may move it again.
+            | LandingCategory::Conflict
+            // Another landing won the push race; this change may win the next one.
+            | LandingCategory::Raced
+            // A push refused for something re-applying cannot fix -- but that is
+            // a statement about the attempt, not about the paths the change touches.
+            | LandingCategory::Rejected
+            // git, fetch, worktree, commit: nothing about the change at all.
+            | LandingCategory::Environment => false,
+        }
+    }
+
+    /// Every category, so the loop below covers the whole set. Kept in step
+    /// with `refused_for_good`, whose match is the half that fails to compile
+    /// when the enum grows.
+    const ALL_CATEGORIES: [LandingCategory; 6] = [
+        LandingCategory::Conflict,
+        LandingCategory::Raced,
+        LandingCategory::Rejected,
+        LandingCategory::Path,
+        LandingCategory::Oversized,
+        LandingCategory::Environment,
+    ];
+
+    /// A refusal the change's own content caused has to leave the channel as
+    /// its own kind. The caller is the only layer that can take the change out
+    /// of the queue, and it can only tell "re-driving repeats this" from "the
+    /// host was busy" if the kind survives the boundary -- it reads that off
+    /// the type alone, so exactly the terminal categories may arrive as
+    /// `Validation` and everything else has to stay `Internal`.
+    #[test]
+    fn only_a_path_refusal_crosses_the_boundary_as_validation() {
+        let mut terminal = Vec::new();
+        for category in ALL_CATEGORIES {
+            let e = LandingError::of(category, CogGitHubError::PrivacyRejected("refused".into()));
+            let mapped = refusal_error(e);
+            if refused_for_good(category) {
+                assert!(matches!(mapped, SFError::Validation(_)), "{category:?}");
+                terminal.push(category);
+            } else {
+                assert!(matches!(mapped, SFError::Internal(_)), "{category:?}");
+            }
+        }
+        assert_eq!(
+            terminal,
+            vec![LandingCategory::Path],
+            "the paths are the one rule approval does not lift"
+        );
     }
 
     #[tokio::test]

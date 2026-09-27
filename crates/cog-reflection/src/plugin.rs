@@ -1886,6 +1886,23 @@ async fn fail_and_retire_change(
         );
         let _ = engine.record_change_outcome(change_id, false, reason).await;
     }
+    retire_change_everywhere(pipeline, landing, change_id, reason).await;
+}
+
+/// Take a change out of both places it can be offered from again.
+///
+/// The queue and the landing record are two independent input channels for the
+/// same change, and each is read on its own: a `.diff` left in the directory
+/// reads back as a change nobody has looked at yet, and an unverified record
+/// is offered to whoever owns the verify loop. Retiring one side only lets the
+/// other bring the change back on the next cycle, which is how a change that
+/// can never land keeps being rebuilt.
+async fn retire_change_everywhere(
+    pipeline: &crate::ChangePipeline,
+    landing: Option<&dyn cog_core::ChangeLanding>,
+    change_id: &str,
+    reason: &str,
+) {
     if let Err(e) = pipeline.retire_change(change_id, reason).await {
         warn!(
             change_id = %change_id,
@@ -2245,6 +2262,32 @@ async fn run_evolution_cycle_in(
                             m.record_event(true).await;
                             m.record_change_failed().await;
                         }
+                        // The channel classified this failure as the paths the
+                        // change touches -- a property of the change, not of the
+                        // world around it -- so running the change again repeats
+                        // the same refusal. Retire it rather than leaving it in
+                        // the queue: an entry left there is rebuilt from scratch
+                        // on the next cycle, and that release build takes the
+                        // single build slot the deployer needs to advance. On
+                        // 2026-09-27 one change the whitelist had already refused
+                        // was rebuilt and refused twelve times in six hours.
+                        //
+                        // Every other landing failure keeps the behaviour it had
+                        // and stays in the queue -- including a size refusal,
+                        // which owner approval can still waive. Only a path
+                        // refusal leaves the channel as `Validation`; the other
+                        // categories arrive as `Internal`, and a category this
+                        // side has never heard of keeps that same retryable
+                        // default rather than being retired unread.
+                        if matches!(&e, cog_core::SFError::Validation(_)) {
+                            retire_change_everywhere(
+                                pipeline,
+                                Some(landing.as_ref()),
+                                &artifact.change_id,
+                                &format!("landing refused the change itself: {e}"),
+                            )
+                            .await;
+                        }
                         continue;
                     }
                 }
@@ -2560,6 +2603,144 @@ mod tests {
         );
         // Retired rather than deleted: what was in the queue stays readable.
         assert!(change_dir.join("retired/chg-1.diff").exists());
+    }
+
+    /// 落地通道替身：记下退休调用。其余方法一律炸掉——退休一条变更不该落地、
+    /// 也不该记录。
+    #[derive(Debug)]
+    struct RecordingLanding {
+        unverified: std::sync::Mutex<Vec<cog_core::GeneratedChange>>,
+        retired: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::ChangeLanding for RecordingLanding {
+        async fn land(
+            &self,
+            _change: &cog_core::GeneratedChange,
+            _source: Option<&cog_core::LandedSource>,
+        ) -> cog_core::SFResult<String> {
+            unreachable!("retiring a change never lands one")
+        }
+
+        async fn record_unverified(
+            &self,
+            _change: &cog_core::GeneratedChange,
+        ) -> cog_core::SFResult<()> {
+            unreachable!("retiring a change never records one")
+        }
+
+        async fn unverified_changes(&self) -> cog_core::SFResult<Vec<cog_core::GeneratedChange>> {
+            Ok(self.unverified.lock().unwrap().clone())
+        }
+
+        /// 与真实通道同语义，不只是记一笔：收口就是把记录**移出未验证集**，而
+        /// 不是未验证的记录（已落地、已退休、或压根不在这一侧）原样不动。
+        /// 只记日志的替身会继续把这条变更供出去，那正好是这条测试要证伪的。
+        async fn retire_unverified(&self, id: &str, reason: &str) -> cog_core::SFResult<()> {
+            let mut unverified = self.unverified.lock().unwrap();
+            if let Some(pos) = unverified.iter().position(|c| c.change_id == id) {
+                unverified.remove(pos);
+                self.retired
+                    .lock()
+                    .unwrap()
+                    .push((id.to_string(), reason.to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    /// 一份同时摆上两份载体的变更：队列里的 `.diff` 与记录里的那条。
+    fn queued_and_recorded() -> (tempfile::TempDir, crate::ChangePipeline, RecordingLanding) {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("chg-1.diff"),
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        let landing = RecordingLanding {
+            unverified: std::sync::Mutex::new(vec![generated("chg-1", "goal from the record")]),
+            retired: std::sync::Mutex::new(Vec::new()),
+        };
+        (temp, pipeline, landing)
+    }
+
+    /// 一条被通道拒死的变更必须**同时**离开两份载体。
+    ///
+    /// 队列里的 `.diff` 与落地记录各自独立供货：只收口一边，另一边下一轮照样
+    /// 把这条变更送进验证队列，代价是再 apply、再测、再发布构建，占的是部署器
+    /// 推进也要的那把唯一的槽。2026-09-27 那条被白名单拒掉的变更，6 小时里被
+    /// 构建了 12 次。
+    ///
+    /// 判据分两半：前半说两份载体**都在供货**，所以后面的空集不可能是"探针根本
+    /// 没伸到那里"；后半说下一轮那次汇合——验证循环自己调的那个函数——在两份
+    /// 载体里都找不到它。
+    #[tokio::test]
+    async fn a_refused_change_leaves_both_channels() {
+        let (_temp, pipeline, landing) = queued_and_recorded();
+
+        assert_eq!(
+            pipeline.pending_changes(None).await.unwrap().len(),
+            1,
+            "队列必须在供货，否则下面的空集什么都证明不了"
+        );
+        assert_eq!(
+            cog_core::ChangeLanding::unverified_changes(&landing)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "记录也在供货：只清队列那一半，这条变更下一轮照样回来"
+        );
+
+        retire_change_everywhere(
+            &pipeline,
+            Some(&landing),
+            "chg-1",
+            "landing refused the change",
+        )
+        .await;
+
+        assert_eq!(
+            landing.retired.lock().unwrap().as_slice(),
+            [(
+                "chg-1".to_string(),
+                "landing refused the change".to_string()
+            )],
+            "记录那份要一起收口，并带上关掉它的原因"
+        );
+        let (again, _) = merge_verification_inputs(
+            pipeline.pending_changes(None).await.unwrap(),
+            Some(&landing),
+        )
+        .await;
+        assert!(again.is_empty(), "下一轮不该在两份载体里再找到它");
+    }
+
+    /// 只收口一边不算退休。这条是"成对"那一半的证伪件：队列清干净了，记录
+    /// 仍把同一条变更交给下一轮。
+    #[tokio::test]
+    async fn one_channel_alone_brings_a_retired_change_back() {
+        let (_temp, pipeline, landing) = queued_and_recorded();
+
+        pipeline
+            .retire_change("chg-1", "landing refused the change")
+            .await
+            .unwrap();
+        assert!(
+            pipeline.pending_changes(None).await.unwrap().is_empty(),
+            "队列那一半已经关了"
+        );
+
+        let (again, _) = merge_verification_inputs(
+            pipeline.pending_changes(None).await.unwrap(),
+            Some(&landing),
+        )
+        .await;
+        assert_eq!(again.len(), 1, "记录还在供货，所以这条变更根本没有被退休");
     }
 
     #[tokio::test]
