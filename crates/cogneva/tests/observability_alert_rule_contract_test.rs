@@ -320,6 +320,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_notification_delivery_total",
         "crates/cog-notification/src/delivery.rs",
     ),
+    // The registry store's walks. What the store holds is published as three
+    // readings that all keep their last value when a walk fails, so the failure
+    // itself needs its own series -- and it is published from the first scrape,
+    // which is what tells a walker that never succeeded apart from a process
+    // that measures no registry (the two publish the same nothing otherwise).
+    (
+        "cogneva_registry_walk_failures_total",
+        "crates/cog-reflection/src/registry_footprint.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.

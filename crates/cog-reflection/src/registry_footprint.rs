@@ -81,6 +81,21 @@ pub const TAG_COUNT_METRIC: &str = "cogneva_registry_tag_count";
 /// that reads as unchanging rather than as unmeasured.
 pub const SCAN_AGE_METRIC: &str = "cogneva_registry_scan_age_seconds";
 
+/// Walks that failed, published from the first scrape.
+///
+/// The three readings above answer "what is the store holding" and go quiet in
+/// two different ways, neither of which says the walk is broken: a walk that
+/// fails after a success leaves the bytes and the tag count at their last
+/// reading with only the age moving, and a process that has never walked once
+/// publishes nothing at all -- which is the same picture as a process that
+/// measures no registry. On 2026-09-27 the second shape is what happened: the
+/// tag list grew past the server's write buffer, every walk failed from that
+/// point on, and the whole family was simply absent from the exposition.
+///
+/// This counter is the reading for the failure itself, so a walker that has
+/// never succeeded reads as a count rather than as a silence.
+pub const WALK_FAILURES_METRIC: &str = "cogneva_registry_walk_failures_total";
+
 /// Deployment variable naming the claim behind the registry's store.
 ///
 /// The declaration is what gates the reading, exactly as it does for the
@@ -182,6 +197,9 @@ pub struct RegistryFootprint {
     claim: String,
     used_bytes: AtomicU64,
     tag_count: AtomicU64,
+    /// Failed walks since this handle was built. Monotonic, so a rule reads its
+    /// increase rather than its value, and reset by the process that restarts.
+    walk_failures: AtomicU64,
     measured: AtomicBool,
     /// Unix seconds of the last walk that succeeded, 0 before the first.
     last_success_secs: AtomicU64,
@@ -196,6 +214,7 @@ impl RegistryFootprint {
             claim: claim.into(),
             used_bytes: AtomicU64::new(0),
             tag_count: AtomicU64::new(0),
+            walk_failures: AtomicU64::new(0),
             measured: AtomicBool::new(false),
             last_success_secs: AtomicU64::new(0),
             started_secs: unix_now(),
@@ -231,6 +250,16 @@ impl RegistryFootprint {
             .then(|| self.tag_count.load(Ordering::Relaxed))
     }
 
+    /// Walks that failed since this handle was built.
+    ///
+    /// Zero before the first walk and zero after a store that walks cleanly,
+    /// which is why a rule reads the increase over a window rather than this
+    /// value: "no walk has failed yet" and "walks stopped failing" are the same
+    /// reading here, and they are the same answer to the question it asks.
+    pub fn walk_failures(&self) -> u64 {
+        self.walk_failures.load(Ordering::Relaxed)
+    }
+
     /// Seconds since the last successful walk, or since this handle was built if
     /// no walk has ever succeeded.
     pub fn scan_age_secs(&self, now: u64) -> u64 {
@@ -246,6 +275,18 @@ impl RegistryFootprint {
     /// silence the comparison this feeds. So a partial walk changes nothing and
     /// is reported instead.
     pub async fn measure(&self) -> SFResult<u64> {
+        let outcome = self.walk().await;
+        if outcome.is_err() {
+            // Counted here rather than at the call site: every caller that can
+            // see a failure is a caller whose failure has to be readable, and a
+            // walk that failed is not otherwise a reading anywhere.
+            self.walk_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// One pass over the store: the tag list, then every tag's manifest.
+    async fn walk(&self) -> SFResult<u64> {
         let tags = self.tags_list().await?;
         // Deduplicated by digest: the layers of rev N are also the base of rev
         // N+1, so summing tag by tag would count the same bytes once per rev that
@@ -356,17 +397,25 @@ impl RegistryFootprint {
 
 #[async_trait]
 impl Observable for RegistryFootprint {
-    /// Nothing at all before the first walk completes, so the series the rule
-    /// compares against the declared size does not exist yet rather than existing
-    /// with a value nothing measured. A process that runs no deployer publishes
-    /// none of these, which is what "this one does not measure the registry"
-    /// looks like from outside.
+    /// The bytes and the tag count exist only once a walk has succeeded, so the
+    /// series the rule compares against the declared size does not exist yet
+    /// rather than existing with a value nothing measured. The failure count is
+    /// published from the first scrape instead: a process whose walks all fail
+    /// publishes nothing else at all, and that absence is indistinguishable from
+    /// a process that measures no registry -- which is a claim only a process
+    /// holding no handle can make.
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
+        let mut out = vec![RawMetric::new(
+            WALK_FAILURES_METRIC,
+            self.walk_failures() as f64,
+        )];
         let Some(bytes) = self.value() else {
-            return Ok(Vec::new());
+            return Ok(out);
         };
-        let mut out = vec![RawMetric::new(REFERENCED_BYTES_METRIC, bytes as f64)
-            .with_label(CLAIM_LABEL, self.claim())];
+        out.push(
+            RawMetric::new(REFERENCED_BYTES_METRIC, bytes as f64)
+                .with_label(CLAIM_LABEL, self.claim()),
+        );
         if let Some(tags) = self.tags() {
             out.push(RawMetric::new(TAG_COUNT_METRIC, tags as f64));
         }
@@ -751,11 +800,59 @@ mod tests {
     }
 
     /// The reading appears only once something has been measured: a zero would be
-    /// a claim that the store is empty.
+    /// a claim that the store is empty. The failure count is the exception and
+    /// appears immediately, because a walker that never succeeded is otherwise
+    /// indistinguishable from one that measures nothing.
     #[tokio::test]
-    async fn nothing_is_published_before_a_walk_succeeds() {
+    async fn nothing_is_published_before_a_walk_succeeds_except_the_failure_count() {
         let footprint = RegistryFootprint::new("127.0.0.1:1", "claim");
-        assert!(footprint.collect_metrics("").await.unwrap().is_empty());
+        let metrics = footprint.collect_metrics("").await.unwrap();
+        assert_eq!(metrics.len(), 1, "only the failure count: {metrics:?}");
+        assert_eq!(metrics[0].name, WALK_FAILURES_METRIC);
+        assert_eq!(metrics[0].value, 0.0, "no walk has failed yet");
+        assert!(
+            !metrics.iter().any(|m| m.name == REFERENCED_BYTES_METRIC),
+            "the bytes must not exist before a walk measured them"
+        );
+    }
+
+    /// A walk that failed is a reading of its own: the bytes keep the last
+    /// successful value and the age moves, so without this count nothing in the
+    /// exposition says the walk is the thing that broke.
+    #[tokio::test]
+    async fn a_failed_walk_is_counted_and_a_successful_one_is_not() {
+        let (dead, _handle) = stub_registry(routes(vec![(
+            tags_path(),
+            http_200(r#"{"name":"cogneva","tags":["local"]}"#),
+        )]))
+        .await;
+        let footprint = RegistryFootprint::new(dead, "claim");
+        assert!(footprint.measure().await.is_err(), "no manifest route");
+        assert_eq!(footprint.walk_failures(), 1);
+        assert_eq!(footprint.value(), None, "a failed walk measured nothing");
+
+        let counter = footprint
+            .collect_metrics("")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == WALK_FAILURES_METRIC)
+            .expect("the count is published even with no reading");
+        assert_eq!(counter.value, 1.0);
+
+        // The same counts stay put across a store that walks cleanly, so the
+        // rule has to read an increase rather than the value.
+        let (endpoint, _handle) = stub_registry(routes(vec![
+            (tags_path(), http_200(&tags_body(&["local"]))),
+            (
+                tag_manifest_path("local"),
+                http_200(&manifest(&[layer("sha256:bin", 4_096)])),
+            ),
+        ]))
+        .await;
+        let healthy = RegistryFootprint::new(endpoint, "claim");
+        assert_eq!(healthy.measure().await.unwrap(), 4_196);
+        assert_eq!(healthy.walk_failures(), 0);
     }
 
     /// The claim and the age are what make the bytes usable: one names the

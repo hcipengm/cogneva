@@ -1035,6 +1035,15 @@ data:
               },
               "severity": "warning",
               "summary": "a notification outlet failed to deliver {value} time(s) in the last hour, on outlet {outlet}, failing at {result}. Nothing else in this deployment shows it: the caller sees the same thing whether the message reached a human or was dropped, so without this reading a broken outlet is visible only by reading one container's log -- and this is the path whose failure makes every other alert silent. The result separates causes that have different owners: unreachable is the network path to that outlet (the evolution pod's egress is an allow-list, so a robot host that is not named there is blocked before any HTTP happens), http_error is the receiver answering with something other than 2xx (a rotated or wrong token, a rate limit, an outage on their side), and envelope_error is the receiver answering 2xx while its own envelope code says the message was refused (a keyword filter, a failed signature) -- the one that reads as delivered everywhere except inside the platform. The count is per pod and resets with the process, and this rule reads a one-hour increase rather than the total, so an outlet that is fixed stops firing by itself. If every outlet fails at once, look for what they share: the gateway in front of them, or the pod's egress. A broadcast to WebSocket subscribers is deliberately not counted: having no subscriber is a legitimate state, not a delivery failure"
+            },
+            {
+              "name": "registry_store_walk_failing",
+              "promql": "increase(cogneva_registry_walk_failures_total[1h])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The walk over the registry store failed {value} time(s) in the last hour. That walk is the only producer of what the store is holding (referenced bytes, tag count, scan age), and the same tag listing feeds the retention round that removes tags when the claim fills -- so while it fails, those readings are last-known rather than current and nothing is being removed, and the pair is invisible without this count: the bytes keep the value of the last successful walk, and a process that never walked once publishes none of the three at all, which is exactly what a process that measures no registry publishes. A walk failing from the first scrape after a restart is the shape to look for first, and the walk's own error in that container's log is where the cause is (a store that answered with something the reader could not frame, an unreachable endpoint, a manifest the registry would not serve). This rule reads the increase, so a walk that starts working stops firing by itself; the count resets with the process, so compare it against the container's uptime before reading it as a rate"
             }
           ]
         },
