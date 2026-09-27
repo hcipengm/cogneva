@@ -638,6 +638,8 @@ sudo apt-get update && sudo apt-get install -y build-essential pkg-config protob
 | serde / serde_json | 1.0 | Serialization |
 | tracing / tracing-subscriber | 0.1 / 0.3 | Logging & tracing |
 
+> The version numbers above mirror `[workspace.dependencies]` in `Cargo.toml`; when dependencies are upgraded, update this table in the same commit to keep the documentation in sync.
+
 **Optional runtime services** — only needed for a full local run (building and unit tests work without them): PostgreSQL, Redis, Qdrant, NATS JetStream, Meilisearch, and S3-compatible object storage. Each is abstracted behind a `cog-core` Backend Trait and can be swapped for another implementation.
 
 **Verify your setup**

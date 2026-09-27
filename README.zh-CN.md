@@ -634,6 +634,8 @@ sudo apt-get update && sudo apt-get install -y build-essential pkg-config protob
 | serde / serde_json | 1.0 | 序列化 |
 | tracing / tracing-subscriber | 0.1 / 0.3 | 日志与链路追踪 |
 
+> 表中版本号与 `Cargo.toml` 的 `[workspace.dependencies]` 保持一致；升级依赖时请在同一提交中同步更新本表，避免文档漂移。
+
 **可选运行时服务**——仅在本地完整运行系统时需要（编译与单元测试不依赖它们）：PostgreSQL、Redis、Qdrant、NATS JetStream、Meilisearch 以及兼容 S3 的对象存储。它们均被抽象在 `cog-core` 的 Backend Trait 之后，可替换为其他实现。
 
 **验证环境**
