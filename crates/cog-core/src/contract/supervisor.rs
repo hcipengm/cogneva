@@ -387,6 +387,14 @@ pub enum SupervisorEvent {
         timestamp: DateTime<Utc>,
     },
 
+    /// Unfinished tasks owned by a dead agent node were reclaimed and
+    /// re-queued for reassignment to surviving agents (issue #62).
+    AgentTasksReclaimed {
+        agent_id: String,
+        task_ids: Vec<String>,
+        timestamp: DateTime<Utc>,
+    },
+
     /// Crew exhausted its retry budget; Squad respawn requested.
     SquadRespawnRequested {
         crew_id: String,
@@ -524,6 +532,7 @@ impl SupervisorEvent {
             SupervisorEvent::AgentRestarted { .. } => "agent_restarted",
             SupervisorEvent::CheckpointRequested { .. } => "checkpoint_requested",
             SupervisorEvent::CrewRetried { .. } => "crew_retried",
+            SupervisorEvent::AgentTasksReclaimed { .. } => "agent_tasks_reclaimed",
             SupervisorEvent::SquadRespawnRequested { .. } => "squad_respawn_requested",
             SupervisorEvent::SquadRespawnExecuted { .. } => "squad_respawn_executed",
             SupervisorEvent::QuotaThresholdBreached { .. } => "quota_threshold_breached",
