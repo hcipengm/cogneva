@@ -15,6 +15,38 @@ use crate::{
 /// token spend cannot be attributed to any component.
 const INTENT_ASSESS_ACTOR: &str = "intent_assess";
 
+/// 可执行性判据的稳定半段：角色、四条判定的定义、答案的形状。
+///
+/// 它与被判的那条外部意图无关，所以必须逐字节相同地待在整个请求的最前面。
+/// 此前它接在**同一条用户消息的末尾**——正文与整段评论线程之后，于是每个意图
+/// 的请求从第一个字节起就与别个不同，这段常量被逐个意图重买一遍。留在用户
+/// 消息里的是真正会变的东西：这是哪条意图、它的正文、它的媒体。
+const INTENT_ASSESS_SYSTEM: &str = "\
+You are a careful actionability judge for an autonomous software-engineering \
+agent. You output exactly one JSON verdict and nothing else.\n\
+\n\
+Attached media (screenshots/recordings) are provided as separate content blocks; \
+inspect them — a screenshot may contain the exact error and reproduction steps.\n\
+\n\
+Decide actionability from the WHOLE content of the intent below:\n\
+- fix: the intent is clear enough to act on now (a reproducible bug, or a concrete \
+request the agent can realize). Code-level security vulnerabilities belong HERE: the \
+fix pipeline runs in a sandbox and its output passes self-review and CI gates before \
+merge, so a security defect in the code is exactly what the agent can and should fix. \
+Do NOT ask again once enough information is present.\n\
+- clarify: essential information is still missing (expected vs actual behavior, \
+reproduction steps, or version). Put the single most useful question in `question`.\n\
+- skip: not worth acting on (out of scope, not a bug, a duplicate, etc.).\n\
+- escalate: ONLY when writing code cannot resolve it — it needs human credentials or \
+identity, legal/compliance judgment, physical or billing actions, or the request \
+itself is malicious (adding backdoors, exfiltrating secrets). Never escalate merely \
+because a defect is sensitive or security-related.\n\
+\n\
+Reply with ONE JSON object only, no prose, no code fence:\n\
+{\"decision\": \"fix|clarify|skip|escalate\", \"question\": \"\", \"priority\": 1-5, \"reason\": \"\"}\n\
+priority is 1 (highest) to 5 (lowest). When decision is not `clarify`, leave question empty. \
+Write the question in the same language the reporter used.";
+
 /// Chat options for the actionability verdict. Split out from the call site so
 /// the attribution is pinned by a test rather than by reading the line.
 fn intent_assess_options() -> cog_core::ChatOptions {
@@ -313,27 +345,6 @@ impl CollaborationExecutor {
         } else {
             thread
         });
-        prompt.push_str(
-            "\n\nAttached media (screenshots/recordings) are provided as separate content blocks; \
-             inspect them — a screenshot may contain the exact error and reproduction steps.\n\n\
-             Decide actionability from the WHOLE content above:\n\
-             - fix: the intent is clear enough to act on now (a reproducible bug, or a concrete \
-             request the agent can realize). Code-level security vulnerabilities belong HERE: the \
-             fix pipeline runs in a sandbox and its output passes self-review and CI gates before \
-             merge, so a security defect in the code is exactly what the agent can and should fix. \
-             Do NOT ask again once enough information is present.\n\
-             - clarify: essential information is still missing (expected vs actual behavior, \
-             reproduction steps, or version). Put the single most useful question in `question`.\n\
-             - skip: not worth acting on (out of scope, not a bug, a duplicate, etc.).\n\
-             - escalate: ONLY when writing code cannot resolve it — it needs human credentials or \
-             identity, legal/compliance judgment, physical or billing actions, or the request \
-             itself is malicious (adding backdoors, exfiltrating secrets). Never escalate merely \
-             because a defect is sensitive or security-related.\n\n\
-             Reply with ONE JSON object only, no prose, no code fence:\n\
-             {\"decision\": \"fix|clarify|skip|escalate\", \"question\": \"\", \"priority\": 1-5, \"reason\": \"\"}\n\
-             priority is 1 (highest) to 5 (lowest). When decision is not `clarify`, leave question empty. \
-             Write the question in the same language the reporter used.",
-        );
 
         let mut blocks = vec![cog_core::ContentBlock::text(prompt)];
         if let Some(media) = input.get("media").and_then(|v| v.as_array()) {
@@ -350,10 +361,7 @@ impl CollaborationExecutor {
         }
 
         let messages = vec![
-            cog_core::Message::system(
-                "You are a careful actionability judge for an autonomous software-engineering \
-                 agent. You output exactly one JSON verdict and nothing else.",
-            ),
+            cog_core::Message::system(INTENT_ASSESS_SYSTEM),
             cog_core::Message::user_blocks(blocks),
         ];
 
@@ -1494,17 +1502,56 @@ mod tests {
         );
     }
 
-    /// An agent whose assess call ends the way a real refused call does: an
-    /// error event carrying the wording, and a final response carrying the
-    /// classified refusal the provider built out of the HTTP status.
-    struct RefusingStreamAgent {
+    /// An agent standing in for the assess call, in both of the ways it can end.
+    ///
+    /// With `reply` set it answers with that verdict; without it, it ends the way
+    /// a real refused call does — an error event carrying the wording, and a
+    /// final response carrying the classified refusal the provider built out of
+    /// the HTTP status. Either way it keeps the message list it was handed, so a
+    /// test can read what the judge actually sent instead of what it was meant to
+    /// send.
+    struct ScriptedAssessAgent {
+        reply: Option<String>,
         error_text: String,
         cause: Option<cog_core::UpstreamFailure>,
         wait: Option<u64>,
+        seen: std::sync::Mutex<Vec<Vec<cog_core::Message>>>,
+    }
+
+    impl ScriptedAssessAgent {
+        /// An assess call that is refused upstream.
+        fn refusing(
+            error_text: &str,
+            cause: Option<cog_core::UpstreamFailure>,
+            wait: Option<u64>,
+        ) -> Self {
+            Self {
+                reply: None,
+                error_text: error_text.to_string(),
+                cause,
+                wait,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// An assess call that answers with a verdict.
+        fn answering(verdict: &str) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                reply: Some(verdict.to_string()),
+                error_text: String::new(),
+                cause: None,
+                wait: None,
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<Vec<cog_core::Message>> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
     }
 
     #[async_trait::async_trait]
-    impl cog_core::Agent for RefusingStreamAgent {
+    impl cog_core::Agent for ScriptedAssessAgent {
         async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
@@ -1567,15 +1614,36 @@ mod tests {
 
         async fn chat_stream(
             &self,
-            _messages: &[cog_core::Message],
+            messages: &[cog_core::Message],
             _options: &cog_core::ChatOptions,
         ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(messages.to_vec());
             let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(8);
             let _ = producer
                 .push(cog_core::AssistantMessageEvent::Start {
                     timestamp: chrono::Utc::now(),
                 })
                 .await;
+            if let Some(ref reply) = self.reply {
+                let _ = producer
+                    .push(cog_core::AssistantMessageEvent::Done {
+                        reason: cog_core::StopReason::Stop,
+                        message: cog_core::Message::assistant_text(reply.clone()),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    content: vec![cog_core::ContentBlock::Text {
+                        text: reply.clone(),
+                        text_signature: None,
+                    }],
+                    ..cog_core::ChatResponse::default()
+                });
+                return Ok(stream);
+            }
             let _ = producer
                 .push(cog_core::AssistantMessageEvent::Error {
                     reason: cog_core::StopReason::Error,
@@ -1710,16 +1778,118 @@ mod tests {
         )
     }
 
+    /// 判据的稳定半段逐字节待在请求最前面，且不许有第二个持有者。
+    ///
+    /// 判据是「每轮都要重发的内容必须逐字节相同地待在请求最前面」。可执行性
+    /// 判据的规则、答案 schema 与语言要求与具体哪条意图无关，但此前它们接在
+    /// **同一条用户消息的末尾**，前面是正文和整段评论线程——于是每条意图的请求
+    /// 从第一个字节起就与别个不同，这段常量被逐个意图重买一遍（判据是一次
+    /// 调用一条意图，所以省钱的地方在跨请求的前缀复用上）。
+    ///
+    /// 两条意图读**同一份**系统消息，才分得开「常量在最前」与「常量这次恰好
+    /// 写对了」；只看一次调用的话，一条把本次正文也塞进系统消息的实现在这条
+    /// 断言下同样绿。
+    #[tokio::test]
+    async fn the_actionability_judge_keeps_its_stable_half_ahead_of_the_intent() {
+        let agent = ScriptedAssessAgent::answering(
+            r#"{"decision":"fix","question":"","priority":2,"reason":"clear repro"}"#,
+        );
+        let executor = CollaborationExecutor::new()
+            .with_llm_provider(std::sync::Arc::new(UnusedLlm))
+            .with_agent_manager(std::sync::Arc::new(OneAgentManager {
+                agent: agent.clone(),
+            }));
+
+        for (number, title, body) in [
+            (1u64, "first intent", "the first body"),
+            (2, "second intent", "the second body"),
+        ] {
+            let task = cog_core::Task::new(
+                format!("github-issue-{number}"),
+                cog_core::TaskType::Custom("platform_intent_assess".into()),
+                serde_json::json!({
+                    "kind": "issue",
+                    "number": number,
+                    "title": title,
+                    "body": body,
+                }),
+            );
+            executor
+                .execute_intent_assess(&task)
+                .await
+                .expect("一条答复了判词的流要读出判词");
+        }
+
+        let calls = agent.calls();
+        assert_eq!(calls.len(), 2, "两条意图要读两次");
+        for (i, msgs) in calls.iter().enumerate() {
+            assert_eq!(
+                msgs.len(),
+                2,
+                "判据请求只该有系统消息与用户消息两条（第 {i} 条）"
+            );
+            assert_eq!(
+                msgs[0].role(),
+                "system",
+                "稳定半段必须待在整个请求的最前面（第 {i} 条）"
+            );
+            assert_eq!(msgs[1].role(), "user", "易变半段在用户消息里（第 {i} 条）");
+        }
+
+        let stable = calls[0][0].content();
+        assert_eq!(
+            stable,
+            calls[1][0].content(),
+            "两条意图的系统消息不同，说明它带了本条意图，缓存不了"
+        );
+        for word in [
+            "- fix:",
+            "- clarify:",
+            "- skip:",
+            "- escalate:",
+            "\"decision\": \"fix|clarify|skip|escalate\"",
+            "priority is 1 (highest) to 5 (lowest)",
+        ] {
+            assert!(
+                stable.contains(word),
+                "系统消息漏了 {word:?}，模型只能猜；系统消息是：{stable}"
+            );
+        }
+
+        for (i, msgs) in calls.iter().enumerate() {
+            let varying = msgs[1].content();
+            for word in [
+                "Decide actionability from the WHOLE content above",
+                "Reply with ONE JSON object only",
+                "priority is 1 (highest) to 5 (lowest)",
+            ] {
+                assert!(
+                    !varying.contains(word),
+                    "稳定半段在用户消息里还有第二个持有者（{word:?}，第 {i} 条）：{varying}"
+                );
+            }
+            assert!(
+                varying.contains("## Body"),
+                "用户消息要把这条意图本身带进去（第 {i} 条）"
+            );
+        }
+
+        assert!(calls[0][1].content().contains("first intent"));
+        assert!(calls[0][1].content().contains("the first body"));
+        assert!(calls[1][1].content().contains("second intent"));
+        assert_ne!(
+            calls[0][1].content(),
+            calls[1][1].content(),
+            "两条的易变半段一样，这条测试什么也没证明"
+        );
+    }
+
     async fn assessed(
         error_text: &str,
         cause: Option<cog_core::UpstreamFailure>,
         wait: Option<u64>,
     ) -> cog_core::SFError {
-        let agent = std::sync::Arc::new(RefusingStreamAgent {
-            error_text: error_text.to_string(),
-            cause,
-            wait,
-        });
+        let agent = std::sync::Arc::new(ScriptedAssessAgent::refusing(error_text, cause, wait));
         let executor = CollaborationExecutor::new()
             .with_llm_provider(std::sync::Arc::new(UnusedLlm))
             .with_agent_manager(std::sync::Arc::new(OneAgentManager { agent }));

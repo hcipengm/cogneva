@@ -15,6 +15,29 @@ use crate::squad::pge::types::{EvaluationResult, PlannerOutput, RoundOutcome, Ve
 use cog_core::{Task, TaskType};
 use std::sync::Arc;
 
+/// 失败分类的稳定半段：角色、分类学、答案的形状。
+///
+/// 它与被分类的失败无关，所以它必须逐字节相同地待在整个请求的最前面——
+/// 系统消息就是这个位置。此前它和 `Evaluation result:` / `History` 同处一条
+/// 用户消息，且**答案 schema 排在两者之后**：请求的第一个字节就已经和上一次
+/// 不同，于是这段常量每次失败都重买一遍，运行得越久买得越多。剩下的用户消息
+/// 只装这一次的失败本身。
+const FAILURE_CLASSIFIER_SYSTEM: &str = "\
+You are a precise failure classifier. Respond only with valid JSON.\n\
+You are a failure-analysis expert for an AI agent system. \
+A squad of agents (Planner → Generator → Evaluator) attempted a task but failed. \
+Analyze the failure and classify it into one of the following types:\n\
+\n\
+- Contradiction: the plan and the generated output contradict each other. → strategy: Modified (adjust prompt/context).\n\
+- SkillGap: the generator lacks the skill/tool needed to execute the plan. → strategy: Escalated (swap agent composition).\n\
+- AmbiguousRequirement: the goal/requirement is unclear or contradictory. → strategy: Modified (re-analyze goal).\n\
+- ResourceError: external tool/API failed (network timeout, rate limit, etc.). → strategy: Identical (simple retry).\n\
+- LogicError: the generated code/reasoning contains a logical bug. → strategy: Modified (inject error hint).\n\
+- Unrecoverable: the task is fundamentally impossible or requires human judgment. → strategy: Unrecoverable.\n\
+\n\
+Respond with **only** a JSON object matching this schema:\n\
+{\"failure_type\":\"...\",\"root_cause\":\"...\",\"recommended_strategy\":\"...\",\"suggested_modifications\":\"...\"}";
+
 /// Ralph Loop 的最终判定。
 #[derive(Debug, Clone)]
 pub enum RalphVerdict {
@@ -893,30 +916,18 @@ impl RalphLoop {
         crate::observable::global_observable()
             .record_failure_history_bytes(history_json.len(), dropped_bytes);
 
+        // The varying half: this failure, and the tail of what the run did before
+        // it. The taxonomy and the answer schema are not here — they sit in
+        // `FAILURE_CLASSIFIER_SYSTEM`, ahead of everything that changes.
         let prompt = format!(
-            "You are a failure-analysis expert for an AI agent system. \
-A squad of agents (Planner → Generator → Evaluator) attempted a task but failed. \
-Analyze the failure and classify it into one of the following types:\n\
+            "Evaluation result:\n{evaluation:?}\n\
 \n\
-- Contradiction: the plan and the generated output contradict each other. → strategy: Modified (adjust prompt/context).\n\
-- SkillGap: the generator lacks the skill/tool needed to execute the plan. → strategy: Escalated (swap agent composition).\n\
-- AmbiguousRequirement: the goal/requirement is unclear or contradictory. → strategy: Modified (re-analyze goal).\n\
-- ResourceError: external tool/API failed (network timeout, rate limit, etc.). → strategy: Identical (simple retry).\n\
-- LogicError: the generated code/reasoning contains a logical bug. → strategy: Modified (inject error hint).\n\
-- Unrecoverable: the task is fundamentally impossible or requires human judgment. → strategy: Unrecoverable.\n\
-\n\
-Evaluation result:\n{evaluation:?}\n\
-\n\
-History of previous attempts:\n{history_json}\n\
-\n\
-Respond with **only** a JSON object matching this schema:\n\
-{{\"failure_type\":\"...\",\"root_cause\":\"...\",\"recommended_strategy\":\"...\",\"suggested_modifications\":\"...\"}}"
+History of previous attempts:\n{history_json}"
         );
 
         let messages = vec![
             cog_core::Message::System {
-                content: "You are a precise failure classifier. Respond only with valid JSON."
-                    .into(),
+                content: FAILURE_CLASSIFIER_SYSTEM.into(),
                 timestamp: chrono::Utc::now(),
             },
             cog_core::Message::User {
@@ -1502,11 +1513,9 @@ mod tests {
     /// `dropped` 说明这条界从没生效过——那不是坏了，是没被用到。
     #[tokio::test]
     async fn the_failure_prompt_records_what_the_bound_left_out() {
-        let llm = Arc::new(MockSemanticLlm {
-            response_json:
-                r#"{"failure_type":"LogicError","root_cause":"x","recommended_strategy":"Modified","suggested_modifications":"y"}"#
-                    .to_string(),
-        });
+        let llm = Arc::new(MockSemanticLlm::new(
+            r#"{"failure_type":"LogicError","root_cause":"x","recommended_strategy":"Modified","suggested_modifications":"y"}"#,
+        ));
         let mut ralph = RalphLoop::with_config(RalphLoopConfig {
             max_iterations: 50,
             stagnation_window: 2,
@@ -1541,6 +1550,114 @@ mod tests {
             after
         );
         assert!(after.0 > before.0, "喂进去的那段也要记");
+    }
+
+    /// 分类学的稳定半段逐字节待在请求最前面，且不许有第二个持有者。
+    ///
+    /// 判据是「每轮都要重发的内容必须逐字节相同地待在请求最前面」。这段文本
+    /// （角色、六个分类、答案 schema）与这一次的失败无关，此前它和
+    /// `Evaluation result:` / `History` 同处一条用户消息、schema 还排在两者
+    /// **之后**，于是一次运行里每失败一次就重买一遍，历史越长它越靠后。
+    ///
+    /// 两次失败读**同一份**系统消息，才分得开「常量在最前」与「常量这次恰好
+    /// 写对了」；只看一次调用的话，一条把本次失败也塞进系统消息的实现在这条
+    /// 断言下同样绿。
+    #[tokio::test]
+    async fn the_classifier_keeps_its_stable_half_ahead_of_what_changes() {
+        let double = Arc::new(MockSemanticLlm::new(
+            r#"{"failure_type":"LogicError","root_cause":"x","recommended_strategy":"Modified","suggested_modifications":"y"}"#,
+        ));
+        let llm: Arc<dyn cog_core::LlmClient> = double.clone();
+        let ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 3,
+        });
+
+        for failure in ["the first failure", "the second failure"] {
+            let eval = EvaluationResult {
+                verdict: Verdict::Fail,
+                score: Some(0),
+                feedback: failure.into(),
+                criteria: vec![],
+                details: None,
+            };
+            // 历史也各不相同：两份请求的易变半段必须真的不同，否则下面
+            // 「稳定半段相同」这条比较证明不了任何事。
+            let history = vec![failed_iteration(1, ResetStrategy::Identical, failure)];
+            ralph
+                .analyze_failure_with_llm(&eval, &history, &llm)
+                .await
+                .expect("mock 的答复是一个合法的分类");
+        }
+
+        let calls = double.calls();
+        assert_eq!(calls.len(), 2, "两次失败要读两次");
+
+        for (i, msgs) in calls.iter().enumerate() {
+            assert_eq!(
+                msgs.len(),
+                2,
+                "分类请求只该有系统消息与用户消息两条（第 {i} 次）"
+            );
+            assert_eq!(
+                msgs[0].role(),
+                "system",
+                "稳定半段必须待在整个请求的最前面（第 {i} 次）"
+            );
+            assert_eq!(msgs[1].role(), "user", "易变半段在用户消息里（第 {i} 次）");
+        }
+
+        let stable = calls[0][0].content();
+        assert_eq!(
+            stable,
+            calls[1][0].content(),
+            "两次失败的系统消息不同，说明它带了本次失败，缓存不了"
+        );
+        for word in [
+            "Contradiction",
+            "SkillGap",
+            "AmbiguousRequirement",
+            "ResourceError",
+            "LogicError",
+            "Unrecoverable",
+            "failure_type",
+            "recommended_strategy",
+        ] {
+            assert!(
+                stable.contains(word),
+                "系统消息漏了 {word:?}，模型只能猜；系统消息是：{stable}"
+            );
+        }
+
+        for (i, msgs) in calls.iter().enumerate() {
+            let varying = msgs[1].content();
+            for word in [
+                "Contradiction",
+                "SkillGap",
+                "AmbiguousRequirement",
+                "ResourceError",
+                "LogicError",
+                "Unrecoverable",
+                "matching this schema",
+            ] {
+                assert!(
+                    !varying.contains(word),
+                    "稳定半段在用户消息里还有第二个持有者（{word:?}，第 {i} 次）：{varying}"
+                );
+            }
+            assert!(
+                varying.contains("Evaluation result:"),
+                "用户消息要把这次的失败本身带进去（第 {i} 次）"
+            );
+        }
+
+        assert!(calls[0][1].content().contains("the first failure"));
+        assert!(calls[1][1].content().contains("the second failure"));
+        assert_ne!(
+            calls[0][1].content(),
+            calls[1][1].content(),
+            "两次的易变半段一样，这条测试什么也没证明"
+        );
     }
 
     /// 失败分析提示词的两端读数（fed, dropped），取自全局观测面。
@@ -1988,6 +2105,22 @@ mod tests {
     // -----------------------------------------------------------------
     struct MockSemanticLlm {
         response_json: String,
+        /// Every message list this double was asked to answer, so a test can read
+        /// what the classifier actually sent instead of what it was meant to send.
+        seen: std::sync::Mutex<Vec<Vec<cog_core::Message>>>,
+    }
+
+    impl MockSemanticLlm {
+        fn new(response_json: impl Into<String>) -> Self {
+            Self {
+                response_json: response_json.into(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<cog_core::Message>> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -2028,9 +2161,13 @@ mod tests {
 
         async fn chat(
             &self,
-            _messages: &[cog_core::Message],
+            messages: &[cog_core::Message],
             _options: &cog_core::ChatOptions,
         ) -> cog_core::SFResult<cog_core::ChatResponse> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(messages.to_vec());
             Ok(cog_core::ChatResponse {
                 content: vec![cog_core::ContentBlock::Text {
                     text: self.response_json.clone(),
@@ -2055,9 +2192,7 @@ mod tests {
     }
 
     fn make_ralph_with_mock(response_json: &str) -> RalphLoop {
-        let llm = Arc::new(MockSemanticLlm {
-            response_json: response_json.into(),
-        });
+        let llm = Arc::new(MockSemanticLlm::new(response_json));
         RalphLoop::new().with_llm_provider(llm)
     }
 
@@ -2425,9 +2560,9 @@ mod tests {
             max_iterations: 5,
             stagnation_window: 1,
         })
-        .with_llm_provider(Arc::new(MockSemanticLlm {
-            response_json: r#"{"failure_type":"Contradiction","root_cause":"plan vs output","recommended_strategy":"Modified","suggested_modifications":"align"}"#.into(),
-        }))
+        .with_llm_provider(Arc::new(MockSemanticLlm::new(
+            r#"{"failure_type":"Contradiction","root_cause":"plan vs output","recommended_strategy":"Modified","suggested_modifications":"align"}"#,
+        )))
         .with_history_store("task-archive".into(), backend.clone());
 
         let verdict = ralph
