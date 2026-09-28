@@ -1993,6 +1993,16 @@ mod tests {
     /// monotonic and shared by every test in this binary, so callers compare a
     /// value read before an action against one read after it rather than
     /// asserting a total.
+    ///
+    /// The comparison has to be `after >= before + 1.0`, not an exact
+    /// difference: the outcome is not an argument the caller chooses — it comes
+    /// from the closed set the recorder takes by type — so unlike the review
+    /// counters, where a test can pass a stage name of its own, there is no way
+    /// to give one test a cell no other test writes. Any test that walks a
+    /// collaboration records one of these cells too, so an exact delta would be
+    /// an assertion about what every other test happened to be doing. The
+    /// weaker form still fails a path that records nothing at all, which is the
+    /// defect these guard.
     async fn boundary_cell(name: &str, label: &str, value: &str) -> f64 {
         let metrics = crate::observable::global_observable()
             .collect_metrics("D8")

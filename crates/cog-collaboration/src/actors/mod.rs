@@ -291,8 +291,25 @@ mod tests {
         )
     }
 
-    /// What one cell of the review counter reads, so a test can assert the
-    /// delta this review left rather than an absolute the other tests share.
+    /// A stage name this one test owns, for reading a counter the production
+    /// paths also write.
+    ///
+    /// The self-review counters live on the process-global observable, and every
+    /// test in this binary runs in that one process, so a difference read of a
+    /// cell a production path also writes is a read of a counter other tests may
+    /// be moving at the same moment: reading `{stage="moderator",
+    /// reason="disabled"}` against its own earlier value once landed five ahead
+    /// of what the call under test had left there. The role and the case both go
+    /// into the name, so no two tests write the same cell; a name no production
+    /// path passes also proves the stage that was recorded came from the
+    /// argument rather than from a constant somewhere.
+    fn own_stage(role: &str, case: &str) -> String {
+        format!("{role} ({case}; own stage)")
+    }
+
+    /// What one cell of the review counter reads. The stage has to be one the
+    /// caller owns (see [`own_stage`]): an exact count of a cell that other
+    /// tests also write is a count of what they wrote.
     async fn cell(stage: &str, criteria: &str, verdict: &str) -> f64 {
         global_observable()
             .collect_metrics("D8")
@@ -309,8 +326,8 @@ mod tests {
             .unwrap_or(0.0)
     }
 
-    /// What one cell of the skip counter reads, for the same reason [`cell`]
-    /// reads a delta rather than an absolute.
+    /// What one cell of the skip counter reads, on the same terms as [`cell`]:
+    /// the stage has to be one the caller owns.
     async fn skip_cell(stage: &str, reason: &str) -> f64 {
         global_observable()
             .collect_metrics("D8")
@@ -326,7 +343,8 @@ mod tests {
             .unwrap_or(0.0)
     }
 
-    /// What one cell of the revision counter reads.
+    /// What one cell of the revision counter reads, on the same terms as
+    /// [`cell`]: the stage has to be one the caller owns.
     async fn revision_cell(stage: &str, outcome: &str) -> f64 {
         global_observable()
             .collect_metrics("D8")
@@ -484,8 +502,9 @@ mod tests {
     #[tokio::test]
     async fn a_review_is_held_to_the_task_it_was_asked_to_satisfy() {
         let (agent, seen) = ReviewRecorder::recording(true);
+        let stage = own_stage("planner", "held to the task");
         let before = cell(
-            "planner",
+            &stage,
             SELF_REVIEW_CRITERIA_DECLARED,
             SELF_REVIEW_VERDICT_PASS,
         )
@@ -495,7 +514,7 @@ mod tests {
             agent.as_ref(),
             &Some(cog_core::SelfReviewConfig::default()),
             "draft",
-            "planner",
+            &stage,
             crate::actors::ReviewBasis::HeldTo(review_spec(
                 &task_with_goal("add a rollback step"),
                 &["the plan names the file"],
@@ -512,13 +531,13 @@ mod tests {
         );
         assert_eq!(
             cell(
-                "planner",
+                &stage,
                 SELF_REVIEW_CRITERIA_DECLARED,
                 SELF_REVIEW_VERDICT_PASS
             )
             .await,
             before + 1.0,
-            "a review with a standard in it is counted as such"
+            "a review with a standard in it is counted as such, under the stage it was given"
         );
     }
 
@@ -556,8 +575,9 @@ mod tests {
     #[tokio::test]
     async fn a_review_with_nothing_declared_is_counted_as_running_without_one() {
         let (agent, seen) = ReviewRecorder::recording(false);
+        let stage = own_stage("moderator", "nothing declared");
         let before = cell(
-            "moderator",
+            &stage,
             SELF_REVIEW_CRITERIA_ABSENT,
             SELF_REVIEW_VERDICT_NEED_REVISION,
         )
@@ -567,7 +587,7 @@ mod tests {
             agent.as_ref(),
             &Some(cog_core::SelfReviewConfig::default()),
             "draft",
-            "moderator",
+            &stage,
             crate::actors::ReviewBasis::HeldTo(review_spec(
                 &cog_core::Task::new("t-2", cog_core::TaskType::Planner, serde_json::json!({})),
                 &[],
@@ -578,7 +598,7 @@ mod tests {
         assert_eq!(seen.lock().unwrap()[0].spec, None);
         assert_eq!(
             cell(
-                "moderator",
+                &stage,
                 SELF_REVIEW_CRITERIA_ABSENT,
                 SELF_REVIEW_VERDICT_NEED_REVISION
             )
@@ -657,13 +677,14 @@ mod tests {
     #[tokio::test]
     async fn a_placeholder_is_not_reviewed_and_the_calls_it_saved_are_counted() {
         let (agent, seen) = ReviewRecorder::recording(true);
-        let before = skip_cell("evaluator", SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE).await;
+        let stage = own_stage("evaluator", "placeholder");
+        let before = skip_cell(&stage, SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE).await;
 
         let revised = maybe_self_review(
             agent.as_ref(),
             &Some(cog_core::SelfReviewConfig::default()),
             "{\"verdict\":\"Fail\"}",
-            "evaluator",
+            &stage,
             crate::actors::ReviewBasis::Skipped(SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE),
         )
         .await;
@@ -677,7 +698,7 @@ mod tests {
             "no LLM call is bought for an upstream that just failed"
         );
         assert_eq!(
-            skip_cell("evaluator", SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE).await,
+            skip_cell(&stage, SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE).await,
             before + 1.0
         );
     }
@@ -687,13 +708,14 @@ mod tests {
     #[tokio::test]
     async fn a_stage_with_reviews_disabled_reports_the_skip_it_is() {
         let (agent, seen) = ReviewRecorder::recording(true);
-        let before = skip_cell("moderator", SELF_REVIEW_SKIP_DISABLED).await;
+        let stage = own_stage("moderator", "reviews off");
+        let before = skip_cell(&stage, SELF_REVIEW_SKIP_DISABLED).await;
 
         let revised = maybe_self_review(
             agent.as_ref(),
             &None,
             "draft",
-            "moderator",
+            &stage,
             crate::actors::ReviewBasis::HeldTo(String::new()),
         )
         .await;
@@ -701,7 +723,7 @@ mod tests {
         assert!(revised.is_none());
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(
-            skip_cell("moderator", SELF_REVIEW_SKIP_DISABLED).await,
+            skip_cell(&stage, SELF_REVIEW_SKIP_DISABLED).await,
             before + 1.0
         );
     }
