@@ -396,9 +396,24 @@ async fn detect_temperature_constraint(base_url: &str, model: &str, api_key: &st
 ///
 /// 判 `Some(false)` 的方向是安全的：它只会让网关继续剥这个字段，即现状。
 /// 反过来把"配额 403"读成"支持"会让每次调用都带一个上游可能不认的字段。
+///
+/// 判据是"**流帧里**有没有 usage"，不是"报文里有没有这个子串"：整块 JSON
+/// 应答里也含这个子串，但那说明上游根本没按流式回，它回答的不是我们要问的
+/// 那个问题（下游读的是流）。两种形态在同一条 grep 下同形，所以这里分开：
+/// 有 usage 但不在任何 `data:` 帧里，判 `None` 而不是 `Some(true)`——把不是
+/// 流式的应答读成"支持"，正好会把"其实不支持"钉成实测结论。
 fn classify_usage_probe(status: u16, body: &str) -> Option<bool> {
     if (200..300).contains(&status) {
-        return Some(body.contains("\"usage\""));
+        let in_frame = body
+            .lines()
+            .any(|l| l.trim_start().starts_with("data:") && l.contains("\"usage\""));
+        if in_frame {
+            return Some(true);
+        }
+        if body.contains("\"usage\"") {
+            return None;
+        }
+        return Some(false);
     }
     let lowered = body.to_lowercase();
     if lowered.contains("stream_options") || lowered.contains("include_usage") {
@@ -414,7 +429,16 @@ fn classify_usage_probe(status: u16, body: &str) -> Option<bool> {
 /// usage"，而 usage 出不出现取决于我们发不发这个字段。按厂商画像硬编码着剥，
 /// 就把"它本来会不会报"变成了不可观测——两种解释在同一份读数上完全同形，判错
 /// 也永远拿不到反证。问过这台上游，判定就不再有这个问题。
-async fn detect_usage_in_streaming(base_url: &str, model: &str, api_key: &str) -> Option<bool> {
+///
+/// 问不出来的理由要跟着回来：这一条被调用的两个地方（管理端配置写入、运行时
+/// 补问）都会把结论当"实测"用，而 `None` 在两边都读作"保持画像兜底"。只报一句
+/// "inconclusive" 的话，"上游回了个不是流式的 200"与"配额墙"在同一行日志里同形，
+/// 而前者要去改判据、后者只能等窗口。
+pub(crate) async fn detect_usage_in_streaming(
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Option<bool> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -437,7 +461,19 @@ async fn detect_usage_in_streaming(base_url: &str, model: &str, api_key: &str) -
         .ok()?;
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
-    classify_usage_probe(status, &body)
+    let verdict = classify_usage_probe(status, &body);
+    // 问到了什么形态跟着判定一起记：`None` 的两个成因（不是流式的 200、
+    // 配额/鉴权类拒服）只能从这三个数分开，而它们指向完全不同的下一步。
+    tracing::info!(
+        base_url = %base_url,
+        model = %model,
+        status,
+        sse_frames = body.lines().filter(|l| l.trim_start().starts_with("data:")).count(),
+        names_usage = body.contains("\"usage\""),
+        verdict = ?verdict,
+        "usage-in-stream probe answered"
+    );
+    verdict
 }
 
 /// function-calling 实证探测：发一个带 tools 的最小 chat 请求，强制模型
@@ -878,6 +914,15 @@ mod tests {
                 "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
             ),
             Some(false)
+        );
+        // 2xx 带 usage 但整块体不是流：上游没按流式回，它答的不是"流里会不会
+        // 有 usage"。读成"支持"等于用一个不流式的应答去断言流式行为。
+        assert_eq!(
+            classify_usage_probe(
+                200,
+                r#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#
+            ),
+            None
         );
         // 上游明确点名这个字段拒绝：剥掉它是保护性的。
         assert_eq!(

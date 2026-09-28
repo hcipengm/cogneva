@@ -210,6 +210,18 @@ metric_names! {
     // like a workload that used nothing. The cell vocabulary is declared next to
     // the producer.
     LLM_USAGE_READINGS_TOTAL => "llm_usage_readings_total",
+    // Whether the decision behind `stream_options` rests on something measured
+    // about this upstream, by `upstream`. 1 = it does (the pool entry carries a
+    // probed verdict, or the runtime asked again and got one), 0 = the gateway
+    // is falling back to the vendor profile for it.
+    //
+    // A series of its own because the other face of this decision cannot carry
+    // the distinction: a zero on the counts and an `absent` in the readings say
+    // the upstream was silent, while this says whether silence was ours to
+    // cause. The gateway that stopped asking and the upstream that reports
+    // nothing look the same on every other series here, and only the second is
+    // the upstream's doing.
+    LLM_USAGE_VERDICT_MEASURED => "llm_usage_verdict_measured",
     LLM_REQUEST_PARAM_CLAMPED_TOTAL => "llm_request_param_clamped_total",
     LLM_UPSTREAM_CLIENT_ERRORS_TOTAL => "llm_upstream_client_errors_total",
     LLM_UPSTREAM_FAILURES_TOTAL => "llm_upstream_failures_total",

@@ -210,6 +210,20 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mirror_push_failures_total",
         "crates/cog-github/src/landing.rs",
     ),
+    // The LLM pool's own readings. `llm_upstream_healthy` is the input the usage
+    // rule needs on the other side: an upstream that is unmeasured *and* is
+    // serving traffic is the condition, and the second half of it lives here.
+    // `llm_usage_verdict_measured` is the measured/unmeasured decision itself,
+    // and it is the one series that separates "the upstream reported nothing"
+    // from "we never asked" -- a distinction no count can carry.
+    (
+        "llm_upstream_healthy",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    (
+        "llm_usage_verdict_measured",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     (
         "cogneva_metric_held_without_producer",
         "crates/cog-gateway/src/lib.rs",
