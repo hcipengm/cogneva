@@ -159,8 +159,8 @@ impl From<std::io::Error> for LandingError {
 /// of the queue, and one flattened variant leaves it unable to tell
 /// "re-driving repeats this refusal" from "try again once the host is free".
 /// On 2026-09-27 that flattening cost a change the whitelist had already
-/// refused twelve release builds in six hours, each holding the single build
-/// slot the deployer needed to advance.
+/// refused seven release builds in just under two hours, each holding the
+/// single build slot the deployer needed to advance.
 ///
 /// A size refusal is deliberately *not* on that side even though it is just as
 /// much a property of the change: the cap is the one gate owner approval
@@ -2418,6 +2418,134 @@ mod tests {
         assert!(!chan.is_ancestor(&two, &one).await.unwrap());
         // git exits above 1 when it could not answer at all, which is not "no".
         assert!(chan.is_ancestor(&"0".repeat(40), &two).await.is_err());
+    }
+
+    /// 两个宿主、真 git：一次推送两端都到同一个 rev；落后的一端下一轮被快进补齐；
+    /// 分叉的一端（tip 不是主分支祖先）被拒并带上两端的 tip，而主分支一步不动。
+    ///
+    /// 上面的单测读的是判据的形状，这一条读的是它们接上真 git 之后还成不成立：
+    /// 「补齐」和「不许动」都是对远端 ref 的操作，用 mock 断言不了。
+    #[tokio::test]
+    async fn a_landing_reaches_every_host_and_repairs_only_a_behind_mirror() {
+        async fn commit(dir: &std::path::Path, content: &str) -> String {
+            std::fs::write(dir.join("f"), content).unwrap();
+            run_git(dir, &["add", "-A"]).await.unwrap();
+            run_git(dir, &["commit", "-qm", content]).await.unwrap();
+            run_git(dir, &["rev-parse", "HEAD"])
+                .await
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+        async fn tip(dir: &std::path::Path, refname: &str) -> String {
+            run_git(dir, &["rev-parse", refname])
+                .await
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+        async fn bare(path: &std::path::Path) {
+            tokio::fs::create_dir_all(path).await.unwrap();
+            run_git(path, &["init", "--bare", "-q"]).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (origin, gitee, work) = (
+            root.join("origin.git"),
+            root.join("gitee.git"),
+            root.join("work"),
+        );
+        bare(&origin).await;
+        bare(&gitee).await;
+        tokio::fs::create_dir_all(&work).await.unwrap();
+        run_git(&work, &["init", "-q", "-b", "main"]).await.unwrap();
+        run_git(&work, &["config", "user.email", "t@example.invalid"])
+            .await
+            .unwrap();
+        run_git(&work, &["config", "user.name", "t"]).await.unwrap();
+        run_git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        run_git(&work, &["remote", "add", "gitee", gitee.to_str().unwrap()])
+            .await
+            .unwrap();
+        let first = commit(&work, "one").await;
+        run_git(&work, &["push", "-q", "origin", "main"])
+            .await
+            .unwrap();
+        run_git(&work, &["push", "-q", "gitee", "main"])
+            .await
+            .unwrap();
+
+        let chan = MainChannel::new(
+            work.clone(),
+            GitHubIntegrationConfig {
+                repo: "o/r".into(),
+                base_branch: "main".into(),
+                ..Default::default()
+            },
+            Arc::new(NullProvider),
+            ContributionController::new_shared(),
+        )
+        .with_mirrors(vec![PushTarget::gitee(&GiteeIntegrationConfig {
+            enabled: true,
+            repo: "o/r".into(),
+            base_branch: "main".into(),
+            ..Default::default()
+        })]);
+
+        // 一次落地：两端的 base 分支都到同一个 rev。
+        let second = commit(&work, "two").await;
+        let refusals = chan.push(&work, &second).await.unwrap();
+        assert!(refusals.is_empty(), "{refusals:?}");
+        assert_eq!(tip(&origin, "refs/heads/main").await, second);
+        assert_eq!(tip(&gitee, "refs/heads/main").await, second);
+
+        // 镜像被回退一版：这一轮之后由快进补齐，且主分支不动。
+        run_git(&gitee, &["update-ref", "refs/heads/main", &first])
+            .await
+            .unwrap();
+        let unrepaired = chan.catch_up_mirrors("main").await.unwrap();
+        assert!(unrepaired.is_empty(), "{unrepaired:?}");
+        assert_eq!(tip(&gitee, "refs/heads/main").await, second);
+        assert_eq!(tip(&origin, "refs/heads/main").await, second);
+
+        // 镜像上一条从第一版分出去的提交：两端历史不同，拒绝并点名两端的 tip。
+        run_git(&work, &["checkout", "-q", "-b", "fork", &first])
+            .await
+            .unwrap();
+        let forked = commit(&work, "diverged").await;
+        run_git(&work, &["push", "-q", "--force", "gitee", "fork:main"])
+            .await
+            .unwrap();
+        run_git(&work, &["checkout", "-q", "main"]).await.unwrap();
+
+        let unrepaired = chan.catch_up_mirrors("main").await.unwrap();
+        assert_eq!(unrepaired.len(), 1, "{unrepaired:?}");
+        assert_eq!(unrepaired[0].target.remote, "gitee");
+        let said = unrepaired[0].failure.to_string();
+        assert!(
+            said.contains(&forked) && said.contains(&second),
+            "两端的 tip 都要在：{said}"
+        );
+        assert_eq!(
+            tip(&origin, "refs/heads/main").await,
+            second,
+            "主分支不该动"
+        );
+        assert_eq!(tip(&gitee, "refs/heads/main").await, forked);
+
+        // 半成功不是成功：主分支前进了，镜像被拒就报出来。
+        let third = commit(&work, "three").await;
+        let refusals = chan.push(&work, &third).await.unwrap();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(refusals[0].target.remote, "gitee");
+        assert_eq!(tip(&origin, "refs/heads/main").await, third);
+        assert_eq!(tip(&gitee, "refs/heads/main").await, forked);
     }
 
     #[tokio::test]
