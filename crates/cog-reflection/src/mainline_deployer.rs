@@ -1648,6 +1648,17 @@ struct MainlineState {
     /// 进程重启一次就少一道闸，而重启这个进程正是它自己会做的事。
     #[serde(default)]
     registry_maintenance_unix: i64,
+    /// 回收轮把 tag 服务重启了、而它还没回到"能解析 tag"的那一刻（unix 秒）。
+    ///
+    /// 重启的代价不是"几秒"：新 Pod 的 initContainer 要把全库扫完才 ready（实测
+    /// 20–28 分钟），窗口里每个 `Always` 的引用都解析不到 tag，连节点上已有的字节
+    /// 也起不来。这时开始的滚动注定要失败——目标 Pod 拉不到镜像，等到超时就判这一版
+    /// 坏。所以这一格在重启后**按住推进**，直到 registry 自己答话为止：判据是它给的
+    /// 回答，不是等够一个猜出来的时长，所以没有配套的预算常量。
+    ///
+    /// 只按"我们自己重启过"按住：别的断源原因不归这一格管，也不该由它顺手承担。
+    #[serde(default)]
+    registry_restart_unix: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2740,6 +2751,20 @@ impl MainlineDeployer {
         cog_core::claim_footprint::quantity_bytes(out.trim())
     }
 
+    /// tag 服务答不答话：`GET /v2/` 通就是能服务。
+    ///
+    /// 问的是它自己给的回答，不是"它该起来了"的推断。读的也刻意是**最原始的那个
+    /// 端点**：新 Pod 的 initContainer 还在扫库时 Service 没有端点，这个请求连不上
+    /// ——正是 kubelet 解析 tag 会撞上的同一件事。换成一个要解析正文的读数（比如
+    /// tag 列表）就把我们自己的解析器拉进了判据，解析器一出错会被读成"它没在服务"。
+    async fn registry_is_serving(&self) -> bool {
+        matches!(
+            self.registry_request("GET", "/v2/", MANIFEST_ACCEPT, None)
+                .await,
+            Ok((200, _, _))
+        )
+    }
+
     /// 让 registry 重启一次。它的 initContainer 就是 `garbage-collect`，只在
     /// Pod 启动时跑——所以"跑一次 GC"在这里就是重启那个运行 registry 的工作负载
     /// （单副本、Recreate）。放在 initContainer 是既有选择：唯一会写这个 store 的
@@ -2976,8 +3001,23 @@ impl MainlineDeployer {
         // 删掉的只是 manifest 上的引用：层还在盘上，直到 GC 跑一次。GC 是 registry
         // Pod 的 initContainer，所以"跑一次 GC"就是让那个 Deployment 重启一次。
         if removed > 0.0 {
-            if let Err(e) = self.restart_registry().await {
-                warn!(error = %e, "could not restart the registry to reclaim; the removed tags stay on disk until it restarts");
+            match self.restart_registry().await {
+                Ok(()) => {
+                    // 重启只是"发下去了"：新 Pod 要把全库扫完才 ready，这中间 tag
+                    // 解析不到。落盘一个标记按住推进，直到它自己答话——不落盘的话，
+                    // 进程在这段窗口里重启一次（它正是会做这件事的那个进程）标记就没了，
+                    // 下一轮照常推进，正好推进到窗口正中。
+                    state.registry_restart_unix = Some(now);
+                    if let Err(e) = self.save_state(state) {
+                        warn!(
+                            error = %e,
+                            "could not record the registry restart; a rollout may start while the tag server rebuilds"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not restart the registry to reclaim; the removed tags stay on disk until it restarts")
+                }
             }
         }
         info!(
@@ -3253,6 +3293,34 @@ impl MainlineDeployer {
             AdvanceDecision::SameRev => return Ok(()),
             other => {
                 info!(decision = ?other, "mainline advance skipped");
+                return Ok(());
+            }
+        }
+
+        // 回收轮刚把 tag 服务重启过、而它还在重建索引：这一轮不推。
+        //
+        // 这一版要滚上去的 Pod 用的是 `main-<rev>`，`Always` 会在启动时向 tag 服务
+        // 解析一次，连节点上已有字节也要解析一次；服务缺席时它们一个都起不来，等到
+        // 就绪超时就把这一版判坏（实测这条链连续三轮如此）。等窗口过去再推，代价是
+        // 晚一轮；不等，代价是一个好版本被回滚 + 一段冷却。
+        //
+        // 释放条件只有一条：**它自己答话**。没有配一个"等够多少秒"的预算——那个数
+        // 只能从一次测量里猜出来，而它答话与否是当场可读的。
+        if let Some(restarted_at) = state.registry_restart_unix {
+            if self.registry_is_serving().await {
+                info!(
+                    rev = %rev12(&bare),
+                    held_secs = now - restarted_at,
+                    "the tag server answers again; resuming the rollout"
+                );
+                state.registry_restart_unix = None;
+                self.save_state(&state)?;
+            } else {
+                info!(
+                    rev = %rev12(&bare),
+                    held_secs = now - restarted_at,
+                    "holding the rollout: the tag server is still rebuilding its index after a reclaim restart"
+                );
                 return Ok(());
             }
         }
@@ -4380,12 +4448,18 @@ fn heartbeat_message(
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
     format!(
-        "bare={} upstream={} last_good={} in_flight={} ci_hold={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
+        "bare={} upstream={} last_good={} in_flight={} ci_hold={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
         rev12(bare_rev),
         upstream,
         state.last_good_rev.as_deref().map(rev12).unwrap_or("none"),
         in_flight,
         state.ci_hold_rev.as_deref().map(rev12).unwrap_or("none"),
+        // 被"tag 服务正在重建索引"按住多久：没有这一格，"等它答话"与"没有新 rev 可滚"
+        // 在同一行上完全同形，而两者的处置相反（一个是等，一个是没事干）。
+        state
+            .registry_restart_unix
+            .map(|t| (now_unix - t).to_string())
+            .unwrap_or_else(|| "none".into()),
         state.failed_rev.as_deref().map(rev12).unwrap_or("none"),
         // 环境类失败不占证据面，`failed_rev` 与 `failed_loci=0` 会同时出现；
         // 不说出类别，这一行读起来就像记账坏了。
@@ -8319,10 +8393,15 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_class: FailureClass::Version,
             ci_hold_rev: Some("deadbeef0011".into()),
             registry_maintenance_unix: 0,
+            registry_restart_unix: Some(940),
         };
         let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date(aabbccddeeff)", 1000);
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
         assert!(msg.contains("upstream=up-to-date(aabbccddeeff)"), "{msg}");
+        assert!(
+            msg.contains("registry_hold_secs=60"),
+            "被 tag 服务按住时要读得出按了多久（940 到现在 1000），否则它与\"没有新 rev 可滚\"同形: {msg}"
+        );
         assert!(msg.contains("failed_rev=112233445566"), "{msg}");
         assert!(msg.contains("failed_class=version"), "{msg}");
         // 两处不同的落点 = 还在往前走；和"复现了"是两件事，不能只看个数。
@@ -8665,6 +8744,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_class: FailureClass::Environment,
             ci_hold_rev: None,
             registry_maintenance_unix: 0,
+            registry_restart_unix: None,
         };
         let text = serde_json::to_string(&state).unwrap();
         let back: MainlineState = serde_json::from_str(&text).unwrap();
@@ -9835,6 +9915,84 @@ exit 0
         assert!(
             !kubectl_calls.contains("apply"),
             "no job dispatch expected: {kubectl_calls}"
+        );
+    }
+
+    /// 回收轮重启完 tag 服务之后按住推进：这一版滚上去的 Pod 用的是 `main-<rev>`，
+    /// `Always` 会在启动时解析一次 tag（连节点上已有字节也要解析），服务缺席时它们
+    /// 一个都起不来、等到就绪超时就把这一版判坏。夹具里 `reg.local:5000` 连不上，
+    /// 正是那个窗口的形状——答不上话就不该开始这一版。
+    #[tokio::test]
+    // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
+    async fn a_reclaim_restart_holds_the_rollout_until_the_tag_server_answers() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 部署停在**旧的**那个 rev 上（bare 的祖先）⇒ 前进判定是 Advance。
+        let (bare, _work, rev_a, _rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let kubectl = fake_kubectl(&bin_dir, &main_image("localhost:30500", &rev_a));
+        let ws = test_workspaces(root, &bare);
+        // 一条不被按住的推进是**能走完的**（否则"没建"这个读数不区分"被按住"与"建不成"）。
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, ws);
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        let mut state = deployer.load_state();
+        state.registry_restart_unix = Some(chrono::Utc::now().timestamp());
+        deployer.save_state(&state).unwrap();
+
+        // 这一轮本该在这里停住。不要把返回摊平：真没停住时会一路走到构建、在别处
+        // 炸出一个与判据无关的错，把真正的红点（有没有开始建、标记清没清）盖掉。
+        let _ = deployer.poll_once().await;
+
+        assert!(
+            !bin_dir.join("buildah.log").exists(),
+            "tag 服务还没答话就不该开始这一版：它注定拉不到镜像"
+        );
+        assert!(
+            deployer.load_state().registry_restart_unix.is_some(),
+            "没答话就不能清标记——清了下一轮就正好推进到窗口正中"
+        );
+    }
+
+    /// 反过来：答话即放行，而且**当场**放行（不看按了多久）。释放条件是它给的回答，
+    /// 所以这里没有可调的等待时长。
+    #[tokio::test]
+    // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
+    async fn the_hold_lifts_as_soon_as_the_tag_server_answers() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, _rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let kubectl = fake_kubectl(&bin_dir, &main_image("localhost:30500", &rev_a));
+        let (registry, _handle) = fake_registry(vec![http_200("{}")]).await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.registry = registry;
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+        let deployer = MainlineDeployer::new(cfg, ws);
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        let mut state = deployer.load_state();
+        state.registry_restart_unix = Some(chrono::Utc::now().timestamp());
+        deployer.save_state(&state).unwrap();
+
+        // 放行之后这一轮还要读 registry（补 tag 内容、前移浮动签……），那个假
+        // registry 只答一次，所以后半程怎么结束与这条判据无关——只看标记。
+        let _ = deployer.poll_once().await;
+
+        assert!(
+            deployer.load_state().registry_restart_unix.is_none(),
+            "它答话了就该放行，而不是等够一个猜出来的时长"
         );
     }
 
