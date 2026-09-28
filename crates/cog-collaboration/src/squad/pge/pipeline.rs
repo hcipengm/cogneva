@@ -527,51 +527,82 @@ impl PgePipeline {
                 }
             }
 
-            // Independent review gate: the evaluator above saw the attempt's
-            // own feedback loop, so its Pass is self-assessment. Re-judge in a
-            // fresh context (no history) before accepting; on conflict the
-            // reviewer wins. Both verdicts stay on the record.
-            if self.config.independent_review && matches!(evaluation.verdict, Verdict::Pass) {
-                let mut review = evaluator
-                    .evaluate(
-                        task,
-                        &plan_json,
-                        &serde_json::to_value(&generation).unwrap_or_default(),
-                        &[],
-                        &criteria,
-                        None,
-                    )
-                    .await;
-                review.enforce_criteria_evidence(!criteria.is_empty());
-                // The reviewer ran out of budget too, so it did not reject the
-                // pass — it never looked. Wrapping that as "independent reviewer
-                // rejected" would put the second role's failure on a verdict the
-                // reviewer never reached.
-                if let Some(reason) = review.terminal_env_failure_reason() {
-                    tracing::warn!(
-                        attempt,
-                        "Independent reviewer reported terminal environment failure; aborting pipeline"
-                    );
-                    return Self::terminal_result(
-                        attempt,
-                        plan.clone(),
-                        generation,
-                        Some(reason),
-                        history,
+            // Independent review gate: the evaluator above judged with the
+            // earlier attempts in hand, so its Pass is the one verdict a second
+            // opinion can be independent *of*. Re-judge in a fresh context (no
+            // history) before accepting; on conflict the reviewer wins. Both
+            // verdicts stay on the record.
+            //
+            // Asked only where that premise holds. On a first attempt the
+            // authoring evaluator was handed no history at all — `eval_history`
+            // is built from the attempts before this one — so the reviewer's
+            // request would be byte-identical to the author's: same task, plan,
+            // generation, criteria, empty history. Paying for it anyway buys
+            // nothing: at a fixed temperature the answer is the same by
+            // construction, and at a sampled one a coin flip gets the power to
+            // reject a Pass the run then has no attempt left to retry. The skip
+            // is a saving and is recorded as one, because an unread saving reads
+            // exactly like a gate that is gone.
+            if matches!(evaluation.verdict, Verdict::Pass) {
+                let not_asked = if !self.config.independent_review {
+                    Some(crate::observable::INDEPENDENT_REVIEW_NOT_ASKED_DISABLED)
+                } else if eval_history.is_empty() {
+                    Some(crate::observable::INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT)
+                } else {
+                    None
+                };
+                if let Some(reason) = not_asked {
+                    crate::observable::global_observable().record_independent_review(reason);
+                } else {
+                    let mut review = evaluator
+                        .evaluate(
+                            task,
+                            &plan_json,
+                            &serde_json::to_value(&generation).unwrap_or_default(),
+                            &[],
+                            &criteria,
+                            None,
+                        )
+                        .await;
+                    review.enforce_criteria_evidence(!criteria.is_empty());
+                    // The reviewer ran out of budget too, so it did not reject the
+                    // pass — it never looked. Wrapping that as "independent reviewer
+                    // rejected" would put the second role's failure on a verdict the
+                    // reviewer never reached, and a review that answered nothing is
+                    // not one of the two verdict cells either.
+                    if let Some(reason) = review.terminal_env_failure_reason() {
+                        tracing::warn!(
+                            attempt,
+                            "Independent reviewer reported terminal environment failure; aborting pipeline"
+                        );
+                        return Self::terminal_result(
+                            attempt,
+                            plan.clone(),
+                            generation,
+                            Some(reason),
+                            history,
+                        );
+                    }
+                    let review_json = serde_json::to_value(&review).unwrap_or_default();
+                    if !matches!(review.verdict, Verdict::Pass) {
+                        evaluation.verdict = Verdict::Fail;
+                        evaluation.feedback = format!(
+                            "independent reviewer rejected the pass: {}",
+                            review.feedback
+                        );
+                    }
+                    let details = evaluation.details.take().unwrap_or(serde_json::json!({}));
+                    let mut details = details;
+                    details["independent_review"] = review_json;
+                    evaluation.details = Some(details);
+                    crate::observable::global_observable().record_independent_review(
+                        if matches!(evaluation.verdict, Verdict::Pass) {
+                            crate::observable::INDEPENDENT_REVIEW_AGREED
+                        } else {
+                            crate::observable::INDEPENDENT_REVIEW_REJECTED
+                        },
                     );
                 }
-                let review_json = serde_json::to_value(&review).unwrap_or_default();
-                if !matches!(review.verdict, Verdict::Pass) {
-                    evaluation.verdict = Verdict::Fail;
-                    evaluation.feedback = format!(
-                        "independent reviewer rejected the pass: {}",
-                        review.feedback
-                    );
-                }
-                let details = evaluation.details.take().unwrap_or(serde_json::json!({}));
-                let mut details = details;
-                details["independent_review"] = review_json;
-                evaluation.details = Some(details);
             }
 
             let passed = matches!(evaluation.verdict, Verdict::Pass);
@@ -1371,19 +1402,26 @@ mod tests {
         }))
     }
 
+    /// The gate the reviewer exists for: the authoring evaluator judged the
+    /// second attempt with the first one in hand, and a fresh judge rejects that
+    /// pass. The reviewer verdict must win.
+    ///
+    /// The reviewed attempt has to be a later one — on a first attempt the
+    /// authoring request carries no history, so there is nothing a second judge
+    /// could be independent of and the gate is not asked (see
+    /// `a_first_attempt_pass_is_not_re_sampled`).
     #[tokio::test]
     async fn independent_review_rejection_fails_the_attempt() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            max_retries: 2,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
             independent_review: true,
         });
-        // First evaluation (author) passes; second evaluation (independent
-        // reviewer) rejects. The reviewer verdict must win.
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
             responses: std::sync::Mutex::new(vec![
+                serde_json::json!({"verdict": "fail", "score": 30, "feedback": "not there yet", "criteria": []}),
                 serde_json::json!({"verdict": "pass", "score": 92, "feedback": "looks fine", "criteria": []}),
                 serde_json::json!({"verdict": "fail", "score": 20, "feedback": "reviewer: output ignores the goal", "criteria": []}),
             ]),
@@ -1417,7 +1455,7 @@ mod tests {
     #[tokio::test]
     async fn independent_review_agreement_passes_and_records_review() {
         let pipeline = PgePipeline::new(PgePipelineConfig {
-            max_retries: 1,
+            max_retries: 2,
             timeout_ms: 5_000,
             local_repair_max: 0,
             stall_threshold: 0,
@@ -1425,6 +1463,7 @@ mod tests {
         });
         let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
             responses: std::sync::Mutex::new(vec![
+                serde_json::json!({"verdict": "fail", "score": 30, "feedback": "not there yet", "criteria": []}),
                 serde_json::json!({"verdict": "pass", "score": 92, "feedback": "good", "criteria": []}),
                 serde_json::json!({"verdict": "pass", "score": 88, "feedback": "reviewer agrees", "criteria": []}),
             ]),
@@ -1450,6 +1489,156 @@ mod tests {
                 .and_then(|d| d.get("independent_review"))
                 .map(|r| r["feedback"].as_str().unwrap_or("")),
             Some("reviewer agrees")
+        );
+    }
+
+    /// A first-attempt pass is not re-asked. The authoring evaluator held no
+    /// history, so the reviewer's request would be byte-identical to its own,
+    /// and the second call could only re-derive an answer already paid for — or,
+    /// at a sampled temperature, spend a coin flip with the power to reject a
+    /// pass the run has no attempt left to retry.
+    ///
+    /// The reading is the pass itself: the second scripted response is a
+    /// rejection, so a gate that asks anyway turns this run into a failed one,
+    /// and the record then also carries a review verdict that was never earned.
+    #[tokio::test]
+    async fn a_first_attempt_pass_is_not_re_sampled() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 2,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 0,
+            independent_review: true,
+        });
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
+            responses: std::sync::Mutex::new(vec![
+                serde_json::json!({"verdict": "pass", "score": 92, "feedback": "good", "criteria": []}),
+                serde_json::json!({"verdict": "fail", "score": 10, "feedback": "reviewer: I would have rejected this", "criteria": []}),
+            ]),
+        }));
+
+        let result = pipeline
+            .execute_task(
+                &test_task("solid goal"),
+                serde_json::json!({}),
+                &pass_planner(),
+                &pass_generator(),
+                &evaluator,
+            )
+            .await;
+
+        assert!(
+            result.passed,
+            "a first-attempt pass must stand: {}",
+            result.final_evaluation.feedback
+        );
+        assert!(
+            result
+                .final_evaluation
+                .details
+                .as_ref()
+                .and_then(|d| d.get("independent_review"))
+                .is_none(),
+            "nothing was reviewed, so no review verdict may be on the record"
+        );
+    }
+
+    /// The gate's cost decision is read off the source, not the run.
+    ///
+    /// A behaviour test can only show the branch taken for the inputs it
+    /// scripts. What has to hold for every input is the ordering itself: the
+    /// premise (`eval_history.is_empty()`, the only thing that makes the second
+    /// judge independent of the first) is read *before* the reviewer is paid
+    /// for, and every route through the gate leaves one of the four cells
+    /// behind. Reading the file the producer runs is the reading that survives
+    /// an input the suite never scripts — and it fails if a later edit reverses
+    /// the two or drops the record.
+    #[test]
+    fn the_review_gate_reads_its_premise_before_it_pays_for_the_reviewer() {
+        let source = include_str!("pipeline.rs");
+        let production = source
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("the file always has a first segment");
+
+        // Anchored on the saving itself: the same `Pass` test appears earlier
+        // for the repair path, and taking the first one would scan past the
+        // gate into unrelated code.
+        let open = "if matches!(evaluation.verdict, Verdict::Pass) {";
+        let anchor = "let not_asked = if !self.config.independent_review {";
+        let start = production
+            .find(anchor)
+            .expect("the gate no longer separates the two reasons for not asking");
+        assert!(
+            production[..start].trim_end().ends_with(open),
+            "the saving is no longer reached only on an authoring Pass"
+        );
+        let gate = &production[start..];
+        let end = gate
+            .find("\n            let passed =")
+            .expect("the gate block no longer ends where the pass is recomputed");
+        let gate = &gate[..end];
+
+        let premise = gate
+            .find("eval_history.is_empty()")
+            .expect("the gate no longer checks whether the premise (a prior verdict) holds");
+        let call = gate
+            .find(".evaluate(")
+            .expect("the gate no longer calls the reviewer");
+        assert!(
+            premise < call,
+            "the gate pays for the second judgement before reading whether it is independent"
+        );
+
+        for name in [
+            "INDEPENDENT_REVIEW_NOT_ASKED_DISABLED",
+            "INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT",
+            "INDEPENDENT_REVIEW_AGREED",
+            "INDEPENDENT_REVIEW_REJECTED",
+        ] {
+            assert!(
+                gate.contains(name),
+                "the gate no longer records `{name}`; a saving nobody can read is \
+                 indistinguishable from a gate that was deleted"
+            );
+        }
+    }
+
+    /// With the gate off the reviewer is not asked even where its premise would
+    /// hold, so the scripted rejection behind the second-attempt pass must never
+    /// be reached. Same reading as above: a run that consults the reviewer
+    /// anyway fails on a response nobody asked for.
+    #[tokio::test]
+    async fn a_disabled_gate_does_not_ask_the_reviewer_where_it_would_have() {
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 2,
+            timeout_ms: 5_000,
+            local_repair_max: 0,
+            stall_threshold: 0,
+            independent_review: false,
+        });
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(SequenceMockAgent {
+            responses: std::sync::Mutex::new(vec![
+                serde_json::json!({"verdict": "fail", "score": 30, "feedback": "not there yet", "criteria": []}),
+                serde_json::json!({"verdict": "pass", "score": 92, "feedback": "good", "criteria": []}),
+                serde_json::json!({"verdict": "fail", "score": 10, "feedback": "reviewer: I would have rejected this", "criteria": []}),
+            ]),
+        }));
+
+        let result = pipeline
+            .execute_task(
+                &test_task("solid goal"),
+                serde_json::json!({}),
+                &pass_planner(),
+                &pass_generator(),
+                &evaluator,
+            )
+            .await;
+
+        assert!(
+            result.passed,
+            "a disabled gate must not consult the reviewer: {}",
+            result.final_evaluation.feedback
         );
     }
 

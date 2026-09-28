@@ -51,6 +51,36 @@ pub const SELF_REVIEW_SKIP_SELF_EVOLUTION: &str = "self_evolution";
 pub const SELF_REVIEW_REVISION_CHANGED: &str = "changed";
 pub const SELF_REVIEW_REVISION_UNCHANGED: &str = "unchanged";
 
+/// How the pipeline's independent-review gate ended for one authoring verdict.
+///
+/// The gate is a second evaluator call asked to confirm a `Pass`, and it is the
+/// fattest prompt in the chain. Two of these cells are verdicts and two are
+/// savings, and all four are needed together: a `rejected` count on its own says
+/// nothing about how often the second call was not spent, and a series with only
+/// the two verdicts cannot be told from a deleted call site, because a call that
+/// never happens writes no cell at all.
+///
+/// `not_asked_no_prior_verdict` is the saving: the gate asks a fresh judge to
+/// confirm a verdict the authoring evaluator reached while holding no history at
+/// all, and in that case the reviewer's request would be byte-identical to the
+/// author's — same task, plan, generation, criteria and (empty) history. A
+/// verdict cannot be independent of a question that was never asked differently.
+/// `not_asked_disabled` is the same skip for the other reason: the gate is
+/// configured off in this deployment.
+pub const INDEPENDENT_REVIEW_AGREED: &str = "agreed";
+pub const INDEPENDENT_REVIEW_REJECTED: &str = "rejected";
+pub const INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT: &str = "not_asked_no_prior_verdict";
+pub const INDEPENDENT_REVIEW_NOT_ASKED_DISABLED: &str = "not_asked_disabled";
+
+/// Every cell of the independent-review outcome, published at zero as well. See
+/// [`INDEPENDENT_REVIEW_AGREED`].
+pub const INDEPENDENT_REVIEW_OUTCOMES: [&str; 4] = [
+    INDEPENDENT_REVIEW_AGREED,
+    INDEPENDENT_REVIEW_REJECTED,
+    INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT,
+    INDEPENDENT_REVIEW_NOT_ASKED_DISABLED,
+];
+
 /// The two ends of the history a failure analysis is shown, summed in bytes of
 /// the serialized prompt section. `dropped` is what the bound removed: a
 /// zero there means the bound never bound (not that it is broken), while a
@@ -216,6 +246,16 @@ pub struct CollaborationObservable {
     /// refused and this says what it refused over — the difference between one
     /// dimension misconfigured and every plan coming in oversized.
     boundary_violations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// How the pipeline's independent-review gate ended, over
+    /// [`INDEPENDENT_REVIEW_OUTCOMES`].
+    ///
+    /// The gate spends a whole evaluator call on a second opinion about a
+    /// verdict already reached, and the two things a reader has to tell apart
+    /// are a gate that buys independence from one that re-samples the same
+    /// question. Neither the accepted verdict nor the log line separates them;
+    /// only these cells and their zeros do. Keyed by a `&'static str` so the
+    /// cells are the constants above and a typo cannot open a fifth.
+    independent_reviews: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -303,6 +343,19 @@ impl CollaborationObservable {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry((stage.to_string(), outcome.to_string()))
             .or_insert(0) += 1;
+    }
+
+    /// Record how the independent-review gate ended for one authoring verdict.
+    ///
+    /// Synchronous for the same reason as the review counters above: a dropped
+    /// count reads as a gate that was never asked, and the saving this family
+    /// exists to show would then be indistinguishable from the gate being gone.
+    pub fn record_independent_review(&self, outcome: &'static str) {
+        let mut map = self
+            .independent_reviews
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(outcome).or_insert(0) += 1;
     }
 
     /// Record the size of the history a failure analysis was shown: the bytes
@@ -482,6 +535,23 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("self_review_revision_total", *count as f64)
                         .with_label("stage", stage)
+                        .with_label("outcome", outcome),
+                );
+            }
+
+            // The independent-review gate's face, every cell published. The two
+            // savings cells are the reason: "the gate was never asked" and "the
+            // call site that asks it is gone" write the same (no) series, and
+            // the second is exactly what a deleted guard looks like.
+            let independent = self
+                .independent_reviews
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for outcome in INDEPENDENT_REVIEW_OUTCOMES {
+                let count = independent.get(outcome).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("pge_independent_review_total", count as f64)
                         .with_label("outcome", outcome),
                 );
             }
@@ -1136,6 +1206,58 @@ mod tests {
             ),
             0.0,
             "counting one dimension twice must not move another"
+        );
+    }
+
+    /// All four independent-review cells are on the wire before the gate has
+    /// been asked anything, and each counts only what was recorded into it.
+    ///
+    /// The two `not_asked_*` cells are the reason the family exists at all: they
+    /// are the saving (one evaluator call, the fattest prompt in the chain) and
+    /// they are written by a branch that spends nothing, so on a series that
+    /// only counts what it bought they would be silence — the same silence a
+    /// deleted call site leaves.
+    #[tokio::test]
+    async fn every_independent_review_cell_is_published_and_counted_apart() {
+        let obs = CollaborationObservable::new();
+        let cell = |metrics: &[RawMetric], outcome: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "pge_independent_review_total"
+                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| {
+                    panic!("pge_independent_review_total{{outcome=\"{outcome}\"}} must be published, at 0 when nothing was recorded")
+                })
+        };
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        for outcome in INDEPENDENT_REVIEW_OUTCOMES {
+            assert_eq!(
+                cell(&metrics, outcome),
+                0.0,
+                "{outcome} must be published even with nothing recorded into it"
+            );
+        }
+
+        obs.record_independent_review(INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT);
+        obs.record_independent_review(INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT);
+        obs.record_independent_review(INDEPENDENT_REVIEW_AGREED);
+        obs.record_independent_review(INDEPENDENT_REVIEW_REJECTED);
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            cell(&metrics, INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT),
+            2.0
+        );
+        assert_eq!(cell(&metrics, INDEPENDENT_REVIEW_AGREED), 1.0);
+        assert_eq!(cell(&metrics, INDEPENDENT_REVIEW_REJECTED), 1.0);
+        assert_eq!(
+            cell(&metrics, INDEPENDENT_REVIEW_NOT_ASKED_DISABLED),
+            0.0,
+            "a saving for one reason must not be counted as a saving for another"
         );
     }
 
