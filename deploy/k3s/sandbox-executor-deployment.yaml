@@ -67,16 +67,31 @@ spec:
                 # 下次重启 init 再试，离线集群不会因此永久卡在 Init 阶段。
                 # http.connectTimeout/lowSpeed 给网络操作兜底，否则离线时
                 # git 会长时间挂在连接上拖慢 Init 与整 Pod 就绪。
+                # 但连接超时与低速阈值管不住"带宽很低但在动"的传输：实测一次
+                # fetch 跑了 14 分钟没完，把整段启动预算吃光、Pod 被判启动超时
+                # （一次网络慢被记成版本缺陷）。所以每个走公网的 git 调用再加
+                # 一层挂钟上界：单次尝试最多 240 秒（实测正常读数秒级到几十秒，
+                # 取数倍余量）。超了就当这个镜像不可用、走下面已有的失败分支，
+                # 语义不变。代价：真的很大的传输可能一次传不完而被放弃，下一轮
+                # 从零再来（被杀掉的 fetch 不落 refs），极端网络下裸仓会停在旧
+                # main——启动可用性优先于基线新鲜度，与"种子失败不阻塞启动"同向。
                 for m in $(echo "$mirrors" | tr ',' ' '); do
                   echo "sandbox volume empty; seeding bare repo from $m ..."
-                  if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare "$m" /tmp/seed.git; then
+                  rc=0
+                  /usr/bin/timeout 240 git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare "$m" /tmp/seed.git || rc=$?
+                  if [ "$rc" = 0 ]; then
                     cp -a /tmp/seed.git/. "$root/repo.git/"
                     rm -rf /tmp/seed.git
                     break
                   fi
+                  if [ "$rc" = 124 ]; then
+                    echo "WARN: sandbox bare repo seed from $m gave up after the 240s bound (transfer slower than the bound, or the mirror never answered)"
+                  else
+                    echo "WARN: sandbox bare repo seed from $m failed (rc=$rc)"
+                  fi
                   rm -rf /tmp/seed.git
                 done
-                [ -f "$root/repo.git/HEAD" ] || echo "WARN: sandbox bare repo seed failed on every mirror (offline?); executor starts without per-task worktrees"
+                [ -f "$root/repo.git/HEAD" ] || echo "WARN: sandbox bare repo seed failed on every mirror (no mirror answered within the bound); executor starts without per-task worktrees"
               fi
               if [ -f "$root/repo.git/HEAD" ]; then
                 for m in $(echo "$mirrors" | tr ',' ' '); do
@@ -84,10 +99,16 @@ spec:
                   git --git-dir="$root/repo.git" remote add upstream "$m"
                   # +main:main advances the local main that task worktrees are cut
                   # from; a plain fetch would only update remote-tracking refs.
-                  if git --git-dir="$root/repo.git" -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force '+main:main'; then
+                  rc=0
+                  /usr/bin/timeout 240 git --git-dir="$root/repo.git" -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force '+main:main' || rc=$?
+                  if [ "$rc" = 0 ]; then
                     break
                   fi
-                  echo "WARN: sandbox seed fetch from $m failed (offline?); trying the next mirror"
+                  if [ "$rc" = 124 ]; then
+                    echo "WARN: sandbox seed fetch from $m gave up after the 240s bound (transfer slower than the bound, or the mirror never answered); trying the next mirror"
+                  else
+                    echo "WARN: sandbox seed fetch from $m failed (rc=$rc); trying the next mirror"
+                  fi
                 done
                 git --git-dir="$root/repo.git" worktree prune || true
               fi

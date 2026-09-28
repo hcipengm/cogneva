@@ -2284,16 +2284,10 @@ impl MainlineDeployer {
     /// 不读 Job：历史滚动 Job 会把它派发过的每个 rev 永久钉住，等于把回收废掉；
     /// 正在跑的那个 Job 用的 tag 就是当轮的 bare，本来就在保留集里。
     async fn live_referenced_revs(&self) -> SFResult<Vec<String>> {
-        // pod 模板在清单里的位置按种类分两处：CronJob 多一层 jobTemplate。
-        const SPECS: [(&str, &str); 4] = [
-            ("deploy", ".spec.template.spec"),
-            ("statefulset", ".spec.template.spec"),
-            ("daemonset", ".spec.template.spec"),
-            ("cronjob", ".spec.jobTemplate.spec.template.spec"),
-        ];
         let repo = format!("{}/{}", self.pull_endpoint(), IMAGE_REPOSITORY);
         let mut revs: Vec<String> = Vec::new();
-        for (kind, spec) in SPECS {
+        for (_, kind, path) in WORKLOAD_POD_TEMPLATES {
+            let spec = format!(".{path}");
             let jsonpath = format!(
                 "jsonpath={{range .items[*]}}{{range {spec}.containers[*]}}{{.image}}{{\" \"}}{{end}}{{range {spec}.initContainers[*]}}{{.image}}{{\" \"}}{{end}}{{end}}"
             );
@@ -4948,6 +4942,115 @@ fn pin_app_image_refs(v: &mut serde_yaml::Value, repo: &str, image: &str) -> usi
     }
 }
 
+/// 集群里四种带 pod 模板的工作负载：(清单里的 kind, 寻址用的资源词, pod 模板在
+/// 文档里的路径)。资源词是 `kubectl` 认的那个单数全名（`deployment`、
+/// `statefulset`…），不是 kind 的大写拼写。
+///
+/// CronJob 的 pod 模板比别的种类深两层：它在 `jobTemplate` 里面。少走这一层会让
+/// 备份 CronJob 这类工作负载整个从读数里消失——而它正是会停在失败 rev 上的那种
+/// 引用（容器指着一个每 rev 一个的 tag）。这条深度只在这里写一次：按文档走的
+/// 快照/还原与按种类列一遍的回收轮保留集都从这里取，免得两头各写一份、改一处漏一处。
+const WORKLOAD_POD_TEMPLATES: [(&str, &str, &str); 4] = [
+    ("Deployment", "deployment", "spec.template.spec"),
+    ("StatefulSet", "statefulset", "spec.template.spec"),
+    ("DaemonSet", "daemonset", "spec.template.spec"),
+    ("CronJob", "cronjob", "spec.jobTemplate.spec.template.spec"),
+];
+
+/// 一份清单文档里工作负载的 pod 模板，以及寻址它用的那个资源词。
+fn workload_pod_spec(doc: &serde_yaml::Value) -> Option<(String, &serde_yaml::Value)> {
+    let kind = doc.get("kind").and_then(|k| k.as_str())?;
+    let (_, resource, path) = WORKLOAD_POD_TEMPLATES
+        .iter()
+        .find(|(known, _, _)| *known == kind)?;
+    let mut node = doc;
+    for segment in path.split('.') {
+        node = node.get(segment)?;
+    }
+    Some((resource.to_string(), node))
+}
+
+/// 清单里一个容器引用，以及清单声明的 image 值。
+///
+/// 判据是"清单声明的值"，不是"本仓库的镜像"：apply 把 pod 模板整体 upsert 成清单
+/// 那一份，所以**声明值与现场值不同的每一个容器都是这次 apply 会改写的**——包括
+/// 清单里顺手更新的第三方镜像（那种改动回滚同样该还）。用一个更窄的判据（只认本
+/// 仓库）会漏掉它们，而漏掉的那一项没有读数。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeclaredRef {
+    resource: String,
+    name: String,
+    container: String,
+    /// 清单声明的值（pin 之后 apply 出去的那个值）：用来判断现场那一个会不会变。
+    image: String,
+}
+
+/// 一次 apply 会改写的引用，以及它**改动之前**的现场值。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RewrittenRef {
+    resource: String,
+    name: String,
+    container: String,
+    /// apply 之前这个容器指着哪个镜像——回滚要还回去的就是它。
+    image: String,
+}
+
+/// 这一轮 apply 会改写的整组引用，按面分两处。
+///
+/// 支撑面在任何镜像变更之前就 apply 了，所以它**一定**被改过，不论目标滚到了
+/// 第几个；目标面只有真滚过的那些才还（没滚到的目标一个字节都没动）。
+#[derive(Default)]
+struct RefSnapshots {
+    support: Vec<RewrittenRef>,
+    targets: Vec<RewrittenRef>,
+}
+
+/// 清单文档里每一个带 image 的容器引用。
+///
+/// 解析失败是硬错误：这份文档马上就要被 apply 出去，读不出它的引用等于回滚没有
+/// 目标——宁可一次变更都不发生（调用方在动任何东西之前就中止）。
+fn bundle_declared_containers(yaml_text: &str) -> SFResult<Vec<DeclaredRef>> {
+    const POD_LISTS: [&str; 2] = ["containers", "initContainers"];
+    let mut out: Vec<DeclaredRef> = Vec::new();
+    for doc in serde_yaml::Deserializer::from_str(yaml_text) {
+        let v = serde_yaml::Value::deserialize(doc)
+            .map_err(|e| SFError::Config(format!("manifest bundle: invalid YAML document: {e}")))?;
+        if v.is_null() {
+            continue;
+        }
+        let Some((resource, spec)) = workload_pod_spec(&v) else {
+            continue;
+        };
+        let Some(name) = v
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+        else {
+            continue;
+        };
+        for list_name in POD_LISTS {
+            let Some(list) = spec.get(list_name).and_then(|l| l.as_sequence()) else {
+                continue;
+            };
+            for c in list {
+                let Some(image) = c.get("image").and_then(|i| i.as_str()) else {
+                    continue;
+                };
+                let Some(container) = c.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                out.push(DeclaredRef {
+                    resource: resource.clone(),
+                    name: name.to_string(),
+                    container: container.to_string(),
+                    image: image.to_string(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// 改写单个 Deployment 文档里指定容器的 image。容器名显式校验且必须恰好
 /// 命中一个——错改比不改危险，宁可整个发布失败。
 fn patch_container_image(
@@ -7052,13 +7155,155 @@ impl RolloutExecutor {
         }
     }
 
+    /// 一份清单文档里**这次 apply 会改写**的那些引用，在 apply **之前**的现场值。
+    ///
+    /// 两个面各读一次，缺一个都等于回滚只还了一半：声明面取清单文档自己（它会
+    /// upsert 出哪些容器、每个容器声明成什么镜像），取值面现场读同一个容器的现值。
+    ///
+    /// 每个工作负载一次读取，不按容器逐个读——同一个 pod 模板的值要成组取，否则两次
+    /// 读取之间发生的变化会被拼成一份不存在的现场。
+    ///
+    /// 现场值恰好等于清单声明的值 ⇒ 这次 apply 不会改动它，不记（记了也只是
+    /// 一条无事的 `set image`）。现场没有这个容器 ⇒ 它是这一版**新加**的引用，没有
+    /// 前值可还，也不记。读不到就报错，由调用方在动任何东西之前中止。
+    async fn snapshot_rewritten_refs(
+        &self,
+        yaml_text: &str,
+        origin: &str,
+    ) -> SFResult<Vec<RewrittenRef>> {
+        let declared = bundle_declared_containers(yaml_text)?;
+        let mut workloads: Vec<(String, String)> = Vec::new();
+        for r in &declared {
+            if !workloads
+                .iter()
+                .any(|(res, n)| res == &r.resource && n == &r.name)
+            {
+                workloads.push((r.resource.clone(), r.name.clone()));
+            }
+        }
+        let mut out: Vec<RewrittenRef> = Vec::new();
+        for (resource, name) in &workloads {
+            // 名字问集群、不问清单：对象可能还没建（首次安装），`--ignore-not-found`
+            // 让"不存在"退 0 且无输出，与"读不到"分开——后者必须是错误。
+            let Some((_, _, path)) = WORKLOAD_POD_TEMPLATES
+                .iter()
+                .find(|(_, known, _)| *known == resource)
+            else {
+                // 快照按声明面走，资源词由上面那张表给出，正常到不了这里；真到了
+                // 就当作读不到（一次变更都不许发生），而不是静默少记一个引用。
+                return Err(SFError::Config(format!(
+                    "{origin}: {resource}/{name} is not a workload kind this snapshot can read"
+                )));
+            };
+            let spec = format!(".{path}");
+            let jsonpath = format!(
+                "jsonpath={{range {spec}.containers[*]}}{{.name}}={{.image}}{{\"\\n\"}}{{end}}{{range {spec}.initContainers[*]}}{{.name}}={{.image}}{{\"\\n\"}}{{end}}"
+            );
+            let readout = self
+                .run_kubectl(
+                    &["get", resource, name, "--ignore-not-found", "-o", &jsonpath],
+                    30,
+                )
+                .await
+                .map_err(|e| {
+                    SFError::IO(format!(
+                        "{origin}: reading the references of {resource}/{name}: {e}"
+                    ))
+                })?;
+            let live: Vec<(&str, &str)> = readout
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .map(|(n, i)| (n.trim(), i.trim()))
+                .collect();
+            for r in declared
+                .iter()
+                .filter(|r| &r.resource == resource && &r.name == name)
+            {
+                let Some((_, image)) = live.iter().find(|(n, _)| *n == r.container) else {
+                    info!(
+                        workload = %format!("{resource}/{name}"),
+                        container = %r.container,
+                        "mainline rollout: this revision adds a reference that has no previous image to restore"
+                    );
+                    continue;
+                };
+                if image.is_empty() || *image == r.image {
+                    continue;
+                }
+                out.push(RewrittenRef {
+                    resource: resource.clone(),
+                    name: name.clone(),
+                    container: r.container.clone(),
+                    image: image.to_string(),
+                });
+            }
+        }
+        if !out.is_empty() {
+            info!(
+                origin = %origin,
+                references = out.len(),
+                "mainline rollout: snapshotted the references this apply will rewrite"
+            );
+        }
+        Ok(out)
+    }
+
+    /// 把一组引用还回 apply 之前的值，返回**没能还成的工作负载数**。
+    ///
+    /// 每个工作负载一条命令、一条命令里带该工作负载的每一个 `容器=镜像`：分成多条
+    /// 会让同一个 pod 模板被改两次、滚两次，而第二遍只是把第一遍刚起的 Pod 再换一次。
+    ///
+    /// 只还镜像、不还文档：回滚是幂等 upsert 的反向，反向删改支撑拓扑比留着新拓扑
+    /// 更危险（旧镜像配新支撑资源能跑）。这里还的每一个引用都是这次 apply 自己改过
+    /// 的那一组，不碰别的东西。
+    async fn restore_rewritten_refs(&self, refs: &[RewrittenRef]) -> usize {
+        let mut workloads: Vec<(String, String)> = Vec::new();
+        for r in refs {
+            if !workloads
+                .iter()
+                .any(|(res, n)| res == &r.resource && n == &r.name)
+            {
+                workloads.push((r.resource.clone(), r.name.clone()));
+            }
+        }
+        let mut failed = 0usize;
+        for (resource, name) in workloads {
+            let specs: Vec<String> = refs
+                .iter()
+                .filter(|r| r.resource == resource && r.name == name)
+                .map(|r| format!("{}={}", r.container, r.image))
+                .collect();
+            let target = format!("{resource}/{name}");
+            let mut args: Vec<&str> = vec!["set", "image", &target];
+            args.extend(specs.iter().map(|s| s.as_str()));
+            match self.run_kubectl(&args, 60).await {
+                Ok(_) => info!(
+                    workload = %target,
+                    containers = %specs.join(","),
+                    "mainline rollback: references restored to the images they had before this rollout"
+                ),
+                Err(e) => {
+                    failed += 1;
+                    warn!(
+                        workload = %target,
+                        error = %e,
+                        "mainline rollback: could not restore these references; they stay on the failed revision"
+                    );
+                }
+            }
+        }
+        failed
+    }
+
     /// 先落地支撑清单（如随镜像下发），再按计划顺序滚动四部署，逐部署等
-    /// rollout 完成，全滚完后 soak 复查；任一失败把已滚目标反向 set image 回
-    /// prev tag（不用 rollout undo——多目标无事务性，undo 还会连带回退
-    /// 其他字段）。回滚只回退 image：支撑资源不反向删改（apply 是幂等
-    /// upsert，旧镜像配新支撑资源可运行；删改支撑资源反而可能把在跑
-    /// 集群打坏）。
+    /// rollout 完成，全滚完后 soak 复查；任一失败把**这次 apply 改写过的整组引用**
+    /// 还原回改动之前的现场值（不用 rollout undo——多目标无事务性，undo 还会连带
+    /// 回退其他字段）。只还原得动的那几处，要还原的组由 `RefSnapshots` 给。
+    /// 回滚只回退 image：支撑资源不反向删改（apply 是幂等 upsert，旧镜像配新支撑
+    /// 资源可运行；删改支撑资源反而可能把在跑集群打坏）。
     pub async fn run(&self, plan: &RolloutPlan) -> Result<(), RolloutFailure> {
+        // 这次 apply 会改写的整组引用，两个面各一份，回滚按同一组还原。
+        let mut refs = RefSnapshots::default();
         // 支撑资源先于任何镜像变更就位：新二进制启动依赖的 RBAC/ConfigMap/
         // Service 若晚于滚动落地，新 Pod 会因缺依赖 crashloop 触发无谓回滚。
         // 失败直接中止，此时一个镜像都没动（线上原样）：清单确实坏就归版本类，
@@ -7091,6 +7336,13 @@ impl RolloutExecutor {
                         // 配置文件的现状也要在 apply 之前取：进程读的是 apply 前那份，
                         // 只有拿它当对照才说得清这次改了什么。取不到就走"说不清→都滚"。
                         let configs_before = self.configmap_contents().await;
+                        // 支撑清单里指向本仓库的引用这次 apply 也会改写（pin 是价值
+                        // 判断，不认对象名），所以在它之前把现场值取下来：取不到就
+                        // 一次变更都不发生——回滚没有目标时，宁可不上线。
+                        refs.support = self
+                            .snapshot_rewritten_refs(&text, "support.yaml")
+                            .await
+                            .map_err(|e| classify_before_any_change("ref-snapshot", "", e))?;
                         info!(
                             source = %support.display(),
                             manifest = %support_arg,
@@ -7176,6 +7428,29 @@ impl RolloutExecutor {
             info!(deployment = %t.deployment, prev = %img, "mainline rollout: snapshot prev image");
             prevs.push((t.deployment.clone(), img));
             prev_shapes.push((t.deployment.clone(), shape));
+            // 同一份目标清单里被这次 apply 改写的其它容器（init 容器、边车）也一起
+            // 快照：`prevs` 只管那个命名主容器，而 apply 换的是整份文档。没有清单
+            // 的那一轮走 set image 兜底，只动主容器，没有别的引用要还。
+            if let Some(dir) = &plan.manifests_dir {
+                let key = target_manifest_key(&t.deployment);
+                match tokio::fs::read_to_string(Path::new(dir).join(&key)).await {
+                    Ok(text) => refs.targets.extend(
+                        self.snapshot_rewritten_refs(&text, &key)
+                            .await
+                            .map_err(|e| {
+                                classify_before_any_change("snapshot", &t.deployment, e)
+                            })?,
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(classify_before_any_change(
+                            "snapshot",
+                            &t.deployment,
+                            SFError::IO(format!("read {key}: {e}")),
+                        ))
+                    }
+                }
+            }
         }
         let mut done: Vec<&RolloutTarget> = Vec::new();
         for target in &plan.targets {
@@ -7186,13 +7461,27 @@ impl RolloutExecutor {
                 .unwrap_or_default();
             if let Err(e) = self.apply_target(plan, target).await {
                 return self
-                    .fail_without_blind_rollback("apply", &target.deployment, e, &done, &prevs)
+                    .fail_without_blind_rollback(
+                        "apply",
+                        &target.deployment,
+                        e,
+                        &done,
+                        &prevs,
+                        &refs,
+                    )
                     .await;
             }
             if let Err(e) = self.wait_rollout_complete(target, prev_shape).await {
                 done.push(target);
                 return self
-                    .fail_without_blind_rollback("wait", &target.deployment, e, &done, &prevs)
+                    .fail_without_blind_rollback(
+                        "wait",
+                        &target.deployment,
+                        e,
+                        &done,
+                        &prevs,
+                        &refs,
+                    )
                     .await;
             }
             done.push(target);
@@ -7206,7 +7495,14 @@ impl RolloutExecutor {
         for target in &plan.targets {
             if let Err(e) = self.pods_healthy(target).await {
                 return self
-                    .fail_without_blind_rollback("soak", &target.deployment, e, &done, &prevs)
+                    .fail_without_blind_rollback(
+                        "soak",
+                        &target.deployment,
+                        e,
+                        &done,
+                        &prevs,
+                        &refs,
+                    )
                     .await;
             }
         }
@@ -7246,6 +7542,7 @@ impl RolloutExecutor {
         e: SFError,
         done: &[&RolloutTarget],
         prevs: &[(String, String)],
+        refs: &RefSnapshots,
     ) -> Result<(), RolloutFailure> {
         let msg = e.to_string();
         if is_cluster_unreachable(&msg) {
@@ -7319,7 +7616,7 @@ impl RolloutExecutor {
                 e,
             ));
         }
-        self.rollback(&e, done, prevs).await;
+        self.rollback(&e, done, prevs, refs).await;
         // 授权被拒这一类在滚动中仍回滚并记版本类：改过的东西要退回去。落点写成
         // auth 而不是 observed，好让"因为读不到集群而回滚"与"版本真的没起来"在
         // 记账和报告里分得开。
@@ -7334,7 +7631,13 @@ impl RolloutExecutor {
     /// 尽力回滚：已滚目标按快照的各自 prev 镜像反向 set image 并等收敛
     /// （不用 rollout undo——多目标无事务性，undo 还会连带回退其他字段）。
     /// 回滚本身失败只 warn（人工介入兜底），不掩盖原始错误。
-    async fn rollback(&self, cause: &SFError, done: &[&RolloutTarget], prevs: &[(String, String)]) {
+    async fn rollback(
+        &self,
+        cause: &SFError,
+        done: &[&RolloutTarget],
+        prevs: &[(String, String)],
+        refs: &RefSnapshots,
+    ) {
         warn!(
             count = done.len(),
             error = %cause,
@@ -7352,14 +7655,38 @@ impl RolloutExecutor {
             // 回退前的放置面：与新版本那一侧同一判据，好让"回退的 Pod 也排
             // 不进去"在日志里读成同一件事（节点满了），不被当成回退本身失败。
             let live_shape = self.current_placement_shape(t).await.unwrap_or_default();
-            if let Err(e) = self.set_image(t, prev).await {
-                warn!(deployment = %t.deployment, error = %e, "rollback set image failed");
+            // 这个目标的**整组**引用一条命令还回去：主容器（`prevs` 里那一份）
+            // 加上同一份文档里被这次 apply 改写的其它引用（init 容器、边车）。
+            // 只还主容器的话，失败 rev 的二进制会继续留在启动路径上——现场就是
+            // 这么来的：进化的 `seed-source`、redis 的 `aof-repair`、沙盒的
+            // `seed-sandbox` 各自停在某一版失败 rev 上，回滚了主容器它们不动。
+            // 分成两条命令会让同一个 pod 模板改两次、滚两次。
+            let mut here: Vec<RewrittenRef> = vec![RewrittenRef {
+                resource: "deployment".to_string(),
+                name: t.deployment.clone(),
+                container: t.container.clone(),
+                image: prev.to_string(),
+            }];
+            // 主容器在目标清单里也有一份声明，两处都过滤掉：同一条命令里出现两个
+            // 同名容器的 `容器=镜像` 时 `set image` 不报错，只会赢一个，而赢哪个
+            // 不在这里决定。主容器以 `prevs` 那一份为准。
+            here.extend(
+                refs.targets
+                    .iter()
+                    .filter(|r| r.resource == "deployment" && r.name == t.deployment)
+                    .filter(|r| r.container != t.container)
+                    .cloned(),
+            );
+            if self.restore_rewritten_refs(&here).await > 0 {
                 continue;
             }
             if let Err(e) = self.wait_rollout_complete(t, &live_shape).await {
                 warn!(deployment = %t.deployment, error = %e, "rollback wait failed");
             }
         }
+        // 支撑面在任何镜像变更之前就 apply 了，所以它的引用一定被改过——不论目标
+        // 滚到了第几个。它的工作负载只有一份文档、各自独立，按工作负载一条命令还。
+        self.restore_rewritten_refs(&refs.support).await;
     }
 }
 
@@ -10640,7 +10967,7 @@ exit 0
         );
 
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
-        for kind in ["deploy", "statefulset", "daemonset", "cronjob"] {
+        for kind in ["deployment", "statefulset", "daemonset", "cronjob"] {
             assert!(
                 calls.contains(&format!("get {kind} -o jsonpath=")),
                 "引用要按工作负载种类逐个读 pod 模板（主容器＋init 容器）；漏掉任何一种，\
@@ -12227,6 +12554,405 @@ exit 0
         assert!(
             calls.contains("set image deployment/cogneva-security-gateway security-gateway=localhost:30500/cogneva:main-new"),
             "rollout should set failed target to new pull-endpoint tag: {calls}"
+        );
+    }
+
+    /// 清单里"会被这次 apply 改写的引用"要按工作负载种类的真实深度取全：Deployment 的
+    /// 容器与 init 容器、CronJob 埋在 `jobTemplate` 里的那一份。少走一层，那一类引用
+    /// 就既不在快照里、也不在还原里——而守着启动路径的正是这些 init 容器。
+    ///
+    /// 判据是"清单声明的值"，不是"本仓库的镜像"：清单里顺手更新的第三方镜像一样会被
+    /// 这次 apply 改写，回滚同样该还。
+    #[test]
+    fn declared_containers_walks_every_workload_kind_to_its_pod_template() {
+        let yaml = "---\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: seed\n          image: reg/app:new\n      containers:\n        - name: app\n          image: reg/app:new\n        - name: sidecar\n          image: redis:7-alpine\n---\nkind: CronJob\nmetadata:\n  name: backup\nspec:\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          containers:\n            - name: backup\n              image: reg/app:new\n---\nkind: StatefulSet\nmetadata:\n  name: redis\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: aof-repair\n          image: reg/app:new\n      containers:\n        - name: redis\n          image: redis:7-alpine\n---\nkind: DaemonSet\nmetadata:\n  name: worker\nspec:\n  template:\n    spec:\n      containers:\n        - name: worker\n          image: quay.io/buildah/stable:latest\n---\nkind: Service\nmetadata:\n  name: svc\nspec:\n  selector:\n    app: app\n---\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n        - name: unnamed\n          image: reg/app:new\n---\nkind: Deployment\nmetadata:\n  name: noimage\nspec:\n  template:\n    spec:\n      containers:\n        - name: x\n---\n";
+        let got: Vec<(String, String, String, String)> = bundle_declared_containers(yaml)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.resource, r.name, r.container, r.image))
+            .collect();
+        let want = |res: &str, name: &str, c: &str, img: &str| {
+            (
+                res.to_string(),
+                name.to_string(),
+                c.to_string(),
+                img.to_string(),
+            )
+        };
+        assert_eq!(
+            got,
+            vec![
+                // 同一个 pod 模板里先容器后 init 容器；无 name 的文档、无 image 的
+                // 容器、非工作负载的文档都不算引用。
+                want("deployment", "app", "app", "reg/app:new"),
+                want("deployment", "app", "sidecar", "redis:7-alpine"),
+                want("deployment", "app", "seed", "reg/app:new"),
+                want("cronjob", "backup", "backup", "reg/app:new"),
+                want("statefulset", "redis", "redis", "redis:7-alpine"),
+                want("statefulset", "redis", "aof-repair", "reg/app:new"),
+                want(
+                    "daemonset",
+                    "worker",
+                    "worker",
+                    "quay.io/buildah/stable:latest"
+                ),
+            ],
+            "unexpected reference set: {got:?}"
+        );
+    }
+
+    /// 解析不了就是硬错误：这份文档马上就 apply 出去，读不出它的引用等于回滚没有
+    /// 目标——宁可一次变更都不发生。
+    #[test]
+    fn declared_containers_rejects_an_unparseable_document() {
+        let err = bundle_declared_containers("kind: Deployment\nmetadata: [\n").unwrap_err();
+        assert!(err.to_string().contains("invalid YAML document"), "{err}");
+    }
+
+    /// 快照的取值面是现场：判据是"清单声明的值"，现场值与声明值相同的容器这次 apply
+    /// 不会改动，不记；现场没有的容器是这一版新加的引用，没有前值可还，也不记。
+    #[tokio::test]
+    async fn snapshot_records_only_the_references_this_apply_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get deployment app --ignore-not-found"*)
+    printf '%s\n' 'app=localhost:30500/cogneva:main-old' 'sidecar=redis:7-alpine' 'seed=localhost:30500/cogneva:main-old' ;;
+  *"get statefulset redis --ignore-not-found"*)
+    printf '%s\n' 'redis=redis:7-alpine' 'aof-repair=localhost:30500/cogneva:main-old' ;;
+  *"get cronjob backup --ignore-not-found"*)
+    printf '%s\n' 'backup=localhost:30500/cogneva:main-old' ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            0,
+            300,
+        );
+        // 主容器与 seed 是新 tag（会变，记）；sidecar 声明值等于现场值（不变，不记）；
+        // `added` 现场还没有（新加的引用，没有前值可还，不记）。
+        let yaml = "kind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: seed\n          image: localhost:30500/cogneva:main-new\n      containers:\n        - name: app\n          image: localhost:30500/cogneva:main-new\n        - name: sidecar\n          image: redis:7-alpine\n        - name: added\n          image: localhost:30500/cogneva:main-new\n---\nkind: StatefulSet\nmetadata:\n  name: redis\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: aof-repair\n          image: localhost:30500/cogneva:main-new\n      containers:\n        - name: redis\n          image: redis:7-alpine\n---\nkind: CronJob\nmetadata:\n  name: backup\nspec:\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          containers:\n            - name: backup\n              image: localhost:30500/cogneva:main-new\n";
+        let refs = executor
+            .snapshot_rewritten_refs(yaml, "support.yaml")
+            .await
+            .unwrap();
+        let got: Vec<String> = refs
+            .iter()
+            .map(|r| format!("{}/{}.{}={}", r.resource, r.name, r.container, r.image))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "deployment/app.app=localhost:30500/cogneva:main-old",
+                "deployment/app.seed=localhost:30500/cogneva:main-old",
+                "statefulset/redis.aof-repair=localhost:30500/cogneva:main-old",
+                "cronjob/backup.backup=localhost:30500/cogneva:main-old",
+            ],
+            "unexpected snapshot: {got:?}"
+        );
+        // 读的是现场，不是清单：jsonpath 按工作负载种类取到它自己的 pod 模板，
+        // CronJob 多走 jobTemplate 那一层。
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("get deployment app --ignore-not-found -o jsonpath={range .spec.template.spec.containers[*]}"),
+            "{calls}"
+        );
+        assert!(
+            calls.contains("get cronjob backup --ignore-not-found -o jsonpath={range .spec.jobTemplate.spec.template.spec.containers[*]}"),
+            "{calls}"
+        );
+    }
+
+    /// 读不到现场就报错，由调用方在动任何东西之前中止：名单不全的后果是回滚漏掉
+    /// 那些引用，而漏掉的那一项没有任何读数。
+    #[tokio::test]
+    async fn snapshot_refuses_to_continue_when_the_live_references_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let script = "#!/bin/sh\necho 'Error from server (Forbidden): deployments.apps \"app\" is forbidden' >&2\nexit 1\n";
+        write_fake_bin(&bin_dir, "fake-kubectl", script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            0,
+            300,
+        );
+        let yaml = "kind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n    spec:\n      containers:\n        - name: app\n          image: localhost:30500/cogneva:main-new\n";
+        let err = executor
+            .snapshot_rewritten_refs(yaml, "support.yaml")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("support.yaml"), "{msg}");
+        assert!(
+            msg.contains("reading the references of deployment/app"),
+            "{msg}"
+        );
+    }
+
+    /// 还原按工作负载各一条命令：同一个 pod 模板分成多条会被改两次、滚两次，而第二遍
+    /// 只是把第一遍刚起的 Pod 再换一次。还不动的工作负载要计数——回滚会据此跳过等待，
+    /// 而不是等一个原地没动的工作负载收敛。
+    #[tokio::test]
+    async fn restore_sends_one_command_per_workload_and_counts_the_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"set image statefulset/redis"*)
+    echo 'Error from server (Forbidden): statefulsets.apps "redis" is forbidden' >&2
+    exit 1 ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            0,
+            300,
+        );
+        let refs = vec![
+            RewrittenRef {
+                resource: "deployment".into(),
+                name: "app".into(),
+                container: "app".into(),
+                image: "localhost:30500/cogneva:main-old".into(),
+            },
+            RewrittenRef {
+                resource: "deployment".into(),
+                name: "app".into(),
+                container: "seed".into(),
+                image: "localhost:30500/cogneva:main-seedold".into(),
+            },
+            RewrittenRef {
+                resource: "statefulset".into(),
+                name: "redis".into(),
+                container: "aof-repair".into(),
+                image: "localhost:30500/cogneva:main-aofold".into(),
+            },
+        ];
+        assert_eq!(executor.restore_rewritten_refs(&refs).await, 1);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains(
+                "set image deployment/app app=localhost:30500/cogneva:main-old seed=localhost:30500/cogneva:main-seedold"
+            ),
+            "both containers of one workload must travel in one command: {calls}"
+        );
+        assert_eq!(
+            calls.matches("set image ").count(),
+            2,
+            "one command per workload, no more: {calls}"
+        );
+    }
+
+    /// 回滚要还的是**这一组**引用，不是一个主容器：主容器（`prevs` 快照）+ 同一份文档
+    /// 里被这次 apply 改写的其它容器一条命令还回去，支撑面的引用在目标之后也还回去。
+    /// 只还主容器的话，失败 rev 的二进制会继续留在启动路径上。
+    #[tokio::test]
+    async fn rollback_restores_the_whole_group_of_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+echo ok
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        // 就绪预算 0：回滚里那次"等它收敛"首轮即过期，只 warn 不拖时间——这个测试
+        // 问的是发出了哪几条命令，不是等它收敛。
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            0,
+            0,
+        );
+        let target = RolloutTarget {
+            deployment: "cogneva-evolution".into(),
+            container: "cogneva".into(),
+            component: "evolution".into(),
+            name: "cogneva".into(),
+        };
+        let other = RolloutTarget {
+            deployment: "cogneva-sandbox-executor".into(),
+            container: "sandbox-executor".into(),
+            component: "sandbox-executor".into(),
+            name: "cogneva".into(),
+        };
+        let refs = RefSnapshots {
+            targets: vec![
+                // 主容器在目标清单里也有一份声明：它与 `prevs` 是同一处，必须只出现一次。
+                RewrittenRef {
+                    resource: "deployment".into(),
+                    name: "cogneva-evolution".into(),
+                    container: "cogneva".into(),
+                    image: "localhost:30500/cogneva:main-stale".into(),
+                },
+                RewrittenRef {
+                    resource: "deployment".into(),
+                    name: "cogneva-evolution".into(),
+                    container: "seed-source".into(),
+                    image: "localhost:30500/cogneva:main-seedold".into(),
+                },
+                // 没滚过的目标：它的引用一个字节都没动，不许出现在还原里。
+                RewrittenRef {
+                    resource: "deployment".into(),
+                    name: "cogneva-sandbox-executor".into(),
+                    container: "seed-sandbox".into(),
+                    image: "localhost:30500/cogneva:main-sandold".into(),
+                },
+            ],
+            support: vec![RewrittenRef {
+                resource: "statefulset".into(),
+                name: "redis".into(),
+                container: "aof-repair".into(),
+                image: "localhost:30500/cogneva:main-aofold".into(),
+            }],
+        };
+        let done = vec![&target, &other];
+        let prevs = vec![
+            (
+                "cogneva-evolution".to_string(),
+                "localhost:30500/cogneva:main-old".to_string(),
+            ),
+            (
+                "cogneva-sandbox-executor".to_string(),
+                "localhost:30500/cogneva:main-old".to_string(),
+            ),
+        ];
+        executor
+            .rollback(
+                &SFError::Agent("rollout did not complete".into()),
+                &done,
+                &prevs,
+                &refs,
+            )
+            .await;
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains(
+                "set image deployment/cogneva-evolution cogneva=localhost:30500/cogneva:main-old seed-source=localhost:30500/cogneva:main-seedold"
+            ),
+            "the main container and the init container of one workload travel together: {calls}"
+        );
+        assert!(
+            calls.contains(
+                "set image statefulset/redis aof-repair=localhost:30500/cogneva:main-aofold"
+            ),
+            "the support face is restored too: {calls}"
+        );
+        // 主容器的前值以 `prevs` 那一份为准：声明面里那一条不许再拼一遍。
+        assert!(
+            !calls.contains("main-stale"),
+            "a duplicated container spec must not reach `set image`: {calls}"
+        );
+    }
+
+    /// 端到端：清单包里的引用在 apply 之前被快照下来，滚动失败时整组还原——目标清单里
+    /// 的 init 容器与支撑清单里的边车都算数（它们正是留在失败 rev 上的那几处）。
+    #[tokio::test]
+    async fn a_failed_rollout_restores_the_manifest_references_it_rewrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let manifests = bin_dir.join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(
+            manifests.join("support.yaml"),
+            "kind: Deployment\nmetadata:\n  name: cogneva-registry\nspec:\n  template:\n    spec:\n      containers:\n        - name: volume-walker\n          image: localhost:30500/cogneva:main-new\n",
+        )
+        .unwrap();
+        std::fs::write(
+            manifests.join("deploy-cogneva-sandbox-executor.yaml"),
+            "kind: Deployment\nmetadata:\n  name: cogneva-sandbox-executor\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: seed-sandbox\n          image: localhost:30500/cogneva:main-new\n      containers:\n        - name: sandbox-executor\n          image: localhost:30500/cogneva:main-new\n",
+        )
+        .unwrap();
+        let log = bin_dir.join("kubectl.log");
+        // 目标永远不收敛（`observedGeneration` 落后），其余照旧；支撑工作负载的代数
+        // 不变，所以没有支撑等待。
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get deployment cogneva-registry --ignore-not-found"*)
+    printf '%s\n' 'volume-walker=localhost:30500/cogneva:main-walkerold' ;;
+  *"get deployment cogneva-sandbox-executor --ignore-not-found"*)
+    printf '%s\n' 'sandbox-executor=localhost:30500/cogneva:main-old' 'seed-sandbox=localhost:30500/cogneva:main-seedold' ;;
+  *"get deploy -o"*) echo "cogneva-registry 1" ;;
+  *"get statefulset -o"*) ;;
+  *"get configmap -o"*) echo '{{"items":[]}}' ;;
+  *"jsonpath={{.spec}}"*) echo '{{"replicas":1}}' ;;
+  *generation*) echo "1|0|1|0|0|" ;;
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"get pods"*) echo "0 true " ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            1,
+            1,
+        );
+        let plan = RolloutPlan {
+            tag: "localhost:30500/cogneva:main-new".into(),
+            targets: vec![RolloutTarget {
+                deployment: "cogneva-sandbox-executor".into(),
+                container: "sandbox-executor".into(),
+                component: "sandbox-executor".into(),
+                name: "cogneva".into(),
+            }],
+            manifests_dir: Some(manifests.to_string_lossy().to_string()),
+        };
+        let err = executor.run(&plan).await.unwrap_err();
+        assert_eq!(err.class, FailureClass::Version, "{err}");
+        assert!(err.to_string().contains("stuck in startup phase"), "{err}");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains(
+                "set image deployment/cogneva-sandbox-executor sandbox-executor=localhost:30500/cogneva:main-old seed-sandbox=localhost:30500/cogneva:main-seedold"
+            ),
+            "the rolled target must go back as one group: {calls}"
+        );
+        assert!(
+            calls.contains("set image deployment/cogneva-registry volume-walker=localhost:30500/cogneva:main-walkerold"),
+            "the support face this apply rewrote must go back too: {calls}"
         );
     }
 

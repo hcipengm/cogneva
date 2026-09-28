@@ -49,6 +49,14 @@ spec:
               # 既 seed 不出空卷、也刷不到新 release tag。
               # http.connectTimeout/lowSpeed 给网络操作兜底，否则离线时 git 会
               # 长时间挂在连接上拖慢 Init 与整 Pod 就绪。
+              # 但连接超时与低速阈值管不住"带宽很低但在动"的传输：实测一次
+              # fetch 跑了 14 分钟没完，把整段启动预算吃光、Pod 被判启动超时
+              # （一次网络慢被记成版本缺陷）。所以每个走公网的 git 调用再加一层
+              # 挂钟上界：单次尝试最多 240 秒（实测正常读数秒级到几十秒，取数倍
+              # 余量）。超了就当这个镜像不可用、走下面已有的失败分支，语义不变。
+              # 代价：真的很大的传输可能一次传不完而被放弃，下一轮从零再来（被杀
+              # 掉的 fetch 不落 refs），极端网络下裸仓会停在旧 main——启动可用性
+              # 优先于基线新鲜度，与"全部镜像失败不阻塞启动"同向。
               mirrors="https://github.com/hcipengm/cogneva.git,https://gitee.com/hcipengm/cogneva.git"
               # gitRemote.mode=pvc 时首挂是空卷，从公开仓库 seed；
               # hostPath 模式宿主已预 seed，本步自动跳过。
@@ -56,14 +64,21 @@ spec:
               if [ ! -f /host-git/HEAD ]; then
                 for m in $(echo "$mirrors" | tr ',' ' '); do
                   echo "git-remote is empty; seeding bare repo from $m ..."
-                  if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare "$m" /tmp/seed.git; then
+                  rc=0
+                  /usr/bin/timeout 240 git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare "$m" /tmp/seed.git || rc=$?
+                  if [ "$rc" = 0 ]; then
                     cp -a /tmp/seed.git/. /host-git/
                     rm -rf /tmp/seed.git
                     break
                   fi
+                  if [ "$rc" = 124 ]; then
+                    echo "WARN: git-remote seed from $m gave up after the 240s bound (transfer slower than the bound, or the mirror never answered)"
+                  else
+                    echo "WARN: git-remote seed from $m failed (rc=$rc)"
+                  fi
                   rm -rf /tmp/seed.git
                 done
-                [ -f /host-git/HEAD ] || echo "WARN: git-remote seed failed on every mirror (offline?); starting without a seeded baseline"
+                [ -f /host-git/HEAD ] || echo "WARN: git-remote seed failed on every mirror (no mirror answered within the bound); starting without a seeded baseline"
               fi
               if [ -f /host-git/HEAD ]; then
                 # bare 保持一个指向上游的 upstream remote，启动时拉最新 main 与
@@ -72,10 +87,16 @@ spec:
                 for m in $(echo "$mirrors" | tr ',' ' '); do
                   git --git-dir=/host-git remote remove upstream 2>/dev/null || true
                   git --git-dir=/host-git remote add upstream "$m"
-                  if git --git-dir=/host-git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force; then
+                  rc=0
+                  /usr/bin/timeout 240 git --git-dir=/host-git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force || rc=$?
+                  if [ "$rc" = 0 ]; then
                     break
                   fi
-                  echo "WARN: fetch upstream tags from $m failed (offline?); trying the next mirror"
+                  if [ "$rc" = 124 ]; then
+                    echo "WARN: fetch upstream tags from $m gave up after the 240s bound (transfer slower than the bound, or the mirror never answered); trying the next mirror"
+                  else
+                    echo "WARN: fetch upstream tags from $m failed (rc=$rc); trying the next mirror"
+                  fi
                 done
               fi
               # 工作树由分配器按需从裸仓库切出（零克隆、共享对象库），这里只清掉
