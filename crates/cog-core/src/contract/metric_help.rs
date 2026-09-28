@@ -63,9 +63,13 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         "llm_tokens_total",
-        "Total LLM tokens consumed, split by input and output. Published at \
-         zero too: a missing cell says the metering path never ran for that \
-         upstream and actor, a cell holding zero says it ran and found nothing",
+        "Total LLM tokens consumed, split by `kind` into input, output and \
+         cached. `cached` is the part of the input the upstream served from its \
+         own cache; on an OpenAI-compatible upstream it is a subset of `input`, \
+         on Anthropic it is disjoint from it, so read the ratio according to the \
+         upstream's protocol. Published at zero too: a missing cell says the \
+         metering path never ran for that upstream and actor, a cell holding \
+         zero says it ran and found nothing",
     ),
     (
         crate::metric_names::LLM_USAGE_READINGS_TOTAL.as_str(),

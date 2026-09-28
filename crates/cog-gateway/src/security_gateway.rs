@@ -1313,8 +1313,9 @@ fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
 /// the fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageOutcome {
-    /// A usage frame was parsed, so the token counts recorded for this call are
-    /// the upstream's own numbers.
+    /// A usage frame was parsed carrying at least one of the three counts, so the
+    /// numbers recorded for this call are the upstream's own — they are not a
+    /// statement about how many of them it sent.
     Read,
     /// The response body finished and carried no usage frame at all, on a call
     /// that did ask the upstream to report usage. The counts recorded beside it
@@ -1354,6 +1355,8 @@ impl UsageOutcome {
 struct UsageReading {
     input: u64,
     output: u64,
+    /// 上游自报的、由缓存服务的那部分输入（协议面决定它与 `input` 是包含还是互斥）。
+    cached: u64,
     outcome: UsageOutcome,
 }
 
@@ -1365,11 +1368,15 @@ impl UsageReading {
     /// A call that never asked cannot have been ignored, so its silence is
     /// `NotAsked`; only a call that did ask leaves the silence on the upstream's
     /// side, which is `Absent`.
-    fn from_usage((input, output): (Option<u64>, Option<u64>), asked: bool) -> Self {
+    fn from_usage(
+        (input, output, cached): (Option<u64>, Option<u64>, Option<u64>),
+        asked: bool,
+    ) -> Self {
         Self {
             input: input.unwrap_or(0),
             output: output.unwrap_or(0),
-            outcome: if input.is_some() || output.is_some() {
+            cached: cached.unwrap_or(0),
+            outcome: if input.is_some() || output.is_some() || cached.is_some() {
                 UsageOutcome::Read
             } else if asked {
                 UsageOutcome::Absent
@@ -1441,6 +1448,18 @@ async fn record_llm_tokens(
         &[("upstream", &key), ("kind", "output"), ("actor", actor)],
     )
     .await;
+    // 第三格是**从缓存服务的那部分输入**，与上面两格同一个名字、同一根 kind 轴。
+    // 被缓存命中的输入没有从缓存里读一遍的价值——它比未命中的输入便宜得多——所以
+    // `kind="cached" / kind="input"` 就是命中率，也是"把稳定前缀排到前面"这类改动
+    // 唯一的验收读数。它与 input 的关系随协议面变（OpenAI 兼容面上是 input 的一部分，
+    // Anthropic 面上与 input 互斥），读的人按上游的协议解释。
+    record_counter_add(
+        state,
+        cog_core::metric_names::LLM_TOKENS_TOTAL,
+        reading.cached as f64,
+        &[("upstream", &key), ("kind", "cached"), ("actor", actor)],
+    )
+    .await;
     // No actor here on purpose: whether an upstream speaks usage at all is
     // settled by the upstream and its compat profile, not by who called it, so
     // splitting by caller would multiply one answer across every caller and
@@ -1461,6 +1480,9 @@ async fn record_llm_tokens(
             .property("actor", serde_json::json!(actor))
             .property("tokens_in", serde_json::json!(reading.input))
             .property("tokens_out", serde_json::json!(reading.output))
+            // 明细里同一格也带上：Prometheus 那条是"命中率在动吗"，这条是"哪一次
+            // 命中、命中多少"——事件表按 JSON 属性存，加一个键不欠 schema 迁移。
+            .property("tokens_cached", serde_json::json!(reading.cached))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
     land_usage_record(
@@ -1487,16 +1509,41 @@ async fn record_llm_tokens(
 /// `None` means it said nothing. Filtering the zeros out here would erase the
 /// difference before any caller could read it, and an upstream that answers
 /// "none was used" would be recorded as one that never answered.
-fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+///
+/// 第三个数是**上游自己报的、由缓存服务的那部分输入 token**。单列一格而不是并进
+/// 输入：它与输入之比就是命中率，而命中率是「把稳定前缀排到前面」这类改动唯一的
+/// 验收读数——没有它，省 token 的改动只能靠推理说"应该省了"。
+/// 两个协议面对它的**关系不同，读的人要按协议读**：OpenAI 兼容面上 `cached_tokens`
+/// 是 `prompt_tokens` 的一部分（命中率 = cached / prompt）；Anthropic 面上
+/// `cache_read_input_tokens` 与 `input_tokens` 互斥（各是 prompt 的一段，相加才是
+/// 完整 prompt，命中率 = cache_read / (input + cache_read)）。这一处差异是协议的，
+/// 不是我们的：合成一格是为了让"从缓存服务了多少"这个量只有一个名字，读的人按
+/// 上游的协议面解释它。读不到仍是 `None`，同上面两个计数。
+fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<u64>) {
     let as_u64 = |v: &serde_json::Value| v.as_u64();
+    // OpenAI 兼容面两种书写都认：实测到的是 `usage.cached_tokens`（顶层），
+    // 另一些实现放在 `usage.prompt_tokens_details.cached_tokens` 里。
+    let cached_of = |usage: &serde_json::Value| {
+        usage.get("cached_tokens").and_then(as_u64).or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(as_u64)
+        })
+    };
     match json.get("type").and_then(|t| t.as_str()) {
         Some("message_start") => {
-            let input = json.pointer("/message/usage/input_tokens").and_then(as_u64);
-            (input, None)
+            let usage = json.pointer("/message/usage");
+            (
+                usage.and_then(|u| u.get("input_tokens")).and_then(as_u64),
+                None,
+                usage
+                    .and_then(|u| u.get("cache_read_input_tokens"))
+                    .and_then(as_u64),
+            )
         }
         Some("message_delta") => {
             let output = json.pointer("/usage/output_tokens").and_then(as_u64);
-            (None, output)
+            (None, output, None)
         }
         _ => {
             let usage = json.get("usage");
@@ -1505,6 +1552,7 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
                 usage
                     .and_then(|u| u.get("completion_tokens"))
                     .and_then(as_u64),
+                usage.and_then(cached_of),
             )
         }
     }
@@ -1519,6 +1567,9 @@ struct UsageScanner {
     raw: Vec<u8>,
     tokens_input: u64,
     tokens_output: u64,
+    /// 上游自报的缓存命中量。与另两个计数同样只在真拿到正数时改写：中间帧常带一个
+    /// 占位的 0，拿它覆盖前面已经报过的真值就把读数弄丢了。
+    tokens_cached: u64,
     /// Set when the response stream yielded an error. Kept because "the body
     /// ended" and "the body was cut off" produce the same zero counts, and only
     /// the second one means the call itself failed.
@@ -1551,8 +1602,8 @@ impl UsageScanner {
                 continue;
             }
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                let (input, output) = extract_usage(&json);
-                self.absorb(input, output);
+                let (input, output, cached) = extract_usage(&json);
+                self.absorb(input, output, cached);
             }
         }
     }
@@ -1579,8 +1630,8 @@ impl UsageScanner {
     /// 把一帧里报出的用量并进读数。两件事分开记：**帧到过没有**（决定归哪一格）
     /// 与**计数取多少**（决定记多少 token）。上游报一个 0 表示"没用量"，那和
     /// "没开口"是两回事，所以这两件事不能共用一个判据。
-    fn absorb(&mut self, input: Option<u64>, output: Option<u64>) {
-        if input.is_some() || output.is_some() {
+    fn absorb(&mut self, input: Option<u64>, output: Option<u64>, cached: Option<u64>) {
+        if input.is_some() || output.is_some() || cached.is_some() {
             self.saw_usage = true;
         }
         // 计数却只在真拿到正数时改写：有的上游在中间帧里带一个 usage:0 当占位，
@@ -1591,6 +1642,9 @@ impl UsageScanner {
         if let Some(n) = output.filter(|n| *n > 0) {
             self.tokens_output = n;
         }
+        if let Some(n) = cached.filter(|n| *n > 0) {
+            self.tokens_cached = n;
+        }
     }
 
     /// 流结束时兜底：SSE 行扫描一无所获时按整体 JSON 解析一次
@@ -1600,8 +1654,8 @@ impl UsageScanner {
             return;
         }
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&self.raw) {
-            let (input, output) = extract_usage(&json);
-            if input.is_some() || output.is_some() {
+            let (input, output, cached) = extract_usage(&json);
+            if input.is_some() || output.is_some() || cached.is_some() {
                 self.saw_usage = true;
             }
             if let Some(n) = input {
@@ -1609,6 +1663,9 @@ impl UsageScanner {
             }
             if let Some(n) = output {
                 self.tokens_output = n;
+            }
+            if let Some(n) = cached {
+                self.tokens_cached = n;
             }
         }
     }
@@ -1651,6 +1708,7 @@ fn wrap_usage_scan(
             UsageReading {
                 input: s.tokens_input,
                 output: s.tokens_output,
+                cached: s.tokens_cached,
                 outcome: s.outcome(),
             }
         };
@@ -4643,7 +4701,7 @@ mod tests {
             "choices": [],
             "usage": {"prompt_tokens": 123, "completion_tokens": 45}
         });
-        assert_eq!(extract_usage(&json), (Some(123), Some(45)));
+        assert_eq!(extract_usage(&json), (Some(123), Some(45), None));
     }
 
     #[test]
@@ -4652,18 +4710,61 @@ mod tests {
             "type": "message_start",
             "message": {"usage": {"input_tokens": 77, "output_tokens": 1}}
         });
-        assert_eq!(extract_usage(&start), (Some(77), None));
+        assert_eq!(extract_usage(&start), (Some(77), None, None));
         let delta = serde_json::json!({
             "type": "message_delta",
             "usage": {"output_tokens": 210}
         });
-        assert_eq!(extract_usage(&delta), (None, Some(210)));
+        assert_eq!(extract_usage(&delta), (None, Some(210), None));
+    }
+
+    /// 缓存命中量两种书写都认，且它自成一格而不是并进输入：并入输入之后
+    /// 「命中率」这个数就再也取不出来了。
+    #[test]
+    fn usage_extract_reads_the_cached_count_however_the_upstream_names_it() {
+        let top_level = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 400, "completion_tokens": 7, "cached_tokens": 384}
+        });
+        assert_eq!(extract_usage(&top_level), (Some(400), Some(7), Some(384)));
+
+        let nested = serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 400,
+                "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 256}
+            }
+        });
+        assert_eq!(extract_usage(&nested), (Some(400), Some(7), Some(256)));
+
+        let anthropic = serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 12, "cache_read_input_tokens": 900}}
+        });
+        assert_eq!(extract_usage(&anthropic), (Some(12), None, Some(900)));
+    }
+
+    /// 「上游报了 0」与「上游没报」在这一格上同样要分开：把它当同一个值处理，
+    /// 一个明说自己没有缓存命中的上游会被记成从没提过缓存这件事。
+    #[test]
+    fn a_named_zero_cache_read_is_not_silence_about_caching() {
+        let named = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 1, "cached_tokens": 0}
+        });
+        assert_eq!(extract_usage(&named), (Some(20), Some(1), Some(0)));
+        let silent = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 1}
+        });
+        assert_eq!(extract_usage(&silent), (Some(20), Some(1), None));
     }
 
     #[test]
     fn usage_extract_unrelated_json_is_none() {
         let json = serde_json::json!({"choices": [{"delta": {"content": "hi"}}]});
-        assert_eq!(extract_usage(&json), (None, None));
+        assert_eq!(extract_usage(&json), (None, None, None));
     }
 
     /// A named zero is presence, not absence. The two only look alike once the
@@ -4675,9 +4776,9 @@ mod tests {
             "choices": [],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0}
         });
-        assert_eq!(extract_usage(&zeroed), (Some(0), Some(0)));
+        assert_eq!(extract_usage(&zeroed), (Some(0), Some(0), None));
         let absent = serde_json::json!({"choices": [], "usage": null});
-        assert_eq!(extract_usage(&absent), (None, None));
+        assert_eq!(extract_usage(&absent), (None, None, None));
     }
 
     #[test]
@@ -4816,23 +4917,30 @@ mod tests {
         s.feed(b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n");
         s.finish();
         assert_eq!(s.outcome(), UsageOutcome::Read);
-        let silent = UsageReading::from_usage((None, None), true);
+        let silent = UsageReading::from_usage((None, None, None), true);
         assert_eq!(silent.outcome, UsageOutcome::Absent);
-        assert_eq!((silent.input, silent.output), (0, 0));
+        assert_eq!((silent.input, silent.output, silent.cached), (0, 0, 0));
         assert_eq!(
-            UsageReading::from_usage((None, None), false).outcome,
+            UsageReading::from_usage((None, None, None), false).outcome,
             UsageOutcome::NotAsked,
             "a call that never asked cannot have been ignored"
         );
         assert_eq!(
-            UsageReading::from_usage((Some(0), None), true).outcome,
+            UsageReading::from_usage((Some(0), None, None), true).outcome,
             UsageOutcome::Read,
             "a named count of zero is still the upstream speaking"
         );
         assert_eq!(
-            UsageReading::from_usage((Some(3), Some(1)), false).outcome,
+            UsageReading::from_usage((Some(3), Some(1), None), false).outcome,
             UsageOutcome::Read,
             "usage that arrived outranks whether we asked for it"
+        );
+        // 只报缓存那一格也算上游开口了：帧到过没有是这一格的判据，帧里带了几个数
+        // 不是——把它当沉默会让一个只谈缓存的应答落进"上游没开口"。
+        assert_eq!(
+            UsageReading::from_usage((None, None, Some(9)), true).outcome,
+            UsageOutcome::Read,
+            "a frame that named only the cached count still spoke"
         );
     }
 

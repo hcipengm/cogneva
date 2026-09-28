@@ -198,6 +198,25 @@ impl RalphLoop {
         (self.config.stagnation_window as usize).max(1)
     }
 
+    /// The span of `history` a failure analysis is shown, and the span it is
+    /// not. Same bound as [`Self::history_keep`], for the same stated reason:
+    /// the earlier iterations are dead weight in a prompt exactly as they are
+    /// on the board. Returned as two slices rather than a length so the caller
+    /// measures what it puts in the prompt against what it left out, instead of
+    /// asserting the difference.
+    fn failure_prompt_history<'a>(
+        &self,
+        history: &'a [RalphIteration],
+    ) -> (&'a [RalphIteration], &'a [RalphIteration]) {
+        let keep = self.history_keep();
+        if history.len() > keep {
+            let (older, tail) = history.split_at(history.len() - keep);
+            (tail, older)
+        } else {
+            (history, &history[..0])
+        }
+    }
+
     /// Load a previously persisted history, replacing the in-memory one.
     /// Only the tail is kept: the archive's job is to carry the last verdict
     /// forward, and reading back every iteration ever run made a re-drive pay
@@ -856,7 +875,23 @@ impl RalphLoop {
         history: &[RalphIteration],
         llm: &Arc<dyn cog_core::LlmClient>,
     ) -> cog_core::SFResult<FailureAnalysis> {
-        let history_json = serde_json::to_string_pretty(history).unwrap_or_default();
+        // The classifier is shown the same tail the other two carriers of this
+        // history are held to. Three places read this run's history — the state
+        // board restore, the archive write and this prompt — and the first two
+        // both trim to `history_keep()`, whose own reason is that everything
+        // older buys nothing. Only the prompt grew with the run, so a long
+        // non-converging run paid for the same dead weight on every failure,
+        // and the later the run got the more it paid. The bound is applied to
+        // what goes into the prompt, never to the slice the caller passed:
+        // `analyze_failure` counts the whole history for its "same failure
+        // repeated N times" verdict, and a trimmed slice would undercount it.
+        let (recent, dropped) = self.failure_prompt_history(history);
+        let history_json = serde_json::to_string_pretty(recent).unwrap_or_default();
+        let dropped_bytes = serde_json::to_string_pretty(dropped)
+            .map(|json| json.len())
+            .unwrap_or(0);
+        crate::observable::global_observable()
+            .record_failure_history_bytes(history_json.len(), dropped_bytes);
 
         let prompt = format!(
             "You are a failure-analysis expert for an AI agent system. \
@@ -1416,6 +1451,119 @@ mod tests {
             snapshot: serde_json::json!({}),
             progress: None,
         }
+    }
+
+    // -----------------------------------------------------------------
+
+    /// 失败分析的提示词只带归档同一条界内的尾部，不带整段历史。
+    ///
+    /// 这条界决定了分类器的提示词会不会随一次已经注定不收敛的运行一直长；
+    /// 没有它，每一次失败都要重新为「循环自己已经认定是死重」的那些迭代
+    /// 付费，而且越到后面付得越多。两端都断言：只裁到空的界会用零证据
+    /// 回答同一个问题。
+    #[test]
+    fn the_failure_prompt_carries_only_the_tail_the_archive_keeps() {
+        let ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 3,
+        });
+        let history: Vec<RalphIteration> = (1..=10)
+            .map(|i| failed_iteration(i, ResetStrategy::Identical, &format!("failure {i}")))
+            .collect();
+
+        let (shown, left_out) = ralph.failure_prompt_history(&history);
+
+        assert_eq!(shown.len(), 3, "一个窗口，不是十轮");
+        assert_eq!(shown[0].iteration, 8, "留下的是尾部");
+        assert_eq!(shown[2].iteration, 10);
+        assert_eq!(left_out.len(), 7);
+        assert_eq!(left_out[0].iteration, 1);
+    }
+
+    /// 比窗口短的历史一条不裁：这条界是上限，不是配额。
+    #[test]
+    fn a_run_shorter_than_the_window_is_shown_in_full() {
+        let ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 5,
+        });
+        let history: Vec<RalphIteration> = (1..=2)
+            .map(|i| failed_iteration(i, ResetStrategy::Identical, &format!("failure {i}")))
+            .collect();
+
+        let (shown, left_out) = ralph.failure_prompt_history(&history);
+
+        assert_eq!(shown.len(), 2);
+        assert!(left_out.is_empty());
+    }
+
+    /// 裁下来的量落成读数：`dropped` 是这条界真的省掉的字节，`fed` 是真正
+    /// 进了提示词的那部分。只发布 `fed` 说不出省了多少，而一个恒为 0 的
+    /// `dropped` 说明这条界从没生效过——那不是坏了，是没被用到。
+    #[tokio::test]
+    async fn the_failure_prompt_records_what_the_bound_left_out() {
+        let llm = Arc::new(MockSemanticLlm {
+            response_json:
+                r#"{"failure_type":"LogicError","root_cause":"x","recommended_strategy":"Modified","suggested_modifications":"y"}"#
+                    .to_string(),
+        });
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 50,
+            stagnation_window: 2,
+        })
+        .with_llm_provider(llm);
+        for i in 1..=5 {
+            // 反馈各不相同：逐字相同的反馈会被纯控制流提前判成不可恢复，
+            // 那条路上根本不建提示词，也就没有这条读数可言。
+            ralph.history.push(failed_iteration(
+                i,
+                ResetStrategy::Identical,
+                &format!("failure {i}"),
+            ));
+        }
+        let eval = EvaluationResult {
+            verdict: Verdict::Fail,
+            score: Some(0),
+            feedback: "the newest failure".into(),
+            criteria: vec![],
+            details: None,
+        };
+
+        let before = prompt_bytes().await;
+        let history = ralph.history.clone();
+        let _ = ralph.analyze_failure(&eval, &history).await;
+        let after = prompt_bytes().await;
+
+        assert!(
+            after.1 > before.1,
+            "被裁掉的字节要记成读数：before={:?} after={:?}",
+            before,
+            after
+        );
+        assert!(after.0 > before.0, "喂进去的那段也要记");
+    }
+
+    /// 失败分析提示词的两端读数（fed, dropped），取自全局观测面。
+    async fn prompt_bytes() -> (f64, f64) {
+        use cog_core::observability::Observable;
+        let metrics = crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap();
+        let cell = |part: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "ralph_failure_prompt_bytes_total"
+                        && m.labels.get("part").map(String::as_str) == Some(part)
+                })
+                .map(|m| m.value)
+                .unwrap_or(0.0)
+        };
+        (
+            cell(crate::observable::RALPH_HISTORY_FED),
+            cell(crate::observable::RALPH_HISTORY_DROPPED),
+        )
     }
 
     #[test]

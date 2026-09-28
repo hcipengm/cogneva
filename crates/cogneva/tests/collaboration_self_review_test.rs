@@ -260,6 +260,78 @@ async fn test_review_without_a_caller_names_the_component_alone() {
     );
 }
 
+/// A revision that rewrote nothing ends the review instead of buying another
+/// round of the identical question.
+///
+/// The loop is driven to `NeedRevision` and the revision step hands back no
+/// text, which the revise step reads as "no revision" and answers with the
+/// original. The next round would build its critique and comparison from that
+/// same text, the same specification and the same best practices, so it asks a
+/// question already answered — and an unchanged text cannot be improved by
+/// asking twice. The call count is the assertion: critique, comparison and
+/// revision, and nothing after them.
+#[tokio::test]
+async fn test_a_revision_that_rewrote_nothing_ends_the_review() {
+    let provider = DummyProvider::new(vec![
+        r#"{"issues":["no test covers the change"],"missing":[],"strengths":[]}"#.into(),
+        r#"{"gaps":["no test"],"aligned":[],"score":0.4}"#.into(),
+        // Empty text: the revision step treats it as "nothing was revised" and
+        // answers with the original output.
+        "".into(),
+    ]);
+    let config = SelfReviewConfig {
+        max_iterations: 3,
+        ..SelfReviewConfig::default()
+    };
+
+    let (text, result) = SelfReviewLoop::new(config)
+        .review("draft", &provider)
+        .await
+        .unwrap();
+
+    assert_eq!(text, "draft", "no revision is the original text");
+    assert!(
+        matches!(result, SelfReviewResult::NeedRevision { .. }),
+        "the judgement already reached is what the caller is handed"
+    );
+    assert_eq!(
+        provider.payloads().len(),
+        3,
+        "critique, comparison, revision — the second round must not be paid for"
+    );
+}
+
+/// A revision that rewrote the text keeps the loop going: the next round has a
+/// different text to judge, so it is the review working rather than repeating
+/// itself.
+#[tokio::test]
+async fn test_a_revision_that_rewrote_the_text_continues_the_review() {
+    let provider = DummyProvider::new(vec![
+        r#"{"issues":["no test covers the change"],"missing":[],"strengths":[]}"#.into(),
+        r#"{"gaps":["no test"],"aligned":[],"score":0.4}"#.into(),
+        "draft with a test".into(),
+        r#"{"issues":[],"missing":[],"strengths":[]}"#.into(),
+        r#"{"gaps":[],"aligned":[],"score":0.95}"#.into(),
+    ]);
+    let config = SelfReviewConfig {
+        max_iterations: 3,
+        ..SelfReviewConfig::default()
+    };
+
+    let (text, result) = SelfReviewLoop::new(config)
+        .review("draft", &provider)
+        .await
+        .unwrap();
+
+    assert_eq!(text, "draft with a test");
+    assert!(matches!(result, SelfReviewResult::Pass { .. }));
+    assert_eq!(
+        provider.payloads().len(),
+        5,
+        "the rewritten text is judged again, and that round passes"
+    );
+}
+
 /// A critique with the given findings and nothing else, for the decide tests.
 fn critique_of(issues: &[&str], missing: &[&str]) -> Critique {
     Critique {

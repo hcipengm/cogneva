@@ -42,6 +42,27 @@ pub const SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE: &str = "upstream_unavailable";
 pub const SELF_REVIEW_SKIP_DISABLED: &str = "disabled";
 pub const SELF_REVIEW_SKIP_SELF_EVOLUTION: &str = "self_evolution";
 
+/// The two ends of a revision step inside a self-review that did run. Both
+/// cells answer a question the verdict cannot: a review that ended in
+/// `need_revision` with the text unchanged is a review the loop could stop at,
+/// and the pair (a revision that rewrote the text, one that rewrote nothing)
+/// is what separates "the loop stops when rewriting buys nothing" from "the
+/// loop never reached its second iteration".
+pub const SELF_REVIEW_REVISION_CHANGED: &str = "changed";
+pub const SELF_REVIEW_REVISION_UNCHANGED: &str = "unchanged";
+
+/// The two ends of the history a failure analysis is shown, summed in bytes of
+/// the serialized prompt section. `dropped` is what the bound removed: a
+/// zero there means the bound never bound (not that it is broken), while a
+/// zero on `fed` would mean the classifier was asked to classify with no
+/// history at all.
+pub const RALPH_HISTORY_FED: &str = "fed";
+pub const RALPH_HISTORY_DROPPED: &str = "dropped";
+
+/// Both ends of the failure-analysis history, published even at zero. See
+/// [`RALPH_HISTORY_FED`].
+pub const RALPH_HISTORY_PARTS: [&str; 2] = [RALPH_HISTORY_FED, RALPH_HISTORY_DROPPED];
+
 pub fn global_observable() -> Arc<CollaborationObservable> {
     GLOBAL
         .get_or_init(|| Arc::new(CollaborationObservable::new()))
@@ -123,6 +144,19 @@ pub struct CollaborationObservable {
     /// closes nothing. Kept apart from the verdict cells so "the gate objected"
     /// and "the gate never opened" never add up to the same number.
     self_review_skips: Arc<std::sync::Mutex<HashMap<SelfReviewSkipCell, u64>>>,
+    /// The two ends of a self-review's revision step, keyed by (stage, outcome).
+    ///
+    /// See [`SELF_REVIEW_REVISION_CHANGED`]: the saving this face measures is the
+    /// rest of the loop — a review whose revision rewrote nothing has nothing
+    /// left to ask, and the iterations it does not run are two calls each.
+    self_review_revisions: Arc<std::sync::Mutex<HashMap<(String, String), u64>>>,
+    /// Bytes of serialized history handed to the failure-analysis classifier,
+    /// keyed by [`RALPH_HISTORY_PARTS`].
+    ///
+    /// A prompt the loop pays for by the byte: without this face the bound that
+    /// keeps it from growing with the run is indistinguishable from the bound
+    /// never being reached, and both look like a classifier that works.
+    ralph_history_bytes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
     /// Resume outcomes, over the closed set in [`crate::resume::RESUME_OUTCOMES`].
     /// The chain whose absence this measures is silent by construction: a task
     /// whose progress was never resumed simply starts again, which is what a
@@ -203,6 +237,30 @@ impl CollaborationObservable {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry((stage.to_string(), reason.to_string()))
             .or_insert(0) += 1;
+    }
+
+    /// Record how one self-review's revision step ended. Synchronous for the
+    /// same reason as the verdict counter: the count is the evidence that the
+    /// loop stopped where it did, and a dropped count reads as a loop that kept
+    /// iterating.
+    pub fn record_self_review_revision(&self, stage: &str, outcome: &str) {
+        let mut map = self
+            .self_review_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry((stage.to_string(), outcome.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    /// Record the size of the history a failure analysis was shown: the bytes
+    /// fed, and the bytes the bound kept out.
+    pub fn record_failure_history_bytes(&self, fed: usize, dropped: usize) {
+        let mut map = self
+            .ralph_history_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(RALPH_HISTORY_FED).or_insert(0) += fed as u64;
+        *map.entry(RALPH_HISTORY_DROPPED).or_insert(0) += dropped as u64;
     }
 
     /// Record one route decision. A synchronous lock, because the cell is the
@@ -337,6 +395,33 @@ impl Observable for CollaborationObservable {
                     RawMetric::new("self_review_skipped_total", *count as f64)
                         .with_label("stage", stage)
                         .with_label("reason", reason),
+                );
+            }
+
+            let revisions = self
+                .self_review_revisions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for ((stage, outcome), count) in revisions.iter() {
+                metrics.push(
+                    RawMetric::new("self_review_revision_total", *count as f64)
+                        .with_label("stage", stage)
+                        .with_label("outcome", outcome),
+                );
+            }
+
+            // The failure-analysis prompt's own size, both ends published.
+            let history_bytes = self
+                .ralph_history_bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for part in RALPH_HISTORY_PARTS {
+                let count = history_bytes.get(part).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("ralph_failure_prompt_bytes_total", count as f64)
+                        .with_label("part", part),
                 );
             }
 
@@ -512,6 +597,54 @@ mod tests {
             cell("moderator", SELF_REVIEW_CRITERIA_ABSENT, "need_revision"),
             1.0
         );
+    }
+
+    /// 失败分析提示词的两端按字节发布，零也发布。
+    #[tokio::test]
+    async fn both_ends_of_the_failure_prompt_history_are_published() {
+        let obs = CollaborationObservable::new();
+        obs.record_failure_history_bytes(120, 0);
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let bytes = |part: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "ralph_failure_prompt_bytes_total"
+                        && m.labels.get("part").map(String::as_str) == Some(part)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| panic!("{part} 这一格在没裁过时也要在"))
+        };
+        assert_eq!(bytes(RALPH_HISTORY_FED), 120.0);
+        assert_eq!(bytes(RALPH_HISTORY_DROPPED), 0.0);
+    }
+
+    /// 改写这一步的两种结局各自成格：改写买到了新文本、改写什么都没改。
+    /// 「循环从没走到改写」与「每次改写都重写了文本」不能读成同一件事。
+    #[tokio::test]
+    async fn a_revision_is_counted_by_what_it_rewrote() {
+        let obs = CollaborationObservable::new();
+        obs.record_self_review_revision("evaluator", SELF_REVIEW_REVISION_UNCHANGED);
+        obs.record_self_review_revision("planner", SELF_REVIEW_REVISION_CHANGED);
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let revisions: Vec<&RawMetric> = metrics
+            .iter()
+            .filter(|m| m.name == "self_review_revision_total")
+            .collect();
+        let cell = |stage: &str, outcome: &str| {
+            revisions
+                .iter()
+                .find(|m| {
+                    m.labels.get("stage").map(String::as_str) == Some(stage)
+                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| panic!("{stage}/{outcome} 这一格要在"))
+        };
+        assert_eq!(cell("evaluator", SELF_REVIEW_REVISION_UNCHANGED), 1.0);
+        assert_eq!(cell("planner", SELF_REVIEW_REVISION_CHANGED), 1.0);
     }
 
     #[tokio::test]

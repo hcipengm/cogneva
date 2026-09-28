@@ -131,6 +131,22 @@ pub(crate) async fn maybe_self_review(
                 &cfg,
                 crate::observable::SELF_REVIEW_VERDICT_NEED_REVISION,
             );
+            // How the revision step ended. A revision that handed back the
+            // text it was given leaves the loop nothing to ask, so the review
+            // ends there rather than buying another critique and comparison
+            // over the identical text; this cell is those rounds, plus the
+            // reviews that reached their last iteration with nothing rewritten.
+            // The other cell is recorded too — a loop that never reached a
+            // revision and one whose every revision rewrote the text must not
+            // read the same.
+            observable.record_self_review_revision(
+                agent_kind,
+                if revised == output {
+                    crate::observable::SELF_REVIEW_REVISION_UNCHANGED
+                } else {
+                    crate::observable::SELF_REVIEW_REVISION_CHANGED
+                },
+            );
             tracing::warn!(
                 agent_kind = %agent_kind,
                 score = %score,
@@ -260,12 +276,32 @@ mod tests {
             .unwrap_or(0.0)
     }
 
+    /// What one cell of the revision counter reads.
+    async fn revision_cell(stage: &str, outcome: &str) -> f64 {
+        global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap()
+            .iter()
+            .find(|m| {
+                m.name == "self_review_revision_total"
+                    && m.labels.get("stage").map(String::as_str) == Some(stage)
+                    && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+            })
+            .map(|m| m.value)
+            .unwrap_or(0.0)
+    }
+
     /// The agent under review, recording the configuration each review was
     /// actually handed — the only place a filled-in specification is visible
     /// from outside the review.
     struct ReviewRecorder {
         seen: Seen,
         pass: bool,
+        /// The text the revision step hands back, when the review asks for one.
+        /// `None` is the revision that rewrote nothing — the text it was given,
+        /// unchanged — which is a different ending from a rewrite.
+        revised: Option<String>,
     }
 
     /// 记录表放在替身外面：断言经 `dyn Agent` 读的是同一份。
@@ -273,10 +309,18 @@ mod tests {
 
     impl ReviewRecorder {
         fn recording(pass: bool) -> (Arc<dyn cog_core::Agent>, Seen) {
+            Self::recording_with_revision(pass, None)
+        }
+
+        fn recording_with_revision(
+            pass: bool,
+            revised: Option<&str>,
+        ) -> (Arc<dyn cog_core::Agent>, Seen) {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let agent = ReviewRecorder {
                 seen: seen.clone(),
                 pass,
+                revised: revised.map(str::to_string),
             };
             (Arc::new(agent), seen)
         }
@@ -378,7 +422,8 @@ mod tests {
                     score: 0.2,
                 }
             };
-            Ok((output.to_string(), result))
+            let revised = self.revised.clone().unwrap_or_else(|| output.to_string());
+            Ok((revised, result))
         }
     }
 
@@ -490,6 +535,67 @@ mod tests {
             .await,
             before + 1.0,
             "the gate objected, and the stage had nothing but its own text to object to"
+        );
+    }
+
+    /// 改写这一步买到了什么，两种结局各自成格。
+    ///
+    /// 「循环从没走到改写」与「改写每次都在重写文本」在判定面上完全同形，
+    /// 而前者省不下任何东西、后者省下的正是下一轮那两次调用。
+    #[tokio::test]
+    async fn a_revision_is_counted_by_what_it_rewrote() {
+        let (_agent_rewriting, _) = ReviewRecorder::recording_with_revision(false, Some("better"));
+        let agent_rewriting = _agent_rewriting;
+        let _ = maybe_self_review(
+            agent_rewriting.as_ref(),
+            &Some(cog_core::SelfReviewConfig::default()),
+            "draft",
+            "revision_probe_rewrote",
+            crate::actors::ReviewBasis::HeldTo("spec".into()),
+        )
+        .await;
+        assert_eq!(
+            revision_cell(
+                "revision_probe_rewrote",
+                crate::observable::SELF_REVIEW_REVISION_CHANGED
+            )
+            .await,
+            1.0
+        );
+        assert_eq!(
+            revision_cell(
+                "revision_probe_rewrote",
+                crate::observable::SELF_REVIEW_REVISION_UNCHANGED
+            )
+            .await,
+            0.0
+        );
+
+        let (agent_noop, _) = ReviewRecorder::recording(false);
+        let _ = maybe_self_review(
+            agent_noop.as_ref(),
+            &Some(cog_core::SelfReviewConfig::default()),
+            "draft",
+            "revision_probe_noop",
+            crate::actors::ReviewBasis::HeldTo("spec".into()),
+        )
+        .await;
+        assert_eq!(
+            revision_cell(
+                "revision_probe_noop",
+                crate::observable::SELF_REVIEW_REVISION_UNCHANGED
+            )
+            .await,
+            1.0,
+            "改写交回原文 = 循环就此收尾，这一格是没买的那些轮"
+        );
+        assert_eq!(
+            revision_cell(
+                "revision_probe_noop",
+                crate::observable::SELF_REVIEW_REVISION_CHANGED
+            )
+            .await,
+            0.0
         );
     }
 

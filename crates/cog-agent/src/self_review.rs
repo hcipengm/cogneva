@@ -150,8 +150,21 @@ impl SelfReviewLoop {
                 }
                 SelfReviewResult::NeedRevision { .. } => {
                     // Step 5: Revise
+                    let previous = current_output.clone();
                     current_output =
                         SelfReviewLoop::revise(&result, &current_output, &self.actor, llm).await?;
+
+                    // A revision that rewrote nothing leaves the loop with
+                    // nothing left to ask: the next critique and comparison
+                    // would be built from the same text, the same spec and the
+                    // same best practices as the pair just paid for, so a
+                    // second round is a reroll of a question already answered —
+                    // and an unchanged text cannot be improved by asking twice.
+                    // Stop here and report the judgement already reached. The
+                    // caller sees the unchanged text and counts it.
+                    if current_output == previous {
+                        return Ok((current_output, result));
+                    }
 
                     // If this was the last allowed iteration, return the revised output
                     // with the last NeedRevision result so callers can log it.
